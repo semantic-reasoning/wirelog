@@ -26,15 +26,22 @@ wirelog_datadir = get_option('datadir') / project_name
 
 # Compiler settings
 cc = meson.get_compiler('c')
-add_project_arguments(
-  [
-    '-Wall',
-    '-Wextra',
-    '-Wno-unused-parameter',
-    '-Wno-missing-field-initializers',
-  ],
-  language: 'c'
-)
+if cc.get_id() == 'msvc'
+  add_project_arguments(
+    ['/W3'],
+    language: 'c'
+  )
+else
+  add_project_arguments(
+    [
+      '-Wall',
+      '-Wextra',
+      '-Wno-unused-parameter',
+      '-Wno-missing-field-initializers',
+    ],
+    language: 'c'
+  )
+endif
 
 # Platform detection
 platform = host_machine.system()
