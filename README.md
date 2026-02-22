@@ -135,6 +135,8 @@ See [LICENSE.md](LICENSE.md) for full details.
 
 wirelog is open source under LGPL-3.0. Contributions are welcome!
 
+Please review our [Contributing Guidelines](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md), and [Security Policy](SECURITY.md) prior to submitting pull requests or reporting security issues.
+
 By submitting a contribution, you agree to the [Contributor License Agreement (CLA)](CLA.md). This is required because wirelog uses dual licensing (LGPL-3.0 + Commercial).
 
 ## Support
