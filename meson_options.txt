@@ -1,0 +1,36 @@
+option(
+  'embedded',
+  type: 'boolean',
+  value: false,
+  description: 'Enable embedded mode (minimal dependencies, smaller binary)'
+)
+
+option(
+  'ipc',
+  type: 'combo',
+  choices: ['disabled', 'enabled'],
+  value: 'disabled',
+  description: 'Enable Arrow IPC support (for data serialization and network transport)'
+)
+
+option(
+  'threads',
+  type: 'combo',
+  choices: ['disabled', 'enabled'],
+  value: 'enabled',
+  description: 'Enable pthreads support for multi-threaded execution'
+)
+
+option(
+  'tests',
+  type: 'boolean',
+  value: true,
+  description: 'Build and run tests'
+)
+
+option(
+  'documentation',
+  type: 'boolean',
+  value: false,
+  description: 'Build documentation (not yet implemented)'
+)
