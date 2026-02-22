@@ -14,6 +14,7 @@
 
 #include "../wirelog/parser/parser.h"
 #include "../wirelog/ir/program.h"
+#include "../wirelog/wirelog-parser.h"
 
 /* ======================================================================== */
 /* Test Helpers                                                             */
@@ -1023,6 +1024,481 @@ test_boolean_false_filter(void)
     PASS();
 }
 
+/* Helper: full pipeline (parse + metadata + convert + merge + schemas + strata) */
+static struct wirelog_program*
+make_full_program(const char *source)
+{
+    struct wirelog_program *prog = make_program_with_rules(source);
+    if (!prog) return NULL;
+
+    if (wl_program_merge_unions(prog) != 0) {
+        wl_program_free(prog);
+        return NULL;
+    }
+
+    wl_program_build_schemas(prog);
+    wl_program_build_default_stratum(prog);
+
+    return prog;
+}
+
+/* ======================================================================== */
+/* UNION Merge Tests                                                        */
+/* ======================================================================== */
+
+static void
+test_union_merge_tc(void)
+{
+    TEST("TC 2 rules same head -> UNION with 2 children");
+
+    struct wirelog_program *prog = make_full_program(
+        ".decl Arc(x: int32, y: int32)\n"
+        ".decl Tc(x: int32, y: int32)\n"
+        "Tc(x, y) :- Arc(x, y).\n"
+        "Tc(x, y) :- Tc(x, z), Arc(z, y).\n"
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    /* Find Tc relation index */
+    int tc_idx = -1;
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (strcmp(prog->relations[i].name, "Tc") == 0) {
+            tc_idx = (int)i;
+            break;
+        }
+    }
+
+    if (tc_idx < 0 || !prog->relation_irs) {
+        wl_program_free(prog);
+        FAIL("Tc relation or relation_irs not found");
+        return;
+    }
+
+    wirelog_ir_node_t *tc_ir = prog->relation_irs[tc_idx];
+    if (!tc_ir || tc_ir->type != WIRELOG_IR_UNION) {
+        wl_program_free(prog);
+        FAIL("Tc should be UNION");
+        return;
+    }
+
+    if (tc_ir->child_count != 2) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "UNION should have 2 children, got %u",
+                 tc_ir->child_count);
+        wl_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    wl_program_free(prog);
+    PASS();
+}
+
+static void
+test_union_single_rule(void)
+{
+    TEST("Single-rule relation -> no UNION wrapping");
+
+    struct wirelog_program *prog = make_full_program(
+        ".decl a(x: int32)\n"
+        ".decl r(x: int32)\n"
+        "r(x) :- a(x).\n"
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    /* Find r relation index */
+    int r_idx = -1;
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (strcmp(prog->relations[i].name, "r") == 0) {
+            r_idx = (int)i;
+            break;
+        }
+    }
+
+    if (r_idx < 0 || !prog->relation_irs) {
+        wl_program_free(prog);
+        FAIL("r relation or relation_irs not found");
+        return;
+    }
+
+    wirelog_ir_node_t *r_ir = prog->relation_irs[r_idx];
+    if (!r_ir) {
+        wl_program_free(prog);
+        FAIL("r IR should not be NULL");
+        return;
+    }
+
+    /* Single rule: should NOT be UNION */
+    if (r_ir->type == WIRELOG_IR_UNION) {
+        wl_program_free(prog);
+        FAIL("single rule should NOT be wrapped in UNION");
+        return;
+    }
+
+    if (r_ir->type != WIRELOG_IR_PROJECT) {
+        wl_program_free(prog);
+        FAIL("single rule should be PROJECT");
+        return;
+    }
+
+    wl_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
+/* Public API Tests                                                         */
+/* ======================================================================== */
+
+static void
+test_api_parse_string(void)
+{
+    TEST("wirelog_parse_string returns valid program");
+
+    wirelog_error_t err = WIRELOG_ERR_UNKNOWN;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n"
+        ".decl Tc(x: int32, y: int32)\n"
+        "Tc(x, y) :- Arc(x, y).\n"
+        "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+        &err
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+    if (err != WIRELOG_OK) { wirelog_program_free(prog); FAIL("error should be OK"); return; }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_parse_string_error(void)
+{
+    TEST("wirelog_parse_string returns NULL for invalid input");
+
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(
+        "this is not valid datalog {{{}}}",
+        &err
+    );
+
+    if (prog != NULL) {
+        wirelog_program_free(prog);
+        FAIL("should return NULL for invalid input");
+        return;
+    }
+
+    if (err != WIRELOG_ERR_PARSE) {
+        FAIL("error should be WIRELOG_ERR_PARSE");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_api_get_rule_count(void)
+{
+    TEST("wirelog_program_get_rule_count returns correct count");
+
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n"
+        ".decl Tc(x: int32, y: int32)\n"
+        "Tc(x, y) :- Arc(x, y).\n"
+        "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+        NULL
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    uint32_t count = wirelog_program_get_rule_count(prog);
+    if (count != 2) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 2 rules, got %u", count);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_get_schema(void)
+{
+    TEST("wirelog_program_get_schema returns correct info");
+
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n",
+        NULL
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    const wirelog_schema_t *schema = wirelog_program_get_schema(prog, "Arc");
+    if (!schema) {
+        wirelog_program_free(prog);
+        FAIL("schema for Arc should not be NULL");
+        return;
+    }
+
+    if (strcmp(schema->relation_name, "Arc") != 0) {
+        wirelog_program_free(prog);
+        FAIL("relation_name should be Arc");
+        return;
+    }
+
+    if (schema->column_count != 2) {
+        wirelog_program_free(prog);
+        FAIL("should have 2 columns");
+        return;
+    }
+
+    if (strcmp(schema->columns[0].name, "x") != 0) {
+        wirelog_program_free(prog);
+        FAIL("column 0 name should be x");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_get_schema_null(void)
+{
+    TEST("wirelog_program_get_schema(nonexistent) returns NULL");
+
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n",
+        NULL
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    const wirelog_schema_t *schema = wirelog_program_get_schema(prog, "nonexistent");
+    if (schema != NULL) {
+        wirelog_program_free(prog);
+        FAIL("should return NULL for nonexistent relation");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_get_stratum_count(void)
+{
+    TEST("wirelog_program_get_stratum_count returns 1");
+
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n"
+        ".decl Tc(x: int32, y: int32)\n"
+        "Tc(x, y) :- Arc(x, y).\n",
+        NULL
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    uint32_t count = wirelog_program_get_stratum_count(prog);
+    if (count != 1) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 1, got %u", count);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_get_stratum(void)
+{
+    TEST("wirelog_program_get_stratum(0) returns valid stratum");
+
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n"
+        ".decl Tc(x: int32, y: int32)\n"
+        "Tc(x, y) :- Arc(x, y).\n"
+        "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+        NULL
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    const wirelog_stratum_t *stratum = wirelog_program_get_stratum(prog, 0);
+    if (!stratum) {
+        wirelog_program_free(prog);
+        FAIL("stratum should not be NULL");
+        return;
+    }
+
+    if (stratum->rule_count != 2) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 2 rules, got %u", stratum->rule_count);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_get_stratum_oob(void)
+{
+    TEST("wirelog_program_get_stratum(99) returns NULL");
+
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n",
+        NULL
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    const wirelog_stratum_t *stratum = wirelog_program_get_stratum(prog, 99);
+    if (stratum != NULL) {
+        wirelog_program_free(prog);
+        FAIL("should return NULL for out-of-bounds");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_is_stratified(void)
+{
+    TEST("wirelog_program_is_stratified returns true (stub)");
+
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n",
+        NULL
+    );
+
+    if (!prog) { FAIL("program is NULL"); return; }
+
+    if (!wirelog_program_is_stratified(prog)) {
+        wirelog_program_free(prog);
+        FAIL("should return true");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_parse_file_stub(void)
+{
+    TEST("wirelog_parse returns NULL with WIRELOG_ERR_IO");
+
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse("nonexistent.dl", &err);
+
+    if (prog != NULL) {
+        wirelog_program_free(prog);
+        FAIL("should return NULL (stub)");
+        return;
+    }
+
+    if (err != WIRELOG_ERR_IO) {
+        FAIL("error should be WIRELOG_ERR_IO");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_api_parse_with_error_stub(void)
+{
+    TEST("wirelog_parse_with_error_info returns NULL + error_code");
+
+    wirelog_parse_error_t info;
+    memset(&info, 0, sizeof(info));
+
+    wirelog_program_t *prog = wirelog_parse_with_error_info("nonexistent.dl", &info);
+
+    if (prog != NULL) {
+        wirelog_program_free(prog);
+        FAIL("should return NULL (stub)");
+        return;
+    }
+
+    if (info.error_code != WIRELOG_ERR_IO) {
+        FAIL("error_code should be WIRELOG_ERR_IO");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_api_end_to_end(void)
+{
+    TEST("End-to-end: parse -> inspect IR -> schema -> free");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl Arc(x: int32, y: int32)\n"
+        ".decl Tc(x: int32, y: int32)\n"
+        ".input Arc(filename=\"arc.csv\")\n"
+        ".output Tc\n"
+        "Tc(x, y) :- Arc(x, y).\n"
+        "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+        &err
+    );
+
+    if (!prog || err != WIRELOG_OK) { FAIL("parse failed"); return; }
+
+    /* Check rule count */
+    if (wirelog_program_get_rule_count(prog) != 2) {
+        wirelog_program_free(prog);
+        FAIL("rule count should be 2");
+        return;
+    }
+
+    /* Check schema */
+    const wirelog_schema_t *arc_schema = wirelog_program_get_schema(prog, "Arc");
+    if (!arc_schema || arc_schema->column_count != 2) {
+        wirelog_program_free(prog);
+        FAIL("Arc schema incorrect");
+        return;
+    }
+
+    /* Check stratum */
+    if (wirelog_program_get_stratum_count(prog) != 1) {
+        wirelog_program_free(prog);
+        FAIL("stratum count should be 1");
+        return;
+    }
+
+    const wirelog_stratum_t *s = wirelog_program_get_stratum(prog, 0);
+    if (!s || s->rule_count != 2) {
+        wirelog_program_free(prog);
+        FAIL("stratum should have 2 rules");
+        return;
+    }
+
+    /* Check stratification */
+    if (!wirelog_program_is_stratified(prog)) {
+        wirelog_program_free(prog);
+        FAIL("should be stratified");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1062,6 +1538,24 @@ main(void)
     test_wildcard_in_scan();
     test_boolean_true_noop();
     test_boolean_false_filter();
+
+    /* UNION merge */
+    test_union_merge_tc();
+    test_union_single_rule();
+
+    /* Public API */
+    test_api_parse_string();
+    test_api_parse_string_error();
+    test_api_get_rule_count();
+    test_api_get_schema();
+    test_api_get_schema_null();
+    test_api_get_stratum_count();
+    test_api_get_stratum();
+    test_api_get_stratum_oob();
+    test_api_is_stratified();
+    test_api_parse_file_stub();
+    test_api_parse_with_error_stub();
+    test_api_end_to_end();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);

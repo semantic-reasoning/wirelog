@@ -925,3 +925,60 @@ wl_program_convert_rules(struct wirelog_program *program,
 
     return 0;
 }
+
+/* ======================================================================== */
+/* UNION Merging                                                            */
+/* ======================================================================== */
+
+int
+wl_program_merge_unions(struct wirelog_program *program)
+{
+    if (!program || program->relation_count == 0) return 0;
+
+    program->relation_irs = (wirelog_ir_node_t **)calloc(
+        program->relation_count, sizeof(wirelog_ir_node_t *));
+    if (!program->relation_irs) return -1;
+
+    for (uint32_t r = 0; r < program->relation_count; r++) {
+        const char *rel_name = program->relations[r].name;
+        if (!rel_name) continue;
+
+        /* Count rules targeting this relation */
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < program->rule_count; i++) {
+            if (program->rules[i].head_relation &&
+                strcmp(program->rules[i].head_relation, rel_name) == 0) {
+                count++;
+            }
+        }
+
+        if (count == 0) {
+            program->relation_irs[r] = NULL;
+        } else if (count == 1) {
+            /* Single rule: use directly (no UNION wrapper) */
+            for (uint32_t i = 0; i < program->rule_count; i++) {
+                if (program->rules[i].head_relation &&
+                    strcmp(program->rules[i].head_relation, rel_name) == 0) {
+                    program->relation_irs[r] = program->rules[i].ir_root;
+                    break;
+                }
+            }
+        } else {
+            /* Multiple rules: wrap in UNION */
+            wirelog_ir_node_t *u = wl_ir_node_create(WIRELOG_IR_UNION);
+            if (!u) return -1;
+            wl_ir_node_set_relation(u, rel_name);
+
+            for (uint32_t i = 0; i < program->rule_count; i++) {
+                if (program->rules[i].head_relation &&
+                    strcmp(program->rules[i].head_relation, rel_name) == 0) {
+                    wl_ir_node_add_child(u, program->rules[i].ir_root);
+                }
+            }
+
+            program->relation_irs[r] = u;
+        }
+    }
+
+    return 0;
+}
