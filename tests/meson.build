@@ -13,6 +13,7 @@ parser_src = files(
 
 ir_src = files(
   '../wirelog/ir/ir.c',
+  '../wirelog/ir/program.c',
 )
 
 # ============================================================================
@@ -41,6 +42,14 @@ test_ir_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
+test_program_exe = executable(
+  'test_program',
+  files('test_program.c'),
+  parser_src,
+  ir_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
 # ============================================================================
 # Register Tests
 # ============================================================================
@@ -48,3 +57,4 @@ test_ir_exe = executable(
 test('lexer', test_lexer_exe)
 test('parser', test_parser_exe)
 test('ir', test_ir_exe)
+test('program', test_program_exe)

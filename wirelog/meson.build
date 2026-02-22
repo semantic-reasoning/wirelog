@@ -17,6 +17,7 @@ wirelog_parser_src = files(
 
 wirelog_ir_src = files(
   'ir/ir.c',
+  'ir/program.c',
 )
 
 # ============================================================================
