@@ -106,29 +106,28 @@ wl_program_free(struct wirelog_program *program)
         free(program->strata);
     }
 
-    /* Free rules */
-    if (program->rules) {
-        for (uint32_t i = 0; i < program->rule_count; i++) {
-            rule_ir_free(&program->rules[i]);
-        }
-        free(program->rules);
-    }
-
-    /* Free merged relation IRs */
+    /* Free merged relation IRs (UNION wrappers only, before rules) */
     if (program->relation_irs) {
         for (uint32_t i = 0; i < program->relation_count; i++) {
-            /* Only free if it's a UNION wrapper we created (not a rule's ir_root) */
             if (program->relation_irs[i] &&
                 program->relation_irs[i]->type == WIRELOG_IR_UNION) {
-                /* UNION node children are rule ir_roots, don't free them again */
+                /* Detach children (rule ir_roots) so they aren't freed here */
                 free(program->relation_irs[i]->children);
                 program->relation_irs[i]->children = NULL;
                 program->relation_irs[i]->child_count = 0;
                 wl_ir_node_free(program->relation_irs[i]);
             }
-            /* Non-UNION entries point directly to rule ir_roots, freed above */
+            /* Non-UNION entries are aliases to rule ir_roots, freed below */
         }
         free(program->relation_irs);
+    }
+
+    /* Free rules (owns ir_root nodes) */
+    if (program->rules) {
+        for (uint32_t i = 0; i < program->rule_count; i++) {
+            rule_ir_free(&program->rules[i]);
+        }
+        free(program->rules);
     }
 
     /* Free AST */
