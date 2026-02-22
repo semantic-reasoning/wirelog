@@ -40,6 +40,22 @@
 #include <string.h>
 
 /* ======================================================================== */
+/* Utility                                                                  */
+/* ======================================================================== */
+
+static char*
+strdup_safe(const char *s)
+{
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    char *dup = (char *)malloc(len + 1);
+    if (dup) {
+        memcpy(dup, s, len + 1);
+    }
+    return dup;
+}
+
+/* ======================================================================== */
 /* Parser State                                                             */
 /* ======================================================================== */
 
@@ -653,7 +669,7 @@ parse_declaration(wl_parser_t *parser)
             wl_ast_node_t *param = wl_ast_node_create(WL_NODE_TYPED_PARAM,
                                                        attr_line, attr_col);
             param->name = attr_name;
-            param->type_name = strdup(type_str);
+            param->type_name = strdup_safe(type_str);
             wl_ast_node_add_child(decl, param);
 
             if (!parser_match(parser, WL_TOK_COMMA)) break;
