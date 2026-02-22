@@ -169,10 +169,6 @@ parse_factor(wl_parser_t *parser)
 
     if (parser_match(parser, WL_TOK_IDENT)) {
         wl_ast_node_t *node = wl_ast_node_create(WL_NODE_VARIABLE, line, col);
-        wl_ast_node_set_name(node, token_to_name(&parser->previous));
-        /* Fix: set_name takes ownership via strdup, but we allocated.
-         * Actually set_name does strdup internally, so free our copy. */
-        free(node->name);
         node->name = token_to_name(&parser->previous);
         return node;
     }
