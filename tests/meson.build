@@ -16,6 +16,7 @@ ir_src = files(
   '../wirelog/ir/program.c',
   '../wirelog/ir/stratify.c',
   '../wirelog/ir/api.c',
+  '../wirelog/ir/dd_plan.c',
 )
 
 # ============================================================================
@@ -69,3 +70,13 @@ test('parser', test_parser_exe)
 test('ir', test_ir_exe)
 test('program', test_program_exe)
 test('stratify', test_stratify_exe)
+
+test_dd_plan_exe = executable(
+  'test_dd_plan',
+  files('test_dd_plan.c'),
+  parser_src,
+  ir_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('dd_plan', test_dd_plan_exe)

@@ -135,12 +135,19 @@ typedef struct {
 /**
  * wirelog_stratum_t:
  *
- * A stratum in the stratified program
+ * A stratum in the stratified program.
+ *
+ * @stratum_id:    Stratum index (0 = computed first).
+ * @rule_names:    Head relation names of rules in this stratum.
+ * @rule_count:    Number of rules.
+ * @is_recursive:  True if stratum contains a recursive SCC
+ *                 (self-loop or mutual recursion cycle).
  */
 typedef struct {
     uint32_t stratum_id;
     const char **rule_names;
     uint32_t rule_count;
+    bool is_recursive;
 } wirelog_stratum_t;
 
 #ifdef __cplusplus

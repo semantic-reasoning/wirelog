@@ -568,6 +568,31 @@ wl_program_stratify(struct wirelog_program *program)
     for (uint32_t s = 0; s < num_strata; s++)
         program->strata[s].rule_count = rules_per_stratum[s];
 
+    /* Step 6: Detect recursive strata.
+       A stratum is recursive if its SCC contains >1 node (mutual recursion)
+       or if any edge within the SCC is a self-loop (self-recursion). */
+    {
+        /* Count nodes per SCC */
+        uint32_t *scc_size = (uint32_t *)calloc(num_strata, sizeof(uint32_t));
+        if (scc_size) {
+            for (uint32_t i = 0; i < graph->relation_count; i++)
+                scc_size[scc->scc_id[i]]++;
+
+            for (uint32_t s = 0; s < num_strata; s++)
+                program->strata[s].is_recursive = (scc_size[s] > 1);
+
+            /* Also check self-loops (self-recursion in singleton SCC) */
+            for (uint32_t e = 0; e < graph->edge_count; e++) {
+                if (graph->edges[e].from == graph->edges[e].to
+                    && graph->edges[e].type == WL_DEP_POSITIVE) {
+                    uint32_t s = scc->scc_id[graph->edges[e].from];
+                    program->strata[s].is_recursive = true;
+                }
+            }
+            free(scc_size);
+        }
+    }
+
     program->is_stratified = true;
 
     free(fill_idx);
