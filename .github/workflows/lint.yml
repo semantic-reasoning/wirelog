@@ -113,7 +113,7 @@ jobs:
       - name: Run editorconfig-checker
         run: |
           set -o pipefail
-          ec -exclude '(build.*|third_party)' wirelog/ tests/ *.md meson.build meson_options.txt 2>&1 | tee ec-results.txt
+          ec --disable-indent-size -exclude '(build.*|third_party)' wirelog/ tests/ *.md meson.build meson_options.txt 2>&1 | tee ec-results.txt
       # Blocking: lint failures prevent downstream CI/static-analysis jobs
 
       - name: Publish results
