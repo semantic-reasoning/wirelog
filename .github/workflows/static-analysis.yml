@@ -7,8 +7,15 @@ on:
     branches: [main]
 
 jobs:
+  # ==========================================================================
+  # Gate: Lint must pass before any static analysis job runs
+  # ==========================================================================
+  lint:
+    uses: ./.github/workflows/lint.yml
+
   cppcheck:
     name: cppcheck (report)
+    needs: [lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +54,7 @@ jobs:
 
   scan-build:
     name: scan-build (report)
+    needs: [lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

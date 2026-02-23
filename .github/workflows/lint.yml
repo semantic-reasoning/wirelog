@@ -1,0 +1,130 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  format-check:
+    name: clang-format (report)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+
+      - name: Verify tool version
+        run: clang-format-18 --version
+
+      - name: Run clang-format
+        run: |
+          set -o pipefail
+          find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs clang-format-18 --dry-run --Werror 2>&1 | tee format-results.txt
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## clang-format Results' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s format-results.txt ]; then
+            count=$(wc -l < format-results.txt | tr -d ' ')
+            echo "**${count} finding(s)**" >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -100 format-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No formatting issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # Blocking: lint failures prevent downstream CI/static-analysis jobs
+
+  clang-tidy:
+    name: clang-tidy (report)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-18 clang-tools-18
+
+      - name: Verify tool version
+        run: clang-tidy-18 --version
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get install -y meson ninja-build
+
+      - name: Configure build
+        run: meson setup builddir-tidy -Dtests=true
+
+      - name: Run clang-tidy
+        run: |
+          set -o pipefail
+          run-clang-tidy-18 -p builddir-tidy wirelog/ tests/ 2>&1 | tee tidy-results.txt
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## clang-tidy Results' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s tidy-results.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -30 tidy-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload tidy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidy-results
+          path: tidy-results.txt
+      # Blocking: lint failures prevent downstream CI/static-analysis jobs
+
+  editorconfig-check:
+    name: editorconfig (report)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install editorconfig-checker
+        env:
+          EC_VERSION: "3.0.3"
+        run: |
+          wget -q "https://github.com/editorconfig-checker/editorconfig-checker/releases/download/v${EC_VERSION}/ec-linux-amd64.tar.gz" -O ec.tar.gz
+          tar xzf ec.tar.gz
+          sudo mv bin/ec /usr/local/bin/
+          ec --version
+
+      - name: Run editorconfig-checker
+        run: |
+          set -o pipefail
+          ec -exclude '(build.*|third_party)' wirelog/ tests/ *.md meson.build meson_options.txt 2>&1 | tee ec-results.txt
+      # Blocking: lint failures prevent downstream CI/static-analysis jobs
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## EditorConfig Results' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s ec-results.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat ec-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi

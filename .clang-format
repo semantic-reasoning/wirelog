@@ -1,0 +1,58 @@
+# Tested against LLVM/clang-format 18.x
+# If upgrading LLVM versions, re-validate against representative files
+# (wirelog/parser/lexer.c, wirelog/ir/program.c, wirelog/wirelog.h) before committing changes.
+---
+BasedOnStyle: GNU
+Language: Cpp  # clang-format uses Cpp for C as well
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+IndentCaseLabels: false
+
+# Braces
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true          # Function body brace on next line
+  AfterControlStatement: false # K&R for if/for/while/switch
+  AfterEnum: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeElse: false            # } else { on same line
+  BeforeWhile: false
+  SplitEmptyFunction: false
+
+# Function declarations - GNU style return type on separate line
+# NOTE: In clang-format 18, AlwaysBreakAfterReturnType is valid.
+# If migrating to clang-format 19+, check for renamed option
+# (BreakAfterReturnType). Verify with: clang-format-18 --dump-config
+AlwaysBreakAfterReturnType: All
+
+# Line width
+ColumnLimit: 100  # Avoids mass reflow; existing code is mostly under 80 but has exceptions
+
+# Pointer alignment
+PointerAlignment: Right  # char *ptr (matches variable declaration convention)
+
+# Includes
+SortIncludes: false  # Preserve existing manual ordering (own header first, then system)
+IncludeBlocks: Preserve
+
+# Comments
+ReflowComments: false  # CRITICAL: Preserve license headers and section markers
+
+# Spaces
+SpaceAfterCStyleCast: false  # (char *)malloc, not (char *) malloc
+SpaceBeforeParens: ControlStatements  # if (...) but func(...)
+SpacesInParentheses: false
+
+# Alignment
+AlignConsecutiveMacros: false  # Preserve existing macro formatting; avoid unexpected diffs
+AlignEscapedNewlines: Left
+
+# Penalties (discourage breaking in certain places)
+PenaltyBreakComment: 300
+PenaltyBreakString: 1000
+PenaltyReturnTypeOnItsOwnLine: 0  # Encourage return type on own line

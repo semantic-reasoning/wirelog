@@ -8,6 +8,12 @@ on:
 
 jobs:
   # ==========================================================================
+  # Gate: Lint must pass before any CI job runs
+  # ==========================================================================
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  # ==========================================================================
   # Job 1: Build & Test Matrix
   # ==========================================================================
   build:
@@ -17,7 +23,7 @@ jobs:
       ${{ matrix.embedded && ' / embedded' || '' }}
       ${{ matrix.ipc == 'enabled' && ' / ipc' || '' }}
       ${{ matrix.threads == 'disabled' && ' / no-threads' || '' }}
-    needs: [sanitizers]
+    needs: [lint, sanitizers]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -121,6 +127,7 @@ jobs:
   # ==========================================================================
   sanitizers:
     name: Sanitizers (${{ matrix.compiler }})
+    needs: [lint]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -51,9 +51,58 @@ Enhancement suggestions are tracked as GitHub issues. When creating an enhanceme
    ```
 6. Issue that pull request!
 
-## Styleguides
+## Code Style
 
-* Use C11 standard features for C code.
+wirelog uses automated formatting and linting. The `.clang-format` file is the source of truth for code style.
+
+### Key Conventions
+
+* **Language:** C11 strict (`-std=c11`)
+* **Indentation:** 4 spaces, no tabs
+* **Braces:** K&R for control flow, next-line for functions
+* **Return type:** Separate line (GNU style)
+* **Naming:** `wl_` prefix (internal), `wirelog_` prefix (public API), `_t` suffix (types), `UPPER_SNAKE_CASE` (macros)
+* **Comments:** C-style `/* */` only (see NOLINT exception below)
+* **Pointer style:** `char *ptr` (Right-aligned)
+
+### Running Checks Locally
+
+**Format check (dry-run):**
+```sh
+find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs clang-format-18 --dry-run --Werror
+```
+
+**Auto-format:**
+```sh
+find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs clang-format-18 -i
+```
+
+**clang-tidy:**
+```sh
+meson setup builddir-tidy --reconfigure -Dtests=true 2>/dev/null || meson setup builddir-tidy -Dtests=true
+run-clang-tidy-18 -p builddir-tidy wirelog/ tests/
+```
+
+### Suppression Policy
+
+* Use `// NOLINTNEXTLINE(check-name)` with a brief reason explaining why
+* `// NOLINT` and `// NOLINTNEXTLINE` are the **only permitted** `//`-style comments (tool-required pragmas, not code comments)
+* No blanket suppressions without specifying the check name
+
+### Pre-commit Hook (Optional)
+
+You can optionally set up a pre-commit hook for auto-formatting:
+```sh
+echo '#!/bin/sh
+find wirelog/ tests/ -name "*.c" -o -name "*.h" | xargs clang-format-18 -i
+git add -u' > .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+```
+
+See [docs/LINTING.md](docs/LINTING.md) for complete linting documentation, check rationale, and rollout plan.
+
+## General Styleguides
+
 * Write clear, self-documenting code.
 * Add comments for complex logic or design decisions.
 * When adding documentation or updating existing texts, adhere to Markdown formatting.

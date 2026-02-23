@@ -1,0 +1,71 @@
+# NOTE: // NOLINT and // NOLINTNEXTLINE comments are the sole permitted
+# use of C++-style (//) comments in this codebase. They are tool-required
+# pragmas for clang-tidy suppression, not code comments. This is a
+# documented policy exception -- see docs/LINTING.md for details.
+#
+# CHECK SELECTION STRATEGY: Explicit C-safe allowlist.
+# We do NOT use wildcards (e.g., bugprone-*) because they silently include
+# C++-only checks. Every enabled check below has been verified as applicable
+# to C11 code. To add a check, verify it applies to C (not just C++) first.
+---
+Checks: >
+  -*,
+  bugprone-assert-side-effect,
+  bugprone-assignment-in-if-condition,
+  bugprone-bool-pointer-implicit-conversion,
+  bugprone-branch-clone,
+  bugprone-implicit-widening-of-multiplication-result,
+  bugprone-incorrect-roundings,
+  bugprone-infinite-loop,
+  bugprone-integer-division,
+  bugprone-macro-parentheses,
+  bugprone-macro-repeated-side-effects,
+  bugprone-misplaced-widening-cast,
+  bugprone-multi-level-implicit-pointer-conversion,
+  bugprone-multiple-statement-macro,
+  bugprone-narrowing-conversions,
+  bugprone-not-null-terminated-result,
+  bugprone-redundant-branch-condition,
+  bugprone-signal-handler,
+  bugprone-signed-char-misuse,
+  bugprone-sizeof-container,
+  bugprone-sizeof-expression,
+  bugprone-spuriously-wake-up-functions,
+  bugprone-suspicious-enum-usage,
+  bugprone-suspicious-include,
+  bugprone-suspicious-memory-comparison,
+  bugprone-suspicious-memset-usage,
+  bugprone-suspicious-missing-comma,
+  bugprone-suspicious-realloc-usage,
+  bugprone-suspicious-semicolon,
+  bugprone-suspicious-string-compare,
+  bugprone-swapped-arguments,
+  bugprone-terminating-continue,
+  bugprone-too-small-loop-variable,
+  bugprone-undefined-memory-manipulation,
+  cert-dcl03-c,
+  cert-env33-c,
+  cert-err34-c,
+  cert-flp30-c,
+  cert-msc30-c,
+  cert-str34-c,
+  clang-analyzer-core.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-nullability.*,
+  clang-analyzer-security.*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  clang-analyzer-unix.*,
+  clang-analyzer-valist.*,
+  misc-redundant-expression,
+  portability-restrict-system-includes,
+  portability-simd-intrinsics,
+  readability-misleading-indentation,
+  readability-redundant-declaration,
+
+WarningsAsErrors: ''
+
+HeaderFilterRegex: 'wirelog/.*\.h$'
+
+CheckOptions:
+  - key: bugprone-assert-side-effect.AssertMacros
+    value: 'assert'
