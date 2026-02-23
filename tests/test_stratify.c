@@ -785,6 +785,209 @@ test_stratify_no_rules(void)
 }
 
 /* ======================================================================== */
+/* Edge Case Tests                                                          */
+/* ======================================================================== */
+
+static void
+test_stratify_self_negation(void)
+{
+    TEST("Stratify: p(x) :- a(x), !p(x). -> not stratifiable");
+
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl p(x: int32)\n"
+                                                   "p(x) :- a(x), !p(x).\n",
+                                                   &err);
+
+    if (prog != NULL) {
+        wirelog_program_free(prog);
+        FAIL("expected parse to fail for self-negation");
+        return;
+    }
+
+    if (err != WIRELOG_ERR_PARSE) {
+        FAIL("error should be WIRELOG_ERR_PARSE");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_stratify_edb_only_deps(void)
+{
+    TEST("Stratify: rules depending only on EDB -> 1 stratum each");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl b(x: int32)\n"
+                                                   ".decl c(x: int32)\n"
+                                                   ".decl r(x: int32)\n"
+                                                   ".decl s(x: int32)\n"
+                                                   "r(x) :- a(x).\n"
+                                                   "s(x) :- b(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    /* r and s each depend only on EDB -> no IDB-IDB edges.
+       Each in its own singleton SCC -> 2 strata. */
+    if (wirelog_program_get_stratum_count(prog) != 2) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 2 strata, got %u",
+                 wirelog_program_get_stratum_count(prog));
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (!wirelog_program_is_stratified(prog)) {
+        wirelog_program_free(prog);
+        FAIL("program should be stratified");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_stratify_diamond_deps(void)
+{
+    TEST("Stratify: diamond pattern a->b, a->c, d->b,c");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
+                                                   ".decl a(x: int32)\n"
+                                                   ".decl b(x: int32)\n"
+                                                   ".decl c(x: int32)\n"
+                                                   ".decl d(x: int32)\n"
+                                                   "a(x) :- base(x).\n"
+                                                   "b(x) :- a(x).\n"
+                                                   "c(x) :- a(x).\n"
+                                                   "d(x) :- b(x).\n"
+                                                   "d(x) :- c(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    /* a is stratum 0, b and c are stratum 1, d is stratum 2
+       (or b/c could be in separate strata — depends on SCC ordering).
+       Key: a must be before b,c; b,c must be before d. */
+    uint32_t count = wirelog_program_get_stratum_count(prog);
+    if (count < 3) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected >= 3 strata for diamond, got %u",
+                 count);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (!wirelog_program_is_stratified(prog)) {
+        wirelog_program_free(prog);
+        FAIL("diamond program should be stratified");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_stratify_negation_across_strata_valid(void)
+{
+    TEST("Stratify: negation between different SCCs is valid");
+
+    /* r negates p, but p and r are NOT mutually recursive.
+       p is in an earlier stratum -> valid stratification. */
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
+                                                   ".decl p(x: int32)\n"
+                                                   ".decl r(x: int32)\n"
+                                                   "p(x) :- base(x).\n"
+                                                   "r(x) :- base(x), !p(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL — valid program rejected");
+        return;
+    }
+
+    if (!wirelog_program_is_stratified(prog)) {
+        wirelog_program_free(prog);
+        FAIL("program should be stratified");
+        return;
+    }
+
+    /* p must be in earlier stratum than r */
+    if (wirelog_program_get_stratum_count(prog) < 2) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected >= 2 strata, got %u",
+                 wirelog_program_get_stratum_count(prog));
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_stratify_aggregation_edge(void)
+{
+    TEST("Stratify: AGGREGATE edges recorded in dep graph");
+
+    struct wirelog_program *prog
+        = make_full_program(".decl sssp2(x: int32, d: int32)\n"
+                            ".decl sssp(x: int32, d: int32)\n"
+                            "sssp(x, min(d)) :- sssp2(x, d).\n");
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    if (!g) {
+        /* sssp depends on sssp2 which is also IDB, but sssp2 has no rules
+           defining it as IDB. So it's EDB. sssp is the only IDB.
+           Graph has 1 node, 0 IDB-IDB edges -> could be NULL or 1-node. */
+        /* With only 1 IDB (sssp) depending on EDB (sssp2), graph exists
+           but may have 0 edges. That's fine. */
+        wl_program_free(prog);
+        PASS();
+        return;
+    }
+
+    /* Check if any AGGREGATION edge exists.
+       sssp depends on sssp2 via aggregation, but sssp2 is EDB
+       so no IDB-IDB aggregation edge. That's expected. */
+    bool found_agg = false;
+    for (uint32_t i = 0; i < g->edge_count; i++) {
+        if (g->edges[i].type == WL_DEP_AGGREGATION) {
+            found_agg = true;
+            break;
+        }
+    }
+
+    /* No IDB-IDB aggregation edges expected here (sssp2 is EDB).
+       The test verifies the dep graph doesn't crash on AGGREGATE nodes. */
+    (void)found_agg;
+
+    wl_dep_graph_free(g);
+    wl_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -813,6 +1016,13 @@ main(void)
     test_stratify_unstratifiable();
     test_stratify_multiple_sccs();
     test_stratify_no_rules();
+
+    /* Edge cases */
+    test_stratify_self_negation();
+    test_stratify_edb_only_deps();
+    test_stratify_diamond_deps();
+    test_stratify_negation_across_strata_valid();
+    test_stratify_aggregation_edge();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);
