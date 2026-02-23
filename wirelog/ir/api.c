@@ -18,6 +18,7 @@
  */
 
 #include "program.h"
+#include "stratify.h"
 #include "../parser/parser.h"
 #include "../wirelog-parser.h"
 
@@ -76,7 +77,20 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
     }
 
     wl_program_build_schemas(prog);
-    wl_program_build_default_stratum(prog);
+
+    int strat_rc = wl_program_stratify(prog);
+    if (strat_rc == -2) {
+        wl_program_free(prog);
+        if (error)
+            *error = WIRELOG_ERR_PARSE;
+        return NULL;
+    }
+    if (strat_rc == -1) {
+        wl_program_free(prog);
+        if (error)
+            *error = WIRELOG_ERR_MEMORY;
+        return NULL;
+    }
 
     if (error)
         *error = WIRELOG_OK;
@@ -157,7 +171,7 @@ wirelog_program_is_stratified(const wirelog_program_t *program)
 {
     if (!program)
         return false;
-    return true; /* Stub: always true until stratification is implemented */
+    return program->is_stratified;
 }
 
 /* ======================================================================== */

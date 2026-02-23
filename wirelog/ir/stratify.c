@@ -411,6 +411,170 @@ wl_scc_free(wl_scc_result_t *result)
 int
 wl_program_stratify(struct wirelog_program *program)
 {
-    (void)program;
-    return -1; /* STUB: to be implemented in Commit 3 */
+    if (!program)
+        return -1;
+
+    /*
+     * 0-rule programs: produce 1 empty stratum (honors >= 1 contract).
+     */
+    if (program->rule_count == 0) {
+        wl_program_build_default_stratum(program);
+        program->is_stratified = true;
+        return 0;
+    }
+
+    /* Step 1: Build dependency graph */
+    wl_dep_graph_t *graph = wl_dep_graph_build(program);
+    if (!graph) {
+        /* No IDB relations (shouldn't happen with rule_count > 0,
+           but handle gracefully) */
+        wl_program_build_default_stratum(program);
+        program->is_stratified = true;
+        return 0;
+    }
+
+    /* Step 2: Detect SCCs */
+    wl_scc_result_t *scc = wl_scc_detect(graph);
+    if (!scc) {
+        wl_dep_graph_free(graph);
+        return -1;
+    }
+
+    /* Step 3: Map SCC IDs to stratum IDs.
+       Tarjan's iterative algorithm produces SCCs such that sinks
+       (no outgoing deps) get lower IDs — this already matches
+       execution order (dependencies computed first = lower stratum). */
+    uint32_t *stratum_id
+        = (uint32_t *)malloc(graph->relation_count * sizeof(uint32_t));
+    if (!stratum_id) {
+        wl_scc_free(scc);
+        wl_dep_graph_free(graph);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < graph->relation_count; i++)
+        stratum_id[i] = scc->scc_id[i];
+
+    /* Step 4: Validate — negation within SCC = not stratifiable */
+    for (uint32_t e = 0; e < graph->edge_count; e++) {
+        wl_dep_edge_t *edge = &graph->edges[e];
+        if (edge->type == WL_DEP_NEGATION && edge->from < graph->relation_count
+            && edge->to < graph->relation_count) {
+            if (scc->scc_id[edge->from] == scc->scc_id[edge->to]) {
+                /* Negation cycle detected — not stratifiable */
+                free(stratum_id);
+                wl_scc_free(scc);
+                wl_dep_graph_free(graph);
+                return -2;
+            }
+        }
+    }
+
+    uint32_t num_strata = scc->scc_count;
+
+    /* Step 5: Assign strata — build wirelog_stratum_t array */
+
+    /* Free existing strata */
+    if (program->strata) {
+        for (uint32_t i = 0; i < program->stratum_count; i++)
+            free((void *)program->strata[i].rule_names);
+        free(program->strata);
+    }
+
+    program->strata
+        = (wirelog_stratum_t *)calloc(num_strata, sizeof(wirelog_stratum_t));
+    if (!program->strata) {
+        program->stratum_count = 0;
+        free(stratum_id);
+        wl_scc_free(scc);
+        wl_dep_graph_free(graph);
+        return -1;
+    }
+    program->stratum_count = num_strata;
+
+    for (uint32_t s = 0; s < num_strata; s++)
+        program->strata[s].stratum_id = s;
+
+    /* Count rules per stratum */
+    uint32_t *rules_per_stratum
+        = (uint32_t *)calloc(num_strata, sizeof(uint32_t));
+    if (!rules_per_stratum) {
+        free(stratum_id);
+        wl_scc_free(scc);
+        wl_dep_graph_free(graph);
+        return -1;
+    }
+
+    /* Map each rule to a stratum based on its head relation's SCC */
+    uint32_t *rule_stratum
+        = (uint32_t *)calloc(program->rule_count, sizeof(uint32_t));
+    if (!rule_stratum) {
+        free(rules_per_stratum);
+        free(stratum_id);
+        wl_scc_free(scc);
+        wl_dep_graph_free(graph);
+        return -1;
+    }
+
+    for (uint32_t r = 0; r < program->rule_count; r++) {
+        const char *head = program->rules[r].head_relation;
+        if (!head)
+            continue;
+
+        uint32_t gi = graph_find_relation(graph, program, head);
+        if (gi != UINT32_MAX) {
+            rule_stratum[r] = stratum_id[gi];
+            rules_per_stratum[stratum_id[gi]]++;
+        }
+    }
+
+    /* Allocate rule_names arrays per stratum */
+    for (uint32_t s = 0; s < num_strata; s++) {
+        if (rules_per_stratum[s] > 0) {
+            program->strata[s].rule_names = (const char **)calloc(
+                rules_per_stratum[s], sizeof(const char *));
+            if (!program->strata[s].rule_names) {
+                free(rule_stratum);
+                free(rules_per_stratum);
+                free(stratum_id);
+                wl_scc_free(scc);
+                wl_dep_graph_free(graph);
+                return -1;
+            }
+        }
+    }
+
+    /* Fill rule_names */
+    uint32_t *fill_idx = (uint32_t *)calloc(num_strata, sizeof(uint32_t));
+    if (!fill_idx) {
+        free(rule_stratum);
+        free(rules_per_stratum);
+        free(stratum_id);
+        wl_scc_free(scc);
+        wl_dep_graph_free(graph);
+        return -1;
+    }
+
+    for (uint32_t r = 0; r < program->rule_count; r++) {
+        if (!program->rules[r].head_relation)
+            continue;
+        uint32_t s = rule_stratum[r];
+        if (s < num_strata && program->strata[s].rule_names) {
+            program->strata[s].rule_names[fill_idx[s]++]
+                = program->rules[r].head_relation;
+        }
+    }
+
+    for (uint32_t s = 0; s < num_strata; s++)
+        program->strata[s].rule_count = rules_per_stratum[s];
+
+    program->is_stratified = true;
+
+    free(fill_idx);
+    free(rule_stratum);
+    free(rules_per_stratum);
+    free(stratum_id);
+    wl_scc_free(scc);
+    wl_dep_graph_free(graph);
+    return 0;
 }

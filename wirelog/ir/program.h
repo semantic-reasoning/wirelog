@@ -70,6 +70,9 @@ struct wirelog_program {
     /* Merged per-relation IR (rules with same head UNIONed) */
     wirelog_ir_node_t **relation_irs;
 
+    /* Stratification flag */
+    bool is_stratified;
+
     /* Source AST (retained for debugging, freed on program_free) */
     wl_ast_node_t *ast;
 };

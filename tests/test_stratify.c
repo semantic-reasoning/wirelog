@@ -15,6 +15,7 @@
 #include "../wirelog/parser/parser.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/ir/stratify.h"
+#include "../wirelog/wirelog-parser.h"
 
 /* ======================================================================== */
 /* Test Helpers                                                             */
@@ -549,6 +550,241 @@ test_scc_two_sccs(void)
 }
 
 /* ======================================================================== */
+/* Stratification Integration Tests                                         */
+/* ======================================================================== */
+
+static void
+test_stratify_simple(void)
+{
+    TEST("Stratify: simple EDB-only deps -> 1 stratum");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl r(x: int32)\n"
+                                                   "r(x) :- a(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    if (wirelog_program_get_stratum_count(prog) != 1) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 1 stratum, got %u",
+                 wirelog_program_get_stratum_count(prog));
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (!wirelog_program_is_stratified(prog)) {
+        wirelog_program_free(prog);
+        FAIL("program should be stratified");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_stratify_recursive_tc(void)
+{
+    TEST("Stratify: TC recursive -> 1 stratum");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
+                               ".decl Tc(x: int32, y: int32)\n"
+                               "Tc(x, y) :- Arc(x, y).\n"
+                               "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    if (wirelog_program_get_stratum_count(prog) != 1) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 1 stratum, got %u",
+                 wirelog_program_get_stratum_count(prog));
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    const wirelog_stratum_t *s0 = wirelog_program_get_stratum(prog, 0);
+    if (!s0 || s0->rule_count != 2) {
+        wirelog_program_free(prog);
+        FAIL("stratum 0 should have 2 rules");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_stratify_two_strata(void)
+{
+    TEST("Stratify: chain b->a, c->b -> 2 strata ordered");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl b(x: int32)\n"
+                                                   ".decl c(x: int32)\n"
+                                                   "b(x) :- a(x).\n"
+                                                   "c(x) :- b(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    if (wirelog_program_get_stratum_count(prog) != 2) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 2 strata, got %u",
+                 wirelog_program_get_stratum_count(prog));
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    /* Stratum 0 should contain b (computed first, depends on EDB a).
+       Stratum 1 should contain c (depends on IDB b). */
+    const wirelog_stratum_t *s0 = wirelog_program_get_stratum(prog, 0);
+    const wirelog_stratum_t *s1 = wirelog_program_get_stratum(prog, 1);
+
+    if (!s0 || !s1) {
+        wirelog_program_free(prog);
+        FAIL("strata should not be NULL");
+        return;
+    }
+
+    if (s0->rule_count != 1 || s1->rule_count != 1) {
+        wirelog_program_free(prog);
+        FAIL("each stratum should have 1 rule");
+        return;
+    }
+
+    /* b must be in earlier stratum than c */
+    bool b_first = (strcmp(s0->rule_names[0], "b") == 0
+                    && strcmp(s1->rule_names[0], "c") == 0);
+    if (!b_first) {
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "expected b in s0, c in s1; got s0=%s, s1=%s",
+                 s0->rule_names[0], s1->rule_names[0]);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_stratify_unstratifiable(void)
+{
+    TEST("Stratify: negation cycle -> parse fails");
+
+    /* p depends on !q, q depends on !p -> negation cycle within SCC */
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
+                                                   ".decl p(x: int32)\n"
+                                                   ".decl q(x: int32)\n"
+                                                   "p(x) :- base(x), !q(x).\n"
+                                                   "q(x) :- base(x), !p(x).\n",
+                                                   &err);
+
+    if (prog != NULL) {
+        wirelog_program_free(prog);
+        FAIL("expected parse to fail for unstratifiable program");
+        return;
+    }
+
+    if (err != WIRELOG_ERR_PARSE) {
+        FAIL("error should be WIRELOG_ERR_PARSE");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_stratify_multiple_sccs(void)
+{
+    TEST("Stratify: 3 SCCs correct ordering");
+
+    /* {a,b} mutual recursion, c depends on a, {d,e} mutual recursion depends on c */
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
+                                                   ".decl a(x: int32)\n"
+                                                   ".decl b(x: int32)\n"
+                                                   ".decl c(x: int32)\n"
+                                                   ".decl d(x: int32)\n"
+                                                   ".decl e(x: int32)\n"
+                                                   "a(x) :- b(x).\n"
+                                                   "b(x) :- a(x).\n"
+                                                   "a(x) :- base(x).\n"
+                                                   "c(x) :- a(x).\n"
+                                                   "d(x) :- e(x).\n"
+                                                   "e(x) :- d(x).\n"
+                                                   "d(x) :- c(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    if (wirelog_program_get_stratum_count(prog) != 3) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected 3 strata, got %u",
+                 wirelog_program_get_stratum_count(prog));
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (!wirelog_program_is_stratified(prog)) {
+        wirelog_program_free(prog);
+        FAIL("program should be stratified");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_stratify_no_rules(void)
+{
+    TEST("Stratify: 0 rules -> 1 stratum (>= 1 contract)");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n", &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    if (wirelog_program_get_stratum_count(prog) < 1) {
+        wirelog_program_free(prog);
+        FAIL("stratum_count should be >= 1");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -569,6 +805,14 @@ main(void)
     test_scc_direct_recursion();
     test_scc_mutual_recursion();
     test_scc_two_sccs();
+
+    /* Stratification integration */
+    test_stratify_simple();
+    test_stratify_recursive_tc();
+    test_stratify_two_strata();
+    test_stratify_unstratifiable();
+    test_stratify_multiple_sccs();
+    test_stratify_no_rules();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);
