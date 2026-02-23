@@ -14,6 +14,7 @@ parser_src = files(
 ir_src = files(
   '../wirelog/ir/ir.c',
   '../wirelog/ir/program.c',
+  '../wirelog/ir/stratify.c',
   '../wirelog/ir/api.c',
 )
 
@@ -51,6 +52,14 @@ test_program_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
+test_stratify_exe = executable(
+  'test_stratify',
+  files('test_stratify.c'),
+  parser_src,
+  ir_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
 # ============================================================================
 # Register Tests
 # ============================================================================
@@ -59,3 +68,4 @@ test('lexer', test_lexer_exe)
 test('parser', test_parser_exe)
 test('ir', test_ir_exe)
 test('program', test_program_exe)
+test('stratify', test_stratify_exe)
