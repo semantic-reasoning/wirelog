@@ -17,6 +17,7 @@ jobs:
       ${{ matrix.embedded && ' / embedded' || '' }}
       ${{ matrix.ipc == 'enabled' && ' / ipc' || '' }}
       ${{ matrix.threads == 'disabled' && ' / no-threads' || '' }}
+    needs: [sanitizers]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
