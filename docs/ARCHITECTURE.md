@@ -211,17 +211,21 @@ wirelog core (C11)
 **File Structure**:
 ```
 wirelog/
-  lexer.c         # Tokenization
-  parser.c        # Datalog → AST (hand-written RDP)
-  ast.c           # AST node management
-  ir.c            # IR node management
-  stratify.c      # Stratification, SCC detection
-  optimizer.c     # Optimizer orchestrator
+  parser/
+    lexer.c         # Tokenization
+    parser.c        # Datalog → AST (hand-written RDP)
+    ast.c           # AST node management
+  ir/
+    ir.c            # IR node construction and management
+    program.c       # Program metadata, AST-to-IR conversion, UNION merge
+    stratify.c      # Stratification, dependency graph, Tarjan's SCC
+    api.c           # Public API implementation
+  optimizer.c       # Optimizer orchestrator (planned)
   passes/
-    fusion.c      # Logic Fusion
-    jpp.c         # Join-Project Plan
-    sip.c         # Semijoin Information Passing
-    sharing.c     # Subplan Sharing
+    fusion.c        # Logic Fusion (planned)
+    jpp.c           # Join-Project Plan (planned)
+    sip.c           # Semijoin Information Passing (planned)
+    sharing.c       # Subplan Sharing (planned)
 ```
 
 **Responsibilities**:
@@ -234,8 +238,10 @@ wirelog/
 - ✅ Parser implemented (hand-written RDP, C11)
 - ✅ Parser tests: 91/91 passing (47 lexer + 44 parser)
 - ✅ Grammar: FlowLog-compatible (declarations, rules, negation, aggregation, arithmetic, comparisons, booleans, .plan marker)
-- 🔄 IR representation definition (in progress)
-- 🔄 Stratification & SCC detection (planned)
+- ✅ IR representation (8 node types, AST-to-IR conversion, UNION merge)
+- ✅ IR tests: 56/56 passing (19 IR + 37 program)
+- ✅ Stratification & SCC detection (Tarjan's iterative, negation validation)
+- ✅ Stratification tests: 20/20 passing
 - 🔄 Optimization passes (planned)
 
 #### DD Translator (C11 ↔ Rust FFI)
@@ -319,8 +325,10 @@ typedef struct {
 - ✅ Parser tests (91/91 passing)
 - ✅ FlowLog-compatible grammar implementation
 - ✅ Build system (Meson, C11)
-- 🔄 IR representation definition (backend-agnostic)
-- 🔄 Stratification & SCC detection
+- ✅ IR representation (8 node types, AST-to-IR, UNION merge)
+- ✅ IR tests (56/56 passing: 19 IR node + 37 program)
+- ✅ Stratification & SCC detection (iterative Tarjan's, O(V+E))
+- ✅ Stratification tests (20/20 passing)
 - 🔄 IR → DD operator graph translator
 - 🔄 Basic integration tests
 
@@ -329,7 +337,7 @@ typedef struct {
 - [ ] Enterprise target (x86-64) build success
 - [ ] Basic Datalog program execution verification
 
-**Current Status**: Parser complete (91/91 tests passing), IR/DD translator in progress
+**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20) complete — 167 tests passing. DD translator next.
 
 ### Phase 1: Optimization (Weeks 5-10) - All environments common
 
@@ -398,6 +406,8 @@ typedef struct {
 | **Language** | C11 | ✅ Confirmed | Minimal dependencies, embedded-friendly, compatibility |
 | **Build** | Meson | ✅ Confirmed | Excellent cross-compile, lightweight |
 | **Parser** | Hand-written RDP | ✅ Implemented | Zero deps, 91/91 tests passing |
+| **IR** | Tree-based (8 node types) | ✅ Implemented | AST-to-IR, UNION merge, 56/56 tests |
+| **Stratification** | Tarjan's SCC | ✅ Implemented | O(V+E), iterative, 20/20 tests |
 | **Memory** | nanoarrow (mid-term) | Planned | Columnar, Arrow interop |
 | **Allocator** | Region/Arena + system malloc | Planned (Phase 2) | jemalloc evaluated and deferred; see §4.1 ADR |
 | **Threading** | Optional pthreads | Planned | Single-threaded default |
@@ -515,12 +525,13 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 | 2026-02-22 | 0.1 | Initial draft, layering definition |
 | 2026-02-22 | 0.2 | Phase 0 parser implementation status update (91/91 tests passing) |
 | 2026-02-23 | 0.3 | Add Allocator Decision Record (§4.1): jemalloc evaluated and deferred |
+| 2026-02-24 | 0.4 | IR representation complete (56 tests); Stratification & SCC complete (20 tests); 167 total |
 
 ---
 
 **Next Steps**:
 1. [x] Parser implementation complete (91/91 tests)
-2. [ ] IR representation definition and implementation
-3. [ ] DD Translator FFI design
-4. [ ] Stratification implementation
+2. [x] IR representation and implementation (56/56 tests)
+3. [x] Stratification & SCC detection (20/20 tests)
+4. [ ] DD Translator FFI design
 5. [ ] Integration test creation
