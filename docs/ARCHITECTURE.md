@@ -216,9 +216,11 @@ wirelog/
     parser.c        # Datalog → AST (hand-written RDP)
     ast.c           # AST node management
   ir/
-    ir.c            # IR node construction and management
+    ir.c            # IR node construction, expression clone
     program.c       # Program metadata, AST-to-IR conversion, UNION merge
     stratify.c      # Stratification, dependency graph, Tarjan's SCC
+    dd_plan.h       # DD execution plan types and internal API
+    dd_plan.c       # IR → DD operator graph translation
     api.c           # Public API implementation
   optimizer.c       # Optimizer orchestrator (planned)
   passes/
@@ -242,29 +244,55 @@ wirelog/
 - ✅ IR tests: 56/56 passing (19 IR + 37 program)
 - ✅ Stratification & SCC detection (Tarjan's iterative, negation validation)
 - ✅ Stratification tests: 20/20 passing
+- ✅ DD Plan Translator (IR → DD operator graph, all 8 IR node types)
+- ✅ DD Plan tests: 19/19 passing
 - 🔄 Optimization passes (planned)
 
 #### DD Translator (C11 ↔ Rust FFI)
 
-**Files** (planned):
+**Files**:
 ```
-src/
-  dd/
-    translator.c    # IR → DD operator graph
-    ffi.h           # FFI definitions
-    data_marshal.c  # Data conversion C ↔ Rust
+wirelog/ir/
+  dd_plan.h         # DD execution plan types and internal API
+  dd_plan.c         # IR → DD operator graph translation
+  (planned)
+  dd_ffi.h          # FFI definitions (Rust boundary)
+  dd_marshal.c      # Data conversion C ↔ Rust
+```
+
+**Phase 0 Status** (DD Plan — C-side complete):
+- ✅ DD execution plan data structures (`wl_dd_plan_t`, `wl_dd_stratum_plan_t`, `wl_dd_relation_plan_t`, `wl_dd_op_t`)
+- ✅ 8 DD operator types: VARIABLE, MAP, FILTER, JOIN, ANTIJOIN, REDUCE, CONCAT, CONSOLIDATE
+- ✅ IR → DD translation for all 8 IR node types (SCAN, PROJECT, FILTER, JOIN, ANTIJOIN, AGGREGATE, UNION, FLATMAP deferred)
+- ✅ Stratum-aware plan generation (EDB collection, per-stratum relation plans)
+- ✅ Recursive stratum detection (`is_recursive` flag for DD `iterate()` wrapping)
+- ✅ Deep-copy ownership semantics (`wl_ir_expr_clone()` for filter expressions)
+- ✅ 19/19 tests passing
+
+**Translation Rules** (IR node → DD operator):
+```
+SCAN      → WL_DD_VARIABLE   (reference to input collection)
+PROJECT   → WL_DD_MAP        (column projection)
+FILTER    → WL_DD_FILTER     (predicate filter, deep-copied expr)
+JOIN      → WL_DD_JOIN       (equijoin with key columns)
+ANTIJOIN  → WL_DD_ANTIJOIN   (negation with right relation)
+AGGREGATE → WL_DD_REDUCE     (group-by + aggregation function)
+UNION     → WL_DD_CONCAT + WL_DD_CONSOLIDATE (union + dedup)
+FLATMAP   → (deferred to Phase 1 Logic Fusion)
 ```
 
 **Responsibilities**:
-- Convert wirelog IR to DD operator graph
-- C ↔ Rust data marshalling
-- DD worker management (single vs multi)
-- Result collection and conversion
+- ✅ Convert wirelog IR to DD operator graph (C-side plan)
+- 🔄 C ↔ Rust data marshalling (planned)
+- 🔄 DD worker management (planned)
+- 🔄 Result collection and conversion (planned)
 
-**Design Decisions** (TODO):
-- [ ] Clarify FFI boundary (memory ownership)
+**Design Decisions**:
+- ✅ All pointer fields in DD ops are owned (deep copies), freed by `wl_dd_plan_free()`
+- ✅ Error return via `int` (0 = success, -1 = memory, -2 = invalid input) + out-parameter
+- ✅ FLATMAP deferred: current IR generates separate FILTER/PROJECT/JOIN nodes
+- [ ] Clarify FFI boundary (memory ownership at Rust boundary)
 - [ ] Data marshalling strategy (zero-copy vs copy)
-- [ ] Error handling approach
 - [ ] Context passing mechanism
 
 #### I/O Layer (Phase 0: Basic)
@@ -329,7 +357,8 @@ typedef struct {
 - ✅ IR tests (56/56 passing: 19 IR node + 37 program)
 - ✅ Stratification & SCC detection (iterative Tarjan's, O(V+E))
 - ✅ Stratification tests (20/20 passing)
-- 🔄 IR → DD operator graph translator
+- ✅ IR → DD operator graph translator (all 8 IR node types, 19/19 tests)
+- 🔄 Rust FFI integration
 - 🔄 Basic integration tests
 
 **Validation**:
@@ -337,7 +366,7 @@ typedef struct {
 - [ ] Enterprise target (x86-64) build success
 - [ ] Basic Datalog program execution verification
 
-**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20) complete — 167 tests passing. DD translator next.
+**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19) complete — 186 tests passing. Rust FFI integration next.
 
 ### Phase 1: Optimization (Weeks 5-10) - All environments common
 
@@ -408,6 +437,7 @@ typedef struct {
 | **Parser** | Hand-written RDP | ✅ Implemented | Zero deps, 91/91 tests passing |
 | **IR** | Tree-based (8 node types) | ✅ Implemented | AST-to-IR, UNION merge, 56/56 tests |
 | **Stratification** | Tarjan's SCC | ✅ Implemented | O(V+E), iterative, 20/20 tests |
+| **DD Plan** | IR → DD op graph | ✅ Implemented | 8 op types, stratum-aware, 19/19 tests |
 | **Memory** | nanoarrow (mid-term) | Planned | Columnar, Arrow interop |
 | **Allocator** | Region/Arena + system malloc | Planned (Phase 2) | jemalloc evaluated and deferred; see §4.1 ADR |
 | **Threading** | Optional pthreads | Planned | Single-threaded default |
@@ -526,6 +556,7 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 | 2026-02-22 | 0.2 | Phase 0 parser implementation status update (91/91 tests passing) |
 | 2026-02-23 | 0.3 | Add Allocator Decision Record (§4.1): jemalloc evaluated and deferred |
 | 2026-02-24 | 0.4 | IR representation complete (56 tests); Stratification & SCC complete (20 tests); 167 total |
+| 2026-02-24 | 0.5 | DD Plan Translator complete (19 tests); all 8 IR→DD translations; 186 total |
 
 ---
 
@@ -533,5 +564,6 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 1. [x] Parser implementation complete (91/91 tests)
 2. [x] IR representation and implementation (56/56 tests)
 3. [x] Stratification & SCC detection (20/20 tests)
-4. [ ] DD Translator FFI design
-5. [ ] Integration test creation
+4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
+5. [ ] Rust FFI integration (DD plan → Rust executor)
+6. [ ] Integration test creation
