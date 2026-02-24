@@ -893,6 +893,151 @@ test_plan_aggregate(void)
 }
 
 /* ======================================================================== */
+/* Recursive Stratum and Multi-Stratum Tests                                */
+/* ======================================================================== */
+
+static void
+test_plan_recursive_stratum(void)
+{
+    TEST("DD plan: recursive tc(x,y) -> is_recursive = true");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl edge(x: int32, y: int32)\n"
+                               ".decl tc(x: int32, y: int32)\n"
+                               "tc(x, y) :- edge(x, y).\n"
+                               "tc(x, y) :- tc(x, z), edge(z, y).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    /* tc is recursive (self-loop), its stratum should be is_recursive */
+    bool found_recursive = false;
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        if (plan->strata[s].is_recursive) {
+            /* Check that tc is in this stratum */
+            for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
+                if (strcmp(plan->strata[s].relations[r].name, "tc") == 0)
+                    found_recursive = true;
+            }
+        }
+    }
+
+    if (!found_recursive) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("expected recursive stratum containing 'tc'");
+        return;
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_non_recursive_stratum(void)
+{
+    TEST("DD plan: non-recursive r(x) :- a(x). -> is_recursive = false");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl r(x: int32)\n"
+                                                   "r(x) :- a(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    /* No stratum should be recursive */
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        if (plan->strata[s].is_recursive) {
+            wl_dd_plan_free(plan);
+            wirelog_program_free(prog);
+            FAIL("no stratum should be recursive");
+            return;
+        }
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_multi_stratum_ordering(void)
+{
+    TEST("DD plan: chain a->b->c -> strata ordered by ID");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl b(x: int32)\n"
+                                                   ".decl c(x: int32)\n"
+                                                   "b(x) :- a(x).\n"
+                                                   "c(x) :- b(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    if (plan->stratum_count < 2) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected >= 2 strata, got %u",
+                 plan->stratum_count);
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    /* Strata should be ordered: stratum_id[0] < stratum_id[1] */
+    if (plan->strata[0].stratum_id >= plan->strata[1].stratum_id) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("strata should be ordered by stratum_id");
+        return;
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -926,6 +1071,11 @@ main(void)
     test_plan_union();
     test_plan_antijoin();
     test_plan_aggregate();
+
+    /* Recursive stratum and multi-stratum */
+    test_plan_recursive_stratum();
+    test_plan_non_recursive_stratum();
+    test_plan_multi_stratum_ordering();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);
