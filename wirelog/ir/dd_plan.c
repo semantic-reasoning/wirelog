@@ -124,6 +124,31 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         }
         break;
 
+    case WIRELOG_IR_JOIN:
+        op.op = WL_DD_JOIN;
+        /* Right relation name from second child */
+        if (node->child_count >= 2 && node->children[1]
+            && node->children[1]->relation_name) {
+            op.right_relation = strdup_safe(node->children[1]->relation_name);
+        }
+        /* Copy join keys */
+        if (node->join_key_count > 0) {
+            op.key_count = node->join_key_count;
+            op.left_keys = (char **)calloc(op.key_count, sizeof(char *));
+            op.right_keys = (char **)calloc(op.key_count, sizeof(char *));
+            if (!op.left_keys || !op.right_keys) {
+                dd_op_free_fields(&op);
+                return -1;
+            }
+            for (uint32_t k = 0; k < op.key_count; k++) {
+                if (node->join_left_keys[k])
+                    op.left_keys[k] = strdup_safe(node->join_left_keys[k]);
+                if (node->join_right_keys[k])
+                    op.right_keys[k] = strdup_safe(node->join_right_keys[k]);
+            }
+        }
+        break;
+
     default:
         /* Other node types implemented in subsequent commits */
         return 0;

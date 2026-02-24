@@ -544,6 +544,154 @@ test_plan_filter_project(void)
 }
 
 /* ======================================================================== */
+/* JOIN Translation Tests                                                   */
+/* ======================================================================== */
+
+static void
+test_plan_join(void)
+{
+    TEST("DD plan: r(x,z) :- a(x,y), b(y,z). -> JOIN with keys");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl b(y: int32, z: int32)\n"
+                               ".decl r(x: int32, z: int32)\n"
+                               "r(x, z) :- a(x, y), b(y, z).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'r' not found in plan");
+        return;
+    }
+
+    /* IR: PROJECT(JOIN(SCAN_a, SCAN_b))
+     * Post-order: VARIABLE(a), VARIABLE(b), JOIN, MAP */
+    bool found_join = false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_JOIN) {
+            if (rp->ops[i].key_count < 1) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("JOIN op has key_count == 0");
+                return;
+            }
+            if (!rp->ops[i].right_relation) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("JOIN op has NULL right_relation");
+                return;
+            }
+            if (strcmp(rp->ops[i].right_relation, "b") != 0) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("JOIN right_relation should be 'b'");
+                return;
+            }
+            found_join = true;
+        }
+    }
+
+    if (!found_join) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("expected JOIN op");
+        return;
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_join_keys(void)
+{
+    TEST("DD plan: JOIN copies left_keys and right_keys");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl b(y: int32, z: int32)\n"
+                               ".decl r(x: int32, z: int32)\n"
+                               "r(x, z) :- a(x, y), b(y, z).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'r' not found in plan");
+        return;
+    }
+
+    /* Find JOIN op and check keys */
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_JOIN) {
+            if (rp->ops[i].key_count != 1 || !rp->ops[i].left_keys
+                || !rp->ops[i].right_keys) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("JOIN should have 1 key pair with non-NULL arrays");
+                return;
+            }
+            if (strcmp(rp->ops[i].left_keys[0], "y") != 0) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("JOIN left_keys[0] should be 'y'");
+                return;
+            }
+            if (strcmp(rp->ops[i].right_keys[0], "y") != 0) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("JOIN right_keys[0] should be 'y'");
+                return;
+            }
+
+            wl_dd_plan_free(plan);
+            wirelog_program_free(prog);
+            PASS();
+            return;
+        }
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    FAIL("JOIN op not found");
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -568,6 +716,10 @@ main(void)
     test_plan_filter();
     test_plan_project();
     test_plan_filter_project();
+
+    /* JOIN translation */
+    test_plan_join();
+    test_plan_join_keys();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);
