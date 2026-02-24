@@ -211,17 +211,23 @@ wirelog core (C11)
 **파일 구조**:
 ```
 wirelog/
-  lexer.c         # Tokenization
-  parser.c        # Datalog → AST (hand-written RDP)
-  ast.c           # AST node 관리
-  ir.c            # IR node 관리
-  stratify.c      # Stratification, SCC 감지
-  optimizer.c     # Optimizer orchestrator
+  parser/
+    lexer.c         # Tokenization
+    parser.c        # Datalog → AST (hand-written RDP)
+    ast.c           # AST node 관리
+  ir/
+    ir.c            # IR node 구성, expression clone
+    program.c       # 프로그램 메타데이터, AST→IR 변환, UNION merge
+    stratify.c      # Stratification, dependency graph, Tarjan's SCC
+    dd_plan.h       # DD 실행 계획 타입 및 내부 API
+    dd_plan.c       # IR → DD operator graph 변환
+    api.c           # Public API 구현
+  optimizer.c       # Optimizer orchestrator (계획)
   passes/
-    fusion.c      # Logic Fusion
-    jpp.c         # Join-Project Plan
-    sip.c         # Semijoin Information Passing
-    sharing.c     # Subplan Sharing
+    fusion.c        # Logic Fusion (계획)
+    jpp.c           # Join-Project Plan (계획)
+    sip.c           # Semijoin Information Passing (계획)
+    sharing.c       # Subplan Sharing (계획)
 ```
 
 **책임**:
@@ -234,31 +240,59 @@ wirelog/
 - ✅ Parser 구현 (hand-written RDP, C11)
 - ✅ 파서 테스트: 91/91 passing (47 lexer + 44 parser)
 - ✅ Grammar: FlowLog-compatible (declarations, rules, negation, aggregation, arithmetic, comparisons, booleans, .plan marker)
-- 🔄 IR 표현 정의 (진행 중)
-- 🔄 Stratification & SCC 감지 (계획됨)
+- ✅ IR 표현 (8가지 노드 타입, AST→IR 변환, UNION merge)
+- ✅ IR 테스트: 56/56 passing (19 IR + 37 program)
+- ✅ Stratification & SCC 감지 (Tarjan's iterative, negation 검증)
+- ✅ Stratification 테스트: 20/20 passing
+- ✅ DD Plan Translator (IR → DD operator graph, 전체 8가지 IR 노드 타입)
+- ✅ DD Plan 테스트: 19/19 passing
 - 🔄 최적화 passes (계획됨)
 
 #### DD Translator (C11 ↔ Rust FFI)
 
-**파일** (계획):
+**파일**:
 ```
-src/
-  dd/
-    translator.c    # IR → DD operator graph
-    ffi.h           # FFI definitions
-    data_marshal.c  # Data conversion C ↔ Rust
+wirelog/ir/
+  dd_plan.h         # DD 실행 계획 타입 및 내부 API
+  dd_plan.c         # IR → DD operator graph 변환
+  (계획)
+  dd_ffi.h          # FFI 정의 (Rust 경계)
+  dd_marshal.c      # 데이터 변환 C ↔ Rust
+```
+
+**Phase 0 상태** (DD Plan — C 측 완료):
+- ✅ DD 실행 계획 데이터 구조 (`wl_dd_plan_t`, `wl_dd_stratum_plan_t`, `wl_dd_relation_plan_t`, `wl_dd_op_t`)
+- ✅ 8가지 DD 연산자 타입: VARIABLE, MAP, FILTER, JOIN, ANTIJOIN, REDUCE, CONCAT, CONSOLIDATE
+- ✅ 전체 8가지 IR 노드 → DD 변환 (SCAN, PROJECT, FILTER, JOIN, ANTIJOIN, AGGREGATE, UNION, FLATMAP 보류)
+- ✅ Stratum 기반 plan 생성 (EDB 수집, stratum별 relation plan)
+- ✅ 재귀 stratum 감지 (`is_recursive` 플래그, DD `iterate()` 래핑용)
+- ✅ Deep-copy 소유 의미론 (`wl_ir_expr_clone()`, filter expression용)
+- ✅ 19/19 테스트 passing
+
+**변환 규칙** (IR 노드 → DD 연산자):
+```
+SCAN      → WL_DD_VARIABLE   (입력 컬렉션 참조)
+PROJECT   → WL_DD_MAP        (컬럼 프로젝션)
+FILTER    → WL_DD_FILTER     (predicate 필터, deep-copy된 expr)
+JOIN      → WL_DD_JOIN       (키 컬럼 기반 equijoin)
+ANTIJOIN  → WL_DD_ANTIJOIN   (negation, right relation 포함)
+AGGREGATE → WL_DD_REDUCE     (group-by + 집계 함수)
+UNION     → WL_DD_CONCAT + WL_DD_CONSOLIDATE (union + 중복 제거)
+FLATMAP   → (Phase 1 Logic Fusion으로 보류)
 ```
 
 **책임**:
-- wirelog IR을 DD operator graph로 변환
-- C ↔ Rust 데이터 마샬링
-- DD 워커 관리 (single vs multi)
-- 결과 수집 및 변환
+- ✅ wirelog IR을 DD operator graph로 변환 (C 측 plan)
+- 🔄 C ↔ Rust 데이터 마샬링 (계획)
+- 🔄 DD 워커 관리 (계획)
+- 🔄 결과 수집 및 변환 (계획)
 
-**설계 결정 사항** (TODO):
-- [ ] FFI 바운더리 명확히 (메모리 소유권)
+**설계 결정 사항**:
+- ✅ DD op의 모든 포인터 필드는 소유(deep copy), `wl_dd_plan_free()`로 해제
+- ✅ 에러 반환: `int` (0 = 성공, -1 = 메모리, -2 = 잘못된 입력) + out-parameter
+- ✅ FLATMAP 보류: 현재 IR이 별도의 FILTER/PROJECT/JOIN 노드를 생성
+- [ ] FFI 바운더리 명확히 (Rust 경계에서 메모리 소유권)
 - [ ] Data marshalling 전략 (zero-copy vs copy)
-- [ ] Error handling 방식
 - [ ] Context 전달 방식
 
 #### I/O Layer (Phase 0: 기본)
@@ -319,9 +353,12 @@ typedef struct {
 - ✅ 파서 테스트 (91/91 passing)
 - ✅ FlowLog-compatible grammar 구현
 - ✅ 빌드 시스템 (Meson, C11)
-- 🔄 IR 표현 정의 (backend-agnostic)
-- 🔄 Stratification & SCC 감지
-- 🔄 IR → DD operator graph 변환기
+- ✅ IR 표현 (8가지 노드 타입, AST→IR, UNION merge)
+- ✅ IR 테스트 (56/56 passing: 19 IR 노드 + 37 program)
+- ✅ Stratification & SCC 감지 (iterative Tarjan's, O(V+E))
+- ✅ Stratification 테스트 (20/20 passing)
+- ✅ IR → DD operator graph 변환기 (전체 8가지 IR 노드 타입, 19/19 tests)
+- 🔄 Rust FFI 통합
 - 🔄 기본 통합 테스트
 
 **검증**:
@@ -329,7 +366,7 @@ typedef struct {
 - [ ] 엔터프라이즈 타겟 (x86-64) 빌드 성공
 - [ ] 기본 Datalog 프로그램 실행 확인
 
-**현재 상태**: Parser 완료 (91/91 tests passing), IR/DD translator 진행 중
+**현재 상태**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19) 완료 — 186 tests passing. 다음 단계: Rust FFI 통합.
 
 ### Phase 1: 최적화 (Weeks 5-10) - 모든 환경 공통
 
@@ -398,6 +435,9 @@ typedef struct {
 | **언어** | C11 | ✅ 확정 | 최소 의존성, 임베디드 친화, 호환성 |
 | **빌드** | Meson | ✅ 확정 | Cross-compile 우수, 경량 |
 | **Parser** | Hand-written RDP | ✅ 구현됨 | Zero deps, 91/91 tests passing |
+| **IR** | Tree-based (8 node types) | ✅ 구현됨 | AST→IR, UNION merge, 56/56 tests |
+| **Stratification** | Tarjan's SCC | ✅ 구현됨 | O(V+E), iterative, 20/20 tests |
+| **DD Plan** | IR → DD op graph | ✅ 구현됨 | 8 op types, stratum-aware, 19/19 tests |
 | **메모리** | nanoarrow (중기) | 계획 | Columnar, Arrow interop |
 | **Allocator** | Region/Arena + system malloc | 계획 (Phase 2) | jemalloc 검토 후 보류; §4.1 ADR 참조 |
 | **Threading** | Optional pthreads | 계획 | Single-threaded 기본 |
@@ -515,12 +555,15 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 | 2026-02-22 | 0.1 | 초안 작성, 레이어링 정의 |
 | 2026-02-22 | 0.2 | Phase 0 parser 구현 상태 업데이트 (91/91 tests passing) |
 | 2026-02-23 | 0.3 | Allocator 결정 기록(§4.1 ADR) 추가: jemalloc 검토 후 보류 결정 |
+| 2026-02-24 | 0.4 | IR 표현 완료 (56 tests); Stratification & SCC 완료 (20 tests); 167 total |
+| 2026-02-24 | 0.5 | DD Plan Translator 완료 (19 tests); 전체 8가지 IR→DD 변환; 186 total |
 
 ---
 
 **다음 단계**:
 1. [x] Parser 구현 완료 (91/91 tests)
-2. [ ] IR 표현 정의 및 구현
-3. [ ] DD Translator FFI 설계
-4. [ ] Stratification 구현
-5. [ ] 통합 테스트 작성
+2. [x] IR 표현 정의 및 구현 (56/56 tests)
+3. [x] Stratification & SCC 감지 (20/20 tests)
+4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
+5. [ ] Rust FFI 통합 (DD plan → Rust executor)
+6. [ ] 통합 테스트 작성
