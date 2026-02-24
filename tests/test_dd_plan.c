@@ -692,6 +692,207 @@ test_plan_join_keys(void)
 }
 
 /* ======================================================================== */
+/* UNION, ANTIJOIN, AGGREGATE Translation Tests                             */
+/* ======================================================================== */
+
+static void
+test_plan_union(void)
+{
+    TEST("DD plan: r(x):-a(x). r(x):-b(x). -> CONCAT + CONSOLIDATE");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl b(x: int32)\n"
+                                                   ".decl r(x: int32)\n"
+                                                   "r(x) :- a(x).\n"
+                                                   "r(x) :- b(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'r' not found in plan");
+        return;
+    }
+
+    /* UNION(PROJECT(SCAN_a), PROJECT(SCAN_b))
+     * Should produce CONCAT and CONSOLIDATE ops */
+    bool found_concat = false;
+    bool found_consolidate = false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_CONCAT)
+            found_concat = true;
+        if (rp->ops[i].op == WL_DD_CONSOLIDATE)
+            found_consolidate = true;
+    }
+
+    if (!found_concat) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("expected CONCAT op for union");
+        return;
+    }
+
+    if (!found_consolidate) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("expected CONSOLIDATE op for union");
+        return;
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_antijoin(void)
+{
+    TEST("DD plan: r(x) :- a(x), !b(x). -> ANTIJOIN");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
+                                                   ".decl b(x: int32)\n"
+                                                   ".decl r(x: int32)\n"
+                                                   "r(x) :- a(x), !b(x).\n",
+                                                   &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'r' not found in plan");
+        return;
+    }
+
+    /* PROJECT(ANTIJOIN(SCAN_a, SCAN_b)) */
+    bool found_antijoin = false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_ANTIJOIN) {
+            if (!rp->ops[i].right_relation) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("ANTIJOIN has NULL right_relation");
+                return;
+            }
+            if (strcmp(rp->ops[i].right_relation, "b") != 0) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("ANTIJOIN right_relation should be 'b'");
+                return;
+            }
+            found_antijoin = true;
+        }
+    }
+
+    if (!found_antijoin) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("expected ANTIJOIN op");
+        return;
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_aggregate(void)
+{
+    TEST("DD plan: r(x, count(y)) :- a(x,y). -> REDUCE");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl r(x: int32, c: int32)\n"
+                               "r(x, count(y)) :- a(x, y).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'r' not found in plan");
+        return;
+    }
+
+    /* AGGREGATE(SCAN) -> VARIABLE, REDUCE */
+    bool found_reduce = false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_REDUCE) {
+            if (rp->ops[i].group_by_count == 0) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("REDUCE has group_by_count == 0");
+                return;
+            }
+            if (!rp->ops[i].group_by_indices) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("REDUCE has NULL group_by_indices");
+                return;
+            }
+            found_reduce = true;
+        }
+    }
+
+    if (!found_reduce) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("expected REDUCE op");
+        return;
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -720,6 +921,11 @@ main(void)
     /* JOIN translation */
     test_plan_join();
     test_plan_join_keys();
+
+    /* UNION, ANTIJOIN, AGGREGATE translation */
+    test_plan_union();
+    test_plan_antijoin();
+    test_plan_aggregate();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);

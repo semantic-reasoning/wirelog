@@ -149,8 +149,59 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         }
         break;
 
+    case WIRELOG_IR_ANTIJOIN:
+        op.op = WL_DD_ANTIJOIN;
+        if (node->child_count >= 2 && node->children[1]
+            && node->children[1]->relation_name) {
+            op.right_relation = strdup_safe(node->children[1]->relation_name);
+        }
+        if (node->join_key_count > 0) {
+            op.key_count = node->join_key_count;
+            op.left_keys = (char **)calloc(op.key_count, sizeof(char *));
+            op.right_keys = (char **)calloc(op.key_count, sizeof(char *));
+            if (!op.left_keys || !op.right_keys) {
+                dd_op_free_fields(&op);
+                return -1;
+            }
+            for (uint32_t k = 0; k < op.key_count; k++) {
+                if (node->join_left_keys[k])
+                    op.left_keys[k] = strdup_safe(node->join_left_keys[k]);
+                if (node->join_right_keys[k])
+                    op.right_keys[k] = strdup_safe(node->join_right_keys[k]);
+            }
+        }
+        break;
+
+    case WIRELOG_IR_AGGREGATE:
+        op.op = WL_DD_REDUCE;
+        op.agg_fn = node->agg_fn;
+        if (node->group_by_count > 0 && node->group_by_indices) {
+            op.group_by_count = node->group_by_count;
+            op.group_by_indices
+                = (uint32_t *)malloc(node->group_by_count * sizeof(uint32_t));
+            if (!op.group_by_indices)
+                return -1;
+            memcpy(op.group_by_indices, node->group_by_indices,
+                   node->group_by_count * sizeof(uint32_t));
+        }
+        break;
+
+    case WIRELOG_IR_UNION: {
+        /* UNION -> CONCAT + CONSOLIDATE (two ops) */
+        wl_dd_op_t concat_op;
+        memset(&concat_op, 0, sizeof(concat_op));
+        concat_op.op = WL_DD_CONCAT;
+        int rc = relation_plan_add_op(rp, concat_op);
+        if (rc != 0)
+            return rc;
+
+        wl_dd_op_t consol_op;
+        memset(&consol_op, 0, sizeof(consol_op));
+        consol_op.op = WL_DD_CONSOLIDATE;
+        return relation_plan_add_op(rp, consol_op);
+    }
+
     default:
-        /* Other node types implemented in subsequent commits */
         return 0;
     }
 
