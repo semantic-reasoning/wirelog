@@ -40,6 +40,40 @@
  *   - Strata are ordered: stratum 0 executes first
  *
  * ========================================================================
+ * Memory Ownership
+ * ========================================================================
+ *
+ * All pointer fields in DD ops are OWNED (deep copies of IR data).
+ * The caller owns the plan returned by wl_dd_plan_generate() and must
+ * free it with wl_dd_plan_free().  No pointers alias the input program.
+ *
+ * Ownership chain:
+ *   wl_dd_plan_t
+ *     -> edb_relations[]     (owned array of owned strings)
+ *     -> strata[]            (owned array)
+ *       -> relations[]       (owned array)
+ *         -> name            (owned string)
+ *         -> ops[]           (owned array)
+ *           -> relation_name   (owned string, VARIABLE only)
+ *           -> right_relation  (owned string, JOIN/ANTIJOIN only)
+ *           -> left_keys[]     (owned array of owned strings, JOIN only)
+ *           -> right_keys[]    (owned array of owned strings, JOIN only)
+ *           -> project_indices (owned array, MAP only)
+ *           -> filter_expr     (owned tree, FILTER only)
+ *           -> group_by_indices(owned array, REDUCE only)
+ *
+ * ========================================================================
+ * Error Handling
+ * ========================================================================
+ *
+ * wl_dd_plan_generate() returns:
+ *    0  success, *out is set
+ *   -1  memory allocation failure (partial state cleaned up)
+ *   -2  invalid input (NULL program, not stratified)
+ *
+ * On error, *out is unchanged (remains NULL if initialized to NULL).
+ *
+ * ========================================================================
  * Usage (internal)
  * ========================================================================
  *
@@ -104,16 +138,32 @@ typedef enum {
  * Fields are used depending on the op type; unused fields are zero/NULL.
  * All pointer fields are OWNED (deep copies); freed by wl_dd_plan_free().
  *
+ * Field usage by operator type:
+ *
+ *   VARIABLE:    relation_name
+ *   MAP:         project_indices, project_count
+ *   FILTER:      filter_expr
+ *   JOIN:        right_relation, left_keys, right_keys, key_count
+ *   ANTIJOIN:    right_relation, left_keys, right_keys, key_count
+ *   REDUCE:      agg_fn, group_by_indices, group_by_count
+ *   CONCAT:      (no fields)
+ *   CONSOLIDATE: (no fields)
+ *
  * @op:              Operator type.
  * @relation_name:   VARIABLE: source relation name (owned).
  * @right_relation:  JOIN/ANTIJOIN: right-side relation name (owned).
- * @left_keys:       JOIN: left key column names (owned array of owned strings).
- * @right_keys:      JOIN: right key column names (owned array of owned strings).
- * @key_count:       JOIN: number of join keys.
- * @project_indices: MAP: output column index mapping (owned).
- * @project_count:   MAP: number of projected columns.
- * @filter_expr:     FILTER: predicate expression (owned deep copy).
- * @agg_fn:          REDUCE: aggregation function.
+ * @left_keys:       JOIN/ANTIJOIN: left key column names (owned array of owned
+ *                   strings).
+ * @right_keys:      JOIN/ANTIJOIN: right key column names (owned array of owned
+ *                   strings).
+ * @key_count:       JOIN/ANTIJOIN: number of join keys.
+ * @project_indices: MAP: output column index mapping (owned). May be NULL if
+ *                   the IR used expression-based projection (project_exprs).
+ * @project_count:   MAP: number of projected columns (always set, even when
+ *                   project_indices is NULL).
+ * @filter_expr:     FILTER: predicate expression tree (owned deep copy via
+ *                   wl_ir_expr_clone). Never aliases the source IR.
+ * @agg_fn:          REDUCE: aggregation function (count, sum, min, max).
  * @group_by_indices: REDUCE: grouping column indices (owned).
  * @group_by_count:  REDUCE: number of grouping columns.
  */
