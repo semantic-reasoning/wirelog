@@ -224,7 +224,8 @@ wirelog/
     api.c           # Public API 구현
   optimizer.c       # Optimizer orchestrator (계획)
   passes/
-    fusion.c        # Logic Fusion (계획)
+    fusion.h        # Logic Fusion 헤더 (내부 API)
+    fusion.c        # Logic Fusion (FILTER+PROJECT → FLATMAP)
     jpp.c           # Join-Project Plan (계획)
     sip.c           # Semijoin Information Passing (계획)
     sharing.c       # Subplan Sharing (계획)
@@ -246,7 +247,8 @@ wirelog/
 - ✅ Stratification 테스트: 20/20 passing
 - ✅ DD Plan Translator (IR → DD operator graph, 전체 8가지 IR 노드 타입)
 - ✅ DD Plan 테스트: 19/19 passing
-- 🔄 최적화 passes (계획됨)
+- 🔄 최적화 passes (Phase 1 진행 중)
+- ✅ Logic Fusion: FILTER+PROJECT → FLATMAP (in-place mutation, 14/14 tests)
 
 #### DD Translator (C11 ↔ Rust FFI)
 
@@ -278,7 +280,7 @@ JOIN      → WL_DD_JOIN       (키 컬럼 기반 equijoin)
 ANTIJOIN  → WL_DD_ANTIJOIN   (negation, right relation 포함)
 AGGREGATE → WL_DD_REDUCE     (group-by + 집계 함수)
 UNION     → WL_DD_CONCAT + WL_DD_CONSOLIDATE (union + 중복 제거)
-FLATMAP   → (Phase 1 Logic Fusion으로 보류)
+FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 ```
 
 **책임**:
@@ -366,14 +368,14 @@ typedef struct {
 - [ ] 엔터프라이즈 타겟 (x86-64) 빌드 성공
 - [ ] 기본 Datalog 프로그램 실행 확인
 
-**현재 상태**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19) 완료 — 186 tests passing. 다음 단계: Rust FFI 통합.
+**현재 상태**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14) 완료 — 200 tests passing. Phase 1 최적화 진행 중.
 
 ### Phase 1: 최적화 (Weeks 5-10) - 모든 환경 공통
 
 **목표**: 논문 기반 최적화 기법을 IR 수준에서 구현 (FlowLog/Soufflé 참고)
 
 **구현 항목** (계획):
-- [ ] Logic Fusion (Join+Map+Filter → FlatMap)
+- ✅ Logic Fusion (FILTER+PROJECT → FLATMAP, in-place mutation, 14/14 tests)
 - [ ] Join-Project Plan (structural cost model, JST enumeration)
 - [ ] SIP (Semijoin Information Passing)
 - [ ] Subplan Sharing (hash-based CTE detection)
@@ -557,6 +559,7 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 | 2026-02-23 | 0.3 | Allocator 결정 기록(§4.1 ADR) 추가: jemalloc 검토 후 보류 결정 |
 | 2026-02-24 | 0.4 | IR 표현 완료 (56 tests); Stratification & SCC 완료 (20 tests); 167 total |
 | 2026-02-24 | 0.5 | DD Plan Translator 완료 (19 tests); 전체 8가지 IR→DD 변환; 186 total |
+| 2026-02-24 | 0.6 | Phase 1 Logic Fusion 완료 (14 tests); in-place FILTER+PROJECT→FLATMAP; 200 total |
 
 ---
 
@@ -565,5 +568,7 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 2. [x] IR 표현 정의 및 구현 (56/56 tests)
 3. [x] Stratification & SCC 감지 (20/20 tests)
 4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
-5. [ ] Rust FFI 통합 (DD plan → Rust executor)
-6. [ ] 통합 테스트 작성
+5. [x] Logic Fusion 최적화 패스 (FILTER+PROJECT → FLATMAP, 14/14 tests)
+6. [ ] 나머지 Phase 1 최적화 패스 (JPP, SIP, Subplan Sharing)
+7. [ ] Rust FFI 통합 (DD plan → Rust executor)
+8. [ ] 통합 테스트 작성

@@ -224,7 +224,8 @@ wirelog/
     api.c           # Public API implementation
   optimizer.c       # Optimizer orchestrator (planned)
   passes/
-    fusion.c        # Logic Fusion (planned)
+    fusion.h        # Logic Fusion header (internal API)
+    fusion.c        # Logic Fusion (FILTER+PROJECT → FLATMAP)
     jpp.c           # Join-Project Plan (planned)
     sip.c           # Semijoin Information Passing (planned)
     sharing.c       # Subplan Sharing (planned)
@@ -246,7 +247,8 @@ wirelog/
 - ✅ Stratification tests: 20/20 passing
 - ✅ DD Plan Translator (IR → DD operator graph, all 8 IR node types)
 - ✅ DD Plan tests: 19/19 passing
-- 🔄 Optimization passes (planned)
+- 🔄 Optimization passes (Phase 1 in progress)
+- ✅ Logic Fusion: FILTER+PROJECT → FLATMAP (in-place mutation, 14/14 tests)
 
 #### DD Translator (C11 ↔ Rust FFI)
 
@@ -278,7 +280,7 @@ JOIN      → WL_DD_JOIN       (equijoin with key columns)
 ANTIJOIN  → WL_DD_ANTIJOIN   (negation with right relation)
 AGGREGATE → WL_DD_REDUCE     (group-by + aggregation function)
 UNION     → WL_DD_CONCAT + WL_DD_CONSOLIDATE (union + dedup)
-FLATMAP   → (deferred to Phase 1 Logic Fusion)
+FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 ```
 
 **Responsibilities**:
@@ -366,14 +368,14 @@ typedef struct {
 - [ ] Enterprise target (x86-64) build success
 - [ ] Basic Datalog program execution verification
 
-**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19) complete — 186 tests passing. Rust FFI integration next.
+**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14) complete — 200 tests passing. Phase 1 Optimization in progress.
 
 ### Phase 1: Optimization (Weeks 5-10) - All environments common
 
 **Goal**: Implement paper-based optimization techniques at IR level (FlowLog/Soufflé reference)
 
 **Implementation Items** (planned):
-- [ ] Logic Fusion (Join+Map+Filter → FlatMap)
+- ✅ Logic Fusion (FILTER+PROJECT → FLATMAP, in-place mutation, 14/14 tests)
 - [ ] Join-Project Plan (structural cost model, JST enumeration)
 - [ ] SIP (Semijoin Information Passing)
 - [ ] Subplan Sharing (hash-based CTE detection)
@@ -557,6 +559,7 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 | 2026-02-23 | 0.3 | Add Allocator Decision Record (§4.1): jemalloc evaluated and deferred |
 | 2026-02-24 | 0.4 | IR representation complete (56 tests); Stratification & SCC complete (20 tests); 167 total |
 | 2026-02-24 | 0.5 | DD Plan Translator complete (19 tests); all 8 IR→DD translations; 186 total |
+| 2026-02-24 | 0.6 | Phase 1 Logic Fusion complete (14 tests); in-place FILTER+PROJECT→FLATMAP; 200 total |
 
 ---
 
@@ -565,5 +568,7 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 2. [x] IR representation and implementation (56/56 tests)
 3. [x] Stratification & SCC detection (20/20 tests)
 4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
-5. [ ] Rust FFI integration (DD plan → Rust executor)
-6. [ ] Integration test creation
+5. [x] Logic Fusion optimization pass (FILTER+PROJECT → FLATMAP, 14/14 tests)
+6. [ ] Remaining Phase 1 optimization passes (JPP, SIP, Subplan Sharing)
+7. [ ] Rust FFI integration (DD plan → Rust executor)
+8. [ ] Integration test creation

@@ -22,7 +22,7 @@ wirelog is a C11-based Datalog engine designed to work seamlessly across embedde
 
 ## Status
 
-**Phase 0: Foundation** - Parser, IR, Stratification, and DD Plan Translator implemented.
+**Phase 0: Foundation** complete. **Phase 1: Optimization** in progress.
 
 | Component | Tests | Status |
 |-----------|-------|--------|
@@ -30,7 +30,8 @@ wirelog is a C11-based Datalog engine designed to work seamlessly across embedde
 | IR | 56 | Complete |
 | Stratification | 20 | Complete |
 | DD Plan Translator | 19 | Complete |
-| **Total** | **186** | **All passing** |
+| Logic Fusion | 14 | Complete |
+| **Total** | **200** | **All passing** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design details.
 
@@ -58,12 +59,14 @@ wirelog/
 │   │   ├── lexer.c/h
 │   │   ├── parser.c/h
 │   │   └── ast.c/h
-│   └── ir/              # IR, stratification, DD plan translator
-│       ├── ir.c/h
-│       ├── program.c/h
-│       ├── stratify.c/h
-│       └── dd_plan.c/h
-├── tests/               # Test suite (186 tests)
+│   ├── ir/              # IR, stratification, DD plan translator
+│   │   ├── ir.c/h
+│   │   ├── program.c/h
+│   │   ├── stratify.c/h
+│   │   └── dd_plan.c/h
+│   └── passes/          # Optimization passes
+│       └── fusion.c/h   # Logic Fusion (FILTER+PROJECT → FLATMAP)
+├── tests/               # Test suite (200 tests)
 ├── docs/                # Documentation
 ├── discussion/          # Design discussions and analysis
 └── third_party/         # External libraries (nanoarrow, etc.)
