@@ -26,7 +26,9 @@ wirelog_ir_src = files(
 # Optimizer Module
 # ============================================================================
 
-wirelog_optimizer_src = []
+wirelog_optimizer_src = files(
+  'passes/fusion.c',
+)
 
 # ============================================================================
 # DD Translator Module

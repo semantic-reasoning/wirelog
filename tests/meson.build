@@ -19,6 +19,10 @@ ir_src = files(
   '../wirelog/ir/dd_plan.c',
 )
 
+optimizer_src = files(
+  '../wirelog/passes/fusion.c',
+)
+
 # ============================================================================
 # Test Executables
 # ============================================================================
@@ -80,3 +84,14 @@ test_dd_plan_exe = executable(
 )
 
 test('dd_plan', test_dd_plan_exe)
+
+test_fusion_exe = executable(
+  'test_fusion',
+  files('test_fusion.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('fusion', test_fusion_exe)
