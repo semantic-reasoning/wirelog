@@ -22,7 +22,15 @@ wirelog is a C11-based Datalog engine designed to work seamlessly across embedde
 
 ## Status
 
-**Architecture Phase** - Detailed design in progress. No code yet.
+**Phase 0: Foundation** - Parser, IR, Stratification, and DD Plan Translator implemented.
+
+| Component | Tests | Status |
+|-----------|-------|--------|
+| Parser | 91 | Complete |
+| IR | 56 | Complete |
+| Stratification | 20 | Complete |
+| DD Plan Translator | 19 | Complete |
+| **Total** | **186** | **All passing** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design details.
 
@@ -33,13 +41,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design details.
 git clone https://github.com/justinjoy/wirelog.git
 cd wirelog
 
-# Build (requires Meson + C11 compiler + Rust)
+# Build (requires Meson + C11 compiler)
 meson setup builddir
-cd builddir
-meson compile
+meson compile -C builddir
 
 # Run tests
-meson test
+meson test -C builddir
 ```
 
 ## Project Structure
@@ -47,12 +54,16 @@ meson test
 ```
 wirelog/
 ├── wirelog/              # Source code
-│   ├── parser/          # Datalog parser
-│   ├── ir/              # Intermediate representation
-│   ├── optimizer/       # Query optimizer
-│   ├── dd/              # Differential Dataflow translator
-│   └── io/              # Input/Output
-├── tests/               # Test suite
+│   ├── parser/          # Datalog parser (lexer, parser, AST)
+│   │   ├── lexer.c/h
+│   │   ├── parser.c/h
+│   │   └── ast.c/h
+│   └── ir/              # IR, stratification, DD plan translator
+│       ├── ir.c/h
+│       ├── program.c/h
+│       ├── stratify.c/h
+│       └── dd_plan.c/h
+├── tests/               # Test suite (186 tests)
 ├── docs/                # Documentation
 ├── discussion/          # Design discussions and analysis
 └── third_party/         # External libraries (nanoarrow, etc.)
@@ -105,7 +116,9 @@ For details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation
 
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed system design
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed system design (English)
+- **[ARCHITECTURE.ko.md](docs/ARCHITECTURE.ko.md)** - Detailed system design (Korean)
+- **[docs/README.md](docs/README.md)** - Documentation guide
 - **[LICENSE.md](LICENSE.md)** - Licensing information
 - **[discussion/](discussion/)** - Design discussions and analysis
 
