@@ -12,7 +12,7 @@
  *
  * Grammar (FlowLog-compatible):
  *
- *   program     = (declaration | input_dir | output_dir | printsize_dir | rule)*
+ *   program     = (declaration | input_dir | output_dir | printsize_dir | rule | fact)*
  *   declaration = ".decl" IDENT "(" attributes? ")"
  *   input_dir   = ".input" IDENT "(" input_params? ")"
  *   output_dir  = ".output" IDENT
@@ -613,11 +613,49 @@ parse_head(wl_parser_t *parser)
 }
 
 /* ======================================================================== */
-/* Rule Parsing                                                             */
+/* Fact / Rule Parsing                                                      */
 /* ======================================================================== */
 
 static wl_ast_node_t *
-parse_rule(wl_parser_t *parser)
+parse_fact(wl_parser_t *parser, wl_ast_node_t *head)
+{
+    /* Convert HEAD node to FACT node, reusing name and children */
+    wl_ast_node_t *fact
+        = wl_ast_node_create(WL_NODE_FACT, head->line, head->col);
+    fact->name = head->name;
+    head->name = NULL;
+
+    /* Move children from head to fact */
+    fact->children = head->children;
+    fact->child_count = head->child_count;
+    fact->child_capacity = head->child_capacity;
+    head->children = NULL;
+    head->child_count = 0;
+    head->child_capacity = 0;
+
+    wl_ast_node_free(head);
+
+    /* Validate: fact arguments must be constants (INTEGER or STRING) */
+    for (uint32_t i = 0; i < fact->child_count; i++) {
+        wl_node_type_t arg_type = fact->children[i]->type;
+        if (arg_type != WL_NODE_INTEGER && arg_type != WL_NODE_STRING) {
+            parser_error(
+                parser, "fact arguments must be constants (integer or string)");
+            wl_ast_node_free(fact);
+            return NULL;
+        }
+    }
+
+    if (!parser_consume(parser, WL_TOK_DOT, "expected '.' at end of fact")) {
+        wl_ast_node_free(fact);
+        return NULL;
+    }
+
+    return fact;
+}
+
+static wl_ast_node_t *
+parse_rule_or_fact(wl_parser_t *parser)
 {
     uint32_t line = parser->current.line;
     uint32_t col = parser->current.col;
@@ -626,7 +664,14 @@ parse_rule(wl_parser_t *parser)
     if (!head)
         return NULL;
 
-    if (!parser_consume(parser, WL_TOK_HORN, "expected ':-' after rule head")) {
+    /* Fact: head followed by '.' */
+    if (parser_check(parser, WL_TOK_DOT)) {
+        return parse_fact(parser, head);
+    }
+
+    /* Rule: head followed by ':-' */
+    if (!parser_consume(parser, WL_TOK_HORN,
+                        "expected ':-' or '.' after head")) {
         wl_ast_node_free(head);
         return NULL;
     }
@@ -867,8 +912,8 @@ parse_program(wl_parser_t *parser)
         } else if (parser_match(parser, WL_TOK_PRINTSIZE)) {
             node = parse_printsize_directive(parser);
         } else if (parser_check(parser, WL_TOK_IDENT)) {
-            /* Rule: starts with identifier (head relation) */
-            node = parse_rule(parser);
+            /* Fact or rule: both start with identifier */
+            node = parse_rule_or_fact(parser);
         } else {
             parser_error(parser, "expected declaration, directive, or rule");
             break;

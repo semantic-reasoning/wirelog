@@ -156,6 +156,8 @@ wl_node_type_str(wl_node_type_t type)
         return "AGGREGATE";
     case WL_NODE_BINARY_EXPR:
         return "BINARY_EXPR";
+    case WL_NODE_FACT:
+        return "FACT";
     case WL_NODE_TYPED_PARAM:
         return "TYPED_PARAM";
     case WL_NODE_INPUT_PARAM:

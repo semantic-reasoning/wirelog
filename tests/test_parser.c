@@ -997,6 +997,203 @@ test_parse_comparison_program(void)
 }
 
 /* ======================================================================== */
+/* Parser: Inline Facts                                                     */
+/* ======================================================================== */
+
+static void
+test_parse_single_fact(void)
+{
+    TEST("inline fact: edge(1, 2).");
+    PARSE("edge(1, 2).");
+    ASSERT_PARSED();
+    if (program->child_count != 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 1 child, got %u",
+                 program->child_count);
+        CLEANUP();
+        FAIL(buf);
+        return;
+    }
+    const wl_ast_node_t *fact = child(program, 0);
+    if (fact->type != WL_NODE_FACT) {
+        CLEANUP();
+        FAIL("expected FACT node");
+        return;
+    }
+    if (!fact->name || strcmp(fact->name, "edge") != 0) {
+        CLEANUP();
+        FAIL("expected relation name 'edge'");
+        return;
+    }
+    if (fact->child_count != 2) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 2 args, got %u",
+                 fact->child_count);
+        CLEANUP();
+        FAIL(buf);
+        return;
+    }
+    const wl_ast_node_t *a0 = child(fact, 0);
+    const wl_ast_node_t *a1 = child(fact, 1);
+    if (a0->type != WL_NODE_INTEGER || a0->int_value != 1) {
+        CLEANUP();
+        FAIL("arg 0 should be INTEGER 1");
+        return;
+    }
+    if (a1->type != WL_NODE_INTEGER || a1->int_value != 2) {
+        CLEANUP();
+        FAIL("arg 1 should be INTEGER 2");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_multiple_facts(void)
+{
+    TEST("multiple inline facts");
+    PARSE("edge(1, 2). edge(2, 3). edge(3, 4).");
+    ASSERT_PARSED();
+    if (program->child_count != 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 3 children, got %u",
+                 program->child_count);
+        CLEANUP();
+        FAIL(buf);
+        return;
+    }
+    /* Check all three are FACT nodes */
+    for (uint32_t i = 0; i < 3; i++) {
+        const wl_ast_node_t *f = child(program, i);
+        if (f->type != WL_NODE_FACT) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "child %u should be FACT", i);
+            CLEANUP();
+            FAIL(buf);
+            return;
+        }
+    }
+    /* Verify values of second fact: edge(2, 3) */
+    const wl_ast_node_t *f1 = child(program, 1);
+    if (!f1->name || strcmp(f1->name, "edge") != 0) {
+        CLEANUP();
+        FAIL("fact 1 name should be 'edge'");
+        return;
+    }
+    if (f1->child_count != 2) {
+        CLEANUP();
+        FAIL("fact 1 should have 2 args");
+        return;
+    }
+    if (child(f1, 0)->int_value != 2 || child(f1, 1)->int_value != 3) {
+        CLEANUP();
+        FAIL("fact 1 args should be 2, 3");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_facts_mixed_with_rules(void)
+{
+    TEST("facts mixed with decls and rules");
+    PARSE(".decl edge(src: int32, dst: int32)\n"
+          "edge(1, 2).\n"
+          "edge(2, 3).\n"
+          "Tc(x, y) :- edge(x, y).\n"
+          ".output Tc\n");
+    ASSERT_PARSED();
+    if (program->child_count != 5) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 5 children, got %u",
+                 program->child_count);
+        CLEANUP();
+        FAIL(buf);
+        return;
+    }
+    if (child(program, 0)->type != WL_NODE_DECL) {
+        CLEANUP();
+        FAIL("child 0 should be DECL");
+        return;
+    }
+    if (child(program, 1)->type != WL_NODE_FACT) {
+        CLEANUP();
+        FAIL("child 1 should be FACT");
+        return;
+    }
+    if (child(program, 2)->type != WL_NODE_FACT) {
+        CLEANUP();
+        FAIL("child 2 should be FACT");
+        return;
+    }
+    if (child(program, 3)->type != WL_NODE_RULE) {
+        CLEANUP();
+        FAIL("child 3 should be RULE");
+        return;
+    }
+    if (child(program, 4)->type != WL_NODE_OUTPUT) {
+        CLEANUP();
+        FAIL("child 4 should be OUTPUT");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_fact_rejects_variables(void)
+{
+    TEST("error: fact with variable argument");
+    PARSE("edge(x, 2).");
+    if (program != NULL) {
+        CLEANUP();
+        FAIL("expected parse failure for fact with variable");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_parse_fact_string_constant(void)
+{
+    TEST("fact with string constant: name(1, \"alice\").");
+    PARSE("name(1, \"alice\").");
+    ASSERT_PARSED();
+    if (program->child_count != 1) {
+        CLEANUP();
+        FAIL("expected 1 child");
+        return;
+    }
+    const wl_ast_node_t *fact = child(program, 0);
+    if (fact->type != WL_NODE_FACT) {
+        CLEANUP();
+        FAIL("expected FACT node");
+        return;
+    }
+    if (fact->child_count != 2) {
+        CLEANUP();
+        FAIL("expected 2 args");
+        return;
+    }
+    if (child(fact, 0)->type != WL_NODE_INTEGER
+        || child(fact, 0)->int_value != 1) {
+        CLEANUP();
+        FAIL("arg 0 should be INTEGER 1");
+        return;
+    }
+    if (child(fact, 1)->type != WL_NODE_STRING || !child(fact, 1)->str_value
+        || strcmp(child(fact, 1)->str_value, "alice") != 0) {
+        CLEANUP();
+        FAIL("arg 1 should be STRING 'alice'");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+/* ======================================================================== */
 /* Parser: Error Cases                                                      */
 /* ======================================================================== */
 
@@ -1165,6 +1362,13 @@ main(void)
     test_parse_sssp();
     test_parse_negation_program();
     test_parse_comparison_program();
+
+    printf("\n--- Inline Facts ---\n");
+    test_parse_single_fact();
+    test_parse_multiple_facts();
+    test_parse_facts_mixed_with_rules();
+    test_parse_fact_rejects_variables();
+    test_parse_fact_string_constant();
 
     printf("\n--- Error Cases ---\n");
     test_parse_error_missing_horn();

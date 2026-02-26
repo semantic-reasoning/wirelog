@@ -59,6 +59,9 @@ typedef enum {
     /* Expressions */
     WL_NODE_BINARY_EXPR, /* arith_op, children[0]=left, children[1]=right */
 
+    /* Inline facts */
+    WL_NODE_FACT, /* name=relation, children=constant args */
+
     /* Declaration parts */
     WL_NODE_TYPED_PARAM, /* name=attr_name, type_name=data_type */
     WL_NODE_INPUT_PARAM, /* name=param_name, str_value=param_value */
