@@ -1,6 +1,6 @@
 [package]
 name = "wirelog-dd"
-version = "0.1.0"
+version = "0.10.0"
 edition = "2021"
 license = "LGPL-3.0"
 description = "Rust DD executor for wirelog Datalog engine"

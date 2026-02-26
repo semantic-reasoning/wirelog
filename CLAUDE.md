@@ -16,7 +16,7 @@ Commits should maintain clear authorship attribution to human developers and the
 
 - Language: C11 (strict C11 compliance)
 - Build: Meson
-- Version: 0.1.0 (Architecture phase)
+- Version: 0.10.0 (Phase 0 complete)
 - License: LGPL-3.0 + Commercial dual license
 
 See `docs/ARCHITECTURE.md` for design details.
