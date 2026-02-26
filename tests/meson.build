@@ -129,3 +129,21 @@ test_dd_execute_exe = executable(
 )
 
 test('dd_execute', test_dd_execute_exe)
+
+cli_src = files(
+  '../wirelog/cli/driver.c',
+)
+
+test_cli_exe = executable(
+  'test_cli',
+  files('test_cli.c'),
+  parser_src,
+  ir_src,
+  ffi_src,
+  facts_loader_src,
+  cli_src,
+  dependencies: [rust_ffi_dep],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('cli', test_cli_exe)
