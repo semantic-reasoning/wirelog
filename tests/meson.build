@@ -110,3 +110,15 @@ test_dd_ffi_exe = executable(
 )
 
 test('dd_ffi', test_dd_ffi_exe)
+
+test_dd_execute_exe = executable(
+  'test_dd_execute',
+  files('test_dd_execute.c'),
+  parser_src,
+  ir_src,
+  ffi_src,
+  dependencies: [rust_ffi_dep],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('dd_execute', test_dd_execute_exe)

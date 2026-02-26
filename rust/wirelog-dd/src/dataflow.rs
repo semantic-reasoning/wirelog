@@ -169,10 +169,15 @@ fn evaluate_relation_plan(
     relation_data: &HashMap<String, Vec<Row>>,
 ) -> Result<Vec<Row>, String> {
     let mut current: Vec<Row> = Vec::new();
+    let mut accumulated: Vec<Row> = Vec::new();
 
     for op in &rel_plan.ops {
         match op {
             SafeOp::Variable { relation_name } => {
+                // Save current to accumulator for CONCAT (UNION branches)
+                if !current.is_empty() {
+                    accumulated.append(&mut current);
+                }
                 current = relation_data
                     .get(relation_name)
                     .cloned()
@@ -180,10 +185,13 @@ fn evaluate_relation_plan(
             }
 
             SafeOp::Map { indices } => {
-                current = current
-                    .into_iter()
-                    .map(|row| indices.iter().map(|&i| row[i as usize]).collect())
-                    .collect();
+                if !indices.is_empty() {
+                    current = current
+                        .into_iter()
+                        .map(|row| indices.iter().map(|&i| row[i as usize]).collect())
+                        .collect();
+                }
+                // Empty indices = identity pass-through (keep current as-is)
             }
 
             SafeOp::Filter { expr } => {
@@ -224,9 +232,9 @@ fn evaluate_relation_plan(
             }
 
             SafeOp::Concat => {
-                // Concat is a union; in the sequential model, the current
-                // collection already accumulates all preceding operators.
-                // Nothing to do here in the interpreter.
+                // Merge accumulated results from previous UNION branches
+                // with the current branch's results.
+                current.append(&mut accumulated);
             }
 
             SafeOp::Consolidate => {

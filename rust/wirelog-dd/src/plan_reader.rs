@@ -195,8 +195,13 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
         }
 
         WlFfiOpType::Map => {
-            let indices =
-                read_u32_array(op.project_indices, op.project_count, "op.project_indices")?;
+            // NULL project_indices with non-zero count means expression-based
+            // projection (not yet supported in FFI).  Treat as identity.
+            let indices = if op.project_indices.is_null() {
+                Vec::new()
+            } else {
+                read_u32_array(op.project_indices, op.project_count, "op.project_indices")?
+            };
             Ok(SafeOp::Map { indices })
         }
 

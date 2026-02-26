@@ -72,21 +72,74 @@ dd_op_free_fields(wl_dd_op_t *op)
 /* ======================================================================== */
 
 /**
+ * Column name context for tracking variable-to-column mappings
+ * through the IR tree translation.  Updated by SCAN nodes (and extended
+ * by JOIN with right-side non-key columns) so that FILTER and PROJECT
+ * nodes can resolve variable names to positional column indices.
+ */
+#define IR_COL_CTX_MAX 32
+
+typedef struct {
+    const char *names[IR_COL_CTX_MAX];
+    uint32_t count;
+} ir_col_ctx_t;
+
+/**
+ * Recursively rewrite variable names in a cloned expression tree
+ * from original Datalog names (e.g., "x") to positional names
+ * (e.g., "col0") that match the Rust executor's convention.
+ */
+static void
+rewrite_expr_vars(wl_ir_expr_t *expr, const char *const *column_names,
+                  uint32_t column_count)
+{
+    if (!expr)
+        return;
+
+    if (expr->type == WL_IR_EXPR_VAR && expr->var_name) {
+        for (uint32_t i = 0; i < column_count; i++) {
+            if (column_names[i]
+                && strcmp(expr->var_name, column_names[i]) == 0) {
+                free(expr->var_name);
+                char buf[16];
+                snprintf(buf, sizeof(buf), "col%u", i);
+                expr->var_name = strdup_safe(buf);
+                break;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < expr->child_count; i++)
+        rewrite_expr_vars(expr->children[i], column_names, column_count);
+}
+
+/**
  * Translate an IR tree node into DD ops, appended to the relation plan.
  * Walks the tree in post-order (children first, then current node).
+ *
+ * @ctx tracks the current column name mapping flowing up from SCAN nodes
+ * so that FILTER expressions can rewrite variable names to positional form.
  *
  * Returns 0 on success, -1 on memory error.
  */
 static int
 translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
-                  const struct wirelog_program *prog)
+                  const struct wirelog_program *prog, ir_col_ctx_t *ctx)
 {
     if (!node)
         return 0;
 
+    /* For JOIN/ANTIJOIN, only translate the left child (child[0]).
+     * The right child is referenced by name in the JOIN/ANTIJOIN op;
+     * translating it would add an extra VARIABLE that overwrites the
+     * left side's data in the sequential interpreter. */
+    uint32_t child_limit = node->child_count;
+    if (node->type == WIRELOG_IR_JOIN || node->type == WIRELOG_IR_ANTIJOIN)
+        child_limit = (node->child_count > 0) ? 1 : 0;
+
     /* Translate children first (post-order) */
-    for (uint32_t i = 0; i < node->child_count; i++) {
-        int rc = translate_ir_node(node->children[i], rp, prog);
+    for (uint32_t i = 0; i < child_limit; i++) {
+        int rc = translate_ir_node(node->children[i], rp, prog, ctx);
         if (rc != 0)
             return rc;
     }
@@ -100,6 +153,13 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         op.op = WL_DD_VARIABLE;
         if (node->relation_name)
             op.relation_name = strdup_safe(node->relation_name);
+        /* Update column context from SCAN's declared variable names */
+        if (node->column_names) {
+            ctx->count = 0;
+            for (uint32_t i = 0; i < node->column_count && i < IR_COL_CTX_MAX;
+                 i++)
+                ctx->names[ctx->count++] = node->column_names[i];
+        }
         break;
 
     case WIRELOG_IR_FILTER:
@@ -108,6 +168,10 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
             op.filter_expr = wl_ir_expr_clone(node->filter_expr);
             if (!op.filter_expr)
                 return -1;
+            /* Rewrite variable names to positional col0, col1, ... */
+            if (ctx->count > 0)
+                rewrite_expr_vars(op.filter_expr,
+                                  (const char *const *)ctx->names, ctx->count);
         }
         break;
 
@@ -115,12 +179,33 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         op.op = WL_DD_MAP;
         op.project_count = node->project_count;
         if (node->project_count > 0 && node->project_indices) {
+            /* Use explicit index mapping */
             op.project_indices
                 = (uint32_t *)malloc(node->project_count * sizeof(uint32_t));
             if (!op.project_indices)
                 return -1;
             memcpy(op.project_indices, node->project_indices,
                    node->project_count * sizeof(uint32_t));
+        } else if (node->project_count > 0 && node->project_exprs
+                   && ctx->count > 0) {
+            /* Resolve VAR expressions to column indices */
+            op.project_indices
+                = (uint32_t *)malloc(node->project_count * sizeof(uint32_t));
+            if (!op.project_indices)
+                return -1;
+            for (uint32_t i = 0; i < node->project_count; i++) {
+                wl_ir_expr_t *e = node->project_exprs[i];
+                op.project_indices[i] = i; /* default: identity */
+                if (e && e->type == WL_IR_EXPR_VAR && e->var_name) {
+                    for (uint32_t j = 0; j < ctx->count; j++) {
+                        if (ctx->names[j]
+                            && strcmp(e->var_name, ctx->names[j]) == 0) {
+                            op.project_indices[i] = j;
+                            break;
+                        }
+                    }
+                }
+            }
         }
         break;
 
@@ -146,6 +231,15 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
                 if (node->join_right_keys[k])
                     op.right_keys[k] = strdup_safe(node->join_right_keys[k]);
             }
+        }
+        /* Update column context: join output = left_cols + right non-key cols */
+        if (node->child_count >= 2 && node->children[1]
+            && node->children[1]->column_names) {
+            uint32_t rkey = node->join_key_count;
+            const wirelog_ir_node_t *rc = node->children[1];
+            for (uint32_t i = rkey;
+                 i < rc->column_count && ctx->count < IR_COL_CTX_MAX; i++)
+                ctx->names[ctx->count++] = rc->column_names[i];
         }
         break;
 
@@ -316,9 +410,10 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
                         if (strcmp(prog->relations[ri].name, unique_names[u])
                             == 0) {
                             if (prog->relation_irs[ri]) {
+                                ir_col_ctx_t ctx = { { 0 }, 0 };
                                 int rc = translate_ir_node(
                                     prog->relation_irs[ri], &sp->relations[u],
-                                    prog);
+                                    prog, &ctx);
                                 if (rc != 0) {
                                     free(unique_names);
                                     wl_dd_plan_free(plan);
