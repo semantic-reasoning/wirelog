@@ -29,6 +29,13 @@ option(
 )
 
 option(
+  'dd',
+  type: 'boolean',
+  value: false,
+  description: 'Enable Differential Dataflow executor (requires Rust toolchain)'
+)
+
+option(
   'documentation',
   type: 'boolean',
   value: false,

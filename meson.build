@@ -55,12 +55,14 @@ ipc_option = get_option('ipc')
 threads_option = get_option('threads')
 tests_option = get_option('tests')
 docs_option = get_option('documentation')
+dd_option = get_option('dd')
 
 message('wirelog ' + project_version)
 message('  Platform: ' + platform)
 message('  Embedded: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
+message('  DD executor: @0@'.format(dd_option))
 
 # ============================================================================
 # Dependencies
@@ -68,9 +70,41 @@ message('  Threading: ' + threads_option)
 
 
 # Rust FFI (Differential Dataflow)
-# Note: In Phase 0, we need to define how Rust FFI will be integrated
-# For now, this is a placeholder
-rust_ffi_dep = disabler()  # Will be enabled when Rust integration is ready
+if dd_option
+  cargo = find_program('cargo', required: true)
+
+  rust_dd_src = meson.project_source_root() / 'rust' / 'wirelog-dd'
+  rust_dd_lib = rust_dd_src / 'target' / 'release' / 'libwirelog_dd.a'
+
+  rust_dd_target = custom_target(
+    'wirelog-dd',
+    command: [cargo, 'build', '--release', '--manifest-path',
+              rust_dd_src / 'Cargo.toml'],
+    output: 'libwirelog_dd.stamp',
+    build_by_default: true,
+    console: true,
+  )
+
+  rust_ffi_dep = declare_dependency(
+    link_args: [rust_dd_lib],
+    sources: rust_dd_target,
+  )
+
+  # Rust lint targets (run manually: ninja rust-clippy / ninja rust-fmt-check)
+  run_target('rust-clippy',
+    command: [cargo, 'clippy', '--manifest-path', rust_dd_src / 'Cargo.toml',
+              '--', '-D', 'warnings'],
+  )
+  run_target('rust-fmt-check',
+    command: [cargo, 'fmt', '--manifest-path', rust_dd_src / 'Cargo.toml',
+              '--check'],
+  )
+  run_target('rust-test',
+    command: [cargo, 'test', '--manifest-path', rust_dd_src / 'Cargo.toml'],
+  )
+else
+  rust_ffi_dep = disabler()
+endif
 
 # Optional: pthreads for threading
 threads_dep = disabler()
@@ -207,5 +241,6 @@ message('  Headers: ' + wirelog_includedir / 'wirelog')
 message('  Embedded mode: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
+message('  DD executor: @0@'.format(dd_option))
 message('  Tests: @0@'.format(tests_option))
 message('')
