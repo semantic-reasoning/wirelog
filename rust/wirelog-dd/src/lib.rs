@@ -7,10 +7,11 @@
  */
 
 #[allow(dead_code)] // Building blocks for dataflow execution
+mod dataflow;
 mod expr;
 mod ffi;
 pub mod ffi_types;
-#[allow(dead_code)] // Used by dataflow execution in later commits
+#[allow(dead_code)] // Used by dataflow execution
 mod plan_reader;
 
 // Re-export FFI entry points (they are #[no_mangle] extern "C")
