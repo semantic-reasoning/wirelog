@@ -6,10 +6,12 @@
  */
 
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
+use crate::dataflow::execute_plan;
 use crate::ffi_types::WlFfiPlan;
+use crate::plan_reader::read_plan;
 
 /* ======================================================================== */
 /* Callback type for result tuple delivery                                  */
@@ -146,12 +148,7 @@ pub unsafe extern "C" fn wl_dd_load_edb(
 /// `plan` and `worker` must be valid pointers or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn wl_dd_execute(plan: *const WlFfiPlan, worker: *mut WlDdWorker) -> c_int {
-    if plan.is_null() || worker.is_null() {
-        return -2;
-    }
-
-    // Stub: not yet implemented
-    -1
+    wl_dd_execute_cb(plan, worker, None, std::ptr::null_mut())
 }
 
 /// Execute a DD plan with result callback.
@@ -180,10 +177,34 @@ pub unsafe extern "C" fn wl_dd_execute_cb(
         return -2;
     }
 
-    // Stub: not yet implemented
-    let _ = on_tuple;
-    let _ = user_data;
-    -1
+    // Read FFI plan into safe Rust types
+    let safe_plan = match read_plan(plan) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+
+    let worker_ref = &*worker;
+
+    // Execute the plan using the interpreter
+    let result = match execute_plan(&safe_plan, &worker_ref.edb_data, worker_ref.num_workers) {
+        Ok(r) => r,
+        Err(_) => return -1,
+    };
+
+    // Deliver results via callback
+    if let Some(cb) = on_tuple {
+        for (rel_name, rows) in &result.tuples {
+            let c_rel = match CString::new(rel_name.as_str()) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            for row in rows {
+                cb(c_rel.as_ptr(), row.as_ptr(), row.len() as u32, user_data);
+            }
+        }
+    }
+
+    0
 }
 
 /* ======================================================================== */
@@ -235,17 +256,6 @@ mod tests {
             let dummy = 1usize as *const WlFfiPlan;
             let rc = wl_dd_execute(dummy, std::ptr::null_mut());
             assert_eq!(rc, -2);
-        }
-    }
-
-    #[test]
-    fn test_execute_stub_returns_not_implemented() {
-        unsafe {
-            let w = wl_dd_worker_create(1);
-            let dummy = 1usize as *const WlFfiPlan;
-            let rc = wl_dd_execute(dummy, w);
-            assert_eq!(rc, -1);
-            wl_dd_worker_destroy(w);
         }
     }
 
@@ -385,13 +395,191 @@ mod tests {
         }
     }
 
+    // ---- Execute with real FFI plan tests ----
+
+    /// Helper: build a minimal FFI plan in Rust-owned memory for testing.
+    /// Creates a plan with one non-recursive stratum containing one relation
+    /// that simply reads from a Variable (EDB passthrough).
+    ///
+    /// Caller must keep returned values alive for the duration of the test.
+    struct TestPlan {
+        _rel_name: CString,
+        _edb_name: CString,
+        _var_rel_name: CString,
+        ops: Vec<crate::ffi_types::WlFfiOp>,
+        relations: Vec<crate::ffi_types::WlFfiRelationPlan>,
+        strata: Vec<crate::ffi_types::WlFfiStratumPlan>,
+        edb_ptrs: Vec<*const c_char>,
+        plan: WlFfiPlan,
+    }
+
+    impl TestPlan {
+        fn passthrough(rel_name: &str, edb_name: &str) -> Self {
+            let rel_cstr = CString::new(rel_name).unwrap();
+            let edb_cstr = CString::new(edb_name).unwrap();
+            let var_cstr = CString::new(edb_name).unwrap();
+
+            let op = crate::ffi_types::WlFfiOp {
+                op: crate::ffi_types::WlFfiOpType::Variable,
+                relation_name: var_cstr.as_ptr(),
+                right_relation: std::ptr::null(),
+                left_keys: std::ptr::null(),
+                right_keys: std::ptr::null(),
+                key_count: 0,
+                project_indices: std::ptr::null(),
+                project_count: 0,
+                filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                    data: std::ptr::null(),
+                    size: 0,
+                },
+                agg_fn: crate::ffi_types::WlAggFn::Count,
+                group_by_indices: std::ptr::null(),
+                group_by_count: 0,
+            };
+
+            let mut tp = TestPlan {
+                _rel_name: rel_cstr,
+                _edb_name: edb_cstr,
+                _var_rel_name: var_cstr,
+                ops: vec![op],
+                relations: Vec::new(),
+                strata: Vec::new(),
+                edb_ptrs: Vec::new(),
+                plan: unsafe { std::mem::zeroed() },
+            };
+
+            tp.relations.push(crate::ffi_types::WlFfiRelationPlan {
+                name: tp._rel_name.as_ptr(),
+                ops: tp.ops.as_ptr(),
+                op_count: 1,
+            });
+
+            tp.strata.push(crate::ffi_types::WlFfiStratumPlan {
+                stratum_id: 0,
+                is_recursive: false,
+                relations: tp.relations.as_ptr(),
+                relation_count: 1,
+            });
+
+            tp.edb_ptrs.push(tp._edb_name.as_ptr());
+
+            tp.plan = WlFfiPlan {
+                strata: tp.strata.as_ptr(),
+                stratum_count: 1,
+                edb_relations: tp.edb_ptrs.as_ptr(),
+                edb_count: 1,
+            };
+
+            tp
+        }
+    }
+
+    /// Callback that collects tuples into a Vec stored behind user_data.
+    unsafe extern "C" fn collect_tuples(
+        relation: *const c_char,
+        row: *const i64,
+        ncols: u32,
+        user_data: *mut c_void,
+    ) {
+        let results = &mut *(user_data as *mut Vec<(String, Vec<i64>)>);
+        let rel = CStr::from_ptr(relation).to_str().unwrap().to_owned();
+        let data = std::slice::from_raw_parts(row, ncols as usize).to_vec();
+        results.push((rel, data));
+    }
+
     #[test]
-    fn test_execute_cb_stub_returns_not_implemented() {
+    fn test_execute_cb_empty_plan_returns_success() {
         unsafe {
             let w = wl_dd_worker_create(1);
-            let dummy = 1usize as *const WlFfiPlan;
-            let rc = wl_dd_execute_cb(dummy, w, None, std::ptr::null_mut());
-            assert_eq!(rc, -1);
+            let strata: Vec<crate::ffi_types::WlFfiStratumPlan> = vec![];
+            let plan = WlFfiPlan {
+                strata: strata.as_ptr(),
+                stratum_count: 0,
+                edb_relations: std::ptr::null(),
+                edb_count: 0,
+            };
+            let mut results: Vec<(String, Vec<i64>)> = Vec::new();
+            let rc = wl_dd_execute_cb(
+                &plan,
+                w,
+                Some(collect_tuples),
+                &mut results as *mut _ as *mut c_void,
+            );
+            assert_eq!(rc, 0, "empty plan should succeed with rc=0");
+            assert!(results.is_empty(), "empty plan should produce no tuples");
+            wl_dd_worker_destroy(w);
+        }
+    }
+
+    #[test]
+    fn test_execute_cb_passthrough_delivers_tuples() {
+        unsafe {
+            let w = wl_dd_worker_create(1);
+
+            // Load EDB: edge(1,2), edge(3,4)
+            let edge_name = CString::new("edge").unwrap();
+            let edb_data: [i64; 4] = [1, 2, 3, 4];
+            wl_dd_load_edb(w, edge_name.as_ptr(), edb_data.as_ptr(), 2, 2);
+
+            // Plan: tc(X,Y) :- edge(X,Y)
+            let tp = TestPlan::passthrough("tc", "edge");
+
+            let mut results: Vec<(String, Vec<i64>)> = Vec::new();
+            let rc = wl_dd_execute_cb(
+                &tp.plan,
+                w,
+                Some(collect_tuples),
+                &mut results as *mut _ as *mut c_void,
+            );
+
+            assert_eq!(rc, 0, "passthrough plan should succeed");
+            assert_eq!(results.len(), 2, "should deliver 2 tuples");
+
+            // All tuples should be for relation "tc"
+            assert!(results.iter().all(|(rel, _)| rel == "tc"));
+
+            // Should contain (1,2) and (3,4)
+            let mut rows: Vec<Vec<i64>> = results.into_iter().map(|(_, r)| r).collect();
+            rows.sort();
+            assert_eq!(rows, vec![vec![1, 2], vec![3, 4]]);
+
+            wl_dd_worker_destroy(w);
+        }
+    }
+
+    #[test]
+    fn test_execute_cb_null_callback_discards_results() {
+        unsafe {
+            let w = wl_dd_worker_create(1);
+
+            let edge_name = CString::new("edge").unwrap();
+            let edb_data: [i64; 2] = [1, 2];
+            wl_dd_load_edb(w, edge_name.as_ptr(), edb_data.as_ptr(), 1, 2);
+
+            let tp = TestPlan::passthrough("tc", "edge");
+
+            // on_tuple = None: results should be silently discarded
+            let rc = wl_dd_execute_cb(&tp.plan, w, None, std::ptr::null_mut());
+            assert_eq!(rc, 0, "null callback should still succeed");
+
+            wl_dd_worker_destroy(w);
+        }
+    }
+
+    #[test]
+    fn test_execute_returns_success_with_plan() {
+        unsafe {
+            let w = wl_dd_worker_create(1);
+
+            let edge_name = CString::new("edge").unwrap();
+            let edb_data: [i64; 4] = [1, 2, 3, 4];
+            wl_dd_load_edb(w, edge_name.as_ptr(), edb_data.as_ptr(), 2, 2);
+
+            let tp = TestPlan::passthrough("tc", "edge");
+
+            let rc = wl_dd_execute(&tp.plan, w);
+            assert_eq!(rc, 0, "execute with valid plan should succeed");
+
             wl_dd_worker_destroy(w);
         }
     }

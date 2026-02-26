@@ -98,6 +98,7 @@ pub struct SafePlan {
 
 /// Errors that can occur when reading an FFI plan.
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)] // Variants constructed via defensive checks on FFI input
 pub enum PlanReadError {
     NullPointer(&'static str),
     InvalidUtf8(&'static str),
