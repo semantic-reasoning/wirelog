@@ -219,9 +219,12 @@ wirelog/
     ir.c            # IR node construction, expression clone
     program.c       # Program metadata, AST-to-IR conversion, UNION merge
     stratify.c      # Stratification, dependency graph, Tarjan's SCC
+    api.c           # Public API implementation
+  ffi/
     dd_plan.h       # DD execution plan types and internal API
     dd_plan.c       # IR → DD operator graph translation
-    api.c           # Public API implementation
+    dd_ffi.h        # FFI-safe type definitions (C ↔ Rust boundary)
+    dd_marshal.c    # DD plan marshalling (internal → FFI-safe)
   optimizer.c       # Optimizer orchestrator (planned)
   passes/
     fusion.h        # Logic Fusion header (internal API)
@@ -250,16 +253,15 @@ wirelog/
 - 🔄 Optimization passes (Phase 1 in progress)
 - ✅ Logic Fusion: FILTER+PROJECT → FLATMAP (in-place mutation, 14/14 tests)
 
-#### DD Translator (C11 ↔ Rust FFI)
+#### DD Translator & FFI Layer (C11 ↔ Rust FFI)
 
 **Files**:
 ```
-wirelog/ir/
+wirelog/ffi/
   dd_plan.h         # DD execution plan types and internal API
   dd_plan.c         # IR → DD operator graph translation
-  (planned)
-  dd_ffi.h          # FFI definitions (Rust boundary)
-  dd_marshal.c      # Data conversion C ↔ Rust
+  dd_ffi.h          # FFI-safe type definitions (C ↔ Rust boundary)
+  dd_marshal.c      # DD plan marshalling (internal → FFI-safe)
 ```
 
 **Phase 0 Status** (DD Plan — C-side complete):
@@ -270,6 +272,14 @@ wirelog/ir/
 - ✅ Recursive stratum detection (`is_recursive` flag for DD `iterate()` wrapping)
 - ✅ Deep-copy ownership semantics (`wl_ir_expr_clone()` for filter expressions)
 - ✅ 19/19 tests passing
+
+**FFI Marshalling Layer** (C-side complete):
+- ✅ FFI-safe type definitions (`wl_ffi_plan_t`, `wl_ffi_stratum_plan_t`, `wl_ffi_relation_plan_t`, `wl_ffi_op_t`)
+- ✅ RPN expression serialization (`wl_ffi_expr_serialize()` — IR expr tree → flat byte buffer)
+- ✅ Plan marshalling (`wl_dd_marshal_plan()` — `wl_dd_plan_t` → `wl_ffi_plan_t`)
+- ✅ Memory ownership: C allocates/frees, Rust borrows via const pointers
+- ✅ Opaque worker handle (`wl_dd_worker_t`) for future Rust executor integration
+- ✅ 27/27 tests passing (expression serialization, operator translation, key fidelity, memory cleanup)
 
 **Translation Rules** (IR node → DD operator):
 ```
@@ -285,17 +295,19 @@ FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 
 **Responsibilities**:
 - ✅ Convert wirelog IR to DD operator graph (C-side plan)
-- 🔄 C ↔ Rust data marshalling (planned)
-- 🔄 DD worker management (planned)
+- ✅ C → Rust data marshalling (FFI-safe flat structs, RPN expression serialization)
+- ✅ FFI boundary defined (memory ownership: C allocates, Rust borrows)
+- 🔄 DD worker management (Rust-side implementation planned)
 - 🔄 Result collection and conversion (planned)
 
 **Design Decisions**:
 - ✅ All pointer fields in DD ops are owned (deep copies), freed by `wl_dd_plan_free()`
 - ✅ Error return via `int` (0 = success, -1 = memory, -2 = invalid input) + out-parameter
 - ✅ FLATMAP deferred: current IR generates separate FILTER/PROJECT/JOIN nodes
-- [ ] Clarify FFI boundary (memory ownership at Rust boundary)
-- [ ] Data marshalling strategy (zero-copy vs copy)
-- [ ] Context passing mechanism
+- ✅ FFI boundary: copy-based marshalling, C owns all memory, Rust borrows via const pointers
+- ✅ Expression trees serialized to RPN byte buffers (avoids pointer trees across FFI)
+- ✅ FFI types use fixed-width integers and explicit enum values for ABI stability
+- [ ] Context passing mechanism (worker handle → execution context)
 
 #### I/O Layer (Phase 0: Basic)
 
@@ -360,7 +372,8 @@ typedef struct {
 - ✅ Stratification & SCC detection (iterative Tarjan's, O(V+E))
 - ✅ Stratification tests (20/20 passing)
 - ✅ IR → DD operator graph translator (all 8 IR node types, 19/19 tests)
-- 🔄 Rust FFI integration
+- ✅ Rust FFI marshalling layer (FFI-safe types, RPN serialization, plan marshalling, 27/27 tests)
+- 🔄 Rust-side executor integration
 - 🔄 Basic integration tests
 
 **Validation**:
@@ -368,7 +381,7 @@ typedef struct {
 - [ ] Enterprise target (x86-64) build success
 - [ ] Basic Datalog program execution verification
 
-**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14) complete — 200 tests passing. Phase 1 Optimization in progress.
+**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14), FFI Marshalling (27/27) complete — 227 tests passing. Phase 1 Optimization in progress.
 
 ### Phase 1: Optimization (Weeks 5-10) - All environments common
 
@@ -440,6 +453,7 @@ typedef struct {
 | **IR** | Tree-based (8 node types) | ✅ Implemented | AST-to-IR, UNION merge, 56/56 tests |
 | **Stratification** | Tarjan's SCC | ✅ Implemented | O(V+E), iterative, 20/20 tests |
 | **DD Plan** | IR → DD op graph | ✅ Implemented | 8 op types, stratum-aware, 19/19 tests |
+| **FFI Marshalling** | DD plan → FFI-safe types | ✅ Implemented | RPN expr serialization, 27/27 tests |
 | **Memory** | nanoarrow (mid-term) | Planned | Columnar, Arrow interop |
 | **Allocator** | Region/Arena + system malloc | Planned (Phase 2) | jemalloc evaluated and deferred; see §4.1 ADR |
 | **Threading** | Optional pthreads | Planned | Single-threaded default |
@@ -560,6 +574,7 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 | 2026-02-24 | 0.4 | IR representation complete (56 tests); Stratification & SCC complete (20 tests); 167 total |
 | 2026-02-24 | 0.5 | DD Plan Translator complete (19 tests); all 8 IR→DD translations; 186 total |
 | 2026-02-24 | 0.6 | Phase 1 Logic Fusion complete (14 tests); in-place FILTER+PROJECT→FLATMAP; 200 total |
+| 2026-02-26 | 0.7 | FFI marshalling layer complete (27 tests); dd_plan moved to ffi/; 227 total |
 
 ---
 
@@ -570,5 +585,6 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
 5. [x] Logic Fusion optimization pass (FILTER+PROJECT → FLATMAP, 14/14 tests)
 6. [ ] Remaining Phase 1 optimization passes (JPP, SIP, Subplan Sharing)
-7. [ ] Rust FFI integration (DD plan → Rust executor)
-8. [ ] Integration test creation
+7. [x] FFI marshalling layer (C-side, FFI-safe types, RPN serialization, 27/27 tests)
+8. [ ] Rust-side DD executor integration (Cargo.toml, lib.rs, cbindgen)
+9. [ ] Integration test creation

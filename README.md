@@ -31,7 +31,8 @@ wirelog is a C11-based Datalog engine designed to work seamlessly across embedde
 | Stratification | 20 | Complete |
 | DD Plan Translator | 19 | Complete |
 | Logic Fusion | 14 | Complete |
-| **Total** | **200** | **All passing** |
+| FFI Marshalling | 27 | Complete |
+| **Total** | **227** | **All passing** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design details.
 
@@ -59,14 +60,17 @@ wirelog/
 │   │   ├── lexer.c/h
 │   │   ├── parser.c/h
 │   │   └── ast.c/h
-│   ├── ir/              # IR, stratification, DD plan translator
+│   ├── ir/              # IR, stratification
 │   │   ├── ir.c/h
 │   │   ├── program.c/h
-│   │   ├── stratify.c/h
-│   │   └── dd_plan.c/h
+│   │   └── stratify.c/h
+│   ├── ffi/             # DD plan translator & FFI marshalling
+│   │   ├── dd_plan.c/h  # IR → DD operator graph translation
+│   │   ├── dd_ffi.h     # FFI-safe type definitions (C ↔ Rust)
+│   │   └── dd_marshal.c # Plan marshalling (internal → FFI-safe)
 │   └── passes/          # Optimization passes
 │       └── fusion.c/h   # Logic Fusion (FILTER+PROJECT → FLATMAP)
-├── tests/               # Test suite (200 tests)
+├── tests/               # Test suite (227 tests)
 ├── docs/                # Documentation
 ├── discussion/          # Design discussions and analysis
 └── third_party/         # External libraries (nanoarrow, etc.)
