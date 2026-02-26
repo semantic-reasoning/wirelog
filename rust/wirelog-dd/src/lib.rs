@@ -6,10 +6,12 @@
  * For commercial licenses, contact: inquiry@cleverplant.com
  */
 
-#[allow(dead_code)] // Building blocks for FFI plan reader + dataflow execution
+#[allow(dead_code)] // Building blocks for dataflow execution
 mod expr;
 mod ffi;
 pub mod ffi_types;
+#[allow(dead_code)] // Used by dataflow execution in later commits
+mod plan_reader;
 
 // Re-export FFI entry points (they are #[no_mangle] extern "C")
 pub use ffi::*;
