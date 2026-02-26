@@ -583,4 +583,483 @@ mod tests {
             wl_dd_worker_destroy(w);
         }
     }
+
+    // ================================================================
+    // End-to-end Datalog integration tests via FFI
+    // ================================================================
+
+    /// Helper: build a serialized expression buffer for "col0 > N".
+    /// Format: [Var("col0")] [ConstInt(N)] [CmpGt]
+    fn build_filter_col0_gt(n: i64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Var("col0"): tag=0x01, name_len=4:u16le, "col0"
+        buf.push(0x01);
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        buf.extend_from_slice(b"col0");
+        // ConstInt(n): tag=0x02, value:i64le
+        buf.push(0x02);
+        buf.extend_from_slice(&n.to_le_bytes());
+        // CmpGt: tag=0x23
+        buf.push(0x23);
+        buf
+    }
+
+    /// Datalog: Transitive Closure (recursive query)
+    ///
+    ///   edge(1,2). edge(2,3). edge(3,4).
+    ///   tc(X,Y) :- edge(X,Y).
+    ///   tc(X,Z) :- tc(X,Y), edge(Y,Z).
+    ///
+    /// Expected: 6 tuples: (1,2),(2,3),(3,4),(1,3),(2,4),(1,4)
+    #[test]
+    fn test_datalog_transitive_closure() {
+        unsafe {
+            let w = wl_dd_worker_create(1);
+
+            // Load EDB
+            let edge_name = CString::new("edge").unwrap();
+            let edb: [i64; 6] = [1, 2, 2, 3, 3, 4];
+            wl_dd_load_edb(w, edge_name.as_ptr(), edb.as_ptr(), 3, 2);
+
+            // Stratum 0 (non-recursive): tc(X,Y) :- edge(X,Y)
+            let tc_name = CString::new("tc").unwrap();
+            let edge_var = CString::new("edge").unwrap();
+            let s0_op = crate::ffi_types::WlFfiOp {
+                op: crate::ffi_types::WlFfiOpType::Variable,
+                relation_name: edge_var.as_ptr(),
+                right_relation: std::ptr::null(),
+                left_keys: std::ptr::null(),
+                right_keys: std::ptr::null(),
+                key_count: 0,
+                project_indices: std::ptr::null(),
+                project_count: 0,
+                filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                    data: std::ptr::null(),
+                    size: 0,
+                },
+                agg_fn: crate::ffi_types::WlAggFn::Count,
+                group_by_indices: std::ptr::null(),
+                group_by_count: 0,
+            };
+            let s0_ops = [s0_op];
+            let s0_rel = crate::ffi_types::WlFfiRelationPlan {
+                name: tc_name.as_ptr(),
+                ops: s0_ops.as_ptr(),
+                op_count: 1,
+            };
+            let s0_rels = [s0_rel];
+
+            // Stratum 1 (recursive): tc(X,Z) :- tc(X,Y), Join(edge), Map[0,2]
+            let tc_var = CString::new("tc").unwrap();
+            let edge_join = CString::new("edge").unwrap();
+            let lk = CString::new("Y").unwrap();
+            let rk = CString::new("X").unwrap();
+            let lk_ptr: *const c_char = lk.as_ptr();
+            let rk_ptr: *const c_char = rk.as_ptr();
+            let proj: [u32; 2] = [0, 2];
+
+            let s1_ops = [
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Variable,
+                    relation_name: tc_var.as_ptr(),
+                    right_relation: std::ptr::null(),
+                    left_keys: std::ptr::null(),
+                    right_keys: std::ptr::null(),
+                    key_count: 0,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Join,
+                    relation_name: std::ptr::null(),
+                    right_relation: edge_join.as_ptr(),
+                    left_keys: &lk_ptr,
+                    right_keys: &rk_ptr,
+                    key_count: 1,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Map,
+                    relation_name: std::ptr::null(),
+                    right_relation: std::ptr::null(),
+                    left_keys: std::ptr::null(),
+                    right_keys: std::ptr::null(),
+                    key_count: 0,
+                    project_indices: proj.as_ptr(),
+                    project_count: 2,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+            ];
+            let s1_rel = crate::ffi_types::WlFfiRelationPlan {
+                name: tc_name.as_ptr(),
+                ops: s1_ops.as_ptr(),
+                op_count: 3,
+            };
+            let s1_rels = [s1_rel];
+
+            let strata = [
+                crate::ffi_types::WlFfiStratumPlan {
+                    stratum_id: 0,
+                    is_recursive: false,
+                    relations: s0_rels.as_ptr(),
+                    relation_count: 1,
+                },
+                crate::ffi_types::WlFfiStratumPlan {
+                    stratum_id: 1,
+                    is_recursive: true,
+                    relations: s1_rels.as_ptr(),
+                    relation_count: 1,
+                },
+            ];
+            let edb_name = CString::new("edge").unwrap();
+            let edb_ptr: *const c_char = edb_name.as_ptr();
+            let plan = WlFfiPlan {
+                strata: strata.as_ptr(),
+                stratum_count: 2,
+                edb_relations: &edb_ptr,
+                edb_count: 1,
+            };
+
+            let mut results: Vec<(String, Vec<i64>)> = Vec::new();
+            let rc = wl_dd_execute_cb(
+                &plan,
+                w,
+                Some(collect_tuples),
+                &mut results as *mut _ as *mut c_void,
+            );
+
+            assert_eq!(rc, 0, "transitive closure should succeed");
+
+            let tc: Vec<Vec<i64>> = results
+                .into_iter()
+                .filter(|(r, _)| r == "tc")
+                .map(|(_, row)| row)
+                .collect();
+
+            assert_eq!(tc.len(), 6, "TC of chain 1->2->3->4 has 6 pairs");
+            // Direct edges
+            assert!(tc.contains(&vec![1, 2]));
+            assert!(tc.contains(&vec![2, 3]));
+            assert!(tc.contains(&vec![3, 4]));
+            // Transitive
+            assert!(tc.contains(&vec![1, 3]));
+            assert!(tc.contains(&vec![2, 4]));
+            assert!(tc.contains(&vec![1, 4]));
+
+            wl_dd_worker_destroy(w);
+        }
+    }
+
+    /// Datalog: Filter query
+    ///
+    ///   edge(1,2). edge(2,3). edge(3,4).
+    ///   big(X,Y) :- edge(X,Y), X > 1.
+    ///
+    /// Expected: (2,3), (3,4)
+    #[test]
+    fn test_datalog_filter() {
+        unsafe {
+            let w = wl_dd_worker_create(1);
+
+            let edge_name = CString::new("edge").unwrap();
+            let edb: [i64; 6] = [1, 2, 2, 3, 3, 4];
+            wl_dd_load_edb(w, edge_name.as_ptr(), edb.as_ptr(), 3, 2);
+
+            let rel_name = CString::new("big").unwrap();
+            let var_name = CString::new("edge").unwrap();
+            let filter_buf = build_filter_col0_gt(1);
+
+            let ops = [
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Variable,
+                    relation_name: var_name.as_ptr(),
+                    right_relation: std::ptr::null(),
+                    left_keys: std::ptr::null(),
+                    right_keys: std::ptr::null(),
+                    key_count: 0,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Filter,
+                    relation_name: std::ptr::null(),
+                    right_relation: std::ptr::null(),
+                    left_keys: std::ptr::null(),
+                    right_keys: std::ptr::null(),
+                    key_count: 0,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: filter_buf.as_ptr(),
+                        size: filter_buf.len() as u32,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+            ];
+            let rels = [crate::ffi_types::WlFfiRelationPlan {
+                name: rel_name.as_ptr(),
+                ops: ops.as_ptr(),
+                op_count: 2,
+            }];
+            let strata = [crate::ffi_types::WlFfiStratumPlan {
+                stratum_id: 0,
+                is_recursive: false,
+                relations: rels.as_ptr(),
+                relation_count: 1,
+            }];
+            let edb_rel = CString::new("edge").unwrap();
+            let edb_ptr: *const c_char = edb_rel.as_ptr();
+            let plan = WlFfiPlan {
+                strata: strata.as_ptr(),
+                stratum_count: 1,
+                edb_relations: &edb_ptr,
+                edb_count: 1,
+            };
+
+            let mut results: Vec<(String, Vec<i64>)> = Vec::new();
+            let rc = wl_dd_execute_cb(
+                &plan,
+                w,
+                Some(collect_tuples),
+                &mut results as *mut _ as *mut c_void,
+            );
+
+            assert_eq!(rc, 0);
+            assert_eq!(results.len(), 2);
+            let mut rows: Vec<Vec<i64>> = results.into_iter().map(|(_, r)| r).collect();
+            rows.sort();
+            assert_eq!(rows, vec![vec![2, 3], vec![3, 4]]);
+
+            wl_dd_worker_destroy(w);
+        }
+    }
+
+    /// Datalog: Join query
+    ///
+    ///   a(1,2). a(3,2).
+    ///   b(2,5). b(2,6).
+    ///   result(X,Y,Z) :- a(X,Y), b(Y,Z).
+    ///
+    /// Expected: (1,2,5), (1,2,6), (3,2,5), (3,2,6)
+    #[test]
+    fn test_datalog_join() {
+        unsafe {
+            let w = wl_dd_worker_create(1);
+
+            let a_name = CString::new("a").unwrap();
+            let a_data: [i64; 4] = [1, 2, 3, 2];
+            wl_dd_load_edb(w, a_name.as_ptr(), a_data.as_ptr(), 2, 2);
+
+            let b_name = CString::new("b").unwrap();
+            let b_data: [i64; 4] = [2, 5, 2, 6];
+            wl_dd_load_edb(w, b_name.as_ptr(), b_data.as_ptr(), 2, 2);
+
+            let rel_name = CString::new("result").unwrap();
+            let var_a = CString::new("a").unwrap();
+            let join_b = CString::new("b").unwrap();
+            let lk = CString::new("Y").unwrap();
+            let rk = CString::new("Y").unwrap();
+            let lk_ptr: *const c_char = lk.as_ptr();
+            let rk_ptr: *const c_char = rk.as_ptr();
+
+            let ops = [
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Variable,
+                    relation_name: var_a.as_ptr(),
+                    right_relation: std::ptr::null(),
+                    left_keys: std::ptr::null(),
+                    right_keys: std::ptr::null(),
+                    key_count: 0,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Join,
+                    relation_name: std::ptr::null(),
+                    right_relation: join_b.as_ptr(),
+                    left_keys: &lk_ptr,
+                    right_keys: &rk_ptr,
+                    key_count: 1,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+            ];
+            let rels = [crate::ffi_types::WlFfiRelationPlan {
+                name: rel_name.as_ptr(),
+                ops: ops.as_ptr(),
+                op_count: 2,
+            }];
+            let strata = [crate::ffi_types::WlFfiStratumPlan {
+                stratum_id: 0,
+                is_recursive: false,
+                relations: rels.as_ptr(),
+                relation_count: 1,
+            }];
+            let edb_a = CString::new("a").unwrap();
+            let edb_b = CString::new("b").unwrap();
+            let edb_ptrs: [*const c_char; 2] = [edb_a.as_ptr(), edb_b.as_ptr()];
+            let plan = WlFfiPlan {
+                strata: strata.as_ptr(),
+                stratum_count: 1,
+                edb_relations: edb_ptrs.as_ptr(),
+                edb_count: 2,
+            };
+
+            let mut results: Vec<(String, Vec<i64>)> = Vec::new();
+            let rc = wl_dd_execute_cb(
+                &plan,
+                w,
+                Some(collect_tuples),
+                &mut results as *mut _ as *mut c_void,
+            );
+
+            assert_eq!(rc, 0);
+            assert_eq!(results.len(), 4);
+            let mut rows: Vec<Vec<i64>> = results.into_iter().map(|(_, r)| r).collect();
+            rows.sort();
+            assert_eq!(
+                rows,
+                vec![vec![1, 2, 5], vec![1, 2, 6], vec![3, 2, 5], vec![3, 2, 6]]
+            );
+
+            wl_dd_worker_destroy(w);
+        }
+    }
+
+    /// Datalog: Aggregation query
+    ///
+    ///   data(1,10). data(1,20). data(2,30).
+    ///   cnt(X, count) :- data(X, _).
+    ///
+    /// Expected: cnt(1, 2), cnt(2, 1)
+    #[test]
+    fn test_datalog_aggregation() {
+        unsafe {
+            let w = wl_dd_worker_create(1);
+
+            let data_name = CString::new("data").unwrap();
+            let edb: [i64; 6] = [1, 10, 1, 20, 2, 30];
+            wl_dd_load_edb(w, data_name.as_ptr(), edb.as_ptr(), 3, 2);
+
+            let rel_name = CString::new("cnt").unwrap();
+            let var_name = CString::new("data").unwrap();
+            let group_by: [u32; 1] = [0]; // group by col0
+
+            let ops = [
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Variable,
+                    relation_name: var_name.as_ptr(),
+                    right_relation: std::ptr::null(),
+                    left_keys: std::ptr::null(),
+                    right_keys: std::ptr::null(),
+                    key_count: 0,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: std::ptr::null(),
+                    group_by_count: 0,
+                },
+                crate::ffi_types::WlFfiOp {
+                    op: crate::ffi_types::WlFfiOpType::Reduce,
+                    relation_name: std::ptr::null(),
+                    right_relation: std::ptr::null(),
+                    left_keys: std::ptr::null(),
+                    right_keys: std::ptr::null(),
+                    key_count: 0,
+                    project_indices: std::ptr::null(),
+                    project_count: 0,
+                    filter_expr: crate::ffi_types::WlFfiExprBuffer {
+                        data: std::ptr::null(),
+                        size: 0,
+                    },
+                    agg_fn: crate::ffi_types::WlAggFn::Count,
+                    group_by_indices: group_by.as_ptr(),
+                    group_by_count: 1,
+                },
+            ];
+            let rels = [crate::ffi_types::WlFfiRelationPlan {
+                name: rel_name.as_ptr(),
+                ops: ops.as_ptr(),
+                op_count: 2,
+            }];
+            let strata = [crate::ffi_types::WlFfiStratumPlan {
+                stratum_id: 0,
+                is_recursive: false,
+                relations: rels.as_ptr(),
+                relation_count: 1,
+            }];
+            let edb_rel = CString::new("data").unwrap();
+            let edb_ptr: *const c_char = edb_rel.as_ptr();
+            let plan = WlFfiPlan {
+                strata: strata.as_ptr(),
+                stratum_count: 1,
+                edb_relations: &edb_ptr,
+                edb_count: 1,
+            };
+
+            let mut results: Vec<(String, Vec<i64>)> = Vec::new();
+            let rc = wl_dd_execute_cb(
+                &plan,
+                w,
+                Some(collect_tuples),
+                &mut results as *mut _ as *mut c_void,
+            );
+
+            assert_eq!(rc, 0);
+            assert_eq!(results.len(), 2);
+            let mut rows: Vec<Vec<i64>> = results.into_iter().map(|(_, r)| r).collect();
+            rows.sort();
+            assert_eq!(rows, vec![vec![1, 2], vec![2, 1]]);
+
+            wl_dd_worker_destroy(w);
+        }
+    }
 }
