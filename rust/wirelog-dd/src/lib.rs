@@ -7,6 +7,7 @@
  */
 
 mod ffi;
+pub mod ffi_types;
 
 // Re-export FFI entry points (they are #[no_mangle] extern "C")
 pub use ffi::*;
