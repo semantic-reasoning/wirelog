@@ -504,6 +504,67 @@ int
 wl_dd_execute(const wl_ffi_plan_t *plan, wl_dd_worker_t *worker);
 
 /* ======================================================================== */
+/* EDB Data Loading (Rust-side)                                             */
+/* ======================================================================== */
+
+/**
+ * wl_dd_load_edb:
+ * @worker:   (borrow): Worker handle.  Must not be NULL.
+ * @relation: (borrow): Null-terminated EDB relation name.
+ * @data:     (borrow): Flat array of int64_t values, row-major.
+ *            Array length is @num_rows * @num_cols.
+ *            May be NULL if @num_rows is 0.
+ * @num_rows: Number of rows to load.  May be 0.
+ * @num_cols: Number of columns per row.  Must be >= 1.
+ *
+ * Load EDB (input) data into the worker before plan execution.
+ * Call once per relation, or multiple times to append rows.
+ * Data must be loaded before calling wl_dd_execute or wl_dd_execute_cb.
+ *
+ * Returns:
+ *    0: Success.
+ *   -2: Invalid arguments (NULL worker/relation, or zero columns).
+ */
+int
+wl_dd_load_edb(wl_dd_worker_t *worker, const char *relation,
+               const int64_t *data, uint32_t num_rows, uint32_t num_cols);
+
+/* ======================================================================== */
+/* Result Callback Execution (Rust-side)                                    */
+/* ======================================================================== */
+
+/**
+ * wl_dd_on_tuple_fn:
+ *
+ * Callback invoked once per computed output tuple during execution.
+ *
+ * @relation:  Null-terminated output relation name.
+ * @row:       Array of int64_t values (length = @ncols).
+ * @ncols:     Number of columns in the row.
+ * @user_data: Opaque pointer passed through from the caller.
+ */
+typedef void (*wl_dd_on_tuple_fn)(const char *relation, const int64_t *row,
+                                  uint32_t ncols, void *user_data);
+
+/**
+ * wl_dd_execute_cb:
+ * @plan:      (borrow): FFI plan to execute.  Must not be NULL.
+ * @worker:    (borrow): Worker pool with EDB data loaded.  Must not be NULL.
+ * @on_tuple:  Callback for result delivery.  May be NULL (results discarded).
+ * @user_data: Opaque pointer passed through to @on_tuple.
+ *
+ * Execute a DD plan and deliver computed IDB tuples via callback.
+ *
+ * Returns:
+ *    0: Success.
+ *   -1: Execution error (DD runtime failure).
+ *   -2: Invalid arguments (NULL plan or worker).
+ */
+int
+wl_dd_execute_cb(const wl_ffi_plan_t *plan, wl_dd_worker_t *worker,
+                 wl_dd_on_tuple_fn on_tuple, void *user_data);
+
+/* ======================================================================== */
 /* Marshalling: Internal Plan -> FFI Plan (C-side)                          */
 /* ======================================================================== */
 
