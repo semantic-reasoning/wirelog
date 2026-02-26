@@ -3,7 +3,7 @@
 **Project**: wirelog - Embedded-to-Enterprise Datalog Engine
 **Copyright**: Copyright (C) CleverPlant
 **Date**: 2026-02-22
-**Status**: 🔄 Design in Progress (Phase 0 Implementation)
+**Status**: Phase 0 Complete, Phase 1 In Progress
 
 ⚠️ **This document is a draft.** It will be continuously updated.
 
@@ -225,6 +225,7 @@ wirelog/
     dd_plan.c       # IR → DD operator graph translation
     dd_ffi.h        # FFI-safe type definitions (C ↔ Rust boundary)
     dd_marshal.c    # DD plan marshalling (internal → FFI-safe)
+    facts_loader.c  # Bulk EDB fact loading via Rust FFI
   optimizer.c       # Optimizer orchestrator (planned)
   passes/
     fusion.h        # Logic Fusion header (internal API)
@@ -232,6 +233,10 @@ wirelog/
     jpp.c           # Join-Project Plan (planned)
     sip.c           # Semijoin Information Passing (planned)
     sharing.c       # Subplan Sharing (planned)
+  cli/
+    driver.h        # CLI driver public interface
+    driver.c        # wl_read_file(), wl_print_tuple(), wl_run_pipeline()
+    main.c          # CLI entry point (--workers N, --help flags)
 ```
 
 **Responsibilities**:
@@ -245,13 +250,16 @@ wirelog/
 - ✅ Parser tests: 91/91 passing (47 lexer + 44 parser)
 - ✅ Grammar: FlowLog-compatible (declarations, rules, negation, aggregation, arithmetic, comparisons, booleans, .plan marker)
 - ✅ IR representation (8 node types, AST-to-IR conversion, UNION merge)
-- ✅ IR tests: 56/56 passing (19 IR + 37 program)
+- ✅ IR tests: 60/60 passing (19 IR + 41 program)
 - ✅ Stratification & SCC detection (Tarjan's iterative, negation validation)
 - ✅ Stratification tests: 20/20 passing
 - ✅ DD Plan Translator (IR → DD operator graph, all 8 IR node types)
 - ✅ DD Plan tests: 19/19 passing
 - 🔄 Optimization passes (Phase 1 in progress)
 - ✅ Logic Fusion: FILTER+PROJECT → FLATMAP (in-place mutation, 14/14 tests)
+- ✅ Inline fact extraction (row-major int64_t arrays, `wirelog_program_get_facts` API, +4 tests)
+- ✅ End-to-end C → Rust execution (11/11 tests, passthrough, TC, join, filter, aggregation, inline facts)
+- ✅ CLI driver (`wirelog` executable, .dl file execution, `--workers` flag, 8/8 tests)
 
 #### DD Translator & FFI Layer (C11 ↔ Rust FFI)
 
@@ -262,6 +270,7 @@ wirelog/ffi/
   dd_plan.c         # IR → DD operator graph translation
   dd_ffi.h          # FFI-safe type definitions (C ↔ Rust boundary)
   dd_marshal.c      # DD plan marshalling (internal → FFI-safe)
+  facts_loader.c    # Bulk EDB fact loading via Rust FFI (wirelog_load_all_facts)
 ```
 
 **Phase 0 Status** (DD Plan — C-side complete):
@@ -328,7 +337,7 @@ FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 - ✅ FFI boundary defined (memory ownership: C allocates, Rust borrows)
 - ✅ DD worker management (Rust-side: worker create/destroy, EDB loading)
 - ✅ Plan execution (Phase 0: interpreter-based, non-recursive + recursive)
-- 🔄 Result callback integration (`wl_dd_execute_cb` stub → full pipeline)
+- ✅ Result callback integration (`wl_dd_execute_cb` fully wired, not a stub)
 
 **Design Decisions**:
 - ✅ All pointer fields in DD ops are owned (deep copies), freed by `wl_dd_plan_free()`
@@ -338,22 +347,23 @@ FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 - ✅ Expression trees serialized to RPN byte buffers (avoids pointer trees across FFI)
 - ✅ FFI types use fixed-width integers and explicit enum values for ABI stability
 - ✅ Context passing mechanism (worker handle → execution context via `WlDdWorker`)
-- [ ] Wire `wl_dd_execute_cb` to dataflow executor (connect FFI stubs to plan reader + interpreter)
+- ✅ `wl_dd_execute_cb` wired to dataflow executor (FFI → plan_reader → interpreter, result callback fully connected)
 
-#### I/O Layer (Phase 0: Basic)
+#### I/O Layer (Phase 0: CLI Driver Implemented)
 
-**Files** (planned):
+**Files**:
 ```
-src/
-  io/
-    csv.c           # CSV input → DD collection
-    output.c        # DD results → output (stdout, file)
+wirelog/cli/
+  driver.h        # CLI driver public interface
+  driver.c        # wl_read_file(), wl_print_tuple(), wl_run_pipeline()
+  main.c          # CLI entry point (--workers N, --help flags)
 ```
 
 **Responsibilities**:
-- Read CSV files → Datalog facts
-- Output results after program execution
-- (Arrow IPC added later)
+- Read .dl files → parse → compile → execute through full pipeline
+- Output results as tuples (e.g. `tc(1, 2)`, `tc(2, 3)`)
+- Built as `wirelog-cli` (avoids build dir collision), installed as `wirelog`
+- (CSV input, Arrow IPC output added later)
 
 ---
 
@@ -399,21 +409,24 @@ typedef struct {
 - ✅ FlowLog-compatible grammar implementation
 - ✅ Build system (Meson, C11)
 - ✅ IR representation (8 node types, AST-to-IR, UNION merge)
-- ✅ IR tests (56/56 passing: 19 IR node + 37 program)
+- ✅ IR tests (60/60 passing: 19 IR node + 41 program)
 - ✅ Stratification & SCC detection (iterative Tarjan's, O(V+E))
 - ✅ Stratification tests (20/20 passing)
 - ✅ IR → DD operator graph translator (all 8 IR node types, 19/19 tests)
 - ✅ Rust FFI marshalling layer (FFI-safe types, RPN serialization, plan marshalling, 27/27 tests)
 - ✅ Rust DD executor crate (`wirelog-dd`, interpreter-based Phase 0, 90/90 Rust tests)
 - ✅ Meson-Cargo build integration (`-Ddd=true`, lint targets)
-- 🔄 End-to-end integration tests (C → FFI → Rust → results)
+- ✅ End-to-end integration tests (C → FFI → Rust → results, 11/11 tests)
+- ✅ Inline fact extraction (`wl_relation_info_t` fact storage, `wirelog_program_get_facts` API, 41/41 program tests)
+- ✅ Bulk fact loading (`wirelog_load_all_facts`, facts_loader.c, Rust FFI-dependent)
+- ✅ CLI driver (`wirelog` executable, .dl file execution, `--workers` flag, 8/8 tests)
 
 **Validation**:
 - [ ] Embedded target (ARM cross-compile) build success
 - [ ] Enterprise target (x86-64) build success
-- [ ] Basic Datalog program execution verification
+- ✅ Basic Datalog program execution verification (TC, join, filter, aggregation via CLI)
 
-**Current Status**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14), FFI Marshalling (27/27), Rust DD Executor (90/90) complete — 317 tests passing (227 C + 90 Rust). Phase 1 Optimization in progress.
+**Current Status**: Parser (91/91), IR (60/60), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14), FFI Marshalling (27/27), DD Execute (11/11), CLI (8/8), Rust DD Executor (90/90) complete — 340 tests passing (250 C + 90 Rust). Phase 1 Optimization in progress.
 
 ### Phase 1: Optimization (Weeks 5-10) - All environments common
 
@@ -488,6 +501,7 @@ typedef struct {
 | **FFI Marshalling** | DD plan → FFI-safe types | ✅ Implemented | RPN expr serialization, 27/27 tests |
 | **Rust DD Executor** | wirelog-dd crate | ✅ Implemented | Interpreter-based Phase 0, 90/90 Rust tests |
 | **Build Integration** | Meson + Cargo | ✅ Implemented | `-Ddd=true`, clippy/fmt/test targets |
+| **CLI Driver** | wirelog-cli binary | ✅ Implemented | .dl file execution, `--workers` flag, 8/8 tests |
 | **Memory** | nanoarrow (mid-term) | Planned | Columnar, Arrow interop |
 | **Allocator** | Region/Arena + system malloc | Planned (Phase 2) | jemalloc evaluated and deferred; see §4.1 ADR |
 | **Threading** | Optional pthreads | Planned | Single-threaded default |
@@ -610,12 +624,13 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 | 2026-02-24 | 0.6 | Phase 1 Logic Fusion complete (14 tests); in-place FILTER+PROJECT→FLATMAP; 200 total |
 | 2026-02-26 | 0.7 | FFI marshalling layer complete (27 tests); dd_plan moved to ffi/; 227 total |
 | 2026-02-26 | 0.8 | Rust DD executor crate complete (90 tests); Meson-Cargo integration; 317 total (227 C + 90 Rust) |
+| 2026-02-27 | 0.9 | Inline fact extraction (Issue #14, +4 program tests); CLI driver (Issue #11, 8 tests); end-to-end pipeline complete (11 DD execute tests); 340 total (250 C + 90 Rust) |
 
 ---
 
 **Next Steps**:
 1. [x] Parser implementation complete (91/91 tests)
-2. [x] IR representation and implementation (56/56 tests)
+2. [x] IR representation and implementation (60/60 tests)
 3. [x] Stratification & SCC detection (20/20 tests)
 4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
 5. [x] Logic Fusion optimization pass (FILTER+PROJECT → FLATMAP, 14/14 tests)
@@ -623,5 +638,9 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 7. [x] FFI marshalling layer (C-side, FFI-safe types, RPN serialization, 27/27 tests)
 8. [x] Rust DD executor crate (FFI stubs, type mirrors, expr evaluator, plan reader, dataflow interpreter, 90/90 Rust tests)
 9. [x] Meson-Cargo build integration (`-Ddd=true`, `ninja rust-clippy/rust-fmt-check/rust-test`)
-10. [ ] Wire `wl_dd_execute_cb` to connect FFI → plan_reader → dataflow executor
-11. [ ] End-to-end integration tests (C program → FFI → Rust execution → result callback)
+10. [x] Wire `wl_dd_execute_cb` to dataflow executor (fully connected, result callback working)
+11. [x] End-to-end integration tests (11/11 passing: passthrough, TC, join, filter, aggregation, inline facts)
+12. [x] Inline fact extraction (`wirelog_program_get_facts` API, `wirelog_load_all_facts` bulk loader, Issue #14)
+13. [x] CLI driver (`wirelog` executable, .dl file execution, `--workers` flag, 8/8 tests, Issue #11)
+14. [ ] Remaining Phase 1 optimization passes (JPP, SIP, Subplan Sharing)
+15. [ ] Embedded target (ARM cross-compile) build validation

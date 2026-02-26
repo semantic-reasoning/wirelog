@@ -26,13 +26,17 @@ wirelog is a C11-based Datalog engine designed to work seamlessly across embedde
 
 | Component | Tests | Status |
 |-----------|-------|--------|
-| Parser | 91 | Complete |
-| IR | 56 | Complete |
+| Parser (lexer + parser) | 91 | Complete |
+| IR (ir + program) | 60 | Complete |
 | Stratification | 20 | Complete |
 | DD Plan Translator | 19 | Complete |
 | Logic Fusion | 14 | Complete |
 | FFI Marshalling | 27 | Complete |
-| **Total** | **227** | **All passing** |
+| DD Execute (end-to-end) | 11 | Complete |
+| CLI Driver | 8 | Complete |
+| **C Total** | **250** | **All passing** |
+| Rust DD Executor | 90 | Complete |
+| **Grand Total** | **340** | **All passing** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design details.
 
@@ -51,6 +55,27 @@ meson compile -C builddir
 meson test -C builddir
 ```
 
+## Usage
+
+```bash
+# Build with DD executor (requires Rust toolchain)
+meson setup builddir -Ddd=true
+meson compile -C builddir
+
+# Run a Datalog program
+./builddir/wirelog-cli tc.dl
+
+# With multiple workers
+./builddir/wirelog-cli --workers 4 tc.dl
+```
+
+Example output for a transitive closure program:
+```
+tc(1, 2)
+tc(1, 3)
+tc(2, 3)
+```
+
 ## Project Structure
 
 ```
@@ -67,10 +92,15 @@ wirelog/
 │   ├── ffi/             # DD plan translator & FFI marshalling
 │   │   ├── dd_plan.c/h  # IR → DD operator graph translation
 │   │   ├── dd_ffi.h     # FFI-safe type definitions (C ↔ Rust)
-│   │   └── dd_marshal.c # Plan marshalling (internal → FFI-safe)
+│   │   ├── dd_marshal.c # Plan marshalling (internal → FFI-safe)
+│   │   └── facts_loader.c # Bulk EDB fact loading via Rust FFI
+│   ├── cli/             # CLI driver
+│   │   ├── driver.h/c   # wl_read_file(), wl_print_tuple(), wl_run_pipeline()
+│   │   └── main.c       # Entry point (--workers N, --help)
 │   └── passes/          # Optimization passes
 │       └── fusion.c/h   # Logic Fusion (FILTER+PROJECT → FLATMAP)
-├── tests/               # Test suite (227 tests)
+├── rust/wirelog-dd/     # Rust DD executor crate (90 tests)
+├── tests/               # Test suite (250 C tests)
 ├── docs/                # Documentation
 ├── discussion/          # Design discussions and analysis
 └── third_party/         # External libraries (nanoarrow, etc.)
@@ -78,20 +108,22 @@ wirelog/
 
 ## Architecture Highlights
 
-### Phase 0-3: All Environments on Differential Dataflow
+### End-to-End Pipeline (Complete)
 
 ```
+.dl file
+    ↓ wl_read_file() [CLI driver]
 wirelog (C11 parser/optimizer)
-    ↓
-IR → DD operator graph
-    ↓
-Differential Dataflow executor
-    ↓
-Results (all environments)
+    ↓ wirelog_program_get_facts() [inline fact extraction]
+IR → DD operator graph + facts
+    ↓ wirelog_load_all_facts() [bulk EDB loading]
+Differential Dataflow executor (Rust)
+    ↓ result callback
+wl_print_tuple() [CLI output]
 ```
 
 - **Embedded**: Single-worker DD, memory-constrained
-- **Enterprise**: Multi-worker DD, distributed processing
+- **Enterprise**: Multi-worker DD (`--workers N`), distributed processing
 
 ### Phase 3+: Optional Embedded Optimization
 

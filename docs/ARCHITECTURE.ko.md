@@ -3,7 +3,7 @@
 **프로젝트**: wirelog - Embedded-to-Enterprise Datalog Engine
 **Copyright**: Copyright (C) CleverPlant
 **작성일**: 2026-02-22
-**상태**: 🔄 설계 진행 중 (Phase 0 구현 중)
+**상태**: Phase 0 완료, Phase 1 진행 중
 
 ⚠️ **이 문서는 초안입니다.** 지속적으로 업데이트됩니다.
 
@@ -225,6 +225,7 @@ wirelog/
     dd_plan.c       # IR → DD operator graph 변환
     dd_ffi.h        # FFI-safe 타입 정의 (C ↔ Rust 경계)
     dd_marshal.c    # DD plan 마샬링 (내부 → FFI-safe)
+    facts_loader.c  # Rust FFI를 통한 EDB 사실 일괄 로딩
   optimizer.c       # Optimizer orchestrator (계획)
   passes/
     fusion.h        # Logic Fusion 헤더 (내부 API)
@@ -232,6 +233,10 @@ wirelog/
     jpp.c           # Join-Project Plan (계획)
     sip.c           # Semijoin Information Passing (계획)
     sharing.c       # Subplan Sharing (계획)
+  cli/
+    driver.h        # CLI driver 공개 인터페이스
+    driver.c        # wl_read_file(), wl_print_tuple(), wl_run_pipeline()
+    main.c          # CLI 진입점 (--workers N, --help 플래그)
 ```
 
 **책임**:
@@ -245,13 +250,16 @@ wirelog/
 - ✅ 파서 테스트: 91/91 passing (47 lexer + 44 parser)
 - ✅ Grammar: FlowLog-compatible (declarations, rules, negation, aggregation, arithmetic, comparisons, booleans, .plan marker)
 - ✅ IR 표현 (8가지 노드 타입, AST→IR 변환, UNION merge)
-- ✅ IR 테스트: 56/56 passing (19 IR + 37 program)
+- ✅ IR 테스트: 60/60 passing (19 IR + 41 program)
 - ✅ Stratification & SCC 감지 (Tarjan's iterative, negation 검증)
 - ✅ Stratification 테스트: 20/20 passing
 - ✅ DD Plan Translator (IR → DD operator graph, 전체 8가지 IR 노드 타입)
 - ✅ DD Plan 테스트: 19/19 passing
 - 🔄 최적화 passes (Phase 1 진행 중)
 - ✅ Logic Fusion: FILTER+PROJECT → FLATMAP (in-place mutation, 14/14 tests)
+- ✅ 인라인 사실 추출 (row-major int64_t 배열, `wirelog_program_get_facts` API, +4 테스트)
+- ✅ 종단간 C → Rust 실행 (11/11 테스트: passthrough, TC, join, filter, aggregation, 인라인 사실)
+- ✅ CLI driver (`wirelog` 실행 파일, .dl 파일 실행, `--workers` 플래그, 8/8 테스트)
 
 #### DD Translator & FFI 레이어 (C11 ↔ Rust FFI)
 
@@ -262,6 +270,7 @@ wirelog/ffi/
   dd_plan.c         # IR → DD operator graph 변환
   dd_ffi.h          # FFI-safe 타입 정의 (C ↔ Rust 경계)
   dd_marshal.c      # DD plan 마샬링 (내부 → FFI-safe)
+  facts_loader.c    # Rust FFI를 통한 EDB 사실 일괄 로딩 (wirelog_load_all_facts)
 ```
 
 **Phase 0 상태** (DD Plan — C 측 완료):
@@ -328,7 +337,7 @@ FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 - ✅ FFI 바운더리 정의 (메모리 소유권: C가 할당, Rust가 빌림)
 - ✅ DD 워커 관리 (Rust 측: 워커 생성/해제, EDB 로딩)
 - ✅ Plan 실행 (Phase 0: 인터프리터 기반, 비재귀 + 재귀)
-- 🔄 결과 콜백 통합 (`wl_dd_execute_cb` 스텁 → 전체 파이프라인)
+- ✅ 결과 콜백 통합 (`wl_dd_execute_cb` 완전 연결, 스텁 아님)
 
 **설계 결정 사항**:
 - ✅ DD op의 모든 포인터 필드는 소유(deep copy), `wl_dd_plan_free()`로 해제
@@ -338,22 +347,23 @@ FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 - ✅ 수식 트리를 RPN 바이트 버퍼로 직렬화 (FFI를 통한 포인터 트리 전달 방지)
 - ✅ FFI 타입은 고정 폭 정수와 명시적 enum 값 사용 (ABI 안정성)
 - ✅ Context 전달 방식 (worker handle → 실행 컨텍스트, `WlDdWorker` 구현)
-- [ ] `wl_dd_execute_cb`를 dataflow executor에 연결 (FFI 스텁 → plan reader + 인터프리터)
+- ✅ `wl_dd_execute_cb`를 dataflow executor에 연결 (FFI → plan_reader → 인터프리터, 결과 콜백 완전 연결)
 
-#### I/O Layer (Phase 0: 기본)
+#### I/O Layer (Phase 0: CLI Driver 구현됨)
 
-**파일** (계획):
+**파일**:
 ```
-src/
-  io/
-    csv.c           # CSV 입력 → DD collection
-    output.c        # DD 결과 → 출력 (stdout, file)
+wirelog/cli/
+  driver.h        # CLI driver 공개 인터페이스
+  driver.c        # wl_read_file(), wl_print_tuple(), wl_run_pipeline()
+  main.c          # CLI 진입점 (--workers N, --help 플래그)
 ```
 
 **책임**:
-- CSV 파일 읽기 → Datalog 사실(facts)
-- 프로그램 실행 후 결과 출력
-- (추후 Arrow IPC 추가)
+- .dl 파일 읽기 → 파싱 → 컴파일 → 전체 파이프라인 실행
+- 결과를 튜플 형태로 출력 (예: `tc(1, 2)`, `tc(2, 3)`)
+- `wirelog-cli`로 빌드 (빌드 디렉터리 충돌 방지), `wirelog`로 설치
+- (CSV 입력, Arrow IPC 출력은 추후 추가)
 
 ---
 
@@ -399,21 +409,24 @@ typedef struct {
 - ✅ FlowLog-compatible grammar 구현
 - ✅ 빌드 시스템 (Meson, C11)
 - ✅ IR 표현 (8가지 노드 타입, AST→IR, UNION merge)
-- ✅ IR 테스트 (56/56 passing: 19 IR 노드 + 37 program)
+- ✅ IR 테스트 (60/60 passing: 19 IR 노드 + 41 program)
 - ✅ Stratification & SCC 감지 (iterative Tarjan's, O(V+E))
 - ✅ Stratification 테스트 (20/20 passing)
 - ✅ IR → DD operator graph 변환기 (전체 8가지 IR 노드 타입, 19/19 tests)
 - ✅ Rust FFI 마샬링 레이어 (FFI-safe 타입, RPN 직렬화, plan 마샬링, 27/27 tests)
 - ✅ Rust DD executor 크레이트 (`wirelog-dd`, 인터프리터 기반 Phase 0, 90/90 Rust tests)
 - ✅ Meson-Cargo 빌드 통합 (`-Ddd=true`, 린트 타겟)
-- 🔄 종단간 통합 테스트 (C → FFI → Rust → 결과)
+- ✅ 종단간 통합 테스트 (C → FFI → Rust → 결과, 11/11 테스트)
+- ✅ 인라인 사실 추출 (`wl_relation_info_t` 사실 저장, `wirelog_program_get_facts` API, 41/41 program 테스트)
+- ✅ 일괄 사실 로딩 (`wirelog_load_all_facts`, facts_loader.c, Rust FFI 의존)
+- ✅ CLI driver (`wirelog` 실행 파일, .dl 파일 실행, `--workers` 플래그, 8/8 테스트)
 
 **검증**:
 - [ ] 임베디드 타겟 (ARM cross-compile) 빌드 성공
 - [ ] 엔터프라이즈 타겟 (x86-64) 빌드 성공
-- [ ] 기본 Datalog 프로그램 실행 확인
+- ✅ 기본 Datalog 프로그램 실행 확인 (TC, join, filter, aggregation — CLI를 통해)
 
-**현재 상태**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14), FFI Marshalling (27/27), Rust DD Executor (90/90) 완료 — 317 tests passing (227 C + 90 Rust). Phase 1 최적화 진행 중.
+**현재 상태**: Parser (91/91), IR (60/60), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14), FFI Marshalling (27/27), DD Execute (11/11), CLI (8/8), Rust DD Executor (90/90) 완료 — 340 tests passing (250 C + 90 Rust). Phase 1 최적화 진행 중.
 
 ### Phase 1: 최적화 (Weeks 5-10) - 모든 환경 공통
 
@@ -488,6 +501,7 @@ typedef struct {
 | **FFI 마샬링** | DD plan → FFI-safe 타입 | ✅ 구현됨 | RPN 수식 직렬화, 27/27 tests |
 | **Rust DD Executor** | wirelog-dd 크레이트 | ✅ 구현됨 | 인터프리터 기반 Phase 0, 90/90 Rust tests |
 | **빌드 통합** | Meson + Cargo | ✅ 구현됨 | `-Ddd=true`, clippy/fmt/test 타겟 |
+| **CLI Driver** | wirelog-cli 바이너리 | ✅ 구현됨 | .dl 파일 실행, `--workers` 플래그, 8/8 테스트 |
 | **메모리** | nanoarrow (중기) | 계획 | Columnar, Arrow interop |
 | **Allocator** | Region/Arena + system malloc | 계획 (Phase 2) | jemalloc 검토 후 보류; §4.1 ADR 참조 |
 | **Threading** | Optional pthreads | 계획 | Single-threaded 기본 |
@@ -610,12 +624,13 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 | 2026-02-24 | 0.6 | Phase 1 Logic Fusion 완료 (14 tests); in-place FILTER+PROJECT→FLATMAP; 200 total |
 | 2026-02-26 | 0.7 | FFI 마샬링 레이어 완료 (27 tests); dd_plan을 ffi/로 이동; 227 total |
 | 2026-02-26 | 0.8 | Rust DD executor 크레이트 완료 (90 tests); Meson-Cargo 통합; 317 total (227 C + 90 Rust) |
+| 2026-02-27 | 0.9 | 인라인 사실 추출 (Issue #14, +4 program 테스트); CLI driver (Issue #11, 8 테스트); 종단간 파이프라인 완료 (11 DD execute 테스트); 340 total (250 C + 90 Rust) |
 
 ---
 
 **다음 단계**:
 1. [x] Parser 구현 완료 (91/91 tests)
-2. [x] IR 표현 정의 및 구현 (56/56 tests)
+2. [x] IR 표현 정의 및 구현 (60/60 tests)
 3. [x] Stratification & SCC 감지 (20/20 tests)
 4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
 5. [x] Logic Fusion 최적화 패스 (FILTER+PROJECT → FLATMAP, 14/14 tests)
@@ -623,5 +638,9 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 7. [x] FFI 마샬링 레이어 (C 측, FFI-safe 타입, RPN 직렬화, 27/27 tests)
 8. [x] Rust DD executor 크레이트 (FFI 스텁, 타입 미러, 수식 평가기, plan 리더, dataflow 인터프리터, 90/90 Rust tests)
 9. [x] Meson-Cargo 빌드 통합 (`-Ddd=true`, `ninja rust-clippy/rust-fmt-check/rust-test`)
-10. [ ] `wl_dd_execute_cb` 연결 (FFI → plan_reader → dataflow executor)
-11. [ ] 종단간 통합 테스트 (C 프로그램 → FFI → Rust 실행 → 결과 콜백)
+10. [x] `wl_dd_execute_cb` 연결 (dataflow executor에 완전 연결, 결과 콜백 동작)
+11. [x] 종단간 통합 테스트 (11/11 통과: passthrough, TC, join, filter, aggregation, 인라인 사실)
+12. [x] 인라인 사실 추출 (`wirelog_program_get_facts` API, `wirelog_load_all_facts` 일괄 로더, Issue #14)
+13. [x] CLI driver (`wirelog` 실행 파일, .dl 파일 실행, `--workers` 플래그, 8/8 tests, Issue #11)
+14. [ ] 나머지 Phase 1 최적화 패스 (JPP, SIP, Subplan Sharing)
+15. [ ] 임베디드 타겟 (ARM cross-compile) 빌드 검증
