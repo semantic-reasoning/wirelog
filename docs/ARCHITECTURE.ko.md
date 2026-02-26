@@ -219,9 +219,12 @@ wirelog/
     ir.c            # IR node 구성, expression clone
     program.c       # 프로그램 메타데이터, AST→IR 변환, UNION merge
     stratify.c      # Stratification, dependency graph, Tarjan's SCC
+    api.c           # Public API 구현
+  ffi/
     dd_plan.h       # DD 실행 계획 타입 및 내부 API
     dd_plan.c       # IR → DD operator graph 변환
-    api.c           # Public API 구현
+    dd_ffi.h        # FFI-safe 타입 정의 (C ↔ Rust 경계)
+    dd_marshal.c    # DD plan 마샬링 (내부 → FFI-safe)
   optimizer.c       # Optimizer orchestrator (계획)
   passes/
     fusion.h        # Logic Fusion 헤더 (내부 API)
@@ -250,16 +253,15 @@ wirelog/
 - 🔄 최적화 passes (Phase 1 진행 중)
 - ✅ Logic Fusion: FILTER+PROJECT → FLATMAP (in-place mutation, 14/14 tests)
 
-#### DD Translator (C11 ↔ Rust FFI)
+#### DD Translator & FFI 레이어 (C11 ↔ Rust FFI)
 
 **파일**:
 ```
-wirelog/ir/
+wirelog/ffi/
   dd_plan.h         # DD 실행 계획 타입 및 내부 API
   dd_plan.c         # IR → DD operator graph 변환
-  (계획)
-  dd_ffi.h          # FFI 정의 (Rust 경계)
-  dd_marshal.c      # 데이터 변환 C ↔ Rust
+  dd_ffi.h          # FFI-safe 타입 정의 (C ↔ Rust 경계)
+  dd_marshal.c      # DD plan 마샬링 (내부 → FFI-safe)
 ```
 
 **Phase 0 상태** (DD Plan — C 측 완료):
@@ -270,6 +272,14 @@ wirelog/ir/
 - ✅ 재귀 stratum 감지 (`is_recursive` 플래그, DD `iterate()` 래핑용)
 - ✅ Deep-copy 소유 의미론 (`wl_ir_expr_clone()`, filter expression용)
 - ✅ 19/19 테스트 passing
+
+**FFI 마샬링 레이어** (C 측 완료):
+- ✅ FFI-safe 타입 정의 (`wl_ffi_plan_t`, `wl_ffi_stratum_plan_t`, `wl_ffi_relation_plan_t`, `wl_ffi_op_t`)
+- ✅ RPN 수식 직렬화 (`wl_ffi_expr_serialize()` — IR expr 트리 → 플랫 바이트 버퍼)
+- ✅ Plan 마샬링 (`wl_dd_marshal_plan()` — `wl_dd_plan_t` → `wl_ffi_plan_t`)
+- ✅ 메모리 소유권: C가 할당/해제, Rust는 const 포인터로 빌림
+- ✅ 불투명 워커 핸들 (`wl_dd_worker_t`) — 향후 Rust executor 통합용
+- ✅ 27/27 테스트 passing (수식 직렬화, 연산자 변환, 키 충실도, 메모리 정리)
 
 **변환 규칙** (IR 노드 → DD 연산자):
 ```
@@ -285,17 +295,19 @@ FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 
 **책임**:
 - ✅ wirelog IR을 DD operator graph로 변환 (C 측 plan)
-- 🔄 C ↔ Rust 데이터 마샬링 (계획)
-- 🔄 DD 워커 관리 (계획)
+- ✅ C → Rust 데이터 마샬링 (FFI-safe 플랫 구조체, RPN 수식 직렬화)
+- ✅ FFI 바운더리 정의 (메모리 소유권: C가 할당, Rust가 빌림)
+- 🔄 DD 워커 관리 (Rust 측 구현 계획)
 - 🔄 결과 수집 및 변환 (계획)
 
 **설계 결정 사항**:
 - ✅ DD op의 모든 포인터 필드는 소유(deep copy), `wl_dd_plan_free()`로 해제
 - ✅ 에러 반환: `int` (0 = 성공, -1 = 메모리, -2 = 잘못된 입력) + out-parameter
 - ✅ FLATMAP 보류: 현재 IR이 별도의 FILTER/PROJECT/JOIN 노드를 생성
-- [ ] FFI 바운더리 명확히 (Rust 경계에서 메모리 소유권)
-- [ ] Data marshalling 전략 (zero-copy vs copy)
-- [ ] Context 전달 방식
+- ✅ FFI 바운더리: 복사 기반 마샬링, C가 모든 메모리 소유, Rust는 const 포인터로 빌림
+- ✅ 수식 트리를 RPN 바이트 버퍼로 직렬화 (FFI를 통한 포인터 트리 전달 방지)
+- ✅ FFI 타입은 고정 폭 정수와 명시적 enum 값 사용 (ABI 안정성)
+- [ ] Context 전달 방식 (worker handle → 실행 컨텍스트)
 
 #### I/O Layer (Phase 0: 기본)
 
@@ -360,7 +372,8 @@ typedef struct {
 - ✅ Stratification & SCC 감지 (iterative Tarjan's, O(V+E))
 - ✅ Stratification 테스트 (20/20 passing)
 - ✅ IR → DD operator graph 변환기 (전체 8가지 IR 노드 타입, 19/19 tests)
-- 🔄 Rust FFI 통합
+- ✅ Rust FFI 마샬링 레이어 (FFI-safe 타입, RPN 직렬화, plan 마샬링, 27/27 tests)
+- 🔄 Rust 측 executor 통합
 - 🔄 기본 통합 테스트
 
 **검증**:
@@ -368,7 +381,7 @@ typedef struct {
 - [ ] 엔터프라이즈 타겟 (x86-64) 빌드 성공
 - [ ] 기본 Datalog 프로그램 실행 확인
 
-**현재 상태**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14) 완료 — 200 tests passing. Phase 1 최적화 진행 중.
+**현재 상태**: Parser (91/91), IR (56/56), Stratification (20/20), DD Plan (19/19), Logic Fusion (14/14), FFI Marshalling (27/27) 완료 — 227 tests passing. Phase 1 최적화 진행 중.
 
 ### Phase 1: 최적화 (Weeks 5-10) - 모든 환경 공통
 
@@ -440,6 +453,7 @@ typedef struct {
 | **IR** | Tree-based (8 node types) | ✅ 구현됨 | AST→IR, UNION merge, 56/56 tests |
 | **Stratification** | Tarjan's SCC | ✅ 구현됨 | O(V+E), iterative, 20/20 tests |
 | **DD Plan** | IR → DD op graph | ✅ 구현됨 | 8 op types, stratum-aware, 19/19 tests |
+| **FFI 마샬링** | DD plan → FFI-safe 타입 | ✅ 구현됨 | RPN 수식 직렬화, 27/27 tests |
 | **메모리** | nanoarrow (중기) | 계획 | Columnar, Arrow interop |
 | **Allocator** | Region/Arena + system malloc | 계획 (Phase 2) | jemalloc 검토 후 보류; §4.1 ADR 참조 |
 | **Threading** | Optional pthreads | 계획 | Single-threaded 기본 |
@@ -560,6 +574,7 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 | 2026-02-24 | 0.4 | IR 표현 완료 (56 tests); Stratification & SCC 완료 (20 tests); 167 total |
 | 2026-02-24 | 0.5 | DD Plan Translator 완료 (19 tests); 전체 8가지 IR→DD 변환; 186 total |
 | 2026-02-24 | 0.6 | Phase 1 Logic Fusion 완료 (14 tests); in-place FILTER+PROJECT→FLATMAP; 200 total |
+| 2026-02-26 | 0.7 | FFI 마샬링 레이어 완료 (27 tests); dd_plan을 ffi/로 이동; 227 total |
 
 ---
 
@@ -570,5 +585,6 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 4. [x] DD Plan Translator (IR → DD operator graph, 19/19 tests)
 5. [x] Logic Fusion 최적화 패스 (FILTER+PROJECT → FLATMAP, 14/14 tests)
 6. [ ] 나머지 Phase 1 최적화 패스 (JPP, SIP, Subplan Sharing)
-7. [ ] Rust FFI 통합 (DD plan → Rust executor)
-8. [ ] 통합 테스트 작성
+7. [x] FFI 마샬링 레이어 (C 측, FFI-safe 타입, RPN 직렬화, 27/27 tests)
+8. [ ] Rust 측 DD executor 통합 (Cargo.toml, lib.rs, cbindgen)
+9. [ ] 통합 테스트 작성
