@@ -128,3 +128,21 @@ jobs:
           else
             echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  rust-lint:
+    name: Rust lint (clippy + rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/wirelog-dd/Cargo.toml --check
+
+      - name: Run clippy
+        run: cargo clippy --manifest-path rust/wirelog-dd/Cargo.toml -- -D warnings
+      # Blocking: lint failures prevent downstream CI/static-analysis jobs
