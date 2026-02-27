@@ -34,4 +34,25 @@ int
 wl_csv_parse_line(const char *line, char delimiter, int64_t *values,
                   uint32_t max_cols, uint32_t *count);
 
+/**
+ * wl_csv_read_file:
+ * @path:      Path to the CSV file.
+ * @delimiter: Field separator character.
+ * @data:      (out) Allocated row-major int64_t array (caller frees).
+ * @nrows:     (out) Number of rows read.
+ * @ncols:     (out) Number of columns (from first non-empty line).
+ *
+ * Read an entire CSV file into a flat int64_t array.  Empty lines are
+ * skipped.  All non-empty lines must have the same number of columns.
+ *
+ * Returns:
+ *    0: Success.
+ *   -1: Invalid arguments or file open error.
+ *   -2: Parse error or inconsistent column count.
+ *   -3: Memory allocation failure.
+ */
+int
+wl_csv_read_file(const char *path, char delimiter, int64_t **data,
+                 uint32_t *nrows, uint32_t *ncols);
+
 #endif /* WIRELOG_IO_CSV_READER_H */

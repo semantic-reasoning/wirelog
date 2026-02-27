@@ -11,6 +11,7 @@
 #include "csv_reader.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -65,5 +66,91 @@ wl_csv_parse_line(const char *line, char delimiter, int64_t *values,
         }
     }
 
+    return 0;
+}
+
+/* Initial capacity for row buffer */
+#define CSV_INITIAL_CAPACITY 64
+#define CSV_MAX_COLS 256
+#define CSV_LINE_BUF 4096
+
+int
+wl_csv_read_file(const char *path, char delimiter, int64_t **data,
+                 uint32_t *nrows, uint32_t *ncols)
+{
+    if (!path || !data || !nrows || !ncols)
+        return -1;
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    *data = NULL;
+    *nrows = 0;
+    *ncols = 0;
+
+    uint32_t capacity = CSV_INITIAL_CAPACITY;
+    uint32_t cols_expected = 0;
+    int64_t *buf = NULL;
+    char line[CSV_LINE_BUF];
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Strip trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        /* Skip empty lines */
+        if (len == 0)
+            continue;
+
+        int64_t row_values[CSV_MAX_COLS];
+        uint32_t col_count = 0;
+        int rc = wl_csv_parse_line(line, delimiter, row_values, CSV_MAX_COLS,
+                                   &col_count);
+        if (rc != 0 || col_count == 0) {
+            free(buf);
+            fclose(f);
+            return -2;
+        }
+
+        /* First row determines column count */
+        if (*nrows == 0) {
+            cols_expected = col_count;
+            buf = (int64_t *)malloc((size_t)capacity * cols_expected
+                                    * sizeof(int64_t));
+            if (!buf) {
+                fclose(f);
+                return -3;
+            }
+        } else if (col_count != cols_expected) {
+            free(buf);
+            fclose(f);
+            return -2; /* inconsistent column count */
+        }
+
+        /* Grow buffer if needed */
+        if (*nrows >= capacity) {
+            capacity *= 2;
+            int64_t *tmp = (int64_t *)realloc(
+                buf, (size_t)capacity * cols_expected * sizeof(int64_t));
+            if (!tmp) {
+                free(buf);
+                fclose(f);
+                return -3;
+            }
+            buf = tmp;
+        }
+
+        /* Copy row into flat array */
+        memcpy(&buf[(size_t)*nrows * cols_expected], row_values,
+               (size_t)cols_expected * sizeof(int64_t));
+        (*nrows)++;
+    }
+
+    fclose(f);
+
+    *data = buf;
+    *ncols = cols_expected;
     return 0;
 }
