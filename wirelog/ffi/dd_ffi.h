@@ -356,6 +356,9 @@ typedef struct {
     wl_agg_fn_t agg_fn;
     const uint32_t *group_by_indices;
     uint32_t group_by_count;
+
+    wl_ffi_expr_buffer_t *map_exprs;
+    uint32_t map_expr_count;
 } wl_ffi_op_t;
 
 /* ======================================================================== */
