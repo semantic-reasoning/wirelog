@@ -254,6 +254,28 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
                    src->project_count * sizeof(uint32_t));
             dst->project_indices = idx;
         }
+        /* Serialize per-column expressions (for computed projections) */
+        if (src->project_exprs && src->project_count > 0) {
+            wl_ffi_expr_buffer_t *bufs = (wl_ffi_expr_buffer_t *)calloc(
+                src->project_count, sizeof(wl_ffi_expr_buffer_t));
+            if (!bufs)
+                return -1;
+            for (uint32_t i = 0; i < src->project_count; i++) {
+                if (src->project_exprs[i]) {
+                    int rc = wl_ffi_expr_serialize(src->project_exprs[i],
+                                                   &bufs[i]);
+                    if (rc != 0) {
+                        for (uint32_t j = 0; j < i; j++)
+                            free(bufs[j].data);
+                        free(bufs);
+                        return rc == -1 ? -1 : -3;
+                    }
+                }
+                /* NULL expr -> bufs[i] remains {NULL, 0} (index-only col) */
+            }
+            dst->map_exprs = bufs;
+            dst->map_expr_count = src->project_count;
+        }
         break;
 
     case WL_DD_FILTER:
@@ -416,6 +438,11 @@ ffi_op_free_fields(wl_ffi_op_t *op)
     free((void *)op->project_indices);
     free((void *)op->group_by_indices);
     free(op->filter_expr.data);
+    if (op->map_exprs) {
+        for (uint32_t i = 0; i < op->map_expr_count; i++)
+            free(op->map_exprs[i].data);
+        free(op->map_exprs);
+    }
 }
 
 /* ======================================================================== */
