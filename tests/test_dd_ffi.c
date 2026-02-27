@@ -893,6 +893,73 @@ test_marshal_map_op(void)
 }
 
 static void
+test_marshal_map_exprs(void)
+{
+    TEST("marshal plan: b(x, y+1) :- a(x,y). -> MAP with map_exprs");
+
+    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
+                                          ".decl b(x: int32, y: int32)\n"
+                                          "b(x, y + 1) :- a(x, y).\n");
+    if (!plan) {
+        FAIL("could not create test plan");
+        return;
+    }
+
+    wl_ffi_plan_t *ffi = NULL;
+    int rc = wl_dd_marshal_plan(plan, &ffi);
+
+    if (rc != 0 || !ffi) {
+        wl_dd_plan_free(plan);
+        FAIL("marshal failed");
+        return;
+    }
+
+    const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "b");
+    if (!rp) {
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(plan);
+        FAIL("relation 'b' not found in FFI plan");
+        return;
+    }
+
+    /* Find MAP op and verify it has map_exprs with serialized data
+     * for column 1 (y+1) and NULL data for column 0 (simple x). */
+    bool found = false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_FFI_OP_MAP && rp->ops[i].map_exprs != NULL
+            && rp->ops[i].map_expr_count == 2) {
+            /* Column 0 (x) should have no expression (data==NULL) */
+            if (rp->ops[i].map_exprs[0].data != NULL) {
+                wl_ffi_plan_free(ffi);
+                wl_dd_plan_free(plan);
+                FAIL("map_exprs[0] should be NULL for simple column x");
+                return;
+            }
+            /* Column 1 (y+1) should have serialized expression data */
+            if (rp->ops[i].map_exprs[1].data == NULL
+                || rp->ops[i].map_exprs[1].size == 0) {
+                wl_ffi_plan_free(ffi);
+                wl_dd_plan_free(plan);
+                FAIL("map_exprs[1] should have serialized data for y+1");
+                return;
+            }
+            found = true;
+        }
+    }
+
+    if (!found) {
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(plan);
+        FAIL("expected MAP op with map_exprs");
+        return;
+    }
+
+    wl_ffi_plan_free(ffi);
+    wl_dd_plan_free(plan);
+    PASS();
+}
+
+static void
 test_marshal_join_op(void)
 {
     TEST("marshal plan: JOIN -> FFI JOIN with keys and right_relation");
@@ -1672,6 +1739,7 @@ main(void)
     test_marshal_scan_op();
     test_marshal_filter_op();
     test_marshal_map_op();
+    test_marshal_map_exprs();
     test_marshal_join_op();
     test_marshal_antijoin_op();
     test_marshal_reduce_op();
