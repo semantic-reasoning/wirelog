@@ -122,6 +122,16 @@ wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
         return -1;
     }
 
+    /* 4b. Load external CSV files from .input directives */
+    rc = wirelog_load_input_files(prog, w);
+    if (rc != 0) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        return -1;
+    }
+
     /* 5. Execute with output callback */
     rc = wl_dd_execute_cb(ffi, w, print_tuple_cb, out);
 

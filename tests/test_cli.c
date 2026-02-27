@@ -292,6 +292,86 @@ test_run_pipeline_parse_error(void)
 }
 
 /* ======================================================================== */
+/* Test: pipeline with .input directive (CSV loading)                        */
+/* ======================================================================== */
+
+static void
+test_run_pipeline_csv_input(void)
+{
+    TEST("wl_run_pipeline with .input CSV loads external data");
+
+    /* Create CSV file */
+    const char *csv_path = "/tmp/wirelog_test_pipeline_edges.csv";
+    FILE *csv = fopen(csv_path, "w");
+    if (!csv) {
+        FAIL("cannot create CSV file");
+        return;
+    }
+    fprintf(csv, "1,2\n2,3\n3,4\n");
+    fclose(csv);
+
+    const char *src
+        = ".decl edge(x: int32, y: int32)\n"
+          ".input edge(filename=\"/tmp/wirelog_test_pipeline_edges.csv\", "
+          "delimiter=\",\")\n"
+          ".decl tc(x: int32, y: int32)\n"
+          "tc(x, y) :- edge(x, y).\n"
+          "tc(x, z) :- tc(x, y), edge(y, z).\n";
+
+    const char *outpath = "/tmp/wirelog_test_pipeline_csv_out.txt";
+    FILE *f = fopen(outpath, "w");
+    if (!f) {
+        remove(csv_path);
+        FAIL("cannot create output file");
+        return;
+    }
+
+    int rc = wl_run_pipeline(src, 1, f);
+    fclose(f);
+
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "wl_run_pipeline returned %d", rc);
+        remove(outpath);
+        remove(csv_path);
+        FAIL(msg);
+        return;
+    }
+
+    char *output = wl_read_file(outpath);
+    if (!output) {
+        remove(outpath);
+        remove(csv_path);
+        FAIL("cannot read output file");
+        return;
+    }
+
+    /* Should have 6 tc tuples */
+    int count = 0;
+    const char *p = output;
+    while ((p = strstr(p, "tc(")) != NULL) {
+        count++;
+        p++;
+    }
+
+    if (count != 6) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected 6 tc tuples, got %d\n%s", count,
+                 output);
+        free(output);
+        remove(outpath);
+        remove(csv_path);
+        FAIL(msg);
+        return;
+    }
+
+    free(output);
+    remove(outpath);
+    remove(csv_path);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -313,6 +393,9 @@ main(void)
     test_run_pipeline_tc();
     test_run_pipeline_null_source();
     test_run_pipeline_parse_error();
+
+    printf("\n--- Pipeline with .input CSV ---\n");
+    test_run_pipeline_csv_input();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);
