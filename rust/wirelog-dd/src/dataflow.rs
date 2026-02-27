@@ -190,7 +190,7 @@ fn evaluate_relation_plan(
                     .unwrap_or_default();
             }
 
-            SafeOp::Map { indices } => {
+            SafeOp::Map { indices, .. } => {
                 if !indices.is_empty() {
                     current = current
                         .into_iter()
@@ -465,6 +465,7 @@ mod tests {
                         },
                         SafeOp::Map {
                             indices: vec![1, 0],
+                            exprs: None,
                         },
                     ],
                 }],
@@ -671,7 +672,10 @@ mod tests {
                             SafeOp::Variable {
                                 relation_name: "edge".to_string(),
                             },
-                            SafeOp::Map { indices: vec![1] },
+                            SafeOp::Map {
+                                indices: vec![1],
+                                exprs: None,
+                            },
                         ],
                     }],
                 },
@@ -748,6 +752,7 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![0, 2],
+                                exprs: None,
                             },
                         ],
                     }],
@@ -804,6 +809,7 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![0, 2],
+                                exprs: None,
                             },
                         ],
                     }],

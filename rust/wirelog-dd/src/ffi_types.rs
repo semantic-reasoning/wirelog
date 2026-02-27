@@ -170,6 +170,9 @@ pub struct WlFfiOp {
     pub agg_fn: WlAggFn,
     pub group_by_indices: *const u32,
     pub group_by_count: u32,
+
+    pub map_exprs: *const WlFfiExprBuffer,
+    pub map_expr_count: u32,
 }
 
 /* ======================================================================== */
@@ -409,12 +412,18 @@ mod tests {
 
         let gbc_offset = &op.group_by_count as *const u32 as usize - base;
         assert_eq!(gbc_offset, 96, "group_by_count field offset");
+
+        let me_offset = &op.map_exprs as *const *const WlFfiExprBuffer as usize - base;
+        assert_eq!(me_offset, 104, "map_exprs field offset");
+
+        let mec_offset = &op.map_expr_count as *const u32 as usize - base;
+        assert_eq!(mec_offset, 112, "map_expr_count field offset");
     }
 
     #[test]
     fn test_op_size() {
-        // Total: 96 + 4 (group_by_count) = 100, padded to 104 (align 8)
+        // Total: 112 + 4 (map_expr_count) = 116, padded to 120 (align 8)
         let size = mem::size_of::<WlFfiOp>();
-        assert_eq!(size, 104, "WlFfiOp size mismatch");
+        assert_eq!(size, 120, "WlFfiOp size mismatch");
     }
 }

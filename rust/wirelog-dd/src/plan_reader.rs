@@ -33,8 +33,11 @@ pub enum SafeOp {
     /// Reference to an input collection (EDB or IDB).
     Variable { relation_name: String },
 
-    /// Column projection.
-    Map { indices: Vec<u32> },
+    /// Column projection with optional per-column expressions.
+    Map {
+        indices: Vec<u32>,
+        exprs: Option<Vec<Vec<ExprOp>>>,
+    },
 
     /// Predicate filter with deserialized expression.
     Filter { expr: Vec<ExprOp> },
@@ -208,7 +211,26 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
             } else {
                 read_u32_array(op.project_indices, op.project_count, "op.project_indices")?
             };
-            Ok(SafeOp::Map { indices })
+
+            let exprs = if !op.map_exprs.is_null() && op.map_expr_count > 0 {
+                let expr_buffers =
+                    std::slice::from_raw_parts(op.map_exprs, op.map_expr_count as usize);
+                let mut result = Vec::new();
+                for buf in expr_buffers {
+                    if buf.data.is_null() || buf.size == 0 {
+                        continue;
+                    }
+                    let data = std::slice::from_raw_parts(buf.data, buf.size as usize);
+                    let expr = deserialize_expr(data)
+                        .map_err(|e| PlanReadError::ExprDeserializeError(e.to_string()))?;
+                    result.push(expr);
+                }
+                Some(result)
+            } else {
+                None
+            };
+
+            Ok(SafeOp::Map { indices, exprs })
         }
 
         WlFfiOpType::Filter => {
@@ -425,6 +447,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
 
         let ops = [op];
@@ -487,6 +511,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
 
         let ops = [op];
@@ -515,7 +541,8 @@ mod tests {
             assert_eq!(
                 result.strata[0].relations[0].ops[0],
                 SafeOp::Map {
-                    indices: vec![1, 0]
+                    indices: vec![1, 0],
+                    exprs: None,
                 }
             );
         }
@@ -548,6 +575,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
 
         let ops = [op];
@@ -613,6 +642,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
 
         let ops = [op];
@@ -678,6 +709,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
 
         let ops = [op];
@@ -737,6 +770,8 @@ mod tests {
             agg_fn: WlAggFn::Sum,
             group_by_indices: gb_indices.as_ptr(),
             group_by_count: 1,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
 
         let ops = [op];
@@ -794,6 +829,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
         let op_consolidate = WlFfiOp {
             op: WlFfiOpType::Consolidate,
@@ -856,6 +893,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
         let s0_ops = [s0_op];
         let s0_rel = WlFfiRelationPlan {
@@ -887,6 +926,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
         let s1_op1 = WlFfiOp {
             op: WlFfiOpType::Join,
@@ -904,6 +945,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
         let s1_ops = [s1_op0, s1_op1];
         let s1_rel = WlFfiRelationPlan {
@@ -1003,6 +1046,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
         let ops = [op];
 
@@ -1054,6 +1099,8 @@ mod tests {
             agg_fn: WlAggFn::Count,
             group_by_indices: std::ptr::null(),
             group_by_count: 0,
+            map_exprs: std::ptr::null(),
+            map_expr_count: 0,
         };
         let ops = [op];
         let relation = WlFfiRelationPlan {
