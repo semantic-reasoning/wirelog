@@ -147,3 +147,16 @@ test_cli_exe = executable(
 )
 
 test('cli', test_cli_exe)
+
+csv_src = files(
+  '../wirelog/io/csv_reader.c',
+)
+
+test_csv_exe = executable(
+  'test_csv',
+  files('test_csv.c'),
+  csv_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('csv', test_csv_exe)

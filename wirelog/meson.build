@@ -50,4 +50,6 @@ wirelog_ffi_src = files(
 # I/O Module
 # ============================================================================
 
-wirelog_io_src = []
+wirelog_io_src = files(
+  'io/csv_reader.c',
+)
