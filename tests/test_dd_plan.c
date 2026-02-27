@@ -1038,6 +1038,204 @@ test_plan_multi_stratum_ordering(void)
 }
 
 /* ======================================================================== */
+/* Head Arithmetic Expression Tests (Issue #20)                             */
+/* ======================================================================== */
+
+static void
+test_plan_head_arith_simple(void)
+{
+    TEST("DD plan: b(x, y+1) :- a(x,y). -> MAP with project_exprs");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl b(x: int32, y: int32)\n"
+                               "b(x, y + 1) :- a(x, y).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'b' not found in plan");
+        return;
+    }
+
+    /* The MAP op must carry project_exprs for the arithmetic column.
+     * Column 0 (x) is a simple variable -> no expression needed.
+     * Column 1 (y + 1) is arithmetic -> must have a non-NULL expression. */
+    bool found_map_with_exprs = false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_MAP) {
+            if (rp->ops[i].project_exprs != NULL
+                && rp->ops[i].project_count == 2) {
+                /* Column 1 must have an arithmetic expression */
+                if (rp->ops[i].project_exprs[1] != NULL
+                    && rp->ops[i].project_exprs[1]->type == WL_IR_EXPR_ARITH) {
+                    found_map_with_exprs = true;
+                }
+            }
+        }
+    }
+
+    if (!found_map_with_exprs) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("MAP op should have project_exprs with ARITH for y+1");
+        return;
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_head_arith_preserves_simple(void)
+{
+    TEST("DD plan: b(x, y) :- a(x,y). -> MAP with indices only (no exprs)");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl b(x: int32, y: int32)\n"
+                               "b(x, y) :- a(x, y).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'b' not found in plan");
+        return;
+    }
+
+    /* Simple variable-only head should NOT have project_exprs.
+     * It should use the existing index-only path. */
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_MAP) {
+            if (rp->ops[i].project_exprs != NULL) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("simple VAR-only MAP should not have project_exprs");
+                return;
+            }
+        }
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_head_arith_rewrite_vars(void)
+{
+    TEST("DD plan: b(x, y+1) :- a(x,y). -> expr vars rewritten to col0/col1");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl b(x: int32, y: int32)\n"
+                               "b(x, y + 1) :- a(x, y).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse returned NULL");
+        return;
+    }
+
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
+
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
+    if (!rp) {
+        wl_dd_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("relation 'b' not found in plan");
+        return;
+    }
+
+    /* Find the MAP with project_exprs and check that the arithmetic
+     * expression's variable child has been rewritten to "col1" (y is
+     * column index 1 in the SCAN). */
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        if (rp->ops[i].op == WL_DD_MAP && rp->ops[i].project_exprs != NULL) {
+            wl_ir_expr_t *arith = rp->ops[i].project_exprs[1];
+            if (!arith || arith->type != WL_IR_EXPR_ARITH
+                || arith->child_count < 2) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("expected ARITH expr with 2 children");
+                return;
+            }
+            /* First child should be VAR "col1" (rewritten from "y") */
+            wl_ir_expr_t *var_child = arith->children[0];
+            if (!var_child || var_child->type != WL_IR_EXPR_VAR
+                || !var_child->var_name
+                || strcmp(var_child->var_name, "col1") != 0) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("ARITH child[0] should be VAR 'col1'");
+                return;
+            }
+            /* Second child should be CONST_INT 1 */
+            wl_ir_expr_t *const_child = arith->children[1];
+            if (!const_child || const_child->type != WL_IR_EXPR_CONST_INT
+                || const_child->int_value != 1) {
+                wl_dd_plan_free(plan);
+                wirelog_program_free(prog);
+                FAIL("ARITH child[1] should be CONST_INT(1)");
+                return;
+            }
+
+            wl_dd_plan_free(plan);
+            wirelog_program_free(prog);
+            PASS();
+            return;
+        }
+    }
+
+    wl_dd_plan_free(plan);
+    wirelog_program_free(prog);
+    FAIL("MAP with project_exprs not found");
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -1076,6 +1274,11 @@ main(void)
     test_plan_recursive_stratum();
     test_plan_non_recursive_stratum();
     test_plan_multi_stratum_ordering();
+
+    /* Head arithmetic expressions (Issue #20) */
+    test_plan_head_arith_simple();
+    test_plan_head_arith_preserves_simple();
+    test_plan_head_arith_rewrite_vars();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);
