@@ -179,6 +179,7 @@ typedef struct {
 
     uint32_t *project_indices;
     uint32_t project_count;
+    struct wl_ir_expr **project_exprs;
 
     struct wl_ir_expr *filter_expr;
 

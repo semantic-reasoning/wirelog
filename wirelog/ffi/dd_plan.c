@@ -61,6 +61,11 @@ dd_op_free_fields(wl_dd_op_t *op)
     free(op->right_keys);
 
     free(op->project_indices);
+    if (op->project_exprs) {
+        for (uint32_t i = 0; i < op->project_count; i++)
+            wl_ir_expr_free(op->project_exprs[i]);
+        free(op->project_exprs);
+    }
     free(op->group_by_indices);
 
     if (op->filter_expr)
@@ -188,15 +193,40 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
                    node->project_count * sizeof(uint32_t));
         } else if (node->project_count > 0 && node->project_exprs
                    && ctx->count > 0) {
-            /* Resolve VAR expressions to column indices */
+            /* Check whether any expression is non-trivial (not a simple
+             * variable reference).  If so, we need per-column expression
+             * trees in addition to the index array. */
+            bool has_complex = false;
+            for (uint32_t i = 0; i < node->project_count; i++) {
+                wl_ir_expr_t *e = node->project_exprs[i];
+                if (e && e->type != WL_IR_EXPR_VAR) {
+                    has_complex = true;
+                    break;
+                }
+            }
+
+            /* Always build the index array (used for simple columns) */
             op.project_indices
                 = (uint32_t *)malloc(node->project_count * sizeof(uint32_t));
             if (!op.project_indices)
                 return -1;
+
+            /* If complex expressions exist, allocate per-column expr array */
+            if (has_complex) {
+                op.project_exprs = (wl_ir_expr_t **)calloc(
+                    node->project_count, sizeof(wl_ir_expr_t *));
+                if (!op.project_exprs) {
+                    free(op.project_indices);
+                    return -1;
+                }
+            }
+
             for (uint32_t i = 0; i < node->project_count; i++) {
                 wl_ir_expr_t *e = node->project_exprs[i];
                 op.project_indices[i] = i; /* default: identity */
+
                 if (e && e->type == WL_IR_EXPR_VAR && e->var_name) {
+                    /* Simple variable -> resolve to column index */
                     for (uint32_t j = 0; j < ctx->count; j++) {
                         if (ctx->names[j]
                             && strcmp(e->var_name, ctx->names[j]) == 0) {
@@ -204,6 +234,16 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
                             break;
                         }
                     }
+                } else if (e && e->type != WL_IR_EXPR_VAR && has_complex) {
+                    /* Non-trivial expression -> clone and rewrite vars */
+                    op.project_exprs[i] = wl_ir_expr_clone(e);
+                    if (!op.project_exprs[i]) {
+                        dd_op_free_fields(&op);
+                        return -1;
+                    }
+                    rewrite_expr_vars(op.project_exprs[i],
+                                      (const char *const *)ctx->names,
+                                      ctx->count);
                 }
             }
         }
