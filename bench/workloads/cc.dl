@@ -1,0 +1,6 @@
+.decl edge(x: int32, y: int32)
+.input edge(filename="EDGES", delimiter=",")
+.decl cc(x: int32, c: int32)
+cc(x, x) :- edge(x, _).
+cc(x, x) :- edge(_, x).
+cc(y, min(c)) :- cc(x, c), edge(x, y).

@@ -1,0 +1,5 @@
+.decl edge(x: int32, y: int32)
+.input edge(filename="EDGES", delimiter=",")
+.decl reach(x: int32)
+reach(1).
+reach(y) :- reach(x), edge(x, y).

@@ -1,0 +1,5 @@
+.decl wedge(x: int32, y: int32, w: int32)
+.input wedge(filename="WEDGES", delimiter=",")
+.decl dist(x: int32, d: int32)
+dist(1, 0).
+dist(y, min(d + w)) :- dist(x, d), wedge(x, y, w).
