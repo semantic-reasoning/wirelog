@@ -10,6 +10,7 @@
  */
 
 #include "../wirelog/ffi/dd_ffi.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 
@@ -1014,6 +1015,228 @@ test_load_input_files_null_args(void)
 }
 
 /* ======================================================================== */
+/* String Interning End-to-End                                              */
+/* ======================================================================== */
+
+static void
+test_e2e_string_inline_facts(void)
+{
+    TEST("e2e: string inline facts with TC");
+
+    const char *src = ".decl edge(x: string, y: string)\n"
+                      "edge(\"A\",\"B\"). edge(\"B\",\"C\").\n"
+                      ".decl tc(x: string, y: string)\n"
+                      "tc(x, y) :- edge(x, y).\n"
+                      "tc(x, z) :- tc(x, y), edge(y, z).\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_dd_plan_t *dd_plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        FAIL("dd_plan_generate failed");
+        return;
+    }
+
+    wl_ffi_plan_t *ffi = NULL;
+    rc = wl_dd_marshal_plan(dd_plan, &ffi);
+    if (rc != 0) {
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("marshal failed");
+        return;
+    }
+
+    wl_dd_worker_t *w = wl_dd_worker_create(1);
+
+    rc = wirelog_load_all_facts(prog, w);
+    if (rc != 0) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("load_all_facts failed");
+        return;
+    }
+
+    tuple_collector_t results;
+    memset(&results, 0, sizeof(results));
+
+    rc = wl_dd_execute_cb(ffi, w, collect_tuple, &results);
+    if (rc != 0) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("execute_cb failed");
+        return;
+    }
+
+    /* tc should have 3 tuples: (A,B), (A,C), (B,C) */
+    int n = count_tuples(&results, "tc");
+    if (n != 3) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected 3 tc tuples, got %d", n);
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return;
+    }
+
+    /* Verify reverse mapping works */
+    const wl_intern_t *intern = wirelog_program_get_intern(prog);
+    if (!intern) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("intern table is NULL");
+        return;
+    }
+
+    if (wl_intern_count(intern) != 3) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected 3 interned strings, got %u",
+                 wl_intern_count(intern));
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return;
+    }
+
+    wl_dd_worker_destroy(w);
+    wl_ffi_plan_free(ffi);
+    wl_dd_plan_free(dd_plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_load_input_files_string_csv(void)
+{
+    TEST("wirelog_load_input_files: string CSV .input + TC");
+
+    /* Create CSV file with string data */
+    char csv_path[512];
+    test_tmppath(csv_path, sizeof(csv_path), "wirelog_test_str_edges.csv");
+    FILE *f = fopen(csv_path, "w");
+    if (!f) {
+        FAIL("cannot create CSV file");
+        return;
+    }
+    fprintf(f, "\"Alice\",\"Bob\"\n\"Bob\",\"Charlie\"\n");
+    fclose(f);
+
+    char src[1024];
+    snprintf(src, sizeof(src),
+             ".decl edge(x: string, y: string)\n"
+             ".input edge(filename=\"%s\", delimiter=\",\")\n"
+             ".decl tc(x: string, y: string)\n"
+             "tc(x, y) :- edge(x, y).\n"
+             "tc(x, z) :- tc(x, y), edge(y, z).\n",
+             csv_path);
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog) {
+        remove(csv_path);
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_dd_plan_t *dd_plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        remove(csv_path);
+        FAIL("dd_plan_generate failed");
+        return;
+    }
+
+    wl_ffi_plan_t *ffi = NULL;
+    rc = wl_dd_marshal_plan(dd_plan, &ffi);
+    if (rc != 0) {
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        remove(csv_path);
+        FAIL("marshal failed");
+        return;
+    }
+
+    wl_dd_worker_t *w = wl_dd_worker_create(1);
+
+    rc = wirelog_load_input_files(prog, w);
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "load_input_files returned %d", rc);
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        remove(csv_path);
+        FAIL(msg);
+        return;
+    }
+
+    tuple_collector_t results;
+    memset(&results, 0, sizeof(results));
+
+    rc = wl_dd_execute_cb(ffi, w, collect_tuple, &results);
+    if (rc != 0) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        remove(csv_path);
+        FAIL("execute_cb failed");
+        return;
+    }
+
+    /* tc: (Alice,Bob), (Alice,Charlie), (Bob,Charlie) = 3 tuples */
+    int n = count_tuples(&results, "tc");
+    if (n != 3) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected 3 tc tuples, got %d", n);
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        remove(csv_path);
+        FAIL(msg);
+        return;
+    }
+
+    /* Verify interned strings */
+    const wl_intern_t *intern = wirelog_program_get_intern(prog);
+    if (!intern || wl_intern_count(intern) != 3) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        remove(csv_path);
+        FAIL("expected 3 interned strings (Alice, Bob, Charlie)");
+        return;
+    }
+
+    wl_dd_worker_destroy(w);
+    wl_ffi_plan_free(ffi);
+    wl_dd_plan_free(dd_plan);
+    wirelog_program_free(prog);
+    remove(csv_path);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -1296,6 +1519,10 @@ main(void)
     test_load_input_files_tc();
     test_load_input_files_no_input();
     test_load_input_files_null_args();
+
+    printf("\n--- String Interning (end-to-end) ---\n");
+    test_e2e_string_inline_facts();
+    test_load_input_files_string_csv();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);
