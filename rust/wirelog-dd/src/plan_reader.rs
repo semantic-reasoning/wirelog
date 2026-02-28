@@ -33,8 +33,11 @@ pub enum SafeOp {
     /// Reference to an input collection (EDB or IDB).
     Variable { relation_name: String },
 
-    /// Column projection with optional per-column expressions.
-    Map { indices: Vec<u32> },
+    /// Column projection with optional per-column arithmetic expressions.
+    Map {
+        indices: Vec<u32>,
+        exprs: Vec<Option<Vec<ExprOp>>>,
+    },
 
     /// Predicate filter with deserialized expression.
     Filter { expr: Vec<ExprOp> },
@@ -44,6 +47,7 @@ pub enum SafeOp {
         right_relation: String,
         left_keys: Vec<String>,
         right_keys: Vec<String>,
+        left_key_indices: Vec<u32>,
     },
 
     /// Antijoin (negation).
@@ -205,7 +209,25 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
             } else {
                 read_u32_array(op.project_indices, op.project_count, "op.project_indices")?
             };
-            Ok(SafeOp::Map { indices })
+            let exprs = if op.map_exprs.is_null() || op.map_expr_count == 0 {
+                Vec::new()
+            } else {
+                let count = op.map_expr_count as usize;
+                let expr_bufs = std::slice::from_raw_parts(op.map_exprs, count);
+                let mut result = Vec::with_capacity(count);
+                for buf in expr_bufs {
+                    if buf.data.is_null() || buf.size == 0 {
+                        result.push(None);
+                    } else {
+                        let data = std::slice::from_raw_parts(buf.data, buf.size as usize);
+                        let expr = deserialize_expr(data)
+                            .map_err(|e| PlanReadError::ExprDeserializeError(e.to_string()))?;
+                        result.push(Some(expr));
+                    }
+                }
+                result
+            };
+            Ok(SafeOp::Map { indices, exprs })
         }
 
         WlFfiOpType::Filter => {
@@ -224,10 +246,16 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
             let right = read_cstr(op.right_relation, "op.right_relation")?;
             let lk = read_cstr_array(op.left_keys, op.key_count, "op.left_keys")?;
             let rk = read_cstr_array(op.right_keys, op.key_count, "op.right_keys")?;
+            let lki = if op.project_count > 0 && !op.project_indices.is_null() {
+                std::slice::from_raw_parts(op.project_indices, op.project_count as usize).to_vec()
+            } else {
+                Vec::new()
+            };
             Ok(SafeOp::Join {
                 right_relation: right,
                 left_keys: lk,
                 right_keys: rk,
+                left_key_indices: lki,
             })
         }
 
@@ -517,6 +545,7 @@ mod tests {
                 result.strata[0].relations[0].ops[0],
                 SafeOp::Map {
                     indices: vec![1, 0],
+                    exprs: vec![],
                 }
             );
         }
@@ -651,6 +680,7 @@ mod tests {
                     right_relation: "edge".to_string(),
                     left_keys: vec!["Y".to_string()],
                     right_keys: vec!["X".to_string()],
+                    left_key_indices: vec![],
                 }
             );
         }
@@ -979,6 +1009,7 @@ mod tests {
                     right_relation: "edge".to_string(),
                     left_keys: vec!["Y".to_string()],
                     right_keys: vec!["X".to_string()],
+                    left_key_indices: vec![],
                 }
             );
         }

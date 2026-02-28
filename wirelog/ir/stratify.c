@@ -581,10 +581,13 @@ wl_program_stratify(struct wirelog_program *program)
             for (uint32_t s = 0; s < num_strata; s++)
                 program->strata[s].is_recursive = (scc_size[s] > 1);
 
-            /* Also check self-loops (self-recursion in singleton SCC) */
+            /* Also check self-loops (self-recursion in singleton SCC).
+               Both positive and aggregation edges indicate recursion;
+               e.g. dist(y, min(d+w)) :- dist(x, d), wedge(x, y, w). */
             for (uint32_t e = 0; e < graph->edge_count; e++) {
                 if (graph->edges[e].from == graph->edges[e].to
-                    && graph->edges[e].type == WL_DEP_POSITIVE) {
+                    && (graph->edges[e].type == WL_DEP_POSITIVE
+                        || graph->edges[e].type == WL_DEP_AGGREGATION)) {
                     uint32_t s = scc->scc_id[graph->edges[e].from];
                     program->strata[s].is_recursive = true;
                 }

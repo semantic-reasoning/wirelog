@@ -334,6 +334,17 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
             dst->left_keys = (const char *const *)lk;
             dst->right_keys = (const char *const *)rk;
         }
+        /* Copy left key column indices (stored in project_indices) */
+        dst->project_count = src->project_count;
+        if (src->project_count > 0 && src->project_indices) {
+            uint32_t *idx
+                = (uint32_t *)malloc(src->project_count * sizeof(uint32_t));
+            if (!idx)
+                return -1;
+            memcpy(idx, src->project_indices,
+                   src->project_count * sizeof(uint32_t));
+            dst->project_indices = idx;
+        }
         break;
 
     case WL_DD_ANTIJOIN:

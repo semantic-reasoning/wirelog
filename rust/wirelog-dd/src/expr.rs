@@ -183,25 +183,8 @@ pub fn deserialize_expr(data: &[u8]) -> Result<Vec<ExprOp>, ExprError> {
 /* Evaluation                                                               */
 /* ======================================================================== */
 
-/// Evaluate a filter expression (must return a boolean result).
-///
-/// # Arguments
-///
-/// - `ops`: Sequence of RPN instructions
-/// - `vars`: Variable bindings (variable name -> value)
-///
-/// # Returns
-///
-/// The boolean result of the filter expression.
-///
-/// # Errors
-///
-/// - `StackUnderflow`: Operator tried to pop from empty stack
-/// - `TypeMismatch`: Operation applied to incompatible types
-/// - `UndefinedVariable`: Variable not found in bindings
-/// - `InvalidResult`: Expression did not leave exactly one Bool on stack
-/// - `DivisionByZero`: Attempted division or modulo by zero
-pub fn eval_filter(ops: &[ExprOp], vars: &HashMap<String, Value>) -> Result<bool, ExprError> {
+/// Internal: evaluate an RPN expression and return the final stack value.
+fn eval_stack(ops: &[ExprOp], vars: &HashMap<String, Value>) -> Result<Value, ExprError> {
     let mut stack: Vec<Value> = Vec::new();
 
     for op in ops {
@@ -297,13 +280,41 @@ pub fn eval_filter(ops: &[ExprOp], vars: &HashMap<String, Value>) -> Result<bool
         }
     }
 
-    // Final stack must have exactly one Int value (0=false, 1=true)
     if stack.len() != 1 {
         return Err(ExprError::InvalidResult);
     }
 
-    match stack.pop().unwrap() {
+    Ok(stack.pop().unwrap())
+}
+
+/// Evaluate a filter expression (must return a boolean result).
+///
+/// # Arguments
+///
+/// - `ops`: Sequence of RPN instructions
+/// - `vars`: Variable bindings (variable name -> value)
+///
+/// # Returns
+///
+/// The boolean result of the filter expression.
+///
+/// # Errors
+///
+/// - `StackUnderflow`: Operator tried to pop from empty stack
+/// - `TypeMismatch`: Operation applied to incompatible types
+/// - `UndefinedVariable`: Variable not found in bindings
+/// - `InvalidResult`: Expression did not leave exactly one Bool on stack
+/// - `DivisionByZero`: Attempted division or modulo by zero
+pub fn eval_filter(ops: &[ExprOp], vars: &HashMap<String, Value>) -> Result<bool, ExprError> {
+    match eval_stack(ops, vars)? {
         Value::Int(i) => Ok(i != 0),
+    }
+}
+
+/// Evaluate an arithmetic expression (returns i64 result).
+pub fn eval_arith(ops: &[ExprOp], vars: &HashMap<String, Value>) -> Result<i64, ExprError> {
+    match eval_stack(ops, vars)? {
+        Value::Int(i) => Ok(i),
     }
 }
 

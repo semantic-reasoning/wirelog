@@ -985,8 +985,20 @@ convert_rule(const wl_ast_node_t *rule_node)
                 uint32_t gi = 0;
                 for (uint32_t i = 0; i < head->child_count; i++) {
                     if (head->children[i]->type != WL_NODE_AGGREGATE) {
+                        /* Resolve head variable name to body column index */
+                        const char *var = head->children[i]->name;
+                        uint32_t col_idx = i; /* fallback to head position */
+                        if (var) {
+                            for (uint32_t j = 0; j < cur_vcount; j++) {
+                                if (cur_vars[j]
+                                    && strcmp(var, cur_vars[j]) == 0) {
+                                    col_idx = j;
+                                    break;
+                                }
+                            }
+                        }
                         if (root->group_by_indices)
-                            root->group_by_indices[gi++] = i;
+                            root->group_by_indices[gi++] = col_idx;
                     }
                 }
             }

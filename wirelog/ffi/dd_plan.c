@@ -272,6 +272,27 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
                     op.right_keys[k] = strdup_safe(node->join_right_keys[k]);
             }
         }
+        /* Resolve left key column positions for the Rust executor.
+         * Stored in project_indices (reused; unused for JOIN otherwise). */
+        if (op.key_count > 0 && ctx->count > 0) {
+            op.project_indices
+                = (uint32_t *)calloc(op.key_count, sizeof(uint32_t));
+            if (op.project_indices) {
+                op.project_count = op.key_count;
+                for (uint32_t k = 0; k < op.key_count; k++) {
+                    if (op.left_keys && op.left_keys[k]) {
+                        for (uint32_t j = 0; j < ctx->count; j++) {
+                            if (ctx->names[j]
+                                && strcmp(op.left_keys[k], ctx->names[j])
+                                       == 0) {
+                                op.project_indices[k] = j;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         /* Update column context: join output = left_cols + right non-key cols */
         if (node->child_count >= 2 && node->children[1]
             && node->children[1]->column_names) {
@@ -306,19 +327,89 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         }
         break;
 
-    case WIRELOG_IR_AGGREGATE:
+    case WIRELOG_IR_AGGREGATE: {
+        /* Emit a MAP before REDUCE to project columns into the layout
+         * expected by the Rust executor: [group_by_cols..., agg_value].
+         * For min/max/sum the value column is the aggregate expression;
+         * for count no value column is needed. */
+        bool needs_value
+            = (node->agg_fn != WL_AGG_COUNT && node->agg_fn != WL_AGG_AVG);
+        uint32_t map_count = node->group_by_count + (needs_value ? 1 : 0);
+
+        if (map_count > 0) {
+            wl_dd_op_t map_op;
+            memset(&map_op, 0, sizeof(map_op));
+            map_op.op = WL_DD_MAP;
+            map_op.project_count = map_count;
+            map_op.project_indices
+                = (uint32_t *)calloc(map_count, sizeof(uint32_t));
+            if (!map_op.project_indices)
+                return -1;
+
+            /* Group-by columns use body column indices (already resolved
+             * by program.c) */
+            for (uint32_t i = 0; i < node->group_by_count; i++)
+                map_op.project_indices[i] = node->group_by_indices[i];
+
+            /* Value column for min/max/sum */
+            if (needs_value && node->agg_expr) {
+                if (node->agg_expr->type == WL_IR_EXPR_VAR) {
+                    /* Simple variable — resolve to body column index */
+                    uint32_t col_idx = 0;
+                    if (node->agg_expr->var_name && ctx->count > 0) {
+                        for (uint32_t j = 0; j < ctx->count; j++) {
+                            if (ctx->names[j]
+                                && strcmp(node->agg_expr->var_name,
+                                          ctx->names[j])
+                                       == 0) {
+                                col_idx = j;
+                                break;
+                            }
+                        }
+                    }
+                    map_op.project_indices[node->group_by_count] = col_idx;
+                } else {
+                    /* Complex expression (e.g. d+w) — use project_exprs */
+                    map_op.project_exprs = (struct wl_ir_expr **)calloc(
+                        map_count, sizeof(struct wl_ir_expr *));
+                    if (!map_op.project_exprs) {
+                        free(map_op.project_indices);
+                        return -1;
+                    }
+                    map_op.project_exprs[node->group_by_count]
+                        = wl_ir_expr_clone(node->agg_expr);
+                    if (!map_op.project_exprs[node->group_by_count]) {
+                        dd_op_free_fields(&map_op);
+                        return -1;
+                    }
+                    rewrite_expr_vars(
+                        map_op.project_exprs[node->group_by_count],
+                        (const char *const *)ctx->names, ctx->count);
+                    map_op.project_indices[node->group_by_count] = 0;
+                }
+            }
+
+            int rc = relation_plan_add_op(rp, map_op);
+            if (rc != 0) {
+                dd_op_free_fields(&map_op);
+                return rc;
+            }
+        }
+
+        /* REDUCE with sequential group_by_indices (MAP already reordered) */
         op.op = WL_DD_REDUCE;
         op.agg_fn = node->agg_fn;
-        if (node->group_by_count > 0 && node->group_by_indices) {
-            op.group_by_count = node->group_by_count;
+        op.group_by_count = node->group_by_count;
+        if (node->group_by_count > 0) {
             op.group_by_indices
                 = (uint32_t *)malloc(node->group_by_count * sizeof(uint32_t));
             if (!op.group_by_indices)
                 return -1;
-            memcpy(op.group_by_indices, node->group_by_indices,
-                   node->group_by_count * sizeof(uint32_t));
+            for (uint32_t i = 0; i < node->group_by_count; i++)
+                op.group_by_indices[i] = i;
         }
         break;
+    }
 
     case WIRELOG_IR_UNION: {
         /* UNION -> CONCAT + CONSOLIDATE (two ops) */

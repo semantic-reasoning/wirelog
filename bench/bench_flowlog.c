@@ -12,8 +12,8 @@
  * .input CSV loading feature is not yet merged to main.
  *
  * Usage:
- *   bench_flowlog --workload {tc|reach|all} --data FILE
- *                 [--workers N] [--repeat R]
+ *   bench_flowlog --workload {tc|reach|cc|sssp|all} --data FILE
+ *                 [--data-weighted FILE] [--workers N] [--repeat R]
  */
 
 #include "bench_util.h"
@@ -115,9 +115,14 @@ overflow:
 
 #define WL_TC 0
 #define WL_REACH 1
-#define WL_COUNT 2
+#define WL_CC 2
+#define WL_SSSP 3
+#define WL_COUNT 4
 
-static const char *wl_names[WL_COUNT] = { "tc", "reach" };
+static const char *wl_names[WL_COUNT] = { "tc", "reach", "cc", "sssp" };
+
+/* Relation name used for CSV-to-facts conversion per workload */
+static const char *wl_relations[WL_COUNT] = { "edge", "edge", "edge", "wedge" };
 
 /* Templates: %s is replaced by inline facts block */
 static const char *wl_templates[WL_COUNT] = {
@@ -133,6 +138,19 @@ static const char *wl_templates[WL_COUNT] = {
     ".decl reach(x: int32)\n"
     "reach(1).\n"
     "reach(y) :- reach(x), edge(x, y).\n",
+    /* CC (Connected Components) */
+    ".decl edge(x: int32, y: int32)\n"
+    "%s\n"
+    ".decl cc(x: int32, c: int32)\n"
+    "cc(x, x) :- edge(x, _).\n"
+    "cc(x, x) :- edge(_, x).\n"
+    "cc(y, min(c)) :- cc(x, c), edge(x, y).\n",
+    /* SSSP (Single-Source Shortest Path) */
+    ".decl wedge(x: int32, y: int32, w: int32)\n"
+    "%s\n"
+    ".decl dist(x: int32, d: int32)\n"
+    "dist(1, 0).\n"
+    "dist(y, min(d + w)) :- dist(x, d), wedge(x, y, w).\n",
 };
 
 /* ----------------------------------------------------------------
@@ -228,7 +246,7 @@ run_workload(int wl_id, const char *data_path, uint32_t workers, int repeat)
         return -1;
 
     int32_t edge_count = 0;
-    if (csv_to_inline_facts(data_path, "edge", facts_buf, SRC_BUFSZ,
+    if (csv_to_inline_facts(data_path, wl_relations[wl_id], facts_buf, SRC_BUFSZ,
                             &edge_count)
         != 0) {
         free(facts_buf);
@@ -316,8 +334,11 @@ static void
 usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s --workload {tc|reach|all} --data FILE\n"
-            "          [--workers N] [--repeat R]\n",
+            "Usage: %s --workload {tc|reach|cc|sssp|all} --data FILE\n"
+            "          [--data-weighted FILE] [--workers N] [--repeat R]\n"
+            "\n"
+            "  --data FILE           Unweighted edge CSV (src,dst)\n"
+            "  --data-weighted FILE  Weighted edge CSV (src,dst,weight) for SSSP\n",
             prog);
 }
 
@@ -326,12 +347,14 @@ main(int argc, char **argv)
 {
     const char *workload = NULL;
     const char *data_path = NULL;
+    const char *data_weighted_path = NULL;
     uint32_t workers = 1;
     int repeat = 3;
 
     static struct option long_opts[] = {
         { "workload", required_argument, NULL, 'w' },
         { "data", required_argument, NULL, 'd' },
+        { "data-weighted", required_argument, NULL, 'W' },
         { "workers", required_argument, NULL, 'j' },
         { "repeat", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
@@ -339,7 +362,7 @@ main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "w:d:j:r:h", long_opts, NULL))
+    while ((opt = getopt_long(argc, argv, "w:d:W:j:r:h", long_opts, NULL))
            != -1) {
         switch (opt) {
         case 'w':
@@ -347,6 +370,9 @@ main(int argc, char **argv)
             break;
         case 'd':
             data_path = optarg;
+            break;
+        case 'W':
+            data_weighted_path = optarg;
             break;
         case 'j':
             workers = (uint32_t)strtoul(optarg, NULL, 10);
@@ -377,9 +403,22 @@ main(int argc, char **argv)
         rc = run_workload(WL_TC, data_path, workers, repeat);
     } else if (strcmp(workload, "reach") == 0) {
         rc = run_workload(WL_REACH, data_path, workers, repeat);
+    } else if (strcmp(workload, "cc") == 0) {
+        rc = run_workload(WL_CC, data_path, workers, repeat);
+    } else if (strcmp(workload, "sssp") == 0) {
+        if (!data_weighted_path) {
+            fprintf(stderr, "error: sssp requires --data-weighted FILE\n");
+            return 1;
+        }
+        rc = run_workload(WL_SSSP, data_weighted_path, workers, repeat);
     } else if (strcmp(workload, "all") == 0) {
         for (int i = 0; i < WL_COUNT; i++) {
-            int r = run_workload(i, data_path, workers, repeat);
+            if (i == WL_SSSP && !data_weighted_path) {
+                fprintf(stderr, "note: skipping sssp (no --data-weighted)\n");
+                continue;
+            }
+            const char *dp = (i == WL_SSSP) ? data_weighted_path : data_path;
+            int r = run_workload(i, dp, workers, repeat);
             if (r != 0)
                 rc = r;
         }

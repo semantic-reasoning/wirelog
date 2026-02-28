@@ -465,12 +465,33 @@ where
                 }
             }
 
-            SafeOp::Map { indices } => {
+            SafeOp::Map { indices, exprs } => {
                 if let Some(c) = current.take() {
                     if !indices.is_empty() {
                         let indices = indices.clone();
+                        let exprs = exprs.clone();
+                        let has_exprs = exprs.iter().any(|e| e.is_some());
                         current = Some(c.map(move |row: Row| {
-                            indices.iter().map(|&i| row[i as usize]).collect()
+                            if has_exprs {
+                                // Evaluate per-column expressions (head arithmetic)
+                                let mut vars = HashMap::new();
+                                for (i, val) in row.iter().enumerate() {
+                                    vars.insert(format!("col{}", i), crate::expr::Value::Int(*val));
+                                }
+                                indices
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(col_idx, &idx)| {
+                                        if let Some(Some(expr)) = exprs.get(col_idx) {
+                                            crate::expr::eval_arith(expr, &vars).unwrap_or(0)
+                                        } else {
+                                            row[idx as usize]
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                indices.iter().map(|&i| row[i as usize]).collect()
+                            }
                         }));
                     } else {
                         // Empty indices = identity pass-through
@@ -497,16 +518,22 @@ where
                 right_relation,
                 left_keys,
                 right_keys: _,
+                left_key_indices,
             } => {
                 if let Some(c) = current.take() {
                     let key_count = left_keys.len();
                     let right_coll = collections.get(right_relation).cloned();
 
                     if let Some(right) = right_coll {
-                        // Left: key = last key_count columns, value = full row
+                        // Left: extract key by indices (or fall back to last k columns)
                         let k = key_count;
+                        let lki = left_key_indices.clone();
                         let left_keyed = c.map(move |row: Row| {
-                            let key: Row = row[row.len() - k..].to_vec();
+                            let key: Row = if !lki.is_empty() {
+                                lki.iter().map(|&i| row[i as usize]).collect()
+                            } else {
+                                row[row.len() - k..].to_vec()
+                            };
                             (key, row)
                         });
 
@@ -726,6 +753,7 @@ mod tests {
                         },
                         SafeOp::Map {
                             indices: vec![1, 0],
+                            exprs: vec![],
                         },
                     ],
                 }],
@@ -797,6 +825,7 @@ mod tests {
                             right_relation: "b".to_string(),
                             left_keys: vec!["Y".to_string()],
                             right_keys: vec!["Y".to_string()],
+                            left_key_indices: vec![],
                         },
                     ],
                 }],
@@ -932,7 +961,10 @@ mod tests {
                             SafeOp::Variable {
                                 relation_name: "edge".to_string(),
                             },
-                            SafeOp::Map { indices: vec![1] },
+                            SafeOp::Map {
+                                indices: vec![1],
+                                exprs: vec![],
+                            },
                         ],
                     }],
                 },
@@ -1006,9 +1038,11 @@ mod tests {
                                 right_relation: "edge".to_string(),
                                 left_keys: vec!["Y".to_string()],
                                 right_keys: vec!["X".to_string()],
+                                left_key_indices: vec![],
                             },
                             SafeOp::Map {
                                 indices: vec![0, 2],
+                                exprs: vec![],
                             },
                         ],
                     }],
@@ -1062,9 +1096,11 @@ mod tests {
                                 right_relation: "edge".to_string(),
                                 left_keys: vec!["Y".to_string()],
                                 right_keys: vec!["X".to_string()],
+                                left_key_indices: vec![],
                             },
                             SafeOp::Map {
                                 indices: vec![0, 2],
+                                exprs: vec![],
                             },
                         ],
                     }],
@@ -1211,12 +1247,14 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![0, 0],
+                                exprs: vec![],
                             }, // (x,y) → (x,x)
                             SafeOp::Variable {
                                 relation_name: "edge".to_string(),
                             },
                             SafeOp::Map {
                                 indices: vec![1, 1],
+                                exprs: vec![],
                             }, // (x,y) → (y,y)
                             SafeOp::Concat,
                             SafeOp::Consolidate,
@@ -1235,15 +1273,18 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![1, 0],
+                                exprs: vec![],
                             }, // (x,c) → (c,x) put join key last
                             SafeOp::Join {
                                 right_relation: "edge".to_string(),
                                 left_keys: vec!["x".to_string()],
                                 right_keys: vec!["x".to_string()],
+                                left_key_indices: vec![],
                             },
                             // After join: (c, x, y) → project to (y, c)
                             SafeOp::Map {
                                 indices: vec![2, 0],
+                                exprs: vec![],
                             },
                             SafeOp::Reduce {
                                 agg_fn: SafeAggFn::Min,
@@ -1297,12 +1338,14 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![0, 0],
+                                exprs: vec![],
                             },
                             SafeOp::Variable {
                                 relation_name: "edge".to_string(),
                             },
                             SafeOp::Map {
                                 indices: vec![1, 1],
+                                exprs: vec![],
                             },
                             SafeOp::Concat,
                             SafeOp::Consolidate,
@@ -1321,14 +1364,17 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![1, 0],
+                                exprs: vec![],
                             },
                             SafeOp::Join {
                                 right_relation: "edge".to_string(),
                                 left_keys: vec!["x".to_string()],
                                 right_keys: vec!["x".to_string()],
+                                left_key_indices: vec![],
                             },
                             SafeOp::Map {
                                 indices: vec![2, 0],
+                                exprs: vec![],
                             },
                             SafeOp::Reduce {
                                 agg_fn: SafeAggFn::Min,
@@ -1396,12 +1442,14 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![0, 0],
+                                exprs: vec![],
                             },
                             SafeOp::Variable {
                                 relation_name: "edge".to_string(),
                             },
                             SafeOp::Map {
                                 indices: vec![1, 1],
+                                exprs: vec![],
                             },
                             SafeOp::Concat,
                             SafeOp::Consolidate,
@@ -1419,14 +1467,17 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![1, 0],
+                                exprs: vec![],
                             },
                             SafeOp::Join {
                                 right_relation: "edge".to_string(),
                                 left_keys: vec!["x".to_string()],
                                 right_keys: vec!["x".to_string()],
+                                left_key_indices: vec![],
                             },
                             SafeOp::Map {
                                 indices: vec![2, 0],
+                                exprs: vec![],
                             },
                             SafeOp::Reduce {
                                 agg_fn: SafeAggFn::Max,
@@ -1453,5 +1504,74 @@ mod tests {
         assert!(label.contains(&vec![1, 3]));
         assert!(label.contains(&vec![2, 3]));
         assert!(label.contains(&vec![3, 3]));
+    }
+
+    // ---- SSSP test (head arithmetic + recursive aggregation) ----
+
+    #[test]
+    fn test_sssp_head_arithmetic() {
+        // SSSP on a simple 3-node chain:
+        //   wedge(1, 2, 2).  wedge(2, 3, 1).
+        //   dist(1, 0).
+        //   dist(y, min(d + w)) :- dist(x, d), wedge(x, y, w).
+        //
+        // Expected: dist = {(1, 0), (2, 2), (3, 3)}
+
+        use crate::expr::ExprOp;
+
+        let plan = SafePlan {
+            strata: vec![SafeStratumPlan {
+                stratum_id: 0,
+                is_recursive: true,
+                relations: vec![SafeRelationPlan {
+                    name: "dist".to_string(),
+                    ops: vec![
+                        SafeOp::Variable {
+                            relation_name: "dist".to_string(),
+                        },
+                        // dist(x, d) → reorder to (d, x) with join key last
+                        SafeOp::Map {
+                            indices: vec![1, 0],
+                            exprs: vec![],
+                        },
+                        SafeOp::Join {
+                            right_relation: "wedge".to_string(),
+                            left_keys: vec!["x".to_string()],
+                            right_keys: vec!["x".to_string()],
+                            left_key_indices: vec![],
+                        },
+                        // After join: (d, x, y, w) → project to (y, d+w)
+                        SafeOp::Map {
+                            indices: vec![2, 1],
+                            exprs: vec![
+                                None, // column 0: y = row[2]
+                                Some(vec![
+                                    ExprOp::Var("col0".to_string()),
+                                    ExprOp::Var("col3".to_string()),
+                                    ExprOp::ArithAdd,
+                                ]), // column 1: d + w
+                            ],
+                        },
+                        SafeOp::Reduce {
+                            agg_fn: SafeAggFn::Min,
+                            group_by_indices: vec![0],
+                        },
+                    ],
+                }],
+            }],
+            edb_relations: vec!["wedge".to_string()],
+        };
+
+        let mut edb = HashMap::new();
+        edb.insert("wedge".to_string(), vec![vec![1, 2, 2], vec![2, 3, 1]]);
+        edb.insert("dist".to_string(), vec![vec![1, 0]]);
+
+        let result = execute_plan(&plan, &edb, 1).unwrap();
+        let dist = result.tuples.get("dist").unwrap();
+
+        assert_eq!(dist.len(), 3, "dist should have 3 tuples, got {:?}", dist);
+        assert!(dist.contains(&vec![1, 0]), "dist(1, 0) missing");
+        assert!(dist.contains(&vec![2, 2]), "dist(2, 2) missing");
+        assert!(dist.contains(&vec![3, 3]), "dist(3, 3) missing");
     }
 }

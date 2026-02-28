@@ -1017,6 +1017,253 @@ test_load_input_files_null_args(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+/* ======================================================================== */
+/* Test: Head Arithmetic                                                    */
+/* ======================================================================== */
+
+/*
+ * Datalog:
+ *   .decl a(x: int32, y: int32)
+ *   .decl b(x: int32, y: int32)
+ *   a(1, 10). a(2, 20).
+ *   b(x, y + 1) :- a(x, y).
+ *
+ * Expected: b(1, 11), b(2, 21)
+ */
+static void
+test_e2e_head_arith_simple(void)
+{
+    TEST("e2e: b(x, y+1) :- a(x,y) head arithmetic");
+
+    const char *src = ".decl a(x: int32, y: int32)\n"
+                      ".decl b(x: int32, y: int32)\n"
+                      "a(1, 10). a(2, 20).\n"
+                      "b(x, y + 1) :- a(x, y).\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_dd_plan_t *dd_plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        FAIL("dd_plan_generate failed");
+        return;
+    }
+
+    wl_ffi_plan_t *ffi = NULL;
+    rc = wl_dd_marshal_plan(dd_plan, &ffi);
+    if (rc != 0) {
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("dd_marshal_plan failed");
+        return;
+    }
+
+    wl_dd_worker_t *w = wl_dd_worker_create(1);
+    rc = wirelog_load_all_facts(prog, w);
+    if (rc != 0) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("wirelog_load_all_facts failed");
+        return;
+    }
+
+    tuple_collector_t results;
+    memset(&results, 0, sizeof(results));
+
+    rc = wl_dd_execute_cb(ffi, w, collect_tuple, &results);
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return;
+    }
+
+    int n = count_tuples(&results, "b");
+    if (n != 2) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected 2 b tuples, got %d", n);
+        /* Print all collected tuples for debugging */
+        for (int i = 0; i < results.count; i++) {
+            fprintf(stderr, "  tuple: %s(", results.relations[i]);
+            for (uint32_t j = 0; j < results.ncols[i]; j++) {
+                if (j > 0)
+                    fprintf(stderr, ", ");
+                fprintf(stderr, "%lld", (long long)results.rows[i][j]);
+            }
+            fprintf(stderr, ")\n");
+        }
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return;
+    }
+
+    int64_t b1[] = { 1, 11 };
+    int64_t b2[] = { 2, 21 };
+    if (!has_tuple(&results, "b", b1, 2) || !has_tuple(&results, "b", b2, 2)) {
+        /* Print tuples for debugging */
+        for (int i = 0; i < results.count; i++) {
+            fprintf(stderr, "  tuple: %s(", results.relations[i]);
+            for (uint32_t j = 0; j < results.ncols[i]; j++) {
+                if (j > 0)
+                    fprintf(stderr, ", ");
+                fprintf(stderr, "%lld", (long long)results.rows[i][j]);
+            }
+            fprintf(stderr, ")\n");
+        }
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("missing expected b tuple (expected b(1,11) and b(2,21))");
+        return;
+    }
+
+    wl_dd_worker_destroy(w);
+    wl_ffi_plan_free(ffi);
+    wl_dd_plan_free(dd_plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * SSSP: dist(y, min(d + w)) :- dist(x, d), wedge(x, y, w).
+ *
+ * EDB:  wedge(1,2,2). wedge(2,3,1).
+ *       dist(1, 0).
+ *
+ * Expected: dist(1,0), dist(2,2), dist(3,3)
+ */
+static void
+test_e2e_sssp(void)
+{
+    TEST("e2e: SSSP dist(y, min(d+w)) head arith + recursive min");
+
+    const char *src = ".decl wedge(x: int32, y: int32, w: int32)\n"
+                      ".decl dist(x: int32, d: int32)\n"
+                      "wedge(1, 2, 2). wedge(2, 3, 1).\n"
+                      "dist(1, 0).\n"
+                      "dist(y, min(d + w)) :- dist(x, d), wedge(x, y, w).\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_dd_plan_t *dd_plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        FAIL("dd_plan_generate failed");
+        return;
+    }
+
+    fprintf(stderr, "\n--- SSSP DD Plan ---\n");
+    wl_dd_plan_print(dd_plan);
+    fprintf(stderr, "--- End SSSP DD Plan ---\n");
+
+    wl_ffi_plan_t *ffi = NULL;
+    rc = wl_dd_marshal_plan(dd_plan, &ffi);
+    if (rc != 0) {
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("dd_marshal_plan failed");
+        return;
+    }
+
+    wl_dd_worker_t *w = wl_dd_worker_create(1);
+    rc = wirelog_load_all_facts(prog, w);
+    if (rc != 0) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("wirelog_load_all_facts failed");
+        return;
+    }
+
+    tuple_collector_t results;
+    memset(&results, 0, sizeof(results));
+
+    rc = wl_dd_execute_cb(ffi, w, collect_tuple, &results);
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return;
+    }
+
+    int n = count_tuples(&results, "dist");
+    if (n != 3) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected 3 dist tuples, got %d", n);
+        for (int i = 0; i < results.count; i++) {
+            fprintf(stderr, "  tuple: %s(", results.relations[i]);
+            for (uint32_t j = 0; j < results.ncols[i]; j++) {
+                if (j > 0)
+                    fprintf(stderr, ", ");
+                fprintf(stderr, "%lld", (long long)results.rows[i][j]);
+            }
+            fprintf(stderr, ")\n");
+        }
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return;
+    }
+
+    int64_t d1[] = { 1, 0 };
+    int64_t d2[] = { 2, 2 };
+    int64_t d3[] = { 3, 3 };
+    if (!has_tuple(&results, "dist", d1, 2)
+        || !has_tuple(&results, "dist", d2, 2)
+        || !has_tuple(&results, "dist", d3, 2)) {
+        for (int i = 0; i < results.count; i++) {
+            fprintf(stderr, "  tuple: %s(", results.relations[i]);
+            for (uint32_t j = 0; j < results.ncols[i]; j++) {
+                if (j > 0)
+                    fprintf(stderr, ", ");
+                fprintf(stderr, "%lld", (long long)results.rows[i][j]);
+            }
+            fprintf(stderr, ")\n");
+        }
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        FAIL("missing expected dist tuple");
+        return;
+    }
+
+    wl_dd_worker_destroy(w);
+    wl_ffi_plan_free(ffi);
+    wl_dd_plan_free(dd_plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -1040,6 +1287,10 @@ main(void)
 
     printf("\n--- End-to-end Inline Facts ---\n");
     test_e2e_inline_facts_tc();
+
+    printf("\n--- Head Arithmetic ---\n");
+    test_e2e_head_arith_simple();
+    test_e2e_sssp();
 
     printf("\n--- .input Directive CSV Loading ---\n");
     test_load_input_files_tc();
