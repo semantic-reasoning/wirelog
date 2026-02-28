@@ -10,6 +10,7 @@
  */
 
 #include "../wirelog/ffi/dd_ffi.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 
@@ -482,6 +483,155 @@ test_run_pipeline_csv_tab_delimiter(void)
 }
 
 /* ======================================================================== */
+/* Test: pipeline with string-typed output (symbol interning)                */
+/* ======================================================================== */
+
+static void
+test_run_pipeline_string_output(void)
+{
+    TEST(
+        "wl_run_pipeline outputs strings (not integer IDs) for string columns");
+
+    const char *src = ".decl edge(x: string, y: string)\n"
+                      "edge(\"A\", \"B\").\n"
+                      "edge(\"B\", \"C\").\n"
+                      ".decl tc(x: string, y: string)\n"
+                      "tc(x, y) :- edge(x, y).\n"
+                      "tc(x, z) :- tc(x, y), edge(y, z).\n";
+
+    char outpath[512];
+    test_tmppath(outpath, sizeof(outpath), "wirelog_test_string_out.txt");
+    FILE *f = fopen(outpath, "w");
+    if (!f) {
+        FAIL("cannot create output file");
+        return;
+    }
+
+    int rc = wl_run_pipeline(src, 1, f);
+    fclose(f);
+
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "wl_run_pipeline returned %d", rc);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    char *output = wl_read_file(outpath);
+    if (!output) {
+        remove(outpath);
+        FAIL("cannot read output file");
+        return;
+    }
+
+    /* Output should contain string values like "A", "B", "C"
+     * rather than integer IDs like 0, 1, 2 */
+    if (strstr(output, "\"A\"") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "output should contain '\"A\"' but got: %s",
+                 output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+    if (strstr(output, "\"B\"") == NULL) {
+        free(output);
+        remove(outpath);
+        FAIL("output should contain '\"B\"'");
+        return;
+    }
+    if (strstr(output, "\"C\"") == NULL) {
+        free(output);
+        remove(outpath);
+        FAIL("output should contain '\"C\"'");
+        return;
+    }
+
+    /* Should have 3 tc tuples: (A,B), (B,C), (A,C) */
+    int count = 0;
+    const char *p = output;
+    while ((p = strstr(p, "tc(")) != NULL) {
+        count++;
+        p++;
+    }
+
+    if (count != 3) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "expected 3 tc tuples, got %d\n%s", count,
+                 output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    free(output);
+    remove(outpath);
+    PASS();
+}
+
+static void
+test_run_pipeline_mixed_type_output(void)
+{
+    TEST("wl_run_pipeline outputs mixed string/int columns correctly");
+
+    const char *src = ".decl person(name: string, age: int32)\n"
+                      "person(\"Alice\", 30).\n"
+                      "person(\"Bob\", 25).\n"
+                      ".decl result(name: string, age: int32)\n"
+                      "result(n, a) :- person(n, a).\n";
+
+    char outpath[512];
+    test_tmppath(outpath, sizeof(outpath), "wirelog_test_mixed_out.txt");
+    FILE *f = fopen(outpath, "w");
+    if (!f) {
+        FAIL("cannot create output file");
+        return;
+    }
+
+    int rc = wl_run_pipeline(src, 1, f);
+    fclose(f);
+
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "wl_run_pipeline returned %d", rc);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    char *output = wl_read_file(outpath);
+    if (!output) {
+        remove(outpath);
+        FAIL("cannot read output file");
+        return;
+    }
+
+    /* Should contain string "Alice" and integer 30 */
+    if (strstr(output, "\"Alice\"") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "output should contain '\"Alice\"' but got: %s", output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+    if (strstr(output, "30") == NULL) {
+        free(output);
+        remove(outpath);
+        FAIL("output should contain integer 30");
+        return;
+    }
+
+    free(output);
+    remove(outpath);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -508,6 +658,10 @@ main(void)
     test_run_pipeline_csv_input();
     test_run_pipeline_csv_missing_file();
     test_run_pipeline_csv_tab_delimiter();
+
+    printf("\n--- Pipeline with String Output ---\n");
+    test_run_pipeline_string_output();
+    test_run_pipeline_mixed_type_output();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);

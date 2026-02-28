@@ -12,6 +12,8 @@
 #include "driver.h"
 
 #include "../ffi/dd_ffi.h"
+#include "../intern.h"
+#include "../ir/program.h"
 #include "../wirelog.h"
 
 #include <inttypes.h>
@@ -67,12 +69,56 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
     fprintf(out, ")\n");
 }
 
-/* Callback adapter: user_data is a FILE* */
+/* ======================================================================== */
+/* Type-aware output callback                                               */
+/* ======================================================================== */
+
+typedef struct {
+    FILE *out;
+    const wirelog_program_t *prog;
+    const wl_intern_t *intern;
+} wl_output_ctx_t;
+
+/* Find the relation info for a given relation name */
+static const wl_relation_info_t *
+find_relation(const wirelog_program_t *prog, const char *name)
+{
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (prog->relations[i].name
+            && strcmp(prog->relations[i].name, name) == 0)
+            return &prog->relations[i];
+    }
+    return NULL;
+}
+
+/* Callback adapter: type-aware output with string reverse-mapping */
 static void
 print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
                void *user_data)
 {
-    wl_print_tuple(relation, row, ncols, (FILE *)user_data);
+    wl_output_ctx_t *ctx = (wl_output_ctx_t *)user_data;
+    const wl_relation_info_t *rel = NULL;
+
+    if (ctx->prog)
+        rel = find_relation(ctx->prog, relation);
+
+    fprintf(ctx->out, "%s(", relation);
+    for (uint32_t i = 0; i < ncols; i++) {
+        if (i > 0)
+            fprintf(ctx->out, ", ");
+
+        if (rel && i < rel->column_count
+            && rel->columns[i].type == WIRELOG_TYPE_STRING && ctx->intern) {
+            const char *str = wl_intern_reverse(ctx->intern, row[i]);
+            if (str)
+                fprintf(ctx->out, "\"%s\"", str);
+            else
+                fprintf(ctx->out, "%" PRId64, row[i]);
+        } else {
+            fprintf(ctx->out, "%" PRId64, row[i]);
+        }
+    }
+    fprintf(ctx->out, ")\n");
 }
 
 int
@@ -132,8 +178,13 @@ wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
         return -1;
     }
 
-    /* 5. Execute with output callback */
-    rc = wl_dd_execute_cb(ffi, w, print_tuple_cb, out);
+    /* 5. Execute with type-aware output callback */
+    wl_output_ctx_t ctx = {
+        .out = out,
+        .prog = prog,
+        .intern = prog->intern,
+    };
+    rc = wl_dd_execute_cb(ffi, w, print_tuple_cb, &ctx);
 
     /* 6. Cleanup */
     wl_dd_worker_destroy(w);
