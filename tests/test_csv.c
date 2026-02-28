@@ -9,6 +9,8 @@
  */
 
 #include "../wirelog/io/csv_reader.h"
+#include "../wirelog/intern.h"
+#include "../wirelog/wirelog-types.h"
 #include "test_tmpdir.h"
 
 #include <stdio.h>
@@ -401,6 +403,142 @@ test_read_file_inconsistent_cols(void)
 }
 
 /* ======================================================================== */
+/* Test: wl_csv_parse_line_ex (mixed int/string)                            */
+/* ======================================================================== */
+
+static void
+test_parse_line_ex_mixed(void)
+{
+    TEST("parse_line_ex: mixed string and int columns");
+
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("intern create failed");
+        return;
+    }
+
+    wirelog_column_type_t types[]
+        = { WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT32, WIRELOG_TYPE_STRING };
+    int64_t values[3];
+    uint32_t count = 0;
+    int rc = wl_csv_parse_line_ex("\"Alice\",42,\"Bob\"", ',', types, 3, values,
+                                  &count, intern);
+
+    if (rc != 0) {
+        FAIL("returned non-zero");
+        wl_intern_free(intern);
+        return;
+    }
+    if (count != 3) {
+        FAIL("expected 3 values");
+        wl_intern_free(intern);
+        return;
+    }
+
+    /* Column 1 (int) should be 42 */
+    if (values[1] != 42) {
+        FAIL("int column should be 42");
+        wl_intern_free(intern);
+        return;
+    }
+
+    /* String columns should be interned */
+    const char *s0 = wl_intern_reverse(intern, values[0]);
+    const char *s2 = wl_intern_reverse(intern, values[2]);
+    if (!s0 || strcmp(s0, "Alice") != 0) {
+        FAIL("first string should be 'Alice'");
+        wl_intern_free(intern);
+        return;
+    }
+    if (!s2 || strcmp(s2, "Bob") != 0) {
+        FAIL("third string should be 'Bob'");
+        wl_intern_free(intern);
+        return;
+    }
+
+    wl_intern_free(intern);
+    PASS();
+}
+
+static void
+test_parse_line_ex_unquoted_strings(void)
+{
+    TEST("parse_line_ex: unquoted string values");
+
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("intern create failed");
+        return;
+    }
+
+    wirelog_column_type_t types[]
+        = { WIRELOG_TYPE_STRING, WIRELOG_TYPE_STRING };
+    int64_t values[2];
+    uint32_t count = 0;
+    int rc = wl_csv_parse_line_ex("hello,world", ',', types, 2, values, &count,
+                                  intern);
+
+    if (rc != 0) {
+        FAIL("returned non-zero");
+        wl_intern_free(intern);
+        return;
+    }
+    if (count != 2) {
+        FAIL("expected 2 values");
+        wl_intern_free(intern);
+        return;
+    }
+
+    const char *s0 = wl_intern_reverse(intern, values[0]);
+    const char *s1 = wl_intern_reverse(intern, values[1]);
+    if (!s0 || strcmp(s0, "hello") != 0) {
+        FAIL("first should be 'hello'");
+        wl_intern_free(intern);
+        return;
+    }
+    if (!s1 || strcmp(s1, "world") != 0) {
+        FAIL("second should be 'world'");
+        wl_intern_free(intern);
+        return;
+    }
+
+    wl_intern_free(intern);
+    PASS();
+}
+
+static void
+test_parse_line_ex_all_int(void)
+{
+    TEST("parse_line_ex: all-integer columns (backward compat)");
+
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("intern create failed");
+        return;
+    }
+
+    wirelog_column_type_t types[] = { WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT32 };
+    int64_t values[2];
+    uint32_t count = 0;
+    int rc
+        = wl_csv_parse_line_ex("10,20", ',', types, 2, values, &count, intern);
+
+    if (rc != 0) {
+        FAIL("returned non-zero");
+        wl_intern_free(intern);
+        return;
+    }
+    if (count != 2 || values[0] != 10 || values[1] != 20) {
+        FAIL("int values should be 10, 20");
+        wl_intern_free(intern);
+        return;
+    }
+
+    wl_intern_free(intern);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -418,6 +556,11 @@ main(void)
     test_parse_line_empty();
     test_parse_line_null_input();
     test_parse_line_overflow();
+
+    printf("\n--- Mixed Type Parsing ---\n");
+    test_parse_line_ex_mixed();
+    test_parse_line_ex_unquoted_strings();
+    test_parse_line_ex_all_int();
 
     printf("\n--- File Reading ---\n");
     test_read_file_basic();

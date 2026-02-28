@@ -12,6 +12,9 @@
 #ifndef WIRELOG_IO_CSV_READER_H
 #define WIRELOG_IO_CSV_READER_H
 
+#include "../wirelog-types.h"
+#include "../intern.h"
+
 #include <stdint.h>
 
 /**
@@ -54,5 +57,31 @@ wl_csv_parse_line(const char *line, char delimiter, int64_t *values,
 int
 wl_csv_read_file(const char *path, char delimiter, int64_t **data,
                  uint32_t *nrows, uint32_t *ncols);
+
+/**
+ * wl_csv_parse_line_ex:
+ * @line:      NUL-terminated line of text.
+ * @delimiter: Field separator character.
+ * @col_types: Array of column types (STRING columns are interned).
+ * @num_cols:  Number of columns expected (length of @col_types).
+ * @values:    Output buffer for parsed int64_t values (length >= @num_cols).
+ * @count:     (out) Number of values parsed.
+ * @intern:    Intern table for string columns (must not be NULL if any
+ *             column is STRING).
+ *
+ * Parse a CSV line with mixed integer and string columns.  Integer
+ * columns are parsed as int64_t; string columns are interned and
+ * stored as int64_t IDs.  Quoted strings (double-quote delimited) are
+ * supported; quotes are stripped before interning.
+ *
+ * Returns:
+ *    0: Success.
+ *   -1: Invalid arguments or parse error.
+ *   -2: Column count mismatch.
+ */
+int
+wl_csv_parse_line_ex(const char *line, char delimiter,
+                     const wirelog_column_type_t *col_types, uint32_t num_cols,
+                     int64_t *values, uint32_t *count, wl_intern_t *intern);
 
 #endif /* WIRELOG_IO_CSV_READER_H */

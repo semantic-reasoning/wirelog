@@ -154,3 +154,84 @@ wl_csv_read_file(const char *path, char delimiter, int64_t **data,
     *ncols = cols_expected;
     return 0;
 }
+
+/* ======================================================================== */
+/* Extended Line Parser (mixed int/string)                                  */
+/* ======================================================================== */
+
+int
+wl_csv_parse_line_ex(const char *line, char delimiter,
+                     const wirelog_column_type_t *col_types, uint32_t num_cols,
+                     int64_t *values, uint32_t *count, wl_intern_t *intern)
+{
+    if (!line || !col_types || !values || !count || num_cols == 0)
+        return -1;
+
+    *count = 0;
+    const char *p = line;
+
+    for (uint32_t col = 0; col < num_cols; col++) {
+        /* Skip leading whitespace */
+        while (*p && *p != delimiter && *p != '"' && isspace((unsigned char)*p))
+            p++;
+
+        if (*p == '\0' && col < num_cols - 1)
+            return -2; /* too few columns */
+
+        if (col_types[col] == WIRELOG_TYPE_STRING) {
+            /* Parse string field: quoted or unquoted */
+            char strbuf[4096];
+            size_t slen = 0;
+
+            if (*p == '"') {
+                /* Quoted field: read until closing quote */
+                p++; /* skip opening quote */
+                while (*p && *p != '"') {
+                    if (slen < sizeof(strbuf) - 1)
+                        strbuf[slen++] = *p;
+                    p++;
+                }
+                if (*p == '"')
+                    p++; /* skip closing quote */
+            } else {
+                /* Unquoted field: read until delimiter or end */
+                while (*p && *p != delimiter && *p != '\n' && *p != '\r') {
+                    if (slen < sizeof(strbuf) - 1)
+                        strbuf[slen++] = *p;
+                    p++;
+                }
+                /* Trim trailing whitespace */
+                while (slen > 0 && isspace((unsigned char)strbuf[slen - 1]))
+                    slen--;
+            }
+            strbuf[slen] = '\0';
+
+            if (!intern)
+                return -1;
+            values[col] = wl_intern_put(intern, strbuf);
+            if (values[col] < 0)
+                return -1;
+        } else {
+            /* Parse integer field */
+            char *end;
+            values[col] = strtoll(p, &end, 10);
+            if (end == p)
+                return -1; /* not a valid integer */
+            p = end;
+
+            /* Skip trailing whitespace */
+            while (*p && *p != delimiter && isspace((unsigned char)*p))
+                p++;
+        }
+
+        (*count)++;
+
+        /* Skip delimiter between fields */
+        if (col < num_cols - 1) {
+            if (*p == delimiter)
+                p++;
+        }
+    }
+
+    return 0;
+}
