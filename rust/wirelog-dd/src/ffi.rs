@@ -328,6 +328,7 @@ mod tests {
             assert_eq!(rc, 0);
 
             // Verify stored data
+            assert!(!w.is_null());
             let worker = &*w;
             let rows = worker.edb_data.get("edge").unwrap();
             assert_eq!(rows.len(), 3);
@@ -353,6 +354,7 @@ mod tests {
             let data_b: [i64; 4] = [1, 2, 3, 4];
             wl_dd_load_edb(w, name_b.as_ptr(), data_b.as_ptr(), 2, 2);
 
+            assert!(!w.is_null());
             let worker = &*w;
             assert_eq!(worker.edb_data.len(), 2);
             assert_eq!(worker.edb_data["a"].len(), 2);
@@ -376,6 +378,7 @@ mod tests {
             let data2: [i64; 2] = [3, 4];
             wl_dd_load_edb(w, name.as_ptr(), data2.as_ptr(), 1, 2);
 
+            assert!(!w.is_null());
             let worker = &*w;
             let rows = worker.edb_data.get("a").unwrap();
             assert_eq!(rows.len(), 2);

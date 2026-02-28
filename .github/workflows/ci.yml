@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   # ==========================================================================
   # Gate: Lint must pass before any CI job runs
