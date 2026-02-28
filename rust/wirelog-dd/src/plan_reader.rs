@@ -34,10 +34,7 @@ pub enum SafeOp {
     Variable { relation_name: String },
 
     /// Column projection with optional per-column expressions.
-    Map {
-        indices: Vec<u32>,
-        exprs: Option<Vec<Vec<ExprOp>>>,
-    },
+    Map { indices: Vec<u32> },
 
     /// Predicate filter with deserialized expression.
     Filter { expr: Vec<ExprOp> },
@@ -76,7 +73,6 @@ pub enum SafeAggFn {
     Sum,
     Min,
     Max,
-    Avg,
 }
 
 /// Safe owned representation of a per-relation operator sequence.
@@ -204,33 +200,12 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
         }
 
         WlFfiOpType::Map => {
-            // NULL project_indices with non-zero count means expression-based
-            // projection (not yet supported in FFI).  Treat as identity.
             let indices = if op.project_indices.is_null() {
                 Vec::new()
             } else {
                 read_u32_array(op.project_indices, op.project_count, "op.project_indices")?
             };
-
-            let exprs = if !op.map_exprs.is_null() && op.map_expr_count > 0 {
-                let expr_buffers =
-                    std::slice::from_raw_parts(op.map_exprs, op.map_expr_count as usize);
-                let mut result = Vec::new();
-                for buf in expr_buffers {
-                    if buf.data.is_null() || buf.size == 0 {
-                        continue;
-                    }
-                    let data = std::slice::from_raw_parts(buf.data, buf.size as usize);
-                    let expr = deserialize_expr(data)
-                        .map_err(|e| PlanReadError::ExprDeserializeError(e.to_string()))?;
-                    result.push(expr);
-                }
-                Some(result)
-            } else {
-                None
-            };
-
-            Ok(SafeOp::Map { indices, exprs })
+            Ok(SafeOp::Map { indices })
         }
 
         WlFfiOpType::Filter => {
@@ -273,7 +248,7 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
                 WlAggFn::Sum => SafeAggFn::Sum,
                 WlAggFn::Min => SafeAggFn::Min,
                 WlAggFn::Max => SafeAggFn::Max,
-                WlAggFn::Avg => SafeAggFn::Avg,
+                WlAggFn::Avg => return Err(PlanReadError::InvalidAggFn(4)),
             };
             let gb = read_u32_array(
                 op.group_by_indices,
@@ -542,7 +517,6 @@ mod tests {
                 result.strata[0].relations[0].ops[0],
                 SafeOp::Map {
                     indices: vec![1, 0],
-                    exprs: None,
                 }
             );
         }

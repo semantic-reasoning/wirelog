@@ -12,8 +12,6 @@ crate-type = ["staticlib"]
 [dependencies]
 differential-dataflow = { git = "https://github.com/TimelyDataflow/differential-dataflow", tag = "differential-dogs3-v0.19.1", default-features = false }
 timely = { version = "0.26", default-features = false }
-columnar = { version = "0.11", default-features = false }
-serde = { version = "1", features = ["derive"] }
 
 [profile.release]
 opt-level = "s"

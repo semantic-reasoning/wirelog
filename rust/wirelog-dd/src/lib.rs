@@ -18,8 +18,5 @@ mod ffi;
 pub mod ffi_types;
 mod plan_reader;
 
-#[cfg(test)]
-mod dd_smoke_test;
-
 // Re-export FFI entry points (they are #[no_mangle] extern "C")
 pub use ffi::*;

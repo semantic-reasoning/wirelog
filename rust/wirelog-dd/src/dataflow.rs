@@ -377,7 +377,7 @@ where
                 }
             }
 
-            SafeOp::Map { indices, .. } => {
+            SafeOp::Map { indices } => {
                 if let Some(c) = current.take() {
                     if !indices.is_empty() {
                         let indices = indices.clone();
@@ -512,18 +512,6 @@ where
                                     let vi = input[0].0.len() - 1;
                                     input.iter().map(|(r, _)| r[vi]).max().unwrap_or(0)
                                 }
-                                SafeAggFn::Avg => {
-                                    let vi = input[0].0.len() - 1;
-                                    let total_count: i64 =
-                                        input.iter().map(|(_, c)| *c as i64).sum();
-                                    let sum: i64 =
-                                        input.iter().map(|(r, c)| r[vi] * (*c as i64)).sum();
-                                    if total_count > 0 {
-                                        sum / total_count
-                                    } else {
-                                        0
-                                    }
-                                }
                             };
                             output.push((agg_val, 1));
                         },
@@ -650,7 +638,6 @@ mod tests {
                         },
                         SafeOp::Map {
                             indices: vec![1, 0],
-                            exprs: None,
                         },
                     ],
                 }],
@@ -857,10 +844,7 @@ mod tests {
                             SafeOp::Variable {
                                 relation_name: "edge".to_string(),
                             },
-                            SafeOp::Map {
-                                indices: vec![1],
-                                exprs: None,
-                            },
+                            SafeOp::Map { indices: vec![1] },
                         ],
                     }],
                 },
@@ -937,7 +921,6 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![0, 2],
-                                exprs: None,
                             },
                         ],
                     }],
@@ -994,7 +977,6 @@ mod tests {
                             },
                             SafeOp::Map {
                                 indices: vec![0, 2],
-                                exprs: None,
                             },
                         ],
                     }],

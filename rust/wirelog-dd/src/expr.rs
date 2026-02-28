@@ -17,11 +17,8 @@
  * Tags and payloads:
  * - 0x01 VAR: [name_len:u16le] [name:u8*name_len] (no NUL terminator)
  * - 0x02 CONST_INT: [value:i64le] (8 bytes)
- * - 0x03 CONST_STR: [len:u16le] [data:u8*len] (no NUL terminator)
- * - 0x04 BOOL: [value:u8] (0=false, 1=true)
  * - 0x10-0x14 ARITH (ADD,SUB,MUL,DIV,MOD): no payload, binary (pop 2, push 1)
  * - 0x20-0x25 CMP (EQ,NEQ,LT,GT,LTE,GTE): no payload, binary (pop 2, push 1)
- * - 0x30-0x33 AGG (COUNT,SUM,MIN,MAX): no payload, unary (pop 1, push 1)
  *
  * Evaluation: walk buffer left-to-right, push values onto stack, operators pop
  * operands and push result. Well-formed expression leaves exactly one value on stack.
@@ -39,8 +36,6 @@ use std::collections::HashMap;
 pub enum ExprOp {
     Var(String),
     ConstInt(i64),
-    ConstStr(String),
-    Bool(bool),
     ArithAdd,
     ArithSub,
     ArithMul,
@@ -52,10 +47,6 @@ pub enum ExprOp {
     CmpGt,
     CmpLte,
     CmpGte,
-    AggCount,
-    AggSum,
-    AggMin,
-    AggMax,
 }
 
 /* ======================================================================== */
@@ -66,8 +57,6 @@ pub enum ExprOp {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Int(i64),
-    Str(String),
-    Bool(bool),
 }
 
 /* ======================================================================== */
@@ -81,7 +70,6 @@ pub enum ExprError {
     UnknownTag(u8),
     InvalidUtf8,
     StackUnderflow,
-    TypeMismatch,
     UndefinedVariable(String),
     InvalidResult,
     DivisionByZero,
@@ -94,7 +82,6 @@ impl std::fmt::Display for ExprError {
             ExprError::UnknownTag(tag) => write!(f, "Unknown expression tag: 0x{:02x}", tag),
             ExprError::InvalidUtf8 => write!(f, "Invalid UTF-8 in expression string"),
             ExprError::StackUnderflow => write!(f, "Stack underflow during evaluation"),
-            ExprError::TypeMismatch => write!(f, "Type mismatch in operation"),
             ExprError::UndefinedVariable(name) => write!(f, "Undefined variable: {}", name),
             ExprError::InvalidResult => write!(f, "Invalid expression result"),
             ExprError::DivisionByZero => write!(f, "Division by zero"),
@@ -162,37 +149,6 @@ pub fn deserialize_expr(data: &[u8]) -> Result<Vec<ExprOp>, ExprError> {
                 ops.push(ExprOp::ConstInt(value));
             }
 
-            WlFfiExprTag::ConstStr => {
-                // CONST_STR: [len:u16le] [data:u8*len]
-                if pos + 2 > data.len() {
-                    return Err(ExprError::TruncatedBuffer);
-                }
-                let str_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
-
-                if pos + str_len > data.len() {
-                    return Err(ExprError::TruncatedBuffer);
-                }
-                let str_bytes = &data[pos..pos + str_len];
-                let string = std::str::from_utf8(str_bytes)
-                    .map_err(|_| ExprError::InvalidUtf8)?
-                    .to_string();
-                pos += str_len;
-
-                ops.push(ExprOp::ConstStr(string));
-            }
-
-            WlFfiExprTag::Bool => {
-                // BOOL: [value:u8]
-                if pos >= data.len() {
-                    return Err(ExprError::TruncatedBuffer);
-                }
-                let value = data[pos] != 0;
-                pos += 1;
-
-                ops.push(ExprOp::Bool(value));
-            }
-
             // Arithmetic operators (no payload)
             WlFfiExprTag::ArithAdd => ops.push(ExprOp::ArithAdd),
             WlFfiExprTag::ArithSub => ops.push(ExprOp::ArithSub),
@@ -208,11 +164,15 @@ pub fn deserialize_expr(data: &[u8]) -> Result<Vec<ExprOp>, ExprError> {
             WlFfiExprTag::CmpLte => ops.push(ExprOp::CmpLte),
             WlFfiExprTag::CmpGte => ops.push(ExprOp::CmpGte),
 
-            // Aggregation operators (no payload)
-            WlFfiExprTag::AggCount => ops.push(ExprOp::AggCount),
-            WlFfiExprTag::AggSum => ops.push(ExprOp::AggSum),
-            WlFfiExprTag::AggMin => ops.push(ExprOp::AggMin),
-            WlFfiExprTag::AggMax => ops.push(ExprOp::AggMax),
+            // Dead code paths (should never appear in i64-only DD execution)
+            WlFfiExprTag::ConstStr
+            | WlFfiExprTag::Bool
+            | WlFfiExprTag::AggCount
+            | WlFfiExprTag::AggSum
+            | WlFfiExprTag::AggMin
+            | WlFfiExprTag::AggMax => {
+                return Err(ExprError::UnknownTag(tag_byte));
+            }
         }
     }
 
@@ -257,14 +217,6 @@ pub fn eval_filter(ops: &[ExprOp], vars: &HashMap<String, Value>) -> Result<bool
                 stack.push(Value::Int(*val));
             }
 
-            ExprOp::ConstStr(s) => {
-                stack.push(Value::Str(s.clone()));
-            }
-
-            ExprOp::Bool(b) => {
-                stack.push(Value::Bool(*b));
-            }
-
             // Arithmetic operations (binary, require Int operands)
             ExprOp::ArithAdd => {
                 let b = pop_int(&mut stack)?;
@@ -302,66 +254,56 @@ pub fn eval_filter(ops: &[ExprOp], vars: &HashMap<String, Value>) -> Result<bool
                 stack.push(Value::Int(a % b));
             }
 
-            // Comparison operations (binary, return Bool)
+            // Comparison operations (binary, return Int: 0=false, 1=true)
             ExprOp::CmpEq => {
                 let b = pop_value(&mut stack)?;
                 let a = pop_value(&mut stack)?;
-                stack.push(Value::Bool(a == b));
+                stack.push(Value::Int(if a == b { 1 } else { 0 }));
             }
 
             ExprOp::CmpNeq => {
                 let b = pop_value(&mut stack)?;
                 let a = pop_value(&mut stack)?;
-                stack.push(Value::Bool(a != b));
+                stack.push(Value::Int(if a != b { 1 } else { 0 }));
             }
 
             ExprOp::CmpLt => {
                 let b = pop_value(&mut stack)?;
                 let a = pop_value(&mut stack)?;
                 let result = compare_values(&a, &b)?;
-                stack.push(Value::Bool(result < 0));
+                stack.push(Value::Int(if result < 0 { 1 } else { 0 }));
             }
 
             ExprOp::CmpGt => {
                 let b = pop_value(&mut stack)?;
                 let a = pop_value(&mut stack)?;
                 let result = compare_values(&a, &b)?;
-                stack.push(Value::Bool(result > 0));
+                stack.push(Value::Int(if result > 0 { 1 } else { 0 }));
             }
 
             ExprOp::CmpLte => {
                 let b = pop_value(&mut stack)?;
                 let a = pop_value(&mut stack)?;
                 let result = compare_values(&a, &b)?;
-                stack.push(Value::Bool(result <= 0));
+                stack.push(Value::Int(if result <= 0 { 1 } else { 0 }));
             }
 
             ExprOp::CmpGte => {
                 let b = pop_value(&mut stack)?;
                 let a = pop_value(&mut stack)?;
                 let result = compare_values(&a, &b)?;
-                stack.push(Value::Bool(result >= 0));
-            }
-
-            // Aggregation operations (pass through for now, used in REDUCE not FILTER)
-            ExprOp::AggCount | ExprOp::AggSum | ExprOp::AggMin | ExprOp::AggMax => {
-                // These are not evaluated in FILTER context; they're used in REDUCE.
-                // For now, we just pass through whatever is on the stack.
-                // In a real implementation, these would be handled differently.
-                let _val = pop_value(&mut stack)?;
-                stack.push(_val);
+                stack.push(Value::Int(if result >= 0 { 1 } else { 0 }));
             }
         }
     }
 
-    // Final stack must have exactly one Bool value
+    // Final stack must have exactly one Int value (0=false, 1=true)
     if stack.len() != 1 {
         return Err(ExprError::InvalidResult);
     }
 
     match stack.pop().unwrap() {
-        Value::Bool(b) => Ok(b),
-        _ => Err(ExprError::InvalidResult),
+        Value::Int(i) => Ok(i != 0),
     }
 }
 
@@ -378,12 +320,10 @@ fn pop_value(stack: &mut Vec<Value>) -> Result<Value, ExprError> {
 fn pop_int(stack: &mut Vec<Value>) -> Result<i64, ExprError> {
     match pop_value(stack)? {
         Value::Int(i) => Ok(i),
-        _ => Err(ExprError::TypeMismatch),
     }
 }
 
 /// Compare two values, returning -1, 0, or 1.
-/// Values must be of the same type.
 fn compare_values(a: &Value, b: &Value) -> Result<i32, ExprError> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(if x < y {
@@ -393,21 +333,6 @@ fn compare_values(a: &Value, b: &Value) -> Result<i32, ExprError> {
         } else {
             0
         }),
-        (Value::Str(x), Value::Str(y)) => Ok(if x < y {
-            -1
-        } else if x > y {
-            1
-        } else {
-            0
-        }),
-        (Value::Bool(x), Value::Bool(y)) => Ok(if x < y {
-            -1
-        } else if x > y {
-            1
-        } else {
-            0
-        }),
-        _ => Err(ExprError::TypeMismatch),
     }
 }
 
@@ -448,30 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_const_str() {
-        // CONST_STR "hello": [0x03] [0x05, 0x00] [h, e, l, l, o]
-        let data = vec![0x03, 0x05, 0x00, b'h', b'e', b'l', b'l', b'o'];
-        let ops = deserialize_expr(&data).unwrap();
-        assert_eq!(ops, vec![ExprOp::ConstStr("hello".to_string())]);
-    }
-
-    #[test]
-    fn test_deserialize_bool_true() {
-        // BOOL true: [0x04] [0x01]
-        let data = vec![0x04, 0x01];
-        let ops = deserialize_expr(&data).unwrap();
-        assert_eq!(ops, vec![ExprOp::Bool(true)]);
-    }
-
-    #[test]
-    fn test_deserialize_bool_false() {
-        // BOOL false: [0x04] [0x00]
-        let data = vec![0x04, 0x00];
-        let ops = deserialize_expr(&data).unwrap();
-        assert_eq!(ops, vec![ExprOp::Bool(false)]);
-    }
-
-    #[test]
     fn test_deserialize_compound() {
         // X > 5: VAR "X", CONST_INT 5, CMP_GT
         // [0x01] [0x01, 0x00] [0x58] [0x02] [5, 0, 0, 0, 0, 0, 0, 0] [0x23]
@@ -500,11 +401,6 @@ mod tests {
 
         // CONST_INT with incomplete value
         let data = vec![0x02, 0x01, 0x02];
-        let result = deserialize_expr(&data);
-        assert_eq!(result, Err(ExprError::TruncatedBuffer));
-
-        // CONST_STR with incomplete data
-        let data = vec![0x03, 0x05, 0x00, b'h', b'i'];
         let result = deserialize_expr(&data);
         assert_eq!(result, Err(ExprError::TruncatedBuffer));
     }
@@ -593,51 +489,6 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_string_eq() {
-        // name = "alice"
-        let ops = vec![
-            ExprOp::Var("name".to_string()),
-            ExprOp::ConstStr("alice".to_string()),
-            ExprOp::CmpEq,
-        ];
-        let mut vars = HashMap::new();
-        vars.insert("name".to_string(), Value::Str("alice".to_string()));
-
-        let result = eval_filter(&ops, &vars).unwrap();
-        assert_eq!(result, true);
-    }
-
-    #[test]
-    fn test_eval_string_eq_false() {
-        // name = "alice" with name = "bob"
-        let ops = vec![
-            ExprOp::Var("name".to_string()),
-            ExprOp::ConstStr("alice".to_string()),
-            ExprOp::CmpEq,
-        ];
-        let mut vars = HashMap::new();
-        vars.insert("name".to_string(), Value::Str("bob".to_string()));
-
-        let result = eval_filter(&ops, &vars).unwrap();
-        assert_eq!(result, false);
-    }
-
-    #[test]
-    fn test_eval_string_comparison() {
-        // name < "charlie" with name = "alice"
-        let ops = vec![
-            ExprOp::Var("name".to_string()),
-            ExprOp::ConstStr("charlie".to_string()),
-            ExprOp::CmpLt,
-        ];
-        let mut vars = HashMap::new();
-        vars.insert("name".to_string(), Value::Str("alice".to_string()));
-
-        let result = eval_filter(&ops, &vars).unwrap();
-        assert_eq!(result, true); // "alice" < "charlie"
-    }
-
-    #[test]
     fn test_eval_undefined_var() {
         // X > 5 with no X defined
         let ops = vec![
@@ -649,36 +500,6 @@ mod tests {
 
         let result = eval_filter(&ops, &vars);
         assert_eq!(result, Err(ExprError::UndefinedVariable("X".to_string())));
-    }
-
-    #[test]
-    fn test_eval_type_mismatch() {
-        // X > "hello" with X = 5 (comparing int with string)
-        let ops = vec![
-            ExprOp::Var("X".to_string()),
-            ExprOp::ConstStr("hello".to_string()),
-            ExprOp::CmpGt,
-        ];
-        let mut vars = HashMap::new();
-        vars.insert("X".to_string(), Value::Int(5));
-
-        let result = eval_filter(&ops, &vars);
-        assert_eq!(result, Err(ExprError::TypeMismatch));
-    }
-
-    #[test]
-    fn test_eval_type_mismatch_arithmetic() {
-        // X + "hello" with X = 5
-        let ops = vec![
-            ExprOp::Var("X".to_string()),
-            ExprOp::ConstStr("hello".to_string()),
-            ExprOp::ArithAdd,
-        ];
-        let mut vars = HashMap::new();
-        vars.insert("X".to_string(), Value::Int(5));
-
-        let result = eval_filter(&ops, &vars);
-        assert_eq!(result, Err(ExprError::TypeMismatch));
     }
 
     #[test]
@@ -724,16 +545,6 @@ mod tests {
     fn test_eval_invalid_result_too_many() {
         // Push two values but no operator (stack has 2 items at end)
         let ops = vec![ExprOp::ConstInt(5), ExprOp::ConstInt(10)];
-        let vars = HashMap::new();
-
-        let result = eval_filter(&ops, &vars);
-        assert_eq!(result, Err(ExprError::InvalidResult));
-    }
-
-    #[test]
-    fn test_eval_invalid_result_not_bool() {
-        // Expression that leaves an Int on stack instead of Bool
-        let ops = vec![ExprOp::ConstInt(5)];
         let vars = HashMap::new();
 
         let result = eval_filter(&ops, &vars);
@@ -812,21 +623,6 @@ mod tests {
 
         let result = eval_filter(&ops, &vars).unwrap();
         assert_eq!(result, true); // 10 % 3 = 1
-    }
-
-    #[test]
-    fn test_eval_bool_comparison() {
-        // flag = true
-        let ops = vec![
-            ExprOp::Var("flag".to_string()),
-            ExprOp::Bool(true),
-            ExprOp::CmpEq,
-        ];
-        let mut vars = HashMap::new();
-        vars.insert("flag".to_string(), Value::Bool(true));
-
-        let result = eval_filter(&ops, &vars).unwrap();
-        assert_eq!(result, true);
     }
 
     // ---- Integration Tests (Deserialize + Eval) ----
