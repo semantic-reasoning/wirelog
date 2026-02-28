@@ -228,6 +228,13 @@ fn execute_recursive_stratum_dd<A: timely::communication::Allocate>(
                 inner.concat(&new_tuples).distinct()
             });
 
+            // Post-process: consolidate recursive min/max results
+            let result = if let Some((agg_fn, num_group_cols)) = find_reduce_in_plan(rel_plan) {
+                apply_post_reduce(result, agg_fn, num_group_cols)
+            } else {
+                result
+            };
+
             let rn = rel_name.clone();
             let results_ref = results_clone.clone();
             result
@@ -308,9 +315,21 @@ fn execute_recursive_stratum_dd<A: timely::communication::Allocate>(
                 let tag = idx as i64;
                 let rn = rel_name.clone();
                 let results_ref = results_clone.clone();
-                result
+
+                let per_rel = result
                     .filter(move |row: &Row| row[0] == tag)
-                    .map(|row: Row| row[1..].to_vec())
+                    .map(|row: Row| row[1..].to_vec());
+
+                // Post-process: consolidate recursive min/max results
+                let per_rel = if let Some((agg_fn, num_group_cols)) =
+                    find_reduce_in_plan(&relations_owned[idx])
+                {
+                    apply_post_reduce(per_rel, agg_fn, num_group_cols)
+                } else {
+                    per_rel
+                };
+
+                per_rel
                     .consolidate()
                     .inspect(move |&(ref data, _time, diff): &(Row, _, isize)| {
                         if diff > 0 {
@@ -335,6 +354,75 @@ fn execute_recursive_stratum_dd<A: timely::communication::Allocate>(
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
     }
+}
+
+/* ======================================================================== */
+/* Post-processing for recursive aggregation                                */
+/* ======================================================================== */
+
+/// Check if a relation plan contains a Reduce operation.
+/// Returns the aggregation function and number of group-by columns.
+fn find_reduce_in_plan(plan: &SafeRelationPlan) -> Option<(SafeAggFn, usize)> {
+    for op in &plan.ops {
+        if let SafeOp::Reduce {
+            agg_fn,
+            group_by_indices,
+        } = op
+        {
+            return Some((*agg_fn, group_by_indices.len()));
+        }
+    }
+    None
+}
+
+/// Apply a post-processing reduction to consolidate recursive aggregation.
+///
+/// After iterate() with concat+distinct, the result contains ALL derived
+/// tuples across iterations.  For min/max aggregation, we must reduce
+/// the accumulated tuples to keep only the aggregate value per group.
+fn apply_post_reduce<G: Scope>(
+    collection: VecCollection<G, Row>,
+    agg_fn: SafeAggFn,
+    num_group_cols: usize,
+) -> VecCollection<G, Row>
+where
+    G::Timestamp: differential_dataflow::lattice::Lattice + Ord,
+{
+    let keyed = collection.map(move |row: Row| {
+        let key: Row = row[..num_group_cols].to_vec();
+        (key, row)
+    });
+
+    let reduced = keyed.reduce(
+        move |_key: &Row, input: &[(&Row, isize)], output: &mut Vec<(i64, isize)>| {
+            let agg_val = match agg_fn {
+                SafeAggFn::Count => input.iter().map(|(_, c)| *c as i64).sum::<i64>(),
+                SafeAggFn::Sum => {
+                    let vi = if !input.is_empty() && !input[0].0.is_empty() {
+                        input[0].0.len() - 1
+                    } else {
+                        0
+                    };
+                    input.iter().map(|(r, c)| r[vi] * (*c as i64)).sum()
+                }
+                SafeAggFn::Min => {
+                    let vi = input[0].0.len() - 1;
+                    input.iter().map(|(r, _)| r[vi]).min().unwrap_or(0)
+                }
+                SafeAggFn::Max => {
+                    let vi = input[0].0.len() - 1;
+                    input.iter().map(|(r, _)| r[vi]).max().unwrap_or(0)
+                }
+            };
+            output.push((agg_val, 1));
+        },
+    );
+
+    reduced.map(|(key, agg): (Row, i64)| {
+        let mut r = key;
+        r.push(agg);
+        r
+    })
 }
 
 /* ======================================================================== */
@@ -1016,5 +1104,354 @@ mod tests {
         let result = execute_plan(&plan, &edb, 1).unwrap();
         let tc = result.tuples.get("tc").unwrap();
         assert!(tc.is_empty());
+    }
+
+    // ---- Non-recursive aggregation tests (sanity checks) ----
+
+    #[test]
+    fn test_reduce_min() {
+        // result(x, min(y)) :- data(x, y)
+        // data: (1,10), (1,20), (2,30), (2,5)
+        // Expected: (1,10), (2,5)
+        let plan = SafePlan {
+            strata: vec![SafeStratumPlan {
+                stratum_id: 0,
+                is_recursive: false,
+                relations: vec![SafeRelationPlan {
+                    name: "result".to_string(),
+                    ops: vec![
+                        SafeOp::Variable {
+                            relation_name: "data".to_string(),
+                        },
+                        SafeOp::Reduce {
+                            agg_fn: SafeAggFn::Min,
+                            group_by_indices: vec![0],
+                        },
+                    ],
+                }],
+            }],
+            edb_relations: vec!["data".to_string()],
+        };
+
+        let mut edb = HashMap::new();
+        edb.insert(
+            "data".to_string(),
+            vec![vec![1, 10], vec![1, 20], vec![2, 30], vec![2, 5]],
+        );
+
+        let result = execute_plan(&plan, &edb, 1).unwrap();
+        let r = result.tuples.get("result").unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(r.contains(&vec![1, 10]));
+        assert!(r.contains(&vec![2, 5]));
+    }
+
+    #[test]
+    fn test_reduce_max() {
+        // result(x, max(y)) :- data(x, y)
+        // data: (1,10), (1,20), (2,30), (2,5)
+        // Expected: (1,20), (2,30)
+        let plan = SafePlan {
+            strata: vec![SafeStratumPlan {
+                stratum_id: 0,
+                is_recursive: false,
+                relations: vec![SafeRelationPlan {
+                    name: "result".to_string(),
+                    ops: vec![
+                        SafeOp::Variable {
+                            relation_name: "data".to_string(),
+                        },
+                        SafeOp::Reduce {
+                            agg_fn: SafeAggFn::Max,
+                            group_by_indices: vec![0],
+                        },
+                    ],
+                }],
+            }],
+            edb_relations: vec!["data".to_string()],
+        };
+
+        let mut edb = HashMap::new();
+        edb.insert(
+            "data".to_string(),
+            vec![vec![1, 10], vec![1, 20], vec![2, 30], vec![2, 5]],
+        );
+
+        let result = execute_plan(&plan, &edb, 1).unwrap();
+        let r = result.tuples.get("result").unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(r.contains(&vec![1, 20]));
+        assert!(r.contains(&vec![2, 30]));
+    }
+
+    // ---- Recursive aggregation tests (Issue #21) ----
+
+    #[test]
+    fn test_recursive_min_simple() {
+        // Simple 2-node connected components:
+        //   edge(1, 2)
+        //   cc(x, x) :- edge(x, _).  cc(x, x) :- edge(_, x).  (base case)
+        //   cc(y, min(c)) :- cc(x, c), edge(x, y).             (recursive)
+        //
+        // Base case: cc = {(1,1), (2,2)}
+        // After recursion: cc(2, min(1)) from cc(1,1) ⋈ edge(1,2)
+        // Expected final: cc = {(1,1), (2,1)}
+
+        let plan = SafePlan {
+            strata: vec![
+                // Stratum 0 (non-recursive): cc(x,x) from edge endpoints
+                SafeStratumPlan {
+                    stratum_id: 0,
+                    is_recursive: false,
+                    relations: vec![SafeRelationPlan {
+                        name: "cc".to_string(),
+                        ops: vec![
+                            SafeOp::Variable {
+                                relation_name: "edge".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![0, 0],
+                            }, // (x,y) → (x,x)
+                            SafeOp::Variable {
+                                relation_name: "edge".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![1, 1],
+                            }, // (x,y) → (y,y)
+                            SafeOp::Concat,
+                            SafeOp::Consolidate,
+                        ],
+                    }],
+                },
+                // Stratum 1 (recursive): cc(y, min(c)) :- cc(x,c), edge(x,y)
+                SafeStratumPlan {
+                    stratum_id: 1,
+                    is_recursive: true,
+                    relations: vec![SafeRelationPlan {
+                        name: "cc".to_string(),
+                        ops: vec![
+                            SafeOp::Variable {
+                                relation_name: "cc".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![1, 0],
+                            }, // (x,c) → (c,x) put join key last
+                            SafeOp::Join {
+                                right_relation: "edge".to_string(),
+                                left_keys: vec!["x".to_string()],
+                                right_keys: vec!["x".to_string()],
+                            },
+                            // After join: (c, x, y) → project to (y, c)
+                            SafeOp::Map {
+                                indices: vec![2, 0],
+                            },
+                            SafeOp::Reduce {
+                                agg_fn: SafeAggFn::Min,
+                                group_by_indices: vec![0],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            edb_relations: vec!["edge".to_string()],
+        };
+
+        let mut edb = HashMap::new();
+        edb.insert("edge".to_string(), vec![vec![1, 2]]);
+
+        let result = execute_plan(&plan, &edb, 1).unwrap();
+        let cc = result.tuples.get("cc").unwrap();
+
+        // Must contain the correct min labels only
+        assert!(cc.contains(&vec![1, 1]), "cc should contain (1,1)");
+        assert!(cc.contains(&vec![2, 1]), "cc should contain (2,1)");
+        // Must NOT contain old base-case value superseded by min
+        assert!(
+            !cc.contains(&vec![2, 2]),
+            "cc should NOT contain (2,2) — min(1) supersedes"
+        );
+        assert_eq!(cc.len(), 2, "cc should have exactly 2 tuples");
+    }
+
+    #[test]
+    fn test_recursive_min_connected_components() {
+        // Connected Components from Issue #21:
+        //   edge(1,2). edge(2,3). edge(3,4).
+        //   cc(x, x) :- edge(x, _).  cc(x, x) :- edge(_, x).
+        //   cc(y, min(c)) :- cc(x, c), edge(x, y).
+        //
+        // Expected: all nodes get minimum label 1
+        //   cc = {(1,1), (2,1), (3,1), (4,1)}
+
+        let plan = SafePlan {
+            strata: vec![
+                // Stratum 0: base case
+                SafeStratumPlan {
+                    stratum_id: 0,
+                    is_recursive: false,
+                    relations: vec![SafeRelationPlan {
+                        name: "cc".to_string(),
+                        ops: vec![
+                            SafeOp::Variable {
+                                relation_name: "edge".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![0, 0],
+                            },
+                            SafeOp::Variable {
+                                relation_name: "edge".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![1, 1],
+                            },
+                            SafeOp::Concat,
+                            SafeOp::Consolidate,
+                        ],
+                    }],
+                },
+                // Stratum 1: recursive min
+                SafeStratumPlan {
+                    stratum_id: 1,
+                    is_recursive: true,
+                    relations: vec![SafeRelationPlan {
+                        name: "cc".to_string(),
+                        ops: vec![
+                            SafeOp::Variable {
+                                relation_name: "cc".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![1, 0],
+                            },
+                            SafeOp::Join {
+                                right_relation: "edge".to_string(),
+                                left_keys: vec!["x".to_string()],
+                                right_keys: vec!["x".to_string()],
+                            },
+                            SafeOp::Map {
+                                indices: vec![2, 0],
+                            },
+                            SafeOp::Reduce {
+                                agg_fn: SafeAggFn::Min,
+                                group_by_indices: vec![0],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            edb_relations: vec!["edge".to_string()],
+        };
+
+        let mut edb = HashMap::new();
+        edb.insert("edge".to_string(), vec![vec![1, 2], vec![2, 3], vec![3, 4]]);
+
+        let result = execute_plan(&plan, &edb, 1).unwrap();
+        let cc = result.tuples.get("cc").unwrap();
+
+        assert_eq!(
+            cc.len(),
+            4,
+            "cc should have exactly 4 tuples (one per node)"
+        );
+        assert!(cc.contains(&vec![1, 1]));
+        assert!(cc.contains(&vec![2, 1]));
+        assert!(cc.contains(&vec![3, 1]));
+        assert!(cc.contains(&vec![4, 1]));
+    }
+
+    #[test]
+    fn test_recursive_max() {
+        // Similar to CC but with max aggregation:
+        //   edge(1,2). edge(2,3).
+        //   label(x, x) :- edge(x, _).  label(x, x) :- edge(_, x).
+        //   label(y, max(c)) :- label(x, c), edge(x, y).
+        //
+        // Base case: label = {(1,1), (2,2), (3,3)}
+        // After recursion: labels propagate forward, max wins
+        // Expected: label = {(1,1), (2,2), (3,3)}
+        // (max propagates larger values, but 3 can't reach 1 or 2, so
+        //  each node keeps its own label or gets a larger one from predecessor)
+        // Actually: label(2, max(1,2))=2, label(3, max(2,3))=3
+        // So max doesn't change anything here. Let me use reverse edges.
+
+        // Better test: reverse edges so max propagates backward
+        //   edge(2,1). edge(3,2).
+        //   label(x, x) :- edge(x, _).  label(x, x) :- edge(_, x).
+        //   label(y, max(c)) :- label(x, c), edge(x, y).
+        //
+        // Base: label = {(1,1), (2,2), (3,3)}
+        // Iter 1: label(3,3) ⋈ edge(3,2) → label(2,3). label(2,2) ⋈ edge(2,1) → label(1,2).
+        // Iter 2: label(2,3) ⋈ edge(2,1) → label(1,3).
+        // Expected: label = {(1,3), (2,3), (3,3)}
+
+        let plan = SafePlan {
+            strata: vec![
+                SafeStratumPlan {
+                    stratum_id: 0,
+                    is_recursive: false,
+                    relations: vec![SafeRelationPlan {
+                        name: "label".to_string(),
+                        ops: vec![
+                            SafeOp::Variable {
+                                relation_name: "edge".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![0, 0],
+                            },
+                            SafeOp::Variable {
+                                relation_name: "edge".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![1, 1],
+                            },
+                            SafeOp::Concat,
+                            SafeOp::Consolidate,
+                        ],
+                    }],
+                },
+                SafeStratumPlan {
+                    stratum_id: 1,
+                    is_recursive: true,
+                    relations: vec![SafeRelationPlan {
+                        name: "label".to_string(),
+                        ops: vec![
+                            SafeOp::Variable {
+                                relation_name: "label".to_string(),
+                            },
+                            SafeOp::Map {
+                                indices: vec![1, 0],
+                            },
+                            SafeOp::Join {
+                                right_relation: "edge".to_string(),
+                                left_keys: vec!["x".to_string()],
+                                right_keys: vec!["x".to_string()],
+                            },
+                            SafeOp::Map {
+                                indices: vec![2, 0],
+                            },
+                            SafeOp::Reduce {
+                                agg_fn: SafeAggFn::Max,
+                                group_by_indices: vec![0],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            edb_relations: vec!["edge".to_string()],
+        };
+
+        let mut edb = HashMap::new();
+        edb.insert("edge".to_string(), vec![vec![2, 1], vec![3, 2]]);
+
+        let result = execute_plan(&plan, &edb, 1).unwrap();
+        let label = result.tuples.get("label").unwrap();
+
+        assert_eq!(
+            label.len(),
+            3,
+            "label should have exactly 3 tuples (one per node)"
+        );
+        assert!(label.contains(&vec![1, 3]));
+        assert!(label.contains(&vec![2, 3]));
+        assert!(label.contains(&vec![3, 3]));
     }
 }
