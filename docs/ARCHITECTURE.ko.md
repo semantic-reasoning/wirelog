@@ -630,8 +630,8 @@ wirelog는 임베디드(ARM/RISC-V, <256MB)와 엔터프라이즈(x86-64, GB 규
 | 2026-02-26 | 0.7 | FFI 마샬링 레이어 완료 (27 tests); dd_plan을 ffi/로 이동; 227 total |
 | 2026-02-26 | 0.8 | Rust DD executor 크레이트 완료 (90 tests); Meson-Cargo 통합; 317 total (227 C + 90 Rust) |
 | 2026-02-27 | 0.9 | 인라인 사실 추출 (Issue #14, +4 program 테스트); CLI driver (Issue #11, 8 테스트); 종단간 파이프라인 완료 (11 DD execute 테스트); 340 total (250 C + 90 Rust) |
-| 2026-02-27 | 1.0 | 실제 DD 통합 (PR #24): 인터프리터를 Differential Dataflow dogs3 v0.19.1로 교체; 재귀 strata에 DD iterate() 적용; antijoin 정확성을 위한 consolidate() 추가 |
-| 2026-02-28 | 1.1 | Rust 코드 최소화 (PR #25): ~460줄 데드 코드 제거; expr.rs를 i64 전용으로 축소; 미사용 의존성(serde, columnar) 제거; 328 total tests (250 C + 78 Rust) |
+| 2026-02-27 | 0.10 | 실제 DD 통합 (PR #24): 인터프리터를 Differential Dataflow dogs3 v0.19.1로 교체; 재귀 strata에 DD iterate() 적용; antijoin 정확성을 위한 consolidate() 추가 |
+| 2026-02-28 | 0.11 | Rust 코드 최소화 (PR #25): ~460줄 데드 코드 제거; expr.rs를 i64 전용으로 축소; 미사용 의존성(serde, columnar) 제거; 328 total tests (250 C + 78 Rust) |
 
 ---
 

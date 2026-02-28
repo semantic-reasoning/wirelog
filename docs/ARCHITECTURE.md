@@ -629,8 +629,8 @@ in the enterprise path, reconsider jemalloc or mimalloc for that target only.
 | 2026-02-26 | 0.7 | FFI marshalling layer complete (27 tests); dd_plan moved to ffi/; 227 total |
 | 2026-02-26 | 0.8 | Rust DD executor crate complete (90 tests); Meson-Cargo integration; 317 total (227 C + 90 Rust) |
 | 2026-02-27 | 0.9 | Inline fact extraction (Issue #14, +4 program tests); CLI driver (Issue #11, 8 tests); end-to-end pipeline complete (11 DD execute tests); 340 total (250 C + 90 Rust) |
-| 2026-02-27 | 1.0 | Actual DD integration (PR #24): interpreter replaced with Differential Dataflow dogs3 v0.19.1; DD iterate() for recursive strata; consolidate() for antijoin correctness |
-| 2026-02-28 | 1.1 | Rust code minimization (PR #25): removed ~460 lines of dead code; stripped expr.rs to i64-only; removed unused deps (serde, columnar); 328 total tests (250 C + 78 Rust) |
+| 2026-02-27 | 0.10 | Actual DD integration (PR #24): interpreter replaced with Differential Dataflow dogs3 v0.19.1; DD iterate() for recursive strata; consolidate() for antijoin correctness |
+| 2026-02-28 | 0.11 | Rust code minimization (PR #25): removed ~460 lines of dead code; stripped expr.rs to i64-only; removed unused deps (serde, columnar); 328 total tests (250 C + 78 Rust) |
 
 ---
 
