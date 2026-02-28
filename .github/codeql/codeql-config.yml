@@ -1,0 +1,18 @@
+name: "wirelog CodeQL Configuration"
+
+queries:
+  - uses: security-and-quality
+
+paths:
+  - wirelog
+  - rust/wirelog-dd/src
+  - tests
+
+paths-ignore:
+  - bench
+  - build*
+  - third_party
+
+threat-models:
+  - remote
+  - local
