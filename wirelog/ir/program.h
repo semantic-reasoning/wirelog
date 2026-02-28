@@ -13,6 +13,7 @@
 #define WIRELOG_PROGRAM_INTERNAL_H
 
 #include "ir.h"
+#include "../intern.h"
 #include "../wirelog-types.h"
 
 /* Forward declaration for AST (used only in program struct) */
@@ -79,6 +80,9 @@ struct wirelog_program {
 
     /* Source AST (retained for debugging, freed on program_free) */
     wl_ast_node_t *ast;
+
+    /* Symbol intern table (string -> int64 mapping) */
+    wl_intern_t *intern;
 };
 
 /* ======================================================================== */

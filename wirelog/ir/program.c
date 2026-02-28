@@ -56,6 +56,15 @@ wl_program_create(void)
 {
     struct wirelog_program *prog
         = (struct wirelog_program *)calloc(1, sizeof(struct wirelog_program));
+    if (!prog)
+        return NULL;
+
+    prog->intern = wl_intern_create();
+    if (!prog->intern) {
+        free(prog);
+        return NULL;
+    }
+
     return prog;
 }
 
@@ -146,6 +155,9 @@ wl_program_free(struct wirelog_program *program)
     if (program->ast) {
         wl_ast_node_free(program->ast);
     }
+
+    /* Free intern table */
+    wl_intern_free(program->intern);
 
     free(program);
 }
@@ -393,8 +405,8 @@ collect_fact(struct wirelog_program *prog, const wl_ast_node_t *fact_node)
         if (arg->type == WL_NODE_INTEGER) {
             rel->fact_data[offset + i] = arg->int_value;
         } else if (arg->type == WL_NODE_STRING) {
-            /* String facts: store 0 for now (string interning TBD) */
-            rel->fact_data[offset + i] = 0;
+            rel->fact_data[offset + i]
+                = wl_intern_put(prog->intern, arg->str_value);
         }
     }
 

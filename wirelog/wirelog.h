@@ -97,6 +97,22 @@ void
 wirelog_program_free(wirelog_program_t *program);
 
 /* ======================================================================== */
+/* Symbol Interning                                                         */
+/* ======================================================================== */
+
+typedef struct wl_intern wl_intern_t;
+
+/**
+ * Get the program's symbol intern table for reverse-mapping
+ * interned integer IDs back to their original strings.
+ *
+ * @param prog  Compiled program
+ * @return Intern table (owned by program, do not free), or NULL
+ */
+const wl_intern_t *
+wirelog_program_get_intern(const wirelog_program_t *prog);
+
+/* ======================================================================== */
 /* Fact Extraction API                                                      */
 /* ======================================================================== */
 
