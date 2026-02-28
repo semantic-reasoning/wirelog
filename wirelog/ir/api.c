@@ -217,6 +217,18 @@ wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
 }
 
 /* ======================================================================== */
+/* Symbol Interning                                                         */
+/* ======================================================================== */
+
+const wl_intern_t *
+wirelog_program_get_intern(const wirelog_program_t *prog)
+{
+    if (!prog)
+        return NULL;
+    return prog->intern;
+}
+
+/* ======================================================================== */
 /* Cleanup                                                                  */
 /* ======================================================================== */
 

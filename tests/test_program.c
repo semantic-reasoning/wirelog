@@ -14,6 +14,7 @@
 
 #include "../wirelog/parser/parser.h"
 #include "../wirelog/ir/program.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
 
 /* ======================================================================== */
@@ -1755,6 +1756,92 @@ test_api_get_facts_unknown_relation(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+static void
+test_string_fact_interning(void)
+{
+    TEST("string fact interning via parser");
+
+    const char *source = ".decl name(x: string)\n"
+                         "name(\"Alice\").\n"
+                         "name(\"Bob\").\n"
+                         "name(\"Alice\").\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(source, &err);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    /* Check fact count */
+    int64_t *data = NULL;
+    uint32_t nrows = 0, ncols = 0;
+    int rc = wirelog_program_get_facts(prog, "name", &data, &nrows, &ncols);
+    if (rc != 0) {
+        FAIL("get_facts failed");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    if (nrows != 3) {
+        FAIL("expected 3 facts");
+        free(data);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    if (ncols != 1) {
+        FAIL("expected 1 column");
+        free(data);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    /* "Alice" and "Bob" should get different IDs */
+    if (data[0] == data[1]) {
+        FAIL("Alice and Bob should have different IDs");
+        free(data);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    /* Both "Alice" facts should have the same ID */
+    if (data[0] != data[2]) {
+        FAIL("duplicate Alice should have same ID");
+        free(data);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    /* Reverse lookup via intern table */
+    const wl_intern_t *intern = wirelog_program_get_intern(prog);
+    if (!intern) {
+        FAIL("intern table is NULL");
+        free(data);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    const char *s0 = wl_intern_reverse(intern, data[0]);
+    const char *s1 = wl_intern_reverse(intern, data[1]);
+    if (!s0 || strcmp(s0, "Alice") != 0) {
+        FAIL("reverse of first ID should be 'Alice'");
+        free(data);
+        wirelog_program_free(prog);
+        return;
+    }
+    if (!s1 || strcmp(s1, "Bob") != 0) {
+        FAIL("reverse of second ID should be 'Bob'");
+        free(data);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    free(data);
+    wirelog_program_free(prog);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -1802,6 +1889,9 @@ main(void)
     test_api_get_facts();
     test_api_get_facts_no_facts();
     test_api_get_facts_unknown_relation();
+
+    /* String interning */
+    test_string_fact_interning();
 
     /* Public API */
     test_api_parse_string();
