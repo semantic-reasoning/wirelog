@@ -328,6 +328,127 @@ run_workload(int wl_id, const char *data_path, uint32_t workers, int repeat)
 }
 
 /* ----------------------------------------------------------------
+ * Andersen pointer analysis (multi-relation workload)
+ * ---------------------------------------------------------------- */
+
+static const char *andersen_template
+    = ".decl addressOf(v: int32, o: int32)\n"
+      "%s\n"
+      ".decl assign(v1: int32, v2: int32)\n"
+      "%s\n"
+      ".decl load(v1: int32, v2: int32)\n"
+      "%s\n"
+      ".decl store(v1: int32, v2: int32)\n"
+      "%s\n"
+      ".decl pointsTo(v: int32, o: int32)\n"
+      "pointsTo(v, o) :- addressOf(v, o).\n"
+      "pointsTo(v1, o) :- assign(v1, v2), pointsTo(v2, o).\n"
+      "pointsTo(v1, o) :- load(v1, v2), pointsTo(v2, p), pointsTo(p, o).\n"
+      "pointsTo(v1, o) :- store(v1, v2), pointsTo(v1, p), pointsTo(v2, o).\n";
+
+static const char *andersen_rels[4]
+    = { "addressOf", "assign", "load", "store" };
+static const char *andersen_files[4]
+    = { "addressOf.csv", "assign.csv", "load.csv", "store.csv" };
+
+static int
+run_andersen_workload(const char *data_dir, uint32_t workers, int repeat)
+{
+    /* Load 4 CSV files into inline facts buffers */
+    size_t per_buf = SRC_BUFSZ / 4;
+    char *bufs[4];
+    int32_t total_facts = 0;
+
+    for (int i = 0; i < 4; i++) {
+        bufs[i] = (char *)malloc(per_buf);
+        if (!bufs[i]) {
+            for (int j = 0; j < i; j++)
+                free(bufs[j]);
+            return -1;
+        }
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", data_dir, andersen_files[i]);
+
+        int32_t count = 0;
+        if (csv_to_inline_facts(path, andersen_rels[i], bufs[i], per_buf,
+                                &count)
+            != 0) {
+            for (int j = 0; j <= i; j++)
+                free(bufs[j]);
+            return -1;
+        }
+        total_facts += count;
+    }
+
+    /* Build combined source */
+    char *source = (char *)malloc(SRC_BUFSZ);
+    if (!source) {
+        for (int i = 0; i < 4; i++)
+            free(bufs[i]);
+        return -1;
+    }
+
+    int n = snprintf(source, SRC_BUFSZ, andersen_template, bufs[0], bufs[1],
+                     bufs[2], bufs[3]);
+    for (int i = 0; i < 4; i++)
+        free(bufs[i]);
+
+    if (n < 0 || (size_t)n >= SRC_BUFSZ) {
+        fprintf(stderr, "error: source buffer overflow\n");
+        free(source);
+        return -1;
+    }
+
+    /* Collect timing samples */
+    double *times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    if (!times) {
+        free(source);
+        return -1;
+    }
+
+    int64_t tuples = 0;
+    int64_t peak_rss = -1;
+    int status_ok = 1;
+
+    for (int r = 0; r < repeat; r++) {
+        bench_time_t t0 = bench_time_now();
+        int64_t cnt = 0;
+        int rc = run_pipeline_count(source, workers, &cnt);
+        bench_time_t t1 = bench_time_now();
+
+        times[r] = bench_time_diff_ms(t0, t1);
+
+        if (rc != 0) {
+            status_ok = 0;
+            break;
+        }
+        tuples = cnt;
+    }
+
+    peak_rss = bench_peak_rss_kb();
+
+    if (status_ok) {
+        qsort(times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        double min_ms = times[0];
+        double median_ms = times[repeat / 2];
+        double max_ms = times[repeat - 1];
+
+        printf("andersen\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64
+               "\t%" PRId64 "\t%s\n",
+               total_facts, workers, repeat, min_ms, median_ms, max_ms,
+               peak_rss, tuples, "OK");
+    } else {
+        printf("andersen\t-\t-\t%u\t%d\t-\t-\t-\t-\t-\tFAIL\n", workers,
+               repeat);
+    }
+
+    free(times);
+    free(source);
+    return status_ok ? 0 : -1;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -343,11 +464,14 @@ usage(const char *prog)
 {
     fprintf(
         stderr,
-        "Usage: %s --workload {tc|reach|cc|sssp|sg|all} --data FILE\n"
-        "          [--data-weighted FILE] [--workers N] [--repeat R]\n"
+        "Usage: %s --workload {tc|reach|cc|sssp|sg|andersen|all} --data FILE\n"
+        "          [--data-weighted FILE] [--data-andersen DIR]\n"
+        "          [--workers N] [--repeat R]\n"
         "\n"
         "  --data FILE           Unweighted edge CSV (src,dst)\n"
-        "  --data-weighted FILE  Weighted edge CSV (src,dst,weight) for SSSP\n",
+        "  --data-weighted FILE  Weighted edge CSV (src,dst,weight) for SSSP\n"
+        "  --data-andersen DIR   Directory with addressOf/assign/load/store "
+        "CSVs\n",
         prog);
 }
 
@@ -357,6 +481,7 @@ main(int argc, char **argv)
     const char *workload = NULL;
     const char *data_path = NULL;
     const char *data_weighted_path = NULL;
+    const char *data_andersen_path = NULL;
     uint32_t workers = 1;
     int repeat = 3;
 
@@ -364,6 +489,7 @@ main(int argc, char **argv)
         { "workload", required_argument, NULL, 'w' },
         { "data", required_argument, NULL, 'd' },
         { "data-weighted", required_argument, NULL, 'W' },
+        { "data-andersen", required_argument, NULL, 'A' },
         { "workers", required_argument, NULL, 'j' },
         { "repeat", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
@@ -371,7 +497,7 @@ main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "w:d:W:j:r:h", long_opts, NULL))
+    while ((opt = getopt_long(argc, argv, "w:d:W:A:j:r:h", long_opts, NULL))
            != -1) {
         switch (opt) {
         case 'w':
@@ -382,6 +508,9 @@ main(int argc, char **argv)
             break;
         case 'W':
             data_weighted_path = optarg;
+            break;
+        case 'A':
+            data_andersen_path = optarg;
             break;
         case 'j':
             workers = (uint32_t)strtoul(optarg, NULL, 10);
@@ -422,6 +551,12 @@ main(int argc, char **argv)
         rc = run_workload(WL_SSSP, data_weighted_path, workers, repeat);
     } else if (strcmp(workload, "sg") == 0) {
         rc = run_workload(WL_SG, data_path, workers, repeat);
+    } else if (strcmp(workload, "andersen") == 0) {
+        if (!data_andersen_path) {
+            fprintf(stderr, "error: andersen requires --data-andersen DIR\n");
+            return 1;
+        }
+        rc = run_andersen_workload(data_andersen_path, workers, repeat);
     } else if (strcmp(workload, "all") == 0) {
         for (int i = 0; i < WL_COUNT; i++) {
             if (i == WL_SSSP && !data_weighted_path) {
@@ -430,6 +565,11 @@ main(int argc, char **argv)
             }
             const char *dp = (i == WL_SSSP) ? data_weighted_path : data_path;
             int r = run_workload(i, dp, workers, repeat);
+            if (r != 0)
+                rc = r;
+        }
+        if (data_andersen_path) {
+            int r = run_andersen_workload(data_andersen_path, workers, repeat);
             if (r != 0)
                 rc = r;
         }

@@ -1,0 +1,13 @@
+.decl addressOf(v: int32, o: int32)
+.input addressOf(filename="ADDR", delimiter=",")
+.decl assign(v1: int32, v2: int32)
+.input assign(filename="ASSIGN", delimiter=",")
+.decl load(v1: int32, v2: int32)
+.input load(filename="LOAD", delimiter=",")
+.decl store(v1: int32, v2: int32)
+.input store(filename="STORE", delimiter=",")
+.decl pointsTo(v: int32, o: int32)
+pointsTo(v, o) :- addressOf(v, o).
+pointsTo(v1, o) :- assign(v1, v2), pointsTo(v2, o).
+pointsTo(v1, o) :- load(v1, v2), pointsTo(v2, p), pointsTo(p, o).
+pointsTo(v1, o) :- store(v1, v2), pointsTo(v1, p), pointsTo(v2, o).
