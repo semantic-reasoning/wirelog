@@ -943,6 +943,268 @@ run_galen_workload(const char *data_dir, uint32_t workers, int repeat)
 }
 
 /* ----------------------------------------------------------------
+ * Polonius - Rust Borrow Checker (multi-relation workload)
+ * ---------------------------------------------------------------- */
+
+#define POLONIUS_NRELS 17
+static const char *polonius_rels[POLONIUS_NRELS] = {
+    "cfg_edge",
+    "subset_base",
+    "loan_issued_at",
+    "loan_killed_at",
+    "loan_invalidated_at",
+    "universal_region",
+    "known_placeholder_subset",
+    "var_used_at",
+    "var_defined_at",
+    "var_dropped_at",
+    "use_of_var_derefs_origin",
+    "drop_of_var_derefs_origin",
+    "child_path",
+    "path_is_var",
+    "path_assigned_at_base",
+    "path_moved_at_base",
+    "path_accessed_at_base",
+};
+static const char *polonius_files[POLONIUS_NRELS] = {
+    "cfg_edge.csv",
+    "subset_base.csv",
+    "loan_issued_at.csv",
+    "loan_killed_at.csv",
+    "loan_invalidated_at.csv",
+    "universal_region.csv",
+    "known_placeholder_subset.csv",
+    "var_used_at.csv",
+    "var_defined_at.csv",
+    "var_dropped_at.csv",
+    "use_of_var_derefs_origin.csv",
+    "drop_of_var_derefs_origin.csv",
+    "child_path.csv",
+    "path_is_var.csv",
+    "path_assigned_at_base.csv",
+    "path_moved_at_base.csv",
+    "path_accessed_at_base.csv",
+};
+static const char *polonius_decls[POLONIUS_NRELS] = {
+    ".decl cfg_edge(p1: int32, p2: int32)\n",
+    ".decl subset_base(o1: int32, o2: int32, p: int32)\n",
+    ".decl loan_issued_at(o: int32, l: int32, p: int32)\n",
+    ".decl loan_killed_at(l: int32, p: int32)\n",
+    ".decl loan_invalidated_at(l: int32, p: int32)\n",
+    ".decl universal_region(o: int32)\n",
+    ".decl known_placeholder_subset(o1: int32, o2: int32)\n",
+    ".decl var_used_at(v: int32, p: int32)\n",
+    ".decl var_defined_at(v: int32, p: int32)\n",
+    ".decl var_dropped_at(v: int32, p: int32)\n",
+    ".decl use_of_var_derefs_origin(v: int32, o: int32)\n",
+    ".decl drop_of_var_derefs_origin(v: int32, o: int32)\n",
+    ".decl child_path(c: int32, p: int32)\n",
+    ".decl path_is_var(p: int32, v: int32)\n",
+    ".decl path_assigned_at_base(p: int32, pt: int32)\n",
+    ".decl path_moved_at_base(p: int32, pt: int32)\n",
+    ".decl path_accessed_at_base(p: int32, pt: int32)\n",
+};
+
+/* IDB declarations + 37 rules */
+static const char *polonius_rules
+    = ".decl ancestor_path(a: int32, d: int32)\n"
+      ".decl path_moved_at(p: int32, pt: int32)\n"
+      ".decl path_assigned_at(p: int32, pt: int32)\n"
+      ".decl path_accessed_at(p: int32, pt: int32)\n"
+      ".decl path_begins_with_var(p: int32, v: int32)\n"
+      ".decl path_maybe_initialized_on_exit(p: int32, pt: int32)\n"
+      ".decl path_maybe_uninitialized_on_exit(p: int32, pt: int32)\n"
+      ".decl var_maybe_partly_initialized_on_exit(v: int32, pt: int32)\n"
+      ".decl move_error(p: int32, pt: int32)\n"
+      ".decl cfg_node(pt: int32)\n"
+      ".decl var_live_on_entry(v: int32, pt: int32)\n"
+      ".decl var_drop_live_on_entry(v: int32, pt: int32)\n"
+      ".decl var_maybe_partly_initialized_on_entry(v: int32, pt: int32)\n"
+      ".decl origin_live_on_entry(o: int32, pt: int32)\n"
+      ".decl placeholder_origin(o: int32)\n"
+      ".decl subset(o1: int32, o2: int32, pt: int32)\n"
+      ".decl origin_contains_loan_on_entry(o: int32, l: int32, pt: int32)\n"
+      ".decl loan_live_at(l: int32, pt: int32)\n"
+      ".decl errors(l: int32, pt: int32)\n"
+      ".decl subset_error(o1: int32, o2: int32, pt: int32)\n"
+      "ancestor_path(x, y) :- child_path(x, y).\n"
+      "ancestor_path(gp, c) :- ancestor_path(p, c), child_path(p, gp).\n"
+      "path_moved_at(x, y) :- path_moved_at_base(x, y).\n"
+      "path_moved_at(c, p) :- path_moved_at(pa, p), ancestor_path(pa, c).\n"
+      "path_assigned_at(x, y) :- path_assigned_at_base(x, y).\n"
+      "path_assigned_at(c, p) :- path_assigned_at(pa, p), "
+      "ancestor_path(pa, c).\n"
+      "path_accessed_at(x, y) :- path_accessed_at_base(x, y).\n"
+      "path_accessed_at(c, p) :- path_accessed_at(pa, p), "
+      "ancestor_path(pa, c).\n"
+      "path_begins_with_var(x, v) :- path_is_var(x, v).\n"
+      "path_begins_with_var(c, v) :- path_begins_with_var(pa, v), "
+      "ancestor_path(pa, c).\n"
+      "path_maybe_initialized_on_exit(path, point) :- "
+      "path_assigned_at(path, point).\n"
+      "path_maybe_uninitialized_on_exit(path, point) :- "
+      "path_moved_at(path, point).\n"
+      "path_maybe_initialized_on_exit(path, p2) :- "
+      "path_maybe_initialized_on_exit(path, p1), cfg_edge(p1, p2), "
+      "!path_moved_at(path, p2).\n"
+      "path_maybe_uninitialized_on_exit(path, p2) :- "
+      "path_maybe_uninitialized_on_exit(path, p1), cfg_edge(p1, p2), "
+      "!path_assigned_at(path, p2).\n"
+      "var_maybe_partly_initialized_on_exit(v, p) :- "
+      "path_maybe_initialized_on_exit(path, p), "
+      "path_begins_with_var(path, v).\n"
+      "move_error(path, t) :- "
+      "path_maybe_uninitialized_on_exit(path, s), cfg_edge(s, t).\n"
+      "cfg_node(p1) :- cfg_edge(p1, _).\n"
+      "cfg_node(p2) :- cfg_edge(_, p2).\n"
+      "var_live_on_entry(v, p) :- var_used_at(v, p).\n"
+      "var_live_on_entry(v, p1) :- var_live_on_entry(v, p2), "
+      "cfg_edge(p1, p2), !var_defined_at(v, p1).\n"
+      "var_maybe_partly_initialized_on_entry(v, p2) :- "
+      "var_maybe_partly_initialized_on_exit(v, p1), cfg_edge(p1, p2).\n"
+      "var_drop_live_on_entry(v, p) :- var_dropped_at(v, p), "
+      "var_maybe_partly_initialized_on_entry(v, p).\n"
+      "var_drop_live_on_entry(v, s) :- var_drop_live_on_entry(v, t), "
+      "cfg_edge(s, t), !var_defined_at(v, s), "
+      "var_maybe_partly_initialized_on_exit(v, s).\n"
+      "origin_live_on_entry(o, p) :- cfg_node(p), universal_region(o).\n"
+      "origin_live_on_entry(o, p) :- var_drop_live_on_entry(v, p), "
+      "drop_of_var_derefs_origin(v, o).\n"
+      "origin_live_on_entry(o, p) :- var_live_on_entry(v, p), "
+      "use_of_var_derefs_origin(v, o).\n"
+      "placeholder_origin(o) :- universal_region(o).\n"
+      "known_placeholder_subset(x, z) :- "
+      "known_placeholder_subset(x, y), known_placeholder_subset(y, z).\n"
+      "subset(o1, o2, p) :- subset_base(o1, o2, p).\n"
+      "subset(o1, o3, p) :- subset(o1, o2, p), "
+      "subset_base(o2, o3, p), o1 != o3.\n"
+      "subset(o1, o2, p2) :- subset(o1, o2, p1), cfg_edge(p1, p2), "
+      "origin_live_on_entry(o1, p2), origin_live_on_entry(o2, p2).\n"
+      "origin_contains_loan_on_entry(o, l, p) :- "
+      "loan_issued_at(o, l, p).\n"
+      "origin_contains_loan_on_entry(o2, l, p) :- "
+      "origin_contains_loan_on_entry(o1, l, p), subset(o1, o2, p).\n"
+      "origin_contains_loan_on_entry(o, l, p2) :- "
+      "origin_contains_loan_on_entry(o, l, p1), cfg_edge(p1, p2), "
+      "!loan_killed_at(l, p1), origin_live_on_entry(o, p2).\n"
+      "loan_live_at(l, p) :- origin_contains_loan_on_entry(o, l, p), "
+      "origin_live_on_entry(o, p).\n"
+      "errors(l, p) :- loan_invalidated_at(l, p), loan_live_at(l, p).\n"
+      "subset_error(o1, o2, p) :- subset(o1, o2, p), "
+      "placeholder_origin(o1), placeholder_origin(o2), "
+      "!known_placeholder_subset(o1, o2), o1 != o2.\n";
+
+static int
+run_polonius_workload(const char *data_dir, uint32_t workers, int repeat)
+{
+    /* Load 17 CSV files into inline facts buffers */
+    size_t per_buf = SRC_BUFSZ / POLONIUS_NRELS;
+    char *bufs[POLONIUS_NRELS];
+    int32_t total_facts = 0;
+
+    for (int i = 0; i < POLONIUS_NRELS; i++) {
+        bufs[i] = (char *)malloc(per_buf);
+        if (!bufs[i]) {
+            for (int j = 0; j < i; j++)
+                free(bufs[j]);
+            return -1;
+        }
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", data_dir, polonius_files[i]);
+
+        int32_t count = 0;
+        if (csv_to_inline_facts(path, polonius_rels[i], bufs[i], per_buf,
+                                &count)
+            != 0) {
+            for (int j = 0; j <= i; j++)
+                free(bufs[j]);
+            return -1;
+        }
+        total_facts += count;
+    }
+
+    /* Build source: decl + facts per EDB, then IDB rules */
+    char *source = (char *)malloc(SRC_BUFSZ);
+    if (!source) {
+        for (int i = 0; i < POLONIUS_NRELS; i++)
+            free(bufs[i]);
+        return -1;
+    }
+
+    size_t pos = 0;
+    for (int i = 0; i < POLONIUS_NRELS; i++) {
+        int n = snprintf(source + pos, SRC_BUFSZ - pos, "%s%s\n",
+                         polonius_decls[i], bufs[i]);
+        if (n < 0 || pos + (size_t)n >= SRC_BUFSZ) {
+            fprintf(stderr, "error: source buffer overflow\n");
+            for (int j = 0; j < POLONIUS_NRELS; j++)
+                free(bufs[j]);
+            free(source);
+            return -1;
+        }
+        pos += (size_t)n;
+    }
+    for (int i = 0; i < POLONIUS_NRELS; i++)
+        free(bufs[i]);
+
+    /* Append IDB declarations and rules */
+    int n = snprintf(source + pos, SRC_BUFSZ - pos, "%s", polonius_rules);
+    if (n < 0 || pos + (size_t)n >= SRC_BUFSZ) {
+        fprintf(stderr, "error: source buffer overflow\n");
+        free(source);
+        return -1;
+    }
+
+    /* Collect timing samples */
+    double *times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    if (!times) {
+        free(source);
+        return -1;
+    }
+
+    int64_t tuples = 0;
+    int64_t peak_rss = -1;
+    int status_ok = 1;
+
+    for (int r = 0; r < repeat; r++) {
+        bench_time_t t0 = bench_time_now();
+        int64_t cnt = 0;
+        int rc = run_pipeline_count(source, workers, &cnt);
+        bench_time_t t1 = bench_time_now();
+
+        times[r] = bench_time_diff_ms(t0, t1);
+
+        if (rc != 0) {
+            status_ok = 0;
+            break;
+        }
+        tuples = cnt;
+    }
+
+    peak_rss = bench_peak_rss_kb();
+
+    if (status_ok) {
+        qsort(times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        double min_ms = times[0];
+        double median_ms = times[repeat / 2];
+        double max_ms = times[repeat - 1];
+
+        printf("polonius\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64
+               "\t%" PRId64 "\t%s\n",
+               total_facts, workers, repeat, min_ms, median_ms, max_ms,
+               peak_rss, tuples, "OK");
+    } else {
+        printf("polonius\t-\t-\t%u\t%d\t-\t-\t-\t-\t-\tFAIL\n", workers,
+               repeat);
+    }
+
+    free(times);
+    free(source);
+    return status_ok ? 0 : -1;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -959,12 +1221,12 @@ usage(const char *prog)
     fprintf(
         stderr,
         "Usage: %s --workload "
-        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|csda|galen|all} "
-        "--data "
-        "FILE\n"
+        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|csda|galen|"
+        "polonius|all} --data FILE\n"
         "          [--data-weighted FILE] [--data-andersen DIR]\n"
         "          [--data-dyck DIR] [--data-cspa DIR]\n"
         "          [--data-csda DIR] [--data-galen DIR]\n"
+        "          [--data-polonius DIR]\n"
         "          [--workers N] [--repeat R]\n"
         "\n"
         "  --data FILE           Unweighted edge CSV (src,dst)\n"
@@ -975,7 +1237,9 @@ usage(const char *prog)
         "CSVs\n"
         "  --data-cspa DIR       Directory with assign/dereference CSVs\n"
         "  --data-csda DIR       Directory with nullEdge/edge CSVs\n"
-        "  --data-galen DIR      Directory with Galen ontology CSVs\n",
+        "  --data-galen DIR      Directory with Galen ontology CSVs\n"
+        "  --data-polonius DIR   Directory with Polonius borrow checker "
+        "CSVs\n",
         prog);
 }
 
@@ -990,6 +1254,7 @@ main(int argc, char **argv)
     const char *data_cspa_path = NULL;
     const char *data_csda_path = NULL;
     const char *data_galen_path = NULL;
+    const char *data_polonius_path = NULL;
     uint32_t workers = 1;
     int repeat = 3;
 
@@ -1002,6 +1267,7 @@ main(int argc, char **argv)
         { "data-cspa", required_argument, NULL, 'C' },
         { "data-csda", required_argument, NULL, 'S' },
         { "data-galen", required_argument, NULL, 'G' },
+        { "data-polonius", required_argument, NULL, 'P' },
         { "workers", required_argument, NULL, 'j' },
         { "repeat", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
@@ -1009,8 +1275,8 @@ main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt
-            = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:j:r:h", long_opts, NULL))
+    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:P:j:r:h", long_opts,
+                              NULL))
            != -1) {
         switch (opt) {
         case 'w':
@@ -1036,6 +1302,9 @@ main(int argc, char **argv)
             break;
         case 'G':
             data_galen_path = optarg;
+            break;
+        case 'P':
+            data_polonius_path = optarg;
             break;
         case 'j':
             workers = (uint32_t)strtoul(optarg, NULL, 10);
@@ -1108,6 +1377,12 @@ main(int argc, char **argv)
             return 1;
         }
         rc = run_galen_workload(data_galen_path, workers, repeat);
+    } else if (strcmp(workload, "polonius") == 0) {
+        if (!data_polonius_path) {
+            fprintf(stderr, "error: polonius requires --data-polonius DIR\n");
+            return 1;
+        }
+        rc = run_polonius_workload(data_polonius_path, workers, repeat);
     } else if (strcmp(workload, "all") == 0) {
         for (int i = 0; i < WL_COUNT; i++) {
             if (i == WL_SSSP && !data_weighted_path) {
@@ -1141,6 +1416,11 @@ main(int argc, char **argv)
         }
         if (data_galen_path) {
             int r = run_galen_workload(data_galen_path, workers, repeat);
+            if (r != 0)
+                rc = r;
+        }
+        if (data_polonius_path) {
+            int r = run_polonius_workload(data_polonius_path, workers, repeat);
             if (r != 0)
                 rc = r;
         }
