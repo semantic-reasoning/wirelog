@@ -353,32 +353,29 @@ typedef struct {
 
 **Test counts**: 325 C tests (14 suites) + 85 Rust tests = **410 total tests passing**
 
-### Phase 2: Performance Baseline (Planned)
+### Phase 2: Documentation (Planned)
 
-**Goal**: Embedded vs enterprise performance and memory comparison
+**Goal**: User-facing documentation for adoption and onboarding
 
-- Comprehensive benchmarking (all environments)
-- Memory profiling (embedded vs enterprise)
-- Bottleneck analysis
-- Assess nanoarrow migration necessity
+- **Language Reference** — Supported grammar, types, operators, directives
+- **Tutorial** — Step-by-step guide from first program to recursion, negation, aggregation
+- **Examples** — Learning-oriented examples (`examples/` directory, not benchmarks)
+- **CLI Usage** — `wirelog --help`, man-page-level CLI documentation
 
-### Phase 3: Selective Embedded Optimization (Planned)
+### Phase 3: nanoarrow Backend (Planned)
 
-**Goal**: Embedded environment only nanoarrow migration (optional)
+**Goal**: C11-native executor replacing DD for embedded targets
 
+- DD-based performance profiling (15 benchmarks: execution time, memory, bottlenecks)
 - Backend abstraction interface design
-- nanoarrow executor implementation
+- nanoarrow executor implementation (sort-merge join, semi-naive delta propagation)
+- DD vs nanoarrow comparison on same benchmark suite
+- Revisit Subplan Sharing ([#61](https://github.com/justinjoy/wirelog/issues/61)) and Boolean Specialization ([#62](https://github.com/justinjoy/wirelog/issues/62)) — see [Discussion #63](https://github.com/justinjoy/wirelog/discussions/63)
 - Binary minimization (LTO, -Os, strip)
 
-**Decision Point**: Determine necessity after Phase 2 benchmark results
+### FPGA Support (Re-evaluate after Phase 3)
 
-### Phase 4: FPGA Support (Planned)
-
-**Goal**: Offload heavy computation to FPGA (optional)
-
-- Extend ComputeBackend to FPGA
-- Arrow IPC FPGA communication
-- Task scheduling & offload
+FPGA acceleration requires the nanoarrow executor as a prerequisite. DD's internal arrangement sharing and incremental computation are software-level optimizations that cannot be directly mapped to hardware. Re-evaluate feasibility after Phase 3 completion.
 
 ---
 
@@ -427,14 +424,10 @@ typedef struct {
 - [ ] Memory usage constraints
 - [ ] Deployment binary size targets
 
-### FPGA Integration
-- [ ] Hardware/Software boundary definition
-- [ ] Arrow IPC communication protocol details
-- [ ] Task scheduling strategy
-
-### nanoarrow Migration Considerations
+### nanoarrow Migration (Phase 3)
 - [ ] Revisit Subplan Sharing (#61) and Boolean Specialization (#62) — see [Discussion #63](https://github.com/justinjoy/wirelog/discussions/63)
 - [ ] Arrow columnar cost model differs from DD: CSE and set-membership filters become valuable
+- [ ] FPGA feasibility assessment (re-evaluate after nanoarrow executor is complete)
 
 ---
 

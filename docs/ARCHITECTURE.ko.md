@@ -353,32 +353,29 @@ typedef struct {
 
 **테스트 수**: C 325개 (14 스위트) + Rust 85개 = **총 410개 테스트 통과**
 
-### Phase 2: 성능 기준선 (계획)
+### Phase 2: 문서화 (계획)
 
-**목표**: 임베디드 vs 엔터프라이즈 성능 및 메모리 비교
+**목표**: 사용자 대상 문서 작성 (도입 및 온보딩)
 
-- 광범위 벤치마킹 (모든 환경)
-- 메모리 프로파일링 (임베디드 vs 엔터프라이즈)
-- 병목 분석
-- nanoarrow 마이그레이션 필요성 판단
+- **Language Reference** — 지원 문법, 타입, 연산자, 지시자 레퍼런스
+- **Tutorial** — 첫 프로그램부터 재귀, 부정, 집계까지 단계별 가이드
+- **Examples** — 벤치마크가 아닌 학습용 예제 (`examples/` 디렉토리)
+- **CLI Usage** — `wirelog --help`, man page 수준의 CLI 문서
 
-### Phase 3: 선택적 임베디드 최적화 (계획)
+### Phase 3: nanoarrow 백엔드 (계획)
 
-**목표**: 임베디드 환경만 nanoarrow로 마이그레이션 (선택)
+**목표**: 임베디드 타겟용 DD 대체 C11 네이티브 실행 엔진
 
+- DD 기반 성능 프로파일링 (15개 벤치마크: 실행 시간, 메모리, 병목)
 - Backend 추상화 인터페이스 설계
-- nanoarrow executor 구현
+- nanoarrow executor 구현 (sort-merge join, semi-naive delta propagation)
+- DD vs nanoarrow 동일 벤치마크 비교
+- Subplan Sharing ([#61](https://github.com/justinjoy/wirelog/issues/61)) 및 Boolean Specialization ([#62](https://github.com/justinjoy/wirelog/issues/62)) 재검토 — [Discussion #63](https://github.com/justinjoy/wirelog/discussions/63) 참조
 - 바이너리 최소화 (LTO, -Os, strip)
 
-**결정 시점**: Phase 2 벤치마크 결과 후 필요 여부 판단
+### FPGA 지원 (Phase 3 완료 후 재평가)
 
-### Phase 4: FPGA 지원 (계획)
-
-**목표**: 무거운 연산을 FPGA로 오프로드 (선택)
-
-- ComputeBackend를 FPGA로 확장
-- Arrow IPC FPGA 통신
-- 작업 스케줄링 & 오프로드
+FPGA 가속은 nanoarrow executor가 전제 조건이다. DD의 내부 arrangement 공유와 증분 연산은 하드웨어에 직접 매핑할 수 없는 소프트웨어 수준 최적화다. Phase 3 완료 후 실현 가능성을 재평가한다.
 
 ---
 
@@ -427,14 +424,10 @@ typedef struct {
 - [ ] 메모리 사용량 제약
 - [ ] 배포 바이너리 크기 목표
 
-### FPGA 통합
-- [ ] Hardware/Software boundary 정의
-- [ ] Arrow IPC 통신 프로토콜 상세
-- [ ] 작업 스케줄링 전략
-
-### nanoarrow 마이그레이션 고려사항
+### nanoarrow 마이그레이션 (Phase 3)
 - [ ] Subplan Sharing (#61) 및 Boolean Specialization (#62) 재검토 — [Discussion #63](https://github.com/justinjoy/wirelog/discussions/63) 참조
 - [ ] Arrow 컬럼형 비용 모델은 DD와 다름: CSE 및 set-membership 필터가 가치 있어짐
+- [ ] FPGA 실현 가능성 평가 (nanoarrow executor 완성 후 재평가)
 
 ---
 
@@ -470,15 +463,3 @@ typedef struct {
 | 2026-02-28 | 0.11 | Rust 코드 최소화; CSV 입력 지원; 벤치마크 스위트 시작 |
 | 2026-03-01 | 0.12 | **Phase 1 완료.** JPP, SIP 최적화 passes; 15개 벤치마크 (TC ~ DOOP); 상수 포함 ANTIJOIN 수정; Subplan Sharing (#61) 및 Boolean Specialization (#62) 프로파일링 후 wontfix 결정. 총 410개 테스트 (C 325 + Rust 85). 디렉토리 구조 목록 제거. |
 
----
-
-## 다음 단계
-
-1. [ ] 임베디드 타겟 (ARM cross-compile) 빌드 검증
-2. [ ] Phase 2: 광범위 성능 벤치마킹 및 메모리 프로파일링
-3. [ ] Phase 2: 병목 분석 및 nanoarrow 마이그레이션 필요성 판단
-4. [ ] Phase 3: Backend 추상화 인터페이스 설계 (nanoarrow executor)
-5. [ ] Phase 3: 바이너리 최소화 (LTO, -Os, strip)
-6. [ ] Phase 4: FPGA backend via Arrow IPC (하드웨어 가용성에 따라)
-7. [ ] Region/Arena allocator 설계 ([Discussion #58](https://github.com/justinjoy/wirelog/discussions/58))
-8. [ ] nanoarrow 마이그레이션 시 Subplan Sharing/Boolean Specialization 재검토 ([Discussion #63](https://github.com/justinjoy/wirelog/discussions/63))

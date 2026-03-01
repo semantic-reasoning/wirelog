@@ -142,9 +142,8 @@ For details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 |-------|--------|-------------|
 | 0: Foundation | ✅ Complete | Parser, IR, DD translator, CLI |
 | 1: Optimization | ✅ Complete | Fusion, JPP, SIP, 15 benchmarks |
-| 2: Baseline | Planned | Performance benchmarking |
-| 3: Embedded Opt. | Planned | nanoarrow backend (optional) |
-| 4: FPGA Support | Planned | Hardware acceleration (optional) |
+| 2: Documentation | Planned | Language reference, tutorial, examples, CLI docs |
+| 3: nanoarrow | Planned | C11-native executor, DD vs nanoarrow comparison |
 
 ## Documentation
 
