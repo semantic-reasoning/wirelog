@@ -14,29 +14,32 @@ wirelog is a C11-based Datalog engine designed to work seamlessly across embedde
 ## Features
 
 - **Unified Codebase**: Single implementation for embedded and enterprise
-- **Differential Dataflow Integration**: Leverages proven incremental processing
-- **Datalog Optimization**: Logic Fusion, Join-Project-Plan, Subplan Sharing, Boolean Specialization
+- **Differential Dataflow Integration**: Proven incremental processing via Rust FFI
+- **Optimization Pipeline**: Logic Fusion, Join-Project Plan (JPP), Semijoin Information Passing (SIP)
+- **Benchmark Suite**: 15 workloads from graph analysis to Java points-to analysis (DOOP, 136 rules)
 - **Layered Architecture**: Clean separation of Logic, Execution, and I/O
 - **FPGA-Ready**: Designed for future hardware acceleration via Arrow IPC
 - **Minimal Dependencies**: C11 + Meson build system
 
 ## Status
 
-**Phase 0: Foundation** complete. **Phase 1: Optimization** in progress.
+**Phase 0: Foundation** complete. **Phase 1: Optimization** complete.
 
 | Component | Tests | Status |
 |-----------|-------|--------|
-| Parser (lexer + parser) | 91 | Complete |
-| IR (ir + program) | 60 | Complete |
+| Parser (lexer + parser) | 96 | Complete |
+| IR (ir + program) | 61 | Complete |
 | Stratification | 20 | Complete |
-| DD Plan Translator | 19 | Complete |
-| Logic Fusion | 14 | Complete |
-| FFI Marshalling | 27 | Complete |
-| DD Execute (end-to-end) | 11 | Complete |
-| CLI Driver | 8 | Complete |
-| **C Total** | **250** | **All passing** |
-| Rust DD Executor | 90 | Complete |
-| **Grand Total** | **340** | **All passing** |
+| DD Plan Translator | 22 | Complete |
+| FFI Marshalling | 31 | Complete |
+| Optimization (Fusion + JPP + SIP) | 36 | Complete |
+| DD Execute (end-to-end) | 18 | Complete |
+| CLI Driver | 15 | Complete |
+| Symbol Interning | 9 | Complete |
+| CSV Input | 17 | Complete |
+| **C Total** | **325** | **14 suites, all passing** |
+| Rust DD Executor | 85 | Complete |
+| **Grand Total** | **410** | **All passing** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design details.
 
@@ -76,54 +79,44 @@ tc(1, 3)
 tc(2, 3)
 ```
 
-## Project Structure
+## Architecture
 
-```
-wirelog/
-├── wirelog/              # Source code
-│   ├── parser/          # Datalog parser (lexer, parser, AST)
-│   │   ├── lexer.c/h
-│   │   ├── parser.c/h
-│   │   └── ast.c/h
-│   ├── ir/              # IR, stratification
-│   │   ├── ir.c/h
-│   │   ├── program.c/h
-│   │   └── stratify.c/h
-│   ├── ffi/             # DD plan translator & FFI marshalling
-│   │   ├── dd_plan.c/h  # IR → DD operator graph translation
-│   │   ├── dd_ffi.h     # FFI-safe type definitions (C ↔ Rust)
-│   │   ├── dd_marshal.c # Plan marshalling (internal → FFI-safe)
-│   │   └── facts_loader.c # Bulk EDB fact loading via Rust FFI
-│   ├── cli/             # CLI driver
-│   │   ├── driver.h/c   # wl_read_file(), wl_print_tuple(), wl_run_pipeline()
-│   │   └── main.c       # Entry point (--workers N, --help)
-│   └── passes/          # Optimization passes
-│       └── fusion.c/h   # Logic Fusion (FILTER+PROJECT → FLATMAP)
-├── rust/wirelog-dd/     # Rust DD executor crate (90 tests)
-├── tests/               # Test suite (250 C tests)
-├── docs/                # Documentation
-├── discussion/          # Design discussions and analysis
-└── third_party/         # External libraries (nanoarrow, etc.)
-```
-
-## Architecture Highlights
-
-### End-to-End Pipeline (Complete)
+### End-to-End Pipeline
 
 ```
 .dl file
-    ↓ wl_read_file() [CLI driver]
-wirelog (C11 parser/optimizer)
-    ↓ wirelog_program_get_facts() [inline fact extraction]
-IR → DD operator graph + facts
-    ↓ wirelog_load_all_facts() [bulk EDB loading]
-Differential Dataflow executor (Rust)
+    ↓ wl_read_file()
+Parser (C11, hand-written RDP)
+    ↓
+IR → Fusion → JPP → SIP
+    ↓
+DD Plan → FFI Marshal
+    ↓
+Differential Dataflow (Rust)
     ↓ result callback
-wl_print_tuple() [CLI output]
+Output
 ```
 
 - **Embedded**: Single-worker DD, memory-constrained
 - **Enterprise**: Multi-worker DD (`--workers N`), distributed processing
+
+### Optimization Passes
+
+| Pass | Description |
+|------|-------------|
+| **Fusion** | Merge adjacent FILTER+PROJECT into FLATMAP |
+| **JPP** | Greedy join reorder for 3+ atom chains to minimize intermediate sizes |
+| **SIP** | Insert semijoin pre-filters in join chains to reduce intermediate cardinality |
+
+### Benchmark Suite
+
+15 workloads covering graph analysis, pointer analysis, and program analysis:
+
+| Category | Workloads |
+|----------|-----------|
+| Graph | TC, Reach, CC, SSSP, SG, Bipartite |
+| Pointer Analysis | Andersen, CSPA, CSDA, Dyck-2 |
+| Advanced | Galen, Polonius, CRDT, DDISASM, DOOP |
 
 ### Phase 3+: Optional Embedded Optimization
 
@@ -138,28 +131,25 @@ For details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Technology Stack
 
 - **Language**: C11
-- **Build**: Meson
-- **Execution** (Phase 0-3): Differential Dataflow (Rust)
-- **Memory** (Phase 3+): nanoarrow (optional)
+- **Build**: Meson + Ninja
+- **Execution**: Differential Dataflow (Rust, dogs3 v0.19.1)
+- **Memory** (future): nanoarrow (optional)
 - **Hardware Acceleration**: Arrow IPC for FPGA/GPU offload (future)
 
 ## Development Roadmap
 
-| Phase | Timeline | Deliverable |
-|-------|----------|-------------|
-| 0: Foundation | Weeks 1-4 | Parser, IR, DD translator |
-| 1: Optimization | Weeks 5-10 | Logic Fusion, JPP, SIP, Subplan Sharing |
-| 2: Baseline | Weeks 11-14 | Performance benchmarking |
-| 3: Embedded Opt. | Month 4+ | nanoarrow backend (optional) |
-| 4: FPGA Support | Month 6+ | Hardware acceleration (optional) |
+| Phase | Status | Deliverable |
+|-------|--------|-------------|
+| 0: Foundation | ✅ Complete | Parser, IR, DD translator, CLI |
+| 1: Optimization | ✅ Complete | Fusion, JPP, SIP, 15 benchmarks |
+| 2: Baseline | Planned | Performance benchmarking |
+| 3: Embedded Opt. | Planned | nanoarrow backend (optional) |
+| 4: FPGA Support | Planned | Hardware acceleration (optional) |
 
 ## Documentation
 
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed system design (English)
-- **[ARCHITECTURE.ko.md](docs/ARCHITECTURE.ko.md)** - Detailed system design (Korean)
-- **[docs/README.md](docs/README.md)** - Documentation guide
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed system design
 - **[LICENSE.md](LICENSE.md)** - Licensing information
-- **[discussion/](discussion/)** - Design discussions and analysis
 
 ## License
 
@@ -213,4 +203,3 @@ By submitting a contribution, you agree to the [Contributor License Agreement (C
 ---
 
 **wirelog** - Building bridges between embedded and enterprise data processing.
-
