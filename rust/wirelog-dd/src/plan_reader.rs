@@ -57,6 +57,14 @@ pub enum SafeOp {
         right_keys: Vec<String>,
     },
 
+    /// Semijoin (SIP pre-filter).
+    Semijoin {
+        right_relation: String,
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
+        left_key_indices: Vec<u32>,
+    },
+
     /// Aggregation with group-by.
     Reduce {
         agg_fn: SafeAggFn,
@@ -267,6 +275,23 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
                 right_relation: right,
                 left_keys: lk,
                 right_keys: rk,
+            })
+        }
+
+        WlFfiOpType::Semijoin => {
+            let right = read_cstr(op.right_relation, "op.right_relation")?;
+            let lk = read_cstr_array(op.left_keys, op.key_count, "op.left_keys")?;
+            let rk = read_cstr_array(op.right_keys, op.key_count, "op.right_keys")?;
+            let lki = if op.project_count > 0 && !op.project_indices.is_null() {
+                std::slice::from_raw_parts(op.project_indices, op.project_count as usize).to_vec()
+            } else {
+                Vec::new()
+            };
+            Ok(SafeOp::Semijoin {
+                right_relation: right,
+                left_keys: lk,
+                right_keys: rk,
+                left_key_indices: lki,
             })
         }
 

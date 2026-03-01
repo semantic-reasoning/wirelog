@@ -16,6 +16,7 @@
 #include "../ir/program.h"
 #include "../passes/fusion.h"
 #include "../passes/jpp.h"
+#include "../passes/sip.h"
 #include "../wirelog.h"
 
 #include <inttypes.h>
@@ -143,6 +144,7 @@ wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
     /* 2. Optimize */
     wl_fusion_apply(prog, NULL);
     wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
 
     /* 3. Generate DD plan */
     wl_dd_plan_t *dd_plan = NULL;

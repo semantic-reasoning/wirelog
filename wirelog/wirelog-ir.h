@@ -50,6 +50,7 @@ typedef enum {
     WIRELOG_IR_AGGREGATE, /* Aggregation */
     WIRELOG_IR_ANTIJOIN,  /* Negation (antijoin) */
     WIRELOG_IR_UNION,     /* Union (append) */
+    WIRELOG_IR_SEMIJOIN,  /* Semijoin (SIP pre-filter) */
 } wirelog_ir_node_type_t;
 
 /* ======================================================================== */

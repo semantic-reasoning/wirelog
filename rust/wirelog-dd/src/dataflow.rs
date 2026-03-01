@@ -588,6 +588,38 @@ where
                 }
             }
 
+            SafeOp::Semijoin {
+                right_relation,
+                left_keys: _,
+                right_keys: _,
+                left_key_indices,
+            } => {
+                if let Some(c) = current.take() {
+                    let right_coll = collections.get(right_relation).cloned();
+
+                    if let Some(right) = right_coll {
+                        let key_indices = left_key_indices.clone();
+                        let key_count = key_indices.len();
+
+                        // Left: extract key from specified column positions
+                        let left_keyed = c.map(move |row: Row| {
+                            let key: Row = key_indices.iter().map(|&i| row[i as usize]).collect();
+                            (key, row)
+                        });
+
+                        // Right: key = first key_count columns
+                        let right_keys_coll = right.map(move |row: Row| row[..key_count].to_vec());
+
+                        // Semijoin: keep left rows whose key exists in right
+                        current =
+                            Some(left_keyed.semijoin(&right_keys_coll).map(|(_key, row)| row));
+                    } else {
+                        // Right relation not found -> semijoin filters everything
+                        current = Some(c.filter(|_: &Row| false));
+                    }
+                }
+            }
+
             SafeOp::Reduce {
                 agg_fn,
                 group_by_indices,

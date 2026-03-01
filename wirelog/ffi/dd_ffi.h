@@ -260,6 +260,7 @@ typedef struct {
  * WL_FFI_OP_REDUCE:      Aggregation (group-by + aggregate function).
  * WL_FFI_OP_CONCAT:      Union of multiple collections.
  * WL_FFI_OP_CONSOLIDATE: Deduplication / consolidation.
+ * WL_FFI_OP_SEMIJOIN:    Semijoin (SIP pre-filter).
  */
 typedef enum {
     WL_FFI_OP_VARIABLE = 0,
@@ -270,6 +271,7 @@ typedef enum {
     WL_FFI_OP_REDUCE = 5,
     WL_FFI_OP_CONCAT = 6,
     WL_FFI_OP_CONSOLIDATE = 7,
+    WL_FFI_OP_SEMIJOIN = 8,
 } wl_ffi_op_type_t;
 
 /* ======================================================================== */

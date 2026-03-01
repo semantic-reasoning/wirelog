@@ -117,6 +117,7 @@ pub enum WlFfiOpType {
     Reduce = 5,
     Concat = 6,
     Consolidate = 7,
+    Semijoin = 8,
 }
 
 /* ======================================================================== */
@@ -283,6 +284,7 @@ mod tests {
         assert_eq!(WlFfiOpType::Reduce as u32, 5);
         assert_eq!(WlFfiOpType::Concat as u32, 6);
         assert_eq!(WlFfiOpType::Consolidate as u32, 7);
+        assert_eq!(WlFfiOpType::Semijoin as u32, 8);
     }
 
     // ---- Agg function enum values ----

@@ -418,6 +418,66 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
     case WL_DD_CONSOLIDATE:
         dst->op = WL_FFI_OP_CONSOLIDATE;
         break;
+
+    case WL_DD_SEMIJOIN:
+        dst->op = WL_FFI_OP_SEMIJOIN;
+        if (src->right_relation) {
+            char *s = strdup_safe(src->right_relation);
+            if (!s)
+                return -1;
+            dst->right_relation = s;
+        }
+        dst->key_count = src->key_count;
+        if (src->key_count > 0) {
+            char **lk = (char **)calloc(src->key_count, sizeof(char *));
+            char **rk = (char **)calloc(src->key_count, sizeof(char *));
+            if (!lk || !rk) {
+                free(lk);
+                free(rk);
+                return -1;
+            }
+            for (uint32_t k = 0; k < src->key_count; k++) {
+                if (src->left_keys && src->left_keys[k]) {
+                    lk[k] = strdup_safe(src->left_keys[k]);
+                    if (!lk[k]) {
+                        for (uint32_t j = 0; j < k; j++) {
+                            free(lk[j]);
+                            free(rk[j]);
+                        }
+                        free(lk);
+                        free(rk);
+                        return -1;
+                    }
+                }
+                if (src->right_keys && src->right_keys[k]) {
+                    rk[k] = strdup_safe(src->right_keys[k]);
+                    if (!rk[k]) {
+                        free(lk[k]);
+                        for (uint32_t j = 0; j < k; j++) {
+                            free(lk[j]);
+                            free(rk[j]);
+                        }
+                        free(lk);
+                        free(rk);
+                        return -1;
+                    }
+                }
+            }
+            dst->left_keys = (const char *const *)lk;
+            dst->right_keys = (const char *const *)rk;
+        }
+        /* Copy left key column indices (stored in project_indices) */
+        dst->project_count = src->project_count;
+        if (src->project_count > 0 && src->project_indices) {
+            uint32_t *idx
+                = (uint32_t *)malloc(src->project_count * sizeof(uint32_t));
+            if (!idx)
+                return -1;
+            memcpy(idx, src->project_indices,
+                   src->project_count * sizeof(uint32_t));
+            dst->project_indices = idx;
+        }
+        break;
     }
 
     return 0;

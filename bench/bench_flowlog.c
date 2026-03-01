@@ -21,6 +21,7 @@
 #include "../wirelog/ffi/dd_ffi.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
+#include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
 
 #include <getopt.h>
@@ -212,6 +213,7 @@ run_pipeline_count(const char *source, uint32_t num_workers, int64_t *out_count)
     /* Optimize */
     wl_fusion_apply(prog, NULL);
     wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
 
     wl_dd_plan_t *dd_plan = NULL;
     int rc = wl_dd_plan_generate(prog, &dd_plan);

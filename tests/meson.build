@@ -23,6 +23,7 @@ ir_src = files(
 optimizer_src = files(
   '../wirelog/passes/fusion.c',
   '../wirelog/passes/jpp.c',
+  '../wirelog/passes/sip.c',
 )
 
 intern_src = files(
@@ -112,6 +113,17 @@ test_jpp_exe = executable(
 )
 
 test('jpp', test_jpp_exe)
+
+test_sip_exe = executable(
+  'test_sip',
+  files('test_sip.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('sip', test_sip_exe)
 
 ffi_src = files(
   '../wirelog/ffi/dd_marshal.c',

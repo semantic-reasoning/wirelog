@@ -134,12 +134,13 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
     if (!node)
         return 0;
 
-    /* For JOIN/ANTIJOIN, only translate the left child (child[0]).
-     * The right child is referenced by name in the JOIN/ANTIJOIN op;
+    /* For JOIN/ANTIJOIN/SEMIJOIN, only translate the left child (child[0]).
+     * The right child is referenced by name in the op;
      * translating it would add an extra VARIABLE that overwrites the
      * left side's data in the sequential interpreter. */
     uint32_t child_limit = node->child_count;
-    if (node->type == WIRELOG_IR_JOIN || node->type == WIRELOG_IR_ANTIJOIN)
+    if (node->type == WIRELOG_IR_JOIN || node->type == WIRELOG_IR_ANTIJOIN
+        || node->type == WIRELOG_IR_SEMIJOIN)
         child_limit = (node->child_count > 0) ? 1 : 0;
 
     /* Translate children first (post-order) */
@@ -495,6 +496,50 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         break;
     }
 
+    case WIRELOG_IR_SEMIJOIN:
+        op.op = WL_DD_SEMIJOIN;
+        if (node->child_count >= 2 && node->children[1]
+            && node->children[1]->relation_name) {
+            op.right_relation = strdup_safe(node->children[1]->relation_name);
+        }
+        if (node->join_key_count > 0) {
+            op.key_count = node->join_key_count;
+            op.left_keys = (char **)calloc(op.key_count, sizeof(char *));
+            op.right_keys = (char **)calloc(op.key_count, sizeof(char *));
+            if (!op.left_keys || !op.right_keys) {
+                dd_op_free_fields(&op);
+                return -1;
+            }
+            for (uint32_t k = 0; k < op.key_count; k++) {
+                if (node->join_left_keys[k])
+                    op.left_keys[k] = strdup_safe(node->join_left_keys[k]);
+                if (node->join_right_keys[k])
+                    op.right_keys[k] = strdup_safe(node->join_right_keys[k]);
+            }
+        }
+        /* Resolve left key column positions for the Rust executor */
+        if (op.key_count > 0 && ctx->count > 0) {
+            op.project_indices
+                = (uint32_t *)calloc(op.key_count, sizeof(uint32_t));
+            if (op.project_indices) {
+                op.project_count = op.key_count;
+                for (uint32_t k = 0; k < op.key_count; k++) {
+                    if (op.left_keys && op.left_keys[k]) {
+                        for (uint32_t j = 0; j < ctx->count; j++) {
+                            if (ctx->names[j]
+                                && strcmp(op.left_keys[k], ctx->names[j])
+                                       == 0) {
+                                op.project_indices[k] = j;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        /* SEMIJOIN does not add columns to context (output = left input) */
+        break;
+
     case WIRELOG_IR_UNION: {
         /* UNION -> CONCAT + CONSOLIDATE (two ops) */
         wl_dd_op_t concat_op;
@@ -711,6 +756,8 @@ wl_dd_op_type_str(wl_dd_op_type_t type)
         return "CONCAT";
     case WL_DD_CONSOLIDATE:
         return "CONSOLIDATE";
+    case WL_DD_SEMIJOIN:
+        return "SEMIJOIN";
     }
     return "UNKNOWN";
 }
