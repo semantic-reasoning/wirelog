@@ -1,0 +1,142 @@
+/* CRDT - Conflict-Free Replicated Data Types Verification
+ *
+ * Verifies a sequence CRDT (ordered list) for collaborative text editing.
+ * Models Kleppmann's tree-based CRDT with Lamport timestamps, computing
+ * a linearized view of the document via DFS pre-order traversal.
+ *
+ * 23 rules across 8 strata:
+ *   Stratum 0: Base facts (insert, remove, assign, hasChild, laterChild,
+ *              sibling, laterSibling, laterSibling2, hasNextSibling)
+ *   Stratum 1: Negation over S0 (firstChild, nextSibling, currentValue)
+ *   Stratum 2: Depends on S1 (hasValue, nextSiblingAnc - recursive)
+ *   Stratum 3: Depends on S2 (nextElem)
+ *   Stratum 4: Depends on S3 (valueStep)
+ *   Stratum 5: Negation over S4 (blankStep)
+ *   Stratum 6: Recursive over S5 (value_blank_star)
+ *   Stratum 7: Output (nextVisible, result)
+ *
+ * EDB: Insert_input(ctr, node, parent_ctr, parent_node)
+ *      Remove_input(ctr, node)
+ *
+ * Uses stratified negation (7 rules with !), no aggregation.
+ * Maximization idioms expressed via quadratic self-joins + anti-join.
+ *
+ * Reference: FlowLog (VLDB 2026), Section 10: Distributed Data Types
+ *            Martin Kleppmann, "Data structures as queries" (2018)
+ *            Frank McSherry, dynamic-datalog/problems/crdt
+ */
+
+/* ---- EDB declarations ---- */
+.decl Insert_input(ctr: int32, node: int32, parent_ctr: int32, parent_node: int32)
+.input Insert_input(filename="Insert_input.csv", delimiter=",")
+.decl Remove_input(ctr: int32, node: int32)
+.input Remove_input(filename="Remove_input.csv", delimiter=",")
+
+/* ---- R1-R2: Copy EDB into working relations ---- */
+.decl insert(ctr: int32, node: int32, parent_ctr: int32, parent_node: int32)
+insert(a, b, c, d) :- Insert_input(a, b, c, d).
+
+.decl remove(ctr: int32, node: int32)
+remove(a, b) :- Remove_input(a, b).
+
+/* ---- R3: Synthetic value assignment ---- */
+.decl assign(id_ctr: int32, id_node: int32, elem_ctr: int32, elem_node: int32, value: int32)
+assign(ctr, n, ctr, n, n) :- insert(ctr, n, _, _).
+
+/* ---- R4-R5: Tree structure - child ordering ---- */
+.decl hasChild(parent_ctr: int32, parent_node: int32)
+hasChild(pc, pn) :- insert(_, _, pc, pn).
+
+.decl laterChild(parent_ctr: int32, parent_node: int32, child_ctr: int32, child_node: int32)
+laterChild(pc, pn, c2, n2) :-
+    insert(c1, n1, pc, pn),
+    insert(c2, n2, pc, pn),
+    c1 * 10 + n1 > c2 * 10 + n2.
+
+/* ---- R6: First child via negation (stratum 1) ---- */
+.decl firstChild(parent_ctr: int32, parent_node: int32, child_ctr: int32, child_node: int32)
+firstChild(pc, pn, cc, cn) :-
+    insert(cc, cn, pc, pn),
+    !laterChild(pc, pn, cc, cn).
+
+/* ---- R7-R11: Sibling ordering ---- */
+.decl sibling(c1: int32, n1: int32, c2: int32, n2: int32)
+sibling(c1, n1, c2, n2) :-
+    insert(c1, n1, pc, pn),
+    insert(c2, n2, pc, pn).
+
+.decl laterSibling(c1: int32, n1: int32, c2: int32, n2: int32)
+laterSibling(c1, n1, c2, n2) :-
+    sibling(c1, n1, c2, n2),
+    c1 * 10 + n1 > c2 * 10 + n2.
+
+.decl laterSibling2(c1: int32, n1: int32, c3: int32, n3: int32)
+laterSibling2(c1, n1, c3, n3) :-
+    sibling(c1, n1, c2, n2),
+    sibling(c1, n1, c3, n3),
+    c1 * 10 + n1 > c2 * 10 + n2,
+    c2 * 10 + n2 > c3 * 10 + n3.
+
+.decl nextSibling(c1: int32, n1: int32, c2: int32, n2: int32)
+nextSibling(c1, n1, c2, n2) :-
+    laterSibling(c1, n1, c2, n2),
+    !laterSibling2(c1, n1, c2, n2).
+
+.decl hasNextSibling(c: int32, n: int32)
+hasNextSibling(c, n) :- laterSibling(c, n, _, _).
+
+/* ---- R12-R13: Recursive ancestor walk (stratum 2) ---- */
+.decl nextSiblingAnc(start_ctr: int32, start_node: int32, next_ctr: int32, next_node: int32)
+nextSiblingAnc(sc, sn, nc, nn) :-
+    nextSibling(sc, sn, nc, nn).
+nextSiblingAnc(sc, sn, nc, nn) :-
+    !hasNextSibling(sc, sn),
+    insert(sc, sn, pc, pn),
+    nextSiblingAnc(pc, pn, nc, nn).
+
+/* ---- R14-R15: DFS pre-order linearization (stratum 3) ---- */
+.decl nextElem(prev_ctr: int32, prev_node: int32, next_ctr: int32, next_node: int32)
+nextElem(pc, pn, nc, nn) :-
+    firstChild(pc, pn, nc, nn).
+nextElem(pc, pn, nc, nn) :-
+    !hasChild(pc, pn),
+    nextSiblingAnc(pc, pn, nc, nn).
+
+/* ---- R16-R17: Value assignment with tombstone (stratum 1) ---- */
+.decl currentValue(elem_ctr: int32, elem_node: int32, value: int32)
+currentValue(ec, en, v) :-
+    assign(ic, in, ec, en, v),
+    !remove(ic, in).
+
+.decl hasValue(elem_ctr: int32, elem_node: int32)
+hasValue(ec, en) :- currentValue(ec, en, _).
+
+/* ---- R18-R21: Blank skipping (strata 4-6) ---- */
+.decl valueStep(from_ctr: int32, from_node: int32, to_ctr: int32, to_node: int32)
+valueStep(fc, fn, tc, tn) :-
+    hasValue(fc, fn),
+    nextElem(fc, fn, tc, tn).
+
+.decl blankStep(from_ctr: int32, from_node: int32, to_ctr: int32, to_node: int32)
+blankStep(fc, fn, tc, tn) :-
+    !valueStep(fc, fn, tc, tn),
+    nextElem(fc, fn, tc, tn).
+
+.decl value_blank_star(from_ctr: int32, from_node: int32, to_ctr: int32, to_node: int32)
+value_blank_star(fc, fn, tc, tn) :-
+    valueStep(fc, fn, tc, tn).
+value_blank_star(fc, fn, tc, tn) :-
+    value_blank_star(fc, fn, vc, vn),
+    blankStep(vc, vn, tc, tn).
+
+/* ---- R22: Visible element chaining (stratum 7) ---- */
+.decl nextVisible(prev_ctr: int32, prev_node: int32, next_ctr: int32, next_node: int32)
+nextVisible(pc, pn, nc, nn) :-
+    value_blank_star(pc, pn, nc, nn),
+    hasValue(nc, nn).
+
+/* ---- R23: Output ---- */
+.decl result(ctr1: int32, ctr2: int32, value: int32)
+result(c1, c2, v) :-
+    nextVisible(c1, _, c2, n2),
+    currentValue(c2, n2, v).
