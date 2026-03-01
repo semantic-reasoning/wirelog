@@ -22,6 +22,7 @@ ir_src = files(
 
 optimizer_src = files(
   '../wirelog/passes/fusion.c',
+  '../wirelog/passes/jpp.c',
 )
 
 intern_src = files(
@@ -100,6 +101,17 @@ test_fusion_exe = executable(
 )
 
 test('fusion', test_fusion_exe)
+
+test_jpp_exe = executable(
+  'test_jpp',
+  files('test_jpp.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('jpp', test_jpp_exe)
 
 ffi_src = files(
   '../wirelog/ffi/dd_marshal.c',

@@ -29,6 +29,7 @@ wirelog_ir_src = files(
 
 wirelog_optimizer_src = files(
   'passes/fusion.c',
+  'passes/jpp.c',
 )
 
 # ============================================================================
