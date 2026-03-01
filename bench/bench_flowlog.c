@@ -582,6 +582,128 @@ run_dyck_workload(const char *data_dir, uint32_t workers, int repeat)
 }
 
 /* ----------------------------------------------------------------
+ * CSPA - Context-Sensitive Points-to Analysis (multi-relation workload)
+ * ---------------------------------------------------------------- */
+
+static const char *cspa_template
+    = ".decl assign(x: int32, y: int32)\n"
+      "%s\n"
+      ".decl dereference(x: int32, y: int32)\n"
+      "%s\n"
+      ".decl valueFlow(x: int32, y: int32)\n"
+      ".decl memoryAlias(x: int32, y: int32)\n"
+      ".decl valueAlias(x: int32, y: int32)\n"
+      "valueFlow(y, x) :- assign(y, x).\n"
+      "valueFlow(x, x) :- assign(x, _).\n"
+      "valueFlow(x, x) :- assign(_, x).\n"
+      "memoryAlias(x, x) :- assign(_, x).\n"
+      "memoryAlias(x, x) :- assign(x, _).\n"
+      "valueFlow(x, y) :- valueFlow(x, z), valueFlow(z, y).\n"
+      "valueFlow(x, y) :- assign(x, z), memoryAlias(z, y).\n"
+      "memoryAlias(x, w) :- dereference(y, x), valueAlias(y, z), "
+      "dereference(z, w).\n"
+      "valueAlias(x, y) :- valueFlow(z, x), valueFlow(z, y).\n"
+      "valueAlias(x, y) :- valueFlow(z, x), memoryAlias(z, w), "
+      "valueFlow(w, y).\n";
+
+static const char *cspa_rels[2] = { "assign", "dereference" };
+static const char *cspa_files[2] = { "assign.csv", "dereference.csv" };
+
+static int
+run_cspa_workload(const char *data_dir, uint32_t workers, int repeat)
+{
+    /* Load 2 CSV files into inline facts buffers */
+    size_t per_buf = SRC_BUFSZ / 2;
+    char *bufs[2];
+    int32_t total_facts = 0;
+
+    for (int i = 0; i < 2; i++) {
+        bufs[i] = (char *)malloc(per_buf);
+        if (!bufs[i]) {
+            if (i > 0)
+                free(bufs[0]);
+            return -1;
+        }
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", data_dir, cspa_files[i]);
+
+        int32_t count = 0;
+        if (csv_to_inline_facts(path, cspa_rels[i], bufs[i], per_buf, &count)
+            != 0) {
+            for (int j = 0; j <= i; j++)
+                free(bufs[j]);
+            return -1;
+        }
+        total_facts += count;
+    }
+
+    /* Build combined source */
+    char *source = (char *)malloc(SRC_BUFSZ);
+    if (!source) {
+        for (int i = 0; i < 2; i++)
+            free(bufs[i]);
+        return -1;
+    }
+
+    int n = snprintf(source, SRC_BUFSZ, cspa_template, bufs[0], bufs[1]);
+    for (int i = 0; i < 2; i++)
+        free(bufs[i]);
+
+    if (n < 0 || (size_t)n >= SRC_BUFSZ) {
+        fprintf(stderr, "error: source buffer overflow\n");
+        free(source);
+        return -1;
+    }
+
+    /* Collect timing samples */
+    double *times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    if (!times) {
+        free(source);
+        return -1;
+    }
+
+    int64_t tuples = 0;
+    int64_t peak_rss = -1;
+    int status_ok = 1;
+
+    for (int r = 0; r < repeat; r++) {
+        bench_time_t t0 = bench_time_now();
+        int64_t cnt = 0;
+        int rc = run_pipeline_count(source, workers, &cnt);
+        bench_time_t t1 = bench_time_now();
+
+        times[r] = bench_time_diff_ms(t0, t1);
+
+        if (rc != 0) {
+            status_ok = 0;
+            break;
+        }
+        tuples = cnt;
+    }
+
+    peak_rss = bench_peak_rss_kb();
+
+    if (status_ok) {
+        qsort(times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        double min_ms = times[0];
+        double median_ms = times[repeat / 2];
+        double max_ms = times[repeat - 1];
+
+        printf("cspa\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64 "\t%" PRId64
+               "\t%s\n",
+               total_facts, workers, repeat, min_ms, median_ms, max_ms,
+               peak_rss, tuples, "OK");
+    } else {
+        printf("cspa\t-\t-\t%u\t%d\t-\t-\t-\t-\t-\tFAIL\n", workers, repeat);
+    }
+
+    free(times);
+    free(source);
+    return status_ok ? 0 : -1;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -598,17 +720,19 @@ usage(const char *prog)
     fprintf(
         stderr,
         "Usage: %s --workload "
-        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|all} --data "
+        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|all} --data "
         "FILE\n"
         "          [--data-weighted FILE] [--data-andersen DIR]\n"
-        "          [--data-dyck DIR] [--workers N] [--repeat R]\n"
+        "          [--data-dyck DIR] [--data-cspa DIR]\n"
+        "          [--workers N] [--repeat R]\n"
         "\n"
         "  --data FILE           Unweighted edge CSV (src,dst)\n"
         "  --data-weighted FILE  Weighted edge CSV (src,dst,weight) for SSSP\n"
         "  --data-andersen DIR   Directory with addressOf/assign/load/store "
         "CSVs\n"
         "  --data-dyck DIR       Directory with open1/close1/open2/close2 "
-        "CSVs\n",
+        "CSVs\n"
+        "  --data-cspa DIR       Directory with assign/dereference CSVs\n",
         prog);
 }
 
@@ -620,6 +744,7 @@ main(int argc, char **argv)
     const char *data_weighted_path = NULL;
     const char *data_andersen_path = NULL;
     const char *data_dyck_path = NULL;
+    const char *data_cspa_path = NULL;
     uint32_t workers = 1;
     int repeat = 3;
 
@@ -629,6 +754,7 @@ main(int argc, char **argv)
         { "data-weighted", required_argument, NULL, 'W' },
         { "data-andersen", required_argument, NULL, 'A' },
         { "data-dyck", required_argument, NULL, 'D' },
+        { "data-cspa", required_argument, NULL, 'C' },
         { "workers", required_argument, NULL, 'j' },
         { "repeat", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
@@ -636,7 +762,7 @@ main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:j:r:h", long_opts, NULL))
+    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:j:r:h", long_opts, NULL))
            != -1) {
         switch (opt) {
         case 'w':
@@ -653,6 +779,9 @@ main(int argc, char **argv)
             break;
         case 'D':
             data_dyck_path = optarg;
+            break;
+        case 'C':
+            data_cspa_path = optarg;
             break;
         case 'j':
             workers = (uint32_t)strtoul(optarg, NULL, 10);
@@ -707,6 +836,12 @@ main(int argc, char **argv)
             return 1;
         }
         rc = run_dyck_workload(data_dyck_path, workers, repeat);
+    } else if (strcmp(workload, "cspa") == 0) {
+        if (!data_cspa_path) {
+            fprintf(stderr, "error: cspa requires --data-cspa DIR\n");
+            return 1;
+        }
+        rc = run_cspa_workload(data_cspa_path, workers, repeat);
     } else if (strcmp(workload, "all") == 0) {
         for (int i = 0; i < WL_COUNT; i++) {
             if (i == WL_SSSP && !data_weighted_path) {
@@ -725,6 +860,11 @@ main(int argc, char **argv)
         }
         if (data_dyck_path) {
             int r = run_dyck_workload(data_dyck_path, workers, repeat);
+            if (r != 0)
+                rc = r;
+        }
+        if (data_cspa_path) {
+            int r = run_cspa_workload(data_cspa_path, workers, repeat);
             if (r != 0)
                 rc = r;
         }

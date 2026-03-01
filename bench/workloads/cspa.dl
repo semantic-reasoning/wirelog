@@ -1,0 +1,17 @@
+.decl assign(x: int32, y: int32)
+.input assign(filename="ASSIGN", delimiter=",")
+.decl dereference(x: int32, y: int32)
+.input dereference(filename="DEREF", delimiter=",")
+.decl valueFlow(x: int32, y: int32)
+.decl memoryAlias(x: int32, y: int32)
+.decl valueAlias(x: int32, y: int32)
+valueFlow(y, x) :- assign(y, x).
+valueFlow(x, x) :- assign(x, _).
+valueFlow(x, x) :- assign(_, x).
+memoryAlias(x, x) :- assign(_, x).
+memoryAlias(x, x) :- assign(x, _).
+valueFlow(x, y) :- valueFlow(x, z), valueFlow(z, y).
+valueFlow(x, y) :- assign(x, z), memoryAlias(z, y).
+memoryAlias(x, w) :- dereference(y, x), valueAlias(y, z), dereference(z, w).
+valueAlias(x, y) :- valueFlow(z, x), valueFlow(z, y).
+valueAlias(x, y) :- valueFlow(z, x), memoryAlias(z, w), valueFlow(w, y).
