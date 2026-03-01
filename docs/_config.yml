@@ -1,0 +1,14 @@
+title: wirelog
+description: Embedded-to-Enterprise Datalog Engine
+remote_theme: just-the-docs/just-the-docs
+
+url: https://justinjoy.github.io
+baseurl: /wirelog
+
+aux_links:
+  "GitHub":
+    - "https://github.com/justinjoy/wirelog"
+
+footer_content: "Copyright &copy; CleverPlant. Licensed under LGPL-3.0."
+
+search_enabled: true
