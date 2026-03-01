@@ -1581,6 +1581,574 @@ run_crdt_workload(const char *data_dir, uint32_t workers, int repeat)
 }
 
 /* ----------------------------------------------------------------
+ * DOOP - Java Points-to Analysis (zxing dataset)
+ * ---------------------------------------------------------------- */
+
+/* DOOP uses .input directives to load 34 CSV files (~3.5M tuples).
+ * EDB definitions are generated programmatically; rules are a static string.
+ * Dataset: zxing (smallest FlowLog DOOP artifact, 83MB).
+ * Magic constants are zxing-specific pre-hashed integer IDs. */
+
+#define DOOP_SRC_BUFSZ ((size_t)64 * 1024)
+#define DOOP_NRELS 34
+
+struct doop_edb {
+    const char *name;
+    const char *cols;
+    const char *csv;
+};
+
+static const struct doop_edb doop_edbs[DOOP_NRELS] = {
+    { "DirectSuperclass", "(class: int32, superclass: int32)",
+      "DirectSuperclass.csv" },
+    { "DirectSuperinterface", "(ref: int32, interface: int32)",
+      "DirectSuperinterface.csv" },
+    { "MainClass", "(class: int32)", "MainClass.csv" },
+    { "FormalParam", "(index: int32, method: int32, var: int32)",
+      "FormalParam.csv" },
+    { "ComponentType", "(arrayType: int32, componentType: int32)",
+      "ComponentType.csv" },
+    { "AssignReturnValue", "(invocation: int32, to: int32)",
+      "AssignReturnValue.csv" },
+    { "ActualParam", "(index: int32, invocation: int32, var: int32)",
+      "ActualParam.csv" },
+    { "Method_Modifier", "(mod: int32, method: int32)", "Method_Modifier.csv" },
+    { "Var_Type", "(var: int32, type: int32)", "Var_Type.csv" },
+    { "HeapAllocation_Type", "(heap: int32, type: int32)",
+      "HeapAllocation_Type.csv" },
+    { "_ClassType", "(class: int32)", "ClassType.csv" },
+    { "_ArrayType", "(arrayType: int32)", "ArrayType.csv" },
+    { "_InterfaceType", "(interface: int32)", "InterfaceType.csv" },
+    { "_Var_DeclaringMethod", "(var: int32, method: int32)",
+      "Var_DeclaringMethod.csv" },
+    { "_ApplicationClass", "(type: int32)", "ApplicationClass.csv" },
+    { "_ThisVar", "(method: int32, var: int32)", "ThisVar.csv" },
+    { "_NormalHeap", "(id: int32, type: int32)", "NormalHeap.csv" },
+    { "_StringConstant", "(id: int32)", "StringConstant.csv" },
+    { "_AssignHeapAllocation",
+      "(instruction: int32, idx: int32, heap: int32, to: int32, "
+      "inmethod: int32, linenumber: int32)",
+      "AssignHeapAllocation.csv" },
+    { "_AssignLocal",
+      "(instruction: int32, idx: int32, from: int32, to: int32, "
+      "inmethod: int32)",
+      "AssignLocal.csv" },
+    { "_AssignCast",
+      "(instruction: int32, idx: int32, from: int32, to: int32, "
+      "type: int32, inmethod: int32)",
+      "AssignCast.csv" },
+    { "_Field",
+      "(signature: int32, declaringClass: int32, simplename: int32, "
+      "type: int32)",
+      "Field.csv" },
+    { "_StaticMethodInvocation",
+      "(instruction: int32, idx: int32, signature: int32, method: int32)",
+      "StaticMethodInvocation.csv" },
+    { "_SpecialMethodInvocation",
+      "(instruction: int32, idx: int32, signature: int32, base: int32, "
+      "method: int32)",
+      "SpecialMethodInvocation.csv" },
+    { "_VirtualMethodInvocation",
+      "(instruction: int32, idx: int32, signature: int32, base: int32, "
+      "method: int32)",
+      "VirtualMethodInvocation.csv" },
+    { "_Method",
+      "(method: int32, simplename: int32, params: int32, "
+      "declaringType: int32, returnType: int32, jvmDescriptor: int32, "
+      "arity: int32)",
+      "Method.csv" },
+    { "Method_Descriptor", "(method: int32, descriptor: int32)",
+      "Method_Descriptor.csv" },
+    { "_StoreInstanceField",
+      "(instruction: int32, idx: int32, from: int32, base: int32, "
+      "signature: int32, method: int32)",
+      "StoreInstanceField.csv" },
+    { "_LoadInstanceField",
+      "(instruction: int32, idx: int32, to: int32, base: int32, "
+      "signature: int32, method: int32)",
+      "LoadInstanceField.csv" },
+    { "_StoreStaticField",
+      "(instruction: int32, idx: int32, from: int32, signature: int32, "
+      "method: int32)",
+      "StoreStaticField.csv" },
+    { "_LoadStaticField",
+      "(instruction: int32, idx: int32, to: int32, signature: int32, "
+      "method: int32)",
+      "LoadStaticField.csv" },
+    { "_StoreArrayIndex",
+      "(instruction: int32, idx: int32, from: int32, base: int32, "
+      "method: int32)",
+      "StoreArrayIndex.csv" },
+    { "_LoadArrayIndex",
+      "(instruction: int32, idx: int32, to: int32, base: int32, "
+      "method: int32)",
+      "LoadArrayIndex.csv" },
+    { "_Return", "(instruction: int32, idx: int32, var: int32, method: int32)",
+      "Return.csv" },
+};
+
+/* IDB declarations + all ~130 rules */
+static const char *doop_rules
+    /* IDB: Narrow schema */
+    = ".decl isType(t: int32)\n"
+      ".decl isReferenceType(t: int32)\n"
+      ".decl isArrayType(t: int32)\n"
+      ".decl isClassType(t: int32)\n"
+      ".decl isInterfaceType(t: int32)\n"
+      ".decl ApplicationClass(ref: int32)\n"
+      ".decl Field_DeclaringType(field: int32, declaringClass: int32)\n"
+      ".decl Method_DeclaringType(method: int32, declaringType: int32)\n"
+      ".decl Method_SimpleName(method: int32, simpleName: int32)\n"
+      ".decl ThisVar(method: int32, var: int32)\n"
+      ".decl Var_DeclaringMethod(var: int32, method: int32)\n"
+      ".decl Instruction_Method(insn: int32, inMethod: int32)\n"
+      ".decl isVirtualMethodInvocation_Insn(insn: int32)\n"
+      ".decl isStaticMethodInvocation_Insn(insn: int32)\n"
+      ".decl FieldInstruction_Signature(insn: int32, sign: int32)\n"
+      ".decl LoadInstanceField_Base(insn: int32, var: int32)\n"
+      ".decl LoadInstanceField_To(insn: int32, var: int32)\n"
+      ".decl StoreInstanceField_From(insn: int32, var: int32)\n"
+      ".decl StoreInstanceField_Base(insn: int32, var: int32)\n"
+      ".decl LoadStaticField_To(insn: int32, var: int32)\n"
+      ".decl StoreStaticField_From(insn: int32, var: int32)\n"
+      ".decl LoadArrayIndex_Base(insn: int32, var: int32)\n"
+      ".decl LoadArrayIndex_To(insn: int32, var: int32)\n"
+      ".decl StoreArrayIndex_From(insn: int32, var: int32)\n"
+      ".decl StoreArrayIndex_Base(insn: int32, var: int32)\n"
+      ".decl AssignInstruction_To(insn: int32, to: int32)\n"
+      ".decl AssignCast_From(insn: int32, from: int32)\n"
+      ".decl AssignCast_Type(insn: int32, type: int32)\n"
+      ".decl AssignLocal_From(insn: int32, from: int32)\n"
+      ".decl AssignHeapAllocation_Heap(insn: int32, heap: int32)\n"
+      ".decl ReturnNonvoid_Var(ret: int32, var: int32)\n"
+      ".decl MethodInvocation_Method(invocation: int32, signature: int32)\n"
+      ".decl VirtualMethodInvocation_Base(invocation: int32, base: int32)\n"
+      ".decl VirtualMethodInvocation_SimpleName(invocation: int32, "
+      "simplename: int32)\n"
+      ".decl VirtualMethodInvocation_Descriptor(invocation: int32, "
+      "descriptor: int32)\n"
+      ".decl SpecialMethodInvocation_Base(invocation: int32, base: int32)\n"
+      ".decl MethodInvocation_Base(invocation: int32, base: int32)\n"
+      /* IDB: Fat schema */
+      ".decl LoadInstanceField(base: int32, sig: int32, to: int32, "
+      "inmethod: int32)\n"
+      ".decl StoreInstanceField(from: int32, base: int32, signature: int32, "
+      "inmethod: int32)\n"
+      ".decl LoadStaticField(sig: int32, to: int32, inmethod: int32)\n"
+      ".decl StoreStaticField(from: int32, signature: int32, "
+      "inmethod: int32)\n"
+      ".decl LoadArrayIndex(base: int32, to: int32, inmethod: int32)\n"
+      ".decl StoreArrayIndex(from: int32, base: int32, inmethod: int32)\n"
+      ".decl AssignCast(type: int32, from: int32, to: int32, "
+      "inmethod: int32)\n"
+      ".decl AssignLocal(from: int32, to: int32, inmethod: int32)\n"
+      ".decl AssignHeapAllocation(heap: int32, to: int32, "
+      "inmethod: int32)\n"
+      ".decl ReturnVar(var: int32, method: int32)\n"
+      ".decl StaticMethodInvocation(invocation: int32, signature: int32, "
+      "inmethod: int32)\n"
+      /* IDB: Type hierarchy */
+      ".decl MethodLookup(simplename: int32, descriptor: int32, "
+      "type: int32, method: int32)\n"
+      ".decl MethodImplemented(simplename: int32, descriptor: int32, "
+      "type: int32, method: int32)\n"
+      ".decl DirectSubclass(a: int32, c: int32)\n"
+      ".decl Subclass(c: int32, a: int32)\n"
+      ".decl Superclass(c: int32, a: int32)\n"
+      ".decl Superinterface(k: int32, c: int32)\n"
+      ".decl SubtypeOf(subtype: int32, type: int32)\n"
+      ".decl SupertypeOf(supertype: int32, type: int32)\n"
+      ".decl SubtypeOfDifferent(subtype: int32, type: int32)\n"
+      ".decl MainMethodDeclaration(method: int32)\n"
+      /* IDB: Class initialization */
+      ".decl ClassInitializer(type: int32, method: int32)\n"
+      ".decl InitializedClass(classOrInterface: int32)\n"
+      /* IDB: Main analysis */
+      ".decl Assign(to: int32, from: int32)\n"
+      ".decl VarPointsTo(heap: int32, var: int32)\n"
+      ".decl InstanceFieldPointsTo(heap: int32, fld: int32, "
+      "baseheap: int32)\n"
+      ".decl StaticFieldPointsTo(heap: int32, fld: int32)\n"
+      ".decl CallGraphEdge(invocation: int32, meth: int32)\n"
+      ".decl ArrayIndexPointsTo(baseheap: int32, heap: int32)\n"
+      ".decl Reachable(method: int32)\n"
+      /* Phase 1: EDB staging & decomposition */
+      "isType(class) :- _ClassType(class).\n"
+      "isReferenceType(class) :- _ClassType(class).\n"
+      "isClassType(class) :- _ClassType(class).\n"
+      "isType(at) :- _ArrayType(at).\n"
+      "isReferenceType(at) :- _ArrayType(at).\n"
+      "isArrayType(at) :- _ArrayType(at).\n"
+      "isType(intf) :- _InterfaceType(intf).\n"
+      "isReferenceType(intf) :- _InterfaceType(intf).\n"
+      "isInterfaceType(intf) :- _InterfaceType(intf).\n"
+      "Var_DeclaringMethod(var, method) :- "
+      "_Var_DeclaringMethod(var, method).\n"
+      "isType(type) :- _ApplicationClass(type).\n"
+      "isReferenceType(type) :- _ApplicationClass(type).\n"
+      "ApplicationClass(type) :- _ApplicationClass(type).\n"
+      "ThisVar(method, var) :- _ThisVar(method, var).\n"
+      "isType(type) :- _NormalHeap(_, type).\n"
+      /* Decompose _AssignHeapAllocation */
+      "Instruction_Method(i, m) :- _AssignHeapAllocation(i, _, _, _, m, _).\n"
+      "AssignInstruction_To(i, t) :- _AssignHeapAllocation(i, _, _, t, _, _).\n"
+      "AssignHeapAllocation_Heap(i, h) :- "
+      "_AssignHeapAllocation(i, _, h, _, _, _).\n"
+      /* Decompose _AssignLocal */
+      "Instruction_Method(i, m) :- _AssignLocal(i, _, _, _, m).\n"
+      "AssignLocal_From(i, f) :- _AssignLocal(i, _, f, _, _).\n"
+      "AssignInstruction_To(i, t) :- _AssignLocal(i, _, _, t, _).\n"
+      /* Decompose _AssignCast */
+      "Instruction_Method(i, m) :- _AssignCast(i, _, _, _, _, m).\n"
+      "AssignCast_Type(i, tp) :- _AssignCast(i, _, _, _, tp, _).\n"
+      "AssignCast_From(i, f) :- _AssignCast(i, _, f, _, _, _).\n"
+      "AssignInstruction_To(i, t) :- _AssignCast(i, _, _, t, _, _).\n"
+      /* Decompose _Field */
+      "Field_DeclaringType(sig, dt) :- _Field(sig, dt, _, _).\n"
+      /* MethodInvocation_Base */
+      "MethodInvocation_Base(inv, b) :- "
+      "VirtualMethodInvocation_Base(inv, b).\n"
+      "MethodInvocation_Base(inv, b) :- "
+      "SpecialMethodInvocation_Base(inv, b).\n"
+      /* Decompose _StaticMethodInvocation */
+      "Instruction_Method(i, m) :- _StaticMethodInvocation(i, _, _, m).\n"
+      "isStaticMethodInvocation_Insn(i) :- "
+      "_StaticMethodInvocation(i, _, _, _).\n"
+      "MethodInvocation_Method(i, sig) :- "
+      "_StaticMethodInvocation(i, _, sig, _).\n"
+      /* Decompose _SpecialMethodInvocation */
+      "Instruction_Method(i, m) :- "
+      "_SpecialMethodInvocation(i, _, _, _, m).\n"
+      "SpecialMethodInvocation_Base(i, b) :- "
+      "_SpecialMethodInvocation(i, _, _, b, _).\n"
+      "MethodInvocation_Method(i, sig) :- "
+      "_SpecialMethodInvocation(i, _, sig, _, _).\n"
+      /* Decompose _VirtualMethodInvocation */
+      "Instruction_Method(i, m) :- "
+      "_VirtualMethodInvocation(i, _, _, _, m).\n"
+      "isVirtualMethodInvocation_Insn(i) :- "
+      "_VirtualMethodInvocation(i, _, _, _, _).\n"
+      "VirtualMethodInvocation_Base(i, b) :- "
+      "_VirtualMethodInvocation(i, _, _, b, _).\n"
+      "MethodInvocation_Method(i, sig) :- "
+      "_VirtualMethodInvocation(i, _, sig, _, _).\n"
+      /* Decompose _Method */
+      "Method_SimpleName(m, sn) :- _Method(m, sn, _, _, _, _, _).\n"
+      "Method_DeclaringType(m, dt) :- _Method(m, _, _, dt, _, _, _).\n"
+      /* Decompose _StoreInstanceField */
+      "Instruction_Method(i, m) :- "
+      "_StoreInstanceField(i, _, _, _, _, m).\n"
+      "FieldInstruction_Signature(i, sig) :- "
+      "_StoreInstanceField(i, _, _, _, sig, _).\n"
+      "StoreInstanceField_Base(i, b) :- "
+      "_StoreInstanceField(i, _, _, b, _, _).\n"
+      "StoreInstanceField_From(i, f) :- "
+      "_StoreInstanceField(i, _, f, _, _, _).\n"
+      /* Decompose _LoadInstanceField */
+      "Instruction_Method(i, m) :- "
+      "_LoadInstanceField(i, _, _, _, _, m).\n"
+      "FieldInstruction_Signature(i, sig) :- "
+      "_LoadInstanceField(i, _, _, _, sig, _).\n"
+      "LoadInstanceField_Base(i, b) :- "
+      "_LoadInstanceField(i, _, _, b, _, _).\n"
+      "LoadInstanceField_To(i, t) :- "
+      "_LoadInstanceField(i, _, t, _, _, _).\n"
+      /* Decompose _StoreStaticField */
+      "Instruction_Method(i, m) :- _StoreStaticField(i, _, _, _, m).\n"
+      "FieldInstruction_Signature(i, sig) :- "
+      "_StoreStaticField(i, _, _, sig, _).\n"
+      "StoreStaticField_From(i, f) :- _StoreStaticField(i, _, f, _, _).\n"
+      /* Decompose _LoadStaticField */
+      "Instruction_Method(i, m) :- _LoadStaticField(i, _, _, _, m).\n"
+      "FieldInstruction_Signature(i, sig) :- "
+      "_LoadStaticField(i, _, _, sig, _).\n"
+      "LoadStaticField_To(i, t) :- _LoadStaticField(i, _, t, _, _).\n"
+      /* Decompose _StoreArrayIndex */
+      "Instruction_Method(i, m) :- _StoreArrayIndex(i, _, _, _, m).\n"
+      "StoreArrayIndex_Base(i, b) :- _StoreArrayIndex(i, _, _, b, _).\n"
+      "StoreArrayIndex_From(i, f) :- _StoreArrayIndex(i, _, f, _, _).\n"
+      /* Decompose _LoadArrayIndex */
+      "Instruction_Method(i, m) :- _LoadArrayIndex(i, _, _, _, m).\n"
+      "LoadArrayIndex_Base(i, b) :- _LoadArrayIndex(i, _, _, b, _).\n"
+      "LoadArrayIndex_To(i, t) :- _LoadArrayIndex(i, _, t, _, _).\n"
+      /* Decompose _Return */
+      "Instruction_Method(i, m) :- _Return(i, _, _, m).\n"
+      "ReturnNonvoid_Var(i, v) :- _Return(i, _, v, _).\n"
+      /* Fat schema population */
+      "LoadInstanceField(base, sig, to, im) :- "
+      "Instruction_Method(insn, im), LoadInstanceField_Base(insn, base), "
+      "FieldInstruction_Signature(insn, sig), "
+      "LoadInstanceField_To(insn, to).\n"
+      "StoreInstanceField(from, base, sig, im) :- "
+      "Instruction_Method(insn, im), StoreInstanceField_From(insn, from), "
+      "StoreInstanceField_Base(insn, base), "
+      "FieldInstruction_Signature(insn, sig).\n"
+      "LoadStaticField(sig, to, im) :- Instruction_Method(insn, im), "
+      "FieldInstruction_Signature(insn, sig), "
+      "LoadStaticField_To(insn, to).\n"
+      "StoreStaticField(from, sig, im) :- Instruction_Method(insn, im), "
+      "StoreStaticField_From(insn, from), "
+      "FieldInstruction_Signature(insn, sig).\n"
+      "LoadArrayIndex(base, to, im) :- Instruction_Method(insn, im), "
+      "LoadArrayIndex_Base(insn, base), LoadArrayIndex_To(insn, to).\n"
+      "StoreArrayIndex(from, base, im) :- Instruction_Method(insn, im), "
+      "StoreArrayIndex_From(insn, from), "
+      "StoreArrayIndex_Base(insn, base).\n"
+      "AssignCast(type, from, to, im) :- Instruction_Method(insn, im), "
+      "AssignCast_From(insn, from), AssignInstruction_To(insn, to), "
+      "AssignCast_Type(insn, type).\n"
+      "AssignLocal(from, to, im) :- AssignInstruction_To(insn, to), "
+      "Instruction_Method(insn, im), AssignLocal_From(insn, from).\n"
+      "AssignHeapAllocation(heap, to, im) :- "
+      "Instruction_Method(insn, im), "
+      "AssignHeapAllocation_Heap(insn, heap), "
+      "AssignInstruction_To(insn, to).\n"
+      "ReturnVar(var, method) :- Instruction_Method(insn, method), "
+      "ReturnNonvoid_Var(insn, var).\n"
+      "StaticMethodInvocation(inv, sig, im) :- "
+      "isStaticMethodInvocation_Insn(inv), Instruction_Method(inv, im), "
+      "MethodInvocation_Method(inv, sig).\n"
+      /* VirtualMethodInvocation derived */
+      "VirtualMethodInvocation_SimpleName(inv, sn) :- "
+      "isVirtualMethodInvocation_Insn(inv), "
+      "MethodInvocation_Method(inv, sig), "
+      "Method_SimpleName(sig, sn), Method_Descriptor(sig, desc).\n"
+      "VirtualMethodInvocation_Descriptor(inv, desc) :- "
+      "isVirtualMethodInvocation_Insn(inv), "
+      "MethodInvocation_Method(inv, sig), "
+      "Method_SimpleName(sig, sn), Method_Descriptor(sig, desc).\n"
+      /* Phase 2: Type hierarchy */
+      "MethodLookup(sn, d, t, m) :- MethodImplemented(sn, d, t, m).\n"
+      "MethodLookup(sn, d, t, m) :- DirectSuperclass(t, st), "
+      "MethodLookup(sn, d, st, m), !MethodImplemented(sn, d, t, _).\n"
+      "MethodLookup(sn, d, t, m) :- DirectSuperinterface(t, st), "
+      "MethodLookup(sn, d, st, m), !MethodImplemented(sn, d, t, _).\n"
+      "MethodImplemented(sn, d, t, m) :- Method_SimpleName(m, sn), "
+      "Method_Descriptor(m, d), Method_DeclaringType(m, t), "
+      "!Method_Modifier(1928492, m).\n"
+      "MainMethodDeclaration(m) :- MainClass(t), "
+      "Method_DeclaringType(m, t), m != 536048, m != 1057660, "
+      "m != 796639, Method_SimpleName(m, 2648290), "
+      "Method_Descriptor(m, 2671384), Method_Modifier(760051, m), "
+      "Method_Modifier(841804, m).\n"
+      "DirectSubclass(a, c) :- DirectSuperclass(a, c).\n"
+      "Subclass(c, a) :- DirectSubclass(a, c).\n"
+      "Subclass(c, a) :- Subclass(b, a), DirectSubclass(b, c).\n"
+      "Superclass(c, a) :- Subclass(a, c).\n"
+      "Superinterface(k, c) :- DirectSuperinterface(c, k).\n"
+      "Superinterface(k, c) :- DirectSuperinterface(c, j), "
+      "Superinterface(k, j).\n"
+      "Superinterface(k, c) :- DirectSuperclass(c, s), "
+      "Superinterface(k, s).\n"
+      "SubtypeOf(s, s) :- isClassType(s).\n"
+      "SubtypeOf(t, t) :- isType(t).\n"
+      "SubtypeOf(s, t) :- Subclass(t, s).\n"
+      "SubtypeOf(s, s) :- isInterfaceType(s).\n"
+      "SubtypeOf(s, t) :- isClassType(s), Superinterface(t, s).\n"
+      "SubtypeOf(s, t) :- isInterfaceType(s), isType(t), t = 613907.\n"
+      "SubtypeOf(s, t) :- isArrayType(s), isType(t), t = 613907.\n"
+      "SubtypeOf(s, t) :- isInterfaceType(s), Superinterface(t, s).\n"
+      "SubtypeOf(s, t) :- SubtypeOf(sc, tc), ComponentType(s, sc), "
+      "ComponentType(t, tc), isReferenceType(sc), "
+      "isReferenceType(tc).\n"
+      "SubtypeOf(s, t) :- isArrayType(s), isInterfaceType(t), "
+      "isType(t), t = 935673.\n"
+      "SubtypeOf(s, t) :- isArrayType(s), isInterfaceType(t), "
+      "isType(t), t = 619327.\n"
+      "SupertypeOf(s, t) :- SubtypeOf(t, s).\n"
+      "SubtypeOfDifferent(s, t) :- SubtypeOf(s, t), s != t.\n"
+      /* Phase 3: Class initialization */
+      "ClassInitializer(t, m) :- MethodImplemented(777634, 2670449, t, m).\n"
+      "InitializedClass(sc) :- InitializedClass(c), "
+      "DirectSuperclass(c, sc).\n"
+      "InitializedClass(si) :- InitializedClass(ci), "
+      "DirectSuperinterface(ci, si).\n"
+      "InitializedClass(c) :- MainMethodDeclaration(m), "
+      "Method_DeclaringType(m, c).\n"
+      "InitializedClass(c) :- Reachable(im), "
+      "AssignHeapAllocation(h, _, im), HeapAllocation_Type(h, c).\n"
+      "InitializedClass(c) :- Reachable(im), "
+      "Instruction_Method(inv, im), "
+      "isStaticMethodInvocation_Insn(inv), "
+      "MethodInvocation_Method(inv, sig), "
+      "Method_DeclaringType(sig, c).\n"
+      "InitializedClass(ci) :- Reachable(im), "
+      "StoreStaticField(_, sig, im), "
+      "Field_DeclaringType(sig, ci).\n"
+      "InitializedClass(ci) :- Reachable(im), "
+      "LoadStaticField(sig, _, im), Field_DeclaringType(sig, ci).\n"
+      "Reachable(cl) :- InitializedClass(c), "
+      "ClassInitializer(c, cl).\n"
+      /* Phase 4: Main analysis */
+      "Assign(act, frm) :- CallGraphEdge(inv, m), "
+      "FormalParam(idx, m, frm), ActualParam(idx, inv, act).\n"
+      "Assign(ret, loc) :- CallGraphEdge(inv, m), ReturnVar(ret, m), "
+      "AssignReturnValue(inv, loc).\n"
+      "VarPointsTo(h, v) :- AssignHeapAllocation(h, v, im), "
+      "Reachable(im).\n"
+      "VarPointsTo(h, to) :- Assign(from, to), VarPointsTo(h, from).\n"
+      "VarPointsTo(h, to) :- Reachable(im), "
+      "AssignLocal(from, to, im), VarPointsTo(h, from).\n"
+      "VarPointsTo(h, to) :- Reachable(im), "
+      "AssignCast(tp, from, to, im), SupertypeOf(tp, ht), "
+      "HeapAllocation_Type(h, ht), VarPointsTo(h, from).\n"
+      "ArrayIndexPointsTo(bh, h) :- Reachable(im), "
+      "StoreArrayIndex(from, base, im), VarPointsTo(bh, base), "
+      "VarPointsTo(h, from), HeapAllocation_Type(h, ht), "
+      "HeapAllocation_Type(bh, bht), ComponentType(bht, ct), "
+      "SupertypeOf(ct, ht).\n"
+      "VarPointsTo(h, to) :- Reachable(im), "
+      "LoadArrayIndex(base, to, im), VarPointsTo(bh, base), "
+      "ArrayIndexPointsTo(bh, h), Var_Type(to, tp), "
+      "HeapAllocation_Type(bh, bht), ComponentType(bht, bct), "
+      "SupertypeOf(tp, bct).\n"
+      "VarPointsTo(h, to) :- Reachable(im), "
+      "LoadInstanceField(base, sig, to, im), "
+      "VarPointsTo(bh, base), "
+      "InstanceFieldPointsTo(h, sig, bh).\n"
+      "VarPointsTo(h, to) :- Reachable(im), "
+      "LoadStaticField(fld, to, im), "
+      "StaticFieldPointsTo(h, fld).\n"
+      "VarPointsTo(h, this) :- Reachable(im), "
+      "Instruction_Method(inv, im), "
+      "VirtualMethodInvocation_Base(inv, base), "
+      "VarPointsTo(h, base), HeapAllocation_Type(h, ht), "
+      "VirtualMethodInvocation_SimpleName(inv, sn), "
+      "VirtualMethodInvocation_Descriptor(inv, desc), "
+      "MethodLookup(sn, desc, ht, tm), ThisVar(tm, this).\n"
+      "InstanceFieldPointsTo(h, fld, bh) :- Reachable(im), "
+      "StoreInstanceField(from, base, fld, im), "
+      "VarPointsTo(h, from), VarPointsTo(bh, base).\n"
+      "StaticFieldPointsTo(h, fld) :- Reachable(im), "
+      "StoreStaticField(from, fld, im), VarPointsTo(h, from).\n"
+      "Reachable(tm) :- Reachable(im), Instruction_Method(inv, im), "
+      "VirtualMethodInvocation_Base(inv, base), "
+      "VarPointsTo(h, base), HeapAllocation_Type(h, ht), "
+      "VirtualMethodInvocation_SimpleName(inv, sn), "
+      "VirtualMethodInvocation_Descriptor(inv, desc), "
+      "MethodLookup(sn, desc, ht, tm).\n"
+      "CallGraphEdge(inv, tm) :- Reachable(im), "
+      "Instruction_Method(inv, im), "
+      "VirtualMethodInvocation_Base(inv, base), "
+      "VarPointsTo(h, base), HeapAllocation_Type(h, ht), "
+      "VirtualMethodInvocation_SimpleName(inv, sn), "
+      "VirtualMethodInvocation_Descriptor(inv, desc), "
+      "MethodLookup(sn, desc, ht, tm).\n"
+      "Reachable(tm) :- Reachable(im), "
+      "StaticMethodInvocation(inv, tm, im).\n"
+      "CallGraphEdge(inv, tm) :- Reachable(im), "
+      "StaticMethodInvocation(inv, tm, im).\n"
+      "Reachable(tm) :- Reachable(im), Instruction_Method(inv, im), "
+      "SpecialMethodInvocation_Base(inv, base), "
+      "VarPointsTo(h, base), "
+      "MethodInvocation_Method(inv, tm), ThisVar(tm, this).\n"
+      "CallGraphEdge(inv, tm) :- Reachable(im), "
+      "Instruction_Method(inv, im), "
+      "SpecialMethodInvocation_Base(inv, base), "
+      "VarPointsTo(h, base), "
+      "MethodInvocation_Method(inv, tm), ThisVar(tm, this).\n"
+      "VarPointsTo(h, this) :- Reachable(im), "
+      "Instruction_Method(inv, im), "
+      "SpecialMethodInvocation_Base(inv, base), "
+      "VarPointsTo(h, base), "
+      "MethodInvocation_Method(inv, tm), ThisVar(tm, this).\n"
+      "Reachable(m) :- MainMethodDeclaration(m).\n";
+
+static int
+run_doop_workload(const char *data_dir, uint32_t workers, int repeat)
+{
+    /* Build source: generate .decl + .input for each EDB, then rules */
+    char *source = (char *)malloc(DOOP_SRC_BUFSZ);
+    if (!source)
+        return -1;
+
+    size_t pos = 0;
+    for (int i = 0; i < DOOP_NRELS; i++) {
+        int n = snprintf(source + pos, DOOP_SRC_BUFSZ - pos,
+                         ".decl %s%s\n"
+                         ".input %s(filename=\"%s/%s\", delimiter=\",\")\n",
+                         doop_edbs[i].name, doop_edbs[i].cols,
+                         doop_edbs[i].name, data_dir, doop_edbs[i].csv);
+        if (n < 0 || pos + (size_t)n >= DOOP_SRC_BUFSZ) {
+            fprintf(stderr, "error: DOOP EDB source buffer overflow\n");
+            free(source);
+            return -1;
+        }
+        pos += (size_t)n;
+    }
+
+    /* Append IDB declarations + rules */
+    int n = snprintf(source + pos, DOOP_SRC_BUFSZ - pos, "%s", doop_rules);
+    if (n < 0 || pos + (size_t)n >= DOOP_SRC_BUFSZ) {
+        fprintf(stderr, "error: DOOP rules source buffer overflow\n");
+        free(source);
+        return -1;
+    }
+
+    /* Count total input facts across all 34 CSV files */
+    int32_t total_facts = 0;
+    {
+        char path[1024];
+        char line[256];
+        for (int i = 0; i < DOOP_NRELS; i++) {
+            snprintf(path, sizeof(path), "%s/%s", data_dir, doop_edbs[i].csv);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                while (fgets(line, sizeof(line), f))
+                    total_facts++;
+                fclose(f);
+            }
+        }
+    }
+
+    /* Collect timing samples */
+    double *times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    if (!times) {
+        free(source);
+        return -1;
+    }
+
+    int64_t tuples = 0;
+    int64_t peak_rss = -1;
+    int status_ok = 1;
+
+    for (int r = 0; r < repeat; r++) {
+        bench_time_t t0 = bench_time_now();
+        int64_t cnt = 0;
+        int rc = run_pipeline_count(source, workers, &cnt);
+        bench_time_t t1 = bench_time_now();
+
+        times[r] = bench_time_diff_ms(t0, t1);
+
+        if (rc != 0) {
+            status_ok = 0;
+            break;
+        }
+        tuples = cnt;
+    }
+
+    peak_rss = bench_peak_rss_kb();
+
+    if (status_ok) {
+        qsort(times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        double min_ms = times[0];
+        double median_ms = times[repeat / 2];
+        double max_ms = times[repeat - 1];
+
+        printf("doop\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64 "\t%" PRId64
+               "\t%s\n",
+               total_facts, workers, repeat, min_ms, median_ms, max_ms,
+               peak_rss, tuples, "OK");
+    } else {
+        printf("doop\t-\t-\t%u\t%d\t-\t-\t-\t-\t-\tFAIL\n", workers, repeat);
+    }
+
+    free(times);
+    free(source);
+    return status_ok ? 0 : -1;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -1598,7 +2166,7 @@ usage(const char *prog)
         stderr,
         "Usage: %s --workload "
         "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|csda|galen|"
-        "polonius|ddisasm|crdt|all} --data FILE\n"
+        "polonius|ddisasm|crdt|doop|all} --data FILE\n"
         "          [--data-weighted FILE] [--data-andersen DIR]\n"
         "          [--data-dyck DIR] [--data-cspa DIR]\n"
         "          [--data-csda DIR] [--data-galen DIR]\n"
@@ -1617,7 +2185,8 @@ usage(const char *prog)
         "  --data-polonius DIR   Directory with Polonius borrow checker "
         "CSVs\n"
         "  --data-ddisasm DIR    Directory with DDISASM disassembly CSVs\n"
-        "  --data-crdt DIR       Directory with CRDT Insert/Remove CSVs\n",
+        "  --data-crdt DIR       Directory with CRDT Insert/Remove CSVs\n"
+        "  --data-doop DIR       Directory with DOOP zxing CSVs\n",
         prog);
 }
 
@@ -1635,6 +2204,7 @@ main(int argc, char **argv)
     const char *data_polonius_path = NULL;
     const char *data_ddisasm_path = NULL;
     const char *data_crdt_path = NULL;
+    const char *data_doop_path = NULL;
     uint32_t workers = 1;
     int repeat = 3;
 
@@ -1650,6 +2220,7 @@ main(int argc, char **argv)
         { "data-polonius", required_argument, NULL, 'P' },
         { "data-ddisasm", required_argument, NULL, 'I' },
         { "data-crdt", required_argument, NULL, 'R' },
+        { "data-doop", required_argument, NULL, 'O' },
         { "workers", required_argument, NULL, 'j' },
         { "repeat", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
@@ -1657,7 +2228,7 @@ main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:P:I:R:j:r:h",
+    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:P:I:R:O:j:r:h",
                               long_opts, NULL))
            != -1) {
         switch (opt) {
@@ -1694,6 +2265,9 @@ main(int argc, char **argv)
         case 'R':
             data_crdt_path = optarg;
             break;
+        case 'O':
+            data_doop_path = optarg;
+            break;
         case 'j':
             workers = (uint32_t)strtoul(optarg, NULL, 10);
             break;
@@ -1707,7 +2281,11 @@ main(int argc, char **argv)
         }
     }
 
-    if (!workload || !data_path) {
+    if (!workload
+        || (!data_path && !data_andersen_path && !data_dyck_path
+            && !data_cspa_path && !data_csda_path && !data_galen_path
+            && !data_polonius_path && !data_ddisasm_path && !data_crdt_path
+            && !data_doop_path)) {
         usage(argv[0]);
         return 1;
     }
@@ -1783,6 +2361,12 @@ main(int argc, char **argv)
             return 1;
         }
         rc = run_crdt_workload(data_crdt_path, workers, repeat);
+    } else if (strcmp(workload, "doop") == 0) {
+        if (!data_doop_path) {
+            fprintf(stderr, "error: doop requires --data-doop DIR\n");
+            return 1;
+        }
+        rc = run_doop_workload(data_doop_path, workers, repeat);
     } else if (strcmp(workload, "all") == 0) {
         for (int i = 0; i < WL_COUNT; i++) {
             if (i == WL_SSSP && !data_weighted_path) {
@@ -1831,6 +2415,11 @@ main(int argc, char **argv)
         }
         if (data_crdt_path) {
             int r = run_crdt_workload(data_crdt_path, workers, repeat);
+            if (r != 0)
+                rc = r;
+        }
+        if (data_doop_path) {
+            int r = run_doop_workload(data_doop_path, workers, repeat);
             if (r != 0)
                 rc = r;
         }

@@ -55,6 +55,8 @@ pub enum SafeOp {
         right_relation: String,
         left_keys: Vec<String>,
         right_keys: Vec<String>,
+        right_key_indices: Vec<u32>,
+        right_filter: Option<Vec<ExprOp>>,
     },
 
     /// Semijoin (SIP pre-filter).
@@ -271,10 +273,27 @@ unsafe fn read_op(op: &WlFfiOp) -> Result<SafeOp, PlanReadError> {
             let right = read_cstr(op.right_relation, "op.right_relation")?;
             let lk = read_cstr_array(op.left_keys, op.key_count, "op.left_keys")?;
             let rk = read_cstr_array(op.right_keys, op.key_count, "op.right_keys")?;
+            let rki = if op.project_count > 0 && !op.project_indices.is_null() {
+                std::slice::from_raw_parts(op.project_indices, op.project_count as usize).to_vec()
+            } else {
+                Vec::new()
+            };
+            let right_filter = if !op.filter_expr.data.is_null() && op.filter_expr.size > 0 {
+                let data =
+                    std::slice::from_raw_parts(op.filter_expr.data, op.filter_expr.size as usize);
+                Some(
+                    deserialize_expr(data)
+                        .map_err(|e| PlanReadError::ExprDeserializeError(e.to_string()))?,
+                )
+            } else {
+                None
+            };
             Ok(SafeOp::Antijoin {
                 right_relation: right,
                 left_keys: lk,
                 right_keys: rk,
+                right_key_indices: rki,
+                right_filter,
             })
         }
 
@@ -771,6 +790,8 @@ mod tests {
                     right_relation: "edge".to_string(),
                     left_keys: vec!["A".to_string()],
                     right_keys: vec!["B".to_string()],
+                    right_key_indices: Vec::new(),
+                    right_filter: None,
                 }
             );
         }

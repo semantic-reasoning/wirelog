@@ -563,12 +563,25 @@ where
                 right_relation,
                 left_keys,
                 right_keys: _,
+                right_key_indices,
+                right_filter,
             } => {
                 if let Some(c) = current.take() {
                     let key_count = left_keys.len();
                     let right_coll = collections.get(right_relation).cloned();
 
                     if let Some(right) = right_coll {
+                        // Apply right-side filter if present (e.g., constants
+                        // in the negated atom like !b(42, x))
+                        let right = if let Some(ref filter) = right_filter {
+                            let filter = filter.clone();
+                            right.filter(move |row: &Row| {
+                                eval_filter_row(row, &filter).unwrap_or(false)
+                            })
+                        } else {
+                            right
+                        };
+
                         // Left: key = last key_count columns, value = full row
                         let k = key_count;
                         let left_keyed = c.map(move |row: Row| {
@@ -576,8 +589,14 @@ where
                             (key, row)
                         });
 
-                        // Right: extract just the keys
-                        let right_keys_coll = right.map(move |row: Row| row[..key_count].to_vec());
+                        // Right: extract keys by index (or first k columns)
+                        let rki = right_key_indices.clone();
+                        let right_keys_coll = if !rki.is_empty() {
+                            right
+                                .map(move |row: Row| rki.iter().map(|&i| row[i as usize]).collect())
+                        } else {
+                            right.map(move |row: Row| row[..key_count].to_vec())
+                        };
 
                         current =
                             Some(left_keyed.antijoin(&right_keys_coll).map(|(_key, row)| row));
@@ -895,6 +914,8 @@ mod tests {
                             right_relation: "b".to_string(),
                             left_keys: vec!["Y".to_string()],
                             right_keys: vec!["Y".to_string()],
+                            right_key_indices: Vec::new(),
+                            right_filter: None,
                         },
                     ],
                 }],
@@ -908,6 +929,51 @@ mod tests {
 
         let result = execute_plan(&plan, &edb, 1).unwrap();
         let r = result.tuples.get("result").unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(r.contains(&vec![3, 4]));
+        assert!(r.contains(&vec![5, 6]));
+    }
+
+    #[test]
+    fn test_antijoin_with_right_filter() {
+        // r(X,Y) :- a(X,Y), !b(42, Y).
+        // b has rows (42,2) and (99,4). Only (42,2) passes filter col0=42.
+        // So antijoin removes rows with Y=2, keeping (3,4) and (5,6).
+        let plan = SafePlan {
+            strata: vec![SafeStratumPlan {
+                stratum_id: 0,
+                is_recursive: false,
+                relations: vec![SafeRelationPlan {
+                    name: "result".to_string(),
+                    ops: vec![
+                        SafeOp::Variable {
+                            relation_name: "a".to_string(),
+                        },
+                        SafeOp::Antijoin {
+                            right_relation: "b".to_string(),
+                            left_keys: vec!["Y".to_string()],
+                            right_keys: vec!["Y".to_string()],
+                            right_key_indices: vec![1],
+                            right_filter: Some(vec![
+                                ExprOp::Var("col0".to_string()),
+                                ExprOp::ConstInt(42),
+                                ExprOp::CmpEq,
+                            ]),
+                        },
+                    ],
+                }],
+            }],
+            edb_relations: vec!["a".to_string(), "b".to_string()],
+        };
+
+        let mut edb = HashMap::new();
+        edb.insert("a".to_string(), vec![vec![1, 2], vec![3, 4], vec![5, 6]]);
+        edb.insert("b".to_string(), vec![vec![42, 2], vec![99, 4]]);
+
+        let result = execute_plan(&plan, &edb, 1).unwrap();
+        let r = result.tuples.get("result").unwrap();
+        // Without filter: b keys = {2, 4}, removes (1,2) and (3,4) -> only (5,6)
+        // With filter col0=42: filtered b = {(42,2)}, keys = {2}, removes (1,2) -> (3,4) and (5,6)
         assert_eq!(r.len(), 2);
         assert!(r.contains(&vec![3, 4]));
         assert!(r.contains(&vec![5, 6]));

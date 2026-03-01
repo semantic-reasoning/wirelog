@@ -394,6 +394,23 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
             dst->left_keys = (const char *const *)lk;
             dst->right_keys = (const char *const *)rk;
         }
+        /* Copy right key column indices */
+        dst->project_count = src->project_count;
+        if (src->project_count > 0 && src->project_indices) {
+            uint32_t *idx
+                = (uint32_t *)malloc(src->project_count * sizeof(uint32_t));
+            if (!idx)
+                return -1;
+            memcpy(idx, src->project_indices,
+                   src->project_count * sizeof(uint32_t));
+            dst->project_indices = idx;
+        }
+        /* Serialize right-side filter if present */
+        if (src->filter_expr) {
+            int rc = wl_ffi_expr_serialize(src->filter_expr, &dst->filter_expr);
+            if (rc != 0)
+                return rc == -1 ? -1 : -3;
+        }
         break;
 
     case WL_DD_REDUCE:

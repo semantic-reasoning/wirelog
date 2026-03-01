@@ -119,6 +119,62 @@ rewrite_expr_vars(wl_ir_expr_t *expr, const char *const *column_names,
 }
 
 /**
+ * Walk through FILTER wrapper nodes in a right-child chain
+ * to find the underlying SCAN node.  Returns the SCAN node, or NULL.
+ */
+static const wirelog_ir_node_t *
+find_scan_in_chain(const wirelog_ir_node_t *node)
+{
+    while (node && node->type != WIRELOG_IR_SCAN) {
+        if (node->child_count > 0)
+            node = node->children[0];
+        else
+            break;
+    }
+    return (node && node->type == WIRELOG_IR_SCAN) ? node : NULL;
+}
+
+/**
+ * Collect filter expressions from a chain of FILTER wrapper nodes.
+ * Returns a cloned expression tree combining all filters with
+ * arithmetic multiplication (boolean AND for i64 filter evaluation).
+ * Returns NULL if no filters are present.
+ */
+static wl_ir_expr_t *
+collect_chain_filters(const wirelog_ir_node_t *node)
+{
+    wl_ir_expr_t *combined = NULL;
+
+    while (node && node->type == WIRELOG_IR_FILTER) {
+        if (node->filter_expr) {
+            wl_ir_expr_t *clone = wl_ir_expr_clone(node->filter_expr);
+            if (clone) {
+                if (combined) {
+                    /* Combine with multiplication (boolean AND) */
+                    wl_ir_expr_t *mul = wl_ir_expr_create(WL_IR_EXPR_ARITH);
+                    if (mul) {
+                        mul->arith_op = WL_ARITH_MUL;
+                        wl_ir_expr_add_child(mul, combined);
+                        wl_ir_expr_add_child(mul, clone);
+                        combined = mul;
+                    } else {
+                        wl_ir_expr_free(clone);
+                    }
+                } else {
+                    combined = clone;
+                }
+            }
+        }
+        if (node->child_count > 0)
+            node = node->children[0];
+        else
+            break;
+    }
+
+    return combined;
+}
+
+/**
  * Translate an IR tree node into DD ops, appended to the relation plan.
  * Walks the tree in post-order (children first, then current node).
  *
@@ -252,10 +308,12 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
 
     case WIRELOG_IR_JOIN:
         op.op = WL_DD_JOIN;
-        /* Right relation name from second child */
-        if (node->child_count >= 2 && node->children[1]
-            && node->children[1]->relation_name) {
-            op.right_relation = strdup_safe(node->children[1]->relation_name);
+        /* Right relation name from second child (walk through FILTERs) */
+        if (node->child_count >= 2 && node->children[1]) {
+            const wirelog_ir_node_t *scan
+                = find_scan_in_chain(node->children[1]);
+            if (scan && scan->relation_name)
+                op.right_relation = strdup_safe(scan->relation_name);
         }
         /* Copy join keys */
         if (node->join_key_count > 0) {
@@ -295,21 +353,32 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
             }
         }
         /* Update column context: join output = left_cols + right non-key cols */
-        if (node->child_count >= 2 && node->children[1]
-            && node->children[1]->column_names) {
-            uint32_t rkey = node->join_key_count;
-            const wirelog_ir_node_t *rc = node->children[1];
-            for (uint32_t i = rkey;
-                 i < rc->column_count && ctx->count < IR_COL_CTX_MAX; i++)
-                ctx->names[ctx->count++] = rc->column_names[i];
+        if (node->child_count >= 2 && node->children[1]) {
+            const wirelog_ir_node_t *rc = find_scan_in_chain(node->children[1]);
+            if (rc && rc->column_names) {
+                uint32_t rkey = node->join_key_count;
+                for (uint32_t i = rkey;
+                     i < rc->column_count && ctx->count < IR_COL_CTX_MAX; i++)
+                    ctx->names[ctx->count++] = rc->column_names[i];
+            }
         }
         break;
 
     case WIRELOG_IR_ANTIJOIN:
         op.op = WL_DD_ANTIJOIN;
-        if (node->child_count >= 2 && node->children[1]
-            && node->children[1]->relation_name) {
-            op.right_relation = strdup_safe(node->children[1]->relation_name);
+        if (node->child_count >= 2 && node->children[1]) {
+            const wirelog_ir_node_t *right = node->children[1];
+            const wirelog_ir_node_t *scan = find_scan_in_chain(right);
+            if (scan && scan->relation_name)
+                op.right_relation = strdup_safe(scan->relation_name);
+            /* Capture right-side filter from FILTER wrappers */
+            if (right->type == WIRELOG_IR_FILTER) {
+                op.filter_expr = collect_chain_filters(right);
+                if (op.filter_expr && scan && scan->column_names)
+                    rewrite_expr_vars(op.filter_expr,
+                                      (const char *const *)scan->column_names,
+                                      scan->column_count);
+            }
         }
         if (node->join_key_count > 0) {
             op.key_count = node->join_key_count;
@@ -324,6 +393,31 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
                     op.left_keys[k] = strdup_safe(node->join_left_keys[k]);
                 if (node->join_right_keys[k])
                     op.right_keys[k] = strdup_safe(node->join_right_keys[k]);
+            }
+        }
+        /* Resolve right key column positions from the right SCAN */
+        if (node->child_count >= 2 && op.key_count > 0) {
+            const wirelog_ir_node_t *scan
+                = find_scan_in_chain(node->children[1]);
+            if (scan && scan->column_names) {
+                op.project_indices
+                    = (uint32_t *)calloc(op.key_count, sizeof(uint32_t));
+                if (op.project_indices) {
+                    op.project_count = op.key_count;
+                    for (uint32_t k = 0; k < op.key_count; k++) {
+                        if (op.right_keys && op.right_keys[k]) {
+                            for (uint32_t j = 0; j < scan->column_count; j++) {
+                                if (scan->column_names[j]
+                                    && strcmp(op.right_keys[k],
+                                              scan->column_names[j])
+                                           == 0) {
+                                    op.project_indices[k] = j;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         break;
@@ -498,9 +592,11 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
 
     case WIRELOG_IR_SEMIJOIN:
         op.op = WL_DD_SEMIJOIN;
-        if (node->child_count >= 2 && node->children[1]
-            && node->children[1]->relation_name) {
-            op.right_relation = strdup_safe(node->children[1]->relation_name);
+        if (node->child_count >= 2 && node->children[1]) {
+            const wirelog_ir_node_t *scan
+                = find_scan_in_chain(node->children[1]);
+            if (scan && scan->relation_name)
+                op.right_relation = strdup_safe(scan->relation_name);
         }
         if (node->join_key_count > 0) {
             op.key_count = node->join_key_count;

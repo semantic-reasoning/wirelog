@@ -19,7 +19,6 @@ compile_commands.json
 *.swp
 *.swo
 *~
-.DS_Store
 *.kate-swp
 .clangd/
 
@@ -50,6 +49,9 @@ third_party/nanoarrow-vendor/
 # OMC and Claude Code specific
 .omc/
 .claude/
+
+# Large benchmark datasets (download via bench/data/*/download.sh)
+bench/data/doop/*.csv
 
 # OS specific
 .DS_Store
