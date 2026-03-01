@@ -37,6 +37,9 @@ __pycache__/
 # Documentation generated files
 docs/_build/
 docs/.doctrees/
+docs/_site/
+docs/.jekyll-cache/
+docs/Gemfile.lock
 
 # Test artifacts
 *.gcda
