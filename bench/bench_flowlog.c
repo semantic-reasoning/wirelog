@@ -247,6 +247,15 @@ run_pipeline_count(const char *source, uint32_t num_workers, int64_t *out_count)
         return -1;
     }
 
+    rc = wirelog_load_input_files(prog, w);
+    if (rc != 0) {
+        wl_dd_worker_destroy(w);
+        wl_ffi_plan_free(ffi);
+        wl_dd_plan_free(dd_plan);
+        wirelog_program_free(prog);
+        return -1;
+    }
+
     struct count_ctx ctx = { 0 };
     rc = wl_dd_execute_cb(ffi, w, count_tuple_cb, &ctx);
 
@@ -1402,6 +1411,176 @@ run_ddisasm_workload(const char *data_dir, uint32_t workers, int repeat)
 }
 
 /* ----------------------------------------------------------------
+ * CRDT - Conflict-Free Replicated Data Types Verification
+ * ---------------------------------------------------------------- */
+
+/* CRDT uses .input directives to load 260K rows from CSV files.
+ * The template has two %s placeholders for the data directory path. */
+
+#define CRDT_SRC_BUFSZ ((size_t)8 * 1024)
+
+static const char *crdt_template
+    = ".decl Insert_input(ctr: int32, node: int32, parent_ctr: int32, "
+      "parent_node: int32)\n"
+      ".input Insert_input(filename=\"%s/Insert_input.csv\", delimiter=\",\")\n"
+      ".decl Remove_input(ctr: int32, node: int32)\n"
+      ".input Remove_input(filename=\"%s/Remove_input.csv\", delimiter=\",\")\n"
+      ".decl insert(ctr: int32, node: int32, parent_ctr: int32, parent_node: "
+      "int32)\n"
+      "insert(a, b, c, d) :- Insert_input(a, b, c, d).\n"
+      ".decl remove(ctr: int32, node: int32)\n"
+      "remove(a, b) :- Remove_input(a, b).\n"
+      ".decl assign(id_ctr: int32, id_node: int32, elem_ctr: int32, "
+      "elem_node: int32, value: int32)\n"
+      "assign(ctr, n, ctr, n, n) :- insert(ctr, n, _, _).\n"
+      ".decl hasChild(parent_ctr: int32, parent_node: int32)\n"
+      "hasChild(pc, pn) :- insert(_, _, pc, pn).\n"
+      ".decl laterChild(parent_ctr: int32, parent_node: int32, child_ctr: "
+      "int32, child_node: int32)\n"
+      "laterChild(pc, pn, c2, n2) :- insert(c1, n1, pc, pn), insert(c2, n2, "
+      "pc, pn), c1 * 10 + n1 > c2 * 10 + n2.\n"
+      ".decl firstChild(parent_ctr: int32, parent_node: int32, child_ctr: "
+      "int32, child_node: int32)\n"
+      "firstChild(pc, pn, cc, cn) :- insert(cc, cn, pc, pn), !laterChild(pc, "
+      "pn, cc, cn).\n"
+      ".decl sibling(c1: int32, n1: int32, c2: int32, n2: int32)\n"
+      "sibling(c1, n1, c2, n2) :- insert(c1, n1, pc, pn), insert(c2, n2, pc, "
+      "pn).\n"
+      ".decl laterSibling(c1: int32, n1: int32, c2: int32, n2: int32)\n"
+      "laterSibling(c1, n1, c2, n2) :- sibling(c1, n1, c2, n2), c1 * 10 + n1 "
+      "> c2 * 10 + n2.\n"
+      ".decl laterSibling2(c1: int32, n1: int32, c3: int32, n3: int32)\n"
+      "laterSibling2(c1, n1, c3, n3) :- sibling(c1, n1, c2, n2), sibling(c1, "
+      "n1, c3, n3), c1 * 10 + n1 > c2 * 10 + n2, c2 * 10 + n2 > c3 * 10 + "
+      "n3.\n"
+      ".decl nextSibling(c1: int32, n1: int32, c2: int32, n2: int32)\n"
+      "nextSibling(c1, n1, c2, n2) :- laterSibling(c1, n1, c2, n2), "
+      "!laterSibling2(c1, n1, c2, n2).\n"
+      ".decl hasNextSibling(c: int32, n: int32)\n"
+      "hasNextSibling(c, n) :- laterSibling(c, n, _, _).\n"
+      ".decl nextSiblingAnc(start_ctr: int32, start_node: int32, next_ctr: "
+      "int32, next_node: int32)\n"
+      "nextSiblingAnc(sc, sn, nc, nn) :- nextSibling(sc, sn, nc, nn).\n"
+      "nextSiblingAnc(sc, sn, nc, nn) :- !hasNextSibling(sc, sn), insert(sc, "
+      "sn, pc, pn), nextSiblingAnc(pc, pn, nc, nn).\n"
+      ".decl nextElem(prev_ctr: int32, prev_node: int32, next_ctr: int32, "
+      "next_node: int32)\n"
+      "nextElem(pc, pn, nc, nn) :- firstChild(pc, pn, nc, nn).\n"
+      "nextElem(pc, pn, nc, nn) :- !hasChild(pc, pn), nextSiblingAnc(pc, pn, "
+      "nc, nn).\n"
+      ".decl currentValue(elem_ctr: int32, elem_node: int32, value: int32)\n"
+      "currentValue(ec, en, v) :- assign(ic, in, ec, en, v), !remove(ic, "
+      "in).\n"
+      ".decl hasValue(elem_ctr: int32, elem_node: int32)\n"
+      "hasValue(ec, en) :- currentValue(ec, en, _).\n"
+      ".decl valueStep(from_ctr: int32, from_node: int32, to_ctr: int32, "
+      "to_node: int32)\n"
+      "valueStep(fc, fn, tc, tn) :- hasValue(fc, fn), nextElem(fc, fn, tc, "
+      "tn).\n"
+      ".decl blankStep(from_ctr: int32, from_node: int32, to_ctr: int32, "
+      "to_node: int32)\n"
+      "blankStep(fc, fn, tc, tn) :- !valueStep(fc, fn, tc, tn), nextElem(fc, "
+      "fn, tc, tn).\n"
+      ".decl value_blank_star(from_ctr: int32, from_node: int32, to_ctr: "
+      "int32, to_node: int32)\n"
+      "value_blank_star(fc, fn, tc, tn) :- valueStep(fc, fn, tc, tn).\n"
+      "value_blank_star(fc, fn, tc, tn) :- value_blank_star(fc, fn, vc, vn), "
+      "blankStep(vc, vn, tc, tn).\n"
+      ".decl nextVisible(prev_ctr: int32, prev_node: int32, next_ctr: int32, "
+      "next_node: int32)\n"
+      "nextVisible(pc, pn, nc, nn) :- value_blank_star(pc, pn, nc, nn), "
+      "hasValue(nc, nn).\n"
+      ".decl result(ctr1: int32, ctr2: int32, value: int32)\n"
+      "result(c1, c2, v) :- nextVisible(c1, _, c2, n2), currentValue(c2, n2, "
+      "v).\n";
+
+static int
+run_crdt_workload(const char *data_dir, uint32_t workers, int repeat)
+{
+    /* Build source with .input paths pointing to data directory */
+    char *source = (char *)malloc(CRDT_SRC_BUFSZ);
+    if (!source)
+        return -1;
+
+    int n = snprintf(source, CRDT_SRC_BUFSZ, crdt_template, data_dir, data_dir);
+    if (n < 0 || (size_t)n >= CRDT_SRC_BUFSZ) {
+        fprintf(stderr, "error: CRDT source buffer overflow\n");
+        free(source);
+        return -1;
+    }
+
+    /* Count total input facts */
+    int32_t total_facts = 0;
+    {
+        char path[1024];
+        char line[256];
+        FILE *f;
+
+        snprintf(path, sizeof(path), "%s/Insert_input.csv", data_dir);
+        f = fopen(path, "r");
+        if (f) {
+            while (fgets(line, sizeof(line), f))
+                total_facts++;
+            fclose(f);
+        }
+
+        snprintf(path, sizeof(path), "%s/Remove_input.csv", data_dir);
+        f = fopen(path, "r");
+        if (f) {
+            while (fgets(line, sizeof(line), f))
+                total_facts++;
+            fclose(f);
+        }
+    }
+
+    /* Collect timing samples */
+    double *times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    if (!times) {
+        free(source);
+        return -1;
+    }
+
+    int64_t tuples = 0;
+    int64_t peak_rss = -1;
+    int status_ok = 1;
+
+    for (int r = 0; r < repeat; r++) {
+        bench_time_t t0 = bench_time_now();
+        int64_t cnt = 0;
+        int rc = run_pipeline_count(source, workers, &cnt);
+        bench_time_t t1 = bench_time_now();
+
+        times[r] = bench_time_diff_ms(t0, t1);
+
+        if (rc != 0) {
+            status_ok = 0;
+            break;
+        }
+        tuples = cnt;
+    }
+
+    peak_rss = bench_peak_rss_kb();
+
+    if (status_ok) {
+        qsort(times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        double min_ms = times[0];
+        double median_ms = times[repeat / 2];
+        double max_ms = times[repeat - 1];
+
+        printf("crdt\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64 "\t%" PRId64
+               "\t%s\n",
+               total_facts, workers, repeat, min_ms, median_ms, max_ms,
+               peak_rss, tuples, "OK");
+    } else {
+        printf("crdt\t-\t-\t%u\t%d\t-\t-\t-\t-\t-\tFAIL\n", workers, repeat);
+    }
+
+    free(times);
+    free(source);
+    return status_ok ? 0 : -1;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -1419,7 +1598,7 @@ usage(const char *prog)
         stderr,
         "Usage: %s --workload "
         "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|csda|galen|"
-        "polonius|ddisasm|all} --data FILE\n"
+        "polonius|ddisasm|crdt|all} --data FILE\n"
         "          [--data-weighted FILE] [--data-andersen DIR]\n"
         "          [--data-dyck DIR] [--data-cspa DIR]\n"
         "          [--data-csda DIR] [--data-galen DIR]\n"
@@ -1437,7 +1616,8 @@ usage(const char *prog)
         "  --data-galen DIR      Directory with Galen ontology CSVs\n"
         "  --data-polonius DIR   Directory with Polonius borrow checker "
         "CSVs\n"
-        "  --data-ddisasm DIR    Directory with DDISASM disassembly CSVs\n",
+        "  --data-ddisasm DIR    Directory with DDISASM disassembly CSVs\n"
+        "  --data-crdt DIR       Directory with CRDT Insert/Remove CSVs\n",
         prog);
 }
 
@@ -1454,6 +1634,7 @@ main(int argc, char **argv)
     const char *data_galen_path = NULL;
     const char *data_polonius_path = NULL;
     const char *data_ddisasm_path = NULL;
+    const char *data_crdt_path = NULL;
     uint32_t workers = 1;
     int repeat = 3;
 
@@ -1468,6 +1649,7 @@ main(int argc, char **argv)
         { "data-galen", required_argument, NULL, 'G' },
         { "data-polonius", required_argument, NULL, 'P' },
         { "data-ddisasm", required_argument, NULL, 'I' },
+        { "data-crdt", required_argument, NULL, 'R' },
         { "workers", required_argument, NULL, 'j' },
         { "repeat", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
@@ -1475,7 +1657,7 @@ main(int argc, char **argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:P:I:j:r:h",
+    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:P:I:R:j:r:h",
                               long_opts, NULL))
            != -1) {
         switch (opt) {
@@ -1508,6 +1690,9 @@ main(int argc, char **argv)
             break;
         case 'I':
             data_ddisasm_path = optarg;
+            break;
+        case 'R':
+            data_crdt_path = optarg;
             break;
         case 'j':
             workers = (uint32_t)strtoul(optarg, NULL, 10);
@@ -1592,6 +1777,12 @@ main(int argc, char **argv)
             return 1;
         }
         rc = run_ddisasm_workload(data_ddisasm_path, workers, repeat);
+    } else if (strcmp(workload, "crdt") == 0) {
+        if (!data_crdt_path) {
+            fprintf(stderr, "error: crdt requires --data-crdt DIR\n");
+            return 1;
+        }
+        rc = run_crdt_workload(data_crdt_path, workers, repeat);
     } else if (strcmp(workload, "all") == 0) {
         for (int i = 0; i < WL_COUNT; i++) {
             if (i == WL_SSSP && !data_weighted_path) {
@@ -1635,6 +1826,11 @@ main(int argc, char **argv)
         }
         if (data_ddisasm_path) {
             int r = run_ddisasm_workload(data_ddisasm_path, workers, repeat);
+            if (r != 0)
+                rc = r;
+        }
+        if (data_crdt_path) {
+            int r = run_crdt_workload(data_crdt_path, workers, repeat);
             if (r != 0)
                 rc = r;
         }
