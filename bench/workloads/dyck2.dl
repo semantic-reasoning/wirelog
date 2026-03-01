@@ -1,0 +1,16 @@
+.decl open1(x: int32, y: int32)
+.input open1(filename="OPEN1", delimiter=",")
+.decl close1(x: int32, y: int32)
+.input close1(filename="CLOSE1", delimiter=",")
+.decl open2(x: int32, y: int32)
+.input open2(filename="OPEN2", delimiter=",")
+.decl close2(x: int32, y: int32)
+.input close2(filename="CLOSE2", delimiter=",")
+.decl dyck(x: int32, y: int32)
+dyck(x, x) :- open1(x, _).
+dyck(x, x) :- close1(x, _).
+dyck(x, x) :- open2(x, _).
+dyck(x, x) :- close2(x, _).
+dyck(x, z) :- dyck(x, y), dyck(y, z).
+dyck(x, z) :- open1(x, y), dyck(y, w), close1(w, z).
+dyck(x, z) :- open2(x, y), dyck(y, w), close2(w, z).
