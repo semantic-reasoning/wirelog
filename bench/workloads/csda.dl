@@ -1,0 +1,7 @@
+.decl nullEdge(x: int32, y: int32)
+.input nullEdge(filename="NULLEDGE", delimiter=",")
+.decl edge(x: int32, y: int32)
+.input edge(filename="EDGE", delimiter=",")
+.decl nullNode(x: int32, y: int32)
+nullNode(x, y) :- nullEdge(x, y).
+nullNode(x, y) :- nullNode(x, w), edge(w, y).
