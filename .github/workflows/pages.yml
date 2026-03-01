@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
@@ -38,16 +38,20 @@ jobs:
           working-directory: ./docs
 
       - name: Setup Pages
-        uses: actions/configure-pages@v4
-
-      - name: Build site
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build with Jekyll
+        # Outputs to the './_site' directory by default
         run: |
           cd docs
           bundle install
           bundle exec jekyll build -d _site
+        env:
+          JEKYLL_ENV: production
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        # Automatically uploads an artifact from the './_site' directory by default
+        uses: actions/upload-pages-artifact@v4
         with:
           path: './docs/_site'
 

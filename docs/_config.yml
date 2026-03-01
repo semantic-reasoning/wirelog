@@ -2,8 +2,27 @@ title: wirelog
 description: Embedded-to-Enterprise Datalog Engine
 remote_theme: just-the-docs/just-the-docs
 
+permalink:           pretty
+relative_permalinks: false
+
+timezone:            'Asia/Seoul'
+
 url: https://justinjoy.github.io
 baseurl: /wirelog
+
+plugins:
+   - jekyll-remote-theme
+   - jekyll-seo-tag
+   - jekyll-sitemap
+   - jekyll-github-metadata
+   - jekyll-include-cache
+   - jekyll-scholar
+
+
+kramdown:
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false   
 
 aux_links:
   "GitHub":
@@ -12,3 +31,23 @@ aux_links:
 footer_content: "Copyright &copy; CleverPlant. Licensed under LGPL-3.0."
 
 search_enabled: true
+
+scholar:
+  style: ieee
+  locale: en
+  source: ./_bibliography
+  bibliography: references.bib
+  replace_strings: true
+  join_strings: true
+  bibliography_template: bib_entry
+
+
+sass:
+  quiet_deps: true
+  silence_deprecations: ['import']
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default 
