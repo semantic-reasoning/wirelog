@@ -21,3 +21,15 @@ mod session;
 
 // Re-export FFI entry points (they are #[no_mangle] extern "C")
 pub use ffi::*;
+
+#[cfg(test)]
+mod debug_tc_plan {
+    use crate::ffi::*;
+    use crate::plan_reader::*;
+
+    #[test]
+    fn print_tc_plan_structure() {
+        // We can't easily call the C parser from Rust tests, but let's look at what
+        // we can infer from the existing test structures
+    }
+}

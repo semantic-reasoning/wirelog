@@ -30,6 +30,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use differential_dataflow::input::Input;
+use differential_dataflow::operators::{Iterate, Threshold};
 
 use crate::dataflow::build_relation_plan;
 use crate::plan_reader::SafePlan;
@@ -110,44 +111,124 @@ impl DdSession {
                     let probe_handle = timely::dataflow::operators::probe::Handle::new();
 
                     for stratum in &plan.strata {
-                        for rel_plan in &stratum.relations {
-                            let coll = build_relation_plan(rel_plan, &collections);
-                            let coll = coll.consolidate();
+                        if stratum.is_recursive {
+                            // Recursive stratum: use iterate() for fixpoint computation.
+                            // Currently handles the single-recursive-relation case (common case).
+                            if stratum.relations.len() == 1 {
+                                let rel_plan = &stratum.relations[0];
+                                let rel_name = rel_plan.name.clone();
 
-                            let rel_name = rel_plan.name.clone();
-                            let delta_cb_clone = delta_cb.clone();
-                            let state_clone = snapshot_worker.clone();
+                                // Seed with the base-case collection for this relation from prior
+                                // non-recursive strata (e.g., tc(X,Y) :- edge(X,Y) base facts),
+                                // or an empty collection if no base case exists.
+                                let seed =
+                                    collections.get(&rel_name).cloned().unwrap_or_else(|| {
+                                        let (_, empty) =
+                                            scope.new_collection_from(Vec::<Row>::new());
+                                        empty
+                                    });
 
-                            coll.inspect(move |&(ref row, _time, diff)| {
-                                if diff == 0 {
-                                    return;
-                                }
-                                {
-                                    let mut state = state_clone.lock().unwrap();
-                                    let rel_state = state.entry(rel_name.clone()).or_default();
-                                    let entry = rel_state.entry(row.clone()).or_insert(0);
-                                    *entry += diff;
-                                    if *entry == 0 {
-                                        rel_state.remove(row);
-                                    }
-                                }
-                                let cb_guard = delta_cb_clone.lock().unwrap();
-                                if let Some(ref cb_info) = *cb_guard {
-                                    let diff_i32 = if diff > 0 { 1i32 } else { -1i32 };
-                                    if let Ok(c_rel) = CString::new(rel_name.as_str()) {
-                                        unsafe {
-                                            (cb_info.callback)(
-                                                c_rel.as_ptr(),
-                                                row.as_ptr(),
-                                                row.len() as u32,
-                                                diff_i32,
-                                                cb_info.user_data,
-                                            );
+                                let result = seed.iterate(|inner| {
+                                    let mut inner_collections = HashMap::new();
+                                    for (name, coll) in &collections {
+                                        if name == &rel_name {
+                                            // Use the iterating variable for the recursive relation
+                                            inner_collections.insert(name.clone(), inner.clone());
+                                        } else {
+                                            inner_collections
+                                                .insert(name.clone(), coll.enter(&inner.scope()));
                                         }
                                     }
-                                }
-                            })
-                            .probe_with(&probe_handle);
+                                    // Ensure recursive relation is in scope even if not in collections
+                                    inner_collections
+                                        .entry(rel_name.clone())
+                                        .or_insert_with(|| inner.clone());
+
+                                    let new_tuples =
+                                        build_relation_plan(rel_plan, &inner_collections);
+                                    inner.concat(&new_tuples).distinct()
+                                });
+
+                                let result = result.consolidate();
+                                let rn = rel_name.clone();
+                                let delta_cb_clone = delta_cb.clone();
+                                let state_clone = snapshot_worker.clone();
+
+                                result
+                                    .inspect(move |&(ref row, _time, diff)| {
+                                        if diff == 0 {
+                                            return;
+                                        }
+                                        {
+                                            let mut state = state_clone.lock().unwrap();
+                                            let rel_state = state.entry(rn.clone()).or_default();
+                                            let entry = rel_state.entry(row.clone()).or_insert(0);
+                                            *entry += diff;
+                                            if *entry == 0 {
+                                                rel_state.remove(row);
+                                            }
+                                        }
+                                        let cb_guard = delta_cb_clone.lock().unwrap();
+                                        if let Some(ref cb_info) = *cb_guard {
+                                            let diff_i32 = if diff > 0 { 1i32 } else { -1i32 };
+                                            if let Ok(c_rel) = CString::new(rn.as_str()) {
+                                                unsafe {
+                                                    (cb_info.callback)(
+                                                        c_rel.as_ptr(),
+                                                        row.as_ptr(),
+                                                        row.len() as u32,
+                                                        diff_i32,
+                                                        cb_info.user_data,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    })
+                                    .probe_with(&probe_handle);
+                            }
+                        } else {
+                            for rel_plan in &stratum.relations {
+                                let coll = build_relation_plan(rel_plan, &collections);
+                                let coll = coll.consolidate();
+
+                                let rel_name = rel_plan.name.clone();
+                                // Make this derived relation available to subsequent strata
+                                // (e.g., base-case tc available to the recursive tc stratum).
+                                collections.insert(rel_name.clone(), coll.clone());
+                                let delta_cb_clone = delta_cb.clone();
+                                let state_clone = snapshot_worker.clone();
+
+                                coll.inspect(move |&(ref row, _time, diff)| {
+                                    if diff == 0 {
+                                        return;
+                                    }
+                                    {
+                                        let mut state = state_clone.lock().unwrap();
+                                        let rel_state = state.entry(rel_name.clone()).or_default();
+                                        let entry = rel_state.entry(row.clone()).or_insert(0);
+                                        *entry += diff;
+                                        if *entry == 0 {
+                                            rel_state.remove(row);
+                                        }
+                                    }
+                                    let cb_guard = delta_cb_clone.lock().unwrap();
+                                    if let Some(ref cb_info) = *cb_guard {
+                                        let diff_i32 = if diff > 0 { 1i32 } else { -1i32 };
+                                        if let Ok(c_rel) = CString::new(rel_name.as_str()) {
+                                            unsafe {
+                                                (cb_info.callback)(
+                                                    c_rel.as_ptr(),
+                                                    row.as_ptr(),
+                                                    row.len() as u32,
+                                                    diff_i32,
+                                                    cb_info.user_data,
+                                                );
+                                            }
+                                        }
+                                    }
+                                })
+                                .probe_with(&probe_handle);
+                            }
                         }
                     }
 
