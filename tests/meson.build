@@ -18,6 +18,7 @@ ir_src = files(
   '../wirelog/ir/api.c',
   '../wirelog/ffi/dd_plan.c',
   '../wirelog/intern.c',
+  '../wirelog/session.c',
 )
 
 optimizer_src = files(
@@ -135,6 +136,10 @@ facts_loader_src = files(
   '../wirelog/ffi/facts_loader.c',
 )
 
+dd_backend_src = files(
+  '../wirelog/backend_dd.c',
+)
+
 test_dd_ffi_exe = executable(
   'test_dd_ffi',
   files('test_dd_ffi.c'),
@@ -157,6 +162,7 @@ test_dd_execute_exe = executable(
   ir_src,
   ffi_src,
   facts_loader_src,
+  dd_backend_src,
   csv_src,
   dependencies: [rust_ffi_dep],
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -175,6 +181,7 @@ test_cli_exe = executable(
   ir_src,
   ffi_src,
   facts_loader_src,
+  dd_backend_src,
   csv_src,
   optimizer_src,
   cli_src,

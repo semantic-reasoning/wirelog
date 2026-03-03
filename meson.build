@@ -221,6 +221,7 @@ if dd_option
   wirelog_cli_src = files(
     'wirelog/cli/driver.c',
     'wirelog/ffi/facts_loader.c',
+    'wirelog/backend_dd.c',
   )
 
   wirelog_cli_deps = [rust_ffi_dep]
