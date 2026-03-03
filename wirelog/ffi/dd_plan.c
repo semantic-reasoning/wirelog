@@ -788,6 +788,38 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
         }
     }
 
+    /* Step 3: Reject non-monotone aggregations in recursive strata.
+     * COUNT and SUM are not monotone and cannot be computed correctly
+     * inside a fixed-point iterate() loop. */
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        if (!plan->strata[s].is_recursive)
+            continue;
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
+            const wl_ffi_dd_relation_plan_t *rp = &plan->strata[s].relations[r];
+            for (uint32_t o = 0; o < rp->op_count; o++) {
+                const wl_ffi_dd_op_t *op = &rp->ops[o];
+                if (op->op != WL_FFI_DD_REDUCE)
+                    continue;
+                if (op->agg_fn == WIRELOG_AGG_COUNT) {
+                    fprintf(stderr,
+                            "wirelog: COUNT aggregation not supported in "
+                            "recursive stratum '%s'\n",
+                            rp->name ? rp->name : "?");
+                    wl_ffi_dd_plan_free(plan);
+                    return -1;
+                }
+                if (op->agg_fn == WIRELOG_AGG_SUM) {
+                    fprintf(stderr,
+                            "wirelog: SUM aggregation not supported in "
+                            "recursive stratum '%s'\n",
+                            rp->name ? rp->name : "?");
+                    wl_ffi_dd_plan_free(plan);
+                    return -1;
+                }
+            }
+        }
+    }
+
     *out = plan;
     return 0;
 }
