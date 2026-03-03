@@ -49,29 +49,29 @@ static struct wirelog_program *
 make_full_program(const char *source)
 {
     char errbuf[512] = { 0 };
-    wl_ast_node_t *ast = wl_parse_string(source, errbuf, sizeof(errbuf));
+    wl_ast_node_t *ast = wl_parser_parse_string(source, errbuf, sizeof(errbuf));
     if (!ast)
         return NULL;
 
-    struct wirelog_program *prog = wl_program_create();
+    struct wirelog_program *prog = wl_ir_program_create();
     if (!prog) {
-        wl_ast_node_free(ast);
+        wl_parser_ast_node_free(ast);
         return NULL;
     }
 
     prog->ast = ast;
-    if (wl_program_collect_metadata(prog, ast) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_collect_metadata(prog, ast) != 0) {
+        wl_ir_program_free(prog);
         return NULL;
     }
 
-    if (wl_program_convert_rules(prog, ast) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_convert_rules(prog, ast) != 0) {
+        wl_ir_program_free(prog);
         return NULL;
     }
 
-    if (wl_program_merge_unions(prog) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_merge_unions(prog) != 0) {
+        wl_ir_program_free(prog);
         return NULL;
     }
 
@@ -96,9 +96,9 @@ test_dep_graph_simple(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
@@ -108,8 +108,8 @@ test_dep_graph_simple(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 IDB relation, got %u",
                  g->relation_count);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
@@ -120,14 +120,14 @@ test_dep_graph_simple(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 0 edges (EDB dep), got %u",
                  g->edge_count);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -151,9 +151,9 @@ test_dep_graph_negation(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
@@ -163,8 +163,8 @@ test_dep_graph_negation(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 3 IDB relations, got %u",
                  g->relation_count);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
@@ -174,8 +174,8 @@ test_dep_graph_negation(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected >= 2 edges, got %u",
                  g->edge_count);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
@@ -183,21 +183,21 @@ test_dep_graph_negation(void)
     /* Find the NEGATION edge */
     bool found_neg = false;
     for (uint32_t i = 0; i < g->edge_count; i++) {
-        if (g->edges[i].type == WL_DEP_NEGATION) {
+        if (g->edges[i].type == WL_IR_STRATIFY_DEP_NEGATION) {
             found_neg = true;
             break;
         }
     }
 
     if (!found_neg) {
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("no NEGATION edge found");
         return;
     }
 
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -217,9 +217,9 @@ test_dep_graph_recursive(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
@@ -228,21 +228,21 @@ test_dep_graph_recursive(void)
     bool found_self = false;
     for (uint32_t i = 0; i < g->edge_count; i++) {
         if (g->edges[i].from == g->edges[i].to
-            && g->edges[i].type == WL_DEP_POSITIVE) {
+            && g->edges[i].type == WL_IR_STRATIFY_DEP_POSITIVE) {
             found_self = true;
             break;
         }
     }
 
     if (!found_self) {
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("no self-loop edge found for Tc");
         return;
     }
 
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -262,9 +262,9 @@ test_dep_graph_multiple(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
@@ -274,8 +274,8 @@ test_dep_graph_multiple(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 IDB relations, got %u",
                  g->relation_count);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
@@ -286,14 +286,14 @@ test_dep_graph_multiple(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 IDB-IDB edge, got %u",
                  g->edge_count);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -309,17 +309,17 @@ test_dep_graph_empty(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
 
     /* 0 rules = no IDB relations = NULL graph is acceptable */
     if (g != NULL) {
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("expected NULL graph for 0-rule program");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -344,17 +344,17 @@ test_scc_no_recursion(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
 
-    wl_scc_result_t *scc = wl_scc_detect(g);
+    wl_ir_stratify_scc_result_t *scc = wl_ir_stratify_scc_detect(g);
     if (!scc) {
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("SCC result is NULL");
         return;
     }
@@ -363,25 +363,25 @@ test_scc_no_recursion(void)
     if (scc->scc_count != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 SCCs, got %u", scc->scc_count);
-        wl_scc_free(scc);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     /* b and c must be in different SCCs */
     if (scc->scc_id[0] == scc->scc_id[1]) {
-        wl_scc_free(scc);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("b and c should be in different SCCs");
         return;
     }
 
-    wl_scc_free(scc);
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_scc_free(scc);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -401,17 +401,17 @@ test_scc_direct_recursion(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
 
-    wl_scc_result_t *scc = wl_scc_detect(g);
+    wl_ir_stratify_scc_result_t *scc = wl_ir_stratify_scc_detect(g);
     if (!scc) {
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("SCC result is NULL");
         return;
     }
@@ -420,16 +420,16 @@ test_scc_direct_recursion(void)
     if (scc->scc_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 SCC, got %u", scc->scc_count);
-        wl_scc_free(scc);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_scc_free(scc);
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_scc_free(scc);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -451,17 +451,17 @@ test_scc_mutual_recursion(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
 
-    wl_scc_result_t *scc = wl_scc_detect(g);
+    wl_ir_stratify_scc_result_t *scc = wl_ir_stratify_scc_detect(g);
     if (!scc) {
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("SCC result is NULL");
         return;
     }
@@ -470,25 +470,25 @@ test_scc_mutual_recursion(void)
     if (scc->scc_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 SCC, got %u", scc->scc_count);
-        wl_scc_free(scc);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     /* Both a and b should be in same SCC */
     if (g->relation_count >= 2 && scc->scc_id[0] != scc->scc_id[1]) {
-        wl_scc_free(scc);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("a and b should be in the same SCC");
         return;
     }
 
-    wl_scc_free(scc);
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_scc_free(scc);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -517,17 +517,17 @@ test_scc_two_sccs(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("dep graph is NULL");
         return;
     }
 
-    wl_scc_result_t *scc = wl_scc_detect(g);
+    wl_ir_stratify_scc_result_t *scc = wl_ir_stratify_scc_detect(g);
     if (!scc) {
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL("SCC result is NULL");
         return;
     }
@@ -536,16 +536,16 @@ test_scc_two_sccs(void)
     if (scc->scc_count != 3) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 3 SCCs, got %u", scc->scc_count);
-        wl_scc_free(scc);
-        wl_dep_graph_free(g);
-        wl_program_free(prog);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(g);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_scc_free(scc);
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_scc_free(scc);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -955,14 +955,14 @@ test_stratify_aggregation_edge(void)
         return;
     }
 
-    wl_dep_graph_t *g = wl_dep_graph_build(prog);
+    wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
     if (!g) {
         /* sssp depends on sssp2 which is also IDB, but sssp2 has no rules
            defining it as IDB. So it's EDB. sssp is the only IDB.
            Graph has 1 node, 0 IDB-IDB edges -> could be NULL or 1-node. */
         /* With only 1 IDB (sssp) depending on EDB (sssp2), graph exists
            but may have 0 edges. That's fine. */
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         PASS();
         return;
     }
@@ -972,7 +972,7 @@ test_stratify_aggregation_edge(void)
        so no IDB-IDB aggregation edge. That's expected. */
     bool found_agg = false;
     for (uint32_t i = 0; i < g->edge_count; i++) {
-        if (g->edges[i].type == WL_DEP_AGGREGATION) {
+        if (g->edges[i].type == WL_IR_STRATIFY_DEP_AGGREGATION) {
             found_agg = true;
             break;
         }
@@ -982,8 +982,8 @@ test_stratify_aggregation_edge(void)
        The test verifies the dep graph doesn't crash on AGGREGATE nodes. */
     (void)found_agg;
 
-    wl_dep_graph_free(g);
-    wl_program_free(prog);
+    wl_ir_stratify_dep_graph_free(g);
+    wl_ir_program_free(prog);
     PASS();
 }
 

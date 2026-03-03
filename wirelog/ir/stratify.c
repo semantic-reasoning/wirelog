@@ -26,7 +26,7 @@
  * Returns the index if found, or UINT32_MAX if not in graph.
  */
 static uint32_t
-graph_find_relation(const wl_dep_graph_t *g, const struct wirelog_program *prog,
+graph_find_relation(const wl_ir_stratify_dep_graph_t *g, const struct wirelog_program *prog,
                     const char *name)
 {
     for (uint32_t i = 0; i < g->relation_count; i++) {
@@ -44,14 +44,14 @@ graph_find_relation(const wl_dep_graph_t *g, const struct wirelog_program *prog,
  * Returns 0 on success, -1 on memory error.
  */
 static int
-graph_add_edge(wl_dep_graph_t *g, uint32_t from, uint32_t to,
-               wl_dep_type_t type)
+graph_add_edge(wl_ir_stratify_dep_graph_t *g, uint32_t from, uint32_t to,
+               wl_ir_stratify_dep_type_t type)
 {
     if (g->edge_count >= g->edge_capacity) {
         uint32_t new_cap = g->edge_capacity == 0 ? EDGE_INITIAL_CAPACITY
                                                  : g->edge_capacity * 2;
-        wl_dep_edge_t *tmp = (wl_dep_edge_t *)realloc(
-            g->edges, new_cap * sizeof(wl_dep_edge_t));
+        wl_ir_stratify_dep_edge_t *tmp = (wl_ir_stratify_dep_edge_t *)realloc(
+            g->edges, new_cap * sizeof(wl_ir_stratify_dep_edge_t));
         if (!tmp)
             return -1;
         g->edges = tmp;
@@ -75,8 +75,8 @@ graph_add_edge(wl_dep_graph_t *g, uint32_t from, uint32_t to,
  * @param dep     Dependency type context (POSITIVE normally, NEGATION inside ANTIJOIN)
  */
 static void
-walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi, wl_dep_graph_t *g,
-             const struct wirelog_program *prog, wl_dep_type_t dep)
+walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi, wl_ir_stratify_dep_graph_t *g,
+             const struct wirelog_program *prog, wl_ir_stratify_dep_type_t dep)
 {
     if (!node)
         return;
@@ -100,14 +100,14 @@ walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi, wl_dep_graph_t *g,
         if (node->child_count >= 1)
             walk_ir_tree(node->children[0], head_gi, g, prog, dep);
         if (node->child_count >= 2)
-            walk_ir_tree(node->children[1], head_gi, g, prog, WL_DEP_NEGATION);
+            walk_ir_tree(node->children[1], head_gi, g, prog, WL_IR_STRATIFY_DEP_NEGATION);
         break;
 
     case WIRELOG_IR_AGGREGATE:
         /* Aggregate child SCANs get AGGREGATION edges */
         for (uint32_t i = 0; i < node->child_count; i++)
             walk_ir_tree(node->children[i], head_gi, g, prog,
-                         WL_DEP_AGGREGATION);
+                         WL_IR_STRATIFY_DEP_AGGREGATION);
         break;
 
     default:
@@ -122,13 +122,13 @@ walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi, wl_dep_graph_t *g,
 /* Dependency Graph — Build                                                 */
 /* ======================================================================== */
 
-wl_dep_graph_t *
-wl_dep_graph_build(const struct wirelog_program *prog)
+wl_ir_stratify_dep_graph_t *
+wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
 {
     if (!prog || prog->rule_count == 0)
         return NULL;
 
-    wl_dep_graph_t *g = (wl_dep_graph_t *)calloc(1, sizeof(wl_dep_graph_t));
+    wl_ir_stratify_dep_graph_t *g = (wl_ir_stratify_dep_graph_t *)calloc(1, sizeof(wl_ir_stratify_dep_graph_t));
     if (!g)
         return NULL;
 
@@ -196,14 +196,14 @@ wl_dep_graph_build(const struct wirelog_program *prog)
         if (head_gi == UINT32_MAX)
             continue;
 
-        walk_ir_tree(prog->rules[r].ir_root, head_gi, g, prog, WL_DEP_POSITIVE);
+        walk_ir_tree(prog->rules[r].ir_root, head_gi, g, prog, WL_IR_STRATIFY_DEP_POSITIVE);
     }
 
     return g;
 }
 
 void
-wl_dep_graph_free(wl_dep_graph_t *graph)
+wl_ir_stratify_dep_graph_free(wl_ir_stratify_dep_graph_t *graph)
 {
     if (!graph)
         return;
@@ -222,16 +222,16 @@ typedef struct {
     uint32_t edge_idx; /* Next edge index to process for this node */
 } tarjan_frame_t;
 
-wl_scc_result_t *
-wl_scc_detect(const wl_dep_graph_t *graph)
+wl_ir_stratify_scc_result_t *
+wl_ir_stratify_scc_detect(const wl_ir_stratify_dep_graph_t *graph)
 {
     if (!graph || graph->relation_count == 0)
         return NULL;
 
     uint32_t n = graph->relation_count;
 
-    wl_scc_result_t *result
-        = (wl_scc_result_t *)calloc(1, sizeof(wl_scc_result_t));
+    wl_ir_stratify_scc_result_t *result
+        = (wl_ir_stratify_scc_result_t *)calloc(1, sizeof(wl_ir_stratify_scc_result_t));
     if (!result)
         return NULL;
 
@@ -391,12 +391,12 @@ cleanup_error:
     free(on_stack);
     free(low);
     free(disc);
-    wl_scc_free(result);
+    wl_ir_stratify_scc_free(result);
     return NULL;
 }
 
 void
-wl_scc_free(wl_scc_result_t *result)
+wl_ir_stratify_scc_free(wl_ir_stratify_scc_result_t *result)
 {
     if (!result)
         return;
@@ -409,7 +409,7 @@ wl_scc_free(wl_scc_result_t *result)
 /* ======================================================================== */
 
 int
-wl_program_stratify(struct wirelog_program *program)
+wl_ir_stratify_program(struct wirelog_program *program)
 {
     if (!program)
         return -1;
@@ -418,25 +418,25 @@ wl_program_stratify(struct wirelog_program *program)
      * 0-rule programs: produce 1 empty stratum (honors >= 1 contract).
      */
     if (program->rule_count == 0) {
-        wl_program_build_default_stratum(program);
+        wl_ir_program_build_default_stratum(program);
         program->is_stratified = true;
         return 0;
     }
 
     /* Step 1: Build dependency graph */
-    wl_dep_graph_t *graph = wl_dep_graph_build(program);
+    wl_ir_stratify_dep_graph_t *graph = wl_ir_stratify_dep_graph_build(program);
     if (!graph) {
         /* No IDB relations (shouldn't happen with rule_count > 0,
            but handle gracefully) */
-        wl_program_build_default_stratum(program);
+        wl_ir_program_build_default_stratum(program);
         program->is_stratified = true;
         return 0;
     }
 
     /* Step 2: Detect SCCs */
-    wl_scc_result_t *scc = wl_scc_detect(graph);
+    wl_ir_stratify_scc_result_t *scc = wl_ir_stratify_scc_detect(graph);
     if (!scc) {
-        wl_dep_graph_free(graph);
+        wl_ir_stratify_dep_graph_free(graph);
         return -1;
     }
 
@@ -447,8 +447,8 @@ wl_program_stratify(struct wirelog_program *program)
     uint32_t *stratum_id
         = (uint32_t *)malloc(graph->relation_count * sizeof(uint32_t));
     if (!stratum_id) {
-        wl_scc_free(scc);
-        wl_dep_graph_free(graph);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(graph);
         return -1;
     }
 
@@ -457,14 +457,14 @@ wl_program_stratify(struct wirelog_program *program)
 
     /* Step 4: Validate — negation within SCC = not stratifiable */
     for (uint32_t e = 0; e < graph->edge_count; e++) {
-        wl_dep_edge_t *edge = &graph->edges[e];
-        if (edge->type == WL_DEP_NEGATION && edge->from < graph->relation_count
+        wl_ir_stratify_dep_edge_t *edge = &graph->edges[e];
+        if (edge->type == WL_IR_STRATIFY_DEP_NEGATION && edge->from < graph->relation_count
             && edge->to < graph->relation_count) {
             if (scc->scc_id[edge->from] == scc->scc_id[edge->to]) {
                 /* Negation cycle detected — not stratifiable */
                 free(stratum_id);
-                wl_scc_free(scc);
-                wl_dep_graph_free(graph);
+                wl_ir_stratify_scc_free(scc);
+                wl_ir_stratify_dep_graph_free(graph);
                 return -2;
             }
         }
@@ -486,8 +486,8 @@ wl_program_stratify(struct wirelog_program *program)
     if (!program->strata) {
         program->stratum_count = 0;
         free(stratum_id);
-        wl_scc_free(scc);
-        wl_dep_graph_free(graph);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(graph);
         return -1;
     }
     program->stratum_count = num_strata;
@@ -500,8 +500,8 @@ wl_program_stratify(struct wirelog_program *program)
         = (uint32_t *)calloc(num_strata, sizeof(uint32_t));
     if (!rules_per_stratum) {
         free(stratum_id);
-        wl_scc_free(scc);
-        wl_dep_graph_free(graph);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(graph);
         return -1;
     }
 
@@ -511,8 +511,8 @@ wl_program_stratify(struct wirelog_program *program)
     if (!rule_stratum) {
         free(rules_per_stratum);
         free(stratum_id);
-        wl_scc_free(scc);
-        wl_dep_graph_free(graph);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(graph);
         return -1;
     }
 
@@ -537,8 +537,8 @@ wl_program_stratify(struct wirelog_program *program)
                 free(rule_stratum);
                 free(rules_per_stratum);
                 free(stratum_id);
-                wl_scc_free(scc);
-                wl_dep_graph_free(graph);
+                wl_ir_stratify_scc_free(scc);
+                wl_ir_stratify_dep_graph_free(graph);
                 return -1;
             }
         }
@@ -550,8 +550,8 @@ wl_program_stratify(struct wirelog_program *program)
         free(rule_stratum);
         free(rules_per_stratum);
         free(stratum_id);
-        wl_scc_free(scc);
-        wl_dep_graph_free(graph);
+        wl_ir_stratify_scc_free(scc);
+        wl_ir_stratify_dep_graph_free(graph);
         return -1;
     }
 
@@ -586,8 +586,8 @@ wl_program_stratify(struct wirelog_program *program)
                e.g. dist(y, min(d+w)) :- dist(x, d), wedge(x, y, w). */
             for (uint32_t e = 0; e < graph->edge_count; e++) {
                 if (graph->edges[e].from == graph->edges[e].to
-                    && (graph->edges[e].type == WL_DEP_POSITIVE
-                        || graph->edges[e].type == WL_DEP_AGGREGATION)) {
+                    && (graph->edges[e].type == WL_IR_STRATIFY_DEP_POSITIVE
+                        || graph->edges[e].type == WL_IR_STRATIFY_DEP_AGGREGATION)) {
                     uint32_t s = scc->scc_id[graph->edges[e].from];
                     program->strata[s].is_recursive = true;
                 }
@@ -602,7 +602,7 @@ wl_program_stratify(struct wirelog_program *program)
     free(rule_stratum);
     free(rules_per_stratum);
     free(stratum_id);
-    wl_scc_free(scc);
-    wl_dep_graph_free(graph);
+    wl_ir_stratify_scc_free(scc);
+    wl_ir_stratify_dep_graph_free(graph);
     return 0;
 }

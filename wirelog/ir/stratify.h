@@ -75,22 +75,22 @@
  *
  * Called by wirelog_parse_string() after rule conversion:
  *
- *   int rc = wl_program_stratify(program);
+ *   int rc = wl_ir_stratify_program(program);
  *   if (rc == -2) { ... not stratifiable ... }
  *   if (rc == -1) { ... memory error ... }
  *   // rc == 0: program->strata populated, program->is_stratified = true
  *
  * For unit testing, the dependency graph and SCC APIs can be used directly:
  *
- *   wl_dep_graph_t *g = wl_dep_graph_build(prog);
- *   wl_scc_result_t *scc = wl_scc_detect(g);
+ *   wl_ir_stratify_dep_graph_t *g = wl_ir_stratify_dep_graph_build(prog);
+ *   wl_ir_stratify_scc_result_t *scc = wl_ir_stratify_scc_detect(g);
  *   // inspect g->edges, scc->scc_id, etc.
- *   wl_scc_free(scc);
- *   wl_dep_graph_free(g);
+ *   wl_ir_stratify_scc_free(scc);
+ *   wl_ir_stratify_dep_graph_free(g);
  */
 
-#ifndef WIRELOG_STRATIFY_H
-#define WIRELOG_STRATIFY_H
+#ifndef WL_IR_STRATIFY_H
+#define WL_IR_STRATIFY_H
 
 #include "../wirelog-types.h"
 
@@ -105,37 +105,37 @@ struct wirelog_program;
 /* ======================================================================== */
 
 /**
- * wl_dep_type_t:
+ * wl_ir_stratify_dep_type_t:
  *
  * Edge types in the dependency graph, representing how one relation
  * depends on another within a Datalog rule.
  *
- * WL_DEP_POSITIVE:    Standard positive dependency. The head relation
+ * WL_IR_STRATIFY_DEP_POSITIVE:    Standard positive dependency. The head relation
  *                     references the body relation through a SCAN node.
  *                     Example: r(x) :- a(x).  produces  r --POSITIVE--> a
  *
- * WL_DEP_NEGATION:    Negated dependency. The head relation references
+ * WL_IR_STRATIFY_DEP_NEGATION:    Negated dependency. The head relation references
  *                     the body relation through an ANTIJOIN node.
  *                     Example: r(x) :- a(x), !b(x).  produces  r --NEGATION--> b
  *                     Negation within an SCC makes the program unstratifiable.
  *
- * WL_DEP_AGGREGATION: Aggregation dependency. The head relation aggregates
+ * WL_IR_STRATIFY_DEP_AGGREGATION: Aggregation dependency. The head relation aggregates
  *                     over the body relation through an AGGREGATE node.
  *                     Example: r(x, min(d)) :- s(x, d).  produces  r --AGGREGATION--> s
  *                     Validation deferred to a future pass.
  */
 typedef enum {
-    WL_DEP_POSITIVE,    /* A depends on B (positive body atom) */
-    WL_DEP_NEGATION,    /* A depends on !B (negation) */
-    WL_DEP_AGGREGATION, /* A aggregates over B (future validation) */
-} wl_dep_type_t;
+    WL_IR_STRATIFY_DEP_POSITIVE,    /* A depends on B (positive body atom) */
+    WL_IR_STRATIFY_DEP_NEGATION,    /* A depends on !B (negation) */
+    WL_IR_STRATIFY_DEP_AGGREGATION, /* A aggregates over B (future validation) */
+} wl_ir_stratify_dep_type_t;
 
 /* ======================================================================== */
 /* Dependency Graph                                                         */
 /* ======================================================================== */
 
 /**
- * wl_dep_edge_t:
+ * wl_ir_stratify_dep_edge_t:
  *
  * Single directed edge in the dependency graph.
  *
@@ -148,11 +148,11 @@ typedef enum {
 typedef struct {
     uint32_t from;
     uint32_t to;
-    wl_dep_type_t type;
-} wl_dep_edge_t;
+    wl_ir_stratify_dep_type_t type;
+} wl_ir_stratify_dep_edge_t;
 
 /**
- * wl_dep_graph_t:
+ * wl_ir_stratify_dep_graph_t:
  *
  * Dependency graph for IDB (intensional database) relations.
  *
@@ -175,17 +175,17 @@ typedef struct {
     uint32_t relation_count;
     uint32_t *relation_map;
 
-    wl_dep_edge_t *edges;
+    wl_ir_stratify_dep_edge_t *edges;
     uint32_t edge_count;
     uint32_t edge_capacity;
-} wl_dep_graph_t;
+} wl_ir_stratify_dep_graph_t;
 
 /* ======================================================================== */
 /* SCC Detection Result                                                     */
 /* ======================================================================== */
 
 /**
- * wl_scc_result_t:
+ * wl_ir_stratify_scc_result_t:
  *
  * Result of Tarjan's SCC detection.
  *
@@ -199,14 +199,14 @@ typedef struct {
 typedef struct {
     uint32_t *scc_id;
     uint32_t scc_count;
-} wl_scc_result_t;
+} wl_ir_stratify_scc_result_t;
 
 /* ======================================================================== */
 /* Internal API                                                             */
 /* ======================================================================== */
 
 /**
- * wl_dep_graph_build:
+ * wl_ir_stratify_dep_graph_build:
  * @prog: Program with converted rules (rule IR trees must exist)
  *
  * Build a dependency graph from the program's rule IR trees.
@@ -224,20 +224,20 @@ typedef struct {
  *          - No IDB relations found
  *          - Memory allocation failed
  */
-wl_dep_graph_t *
-wl_dep_graph_build(const struct wirelog_program *prog);
+wl_ir_stratify_dep_graph_t *
+wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog);
 
 /**
- * wl_dep_graph_free:
+ * wl_ir_stratify_dep_graph_free:
  * @graph: (transfer full): Graph to free (NULL-safe)
  *
  * Free a dependency graph and all associated memory.
  */
 void
-wl_dep_graph_free(wl_dep_graph_t *graph);
+wl_ir_stratify_dep_graph_free(wl_ir_stratify_dep_graph_t *graph);
 
 /**
- * wl_scc_detect:
+ * wl_ir_stratify_scc_detect:
  * @graph: Dependency graph (must not be NULL, relation_count > 0)
  *
  * Detect strongly connected components using iterative Tarjan's algorithm.
@@ -250,20 +250,20 @@ wl_dep_graph_free(wl_dep_graph_t *graph);
  *
  * Returns: (transfer full): SCC result, or NULL on error
  */
-wl_scc_result_t *
-wl_scc_detect(const wl_dep_graph_t *graph);
+wl_ir_stratify_scc_result_t *
+wl_ir_stratify_scc_detect(const wl_ir_stratify_dep_graph_t *graph);
 
 /**
- * wl_scc_free:
+ * wl_ir_stratify_scc_free:
  * @result: (transfer full): SCC result to free (NULL-safe)
  *
  * Free an SCC result and its scc_id array.
  */
 void
-wl_scc_free(wl_scc_result_t *result);
+wl_ir_stratify_scc_free(wl_ir_stratify_scc_result_t *result);
 
 /**
- * wl_program_stratify:
+ * wl_ir_stratify_program:
  * @program: Program to stratify (modified in place)
  *
  * Full stratification pipeline:
@@ -288,6 +288,6 @@ wl_scc_free(wl_scc_result_t *result);
  *        by any ordering of strata.
  */
 int
-wl_program_stratify(struct wirelog_program *program);
+wl_ir_stratify_program(struct wirelog_program *program);
 
-#endif /* WIRELOG_STRATIFY_H */
+#endif /* WL_IR_STRATIFY_H */

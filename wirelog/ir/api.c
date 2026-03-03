@@ -39,16 +39,16 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
     }
 
     char errbuf[512] = { 0 };
-    wl_ast_node_t *ast = wl_parse_string(program_text, errbuf, sizeof(errbuf));
+    wl_ast_node_t *ast = wl_parser_parse_string(program_text, errbuf, sizeof(errbuf));
     if (!ast) {
         if (error)
             *error = WIRELOG_ERR_PARSE;
         return NULL;
     }
 
-    struct wirelog_program *prog = wl_program_create();
+    struct wirelog_program *prog = wl_ir_program_create();
     if (!prog) {
-        wl_ast_node_free(ast);
+        wl_parser_ast_node_free(ast);
         if (error)
             *error = WIRELOG_ERR_MEMORY;
         return NULL;
@@ -56,38 +56,38 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
 
     prog->ast = ast;
 
-    if (wl_program_collect_metadata(prog, ast) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_collect_metadata(prog, ast) != 0) {
+        wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_PARSE;
         return NULL;
     }
 
-    if (wl_program_convert_rules(prog, ast) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_convert_rules(prog, ast) != 0) {
+        wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_PARSE;
         return NULL;
     }
 
-    if (wl_program_merge_unions(prog) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_merge_unions(prog) != 0) {
+        wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_MEMORY;
         return NULL;
     }
 
-    wl_program_build_schemas(prog);
+    wl_ir_program_build_schemas(prog);
 
-    int strat_rc = wl_program_stratify(prog);
+    int strat_rc = wl_ir_stratify_program(prog);
     if (strat_rc == -2) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_PARSE;
         return NULL;
     }
     if (strat_rc == -1) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_MEMORY;
         return NULL;
@@ -195,7 +195,7 @@ wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         if (prog->relations[i].name
             && strcmp(prog->relations[i].name, relation) == 0) {
-            const wl_relation_info_t *rel = &prog->relations[i];
+            const wl_ir_relation_info_t *rel = &prog->relations[i];
             if (rel->fact_count == 0)
                 return 1;
 
@@ -235,5 +235,5 @@ wirelog_program_get_intern(const wirelog_program_t *prog)
 void
 wirelog_program_free(wirelog_program_t *program)
 {
-    wl_program_free(program);
+    wl_ir_program_free(program);
 }
