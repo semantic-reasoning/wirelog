@@ -223,3 +223,48 @@ test_session_exe = executable(
 )
 
 test('session', test_session_exe)
+
+# ============================================================================
+# Recursive Aggregation Tests (issue #69)
+# ============================================================================
+
+# Baseline: recursive programs without aggregation (must pass)
+test_recursive_agg_baseline_exe = executable(
+  'test_recursive_agg_baseline',
+  files('test_recursive_agg_baseline.c'),
+  parser_src,
+  ir_src,
+  ffi_src,
+  facts_loader_src,
+  dd_backend_src,
+  dependencies: [rust_ffi_dep],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('recursive_agg_baseline', test_recursive_agg_baseline_exe)
+
+# Plan-level: non-monotone rejection and monotone acceptance (RED phase)
+test_recursive_agg_plan_exe = executable(
+  'test_recursive_agg_plan',
+  files('test_recursive_agg_plan.c'),
+  parser_src,
+  ir_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('recursive_agg_plan', test_recursive_agg_plan_exe)
+
+# Execution: MIN/MAX in iterate() end-to-end (RED phase)
+test_recursive_agg_exe = executable(
+  'test_recursive_agg',
+  files('test_recursive_agg.c'),
+  parser_src,
+  ir_src,
+  ffi_src,
+  facts_loader_src,
+  dd_backend_src,
+  dependencies: [rust_ffi_dep],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('recursive_agg', test_recursive_agg_exe)
