@@ -227,12 +227,12 @@ wl_ffi_expr_serialize(const struct wl_ir_expr *expr, wl_ffi_expr_buffer_t *out)
  * Returns 0 on success, -1 on memory error, -3 on expr error.
  */
 static int
-marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
+marshal_op(const wl_ffi_dd_op_t *src, wl_ffi_op_t *dst)
 {
     memset(dst, 0, sizeof(*dst));
 
     switch (src->op) {
-    case WL_DD_VARIABLE:
+    case WL_FFI_DD_VARIABLE:
         dst->op = WL_FFI_OP_VARIABLE;
         if (src->relation_name) {
             char *s = strdup_safe(src->relation_name);
@@ -242,7 +242,7 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
         }
         break;
 
-    case WL_DD_MAP:
+    case WL_FFI_DD_MAP:
         dst->op = WL_FFI_OP_MAP;
         dst->project_count = src->project_count;
         if (src->project_count > 0 && src->project_indices) {
@@ -278,7 +278,7 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
         }
         break;
 
-    case WL_DD_FILTER:
+    case WL_FFI_DD_FILTER:
         dst->op = WL_FFI_OP_FILTER;
         if (src->filter_expr) {
             int rc = wl_ffi_expr_serialize(src->filter_expr, &dst->filter_expr);
@@ -287,7 +287,7 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
         }
         break;
 
-    case WL_DD_JOIN:
+    case WL_FFI_DD_JOIN:
         dst->op = WL_FFI_OP_JOIN;
         if (src->right_relation) {
             char *s = strdup_safe(src->right_relation);
@@ -347,7 +347,7 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
         }
         break;
 
-    case WL_DD_ANTIJOIN:
+    case WL_FFI_DD_ANTIJOIN:
         dst->op = WL_FFI_OP_ANTIJOIN;
         if (src->right_relation) {
             char *s = strdup_safe(src->right_relation);
@@ -413,7 +413,7 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
         }
         break;
 
-    case WL_DD_REDUCE:
+    case WL_FFI_DD_REDUCE:
         dst->op = WL_FFI_OP_REDUCE;
         dst->agg_fn = src->agg_fn;
         dst->group_by_count = src->group_by_count;
@@ -428,15 +428,15 @@ marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
         }
         break;
 
-    case WL_DD_CONCAT:
+    case WL_FFI_DD_CONCAT:
         dst->op = WL_FFI_OP_CONCAT;
         break;
 
-    case WL_DD_CONSOLIDATE:
+    case WL_FFI_DD_CONSOLIDATE:
         dst->op = WL_FFI_OP_CONSOLIDATE;
         break;
 
-    case WL_DD_SEMIJOIN:
+    case WL_FFI_DD_SEMIJOIN:
         dst->op = WL_FFI_OP_SEMIJOIN;
         if (src->right_relation) {
             char *s = strdup_safe(src->right_relation);
@@ -538,7 +538,7 @@ ffi_op_free_fields(wl_ffi_op_t *op)
 /* ======================================================================== */
 
 int
-wl_dd_marshal_plan(const wl_dd_plan_t *plan, wl_ffi_plan_t **out)
+wl_dd_marshal_plan(const wl_ffi_dd_plan_t *plan, wl_ffi_plan_t **out)
 {
     if (!plan || !out)
         return -2;
@@ -580,7 +580,7 @@ wl_dd_marshal_plan(const wl_dd_plan_t *plan, wl_ffi_plan_t **out)
         ffi->stratum_count = plan->stratum_count;
 
         for (uint32_t s = 0; s < plan->stratum_count; s++) {
-            const wl_dd_stratum_plan_t *src_s = &plan->strata[s];
+            const wl_ffi_dd_stratum_plan_t *src_s = &plan->strata[s];
             wl_ffi_stratum_plan_t *dst_s = &strata[s];
 
             dst_s->stratum_id = src_s->stratum_id;
@@ -597,7 +597,7 @@ wl_dd_marshal_plan(const wl_dd_plan_t *plan, wl_ffi_plan_t **out)
                 dst_s->relation_count = src_s->relation_count;
 
                 for (uint32_t r = 0; r < src_s->relation_count; r++) {
-                    const wl_dd_relation_plan_t *src_r = &src_s->relations[r];
+                    const wl_ffi_dd_relation_plan_t *src_r = &src_s->relations[r];
                     wl_ffi_relation_plan_t *dst_r = &rels[r];
 
                     /* Deep copy relation name */

@@ -27,13 +27,13 @@
  * Returns 0 on success, -1 on memory error.
  */
 static int
-relation_plan_add_op(wl_dd_relation_plan_t *rp, wl_dd_op_t op)
+relation_plan_add_op(wl_ffi_dd_relation_plan_t *rp, wl_ffi_dd_op_t op)
 {
     if (rp->op_count >= rp->op_capacity) {
         uint32_t new_cap
             = rp->op_capacity == 0 ? OP_INITIAL_CAPACITY : rp->op_capacity * 2;
-        wl_dd_op_t *tmp
-            = (wl_dd_op_t *)realloc(rp->ops, new_cap * sizeof(wl_dd_op_t));
+        wl_ffi_dd_op_t *tmp
+            = (wl_ffi_dd_op_t *)realloc(rp->ops, new_cap * sizeof(wl_ffi_dd_op_t));
         if (!tmp)
             return -1;
         rp->ops = tmp;
@@ -48,7 +48,7 @@ relation_plan_add_op(wl_dd_relation_plan_t *rp, wl_dd_op_t op)
  * Free all owned memory in a single DD op.
  */
 static void
-dd_op_free_fields(wl_dd_op_t *op)
+dd_op_free_fields(wl_ffi_dd_op_t *op)
 {
     free(op->relation_name);
     free(op->right_relation);
@@ -153,7 +153,7 @@ collect_chain_filters(const wirelog_ir_node_t *node)
                     /* Combine with multiplication (boolean AND) */
                     wl_ir_expr_t *mul = wl_ir_expr_create(WL_IR_EXPR_ARITH);
                     if (mul) {
-                        mul->arith_op = WL_ARITH_MUL;
+                        mul->arith_op = WIRELOG_ARITH_MUL;
                         wl_ir_expr_add_child(mul, combined);
                         wl_ir_expr_add_child(mul, clone);
                         combined = mul;
@@ -184,7 +184,7 @@ collect_chain_filters(const wirelog_ir_node_t *node)
  * Returns 0 on success, -1 on memory error.
  */
 static int
-translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
+translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
                   const struct wirelog_program *prog, ir_col_ctx_t *ctx)
 {
     if (!node)
@@ -207,12 +207,12 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
     }
 
     /* Translate the current node */
-    wl_dd_op_t op;
+    wl_ffi_dd_op_t op;
     memset(&op, 0, sizeof(op));
 
     switch (node->type) {
     case WIRELOG_IR_SCAN:
-        op.op = WL_DD_VARIABLE;
+        op.op = WL_FFI_DD_VARIABLE;
         if (node->relation_name)
             op.relation_name = strdup_safe(node->relation_name);
         /* Update column context from SCAN's declared variable names */
@@ -225,7 +225,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         break;
 
     case WIRELOG_IR_FILTER:
-        op.op = WL_DD_FILTER;
+        op.op = WL_FFI_DD_FILTER;
         if (node->filter_expr) {
             op.filter_expr = wl_ir_expr_clone(node->filter_expr);
             if (!op.filter_expr)
@@ -238,7 +238,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         break;
 
     case WIRELOG_IR_PROJECT:
-        op.op = WL_DD_MAP;
+        op.op = WL_FFI_DD_MAP;
         op.project_count = node->project_count;
         if (node->project_count > 0 && node->project_indices) {
             /* Use explicit index mapping */
@@ -307,7 +307,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         break;
 
     case WIRELOG_IR_JOIN:
-        op.op = WL_DD_JOIN;
+        op.op = WL_FFI_DD_JOIN;
         /* Right relation name from second child (walk through FILTERs) */
         if (node->child_count >= 2 && node->children[1]) {
             const wirelog_ir_node_t *scan
@@ -365,7 +365,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         break;
 
     case WIRELOG_IR_ANTIJOIN:
-        op.op = WL_DD_ANTIJOIN;
+        op.op = WL_FFI_DD_ANTIJOIN;
         if (node->child_count >= 2 && node->children[1]) {
             const wirelog_ir_node_t *right = node->children[1];
             const wirelog_ir_node_t *scan = find_scan_in_chain(right);
@@ -428,13 +428,13 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
          * For min/max/sum the value column is the aggregate expression;
          * for count no value column is needed. */
         bool needs_value
-            = (node->agg_fn != WL_AGG_COUNT && node->agg_fn != WL_AGG_AVG);
+            = (node->agg_fn != WIRELOG_AGG_COUNT && node->agg_fn != WIRELOG_AGG_AVG);
         uint32_t map_count = node->group_by_count + (needs_value ? 1 : 0);
 
         if (map_count > 0) {
-            wl_dd_op_t map_op;
+            wl_ffi_dd_op_t map_op;
             memset(&map_op, 0, sizeof(map_op));
-            map_op.op = WL_DD_MAP;
+            map_op.op = WL_FFI_DD_MAP;
             map_op.project_count = map_count;
             map_op.project_indices
                 = (uint32_t *)calloc(map_count, sizeof(uint32_t));
@@ -492,7 +492,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         }
 
         /* REDUCE with sequential group_by_indices (MAP already reordered) */
-        op.op = WL_DD_REDUCE;
+        op.op = WL_FFI_DD_REDUCE;
         op.agg_fn = node->agg_fn;
         op.group_by_count = node->group_by_count;
         if (node->group_by_count > 0) {
@@ -512,9 +512,9 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
 
         /* 1. FILTER */
         if (node->filter_expr) {
-            wl_dd_op_t filt_op;
+            wl_ffi_dd_op_t filt_op;
             memset(&filt_op, 0, sizeof(filt_op));
-            filt_op.op = WL_DD_FILTER;
+            filt_op.op = WL_FFI_DD_FILTER;
             filt_op.filter_expr = wl_ir_expr_clone(node->filter_expr);
             if (!filt_op.filter_expr)
                 return -1;
@@ -529,7 +529,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
         }
 
         /* 2. MAP (same logic as PROJECT) */
-        op.op = WL_DD_MAP;
+        op.op = WL_FFI_DD_MAP;
         op.project_count = node->project_count;
         if (node->project_count > 0 && node->project_indices) {
             op.project_indices
@@ -591,7 +591,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
     }
 
     case WIRELOG_IR_SEMIJOIN:
-        op.op = WL_DD_SEMIJOIN;
+        op.op = WL_FFI_DD_SEMIJOIN;
         if (node->child_count >= 2 && node->children[1]) {
             const wirelog_ir_node_t *scan
                 = find_scan_in_chain(node->children[1]);
@@ -638,16 +638,16 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
 
     case WIRELOG_IR_UNION: {
         /* UNION -> CONCAT + CONSOLIDATE (two ops) */
-        wl_dd_op_t concat_op;
+        wl_ffi_dd_op_t concat_op;
         memset(&concat_op, 0, sizeof(concat_op));
-        concat_op.op = WL_DD_CONCAT;
+        concat_op.op = WL_FFI_DD_CONCAT;
         int rc = relation_plan_add_op(rp, concat_op);
         if (rc != 0)
             return rc;
 
-        wl_dd_op_t consol_op;
+        wl_ffi_dd_op_t consol_op;
         memset(&consol_op, 0, sizeof(consol_op));
-        consol_op.op = WL_DD_CONSOLIDATE;
+        consol_op.op = WL_FFI_DD_CONSOLIDATE;
         return relation_plan_add_op(rp, consol_op);
     }
 
@@ -663,7 +663,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
 /* ======================================================================== */
 
 int
-wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
+wl_ffi_dd_plan_generate(const struct wirelog_program *prog, wl_ffi_dd_plan_t **out)
 {
     if (!prog || !out)
         return -2;
@@ -673,7 +673,7 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
 
     *out = NULL;
 
-    wl_dd_plan_t *plan = (wl_dd_plan_t *)calloc(1, sizeof(wl_dd_plan_t));
+    wl_ffi_dd_plan_t *plan = (wl_ffi_dd_plan_t *)calloc(1, sizeof(wl_ffi_dd_plan_t));
     if (!plan)
         return -1;
 
@@ -689,7 +689,7 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
         if (edb_count > 0) {
             plan->edb_relations = (char **)calloc(edb_count, sizeof(char *));
             if (!plan->edb_relations) {
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 return -1;
             }
 
@@ -700,7 +700,7 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
                         = strdup_safe(prog->relations[r].name);
                     if (!plan->edb_relations[idx]) {
                         plan->edb_count = idx;
-                        wl_dd_plan_free(plan);
+                        wl_ffi_dd_plan_free(plan);
                         return -1;
                     }
                     idx++;
@@ -712,17 +712,17 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
 
     /* Step 2: Create stratum plans */
     if (prog->stratum_count > 0) {
-        plan->strata = (wl_dd_stratum_plan_t *)calloc(
-            prog->stratum_count, sizeof(wl_dd_stratum_plan_t));
+        plan->strata = (wl_ffi_dd_stratum_plan_t *)calloc(
+            prog->stratum_count, sizeof(wl_ffi_dd_stratum_plan_t));
         if (!plan->strata) {
-            wl_dd_plan_free(plan);
+            wl_ffi_dd_plan_free(plan);
             return -1;
         }
         plan->stratum_count = prog->stratum_count;
 
         for (uint32_t s = 0; s < prog->stratum_count; s++) {
             const wirelog_stratum_t *src = &prog->strata[s];
-            wl_dd_stratum_plan_t *sp = &plan->strata[s];
+            wl_ffi_dd_stratum_plan_t *sp = &plan->strata[s];
 
             sp->stratum_id = src->stratum_id;
             sp->is_recursive = src->is_recursive;
@@ -732,7 +732,7 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
             char **unique_names
                 = (char **)calloc(src->rule_count + 1, sizeof(char *));
             if (!unique_names && src->rule_count > 0) {
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 return -1;
             }
 
@@ -749,11 +749,11 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
             }
 
             if (unique_count > 0) {
-                sp->relations = (wl_dd_relation_plan_t *)calloc(
-                    unique_count, sizeof(wl_dd_relation_plan_t));
+                sp->relations = (wl_ffi_dd_relation_plan_t *)calloc(
+                    unique_count, sizeof(wl_ffi_dd_relation_plan_t));
                 if (!sp->relations) {
                     free(unique_names);
-                    wl_dd_plan_free(plan);
+                    wl_ffi_dd_plan_free(plan);
                     return -1;
                 }
                 sp->relation_count = unique_count;
@@ -772,7 +772,7 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
                                     prog, &ctx);
                                 if (rc != 0) {
                                     free(unique_names);
-                                    wl_dd_plan_free(plan);
+                                    wl_ffi_dd_plan_free(plan);
                                     return -1;
                                 }
                             }
@@ -795,7 +795,7 @@ wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
 /* ======================================================================== */
 
 static void
-relation_plan_free(wl_dd_relation_plan_t *rp)
+relation_plan_free(wl_ffi_dd_relation_plan_t *rp)
 {
     if (!rp)
         return;
@@ -808,13 +808,13 @@ relation_plan_free(wl_dd_relation_plan_t *rp)
 }
 
 void
-wl_dd_plan_free(wl_dd_plan_t *plan)
+wl_ffi_dd_plan_free(wl_ffi_dd_plan_t *plan)
 {
     if (!plan)
         return;
 
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
-        wl_dd_stratum_plan_t *sp = &plan->strata[s];
+        wl_ffi_dd_stratum_plan_t *sp = &plan->strata[s];
         for (uint32_t r = 0; r < sp->relation_count; r++)
             relation_plan_free(&sp->relations[r]);
         free(sp->relations);
@@ -833,33 +833,33 @@ wl_dd_plan_free(wl_dd_plan_t *plan)
 /* ======================================================================== */
 
 const char *
-wl_dd_op_type_str(wl_dd_op_type_t type)
+wl_ffi_dd_op_type_str(wl_ffi_dd_op_type_t type)
 {
     switch (type) {
-    case WL_DD_VARIABLE:
+    case WL_FFI_DD_VARIABLE:
         return "VARIABLE";
-    case WL_DD_MAP:
+    case WL_FFI_DD_MAP:
         return "MAP";
-    case WL_DD_FILTER:
+    case WL_FFI_DD_FILTER:
         return "FILTER";
-    case WL_DD_JOIN:
+    case WL_FFI_DD_JOIN:
         return "JOIN";
-    case WL_DD_ANTIJOIN:
+    case WL_FFI_DD_ANTIJOIN:
         return "ANTIJOIN";
-    case WL_DD_REDUCE:
+    case WL_FFI_DD_REDUCE:
         return "REDUCE";
-    case WL_DD_CONCAT:
+    case WL_FFI_DD_CONCAT:
         return "CONCAT";
-    case WL_DD_CONSOLIDATE:
+    case WL_FFI_DD_CONSOLIDATE:
         return "CONSOLIDATE";
-    case WL_DD_SEMIJOIN:
+    case WL_FFI_DD_SEMIJOIN:
         return "SEMIJOIN";
     }
     return "UNKNOWN";
 }
 
 void
-wl_dd_plan_print(const wl_dd_plan_t *plan)
+wl_ffi_dd_plan_print(const wl_ffi_dd_plan_t *plan)
 {
     if (!plan) {
         printf("DD Plan: (null)\n");
@@ -873,18 +873,18 @@ wl_dd_plan_print(const wl_dd_plan_t *plan)
         printf("  EDB: %s\n", plan->edb_relations[i]);
 
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
-        wl_dd_stratum_plan_t *sp = &plan->strata[s];
+        wl_ffi_dd_stratum_plan_t *sp = &plan->strata[s];
         printf("  Stratum %u [%s] (%u relations):\n", sp->stratum_id,
                sp->is_recursive ? "recursive" : "non-recursive",
                sp->relation_count);
 
         for (uint32_t r = 0; r < sp->relation_count; r++) {
-            wl_dd_relation_plan_t *rp = &sp->relations[r];
+            wl_ffi_dd_relation_plan_t *rp = &sp->relations[r];
             printf("    %s (%u ops):\n", rp->name, rp->op_count);
 
             for (uint32_t o = 0; o < rp->op_count; o++) {
-                wl_dd_op_t *op = &rp->ops[o];
-                printf("      [%u] %s", o, wl_dd_op_type_str(op->op));
+                wl_ffi_dd_op_t *op = &rp->ops[o];
+                printf("      [%u] %s", o, wl_ffi_dd_op_type_str(op->op));
                 if (op->relation_name)
                     printf("(%s)", op->relation_name);
                 if (op->right_relation)

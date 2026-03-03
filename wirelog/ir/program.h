@@ -9,16 +9,16 @@
  * Defines the internal structure of wirelog_program_t (opaque in public header).
  */
 
-#ifndef WIRELOG_PROGRAM_INTERNAL_H
-#define WIRELOG_PROGRAM_INTERNAL_H
+#ifndef WIRELOG_IR_PROGRAM_INTERNAL_H
+#define WIRELOG_IR_PROGRAM_INTERNAL_H
 
 #include "ir.h"
 #include "../intern.h"
 #include "../wirelog-types.h"
 
 /* Forward declaration for AST (used only in program struct) */
-struct wl_ast_node;
-typedef struct wl_ast_node wl_ast_node_t;
+struct wl_parser_ast_node;
+typedef struct wl_parser_ast_node wl_parser_ast_node_t;
 
 /* ======================================================================== */
 /* Relation Metadata                                                        */
@@ -39,7 +39,7 @@ typedef struct {
     int64_t *fact_data;
     uint32_t fact_count;
     uint32_t fact_capacity;
-} wl_relation_info_t;
+} wl_ir_relation_info_t;
 
 /* ======================================================================== */
 /* Rule IR                                                                  */
@@ -48,7 +48,7 @@ typedef struct {
 typedef struct {
     char *head_relation;
     wirelog_ir_node_t *ir_root;
-} wl_rule_ir_t;
+} wl_ir_rule_ir_t;
 
 /* ======================================================================== */
 /* Program Structure                                                        */
@@ -56,7 +56,7 @@ typedef struct {
 
 struct wirelog_program {
     /* Relation metadata */
-    wl_relation_info_t *relations;
+    wl_ir_relation_info_t *relations;
     uint32_t relation_count;
     uint32_t relation_capacity;
 
@@ -68,7 +68,7 @@ struct wirelog_program {
     uint32_t stratum_count;
 
     /* Rule IR trees */
-    wl_rule_ir_t *rules;
+    wl_ir_rule_ir_t *rules;
     uint32_t rule_count;
     uint32_t rule_capacity;
 
@@ -79,7 +79,7 @@ struct wirelog_program {
     bool is_stratified;
 
     /* Source AST (retained for debugging, freed on program_free) */
-    wl_ast_node_t *ast;
+    wl_parser_ast_node_t *ast;
 
     /* Symbol intern table (string -> int64 mapping) */
     wl_intern_t *intern;
@@ -90,24 +90,24 @@ struct wirelog_program {
 /* ======================================================================== */
 
 struct wirelog_program *
-wl_program_create(void);
+wl_ir_program_create(void);
 void
-wl_program_free(struct wirelog_program *program);
+wl_ir_program_free(struct wirelog_program *program);
 
 int
-wl_program_collect_metadata(struct wirelog_program *program,
-                            const wl_ast_node_t *ast);
+wl_ir_program_collect_metadata(struct wirelog_program *program,
+                            const wl_parser_ast_node_t *ast);
 
 int
-wl_program_convert_rules(struct wirelog_program *program,
-                         const wl_ast_node_t *ast);
+wl_ir_program_convert_rules(struct wirelog_program *program,
+                         const wl_parser_ast_node_t *ast);
 
 int
-wl_program_merge_unions(struct wirelog_program *program);
+wl_ir_program_merge_unions(struct wirelog_program *program);
 
 void
-wl_program_build_schemas(struct wirelog_program *program);
+wl_ir_program_build_schemas(struct wirelog_program *program);
 void
-wl_program_build_default_stratum(struct wirelog_program *program);
+wl_ir_program_build_default_stratum(struct wirelog_program *program);
 
-#endif /* WIRELOG_PROGRAM_INTERNAL_H */
+#endif /* WIRELOG_IR_PROGRAM_INTERNAL_H */
