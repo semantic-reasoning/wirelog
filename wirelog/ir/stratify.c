@@ -26,8 +26,8 @@
  * Returns the index if found, or UINT32_MAX if not in graph.
  */
 static uint32_t
-graph_find_relation(const wl_ir_stratify_dep_graph_t *g, const struct wirelog_program *prog,
-                    const char *name)
+graph_find_relation(const wl_ir_stratify_dep_graph_t *g,
+                    const struct wirelog_program *prog, const char *name)
 {
     for (uint32_t i = 0; i < g->relation_count; i++) {
         uint32_t ri = g->relation_map[i];
@@ -75,8 +75,9 @@ graph_add_edge(wl_ir_stratify_dep_graph_t *g, uint32_t from, uint32_t to,
  * @param dep     Dependency type context (POSITIVE normally, NEGATION inside ANTIJOIN)
  */
 static void
-walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi, wl_ir_stratify_dep_graph_t *g,
-             const struct wirelog_program *prog, wl_ir_stratify_dep_type_t dep)
+walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi,
+             wl_ir_stratify_dep_graph_t *g, const struct wirelog_program *prog,
+             wl_ir_stratify_dep_type_t dep)
 {
     if (!node)
         return;
@@ -100,7 +101,8 @@ walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi, wl_ir_stratify_dep
         if (node->child_count >= 1)
             walk_ir_tree(node->children[0], head_gi, g, prog, dep);
         if (node->child_count >= 2)
-            walk_ir_tree(node->children[1], head_gi, g, prog, WL_IR_STRATIFY_DEP_NEGATION);
+            walk_ir_tree(node->children[1], head_gi, g, prog,
+                         WL_IR_STRATIFY_DEP_NEGATION);
         break;
 
     case WIRELOG_IR_AGGREGATE:
@@ -128,7 +130,8 @@ wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
     if (!prog || prog->rule_count == 0)
         return NULL;
 
-    wl_ir_stratify_dep_graph_t *g = (wl_ir_stratify_dep_graph_t *)calloc(1, sizeof(wl_ir_stratify_dep_graph_t));
+    wl_ir_stratify_dep_graph_t *g = (wl_ir_stratify_dep_graph_t *)calloc(
+        1, sizeof(wl_ir_stratify_dep_graph_t));
     if (!g)
         return NULL;
 
@@ -196,7 +199,8 @@ wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
         if (head_gi == UINT32_MAX)
             continue;
 
-        walk_ir_tree(prog->rules[r].ir_root, head_gi, g, prog, WL_IR_STRATIFY_DEP_POSITIVE);
+        walk_ir_tree(prog->rules[r].ir_root, head_gi, g, prog,
+                     WL_IR_STRATIFY_DEP_POSITIVE);
     }
 
     return g;
@@ -230,8 +234,8 @@ wl_ir_stratify_scc_detect(const wl_ir_stratify_dep_graph_t *graph)
 
     uint32_t n = graph->relation_count;
 
-    wl_ir_stratify_scc_result_t *result
-        = (wl_ir_stratify_scc_result_t *)calloc(1, sizeof(wl_ir_stratify_scc_result_t));
+    wl_ir_stratify_scc_result_t *result = (wl_ir_stratify_scc_result_t *)calloc(
+        1, sizeof(wl_ir_stratify_scc_result_t));
     if (!result)
         return NULL;
 
@@ -458,7 +462,8 @@ wl_ir_stratify_program(struct wirelog_program *program)
     /* Step 4: Validate — negation within SCC = not stratifiable */
     for (uint32_t e = 0; e < graph->edge_count; e++) {
         wl_ir_stratify_dep_edge_t *edge = &graph->edges[e];
-        if (edge->type == WL_IR_STRATIFY_DEP_NEGATION && edge->from < graph->relation_count
+        if (edge->type == WL_IR_STRATIFY_DEP_NEGATION
+            && edge->from < graph->relation_count
             && edge->to < graph->relation_count) {
             if (scc->scc_id[edge->from] == scc->scc_id[edge->to]) {
                 /* Negation cycle detected — not stratifiable */
@@ -587,7 +592,8 @@ wl_ir_stratify_program(struct wirelog_program *program)
             for (uint32_t e = 0; e < graph->edge_count; e++) {
                 if (graph->edges[e].from == graph->edges[e].to
                     && (graph->edges[e].type == WL_IR_STRATIFY_DEP_POSITIVE
-                        || graph->edges[e].type == WL_IR_STRATIFY_DEP_AGGREGATION)) {
+                        || graph->edges[e].type
+                               == WL_IR_STRATIFY_DEP_AGGREGATION)) {
                     uint32_t s = scc->scc_id[graph->edges[e].from];
                     program->strata[s].is_recursive = true;
                 }

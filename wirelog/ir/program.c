@@ -223,7 +223,8 @@ add_rule_placeholder(struct wirelog_program *prog, const char *head_name)
 /* ======================================================================== */
 
 static int
-collect_decl(struct wirelog_program *prog, const wl_parser_ast_node_t *decl_node)
+collect_decl(struct wirelog_program *prog,
+             const wl_parser_ast_node_t *decl_node)
 {
     if (!decl_node->name)
         return -1;
@@ -266,7 +267,8 @@ collect_decl(struct wirelog_program *prog, const wl_parser_ast_node_t *decl_node
 }
 
 static int
-collect_input(struct wirelog_program *prog, const wl_parser_ast_node_t *input_node)
+collect_input(struct wirelog_program *prog,
+              const wl_parser_ast_node_t *input_node)
 {
     if (!input_node->name)
         return -1;
@@ -310,7 +312,8 @@ collect_input(struct wirelog_program *prog, const wl_parser_ast_node_t *input_no
 }
 
 static int
-collect_output(struct wirelog_program *prog, const wl_parser_ast_node_t *output_node)
+collect_output(struct wirelog_program *prog,
+               const wl_parser_ast_node_t *output_node)
 {
     if (!output_node->name)
         return -1;
@@ -327,7 +330,8 @@ collect_output(struct wirelog_program *prog, const wl_parser_ast_node_t *output_
 }
 
 static int
-collect_printsize(struct wirelog_program *prog, const wl_parser_ast_node_t *ps_node)
+collect_printsize(struct wirelog_program *prog,
+                  const wl_parser_ast_node_t *ps_node)
 {
     if (!ps_node->name)
         return -1;
@@ -344,7 +348,8 @@ collect_printsize(struct wirelog_program *prog, const wl_parser_ast_node_t *ps_n
 }
 
 static int
-collect_rule(struct wirelog_program *prog, const wl_parser_ast_node_t *rule_node)
+collect_rule(struct wirelog_program *prog,
+             const wl_parser_ast_node_t *rule_node)
 {
     /* rule_node: children[0] = HEAD, children[1..] = body */
     if (rule_node->child_count < 1)
@@ -369,7 +374,8 @@ collect_rule(struct wirelog_program *prog, const wl_parser_ast_node_t *rule_node
 }
 
 static int
-collect_fact(struct wirelog_program *prog, const wl_parser_ast_node_t *fact_node)
+collect_fact(struct wirelog_program *prog,
+             const wl_parser_ast_node_t *fact_node)
 {
     if (!fact_node->name)
         return -1;
@@ -416,7 +422,7 @@ collect_fact(struct wirelog_program *prog, const wl_parser_ast_node_t *fact_node
 
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
-                            const wl_parser_ast_node_t *ast)
+                               const wl_parser_ast_node_t *ast)
 {
     if (!program || !ast || ast->type != WL_PARSER_AST_NODE_PROGRAM)
         return -1;
@@ -936,7 +942,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
 
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
-        if (b->type == WL_PARSER_AST_NODE_NEGATION && b->child_count >= 1 && current) {
+        if (b->type == WL_PARSER_AST_NODE_NEGATION && b->child_count >= 1
+            && current) {
             const wl_parser_ast_node_t *neg_atom = b->children[0];
             if (neg_atom->type != WL_PARSER_AST_NODE_ATOM)
                 continue;
@@ -996,7 +1003,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
                     = (uint32_t *)calloc(non_agg_count, sizeof(uint32_t));
                 uint32_t gi = 0;
                 for (uint32_t i = 0; i < head->child_count; i++) {
-                    if (head->children[i]->type != WL_PARSER_AST_NODE_AGGREGATE) {
+                    if (head->children[i]->type
+                        != WL_PARSER_AST_NODE_AGGREGATE) {
                         /* Resolve head variable name to body column index */
                         const char *var = head->children[i]->name;
                         uint32_t col_idx = i; /* fallback to head position */
@@ -1060,7 +1068,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
 
 int
 wl_ir_program_convert_rules(struct wirelog_program *program,
-                         const wl_parser_ast_node_t *ast)
+                            const wl_parser_ast_node_t *ast)
 {
     if (!program || !ast || ast->type != WL_PARSER_AST_NODE_PROGRAM)
         return -1;

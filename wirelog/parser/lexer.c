@@ -156,7 +156,8 @@ scan_integer(wl_parser_lexer_t *lexer)
         advance(lexer);
     }
 
-    wl_parser_lexer_token_t token = make_token(lexer, WL_PARSER_LEXER_TOK_INTEGER);
+    wl_parser_lexer_token_t token
+        = make_token(lexer, WL_PARSER_LEXER_TOK_INTEGER);
 
     /* Parse the integer value */
     int64_t value = 0;

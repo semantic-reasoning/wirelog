@@ -43,61 +43,61 @@ static int tests_failed = 0;
         printf(" FAIL: %s\n", msg); \
     } while (0)
 
-#define ASSERT_TOK(lexer, expected_type)                              \
-    do {                                                              \
-        wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&(lexer));               \
-        if (tok.type != (expected_type)) {                            \
-            char buf[256];                                            \
-            snprintf(buf, sizeof(buf),                                \
-                     "expected %s, got %s (line %u, col %u)",         \
-                     wl_parser_lexer_token_type_str(expected_type),                \
-                     wl_parser_lexer_token_type_str(tok.type), tok.line, tok.col); \
-            FAIL(buf);                                                \
-            return;                                                   \
-        }                                                             \
+#define ASSERT_TOK(lexer, expected_type)                                      \
+    do {                                                                      \
+        wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&(lexer));   \
+        if (tok.type != (expected_type)) {                                    \
+            char buf[256];                                                    \
+            snprintf(                                                         \
+                buf, sizeof(buf), "expected %s, got %s (line %u, col %u)",    \
+                wl_parser_lexer_token_type_str(expected_type),                \
+                wl_parser_lexer_token_type_str(tok.type), tok.line, tok.col); \
+            FAIL(buf);                                                        \
+            return;                                                           \
+        }                                                                     \
     } while (0)
 
-#define ASSERT_TOK_VAL(lexer, expected_type, expected_val)                 \
-    do {                                                                   \
-        wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&(lexer));                    \
-        if (tok.type != (expected_type)) {                                 \
-            char buf[256];                                                 \
-            snprintf(buf, sizeof(buf), "expected %s, got %s",              \
-                     wl_parser_lexer_token_type_str(expected_type),                     \
-                     wl_parser_lexer_token_type_str(tok.type));                         \
-            FAIL(buf);                                                     \
-            return;                                                        \
-        }                                                                  \
-        if (tok.int_value != (expected_val)) {                             \
-            char buf[256];                                                 \
-            snprintf(buf, sizeof(buf), "expected value %lld, got %lld",    \
-                     (long long)(expected_val), (long long)tok.int_value); \
-            FAIL(buf);                                                     \
-            return;                                                        \
-        }                                                                  \
+#define ASSERT_TOK_VAL(lexer, expected_type, expected_val)                  \
+    do {                                                                    \
+        wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&(lexer)); \
+        if (tok.type != (expected_type)) {                                  \
+            char buf[256];                                                  \
+            snprintf(buf, sizeof(buf), "expected %s, got %s",               \
+                     wl_parser_lexer_token_type_str(expected_type),         \
+                     wl_parser_lexer_token_type_str(tok.type));             \
+            FAIL(buf);                                                      \
+            return;                                                         \
+        }                                                                   \
+        if (tok.int_value != (expected_val)) {                              \
+            char buf[256];                                                  \
+            snprintf(buf, sizeof(buf), "expected value %lld, got %lld",     \
+                     (long long)(expected_val), (long long)tok.int_value);  \
+            FAIL(buf);                                                      \
+            return;                                                         \
+        }                                                                   \
     } while (0)
 
-#define ASSERT_TOK_STR(lexer, expected_type, expected_str)            \
-    do {                                                              \
-        wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&(lexer));               \
-        if (tok.type != (expected_type)) {                            \
-            char buf[256];                                            \
-            snprintf(buf, sizeof(buf), "expected %s, got %s",         \
-                     wl_parser_lexer_token_type_str(expected_type),                \
-                     wl_parser_lexer_token_type_str(tok.type));                    \
-            FAIL(buf);                                                \
-            return;                                                   \
-        }                                                             \
-        char *s = wl_parser_lexer_token_to_string(&tok);                           \
-        if (strcmp(s, expected_str) != 0) {                           \
-            char buf[256];                                            \
-            snprintf(buf, sizeof(buf), "expected \"%s\", got \"%s\"", \
-                     expected_str, s);                                \
-            free(s);                                                  \
-            FAIL(buf);                                                \
-            return;                                                   \
-        }                                                             \
-        free(s);                                                      \
+#define ASSERT_TOK_STR(lexer, expected_type, expected_str)                  \
+    do {                                                                    \
+        wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&(lexer)); \
+        if (tok.type != (expected_type)) {                                  \
+            char buf[256];                                                  \
+            snprintf(buf, sizeof(buf), "expected %s, got %s",               \
+                     wl_parser_lexer_token_type_str(expected_type),         \
+                     wl_parser_lexer_token_type_str(tok.type));             \
+            FAIL(buf);                                                      \
+            return;                                                         \
+        }                                                                   \
+        char *s = wl_parser_lexer_token_to_string(&tok);                    \
+        if (strcmp(s, expected_str) != 0) {                                 \
+            char buf[256];                                                  \
+            snprintf(buf, sizeof(buf), "expected \"%s\", got \"%s\"",       \
+                     expected_str, s);                                      \
+            free(s);                                                        \
+            FAIL(buf);                                                      \
+            return;                                                         \
+        }                                                                   \
+        free(s);                                                            \
     } while (0)
 
 /* ======================================================================== */
@@ -567,7 +567,8 @@ test_peek_does_not_advance(void)
     wl_parser_lexer_token_t t1 = wl_parser_lexer_peek_token(&lex);
     wl_parser_lexer_token_t t2 = wl_parser_lexer_peek_token(&lex);
     wl_parser_lexer_token_t t3 = wl_parser_lexer_next_token(&lex);
-    if (t1.type != WL_PARSER_LEXER_TOK_IDENT || t2.type != WL_PARSER_LEXER_TOK_IDENT
+    if (t1.type != WL_PARSER_LEXER_TOK_IDENT
+        || t2.type != WL_PARSER_LEXER_TOK_IDENT
         || t3.type != WL_PARSER_LEXER_TOK_IDENT) {
         FAIL("peek should return same token");
         return;

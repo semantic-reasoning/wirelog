@@ -122,7 +122,8 @@ test_op_type_str(void)
         return;
     }
 
-    if (strcmp(wl_ffi_dd_op_type_str(WL_FFI_DD_CONSOLIDATE), "CONSOLIDATE") != 0) {
+    if (strcmp(wl_ffi_dd_op_type_str(WL_FFI_DD_CONSOLIDATE), "CONSOLIDATE")
+        != 0) {
         FAIL("CONSOLIDATE name wrong");
         return;
     }
@@ -1194,7 +1195,8 @@ test_plan_head_arith_rewrite_vars(void)
      * expression's variable child has been rewritten to "col1" (y is
      * column index 1 in the SCAN). */
     for (uint32_t i = 0; i < rp->op_count; i++) {
-        if (rp->ops[i].op == WL_FFI_DD_MAP && rp->ops[i].project_exprs != NULL) {
+        if (rp->ops[i].op == WL_FFI_DD_MAP
+            && rp->ops[i].project_exprs != NULL) {
             wl_ir_expr_t *arith = rp->ops[i].project_exprs[1];
             if (!arith || arith->type != WL_IR_EXPR_ARITH
                 || arith->child_count < 2) {

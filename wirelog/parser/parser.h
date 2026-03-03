@@ -32,7 +32,8 @@ extern "C" {
  * Returns: (transfer full): AST root (WL_PARSER_AST_NODE_PROGRAM), or NULL on error
  */
 wl_parser_ast_node_t *
-wl_parser_parse_string(const char *source, char *error_buf, size_t error_buf_size);
+wl_parser_parse_string(const char *source, char *error_buf,
+                       size_t error_buf_size);
 
 #ifdef __cplusplus
 }

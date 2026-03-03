@@ -32,8 +32,8 @@ relation_plan_add_op(wl_ffi_dd_relation_plan_t *rp, wl_ffi_dd_op_t op)
     if (rp->op_count >= rp->op_capacity) {
         uint32_t new_cap
             = rp->op_capacity == 0 ? OP_INITIAL_CAPACITY : rp->op_capacity * 2;
-        wl_ffi_dd_op_t *tmp
-            = (wl_ffi_dd_op_t *)realloc(rp->ops, new_cap * sizeof(wl_ffi_dd_op_t));
+        wl_ffi_dd_op_t *tmp = (wl_ffi_dd_op_t *)realloc(
+            rp->ops, new_cap * sizeof(wl_ffi_dd_op_t));
         if (!tmp)
             return -1;
         rp->ops = tmp;
@@ -427,8 +427,8 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
          * expected by the Rust executor: [group_by_cols..., agg_value].
          * For min/max/sum the value column is the aggregate expression;
          * for count no value column is needed. */
-        bool needs_value
-            = (node->agg_fn != WIRELOG_AGG_COUNT && node->agg_fn != WIRELOG_AGG_AVG);
+        bool needs_value = (node->agg_fn != WIRELOG_AGG_COUNT
+                            && node->agg_fn != WIRELOG_AGG_AVG);
         uint32_t map_count = node->group_by_count + (needs_value ? 1 : 0);
 
         if (map_count > 0) {
@@ -663,7 +663,8 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
 /* ======================================================================== */
 
 int
-wl_ffi_dd_plan_generate(const struct wirelog_program *prog, wl_ffi_dd_plan_t **out)
+wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
+                        wl_ffi_dd_plan_t **out)
 {
     if (!prog || !out)
         return -2;
@@ -673,7 +674,8 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog, wl_ffi_dd_plan_t **o
 
     *out = NULL;
 
-    wl_ffi_dd_plan_t *plan = (wl_ffi_dd_plan_t *)calloc(1, sizeof(wl_ffi_dd_plan_t));
+    wl_ffi_dd_plan_t *plan
+        = (wl_ffi_dd_plan_t *)calloc(1, sizeof(wl_ffi_dd_plan_t));
     if (!plan)
         return -1;
 

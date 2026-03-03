@@ -275,7 +275,8 @@ typedef struct {
  *   -2: Invalid program (NULL, not stratified, etc.).
  */
 int
-wl_ffi_dd_plan_generate(const struct wirelog_program *prog, wl_ffi_dd_plan_t **out);
+wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
+                        wl_ffi_dd_plan_t **out);
 
 /**
  * wl_ffi_dd_plan_free:

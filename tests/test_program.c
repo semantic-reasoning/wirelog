@@ -49,7 +49,8 @@ static struct wirelog_program *
 make_program(const char *source)
 {
     char errbuf[512] = { 0 };
-    wl_parser_ast_node_t *ast = wl_parser_parse_string(source, errbuf, sizeof(errbuf));
+    wl_parser_ast_node_t *ast
+        = wl_parser_parse_string(source, errbuf, sizeof(errbuf));
     if (!ast)
         return NULL;
 

@@ -96,11 +96,11 @@ wl_ir_program_free(struct wirelog_program *program);
 
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
-                            const wl_parser_ast_node_t *ast);
+                               const wl_parser_ast_node_t *ast);
 
 int
 wl_ir_program_convert_rules(struct wirelog_program *program,
-                         const wl_parser_ast_node_t *ast);
+                            const wl_parser_ast_node_t *ast);
 
 int
 wl_ir_program_merge_unions(struct wirelog_program *program);

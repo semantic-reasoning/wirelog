@@ -597,7 +597,8 @@ wl_dd_marshal_plan(const wl_ffi_dd_plan_t *plan, wl_ffi_plan_t **out)
                 dst_s->relation_count = src_s->relation_count;
 
                 for (uint32_t r = 0; r < src_s->relation_count; r++) {
-                    const wl_ffi_dd_relation_plan_t *src_r = &src_s->relations[r];
+                    const wl_ffi_dd_relation_plan_t *src_r
+                        = &src_s->relations[r];
                     wl_ffi_relation_plan_t *dst_r = &rels[r];
 
                     /* Deep copy relation name */

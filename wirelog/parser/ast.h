@@ -36,18 +36,18 @@ typedef enum {
     WL_PARSER_AST_NODE_PROGRAM, /* children = declarations + rules */
 
     /* Declarations */
-    WL_PARSER_AST_NODE_DECL,      /* .decl name(params): children = typed_params */
-    WL_PARSER_AST_NODE_INPUT,     /* .input name(params): children = input_params */
+    WL_PARSER_AST_NODE_DECL,  /* .decl name(params): children = typed_params */
+    WL_PARSER_AST_NODE_INPUT, /* .input name(params): children = input_params */
     WL_PARSER_AST_NODE_OUTPUT,    /* .output name */
     WL_PARSER_AST_NODE_PRINTSIZE, /* .printsize name */
 
     /* Rule structure */
-    WL_PARSER_AST_NODE_RULE,       /* children[0]=head, children[1..]=body; is_planning */
-    WL_PARSER_AST_NODE_HEAD,       /* name=relation, children=head_args */
-    WL_PARSER_AST_NODE_ATOM,       /* name=relation, children=atom_args */
-    WL_PARSER_AST_NODE_NEGATION,   /* !atom: children[0]=atom */
+    WL_PARSER_AST_NODE_RULE, /* children[0]=head, children[1..]=body; is_planning */
+    WL_PARSER_AST_NODE_HEAD,     /* name=relation, children=head_args */
+    WL_PARSER_AST_NODE_ATOM,     /* name=relation, children=atom_args */
+    WL_PARSER_AST_NODE_NEGATION, /* !atom: children[0]=atom */
     WL_PARSER_AST_NODE_COMPARISON, /* cmp_op: children[0]=left, children[1]=right */
-    WL_PARSER_AST_NODE_BOOLEAN,    /* bool_value (True/False predicate) */
+    WL_PARSER_AST_NODE_BOOLEAN, /* bool_value (True/False predicate) */
 
     /* Terms / Arguments */
     WL_PARSER_AST_NODE_VARIABLE,  /* name = variable name */
@@ -106,10 +106,12 @@ struct wl_parser_ast_node {
 /* ======================================================================== */
 
 wl_parser_ast_node_t *
-wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line, uint32_t col);
+wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line,
+                          uint32_t col);
 
 void
-wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent, wl_parser_ast_node_t *child);
+wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent,
+                             wl_parser_ast_node_t *child);
 
 void
 wl_parser_ast_node_set_name(wl_parser_ast_node_t *node, const char *name);
@@ -118,7 +120,8 @@ void
 wl_parser_ast_node_set_str_value(wl_parser_ast_node_t *node, const char *value);
 
 void
-wl_parser_ast_node_set_type_name(wl_parser_ast_node_t *node, const char *type_name);
+wl_parser_ast_node_set_type_name(wl_parser_ast_node_t *node,
+                                 const char *type_name);
 
 void
 wl_parser_ast_node_free(wl_parser_ast_node_t *node);
