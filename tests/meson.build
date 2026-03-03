@@ -209,3 +209,17 @@ test_intern_exe = executable(
 )
 
 test('intern', test_intern_exe)
+
+test_session_exe = executable(
+  'test_session',
+  files('test_session.c'),
+  parser_src,
+  ir_src,
+  ffi_src,
+  facts_loader_src,
+  dd_backend_src,
+  dependencies: [rust_ffi_dep],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('session', test_session_exe)
