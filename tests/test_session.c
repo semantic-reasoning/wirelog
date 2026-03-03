@@ -906,6 +906,114 @@ test_session_duplicate_insert(void)
 }
 
 /* ======================================================================== */
+/* TEST: Transitive Closure Insert (RED phase - will FAIL)                 */
+/* ======================================================================== */
+
+static void
+test_session_tc_insert(void)
+{
+    TEST("session: transitive closure insert test (recursive iterate)");
+
+    /* Program:
+       tc(X, Y) :- edge(X, Y).
+       tc(X, Z) :- edge(X, Y), tc(Y, Z).
+    */
+    wl_ffi_plan_t *ffi = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    ffi = ffi_plan_from_source(".decl edge(x: int32, y: int32)\n"
+                               ".decl tc(x: int32, y: int32)\n"
+                               "tc(X, Y) :- edge(X, Y).\n"
+                               "tc(X, Z) :- edge(X, Y), tc(Y, Z).\n",
+                               &dd_plan);
+
+    if (!ffi || !dd_plan) {
+        FAIL("failed to parse TC program");
+        if (ffi)
+            wl_ffi_plan_free(ffi);
+        return;
+    }
+
+    /* Create persistent session */
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_dd(), ffi, 1, &session);
+    if (rc != 0) {
+        wl_ffi_plan_free(ffi);
+        FAIL("session creation failed");
+        return;
+    }
+
+    /* Setup delta collector */
+    delta_collector_t deltas = { 0 };
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+
+    /* Step 1: Insert edge(1,2), edge(2,3) */
+    int64_t edge_12[] = { 1, 2 };
+    int64_t edge_23[] = { 2, 3 };
+    wl_session_insert(session, "edge", edge_12, 1, 2);
+    wl_session_insert(session, "edge", edge_23, 1, 2);
+    rc = wl_session_step(session);
+    if (rc != 0) {
+        wl_session_destroy(session);
+        wl_ffi_plan_free(ffi);
+        FAIL("first step failed");
+        return;
+    }
+
+    /* Should have TC: (1,2), (2,3), (1,3) */
+    if (!has_delta(&deltas, "tc", (int64_t[]){ 1, 2 }, 2, +1)) {
+        wl_session_destroy(session);
+        wl_ffi_plan_free(ffi);
+        FAIL("expected tc(1,2) with diff=+1");
+        return;
+    }
+    if (!has_delta(&deltas, "tc", (int64_t[]){ 1, 3 }, 2, +1)) {
+        wl_session_destroy(session);
+        wl_ffi_plan_free(ffi);
+        FAIL("expected tc(1,3) with diff=+1 (recursive)");
+        return;
+    }
+
+    /* Reset for step 2 */
+    memset(&deltas, 0, sizeof(deltas));
+
+    /* Step 2: Insert edge(3,4) - should derive tc(1,4), tc(2,4), tc(3,4) */
+    int64_t edge_34[] = { 3, 4 };
+    wl_session_insert(session, "edge", edge_34, 1, 2);
+    rc = wl_session_step(session);
+    if (rc != 0) {
+        wl_session_destroy(session);
+        wl_ffi_plan_free(ffi);
+        FAIL("second step failed");
+        return;
+    }
+
+    /* Verify exactly 3 new TC tuples */
+    int new_tc_count = count_deltas(&deltas, "tc", +1);
+    if (new_tc_count != 3) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected 3 new TC deltas, got %d",
+                 new_tc_count);
+        wl_session_destroy(session);
+        wl_ffi_plan_free(ffi);
+        FAIL(msg);
+        return;
+    }
+
+    if (!has_delta(&deltas, "tc", (int64_t[]){ 1, 4 }, 2, +1)
+        || !has_delta(&deltas, "tc", (int64_t[]){ 2, 4 }, 2, +1)
+        || !has_delta(&deltas, "tc", (int64_t[]){ 3, 4 }, 2, +1)) {
+        wl_session_destroy(session);
+        wl_ffi_plan_free(ffi);
+        FAIL("expected tc(1,4), tc(2,4), tc(3,4) deltas");
+        return;
+    }
+
+    wl_session_destroy(session);
+    wl_ffi_plan_free(ffi);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -925,6 +1033,8 @@ main(void)
     test_session_snapshot_empty();
     test_session_snapshot_after_insert();
     test_session_duplicate_insert();
+    /* RED: the following tests require TASK 4 (Variable collections + iterate) */
+    test_session_tc_insert();
 
     printf("\n  %d tests: %d passed, %d failed\n", tests_run, tests_passed,
            tests_failed);
