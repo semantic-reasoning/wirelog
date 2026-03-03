@@ -174,7 +174,7 @@ test_create_filter_node(void)
     right->var_name = strdup_safe("y");
 
     wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
-    cmp->cmp_op = WL_CMP_NEQ;
+    cmp->cmp_op = WIRELOG_CMP_NEQ;
     wl_ir_expr_add_child(cmp, left);
     wl_ir_expr_add_child(cmp, right);
 
@@ -194,7 +194,7 @@ test_create_filter_node(void)
         return;
     }
 
-    if (filter->filter_expr->cmp_op != WL_CMP_NEQ) {
+    if (filter->filter_expr->cmp_op != WIRELOG_CMP_NEQ) {
         wl_ir_node_free(filter);
         FAIL("filter cmp_op should be NEQ");
         return;
@@ -223,7 +223,7 @@ test_create_aggregate_node(void)
 
     wirelog_ir_node_t *agg = wl_ir_node_create(WIRELOG_IR_AGGREGATE);
     wl_ir_node_set_relation(agg, "sssp");
-    agg->agg_fn = WL_AGG_MIN;
+    agg->agg_fn = WIRELOG_AGG_MIN;
     agg->agg_expr = agg_expr;
 
     /* group_by indices */
@@ -233,7 +233,7 @@ test_create_aggregate_node(void)
 
     wl_ir_node_add_child(agg, scan);
 
-    if (agg->agg_fn != WL_AGG_MIN) {
+    if (agg->agg_fn != WIRELOG_AGG_MIN) {
         wl_ir_node_free(agg);
         FAIL("agg_fn should be MIN");
         return;
@@ -333,7 +333,7 @@ test_create_expression_tree(void)
     const_1->int_value = 1;
 
     wl_ir_expr_t *arith = wl_ir_expr_create(WL_IR_EXPR_ARITH);
-    arith->arith_op = WL_ARITH_ADD;
+    arith->arith_op = WIRELOG_ARITH_ADD;
     wl_ir_expr_add_child(arith, var_x);
     wl_ir_expr_add_child(arith, const_1);
 
@@ -341,7 +341,7 @@ test_create_expression_tree(void)
     var_y->var_name = strdup_safe("y");
 
     wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
-    cmp->cmp_op = WL_CMP_LT;
+    cmp->cmp_op = WIRELOG_CMP_LT;
     wl_ir_expr_add_child(cmp, arith);
     wl_ir_expr_add_child(cmp, var_y);
 
@@ -351,7 +351,7 @@ test_create_expression_tree(void)
         wl_ir_expr_free(cmp);
         return;
     }
-    if (cmp->cmp_op != WL_CMP_LT) {
+    if (cmp->cmp_op != WIRELOG_CMP_LT) {
         FAIL("cmp_op should be LT");
         wl_ir_expr_free(cmp);
         return;
@@ -368,7 +368,7 @@ test_create_expression_tree(void)
         wl_ir_expr_free(cmp);
         return;
     }
-    if (left->arith_op != WL_ARITH_ADD) {
+    if (left->arith_op != WIRELOG_ARITH_ADD) {
         FAIL("arith_op should be ADD");
         wl_ir_expr_free(cmp);
         return;
@@ -474,7 +474,7 @@ test_expr_aggregate(void)
     inner->var_name = strdup_safe("d");
 
     wl_ir_expr_t *agg = wl_ir_expr_create(WL_IR_EXPR_AGG);
-    agg->agg_fn = WL_AGG_MIN;
+    agg->agg_fn = WIRELOG_AGG_MIN;
     wl_ir_expr_add_child(agg, inner);
 
     if (agg->type != WL_IR_EXPR_AGG) {
@@ -482,7 +482,7 @@ test_expr_aggregate(void)
         wl_ir_expr_free(agg);
         return;
     }
-    if (agg->agg_fn != WL_AGG_MIN) {
+    if (agg->agg_fn != WIRELOG_AGG_MIN) {
         FAIL("agg_fn should be MIN");
         wl_ir_expr_free(agg);
         return;

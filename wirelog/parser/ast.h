@@ -14,8 +14,8 @@
  * See discussion/FlowLog_Grammar_Analysis.md for grammar reference.
  */
 
-#ifndef WIRELOG_AST_H
-#define WIRELOG_AST_H
+#ifndef WL_PARSER_AST_H
+#define WL_PARSER_AST_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,48 +33,48 @@ extern "C" {
 
 typedef enum {
     /* Top-level */
-    WL_NODE_PROGRAM, /* children = declarations + rules */
+    WL_PARSER_AST_NODE_PROGRAM, /* children = declarations + rules */
 
     /* Declarations */
-    WL_NODE_DECL,      /* .decl name(params): children = typed_params */
-    WL_NODE_INPUT,     /* .input name(params): children = input_params */
-    WL_NODE_OUTPUT,    /* .output name */
-    WL_NODE_PRINTSIZE, /* .printsize name */
+    WL_PARSER_AST_NODE_DECL,      /* .decl name(params): children = typed_params */
+    WL_PARSER_AST_NODE_INPUT,     /* .input name(params): children = input_params */
+    WL_PARSER_AST_NODE_OUTPUT,    /* .output name */
+    WL_PARSER_AST_NODE_PRINTSIZE, /* .printsize name */
 
     /* Rule structure */
-    WL_NODE_RULE,       /* children[0]=head, children[1..]=body; is_planning */
-    WL_NODE_HEAD,       /* name=relation, children=head_args */
-    WL_NODE_ATOM,       /* name=relation, children=atom_args */
-    WL_NODE_NEGATION,   /* !atom: children[0]=atom */
-    WL_NODE_COMPARISON, /* cmp_op: children[0]=left, children[1]=right */
-    WL_NODE_BOOLEAN,    /* bool_value (True/False predicate) */
+    WL_PARSER_AST_NODE_RULE,       /* children[0]=head, children[1..]=body; is_planning */
+    WL_PARSER_AST_NODE_HEAD,       /* name=relation, children=head_args */
+    WL_PARSER_AST_NODE_ATOM,       /* name=relation, children=atom_args */
+    WL_PARSER_AST_NODE_NEGATION,   /* !atom: children[0]=atom */
+    WL_PARSER_AST_NODE_COMPARISON, /* cmp_op: children[0]=left, children[1]=right */
+    WL_PARSER_AST_NODE_BOOLEAN,    /* bool_value (True/False predicate) */
 
     /* Terms / Arguments */
-    WL_NODE_VARIABLE,  /* name = variable name */
-    WL_NODE_INTEGER,   /* int_value = integer constant */
-    WL_NODE_STRING,    /* str_value = string constant */
-    WL_NODE_WILDCARD,  /* _ placeholder */
-    WL_NODE_AGGREGATE, /* agg_fn, children[0] = arithmetic expr */
+    WL_PARSER_AST_NODE_VARIABLE,  /* name = variable name */
+    WL_PARSER_AST_NODE_INTEGER,   /* int_value = integer constant */
+    WL_PARSER_AST_NODE_STRING,    /* str_value = string constant */
+    WL_PARSER_AST_NODE_WILDCARD,  /* _ placeholder */
+    WL_PARSER_AST_NODE_AGGREGATE, /* agg_fn, children[0] = arithmetic expr */
 
     /* Expressions */
-    WL_NODE_BINARY_EXPR, /* arith_op, children[0]=left, children[1]=right */
+    WL_PARSER_AST_NODE_BINARY_EXPR, /* arith_op, children[0]=left, children[1]=right */
 
     /* Inline facts */
-    WL_NODE_FACT, /* name=relation, children=constant args */
+    WL_PARSER_AST_NODE_FACT, /* name=relation, children=constant args */
 
     /* Declaration parts */
-    WL_NODE_TYPED_PARAM, /* name=attr_name, type_name=data_type */
-    WL_NODE_INPUT_PARAM, /* name=param_name, str_value=param_value */
-} wl_node_type_t;
+    WL_PARSER_AST_NODE_TYPED_PARAM, /* name=attr_name, type_name=data_type */
+    WL_PARSER_AST_NODE_INPUT_PARAM, /* name=param_name, str_value=param_value */
+} wl_parser_ast_node_type_t;
 
 /* ======================================================================== */
 /* AST Node                                                                 */
 /* ======================================================================== */
 
-typedef struct wl_ast_node wl_ast_node_t;
+typedef struct wl_parser_ast_node wl_parser_ast_node_t;
 
-struct wl_ast_node {
-    wl_node_type_t type;
+struct wl_parser_ast_node {
+    wl_parser_ast_node_type_t type;
 
     /* Source location */
     uint32_t line;
@@ -88,15 +88,15 @@ struct wl_ast_node {
     bool is_planning;  /* .plan optimization marker (rules only) */
 
     /* Operator (for comparisons, arithmetic, aggregates) */
-    wl_cmp_op_t cmp_op;
-    wl_arith_op_t arith_op;
-    wl_agg_fn_t agg_fn;
+    wirelog_cmp_op_t cmp_op;
+    wirelog_arith_op_t arith_op;
+    wirelog_agg_fn_t agg_fn;
 
     /* Type name for typed parameters (int32, int64, string) */
     char *type_name;
 
     /* Children */
-    wl_ast_node_t **children;
+    wl_parser_ast_node_t **children;
     uint32_t child_count;
     uint32_t child_capacity;
 };
@@ -105,36 +105,36 @@ struct wl_ast_node {
 /* AST Construction API                                                     */
 /* ======================================================================== */
 
-wl_ast_node_t *
-wl_ast_node_create(wl_node_type_t type, uint32_t line, uint32_t col);
+wl_parser_ast_node_t *
+wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line, uint32_t col);
 
 void
-wl_ast_node_add_child(wl_ast_node_t *parent, wl_ast_node_t *child);
+wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent, wl_parser_ast_node_t *child);
 
 void
-wl_ast_node_set_name(wl_ast_node_t *node, const char *name);
+wl_parser_ast_node_set_name(wl_parser_ast_node_t *node, const char *name);
 
 void
-wl_ast_node_set_str_value(wl_ast_node_t *node, const char *value);
+wl_parser_ast_node_set_str_value(wl_parser_ast_node_t *node, const char *value);
 
 void
-wl_ast_node_set_type_name(wl_ast_node_t *node, const char *type_name);
+wl_parser_ast_node_set_type_name(wl_parser_ast_node_t *node, const char *type_name);
 
 void
-wl_ast_node_free(wl_ast_node_t *node);
+wl_parser_ast_node_free(wl_parser_ast_node_t *node);
 
 /* ======================================================================== */
 /* AST Printing / Debugging                                                 */
 /* ======================================================================== */
 
 void
-wl_ast_print(const wl_ast_node_t *node, int indent);
+wl_parser_ast_print(const wl_parser_ast_node_t *node, int indent);
 
 const char *
-wl_node_type_str(wl_node_type_t type);
+wl_parser_ast_node_type_str(wl_parser_ast_node_type_t type);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* WIRELOG_AST_H */
+#endif /* WL_PARSER_AST_H */

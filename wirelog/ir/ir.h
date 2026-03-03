@@ -44,9 +44,9 @@ struct wl_ir_expr {
     char *str_value;   /* WL_IR_EXPR_CONST_STR */
     bool bool_value;   /* WL_IR_EXPR_BOOL */
 
-    wl_arith_op_t arith_op; /* WL_IR_EXPR_ARITH */
-    wl_cmp_op_t cmp_op;     /* WL_IR_EXPR_CMP */
-    wl_agg_fn_t agg_fn;     /* WL_IR_EXPR_AGG */
+    wirelog_arith_op_t arith_op; /* WL_IR_EXPR_ARITH */
+    wirelog_cmp_op_t cmp_op;     /* WL_IR_EXPR_CMP */
+    wirelog_agg_fn_t agg_fn;     /* WL_IR_EXPR_AGG */
 
     /* Children (binary ops have 2, aggregate has 1) */
     wl_ir_expr_t **children;
@@ -77,7 +77,7 @@ struct wirelog_ir_node {
     char **join_right_keys;  /* JOIN: right join key variable names */
     uint32_t join_key_count; /* JOIN: number of join keys */
 
-    wl_agg_fn_t agg_fn;         /* AGGREGATE: function */
+    wirelog_agg_fn_t agg_fn;         /* AGGREGATE: function */
     wl_ir_expr_t *agg_expr;     /* AGGREGATE: expression to aggregate */
     uint32_t *group_by_indices; /* AGGREGATE: grouping column indices */
     uint32_t group_by_count;    /* AGGREGATE: number of grouping columns */

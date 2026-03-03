@@ -36,48 +36,48 @@ extern "C" {
 /* ======================================================================== */
 
 typedef enum {
-    WL_CMP_EQ,  /* = */
-    WL_CMP_NEQ, /* != */
-    WL_CMP_LT,  /* < */
-    WL_CMP_GT,  /* > */
-    WL_CMP_LTE, /* <= */
-    WL_CMP_GTE, /* >= */
-} wl_cmp_op_t;
+    WIRELOG_CMP_EQ,  /* = */
+    WIRELOG_CMP_NEQ, /* != */
+    WIRELOG_CMP_LT,  /* < */
+    WIRELOG_CMP_GT,  /* > */
+    WIRELOG_CMP_LTE, /* <= */
+    WIRELOG_CMP_GTE, /* >= */
+} wirelog_cmp_op_t;
 
 /* ======================================================================== */
 /* Arithmetic Operators                                                     */
 /* ======================================================================== */
 
 typedef enum {
-    WL_ARITH_ADD, /* + */
-    WL_ARITH_SUB, /* - */
-    WL_ARITH_MUL, /* * */
-    WL_ARITH_DIV, /* / */
-    WL_ARITH_MOD, /* % */
-} wl_arith_op_t;
+    WIRELOG_ARITH_ADD, /* + */
+    WIRELOG_ARITH_SUB, /* - */
+    WIRELOG_ARITH_MUL, /* * */
+    WIRELOG_ARITH_DIV, /* / */
+    WIRELOG_ARITH_MOD, /* % */
+} wirelog_arith_op_t;
 
 /* ======================================================================== */
 /* Aggregate Functions                                                      */
 /* ======================================================================== */
 
 typedef enum {
-    WL_AGG_COUNT, /* count / COUNT */
-    WL_AGG_SUM,   /* sum / SUM */
-    WL_AGG_MIN,   /* min / MIN */
-    WL_AGG_MAX,   /* max / MAX */
-    WL_AGG_AVG,   /* average / AVG */
-} wl_agg_fn_t;
+    WIRELOG_AGG_COUNT, /* count / COUNT */
+    WIRELOG_AGG_SUM,   /* sum / SUM */
+    WIRELOG_AGG_MIN,   /* min / MIN */
+    WIRELOG_AGG_MAX,   /* max / MAX */
+    WIRELOG_AGG_AVG,   /* average / AVG */
+} wirelog_agg_fn_t;
 
 /* ======================================================================== */
 /* Operator String Conversion                                               */
 /* ======================================================================== */
 
 const char *
-wl_cmp_op_str(wl_cmp_op_t op);
+wirelog_cmp_op_str(wirelog_cmp_op_t op);
 const char *
-wl_arith_op_str(wl_arith_op_t op);
+wirelog_arith_op_str(wirelog_arith_op_t op);
 const char *
-wl_agg_fn_str(wl_agg_fn_t fn);
+wirelog_agg_fn_str(wirelog_agg_fn_t fn);
 
 /* ======================================================================== */
 /* Basic Types                                                              */

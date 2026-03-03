@@ -23,10 +23,10 @@
 
 #define INITIAL_CHILD_CAPACITY 4
 
-wl_ast_node_t *
-wl_ast_node_create(wl_node_type_t type, uint32_t line, uint32_t col)
+wl_parser_ast_node_t *
+wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line, uint32_t col)
 {
-    wl_ast_node_t *node = (wl_ast_node_t *)calloc(1, sizeof(wl_ast_node_t));
+    wl_parser_ast_node_t *node = (wl_parser_ast_node_t *)calloc(1, sizeof(wl_parser_ast_node_t));
     if (!node)
         return NULL;
 
@@ -38,7 +38,7 @@ wl_ast_node_create(wl_node_type_t type, uint32_t line, uint32_t col)
 }
 
 void
-wl_ast_node_add_child(wl_ast_node_t *parent, wl_ast_node_t *child)
+wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent, wl_parser_ast_node_t *child)
 {
     if (!parent || !child)
         return;
@@ -47,8 +47,8 @@ wl_ast_node_add_child(wl_ast_node_t *parent, wl_ast_node_t *child)
         uint32_t new_cap = parent->child_capacity == 0
                                ? INITIAL_CHILD_CAPACITY
                                : parent->child_capacity * 2;
-        wl_ast_node_t **new_children = (wl_ast_node_t **)realloc(
-            parent->children, new_cap * sizeof(wl_ast_node_t *));
+        wl_parser_ast_node_t **new_children = (wl_parser_ast_node_t **)realloc(
+            parent->children, new_cap * sizeof(wl_parser_ast_node_t *));
         if (!new_children)
             return;
         parent->children = new_children;
@@ -72,7 +72,7 @@ strdup_safe(const char *s)
 }
 
 void
-wl_ast_node_set_name(wl_ast_node_t *node, const char *name)
+wl_parser_ast_node_set_name(wl_parser_ast_node_t *node, const char *name)
 {
     if (!node)
         return;
@@ -81,7 +81,7 @@ wl_ast_node_set_name(wl_ast_node_t *node, const char *name)
 }
 
 void
-wl_ast_node_set_str_value(wl_ast_node_t *node, const char *value)
+wl_parser_ast_node_set_str_value(wl_parser_ast_node_t *node, const char *value)
 {
     if (!node)
         return;
@@ -90,7 +90,7 @@ wl_ast_node_set_str_value(wl_ast_node_t *node, const char *value)
 }
 
 void
-wl_ast_node_set_type_name(wl_ast_node_t *node, const char *type_name)
+wl_parser_ast_node_set_type_name(wl_parser_ast_node_t *node, const char *type_name)
 {
     if (!node)
         return;
@@ -99,13 +99,13 @@ wl_ast_node_set_type_name(wl_ast_node_t *node, const char *type_name)
 }
 
 void
-wl_ast_node_free(wl_ast_node_t *node)
+wl_parser_ast_node_free(wl_parser_ast_node_t *node)
 {
     if (!node)
         return;
 
     for (uint32_t i = 0; i < node->child_count; i++) {
-        wl_ast_node_free(node->children[i]);
+        wl_parser_ast_node_free(node->children[i]);
     }
     free(node->children);
     free(node->name);
@@ -119,111 +119,111 @@ wl_ast_node_free(wl_ast_node_t *node)
 /* ======================================================================== */
 
 const char *
-wl_node_type_str(wl_node_type_t type)
+wl_parser_ast_node_type_str(wl_parser_ast_node_type_t type)
 {
     switch (type) {
-    case WL_NODE_PROGRAM:
+    case WL_PARSER_AST_NODE_PROGRAM:
         return "PROGRAM";
-    case WL_NODE_DECL:
+    case WL_PARSER_AST_NODE_DECL:
         return "DECL";
-    case WL_NODE_INPUT:
+    case WL_PARSER_AST_NODE_INPUT:
         return "INPUT";
-    case WL_NODE_OUTPUT:
+    case WL_PARSER_AST_NODE_OUTPUT:
         return "OUTPUT";
-    case WL_NODE_PRINTSIZE:
+    case WL_PARSER_AST_NODE_PRINTSIZE:
         return "PRINTSIZE";
-    case WL_NODE_RULE:
+    case WL_PARSER_AST_NODE_RULE:
         return "RULE";
-    case WL_NODE_HEAD:
+    case WL_PARSER_AST_NODE_HEAD:
         return "HEAD";
-    case WL_NODE_ATOM:
+    case WL_PARSER_AST_NODE_ATOM:
         return "ATOM";
-    case WL_NODE_NEGATION:
+    case WL_PARSER_AST_NODE_NEGATION:
         return "NEGATION";
-    case WL_NODE_COMPARISON:
+    case WL_PARSER_AST_NODE_COMPARISON:
         return "COMPARISON";
-    case WL_NODE_BOOLEAN:
+    case WL_PARSER_AST_NODE_BOOLEAN:
         return "BOOLEAN";
-    case WL_NODE_VARIABLE:
+    case WL_PARSER_AST_NODE_VARIABLE:
         return "VARIABLE";
-    case WL_NODE_INTEGER:
+    case WL_PARSER_AST_NODE_INTEGER:
         return "INTEGER";
-    case WL_NODE_STRING:
+    case WL_PARSER_AST_NODE_STRING:
         return "STRING";
-    case WL_NODE_WILDCARD:
+    case WL_PARSER_AST_NODE_WILDCARD:
         return "WILDCARD";
-    case WL_NODE_AGGREGATE:
+    case WL_PARSER_AST_NODE_AGGREGATE:
         return "AGGREGATE";
-    case WL_NODE_BINARY_EXPR:
+    case WL_PARSER_AST_NODE_BINARY_EXPR:
         return "BINARY_EXPR";
-    case WL_NODE_FACT:
+    case WL_PARSER_AST_NODE_FACT:
         return "FACT";
-    case WL_NODE_TYPED_PARAM:
+    case WL_PARSER_AST_NODE_TYPED_PARAM:
         return "TYPED_PARAM";
-    case WL_NODE_INPUT_PARAM:
+    case WL_PARSER_AST_NODE_INPUT_PARAM:
         return "INPUT_PARAM";
     }
     return "UNKNOWN";
 }
 
 const char *
-wl_cmp_op_str(wl_cmp_op_t op)
+wirelog_cmp_op_str(wirelog_cmp_op_t op)
 {
     switch (op) {
-    case WL_CMP_EQ:
+    case WIRELOG_CMP_EQ:
         return "=";
-    case WL_CMP_NEQ:
+    case WIRELOG_CMP_NEQ:
         return "!=";
-    case WL_CMP_LT:
+    case WIRELOG_CMP_LT:
         return "<";
-    case WL_CMP_GT:
+    case WIRELOG_CMP_GT:
         return ">";
-    case WL_CMP_LTE:
+    case WIRELOG_CMP_LTE:
         return "<=";
-    case WL_CMP_GTE:
+    case WIRELOG_CMP_GTE:
         return ">=";
     }
     return "?";
 }
 
 const char *
-wl_arith_op_str(wl_arith_op_t op)
+wirelog_arith_op_str(wirelog_arith_op_t op)
 {
     switch (op) {
-    case WL_ARITH_ADD:
+    case WIRELOG_ARITH_ADD:
         return "+";
-    case WL_ARITH_SUB:
+    case WIRELOG_ARITH_SUB:
         return "-";
-    case WL_ARITH_MUL:
+    case WIRELOG_ARITH_MUL:
         return "*";
-    case WL_ARITH_DIV:
+    case WIRELOG_ARITH_DIV:
         return "/";
-    case WL_ARITH_MOD:
+    case WIRELOG_ARITH_MOD:
         return "%";
     }
     return "?";
 }
 
 const char *
-wl_agg_fn_str(wl_agg_fn_t fn)
+wirelog_agg_fn_str(wirelog_agg_fn_t fn)
 {
     switch (fn) {
-    case WL_AGG_COUNT:
+    case WIRELOG_AGG_COUNT:
         return "count";
-    case WL_AGG_SUM:
+    case WIRELOG_AGG_SUM:
         return "sum";
-    case WL_AGG_MIN:
+    case WIRELOG_AGG_MIN:
         return "min";
-    case WL_AGG_MAX:
+    case WIRELOG_AGG_MAX:
         return "max";
-    case WL_AGG_AVG:
+    case WIRELOG_AGG_AVG:
         return "avg";
     }
     return "?";
 }
 
 void
-wl_ast_print(const wl_ast_node_t *node, int indent)
+wl_parser_ast_print(const wl_parser_ast_node_t *node, int indent)
 {
     if (!node)
         return;
@@ -231,22 +231,22 @@ wl_ast_print(const wl_ast_node_t *node, int indent)
     for (int i = 0; i < indent; i++)
         fprintf(stderr, "  ");
 
-    fprintf(stderr, "%s", wl_node_type_str(node->type));
+    fprintf(stderr, "%s", wl_parser_ast_node_type_str(node->type));
 
     if (node->name)
         fprintf(stderr, " name=\"%s\"", node->name);
-    if (node->type == WL_NODE_INTEGER)
+    if (node->type == WL_PARSER_AST_NODE_INTEGER)
         fprintf(stderr, " value=%lld", (long long)node->int_value);
     if (node->str_value)
         fprintf(stderr, " str=\"%s\"", node->str_value);
-    if (node->type == WL_NODE_BOOLEAN)
+    if (node->type == WL_PARSER_AST_NODE_BOOLEAN)
         fprintf(stderr, " value=%s", node->bool_value ? "True" : "False");
-    if (node->type == WL_NODE_COMPARISON)
-        fprintf(stderr, " op=%s", wl_cmp_op_str(node->cmp_op));
-    if (node->type == WL_NODE_BINARY_EXPR)
-        fprintf(stderr, " op=%s", wl_arith_op_str(node->arith_op));
-    if (node->type == WL_NODE_AGGREGATE)
-        fprintf(stderr, " fn=%s", wl_agg_fn_str(node->agg_fn));
+    if (node->type == WL_PARSER_AST_NODE_COMPARISON)
+        fprintf(stderr, " op=%s", wirelog_cmp_op_str(node->cmp_op));
+    if (node->type == WL_PARSER_AST_NODE_BINARY_EXPR)
+        fprintf(stderr, " op=%s", wirelog_arith_op_str(node->arith_op));
+    if (node->type == WL_PARSER_AST_NODE_AGGREGATE)
+        fprintf(stderr, " fn=%s", wirelog_agg_fn_str(node->agg_fn));
     if (node->type_name)
         fprintf(stderr, " type=%s", node->type_name);
     if (node->is_planning)
@@ -255,6 +255,6 @@ wl_ast_print(const wl_ast_node_t *node, int indent)
     fprintf(stderr, "\n");
 
     for (uint32_t i = 0; i < node->child_count; i++) {
-        wl_ast_print(node->children[i], indent + 1);
+        wl_parser_ast_print(node->children[i], indent + 1);
     }
 }

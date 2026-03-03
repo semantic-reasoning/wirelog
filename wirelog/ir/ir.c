@@ -318,7 +318,7 @@ ir_expr_to_buf(const wl_ir_expr_t *expr, char *buf, size_t bufsize, size_t *pos)
             *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "(");
             ir_expr_to_buf(expr->children[0], buf, bufsize, pos);
             *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " %s ",
-                                     wl_arith_op_str(expr->arith_op));
+                                     wirelog_arith_op_str(expr->arith_op));
             ir_expr_to_buf(expr->children[1], buf, bufsize, pos);
             *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ")");
         }
@@ -327,13 +327,13 @@ ir_expr_to_buf(const wl_ir_expr_t *expr, char *buf, size_t bufsize, size_t *pos)
         if (expr->child_count >= 2) {
             ir_expr_to_buf(expr->children[0], buf, bufsize, pos);
             *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " %s ",
-                                     wl_cmp_op_str(expr->cmp_op));
+                                     wirelog_cmp_op_str(expr->cmp_op));
             ir_expr_to_buf(expr->children[1], buf, bufsize, pos);
         }
         break;
     case WL_IR_EXPR_AGG:
         *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "%s(",
-                                 wl_agg_fn_str(expr->agg_fn));
+                                 wirelog_agg_fn_str(expr->agg_fn));
         if (expr->child_count >= 1) {
             ir_expr_to_buf(expr->children[0], buf, bufsize, pos);
         }

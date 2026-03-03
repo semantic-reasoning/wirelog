@@ -124,7 +124,7 @@ pub enum WlFfiOpType {
 /* Aggregation Function Enum                                                */
 /* ======================================================================== */
 
-/// Aggregation function type.  Mirrors `wl_agg_fn_t` from wirelog-types.h.
+/// Aggregation function type.  Mirrors `wirelog_agg_fn_t` from wirelog-types.h.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum WlAggFn {
