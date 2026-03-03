@@ -77,7 +77,7 @@ struct wirelog_ir_node {
     char **join_right_keys;  /* JOIN: right join key variable names */
     uint32_t join_key_count; /* JOIN: number of join keys */
 
-    wirelog_agg_fn_t agg_fn;         /* AGGREGATE: function */
+    wirelog_agg_fn_t agg_fn;    /* AGGREGATE: function */
     wl_ir_expr_t *agg_expr;     /* AGGREGATE: expression to aggregate */
     uint32_t *group_by_indices; /* AGGREGATE: grouping column indices */
     uint32_t group_by_count;    /* AGGREGATE: number of grouping columns */

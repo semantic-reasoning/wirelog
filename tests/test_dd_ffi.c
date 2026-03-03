@@ -679,10 +679,10 @@ test_marshal_edb_relations(void)
     TEST("marshal plan: multiple EDB -> edb_relations array correct");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl b(x: int32)\n"
-                                          ".decl c(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x).\n");
+                                              ".decl b(x: int32)\n"
+                                              ".decl c(x: int32)\n"
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -732,8 +732,8 @@ test_marshal_scan_op(void)
     TEST("marshal plan: SCAN -> FFI VARIABLE op");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x).\n");
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -785,8 +785,8 @@ test_marshal_filter_op(void)
     TEST("marshal plan: FILTER -> FFI FILTER with serialized expr");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x), x > 5.\n");
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x), x > 5.\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -842,8 +842,8 @@ test_marshal_map_op(void)
     TEST("marshal plan: PROJECT -> FFI MAP with project_indices");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x, y).\n");
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x, y).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -898,8 +898,8 @@ test_marshal_map_exprs(void)
     TEST("marshal plan: b(x, y+1) :- a(x,y). -> MAP with map_exprs");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
-                                          ".decl b(x: int32, y: int32)\n"
-                                          "b(x, y + 1) :- a(x, y).\n");
+                                              ".decl b(x: int32, y: int32)\n"
+                                              "b(x, y + 1) :- a(x, y).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -965,9 +965,9 @@ test_marshal_join_op(void)
     TEST("marshal plan: JOIN -> FFI JOIN with keys and right_relation");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
-                                          ".decl b(y: int32, z: int32)\n"
-                                          ".decl r(x: int32, z: int32)\n"
-                                          "r(x, z) :- a(x, y), b(y, z).\n");
+                                              ".decl b(y: int32, z: int32)\n"
+                                              ".decl r(x: int32, z: int32)\n"
+                                              "r(x, z) :- a(x, y), b(y, z).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1039,9 +1039,9 @@ test_marshal_antijoin_op(void)
     TEST("marshal plan: ANTIJOIN -> FFI ANTIJOIN with right_relation");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl b(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x), !b(x).\n");
+                                              ".decl b(x: int32)\n"
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x), !b(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1101,8 +1101,8 @@ test_marshal_reduce_op(void)
     TEST("marshal plan: AGGREGATE -> FFI REDUCE with agg_fn + group_by");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
-                                          ".decl r(x: int32, c: int32)\n"
-                                          "r(x, count(y)) :- a(x, y).\n");
+                                              ".decl r(x: int32, c: int32)\n"
+                                              "r(x, count(y)) :- a(x, y).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1162,10 +1162,10 @@ test_marshal_union_ops(void)
     TEST("marshal plan: UNION -> FFI CONCAT + CONSOLIDATE");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl b(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x).\n"
-                                          "r(x) :- b(x).\n");
+                                              ".decl b(x: int32)\n"
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x).\n"
+                                              "r(x) :- b(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1272,10 +1272,10 @@ test_marshal_multi_stratum_ordering(void)
     TEST("marshal plan: chain a->b->c -> strata ordered by ID");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl b(x: int32)\n"
-                                          ".decl c(x: int32)\n"
-                                          "b(x) :- a(x).\n"
-                                          "c(x) :- b(x).\n");
+                                              ".decl b(x: int32)\n"
+                                              ".decl c(x: int32)\n"
+                                              "b(x) :- a(x).\n"
+                                              "c(x) :- b(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1321,10 +1321,10 @@ test_marshal_stratum_count_matches(void)
     TEST("marshal plan: FFI stratum_count matches DD plan");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl b(x: int32)\n"
-                                          ".decl c(x: int32)\n"
-                                          "b(x) :- a(x).\n"
-                                          "c(x) :- b(x).\n");
+                                              ".decl b(x: int32)\n"
+                                              ".decl c(x: int32)\n"
+                                              "b(x) :- a(x).\n"
+                                              "c(x) :- b(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1366,8 +1366,8 @@ test_marshal_relation_name_copied(void)
     TEST("marshal plan: relation name is a deep copy");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x).\n");
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1415,9 +1415,9 @@ test_marshal_edb_count_matches(void)
     TEST("marshal plan: FFI edb_count matches DD plan");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl b(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x).\n");
+                                              ".decl b(x: int32)\n"
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1459,9 +1459,9 @@ test_marshal_join_keys_copied(void)
     TEST("marshal plan: JOIN left_keys/right_keys are deep copies");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
-                                          ".decl b(y: int32, z: int32)\n"
-                                          ".decl r(x: int32, z: int32)\n"
-                                          "r(x, z) :- a(x, y), b(y, z).\n");
+                                              ".decl b(y: int32, z: int32)\n"
+                                              ".decl r(x: int32, z: int32)\n"
+                                              "r(x, z) :- a(x, y), b(y, z).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -1538,8 +1538,8 @@ test_ffi_plan_free_after_marshal(void)
     TEST("ffi plan free: fields accessible before free");
 
     wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
-                                          ".decl r(x: int32)\n"
-                                          "r(x) :- a(x).\n");
+                                              ".decl r(x: int32)\n"
+                                              "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;

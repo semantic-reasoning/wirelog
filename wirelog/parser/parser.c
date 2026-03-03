@@ -80,7 +80,8 @@ parser_error(wl_parser_t *parser, const char *msg)
     parser->had_error = true;
     snprintf(parser->error_msg, sizeof(parser->error_msg),
              "line %u, col %u: %s (got %s)", parser->current.line,
-             parser->current.col, msg, wl_parser_lexer_token_type_str(parser->current.type));
+             parser->current.col, msg,
+             wl_parser_lexer_token_type_str(parser->current.type));
 }
 
 /* ======================================================================== */
@@ -114,7 +115,8 @@ parser_match(wl_parser_t *parser, wl_parser_lexer_token_type_t type)
 }
 
 static bool
-parser_consume(wl_parser_t *parser, wl_parser_lexer_token_type_t type, const char *msg)
+parser_consume(wl_parser_t *parser, wl_parser_lexer_token_type_t type,
+               const char *msg)
 {
     if (parser_check(parser, type)) {
         parser_advance(parser);
@@ -172,19 +174,22 @@ parse_factor(wl_parser_t *parser)
     uint32_t col = parser->current.col;
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_IDENT)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, line, col);
         node->name = token_to_name(&parser->previous);
         return node;
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_INTEGER)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INTEGER, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INTEGER, line, col);
         node->int_value = parser->previous.int_value;
         return node;
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_STRING)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_STRING, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_STRING, line, col);
         node->str_value = token_to_str_value(&parser->previous);
         return node;
     }
@@ -215,8 +220,10 @@ token_to_arith_op(wl_parser_lexer_token_type_t type)
 static bool
 is_arith_op(wl_parser_lexer_token_type_t type)
 {
-    return type == WL_PARSER_LEXER_TOK_PLUS || type == WL_PARSER_LEXER_TOK_MINUS || type == WL_PARSER_LEXER_TOK_STAR
-           || type == WL_PARSER_LEXER_TOK_SLASH || type == WL_PARSER_LEXER_TOK_PERCENT;
+    return type == WL_PARSER_LEXER_TOK_PLUS || type == WL_PARSER_LEXER_TOK_MINUS
+           || type == WL_PARSER_LEXER_TOK_STAR
+           || type == WL_PARSER_LEXER_TOK_SLASH
+           || type == WL_PARSER_LEXER_TOK_PERCENT;
 }
 
 static wl_parser_ast_node_t *
@@ -238,7 +245,8 @@ parse_arithmetic_expr(wl_parser_t *parser)
             return NULL;
         }
 
-        wl_parser_ast_node_t *bin = wl_parser_ast_node_create(WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         bin->arith_op = op;
         wl_parser_ast_node_add_child(bin, left);
         wl_parser_ast_node_add_child(bin, right);
@@ -270,8 +278,9 @@ token_to_agg_fn(wl_parser_lexer_token_type_t type)
 static bool
 is_aggregate_token(wl_parser_lexer_token_type_t type)
 {
-    return type == WL_PARSER_LEXER_TOK_COUNT || type == WL_PARSER_LEXER_TOK_SUM || type == WL_PARSER_LEXER_TOK_MIN
-           || type == WL_PARSER_LEXER_TOK_MAX || type == WL_PARSER_LEXER_TOK_AVG;
+    return type == WL_PARSER_LEXER_TOK_COUNT || type == WL_PARSER_LEXER_TOK_SUM
+           || type == WL_PARSER_LEXER_TOK_MIN || type == WL_PARSER_LEXER_TOK_MAX
+           || type == WL_PARSER_LEXER_TOK_AVG;
 }
 
 static wl_parser_ast_node_t *
@@ -297,7 +306,8 @@ parse_aggregate_expr(wl_parser_t *parser)
         return NULL;
     }
 
-    wl_parser_ast_node_t *agg = wl_parser_ast_node_create(WL_PARSER_AST_NODE_AGGREGATE, line, col);
+    wl_parser_ast_node_t *agg
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_AGGREGATE, line, col);
     agg->agg_fn = fn;
     wl_parser_ast_node_add_child(agg, expr);
     return agg;
@@ -327,23 +337,27 @@ parse_atom_arg(wl_parser_t *parser)
     uint32_t col = parser->current.col;
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_UNDERSCORE)) {
-        return wl_parser_ast_node_create(WL_PARSER_AST_NODE_WILDCARD, line, col);
+        return wl_parser_ast_node_create(WL_PARSER_AST_NODE_WILDCARD, line,
+                                         col);
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_IDENT)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, line, col);
         node->name = token_to_name(&parser->previous);
         return node;
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_INTEGER)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INTEGER, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INTEGER, line, col);
         node->int_value = parser->previous.int_value;
         return node;
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_STRING)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_STRING, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_STRING, line, col);
         node->str_value = token_to_str_value(&parser->previous);
         return node;
     }
@@ -363,7 +377,8 @@ parse_atom(wl_parser_t *parser)
     uint32_t col = parser->previous.col;
 
     /* IDENT already consumed */
-    wl_parser_ast_node_t *atom = wl_parser_ast_node_create(WL_PARSER_AST_NODE_ATOM, line, col);
+    wl_parser_ast_node_t *atom
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_ATOM, line, col);
     atom->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
@@ -407,8 +422,10 @@ parse_atom(wl_parser_t *parser)
 static bool
 is_compare_op(wl_parser_lexer_token_type_t type)
 {
-    return type == WL_PARSER_LEXER_TOK_EQ || type == WL_PARSER_LEXER_TOK_NEQ || type == WL_PARSER_LEXER_TOK_LT
-           || type == WL_PARSER_LEXER_TOK_GT || type == WL_PARSER_LEXER_TOK_LTE || type == WL_PARSER_LEXER_TOK_GTE;
+    return type == WL_PARSER_LEXER_TOK_EQ || type == WL_PARSER_LEXER_TOK_NEQ
+           || type == WL_PARSER_LEXER_TOK_LT || type == WL_PARSER_LEXER_TOK_GT
+           || type == WL_PARSER_LEXER_TOK_LTE
+           || type == WL_PARSER_LEXER_TOK_GTE;
 }
 
 static wirelog_cmp_op_t
@@ -443,12 +460,14 @@ parse_predicate(wl_parser_t *parser)
 
     /* Boolean predicate */
     if (parser_match(parser, WL_PARSER_LEXER_TOK_TRUE)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_BOOLEAN, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_BOOLEAN, line, col);
         node->bool_value = true;
         return node;
     }
     if (parser_match(parser, WL_PARSER_LEXER_TOK_FALSE)) {
-        wl_parser_ast_node_t *node = wl_parser_ast_node_create(WL_PARSER_AST_NODE_BOOLEAN, line, col);
+        wl_parser_ast_node_t *node
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_BOOLEAN, line, col);
         node->bool_value = false;
         return node;
     }
@@ -463,7 +482,8 @@ parse_predicate(wl_parser_t *parser)
         if (!atom)
             return NULL;
 
-        wl_parser_ast_node_t *neg = wl_parser_ast_node_create(WL_PARSER_AST_NODE_NEGATION, line, col);
+        wl_parser_ast_node_t *neg
+            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_NEGATION, line, col);
         wl_parser_ast_node_add_child(neg, atom);
         return neg;
     }
@@ -478,7 +498,8 @@ parse_predicate(wl_parser_t *parser)
         /* Otherwise it's a comparison: arith_expr compare_op arith_expr
          * We already consumed the identifier, so build the left side. */
         wl_parser_ast_node_t *left_var = wl_parser_ast_node_create(
-            WL_PARSER_AST_NODE_VARIABLE, parser->previous.line, parser->previous.col);
+            WL_PARSER_AST_NODE_VARIABLE, parser->previous.line,
+            parser->previous.col);
         left_var->name = token_to_name(&parser->previous);
 
         /* Build left arithmetic expression */
@@ -493,8 +514,8 @@ parse_predicate(wl_parser_t *parser)
                 wl_parser_ast_node_free(left);
                 return NULL;
             }
-            wl_parser_ast_node_t *bin
-                = wl_parser_ast_node_create(WL_PARSER_AST_NODE_BINARY_EXPR, op_line, op_col);
+            wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
+                WL_PARSER_AST_NODE_BINARY_EXPR, op_line, op_col);
             bin->arith_op = op;
             wl_parser_ast_node_add_child(bin, left);
             wl_parser_ast_node_add_child(bin, right_factor);
@@ -518,8 +539,8 @@ parse_predicate(wl_parser_t *parser)
             return NULL;
         }
 
-        wl_parser_ast_node_t *cmp
-            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
+        wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
         cmp->cmp_op = cmp_op;
         wl_parser_ast_node_add_child(cmp, left);
         wl_parser_ast_node_add_child(cmp, right);
@@ -549,8 +570,8 @@ parse_predicate(wl_parser_t *parser)
             return NULL;
         }
 
-        wl_parser_ast_node_t *cmp
-            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
+        wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
         cmp->cmp_op = cmp_op;
         wl_parser_ast_node_add_child(cmp, left);
         wl_parser_ast_node_add_child(cmp, right);
@@ -576,7 +597,8 @@ parse_head(wl_parser_t *parser)
         return NULL;
     }
 
-    wl_parser_ast_node_t *head = wl_parser_ast_node_create(WL_PARSER_AST_NODE_HEAD, line, col);
+    wl_parser_ast_node_t *head
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_HEAD, line, col);
     head->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
@@ -604,7 +626,8 @@ parse_head(wl_parser_t *parser)
         }
     }
 
-    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN, "expected ')' in head")) {
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                        "expected ')' in head")) {
         wl_parser_ast_node_free(head);
         return NULL;
     }
@@ -620,8 +643,8 @@ static wl_parser_ast_node_t *
 parse_fact(wl_parser_t *parser, wl_parser_ast_node_t *head)
 {
     /* Convert HEAD node to FACT node, reusing name and children */
-    wl_parser_ast_node_t *fact
-        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_FACT, head->line, head->col);
+    wl_parser_ast_node_t *fact = wl_parser_ast_node_create(
+        WL_PARSER_AST_NODE_FACT, head->line, head->col);
     fact->name = head->name;
     head->name = NULL;
 
@@ -638,7 +661,8 @@ parse_fact(wl_parser_t *parser, wl_parser_ast_node_t *head)
     /* Validate: fact arguments must be constants (INTEGER or STRING) */
     for (uint32_t i = 0; i < fact->child_count; i++) {
         wl_parser_ast_node_type_t arg_type = fact->children[i]->type;
-        if (arg_type != WL_PARSER_AST_NODE_INTEGER && arg_type != WL_PARSER_AST_NODE_STRING) {
+        if (arg_type != WL_PARSER_AST_NODE_INTEGER
+            && arg_type != WL_PARSER_AST_NODE_STRING) {
             parser_error(
                 parser, "fact arguments must be constants (integer or string)");
             wl_parser_ast_node_free(fact);
@@ -646,7 +670,8 @@ parse_fact(wl_parser_t *parser, wl_parser_ast_node_t *head)
         }
     }
 
-    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT, "expected '.' at end of fact")) {
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT,
+                        "expected '.' at end of fact")) {
         wl_parser_ast_node_free(fact);
         return NULL;
     }
@@ -676,7 +701,8 @@ parse_rule_or_fact(wl_parser_t *parser)
         return NULL;
     }
 
-    wl_parser_ast_node_t *rule = wl_parser_ast_node_create(WL_PARSER_AST_NODE_RULE, line, col);
+    wl_parser_ast_node_t *rule
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_RULE, line, col);
     wl_parser_ast_node_add_child(rule, head);
 
     /* Parse body predicates */
@@ -696,7 +722,8 @@ parse_rule_or_fact(wl_parser_t *parser)
         wl_parser_ast_node_add_child(rule, pred);
     }
 
-    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT, "expected '.' at end of rule")) {
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT,
+                        "expected '.' at end of rule")) {
         wl_parser_ast_node_free(rule);
         return NULL;
     }
@@ -725,7 +752,8 @@ parse_declaration(wl_parser_t *parser)
         return NULL;
     }
 
-    wl_parser_ast_node_t *decl = wl_parser_ast_node_create(WL_PARSER_AST_NODE_DECL, line, col);
+    wl_parser_ast_node_t *decl
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_DECL, line, col);
     decl->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
@@ -769,8 +797,8 @@ parse_declaration(wl_parser_t *parser)
                 return NULL;
             }
 
-            wl_parser_ast_node_t *param
-                = wl_parser_ast_node_create(WL_PARSER_AST_NODE_TYPED_PARAM, attr_line, attr_col);
+            wl_parser_ast_node_t *param = wl_parser_ast_node_create(
+                WL_PARSER_AST_NODE_TYPED_PARAM, attr_line, attr_col);
             param->name = attr_name;
             param->type_name = strdup_safe(type_str);
             wl_parser_ast_node_add_child(decl, param);
@@ -780,7 +808,8 @@ parse_declaration(wl_parser_t *parser)
         }
     }
 
-    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN, "expected ')' after .decl")) {
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                        "expected ')' after .decl")) {
         wl_parser_ast_node_free(decl);
         return NULL;
     }
@@ -800,7 +829,8 @@ parse_input_directive(wl_parser_t *parser)
         return NULL;
     }
 
-    wl_parser_ast_node_t *input = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INPUT, line, col);
+    wl_parser_ast_node_t *input
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INPUT, line, col);
     input->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
@@ -837,8 +867,8 @@ parse_input_directive(wl_parser_t *parser)
             }
             char *param_value = token_to_str_value(&parser->previous);
 
-            wl_parser_ast_node_t *param
-                = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INPUT_PARAM, p_line, p_col);
+            wl_parser_ast_node_t *param = wl_parser_ast_node_create(
+                WL_PARSER_AST_NODE_INPUT_PARAM, p_line, p_col);
             param->name = param_name;
             param->str_value = param_value;
             wl_parser_ast_node_add_child(input, param);
@@ -868,7 +898,8 @@ parse_output_directive(wl_parser_t *parser)
         return NULL;
     }
 
-    wl_parser_ast_node_t *output = wl_parser_ast_node_create(WL_PARSER_AST_NODE_OUTPUT, line, col);
+    wl_parser_ast_node_t *output
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_OUTPUT, line, col);
     output->name = token_to_name(&parser->previous);
     return output;
 }
@@ -884,7 +915,8 @@ parse_printsize_directive(wl_parser_t *parser)
         return NULL;
     }
 
-    wl_parser_ast_node_t *ps = wl_parser_ast_node_create(WL_PARSER_AST_NODE_PRINTSIZE, line, col);
+    wl_parser_ast_node_t *ps
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_PRINTSIZE, line, col);
     ps->name = token_to_name(&parser->previous);
     return ps;
 }
@@ -896,11 +928,13 @@ parse_printsize_directive(wl_parser_t *parser)
 static wl_parser_ast_node_t *
 parse_program(wl_parser_t *parser)
 {
-    wl_parser_ast_node_t *program = wl_parser_ast_node_create(WL_PARSER_AST_NODE_PROGRAM, 1, 1);
+    wl_parser_ast_node_t *program
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_PROGRAM, 1, 1);
     if (!program)
         return NULL;
 
-    while (!parser_check(parser, WL_PARSER_LEXER_TOK_EOF) && !parser->had_error) {
+    while (!parser_check(parser, WL_PARSER_LEXER_TOK_EOF)
+           && !parser->had_error) {
         wl_parser_ast_node_t *node = NULL;
 
         if (parser_match(parser, WL_PARSER_LEXER_TOK_DECL)) {
@@ -940,7 +974,8 @@ parse_program(wl_parser_t *parser)
 /* ======================================================================== */
 
 wl_parser_ast_node_t *
-wl_parser_parse_string(const char *source, char *error_buf, size_t error_buf_size)
+wl_parser_parse_string(const char *source, char *error_buf,
+                       size_t error_buf_size)
 {
     wl_parser_t parser;
     memset(&parser, 0, sizeof(parser));

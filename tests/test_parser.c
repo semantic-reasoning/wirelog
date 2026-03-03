@@ -42,9 +42,10 @@ static int tests_failed = 0;
         printf(" FAIL: %s\n", msg); \
     } while (0)
 
-#define PARSE(src)            \
-    char errbuf[512] = { 0 }; \
-    wl_parser_ast_node_t *program = wl_parser_parse_string(src, errbuf, sizeof(errbuf))
+#define PARSE(src)                \
+    char errbuf[512] = { 0 };     \
+    wl_parser_ast_node_t *program \
+        = wl_parser_parse_string(src, errbuf, sizeof(errbuf))
 
 #define ASSERT_PARSED()                                             \
     do {                                                            \
@@ -54,8 +55,8 @@ static int tests_failed = 0;
             FAIL(buf);                                              \
             return;                                                 \
         }                                                           \
-        if (program->type != WL_PARSER_AST_NODE_PROGRAM) {                     \
-            wl_parser_ast_node_free(program);                              \
+        if (program->type != WL_PARSER_AST_NODE_PROGRAM) {          \
+            wl_parser_ast_node_free(program);                       \
             FAIL("root is not PROGRAM");                            \
             return;                                                 \
         }                                                           \
@@ -252,8 +253,8 @@ test_parse_input_directive(void)
         return;
     }
     const wl_parser_ast_node_t *p0 = child(inp, 0);
-    if (p0->type != WL_PARSER_AST_NODE_INPUT_PARAM || strcmp(p0->name, "IO") != 0
-        || strcmp(p0->str_value, "file") != 0) {
+    if (p0->type != WL_PARSER_AST_NODE_INPUT_PARAM
+        || strcmp(p0->name, "IO") != 0 || strcmp(p0->str_value, "file") != 0) {
         CLEANUP();
         FAIL("first param should be IO=\"file\"");
         return;
@@ -269,7 +270,8 @@ test_parse_output_directive(void)
     PARSE(".output Reach");
     ASSERT_PARSED();
     const wl_parser_ast_node_t *out = child(program, 0);
-    if (out->type != WL_PARSER_AST_NODE_OUTPUT || strcmp(out->name, "Reach") != 0) {
+    if (out->type != WL_PARSER_AST_NODE_OUTPUT
+        || strcmp(out->name, "Reach") != 0) {
         CLEANUP();
         FAIL("expected OUTPUT 'Reach'");
         return;
@@ -285,7 +287,8 @@ test_parse_printsize_directive(void)
     PARSE(".printsize Tc");
     ASSERT_PARSED();
     const wl_parser_ast_node_t *ps = child(program, 0);
-    if (ps->type != WL_PARSER_AST_NODE_PRINTSIZE || strcmp(ps->name, "Tc") != 0) {
+    if (ps->type != WL_PARSER_AST_NODE_PRINTSIZE
+        || strcmp(ps->name, "Tc") != 0) {
         CLEANUP();
         FAIL("expected PRINTSIZE 'Tc'");
         return;
@@ -312,7 +315,8 @@ test_parse_simple_rule(void)
     }
     /* head is first child */
     const wl_parser_ast_node_t *head = child(rule, 0);
-    if (head->type != WL_PARSER_AST_NODE_HEAD || strcmp(head->name, "Tc") != 0) {
+    if (head->type != WL_PARSER_AST_NODE_HEAD
+        || strcmp(head->name, "Tc") != 0) {
         CLEANUP();
         FAIL("expected HEAD 'Tc'");
         return;
@@ -388,7 +392,8 @@ test_parse_rule_with_string_constant(void)
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *body = child(rule, 1);
     const wl_parser_ast_node_t *arg1 = child(body, 1);
-    if (arg1->type != WL_PARSER_AST_NODE_STRING || strcmp(arg1->str_value, "hello") != 0) {
+    if (arg1->type != WL_PARSER_AST_NODE_STRING
+        || strcmp(arg1->str_value, "hello") != 0) {
         CLEANUP();
         FAIL("expected string constant 'hello'");
         return;
@@ -433,7 +438,8 @@ test_parse_negation(void)
         return;
     }
     const wl_parser_ast_node_t *inner = child(neg, 0);
-    if (inner->type != WL_PARSER_AST_NODE_ATOM || strcmp(inner->name, "b") != 0) {
+    if (inner->type != WL_PARSER_AST_NODE_ATOM
+        || strcmp(inner->name, "b") != 0) {
         CLEANUP();
         FAIL("negation should wrap atom 'b'");
         return;
@@ -454,7 +460,8 @@ test_parse_equality_constraint(void)
     ASSERT_PARSED();
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *cmp = child(rule, 2);
-    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON || cmp->cmp_op != WIRELOG_CMP_EQ) {
+    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON
+        || cmp->cmp_op != WIRELOG_CMP_EQ) {
         CLEANUP();
         FAIL("expected COMPARISON with EQ");
         return;
@@ -471,7 +478,8 @@ test_parse_inequality_constraint(void)
     ASSERT_PARSED();
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *cmp = child(rule, 2);
-    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON || cmp->cmp_op != WIRELOG_CMP_NEQ) {
+    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON
+        || cmp->cmp_op != WIRELOG_CMP_NEQ) {
         CLEANUP();
         FAIL("expected COMPARISON with NEQ");
         return;
@@ -488,7 +496,8 @@ test_parse_less_than(void)
     ASSERT_PARSED();
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *cmp = child(rule, 2);
-    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON || cmp->cmp_op != WIRELOG_CMP_LT) {
+    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON
+        || cmp->cmp_op != WIRELOG_CMP_LT) {
         CLEANUP();
         FAIL("expected COMPARISON with LT");
         return;
@@ -526,14 +535,16 @@ test_parse_arithmetic_comparison(void)
     ASSERT_PARSED();
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *cmp = child(rule, 2);
-    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON || cmp->cmp_op != WIRELOG_CMP_LT) {
+    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON
+        || cmp->cmp_op != WIRELOG_CMP_LT) {
         CLEANUP();
         FAIL("expected COMPARISON with LT");
         return;
     }
     /* Left side should be binary expr (x + 1) */
     const wl_parser_ast_node_t *left = child(cmp, 0);
-    if (left->type != WL_PARSER_AST_NODE_BINARY_EXPR || left->arith_op != WIRELOG_ARITH_ADD) {
+    if (left->type != WL_PARSER_AST_NODE_BINARY_EXPR
+        || left->arith_op != WIRELOG_ARITH_ADD) {
         CLEANUP();
         FAIL("left should be binary ADD");
         return;
@@ -556,7 +567,8 @@ test_parse_min_aggregate(void)
     const wl_parser_ast_node_t *head = child(rule, 0);
     /* Second head arg should be aggregate */
     const wl_parser_ast_node_t *agg = child(head, 1);
-    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE || agg->agg_fn != WIRELOG_AGG_MIN) {
+    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE
+        || agg->agg_fn != WIRELOG_AGG_MIN) {
         CLEANUP();
         FAIL("expected AGGREGATE MIN");
         return;
@@ -574,7 +586,8 @@ test_parse_count_aggregate(void)
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *head = child(rule, 0);
     const wl_parser_ast_node_t *agg = child(head, 0);
-    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE || agg->agg_fn != WIRELOG_AGG_COUNT) {
+    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE
+        || agg->agg_fn != WIRELOG_AGG_COUNT) {
         CLEANUP();
         FAIL("expected AGGREGATE COUNT");
         return;
@@ -646,13 +659,15 @@ test_parse_aggregate_with_arithmetic(void)
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *head = child(rule, 0);
     const wl_parser_ast_node_t *agg = child(head, 1);
-    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE || agg->agg_fn != WIRELOG_AGG_MIN) {
+    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE
+        || agg->agg_fn != WIRELOG_AGG_MIN) {
         CLEANUP();
         FAIL("expected AGGREGATE MIN");
         return;
     }
     const wl_parser_ast_node_t *expr = child(agg, 0);
-    if (expr->type != WL_PARSER_AST_NODE_BINARY_EXPR || expr->arith_op != WIRELOG_ARITH_ADD) {
+    if (expr->type != WL_PARSER_AST_NODE_BINARY_EXPR
+        || expr->arith_op != WIRELOG_ARITH_ADD) {
         CLEANUP();
         FAIL("aggregate body should be ADD");
         return;
@@ -736,7 +751,8 @@ test_parse_arithmetic_head(void)
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *head = child(rule, 0);
     const wl_parser_ast_node_t *arg0 = child(head, 0);
-    if (arg0->type != WL_PARSER_AST_NODE_BINARY_EXPR || arg0->arith_op != WIRELOG_ARITH_ADD) {
+    if (arg0->type != WL_PARSER_AST_NODE_BINARY_EXPR
+        || arg0->arith_op != WIRELOG_ARITH_ADD) {
         CLEANUP();
         FAIL("head arg should be ADD expression");
         return;
@@ -910,13 +926,15 @@ test_parse_sssp(void)
     }
     const wl_parser_ast_node_t *head = child(rule2, 0);
     const wl_parser_ast_node_t *agg = child(head, 1);
-    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE || agg->agg_fn != WIRELOG_AGG_MIN) {
+    if (agg->type != WL_PARSER_AST_NODE_AGGREGATE
+        || agg->agg_fn != WIRELOG_AGG_MIN) {
         CLEANUP();
         FAIL("head arg 1 should be min aggregate");
         return;
     }
     const wl_parser_ast_node_t *arith = child(agg, 0);
-    if (arith->type != WL_PARSER_AST_NODE_BINARY_EXPR || arith->arith_op != WIRELOG_ARITH_ADD) {
+    if (arith->type != WL_PARSER_AST_NODE_BINARY_EXPR
+        || arith->arith_op != WIRELOG_ARITH_ADD) {
         CLEANUP();
         FAIL("aggregate should contain d1 + d2");
         return;
@@ -987,7 +1005,8 @@ test_parse_comparison_program(void)
         return;
     }
     const wl_parser_ast_node_t *cmp = child(rule, 3);
-    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON || cmp->cmp_op != WIRELOG_CMP_NEQ) {
+    if (cmp->type != WL_PARSER_AST_NODE_COMPARISON
+        || cmp->cmp_op != WIRELOG_CMP_NEQ) {
         CLEANUP();
         FAIL("third body pred should be COMPARISON NEQ");
         return;
@@ -1183,7 +1202,8 @@ test_parse_fact_string_constant(void)
         FAIL("arg 0 should be INTEGER 1");
         return;
     }
-    if (child(fact, 1)->type != WL_PARSER_AST_NODE_STRING || !child(fact, 1)->str_value
+    if (child(fact, 1)->type != WL_PARSER_AST_NODE_STRING
+        || !child(fact, 1)->str_value
         || strcmp(child(fact, 1)->str_value, "alice") != 0) {
         CLEANUP();
         FAIL("arg 1 should be STRING 'alice'");

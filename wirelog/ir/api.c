@@ -39,7 +39,8 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
     }
 
     char errbuf[512] = { 0 };
-    wl_parser_ast_node_t *ast = wl_parser_parse_string(program_text, errbuf, sizeof(errbuf));
+    wl_parser_ast_node_t *ast
+        = wl_parser_parse_string(program_text, errbuf, sizeof(errbuf));
     if (!ast) {
         if (error)
             *error = WIRELOG_ERR_PARSE;
