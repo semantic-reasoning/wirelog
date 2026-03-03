@@ -49,7 +49,7 @@ static int tests_failed = 0;
 /* Helper: generate DD plan from Datalog source                             */
 /* ======================================================================== */
 
-static wl_dd_plan_t *
+static wl_ffi_dd_plan_t *
 plan_from_source(const char *src)
 {
     wirelog_error_t err;
@@ -57,8 +57,8 @@ plan_from_source(const char *src)
     if (!prog)
         return NULL;
 
-    wl_dd_plan_t *plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &plan);
+    wl_ffi_dd_plan_t *plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &plan);
     wirelog_program_free(prog);
 
     if (rc != 0)
@@ -335,7 +335,7 @@ test_expr_serialize_cmp_gt(void)
     const5->int_value = 5;
 
     wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
-    cmp->cmp_op = WL_CMP_GT;
+    cmp->cmp_op = WIRELOG_CMP_GT;
     wl_ir_expr_add_child(cmp, var_x);
     wl_ir_expr_add_child(cmp, const5);
 
@@ -411,7 +411,7 @@ test_expr_serialize_arith_add(void)
     var_b->var_name = strdup_safe("B");
 
     wl_ir_expr_t *arith = wl_ir_expr_create(WL_IR_EXPR_ARITH);
-    arith->arith_op = WL_ARITH_ADD;
+    arith->arith_op = WIRELOG_ARITH_ADD;
     wl_ir_expr_add_child(arith, var_a);
     wl_ir_expr_add_child(arith, var_b);
 
@@ -482,7 +482,7 @@ test_expr_serialize_nested(void)
     const1->int_value = 1;
 
     wl_ir_expr_t *add = wl_ir_expr_create(WL_IR_EXPR_ARITH);
-    add->arith_op = WL_ARITH_ADD;
+    add->arith_op = WIRELOG_ARITH_ADD;
     wl_ir_expr_add_child(add, var_x);
     wl_ir_expr_add_child(add, const1);
 
@@ -490,7 +490,7 @@ test_expr_serialize_nested(void)
     const5->int_value = 5;
 
     wl_ir_expr_t *gt = wl_ir_expr_create(WL_IR_EXPR_CMP);
-    gt->cmp_op = WL_CMP_GT;
+    gt->cmp_op = WIRELOG_CMP_GT;
     wl_ir_expr_add_child(gt, add);
     wl_ir_expr_add_child(gt, const5);
 
@@ -596,7 +596,7 @@ test_marshal_null_out(void)
     TEST("marshal plan: NULL out -> returns -2");
 
     /* Create a minimal valid plan to test the out parameter check */
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n");
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -607,12 +607,12 @@ test_marshal_null_out(void)
     if (rc != -2) {
         char msg[100];
         snprintf(msg, sizeof(msg), "expected rc=-2, got %d", rc);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL(msg);
         return;
     }
 
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -625,7 +625,7 @@ test_marshal_empty_plan(void)
 {
     TEST("marshal plan: EDB-only -> valid empty FFI plan");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n");
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n");
     if (!plan) {
         FAIL("could not create test plan");
         return;
@@ -637,13 +637,13 @@ test_marshal_empty_plan(void)
     if (rc != 0) {
         char msg[100];
         snprintf(msg, sizeof(msg), "expected rc=0, got %d", rc);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL(msg);
         return;
     }
 
     if (!ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("ffi plan should not be NULL");
         return;
     }
@@ -652,20 +652,20 @@ test_marshal_empty_plan(void)
         char msg[100];
         snprintf(msg, sizeof(msg), "expected 1 EDB, got %u", ffi->edb_count);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL(msg);
         return;
     }
 
     if (strcmp(ffi->edb_relations[0], "a") != 0) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("EDB relation should be 'a'");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -678,7 +678,7 @@ test_marshal_edb_relations(void)
 {
     TEST("marshal plan: multiple EDB -> edb_relations array correct");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl b(x: int32)\n"
                                           ".decl c(x: int32)\n"
                                           ".decl r(x: int32)\n"
@@ -692,7 +692,7 @@ test_marshal_edb_relations(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -702,7 +702,7 @@ test_marshal_edb_relations(void)
         char msg[100];
         snprintf(msg, sizeof(msg), "expected 3 EDB, got %u", ffi->edb_count);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL(msg);
         return;
     }
@@ -711,14 +711,14 @@ test_marshal_edb_relations(void)
     for (uint32_t i = 0; i < ffi->edb_count; i++) {
         if (!ffi->edb_relations[i] || strlen(ffi->edb_relations[i]) == 0) {
             wl_ffi_plan_free(ffi);
-            wl_dd_plan_free(plan);
+            wl_ffi_dd_plan_free(plan);
             FAIL("EDB relation name is NULL or empty");
             return;
         }
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -731,7 +731,7 @@ test_marshal_scan_op(void)
 {
     TEST("marshal plan: SCAN -> FFI VARIABLE op");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x).\n");
     if (!plan) {
@@ -743,7 +743,7 @@ test_marshal_scan_op(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -751,7 +751,7 @@ test_marshal_scan_op(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -769,13 +769,13 @@ test_marshal_scan_op(void)
 
     if (!found_var) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI VARIABLE op with relation_name='a'");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -784,7 +784,7 @@ test_marshal_filter_op(void)
 {
     TEST("marshal plan: FILTER -> FFI FILTER with serialized expr");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x), x > 5.\n");
     if (!plan) {
@@ -796,7 +796,7 @@ test_marshal_filter_op(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -804,7 +804,7 @@ test_marshal_filter_op(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -817,7 +817,7 @@ test_marshal_filter_op(void)
                 found_filter = true;
             } else {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("FILTER op has NULL/empty filter_expr");
                 return;
             }
@@ -826,13 +826,13 @@ test_marshal_filter_op(void)
 
     if (!found_filter) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI FILTER op");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -841,7 +841,7 @@ test_marshal_map_op(void)
 {
     TEST("marshal plan: PROJECT -> FFI MAP with project_indices");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x, y).\n");
     if (!plan) {
@@ -853,7 +853,7 @@ test_marshal_map_op(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -861,7 +861,7 @@ test_marshal_map_op(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -873,7 +873,7 @@ test_marshal_map_op(void)
                 found_map = true;
             } else {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("MAP op has project_count == 0");
                 return;
             }
@@ -882,13 +882,13 @@ test_marshal_map_op(void)
 
     if (!found_map) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI MAP op");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -897,7 +897,7 @@ test_marshal_map_exprs(void)
 {
     TEST("marshal plan: b(x, y+1) :- a(x,y). -> MAP with map_exprs");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
                                           ".decl b(x: int32, y: int32)\n"
                                           "b(x, y + 1) :- a(x, y).\n");
     if (!plan) {
@@ -909,7 +909,7 @@ test_marshal_map_exprs(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -917,7 +917,7 @@ test_marshal_map_exprs(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "b");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'b' not found in FFI plan");
         return;
     }
@@ -931,7 +931,7 @@ test_marshal_map_exprs(void)
             /* Column 0 (x) should have no expression (data==NULL) */
             if (rp->ops[i].map_exprs[0].data != NULL) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("map_exprs[0] should be NULL for simple column x");
                 return;
             }
@@ -939,7 +939,7 @@ test_marshal_map_exprs(void)
             if (rp->ops[i].map_exprs[1].data == NULL
                 || rp->ops[i].map_exprs[1].size == 0) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("map_exprs[1] should have serialized data for y+1");
                 return;
             }
@@ -949,13 +949,13 @@ test_marshal_map_exprs(void)
 
     if (!found) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected MAP op with map_exprs");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -964,7 +964,7 @@ test_marshal_join_op(void)
 {
     TEST("marshal plan: JOIN -> FFI JOIN with keys and right_relation");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
                                           ".decl b(y: int32, z: int32)\n"
                                           ".decl r(x: int32, z: int32)\n"
                                           "r(x, z) :- a(x, y), b(y, z).\n");
@@ -977,7 +977,7 @@ test_marshal_join_op(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -985,7 +985,7 @@ test_marshal_join_op(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -995,25 +995,25 @@ test_marshal_join_op(void)
         if (rp->ops[i].op == WL_FFI_OP_JOIN) {
             if (rp->ops[i].key_count < 1) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("JOIN key_count should be >= 1");
                 return;
             }
             if (!rp->ops[i].right_relation) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("JOIN right_relation should not be NULL");
                 return;
             }
             if (strcmp(rp->ops[i].right_relation, "b") != 0) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("JOIN right_relation should be 'b'");
                 return;
             }
             if (!rp->ops[i].left_keys || !rp->ops[i].right_keys) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("JOIN left_keys/right_keys should not be NULL");
                 return;
             }
@@ -1023,13 +1023,13 @@ test_marshal_join_op(void)
 
     if (!found_join) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI JOIN op");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1038,7 +1038,7 @@ test_marshal_antijoin_op(void)
 {
     TEST("marshal plan: ANTIJOIN -> FFI ANTIJOIN with right_relation");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl b(x: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x), !b(x).\n");
@@ -1051,7 +1051,7 @@ test_marshal_antijoin_op(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1059,7 +1059,7 @@ test_marshal_antijoin_op(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -1069,13 +1069,13 @@ test_marshal_antijoin_op(void)
         if (rp->ops[i].op == WL_FFI_OP_ANTIJOIN) {
             if (!rp->ops[i].right_relation) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("ANTIJOIN right_relation should not be NULL");
                 return;
             }
             if (strcmp(rp->ops[i].right_relation, "b") != 0) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("ANTIJOIN right_relation should be 'b'");
                 return;
             }
@@ -1085,13 +1085,13 @@ test_marshal_antijoin_op(void)
 
     if (!found_antijoin) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI ANTIJOIN op");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1100,7 +1100,7 @@ test_marshal_reduce_op(void)
 {
     TEST("marshal plan: AGGREGATE -> FFI REDUCE with agg_fn + group_by");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
                                           ".decl r(x: int32, c: int32)\n"
                                           "r(x, count(y)) :- a(x, y).\n");
     if (!plan) {
@@ -1112,7 +1112,7 @@ test_marshal_reduce_op(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1120,7 +1120,7 @@ test_marshal_reduce_op(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -1130,13 +1130,13 @@ test_marshal_reduce_op(void)
         if (rp->ops[i].op == WL_FFI_OP_REDUCE) {
             if (rp->ops[i].group_by_count == 0) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("REDUCE group_by_count should be > 0");
                 return;
             }
             if (!rp->ops[i].group_by_indices) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("REDUCE group_by_indices should not be NULL");
                 return;
             }
@@ -1146,13 +1146,13 @@ test_marshal_reduce_op(void)
 
     if (!found_reduce) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI REDUCE op");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1161,7 +1161,7 @@ test_marshal_union_ops(void)
 {
     TEST("marshal plan: UNION -> FFI CONCAT + CONSOLIDATE");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl b(x: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x).\n"
@@ -1175,7 +1175,7 @@ test_marshal_union_ops(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1183,7 +1183,7 @@ test_marshal_union_ops(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -1199,20 +1199,20 @@ test_marshal_union_ops(void)
 
     if (!found_concat) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI CONCAT op for union");
         return;
     }
 
     if (!found_consolidate) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected FFI CONSOLIDATE op for union");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1225,7 +1225,7 @@ test_marshal_recursive_stratum(void)
 {
     TEST("marshal plan: recursive tc -> is_recursive preserved");
 
-    wl_dd_plan_t *plan
+    wl_ffi_dd_plan_t *plan
         = plan_from_source(".decl edge(x: int32, y: int32)\n"
                            ".decl tc(x: int32, y: int32)\n"
                            "tc(x, y) :- edge(x, y).\n"
@@ -1239,7 +1239,7 @@ test_marshal_recursive_stratum(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1256,13 +1256,13 @@ test_marshal_recursive_stratum(void)
 
     if (!found_recursive) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("expected recursive stratum containing 'tc'");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1271,7 +1271,7 @@ test_marshal_multi_stratum_ordering(void)
 {
     TEST("marshal plan: chain a->b->c -> strata ordered by ID");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl b(x: int32)\n"
                                           ".decl c(x: int32)\n"
                                           "b(x) :- a(x).\n"
@@ -1285,7 +1285,7 @@ test_marshal_multi_stratum_ordering(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1295,7 +1295,7 @@ test_marshal_multi_stratum_ordering(void)
         snprintf(msg, sizeof(msg), "expected >= 2 strata, got %u",
                  ffi->stratum_count);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL(msg);
         return;
     }
@@ -1304,14 +1304,14 @@ test_marshal_multi_stratum_ordering(void)
     for (uint32_t s = 1; s < ffi->stratum_count; s++) {
         if (ffi->strata[s].stratum_id <= ffi->strata[s - 1].stratum_id) {
             wl_ffi_plan_free(ffi);
-            wl_dd_plan_free(plan);
+            wl_ffi_dd_plan_free(plan);
             FAIL("strata should be ordered by ascending stratum_id");
             return;
         }
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1320,7 +1320,7 @@ test_marshal_stratum_count_matches(void)
 {
     TEST("marshal plan: FFI stratum_count matches DD plan");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl b(x: int32)\n"
                                           ".decl c(x: int32)\n"
                                           "b(x) :- a(x).\n"
@@ -1336,7 +1336,7 @@ test_marshal_stratum_count_matches(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1346,13 +1346,13 @@ test_marshal_stratum_count_matches(void)
         snprintf(msg, sizeof(msg), "expected %u strata, got %u", expected_count,
                  ffi->stratum_count);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL(msg);
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1365,7 +1365,7 @@ test_marshal_relation_name_copied(void)
 {
     TEST("marshal plan: relation name is a deep copy");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x).\n");
     if (!plan) {
@@ -1377,7 +1377,7 @@ test_marshal_relation_name_copied(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1385,27 +1385,27 @@ test_marshal_relation_name_copied(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
 
     if (strcmp(rp->name, "r") != 0) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("FFI relation name should be 'r'");
         return;
     }
 
     if (rp->op_count < 1) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("FFI relation should have >= 1 op");
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1414,7 +1414,7 @@ test_marshal_edb_count_matches(void)
 {
     TEST("marshal plan: FFI edb_count matches DD plan");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl b(x: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x).\n");
@@ -1429,7 +1429,7 @@ test_marshal_edb_count_matches(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1439,13 +1439,13 @@ test_marshal_edb_count_matches(void)
         snprintf(msg, sizeof(msg), "expected %u EDB, got %u", expected_edb,
                  ffi->edb_count);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL(msg);
         return;
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 
@@ -1458,7 +1458,7 @@ test_marshal_join_keys_copied(void)
 {
     TEST("marshal plan: JOIN left_keys/right_keys are deep copies");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32, y: int32)\n"
                                           ".decl b(y: int32, z: int32)\n"
                                           ".decl r(x: int32, z: int32)\n"
                                           "r(x, z) :- a(x, y), b(y, z).\n");
@@ -1471,7 +1471,7 @@ test_marshal_join_keys_copied(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1479,7 +1479,7 @@ test_marshal_join_keys_copied(void)
     const wl_ffi_relation_plan_t *rp = find_ffi_relation(ffi, "r");
     if (!rp) {
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("relation 'r' not found in FFI plan");
         return;
     }
@@ -1489,32 +1489,32 @@ test_marshal_join_keys_copied(void)
         if (rp->ops[i].op == WL_FFI_OP_JOIN) {
             if (rp->ops[i].key_count != 1) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("JOIN should have 1 key pair");
                 return;
             }
             if (strcmp(rp->ops[i].left_keys[0], "y") != 0) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("JOIN left_keys[0] should be 'y'");
                 return;
             }
             if (strcmp(rp->ops[i].right_keys[0], "y") != 0) {
                 wl_ffi_plan_free(ffi);
-                wl_dd_plan_free(plan);
+                wl_ffi_dd_plan_free(plan);
                 FAIL("JOIN right_keys[0] should be 'y'");
                 return;
             }
 
             wl_ffi_plan_free(ffi);
-            wl_dd_plan_free(plan);
+            wl_ffi_dd_plan_free(plan);
             PASS();
             return;
         }
     }
 
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     FAIL("JOIN op not found");
 }
 
@@ -1537,7 +1537,7 @@ test_ffi_plan_free_after_marshal(void)
 {
     TEST("ffi plan free: fields accessible before free");
 
-    wl_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
+    wl_ffi_dd_plan_t *plan = plan_from_source(".decl a(x: int32)\n"
                                           ".decl r(x: int32)\n"
                                           "r(x) :- a(x).\n");
     if (!plan) {
@@ -1549,7 +1549,7 @@ test_ffi_plan_free_after_marshal(void)
     int rc = wl_dd_marshal_plan(plan, &ffi);
 
     if (rc != 0 || !ffi) {
-        wl_dd_plan_free(plan);
+        wl_ffi_dd_plan_free(plan);
         FAIL("marshal failed");
         return;
     }
@@ -1578,7 +1578,7 @@ test_ffi_plan_free_after_marshal(void)
 
     /* Free should not crash */
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(plan);
+    wl_ffi_dd_plan_free(plan);
     PASS();
 }
 

@@ -117,15 +117,15 @@ count_tuples(const tuple_collector_t *c, const char *relation)
 /* ======================================================================== */
 
 static wl_ffi_plan_t *
-ffi_plan_from_source(const char *src, wl_dd_plan_t **dd_plan_out)
+ffi_plan_from_source(const char *src, wl_ffi_dd_plan_t **dd_plan_out)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
     if (!prog)
         return NULL;
 
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
     wirelog_program_free(prog);
     if (rc != 0)
         return NULL;
@@ -133,7 +133,7 @@ ffi_plan_from_source(const char *src, wl_dd_plan_t **dd_plan_out)
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         return NULL;
     }
 
@@ -155,7 +155,7 @@ test_execute_passthrough(void)
 {
     TEST("execute: passthrough r(x) :- a(x)");
 
-    wl_dd_plan_t *dd_plan = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32)\n"
                                               ".decl r(x: int32)\n"
                                               "r(x) :- a(x).\n",
@@ -179,7 +179,7 @@ test_execute_passthrough(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -190,7 +190,7 @@ test_execute_passthrough(void)
         snprintf(msg, sizeof(msg), "expected 3 tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -200,14 +200,14 @@ test_execute_passthrough(void)
         || !has_tuple(&results, "r", t3, 1)) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL("missing expected tuple");
         return;
     }
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     PASS();
 }
 
@@ -228,7 +228,7 @@ test_execute_transitive_closure(void)
 {
     TEST("execute: transitive closure (recursive)");
 
-    wl_dd_plan_t *dd_plan = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi
         = ffi_plan_from_source(".decl edge(x: int32, y: int32)\n"
                                ".decl tc(x: int32, y: int32)\n"
@@ -254,7 +254,7 @@ test_execute_transitive_closure(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -265,7 +265,7 @@ test_execute_transitive_closure(void)
         snprintf(msg, sizeof(msg), "expected 6 tc tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -282,14 +282,14 @@ test_execute_transitive_closure(void)
         || !has_tuple(&results, "tc", e14, 2)) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL("missing expected tc tuple");
         return;
     }
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     PASS();
 }
 
@@ -310,7 +310,7 @@ test_execute_join(void)
 {
     TEST("execute: join r(x,z) :- a(x,y), b(y,z)");
 
-    wl_dd_plan_t *dd_plan = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32, y: int32)\n"
                                               ".decl b(y: int32, z: int32)\n"
                                               ".decl r(x: int32, z: int32)\n"
@@ -337,7 +337,7 @@ test_execute_join(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -348,7 +348,7 @@ test_execute_join(void)
         snprintf(msg, sizeof(msg), "expected 4 result tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -360,14 +360,14 @@ test_execute_join(void)
         || !has_tuple(&results, "r", r4, 2)) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL("missing expected result tuple");
         return;
     }
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     PASS();
 }
 
@@ -387,7 +387,7 @@ test_execute_filter(void)
 {
     TEST("execute: filter big(x,y) :- edge(x,y), x > 1");
 
-    wl_dd_plan_t *dd_plan = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi
         = ffi_plan_from_source(".decl edge(x: int32, y: int32)\n"
                                ".decl big(x: int32, y: int32)\n"
@@ -412,7 +412,7 @@ test_execute_filter(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -423,7 +423,7 @@ test_execute_filter(void)
         snprintf(msg, sizeof(msg), "expected 2 big tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -433,14 +433,14 @@ test_execute_filter(void)
         || !has_tuple(&results, "big", t2, 2)) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL("missing expected big tuple");
         return;
     }
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     PASS();
 }
 
@@ -460,7 +460,7 @@ test_execute_aggregation(void)
 {
     TEST("execute: aggregation cnt(x, count(y)) :- data(x, y)");
 
-    wl_dd_plan_t *dd_plan = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi
         = ffi_plan_from_source(".decl data(x: int32, y: int32)\n"
                                ".decl cnt(x: int32, c: int32)\n"
@@ -485,7 +485,7 @@ test_execute_aggregation(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -496,7 +496,7 @@ test_execute_aggregation(void)
         snprintf(msg, sizeof(msg), "expected 2 cnt tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
@@ -506,14 +506,14 @@ test_execute_aggregation(void)
         || !has_tuple(&results, "cnt", c2, 2)) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL("missing expected cnt tuple");
         return;
     }
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     PASS();
 }
 
@@ -526,7 +526,7 @@ test_execute_null_callback(void)
 {
     TEST("execute: NULL callback discards results");
 
-    wl_dd_plan_t *dd_plan = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32)\n"
                                               ".decl r(x: int32)\n"
                                               "r(x) :- a(x).\n",
@@ -547,14 +547,14 @@ test_execute_null_callback(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     PASS();
 }
 
@@ -563,7 +563,7 @@ test_execute_no_callback(void)
 {
     TEST("execute: wl_dd_execute (no callback variant)");
 
-    wl_dd_plan_t *dd_plan = NULL;
+    wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32)\n"
                                               ".decl r(x: int32)\n"
                                               "r(x) :- a(x).\n",
@@ -584,14 +584,14 @@ test_execute_no_callback(void)
         snprintf(msg, sizeof(msg), "execute returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         FAIL(msg);
         return;
     }
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     PASS();
 }
 
@@ -750,8 +750,8 @@ test_e2e_inline_facts_tc(void)
     }
 
     /* Generate DD plan */
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
     if (rc != 0) {
         wirelog_program_free(prog);
         FAIL("dd_plan_generate failed");
@@ -761,7 +761,7 @@ test_e2e_inline_facts_tc(void)
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("dd_marshal_plan failed");
         return;
@@ -773,7 +773,7 @@ test_e2e_inline_facts_tc(void)
     if (rc != 0) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("wirelog_load_all_facts failed");
         return;
@@ -789,7 +789,7 @@ test_e2e_inline_facts_tc(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -802,7 +802,7 @@ test_e2e_inline_facts_tc(void)
         snprintf(msg, sizeof(msg), "expected 6 tc tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -818,7 +818,7 @@ test_e2e_inline_facts_tc(void)
         || !has_tuple(&results, "tc", e14, 2)) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("missing expected tc tuple");
         return;
@@ -826,7 +826,7 @@ test_e2e_inline_facts_tc(void)
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -886,8 +886,8 @@ test_load_input_files_tc(void)
     }
 
     /* Generate plan */
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
     if (rc != 0) {
         wirelog_program_free(prog);
         remove(csv_path);
@@ -898,7 +898,7 @@ test_load_input_files_tc(void)
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL("marshal failed");
@@ -914,7 +914,7 @@ test_load_input_files_tc(void)
         snprintf(msg, sizeof(msg), "load_input_files returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL(msg);
@@ -931,7 +931,7 @@ test_load_input_files_tc(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL(msg);
@@ -944,7 +944,7 @@ test_load_input_files_tc(void)
         snprintf(msg, sizeof(msg), "expected 6 tc tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL(msg);
@@ -953,7 +953,7 @@ test_load_input_files_tc(void)
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     wirelog_program_free(prog);
     remove(csv_path);
     PASS();
@@ -1036,8 +1036,8 @@ test_e2e_string_inline_facts(void)
         return;
     }
 
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
     if (rc != 0) {
         wirelog_program_free(prog);
         FAIL("dd_plan_generate failed");
@@ -1047,7 +1047,7 @@ test_e2e_string_inline_facts(void)
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("marshal failed");
         return;
@@ -1059,7 +1059,7 @@ test_e2e_string_inline_facts(void)
     if (rc != 0) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("load_all_facts failed");
         return;
@@ -1072,7 +1072,7 @@ test_e2e_string_inline_facts(void)
     if (rc != 0) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("execute_cb failed");
         return;
@@ -1085,7 +1085,7 @@ test_e2e_string_inline_facts(void)
         snprintf(msg, sizeof(msg), "expected 3 tc tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -1096,7 +1096,7 @@ test_e2e_string_inline_facts(void)
     if (!intern) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("intern table is NULL");
         return;
@@ -1108,7 +1108,7 @@ test_e2e_string_inline_facts(void)
                  wl_intern_count(intern));
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -1116,7 +1116,7 @@ test_e2e_string_inline_facts(void)
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -1154,8 +1154,8 @@ test_load_input_files_string_csv(void)
         return;
     }
 
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
     if (rc != 0) {
         wirelog_program_free(prog);
         remove(csv_path);
@@ -1166,7 +1166,7 @@ test_load_input_files_string_csv(void)
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL("marshal failed");
@@ -1181,7 +1181,7 @@ test_load_input_files_string_csv(void)
         snprintf(msg, sizeof(msg), "load_input_files returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL(msg);
@@ -1195,7 +1195,7 @@ test_load_input_files_string_csv(void)
     if (rc != 0) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL("execute_cb failed");
@@ -1209,7 +1209,7 @@ test_load_input_files_string_csv(void)
         snprintf(msg, sizeof(msg), "expected 3 tc tuples, got %d", n);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL(msg);
@@ -1221,7 +1221,7 @@ test_load_input_files_string_csv(void)
     if (!intern || wl_intern_count(intern) != 3) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         remove(csv_path);
         FAIL("expected 3 interned strings (Alice, Bob, Charlie)");
@@ -1230,7 +1230,7 @@ test_load_input_files_string_csv(void)
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     wirelog_program_free(prog);
     remove(csv_path);
     PASS();
@@ -1270,8 +1270,8 @@ test_e2e_head_arith_simple(void)
         return;
     }
 
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
     if (rc != 0) {
         wirelog_program_free(prog);
         FAIL("dd_plan_generate failed");
@@ -1281,7 +1281,7 @@ test_e2e_head_arith_simple(void)
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("dd_marshal_plan failed");
         return;
@@ -1292,7 +1292,7 @@ test_e2e_head_arith_simple(void)
     if (rc != 0) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("wirelog_load_all_facts failed");
         return;
@@ -1307,7 +1307,7 @@ test_e2e_head_arith_simple(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -1329,7 +1329,7 @@ test_e2e_head_arith_simple(void)
         }
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -1350,7 +1350,7 @@ test_e2e_head_arith_simple(void)
         }
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("missing expected b tuple (expected b(1,11) and b(2,21))");
         return;
@@ -1358,7 +1358,7 @@ test_e2e_head_arith_simple(void)
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -1389,8 +1389,8 @@ test_e2e_sssp(void)
         return;
     }
 
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_ffi_dd_plan_t *dd_plan = NULL;
+    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
     if (rc != 0) {
         wirelog_program_free(prog);
         FAIL("dd_plan_generate failed");
@@ -1398,13 +1398,13 @@ test_e2e_sssp(void)
     }
 
     fprintf(stderr, "\n--- SSSP DD Plan ---\n");
-    wl_dd_plan_print(dd_plan);
+    wl_ffi_dd_plan_print(dd_plan);
     fprintf(stderr, "--- End SSSP DD Plan ---\n");
 
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("dd_marshal_plan failed");
         return;
@@ -1415,7 +1415,7 @@ test_e2e_sssp(void)
     if (rc != 0) {
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("wirelog_load_all_facts failed");
         return;
@@ -1430,7 +1430,7 @@ test_e2e_sssp(void)
         snprintf(msg, sizeof(msg), "execute_cb returned %d", rc);
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -1451,7 +1451,7 @@ test_e2e_sssp(void)
         }
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -1474,7 +1474,7 @@ test_e2e_sssp(void)
         }
         wl_dd_worker_destroy(w);
         wl_ffi_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_ffi_dd_plan_free(dd_plan);
         wirelog_program_free(prog);
         FAIL("missing expected dist tuple");
         return;
@@ -1482,7 +1482,7 @@ test_e2e_sssp(void)
 
     wl_dd_worker_destroy(w);
     wl_ffi_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_ffi_dd_plan_free(dd_plan);
     wirelog_program_free(prog);
     PASS();
 }

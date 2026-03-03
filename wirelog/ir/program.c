@@ -52,7 +52,7 @@ type_name_to_column_type(const char *type_name)
 /* ======================================================================== */
 
 struct wirelog_program *
-wl_program_create(void)
+wl_ir_program_create(void)
 {
     struct wirelog_program *prog
         = (struct wirelog_program *)calloc(1, sizeof(struct wirelog_program));
@@ -69,7 +69,7 @@ wl_program_create(void)
 }
 
 static void
-relation_info_free(wl_relation_info_t *info)
+relation_info_free(wl_ir_relation_info_t *info)
 {
     if (!info)
         return;
@@ -92,7 +92,7 @@ relation_info_free(wl_relation_info_t *info)
 }
 
 static void
-rule_ir_free(wl_rule_ir_t *rule)
+rule_ir_free(wl_ir_rule_ir_t *rule)
 {
     if (!rule)
         return;
@@ -101,7 +101,7 @@ rule_ir_free(wl_rule_ir_t *rule)
 }
 
 void
-wl_program_free(struct wirelog_program *program)
+wl_ir_program_free(struct wirelog_program *program)
 {
     if (!program)
         return;
@@ -153,7 +153,7 @@ wl_program_free(struct wirelog_program *program)
 
     /* Free AST */
     if (program->ast) {
-        wl_ast_node_free(program->ast);
+        wl_parser_ast_node_free(program->ast);
     }
 
     /* Free intern table */
@@ -166,7 +166,7 @@ wl_program_free(struct wirelog_program *program)
 /* Relation Lookup / Add                                                    */
 /* ======================================================================== */
 
-static wl_relation_info_t *
+static wl_ir_relation_info_t *
 find_relation(struct wirelog_program *prog, const char *name)
 {
     for (uint32_t i = 0; i < prog->relation_count; i++) {
@@ -178,23 +178,23 @@ find_relation(struct wirelog_program *prog, const char *name)
     return NULL;
 }
 
-static wl_relation_info_t *
+static wl_ir_relation_info_t *
 add_relation(struct wirelog_program *prog, const char *name)
 {
     if (prog->relation_count >= prog->relation_capacity) {
         uint32_t new_cap = prog->relation_capacity == 0
                                ? INITIAL_CAPACITY
                                : prog->relation_capacity * 2;
-        wl_relation_info_t *new_rels = (wl_relation_info_t *)realloc(
-            prog->relations, new_cap * sizeof(wl_relation_info_t));
+        wl_ir_relation_info_t *new_rels = (wl_ir_relation_info_t *)realloc(
+            prog->relations, new_cap * sizeof(wl_ir_relation_info_t));
         if (!new_rels)
             return NULL;
         prog->relations = new_rels;
         prog->relation_capacity = new_cap;
     }
 
-    wl_relation_info_t *rel = &prog->relations[prog->relation_count++];
-    memset(rel, 0, sizeof(wl_relation_info_t));
+    wl_ir_relation_info_t *rel = &prog->relations[prog->relation_count++];
+    memset(rel, 0, sizeof(wl_ir_relation_info_t));
     rel->name = strdup_safe(name);
     return rel;
 }
@@ -205,16 +205,16 @@ add_rule_placeholder(struct wirelog_program *prog, const char *head_name)
     if (prog->rule_count >= prog->rule_capacity) {
         uint32_t new_cap = prog->rule_capacity == 0 ? INITIAL_CAPACITY
                                                     : prog->rule_capacity * 2;
-        wl_rule_ir_t *new_rules = (wl_rule_ir_t *)realloc(
-            prog->rules, new_cap * sizeof(wl_rule_ir_t));
+        wl_ir_rule_ir_t *new_rules = (wl_ir_rule_ir_t *)realloc(
+            prog->rules, new_cap * sizeof(wl_ir_rule_ir_t));
         if (!new_rules)
             return;
         prog->rules = new_rules;
         prog->rule_capacity = new_cap;
     }
 
-    wl_rule_ir_t *rule = &prog->rules[prog->rule_count++];
-    memset(rule, 0, sizeof(wl_rule_ir_t));
+    wl_ir_rule_ir_t *rule = &prog->rules[prog->rule_count++];
+    memset(rule, 0, sizeof(wl_ir_rule_ir_t));
     rule->head_relation = strdup_safe(head_name);
 }
 
@@ -223,12 +223,12 @@ add_rule_placeholder(struct wirelog_program *prog, const char *head_name)
 /* ======================================================================== */
 
 static int
-collect_decl(struct wirelog_program *prog, const wl_ast_node_t *decl_node)
+collect_decl(struct wirelog_program *prog, const wl_parser_ast_node_t *decl_node)
 {
     if (!decl_node->name)
         return -1;
 
-    wl_relation_info_t *rel = find_relation(prog, decl_node->name);
+    wl_ir_relation_info_t *rel = find_relation(prog, decl_node->name);
     if (!rel) {
         rel = add_relation(prog, decl_node->name);
         if (!rel)
@@ -238,7 +238,7 @@ collect_decl(struct wirelog_program *prog, const wl_ast_node_t *decl_node)
     /* Extract typed params as columns */
     uint32_t col_count = 0;
     for (uint32_t i = 0; i < decl_node->child_count; i++) {
-        if (decl_node->children[i]->type == WL_NODE_TYPED_PARAM) {
+        if (decl_node->children[i]->type == WL_PARSER_AST_NODE_TYPED_PARAM) {
             col_count++;
         }
     }
@@ -252,8 +252,8 @@ collect_decl(struct wirelog_program *prog, const wl_ast_node_t *decl_node)
 
         uint32_t idx = 0;
         for (uint32_t i = 0; i < decl_node->child_count; i++) {
-            const wl_ast_node_t *param = decl_node->children[i];
-            if (param->type == WL_NODE_TYPED_PARAM) {
+            const wl_parser_ast_node_t *param = decl_node->children[i];
+            if (param->type == WL_PARSER_AST_NODE_TYPED_PARAM) {
                 rel->columns[idx].name = strdup_safe(param->name);
                 rel->columns[idx].type
                     = type_name_to_column_type(param->type_name);
@@ -266,12 +266,12 @@ collect_decl(struct wirelog_program *prog, const wl_ast_node_t *decl_node)
 }
 
 static int
-collect_input(struct wirelog_program *prog, const wl_ast_node_t *input_node)
+collect_input(struct wirelog_program *prog, const wl_parser_ast_node_t *input_node)
 {
     if (!input_node->name)
         return -1;
 
-    wl_relation_info_t *rel = find_relation(prog, input_node->name);
+    wl_ir_relation_info_t *rel = find_relation(prog, input_node->name);
     if (!rel) {
         rel = add_relation(prog, input_node->name);
         if (!rel)
@@ -283,7 +283,7 @@ collect_input(struct wirelog_program *prog, const wl_ast_node_t *input_node)
     /* Extract input parameters */
     uint32_t param_count = 0;
     for (uint32_t i = 0; i < input_node->child_count; i++) {
-        if (input_node->children[i]->type == WL_NODE_INPUT_PARAM) {
+        if (input_node->children[i]->type == WL_PARSER_AST_NODE_INPUT_PARAM) {
             param_count++;
         }
     }
@@ -297,8 +297,8 @@ collect_input(struct wirelog_program *prog, const wl_ast_node_t *input_node)
 
         uint32_t idx = 0;
         for (uint32_t i = 0; i < input_node->child_count; i++) {
-            const wl_ast_node_t *param = input_node->children[i];
-            if (param->type == WL_NODE_INPUT_PARAM) {
+            const wl_parser_ast_node_t *param = input_node->children[i];
+            if (param->type == WL_PARSER_AST_NODE_INPUT_PARAM) {
                 rel->input_param_names[idx] = strdup_safe(param->name);
                 rel->input_param_values[idx] = strdup_safe(param->str_value);
                 idx++;
@@ -310,12 +310,12 @@ collect_input(struct wirelog_program *prog, const wl_ast_node_t *input_node)
 }
 
 static int
-collect_output(struct wirelog_program *prog, const wl_ast_node_t *output_node)
+collect_output(struct wirelog_program *prog, const wl_parser_ast_node_t *output_node)
 {
     if (!output_node->name)
         return -1;
 
-    wl_relation_info_t *rel = find_relation(prog, output_node->name);
+    wl_ir_relation_info_t *rel = find_relation(prog, output_node->name);
     if (!rel) {
         rel = add_relation(prog, output_node->name);
         if (!rel)
@@ -327,12 +327,12 @@ collect_output(struct wirelog_program *prog, const wl_ast_node_t *output_node)
 }
 
 static int
-collect_printsize(struct wirelog_program *prog, const wl_ast_node_t *ps_node)
+collect_printsize(struct wirelog_program *prog, const wl_parser_ast_node_t *ps_node)
 {
     if (!ps_node->name)
         return -1;
 
-    wl_relation_info_t *rel = find_relation(prog, ps_node->name);
+    wl_ir_relation_info_t *rel = find_relation(prog, ps_node->name);
     if (!rel) {
         rel = add_relation(prog, ps_node->name);
         if (!rel)
@@ -344,18 +344,18 @@ collect_printsize(struct wirelog_program *prog, const wl_ast_node_t *ps_node)
 }
 
 static int
-collect_rule(struct wirelog_program *prog, const wl_ast_node_t *rule_node)
+collect_rule(struct wirelog_program *prog, const wl_parser_ast_node_t *rule_node)
 {
     /* rule_node: children[0] = HEAD, children[1..] = body */
     if (rule_node->child_count < 1)
         return -1;
 
-    const wl_ast_node_t *head = rule_node->children[0];
-    if (head->type != WL_NODE_HEAD || !head->name)
+    const wl_parser_ast_node_t *head = rule_node->children[0];
+    if (head->type != WL_PARSER_AST_NODE_HEAD || !head->name)
         return -1;
 
     /* Ensure relation exists */
-    const wl_relation_info_t *rel = find_relation(prog, head->name);
+    const wl_ir_relation_info_t *rel = find_relation(prog, head->name);
     if (!rel) {
         rel = add_relation(prog, head->name);
         if (!rel)
@@ -369,12 +369,12 @@ collect_rule(struct wirelog_program *prog, const wl_ast_node_t *rule_node)
 }
 
 static int
-collect_fact(struct wirelog_program *prog, const wl_ast_node_t *fact_node)
+collect_fact(struct wirelog_program *prog, const wl_parser_ast_node_t *fact_node)
 {
     if (!fact_node->name)
         return -1;
 
-    wl_relation_info_t *rel = find_relation(prog, fact_node->name);
+    wl_ir_relation_info_t *rel = find_relation(prog, fact_node->name);
     if (!rel) {
         rel = add_relation(prog, fact_node->name);
         if (!rel)
@@ -401,10 +401,10 @@ collect_fact(struct wirelog_program *prog, const wl_ast_node_t *fact_node)
     /* Copy fact values into row-major layout */
     uint32_t offset = rel->fact_count * ncols;
     for (uint32_t i = 0; i < ncols; i++) {
-        const wl_ast_node_t *arg = fact_node->children[i];
-        if (arg->type == WL_NODE_INTEGER) {
+        const wl_parser_ast_node_t *arg = fact_node->children[i];
+        if (arg->type == WL_PARSER_AST_NODE_INTEGER) {
             rel->fact_data[offset + i] = arg->int_value;
-        } else if (arg->type == WL_NODE_STRING) {
+        } else if (arg->type == WL_PARSER_AST_NODE_STRING) {
             rel->fact_data[offset + i]
                 = wl_intern_put(prog->intern, arg->str_value);
         }
@@ -415,33 +415,33 @@ collect_fact(struct wirelog_program *prog, const wl_ast_node_t *fact_node)
 }
 
 int
-wl_program_collect_metadata(struct wirelog_program *program,
-                            const wl_ast_node_t *ast)
+wl_ir_program_collect_metadata(struct wirelog_program *program,
+                            const wl_parser_ast_node_t *ast)
 {
-    if (!program || !ast || ast->type != WL_NODE_PROGRAM)
+    if (!program || !ast || ast->type != WL_PARSER_AST_NODE_PROGRAM)
         return -1;
 
     for (uint32_t i = 0; i < ast->child_count; i++) {
-        const wl_ast_node_t *child = ast->children[i];
+        const wl_parser_ast_node_t *child = ast->children[i];
         int rc = 0;
 
         switch (child->type) {
-        case WL_NODE_DECL:
+        case WL_PARSER_AST_NODE_DECL:
             rc = collect_decl(program, child);
             break;
-        case WL_NODE_INPUT:
+        case WL_PARSER_AST_NODE_INPUT:
             rc = collect_input(program, child);
             break;
-        case WL_NODE_OUTPUT:
+        case WL_PARSER_AST_NODE_OUTPUT:
             rc = collect_output(program, child);
             break;
-        case WL_NODE_PRINTSIZE:
+        case WL_PARSER_AST_NODE_PRINTSIZE:
             rc = collect_printsize(program, child);
             break;
-        case WL_NODE_RULE:
+        case WL_PARSER_AST_NODE_RULE:
             rc = collect_rule(program, child);
             break;
-        case WL_NODE_FACT:
+        case WL_PARSER_AST_NODE_FACT:
             rc = collect_fact(program, child);
             break;
         default:
@@ -461,7 +461,7 @@ wl_program_collect_metadata(struct wirelog_program *program,
 /* ======================================================================== */
 
 void
-wl_program_build_schemas(struct wirelog_program *program)
+wl_ir_program_build_schemas(struct wirelog_program *program)
 {
     if (!program || program->relation_count == 0)
         return;
@@ -475,7 +475,7 @@ wl_program_build_schemas(struct wirelog_program *program)
         return;
 
     for (uint32_t i = 0; i < program->relation_count; i++) {
-        wl_relation_info_t *rel = &program->relations[i];
+        wl_ir_relation_info_t *rel = &program->relations[i];
         program->schemas[i].relation_name = rel->name; /* shared pointer */
         program->schemas[i].columns = rel->columns;    /* shared pointer */
         program->schemas[i].column_count = rel->column_count;
@@ -483,7 +483,7 @@ wl_program_build_schemas(struct wirelog_program *program)
 }
 
 void
-wl_program_build_default_stratum(struct wirelog_program *program)
+wl_ir_program_build_default_stratum(struct wirelog_program *program)
 {
     if (!program)
         return;
@@ -525,31 +525,31 @@ wl_program_build_default_stratum(struct wirelog_program *program)
 /* ---- Expression Conversion (AST expr -> IR expr) ---- */
 
 static wl_ir_expr_t *
-convert_expr(const wl_ast_node_t *node)
+convert_expr(const wl_parser_ast_node_t *node)
 {
     if (!node)
         return NULL;
 
     switch (node->type) {
-    case WL_NODE_VARIABLE: {
+    case WL_PARSER_AST_NODE_VARIABLE: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_VAR);
         if (e)
             e->var_name = strdup_safe(node->name);
         return e;
     }
-    case WL_NODE_INTEGER: {
+    case WL_PARSER_AST_NODE_INTEGER: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_CONST_INT);
         if (e)
             e->int_value = node->int_value;
         return e;
     }
-    case WL_NODE_STRING: {
+    case WL_PARSER_AST_NODE_STRING: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
         if (e)
             e->str_value = strdup_safe(node->str_value);
         return e;
     }
-    case WL_NODE_BINARY_EXPR: {
+    case WL_PARSER_AST_NODE_BINARY_EXPR: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_ARITH);
         if (!e)
             return NULL;
@@ -560,7 +560,7 @@ convert_expr(const wl_ast_node_t *node)
         }
         return e;
     }
-    case WL_NODE_COMPARISON: {
+    case WL_PARSER_AST_NODE_COMPARISON: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_CMP);
         if (!e)
             return NULL;
@@ -571,7 +571,7 @@ convert_expr(const wl_ast_node_t *node)
         }
         return e;
     }
-    case WL_NODE_AGGREGATE: {
+    case WL_PARSER_AST_NODE_AGGREGATE: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_AGG);
         if (!e)
             return NULL;
@@ -581,7 +581,7 @@ convert_expr(const wl_ast_node_t *node)
         }
         return e;
     }
-    case WL_NODE_BOOLEAN: {
+    case WL_PARSER_AST_NODE_BOOLEAN: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_BOOL);
         if (e)
             e->bool_value = node->bool_value;
@@ -701,7 +701,7 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
 /* ---- Scan Building with Intra-atom Filters ---- */
 
 static wirelog_ir_node_t *
-build_atom_scan(const wl_ast_node_t *atom, char ***out_var_names,
+build_atom_scan(const wl_parser_ast_node_t *atom, char ***out_var_names,
                 uint32_t *out_var_count)
 {
     wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
@@ -725,8 +725,8 @@ build_atom_scan(const wl_ast_node_t *atom, char ***out_var_names,
 
     /* Collect column names from atom arguments */
     for (uint32_t i = 0; i < arg_count; i++) {
-        const wl_ast_node_t *arg = atom->children[i];
-        if (arg->type == WL_NODE_VARIABLE) {
+        const wl_parser_ast_node_t *arg = atom->children[i];
+        if (arg->type == WL_PARSER_AST_NODE_VARIABLE) {
             scan->column_names[i] = strdup_safe(arg->name);
             var_names[i] = strdup_safe(arg->name);
         } else {
@@ -752,7 +752,7 @@ build_atom_scan(const wl_ast_node_t *atom, char ***out_var_names,
 
                 wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
                 if (cmp) {
-                    cmp->cmp_op = WL_CMP_EQ;
+                    cmp->cmp_op = WIRELOG_CMP_EQ;
                     wl_ir_expr_t *lhs = wl_ir_expr_create(WL_IR_EXPR_VAR);
                     if (lhs)
                         lhs->var_name = strdup_safe(var_names[i]);
@@ -771,15 +771,15 @@ build_atom_scan(const wl_ast_node_t *atom, char ***out_var_names,
 
     /* Step 1b: Intra-atom FILTER for constants */
     for (uint32_t i = 0; i < arg_count; i++) {
-        const wl_ast_node_t *arg = atom->children[i];
-        if (arg->type == WL_NODE_INTEGER) {
+        const wl_parser_ast_node_t *arg = atom->children[i];
+        if (arg->type == WL_PARSER_AST_NODE_INTEGER) {
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
             if (!f)
                 continue;
 
             wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
             if (cmp) {
-                cmp->cmp_op = WL_CMP_EQ;
+                cmp->cmp_op = WIRELOG_CMP_EQ;
                 wl_ir_expr_t *lhs = wl_ir_expr_create(WL_IR_EXPR_VAR);
                 if (lhs) {
                     char col[32];
@@ -795,14 +795,14 @@ build_atom_scan(const wl_ast_node_t *atom, char ***out_var_names,
             f->filter_expr = cmp;
             wl_ir_node_add_child(f, result);
             result = f;
-        } else if (arg->type == WL_NODE_STRING) {
+        } else if (arg->type == WL_PARSER_AST_NODE_STRING) {
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
             if (!f)
                 continue;
 
             wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
             if (cmp) {
-                cmp->cmp_op = WL_CMP_EQ;
+                cmp->cmp_op = WIRELOG_CMP_EQ;
                 wl_ir_expr_t *lhs = wl_ir_expr_create(WL_IR_EXPR_VAR);
                 if (lhs) {
                     char col[32];
@@ -829,13 +829,13 @@ build_atom_scan(const wl_ast_node_t *atom, char ***out_var_names,
 /* ---- Single Rule Conversion ---- */
 
 static wirelog_ir_node_t *
-convert_rule(const wl_ast_node_t *rule_node)
+convert_rule(const wl_parser_ast_node_t *rule_node)
 {
     if (!rule_node || rule_node->child_count < 1)
         return NULL;
 
-    wl_ast_node_t *head = rule_node->children[0];
-    if (head->type != WL_NODE_HEAD)
+    wl_parser_ast_node_t *head = rule_node->children[0];
+    if (head->type != WL_PARSER_AST_NODE_HEAD)
         return NULL;
 
     uint32_t body_count = rule_node->child_count - 1;
@@ -856,8 +856,8 @@ convert_rule(const wl_ast_node_t *rule_node)
 
     uint32_t scan_count = 0;
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
-        const wl_ast_node_t *b = rule_node->children[i];
-        if (b->type == WL_NODE_ATOM) {
+        const wl_parser_ast_node_t *b = rule_node->children[i];
+        if (b->type == WL_PARSER_AST_NODE_ATOM) {
             scans[scan_count] = build_atom_scan(b, &scan_vars[scan_count],
                                                 &scan_vcounts[scan_count]);
             scan_count++;
@@ -908,15 +908,15 @@ convert_rule(const wl_ast_node_t *rule_node)
     /* ---- Step 3: FILTER for explicit comparisons ---- */
 
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
-        const wl_ast_node_t *b = rule_node->children[i];
-        if (b->type == WL_NODE_COMPARISON && current) {
+        const wl_parser_ast_node_t *b = rule_node->children[i];
+        if (b->type == WL_PARSER_AST_NODE_COMPARISON && current) {
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
             if (!f)
                 continue;
             f->filter_expr = convert_expr(b);
             wl_ir_node_add_child(f, current);
             current = f;
-        } else if (b->type == WL_NODE_BOOLEAN) {
+        } else if (b->type == WL_PARSER_AST_NODE_BOOLEAN) {
             if (!b->bool_value && current) {
                 wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
                 if (!f)
@@ -935,10 +935,10 @@ convert_rule(const wl_ast_node_t *rule_node)
     /* ---- Step 4: ANTIJOIN for negations ---- */
 
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
-        const wl_ast_node_t *b = rule_node->children[i];
-        if (b->type == WL_NODE_NEGATION && b->child_count >= 1 && current) {
-            const wl_ast_node_t *neg_atom = b->children[0];
-            if (neg_atom->type != WL_NODE_ATOM)
+        const wl_parser_ast_node_t *b = rule_node->children[i];
+        if (b->type == WL_PARSER_AST_NODE_NEGATION && b->child_count >= 1 && current) {
+            const wl_parser_ast_node_t *neg_atom = b->children[0];
+            if (neg_atom->type != WL_PARSER_AST_NODE_ATOM)
                 continue;
 
             char **neg_vars = NULL;
@@ -966,11 +966,11 @@ convert_rule(const wl_ast_node_t *rule_node)
     /* ---- Step 5: PROJECT or AGGREGATE for head ---- */
 
     bool has_agg = false;
-    const wl_ast_node_t *agg_node = NULL;
+    const wl_parser_ast_node_t *agg_node = NULL;
     uint32_t non_agg_count = 0;
 
     for (uint32_t i = 0; i < head->child_count; i++) {
-        if (head->children[i]->type == WL_NODE_AGGREGATE) {
+        if (head->children[i]->type == WL_PARSER_AST_NODE_AGGREGATE) {
             has_agg = true;
             agg_node = head->children[i];
         } else {
@@ -996,7 +996,7 @@ convert_rule(const wl_ast_node_t *rule_node)
                     = (uint32_t *)calloc(non_agg_count, sizeof(uint32_t));
                 uint32_t gi = 0;
                 for (uint32_t i = 0; i < head->child_count; i++) {
-                    if (head->children[i]->type != WL_NODE_AGGREGATE) {
+                    if (head->children[i]->type != WL_PARSER_AST_NODE_AGGREGATE) {
                         /* Resolve head variable name to body column index */
                         const char *var = head->children[i]->name;
                         uint32_t col_idx = i; /* fallback to head position */
@@ -1059,17 +1059,17 @@ convert_rule(const wl_ast_node_t *rule_node)
 /* ---- Public Entry Point for Pass 2 ---- */
 
 int
-wl_program_convert_rules(struct wirelog_program *program,
-                         const wl_ast_node_t *ast)
+wl_ir_program_convert_rules(struct wirelog_program *program,
+                         const wl_parser_ast_node_t *ast)
 {
-    if (!program || !ast || ast->type != WL_NODE_PROGRAM)
+    if (!program || !ast || ast->type != WL_PARSER_AST_NODE_PROGRAM)
         return -1;
 
     uint32_t rule_idx = 0;
 
     for (uint32_t i = 0; i < ast->child_count; i++) {
-        const wl_ast_node_t *child = ast->children[i];
-        if (child->type != WL_NODE_RULE)
+        const wl_parser_ast_node_t *child = ast->children[i];
+        if (child->type != WL_PARSER_AST_NODE_RULE)
             continue;
 
         if (rule_idx >= program->rule_count)
@@ -1091,7 +1091,7 @@ wl_program_convert_rules(struct wirelog_program *program,
 /* ======================================================================== */
 
 int
-wl_program_merge_unions(struct wirelog_program *program)
+wl_ir_program_merge_unions(struct wirelog_program *program)
 {
     if (!program || program->relation_count == 0)
         return 0;

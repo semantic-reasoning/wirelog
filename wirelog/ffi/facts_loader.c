@@ -29,7 +29,7 @@ wirelog_load_all_facts(const wirelog_program_t *prog, void *worker)
     wl_dd_worker_t *w = (wl_dd_worker_t *)worker;
 
     for (uint32_t i = 0; i < prog->relation_count; i++) {
-        const wl_relation_info_t *rel = &prog->relations[i];
+        const wl_ir_relation_info_t *rel = &prog->relations[i];
         if (rel->fact_count == 0)
             continue;
 
@@ -44,7 +44,7 @@ wirelog_load_all_facts(const wirelog_program_t *prog, void *worker)
 
 /* Look up a parameter value by name from .input directive */
 static const char *
-input_param_get(const wl_relation_info_t *rel, const char *name)
+input_param_get(const wl_ir_relation_info_t *rel, const char *name)
 {
     for (uint32_t i = 0; i < rel->input_param_count; i++) {
         if (strcmp(rel->input_param_names[i], name) == 0)
@@ -55,7 +55,7 @@ input_param_get(const wl_relation_info_t *rel, const char *name)
 
 /* Check if any column in the relation has string type */
 static bool
-has_string_columns(const wl_relation_info_t *rel)
+has_string_columns(const wl_ir_relation_info_t *rel)
 {
     for (uint32_t i = 0; i < rel->column_count; i++) {
         if (rel->columns[i].type == WIRELOG_TYPE_STRING)
@@ -66,7 +66,7 @@ has_string_columns(const wl_relation_info_t *rel)
 
 /* Build column type array from relation metadata */
 static wirelog_column_type_t *
-build_col_types(const wl_relation_info_t *rel)
+build_col_types(const wl_ir_relation_info_t *rel)
 {
     wirelog_column_type_t *types = (wirelog_column_type_t *)malloc(
         rel->column_count * sizeof(wirelog_column_type_t));
@@ -83,7 +83,7 @@ build_col_types(const wl_relation_info_t *rel)
 /* Load a CSV file with string columns using line-by-line parsing */
 static int
 load_csv_with_strings(const char *filename, char delimiter,
-                      const wl_relation_info_t *rel, wl_intern_t *intern,
+                      const wl_ir_relation_info_t *rel, wl_intern_t *intern,
                       int64_t **out_data, uint32_t *out_nrows)
 {
     FILE *f = fopen(filename, "r");
@@ -161,7 +161,7 @@ wirelog_load_input_files(const wirelog_program_t *prog, void *worker)
     wl_dd_worker_t *w = (wl_dd_worker_t *)worker;
 
     for (uint32_t i = 0; i < prog->relation_count; i++) {
-        const wl_relation_info_t *rel = &prog->relations[i];
+        const wl_ir_relation_info_t *rel = &prog->relations[i];
         if (!rel->has_input)
             continue;
 

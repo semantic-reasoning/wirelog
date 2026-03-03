@@ -49,19 +49,19 @@ static struct wirelog_program *
 make_program(const char *source)
 {
     char errbuf[512] = { 0 };
-    wl_ast_node_t *ast = wl_parse_string(source, errbuf, sizeof(errbuf));
+    wl_parser_ast_node_t *ast = wl_parser_parse_string(source, errbuf, sizeof(errbuf));
     if (!ast)
         return NULL;
 
-    struct wirelog_program *prog = wl_program_create();
+    struct wirelog_program *prog = wl_ir_program_create();
     if (!prog) {
-        wl_ast_node_free(ast);
+        wl_parser_ast_node_free(ast);
         return NULL;
     }
 
     prog->ast = ast;
-    if (wl_program_collect_metadata(prog, ast) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_collect_metadata(prog, ast) != 0) {
+        wl_ir_program_free(prog);
         return NULL;
     }
 
@@ -89,30 +89,30 @@ test_decl_single_relation(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 relation, got %u",
                  prog->relation_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     if (strcmp(prog->relations[0].name, "Arc") != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("relation name should be Arc");
         return;
     }
 
     if (prog->relations[0].column_count != 2) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("should have 2 columns");
         return;
     }
 
     if (strcmp(prog->relations[0].columns[0].name, "x") != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("column 0 name should be x");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -131,18 +131,18 @@ test_input_directive(void)
     }
 
     if (!prog->relations[0].has_input) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("has_input should be true");
         return;
     }
 
     if (prog->relations[0].input_param_count < 1) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("should have input params");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -161,12 +161,12 @@ test_output_directive(void)
     }
 
     if (!prog->relations[0].has_output) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("has_output should be true");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -184,12 +184,12 @@ test_printsize_directive(void)
     }
 
     if (!prog->relations[0].has_printsize) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("has_printsize should be true");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -215,7 +215,7 @@ test_full_tc_metadata(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 relations, got %u",
                  prog->relation_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
@@ -230,19 +230,19 @@ test_full_tc_metadata(void)
     }
 
     if (arc_idx < 0 || tc_idx < 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("should have Arc and Tc relations");
         return;
     }
 
     if (!prog->relations[arc_idx].has_input) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("Arc should have has_input");
         return;
     }
 
     if (!prog->relations[tc_idx].has_output) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("Tc should have has_output");
         return;
     }
@@ -251,12 +251,12 @@ test_full_tc_metadata(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 rules, got %u",
                  prog->rule_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -275,12 +275,12 @@ test_no_rules_program(void)
     }
 
     if (prog->rule_count != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("rule_count should be 0");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -297,33 +297,33 @@ test_schema_synthesis(void)
         return;
     }
 
-    wl_program_build_schemas(prog);
+    wl_ir_program_build_schemas(prog);
 
     if (!prog->schemas) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("schemas should not be NULL");
         return;
     }
 
     if (strcmp(prog->schemas[0].relation_name, "Arc") != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("schema relation_name should be Arc");
         return;
     }
 
     if (prog->schemas[0].column_count != 2) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("schema column_count should be 2");
         return;
     }
 
     if (strcmp(prog->schemas[0].columns[0].name, "x") != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("schema column 0 name should be x");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -343,16 +343,16 @@ test_default_stratum(void)
         return;
     }
 
-    wl_program_build_default_stratum(prog);
+    wl_ir_program_build_default_stratum(prog);
 
     if (prog->stratum_count != 1) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("stratum_count should be 1");
         return;
     }
 
     if (prog->strata[0].stratum_id != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("stratum_id should be 0");
         return;
     }
@@ -361,12 +361,12 @@ test_default_stratum(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 rule names, got %u",
                  prog->strata[0].rule_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -375,7 +375,7 @@ test_program_free_null(void)
 {
     TEST("Program free handles NULL safely");
 
-    wl_program_free(NULL);
+    wl_ir_program_free(NULL);
 
     PASS();
 }
@@ -388,8 +388,8 @@ make_program_with_rules(const char *source)
     if (!prog)
         return NULL;
 
-    if (wl_program_convert_rules(prog, prog->ast) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
         return NULL;
     }
 
@@ -414,31 +414,31 @@ test_simple_rule(void)
         return;
     }
     if (prog->rule_count != 1 || !prog->rules[0].ir_root) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("should have 1 rule with IR");
         return;
     }
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
 
     if (root->child_count != 1 || root->children[0]->type != WIRELOG_IR_SCAN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("PROJECT child should be SCAN");
         return;
     }
 
     if (strcmp(root->children[0]->relation_name, "a") != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("SCAN relation should be a");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -459,27 +459,27 @@ test_two_body_join(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
 
     wirelog_ir_node_t *join = root->children[0];
     if (join->type != WIRELOG_IR_JOIN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("child should be JOIN");
         return;
     }
 
     if (join->child_count != 2) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("JOIN should have 2 children");
         return;
     }
 
     if (join->children[0]->type != WIRELOG_IR_SCAN
         || join->children[1]->type != WIRELOG_IR_SCAN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("JOIN children should be SCANs");
         return;
     }
@@ -489,18 +489,18 @@ test_two_body_join(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 join key, got %u",
                  join->join_key_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     if (strcmp(join->join_left_keys[0], "z") != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("join key should be z");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -521,38 +521,38 @@ test_comparison_filter(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
 
     wirelog_ir_node_t *filter = root->children[0];
     if (filter->type != WIRELOG_IR_FILTER) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("child should be FILTER");
         return;
     }
 
     if (!filter->filter_expr || filter->filter_expr->type != WL_IR_EXPR_CMP) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("filter should have CMP expression");
         return;
     }
 
-    if (filter->filter_expr->cmp_op != WL_CMP_NEQ) {
-        wl_program_free(prog);
+    if (filter->filter_expr->cmp_op != WIRELOG_CMP_NEQ) {
+        wl_ir_program_free(prog);
         FAIL("cmp_op should be NEQ");
         return;
     }
 
     wirelog_ir_node_t *join = filter->children[0];
     if (join->type != WIRELOG_IR_JOIN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("filter child should be JOIN");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -574,7 +574,7 @@ test_negation_antijoin(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
@@ -584,18 +584,18 @@ test_negation_antijoin(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected ANTIJOIN, got type %d",
                  antijoin->type);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     if (antijoin->child_count != 2) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("ANTIJOIN should have 2 children");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -616,24 +616,24 @@ test_aggregation_simple(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_AGGREGATE) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be AGGREGATE");
         return;
     }
 
-    if (root->agg_fn != WL_AGG_MIN) {
-        wl_program_free(prog);
+    if (root->agg_fn != WIRELOG_AGG_MIN) {
+        wl_ir_program_free(prog);
         FAIL("agg_fn should be MIN");
         return;
     }
 
     if (root->child_count != 1 || root->children[0]->type != WIRELOG_IR_SCAN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("AGGREGATE child should be SCAN");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -654,32 +654,32 @@ test_aggregation_with_join(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_AGGREGATE) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be AGGREGATE");
         return;
     }
 
     if (!root->agg_expr) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("agg_expr should not be NULL");
         return;
     }
 
     /* agg_expr should be an arithmetic expression (d1 + d2) */
     if (root->agg_expr->type != WL_IR_EXPR_ARITH) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("agg_expr should be ARITH");
         return;
     }
 
     wirelog_ir_node_t *join = root->children[0];
     if (join->type != WIRELOG_IR_JOIN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("AGGREGATE child should be JOIN");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -700,24 +700,24 @@ test_aggregation_constant(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_AGGREGATE) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be AGGREGATE");
         return;
     }
 
     if (!root->agg_expr || root->agg_expr->type != WL_IR_EXPR_CONST_INT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("agg_expr should be CONST_INT");
         return;
     }
 
     if (root->agg_expr->int_value != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("agg_expr value should be 0");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -740,7 +740,7 @@ test_three_body_join(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
@@ -748,31 +748,31 @@ test_three_body_join(void)
     /* Should be: PROJECT -> JOIN(JOIN(SCAN_a, SCAN_b), SCAN_c) */
     wirelog_ir_node_t *outer_join = root->children[0];
     if (outer_join->type != WIRELOG_IR_JOIN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("child should be JOIN");
         return;
     }
 
     if (outer_join->child_count != 2) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("outer JOIN should have 2 children");
         return;
     }
 
     wirelog_ir_node_t *inner_join = outer_join->children[0];
     if (inner_join->type != WIRELOG_IR_JOIN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("left child should be inner JOIN");
         return;
     }
 
     if (outer_join->children[1]->type != WIRELOG_IR_SCAN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("right child should be SCAN");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -793,7 +793,7 @@ test_duplicate_variable(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
@@ -804,30 +804,30 @@ test_duplicate_variable(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected FILTER, got type %d",
                  filter->type);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     if (!filter->filter_expr || filter->filter_expr->type != WL_IR_EXPR_CMP) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("filter should have CMP expr (col0 = col1)");
         return;
     }
 
-    if (filter->filter_expr->cmp_op != WL_CMP_EQ) {
-        wl_program_free(prog);
+    if (filter->filter_expr->cmp_op != WIRELOG_CMP_EQ) {
+        wl_ir_program_free(prog);
         FAIL("cmp_op should be EQ");
         return;
     }
 
     if (filter->children[0]->type != WIRELOG_IR_SCAN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("FILTER child should be SCAN");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -848,7 +848,7 @@ test_constant_in_atom(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
@@ -858,14 +858,14 @@ test_constant_in_atom(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected FILTER, got type %d",
                  filter->type);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     /* The filter expression should compare a var with the constant 42 */
     if (!filter->filter_expr || filter->filter_expr->type != WL_IR_EXPR_CMP) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("filter should have CMP expr");
         return;
     }
@@ -881,12 +881,12 @@ test_constant_in_atom(void)
     }
 
     if (!found_42) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("filter should reference constant 42");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -917,7 +917,7 @@ test_wildcard_not_join_key(void)
     }
 
     if (!join_node || join_node->type != WIRELOG_IR_JOIN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("should have a JOIN node");
         return;
     }
@@ -927,7 +927,7 @@ test_wildcard_not_join_key(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 join key, got %u",
                  join_node->join_key_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
@@ -936,12 +936,12 @@ test_wildcard_not_join_key(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "join key should be x, got %s",
                  join_node->join_left_keys[0]);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -968,37 +968,37 @@ test_wildcard_in_scan(void)
     }
 
     if (!scan || scan->type != WIRELOG_IR_SCAN) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("should have SCAN node");
         return;
     }
 
     if (scan->column_count != 3) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("SCAN should have 3 columns");
         return;
     }
 
     /* column 0 should be "x", columns 1 and 2 should be NULL (wildcard) */
     if (!scan->column_names[0] || strcmp(scan->column_names[0], "x") != 0) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("column 0 should be x");
         return;
     }
 
     if (scan->column_names[1] != NULL) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("column 1 should be NULL (wildcard)");
         return;
     }
 
     if (scan->column_names[2] != NULL) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("column 2 should be NULL (wildcard)");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -1020,7 +1020,7 @@ test_boolean_true_noop(void)
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     /* Should be PROJECT -> SCAN (no FILTER for True) */
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
@@ -1030,12 +1030,12 @@ test_boolean_true_noop(void)
         snprintf(buf, sizeof(buf),
                  "expected SCAN, got type %d (True should be no-op)",
                  root->children[0]->type);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -1056,31 +1056,31 @@ test_boolean_false_filter(void)
 
     wirelog_ir_node_t *root = prog->rules[0].ir_root;
     if (root->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("root should be PROJECT");
         return;
     }
 
     wirelog_ir_node_t *filter = root->children[0];
     if (filter->type != WIRELOG_IR_FILTER) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("child should be FILTER");
         return;
     }
 
     if (!filter->filter_expr || filter->filter_expr->type != WL_IR_EXPR_BOOL) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("filter should have BOOL expr");
         return;
     }
 
     if (filter->filter_expr->bool_value != false) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("bool_value should be false");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -1092,13 +1092,13 @@ make_full_program(const char *source)
     if (!prog)
         return NULL;
 
-    if (wl_program_merge_unions(prog) != 0) {
-        wl_program_free(prog);
+    if (wl_ir_program_merge_unions(prog) != 0) {
+        wl_ir_program_free(prog);
         return NULL;
     }
 
-    wl_program_build_schemas(prog);
-    wl_program_build_default_stratum(prog);
+    wl_ir_program_build_schemas(prog);
+    wl_ir_program_build_default_stratum(prog);
 
     return prog;
 }
@@ -1133,14 +1133,14 @@ test_union_merge_tc(void)
     }
 
     if (tc_idx < 0 || !prog->relation_irs) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("Tc relation or relation_irs not found");
         return;
     }
 
     wirelog_ir_node_t *tc_ir = prog->relation_irs[tc_idx];
     if (!tc_ir || tc_ir->type != WIRELOG_IR_UNION) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("Tc should be UNION");
         return;
     }
@@ -1149,12 +1149,12 @@ test_union_merge_tc(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "UNION should have 2 children, got %u",
                  tc_ir->child_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -1182,32 +1182,32 @@ test_union_single_rule(void)
     }
 
     if (r_idx < 0 || !prog->relation_irs) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("r relation or relation_irs not found");
         return;
     }
 
     wirelog_ir_node_t *r_ir = prog->relation_irs[r_idx];
     if (!r_ir) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("r IR should not be NULL");
         return;
     }
 
     /* Single rule: should NOT be UNION */
     if (r_ir->type == WIRELOG_IR_UNION) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("single rule should NOT be wrapped in UNION");
         return;
     }
 
     if (r_ir->type != WIRELOG_IR_PROJECT) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("single rule should be PROJECT");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 
@@ -1603,40 +1603,40 @@ test_fact_collection_single_relation(void)
     }
 
     if (prog->relation_count != 1) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("expected 1 relation");
         return;
     }
 
-    wl_relation_info_t *rel = &prog->relations[0];
+    wl_ir_relation_info_t *rel = &prog->relations[0];
     if (rel->fact_count != 2) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 2 facts, got %u", rel->fact_count);
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL(buf);
         return;
     }
 
     /* fact_data layout: [1, 2, 2, 3] (row-major, 2 cols per row) */
     if (!rel->fact_data) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("fact_data should not be NULL");
         return;
     }
 
     if (rel->fact_data[0] != 1 || rel->fact_data[1] != 2) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("fact 0 should be (1, 2)");
         return;
     }
 
     if (rel->fact_data[2] != 2 || rel->fact_data[3] != 3) {
-        wl_program_free(prog);
+        wl_ir_program_free(prog);
         FAIL("fact 1 should be (2, 3)");
         return;
     }
 
-    wl_program_free(prog);
+    wl_ir_program_free(prog);
     PASS();
 }
 

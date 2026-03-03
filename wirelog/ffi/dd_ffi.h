@@ -15,7 +15,7 @@
  * Overview
  * ========================================================================
  *
- * The wirelog pipeline produces DD execution plans (wl_dd_plan_t) on
+ * The wirelog pipeline produces DD execution plans (wl_ffi_dd_plan_t) on
  * the C side.  These plans must cross into Rust where Differential
  * Dataflow executes them.  The internal plan types (dd_plan.h) contain
  * owned pointer trees (wl_ir_expr*), string arrays, and other shapes
@@ -25,10 +25,10 @@
  *
  *   Internal (dd_plan.h)         FFI (dd_ffi.h)
  *   -------------------------    ---------------------------
- *   wl_dd_op_t                   wl_ffi_op_t
- *   wl_dd_relation_plan_t        wl_ffi_relation_plan_t
- *   wl_dd_stratum_plan_t         wl_ffi_stratum_plan_t
- *   wl_dd_plan_t                 wl_ffi_plan_t
+ *   wl_ffi_dd_op_t                   wl_ffi_op_t
+ *   wl_ffi_dd_relation_plan_t        wl_ffi_relation_plan_t
+ *   wl_ffi_dd_stratum_plan_t         wl_ffi_stratum_plan_t
+ *   wl_ffi_dd_plan_t                 wl_ffi_plan_t
  *   wl_ir_expr (tree)            wl_ffi_expr_buffer_t (flat)
  *
  * A marshalling step (wl_dd_marshal_plan) converts the internal plan
@@ -125,8 +125,8 @@
  * Usage (internal)
  * ========================================================================
  *
- *   wl_dd_plan_t *plan = NULL;
- *   int rc = wl_dd_plan_generate(program, &plan);
+ *   wl_ffi_dd_plan_t *plan = NULL;
+ *   int rc = wl_ffi_dd_plan_generate(program, &plan);
  *   if (rc != 0) { handle error }
  *
  *   wl_ffi_plan_t *ffi_plan = NULL;
@@ -138,7 +138,7 @@
  *
  *   wl_dd_worker_destroy(worker);
  *   wl_ffi_plan_free(ffi_plan);
- *   wl_dd_plan_free(plan);
+ *   wl_ffi_dd_plan_free(plan);
  */
 
 #ifndef WIRELOG_DD_FFI_H
@@ -150,9 +150,9 @@
 #include <stdint.h>
 
 /*
- * dd_plan.h provides wl_dd_plan_t (the internal DD plan type).
+ * dd_plan.h provides wl_ffi_dd_plan_t (the internal DD plan type).
  * Both headers are internal (not installed), so this include is safe.
- * The marshalling functions below convert wl_dd_plan_t -> wl_ffi_plan_t.
+ * The marshalling functions below convert wl_ffi_dd_plan_t -> wl_ffi_plan_t.
  */
 #include "dd_plan.h"
 
@@ -249,7 +249,7 @@ typedef struct {
 /**
  * wl_ffi_op_type_t:
  *
- * FFI-safe operator type enum.  Mirrors wl_dd_op_type_t but uses
+ * FFI-safe operator type enum.  Mirrors wl_ffi_dd_op_type_t but uses
  * explicit integer values for stable ABI across C and Rust.
  *
  * WL_FFI_OP_VARIABLE:    Reference to an input collection (EDB or IDB).
@@ -284,7 +284,7 @@ typedef enum {
  * FFI-safe flat operator descriptor.  All pointer fields point to
  * C-owned memory.  Rust must NOT free or retain these pointers.
  *
- * This is the FFI counterpart of wl_dd_op_t.  Key differences:
+ * This is the FFI counterpart of wl_ffi_dd_op_t.  Key differences:
  *   - filter_expr (pointer tree) is replaced by filter_expr (flat buffer)
  *   - All enum values have explicit integer backing
  *   - No internal-only types are referenced
@@ -331,7 +331,7 @@ typedef enum {
  *                    Buffer data is owned by C; Rust borrows.
  *                    data=NULL and size=0 if no filter expression.
  *
- * @agg_fn:           REDUCE: aggregation function (uses wl_agg_fn_t from
+ * @agg_fn:           REDUCE: aggregation function (uses wirelog_agg_fn_t from
  *                    wirelog-types.h, which has stable integer values).
  *
  * @group_by_indices: REDUCE: array of grouping column indices.
@@ -355,7 +355,7 @@ typedef struct {
 
     wl_ffi_expr_buffer_t filter_expr;
 
-    wl_agg_fn_t agg_fn;
+    wirelog_agg_fn_t agg_fn;
     const uint32_t *group_by_indices;
     uint32_t group_by_count;
 
@@ -597,7 +597,7 @@ wl_dd_execute_cb(const wl_ffi_plan_t *plan, wl_dd_worker_t *worker,
  * On error, *out is unchanged (remains NULL if initialized to NULL).
  */
 int
-wl_dd_marshal_plan(const wl_dd_plan_t *plan, wl_ffi_plan_t **out);
+wl_dd_marshal_plan(const wl_ffi_dd_plan_t *plan, wl_ffi_plan_t **out);
 
 /**
  * wl_ffi_plan_free:
