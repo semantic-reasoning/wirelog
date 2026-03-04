@@ -267,6 +267,31 @@ UNION     → WL_DD_CONCAT + WL_DD_CONSOLIDATE (union + dedup)
 FLATMAP   → WL_DD_FILTER + WL_DD_MAP  (fused filter+project)
 ```
 
+#### Monotone Aggregation in Recursive Strata
+
+Recursive strata use Differential Dataflow's `iterate()` combinator to compute fixed points. Only **monotone aggregation functions** are safe inside iterate():
+
+**Supported (Monotone)**:
+- `MIN`: Monotone decreasing; guaranteed to stabilize at the minimum value
+- `MAX`: Monotone increasing; guaranteed to stabilize at the maximum value
+
+**Rejected (Non-Monotone)**:
+- `COUNT`: Cardinality oscillates with delta arrival; non-deterministic result
+- `SUM`: Cumulative values don't converge monotonically; order-dependent
+- `AVG`: Quotient of non-monotone functions; unstable
+
+**Validation**: Non-monotone aggregations are detected at DD plan generation time (`/wirelog/ffi/dd_plan.c` lines 791–821). If COUNT or SUM appears in a recursive stratum, plan generation returns error code -1 and prints:
+```
+wirelog: COUNT aggregation not supported in recursive stratum 'RelationName'
+wirelog: SUM aggregation not supported in recursive stratum 'RelationName'
+```
+
+**Examples**:
+- Connected components with MIN: Label each node with the minimum ID in its component
+- Shortest path with MAX: Compute longest reachable distance from a fixed source
+
+See `/docs/MONOTONE_AGGREGATION.md` for formal proofs of monotonicity and detailed use cases.
+
 **Design Decisions**:
 - All pointer fields in DD ops are owned (deep copies), freed by `wl_dd_plan_free()`
 - Error return via `int` (0 = success, -1 = memory, -2 = invalid input) + out-parameter
