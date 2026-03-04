@@ -268,3 +268,33 @@ test_recursive_agg_exe = executable(
 )
 
 test('recursive_agg', test_recursive_agg_exe)
+
+# CC with MIN aggregation integration test (Phase 4 REFACTOR)
+test_recursive_agg_cc_min_exe = executable(
+  'test_recursive_agg_cc_min',
+  files('test_recursive_agg_cc_min.c'),
+  parser_src,
+  ir_src,
+  ffi_src,
+  facts_loader_src,
+  dd_backend_src,
+  dependencies: [rust_ffi_dep],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('recursive_agg_cc_min', test_recursive_agg_cc_min_exe)
+
+# SSSP with MAX aggregation integration test (Phase 5 REFACTOR)
+test_recursive_agg_sssp_max_exe = executable(
+  'test_recursive_agg_sssp_max',
+  files('test_recursive_agg_sssp_max.c'),
+  parser_src,
+  ir_src,
+  ffi_src,
+  facts_loader_src,
+  dd_backend_src,
+  dependencies: [rust_ffi_dep],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('recursive_agg_sssp_max', test_recursive_agg_sssp_max_exe)
