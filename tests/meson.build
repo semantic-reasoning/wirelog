@@ -126,70 +126,25 @@ test_sip_exe = executable(
 
 test('sip', test_sip_exe)
 
-ffi_src = files(
-  '../wirelog/ffi/dd_marshal.c',
-)
-
-# facts_loader.c calls wl_dd_load_edb (Rust FFI), so it is only
-# compiled into targets that link rust_ffi_dep.
-facts_loader_src = files(
-  '../wirelog/ffi/facts_loader.c',
-)
-
-dd_backend_src = files(
-  '../wirelog/backend_dd.c',
-)
-
-test_dd_ffi_exe = executable(
-  'test_dd_ffi',
-  files('test_dd_ffi.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('dd_ffi', test_dd_ffi_exe)
+# ============================================================================
+# Rust FFI Tests (deferred to Phase 2A columnar backend)
+# ============================================================================
+#
+# The following tests require the Rust Differential Dataflow executor:
+# - test_dd_ffi
+# - test_dd_execute
+# - test_cli
+# - test_session
+# - test_recursive_agg_baseline
+# - test_recursive_agg
+# - test_recursive_agg_cc_min
+# - test_recursive_agg_sssp_max
+#
+# These are deferred to Phase 2A when the columnar backend is implemented.
 
 csv_src = files(
   '../wirelog/io/csv_reader.c',
 )
-
-test_dd_execute_exe = executable(
-  'test_dd_execute',
-  files('test_dd_execute.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  facts_loader_src,
-  dd_backend_src,
-  csv_src,
-  dependencies: [rust_ffi_dep],
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('dd_execute', test_dd_execute_exe)
-
-cli_src = files(
-  '../wirelog/cli/driver.c',
-)
-
-test_cli_exe = executable(
-  'test_cli',
-  files('test_cli.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  facts_loader_src,
-  dd_backend_src,
-  csv_src,
-  optimizer_src,
-  cli_src,
-  dependencies: [rust_ffi_dep],
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('cli', test_cli_exe)
 
 test_csv_exe = executable(
   'test_csv',
@@ -210,40 +165,11 @@ test_intern_exe = executable(
 
 test('intern', test_intern_exe)
 
-test_session_exe = executable(
-  'test_session',
-  files('test_session.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  facts_loader_src,
-  dd_backend_src,
-  dependencies: [rust_ffi_dep],
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('session', test_session_exe)
-
 # ============================================================================
-# Recursive Aggregation Tests (issue #69)
+# Recursive Aggregation Plan Tests (no Rust execution)
 # ============================================================================
 
-# Baseline: recursive programs without aggregation (must pass)
-test_recursive_agg_baseline_exe = executable(
-  'test_recursive_agg_baseline',
-  files('test_recursive_agg_baseline.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  facts_loader_src,
-  dd_backend_src,
-  dependencies: [rust_ffi_dep],
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('recursive_agg_baseline', test_recursive_agg_baseline_exe)
-
-# Plan-level: non-monotone rejection and monotone acceptance (RED phase)
+# Plan-level: non-monotone rejection and monotone acceptance
 test_recursive_agg_plan_exe = executable(
   'test_recursive_agg_plan',
   files('test_recursive_agg_plan.c'),
@@ -253,48 +179,3 @@ test_recursive_agg_plan_exe = executable(
 )
 
 test('recursive_agg_plan', test_recursive_agg_plan_exe)
-
-# Execution: MIN/MAX in iterate() end-to-end (RED phase)
-test_recursive_agg_exe = executable(
-  'test_recursive_agg',
-  files('test_recursive_agg.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  facts_loader_src,
-  dd_backend_src,
-  dependencies: [rust_ffi_dep],
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('recursive_agg', test_recursive_agg_exe)
-
-# CC with MIN aggregation integration test (Phase 4 REFACTOR)
-test_recursive_agg_cc_min_exe = executable(
-  'test_recursive_agg_cc_min',
-  files('test_recursive_agg_cc_min.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  facts_loader_src,
-  dd_backend_src,
-  dependencies: [rust_ffi_dep],
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('recursive_agg_cc_min', test_recursive_agg_cc_min_exe)
-
-# SSSP with MAX aggregation integration test (Phase 5 REFACTOR)
-test_recursive_agg_sssp_max_exe = executable(
-  'test_recursive_agg_sssp_max',
-  files('test_recursive_agg_sssp_max.c'),
-  parser_src,
-  ir_src,
-  ffi_src,
-  facts_loader_src,
-  dd_backend_src,
-  dependencies: [rust_ffi_dep],
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('recursive_agg_sssp_max', test_recursive_agg_sssp_max_exe)

@@ -170,25 +170,3 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
 
-  # ==========================================================================
-  # Job 3: Rust DD Executor Tests
-  # ==========================================================================
-  rust-test:
-    name: Rust tests (${{ matrix.os }})
-    needs: [lint]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-          - os: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run tests
-        run: cargo test --manifest-path rust/wirelog-dd/Cargo.toml
-

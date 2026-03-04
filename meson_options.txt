@@ -29,22 +29,8 @@ option(
 )
 
 option(
-  'dd',
-  type: 'boolean',
-  value: false,
-  description: 'Enable Differential Dataflow executor (requires Rust toolchain)'
-)
-
-option(
   'documentation',
   type: 'boolean',
   value: false,
   description: 'Build documentation (not yet implemented)'
-)
-
-option(
-  'bench',
-  type: 'boolean',
-  value: false,
-  description: 'Build benchmark programs (requires DD executor)'
 )

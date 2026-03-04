@@ -55,56 +55,16 @@ ipc_option = get_option('ipc')
 threads_option = get_option('threads')
 tests_option = get_option('tests')
 docs_option = get_option('documentation')
-dd_option = get_option('dd')
 
 message('wirelog ' + project_version)
 message('  Platform: ' + platform)
 message('  Embedded: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
-message('  DD executor: @0@'.format(dd_option))
 
 # ============================================================================
 # Dependencies
 # ============================================================================
-
-
-# Rust FFI (Differential Dataflow)
-if dd_option
-  cargo = find_program('cargo', required: true)
-
-  rust_dd_src = meson.project_source_root() / 'rust' / 'wirelog-dd'
-  rust_dd_lib = rust_dd_src / 'target' / 'release' / 'libwirelog_dd.a'
-
-  rust_dd_target = custom_target(
-    'wirelog-dd',
-    command: [cargo, 'build', '--release', '--manifest-path',
-              rust_dd_src / 'Cargo.toml'],
-    output: 'libwirelog_dd.stamp',
-    build_by_default: true,
-    console: true,
-  )
-
-  rust_ffi_dep = declare_dependency(
-    link_args: [rust_dd_lib],
-    sources: rust_dd_target,
-  )
-
-  # Rust lint targets (run manually: ninja rust-clippy / ninja rust-fmt-check)
-  run_target('rust-clippy',
-    command: [cargo, 'clippy', '--manifest-path', rust_dd_src / 'Cargo.toml',
-              '--', '-D', 'warnings'],
-  )
-  run_target('rust-fmt-check',
-    command: [cargo, 'fmt', '--manifest-path', rust_dd_src / 'Cargo.toml',
-              '--check'],
-  )
-  run_target('rust-test',
-    command: [cargo, 'test', '--manifest-path', rust_dd_src / 'Cargo.toml'],
-  )
-else
-  rust_ffi_dep = disabler()
-endif
 
 # Optional: pthreads for threading
 threads_dep = disabler()
@@ -214,42 +174,16 @@ pkg.generate(
 )
 
 # ============================================================================
-# CLI Driver (requires DD executor)
+# CLI Driver
 # ============================================================================
 
-if dd_option
-  wirelog_cli_src = files(
-    'wirelog/cli/driver.c',
-    'wirelog/ffi/facts_loader.c',
-    'wirelog/backend_dd.c',
-  )
-
-  wirelog_cli_deps = [rust_ffi_dep]
-  if threads_option == 'enabled'
-    wirelog_cli_deps += threads_dep
-  endif
-
-  wirelog_cli = executable(
-    'wirelog-cli',
-    files('wirelog/cli/main.c'),
-    wirelog_sources,
-    wirelog_cli_src,
-    config_h_file,
-    include_directories: [wirelog_inc, wirelog_src_inc],
-    dependencies: wirelog_cli_deps,
-    install: true,
-    install_dir: get_option('bindir'),
-  )
-endif
+# Note: CLI driver is deferred to Phase 2A (columnar backend implementation)
 
 # ============================================================================
-# Benchmarks (requires DD executor)
+# Benchmarks
 # ============================================================================
 
-bench_option = get_option('bench')
-if bench_option and dd_option
-  subdir('bench')
-endif
+# Note: Benchmarks are deferred to Phase 2A (columnar backend implementation)
 
 # ============================================================================
 # Tests
@@ -279,7 +213,5 @@ message('  Headers: ' + wirelog_includedir / 'wirelog')
 message('  Embedded mode: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
-message('  DD executor: @0@'.format(dd_option))
-message('  Benchmarks: @0@'.format(bench_option))
 message('  Tests: @0@'.format(tests_option))
 message('')
