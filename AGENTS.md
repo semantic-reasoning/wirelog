@@ -54,6 +54,26 @@ Top-level internal headers use the file name: `wl_backend_*`, `wl_session_*`, `w
 
 See [issue #75](https://github.com/justinjoy/wirelog/issues/75) for the full rename plan.
 
+## Recursive Aggregation Tests
+
+When writing tests for recursive aggregations (MIN, MAX in iterate()):
+
+**Test Structure** (see `tests/test_recursive_agg_cc_min.c` and `tests/test_recursive_agg_sssp_max.c`):
+1. Define Datalog program with aggregation in recursive rule
+2. Parse program → generate DD plan → marshal to FFI
+3. Create DD worker → load EDB facts → execute with callback
+4. Collect results in tuple collector
+5. Verify: exact tuple count, specific values, no cross-contamination
+
+**Each test file**:
+- Has its own `main()` function (separate executable)
+- Uses consistent TEST/PASS/FAIL macros
+- Registers test suite in `tests/meson.build`
+
+**Integration points**:
+- Full pipeline: parse → IR → stratify → DD plan → marshal → Rust execution
+- Validates monotone aggregation behavior end-to-end
+
 ## Linting
 
 Always use **clang-format version 18** for C code formatting.
