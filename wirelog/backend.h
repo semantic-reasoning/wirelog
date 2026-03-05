@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#include "ffi/dd_ffi.h"
+#include "exec_plan.h"
 
 #include <stdint.h>
 #include <stdbool.h>

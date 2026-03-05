@@ -67,19 +67,29 @@ message('  Threading: ' + threads_option)
 # ============================================================================
 
 # Optional: pthreads for threading
-threads_dep = disabler()
+threads_dep = []
 if threads_option == 'enabled'
-  threads_dep = dependency('threads', required: false)
-  if not threads_dep.found()
-    threads_dep = cc.find_library('pthread', required: false)
+  _td = dependency('threads', required: false)
+  if not _td.found()
+    _td = cc.find_library('pthread', required: false)
+  endif
+  if _td.found()
+    threads_dep = [_td]
   endif
 endif
 
 # Optional: zlib for IPC compression (future)
-zlib_dep = disabler()
+zlib_dep = []
 if ipc_option == 'enabled'
-  zlib_dep = dependency('zlib', required: false)
+  _zd = dependency('zlib', required: false)
+  if _zd.found()
+    zlib_dep = [_zd]
+  endif
 endif
+
+# Phase 2A: nanoarrow for columnar backend (via git submodule)
+nanoarrow_proj = subproject('nanoarrow', default_options: ['tests=disabled', 'apps=disabled', 'ipc=disabled', 'device=disabled', 'testing=disabled'])
+nanoarrow_dep = nanoarrow_proj.get_variable('nanoarrow_dep')
 
 # ============================================================================
 # Configuration
@@ -121,6 +131,7 @@ wirelog_sources += wirelog_ir_src
 wirelog_sources += wirelog_optimizer_src
 wirelog_sources += wirelog_dd_src
 wirelog_sources += wirelog_ffi_src
+wirelog_sources += wirelog_backend_src
 wirelog_sources += wirelog_io_src
 
 # Public headers
@@ -142,7 +153,7 @@ wirelog_lib = library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep],
   install: true,
   version: project_version,
 )
@@ -153,7 +164,7 @@ wirelog_static_lib = static_library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep],
   install: false,  # Not installed by default
 )
 

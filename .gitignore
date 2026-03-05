@@ -21,6 +21,7 @@ compile_commands.json
 *~
 *.kate-swp
 .clangd/
+.cache/
 
 # Python cache
 __pycache__/

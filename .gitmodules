@@ -1,0 +1,3 @@
+[submodule "subprojects/nanoarrow"]
+	path = subprojects/nanoarrow
+	url = https://github.com/apache/arrow-nanoarrow.git
