@@ -1622,11 +1622,19 @@ col_session_remove(wl_session_t *session, const char *relation,
 static int
 col_session_step(wl_session_t *session)
 {
-    /* Incremental step: run one epoch of evaluation.
-     * For Phase 2A, delegate to snapshot (full re-evaluation). */
+    /* Execute one epoch of evaluation: all strata in order.
+     * Each stratum evaluation computes all its IDB relations via fixed-point.
+     * Previous stratum's IDB becomes current stratum's EDB (natural layering).
+     */
     wl_col_session_t *sess = COL_SESSION(session);
-    return col_eval_stratum(sess->plan->strata, /* first stratum only for now */
-                            sess);
+    const wl_ffi_plan_t *plan = sess->plan;
+
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        int rc = col_eval_stratum(&plan->strata[si], sess);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
 }
 
 /*
