@@ -1,15 +1,14 @@
 /*
- * dd_ffi.h - wirelog DD FFI Boundary Types
+ * dd_ffi.h - wirelog DD Backend Declarations
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
  * INTERNAL HEADER - not installed, not part of public API.
- * Defines FFI-safe (C ABI compatible) types for passing DD execution
- * plans across the C-to-Rust boundary.  These types mirror the internal
- * dd_plan.h structures but are flattened for safe interop: no nested
- * owned pointers, no expression trees, no internal-only types.
+ * Declares flat, C ABI compatible types for DD backend execution plans.
+ * These types are used by the DD execution engine and marshaling code.
+ * Provides stable naming and structure definitions for the DD subsystem.
  *
  * ========================================================================
  * Overview

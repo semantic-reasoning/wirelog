@@ -6,15 +6,15 @@
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
  * INTERNAL HEADER - not installed, not part of public API.
- * Defines FFI-safe (C ABI compatible) types for passing execution plans
+ * Defines stable, C ABI compatible types for passing execution plans
  * to any backend (Differential Dataflow, columnar C11, etc.).
  *
  * These types are shared between:
- *   - The DD backend (ffi/dd_ffi.h wraps these for Rust FFI transport)
+ *   - The DD backend (backend/dd/dd_ffi.h wraps these for plan transport)
  *   - The columnar C11 backend (backend/columnar.c consumes these directly)
  *
- * Split from ffi/dd_ffi.h during Phase 2A (Issue #80) to enable
- * backend-agnostic plan consumption without Rust FFI dependencies.
+ * Split from backend/dd/dd_ffi.h during Phase 2A (Issue #80) to enable
+ * backend-agnostic plan consumption without FFI-specific dependencies.
  *
  * ========================================================================
  * Filter Expression Serialization
