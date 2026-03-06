@@ -8,6 +8,7 @@
 
 #include "columnar_nanoarrow.h"
 #include "memory.h"
+#include "../session.h"
 #include "../wirelog-internal.h"
 
 #include "nanoarrow/nanoarrow.h"
@@ -149,7 +150,7 @@ static int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
     if (r->nrows >= r->capacity) {
-        uint32_t new_cap = r->capacity * 2;
+        uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
         int64_t *nd = (int64_t *)realloc(
             r->data, sizeof(int64_t) * (size_t)new_cap * r->ncols);
         if (!nd)
@@ -200,17 +201,65 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
 /* Session                                                                   */
 /* ======================================================================== */
 
-struct wl_session {
-    const wl_ffi_plan_t *plan; /* borrowed                          */
-    col_rel_t **rels;          /* owned array of owned pointers     */
-    uint32_t nrels;
-    uint32_t rel_cap;
-    wl_on_delta_fn delta_cb;
-    void *delta_data;
-};
+/*
+ * wl_col_session_t: Columnar backend session state
+ *
+ * Memory layout (C11 §6.7.2.1 ¶15 - pointer compatibility):
+ *   Offset 0: wl_session_t base
+ *     └─ Contains: backend pointer (vtable dispatch, set by session.c:38)
+ *   Offset sizeof(wl_session_t): columnar-specific fields
+ *     ├─ const wl_ffi_plan_t *plan
+ *     ├─ col_rel_t **rels
+ *     ├─ uint32_t nrels
+ *     ├─ uint32_t rel_cap
+ *     ├─ wl_on_delta_fn delta_cb
+ *     └─ void *delta_data
+ *
+ * Memory ownership:
+ *   - base.backend: set by session.c:38 after col_session_create returns
+ *   - plan: borrowed (lifetime: caller, must outlive session)
+ *   - rels[]: owned malloc array, grown on demand via session_add_rel()
+ *   - rels[i]: owned col_rel_t* (each allocated separately, freed on destroy)
+ *   - rels[i]->data: owned int64_t[] row-major buffer (persistent across steps)
+ *   - rels[i]->col_names: owned char*[] (set on first insert or eval output)
+ *
+ * Casting contract:
+ *   - (wl_col_session_t *)session is safe because base is the first field
+ *   - session.c:38 writes to (*out)->backend which aliases &base.backend
+ *   - All col_session_* vtable functions MUST cast via COL_SESSION() macro
+ *
+ * Phase 2A vs 2B boundary:
+ *   - Phase 2A (current): full re-evaluation each step; set-diff for deltas
+ *   - Phase 2B (future): semi-naive delta propagation (split rels: R + ΔR)
+ *   - DO NOT optimize the iteration loop here; marked for Phase 2B rewrite
+ *
+ * Thread safety: NOT thread-safe. Each worker thread must own its session.
+ *
+ * @see backend_dd.c:35-44 for the embedding pattern reference (wl_dd_session_t)
+ * @see session.h:38-40 for canonical wl_session_t definition
+ * @see exec_plan.h for wl_ffi_plan_t backend-agnostic plan types
+ */
+typedef struct {
+    wl_session_t base;         /* MUST be first field (vtable dispatch)  */
+    const wl_ffi_plan_t *plan; /* borrowed, lifetime: caller             */
+    col_rel_t **rels;          /* owned array of owned col_rel_t*        */
+    uint32_t nrels;            /* current number of registered relations */
+    uint32_t rel_cap;          /* allocated capacity of rels[]           */
+    wl_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
+    void *delta_data;          /* opaque user context for delta_cb       */
+    /* TODO(Phase 2B): add delta relation tracking (ΔR fields) here */
+} wl_col_session_t;
+
+/*
+ * COL_SESSION: Cast wl_session_t* to wl_col_session_t*
+ *
+ * Safe because wl_session_t base is the first member of wl_col_session_t
+ * (C11 §6.7.2.1 ¶15 guarantees address equality of struct and first member).
+ */
+#define COL_SESSION(s) ((wl_col_session_t *)(s))
 
 static col_rel_t *
-session_find_rel(struct wl_session *sess, const char *name)
+session_find_rel(wl_col_session_t *sess, const char *name)
 {
     for (uint32_t i = 0; i < sess->nrels; i++) {
         if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0)
@@ -220,7 +269,7 @@ session_find_rel(struct wl_session *sess, const char *name)
 }
 
 static int
-session_add_rel(struct wl_session *sess, col_rel_t *r)
+session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 {
     if (sess->nrels >= sess->rel_cap) {
         uint32_t nc = sess->rel_cap ? sess->rel_cap * 2 : 16;
@@ -498,7 +547,7 @@ col_rel_new_like(const char *name, const col_rel_t *src)
 
 static int
 col_op_variable(const wl_ffi_op_t *op, eval_stack_t *stack,
-                struct wl_session *sess)
+                wl_col_session_t *sess)
 {
     col_rel_t *rel = session_find_rel(sess, op->relation_name);
     if (!rel)
@@ -614,7 +663,7 @@ col_op_filter(const wl_ffi_op_t *op, eval_stack_t *stack)
 /* --- JOIN ---------------------------------------------------------------- */
 
 static int
-col_op_join(const wl_ffi_op_t *op, eval_stack_t *stack, struct wl_session *sess)
+col_op_join(const wl_ffi_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
     eval_entry_t left_e = eval_stack_pop(stack);
     if (!left_e.rel)
@@ -721,7 +770,7 @@ col_op_join(const wl_ffi_op_t *op, eval_stack_t *stack, struct wl_session *sess)
 
 static int
 col_op_antijoin(const wl_ffi_op_t *op, eval_stack_t *stack,
-                struct wl_session *sess)
+                wl_col_session_t *sess)
 {
     eval_entry_t left_e = eval_stack_pop(stack);
     if (!left_e.rel)
@@ -935,7 +984,7 @@ col_op_consolidate(eval_stack_t *stack)
 
 static int
 col_op_semijoin(const wl_ffi_op_t *op, eval_stack_t *stack,
-                struct wl_session *sess)
+                wl_col_session_t *sess)
 {
     eval_entry_t left_e = eval_stack_pop(stack);
     if (!left_e.rel)
@@ -1154,7 +1203,7 @@ col_op_reduce(const wl_ffi_op_t *op, eval_stack_t *stack)
  */
 static int
 col_eval_relation_plan(const wl_ffi_relation_plan_t *rplan, eval_stack_t *stack,
-                       struct wl_session *sess)
+                       wl_col_session_t *sess)
 {
     for (uint32_t i = 0; i < rplan->op_count; i++) {
         const wl_ffi_op_t *op = &rplan->ops[i];
@@ -1205,7 +1254,7 @@ col_eval_relation_plan(const wl_ffi_relation_plan_t *rplan, eval_stack_t *stack,
  * Returns 0 on success, non-zero on error.
  */
 static int
-col_eval_stratum(const wl_ffi_stratum_plan_t *sp, struct wl_session *sess)
+col_eval_stratum(const wl_ffi_stratum_plan_t *sp, wl_col_session_t *sess)
 {
     if (!sp->is_recursive) {
         /* Non-recursive: evaluate each relation plan once */
@@ -1394,6 +1443,27 @@ col_eval_stratum(const wl_ffi_stratum_plan_t *sp, struct wl_session *sess)
 /* Vtable Functions                                                          */
 /* ======================================================================== */
 
+/*
+ * col_session_create: Initialize a columnar backend session
+ *
+ * Implements wl_compute_backend_t.session_create vtable slot.
+ *
+ * @param plan:        Execution plan (borrowed, must outlive session)
+ * @param num_workers: Ignored; columnar backend is single-threaded
+ * @param out:         (out) Receives &sess->base on success
+ *
+ * Memory initialization order:
+ *   1. Allocate wl_col_session_t (zero-initialized via calloc)
+ *   2. Set sess->plan = plan (borrowed reference)
+ *   3. Allocate rels[] with initial capacity 16
+ *   4. Pre-register EDB relations from plan->edb_relations (ncols lazy-inited)
+ *   5. Set *out = &sess->base  (session.c:38 then sets base.backend)
+ *
+ * @return 0 on success, EINVAL if plan/out is NULL, ENOMEM on alloc failure
+ *
+ * @see wl_session_create in session.c for vtable dispatch context
+ * @see wl_col_session_t memory layout documentation above
+ */
 static int
 col_session_create(const wl_ffi_plan_t *plan, uint32_t num_workers,
                    wl_session_t **out)
@@ -1403,8 +1473,8 @@ col_session_create(const wl_ffi_plan_t *plan, uint32_t num_workers,
     if (!plan || !out)
         return EINVAL;
 
-    struct wl_session *sess
-        = (struct wl_session *)calloc(1, sizeof(struct wl_session));
+    wl_col_session_t *sess
+        = (wl_col_session_t *)calloc(1, sizeof(wl_col_session_t));
     if (!sess)
         return ENOMEM;
 
@@ -1430,7 +1500,7 @@ col_session_create(const wl_ffi_plan_t *plan, uint32_t num_workers,
         }
     }
 
-    *out = sess;
+    *out = &sess->base;
     return 0;
 
 oom:
@@ -1443,17 +1513,27 @@ oom:
     return ENOMEM;
 }
 
+/*
+ * col_session_destroy: Free all resources owned by a columnar session
+ *
+ * Implements wl_compute_backend_t.session_destroy vtable slot.
+ * NULL-safe. Frees rels[], each rels[i], and the session struct itself.
+ * The plan is borrowed and NOT freed here.
+ *
+ * @param session: wl_session_t* (cast to wl_col_session_t* internally)
+ */
 static void
 col_session_destroy(wl_session_t *session)
 {
     if (!session)
         return;
-    for (uint32_t i = 0; i < session->nrels; i++) {
-        col_rel_free_contents(session->rels[i]);
-        free(session->rels[i]);
+    wl_col_session_t *sess = COL_SESSION(session);
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        col_rel_free_contents(sess->rels[i]);
+        free(sess->rels[i]);
     }
-    free(session->rels);
-    free(session);
+    free(sess->rels);
+    free(sess);
 }
 
 static int
@@ -1463,7 +1543,7 @@ col_session_insert(wl_session_t *session, const char *relation,
     if (!session || !relation || !data)
         return EINVAL;
 
-    col_rel_t *r = session_find_rel(session, relation);
+    col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
     if (!r)
         return ENOENT;
 
@@ -1491,7 +1571,7 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (!session || !relation || !data)
         return EINVAL;
 
-    col_rel_t *r = session_find_rel(session, relation);
+    col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
     if (!r || r->ncols != num_cols)
         return ENOENT;
 
@@ -1523,26 +1603,75 @@ col_session_remove(wl_session_t *session, const char *relation,
     return 0;
 }
 
+/*
+ * col_session_step: Advance the session by one evaluation epoch
+ *
+ * Implements wl_compute_backend_t.session_step vtable slot.
+ *
+ * Phase 2A: Delegates to col_eval_stratum (full re-evaluation of stratum 0).
+ * Fires delta_cb for newly derived tuples via the stratum evaluation path.
+ *
+ * TODO(Phase 2B): Replace with semi-naive delta propagation:
+ *   - Maintain ΔR (delta relations) alongside R (stable relations)
+ *   - One epoch = propagate ΔR through rules to produce new ΔR'
+ *   - Merge ΔR' into R, fire delta_cb for each new tuple
+ *
+ * @param session: wl_session_t* (cast to wl_col_session_t* internally)
+ * @return 0 on success, non-zero on evaluation error
+ */
 static int
 col_session_step(wl_session_t *session)
 {
     /* Incremental step: run one epoch of evaluation.
      * For Phase 2A, delegate to snapshot (full re-evaluation). */
-    return col_eval_stratum(
-        session->plan->strata, /* first stratum only for now */
-        session);
+    wl_col_session_t *sess = COL_SESSION(session);
+    return col_eval_stratum(sess->plan->strata, /* first stratum only for now */
+                            sess);
 }
 
+/*
+ * col_session_set_delta_cb: Register a delta callback on this session
+ *
+ * Implements wl_compute_backend_t.session_set_delta_cb vtable slot.
+ * The callback is invoked with diff=+1 for new tuples during col_session_step.
+ *
+ * TODO(Phase 2B): Also fire diff=-1 for retracted tuples when semi-naive
+ * delta propagation tracks removed tuples explicitly.
+ *
+ * @param session:   wl_session_t* (cast to wl_col_session_t* internally)
+ * @param callback:  Function invoked per output delta tuple (NULL to disable)
+ * @param user_data: Opaque pointer passed through to callback
+ */
 static void
 col_session_set_delta_cb(wl_session_t *session, wl_on_delta_fn callback,
                          void *user_data)
 {
     if (!session)
         return;
-    session->delta_cb = callback;
-    session->delta_data = user_data;
+    wl_col_session_t *sess = COL_SESSION(session);
+    sess->delta_cb = callback;
+    sess->delta_data = user_data;
 }
 
+/*
+ * col_session_snapshot: Evaluate all strata and emit current IDB tuples
+ *
+ * Implements wl_compute_backend_t.session_snapshot vtable slot.
+ *
+ * Evaluation order:
+ *   1. Execute all strata in plan order (col_eval_stratum per stratum)
+ *   2. For each IDB relation in each stratum, invoke callback once per row
+ *
+ * Complexity: O(S * R * N) where S=strata, R=relations per stratum, N=rows
+ *
+ * TODO(Phase 2B): Snapshot should read from stable R (not recompute);
+ * currently re-evaluates on every call which is O(input) per snapshot.
+ *
+ * @param session:   wl_session_t* (cast to wl_col_session_t* internally)
+ * @param callback:  Invoked once per output tuple (relation, row, ncols)
+ * @param user_data: Opaque pointer passed through to callback
+ * @return 0 on success, EINVAL if session/callback NULL, non-zero on eval error
+ */
 static int
 col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                      void *user_data)
@@ -1550,11 +1679,12 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     if (!session || !callback)
         return EINVAL;
 
-    const wl_ffi_plan_t *plan = session->plan;
+    wl_col_session_t *sess = COL_SESSION(session);
+    const wl_ffi_plan_t *plan = sess->plan;
 
     /* Execute all strata in order */
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
-        int rc = col_eval_stratum(&plan->strata[si], session);
+        int rc = col_eval_stratum(&plan->strata[si], sess);
         if (rc != 0)
             return rc;
     }
@@ -1564,7 +1694,7 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
         const wl_ffi_stratum_plan_t *sp = &plan->strata[si];
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             const char *rname = sp->relations[ri].name;
-            col_rel_t *r = session_find_rel(session, rname);
+            col_rel_t *r = session_find_rel(sess, rname);
             if (!r || r->nrows == 0)
                 continue;
             for (uint32_t row = 0; row < r->nrows; row++) {
