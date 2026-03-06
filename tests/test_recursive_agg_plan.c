@@ -105,8 +105,7 @@ plan_has_reduce_with_fn(const wl_dd_plan_t *plan, wirelog_agg_fn_t fn)
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
             const wl_dd_relation_plan_t *rel = &plan->strata[s].relations[r];
             for (uint32_t o = 0; o < rel->op_count; o++) {
-                if (rel->ops[o].op == WL_DD_REDUCE
-                    && rel->ops[o].agg_fn == fn)
+                if (rel->ops[o].op == WL_DD_REDUCE && rel->ops[o].agg_fn == fn)
                     return true;
             }
         }
