@@ -36,8 +36,8 @@ wirelog/{subdir}/{file}.h  →  wl_{subdir}_{file}_*
 Examples:
 - `wirelog/parser/ast.h` → `wl_parser_ast_node_t`, `wl_parser_ast_node_create()`
 - `wirelog/ir/stratify.h` → `wl_ir_stratify_dep_graph_t`
-- `wirelog/backend/dd/dd_ffi.h` → `wl_plan_t`, `wl_plan_op_t` (backend-agnostic plan types)
-- `wirelog/backend/dd/dd_plan.h` → `wl_dd_plan_t`, `wl_dd_op_t` (DD-specific plan types)
+- `wirelog/exec_plan.h` → `wl_plan_t`, `wl_plan_op_t` (backend-agnostic execution plan types)
+- `wirelog/backend.h` → `wl_compute_backend_t` (columnar backend abstraction)
 
 Top-level internal headers use the file name: `wl_backend_*`, `wl_session_*`, `wl_intern_*`
 
@@ -57,14 +57,16 @@ See [issue #75](https://github.com/justinjoy/wirelog/issues/75) for the full ren
 
 ## Recursive Aggregation Tests
 
-When writing tests for recursive aggregations (MIN, MAX in iterate()):
+When writing tests for recursive aggregations (MIN, MAX in recursive strata):
 
-**Test Structure** (see `tests/test_recursive_agg_cc_min.c` and `tests/test_recursive_agg_sssp_max.c`):
+**Test Structure**:
 1. Define Datalog program with aggregation in recursive rule
-2. Parse program → generate DD plan → marshal to FFI
-3. Create DD worker → load EDB facts → execute with callback
-4. Collect results in tuple collector
-5. Verify: exact tuple count, specific values, no cross-contamination
+2. Parse program → generate execution plan (columnar backend)
+3. Initialize columnar backend session
+4. Load EDB facts via columnar backend
+5. Execute with fixed-point iteration until convergence
+6. Collect results via delta callback or snapshot
+7. Verify: exact tuple count, specific values, no cross-contamination
 
 **Each test file**:
 - Has its own `main()` function (separate executable)
@@ -72,8 +74,9 @@ When writing tests for recursive aggregations (MIN, MAX in iterate()):
 - Registers test suite in `tests/meson.build`
 
 **Integration points**:
-- Full pipeline: parse → IR → stratify → DD plan → marshal → Rust execution
-- Validates monotone aggregation behavior end-to-end
+- Full pipeline: parse → IR → stratify → columnar execution plan → C11 backend execution
+- Validates aggregation behavior with fixed-point iteration
+- No DD/Rust dependencies; pure C11 implementation
 
 ## Linting
 
