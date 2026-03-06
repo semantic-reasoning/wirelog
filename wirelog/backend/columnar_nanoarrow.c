@@ -152,6 +152,8 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
     if (r->nrows >= r->capacity) {
         uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
+        if (new_cap <= r->capacity) /* overflow guard */
+            return ENOMEM;
         int64_t *nd = (int64_t *)realloc(
             r->data, sizeof(int64_t) * (size_t)new_cap * r->ncols);
         if (!nd)
@@ -263,6 +265,8 @@ typedef struct {
 static col_rel_t *
 session_find_rel(wl_col_session_t *sess, const char *name)
 {
+    if (!name)
+        return NULL;
     for (uint32_t i = 0; i < sess->nrels; i++) {
         if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0)
             return sess->rels[i];
@@ -284,6 +288,19 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
     }
     sess->rels[sess->nrels++] = r;
     return 0;
+}
+
+static void
+session_remove_rel(wl_col_session_t *sess, const char *name)
+{
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0) {
+            col_rel_free_contents(sess->rels[i]);
+            free(sess->rels[i]);
+            sess->rels[i] = NULL;
+            return;
+        }
+    }
 }
 
 /* ======================================================================== */
@@ -551,7 +568,14 @@ static int
 col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
                 wl_col_session_t *sess)
 {
-    col_rel_t *rel = session_find_rel(sess, op->relation_name);
+    if (!op->relation_name)
+        return ENOENT;
+    /* Prefer delta relation for semi-naive evaluation; fall back to full. */
+    char dname[256];
+    snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
+    col_rel_t *rel = session_find_rel(sess, dname);
+    if (!rel)
+        rel = session_find_rel(sess, op->relation_name);
     if (!rel)
         return ENOENT;
     /* push borrowed reference - session owns the relation */
@@ -1438,19 +1462,56 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
     }
 
     /*
-     * TODO(Task #3): implement proper delta/delta_next tracking.
-     * Current implementation: naive re-evaluation until stable.
+     * Semi-naive fixed-point iteration with delta tracking.
+     * VARIABLE ops prefer "$d$relname" delta relations (rows added in the
+     * previous iteration). JOIN right-side lookups always use the full
+     * relation by name, giving delta (left) x full (right) join semantics.
      */
+    uint32_t nrels = sp->relation_count;
+    col_rel_t **delta_rels = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
+    if (!delta_rels)
+        return ENOMEM;
+
     for (uint32_t iter = 0; iter < MAX_ITERATIONS; iter++) {
-        uint32_t total_before = 0;
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        /* Register delta relations from previous iteration into session */
+        for (uint32_t ri = 0; ri < nrels; ri++) {
+            if (!delta_rels[ri])
+                continue;
+            char dname[256];
+            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+            session_remove_rel(sess, dname);
+            int rc = session_add_rel(sess, delta_rels[ri]);
+            if (rc != 0) {
+                col_rel_free_contents(delta_rels[ri]);
+                free(delta_rels[ri]);
+            }
+            delta_rels[ri] = NULL; /* session now owns it */
+        }
+
+        /* Record per-relation row counts and save sorted snapshots for delta
+         * computation after consolidation. old_data[ri] is a copy of the
+         * pre-evaluation sorted+unique relation; delta = R_new - R_old. */
+        uint32_t *snap = (uint32_t *)malloc(nrels * sizeof(uint32_t));
+        int64_t **old_data = (int64_t **)calloc(nrels, sizeof(int64_t *));
+        if (!snap || !old_data) {
+            free(snap);
+            free(old_data);
+            free(delta_rels);
+            return ENOMEM;
+        }
+        for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            if (r)
-                total_before += r->nrows;
+            snap[ri] = r ? r->nrows : 0;
+            if (snap[ri] > 0 && r && r->ncols > 0) {
+                size_t bytes = (size_t)snap[ri] * r->ncols * sizeof(int64_t);
+                old_data[ri] = (int64_t *)malloc(bytes);
+                if (old_data[ri])
+                    memcpy(old_data[ri], r->data, bytes);
+            }
         }
 
         /* One pass: evaluate each relation plan */
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        for (uint32_t ri = 0; ri < nrels; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
 
             eval_stack_t stack;
@@ -1459,6 +1520,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
             int rc = col_eval_relation_plan(rp, &stack, sess);
             if (rc != 0) {
                 eval_stack_drain(&stack);
+                free(snap);
+                free(delta_rels);
                 return rc;
             }
 
@@ -1478,16 +1541,23 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
                     if (!copy->name) {
                         col_rel_free_contents(copy);
                         free(copy);
+                        free(snap);
+                        free(delta_rels);
                         return ENOMEM;
                     }
                     result.owned = false;
                 } else {
                     copy = col_rel_new_like(rp->name, result.rel);
-                    if (!copy)
+                    if (!copy) {
+                        free(snap);
+                        free(delta_rels);
                         return ENOMEM;
+                    }
                     if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
                         col_rel_free_contents(copy);
                         free(copy);
+                        free(snap);
+                        free(delta_rels);
                         return rc;
                     }
                 }
@@ -1495,6 +1565,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
                 if (rc != 0) {
                     col_rel_free_contents(copy);
                     free(copy);
+                    free(snap);
+                    free(delta_rels);
                     return rc;
                 }
             } else {
@@ -1508,6 +1580,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
                             col_rel_free_contents(result.rel);
                             free(result.rel);
                         }
+                        free(snap);
+                        free(delta_rels);
                         return rc;
                     }
                 }
@@ -1516,13 +1590,23 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
                     col_rel_free_contents(result.rel);
                     free(result.rel);
                 }
-                if (rc != 0)
+                if (rc != 0) {
+                    free(snap);
+                    free(delta_rels);
                     return rc;
+                }
             }
         }
 
+        /* Remove delta relations from session (evaluation is complete) */
+        for (uint32_t ri = 0; ri < nrels; ri++) {
+            char dname[256];
+            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+            session_remove_rel(sess, dname);
+        }
+
         /* Consolidate all IDB relations to remove duplicates */
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
             if (!r || r->nrows == 0)
                 continue;
@@ -1547,17 +1631,81 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
             }
         }
 
-        /* Check convergence */
-        uint32_t total_after = 0;
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        /* Compute proper delta: R_new - R_old via sorted merge walk.
+         * Both old_data[ri] and r->data are sorted+unique (old from previous
+         * consolidation, new from consolidation just done above).
+         * This ensures delta contains only truly new tuples, preventing the
+         * base-case re-evaluation from polluting delta with known rows. */
+        bool any_new = false;
+        for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            if (r)
-                total_after += r->nrows;
+            if (!r || r->nrows == 0 || r->ncols == 0)
+                continue;
+            char dname[256];
+            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+            col_rel_t *delta = col_rel_new_like(dname, r);
+            if (!delta)
+                continue;
+            uint32_t nc = r->ncols;
+            size_t row_bytes = (size_t)nc * sizeof(int64_t);
+            int64_t *old = old_data[ri];
+            uint32_t old_n = snap[ri];
+            if (old == NULL || old_n == 0) {
+                /* First time: all consolidated rows are new */
+                col_rel_append_all(delta, r); /* best-effort */
+            } else {
+                /* Merge walk: emit rows in R_new not present in R_old */
+                uint32_t oi = 0, ni = 0;
+                while (ni < r->nrows) {
+                    const int64_t *nrow = r->data + (size_t)ni * nc;
+                    if (oi < old_n) {
+                        const int64_t *orow = old + (size_t)oi * nc;
+                        int cmp = memcmp(nrow, orow, row_bytes);
+                        if (cmp < 0) {
+                            col_rel_append_row(delta, nrow);
+                            ni++;
+                        } else if (cmp == 0) {
+                            ni++;
+                            oi++;
+                        } else {
+                            oi++;
+                        }
+                    } else {
+                        col_rel_append_row(delta, nrow);
+                        ni++;
+                    }
+                }
+            }
+            if (delta->nrows > 0) {
+                delta_rels[ri] = delta;
+                any_new = true;
+            } else {
+                col_rel_free_contents(delta);
+                free(delta);
+            }
         }
-        if (total_after == total_before)
-            break; /* fixed point reached */
+
+        /* Free pre-evaluation snapshots */
+        for (uint32_t ri = 0; ri < nrels; ri++)
+            free(old_data[ri]);
+        free(old_data);
+        free(snap);
+
+        if (!any_new)
+            break;
     }
 
+    /* Cleanup any remaining pending delta relations */
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        if (delta_rels[ri]) {
+            col_rel_free_contents(delta_rels[ri]);
+            free(delta_rels[ri]);
+        }
+        char dname[256];
+        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        session_remove_rel(sess, dname);
+    }
+    free(delta_rels);
     return 0;
 }
 
