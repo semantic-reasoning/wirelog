@@ -152,7 +152,7 @@
  *
  * These types are shared with the columnar C11 backend (Phase 2A).
  */
-#include "../exec_plan.h"
+#include "../../exec_plan.h"
 
 #include <stdbool.h>
 #include <stdint.h>

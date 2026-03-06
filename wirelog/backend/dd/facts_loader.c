@@ -12,9 +12,9 @@
  */
 
 #include "dd_ffi.h"
-#include "../io/csv_reader.h"
-#include "../ir/program.h"
-#include "../wirelog.h"
+#include "../../io/csv_reader.h"
+#include "../../ir/program.h"
+#include "../../wirelog.h"
 
 #include <stdio.h>
 #include <stdlib.h>

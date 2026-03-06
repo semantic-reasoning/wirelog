@@ -10,7 +10,7 @@
  */
 
 #include "dd_ffi.h"
-#include "../ir/ir.h"
+#include "../../ir/ir.h"
 
 #include <stdlib.h>
 #include <string.h>

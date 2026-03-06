@@ -90,7 +90,7 @@
 #ifndef WIRELOG_FFI_DD_PLAN_H
 #define WIRELOG_FFI_DD_PLAN_H
 
-#include "../wirelog-types.h"
+#include "../../wirelog-types.h"
 
 #include <stdbool.h>
 #include <stdint.h>

@@ -16,7 +16,7 @@ ir_src = files(
   '../wirelog/ir/program.c',
   '../wirelog/ir/stratify.c',
   '../wirelog/ir/api.c',
-  '../wirelog/ffi/dd_plan.c',
+  '../wirelog/backend/dd/dd_plan.c',
   '../wirelog/intern.c',
   '../wirelog/session.c',
 )
@@ -149,7 +149,7 @@ test('sip', test_sip_exe)
 columnar_backend_src = files(
   '../wirelog/arena/arena.c',
   '../wirelog/backend/columnar_nanoarrow.c',
-  '../wirelog/ffi/dd_marshal.c',
+  '../wirelog/backend/dd/dd_marshal.c',
 )
 
 test_session_columnar_exe = executable(

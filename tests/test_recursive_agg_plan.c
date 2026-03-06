@@ -22,7 +22,7 @@
  * Tests 9-10 (non-recursive MIN/MAX) are expected to PASS already.
  */
 
-#include "../wirelog/ffi/dd_plan.h"
+#include "../wirelog/backend/dd/dd_plan.h"
 #include "../wirelog/wirelog-parser.h"
 
 #include <stdio.h>

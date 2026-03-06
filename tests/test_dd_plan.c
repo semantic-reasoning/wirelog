@@ -6,7 +6,7 @@
  * For commercial licenses, contact: inquiry@cleverplant.com
  */
 
-#include "../wirelog/ffi/dd_plan.h"
+#include "../wirelog/backend/dd/dd_plan.h"
 #include "../wirelog/ir/ir.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/wirelog-parser.h"

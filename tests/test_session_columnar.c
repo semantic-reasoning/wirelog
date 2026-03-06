@@ -11,7 +11,7 @@
  */
 
 #include "../wirelog/backend/columnar_nanoarrow.h"
-#include "../wirelog/ffi/dd_ffi.h"
+#include "../wirelog/backend/dd/dd_ffi.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"

@@ -9,8 +9,8 @@
  */
 
 #include "dd_plan.h"
-#include "../ir/ir.h"
-#include "../ir/program.h"
+#include "../../ir/ir.h"
+#include "../../ir/program.h"
 
 #include <stdio.h>
 #include <stdlib.h>

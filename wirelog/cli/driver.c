@@ -11,7 +11,7 @@
 
 #include "driver.h"
 
-#include "../ffi/dd_ffi.h"
+#include "../backend/dd/dd_ffi.h"
 #include "../intern.h"
 #include "../ir/program.h"
 #include "../passes/fusion.h"
