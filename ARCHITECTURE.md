@@ -2,17 +2,17 @@
 
 **Project**: wirelog - Embedded-to-Enterprise Datalog Engine
 **Copyright**: Copyright (C) CleverPlant
-**Date**: 2026-03-01
-**Status**: Phase 0 Complete, Phase 1 Complete
+**Date**: 2026-03-06
+**Status**: Phase 2C Complete - Pure C11 Columnar Backend (Differential Dataflow Removed)
 
 ---
 
 ## Core Requirements
 
-1. **Multi-Target (Unified Start)**: Both embedded and enterprise targets **start with DD integration**
-2. **FPGA Acceleration Ready**: Lightweight design enabling future FPGA acceleration without heavy libraries
-3. **Strict Layering**: Layer separation for future optimization flexibility
-4. **nanoarrow Deferred**: Not needed initially; added during embedded optimization phase
+1. **Pure C11 Columnar Backend**: All execution uses nanoarrow columnar backend (Rust/DD removed in Phase 2C)
+2. **Embedded-First Design**: Lightweight C11 implementation for embedded and enterprise targets
+3. **FPGA Acceleration Ready**: Lightweight design enabling future FPGA acceleration without heavy libraries
+4. **Strict Layering**: Layer separation for future optimization flexibility
 5. **C11 Foundation**: C11 for broad compatibility and modern features (_Static_assert, stdatomic)
 
 ---
@@ -21,36 +21,35 @@
 
 ### 1.1 Multi-Target Architecture (Embedded ↔ Enterprise)
 
-**Phase 0-1 (Current): All DD-based**
+**Phase 2C (Current): Pure C11 Columnar Backend**
 ```
 wirelog core (C11)
 ├─ Parser (Datalog → IR)
 ├─ Optimizer (Fusion, JPP, SIP)
-└─ DD Executor (Rust FFI)
+└─ Columnar Backend (C11 + nanoarrow)
     │
     ├─ [Embedded Target]
     │   ├─ ARM/RISC-V CPU targets
-    │   ├─ Single worker or local multi-threading
-    │   └─ Memory constrained (<256MB)
+    │   ├─ Single-threaded or local multi-threading
+    │   ├─ Memory constrained (<256MB)
+    │   └─ Lightweight binary (<5MB)
     │
     └─ [Enterprise Target]
         ├─ x86-64 servers
-        ├─ Multi-worker, distributed processing
-        └─ Memory abundant (GB scale)
+        ├─ Multi-threaded execution
+        ├─ Memory abundant (GB scale)
+        └─ Scalable columnar processing
 ```
 
-**Mid-term (Phase 4+): Selective Optimization**
+**Future (Phase 4+): Optional Backend Selection**
 ```
 wirelog core (C11)
-    └─ Backend Abstraction (optional)
+    └─ Backend Interface (optional)
         │
-        ├─ [Embedded Path]
-        │   ├─ nanoarrow memory (columnar, optional)
-        │   ├─ Semi-naive executor (C11)
+        ├─ [Columnar Path] (default, current)
+        │   ├─ nanoarrow columnar storage
+        │   ├─ C11 semi-naive executor
         │   └─ 500KB-2MB standalone binary
-        │
-        ├─ [Enterprise Path]
-        │   └─ DD retained (no changes)
         │
         └─ [FPGA Path] (future)
             ├─ Abstracted compute kernels
@@ -82,61 +81,61 @@ wirelog core (C11)
 [Execution Interface]
   Backend abstraction (backend.h)
     │
-    ├─ [DD Backend]       ├─ [CPU Backend]    ├─ [FPGA Backend]
-    │  Rust FFI           │  nanoarrow        │  Arrow IPC
-    │  (initial)          │  (mid-term)       │  (future)
+    ├─ [Columnar Backend]    ├─ [Future FPGA Backend]
+    │  nanoarrow + C11       │  Arrow IPC
+    │  (Phase 2C+)           │  (Phase 4+)
     │
 [Memory Layer]
-  ArrowBuffer / malloc / custom allocator
+  nanoarrow buffers / malloc / custom allocator
     │
 [I/O Layer]
   CSV, Arrow IPC, network sockets
 ```
 
-### 1.4 Differential Dataflow Integration
+### 1.4 Columnar Execution Backend
 
-**Phase 0-1: DD-based Implementation**
+**Phase 2C: Pure C11 Columnar Implementation**
 ```
 wirelog (C11 parser/optimizer)
-    ↓ (IR → DD operator graph conversion)
-Differential Dataflow (Rust executor, standalone)
+    ↓ (IR → columnar execution plan)
+nanoarrow Columnar Backend (C11)
     ↓
 Result
 ```
 
 **Advantages**:
-- Proven performance (Differential Dataflow's incremental computation)
-- Immediate access to DD's multi-worker, distributed processing
-- wirelog implements only parser/optimizer in C11
-- Embedded + enterprise start from the same foundation
-- Embedded can selectively migrate to nanoarrow later
+- Pure C11 implementation (no Rust, no FFI overhead)
+- Efficient columnar storage and vectorized operations
+- Lightweight embedding (5MB standalone binary)
+- Unified execution for embedded and enterprise targets
+- Direct nanoarrow integration for columnar data formats
 
 **Execution Path** (all environments):
 ```
 wirelog (C11 parser/optimizer)
     ↓
-IR → Fusion → JPP → SIP → DD operator graph
+IR → Fusion → JPP → SIP → Columnar execution plan
     ↓
-Differential Dataflow (Rust executor)
+nanoarrow Columnar Backend (C11)
     ↓
 Result
 
-• Embedded: DD single-worker mode, local memory
-• Enterprise: DD multi-worker, distributed processing
+• Embedded: single-threaded or multi-threaded execution, local memory
+• Enterprise: multi-threaded execution, scalable processing
 • Same codebase, only build configuration differs per target
 ```
 
-**Selective Optimization Path** (Phase 4+):
+**Future FPGA Path** (Phase 4+):
 ```
-Embedded only (optional):
+Both embedded and enterprise (optional):
   wirelog (C11 parser/optimizer)
       ↓
-  nanoarrow executor (C11, fully standalone)
+  Arrow IPC + custom FPGA backend
       ↓
-  Result (500KB-2MB binary)
+  Result (hardware-accelerated computation)
 
-Enterprise:
-  (DD path retained, no changes)
+Current path:
+  (Columnar backend provides baseline implementation)
 
 FPGA acceleration (future):
   wirelog (C11 parser/optimizer)
@@ -150,7 +149,7 @@ FPGA acceleration (future):
 
 ## 2. Architecture Layer Design
 
-### 2.1 Layer Structure (Phase 0-1: All DD-based)
+### 2.1 Layer Structure (Phase 2C: Pure C11 Columnar)
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -170,35 +169,33 @@ FPGA acceleration (future):
 └──────────────────┬──────────────────────────────────┘
                    │
 ┌──────────────────▼──────────────────────────────────┐
-│ DD Translator (C11 ↔ Rust FFI)                      │
-│ - IR → DD operator graph conversion                 │
-│ - Result collection from DD runtime                 │
-│ - Data marshalling                                  │
+│ Execution Plan Layer (C11)                          │
+│ - IR → Columnar execution plan conversion           │
+│ - Plan validation and optimization                  │
+│ - Delta buffer management                           │
 └──────────────────┬──────────────────────────────────┘
                    │
 ┌──────────────────▼──────────────────────────────────┐
-│ Differential Dataflow (Rust, Timely)                │
-│ - Multi-worker execution                            │
-│ - Incremental computation                           │
-│ - Distributed processing (enterprise)               │
-│ - Single-worker mode (embedded)                     │
+│ Columnar Backend (C11 + nanoarrow)                  │
+│ - Columnar storage (nanoarrow)                      │
+│ - Filter, map, join, reduce operations              │
+│ - Multi-threaded execution (optional)               │
+│ - Result collection and materialization             │
 └──────────────────────────────────────────────────────┘
 
 [I/O Layer]
-  CSV, JSON, Arrow IPC (later)
+  CSV, Arrow IPC, network sockets
 ```
 
-### 2.1b Layer Structure (Phase 3+: Selective Embedded Optimization)
+### 2.1b Layer Structure (Phase 4+: Optional FPGA Backend)
 
 ```
 wirelog core (C11)
-    ├─ [Enterprise: DD retained]
-    │   └─ Differential Dataflow (no changes)
+    ├─ [Columnar Backend] (Phase 2C, current)
+    │   └─ nanoarrow executor (C11)
     │
-    └─ [Embedded: Selective migration]
-        └─ ComputeBackend abstraction
-            ├─ nanoarrow executor (C11)
-            └─ (future) FPGA backend via Arrow IPC
+    └─ [FPGA Backend] (Phase 4+, optional)
+        └─ Arrow IPC + custom hardware backend
 ```
 
 ### 2.2 Layer Responsibilities
@@ -210,7 +207,7 @@ wirelog core (C11)
 - AST → IR conversion (backend-agnostic)
 - IR-level optimization passes (Fusion, JPP, SIP)
 - Stratification via Tarjan's iterative SCC detection
-- DD-independent design
+- Backend-independent design
 
 **Status**:
 - ✅ Parser (hand-written RDP, FlowLog-compatible grammar, 96 tests)
@@ -223,31 +220,32 @@ wirelog core (C11)
 - ✅ SIP: Semijoin Information Passing (pre-filter insertion in join chains, 9 tests)
 - ✅ CLI driver (`wirelog` executable, .dl file execution, `--workers` flag, 15 tests)
 
-#### DD Translator & FFI Layer (C11 ↔ Rust FFI)
+#### Execution Plan Layer (C11)
 
 **Responsibilities**:
-- IR → DD execution plan translation (all 9 IR node types)
-- Plan marshalling to FFI-safe flat structs
+- IR → Columnar execution plan translation (all 9 IR node types)
+- Plan validation and optimization
 - RPN expression serialization (IR expr tree → byte buffer)
-- Bulk EDB fact loading via Rust FFI
-- Memory ownership: C allocates/frees, Rust borrows via const pointers
+- Delta buffer management across strata
+- Memory ownership: C allocates/frees all buffers
 
 **Status**:
-- ✅ DD execution plan data structures (`wl_dd_plan_t`, `wl_dd_stratum_plan_t`, `wl_dd_relation_plan_t`, `wl_dd_op_t`)
-- ✅ 9 DD operator types: VARIABLE, MAP, FILTER, JOIN, ANTIJOIN, REDUCE, CONCAT, CONSOLIDATE, SEMIJOIN
+- ✅ Execution plan data structures (`wl_plan_t`, `wl_plan_stratum_t`, `wl_plan_relation_t`, `wl_plan_op_t`)
+- ✅ 9 Execution operator types: VARIABLE, MAP, FILTER, JOIN, ANTIJOIN, REDUCE, CONCAT, CONSOLIDATE, SEMIJOIN
 - ✅ Stratum-aware plan generation with recursive stratum detection
-- ✅ FFI-safe type definitions with RPN expression serialization
+- ✅ Backend-agnostic type definitions with RPN expression serialization
 - ✅ ANTIJOIN with constants support (right-side filter, key indices)
-- ✅ 22 DD plan tests + 31 FFI marshalling tests
+- ✅ Columnar backend integration tests
 
-#### Rust DD Executor (`wirelog-dd` crate)
+#### Columnar Executor (`backend/columnar_nanoarrow.c`)
 
 **Status**:
-- ✅ `staticlib` crate with `#[no_mangle] extern "C"` FFI entry points
-- ✅ `repr(C)` type mirrors matching `dd_ffi.h` layout
-- ✅ FFI entry points: `wl_dd_worker_create/destroy`, `wl_dd_load_edb`, `wl_dd_execute_cb`
-- ✅ RPN expression deserializer + stack evaluator (i64-only)
-- ✅ FFI plan reader: unsafe C pointers → safe owned Rust types
+- ✅ Pure C11 implementation (no Rust, no FFI)
+- ✅ nanoarrow integration for columnar storage
+- ✅ Operator implementations: VARIABLE, MAP, FILTER, JOIN, ANTIJOIN, REDUCE, CONCAT, CONSOLIDATE, SEMIJOIN
+- ✅ Multi-threaded execution support (optional)
+- ✅ Delta buffer materialization and result collection
+- ✅ Columnar backend execution tests
 - ✅ Non-recursive stratum execution with `timely::execute()`
 - ✅ Recursive stratum execution with DD `iterate()` + `distinct()`
 - ✅ All 9 operator types: Variable, Map, Filter, Join, Antijoin, Reduce, Concat, Consolidate, Semijoin
