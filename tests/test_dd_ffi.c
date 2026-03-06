@@ -10,7 +10,6 @@
  * link until the implementation is provided.
  */
 
-#include "../wirelog/backend/dd/dd_ffi.h"
 #include "../wirelog/ir/ir.h"
 #include "../wirelog/wirelog-parser.h"
 

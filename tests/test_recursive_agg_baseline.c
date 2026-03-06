@@ -18,7 +18,6 @@
  *   3. SSSP skeleton - graph reachability without distance aggregation
  */
 
-#include "../wirelog/backend/dd/dd_ffi.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 

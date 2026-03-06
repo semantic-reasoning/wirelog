@@ -16,7 +16,6 @@ ir_src = files(
   '../wirelog/ir/program.c',
   '../wirelog/ir/stratify.c',
   '../wirelog/ir/api.c',
-  '../wirelog/backend/dd/dd_plan.c',
   '../wirelog/intern.c',
   '../wirelog/session.c',
 )
@@ -83,16 +82,6 @@ test('ir', test_ir_exe)
 test('program', test_program_exe)
 test('stratify', test_stratify_exe)
 
-test_dd_plan_exe = executable(
-  'test_dd_plan',
-  files('test_dd_plan.c'),
-  parser_src,
-  ir_src,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-
-test('dd_plan', test_dd_plan_exe)
-
 test_fusion_exe = executable(
   'test_fusion',
   files('test_fusion.c'),
@@ -149,7 +138,6 @@ test('sip', test_sip_exe)
 columnar_backend_src = files(
   '../wirelog/arena/arena.c',
   '../wirelog/backend/columnar_nanoarrow.c',
-  '../wirelog/backend/dd/dd_marshal.c',
 )
 
 test_session_columnar_exe = executable(

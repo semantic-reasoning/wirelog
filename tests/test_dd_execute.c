@@ -9,7 +9,6 @@
  * DD plan -> marshal -> FFI -> Rust execute -> callback results.
  */
 
-#include "../wirelog/backend/dd/dd_ffi.h"
 #include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"

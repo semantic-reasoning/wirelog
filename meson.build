@@ -13,18 +13,18 @@ project(
   ]
 )
 
-# Project metadata
+#Project metadata
 project_name = meson.project_name()
 project_version = meson.project_version()
 project_license = 'LGPL-3.0'
 project_url = 'https://github.com/justinjoy/wirelog'
 
-# Directories
+#Directories
 wirelog_libdir = get_option('libdir')
 wirelog_includedir = get_option('includedir')
 wirelog_datadir = get_option('datadir') / project_name
 
-# Compiler settings
+#Compiler settings
 cc = meson.get_compiler('c')
 if cc.get_id() == 'msvc'
   add_project_arguments(
@@ -43,14 +43,14 @@ else
   )
 endif
 
-# Platform detection
+#Platform detection
 platform = host_machine.system()
 is_embedded = get_option('embedded')
 is_windows = platform == 'windows'
 is_macos = platform == 'darwin'
 is_linux = platform == 'linux'
 
-# Build options
+#Build options
 ipc_option = get_option('ipc')
 threads_option = get_option('threads')
 tests_option = get_option('tests')
@@ -62,11 +62,11 @@ message('  Embedded: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
 
-# ============================================================================
-# Dependencies
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Dependencies
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-# Optional: pthreads for threading
+#Optional : pthreads for threading
 threads_dep = []
 if threads_option == 'enabled'
   _td = dependency('threads', required: false)
@@ -78,7 +78,7 @@ if threads_option == 'enabled'
   endif
 endif
 
-# Optional: zlib for IPC compression (future)
+#Optional : zlib for IPC compression(future)
 zlib_dep = []
 if ipc_option == 'enabled'
   _zd = dependency('zlib', required: false)
@@ -87,13 +87,13 @@ if ipc_option == 'enabled'
   endif
 endif
 
-# Phase 2A: nanoarrow for columnar backend (via git submodule)
+#Phase 2A : nanoarrow for columnar backend(via git submodule)
 nanoarrow_proj = subproject('nanoarrow', default_options: ['tests=disabled', 'apps=disabled', 'ipc=disabled', 'device=disabled', 'testing=disabled'])
 nanoarrow_dep = nanoarrow_proj.get_variable('nanoarrow_dep')
 
-# ============================================================================
-# Configuration
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Configuration
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 config_h = configuration_data()
 config_h.set_quoted('WIRELOG_VERSION', project_version)
@@ -102,7 +102,7 @@ config_h.set('WIRELOG_EMBEDDED', is_embedded)
 config_h.set('WIRELOG_IPC', ipc_option == 'enabled')
 config_h.set('WIRELOG_THREADS', threads_option == 'enabled')
 
-# Generate config header
+#Generate config header
 config_h_file = configure_file(
   input: 'config.h.in',
   output: 'wirelog-config.h',
@@ -110,32 +110,30 @@ config_h_file = configure_file(
   install_dir: wirelog_includedir / 'wirelog'
 )
 
-# ============================================================================
-# Include directories
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Include directories
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_inc = include_directories('.')
 wirelog_src_inc = include_directories('wirelog')
 
-# ============================================================================
-# Source files
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Source files
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-# Collect source files for each module
+#Collect source files for each module
 subdir('wirelog')
 
-# Combine all sources
+#Combine all sources
 wirelog_sources = []
 wirelog_sources += wirelog_parser_src
 wirelog_sources += wirelog_ir_src
 wirelog_sources += wirelog_optimizer_src
-wirelog_sources += wirelog_dd_src
-wirelog_sources += wirelog_ffi_src
 wirelog_sources += wirelog_arena_src
 wirelog_sources += wirelog_backend_src
 wirelog_sources += wirelog_io_src
 
-# Public headers
+#Public headers
 wirelog_public_headers = [
   'wirelog/wirelog.h',
   'wirelog/wirelog-types.h',
@@ -144,11 +142,11 @@ wirelog_public_headers = [
   'wirelog/wirelog-optimizer.h',
 ]
 
-# ============================================================================
-# Build targets
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Build targets
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-# Shared library
+#Shared library
 wirelog_lib = library(
   'wirelog',
   wirelog_sources,
@@ -159,7 +157,7 @@ wirelog_lib = library(
   version: project_version,
 )
 
-# Static library (optional)
+#Static library(optional)
 wirelog_static_lib = static_library(
   'wirelog_static',
   wirelog_sources,
@@ -169,13 +167,13 @@ wirelog_static_lib = static_library(
   install: false,  # Not installed by default
 )
 
-# Install public headers
+#Install public headers
 install_headers(
   wirelog_public_headers,
   subdir: 'wirelog'
 )
 
-# pkg-config file
+#pkg - config file
 pkg = import('pkgconfig')
 pkg.generate(
   wirelog_lib,
@@ -185,38 +183,38 @@ pkg.generate(
   filebase: project_name,
 )
 
-# ============================================================================
-# CLI Driver
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#CLI Driver
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-# Note: CLI driver is deferred to Phase 2A (columnar backend implementation)
+#Note : CLI driver is deferred to Phase 2A(columnar backend implementation)
 
-# ============================================================================
-# Benchmarks
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Benchmarks
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-# Note: Benchmarks are deferred to Phase 2A (columnar backend implementation)
+#Note : Benchmarks are deferred to Phase 2A(columnar backend implementation)
 
-# ============================================================================
-# Tests
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Tests
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 if tests_option
   subdir('tests')
 endif
 
-# ============================================================================
-# Documentation
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Documentation
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 if docs_option
-  # Documentation build (optional, not yet implemented)
+#Documentation build(optional, not yet implemented)
   message('Documentation: enabled (not yet implemented)')
 endif
 
-# ============================================================================
-# Summary
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Summary
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 message('')
 message('wirelog ' + project_version + ' Configuration:')

@@ -22,7 +22,6 @@
  * When implementation is complete, all tests should PASS.
  */
 
-#include "../wirelog/backend/dd/dd_ffi.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 

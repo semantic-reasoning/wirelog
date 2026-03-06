@@ -38,7 +38,6 @@
  *   5. Three components     -- each component gets correct minimal label
  */
 
-#include "../wirelog/backend/dd/dd_ffi.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 
