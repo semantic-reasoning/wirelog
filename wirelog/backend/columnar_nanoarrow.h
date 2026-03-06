@@ -43,6 +43,21 @@
 
 #include "../backend.h"
 
+/*
+ * NOTE: wl_col_session_t and COL_SESSION() are defined in columnar_nanoarrow.c
+ * because col_rel_t (a private implementation type) cannot be declared in this
+ * header. See columnar_nanoarrow.c for the full memory layout documentation.
+ *
+ * Summary of the embedding contract:
+ *   - wl_col_session_t embeds wl_session_t as its first field (base)
+ *   - (wl_col_session_t *)session is safe per C11 §6.7.2.1 ¶15
+ *   - session.c:38 sets (*out)->backend after col_session_create returns
+ *   - All col_session_* vtable functions cast via COL_SESSION() internally
+ *
+ * @see backend_dd.c:35-44 for the embedding pattern reference
+ * @see session.h:38-40 for canonical wl_session_t definition
+ */
+
 /**
  * wl_backend_columnar:
  *

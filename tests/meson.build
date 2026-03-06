@@ -147,6 +147,7 @@ test('sip', test_sip_exe)
 # ============================================================================
 
 columnar_backend_src = files(
+  '../wirelog/arena/arena.c',
   '../wirelog/backend/columnar_nanoarrow.c',
   '../wirelog/ffi/dd_marshal.c',
 )

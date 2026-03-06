@@ -10,6 +10,7 @@
 #include "memory.h"
 #include "../session.h"
 #include "../wirelog-internal.h"
+#include "arena/arena.h"
 
 #include "nanoarrow/nanoarrow.h"
 
@@ -247,6 +248,7 @@ typedef struct {
     uint32_t rel_cap;          /* allocated capacity of rels[]           */
     wl_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
     void *delta_data;          /* opaque user context for delta_cb       */
+    wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
     /* TODO(Phase 2B): add delta relation tracking (ΔR fields) here */
 } wl_col_session_t;
 
@@ -1486,6 +1488,14 @@ col_session_create(const wl_ffi_plan_t *plan, uint32_t num_workers,
         return ENOMEM;
     }
 
+    /* Allocate per-iteration arena (256MB for temporary evaluation data) */
+    sess->eval_arena = wl_arena_create(256 * 1024 * 1024);
+    if (!sess->eval_arena) {
+        free(sess->rels);
+        free(sess);
+        return ENOMEM;
+    }
+
     /* Pre-register EDB relations (ncols determined at first insert) */
     for (uint32_t i = 0; i < plan->edb_count; i++) {
         col_rel_t *r = NULL;
@@ -1533,6 +1543,8 @@ col_session_destroy(wl_session_t *session)
         free(sess->rels[i]);
     }
     free(sess->rels);
+    if (sess->eval_arena)
+        wl_arena_free(sess->eval_arena);
     free(sess);
 }
 
@@ -1625,6 +1637,7 @@ col_session_step(wl_session_t *session)
     /* Execute one epoch of evaluation: all strata in order.
      * Each stratum evaluation computes all its IDB relations via fixed-point.
      * Previous stratum's IDB becomes current stratum's EDB (natural layering).
+     * Arena is reset after each stratum to reclaim temporary evaluation data.
      */
     wl_col_session_t *sess = COL_SESSION(session);
     const wl_ffi_plan_t *plan = sess->plan;
@@ -1633,6 +1646,9 @@ col_session_step(wl_session_t *session)
         int rc = col_eval_stratum(&plan->strata[si], sess);
         if (rc != 0)
             return rc;
+        /* Reset arena after stratum evaluation to free temporaries */
+        if (sess->eval_arena)
+            wl_arena_reset(sess->eval_arena);
     }
     return 0;
 }

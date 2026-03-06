@@ -1,12 +1,12 @@
 /*
- * backend/memory.c - wirelog Columnar Backend Arena Allocator
+ * arena/arena.c - wirelog Columnar Backend Arena Allocator
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
  * For commercial licenses, contact: inquiry@cleverplant.com
  */
 
-#include "memory.h"
+#include "arena.h"
 
 #include <stdlib.h>
 #include <string.h>

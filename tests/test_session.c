@@ -11,6 +11,7 @@
  */
 
 #include "../wirelog/backend.h"
+#include "../wirelog/backend/columnar_nanoarrow.h"
 #include "../wirelog/ffi/dd_ffi.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog-parser.h"
@@ -199,10 +200,8 @@ ffi_plan_from_source(const char *src, wl_ffi_dd_plan_t **dd_plan_out)
  * Test: create a session and destroy it without crash.
  */
 static void
-test_session_create_destroy(void)
+test_session_create_destroy_impl(const wl_compute_backend_t *backend)
 {
-    TEST("session: create and destroy");
-
     wl_ffi_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32)\n"
                                               ".decl r(x: int32)\n"
@@ -214,7 +213,7 @@ test_session_create_destroy(void)
     }
 
     wl_session_t *session = NULL;
-    int rc = wl_session_create(wl_backend_dd(), ffi, 1, &session);
+    int rc = wl_session_create(backend, ffi, 1, &session);
     if (rc != 0 || !session) {
         wl_ffi_plan_free(ffi);
         wl_ffi_dd_plan_free(dd_plan);
@@ -226,6 +225,20 @@ test_session_create_destroy(void)
     wl_ffi_plan_free(ffi);
     wl_ffi_dd_plan_free(dd_plan);
     PASS();
+}
+
+static void
+test_session_create_destroy(void)
+{
+    TEST("session: create and destroy");
+    test_session_create_destroy_impl(wl_backend_dd());
+}
+
+static void
+test_session_create_destroy_columnar(void)
+{
+    TEST("session(columnar): create and destroy");
+    test_session_create_destroy_impl(wl_backend_columnar());
 }
 
 /*
@@ -1023,6 +1036,7 @@ main(void)
     printf("test_session: persistent DD session delta tests\n");
 
     test_session_create_destroy();
+    test_session_create_destroy_columnar();
     test_session_create_multi_worker_rejected();
     test_session_step_initial_delta();
     test_session_step_incremental_delta();
