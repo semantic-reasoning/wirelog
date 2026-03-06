@@ -227,7 +227,7 @@ wl_ffi_expr_serialize(const struct wl_ir_expr *expr, wl_plan_expr_buffer_t *out)
  * Returns 0 on success, -1 on memory error, -3 on expr error.
  */
 static int
-marshal_op(const wl_ffi_dd_op_t *src, wl_ffi_op_t *dst)
+marshal_op(const wl_dd_op_t *src, wl_ffi_op_t *dst)
 {
     memset(dst, 0, sizeof(*dst));
 
@@ -538,7 +538,7 @@ ffi_op_free_fields(wl_ffi_op_t *op)
 /* ======================================================================== */
 
 int
-wl_dd_marshal_plan(const wl_ffi_dd_plan_t *plan, wl_ffi_plan_t **out)
+wl_dd_marshal_plan(const wl_dd_plan_t *plan, wl_ffi_plan_t **out)
 {
     if (!plan || !out)
         return -2;
@@ -580,7 +580,7 @@ wl_dd_marshal_plan(const wl_ffi_dd_plan_t *plan, wl_ffi_plan_t **out)
         ffi->stratum_count = plan->stratum_count;
 
         for (uint32_t s = 0; s < plan->stratum_count; s++) {
-            const wl_ffi_dd_stratum_plan_t *src_s = &plan->strata[s];
+            const wl_dd_stratum_plan_t *src_s = &plan->strata[s];
             wl_plan_stratum_t *dst_s = &strata[s];
 
             dst_s->stratum_id = src_s->stratum_id;
@@ -597,8 +597,7 @@ wl_dd_marshal_plan(const wl_ffi_dd_plan_t *plan, wl_ffi_plan_t **out)
                 dst_s->relation_count = src_s->relation_count;
 
                 for (uint32_t r = 0; r < src_s->relation_count; r++) {
-                    const wl_ffi_dd_relation_plan_t *src_r
-                        = &src_s->relations[r];
+                    const wl_dd_relation_plan_t *src_r = &src_s->relations[r];
                     wl_plan_relation_t *dst_r = &rels[r];
 
                     /* Deep copy relation name */

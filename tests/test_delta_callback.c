@@ -31,24 +31,36 @@ static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-#define TEST(name) do { tests_run++; printf("  [%d] %s", tests_run, name); } while (0)
-#define PASS() do { tests_passed++; printf(" ... PASS\n"); } while (0)
-#define FAIL(msg) do { tests_failed++; printf(" ... FAIL: %s\n", (msg)); } while (0)
+#define TEST(name)                            \
+    do {                                      \
+        tests_run++;                          \
+        printf("  [%d] %s", tests_run, name); \
+    } while (0)
+#define PASS()                 \
+    do {                       \
+        tests_passed++;        \
+        printf(" ... PASS\n"); \
+    } while (0)
+#define FAIL(msg)                         \
+    do {                                  \
+        tests_failed++;                   \
+        printf(" ... FAIL: %s\n", (msg)); \
+    } while (0)
 
 /* ======================================================================== */
 /* Plan Helper                                                             */
 /* ======================================================================== */
 
 static wl_ffi_plan_t *
-ffi_plan_from_source(const char *src, wl_ffi_dd_plan_t **dd_plan_out)
+ffi_plan_from_source(const char *src, wl_dd_plan_t **dd_plan_out)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
     if (!prog)
         return NULL;
 
-    wl_ffi_dd_plan_t *dd_plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &dd_plan);
+    wl_dd_plan_t *dd_plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &dd_plan);
     wirelog_program_free(prog);
     if (rc != 0)
         return NULL;
@@ -56,7 +68,7 @@ ffi_plan_from_source(const char *src, wl_ffi_dd_plan_t **dd_plan_out)
     wl_ffi_plan_t *ffi = NULL;
     rc = wl_dd_marshal_plan(dd_plan, &ffi);
     if (rc != 0) {
-        wl_ffi_dd_plan_free(dd_plan);
+        wl_dd_plan_free(dd_plan);
         return NULL;
     }
 
@@ -121,7 +133,7 @@ test_delta_callback_invoked(void)
     TEST("Delta callback invoked on step()");
 
     /* Program: r(x) :- a(x).  EDB: a={42}  Expected delta: r(42) diff=+1 */
-    wl_ffi_dd_plan_t *dd_plan = NULL;
+    wl_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32)\n"
                                               ".decl r(x: int32)\n"
                                               "r(x) :- a(x).\n",
@@ -135,7 +147,7 @@ test_delta_callback_invoked(void)
     int rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
     if (rc != 0 || !session) {
         wl_ffi_plan_free(ffi);
-        wl_ffi_dd_plan_free(dd_plan);
+        wl_dd_plan_free(dd_plan);
         FAIL("session_create failed");
         return 1;
     }
@@ -150,7 +162,7 @@ test_delta_callback_invoked(void)
 
     wl_session_destroy(session);
     wl_ffi_plan_free(ffi);
-    wl_ffi_dd_plan_free(dd_plan);
+    wl_dd_plan_free(dd_plan);
 
     if (rc != 0) {
         FAIL("session_step returned non-zero");
@@ -163,10 +175,8 @@ test_delta_callback_invoked(void)
     /* Find r(42) diff=+1 */
     bool found = false;
     for (int i = 0; i < deltas.count; i++) {
-        if (strcmp(deltas.relations[i], "r") == 0 &&
-            deltas.ncols[i] == 1 &&
-            deltas.rows[i][0] == 42 &&
-            deltas.diffs[i] == 1) {
+        if (strcmp(deltas.relations[i], "r") == 0 && deltas.ncols[i] == 1
+            && deltas.rows[i][0] == 42 && deltas.diffs[i] == 1) {
             found = true;
             break;
         }
@@ -199,7 +209,7 @@ test_delta_set_difference(void)
      * Step 1: insert a(1) → delta fires r(1) diff=+1
      * Step 2: insert a(2) → delta fires r(2) diff=+1, NOT r(1) again
      */
-    wl_ffi_dd_plan_t *dd_plan = NULL;
+    wl_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32)\n"
                                               ".decl r(x: int32)\n"
                                               "r(x) :- a(x).\n",
@@ -213,7 +223,7 @@ test_delta_set_difference(void)
     int rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
     if (rc != 0 || !session) {
         wl_ffi_plan_free(ffi);
-        wl_ffi_dd_plan_free(dd_plan);
+        wl_dd_plan_free(dd_plan);
         FAIL("session_create failed");
         return 1;
     }
@@ -235,7 +245,7 @@ test_delta_set_difference(void)
 
     wl_session_destroy(session);
     wl_ffi_plan_free(ffi);
-    wl_ffi_dd_plan_free(dd_plan);
+    wl_dd_plan_free(dd_plan);
 
     if (rc != 0) {
         FAIL("session_step returned non-zero");
@@ -245,9 +255,8 @@ test_delta_set_difference(void)
     /* Step 1 must have fired r(1) */
     bool found_r1_step1 = false;
     for (int i = 0; i < count_after_step1; i++) {
-        if (strcmp(deltas.relations[i], "r") == 0 &&
-            deltas.ncols[i] == 1 && deltas.rows[i][0] == 1 &&
-            deltas.diffs[i] == 1) {
+        if (strcmp(deltas.relations[i], "r") == 0 && deltas.ncols[i] == 1
+            && deltas.rows[i][0] == 1 && deltas.diffs[i] == 1) {
             found_r1_step1 = true;
             break;
         }
@@ -300,7 +309,7 @@ test_delta_multi_step(void)
      * Step 1 → deltas: r(1), r(2)
      * Step 2 (no new EDB) → no new deltas (convergence)
      */
-    wl_ffi_dd_plan_t *dd_plan = NULL;
+    wl_dd_plan_t *dd_plan = NULL;
     wl_ffi_plan_t *ffi = ffi_plan_from_source(".decl a(x: int32)\n"
                                               ".decl r(x: int32)\n"
                                               "r(x) :- a(x).\n",
@@ -314,7 +323,7 @@ test_delta_multi_step(void)
     int rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
     if (rc != 0 || !session) {
         wl_ffi_plan_free(ffi);
-        wl_ffi_dd_plan_free(dd_plan);
+        wl_dd_plan_free(dd_plan);
         FAIL("session_create failed");
         return 1;
     }
@@ -336,7 +345,7 @@ test_delta_multi_step(void)
 
     wl_session_destroy(session);
     wl_ffi_plan_free(ffi);
-    wl_ffi_dd_plan_free(dd_plan);
+    wl_dd_plan_free(dd_plan);
 
     if (rc != 0) {
         FAIL("session_step returned non-zero");
@@ -348,8 +357,7 @@ test_delta_multi_step(void)
     }
     if (count_step2 != count_step1) {
         char msg[64];
-        snprintf(msg, sizeof(msg),
-                 "step 2 fired %d extra deltas (expected 0)",
+        snprintf(msg, sizeof(msg), "step 2 fired %d extra deltas (expected 0)",
                  count_step2 - count_step1);
         FAIL(msg);
         return 1;

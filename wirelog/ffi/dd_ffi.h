@@ -15,7 +15,7 @@
  * Overview
  * ========================================================================
  *
- * The wirelog pipeline produces DD execution plans (wl_ffi_dd_plan_t) on
+ * The wirelog pipeline produces DD execution plans (wl_dd_plan_t) on
  * the C side.  These plans must cross into Rust where Differential
  * Dataflow executes them.  The internal plan types (dd_plan.h) contain
  * owned pointer trees (wl_ir_expr*), string arrays, and other shapes
@@ -25,10 +25,10 @@
  *
  *   Internal (dd_plan.h)         FFI (dd_ffi.h)
  *   -------------------------    ---------------------------
- *   wl_ffi_dd_op_t                   wl_ffi_op_t
- *   wl_ffi_dd_relation_plan_t        wl_plan_relation_t
- *   wl_ffi_dd_stratum_plan_t         wl_plan_stratum_t
- *   wl_ffi_dd_plan_t                 wl_ffi_plan_t
+ *   wl_dd_op_t                   wl_ffi_op_t
+ *   wl_dd_relation_plan_t        wl_plan_relation_t
+ *   wl_dd_stratum_plan_t         wl_plan_stratum_t
+ *   wl_dd_plan_t                 wl_ffi_plan_t
  *   wl_ir_expr (tree)            wl_plan_expr_buffer_t (flat)
  *
  * A marshalling step (wl_dd_marshal_plan) converts the internal plan
@@ -125,8 +125,8 @@
  * Usage (internal)
  * ========================================================================
  *
- *   wl_ffi_dd_plan_t *plan = NULL;
- *   int rc = wl_ffi_dd_plan_generate(program, &plan);
+ *   wl_dd_plan_t *plan = NULL;
+ *   int rc = wl_dd_plan_generate(program, &plan);
  *   if (rc != 0) { handle error }
  *
  *   wl_ffi_plan_t *ffi_plan = NULL;
@@ -138,7 +138,7 @@
  *
  *   wl_dd_worker_destroy(worker);
  *   wl_ffi_plan_free(ffi_plan);
- *   wl_ffi_dd_plan_free(plan);
+ *   wl_dd_plan_free(plan);
  */
 
 #ifndef WIRELOG_DD_FFI_H
@@ -158,9 +158,9 @@
 #include <stdint.h>
 
 /*
- * dd_plan.h provides wl_ffi_dd_plan_t (the internal DD plan type).
+ * dd_plan.h provides wl_dd_plan_t (the internal DD plan type).
  * Both headers are internal (not installed), so this include is safe.
- * The marshalling functions below convert wl_ffi_dd_plan_t -> wl_ffi_plan_t.
+ * The marshalling functions below convert wl_dd_plan_t -> wl_ffi_plan_t.
  */
 #include "dd_plan.h"
 
@@ -324,7 +324,7 @@ wl_dd_execute_cb(const wl_ffi_plan_t *plan, wl_dd_worker_t *worker,
  * On error, *out is unchanged (remains NULL if initialized to NULL).
  */
 int
-wl_dd_marshal_plan(const wl_ffi_dd_plan_t *plan, wl_ffi_plan_t **out);
+wl_dd_marshal_plan(const wl_dd_plan_t *plan, wl_ffi_plan_t **out);
 
 /**
  * wl_ffi_plan_free:

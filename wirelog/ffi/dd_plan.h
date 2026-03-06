@@ -35,7 +35,7 @@
  *
  * Stratum-aware generation:
  *   - EDB relations are collected as input collections
- *   - Each stratum produces a wl_ffi_dd_stratum_plan_t
+ *   - Each stratum produces a wl_dd_stratum_plan_t
  *   - Recursive strata (SCC size > 1 or self-loop) are marked
  *     is_recursive = true, indicating DD should wrap in iterate()
  *   - Strata are ordered: stratum 0 executes first
@@ -45,11 +45,11 @@
  * ========================================================================
  *
  * All pointer fields in DD ops are OWNED (deep copies of IR data).
- * The caller owns the plan returned by wl_ffi_dd_plan_generate() and must
- * free it with wl_ffi_dd_plan_free().  No pointers alias the input program.
+ * The caller owns the plan returned by wl_dd_plan_generate() and must
+ * free it with wl_dd_plan_free().  No pointers alias the input program.
  *
  * Ownership chain:
- *   wl_ffi_dd_plan_t
+ *   wl_dd_plan_t
  *     -> edb_relations[]     (owned array of owned strings)
  *     -> strata[]            (owned array)
  *       -> relations[]       (owned array)
@@ -67,7 +67,7 @@
  * Error Handling
  * ========================================================================
  *
- * wl_ffi_dd_plan_generate() returns:
+ * wl_dd_plan_generate() returns:
  *    0  success, *out is set
  *   -1  memory allocation failure (partial state cleaned up)
  *   -2  invalid input (NULL program, not stratified)
@@ -78,12 +78,12 @@
  * Usage (internal)
  * ========================================================================
  *
- *   wl_ffi_dd_plan_t *plan = NULL;
- *   int rc = wl_ffi_dd_plan_generate(program, &plan);
+ *   wl_dd_plan_t *plan = NULL;
+ *   int rc = wl_dd_plan_generate(program, &plan);
  *   if (rc == 0) {
- *       wl_ffi_dd_plan_print(plan);  // debug
+ *       wl_dd_plan_print(plan);  // debug
  *       // ... pass to FFI layer ...
- *       wl_ffi_dd_plan_free(plan);
+ *       wl_dd_plan_free(plan);
  *   }
  */
 
@@ -104,7 +104,7 @@ struct wl_ir_expr;
 /* ======================================================================== */
 
 /**
- * wl_ffi_dd_op_type_t:
+ * wl_dd_op_type_t:
  *
  * Operator types in the DD execution plan.
  *
@@ -128,18 +128,18 @@ typedef enum {
     WL_FFI_DD_CONCAT,
     WL_FFI_DD_CONSOLIDATE,
     WL_FFI_DD_SEMIJOIN,
-} wl_ffi_dd_op_type_t;
+} wl_dd_op_type_t;
 
 /* ======================================================================== */
 /* DD Operator Node                                                         */
 /* ======================================================================== */
 
 /**
- * wl_ffi_dd_op_t:
+ * wl_dd_op_t:
  *
  * Single operator in a DD execution plan.
  * Fields are used depending on the op type; unused fields are zero/NULL.
- * All pointer fields are OWNED (deep copies); freed by wl_ffi_dd_plan_free().
+ * All pointer fields are OWNED (deep copies); freed by wl_dd_plan_free().
  *
  * Field usage by operator type:
  *
@@ -173,7 +173,7 @@ typedef enum {
  * @group_by_count:  REDUCE: number of grouping columns.
  */
 typedef struct {
-    wl_ffi_dd_op_type_t op;
+    wl_dd_op_type_t op;
 
     char *relation_name;
     char *right_relation;
@@ -191,14 +191,14 @@ typedef struct {
     wirelog_agg_fn_t agg_fn;
     uint32_t *group_by_indices;
     uint32_t group_by_count;
-} wl_ffi_dd_op_t;
+} wl_dd_op_t;
 
 /* ======================================================================== */
 /* Per-Relation Plan                                                        */
 /* ======================================================================== */
 
 /**
- * wl_ffi_dd_relation_plan_t:
+ * wl_dd_relation_plan_t:
  *
  * Operator sequence for a single IDB relation within a stratum.
  *
@@ -209,17 +209,17 @@ typedef struct {
  */
 typedef struct {
     char *name;
-    wl_ffi_dd_op_t *ops;
+    wl_dd_op_t *ops;
     uint32_t op_count;
     uint32_t op_capacity;
-} wl_ffi_dd_relation_plan_t;
+} wl_dd_relation_plan_t;
 
 /* ======================================================================== */
 /* Stratum Plan                                                             */
 /* ======================================================================== */
 
 /**
- * wl_ffi_dd_stratum_plan_t:
+ * wl_dd_stratum_plan_t:
  *
  * Execution plan for a single stratum.
  *
@@ -232,16 +232,16 @@ typedef struct {
 typedef struct {
     uint32_t stratum_id;
     bool is_recursive;
-    wl_ffi_dd_relation_plan_t *relations;
+    wl_dd_relation_plan_t *relations;
     uint32_t relation_count;
-} wl_ffi_dd_stratum_plan_t;
+} wl_dd_stratum_plan_t;
 
 /* ======================================================================== */
 /* Full DD Plan                                                             */
 /* ======================================================================== */
 
 /**
- * wl_ffi_dd_plan_t:
+ * wl_dd_plan_t:
  *
  * Complete DD execution plan for a stratified program.
  *
@@ -251,18 +251,18 @@ typedef struct {
  * @edb_count:     Number of EDB relations.
  */
 typedef struct {
-    wl_ffi_dd_stratum_plan_t *strata;
+    wl_dd_stratum_plan_t *strata;
     uint32_t stratum_count;
     char **edb_relations;
     uint32_t edb_count;
-} wl_ffi_dd_plan_t;
+} wl_dd_plan_t;
 
 /* ======================================================================== */
 /* Internal API                                                             */
 /* ======================================================================== */
 
 /**
- * wl_ffi_dd_plan_generate:
+ * wl_dd_plan_generate:
  * @prog: Stratified program (must have is_stratified = true)
  * @out:  (out): On success, receives the generated plan.
  *
@@ -275,34 +275,33 @@ typedef struct {
  *   -2: Invalid program (NULL, not stratified, etc.).
  */
 int
-wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
-                        wl_ffi_dd_plan_t **out);
+wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out);
 
 /**
- * wl_ffi_dd_plan_free:
+ * wl_dd_plan_free:
  * @plan: (transfer full): Plan to free (NULL-safe).
  *
  * Free a DD plan and all owned memory.
  */
 void
-wl_ffi_dd_plan_free(wl_ffi_dd_plan_t *plan);
+wl_dd_plan_free(wl_dd_plan_t *plan);
 
 /**
- * wl_ffi_dd_op_type_str:
+ * wl_dd_op_type_str:
  * @type: DD operator type.
  *
  * Returns: Static string name for the operator type.
  */
 const char *
-wl_ffi_dd_op_type_str(wl_ffi_dd_op_type_t type);
+wl_dd_op_type_str(wl_dd_op_type_t type);
 
 /**
- * wl_ffi_dd_plan_print:
+ * wl_dd_plan_print:
  * @plan: Plan to print (NULL-safe).
  *
  * Print a DD plan to stdout for debugging.
  */
 void
-wl_ffi_dd_plan_print(const wl_ffi_dd_plan_t *plan);
+wl_dd_plan_print(const wl_dd_plan_t *plan);
 
 #endif /* WIRELOG_FFI_DD_PLAN_H */

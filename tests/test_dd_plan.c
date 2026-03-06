@@ -50,23 +50,23 @@ test_plan_types_exist(void)
 {
     TEST("DD plan types: structs have non-zero size");
 
-    if (sizeof(wl_ffi_dd_op_t) == 0) {
-        FAIL("wl_ffi_dd_op_t has zero size");
+    if (sizeof(wl_dd_op_t) == 0) {
+        FAIL("wl_dd_op_t has zero size");
         return;
     }
 
-    if (sizeof(wl_ffi_dd_relation_plan_t) == 0) {
-        FAIL("wl_ffi_dd_relation_plan_t has zero size");
+    if (sizeof(wl_dd_relation_plan_t) == 0) {
+        FAIL("wl_dd_relation_plan_t has zero size");
         return;
     }
 
-    if (sizeof(wl_ffi_dd_stratum_plan_t) == 0) {
-        FAIL("wl_ffi_dd_stratum_plan_t has zero size");
+    if (sizeof(wl_dd_stratum_plan_t) == 0) {
+        FAIL("wl_dd_stratum_plan_t has zero size");
         return;
     }
 
-    if (sizeof(wl_ffi_dd_plan_t) == 0) {
-        FAIL("wl_ffi_dd_plan_t has zero size");
+    if (sizeof(wl_dd_plan_t) == 0) {
+        FAIL("wl_dd_plan_t has zero size");
         return;
     }
 
@@ -78,8 +78,8 @@ test_plan_null_program(void)
 {
     TEST("DD plan generate: NULL program returns -2");
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(NULL, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(NULL, &plan);
 
     if (rc != -2) {
         char buf[100];
@@ -89,7 +89,7 @@ test_plan_null_program(void)
     }
 
     if (plan != NULL) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("plan should be NULL on error");
         return;
     }
@@ -102,7 +102,7 @@ test_plan_free_null(void)
 {
     TEST("DD plan free: NULL does not crash");
 
-    wl_ffi_dd_plan_free(NULL);
+    wl_dd_plan_free(NULL);
 
     PASS();
 }
@@ -112,18 +112,17 @@ test_op_type_str(void)
 {
     TEST("DD op type str: all types have names");
 
-    if (strcmp(wl_ffi_dd_op_type_str(WL_FFI_DD_VARIABLE), "VARIABLE") != 0) {
+    if (strcmp(wl_dd_op_type_str(WL_FFI_DD_VARIABLE), "VARIABLE") != 0) {
         FAIL("VARIABLE name wrong");
         return;
     }
 
-    if (strcmp(wl_ffi_dd_op_type_str(WL_FFI_DD_JOIN), "JOIN") != 0) {
+    if (strcmp(wl_dd_op_type_str(WL_FFI_DD_JOIN), "JOIN") != 0) {
         FAIL("JOIN name wrong");
         return;
     }
 
-    if (strcmp(wl_ffi_dd_op_type_str(WL_FFI_DD_CONSOLIDATE), "CONSOLIDATE")
-        != 0) {
+    if (strcmp(wl_dd_op_type_str(WL_FFI_DD_CONSOLIDATE), "CONSOLIDATE") != 0) {
         FAIL("CONSOLIDATE name wrong");
         return;
     }
@@ -148,8 +147,8 @@ test_plan_edb_only(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0) {
         char buf[100];
@@ -168,20 +167,20 @@ test_plan_edb_only(void)
     if (plan->edb_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 EDB, got %u", plan->edb_count);
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
     }
 
     if (strcmp(plan->edb_relations[0], "a") != 0) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("EDB relation should be 'a'");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -202,8 +201,8 @@ test_plan_simple_scan(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -213,7 +212,7 @@ test_plan_simple_scan(void)
 
     /* Should have 1 stratum with relation "r" */
     if (plan->stratum_count < 1) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected >= 1 stratum");
         return;
@@ -223,7 +222,7 @@ test_plan_simple_scan(void)
     bool found_var = false;
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
-            wl_ffi_dd_relation_plan_t *rp = &plan->strata[s].relations[r];
+            wl_dd_relation_plan_t *rp = &plan->strata[s].relations[r];
             if (strcmp(rp->name, "r") == 0) {
                 /* First op should be VARIABLE("a") */
                 if (rp->op_count >= 1 && rp->ops[0].op == WL_FFI_DD_VARIABLE
@@ -236,13 +235,13 @@ test_plan_simple_scan(void)
     }
 
     if (!found_var) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected VARIABLE(a) op for relation r");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -265,8 +264,8 @@ test_plan_edb_list(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -278,13 +277,13 @@ test_plan_edb_list(void)
     if (plan->edb_count != 3) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 3 EDB, got %u", plan->edb_count);
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -307,8 +306,8 @@ test_plan_stratum_count(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -320,13 +319,13 @@ test_plan_stratum_count(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 strata, got %u",
                  plan->stratum_count);
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -335,8 +334,8 @@ test_plan_stratum_count(void)
 /* Helper: find relation plan by name                                       */
 /* ======================================================================== */
 
-static wl_ffi_dd_relation_plan_t *
-find_relation_plan(const wl_ffi_dd_plan_t *plan, const char *name)
+static wl_dd_relation_plan_t *
+find_relation_plan(const wl_dd_plan_t *plan, const char *name)
 {
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
@@ -367,8 +366,8 @@ test_plan_filter(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -376,9 +375,9 @@ test_plan_filter(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -392,7 +391,7 @@ test_plan_filter(void)
             if (rp->ops[i].filter_expr != NULL)
                 found_filter = true;
             else {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("FILTER op has NULL filter_expr");
                 return;
@@ -401,13 +400,13 @@ test_plan_filter(void)
     }
 
     if (!found_filter) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected FILTER op for r(x) :- a(x), x > 5.");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -429,8 +428,8 @@ test_plan_project(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -438,9 +437,9 @@ test_plan_project(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -453,7 +452,7 @@ test_plan_project(void)
             if (rp->ops[i].project_count > 0)
                 found_map = true;
             else {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("MAP op has project_count == 0");
                 return;
@@ -462,13 +461,13 @@ test_plan_project(void)
     }
 
     if (!found_map) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected MAP op for r(x) :- a(x, y).");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -490,8 +489,8 @@ test_plan_filter_project(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -499,9 +498,9 @@ test_plan_filter_project(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -512,34 +511,34 @@ test_plan_filter_project(void)
     if (rp->op_count < 3) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected >= 3 ops, got %u", rp->op_count);
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
     }
 
     if (rp->ops[0].op != WL_FFI_DD_VARIABLE) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("op[0] should be VARIABLE");
         return;
     }
 
     if (rp->ops[1].op != WL_FFI_DD_FILTER || rp->ops[1].filter_expr == NULL) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("op[1] should be FILTER with non-NULL filter_expr");
         return;
     }
 
     if (rp->ops[2].op != WL_FFI_DD_MAP || rp->ops[2].project_count == 0) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("op[2] should be MAP with project_count > 0");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -566,8 +565,8 @@ test_plan_join(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -575,9 +574,9 @@ test_plan_join(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -589,19 +588,19 @@ test_plan_join(void)
     for (uint32_t i = 0; i < rp->op_count; i++) {
         if (rp->ops[i].op == WL_FFI_DD_JOIN) {
             if (rp->ops[i].key_count < 1) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("JOIN op has key_count == 0");
                 return;
             }
             if (!rp->ops[i].right_relation) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("JOIN op has NULL right_relation");
                 return;
             }
             if (strcmp(rp->ops[i].right_relation, "b") != 0) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("JOIN right_relation should be 'b'");
                 return;
@@ -611,13 +610,13 @@ test_plan_join(void)
     }
 
     if (!found_join) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected JOIN op");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -640,8 +639,8 @@ test_plan_join_keys(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -649,9 +648,9 @@ test_plan_join_keys(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -662,32 +661,32 @@ test_plan_join_keys(void)
         if (rp->ops[i].op == WL_FFI_DD_JOIN) {
             if (rp->ops[i].key_count != 1 || !rp->ops[i].left_keys
                 || !rp->ops[i].right_keys) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("JOIN should have 1 key pair with non-NULL arrays");
                 return;
             }
             if (strcmp(rp->ops[i].left_keys[0], "y") != 0) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("JOIN left_keys[0] should be 'y'");
                 return;
             }
             if (strcmp(rp->ops[i].right_keys[0], "y") != 0) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("JOIN right_keys[0] should be 'y'");
                 return;
             }
 
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
             wirelog_program_free(prog);
             PASS();
             return;
         }
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     FAIL("JOIN op not found");
 }
@@ -714,8 +713,8 @@ test_plan_union(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -723,9 +722,9 @@ test_plan_union(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -743,20 +742,20 @@ test_plan_union(void)
     }
 
     if (!found_concat) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected CONCAT op for union");
         return;
     }
 
     if (!found_consolidate) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected CONSOLIDATE op for union");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -778,8 +777,8 @@ test_plan_antijoin(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -787,9 +786,9 @@ test_plan_antijoin(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -800,13 +799,13 @@ test_plan_antijoin(void)
     for (uint32_t i = 0; i < rp->op_count; i++) {
         if (rp->ops[i].op == WL_FFI_DD_ANTIJOIN) {
             if (!rp->ops[i].right_relation) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("ANTIJOIN has NULL right_relation");
                 return;
             }
             if (strcmp(rp->ops[i].right_relation, "b") != 0) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("ANTIJOIN right_relation should be 'b'");
                 return;
@@ -816,13 +815,13 @@ test_plan_antijoin(void)
     }
 
     if (!found_antijoin) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected ANTIJOIN op");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -844,8 +843,8 @@ test_plan_aggregate(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -853,9 +852,9 @@ test_plan_aggregate(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "r");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'r' not found in plan");
         return;
@@ -866,13 +865,13 @@ test_plan_aggregate(void)
     for (uint32_t i = 0; i < rp->op_count; i++) {
         if (rp->ops[i].op == WL_FFI_DD_REDUCE) {
             if (rp->ops[i].group_by_count == 0) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("REDUCE has group_by_count == 0");
                 return;
             }
             if (!rp->ops[i].group_by_indices) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("REDUCE has NULL group_by_indices");
                 return;
@@ -882,13 +881,13 @@ test_plan_aggregate(void)
     }
 
     if (!found_reduce) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected REDUCE op");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -915,8 +914,8 @@ test_plan_recursive_stratum(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -937,13 +936,13 @@ test_plan_recursive_stratum(void)
     }
 
     if (!found_recursive) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("expected recursive stratum containing 'tc'");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -964,8 +963,8 @@ test_plan_non_recursive_stratum(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -976,14 +975,14 @@ test_plan_non_recursive_stratum(void)
     /* No stratum should be recursive */
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         if (plan->strata[s].is_recursive) {
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
             wirelog_program_free(prog);
             FAIL("no stratum should be recursive");
             return;
         }
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -1006,8 +1005,8 @@ test_plan_multi_stratum_ordering(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -1019,7 +1018,7 @@ test_plan_multi_stratum_ordering(void)
         char buf[100];
         snprintf(buf, sizeof(buf), "expected >= 2 strata, got %u",
                  plan->stratum_count);
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -1027,13 +1026,13 @@ test_plan_multi_stratum_ordering(void)
 
     /* Strata should be ordered: stratum_id[0] < stratum_id[1] */
     if (plan->strata[0].stratum_id >= plan->strata[1].stratum_id) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("strata should be ordered by stratum_id");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -1059,8 +1058,8 @@ test_plan_head_arith_simple(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -1068,9 +1067,9 @@ test_plan_head_arith_simple(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'b' not found in plan");
         return;
@@ -1094,13 +1093,13 @@ test_plan_head_arith_simple(void)
     }
 
     if (!found_map_with_exprs) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("MAP op should have project_exprs with ARITH for y+1");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -1122,8 +1121,8 @@ test_plan_head_arith_preserves_simple(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -1131,9 +1130,9 @@ test_plan_head_arith_preserves_simple(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'b' not found in plan");
         return;
@@ -1144,7 +1143,7 @@ test_plan_head_arith_preserves_simple(void)
     for (uint32_t i = 0; i < rp->op_count; i++) {
         if (rp->ops[i].op == WL_FFI_DD_MAP) {
             if (rp->ops[i].project_exprs != NULL) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("simple VAR-only MAP should not have project_exprs");
                 return;
@@ -1152,7 +1151,7 @@ test_plan_head_arith_preserves_simple(void)
         }
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     PASS();
 }
@@ -1174,8 +1173,8 @@ test_plan_head_arith_rewrite_vars(void)
         return;
     }
 
-    wl_ffi_dd_plan_t *plan = NULL;
-    int rc = wl_ffi_dd_plan_generate(prog, &plan);
+    wl_dd_plan_t *plan = NULL;
+    int rc = wl_dd_plan_generate(prog, &plan);
 
     if (rc != 0 || !plan) {
         wirelog_program_free(prog);
@@ -1183,9 +1182,9 @@ test_plan_head_arith_rewrite_vars(void)
         return;
     }
 
-    wl_ffi_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
+    wl_dd_relation_plan_t *rp = find_relation_plan(plan, "b");
     if (!rp) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         wirelog_program_free(prog);
         FAIL("relation 'b' not found in plan");
         return;
@@ -1200,7 +1199,7 @@ test_plan_head_arith_rewrite_vars(void)
             wl_ir_expr_t *arith = rp->ops[i].project_exprs[1];
             if (!arith || arith->type != WL_IR_EXPR_ARITH
                 || arith->child_count < 2) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("expected ARITH expr with 2 children");
                 return;
@@ -1210,7 +1209,7 @@ test_plan_head_arith_rewrite_vars(void)
             if (!var_child || var_child->type != WL_IR_EXPR_VAR
                 || !var_child->var_name
                 || strcmp(var_child->var_name, "col1") != 0) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("ARITH child[0] should be VAR 'col1'");
                 return;
@@ -1219,20 +1218,20 @@ test_plan_head_arith_rewrite_vars(void)
             wl_ir_expr_t *const_child = arith->children[1];
             if (!const_child || const_child->type != WL_IR_EXPR_CONST_INT
                 || const_child->int_value != 1) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 wirelog_program_free(prog);
                 FAIL("ARITH child[1] should be CONST_INT(1)");
                 return;
             }
 
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
             wirelog_program_free(prog);
             PASS();
             return;
         }
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     wirelog_program_free(prog);
     FAIL("MAP with project_exprs not found");
 }

@@ -27,13 +27,13 @@
  * Returns 0 on success, -1 on memory error.
  */
 static int
-relation_plan_add_op(wl_ffi_dd_relation_plan_t *rp, wl_ffi_dd_op_t op)
+relation_plan_add_op(wl_dd_relation_plan_t *rp, wl_dd_op_t op)
 {
     if (rp->op_count >= rp->op_capacity) {
         uint32_t new_cap
             = rp->op_capacity == 0 ? OP_INITIAL_CAPACITY : rp->op_capacity * 2;
-        wl_ffi_dd_op_t *tmp = (wl_ffi_dd_op_t *)realloc(
-            rp->ops, new_cap * sizeof(wl_ffi_dd_op_t));
+        wl_dd_op_t *tmp
+            = (wl_dd_op_t *)realloc(rp->ops, new_cap * sizeof(wl_dd_op_t));
         if (!tmp)
             return -1;
         rp->ops = tmp;
@@ -48,7 +48,7 @@ relation_plan_add_op(wl_ffi_dd_relation_plan_t *rp, wl_ffi_dd_op_t op)
  * Free all owned memory in a single DD op.
  */
 static void
-dd_op_free_fields(wl_ffi_dd_op_t *op)
+dd_op_free_fields(wl_dd_op_t *op)
 {
     free(op->relation_name);
     free(op->right_relation);
@@ -184,7 +184,7 @@ collect_chain_filters(const wirelog_ir_node_t *node)
  * Returns 0 on success, -1 on memory error.
  */
 static int
-translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
+translate_ir_node(const wirelog_ir_node_t *node, wl_dd_relation_plan_t *rp,
                   const struct wirelog_program *prog, ir_col_ctx_t *ctx)
 {
     if (!node)
@@ -207,7 +207,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
     }
 
     /* Translate the current node */
-    wl_ffi_dd_op_t op;
+    wl_dd_op_t op;
     memset(&op, 0, sizeof(op));
 
     switch (node->type) {
@@ -432,7 +432,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
         uint32_t map_count = node->group_by_count + (needs_value ? 1 : 0);
 
         if (map_count > 0) {
-            wl_ffi_dd_op_t map_op;
+            wl_dd_op_t map_op;
             memset(&map_op, 0, sizeof(map_op));
             map_op.op = WL_FFI_DD_MAP;
             map_op.project_count = map_count;
@@ -512,7 +512,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
 
         /* 1. FILTER */
         if (node->filter_expr) {
-            wl_ffi_dd_op_t filt_op;
+            wl_dd_op_t filt_op;
             memset(&filt_op, 0, sizeof(filt_op));
             filt_op.op = WL_FFI_DD_FILTER;
             filt_op.filter_expr = wl_ir_expr_clone(node->filter_expr);
@@ -638,14 +638,14 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
 
     case WIRELOG_IR_UNION: {
         /* UNION -> CONCAT + CONSOLIDATE (two ops) */
-        wl_ffi_dd_op_t concat_op;
+        wl_dd_op_t concat_op;
         memset(&concat_op, 0, sizeof(concat_op));
         concat_op.op = WL_FFI_DD_CONCAT;
         int rc = relation_plan_add_op(rp, concat_op);
         if (rc != 0)
             return rc;
 
-        wl_ffi_dd_op_t consol_op;
+        wl_dd_op_t consol_op;
         memset(&consol_op, 0, sizeof(consol_op));
         consol_op.op = WL_FFI_DD_CONSOLIDATE;
         return relation_plan_add_op(rp, consol_op);
@@ -663,8 +663,7 @@ translate_ir_node(const wirelog_ir_node_t *node, wl_ffi_dd_relation_plan_t *rp,
 /* ======================================================================== */
 
 int
-wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
-                        wl_ffi_dd_plan_t **out)
+wl_dd_plan_generate(const struct wirelog_program *prog, wl_dd_plan_t **out)
 {
     if (!prog || !out)
         return -2;
@@ -674,8 +673,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
 
     *out = NULL;
 
-    wl_ffi_dd_plan_t *plan
-        = (wl_ffi_dd_plan_t *)calloc(1, sizeof(wl_ffi_dd_plan_t));
+    wl_dd_plan_t *plan = (wl_dd_plan_t *)calloc(1, sizeof(wl_dd_plan_t));
     if (!plan)
         return -1;
 
@@ -691,7 +689,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
         if (edb_count > 0) {
             plan->edb_relations = (char **)calloc(edb_count, sizeof(char *));
             if (!plan->edb_relations) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 return -1;
             }
 
@@ -702,7 +700,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
                         = strdup_safe(prog->relations[r].name);
                     if (!plan->edb_relations[idx]) {
                         plan->edb_count = idx;
-                        wl_ffi_dd_plan_free(plan);
+                        wl_dd_plan_free(plan);
                         return -1;
                     }
                     idx++;
@@ -714,17 +712,17 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
 
     /* Step 2: Create stratum plans */
     if (prog->stratum_count > 0) {
-        plan->strata = (wl_ffi_dd_stratum_plan_t *)calloc(
-            prog->stratum_count, sizeof(wl_ffi_dd_stratum_plan_t));
+        plan->strata = (wl_dd_stratum_plan_t *)calloc(
+            prog->stratum_count, sizeof(wl_dd_stratum_plan_t));
         if (!plan->strata) {
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
             return -1;
         }
         plan->stratum_count = prog->stratum_count;
 
         for (uint32_t s = 0; s < prog->stratum_count; s++) {
             const wirelog_stratum_t *src = &prog->strata[s];
-            wl_ffi_dd_stratum_plan_t *sp = &plan->strata[s];
+            wl_dd_stratum_plan_t *sp = &plan->strata[s];
 
             sp->stratum_id = src->stratum_id;
             sp->is_recursive = src->is_recursive;
@@ -734,7 +732,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
             char **unique_names
                 = (char **)calloc(src->rule_count + 1, sizeof(char *));
             if (!unique_names && src->rule_count > 0) {
-                wl_ffi_dd_plan_free(plan);
+                wl_dd_plan_free(plan);
                 return -1;
             }
 
@@ -751,11 +749,11 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
             }
 
             if (unique_count > 0) {
-                sp->relations = (wl_ffi_dd_relation_plan_t *)calloc(
-                    unique_count, sizeof(wl_ffi_dd_relation_plan_t));
+                sp->relations = (wl_dd_relation_plan_t *)calloc(
+                    unique_count, sizeof(wl_dd_relation_plan_t));
                 if (!sp->relations) {
                     free(unique_names);
-                    wl_ffi_dd_plan_free(plan);
+                    wl_dd_plan_free(plan);
                     return -1;
                 }
                 sp->relation_count = unique_count;
@@ -774,7 +772,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
                                     prog, &ctx);
                                 if (rc != 0) {
                                     free(unique_names);
-                                    wl_ffi_dd_plan_free(plan);
+                                    wl_dd_plan_free(plan);
                                     return -1;
                                 }
                             }
@@ -795,9 +793,9 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
         if (!plan->strata[s].is_recursive)
             continue;
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
-            const wl_ffi_dd_relation_plan_t *rp = &plan->strata[s].relations[r];
+            const wl_dd_relation_plan_t *rp = &plan->strata[s].relations[r];
             for (uint32_t o = 0; o < rp->op_count; o++) {
-                const wl_ffi_dd_op_t *op = &rp->ops[o];
+                const wl_dd_op_t *op = &rp->ops[o];
                 if (op->op != WL_FFI_DD_REDUCE)
                     continue;
                 if (op->agg_fn == WIRELOG_AGG_COUNT) {
@@ -805,7 +803,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
                             "wirelog: COUNT aggregation not supported in "
                             "recursive stratum '%s'\n",
                             rp->name ? rp->name : "?");
-                    wl_ffi_dd_plan_free(plan);
+                    wl_dd_plan_free(plan);
                     return -1;
                 }
                 if (op->agg_fn == WIRELOG_AGG_SUM) {
@@ -813,7 +811,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
                             "wirelog: SUM aggregation not supported in "
                             "recursive stratum '%s'\n",
                             rp->name ? rp->name : "?");
-                    wl_ffi_dd_plan_free(plan);
+                    wl_dd_plan_free(plan);
                     return -1;
                 }
             }
@@ -829,7 +827,7 @@ wl_ffi_dd_plan_generate(const struct wirelog_program *prog,
 /* ======================================================================== */
 
 static void
-relation_plan_free(wl_ffi_dd_relation_plan_t *rp)
+relation_plan_free(wl_dd_relation_plan_t *rp)
 {
     if (!rp)
         return;
@@ -842,13 +840,13 @@ relation_plan_free(wl_ffi_dd_relation_plan_t *rp)
 }
 
 void
-wl_ffi_dd_plan_free(wl_ffi_dd_plan_t *plan)
+wl_dd_plan_free(wl_dd_plan_t *plan)
 {
     if (!plan)
         return;
 
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
-        wl_ffi_dd_stratum_plan_t *sp = &plan->strata[s];
+        wl_dd_stratum_plan_t *sp = &plan->strata[s];
         for (uint32_t r = 0; r < sp->relation_count; r++)
             relation_plan_free(&sp->relations[r]);
         free(sp->relations);
@@ -867,7 +865,7 @@ wl_ffi_dd_plan_free(wl_ffi_dd_plan_t *plan)
 /* ======================================================================== */
 
 const char *
-wl_ffi_dd_op_type_str(wl_ffi_dd_op_type_t type)
+wl_dd_op_type_str(wl_dd_op_type_t type)
 {
     switch (type) {
     case WL_FFI_DD_VARIABLE:
@@ -893,7 +891,7 @@ wl_ffi_dd_op_type_str(wl_ffi_dd_op_type_t type)
 }
 
 void
-wl_ffi_dd_plan_print(const wl_ffi_dd_plan_t *plan)
+wl_dd_plan_print(const wl_dd_plan_t *plan)
 {
     if (!plan) {
         printf("DD Plan: (null)\n");
@@ -907,18 +905,18 @@ wl_ffi_dd_plan_print(const wl_ffi_dd_plan_t *plan)
         printf("  EDB: %s\n", plan->edb_relations[i]);
 
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
-        wl_ffi_dd_stratum_plan_t *sp = &plan->strata[s];
+        wl_dd_stratum_plan_t *sp = &plan->strata[s];
         printf("  Stratum %u [%s] (%u relations):\n", sp->stratum_id,
                sp->is_recursive ? "recursive" : "non-recursive",
                sp->relation_count);
 
         for (uint32_t r = 0; r < sp->relation_count; r++) {
-            wl_ffi_dd_relation_plan_t *rp = &sp->relations[r];
+            wl_dd_relation_plan_t *rp = &sp->relations[r];
             printf("    %s (%u ops):\n", rp->name, rp->op_count);
 
             for (uint32_t o = 0; o < rp->op_count; o++) {
-                wl_ffi_dd_op_t *op = &rp->ops[o];
-                printf("      [%u] %s", o, wl_ffi_dd_op_type_str(op->op));
+                wl_dd_op_t *op = &rp->ops[o];
+                printf("      [%u] %s", o, wl_dd_op_type_str(op->op));
                 if (op->relation_name)
                     printf("(%s)", op->relation_name);
                 if (op->right_relation)

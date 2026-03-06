@@ -61,14 +61,14 @@ static int tests_failed = 0;
 /* ======================================================================== */
 
 static int
-plan_from_source(const char *src, wl_ffi_dd_plan_t **out)
+plan_from_source(const char *src, wl_dd_plan_t **out)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
     if (!prog)
         return -10; /* parse failure */
 
-    int rc = wl_ffi_dd_plan_generate(prog, out);
+    int rc = wl_dd_plan_generate(prog, out);
     wirelog_program_free(prog);
     return rc;
 }
@@ -78,14 +78,13 @@ plan_from_source(const char *src, wl_ffi_dd_plan_t **out)
 /* ======================================================================== */
 
 static bool
-plan_has_reduce_in_recursive_stratum(const wl_ffi_dd_plan_t *plan)
+plan_has_reduce_in_recursive_stratum(const wl_dd_plan_t *plan)
 {
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         if (!plan->strata[s].is_recursive)
             continue;
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
-            const wl_ffi_dd_relation_plan_t *rel
-                = &plan->strata[s].relations[r];
+            const wl_dd_relation_plan_t *rel = &plan->strata[s].relations[r];
             for (uint32_t o = 0; o < rel->op_count; o++) {
                 if (rel->ops[o].op == WL_FFI_DD_REDUCE)
                     return true;
@@ -100,12 +99,11 @@ plan_has_reduce_in_recursive_stratum(const wl_ffi_dd_plan_t *plan)
 /* ======================================================================== */
 
 static bool
-plan_has_reduce_with_fn(const wl_ffi_dd_plan_t *plan, wirelog_agg_fn_t fn)
+plan_has_reduce_with_fn(const wl_dd_plan_t *plan, wirelog_agg_fn_t fn)
 {
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
-            const wl_ffi_dd_relation_plan_t *rel
-                = &plan->strata[s].relations[r];
+            const wl_dd_relation_plan_t *rel = &plan->strata[s].relations[r];
             for (uint32_t o = 0; o < rel->op_count; o++) {
                 if (rel->ops[o].op == WL_FFI_DD_REDUCE
                     && rel->ops[o].agg_fn == fn)
@@ -127,7 +125,7 @@ test_plan_recursive_no_agg_succeeds(void)
 {
     TEST("plan: recursive TC (no agg) generates successfully");
 
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(".decl Arc(x: int32, y: int32)\n"
                               ".decl Tc(x: int32, y: int32)\n"
                               "Tc(x, y) :- Arc(x, y).\n"
@@ -146,7 +144,7 @@ test_plan_recursive_no_agg_succeeds(void)
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     PASS();
 }
 
@@ -167,7 +165,7 @@ test_plan_count_in_recursive_rejected(void)
      *
      * Expected: plan_generate returns != 0 and plan remains NULL.
      */
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(".decl Edge(x: int32, y: int32)\n"
                               ".decl Dist(x: int32, d: int32)\n"
                               "Dist(x, count(y)) :- Edge(x, y).\n"
@@ -177,13 +175,13 @@ test_plan_count_in_recursive_rejected(void)
     if (rc == 0) {
         /* plan was accepted - this is the bug we are testing for */
         if (plan)
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
         FAIL("COUNT in recursive stratum was accepted (should be rejected)");
         return;
     }
 
     if (plan != NULL) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("plan should be NULL when generation fails");
         return;
     }
@@ -201,7 +199,7 @@ test_plan_sum_in_recursive_rejected(void)
 {
     TEST("plan: SUM in recursive stratum returns error (non-monotone)");
 
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(
         ".decl Edge(x: int32, y: int32, w: int32)\n"
         ".decl TotalCost(x: int32, c: int32)\n"
@@ -211,13 +209,13 @@ test_plan_sum_in_recursive_rejected(void)
 
     if (rc == 0) {
         if (plan)
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
         FAIL("SUM in recursive stratum was accepted (should be rejected)");
         return;
     }
 
     if (plan != NULL) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("plan should be NULL when generation fails");
         return;
     }
@@ -235,7 +233,7 @@ test_plan_avg_in_recursive_rejected(void)
 {
     TEST("plan: AVG in recursive stratum returns error (non-monotone)");
 
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(
         ".decl Score(x: int32, v: int32)\n"
         ".decl AvgScore(x: int32, a: int32)\n"
@@ -245,13 +243,13 @@ test_plan_avg_in_recursive_rejected(void)
 
     if (rc == 0) {
         if (plan)
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
         FAIL("AVG in recursive stratum was accepted (should be rejected)");
         return;
     }
 
     if (plan != NULL) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("plan should be NULL when generation fails");
         return;
     }
@@ -269,7 +267,7 @@ test_plan_count_in_mutual_recursion_rejected(void)
 {
     TEST("plan: COUNT in mutually recursive SCC returns error");
 
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(".decl Base(x: int32)\n"
                               ".decl A(x: int32, n: int32)\n"
                               ".decl B(x: int32, n: int32)\n"
@@ -280,13 +278,13 @@ test_plan_count_in_mutual_recursion_rejected(void)
 
     if (rc == 0) {
         if (plan)
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
         FAIL("COUNT in mutual recursion was accepted (should be rejected)");
         return;
     }
 
     if (plan != NULL) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("plan should be NULL when generation fails");
         return;
     }
@@ -304,7 +302,7 @@ test_plan_sum_self_recursive_rejected(void)
 {
     TEST("plan: SUM in self-recursive rule returns error");
 
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(".decl Node(x: int32, v: int32)\n"
                               ".decl Agg(x: int32, s: int32)\n"
                               "Agg(x, sum(v)) :- Node(x, v).\n"
@@ -313,13 +311,13 @@ test_plan_sum_self_recursive_rejected(void)
 
     if (rc == 0) {
         if (plan)
-            wl_ffi_dd_plan_free(plan);
+            wl_dd_plan_free(plan);
         FAIL("SUM in self-recursive rule was accepted (should be rejected)");
         return;
     }
 
     if (plan != NULL) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("plan should be NULL when generation fails");
         return;
     }
@@ -345,7 +343,7 @@ test_plan_min_in_recursive_accepted(void)
      * MIN is monotone (values only decrease) so this must be accepted.
      * Expected: rc=0, plan has is_recursive=true stratum with REDUCE(MIN).
      */
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(
         ".decl Edge(x: int32, y: int32, w: int32)\n"
         ".decl Dist(x: int32, d: int32)\n"
@@ -368,18 +366,18 @@ test_plan_min_in_recursive_accepted(void)
 
     /* verify a REDUCE(MIN) op exists in a recursive stratum */
     if (!plan_has_reduce_in_recursive_stratum(plan)) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("no REDUCE op found in any recursive stratum");
         return;
     }
 
     if (!plan_has_reduce_with_fn(plan, WIRELOG_AGG_MIN)) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("no REDUCE(MIN) op found in plan");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     PASS();
 }
 
@@ -400,7 +398,7 @@ test_plan_max_in_recursive_accepted(void)
      *
      * MAX is monotone (values only increase) so this must be accepted.
      */
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(
         ".decl Edge(x: int32, y: int32, w: int32)\n"
         ".decl MaxDist(x: int32, d: int32)\n"
@@ -422,18 +420,18 @@ test_plan_max_in_recursive_accepted(void)
     }
 
     if (!plan_has_reduce_in_recursive_stratum(plan)) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("no REDUCE op found in any recursive stratum");
         return;
     }
 
     if (!plan_has_reduce_with_fn(plan, WIRELOG_AGG_MAX)) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("no REDUCE(MAX) op found in plan");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     PASS();
 }
 
@@ -447,7 +445,7 @@ test_plan_min_nonrecursive_accepted(void)
 {
     TEST("plan: MIN in non-recursive stratum accepted and has REDUCE(MIN)");
 
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(".decl Data(x: int32, v: int32)\n"
                               ".decl MinVal(x: int32, m: int32)\n"
                               "MinVal(x, min(v)) :- Data(x, v).\n",
@@ -466,12 +464,12 @@ test_plan_min_nonrecursive_accepted(void)
     }
 
     if (!plan_has_reduce_with_fn(plan, WIRELOG_AGG_MIN)) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("no REDUCE(MIN) op found in non-recursive plan");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     PASS();
 }
 
@@ -485,7 +483,7 @@ test_plan_max_nonrecursive_accepted(void)
 {
     TEST("plan: MAX in non-recursive stratum accepted and has REDUCE(MAX)");
 
-    wl_ffi_dd_plan_t *plan = NULL;
+    wl_dd_plan_t *plan = NULL;
     int rc = plan_from_source(".decl Score(x: int32, v: int32)\n"
                               ".decl MaxScore(x: int32, m: int32)\n"
                               "MaxScore(x, max(v)) :- Score(x, v).\n",
@@ -504,12 +502,12 @@ test_plan_max_nonrecursive_accepted(void)
     }
 
     if (!plan_has_reduce_with_fn(plan, WIRELOG_AGG_MAX)) {
-        wl_ffi_dd_plan_free(plan);
+        wl_dd_plan_free(plan);
         FAIL("no REDUCE(MAX) op found in non-recursive plan");
         return;
     }
 
-    wl_ffi_dd_plan_free(plan);
+    wl_dd_plan_free(plan);
     PASS();
 }
 
