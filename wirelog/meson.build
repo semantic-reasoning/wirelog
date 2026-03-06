@@ -12,7 +12,7 @@ wirelog_parser_src = files('parser/lexer.c', 'parser/ast.c', 'parser/parser.c', 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_ir_src = files('ir/ir.c', 'ir/program.c', 'ir/stratify.c', 'ir/api.c', 'intern.c',
-                        'session.c', )
+                        'session.c', 'exec_plan_gen.c', 'session_facts.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Optimizer Module

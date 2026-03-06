@@ -1,0 +1,1105 @@
+/*
+ * exec_plan_gen.c - wirelog Plan Generator from Parsed Program
+ *
+ * Copyright (C) CleverPlant
+ * Licensed under LGPL-3.0
+ * For commercial licenses, contact: inquiry@cleverplant.com
+ *
+ * Converts a parsed+stratified wirelog_program_t into a wl_plan_t
+ * execution plan.  Replaces the deleted DD plan generation path.
+ */
+
+#include "exec_plan_gen.h"
+
+#include "ir/ir.h"
+#include "ir/program.h"
+#include "wirelog-ir.h"
+#include "wirelog-types.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ======================================================================== */
+/* Internal helpers                                                         */
+/* ======================================================================== */
+
+static char *
+dup_str(const char *s)
+{
+    if (!s)
+        return NULL;
+    size_t len = strlen(s);
+    char *d = (char *)malloc(len + 1);
+    if (!d)
+        return NULL;
+    memcpy(d, s, len + 1);
+    return d;
+}
+
+/* ======================================================================== */
+/* Expression serialization (IR expr tree -> postfix byte buffer)           */
+/* ======================================================================== */
+
+/* Dynamic byte buffer for building expression bytes */
+typedef struct {
+    uint8_t *data;
+    uint32_t size;
+    uint32_t capacity;
+} expr_buf_t;
+
+static int
+expr_buf_init(expr_buf_t *buf)
+{
+    buf->capacity = 64;
+    buf->size = 0;
+    buf->data = (uint8_t *)malloc(buf->capacity);
+    return buf->data ? 0 : -1;
+}
+
+static int
+expr_buf_ensure(expr_buf_t *buf, uint32_t extra)
+{
+    uint32_t need = buf->size + extra;
+    if (need <= buf->capacity)
+        return 0;
+    uint32_t cap = buf->capacity;
+    while (cap < need)
+        cap *= 2;
+    uint8_t *p = (uint8_t *)realloc(buf->data, cap);
+    if (!p)
+        return -1;
+    buf->data = p;
+    buf->capacity = cap;
+    return 0;
+}
+
+static int
+expr_buf_push_u8(expr_buf_t *buf, uint8_t v)
+{
+    if (expr_buf_ensure(buf, 1) != 0)
+        return -1;
+    buf->data[buf->size++] = v;
+    return 0;
+}
+
+static int
+expr_buf_push_u16(expr_buf_t *buf, uint16_t v)
+{
+    if (expr_buf_ensure(buf, 2) != 0)
+        return -1;
+    /* little-endian */
+    buf->data[buf->size++] = (uint8_t)(v & 0xFF);
+    buf->data[buf->size++] = (uint8_t)((v >> 8) & 0xFF);
+    return 0;
+}
+
+static int
+expr_buf_push_i64(expr_buf_t *buf, int64_t v)
+{
+    if (expr_buf_ensure(buf, 8) != 0)
+        return -1;
+    /* little-endian */
+    uint64_t u = (uint64_t)v;
+    for (int i = 0; i < 8; i++) {
+        buf->data[buf->size++] = (uint8_t)(u & 0xFF);
+        u >>= 8;
+    }
+    return 0;
+}
+
+static int
+expr_buf_push_bytes(expr_buf_t *buf, const uint8_t *data, uint32_t len)
+{
+    if (expr_buf_ensure(buf, len) != 0)
+        return -1;
+    memcpy(buf->data + buf->size, data, len);
+    buf->size += len;
+    return 0;
+}
+
+/* Map IR arith op -> plan expr tag */
+static uint8_t
+arith_to_tag(wirelog_arith_op_t op)
+{
+    switch (op) {
+    case WIRELOG_ARITH_ADD:
+        return WL_PLAN_EXPR_ARITH_ADD;
+    case WIRELOG_ARITH_SUB:
+        return WL_PLAN_EXPR_ARITH_SUB;
+    case WIRELOG_ARITH_MUL:
+        return WL_PLAN_EXPR_ARITH_MUL;
+    case WIRELOG_ARITH_DIV:
+        return WL_PLAN_EXPR_ARITH_DIV;
+    case WIRELOG_ARITH_MOD:
+        return WL_PLAN_EXPR_ARITH_MOD;
+    }
+    return WL_PLAN_EXPR_ARITH_ADD; /* fallback */
+}
+
+/* Map IR cmp op -> plan expr tag */
+static uint8_t
+cmp_to_tag(wirelog_cmp_op_t op)
+{
+    switch (op) {
+    case WIRELOG_CMP_EQ:
+        return WL_PLAN_EXPR_CMP_EQ;
+    case WIRELOG_CMP_NEQ:
+        return WL_PLAN_EXPR_CMP_NEQ;
+    case WIRELOG_CMP_LT:
+        return WL_PLAN_EXPR_CMP_LT;
+    case WIRELOG_CMP_GT:
+        return WL_PLAN_EXPR_CMP_GT;
+    case WIRELOG_CMP_LTE:
+        return WL_PLAN_EXPR_CMP_LTE;
+    case WIRELOG_CMP_GTE:
+        return WL_PLAN_EXPR_CMP_GTE;
+    }
+    return WL_PLAN_EXPR_CMP_EQ; /* fallback */
+}
+
+/* Map IR agg fn -> plan expr tag */
+static uint8_t
+agg_to_tag(wirelog_agg_fn_t fn)
+{
+    switch (fn) {
+    case WIRELOG_AGG_COUNT:
+        return WL_PLAN_EXPR_AGG_COUNT;
+    case WIRELOG_AGG_SUM:
+        return WL_PLAN_EXPR_AGG_SUM;
+    case WIRELOG_AGG_MIN:
+        return WL_PLAN_EXPR_AGG_MIN;
+    case WIRELOG_AGG_MAX:
+        return WL_PLAN_EXPR_AGG_MAX;
+    case WIRELOG_AGG_AVG:
+        return WL_PLAN_EXPR_AGG_SUM; /* approximate: no AVG tag */
+    }
+    return WL_PLAN_EXPR_AGG_COUNT; /* fallback */
+}
+
+/**
+ * Serialize an IR expression tree into postfix (RPN) byte encoding.
+ * Walks the tree recursively: children first (postfix), then operator.
+ */
+static int
+serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr)
+{
+    if (!expr)
+        return -1;
+
+    switch (expr->type) {
+    case WL_IR_EXPR_VAR: {
+        if (!expr->var_name)
+            return -1;
+        uint16_t len = (uint16_t)strlen(expr->var_name);
+        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_VAR) != 0)
+            return -1;
+        if (expr_buf_push_u16(buf, len) != 0)
+            return -1;
+        if (expr_buf_push_bytes(buf, (const uint8_t *)expr->var_name, len) != 0)
+            return -1;
+        return 0;
+    }
+    case WL_IR_EXPR_CONST_INT:
+        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_CONST_INT) != 0)
+            return -1;
+        return expr_buf_push_i64(buf, expr->int_value);
+
+    case WL_IR_EXPR_CONST_STR: {
+        if (!expr->str_value)
+            return -1;
+        uint16_t len = (uint16_t)strlen(expr->str_value);
+        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_CONST_STR) != 0)
+            return -1;
+        if (expr_buf_push_u16(buf, len) != 0)
+            return -1;
+        if (expr_buf_push_bytes(buf, (const uint8_t *)expr->str_value, len)
+            != 0)
+            return -1;
+        return 0;
+    }
+    case WL_IR_EXPR_BOOL:
+        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_BOOL) != 0)
+            return -1;
+        return expr_buf_push_u8(buf, expr->bool_value ? 1 : 0);
+
+    case WL_IR_EXPR_ARITH:
+        /* Serialize children first (postfix) */
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+            if (serialize_expr(buf, expr->children[i]) != 0)
+                return -1;
+        }
+        return expr_buf_push_u8(buf, arith_to_tag(expr->arith_op));
+
+    case WL_IR_EXPR_CMP:
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+            if (serialize_expr(buf, expr->children[i]) != 0)
+                return -1;
+        }
+        return expr_buf_push_u8(buf, cmp_to_tag(expr->cmp_op));
+
+    case WL_IR_EXPR_AGG:
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+            if (serialize_expr(buf, expr->children[i]) != 0)
+                return -1;
+        }
+        return expr_buf_push_u8(buf, agg_to_tag(expr->agg_fn));
+    }
+
+    return -1; /* unknown type */
+}
+
+/**
+ * Serialize an IR expression into a wl_plan_expr_buffer_t.
+ * Returns 0 on success. On NULL expr, produces empty buffer (valid no-op).
+ */
+static int
+serialize_expr_to_buffer(const wl_ir_expr_t *expr,
+                         wl_plan_expr_buffer_t *out_buf)
+{
+    out_buf->data = NULL;
+    out_buf->size = 0;
+
+    if (!expr)
+        return 0; /* empty = no expression */
+
+    expr_buf_t buf;
+    if (expr_buf_init(&buf) != 0)
+        return -1;
+
+    if (serialize_expr(&buf, expr) != 0) {
+        free(buf.data);
+        return -1;
+    }
+
+    out_buf->data = buf.data;
+    out_buf->size = buf.size;
+    return 0;
+}
+
+/* ======================================================================== */
+/* Operator list builder                                                    */
+/* ======================================================================== */
+
+typedef struct {
+    wl_plan_op_t *ops;
+    uint32_t count;
+    uint32_t capacity;
+} op_list_t;
+
+static int
+op_list_init(op_list_t *list)
+{
+    list->capacity = 8;
+    list->count = 0;
+    list->ops = (wl_plan_op_t *)calloc(list->capacity, sizeof(wl_plan_op_t));
+    return list->ops ? 0 : -1;
+}
+
+static wl_plan_op_t *
+op_list_push(op_list_t *list)
+{
+    if (list->count >= list->capacity) {
+        uint32_t cap = list->capacity * 2;
+        wl_plan_op_t *p
+            = (wl_plan_op_t *)realloc(list->ops, cap * sizeof(wl_plan_op_t));
+        if (!p)
+            return NULL;
+        list->ops = p;
+        list->capacity = cap;
+    }
+    wl_plan_op_t *op = &list->ops[list->count];
+    memset(op, 0, sizeof(*op));
+    list->count++;
+    return op;
+}
+
+/* Duplicate a string array (array of char*) */
+static char **
+dup_str_array(char **src, uint32_t count)
+{
+    if (!src || count == 0)
+        return NULL;
+    char **dst = (char **)malloc(count * sizeof(char *));
+    if (!dst)
+        return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        dst[i] = dup_str(src[i]);
+        if (!dst[i]) {
+            for (uint32_t j = 0; j < i; j++)
+                free(dst[j]);
+            free(dst);
+            return NULL;
+        }
+    }
+    return dst;
+}
+
+/* Duplicate a uint32_t array */
+static uint32_t *
+dup_indices(const uint32_t *src, uint32_t count)
+{
+    if (!src || count == 0)
+        return NULL;
+    uint32_t *dst = (uint32_t *)malloc(count * sizeof(uint32_t));
+    if (!dst)
+        return NULL;
+    memcpy(dst, src, count * sizeof(uint32_t));
+    return dst;
+}
+
+/* ======================================================================== */
+/* Column layout resolution                                                 */
+/* ======================================================================== */
+
+/**
+ * Collect the output column names produced by an IR node.
+ * For SCAN: returns the declared column_names.
+ * For JOIN: concatenates left + right child column names.
+ * For PROJECT/FILTER/FLATMAP/UNION: delegates to child[0].
+ *
+ * out_names and out_count are set on success (caller must free out_names
+ * array AND each string in it).  Returns 0 on success, -1 on failure.
+ */
+static int
+collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
+                       uint32_t *out_count)
+{
+    if (!node) {
+        *out_names = NULL;
+        *out_count = 0;
+        return -1;
+    }
+
+    switch (node->type) {
+    case WIRELOG_IR_SCAN: {
+        uint32_t nc = node->column_count;
+        char **names = (char **)calloc(nc ? nc : 1, sizeof(char *));
+        if (!names)
+            return -1;
+        for (uint32_t i = 0; i < nc; i++) {
+            names[i]
+                = dup_str(node->column_names ? node->column_names[i] : NULL);
+        }
+        *out_names = names;
+        *out_count = nc;
+        return 0;
+    }
+
+    case WIRELOG_IR_JOIN:
+    case WIRELOG_IR_ANTIJOIN:
+    case WIRELOG_IR_SEMIJOIN: {
+        /* Concatenate left child columns + right child columns */
+        char **left_names = NULL, **right_names = NULL;
+        uint32_t left_count = 0, right_count = 0;
+        if (node->child_count > 0)
+            collect_output_columns(node->children[0], &left_names, &left_count);
+        if (node->child_count > 1)
+            collect_output_columns(node->children[1], &right_names,
+                                   &right_count);
+
+        uint32_t total = left_count + right_count;
+        char **names = (char **)calloc(total ? total : 1, sizeof(char *));
+        if (!names) {
+            for (uint32_t i = 0; i < left_count; i++)
+                free(left_names[i]);
+            free(left_names);
+            for (uint32_t i = 0; i < right_count; i++)
+                free(right_names[i]);
+            free(right_names);
+            return -1;
+        }
+        for (uint32_t i = 0; i < left_count; i++)
+            names[i] = left_names[i]; /* transfer ownership */
+        for (uint32_t i = 0; i < right_count; i++)
+            names[left_count + i] = right_names[i]; /* transfer ownership */
+        free(left_names);
+        free(right_names);
+        *out_names = names;
+        *out_count = total;
+        return 0;
+    }
+
+    case WIRELOG_IR_PROJECT:
+    case WIRELOG_IR_FILTER:
+    case WIRELOG_IR_FLATMAP:
+    case WIRELOG_IR_AGGREGATE:
+        /* Delegate to first child */
+        if (node->child_count > 0)
+            return collect_output_columns(node->children[0], out_names,
+                                          out_count);
+        *out_names = NULL;
+        *out_count = 0;
+        return -1;
+
+    case WIRELOG_IR_UNION:
+        /* Use first child's layout */
+        if (node->child_count > 0)
+            return collect_output_columns(node->children[0], out_names,
+                                          out_count);
+        *out_names = NULL;
+        *out_count = 0;
+        return -1;
+    }
+
+    *out_names = NULL;
+    *out_count = 0;
+    return -1;
+}
+
+/**
+ * Resolve PROJECT expression variable names to column indices.
+ * Uses the child node's output column layout to map var names to positions.
+ * Returns allocated uint32_t array of indices, or NULL on failure.
+ */
+static uint32_t *
+resolve_project_indices(const wirelog_ir_node_t *project_node)
+{
+    if (!project_node || project_node->project_count == 0
+        || !project_node->project_exprs)
+        return NULL;
+
+    /* Get child's column layout */
+    const wirelog_ir_node_t *child = NULL;
+    if (project_node->child_count > 0)
+        child = project_node->children[0];
+
+    char **col_names = NULL;
+    uint32_t col_count = 0;
+    if (collect_output_columns(child, &col_names, &col_count) != 0)
+        return NULL;
+
+    uint32_t pc = project_node->project_count;
+    uint32_t *indices = (uint32_t *)malloc(pc * sizeof(uint32_t));
+    if (!indices) {
+        for (uint32_t i = 0; i < col_count; i++)
+            free(col_names[i]);
+        free(col_names);
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < pc; i++) {
+        indices[i] = i; /* fallback: identity */
+        const wl_ir_expr_t *expr = project_node->project_exprs[i];
+        if (expr && expr->type == WL_IR_EXPR_VAR && expr->var_name) {
+            for (uint32_t c = 0; c < col_count; c++) {
+                if (col_names[c] && strcmp(col_names[c], expr->var_name) == 0) {
+                    indices[i] = c;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < col_count; i++)
+        free(col_names[i]);
+    free(col_names);
+    return indices;
+}
+
+/**
+ * Resolve a join key variable name to "colN" format using the child's
+ * column layout.  Returns a newly allocated string like "col1".
+ * Falls back to "col0" if the name is not found.
+ */
+static char *
+resolve_key_to_colN(const char *key_name, const wirelog_ir_node_t *child)
+{
+    char buf[32];
+    uint32_t idx = 0; /* fallback */
+
+    if (key_name && child) {
+        char **col_names = NULL;
+        uint32_t col_count = 0;
+        if (collect_output_columns(child, &col_names, &col_count) == 0) {
+            for (uint32_t c = 0; c < col_count; c++) {
+                if (col_names[c] && strcmp(col_names[c], key_name) == 0) {
+                    idx = c;
+                    break;
+                }
+            }
+            for (uint32_t c = 0; c < col_count; c++)
+                free(col_names[c]);
+            free(col_names);
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "col%u", idx);
+    return dup_str(buf);
+}
+
+/**
+ * Resolve an array of join key variable names to "colN" format.
+ * Returns a newly allocated array of strings.
+ */
+static char **
+resolve_keys_to_colN(char **keys, uint32_t count,
+                     const wirelog_ir_node_t *child)
+{
+    if (!keys || count == 0)
+        return NULL;
+    char **out = (char **)malloc(count * sizeof(char *));
+    if (!out)
+        return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        out[i] = resolve_key_to_colN(keys[i], child);
+        if (!out[i]) {
+            for (uint32_t j = 0; j < i; j++)
+                free(out[j]);
+            free(out);
+            return NULL;
+        }
+    }
+    return out;
+}
+
+/**
+ * Recursively translate an IR node tree into plan operators.
+ * Operators are emitted in post-order (children first) to form a
+ * stack-machine sequence.
+ */
+static int
+translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
+{
+    if (!node)
+        return -1;
+
+    switch (node->type) {
+    case WIRELOG_IR_SCAN: {
+        wl_plan_op_t *op = op_list_push(ops);
+        if (!op)
+            return -1;
+        op->op = WL_PLAN_OP_VARIABLE;
+        op->relation_name = dup_str(node->relation_name);
+        if (node->relation_name && !op->relation_name)
+            return -1;
+        return 0;
+    }
+
+    case WIRELOG_IR_PROJECT: {
+        /* Translate child first */
+        if (node->child_count > 0) {
+            if (translate_ir_node(node->children[0], ops) != 0)
+                return -1;
+        }
+        wl_plan_op_t *op = op_list_push(ops);
+        if (!op)
+            return -1;
+        op->op = WL_PLAN_OP_MAP;
+        op->project_count = node->project_count;
+        if (node->project_indices) {
+            op->project_indices
+                = dup_indices(node->project_indices, node->project_count);
+            if (node->project_count > 0 && !op->project_indices)
+                return -1;
+        } else if (node->project_count > 0) {
+            /* Resolve variable names to column indices from child layout */
+            uint32_t *resolved = resolve_project_indices(node);
+            if (resolved) {
+                op->project_indices = resolved;
+            } else {
+                /* Fallback: synthesize identity [0..n-1] */
+                uint32_t *ids = (uint32_t *)malloc(node->project_count
+                                                   * sizeof(uint32_t));
+                if (!ids)
+                    return -1;
+                for (uint32_t pi = 0; pi < node->project_count; pi++)
+                    ids[pi] = pi;
+                op->project_indices = ids;
+            }
+        }
+        /* Serialize project expressions if present */
+        if (node->project_exprs && node->project_count > 0) {
+            op->map_exprs = (wl_plan_expr_buffer_t *)calloc(
+                node->project_count, sizeof(wl_plan_expr_buffer_t));
+            if (!op->map_exprs)
+                return -1;
+            op->map_expr_count = node->project_count;
+            for (uint32_t i = 0; i < node->project_count; i++) {
+                if (node->project_exprs[i]) {
+                    if (serialize_expr_to_buffer(node->project_exprs[i],
+                                                 &op->map_exprs[i])
+                        != 0)
+                        return -1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    case WIRELOG_IR_FILTER: {
+        /* Translate child first */
+        if (node->child_count > 0) {
+            if (translate_ir_node(node->children[0], ops) != 0)
+                return -1;
+        }
+        wl_plan_op_t *op = op_list_push(ops);
+        if (!op)
+            return -1;
+        op->op = WL_PLAN_OP_FILTER;
+        if (serialize_expr_to_buffer(node->filter_expr, &op->filter_expr) != 0)
+            return -1;
+        return 0;
+    }
+
+    case WIRELOG_IR_JOIN: {
+        /* Left child first */
+        if (node->child_count > 0) {
+            if (translate_ir_node(node->children[0], ops) != 0)
+                return -1;
+        }
+        wl_plan_op_t *op = op_list_push(ops);
+        if (!op)
+            return -1;
+        op->op = WL_PLAN_OP_JOIN;
+        /* Right relation is the second child's relation name */
+        if (node->child_count > 1 && node->children[1]) {
+            op->right_relation = dup_str(node->children[1]->relation_name);
+        }
+        /* Resolve join key variable names to "colN" positional format */
+        op->left_keys = (const char *const *)resolve_keys_to_colN(
+            node->join_left_keys, node->join_key_count,
+            node->child_count > 0 ? node->children[0] : NULL);
+        op->right_keys = (const char *const *)resolve_keys_to_colN(
+            node->join_right_keys, node->join_key_count,
+            node->child_count > 1 ? node->children[1] : NULL);
+        op->key_count = node->join_key_count;
+        return 0;
+    }
+
+    case WIRELOG_IR_ANTIJOIN: {
+        /* Left child first */
+        if (node->child_count > 0) {
+            if (translate_ir_node(node->children[0], ops) != 0)
+                return -1;
+        }
+        wl_plan_op_t *op = op_list_push(ops);
+        if (!op)
+            return -1;
+        op->op = WL_PLAN_OP_ANTIJOIN;
+        if (node->child_count > 1 && node->children[1]) {
+            op->right_relation = dup_str(node->children[1]->relation_name);
+        }
+        op->left_keys = (const char *const *)resolve_keys_to_colN(
+            node->join_left_keys, node->join_key_count,
+            node->child_count > 0 ? node->children[0] : NULL);
+        op->right_keys = (const char *const *)resolve_keys_to_colN(
+            node->join_right_keys, node->join_key_count,
+            node->child_count > 1 ? node->children[1] : NULL);
+        op->key_count = node->join_key_count;
+        return 0;
+    }
+
+    case WIRELOG_IR_SEMIJOIN: {
+        /* Left child first */
+        if (node->child_count > 0) {
+            if (translate_ir_node(node->children[0], ops) != 0)
+                return -1;
+        }
+        wl_plan_op_t *op = op_list_push(ops);
+        if (!op)
+            return -1;
+        op->op = WL_PLAN_OP_SEMIJOIN;
+        if (node->child_count > 1 && node->children[1]) {
+            op->right_relation = dup_str(node->children[1]->relation_name);
+        }
+        op->left_keys = (const char *const *)resolve_keys_to_colN(
+            node->join_left_keys, node->join_key_count,
+            node->child_count > 0 ? node->children[0] : NULL);
+        op->right_keys = (const char *const *)resolve_keys_to_colN(
+            node->join_right_keys, node->join_key_count,
+            node->child_count > 1 ? node->children[1] : NULL);
+        op->key_count = node->join_key_count;
+        op->project_indices
+            = dup_indices(node->project_indices, node->project_count);
+        op->project_count = node->project_count;
+        return 0;
+    }
+
+    case WIRELOG_IR_AGGREGATE: {
+        /* Translate child first */
+        if (node->child_count > 0) {
+            if (translate_ir_node(node->children[0], ops) != 0)
+                return -1;
+        }
+        wl_plan_op_t *op = op_list_push(ops);
+        if (!op)
+            return -1;
+        op->op = WL_PLAN_OP_REDUCE;
+        op->agg_fn = node->agg_fn;
+        op->group_by_indices
+            = dup_indices(node->group_by_indices, node->group_by_count);
+        op->group_by_count = node->group_by_count;
+        return 0;
+    }
+
+    case WIRELOG_IR_UNION: {
+        /* Each child is translated, then CONCAT + CONSOLIDATE */
+        for (uint32_t i = 0; i < node->child_count; i++) {
+            int crc = translate_ir_node(node->children[i], ops);
+            if (crc != 0)
+                return -1;
+            /* After the second+ child, emit CONCAT to merge with previous */
+            if (i > 0) {
+                wl_plan_op_t *concat = op_list_push(ops);
+                if (!concat)
+                    return -1;
+                concat->op = WL_PLAN_OP_CONCAT;
+            }
+        }
+        /* Emit CONSOLIDATE to deduplicate */
+        if (node->child_count > 0) {
+            wl_plan_op_t *consol = op_list_push(ops);
+            if (!consol)
+                return -1;
+            consol->op = WL_PLAN_OP_CONSOLIDATE;
+        }
+        return 0;
+    }
+
+    case WIRELOG_IR_FLATMAP: {
+        /* Decompose into FILTER + MAP per ARCHITECTURE.md:267 */
+        /* Translate child (source) first */
+        if (node->child_count > 0) {
+            if (translate_ir_node(node->children[0], ops) != 0)
+                return -1;
+        }
+
+        /* FILTER op (from filter_expr) */
+        if (node->filter_expr) {
+            wl_plan_op_t *filt = op_list_push(ops);
+            if (!filt)
+                return -1;
+            filt->op = WL_PLAN_OP_FILTER;
+            if (serialize_expr_to_buffer(node->filter_expr, &filt->filter_expr)
+                != 0)
+                return -1;
+        }
+
+        /* MAP op (from project_indices/project_count) */
+        if (node->project_count > 0) {
+            wl_plan_op_t *map = op_list_push(ops);
+            if (!map)
+                return -1;
+            map->op = WL_PLAN_OP_MAP;
+            map->project_count = node->project_count;
+            if (node->project_indices) {
+                map->project_indices
+                    = dup_indices(node->project_indices, node->project_count);
+                if (!map->project_indices)
+                    return -1;
+            } else {
+                /* Synthesize identity indices */
+                uint32_t *ids = (uint32_t *)malloc(node->project_count
+                                                   * sizeof(uint32_t));
+                if (!ids)
+                    return -1;
+                for (uint32_t pi = 0; pi < node->project_count; pi++)
+                    ids[pi] = pi;
+                map->project_indices = ids;
+            }
+            /* Serialize project expressions if present */
+            if (node->project_exprs) {
+                map->map_exprs = (wl_plan_expr_buffer_t *)calloc(
+                    node->project_count, sizeof(wl_plan_expr_buffer_t));
+                if (!map->map_exprs)
+                    return -1;
+                map->map_expr_count = node->project_count;
+                for (uint32_t i = 0; i < node->project_count; i++) {
+                    if (node->project_exprs[i]) {
+                        if (serialize_expr_to_buffer(node->project_exprs[i],
+                                                     &map->map_exprs[i])
+                            != 0)
+                            return -1;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    }
+
+    return -1; /* unknown node type */
+}
+
+/* ======================================================================== */
+/* Free helpers                                                             */
+/* ======================================================================== */
+
+static void
+free_op(wl_plan_op_t *op)
+{
+    free((void *)op->relation_name);
+    free((void *)op->right_relation);
+
+    if (op->left_keys) {
+        for (uint32_t i = 0; i < op->key_count; i++)
+            free((void *)op->left_keys[i]);
+        free((void *)op->left_keys);
+    }
+    if (op->right_keys) {
+        for (uint32_t i = 0; i < op->key_count; i++)
+            free((void *)op->right_keys[i]);
+        free((void *)op->right_keys);
+    }
+
+    free((void *)op->project_indices);
+    free(op->filter_expr.data);
+    free((void *)op->group_by_indices);
+
+    if (op->map_exprs) {
+        for (uint32_t i = 0; i < op->map_expr_count; i++)
+            free(op->map_exprs[i].data);
+        free(op->map_exprs);
+    }
+}
+
+/* ======================================================================== */
+/* Public API                                                               */
+/* ======================================================================== */
+
+void
+wl_plan_free(wl_plan_t *plan)
+{
+    if (!plan)
+        return;
+
+    if (plan->strata) {
+        for (uint32_t s = 0; s < plan->stratum_count; s++) {
+            wl_plan_stratum_t *st = (wl_plan_stratum_t *)&plan->strata[s];
+            if (st->relations) {
+                for (uint32_t r = 0; r < st->relation_count; r++) {
+                    wl_plan_relation_t *rel
+                        = (wl_plan_relation_t *)&st->relations[r];
+                    free((void *)rel->name);
+                    if (rel->ops) {
+                        for (uint32_t o = 0; o < rel->op_count; o++)
+                            free_op((wl_plan_op_t *)&rel->ops[o]);
+                        free((void *)rel->ops);
+                    }
+                }
+                free((void *)st->relations);
+            }
+        }
+        free((void *)plan->strata);
+    }
+
+    if (plan->edb_relations) {
+        for (uint32_t i = 0; i < plan->edb_count; i++)
+            free((void *)plan->edb_relations[i]);
+        free((void *)plan->edb_relations);
+    }
+
+    free(plan);
+}
+
+int
+wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
+{
+    if (!prog || !out)
+        return -1;
+
+    *out = NULL;
+
+    wl_plan_t *plan = (wl_plan_t *)calloc(1, sizeof(wl_plan_t));
+    if (!plan)
+        return -1;
+
+    /* ----------------------------------------------------------------
+     * Build EDB relation list (relations with no rules / only facts)
+     * ---------------------------------------------------------------- */
+    uint32_t edb_cap = 8;
+    char **edb_rels = (char **)malloc(edb_cap * sizeof(char *));
+    if (!edb_rels) {
+        free(plan);
+        return -1;
+    }
+    uint32_t edb_count = 0;
+
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        const wl_ir_relation_info_t *rel = &prog->relations[i];
+        if (!rel->name)
+            continue;
+
+        /* Check if this relation is a pure IDB (has rules but no facts).
+         * Relations with both rules and inline facts (e.g., reach(1).)
+         * must still be pre-registered so that fact loading can insert
+         * seed tuples before evaluation begins. */
+        bool is_idb = false;
+        bool has_facts = (rel->fact_count > 0 && rel->fact_data != NULL);
+        for (uint32_t r = 0; r < prog->rule_count; r++) {
+            if (prog->rules[r].head_relation
+                && strcmp(prog->rules[r].head_relation, rel->name) == 0) {
+                is_idb = true;
+                break;
+            }
+        }
+        if (!is_idb || has_facts) {
+            if (edb_count >= edb_cap) {
+                edb_cap *= 2;
+                char **tmp
+                    = (char **)realloc(edb_rels, edb_cap * sizeof(char *));
+                if (!tmp) {
+                    for (uint32_t j = 0; j < edb_count; j++)
+                        free(edb_rels[j]);
+                    free(edb_rels);
+                    free(plan);
+                    return -1;
+                }
+                edb_rels = tmp;
+            }
+            edb_rels[edb_count] = dup_str(rel->name);
+            if (!edb_rels[edb_count]) {
+                for (uint32_t j = 0; j < edb_count; j++)
+                    free(edb_rels[j]);
+                free(edb_rels);
+                free(plan);
+                return -1;
+            }
+            edb_count++;
+        }
+    }
+
+    plan->edb_relations = (const char *const *)edb_rels;
+    plan->edb_count = edb_count;
+
+    /* ----------------------------------------------------------------
+     * Build strata
+     * ---------------------------------------------------------------- */
+    uint32_t stratum_count = prog->stratum_count;
+    if (stratum_count == 0)
+        stratum_count = 1; /* guarantee at least 1 stratum */
+
+    wl_plan_stratum_t *strata
+        = (wl_plan_stratum_t *)calloc(stratum_count, sizeof(wl_plan_stratum_t));
+    if (!strata) {
+        wl_plan_free(plan);
+        return -1;
+    }
+
+    for (uint32_t s = 0; s < prog->stratum_count; s++) {
+        const wirelog_stratum_t *src = &prog->strata[s];
+        wl_plan_stratum_t *dst = &strata[s];
+
+        dst->stratum_id = src->stratum_id;
+        dst->is_recursive = src->is_recursive;
+
+        /* Count unique relations in this stratum */
+        /* Build per-relation plan from relation_irs[] */
+        if (!src->rule_names || src->rule_count == 0) {
+            dst->relations = NULL;
+            dst->relation_count = 0;
+            continue;
+        }
+
+        /* Collect unique relation names in this stratum */
+        uint32_t max_rels = src->rule_count;
+        char **unique_names = (char **)calloc(max_rels, sizeof(char *));
+        if (!unique_names) {
+            free(strata);
+            wl_plan_free(plan);
+            return -1;
+        }
+        uint32_t unique_count = 0;
+
+        for (uint32_t r = 0; r < src->rule_count; r++) {
+            const char *name = src->rule_names[r];
+            if (!name)
+                continue;
+            bool found = false;
+            for (uint32_t u = 0; u < unique_count; u++) {
+                if (strcmp(unique_names[u], name) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                unique_names[unique_count++] = (char *)name;
+        }
+
+        wl_plan_relation_t *rels = (wl_plan_relation_t *)calloc(
+            unique_count, sizeof(wl_plan_relation_t));
+        if (!rels) {
+            free(unique_names);
+            free(strata);
+            wl_plan_free(plan);
+            return -1;
+        }
+
+        for (uint32_t u = 0; u < unique_count; u++) {
+            const char *rel_name = unique_names[u];
+
+            /* Find the relation_irs[] index for this relation */
+            wirelog_ir_node_t *ir_root = NULL;
+            for (uint32_t ri = 0; ri < prog->relation_count; ri++) {
+                if (prog->relations[ri].name
+                    && strcmp(prog->relations[ri].name, rel_name) == 0
+                    && prog->relation_irs && prog->relation_irs[ri]) {
+                    ir_root = prog->relation_irs[ri];
+                    break;
+                }
+            }
+
+            rels[u].name = dup_str(rel_name);
+
+            if (ir_root) {
+                op_list_t ol;
+                if (op_list_init(&ol) != 0) {
+                    free(unique_names);
+                    /* Clean up already-built relations */
+                    for (uint32_t v = 0; v < u; v++) {
+                        free((void *)rels[v].name);
+                        if (rels[v].ops) {
+                            for (uint32_t o = 0; o < rels[v].op_count; o++)
+                                free_op((wl_plan_op_t *)&rels[v].ops[o]);
+                            free((void *)rels[v].ops);
+                        }
+                    }
+                    free((void *)rels[u].name);
+                    free(rels);
+                    free(strata);
+                    wl_plan_free(plan);
+                    return -1;
+                }
+
+                int rc = translate_ir_node(ir_root, &ol);
+                if (rc != 0) {
+                    /* Clean up ops */
+                    for (uint32_t o = 0; o < ol.count; o++)
+                        free_op(&ol.ops[o]);
+                    free(ol.ops);
+                    free(unique_names);
+                    for (uint32_t v = 0; v < u; v++) {
+                        free((void *)rels[v].name);
+                        if (rels[v].ops) {
+                            for (uint32_t o = 0; o < rels[v].op_count; o++)
+                                free_op((wl_plan_op_t *)&rels[v].ops[o]);
+                            free((void *)rels[v].ops);
+                        }
+                    }
+                    free((void *)rels[u].name);
+                    free(rels);
+                    free(strata);
+                    wl_plan_free(plan);
+                    return -1;
+                }
+
+                rels[u].ops = ol.ops;
+                rels[u].op_count = ol.count;
+            } else {
+                rels[u].ops = NULL;
+                rels[u].op_count = 0;
+            }
+        }
+
+        free(unique_names);
+        dst->relations = rels;
+        dst->relation_count = unique_count;
+    }
+
+    plan->strata = strata;
+    plan->stratum_count = stratum_count;
+
+    *out = plan;
+    return 0;
+}
