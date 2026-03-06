@@ -18,6 +18,8 @@ ir_src = files(
   '../wirelog/ir/api.c',
   '../wirelog/intern.c',
   '../wirelog/session.c',
+  '../wirelog/exec_plan_gen.c',
+  '../wirelog/session_facts.c',
 )
 
 optimizer_src = files(
@@ -161,6 +163,37 @@ test_intern_exe = executable(
 )
 
 test('intern', test_intern_exe)
+
+# ============================================================================
+# Plan Generator + Session Facts Tests (Phase 2C columnar backend)
+# ============================================================================
+
+backend_src = files(
+  '../wirelog/backend/columnar_nanoarrow.c',
+)
+
+io_src = files(
+  '../wirelog/io/csv_reader.c',
+)
+
+arena_src = files(
+  '../wirelog/arena/arena.c',
+)
+
+test_plan_gen_exe = executable(
+  'test_plan_gen',
+  files('test_plan_gen.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep],
+)
+
+test('plan_gen', test_plan_gen_exe)
 
 # ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C

@@ -314,27 +314,6 @@ op_list_push(op_list_t *list)
     return op;
 }
 
-/* Duplicate a string array (array of char*) */
-static char **
-dup_str_array(char **src, uint32_t count)
-{
-    if (!src || count == 0)
-        return NULL;
-    char **dst = (char **)malloc(count * sizeof(char *));
-    if (!dst)
-        return NULL;
-    for (uint32_t i = 0; i < count; i++) {
-        dst[i] = dup_str(src[i]);
-        if (!dst[i]) {
-            for (uint32_t j = 0; j < i; j++)
-                free(dst[j]);
-            free(dst);
-            return NULL;
-        }
-    }
-    return dst;
-}
-
 /* Duplicate a uint32_t array */
 static uint32_t *
 dup_indices(const uint32_t *src, uint32_t count)
@@ -403,18 +382,18 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
         if (!names) {
             for (uint32_t i = 0; i < left_count; i++)
                 free(left_names[i]);
-            free(left_names);
+            free((void *)left_names);
             for (uint32_t i = 0; i < right_count; i++)
                 free(right_names[i]);
-            free(right_names);
+            free((void *)right_names);
             return -1;
         }
         for (uint32_t i = 0; i < left_count; i++)
             names[i] = left_names[i]; /* transfer ownership */
         for (uint32_t i = 0; i < right_count; i++)
             names[left_count + i] = right_names[i]; /* transfer ownership */
-        free(left_names);
-        free(right_names);
+        free((void *)left_names);
+        free((void *)right_names);
         *out_names = names;
         *out_count = total;
         return 0;
@@ -424,16 +403,8 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
     case WIRELOG_IR_FILTER:
     case WIRELOG_IR_FLATMAP:
     case WIRELOG_IR_AGGREGATE:
-        /* Delegate to first child */
-        if (node->child_count > 0)
-            return collect_output_columns(node->children[0], out_names,
-                                          out_count);
-        *out_names = NULL;
-        *out_count = 0;
-        return -1;
-
     case WIRELOG_IR_UNION:
-        /* Use first child's layout */
+        /* Delegate to first child */
         if (node->child_count > 0)
             return collect_output_columns(node->children[0], out_names,
                                           out_count);
@@ -474,7 +445,7 @@ resolve_project_indices(const wirelog_ir_node_t *project_node)
     if (!indices) {
         for (uint32_t i = 0; i < col_count; i++)
             free(col_names[i]);
-        free(col_names);
+        free((void *)col_names);
         return NULL;
     }
 
@@ -493,7 +464,7 @@ resolve_project_indices(const wirelog_ir_node_t *project_node)
 
     for (uint32_t i = 0; i < col_count; i++)
         free(col_names[i]);
-    free(col_names);
+    free((void *)col_names);
     return indices;
 }
 
@@ -520,7 +491,7 @@ resolve_key_to_colN(const char *key_name, const wirelog_ir_node_t *child)
             }
             for (uint32_t c = 0; c < col_count; c++)
                 free(col_names[c]);
-            free(col_names);
+            free((void *)col_names);
         }
     }
 
@@ -546,7 +517,7 @@ resolve_keys_to_colN(char **keys, uint32_t count,
         if (!out[i]) {
             for (uint32_t j = 0; j < i; j++)
                 free(out[j]);
-            free(out);
+            free((void *)out);
             return NULL;
         }
     }
@@ -942,7 +913,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                 if (!tmp) {
                     for (uint32_t j = 0; j < edb_count; j++)
                         free(edb_rels[j]);
-                    free(edb_rels);
+                    free((void *)edb_rels);
                     free(plan);
                     return -1;
                 }
@@ -952,7 +923,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
             if (!edb_rels[edb_count]) {
                 for (uint32_t j = 0; j < edb_count; j++)
                     free(edb_rels[j]);
-                free(edb_rels);
+                free((void *)edb_rels);
                 free(plan);
                 return -1;
             }
@@ -1020,7 +991,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         wl_plan_relation_t *rels = (wl_plan_relation_t *)calloc(
             unique_count, sizeof(wl_plan_relation_t));
         if (!rels) {
-            free(unique_names);
+            free((void *)unique_names);
             free(strata);
             wl_plan_free(plan);
             return -1;
@@ -1045,7 +1016,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
             if (ir_root) {
                 op_list_t ol;
                 if (op_list_init(&ol) != 0) {
-                    free(unique_names);
+                    free((void *)unique_names);
                     /* Clean up already-built relations */
                     for (uint32_t v = 0; v < u; v++) {
                         free((void *)rels[v].name);
@@ -1068,7 +1039,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     for (uint32_t o = 0; o < ol.count; o++)
                         free_op(&ol.ops[o]);
                     free(ol.ops);
-                    free(unique_names);
+                    free((void *)unique_names);
                     for (uint32_t v = 0; v < u; v++) {
                         free((void *)rels[v].name);
                         if (rels[v].ops) {
@@ -1092,7 +1063,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
             }
         }
 
-        free(unique_names);
+        free((void *)unique_names);
         dst->relations = rels;
         dst->relation_count = unique_count;
     }
