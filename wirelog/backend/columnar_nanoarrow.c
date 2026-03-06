@@ -251,7 +251,6 @@ typedef struct {
     wl_on_delta_fn delta_cb; /* delta callback (NULL = disabled)       */
     void *delta_data;        /* opaque user context for delta_cb       */
     wl_arena_t *eval_arena;  /* arena for per-iteration temporaries    */
-    /* TODO(Phase 2B): add delta relation tracking (ΔR fields) here */
 } wl_col_session_t;
 
 /*
@@ -482,6 +481,7 @@ bad:
 typedef struct {
     col_rel_t *rel;
     bool owned;
+    bool is_delta; /* true when rel is a delta (ΔR) relation, not the full */
 } eval_entry_t;
 
 typedef struct {
@@ -502,14 +502,25 @@ eval_stack_push(eval_stack_t *s, col_rel_t *r, bool owned)
         return ENOBUFS;
     s->items[s->top].rel = r;
     s->items[s->top].owned = owned;
+    s->items[s->top].is_delta = false;
     s->top++;
     return 0;
+}
+
+/* Push with explicit delta flag (used by VARIABLE and JOIN to tag delta results). */
+static int
+eval_stack_push_delta(eval_stack_t *s, col_rel_t *r, bool owned, bool is_delta)
+{
+    int rc = eval_stack_push(s, r, owned);
+    if (rc == 0)
+        s->items[s->top - 1].is_delta = is_delta;
+    return rc;
 }
 
 static eval_entry_t
 eval_stack_pop(eval_stack_t *s)
 {
-    eval_entry_t e = { NULL, false };
+    eval_entry_t e = { NULL, false, false };
     if (s->top > 0)
         e = s->items[--s->top];
     return e;
@@ -570,16 +581,21 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
 {
     if (!op->relation_name)
         return ENOENT;
-    /* Prefer delta relation for semi-naive evaluation; fall back to full. */
+    col_rel_t *full_rel = session_find_rel(sess, op->relation_name);
+    if (!full_rel)
+        return ENOENT;
+    /* Prefer delta only when it is a genuine strict subset of the full
+     * relation (nrows < full.nrows). On the first iteration after a
+     * relation is populated its delta equals the full, so we use full
+     * to avoid doubling the work vs. naive evaluation. */
     char dname[256];
     snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
-    col_rel_t *rel = session_find_rel(sess, dname);
-    if (!rel)
-        rel = session_find_rel(sess, op->relation_name);
-    if (!rel)
-        return ENOENT;
+    col_rel_t *delta = session_find_rel(sess, dname);
+    bool use_delta = (delta && delta->nrows > 0
+                      && delta->nrows < full_rel->nrows);
+    col_rel_t *rel = use_delta ? delta : full_rel;
     /* push borrowed reference - session owns the relation */
-    return eval_stack_push(stack, rel, false);
+    return eval_stack_push_delta(stack, rel, false, use_delta);
 }
 
 /* --- MAP ----------------------------------------------------------------- */
@@ -734,6 +750,21 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         return ENOENT;
     }
 
+    /* Pass 1 (right-delta): substitute delta of right when left is a full
+     * relation. This covers the A_full × ΔB variant of semi-naive:
+     * when left is NOT a delta (full relation), substitute the delta of
+     * right if it exists and is strictly smaller than the full right. */
+    bool used_right_delta = false;
+    if (!left_e.is_delta && op->right_relation) {
+        char rdname[256];
+        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
+        col_rel_t *rdelta = session_find_rel(sess, rdname);
+        if (rdelta && rdelta->nrows > 0 && rdelta->nrows < right->nrows) {
+            right = rdelta;
+            used_right_delta = true;
+        }
+    }
+
     uint32_t kc = op->key_count;
     col_rel_t *left = left_e.rel;
 
@@ -808,6 +839,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         ht_next[rr] = ht_head[h];
         ht_head[h] = rr + 1; /* 1-based index; 0 = end of chain */
     }
+
     int join_rc = 0;
     for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
         const int64_t *lrow = left->data + (size_t)lr * left->ncols;
@@ -849,7 +881,11 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         col_rel_free_contents(left);
         free(left);
     }
-    return eval_stack_push(stack, out, true);
+    /* Propagate delta flag: result is a delta if left was delta OR we used
+     * right-delta. This ensures subsequent JOINs in the same rule plan know
+     * whether to apply right-delta (they should NOT if we already used one). */
+    bool result_is_delta = left_e.is_delta || used_right_delta;
+    return eval_stack_push_delta(stack, out, true, result_is_delta);
 }
 
 /* --- ANTIJOIN ------------------------------------------------------------ */
@@ -1510,7 +1546,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
             }
         }
 
-        /* One pass: evaluate each relation plan */
+        /* Single-pass semi-naive evaluation. VARIABLE prefers delta when it
+         * is a strict subset of full (genuine new facts). JOIN propagates
+         * the is_delta flag through results and applies right-delta when
+         * left is full and a strictly-smaller right delta exists. */
         for (uint32_t ri = 0; ri < nrels; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
 
