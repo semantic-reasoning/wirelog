@@ -193,7 +193,7 @@ pkg.generate(
 #Benchmarks
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-#Note : Benchmarks are deferred to Phase 2A(columnar backend implementation)
+subdir('bench')
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Tests

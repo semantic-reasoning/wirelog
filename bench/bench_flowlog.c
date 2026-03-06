@@ -18,10 +18,13 @@
 
 #include "bench_util.h"
 
-#include "../wirelog/backend/dd/dd_ffi.h"
+#include "../wirelog/backend.h"
+#include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
+#include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog.h"
 
 #include <getopt.h>
@@ -215,53 +218,42 @@ run_pipeline_count(const char *source, uint32_t num_workers, int64_t *out_count)
     wl_jpp_apply(prog, NULL);
     wl_sip_apply(prog, NULL);
 
-    wl_dd_plan_t *dd_plan = NULL;
-    int rc = wl_dd_plan_generate(prog, &dd_plan);
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
     if (rc != 0) {
         wirelog_program_free(prog);
         return -1;
     }
 
-    wl_plan_t *ffi = NULL;
-    rc = wl_dd_marshal_plan(dd_plan, &ffi);
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, num_workers, &sess);
     if (rc != 0) {
-        wl_dd_plan_free(dd_plan);
+        wl_plan_free(plan);
         wirelog_program_free(prog);
         return -1;
     }
 
-    wl_dd_worker_t *w = wl_dd_worker_create(num_workers);
-    if (!w) {
-        wl_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+    rc = wl_session_load_facts(sess, prog);
+    if (rc != 0) {
+        wl_session_destroy(sess);
+        wl_plan_free(plan);
         wirelog_program_free(prog);
         return -1;
     }
 
-    rc = wirelog_load_all_facts(prog, w);
+    rc = wl_session_load_input_files(sess, prog);
     if (rc != 0) {
-        wl_dd_worker_destroy(w);
-        wl_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
-        wirelog_program_free(prog);
-        return -1;
-    }
-
-    rc = wirelog_load_input_files(prog, w);
-    if (rc != 0) {
-        wl_dd_worker_destroy(w);
-        wl_plan_free(ffi);
-        wl_dd_plan_free(dd_plan);
+        wl_session_destroy(sess);
+        wl_plan_free(plan);
         wirelog_program_free(prog);
         return -1;
     }
 
     struct count_ctx ctx = { 0 };
-    rc = wl_dd_execute_cb(ffi, w, count_tuple_cb, &ctx);
+    rc = wl_session_snapshot(sess, count_tuple_cb, &ctx);
 
-    wl_dd_worker_destroy(w);
-    wl_plan_free(ffi);
-    wl_dd_plan_free(dd_plan);
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
     wirelog_program_free(prog);
 
     if (rc == 0 && out_count)
