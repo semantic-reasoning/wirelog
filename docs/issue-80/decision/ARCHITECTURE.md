@@ -280,7 +280,7 @@ Recursive strata use Differential Dataflow's `iterate()` combinator to compute f
 - `SUM`: Cumulative values don't converge monotonically; order-dependent
 - `AVG`: Quotient of non-monotone functions; unstable
 
-**Validation**: Non-monotone aggregations are detected at DD plan generation time (`/wirelog/ffi/dd_plan.c` lines 791–821). If COUNT or SUM appears in a recursive stratum, plan generation returns error code -1 and prints:
+**Validation**: Non-monotone aggregations are detected at DD plan generation time (`/wirelog/backend/dd/dd_plan.c` lines 791–821). If COUNT or SUM appears in a recursive stratum, plan generation returns error code -1 and prints:
 ```
 wirelog: COUNT aggregation not supported in recursive stratum 'RelationName'
 wirelog: SUM aggregation not supported in recursive stratum 'RelationName'

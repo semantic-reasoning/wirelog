@@ -98,7 +98,7 @@ typedef struct {
 #include "exec_plan.h"
 ```
 
-**Delete from** `wirelog/ffi/dd_ffi.h`:
+**Delete from** `wirelog/backend/dd/dd_ffi.h`:
 ```c
 // REMOVE these Rust FFI declarations:
 // - wl_dd_worker_create()
@@ -261,14 +261,14 @@ int wl_ffi_relation_plan_unmarshal(const uint8_t *bytes,
 
 **Before**:
 ```
-wirelog/ffi/dd_marshal.c (785 LOC)
+wirelog/backend/dd/dd_marshal.c (785 LOC)
   ├── Generic marshaling (440 LOC) → keep
   ├── Rust-specific wrappers (345 LOC) → delete
 ```
 
 **After**:
 ```
-wirelog/ffi/exec_marshal.c (440 LOC)
+wirelog/backend/dd/exec_marshal.c (440 LOC)
   ├── Generic plan unmarshaling ✅
   ├── Operator unmarshaling ✅
   ├── Expression evaluation ✅

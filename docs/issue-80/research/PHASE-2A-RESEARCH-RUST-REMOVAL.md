@@ -587,8 +587,8 @@ goal is Rust removal. Tier 2 alone IS Option B.
 |-----------|-----|--------|
 | `rust/wirelog-dd/src/*.rs` | 5,045 | Rust DD executor |
 | `wirelog/backend_dd.c` | 169 | DD backend vtable impl |
-| `wirelog/ffi/dd_ffi.h` | 785 | Rust FFI declarations |
-| `wirelog/ffi/dd_marshal.c` | 686 | Plan marshaling for Rust FFI |
+| `wirelog/backend/dd/dd_ffi.h` | 785 | Rust FFI declarations |
+| `wirelog/backend/dd/dd_marshal.c` | 686 | Plan marshaling for Rust FFI |
 | Cargo.toml, Cargo.lock | ~50 | Rust build config |
 | Meson Cargo integration | ~30 | Meson-to-Cargo bridge |
 | **Total removed** | **~6,765** | |

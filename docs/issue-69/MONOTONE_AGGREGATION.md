@@ -241,7 +241,7 @@ The value oscillates between 8 and 23 depending on when deltas arrive.
 
 ### 4.1 Error Detection and Rejection
 
-**File**: `/wirelog/ffi/dd_plan.c` (lines 791–821)
+**File**: `/wirelog/backend/dd/dd_plan.c` (lines 791–821)
 
 The DD plan generator detects non-monotone aggregations during plan generation:
 
@@ -468,7 +468,7 @@ COUNT with cardinality bounds: count(distinct x)  ← bounded cardinality
 - Monotone functions in lattices: Derek Dreyer et al., "Verifying Higher-order Imperative Programs with Higher-order Separation Logic" (POPL 2010)
 
 ### wirelog Implementation
-- Plan generation: `/wirelog/ffi/dd_plan.c` (lines 791–821)
+- Plan generation: `/wirelog/backend/dd/dd_plan.c` (lines 791–821)
 - Aggregation enum: `/wirelog/wirelog-types.h`
 - Integration tests:
   - `/tests/test_recursive_agg_cc_min.c` (MIN with connected components)

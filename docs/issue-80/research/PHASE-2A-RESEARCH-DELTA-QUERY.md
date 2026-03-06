@@ -106,8 +106,8 @@ Add `wirelog/backend/backend.c` (the DD backend vtable init) to both
 | MODIFY | `wirelog/meson.build` | Add backend source |
 | MODIFY | `tests/meson.build` | Add backend source to test builds |
 | NO TOUCH | `rust/**` | No Rust changes |
-| NO TOUCH | `wirelog/ffi/dd_ffi.h` | FFI boundary unchanged |
-| NO TOUCH | `wirelog/ffi/dd_plan.h` | Plan types unchanged |
+| NO TOUCH | `wirelog/backend/dd/dd_ffi.h` | FFI boundary unchanged |
+| NO TOUCH | `wirelog/backend/dd/dd_plan.h` | Plan types unchanged |
 
 ### Phase 0 Naming Decision
 
@@ -215,7 +215,7 @@ wl_dd_session_update_edb(session, relation, data, num_rows, num_cols, diff) -> c
 wl_dd_session_destroy(session)
 ```
 
-**Modified file**: `wirelog/ffi/dd_ffi.h`
+**Modified file**: `wirelog/backend/dd/dd_ffi.h`
 
 Add C declarations for the new Rust-exported session functions.
 
@@ -274,7 +274,7 @@ Test cases:
 | CREATE | `tests/test_session.c` | Session integration tests |
 | MODIFY | `rust/wirelog-dd/src/lib.rs` | Add `mod session;` |
 | MODIFY | `rust/wirelog-dd/src/ffi.rs` | Add session FFI entry points |
-| MODIFY | `wirelog/ffi/dd_ffi.h` | Add session FFI declarations |
+| MODIFY | `wirelog/backend/dd/dd_ffi.h` | Add session FFI declarations |
 | MODIFY | `wirelog/backend/backend.h` | Add session vtable entries |
 | MODIFY | `wirelog/backend/backend.c` | Wire DD session functions |
 | MODIFY | `wirelog/meson.build` | Add session source |
