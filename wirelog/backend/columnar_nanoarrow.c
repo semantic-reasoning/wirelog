@@ -1478,6 +1478,22 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     return 0;
 }
 
+/* Helper: lexicographic int64_t row comparison (-1/0/+1).
+ * Compares rows a and b with ncols columns using int64_t values (not bytes).
+ * Required for correct little-endian int64_t comparisons.
+ */
+static int
+row_cmp_lex(const int64_t *a, const int64_t *b, uint32_t ncols)
+{
+    for (uint32_t c = 0; c < ncols; c++) {
+        if (a[c] < b[c])
+            return -1;
+        if (a[c] > b[c])
+            return 1;
+    }
+    return 0;
+}
+
 /*
  * col_op_consolidate_incremental_delta - Incremental consolidation with delta output
  *
@@ -1533,8 +1549,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
     for (uint32_t i = 1; i < delta_count; i++) {
-        if (memcmp(delta_start + (size_t)(i - 1) * nc,
-                   delta_start + (size_t)i * nc, row_bytes)
+        if (row_cmp_lex(delta_start + (size_t)(i - 1) * nc,
+                        delta_start + (size_t)i * nc, nc)
             != 0) {
             if (d_unique != i)
                 memcpy(delta_start + (size_t)d_unique * nc,
@@ -1554,7 +1570,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     while (oi < old_nrows && di < d_unique) {
         const int64_t *orow = rel->data + (size_t)oi * nc;
         const int64_t *drow = delta_start + (size_t)di * nc;
-        int cmp = memcmp(orow, drow, row_bytes);
+        int cmp = row_cmp_lex(orow, drow, nc);
         if (cmp < 0) {
             memcpy(merged + (size_t)out * nc, orow, row_bytes);
             oi++;
