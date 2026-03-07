@@ -1741,29 +1741,23 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
             session_remove_rel(sess, dname);
         }
 
-        /* Consolidate all IDB relations to remove duplicates */
+        /* Consolidate all IDB relations to remove duplicates.
+         * Use incremental merge: sort only new rows O(D log D), then
+         * merge with sorted old prefix O(N).  snap[ri] marks the boundary
+         * between the already-sorted prefix and unsorted new rows. */
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
             if (!r || r->nrows == 0)
                 continue;
 
-            eval_stack_t stk;
-            eval_stack_init(&stk);
-            eval_stack_push(&stk, r, false); /* borrowed */
-            col_op_consolidate(&stk);
-
-            if (stk.top > 0) {
-                eval_entry_t ce = eval_stack_pop(&stk);
-                if (ce.owned && ce.rel != r) {
-                    /* Replace relation contents */
-                    free(r->data);
-                    r->data = ce.rel->data;
-                    r->nrows = ce.rel->nrows;
-                    r->capacity = ce.rel->capacity;
-                    ce.rel->data = NULL;
-                    col_rel_free_contents(ce.rel);
-                    free(ce.rel);
-                }
+            int rc2 = col_op_consolidate_incremental(r, snap[ri]);
+            if (rc2 != 0) {
+                for (uint32_t j = 0; j < nrels; j++)
+                    free(old_data[j]);
+                free(old_data);
+                free(snap);
+                free(delta_rels);
+                return rc2;
             }
         }
 
