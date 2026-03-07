@@ -294,6 +294,40 @@ test_cse_cache_hit_rate_exe = executable(
 test('cse_cache_hit_rate', test_cse_cache_hit_rate_exe)
 
 # ============================================================================
+# K-way Merge CONSOLIDATE Tests (US-002 TDD RED Phase)
+# ============================================================================
+
+test_consolidate_kway_merge_exe = executable(
+  'test_consolidate_kway_merge',
+  files('test_consolidate_kway_merge.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('consolidate_kway_merge', test_consolidate_kway_merge_exe)
+
+# ============================================================================
+# Empty-Delta Skip Tests (US-006/US-007)
+# ============================================================================
+
+test_empty_delta_skip_exe = executable(
+  'test_empty_delta_skip',
+  files('test_empty_delta_skip.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('empty_delta_skip', test_empty_delta_skip_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #

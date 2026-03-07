@@ -18,6 +18,8 @@
 
 #include "bench_util.h"
 
+#include <inttypes.h>
+
 #include "../wirelog/backend.h"
 #include "../wirelog/backend/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan_gen.h"
@@ -27,6 +29,11 @@
 #include "../wirelog/session.h"
 #include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog.h"
+
+/* Forward declaration for CSE cache statistics extraction */
+extern void
+col_session_get_cache_stats(wl_session_t *sess, uint64_t *out_hits,
+                            uint64_t *out_misses);
 
 #include <getopt.h>
 #include <inttypes.h>
@@ -255,6 +262,18 @@ run_pipeline_count(const char *source, uint32_t num_workers, int64_t *out_count,
     rc = wl_session_snapshot(sess, count_tuple_cb, &ctx);
 
     uint32_t total_iters = col_session_get_iteration_count(sess);
+
+    /* Extract CSE cache statistics before destroying session */
+    uint64_t cache_hits = 0, cache_misses = 0;
+    col_session_get_cache_stats(sess, &cache_hits, &cache_misses);
+    if (cache_hits + cache_misses > 0) {
+        double hit_rate
+            = 100.0 * (double)cache_hits / (double)(cache_hits + cache_misses);
+        fprintf(stderr,
+                "CSE Cache: %" PRIu64 " hits, %" PRIu64
+                " misses (hit_rate=%.1f%%)\n",
+                cache_hits, cache_misses, hit_rate);
+    }
 
     wl_session_destroy(sess);
     wl_plan_free(plan);

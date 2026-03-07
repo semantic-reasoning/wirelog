@@ -2379,6 +2379,49 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
 }
 
 /*
+ * has_empty_forced_delta:
+ * Check if a relation plan would produce empty output because it contains
+ * a FORCE_DELTA op whose delta relation is empty or absent.
+ *
+ * On iteration 0, no deltas exist yet; FORCE_DELTA ops fall back to the
+ * full relation (base-case seeding), so we always return false.
+ *
+ * On iteration > 0, if any FORCE_DELTA VARIABLE or JOIN op references a
+ * delta that is empty/absent, the entire plan would produce 0 rows, so
+ * we can safely skip evaluation.
+ *
+ * Returns true if the plan can be skipped (empty forced-delta found).
+ */
+static bool
+has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
+                       uint32_t iteration)
+{
+    if (iteration == 0)
+        return false; /* Base case: no deltas exist yet */
+
+    for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+        const wl_plan_op_t *op = &rp->ops[oi];
+        if (op->delta_mode != WL_DELTA_FORCE_DELTA)
+            continue;
+
+        const char *rel_name = NULL;
+        if (op->op == WL_PLAN_OP_VARIABLE)
+            rel_name = op->relation_name;
+        else if (op->op == WL_PLAN_OP_JOIN || op->op == WL_PLAN_OP_SEMIJOIN)
+            rel_name = op->right_relation;
+
+        if (rel_name) {
+            char dname[256];
+            snprintf(dname, sizeof(dname), "$d$%s", rel_name);
+            col_rel_t *d = session_find_rel(sess, dname);
+            if (!d || d->nrows == 0)
+                return true; /* Found empty forced-delta */
+        }
+    }
+    return false;
+}
+
+/*
  * col_eval_stratum:
  * Evaluate one stratum, writing results into session relations.
  * Non-recursive strata are evaluated once.
@@ -2528,6 +2571,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
         for (uint32_t ri = 0; ri < nrels; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
 
+            /* Pre-scan skip: if a FORCE_DELTA op references an empty or
+             * absent delta (iteration > 0), the plan would produce 0 rows.
+             * Skip evaluation entirely to avoid unnecessary work. */
+            if (has_empty_forced_delta(rp, sess, iter)) {
+                continue;
+            }
+
             eval_stack_t stack;
             eval_stack_init(&stack);
 
@@ -2544,6 +2594,18 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
 
             eval_entry_t result = eval_stack_pop(&stack);
             eval_stack_drain(&stack);
+
+            /* Post-eval skip: if evaluation produced 0 rows, skip the
+             * append + consolidate path.  This is a safety net for cases
+             * not caught by the pre-scan (e.g. filters that eliminate
+             * all rows). */
+            if (result.rel && result.rel->nrows == 0) {
+                if (result.owned) {
+                    col_rel_free_contents(result.rel);
+                    free(result.rel);
+                }
+                continue;
+            }
 
             col_rel_t *target = session_find_rel(sess, rp->name);
             if (!target) {
