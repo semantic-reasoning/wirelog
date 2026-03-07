@@ -224,7 +224,7 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
  * col_materialized_join_create - Allocate and initialize a materialized join.
  * Memory limit defaults to 10MB if not specified.
  */
-static col_materialized_join_t *
+static col_materialized_join_t * __attribute__((unused))
 col_materialized_join_create(uint32_t ncols, uint32_t memory_limit)
 {
     col_materialized_join_t *mj
@@ -253,7 +253,7 @@ col_materialized_join_create(uint32_t ncols, uint32_t memory_limit)
  * col_materialized_join_append - Add a row to materialized join.
  * Returns 0 on success, ENOMEM if materialized join would exceed memory limit.
  */
-static int
+static int __attribute__((unused))
 col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row)
 {
     if (!mj || !mj->data || mj->ncols == 0)
@@ -283,7 +283,7 @@ col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row)
 /**
  * col_materialized_join_free - Free materialized join and release data.
  */
-static void
+static void __attribute__((unused))
 col_materialized_join_free(col_materialized_join_t *mj)
 {
     if (!mj)
@@ -296,7 +296,7 @@ col_materialized_join_free(col_materialized_join_t *mj)
 /**
  * col_materialized_join_invalidate - Mark as invalid (expires at end of iteration).
  */
-static void
+static void __attribute__((unused))
 col_materialized_join_invalidate(col_materialized_join_t *mj)
 {
     if (mj)
