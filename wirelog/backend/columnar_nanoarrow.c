@@ -591,8 +591,8 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     char dname[256];
     snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
     col_rel_t *delta = session_find_rel(sess, dname);
-    bool use_delta = (delta && delta->nrows > 0
-                      && delta->nrows < full_rel->nrows);
+    bool use_delta
+        = (delta && delta->nrows > 0 && delta->nrows < full_rel->nrows);
     col_rel_t *rel = use_delta ? delta : full_rel;
     /* push borrowed reference - session owns the relation */
     return eval_stack_push_delta(stack, rel, false, use_delta);
@@ -818,7 +818,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     /* Hash join: build hash table from right relation, probe with left. */
     uint32_t nbuckets = next_pow2(right->nrows > 0 ? right->nrows * 2 : 1);
     uint32_t *ht_head = (uint32_t *)calloc(nbuckets, sizeof(uint32_t));
-    uint32_t *ht_next = (uint32_t *)malloc((right->nrows + 1) * sizeof(uint32_t));
+    uint32_t *ht_next
+        = (uint32_t *)malloc((right->nrows + 1) * sizeof(uint32_t));
     if (!ht_head || !ht_next) {
         free(ht_head);
         free(ht_next);
@@ -940,7 +941,8 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Hash antijoin: build hash set from right, iterate left. */
     uint32_t aj_nbuckets = next_pow2(right->nrows > 0 ? right->nrows * 2 : 1);
     uint32_t *aj_head = (uint32_t *)calloc(aj_nbuckets, sizeof(uint32_t));
-    uint32_t *aj_next = (uint32_t *)malloc((right->nrows + 1) * sizeof(uint32_t));
+    uint32_t *aj_next
+        = (uint32_t *)malloc((right->nrows + 1) * sizeof(uint32_t));
     if (!aj_head || !aj_next) {
         free(aj_head);
         free(aj_next);
@@ -1061,18 +1063,21 @@ col_op_concat(eval_stack_t *stack)
 
 /* --- CONSOLIDATE --------------------------------------------------------- */
 
-/* Comparison for qsort: lexicographic int64 row order. */
-static uint32_t g_consolidate_ncols; /* qsort context (single-threaded) */
+/* Comparison for qsort_r: lexicographic int64 row order. */
+typedef struct {
+    uint32_t ncols;
+} row_cmp_ctx_t;
 
 static int
-row_cmp(const void *a, const void *b)
+row_cmp_fn(void *ctx, const void *a, const void *b)
 {
+    const row_cmp_ctx_t *c = (const row_cmp_ctx_t *)ctx;
     const int64_t *ra = (const int64_t *)a;
     const int64_t *rb = (const int64_t *)b;
-    for (uint32_t c = 0; c < g_consolidate_ncols; c++) {
-        if (ra[c] < rb[c])
+    for (uint32_t i = 0; i < c->ncols; i++) {
+        if (ra[i] < rb[i])
             return -1;
-        if (ra[c] > rb[c])
+        if (ra[i] > rb[i])
             return 1;
     }
     return 0;
@@ -1109,8 +1114,8 @@ col_op_consolidate(eval_stack_t *stack)
         work_owned = true;
     }
 
-    g_consolidate_ncols = nc;
-    qsort(work->data, nr, sizeof(int64_t) * nc, row_cmp);
+    row_cmp_ctx_t ctx = { .ncols = nc };
+    qsort_r(work->data, nr, sizeof(int64_t) * nc, &ctx, row_cmp_fn);
 
     /* Compact: keep only unique rows */
     uint32_t out_r = 1; /* first row always kept */
