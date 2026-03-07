@@ -47,6 +47,22 @@ typedef struct {
     bool schema_ok;            /* true after schema is initialised      */
 } col_rel_t;
 
+/**
+ * col_materialized_join_t - Cached intermediate join result for CSE
+ *
+ * Stores the output of a multi-way join operation for reuse across
+ * multiple semi-naive iterations. Used by Option 2 + Materialization
+ * to avoid redundant computation of shared join prefixes.
+ */
+typedef struct {
+    int64_t *data;             /* owned, row-major int64 buffer         */
+    uint32_t nrows;            /* current row count                     */
+    uint32_t ncols;            /* columns per tuple                     */
+    uint32_t capacity;         /* allocated row capacity (for appending)*/
+    uint32_t memory_limit;     /* max bytes before eviction             */
+    bool is_valid;             /* true if data is current for this iter */
+} col_materialized_join_t;
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 static void
@@ -198,6 +214,93 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
             return (int)v;
     }
     return -1;
+}
+
+/* ======================================================================== */
+/* CSE Materialized Join Management (US-003)                               */
+/* ======================================================================== */
+
+/**
+ * col_materialized_join_create - Allocate and initialize a materialized join.
+ * Memory limit defaults to 10MB if not specified.
+ */
+static col_materialized_join_t *
+col_materialized_join_create(uint32_t ncols, uint32_t memory_limit)
+{
+    col_materialized_join_t *mj
+        = (col_materialized_join_t *)calloc(1, sizeof(*mj));
+    if (!mj)
+        return NULL;
+
+    mj->ncols = ncols;
+    mj->memory_limit = (memory_limit > 0) ? memory_limit : (10 * 1024 * 1024);
+    mj->capacity = 64; /* start small, grow on demand */
+    mj->nrows = 0;
+    mj->is_valid = false;
+
+    if (ncols > 0) {
+        mj->data = (int64_t *)malloc(sizeof(int64_t) * mj->capacity * ncols);
+        if (!mj->data) {
+            free(mj);
+            return NULL;
+        }
+    }
+
+    return mj;
+}
+
+/**
+ * col_materialized_join_append - Add a row to materialized join.
+ * Returns 0 on success, ENOMEM if materialized join would exceed memory limit.
+ */
+static int
+col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row)
+{
+    if (!mj || !mj->data || mj->ncols == 0)
+        return EINVAL;
+
+    /* Check memory limit */
+    uint32_t row_bytes = sizeof(int64_t) * mj->ncols;
+    if ((size_t)mj->nrows * row_bytes + row_bytes > mj->memory_limit)
+        return ENOMEM; /* exceeds memory limit */
+
+    /* Grow capacity if needed */
+    if (mj->nrows >= mj->capacity) {
+        uint32_t new_cap = mj->capacity * 2;
+        int64_t *new_data = (int64_t *)realloc(mj->data,
+                                               sizeof(int64_t) * new_cap * mj->ncols);
+        if (!new_data)
+            return ENOMEM;
+        mj->data = new_data;
+        mj->capacity = new_cap;
+    }
+
+    memcpy(mj->data + (size_t)mj->nrows * mj->ncols, row, row_bytes);
+    mj->nrows++;
+    return 0;
+}
+
+/**
+ * col_materialized_join_free - Free materialized join and release data.
+ */
+static void
+col_materialized_join_free(col_materialized_join_t *mj)
+{
+    if (!mj)
+        return;
+    free(mj->data);
+    memset(mj, 0, sizeof(*mj));
+    free(mj);
+}
+
+/**
+ * col_materialized_join_invalidate - Mark as invalid (expires at end of iteration).
+ */
+static void
+col_materialized_join_invalidate(col_materialized_join_t *mj)
+{
+    if (mj)
+        mj->is_valid = false;
 }
 
 /* ======================================================================== */
