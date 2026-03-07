@@ -224,7 +224,7 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
  * col_materialized_join_create - Allocate and initialize a materialized join.
  * Memory limit defaults to 10MB if not specified.
  */
-static col_materialized_join_t * __attribute__((unused))
+static col_materialized_join_t *__attribute__((unused))
 col_materialized_join_create(uint32_t ncols, uint32_t memory_limit)
 {
     col_materialized_join_t *mj
@@ -359,10 +359,10 @@ static void
 col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
                      const col_rel_t *right, col_rel_t *result)
 {
-    size_t result_bytes = (result->nrows > 0 && result->ncols > 0)
-                              ? (size_t)result->nrows * result->ncols
-                                    * sizeof(int64_t)
-                              : 0;
+    size_t result_bytes
+        = (result->nrows > 0 && result->ncols > 0)
+              ? (size_t)result->nrows * result->ncols * sizeof(int64_t)
+              : 0;
 
     /* Evict LRU entries until within memory limit */
     while (cache->count > 0
@@ -447,14 +447,14 @@ col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
  * @see exec_plan.h for wl_plan_t backend-agnostic plan types
  */
 typedef struct {
-    wl_session_t base;       /* MUST be first field (vtable dispatch)  */
-    const wl_plan_t *plan;   /* borrowed, lifetime: caller             */
-    col_rel_t **rels;        /* owned array of owned col_rel_t*        */
-    uint32_t nrels;          /* current number of registered relations */
-    uint32_t rel_cap;        /* allocated capacity of rels[]           */
-    wl_on_delta_fn delta_cb; /* delta callback (NULL = disabled)       */
-    void *delta_data;        /* opaque user context for delta_cb       */
-    wl_arena_t *eval_arena;  /* arena for per-iteration temporaries    */
+    wl_session_t base;         /* MUST be first field (vtable dispatch)  */
+    const wl_plan_t *plan;     /* borrowed, lifetime: caller             */
+    col_rel_t **rels;          /* owned array of owned col_rel_t*        */
+    uint32_t nrels;            /* current number of registered relations */
+    uint32_t rel_cap;          /* allocated capacity of rels[]           */
+    wl_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
+    void *delta_data;          /* opaque user context for delta_cb       */
+    wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
     col_mat_cache_t mat_cache; /* materialization cache (US-006)        */
 } wl_col_session_t;
 
@@ -1318,15 +1318,14 @@ col_op_concat(eval_stack_t *stack)
 
 /* --- CONSOLIDATE --------------------------------------------------------- */
 
-/* Comparison for qsort: lexicographic int64 row order. */
-static uint32_t g_consolidate_ncols; /* qsort context (single-threaded) */
-
+/* Comparison for qsort_r: lexicographic int64 row order. */
 static int
-row_cmp(const void *a, const void *b)
+row_cmp_fn(void *ctx, const void *a, const void *b)
 {
+    const uint32_t ncols = *(const uint32_t *)ctx;
     const int64_t *ra = (const int64_t *)a;
     const int64_t *rb = (const int64_t *)b;
-    for (uint32_t c = 0; c < g_consolidate_ncols; c++) {
+    for (uint32_t c = 0; c < ncols; c++) {
         if (ra[c] < rb[c])
             return -1;
         if (ra[c] > rb[c])
@@ -1366,8 +1365,7 @@ col_op_consolidate(eval_stack_t *stack)
         work_owned = true;
     }
 
-    g_consolidate_ncols = nc;
-    qsort(work->data, nr, sizeof(int64_t) * nc, row_cmp);
+    qsort_r(work->data, nr, sizeof(int64_t) * nc, &nc, row_cmp_fn);
 
     /* Compact: keep only unique rows */
     uint32_t out_r = 1; /* first row always kept */
@@ -1415,8 +1413,7 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     size_t row_bytes = (size_t)nc * sizeof(int64_t);
 
     /* Phase 1: sort only the new delta rows */
-    g_consolidate_ncols = nc;
-    qsort(delta_start, delta_count, row_bytes, row_cmp);
+    qsort_r(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
