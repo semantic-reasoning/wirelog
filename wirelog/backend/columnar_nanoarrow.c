@@ -304,6 +304,107 @@ col_materialized_join_invalidate(col_materialized_join_t *mj)
 }
 
 /* ======================================================================== */
+/* Materialization Cache (US-006)                                            */
+/* ======================================================================== */
+
+#define COL_MAT_CACHE_MAX 64u
+#define COL_MAT_CACHE_LIMIT_BYTES (100ULL * 1024ULL * 1024ULL)
+
+/*
+ * col_mat_entry_t: one entry in the materialization cache.
+ * Keyed by (left_ptr, right_ptr) — stable session relation pointers.
+ * The cache owns result; freed when the entry is evicted or cache cleared.
+ */
+typedef struct {
+    const col_rel_t *left_ptr;  /* cache key: left input relation ptr  */
+    const col_rel_t *right_ptr; /* cache key: right input relation ptr */
+    col_rel_t *result;          /* owned cached join result            */
+    size_t mem_bytes;           /* bytes used by result->data          */
+    uint64_t lru_clock;         /* logical time of last access         */
+} col_mat_entry_t;
+
+typedef struct {
+    col_mat_entry_t entries[COL_MAT_CACHE_MAX];
+    uint32_t count;
+    size_t total_bytes;
+    uint64_t clock;
+} col_mat_cache_t;
+
+static void
+col_mat_cache_clear(col_mat_cache_t *cache)
+{
+    for (uint32_t i = 0; i < cache->count; i++) {
+        col_rel_free_contents(cache->entries[i].result);
+        free(cache->entries[i].result);
+    }
+    cache->count = 0;
+    cache->total_bytes = 0;
+}
+
+static col_rel_t *
+col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
+                     const col_rel_t *right)
+{
+    for (uint32_t i = 0; i < cache->count; i++) {
+        if (cache->entries[i].left_ptr == left
+            && cache->entries[i].right_ptr == right) {
+            cache->entries[i].lru_clock = ++cache->clock;
+            return cache->entries[i].result;
+        }
+    }
+    return NULL;
+}
+
+static void
+col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
+                     const col_rel_t *right, col_rel_t *result)
+{
+    size_t result_bytes = (result->nrows > 0 && result->ncols > 0)
+                              ? (size_t)result->nrows * result->ncols
+                                    * sizeof(int64_t)
+                              : 0;
+
+    /* Evict LRU entries until within memory limit */
+    while (cache->count > 0
+           && cache->total_bytes + result_bytes > COL_MAT_CACHE_LIMIT_BYTES) {
+        uint32_t lru = 0;
+        for (uint32_t i = 1; i < cache->count; i++) {
+            if (cache->entries[i].lru_clock < cache->entries[lru].lru_clock)
+                lru = i;
+        }
+        cache->total_bytes -= cache->entries[lru].mem_bytes;
+        col_rel_free_contents(cache->entries[lru].result);
+        free(cache->entries[lru].result);
+        memmove(&cache->entries[lru], &cache->entries[lru + 1],
+                (cache->count - lru - 1) * sizeof(col_mat_entry_t));
+        cache->count--;
+    }
+
+    /* Evict oldest entry if array is full */
+    if (cache->count >= COL_MAT_CACHE_MAX) {
+        uint32_t lru = 0;
+        for (uint32_t i = 1; i < cache->count; i++) {
+            if (cache->entries[i].lru_clock < cache->entries[lru].lru_clock)
+                lru = i;
+        }
+        cache->total_bytes -= cache->entries[lru].mem_bytes;
+        col_rel_free_contents(cache->entries[lru].result);
+        free(cache->entries[lru].result);
+        memmove(&cache->entries[lru], &cache->entries[lru + 1],
+                (cache->count - lru - 1) * sizeof(col_mat_entry_t));
+        cache->count--;
+    }
+
+    col_mat_entry_t *e = &cache->entries[cache->count++];
+    e->left_ptr = left;
+    e->right_ptr = right;
+    e->result = result;
+    e->mem_bytes = result_bytes;
+    e->lru_clock = ++cache->clock;
+    cache->total_bytes += result_bytes;
+}
+
+/* ======================================================================== */
 /* Session                                                                   */
 /* ======================================================================== */
 
@@ -354,6 +455,7 @@ typedef struct {
     wl_on_delta_fn delta_cb; /* delta callback (NULL = disabled)       */
     void *delta_data;        /* opaque user context for delta_cb       */
     wl_arena_t *eval_arena;  /* arena for per-iteration temporaries    */
+    col_mat_cache_t mat_cache; /* materialization cache (US-006)        */
 } wl_col_session_t;
 
 /*
@@ -706,12 +808,9 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         if (delta && delta->nrows > 0) {
             return eval_stack_push_delta(stack, delta, false, true);
         }
-        /* No delta available: push empty relation so this rule copy
-         * produces no tuples (correct semi-naive behavior). */
-        col_rel_t *empty = col_rel_new_like("$empty", full_rel);
-        if (!empty)
-            return ENOMEM;
-        return eval_stack_push_delta(stack, empty, true, true);
+        /* No delta available (base-case iteration): fall back to full
+         * relation so EDB-grounded rules can still fire on iter 0. */
+        return eval_stack_push_delta(stack, full_rel, false, false);
     }
 
     /* WL_DELTA_AUTO: original heuristic */
@@ -889,18 +988,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (rdelta && rdelta->nrows > 0) {
             right = rdelta;
             used_right_delta = true;
-        } else {
-            /* No delta available: push empty result and return early. */
-            uint32_t ocols = left_e.rel->ncols + right->ncols;
-            if (left_e.owned) {
-                col_rel_free_contents(left_e.rel);
-                free(left_e.rel);
-            }
-            col_rel_t *empty = col_rel_new_auto("$join", ocols);
-            if (!empty)
-                return ENOMEM;
-            return eval_stack_push_delta(stack, empty, true, true);
         }
+        /* else: no delta available - fall through using full right relation */
     } else if (op->delta_mode != WL_DELTA_FORCE_FULL && !left_e.is_delta
                && op->right_relation) {
         /* AUTO: original heuristic */
@@ -910,6 +999,17 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (rdelta && rdelta->nrows > 0 && rdelta->nrows < right->nrows) {
             right = rdelta;
             used_right_delta = true;
+        }
+    }
+
+    /* Materialization cache: reuse previous join result when available.
+     * Only when left is borrowed (stable session pointer) so the key is stable. */
+    if (op->materialized && !left_e.owned) {
+        col_rel_t *cached
+            = col_mat_cache_lookup(&sess->mat_cache, left_e.rel, right);
+        if (cached) {
+            return eval_stack_push_delta(stack, cached, false,
+                                         left_e.is_delta || used_right_delta);
         }
     }
 
@@ -1034,6 +1134,13 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
      * right-delta. This ensures subsequent JOINs in the same rule plan know
      * whether to apply right-delta (they should NOT if we already used one). */
     bool result_is_delta = left_e.is_delta || used_right_delta;
+
+    /* Populate materialization cache when hint is set and left was stable.
+     * Cache takes ownership of out; we push a borrowed reference. */
+    if (op->materialized && !left_e.owned) {
+        col_mat_cache_insert(&sess->mat_cache, left, right, out);
+        return eval_stack_push_delta(stack, out, false, result_is_delta);
+    }
     return eval_stack_push_delta(stack, out, true, result_is_delta);
 }
 
@@ -1156,7 +1263,7 @@ static int
 col_op_concat(eval_stack_t *stack)
 {
     if (stack->top < 2)
-        return EINVAL;
+        return 0; /* single-item passthrough for K-copy boundary marker */
 
     eval_entry_t b_e = eval_stack_pop(stack);
     eval_entry_t a_e = eval_stack_pop(stack);
@@ -1716,6 +1823,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
                     return rc;
             }
         }
+        col_mat_cache_clear(&sess->mat_cache);
         return 0;
     }
 
@@ -1969,6 +2077,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
         free(old_data);
         free(snap);
 
+        /* Clear materialization cache between iterations (relation data changed) */
+        col_mat_cache_clear(&sess->mat_cache);
+
         if (!any_new)
             break;
     }
@@ -1984,6 +2095,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
         session_remove_rel(sess, dname);
     }
     free(delta_rels);
+    col_mat_cache_clear(&sess->mat_cache);
     return 0;
 }
 
@@ -2091,6 +2203,7 @@ col_session_destroy(wl_session_t *session)
     free(sess->rels);
     if (sess->eval_arena)
         wl_arena_free(sess->eval_arena);
+    col_mat_cache_clear(&sess->mat_cache);
     free(sess);
 }
 
