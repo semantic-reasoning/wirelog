@@ -369,6 +369,8 @@ typedef struct {
     uint32_t count;
     size_t total_bytes;
     uint64_t clock;
+    uint64_t hits;   /* cache hit counter  */
+    uint64_t misses; /* cache miss counter */
 } col_mat_cache_t;
 
 static void
@@ -392,9 +394,11 @@ col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
         if (cache->entries[i].left_hash == lh
             && cache->entries[i].right_hash == rh) {
             cache->entries[i].lru_clock = ++cache->clock;
+            cache->hits++;
             return cache->entries[i].result;
         }
     }
+    cache->misses++;
     return NULL;
 }
 
@@ -731,6 +735,9 @@ typedef struct {
     col_rel_t *rel;
     bool owned;
     bool is_delta; /* true when rel is a delta (ΔR) relation, not the full */
+    uint32_t
+        *seg_boundaries; /* Array of K+1 boundary row indices (K-way merge) */
+    uint32_t seg_count;  /* Number of segments (0 = no segmentation) */
 } eval_entry_t;
 
 typedef struct {
@@ -752,6 +759,8 @@ eval_stack_push(eval_stack_t *s, col_rel_t *r, bool owned)
     s->items[s->top].rel = r;
     s->items[s->top].owned = owned;
     s->items[s->top].is_delta = false;
+    s->items[s->top].seg_boundaries = NULL;
+    s->items[s->top].seg_count = 0;
     s->top++;
     return 0;
 }
@@ -769,7 +778,7 @@ eval_stack_push_delta(eval_stack_t *s, col_rel_t *r, bool owned, bool is_delta)
 static eval_entry_t
 eval_stack_pop(eval_stack_t *s)
 {
-    eval_entry_t e = { NULL, false, false };
+    eval_entry_t e = { NULL, false, false, NULL, 0 };
     if (s->top > 0)
         e = s->items[--s->top];
     return e;
@@ -780,6 +789,8 @@ eval_stack_drain(eval_stack_t *s)
 {
     while (s->top > 0) {
         eval_entry_t e = eval_stack_pop(s);
+        if (e.seg_boundaries)
+            free(e.seg_boundaries);
         if (e.owned) {
             col_rel_free_contents(e.rel);
             free(e.rel);
@@ -1343,6 +1354,75 @@ col_op_concat(eval_stack_t *stack)
     if (rc == 0)
         rc = col_rel_append_all(out, b);
 
+    if (rc != 0) {
+        if (a_e.seg_boundaries)
+            free(a_e.seg_boundaries);
+        if (b_e.seg_boundaries)
+            free(b_e.seg_boundaries);
+        if (a_e.owned) {
+            col_rel_free_contents(a);
+            free(a);
+        }
+        if (b_e.owned) {
+            col_rel_free_contents(b);
+            free(b);
+        }
+        col_rel_free_contents(out);
+        free(out);
+        return rc;
+    }
+
+    /* Track segment boundaries for K-way merge optimization. */
+    uint32_t left_segs = a_e.seg_count > 0 ? a_e.seg_count : 1;
+    uint32_t right_segs = b_e.seg_count > 0 ? b_e.seg_count : 1;
+    uint32_t total_segs = left_segs + right_segs;
+
+    uint32_t *out_boundaries
+        = (uint32_t *)malloc((total_segs + 1) * sizeof(uint32_t));
+    if (!out_boundaries) {
+        if (a_e.seg_boundaries)
+            free(a_e.seg_boundaries);
+        if (b_e.seg_boundaries)
+            free(b_e.seg_boundaries);
+        if (a_e.owned) {
+            col_rel_free_contents(a);
+            free(a);
+        }
+        if (b_e.owned) {
+            col_rel_free_contents(b);
+            free(b);
+        }
+        col_rel_free_contents(out);
+        free(out);
+        return ENOMEM;
+    }
+
+    /* Copy left boundaries */
+    if (a_e.seg_boundaries != NULL) {
+        memcpy(out_boundaries, a_e.seg_boundaries,
+               (left_segs + 1) * sizeof(uint32_t));
+    } else {
+        out_boundaries[0] = 0;
+        out_boundaries[1] = a->nrows;
+    }
+
+    /* Adjust and append right boundaries */
+    uint32_t right_offset = a->nrows;
+    if (b_e.seg_boundaries != NULL) {
+        for (uint32_t i = 0; i <= right_segs; i++)
+            out_boundaries[left_segs + i]
+                = b_e.seg_boundaries[i] + right_offset;
+    } else {
+        out_boundaries[left_segs] = right_offset;
+        out_boundaries[left_segs + 1] = out->nrows;
+    }
+
+    /* Clean up input boundaries */
+    if (a_e.seg_boundaries)
+        free(a_e.seg_boundaries);
+    if (b_e.seg_boundaries)
+        free(b_e.seg_boundaries);
+
     if (a_e.owned) {
         col_rel_free_contents(a);
         free(a);
@@ -1352,12 +1432,18 @@ col_op_concat(eval_stack_t *stack)
         free(b);
     }
 
+    rc = eval_stack_push(stack, out, true);
     if (rc != 0) {
+        free(out_boundaries);
         col_rel_free_contents(out);
         free(out);
         return rc;
     }
-    return eval_stack_push(stack, out, true);
+
+    /* Attach boundary metadata to the pushed entry */
+    stack->items[stack->top - 1].seg_boundaries = out_boundaries;
+    stack->items[stack->top - 1].seg_count = total_segs;
+    return 0;
 }
 
 /* --- CONSOLIDATE --------------------------------------------------------- */
@@ -1378,6 +1464,225 @@ row_cmp_fn(void *ctx, const void *a, const void *b)
     return 0;
 }
 
+/* Lexicographic int64_t row comparison for K-way merge.
+ * Equivalent to row_cmp_lex / row_cmp_optimized but available before
+ * the SIMD dispatcher is defined. */
+static inline int
+kway_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
+{
+    for (uint32_t c = 0; c < ncols; c++) {
+        if (a[c] < b[c])
+            return -1;
+        if (a[c] > b[c])
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * col_op_consolidate_kway_merge - K-way merge with per-segment sort and dedup.
+ *
+ * Sorts each segment in-place, then merges K sorted segments using a min-heap.
+ * Deduplicates on-the-fly during merge. Writes merged result back into rel.
+ *
+ * For K=1: just sort + dedup in-place.
+ * For K=2: optimized 2-way merge (no heap overhead).
+ * For K>=3: min-heap merge with O(M log K) comparisons.
+ *
+ * @rel            Relation containing K concatenated segments.
+ * @seg_boundaries Array of (seg_count+1) offsets [s0, s1, ..., sK].
+ * @seg_count      Number of segments K.
+ * @return         0 on success, ENOMEM on allocation failure.
+ */
+int
+col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
+                              uint32_t seg_count)
+{
+    uint32_t nc = rel->ncols;
+    uint32_t nr = rel->nrows;
+    size_t row_bytes = (size_t)nc * sizeof(int64_t);
+
+    if (nr <= 1)
+        return 0;
+
+    /* Sort each segment in-place */
+    for (uint32_t s = 0; s < seg_count; s++) {
+        uint32_t start = seg_boundaries[s];
+        uint32_t end = seg_boundaries[s + 1];
+        if (end > start + 1) {
+            qsort_r(rel->data + (size_t)start * nc, end - start, row_bytes, &nc,
+                    row_cmp_fn);
+        }
+    }
+
+    /* K=1: segments already sorted, just dedup in-place */
+    if (seg_count == 1) {
+        uint32_t out_r = 1;
+        for (uint32_t r = 1; r < nr; r++) {
+            const int64_t *prev = rel->data + (size_t)(r - 1) * nc;
+            const int64_t *cur = rel->data + (size_t)r * nc;
+            if (memcmp(prev, cur, row_bytes) != 0) {
+                if (out_r != r)
+                    memcpy(rel->data + (size_t)out_r * nc, cur, row_bytes);
+                out_r++;
+            }
+        }
+        rel->nrows = out_r;
+        return 0;
+    }
+
+    /* Allocate merge output buffer */
+    int64_t *merged = (int64_t *)malloc((size_t)nr * nc * sizeof(int64_t));
+    if (!merged)
+        return ENOMEM;
+
+    if (seg_count == 2) {
+        /* Optimized 2-way merge (no heap) */
+        uint32_t mid = seg_boundaries[1];
+        uint32_t i = seg_boundaries[0], j = mid;
+        uint32_t i_end = mid, j_end = seg_boundaries[2];
+        uint32_t out = 0;
+        int64_t *last_row = NULL;
+
+        while (i < i_end && j < j_end) {
+            int64_t *row_i = rel->data + (size_t)i * nc;
+            int64_t *row_j = rel->data + (size_t)j * nc;
+            int cmp = kway_row_cmp(row_i, row_j, nc);
+            int64_t *row_to_add;
+
+            if (cmp <= 0) {
+                row_to_add = row_i;
+                i++;
+                if (cmp == 0)
+                    j++; /* skip duplicate */
+            } else {
+                row_to_add = row_j;
+                j++;
+            }
+
+            if (last_row == NULL
+                || memcmp(last_row, row_to_add, row_bytes) != 0) {
+                memcpy(merged + (size_t)out * nc, row_to_add, row_bytes);
+                last_row = merged + (size_t)out * nc;
+                out++;
+            }
+        }
+
+        while (i < i_end) {
+            int64_t *row = rel->data + (size_t)i * nc;
+            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+                memcpy(merged + (size_t)out * nc, row, row_bytes);
+                last_row = merged + (size_t)out * nc;
+                out++;
+            }
+            i++;
+        }
+
+        while (j < j_end) {
+            int64_t *row = rel->data + (size_t)j * nc;
+            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+                memcpy(merged + (size_t)out * nc, row, row_bytes);
+                last_row = merged + (size_t)out * nc;
+                out++;
+            }
+            j++;
+        }
+
+        memcpy(rel->data, merged, (size_t)out * nc * sizeof(int64_t));
+        rel->nrows = out;
+        free(merged);
+        return 0;
+    }
+
+    /* General K-way merge (K >= 3) using min-heap.
+     *
+     * Heap entries: (segment_index, current_row_pointer).
+     * Heap property: parent row <= child rows (lexicographic).
+     */
+    typedef struct {
+        uint32_t seg;    /* segment index */
+        uint32_t cursor; /* current row index within rel->data */
+        uint32_t end;    /* one-past-end row index for this segment */
+    } heap_entry_t;
+
+    /* Build initial heap from non-empty segments */
+    heap_entry_t *heap
+        = (heap_entry_t *)malloc(seg_count * sizeof(heap_entry_t));
+    if (!heap) {
+        free(merged);
+        return ENOMEM;
+    }
+
+    uint32_t heap_size = 0;
+    for (uint32_t s = 0; s < seg_count; s++) {
+        if (seg_boundaries[s] < seg_boundaries[s + 1]) {
+            heap[heap_size].seg = s;
+            heap[heap_size].cursor = seg_boundaries[s];
+            heap[heap_size].end = seg_boundaries[s + 1];
+            heap_size++;
+        }
+    }
+
+    /* Sift-down helper (inline macro for performance) */
+#define HEAP_ROW(idx) (rel->data + (size_t)heap[(idx)].cursor * nc)
+#define HEAP_SIFT_DOWN(start, size)                                      \
+    do {                                                                 \
+        uint32_t _p = (start);                                           \
+        while (2 * _p + 1 < (size)) {                                    \
+            uint32_t _c = 2 * _p + 1;                                    \
+            if (_c + 1 < (size)                                          \
+                && kway_row_cmp(HEAP_ROW(_c + 1), HEAP_ROW(_c), nc) < 0) \
+                _c++;                                                    \
+            if (kway_row_cmp(HEAP_ROW(_p), HEAP_ROW(_c), nc) <= 0)       \
+                break;                                                   \
+            heap_entry_t _tmp = heap[_p];                                \
+            heap[_p] = heap[_c];                                         \
+            heap[_c] = _tmp;                                             \
+            _p = _c;                                                     \
+        }                                                                \
+    } while (0)
+
+    /* Build min-heap (heapify) */
+    if (heap_size > 1) {
+        for (int32_t i = (int32_t)(heap_size / 2) - 1; i >= 0; i--)
+            HEAP_SIFT_DOWN((uint32_t)i, heap_size);
+    }
+
+    /* Extract-min loop with dedup */
+    uint32_t out = 0;
+    int64_t *last_row = NULL;
+
+    while (heap_size > 0) {
+        int64_t *min_row = HEAP_ROW(0);
+
+        /* Dedup: skip if same as last emitted row */
+        if (last_row == NULL || memcmp(last_row, min_row, row_bytes) != 0) {
+            memcpy(merged + (size_t)out * nc, min_row, row_bytes);
+            last_row = merged + (size_t)out * nc;
+            out++;
+        }
+
+        /* Advance cursor of min segment */
+        heap[0].cursor++;
+        if (heap[0].cursor >= heap[0].end) {
+            /* Segment exhausted: replace root with last element */
+            heap[0] = heap[heap_size - 1];
+            heap_size--;
+        }
+        if (heap_size > 0)
+            HEAP_SIFT_DOWN(0, heap_size);
+    }
+
+#undef HEAP_ROW
+#undef HEAP_SIFT_DOWN
+
+    memcpy(rel->data, merged, (size_t)out * nc * sizeof(int64_t));
+    rel->nrows = out;
+    free(merged);
+    free(heap);
+    return 0;
+}
+
 static int
 col_op_consolidate(eval_stack_t *stack)
 {
@@ -1391,6 +1696,8 @@ col_op_consolidate(eval_stack_t *stack)
 
     if (nr <= 1) {
         /* Nothing to deduplicate */
+        if (e.seg_boundaries)
+            free(e.seg_boundaries);
         return eval_stack_push(stack, in, e.owned);
     }
 
@@ -1399,15 +1706,39 @@ col_op_consolidate(eval_stack_t *stack)
     bool work_owned = e.owned;
     if (!work_owned) {
         work = col_rel_new_like("$consol", in);
-        if (!work)
+        if (!work) {
+            if (e.seg_boundaries)
+                free(e.seg_boundaries);
             return ENOMEM;
+        }
         if (col_rel_append_all(work, in) != 0) {
             col_rel_free_contents(work);
             free(work);
+            if (e.seg_boundaries)
+                free(e.seg_boundaries);
             return ENOMEM;
         }
         work_owned = true;
     }
+
+    /* Dispatch: K-way merge when segment boundaries are available */
+    uint32_t k = e.seg_count > 0 ? e.seg_count : 1;
+    if (k >= 2 && e.seg_boundaries != NULL) {
+        int rc = col_op_consolidate_kway_merge(work, e.seg_boundaries, k);
+        free(e.seg_boundaries);
+        if (rc != 0) {
+            if (work_owned) {
+                col_rel_free_contents(work);
+                free(work);
+            }
+            return rc;
+        }
+        return eval_stack_push(stack, work, work_owned);
+    }
+
+    /* Fallback: standard qsort + dedup */
+    if (e.seg_boundaries)
+        free(e.seg_boundaries);
 
     qsort_r(work->data, nr, sizeof(int64_t) * nc, &nc, row_cmp_fn);
 
@@ -2368,6 +2699,27 @@ uint32_t
 col_session_get_iteration_count(wl_session_t *sess)
 {
     return COL_SESSION(sess)->total_iterations;
+}
+
+/*
+ * col_session_get_cache_stats:
+ *
+ * Return CSE materialization cache hit and miss counts accumulated during
+ * the last evaluation.  Both out-parameters are optional (NULL-safe).
+ *
+ * @param sess    A wl_session_t* backed by the columnar backend.
+ * @param out_hits    Set to the number of cache hits (may be NULL).
+ * @param out_misses  Set to the number of cache misses (may be NULL).
+ */
+void
+col_session_get_cache_stats(wl_session_t *sess, uint64_t *out_hits,
+                            uint64_t *out_misses)
+{
+    wl_col_session_t *cs = COL_SESSION(sess);
+    if (out_hits)
+        *out_hits = cs->mat_cache.hits;
+    if (out_misses)
+        *out_misses = cs->mat_cache.misses;
 }
 
 /* ======================================================================== */
