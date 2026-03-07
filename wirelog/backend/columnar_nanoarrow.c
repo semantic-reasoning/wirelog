@@ -10,6 +10,7 @@
 #include "memory.h"
 #include "../session.h"
 #include "../wirelog-internal.h"
+#include "../workqueue.h"
 #include "arena/arena.h"
 
 #include "nanoarrow/nanoarrow.h"
@@ -251,6 +252,8 @@ typedef struct {
     wl_on_delta_fn delta_cb; /* delta callback (NULL = disabled)       */
     void *delta_data;        /* opaque user context for delta_cb       */
     wl_arena_t *eval_arena;  /* arena for per-iteration temporaries    */
+    wl_work_queue_t *wq;     /* workqueue for parallel non-recursive   */
+    uint32_t num_workers;    /* thread pool size (0 = single-threaded) */
 } wl_col_session_t;
 
 /*
@@ -1400,10 +1403,125 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
 }
 
 /*
+ * Workqueue integration: per-relation worker context for parallel
+ * non-recursive stratum evaluation (collect-then-merge pattern).
+ *
+ * Each worker evaluates one relation plan independently.  The session
+ * is read-only during non-recursive evaluation (EDB lookups only),
+ * so concurrent reads are safe.  Each worker owns its own eval_stack_t
+ * (stack-allocated inside the worker function).
+ *
+ * After all workers complete, the main thread merges results
+ * sequentially into the session.
+ */
+typedef struct {
+    const wl_plan_relation_t *rplan; /* borrowed: relation plan to evaluate */
+    wl_col_session_t *sess;          /* borrowed: session (read-only access) */
+    col_rel_t *result;               /* output: worker-produced relation     */
+    bool result_owned;               /* true if result was owned by stack    */
+    int rc;                          /* output: 0 on success, errno on error */
+} wq_eval_ctx_t;
+
+static void
+wq_eval_relation(void *arg)
+{
+    wq_eval_ctx_t *ctx = (wq_eval_ctx_t *)arg;
+
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+
+    ctx->rc = col_eval_relation_plan(ctx->rplan, &stack, ctx->sess);
+    if (ctx->rc != 0) {
+        eval_stack_drain(&stack);
+        ctx->result = NULL;
+        ctx->result_owned = false;
+        return;
+    }
+
+    if (stack.top == 0) {
+        ctx->result = NULL;
+        ctx->result_owned = false;
+        return;
+    }
+
+    eval_entry_t entry = eval_stack_pop(&stack);
+    eval_stack_drain(&stack);
+
+    ctx->result = entry.rel;
+    ctx->result_owned = entry.owned;
+}
+
+/*
+ * col_merge_worker_result:
+ * Merge one worker's result relation into the session (main thread only).
+ * Implements the same logic as the original sequential non-recursive path.
+ *
+ * Returns 0 on success, non-zero on error.
+ */
+static int
+col_merge_worker_result(wq_eval_ctx_t *ctx, wl_col_session_t *sess)
+{
+    if (!ctx->result)
+        return 0; /* no output (empty plan) */
+
+    const char *name = ctx->rplan->name;
+    col_rel_t *target = session_find_rel(sess, name);
+
+    if (!target) {
+        if (ctx->result_owned) {
+            free(ctx->result->name);
+            ctx->result->name = wl_strdup(name);
+            if (!ctx->result->name) {
+                col_rel_free_contents(ctx->result);
+                free(ctx->result);
+                return ENOMEM;
+            }
+            int rc = session_add_rel(sess, ctx->result);
+            if (rc != 0) {
+                col_rel_free_contents(ctx->result);
+                free(ctx->result);
+                return rc;
+            }
+            ctx->result_owned = false;
+        } else {
+            col_rel_t *copy = col_rel_new_like(name, ctx->result);
+            if (!copy)
+                return ENOMEM;
+            int rc = col_rel_append_all(copy, ctx->result);
+            if (rc != 0) {
+                col_rel_free_contents(copy);
+                free(copy);
+                return rc;
+            }
+            rc = session_add_rel(sess, copy);
+            if (rc != 0) {
+                col_rel_free_contents(copy);
+                free(copy);
+                return rc;
+            }
+        }
+    } else {
+        int rc = col_rel_append_all(target, ctx->result);
+        if (ctx->result_owned) {
+            col_rel_free_contents(ctx->result);
+            free(ctx->result);
+        }
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
+/*
  * col_eval_stratum:
  * Evaluate one stratum, writing results into session relations.
- * Non-recursive strata are evaluated once.
+ * Non-recursive strata are evaluated once (optionally in parallel).
  * Recursive strata use semi-naive fixed-point iteration.
+ *
+ * When a workqueue is available (num_workers > 1), non-recursive
+ * relations are evaluated in parallel using the collect-then-merge
+ * pattern: all relation plans are submitted as work items, then
+ * results are merged sequentially after wait_all().
  *
  * Returns 0 on success, non-zero on error.
  */
@@ -1411,7 +1529,72 @@ static int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
 {
     if (!sp->is_recursive) {
-        /* Non-recursive: evaluate each relation plan once */
+        /*
+         * Parallel path: submit each relation plan to the workqueue.
+         * Workers evaluate independently; main thread merges after barrier.
+         */
+        if (sess->wq && sp->relation_count > 1) {
+            wq_eval_ctx_t *ctxs = (wq_eval_ctx_t *)calloc(
+                sp->relation_count, sizeof(wq_eval_ctx_t));
+            if (!ctxs)
+                return ENOMEM;
+
+            for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+                ctxs[ri].rplan = &sp->relations[ri];
+                ctxs[ri].sess = sess;
+                ctxs[ri].result = NULL;
+                ctxs[ri].result_owned = false;
+                ctxs[ri].rc = 0;
+
+                int rc = wl_workqueue_submit(sess->wq, wq_eval_relation,
+                                             &ctxs[ri]);
+                if (rc != 0) {
+                    /* Submission failed: wait for already-submitted, cleanup */
+                    wl_workqueue_wait_all(sess->wq);
+                    for (uint32_t j = 0; j < ri; j++) {
+                        if (ctxs[j].result && ctxs[j].result_owned) {
+                            col_rel_free_contents(ctxs[j].result);
+                            free(ctxs[j].result);
+                        }
+                    }
+                    free(ctxs);
+                    return ENOMEM;
+                }
+            }
+
+            wl_workqueue_wait_all(sess->wq);
+
+            /* Check for worker errors and merge results sequentially */
+            int merge_rc = 0;
+            for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+                if (ctxs[ri].rc != 0) {
+                    merge_rc = ctxs[ri].rc;
+                    /* Free remaining results */
+                    for (uint32_t j = ri; j < sp->relation_count; j++) {
+                        if (ctxs[j].result && ctxs[j].result_owned) {
+                            col_rel_free_contents(ctxs[j].result);
+                            free(ctxs[j].result);
+                        }
+                    }
+                    break;
+                }
+                merge_rc = col_merge_worker_result(&ctxs[ri], sess);
+                if (merge_rc != 0) {
+                    /* Free remaining results */
+                    for (uint32_t j = ri + 1; j < sp->relation_count; j++) {
+                        if (ctxs[j].result && ctxs[j].result_owned) {
+                            col_rel_free_contents(ctxs[j].result);
+                            free(ctxs[j].result);
+                        }
+                    }
+                    break;
+                }
+            }
+            free(ctxs);
+            return merge_rc;
+        }
+
+        /* Sequential fallback: single worker or single relation */
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
 
@@ -1763,7 +1946,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
  * Implements wl_compute_backend_t.session_create vtable slot.
  *
  * @param plan:        Execution plan (borrowed, must outlive session)
- * @param num_workers: Ignored; columnar backend is single-threaded
+ * @param num_workers: Thread pool size (1 = single-threaded, >1 = parallel)
  * @param out:         (out) Receives &sess->base on success
  *
  * Memory initialization order:
@@ -1782,8 +1965,6 @@ static int
 col_session_create(const wl_plan_t *plan, uint32_t num_workers,
                    wl_session_t **out)
 {
-    (void)num_workers; /* columnar backend is single-threaded */
-
     if (!plan || !out)
         return EINVAL;
 
@@ -1806,6 +1987,18 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         free(sess->rels);
         free(sess);
         return ENOMEM;
+    }
+
+    /* Create workqueue for parallel non-recursive stratum evaluation */
+    sess->num_workers = num_workers;
+    if (num_workers > 1) {
+        sess->wq = wl_workqueue_create(num_workers);
+        if (!sess->wq) {
+            wl_arena_free(sess->eval_arena);
+            free(sess->rels);
+            free(sess);
+            return ENOMEM;
+        }
     }
 
     /* Pre-register EDB relations (ncols determined at first insert) */
@@ -1857,6 +2050,8 @@ col_session_destroy(wl_session_t *session)
     free(sess->rels);
     if (sess->eval_arena)
         wl_arena_free(sess->eval_arena);
+    if (sess->wq)
+        wl_workqueue_destroy(sess->wq);
     free(sess);
 }
 
