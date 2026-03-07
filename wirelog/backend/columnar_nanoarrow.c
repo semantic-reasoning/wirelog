@@ -55,12 +55,12 @@ typedef struct {
  * to avoid redundant computation of shared join prefixes.
  */
 typedef struct {
-    int64_t *data;             /* owned, row-major int64 buffer         */
-    uint32_t nrows;            /* current row count                     */
-    uint32_t ncols;            /* columns per tuple                     */
-    uint32_t capacity;         /* allocated row capacity (for appending)*/
-    uint32_t memory_limit;     /* max bytes before eviction             */
-    bool is_valid;             /* true if data is current for this iter */
+    int64_t *data;         /* owned, row-major int64 buffer         */
+    uint32_t nrows;        /* current row count                     */
+    uint32_t ncols;        /* columns per tuple                     */
+    uint32_t capacity;     /* allocated row capacity (for appending)*/
+    uint32_t memory_limit; /* max bytes before eviction             */
+    bool is_valid;         /* true if data is current for this iter */
 } col_materialized_join_t;
 
 /* ---- lifecycle ---------------------------------------------------------- */
@@ -267,8 +267,8 @@ col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row)
     /* Grow capacity if needed */
     if (mj->nrows >= mj->capacity) {
         uint32_t new_cap = mj->capacity * 2;
-        int64_t *new_data = (int64_t *)realloc(mj->data,
-                                               sizeof(int64_t) * new_cap * mj->ncols);
+        int64_t *new_data = (int64_t *)realloc(
+            mj->data, sizeof(int64_t) * new_cap * mj->ncols);
         if (!new_data)
             return ENOMEM;
         mj->data = new_data;
