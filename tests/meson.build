@@ -268,6 +268,20 @@ test('option2_doop', test_option2_doop_exe,
 )
 
 # ============================================================================
+# Consolidation Function Tests (US-003 TDD RED Phase)
+# ============================================================================
+
+test_consolidate_incremental_delta_exe = executable(
+  'test_consolidate_incremental_delta',
+  files('test_consolidate_incremental_delta.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('consolidate_incremental_delta', test_consolidate_incremental_delta_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
