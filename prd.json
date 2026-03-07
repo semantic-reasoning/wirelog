@@ -89,7 +89,7 @@
       "title": "Validation: CSPA correctness after integration",
       "description": "Verify CSPA produces identical output (20,381 tuples) after CONSOLIDATE optimization.",
       "priority": "critical",
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "CSPA benchmark compiles: meson compile -C build bench_flowlog",
         "CSPA runs: ./build/bench/bench_flowlog --workload cspa",
@@ -104,7 +104,7 @@
       "title": "Performance: Peak RSS reduction measurement",
       "description": "Measure peak RSS before/after. Target: 4.46GB → <500MB (90% reduction from old_data snapshots).",
       "priority": "high",
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Baseline measurement recorded: /usr/bin/time -l ./build/bench/bench_flowlog --workload cspa (3 runs)",
         "Peak RSS before optimization: documented as 4.46GB (known from earlier profiling)",
@@ -119,7 +119,7 @@
       "title": "Performance: Wall time improvement measurement",
       "description": "Measure wall time improvement. Target: 2-4× speedup from eliminating memory allocation overhead.",
       "priority": "high",
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Baseline wall time recorded: 35.3s (median, from earlier profiling)",
         "Wall time after optimization: measured (3 runs, median)",
@@ -134,7 +134,7 @@
       "title": "Regression: Full benchmark suite validation",
       "description": "Verify all 15 workloads produce identical output and no performance regressions.",
       "priority": "critical",
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Full benchmark run: ./build/bench/bench_flowlog --workload all",
         "All 15 workloads complete without error",
