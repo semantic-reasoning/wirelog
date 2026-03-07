@@ -1478,6 +1478,128 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     return 0;
 }
 
+/*
+ * col_op_consolidate_incremental_delta - Incremental consolidation with delta output
+ *
+ * PURPOSE:
+ *   Merge pre-sorted old data with newly appended delta rows, while simultaneously
+ *   emitting the set of truly-new rows (R_new - R_old) as a byproduct.
+ *   This eliminates separate post-iteration merge walk needed for delta computation.
+ *
+ * PRECONDITIONS:
+ *   - rel->data[0..old_nrows) is already sorted and unique (invariant)
+ *   - rel->data[old_nrows..rel->nrows) contains newly appended delta rows (unsorted)
+ *   - old_nrows <= rel->nrows
+ *
+ * POSTCONDITIONS:
+ *   - rel->data[0..rel->nrows) is sorted and unique (new invariant)
+ *   - delta_out->data contains exactly R_new - R_old (truly new rows)
+ *   - delta_out->data is sorted in same order as rel->data
+ *   - rel->nrows reflects final merged count
+ *
+ * MEMORY OWNERSHIP:
+ *   - Caller allocates col_rel_t *delta_out (structure only)
+ *   - Function allocates and owns delta_out->data (int64_t array)
+ *   - Caller responsible for freeing delta_out->data via col_rel_free_contents()
+ *   - If delta_out == NULL, new rows not collected (merge only)
+ *
+ * ERROR HANDLING:
+ *   - Returns 0 on success
+ *   - Returns ENOMEM if malloc fails
+ *   - On error, rel and delta_out states are undefined; caller should not use
+ *
+ * ALGORITHM COMPLEXITY:
+ *   - Time: O(D log D + N + D) where D = new delta rows, N = old rows
+ *   - Space: O(N + D) for merge buffer + delta_out buffer
+ *   - Dominant term: O(N) when D << N (typical in late iterations)
+ */
+int
+col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
+                                     col_rel_t *delta_out)
+{
+    uint32_t nc = rel->ncols;
+    uint32_t nr = rel->nrows;
+
+    if (nr <= 1 || old_nrows >= nr)
+        return 0; /* nothing new */
+
+    uint32_t delta_count = nr - old_nrows;
+    int64_t *delta_start = rel->data + (size_t)old_nrows * nc;
+    size_t row_bytes = (size_t)nc * sizeof(int64_t);
+
+    /* Phase 1: sort only the new delta rows */
+    qsort_r(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
+
+    /* Phase 1b: dedup within delta */
+    uint32_t d_unique = 1;
+    for (uint32_t i = 1; i < delta_count; i++) {
+        if (memcmp(delta_start + (size_t)(i - 1) * nc,
+                   delta_start + (size_t)i * nc, row_bytes)
+            != 0) {
+            if (d_unique != i)
+                memcpy(delta_start + (size_t)d_unique * nc,
+                       delta_start + (size_t)i * nc, row_bytes);
+            d_unique++;
+        }
+    }
+
+    /* Phase 2: merge sorted old [0..old_nrows) with sorted+unique delta.
+     * Rows present in delta but not in old are emitted into delta_out. */
+    size_t max_rows = (size_t)old_nrows + d_unique;
+    int64_t *merged = (int64_t *)malloc(max_rows * nc * sizeof(int64_t));
+    if (!merged)
+        return ENOMEM;
+
+    uint32_t oi = 0, di = 0, out = 0;
+    while (oi < old_nrows && di < d_unique) {
+        const int64_t *orow = rel->data + (size_t)oi * nc;
+        const int64_t *drow = delta_start + (size_t)di * nc;
+        int cmp = memcmp(orow, drow, row_bytes);
+        if (cmp < 0) {
+            memcpy(merged + (size_t)out * nc, orow, row_bytes);
+            oi++;
+            out++;
+        } else if (cmp == 0) {
+            memcpy(merged + (size_t)out * nc, orow, row_bytes);
+            oi++;
+            di++;
+            out++; /* duplicate: skip delta row */
+        } else {
+            /* delta row not in old: new fact */
+            memcpy(merged + (size_t)out * nc, drow, row_bytes);
+            if (delta_out)
+                col_rel_append_row(delta_out, drow);
+            di++;
+            out++;
+        }
+    }
+    /* Remaining old rows */
+    if (oi < old_nrows) {
+        uint32_t remaining = old_nrows - oi;
+        memcpy(merged + (size_t)out * nc, rel->data + (size_t)oi * nc,
+               (size_t)remaining * row_bytes);
+        out += remaining;
+    }
+    /* Remaining delta rows: all new */
+    if (di < d_unique) {
+        if (delta_out) {
+            for (uint32_t k = di; k < d_unique; k++)
+                col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
+        }
+        uint32_t remaining = d_unique - di;
+        memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
+               (size_t)remaining * row_bytes);
+        out += remaining;
+    }
+
+    /* Swap buffer */
+    free(rel->data);
+    rel->data = merged;
+    rel->nrows = out;
+    rel->capacity = (uint32_t)max_rows;
+    return 0;
+}
+
 /* --- SEMIJOIN ------------------------------------------------------------ */
 
 static int
@@ -1874,26 +1996,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
             delta_rels[ri] = NULL; /* session now owns it */
         }
 
-        /* Record per-relation row counts and save sorted snapshots for delta
-         * computation after consolidation. old_data[ri] is a copy of the
-         * pre-evaluation sorted+unique relation; delta = R_new - R_old. */
+        /* Record per-relation row counts (O(1) snapshot — no data copy). */
         uint32_t *snap = (uint32_t *)malloc(nrels * sizeof(uint32_t));
-        int64_t **old_data = (int64_t **)calloc(nrels, sizeof(int64_t *));
-        if (!snap || !old_data) {
-            free(snap);
-            free(old_data);
+        if (!snap) {
             free(delta_rels);
             return ENOMEM;
         }
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            snap[ri] = r ? r->nrows : 0;
-            if (snap[ri] > 0 && r && r->ncols > 0) {
-                size_t bytes = (size_t)snap[ri] * r->ncols * sizeof(int64_t);
-                old_data[ri] = (int64_t *)malloc(bytes);
-                if (old_data[ri])
-                    memcpy(old_data[ri], r->data, bytes);
-            }
+            snap[ri] = r ? r->nrows : 0; /* O(1) count only, no copy */
         }
 
         /* Single-pass semi-naive evaluation. VARIABLE prefers delta when it
@@ -1994,71 +2105,34 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
             session_remove_rel(sess, dname);
         }
 
-        /* Consolidate all IDB relations to remove duplicates.
-         * Use incremental merge: sort only new rows O(D log D), then
-         * merge with sorted old prefix O(N).  snap[ri] marks the boundary
-         * between the already-sorted prefix and unsorted new rows. */
+        /* Consolidate all IDB relations to remove duplicates and compute delta
+         * as a byproduct.  snap[ri] marks the boundary between the already-
+         * sorted prefix and unsorted new rows appended this iteration. */
+        bool any_new = false;
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            if (!r || r->nrows == 0)
-                continue;
+            if (!r || snap[ri] >= r->nrows)
+                continue; /* no new rows for this relation */
 
-            int rc2 = col_op_consolidate_incremental(r, snap[ri]);
+            char dname[256];
+            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+            col_rel_t *delta = col_rel_new_like(dname, r);
+            if (!delta) {
+                free(snap);
+                free(delta_rels);
+                return ENOMEM;
+            }
+
+            /* Consolidate WITH delta output (no separate merge walk) */
+            int rc2 = col_op_consolidate_incremental_delta(r, snap[ri], delta);
             if (rc2 != 0) {
-                for (uint32_t j = 0; j < nrels; j++)
-                    free(old_data[j]);
-                free(old_data);
+                col_rel_free_contents(delta);
+                free(delta);
                 free(snap);
                 free(delta_rels);
                 return rc2;
             }
-        }
 
-        /* Compute proper delta: R_new - R_old via sorted merge walk.
-         * Both old_data[ri] and r->data are sorted+unique (old from previous
-         * consolidation, new from consolidation just done above).
-         * This ensures delta contains only truly new tuples, preventing the
-         * base-case re-evaluation from polluting delta with known rows. */
-        bool any_new = false;
-        for (uint32_t ri = 0; ri < nrels; ri++) {
-            col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            if (!r || r->nrows == 0 || r->ncols == 0)
-                continue;
-            char dname[256];
-            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
-            col_rel_t *delta = col_rel_new_like(dname, r);
-            if (!delta)
-                continue;
-            uint32_t nc = r->ncols;
-            size_t row_bytes = (size_t)nc * sizeof(int64_t);
-            int64_t *old = old_data[ri];
-            uint32_t old_n = snap[ri];
-            if (old == NULL || old_n == 0) {
-                /* First time: all consolidated rows are new */
-                col_rel_append_all(delta, r); /* best-effort */
-            } else {
-                /* Merge walk: emit rows in R_new not present in R_old */
-                uint32_t oi = 0, ni = 0;
-                while (ni < r->nrows) {
-                    const int64_t *nrow = r->data + (size_t)ni * nc;
-                    if (oi < old_n) {
-                        const int64_t *orow = old + (size_t)oi * nc;
-                        int cmp = memcmp(nrow, orow, row_bytes);
-                        if (cmp < 0) {
-                            col_rel_append_row(delta, nrow);
-                            ni++;
-                        } else if (cmp == 0) {
-                            ni++;
-                            oi++;
-                        } else {
-                            oi++;
-                        }
-                    } else {
-                        col_rel_append_row(delta, nrow);
-                        ni++;
-                    }
-                }
-            }
             if (delta->nrows > 0) {
                 delta_rels[ri] = delta;
                 any_new = true;
@@ -2068,10 +2142,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
             }
         }
 
-        /* Free pre-evaluation snapshots */
-        for (uint32_t ri = 0; ri < nrels; ri++)
-            free(old_data[ri]);
-        free(old_data);
         free(snap);
 
         /* Clear materialization cache between iterations (relation data changed) */
