@@ -2342,8 +2342,13 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
-    /* Create workqueue with K workers (one per delta copy) */
-    wl_work_queue_t *wq = wl_workqueue_create(k);
+    /* BUGFIX: K-fusion race condition (ASAN detected heap-use-after-free)
+     * Root cause: Multiple workers share same session (sess) and can
+     * simultaneously free/access relations (col_op_join -> col_rel_free_contents).
+     * Temporary fix: Run sequentially (K=1) instead of parallel.
+     * TODO: Implement proper thread-safe session management for K>1.
+     * See: SEGFAULT-INVESTIGATION.md for detailed analysis. */
+    wl_work_queue_t *wq = wl_workqueue_create(1);  /* Changed from k to 1 for safety */
     if (!wq) {
         free(results);
         free(workers);
@@ -2352,7 +2357,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
 
     int rc = 0;
 
-    /* Prepare and submit K worker tasks */
+    /* Prepare and execute K worker tasks sequentially */
     for (uint32_t d = 0; d < k; d++) {
         workers[d].plan = &(wl_plan_relation_t){
             .name = "<k_fusion_copy>",
@@ -2368,12 +2373,13 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
             wl_workqueue_drain(wq);
             goto cleanup_wq;
         }
-    }
 
-    /* Wait for all K workers to complete (barrier) */
-    if (wl_workqueue_wait_all(wq) != 0) {
-        rc = -1;
-        goto cleanup_wq;
+        /* Wait for each worker to complete before submitting next
+         * (sequential execution, not parallel) */
+        if (wl_workqueue_wait_all(wq) != 0) {
+            rc = -1;
+            goto cleanup_wq;
+        }
     }
 
     /* Collect results from each worker's eval_stack */
