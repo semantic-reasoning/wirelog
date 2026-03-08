@@ -357,7 +357,7 @@ test_multiple_incremental_inserts_preserve_frontier(void)
 
     col_frontier_t f1;
     rc = col_session_get_frontier(sess, rec_si, &f1);
-    if (rc != 0 || (f1.iteration == 0 && f1.stratum == 0)) {
+    if (rc != 0 || f1.iteration == UINT32_MAX) {
         wl_session_destroy(sess);
         wl_plan_free(plan);
         FAIL("frontier not set after first step");
@@ -418,7 +418,7 @@ test_multiple_incremental_inserts_preserve_frontier(void)
         return;
     }
     /* Frontier must still be set (not zero-reset) after second insert */
-    if (f2.iteration == 0 && f2.stratum == 0) {
+    if (f2.iteration == UINT32_MAX) {
         wl_session_destroy(sess);
         wl_plan_free(plan);
         FAIL("frontier reset to zero after second incremental insert");
@@ -498,7 +498,7 @@ test_empty_incremental_insert_safe_frontier_unchanged(void)
 
     col_frontier_t f_before;
     rc = col_session_get_frontier(sess, rec_si, &f_before);
-    if (rc != 0 || (f_before.iteration == 0 && f_before.stratum == 0)) {
+    if (rc != 0 || f_before.iteration == UINT32_MAX) {
         wl_session_destroy(sess);
         wl_plan_free(plan);
         FAIL("frontier not set after step");
