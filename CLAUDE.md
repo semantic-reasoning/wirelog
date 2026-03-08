@@ -8,6 +8,9 @@ When committing to this project:
 - Do NOT add "Co-Authored-By: Claude" lines
 - Commit message format should be clean author attribution only
 - Do NOT use emojis in commit messages (clean text only)
+- **MANDATORY: Run clang-format linting before every commit**
+  - `clang-format --style=file -i <modified .c files>`
+  - Verify: `git diff` shows no formatting changes after linting
 
 ### Reason
 wirelog is a professional open-source project with dual licensing (LGPL-3.0 and commercial).
