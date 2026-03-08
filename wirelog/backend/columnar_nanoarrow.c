@@ -3617,6 +3617,73 @@ col_frontier_compute(const col_rel_t *rel)
     return f;
 }
 
+/*
+ * col_session_cleanup_old_data:
+ *
+ * Remove data that is entirely before the frontier (iteration, stratum).
+ * Only rows with timestamps <= frontier are removed.
+ *
+ * This function performs selective cleanup of old delta rows to reduce
+ * memory usage. Timestamps before the frontier have already been processed
+ * and will not be needed again during evaluation.
+ *
+ * @param sess     wl_session_t* backed by columnar backend
+ * @param frontier Minimum (iteration, stratum) to preserve; data before this
+ * can be freed
+ */
+static void
+col_session_cleanup_old_data(wl_session_t *sess, col_frontier_t frontier)
+{
+    if (!sess)
+        return;
+
+    wl_col_session_t *cs = COL_SESSION(sess);
+
+    /* Scan all relations, remove rows with timestamps <= frontier */
+    for (uint32_t ri = 0; ri < cs->nrels; ri++) {
+        col_rel_t *rel = cs->rels[ri];
+        if (!rel || !rel->timestamps || rel->nrows == 0)
+            continue;
+
+        /* Find first row that is after frontier */
+        uint32_t keep_from = 0;
+        for (uint32_t row = 0; row < rel->nrows; row++) {
+            const col_delta_timestamp_t *ts = &rel->timestamps[row];
+            if (ts->iteration > frontier.iteration
+                || (ts->iteration == frontier.iteration
+                    && ts->stratum > frontier.stratum)) {
+                keep_from = row;
+                break;
+            }
+        }
+
+        /* If all rows are at or before frontier, clear entire relation */
+        if (keep_from == rel->nrows) {
+            free(rel->timestamps);
+            rel->timestamps = NULL;
+            rel->nrows = 0;
+            rel->capacity = 0;
+            free(rel->data);
+            rel->data = NULL;
+            /* Invalidate arrangements (data changed) */
+            col_session_invalidate_arrangements(sess, rel->name);
+        } else if (keep_from > 0) {
+            /* Shift rows forward and update timestamps */
+            uint32_t new_nrows = rel->nrows - keep_from;
+            size_t row_bytes = (size_t)rel->ncols * sizeof(int64_t);
+
+            memmove(rel->data, rel->data + (size_t)keep_from * rel->ncols,
+                    new_nrows * row_bytes);
+            memmove(rel->timestamps, rel->timestamps + keep_from,
+                    new_nrows * sizeof(col_delta_timestamp_t));
+
+            rel->nrows = new_nrows;
+            /* Invalidate arrangements (data changed) */
+            col_session_invalidate_arrangements(sess, rel->name);
+        }
+    }
+}
+
 /* ======================================================================== */
 /* Arrangement Accessors (Phase 3C)                                         */
 /* ======================================================================== */
