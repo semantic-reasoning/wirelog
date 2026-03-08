@@ -2167,8 +2167,8 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         for (uint32_t r = 0; r < src->nrows; r++) {
             const int64_t *row = src->data + (size_t)r * nc;
             if (r == 0
-                || memcmp(out->data + (size_t)(out->nrows - 1) * nc, row,
-                          row_bytes)
+                || kway_row_cmp(out->data + (size_t)(out->nrows - 1) * nc, row,
+                          nc)
                        != 0) {
                 memcpy(out->data + (size_t)out->nrows * nc, row, row_bytes);
                 out->nrows++;
@@ -2187,7 +2187,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         while (li < left->nrows && ri < right->nrows) {
             const int64_t *lrow = left->data + (size_t)li * nc;
             const int64_t *rrow = right->data + (size_t)ri * nc;
-            int cmp = memcmp(lrow, rrow, row_bytes);
+            int cmp = kway_row_cmp(lrow, rrow, nc);
 
             const int64_t *row_to_add = NULL;
             if (cmp < 0) {
@@ -2204,7 +2204,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             }
 
             if (last_row == NULL
-                || memcmp(last_row, row_to_add, row_bytes) != 0) {
+                || kway_row_cmp(last_row, row_to_add, nc) != 0) {
                 memcpy(out->data + (size_t)out->nrows * nc, row_to_add,
                        row_bytes);
                 last_row = out->data + (size_t)out->nrows * nc;
@@ -2215,7 +2215,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         /* Drain remaining rows from left */
         while (li < left->nrows) {
             const int64_t *row = left->data + (size_t)li * nc;
-            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+            if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 memcpy(out->data + (size_t)out->nrows * nc, row, row_bytes);
                 last_row = out->data + (size_t)out->nrows * nc;
                 out->nrows++;
@@ -2226,7 +2226,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         /* Drain remaining rows from right */
         while (ri < right->nrows) {
             const int64_t *row = right->data + (size_t)ri * nc;
-            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+            if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 memcpy(out->data + (size_t)out->nrows * nc, row, row_bytes);
                 last_row = out->data + (size_t)out->nrows * nc;
                 out->nrows++;
