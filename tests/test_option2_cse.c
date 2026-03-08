@@ -60,6 +60,24 @@ static int fail_count = 0;
     } while (0)
 
 /* ========================================================================
+ * K-FUSION mode detection
+ * ======================================================================== */
+
+#ifdef ENABLE_K_FUSION
+static bool
+using_k_fusion(void)
+{
+    return ENABLE_K_FUSION;
+}
+#else
+static bool
+using_k_fusion(void)
+{
+    return false;
+}
+#endif
+
+/* ========================================================================
  * Helpers
  * ======================================================================== */
 
@@ -238,14 +256,19 @@ test_3atom_expansion(void)
     const wl_plan_relation_t *r = find_relation(plan, "r");
     ASSERT(r != NULL, "r not found");
 
-    uint32_t force_delta = count_delta_mode(r, WL_DELTA_FORCE_DELTA);
-    ASSERT(force_delta == 3, "expected 3 FORCE_DELTA ops for 3-atom rule");
+    if (using_k_fusion()) {
+        uint32_t k_fusions = count_ops(r, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        uint32_t force_delta = count_delta_mode(r, WL_DELTA_FORCE_DELTA);
+        ASSERT(force_delta == 3, "expected 3 FORCE_DELTA ops for 3-atom rule");
 
-    uint32_t concats = count_ops(r, WL_PLAN_OP_CONCAT);
-    ASSERT(concats >= 2, "expected at least 2 CONCAT ops");
+        uint32_t concats = count_ops(r, WL_PLAN_OP_CONCAT);
+        ASSERT(concats >= 2, "expected at least 2 CONCAT ops");
 
-    uint32_t consols = count_ops(r, WL_PLAN_OP_CONSOLIDATE);
-    ASSERT(consols >= 1, "expected CONSOLIDATE op");
+        uint32_t consols = count_ops(r, WL_PLAN_OP_CONSOLIDATE);
+        ASSERT(consols >= 1, "expected CONSOLIDATE op");
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -272,10 +295,16 @@ test_3atom_materialization_hints(void)
     const wl_plan_relation_t *r = find_relation(plan, "r");
     ASSERT(r != NULL, "r not found");
 
-    /* K=3: first K-2=1 JOIN position is materialized per copy.
-     * 3 copies × 1 materialized JOIN = 3 total. */
-    uint32_t mat = count_materialized(r);
-    ASSERT(mat == 3, "expected 3 materialized hints (1 per copy × 3 copies)");
+    if (using_k_fusion()) {
+        /* K_FUSION encapsulates all copies; materialization hints are internal */
+        uint32_t k_fusions = count_ops(r, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        /* K=3: first K-2=1 JOIN position is materialized per copy.
+         * 3 copies × 1 materialized JOIN = 3 total. */
+        uint32_t mat = count_materialized(r);
+        ASSERT(mat == 3, "expected 3 materialized hints (1 per copy × 3 copies)");
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -302,10 +331,16 @@ test_3atom_force_full(void)
     const wl_plan_relation_t *r = find_relation(plan, "r");
     ASSERT(r != NULL, "r not found");
 
-    /* Each copy: 1 FORCE_DELTA + 2 FORCE_FULL = K*(K-1) = 6 FORCE_FULL */
-    uint32_t force_full = count_delta_mode(r, WL_DELTA_FORCE_FULL);
-    ASSERT(force_full == 6,
-           "expected 6 FORCE_FULL ops (2 per copy × 3 copies)");
+    if (using_k_fusion()) {
+        /* K_FUSION encapsulates all copies; FORCE_FULL is internal */
+        uint32_t k_fusions = count_ops(r, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        /* Each copy: 1 FORCE_DELTA + 2 FORCE_FULL = K*(K-1) = 6 FORCE_FULL */
+        uint32_t force_full = count_delta_mode(r, WL_DELTA_FORCE_FULL);
+        ASSERT(force_full == 6,
+               "expected 6 FORCE_FULL ops (2 per copy × 3 copies)");
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -357,16 +392,22 @@ test_delta_and_full_invariant(void)
     const wl_plan_relation_t *r = find_relation(plan, "r");
     ASSERT(r != NULL, "r not found");
 
-    /* For K copies, each copy has K IDB positions:
-     * 1 FORCE_DELTA + (K-1) FORCE_FULL = K per copy.
-     * Total: K FORCE_DELTA + K*(K-1) FORCE_FULL = K*K annotated ops.
-     * K=3: 3 + 6 = 9 total annotated IDB ops. */
-    uint32_t fd = count_delta_mode(r, WL_DELTA_FORCE_DELTA);
-    uint32_t ff = count_delta_mode(r, WL_DELTA_FORCE_FULL);
-    char msg[128];
-    snprintf(msg, sizeof(msg), "expected fd+ff=9 (K*K), got fd=%u ff=%u", fd,
-             ff);
-    ASSERT(fd + ff == 9, msg);
+    if (using_k_fusion()) {
+        /* K_FUSION encapsulates all copies; fd/ff counts are internal */
+        uint32_t k_fusions = count_ops(r, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        /* For K copies, each copy has K IDB positions:
+         * 1 FORCE_DELTA + (K-1) FORCE_FULL = K per copy.
+         * Total: K FORCE_DELTA + K*(K-1) FORCE_FULL = K*K annotated ops.
+         * K=3: 3 + 6 = 9 total annotated IDB ops. */
+        uint32_t fd = count_delta_mode(r, WL_DELTA_FORCE_DELTA);
+        uint32_t ff = count_delta_mode(r, WL_DELTA_FORCE_FULL);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected fd+ff=9 (K*K), got fd=%u ff=%u",
+                 fd, ff);
+        ASSERT(fd + ff == 9, msg);
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -420,11 +461,17 @@ test_2atom_k2_expansion(void)
     const wl_plan_relation_t *a = find_relation(plan, "a");
     ASSERT(a != NULL, "relation a not found");
 
-    uint32_t force_delta = count_delta_mode(a, WL_DELTA_FORCE_DELTA);
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "expected >= 2 FORCE_DELTA ops for K=2 rule, got %u", force_delta);
-    ASSERT(force_delta >= 2, msg);
+    if (using_k_fusion()) {
+        uint32_t k_fusions = count_ops(a, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        uint32_t force_delta = count_delta_mode(a, WL_DELTA_FORCE_DELTA);
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "expected >= 2 FORCE_DELTA ops for K=2 rule, got %u",
+                 force_delta);
+        ASSERT(force_delta >= 2, msg);
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -441,13 +488,20 @@ test_2atom_k2_force_full(void)
     const wl_plan_relation_t *a = find_relation(plan, "a");
     ASSERT(a != NULL, "relation a not found");
 
-    /* K=2: each copy has 1 FORCE_DELTA + 1 FORCE_FULL.
-     * 2 copies => 2 FORCE_FULL total. */
-    uint32_t force_full = count_delta_mode(a, WL_DELTA_FORCE_FULL);
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "expected >= 2 FORCE_FULL ops for K=2 rule, got %u", force_full);
-    ASSERT(force_full >= 2, msg);
+    if (using_k_fusion()) {
+        /* K_FUSION encapsulates all copies; FORCE_FULL is internal */
+        uint32_t k_fusions = count_ops(a, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        /* K=2: each copy has 1 FORCE_DELTA + 1 FORCE_FULL.
+         * 2 copies => 2 FORCE_FULL total. */
+        uint32_t force_full = count_delta_mode(a, WL_DELTA_FORCE_FULL);
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "expected >= 2 FORCE_FULL ops for K=2 rule, got %u",
+                 force_full);
+        ASSERT(force_full >= 2, msg);
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -464,17 +518,23 @@ test_2atom_k2_concat_consolidate(void)
     const wl_plan_relation_t *a = find_relation(plan, "a");
     ASSERT(a != NULL, "relation a not found");
 
-    uint32_t concats = count_ops(a, WL_PLAN_OP_CONCAT);
-    char msg_concat[128];
-    snprintf(msg_concat, sizeof(msg_concat),
-             "expected >= 2 CONCAT ops for K=2 rule, got %u", concats);
-    ASSERT(concats >= 2, msg_concat);
+    if (using_k_fusion()) {
+        /* K_FUSION replaces CONCAT+CONSOLIDATE structure */
+        uint32_t k_fusions = count_ops(a, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        uint32_t concats = count_ops(a, WL_PLAN_OP_CONCAT);
+        char msg_concat[128];
+        snprintf(msg_concat, sizeof(msg_concat),
+                 "expected >= 2 CONCAT ops for K=2 rule, got %u", concats);
+        ASSERT(concats >= 2, msg_concat);
 
-    uint32_t consols = count_ops(a, WL_PLAN_OP_CONSOLIDATE);
-    char msg_consol[128];
-    snprintf(msg_consol, sizeof(msg_consol),
-             "expected >= 1 CONSOLIDATE op for K=2 rule, got %u", consols);
-    ASSERT(consols >= 1, msg_consol);
+        uint32_t consols = count_ops(a, WL_PLAN_OP_CONSOLIDATE);
+        char msg_consol[128];
+        snprintf(msg_consol, sizeof(msg_consol),
+                 "expected >= 1 CONSOLIDATE op for K=2 rule, got %u", consols);
+        ASSERT(consols >= 1, msg_consol);
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -491,12 +551,18 @@ test_2atom_k2_invariant(void)
     const wl_plan_relation_t *a = find_relation(plan, "a");
     ASSERT(a != NULL, "relation a not found");
 
-    uint32_t fd = count_delta_mode(a, WL_DELTA_FORCE_DELTA);
-    uint32_t ff = count_delta_mode(a, WL_DELTA_FORCE_FULL);
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "expected fd+ff=4 (K*K for K=2), got fd=%u ff=%u", fd, ff);
-    ASSERT(fd + ff == 4, msg);
+    if (using_k_fusion()) {
+        /* K_FUSION encapsulates all copies; fd/ff counts are internal */
+        uint32_t k_fusions = count_ops(a, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        uint32_t fd = count_delta_mode(a, WL_DELTA_FORCE_DELTA);
+        uint32_t ff = count_delta_mode(a, WL_DELTA_FORCE_FULL);
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "expected fd+ff=4 (K*K for K=2), got fd=%u ff=%u", fd, ff);
+        ASSERT(fd + ff == 4, msg);
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -513,12 +579,18 @@ test_2atom_k2_no_materialization(void)
     const wl_plan_relation_t *a = find_relation(plan, "a");
     ASSERT(a != NULL, "relation a not found");
 
-    /* K=2: K-2 = 0 intermediate joins to materialize per copy. */
-    uint32_t mat = count_materialized(a);
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "expected 0 materialized hints for K=2 rule, got %u", mat);
-    ASSERT(mat == 0, msg);
+    if (using_k_fusion()) {
+        /* K_FUSION encapsulates all copies; materialization is internal */
+        uint32_t k_fusions = count_ops(a, WL_PLAN_OP_K_FUSION);
+        ASSERT(k_fusions >= 1, "expected K_FUSION operator with ENABLE_K_FUSION=1");
+    } else {
+        /* K=2: K-2 = 0 intermediate joins to materialize per copy. */
+        uint32_t mat = count_materialized(a);
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "expected 0 materialized hints for K=2 rule, got %u", mat);
+        ASSERT(mat == 0, msg);
+    }
 
     wl_plan_free(plan);
     PASS();
@@ -568,11 +640,20 @@ test_k1_k3_unaffected(void)
     const wl_plan_relation_t *r = find_relation(plan_cspa, "r");
     ASSERT(r != NULL, "r not found");
 
-    uint32_t fd_k3 = count_delta_mode(r, WL_DELTA_FORCE_DELTA);
-    char msg_k3[128];
-    snprintf(msg_k3, sizeof(msg_k3),
-             "K=3 rule should have 3 FORCE_DELTA ops, got %u", fd_k3);
-    ASSERT(fd_k3 == 3, msg_k3);
+    if (using_k_fusion()) {
+        uint32_t k_fusions = count_ops(r, WL_PLAN_OP_K_FUSION);
+        char msg_k3[128];
+        snprintf(msg_k3, sizeof(msg_k3),
+                 "K=3 rule should have K_FUSION operator, got %u k_fusions",
+                 k_fusions);
+        ASSERT(k_fusions >= 1, msg_k3);
+    } else {
+        uint32_t fd_k3 = count_delta_mode(r, WL_DELTA_FORCE_DELTA);
+        char msg_k3[128];
+        snprintf(msg_k3, sizeof(msg_k3),
+                 "K=3 rule should have 3 FORCE_DELTA ops, got %u", fd_k3);
+        ASSERT(fd_k3 == 3, msg_k3);
+    }
 
     wl_plan_free(plan_cspa);
     PASS();
