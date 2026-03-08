@@ -525,6 +525,22 @@ test_phase4_frontier_array_exe = executable(
 test('phase4_frontier_array', test_phase4_frontier_array_exe)
 
 # ============================================================================
+# Phase 4: Incremental Fact Insertion Tests (US-4-002)
+# ============================================================================
+
+test_incremental_insertion_exe = executable(
+  'incremental_insertion',
+  files('test_incremental_insertion.c'),
+  backend_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('incremental_insertion', test_incremental_insertion_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #

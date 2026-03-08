@@ -251,4 +251,31 @@ col_session_get_perf_stats(wl_session_t *sess, uint64_t *out_consolidation_ns,
 uint32_t
 col_session_get_darr_count(wl_session_t *sess);
 
+/**
+ * col_session_insert_incremental:
+ *
+ * Append facts to an EDB relation WITHOUT resetting per-stratum frontiers.
+ *
+ * Unlike the standard session_insert vtable slot (which may reset evaluation
+ * state), this function preserves the frontiers[] array so that a subsequent
+ * col_session_step() call performs incremental re-evaluation: strata whose
+ * frontier has already converged past the current iteration are skipped.
+ *
+ * Facts are appended to the existing relation; existing rows are kept.
+ * Schema is lazily initialised on the first call (same rule as session_insert).
+ * An empty insertion (num_rows == 0) is a safe no-op that returns 0.
+ *
+ * @param session   Active session created by col_session_create.
+ * @param relation  Name of the EDB relation to append to.
+ * @param data      Row-major int64_t array, num_rows * num_cols elements.
+ * @param num_rows  Number of rows to append (0 is a safe no-op).
+ * @param num_cols  Number of columns per row.
+ * @return 0 on success, EINVAL on bad arguments or column-count mismatch,
+ *         ENOENT if the relation is not registered, ENOMEM on allocation failure.
+ */
+int
+col_session_insert_incremental(wl_session_t *session, const char *relation,
+                               const int64_t *data, uint32_t num_rows,
+                               uint32_t num_cols);
+
 #endif /* WL_BACKEND_COLUMNAR_NANOARROW_H */
