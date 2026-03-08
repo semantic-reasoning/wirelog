@@ -3278,11 +3278,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         && sess->frontiers[stratum_idx].iteration == 0) {
         sess->frontiers[stratum_idx].iteration = UINT32_MAX;
         sess->frontiers[stratum_idx].stratum = stratum_idx;
-        fprintf(
-            stderr,
-            "[phase4-debug] stratum %u: frontier initialized to UINT32_MAX\n",
-            stratum_idx);
-    } else if (stratum_idx < MAX_STRATA) {
     }
 
     uint32_t iter;
@@ -3334,7 +3329,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         if (stratum_idx < MAX_STRATA) {
             if (iter > sess->frontiers[stratum_idx].iteration) {
                 continue; /* Skip this iteration: already processed in prior session_step */
-            } else if (iter == 0) {
             }
         }
 
@@ -3620,11 +3614,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * was fully processed during iteration loop. This enables skipping
          * iterations if frontier persists across session_step calls. */
         sess->frontiers[stratum_idx] = strat_frontier;
-        fprintf(
-            stderr,
-            "[frontier-final] UPDATED frontier[%u] to (iter=%u, strat=%u)\n",
-            stratum_idx, strat_frontier.iteration, strat_frontier.stratum);
-    } else {
     }
 
     /* Cleanup all delta relations after frontier has been computed */
