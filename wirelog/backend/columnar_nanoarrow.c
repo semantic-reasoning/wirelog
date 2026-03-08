@@ -4523,6 +4523,151 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
 }
 
 /* ======================================================================== */
+/* Affected Strata Detection (Phase 4)                                      */
+/* ======================================================================== */
+
+/*
+ * bitmask_or_simd - Union two 64-bit bitmasks using SIMD when available.
+ *
+ * For >8 strata this avoids sequential OR chains by operating on two 64-bit
+ * words packed into a 128-bit vector in a single instruction.
+ *
+ * When SIMD is unavailable the scalar fallback is a single OR, which the
+ * compiler will inline. The result is always written back to *dst.
+ */
+static inline uint64_t
+bitmask_or_simd(uint64_t dst, uint64_t src)
+{
+#if defined(__ARM_NEON__)
+    /* Pack both masks into a 128-bit vector and OR them in one shot. */
+    uint64x2_t vd = vcombine_u64(vcreate_u64(dst), vcreate_u64(0));
+    uint64x2_t vs = vcombine_u64(vcreate_u64(src), vcreate_u64(0));
+    uint64x2_t vr = vorrq_u64(vd, vs);
+    return vgetq_lane_u64(vr, 0);
+#elif defined(__SSE2__)
+    __m128i vd = _mm_set_epi64x(0, (int64_t)dst);
+    __m128i vs = _mm_set_epi64x(0, (int64_t)src);
+    __m128i vr = _mm_or_si128(vd, vs);
+    return (uint64_t)_mm_cvtsi128_si64(vr);
+#else
+    return dst | src;
+#endif
+}
+
+/*
+ * stratum_references_relation - Return true if any VARIABLE op in stratum sp
+ * references the relation named `rel`.
+ */
+static bool
+stratum_references_relation(const wl_plan_stratum_t *sp, const char *rel)
+{
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const wl_plan_relation_t *pr = &sp->relations[ri];
+        for (uint32_t oi = 0; oi < pr->op_count; oi++) {
+            if (pr->ops[oi].op == WL_PLAN_OP_VARIABLE
+                && pr->ops[oi].relation_name != NULL
+                && strcmp(pr->ops[oi].relation_name, rel) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * col_compute_affected_strata - Identify strata needing re-evaluation.
+ *
+ * Walks the stratum dependency graph rooted at `inserted_relation` and
+ * returns a bitmask where bit i is set if stratum i directly or transitively
+ * depends on the newly inserted relation.
+ *
+ * Algorithm (iterative worklist BFS over stratum indices):
+ *   1. Seed: mark every stratum that directly references inserted_relation.
+ *   2. Propagate: for each newly-marked stratum, find all strata that
+ *      reference any relation produced by the marked stratum, and mark them.
+ *   3. Repeat until no new strata are marked.
+ *
+ * "Produced by stratum s" = every relation listed in plan->strata[s].relations.
+ *
+ * SIMD: bitmask union uses bitmask_or_simd() which compiles to a single
+ * vorrq_u64 (NEON) or _mm_or_si128 (SSE2) instruction when those ISAs are
+ * available. The scalar path is a plain | operator.
+ *
+ * Supports up to 64 strata (one uint64_t bitmask). Plans with more strata
+ * will have bits beyond 63 silently ignored (conservative: returns 0 for
+ * those strata, which causes them to be re-evaluated unconditionally by the
+ * caller's fallback).
+ *
+ * @param session          Active session (must have a plan attached).
+ * @param inserted_relation Name of the EDB relation receiving new facts.
+ * @return Bitmask of affected stratum indices; 0 on invalid input.
+ */
+uint64_t
+col_compute_affected_strata(wl_session_t *session,
+                            const char *inserted_relation)
+{
+    if (!session || !inserted_relation)
+        return 0;
+
+    wl_col_session_t *sess = COL_SESSION(session);
+    const wl_plan_t *plan = sess->plan;
+    if (!plan || plan->stratum_count == 0)
+        return 0;
+
+    uint32_t nstrata = plan->stratum_count;
+    if (nstrata > 64)
+        nstrata = 64; /* clamp to bitmask width */
+
+    uint64_t affected = 0;
+
+    /* --- Pass 1: seed with strata directly referencing inserted_relation --- */
+    for (uint32_t si = 0; si < nstrata; si++) {
+        if (stratum_references_relation(&plan->strata[si], inserted_relation)) {
+            affected = bitmask_or_simd(affected, (uint64_t)1 << si);
+        }
+    }
+
+    /* --- Pass 2: transitive propagation via fixed-point iteration ---------- */
+    /*
+     * For every newly-marked stratum, find all strata that reference any
+     * relation produced by that stratum. We loop until the bitmask stabilises.
+     */
+    uint64_t prev = 0;
+    while (prev != affected) {
+        prev = affected;
+        /* Iterate over all currently marked strata. */
+        uint64_t pending = affected;
+        while (pending) {
+            /* Extract lowest set bit index. */
+            uint32_t si = (uint32_t)__builtin_ctzll(pending);
+            pending &= pending - 1; /* clear lowest set bit */
+
+            if (si >= nstrata)
+                break;
+
+            const wl_plan_stratum_t *src_sp = &plan->strata[si];
+            /* For each relation produced by stratum si ... */
+            for (uint32_t ri = 0; ri < src_sp->relation_count; ri++) {
+                const char *produced = src_sp->relations[ri].name;
+                if (!produced)
+                    continue;
+                /* ... mark any stratum that references it. */
+                for (uint32_t sj = 0; sj < nstrata; sj++) {
+                    if (affected & ((uint64_t)1 << sj))
+                        continue; /* already marked */
+                    if (stratum_references_relation(&plan->strata[sj],
+                                                    produced)) {
+                        affected = bitmask_or_simd(affected, (uint64_t)1 << sj);
+                    }
+                }
+            }
+        }
+    }
+
+    return affected;
+}
+
+/* ======================================================================== */
 /* Vtable Singleton                                                          */
 /* ======================================================================== */
 

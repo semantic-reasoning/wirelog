@@ -252,6 +252,24 @@ uint32_t
 col_session_get_darr_count(wl_session_t *sess);
 
 /**
+ * col_compute_affected_strata:
+ *
+ * Identify which strata need re-evaluation after new facts are inserted into
+ * `inserted_relation`.  Returns a uint64_t bitmask where bit i is set if
+ * stratum i directly or transitively depends on that relation.
+ *
+ * Uses SIMD (ARM NEON or SSE2) to accelerate bitmask union operations when
+ * more than 8 strata are present.  Supports up to 64 strata.
+ *
+ * @param session           Active session backed by the columnar backend.
+ * @param inserted_relation Name of the EDB relation receiving new facts.
+ * @return Bitmask of affected stratum indices; 0 on invalid input.
+ */
+uint64_t
+col_compute_affected_strata(wl_session_t *session,
+                            const char *inserted_relation);
+
+/**
  * col_session_insert_incremental:
  *
  * Append facts to an EDB relation WITHOUT resetting per-stratum frontiers.

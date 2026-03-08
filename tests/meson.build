@@ -541,6 +541,22 @@ test_incremental_insertion_exe = executable(
 test('incremental_insertion', test_incremental_insertion_exe)
 
 # ============================================================================
+# Phase 4: Affected Strata Detection Tests (US-4-affected_strata)
+# ============================================================================
+
+test_affected_strata_exe = executable(
+  'test_affected_strata',
+  files('test_affected_strata.c'),
+  backend_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('affected_strata', test_affected_strata_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
