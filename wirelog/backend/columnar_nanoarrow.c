@@ -10,6 +10,7 @@
 #include "memory.h"
 #include "../session.h"
 #include "../wirelog-internal.h"
+#include "../workqueue.h"
 #include "arena/arena.h"
 
 #include "nanoarrow/nanoarrow.h"
@@ -2303,7 +2304,7 @@ typedef struct {
  * Worker thread function for K-fusion parallel evaluation.
  * Evaluates a single relation plan and collects result in context.
  */
-static void __attribute__((unused))
+static void
 col_op_k_fusion_worker(void *ctx)
 {
     col_op_k_fusion_worker_t *wc = (col_op_k_fusion_worker_t *)ctx;
@@ -2312,12 +2313,13 @@ col_op_k_fusion_worker(void *ctx)
 }
 
 /**
- * K-Fusion operator: evaluate K copies of a relation plan sequentially,
+ * K-Fusion operator: evaluate K copies of a relation plan via workqueue,
  * merge results with deduplication, and push result onto stack.
  *
- * Each of the K operator sequences in opaque_data is evaluated
- * independently into a temporary eval stack.  The K resulting relations
- * are then merged via col_rel_merge_k() and pushed onto the caller's stack.
+ * Each of the K operator sequences in opaque_data is submitted as a
+ * separate worker task to the workqueue. The K workers evaluate in
+ * parallel (or sequentially on single-threaded systems).
+ * Results are merged via col_rel_merge_k() after all workers complete.
  */
 static int
 col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
@@ -2332,35 +2334,70 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         return EINVAL;
 
     col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
-    if (!results)
+    col_op_k_fusion_worker_t *workers = (col_op_k_fusion_worker_t *)calloc(
+        k, sizeof(col_op_k_fusion_worker_t));
+    if (!results || !workers) {
+        free(results);
+        free(workers);
         return ENOMEM;
+    }
+
+    /* Create workqueue with K workers (one per delta copy) */
+    wl_work_queue_t *wq = wl_workqueue_create(k);
+    if (!wq) {
+        free(results);
+        free(workers);
+        return ENOMEM;
+    }
 
     int rc = 0;
-    for (uint32_t d = 0; d < k; d++) {
-        wl_plan_relation_t synthetic;
-        synthetic.name = "<k_fusion_copy>";
-        synthetic.ops = meta->k_ops[d];
-        synthetic.op_count = meta->k_op_counts[d];
 
-        eval_stack_t tmp;
-        eval_stack_init(&tmp);
-        rc = col_eval_relation_plan(&synthetic, &tmp, sess);
-        if (rc != 0) {
-            eval_stack_drain(&tmp);
-            goto cleanup;
+    /* Prepare and submit K worker tasks */
+    for (uint32_t d = 0; d < k; d++) {
+        workers[d].plan = &(wl_plan_relation_t){
+            .name = "<k_fusion_copy>",
+            .ops = meta->k_ops[d],
+            .op_count = meta->k_op_counts[d],
+        };
+        workers[d].sess = sess;
+        workers[d].rc = 0;
+
+        if (wl_workqueue_submit(wq, col_op_k_fusion_worker, &workers[d]) != 0) {
+            rc = ENOMEM;
+            /* Drain remaining tasks on submit failure */
+            wl_workqueue_drain(wq);
+            goto cleanup_wq;
+        }
+    }
+
+    /* Wait for all K workers to complete (barrier) */
+    if (wl_workqueue_wait_all(wq) != 0) {
+        rc = -1;
+        goto cleanup_wq;
+    }
+
+    /* Collect results from each worker's eval_stack */
+    for (uint32_t d = 0; d < k; d++) {
+        if (workers[d].rc != 0) {
+            rc = workers[d].rc;
+            eval_stack_drain(&workers[d].stack);
+            goto cleanup_results;
         }
 
-        eval_entry_t e = eval_stack_pop(&tmp);
+        eval_entry_t e = eval_stack_pop(&workers[d].stack);
         if (!e.rel) {
             rc = EINVAL;
-            goto cleanup;
+            eval_stack_drain(&workers[d].stack);
+            goto cleanup_results;
         }
+
         /* If not owned, make a copy we can hand to merge */
         if (!e.owned) {
             col_rel_t *copy = col_rel_new_like("<k_fusion_copy>", e.rel);
             if (!copy) {
                 rc = ENOMEM;
-                goto cleanup;
+                eval_stack_drain(&workers[d].stack);
+                goto cleanup_results;
             }
             size_t row_bytes = (size_t)e.rel->ncols * sizeof(int64_t);
             memcpy(copy->data, e.rel->data, (size_t)e.rel->nrows * row_bytes);
@@ -2369,14 +2406,15 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         } else {
             results[d] = e.rel;
         }
-        eval_stack_drain(&tmp);
+        eval_stack_drain(&workers[d].stack);
     }
 
+    /* Merge K results with deduplication */
     {
         col_rel_t *merged = col_rel_merge_k(results, k);
         if (!merged) {
             rc = ENOMEM;
-            goto cleanup;
+            goto cleanup_results;
         }
         rc = eval_stack_push(stack, merged, true);
         if (rc != 0) {
@@ -2385,14 +2423,18 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
-cleanup:
+cleanup_results:
     for (uint32_t d = 0; d < k; d++) {
         if (results[d]) {
             col_rel_free_contents(results[d]);
             free(results[d]);
         }
     }
+
+cleanup_wq:
+    wl_workqueue_destroy(wq);
     free(results);
+    free(workers);
     return rc;
 }
 
