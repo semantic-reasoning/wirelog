@@ -3291,7 +3291,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     }
 
     uint32_t iter;
-    col_frontier_t strat_frontier = { UINT32_MAX, UINT32_MAX };
+    col_frontier_t strat_frontier = { 0, 0 };
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
         /* Phase 3D-Ext-002 (DORMANT): Fine-grained frontier skip infrastructure.
          *
