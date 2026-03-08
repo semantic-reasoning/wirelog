@@ -696,6 +696,8 @@ typedef struct {
     col_arr_entry_t *darr_entries; /* owned flat array of delta arrs      */
     uint32_t darr_count;           /* number of active delta arrangements */
     uint32_t darr_cap;             /* allocated capacity                  */
+    /* Frontier tracking (Phase 3B): minimum (iteration, stratum) processed */
+    col_frontier_t frontier; /* tracks lowest point fully processed  */
 } wl_col_session_t;
 
 /*
@@ -3089,6 +3091,10 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
     return false;
 }
 
+/* Forward declaration of col_frontier_compute (defined later) */
+static col_frontier_t
+col_frontier_compute(const col_rel_t *rel);
+
 /*
  * col_eval_stratum:
  * Evaluate one stratum, writing results into session relations.
@@ -3168,6 +3174,12 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             }
         }
         col_mat_cache_clear(&sess->mat_cache);
+
+        /* Non-recursive stratum frontier: initialize to (0, 0) for EDB relations.
+         * Non-recursive strata don't produce timestamps, so no frontier update needed. */
+        sess->frontier.iteration = 0;
+        sess->frontier.stratum = stratum_idx;
+
         return 0;
     }
 
@@ -3465,6 +3477,40 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     }
     free(delta_rels);
     col_mat_cache_clear(&sess->mat_cache);
+
+    /* Compute frontier: minimum (iteration, stratum) from all stratum relations.
+     * Frontier tracks the lowest point that has been fully processed, enabling
+     * frontier-based filtering to skip redundant recalculation in future phases. */
+    col_frontier_t strat_frontier = { UINT32_MAX, UINT32_MAX };
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+        if (!r)
+            continue;
+        col_frontier_t rel_frontier = col_frontier_compute(r);
+        /* Skip if relation has no timestamps (empty or not yet stamped) */
+        if (rel_frontier.iteration == 0 && rel_frontier.stratum == 0
+            && r->nrows == 0)
+            continue;
+        /* Update stratum frontier to minimum */
+        if (rel_frontier.iteration < strat_frontier.iteration
+            || (rel_frontier.iteration == strat_frontier.iteration
+                && rel_frontier.stratum < strat_frontier.stratum)) {
+            strat_frontier = rel_frontier;
+        }
+    }
+    /* Update session frontier if new stratum frontier is lower (non-zero) */
+    if (strat_frontier.iteration != UINT32_MAX) {
+        if (sess->frontier.iteration == 0 && sess->frontier.stratum == 0) {
+            /* First frontier: initialize */
+            sess->frontier = strat_frontier;
+        } else if (strat_frontier.iteration < sess->frontier.iteration
+                   || (strat_frontier.iteration == sess->frontier.iteration
+                       && strat_frontier.stratum < sess->frontier.stratum)) {
+            /* Update to lower frontier */
+            sess->frontier = strat_frontier;
+        }
+    }
+
     return 0;
 }
 
