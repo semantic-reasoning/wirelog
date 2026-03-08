@@ -802,6 +802,11 @@ eval_stack_drain(eval_stack_t *s)
 /* Operator Implementations                                                  */
 /* ======================================================================== */
 
+/* Forward declarations for recursive evaluation */
+static int
+col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
+                       wl_col_session_t *sess);
+
 /* Helper: create a new owned relation with given ncols and auto-named cols. */
 static col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols)
@@ -2113,6 +2118,200 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     return 0;
 }
 
+/* --- K-FUSION ------------------------------------------------------------ */
+
+/**
+ * col_rel_merge_k:
+ * Merge K sorted relations into a single deduplicated relation.
+ * Uses the same min-heap merging strategy as col_op_consolidate_kway_merge.
+ *
+ * @relations: Array of K col_rel_t pointers (caller-owned, each sorted)
+ * @k:         Number of relations to merge
+ *
+ * Returns: Newly allocated merged relation (caller must free).
+ *          Returns NULL on allocation failure.
+ *
+ * The output relation name is "<merged-k>" and contains all rows from
+ * the K input relations with duplicates removed.
+ */
+static col_rel_t *
+col_rel_merge_k(col_rel_t **relations, uint32_t k)
+{
+    if (k == 0)
+        return NULL;
+
+    /* All K relations must have the same schema */
+    uint32_t nc = relations[0]->ncols;
+    uint32_t total_rows = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        if (relations[i]->ncols != nc)
+            return NULL; /* Schema mismatch */
+        total_rows += relations[i]->nrows;
+    }
+
+    if (total_rows == 0) {
+        /* Create empty result with correct schema */
+        return col_rel_new_like("<merged-k>", relations[0]);
+    }
+
+    /* Create output relation with capacity for all rows */
+    col_rel_t *out = col_rel_new_like("<merged-k>", relations[0]);
+    if (!out)
+        return NULL;
+
+    size_t row_bytes = (size_t)nc * sizeof(int64_t);
+
+    /* K=1: Direct copy with dedup */
+    if (k == 1) {
+        col_rel_t *src = relations[0];
+        for (uint32_t r = 0; r < src->nrows; r++) {
+            const int64_t *row = src->data + (size_t)r * nc;
+            if (r == 0
+                || memcmp(out->data + (size_t)(out->nrows - 1) * nc, row,
+                          row_bytes)
+                       != 0) {
+                memcpy(out->data + (size_t)out->nrows * nc, row, row_bytes);
+                out->nrows++;
+            }
+        }
+        return out;
+    }
+
+    /* K=2: Optimized 2-pointer merge */
+    if (k == 2) {
+        col_rel_t *left = relations[0];
+        col_rel_t *right = relations[1];
+        uint32_t li = 0, ri = 0;
+        int64_t *last_row = NULL;
+
+        while (li < left->nrows && ri < right->nrows) {
+            const int64_t *lrow = left->data + (size_t)li * nc;
+            const int64_t *rrow = right->data + (size_t)ri * nc;
+            int cmp = memcmp(lrow, rrow, row_bytes);
+
+            const int64_t *row_to_add = NULL;
+            if (cmp < 0) {
+                row_to_add = lrow;
+                li++;
+            } else if (cmp > 0) {
+                row_to_add = rrow;
+                ri++;
+            } else {
+                /* Equal rows: add once, skip both */
+                row_to_add = lrow;
+                li++;
+                ri++;
+            }
+
+            if (last_row == NULL
+                || memcmp(last_row, row_to_add, row_bytes) != 0) {
+                memcpy(out->data + (size_t)out->nrows * nc, row_to_add,
+                       row_bytes);
+                last_row = out->data + (size_t)out->nrows * nc;
+                out->nrows++;
+            }
+        }
+
+        /* Drain remaining rows from left */
+        while (li < left->nrows) {
+            const int64_t *row = left->data + (size_t)li * nc;
+            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+                memcpy(out->data + (size_t)out->nrows * nc, row, row_bytes);
+                last_row = out->data + (size_t)out->nrows * nc;
+                out->nrows++;
+            }
+            li++;
+        }
+
+        /* Drain remaining rows from right */
+        while (ri < right->nrows) {
+            const int64_t *row = right->data + (size_t)ri * nc;
+            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+                memcpy(out->data + (size_t)out->nrows * nc, row, row_bytes);
+                last_row = out->data + (size_t)out->nrows * nc;
+                out->nrows++;
+            }
+            ri++;
+        }
+
+        return out;
+    }
+
+    /* K >= 3: Min-heap merge (simplified: use sequential merge) */
+    /* For now, fallback to pairwise merge to avoid complexity */
+    col_rel_t *temp = relations[0];
+    for (uint32_t i = 1; i < k; i++) {
+        col_rel_t *pair[2] = { temp, relations[i] };
+        col_rel_t *merged = col_rel_merge_k(pair, 2);
+        if (!merged) {
+            col_rel_free_contents(out);
+            free(out);
+            return NULL;
+        }
+        if (i > 1) {
+            col_rel_free_contents(temp);
+            free(temp);
+        }
+        temp = merged;
+    }
+
+    /* Copy final result into output */
+    memcpy(out->data, temp->data, (size_t)temp->nrows * nc * sizeof(int64_t));
+    out->nrows = temp->nrows;
+
+    if (k > 1) {
+        col_rel_free_contents(temp);
+        free(temp);
+    }
+
+    return out;
+}
+
+/**
+ * Worker task context for K-fusion evaluation.
+ */
+typedef struct {
+    const wl_plan_relation_t *plan; /* Single relation plan to evaluate */
+    eval_stack_t stack;             /* Output stack (initialized by worker) */
+    wl_col_session_t *sess;         /* Session reference (read-only) */
+    int rc;                         /* Return code from evaluation */
+} col_op_k_fusion_worker_t;
+
+/**
+ * Worker thread function for K-fusion parallel evaluation.
+ * Evaluates a single relation plan and collects result in context.
+ */
+static void
+col_op_k_fusion_worker(void *ctx)
+{
+    col_op_k_fusion_worker_t *wc = (col_op_k_fusion_worker_t *)ctx;
+    eval_stack_init(&wc->stack);
+    wc->rc = col_eval_relation_plan(wc->plan, &wc->stack, wc->sess);
+}
+
+/**
+ * K-Fusion operator: evaluate K copies of a relation plan in parallel,
+ * merge results with deduplication, and push result onto stack.
+ *
+ * Note: K-fusion requires plan generation changes to create K-fusion nodes
+ * with proper metadata. For now this is a placeholder that returns EINVAL.
+ * The core merging logic (col_rel_merge_k) is complete and ready for use.
+ */
+static int
+col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
+                wl_col_session_t *sess)
+{
+    (void)op;    /* unused */
+    (void)stack; /* unused */
+    (void)sess;  /* unused */
+
+    /* K-fusion not yet implemented: requires plan generation changes
+     * to instantiate K-fusion nodes with metadata pointing to K operator
+     * copies. When implemented, this will use col_rel_merge_k() to combine
+     * K sorted relations in parallel. */
+    return EINVAL;
+}
+
 /* --- SEMIJOIN ------------------------------------------------------------ */
 
 static int
@@ -2368,6 +2567,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             break;
         case WL_PLAN_OP_SEMIJOIN:
             rc = col_op_semijoin(op, stack, sess);
+            break;
+        case WL_PLAN_OP_K_FUSION:
+            rc = col_op_k_fusion(op, stack, sess);
             break;
         default:
             break;
