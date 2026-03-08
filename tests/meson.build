@@ -513,6 +513,18 @@ test_frontier_skip_integration_exe = executable(
 test('frontier_skip_integration', test_frontier_skip_integration_exe)
 
 # ============================================================================
+# Phase 4: Per-Stratum Frontier Array Tests (US-4-001)
+# ============================================================================
+
+test_phase4_frontier_array_exe = executable(
+  'test_phase4_frontier_array',
+  files('test_phase4_frontier_array.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('phase4_frontier_array', test_phase4_frontier_array_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
