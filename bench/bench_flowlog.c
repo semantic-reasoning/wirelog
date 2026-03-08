@@ -2681,7 +2681,7 @@ usage(const char *prog)
     fprintf(
         stderr,
         "Usage: %s --workload "
-        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|cspa_incr|csda|"
+        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|csda|"
         "galen|polonius|ddisasm|crdt|doop|all} --data FILE\n"
         "          [--data-weighted FILE] [--data-andersen DIR]\n"
         "          [--data-dyck DIR] [--data-cspa DIR]\n"
@@ -2848,12 +2848,6 @@ main(int argc, char **argv)
     } else if (strcmp(workload, "cspa") == 0) {
         if (!data_cspa_path) {
             fprintf(stderr, "error: cspa requires --data-cspa DIR\n");
-            return 1;
-        }
-        rc = run_cspa_workload(data_cspa_path, workers, repeat);
-    } else if (strcmp(workload, "cspa_incr") == 0) {
-        if (!data_cspa_path) {
-            fprintf(stderr, "error: cspa_incr requires --data-cspa DIR\n");
             return 1;
         }
         rc = run_cspa_incremental_workload(data_cspa_path, workers, repeat);

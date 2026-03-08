@@ -558,6 +558,7 @@ bench_incremental_frontier_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep],
 )
 
+
 # ============================================================================
 # Phase 4: Affected Strata Detection Tests (US-4-affected_strata)
 # ============================================================================
