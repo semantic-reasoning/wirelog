@@ -667,6 +667,13 @@ typedef struct {
  * @see session.h:38-40 for canonical wl_session_t definition
  * @see exec_plan.h for wl_plan_t backend-agnostic plan types
  */
+/*
+ * Phase 4: Per-Stratum Frontier Array Limit
+ * Max strata supported for incremental evaluation. Most Datalog programs have
+ * 2-10 strata; 32 is a practical upper bound. Increase if needed.
+ */
+#define MAX_STRATA 32
+
 typedef struct {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     const wl_plan_t *plan;     /* borrowed, lifetime: caller             */
@@ -696,8 +703,12 @@ typedef struct {
     col_arr_entry_t *darr_entries; /* owned flat array of delta arrs      */
     uint32_t darr_count;           /* number of active delta arrangements */
     uint32_t darr_cap;             /* allocated capacity                  */
-    /* Frontier tracking (Phase 3B): minimum (iteration, stratum) processed */
-    col_frontier_t frontier; /* tracks lowest point fully processed  */
+    /* Frontier tracking (Phase 4): per-stratum frontier array for
+     * incremental re-evaluation. Each frontiers[i] tracks the minimum
+     * (iteration, stratum) boundary that has been fully processed for
+     * stratum i. This enables skipping redundant iterations when frontier
+     * persists across session_step calls (incremental evaluation). */
+    col_frontier_t frontiers[MAX_STRATA]; /* per-stratum frontier tracking */
 } wl_col_session_t;
 
 /*
@@ -3175,10 +3186,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
         col_mat_cache_clear(&sess->mat_cache);
 
-        /* Non-recursive stratum frontier: initialize to (0, 0) for EDB relations.
-         * Non-recursive strata don't produce timestamps, so no frontier update needed. */
-        sess->frontier.iteration = 0;
-        sess->frontier.stratum = stratum_idx;
+        /* Non-recursive stratum frontier: initialize to UINT32_MAX (not set sentinel).
+         * Each stratum has its own frontier tracking. Frontier is set during evaluation
+         * if tuple-producing operators exist. Using UINT32_MAX prevents premature skip
+         * (since iter < MAX_ITERATIONS < UINT32_MAX). */
+        if (stratum_idx < MAX_STRATA) {
+            sess->frontiers[stratum_idx].iteration = UINT32_MAX;
+            sess->frontiers[stratum_idx].stratum = stratum_idx;
+        }
 
         return 0;
     }
@@ -3233,6 +3248,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
     }
 
+    /* Initialize recursive stratum frontier to UINT32_MAX (not set sentinel).
+     * Phase 4: Per-stratum frontier allows incremental re-evaluation by tracking
+     * the maximum iteration reached. UINT32_MAX indicates "not yet evaluated",
+     * preventing premature skip of iterations 1+ in single session_step calls. */
+    if (stratum_idx < MAX_STRATA) {
+        sess->frontiers[stratum_idx].iteration = UINT32_MAX;
+        sess->frontiers[stratum_idx].stratum = stratum_idx;
+    }
+
     uint32_t iter;
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
         /* Phase 3D-Ext-002 (DORMANT): Fine-grained frontier skip infrastructure.
@@ -3241,10 +3265,11 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * model (session_step, session_snapshot). Designed for future incremental re-evaluation
          * where the frontier persists across multiple calls without being reset.
          *
-         * WHY UNREACHABLE: Non-recursive strata unconditionally reset frontier.iteration to 0
-         * (line 3180) before recursive strata evaluate. Since non-recursive strata precede
-         * recursive strata in topological order, frontier.iteration is always 0 when this
-         * skip condition is evaluated. Guard `sess->frontier.iteration > 0` is never true.
+         * WHY UNREACHABLE (Phase 4): Non-recursive strata reset their frontier to (0, stratum_idx)
+         * before recursive strata evaluate. Since each stratum initializes its frontier to iteration=0,
+         * the per-stratum skip condition `iter > frontiers[stratum_idx].iteration` is always false
+         * when evaluating the first session_step call. Becomes active only when frontier persists
+         * across multiple session_step calls (incremental re-evaluation, Phase 4+).
          *
          * INTENDED SEMANTICS (when frontier persists across calls):
          * Skip iteration only if: iter > frontier.iteration AND frontier.stratum < current_stratum.
@@ -3271,9 +3296,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * Dormant status verified. Recommendation: document before activation.
          * See progress.txt Phase 3D-Ext section for full architect findings.
          */
-        if (sess->frontier.iteration > 0 && iter > sess->frontier.iteration
-            && sess->frontier.stratum < stratum_idx) {
-            continue; /* Skip redundant stratum (dormant: never executes) */
+        /* Phase 4: Per-stratum frontier skip condition. Skip this iteration if
+         * we've already processed it in a prior session_step call (incremental
+         * re-evaluation). Each stratum compares against its own frontier,
+         * avoiding cross-stratum iteration comparison bugs.
+         * Currently dormant: frontier resets per session_step. Activated when
+         * incremental fact insertion preserves frontier across calls. */
+        if (stratum_idx < MAX_STRATA
+            && iter > sess->frontiers[stratum_idx].iteration) {
+            continue; /* Skip this iteration: already processed in prior session_step */
         }
 
         /* Clear per-iteration delta arrangement cache (sequential eval path).
@@ -3539,17 +3570,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             strat_frontier = rel_frontier;
         }
     }
-    /* Update session frontier if new stratum frontier is lower (non-zero) */
-    if (strat_frontier.iteration != UINT32_MAX) {
-        if (sess->frontier.iteration == 0 && sess->frontier.stratum == 0) {
-            /* First frontier: initialize */
-            sess->frontier = strat_frontier;
-        } else if (strat_frontier.iteration < sess->frontier.iteration
-                   || (strat_frontier.iteration == sess->frontier.iteration
-                       && strat_frontier.stratum < sess->frontier.stratum)) {
-            /* Update to lower frontier */
-            sess->frontier = strat_frontier;
-        }
+    /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
+     * Each stratum independently tracks its convergence frontier. */
+    if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
+        /* Set this stratum's frontier to the minimum (iteration, stratum) that
+         * was fully processed during iteration loop. This enables skipping
+         * iterations if frontier persists across session_step calls. */
+        sess->frontiers[stratum_idx] = strat_frontier;
     }
 
     return 0;
