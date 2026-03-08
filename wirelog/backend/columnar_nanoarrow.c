@@ -3283,11 +3283,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             "[phase4-debug] stratum %u: frontier initialized to UINT32_MAX\n",
             stratum_idx);
     } else if (stratum_idx < MAX_STRATA) {
-        fprintf(stderr,
-                "[phase4-debug] stratum %u: using preserved frontier "
-                "(iter=%u, strat=%u)\n",
-                stratum_idx, sess->frontiers[stratum_idx].iteration,
-                sess->frontiers[stratum_idx].stratum);
     }
 
     uint32_t iter;
@@ -3338,18 +3333,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * incremental fact insertion preserves frontier across calls. */
         if (stratum_idx < MAX_STRATA) {
             if (iter > sess->frontiers[stratum_idx].iteration) {
-                fprintf(stderr,
-                        "[phase4-skip] stratum %u: skip iter %u (frontier "
-                        "iter=%u)\n",
-                        stratum_idx, iter,
-                        sess->frontiers[stratum_idx].iteration);
                 continue; /* Skip this iteration: already processed in prior session_step */
             } else if (iter == 0) {
-                fprintf(stderr,
-                        "[phase4-skip] stratum %u: evaluating iter %u "
-                        "(frontier iter=%u)\n",
-                        stratum_idx, iter,
-                        sess->frontiers[stratum_idx].iteration);
             }
         }
 
@@ -3516,9 +3501,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 ri, sp->relations[ri].name, r ? "EXISTS" : "NULL", snap[ri],
                 r ? r->nrows : 0);
             if (!r || snap[ri] >= r->nrows) {
-                fprintf(stderr,
-                        "[consolidate-loop] skipping ri=%u (no new rows)\n",
-                        ri);
                 continue; /* no new rows for this relation */
             }
 
@@ -3602,18 +3584,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                  * frontier = MAXIMUM iteration that produced facts. Enables skip
                  * optimization in next session_step: skip iterations <= frontier. */
                 col_frontier_t rel_frontier = col_frontier_compute(delta);
-                fprintf(stderr,
-                        "[frontier-immediate] ri=%u: rel_frontier=(iter=%u, "
-                        "strat=%u)\n",
-                        ri, rel_frontier.iteration, rel_frontier.stratum);
                 if (rel_frontier.iteration > strat_frontier.iteration
                     || (rel_frontier.iteration == strat_frontier.iteration
                         && rel_frontier.stratum > strat_frontier.stratum)) {
                     strat_frontier = rel_frontier;
-                    fprintf(stderr,
-                            "[frontier-immediate] updated strat_frontier to "
-                            "(iter=%u, strat=%u)\n",
-                            strat_frontier.iteration, strat_frontier.stratum);
                 }
             } else {
                 col_rel_free_contents(delta);
@@ -3651,9 +3625,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             "[frontier-final] UPDATED frontier[%u] to (iter=%u, strat=%u)\n",
             stratum_idx, strat_frontier.iteration, strat_frontier.stratum);
     } else {
-        fprintf(stderr,
-                "[frontier-final] NOT updated (strat_frontier=UINT32_MAX or "
-                "stratum_idx out of range)\n");
     }
 
     /* Cleanup all delta relations after frontier has been computed */
@@ -4307,6 +4278,9 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     if (!session || !relation || !data)
         return EINVAL;
 
+    if (num_rows == 0)
+        return 0; /* true no-op */
+
     col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
     if (!r)
         return ENOENT;
@@ -4632,11 +4606,6 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     if (sess->last_inserted_relation != NULL) {
         affected_mask = col_compute_affected_strata(
             session, sess->last_inserted_relation);
-        fprintf(stderr,
-                "[incr-debug] stratum_count=%u affected_mask=0x%016llx "
-                "inserted='%s'\n",
-                plan->stratum_count, (unsigned long long)affected_mask,
-                sess->last_inserted_relation);
     }
 
     /* Phase 4: Do NOT reset frontier for affected strata. Keep the
