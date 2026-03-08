@@ -2418,6 +2418,15 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     rel->data = merged;
     rel->nrows = out;
     rel->capacity = (uint32_t)max_rows;
+
+    /* Phase 4: Update timestamp array to match consolidated data.
+     * After merge, timestamps for old rows are still valid, but new rows
+     * from delta have no timestamp information. Mark timestamps as invalid
+     * by deallocating (frontier computation will see NULL and return (0,0)). */
+    if (rel->timestamps) {
+        free(rel->timestamps);
+        rel->timestamps = NULL;
+    }
     return 0;
 }
 
@@ -3531,6 +3540,23 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     delta->timestamps[ti].stratum = stratum_idx;
                     /* worker left zero: sequential evaluation path */
                 }
+
+                /* Phase 4: Enable timestamp tracking on target relation to preserve
+                 * provenance through consolidation. This enables frontier computation
+                 * to determine which iterations have converged. */
+                if (!r->timestamps && r->capacity > 0) {
+                    r->timestamps = (col_delta_timestamp_t *)calloc(
+                        r->capacity, sizeof(col_delta_timestamp_t));
+                    if (!r->timestamps) {
+                        free(delta->timestamps);
+                        col_rel_free_contents(delta);
+                        free(delta);
+                        free(snap);
+                        free(delta_rels);
+                        return ENOMEM;
+                    }
+                }
+
                 delta_rels[ri] = delta;
                 any_new = true;
             } else {
@@ -3561,21 +3587,17 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
         session_remove_rel(sess, dname);
     }
-    free(delta_rels);
-    col_mat_cache_clear(&sess->mat_cache);
-
-    /* Compute frontier: minimum (iteration, stratum) from all stratum relations.
-     * Frontier tracks the lowest point that has been fully processed, enabling
-     * frontier-based filtering to skip redundant recalculation in future phases. */
+    /* Phase 4: Compute frontier BEFORE freeing delta relations.
+     * Only delta relations have timestamp information (provenance tracking).
+     * Final consolidated relations don't retain timestamps after merge. */
     col_frontier_t strat_frontier = { UINT32_MAX, UINT32_MAX };
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r)
+        if (!delta_rels[ri])
             continue;
-        col_frontier_t rel_frontier = col_frontier_compute(r);
-        /* Skip if relation has no timestamps (empty or not yet stamped) */
+        col_frontier_t rel_frontier = col_frontier_compute(delta_rels[ri]);
+        /* Skip empty deltas (no frontier info) */
         if (rel_frontier.iteration == 0 && rel_frontier.stratum == 0
-            && r->nrows == 0)
+            && delta_rels[ri]->nrows == 0)
             continue;
         /* Update stratum frontier to minimum */
         if (rel_frontier.iteration < strat_frontier.iteration
@@ -3584,6 +3606,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             strat_frontier = rel_frontier;
         }
     }
+
+    free(delta_rels);
+    col_mat_cache_clear(&sess->mat_cache);
     /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
      * Each stratum independently tracks its convergence frontier. */
     if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
@@ -4040,6 +4065,22 @@ col_session_get_darr_count(wl_session_t *sess)
     if (!sess)
         return 0;
     return COL_SESSION(sess)->darr_count;
+}
+
+/*
+ * col_session_get_frontier:
+ *
+ * Copy frontiers[stratum_idx] into *out_frontier.
+ * Returns EINVAL for NULL args or out-of-range stratum_idx.
+ */
+int
+col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
+                         col_frontier_t *out_frontier)
+{
+    if (!session || !out_frontier || stratum_idx >= MAX_STRATA)
+        return EINVAL;
+    *out_frontier = COL_SESSION(session)->frontiers[stratum_idx];
+    return 0;
 }
 
 /* ======================================================================== */
@@ -4540,6 +4581,26 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     if (sess->last_inserted_relation != NULL) {
         affected_mask = col_compute_affected_strata(
             session, sess->last_inserted_relation);
+        fprintf(stderr,
+                "[incr-debug] stratum_count=%u affected_mask=0x%016llx "
+                "inserted='%s'\n",
+                plan->stratum_count, (unsigned long long)affected_mask,
+                sess->last_inserted_relation);
+    }
+
+    /* For affected strata, reset the per-stratum frontier so the
+     * per-iteration skip condition (iter > frontiers[si].iteration) does
+     * not prematurely skip iterations.  IDB relations are intentionally
+     * kept: existing tuples act as seeds so semi-naive delta propagation
+     * converges in fewer iterations (only new-fact consequences are novel,
+     * and the consolidation dedup discards already-present old tuples). */
+    if (affected_mask != UINT64_MAX) {
+        for (uint32_t si = 0; si < plan->stratum_count; si++) {
+            if ((affected_mask & ((uint64_t)1 << si)) == 0)
+                continue;
+            if (si < MAX_STRATA)
+                sess->frontiers[si].iteration = 0;
+        }
     }
 
     /* Execute strata in order, skipping unaffected ones */

@@ -531,7 +531,11 @@ test('phase4_frontier_array', test_phase4_frontier_array_exe)
 test_incremental_insertion_exe = executable(
   'incremental_insertion',
   files('test_incremental_insertion.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
   backend_src,
+  io_src,
   arena_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -539,6 +543,20 @@ test_incremental_insertion_exe = executable(
 )
 
 test('incremental_insertion', test_incremental_insertion_exe)
+
+bench_incremental_frontier_exe = executable(
+  'bench_incremental_frontier',
+  files('bench_incremental_frontier.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
 
 # ============================================================================
 # Phase 4: Affected Strata Detection Tests (US-4-affected_strata)

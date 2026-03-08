@@ -270,6 +270,25 @@ col_compute_affected_strata(wl_session_t *session,
                             const char *inserted_relation);
 
 /**
+ * col_session_get_frontier:
+ *
+ * Copy the per-stratum frontier value for stratum index @stratum_idx into
+ * @out_frontier.  Returns 0 on success, EINVAL if @session or @out_frontier
+ * is NULL, or if @stratum_idx is out of range.
+ *
+ * This accessor is provided for testing: production code accesses frontiers
+ * via the COL_SESSION() cast which is private to columnar_nanoarrow.c.
+ *
+ * @param session       Active session backed by the columnar backend.
+ * @param stratum_idx   Zero-based stratum index.
+ * @param out_frontier  Receives a copy of frontiers[stratum_idx].
+ * @return 0 on success, EINVAL on bad arguments or out-of-range index.
+ */
+int
+col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
+                         col_frontier_t *out_frontier);
+
+/**
  * col_session_insert_incremental:
  *
  * Append facts to an EDB relation WITHOUT resetting per-stratum frontiers.
