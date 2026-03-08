@@ -793,6 +793,382 @@ run_cspa_workload(const char *data_dir, uint32_t workers, int repeat)
 }
 
 /* ----------------------------------------------------------------
+ * CSPA Incremental - Phase 4 incremental re-evaluation benchmark
+ *
+ * Demonstrates frontier-skip speedup:
+ *   Run 1 (baseline): full fresh CSPA evaluation from scratch
+ *   Run 2 (incremental):
+ *     a. Initial eval on 100% facts (should match baseline)
+ *     b. Insert 20% new facts via col_session_insert_incremental
+ *     c. Re-eval: session_snapshot with frontier active (skip converged strata)
+ *
+ * Output columns (TSV):
+ *   workload  facts  baseline_ms  initial_ms  insert_ms  reeval_ms
+ *   speedup  tuples_before  tuples_after  iters_before  iters_after  status
+ * ---------------------------------------------------------------- */
+
+/*
+ * csv_load_int64: Load a 2-column CSV into a freshly allocated int64_t array.
+ * Returns number of rows loaded, or -1 on error.  *out_data must be freed by
+ * the caller.  Rows beyond max_rows are silently ignored.
+ */
+static int32_t
+csv_load_int64(const char *path, int64_t **out_data, uint32_t max_rows)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "error: cannot open '%s'\n", path);
+        return -1;
+    }
+
+    int64_t *buf = (int64_t *)malloc(sizeof(int64_t) * 2 * (size_t)max_rows);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+
+    int32_t count = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) && (uint32_t)count < max_rows) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0)
+            continue;
+
+        char *saveptr = NULL;
+        char *tok = strtok_r(line, ",", &saveptr);
+        if (!tok)
+            continue;
+        int64_t v0 = strtol(tok, NULL, 10);
+        tok = strtok_r(NULL, ",", &saveptr);
+        if (!tok)
+            continue;
+        int64_t v1 = strtol(tok, NULL, 10);
+
+        buf[(size_t)count * 2] = v0;
+        buf[(size_t)count * 2 + 1] = v1;
+        count++;
+    }
+    fclose(f);
+
+    *out_data = buf;
+    return count;
+}
+
+static int
+run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
+                              int repeat)
+{
+    /* CSPA source: empty EDB declarations, IDB rules only.
+     * Facts are loaded via col_session_insert_incremental. */
+    static const char *cspa_incr_source
+        = ".decl assign(x: int32, y: int32)\n"
+          ".decl dereference(x: int32, y: int32)\n"
+          ".decl valueFlow(x: int32, y: int32)\n"
+          ".decl memoryAlias(x: int32, y: int32)\n"
+          ".decl valueAlias(x: int32, y: int32)\n"
+          "valueFlow(y, x) :- assign(y, x).\n"
+          "valueFlow(x, x) :- assign(x, _).\n"
+          "valueFlow(x, x) :- assign(_, x).\n"
+          "memoryAlias(x, x) :- assign(_, x).\n"
+          "memoryAlias(x, x) :- assign(x, _).\n"
+          "valueFlow(x, y) :- valueFlow(x, z), valueFlow(z, y).\n"
+          "valueFlow(x, y) :- assign(x, z), memoryAlias(z, y).\n"
+          "memoryAlias(x, w) :- dereference(y, x), valueAlias(y, z), "
+          "dereference(z, w).\n"
+          "valueAlias(x, y) :- valueFlow(z, x), valueFlow(z, y).\n"
+          "valueAlias(x, y) :- valueFlow(z, x), memoryAlias(z, w), "
+          "valueFlow(w, y).\n";
+
+    /* Load assign.csv and dereference.csv */
+    char assign_path[1024], deref_path[1024];
+    snprintf(assign_path, sizeof(assign_path), "%s/assign.csv", data_dir);
+    snprintf(deref_path, sizeof(deref_path), "%s/dereference.csv", data_dir);
+
+#define CSPA_INCR_MAX_ROWS 65536
+    int64_t *assign_data = NULL;
+    int64_t *deref_data = NULL;
+
+    int32_t assign_count
+        = csv_load_int64(assign_path, &assign_data, CSPA_INCR_MAX_ROWS);
+    if (assign_count < 0)
+        return -1;
+
+    int32_t deref_count
+        = csv_load_int64(deref_path, &deref_data, CSPA_INCR_MAX_ROWS);
+    if (deref_count < 0) {
+        free(assign_data);
+        return -1;
+    }
+
+    int32_t total_facts = assign_count + deref_count;
+
+    /* Generate 20% synthetic new assign facts by offsetting existing values */
+    int32_t new_count = assign_count / 5;
+    if (new_count < 1)
+        new_count = 1;
+    int64_t *new_assign
+        = (int64_t *)malloc(sizeof(int64_t) * 2 * (size_t)new_count);
+    if (!new_assign) {
+        free(assign_data);
+        free(deref_data);
+        return -1;
+    }
+    /* Synthetic facts: shift node IDs by a large offset to ensure novelty */
+    int64_t offset = 10000;
+    for (int32_t i = 0; i < new_count; i++) {
+        new_assign[(size_t)i * 2]
+            = assign_data[(size_t)(i % assign_count) * 2] + offset;
+        new_assign[(size_t)i * 2 + 1]
+            = assign_data[(size_t)(i % assign_count) * 2 + 1] + offset;
+    }
+
+    /* ---- Run 1 (baseline): full fresh evaluation from scratch ----------- */
+    double *baseline_times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    if (!baseline_times) {
+        free(assign_data);
+        free(deref_data);
+        free(new_assign);
+        return -1;
+    }
+
+    int64_t baseline_tuples = 0;
+    uint32_t baseline_iters = 0;
+    int status_ok = 1;
+
+    for (int r = 0; r < repeat; r++) {
+        int64_t cnt = 0;
+        uint32_t iters = 0;
+        /* Build full inline source for baseline */
+        char *facts_assign = (char *)malloc(SRC_BUFSZ / 2);
+        char *facts_deref = (char *)malloc(SRC_BUFSZ / 2);
+        if (!facts_assign || !facts_deref) {
+            free(facts_assign);
+            free(facts_deref);
+            status_ok = 0;
+            break;
+        }
+        if (csv_to_inline_facts(assign_path, "assign", facts_assign,
+                                SRC_BUFSZ / 2, NULL)
+                != 0
+            || csv_to_inline_facts(deref_path, "dereference", facts_deref,
+                                   SRC_BUFSZ / 2, NULL)
+                   != 0) {
+            free(facts_assign);
+            free(facts_deref);
+            status_ok = 0;
+            break;
+        }
+        char *src = (char *)malloc(SRC_BUFSZ);
+        if (!src) {
+            free(facts_assign);
+            free(facts_deref);
+            status_ok = 0;
+            break;
+        }
+        int n = snprintf(src, SRC_BUFSZ, cspa_template, facts_assign,
+                         facts_deref);
+        free(facts_assign);
+        free(facts_deref);
+        if (n < 0 || (size_t)n >= SRC_BUFSZ) {
+            free(src);
+            status_ok = 0;
+            break;
+        }
+
+        bench_time_t t0 = bench_time_now();
+        int rc = run_pipeline_count(src, workers, &cnt, &iters);
+        bench_time_t t1 = bench_time_now();
+        free(src);
+
+        baseline_times[r] = bench_time_diff_ms(t0, t1);
+        if (rc != 0) {
+            status_ok = 0;
+            break;
+        }
+        baseline_tuples = cnt;
+        baseline_iters = iters;
+    }
+
+    if (!status_ok) {
+        free(baseline_times);
+        free(assign_data);
+        free(deref_data);
+        free(new_assign);
+        printf("cspa_incr\t%d\t-\t-\t-\t-\t-\t-\t-\t-\t-\tFAIL\n", total_facts);
+        return -1;
+    }
+
+    /* ---- Run 2 (incremental): initial eval + insert + re-eval ----------- */
+    double *initial_times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    double *insert_times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    double *reeval_times = (double *)malloc(sizeof(double) * (size_t)repeat);
+    if (!initial_times || !insert_times || !reeval_times) {
+        free(baseline_times);
+        free(initial_times);
+        free(insert_times);
+        free(reeval_times);
+        free(assign_data);
+        free(deref_data);
+        free(new_assign);
+        return -1;
+    }
+
+    int64_t initial_tuples = 0;
+    int64_t reeval_tuples = 0;
+    uint32_t initial_iters = 0;
+    uint32_t reeval_iters = 0;
+
+    /* Parse program once — reused across repeat runs */
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(cspa_incr_source, &err);
+    if (!prog) {
+        free(baseline_times);
+        free(initial_times);
+        free(insert_times);
+        free(reeval_times);
+        free(assign_data);
+        free(deref_data);
+        free(new_assign);
+        return -1;
+    }
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        free(baseline_times);
+        free(initial_times);
+        free(insert_times);
+        free(reeval_times);
+        free(assign_data);
+        free(deref_data);
+        free(new_assign);
+        return -1;
+    }
+
+    for (int r = 0; r < repeat; r++) {
+        /* Create a fresh session for each repeat */
+        wl_session_t *sess = NULL;
+        rc = wl_session_create(wl_backend_columnar(), plan, workers, &sess);
+        if (rc != 0) {
+            status_ok = 0;
+            break;
+        }
+
+        /* Load all facts incrementally (frontier-preserving) */
+        rc = col_session_insert_incremental(sess, "assign", assign_data,
+                                            (uint32_t)assign_count, 2);
+        if (rc == 0)
+            rc = col_session_insert_incremental(sess, "dereference", deref_data,
+                                                (uint32_t)deref_count, 2);
+        if (rc != 0) {
+            wl_session_destroy(sess);
+            status_ok = 0;
+            break;
+        }
+
+        /* Initial evaluation (full, frontier not yet set) */
+        struct count_ctx ctx1 = { 0 };
+        bench_time_t t0 = bench_time_now();
+        rc = wl_session_snapshot(sess, count_tuple_cb, &ctx1);
+        bench_time_t t1 = bench_time_now();
+        initial_times[r] = bench_time_diff_ms(t0, t1);
+        if (rc != 0) {
+            wl_session_destroy(sess);
+            status_ok = 0;
+            break;
+        }
+        initial_tuples = ctx1.count;
+        (void)initial_tuples;
+        initial_iters = col_session_get_iteration_count(sess);
+        (void)initial_iters;
+
+        /* Insert 20% new assign facts WITHOUT resetting frontier */
+        bench_time_t ti0 = bench_time_now();
+        rc = col_session_insert_incremental(sess, "assign", new_assign,
+                                            (uint32_t)new_count, 2);
+        bench_time_t ti1 = bench_time_now();
+        insert_times[r] = bench_time_diff_ms(ti0, ti1);
+        if (rc != 0) {
+            wl_session_destroy(sess);
+            status_ok = 0;
+            break;
+        }
+
+        /* Incremental re-evaluation: frontier skip active for converged strata */
+        struct count_ctx ctx2 = { 0 };
+        bench_time_t tr0 = bench_time_now();
+        rc = wl_session_snapshot(sess, count_tuple_cb, &ctx2);
+        bench_time_t tr1 = bench_time_now();
+        reeval_times[r] = bench_time_diff_ms(tr0, tr1);
+        if (rc != 0) {
+            wl_session_destroy(sess);
+            status_ok = 0;
+            break;
+        }
+        reeval_tuples = ctx2.count;
+        reeval_iters = col_session_get_iteration_count(sess);
+
+        wl_session_destroy(sess);
+    }
+
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    free(assign_data);
+    free(deref_data);
+    free(new_assign);
+
+    int64_t peak_rss = bench_peak_rss_kb();
+
+    if (status_ok) {
+        qsort(baseline_times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        qsort(initial_times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        qsort(insert_times, (size_t)repeat, sizeof(double), bench_cmp_double);
+        qsort(reeval_times, (size_t)repeat, sizeof(double), bench_cmp_double);
+
+        double baseline_ms = baseline_times[repeat / 2];
+        double initial_ms = initial_times[repeat / 2];
+        double insert_ms = insert_times[repeat / 2];
+        double reeval_ms = reeval_times[repeat / 2];
+        double speedup = (reeval_ms > 0.0) ? baseline_ms / reeval_ms : 0.0;
+        const char *status = (speedup >= 2.0) ? "OK" : "SLOW";
+
+        /* Print custom incremental header on first line */
+        printf("# cspa_incr columns: workload facts baseline_ms initial_ms "
+               "insert_ms reeval_ms speedup tuples_before tuples_after "
+               "iters_before iters_after peak_rss_kb status\n");
+        printf("cspa_incr\t%d\t%.1f\t%.1f\t%.3f\t%.1f\t%.2f\t%" PRId64
+               "\t%" PRId64 "\t%u\t%u\t%" PRId64 "\t%s\n",
+               total_facts, baseline_ms, initial_ms, insert_ms, reeval_ms,
+               speedup, baseline_tuples, reeval_tuples, baseline_iters,
+               reeval_iters, peak_rss, status);
+
+        fprintf(stderr,
+                "cspa_incr: baseline=%.1fms initial=%.1fms insert=%.3fms "
+                "reeval=%.1fms speedup=%.2fx tuples=%lld->%lld "
+                "iters=%u->%u\n",
+                baseline_ms, initial_ms, insert_ms, reeval_ms, speedup,
+                (long long)baseline_tuples, (long long)reeval_tuples,
+                baseline_iters, reeval_iters);
+    } else {
+        printf("cspa_incr\t%d\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tFAIL\n",
+               total_facts);
+    }
+
+    free(baseline_times);
+    free(initial_times);
+    free(insert_times);
+    free(reeval_times);
+    return status_ok ? 0 : -1;
+}
+
+/* ----------------------------------------------------------------
  * CSDA - Context-Sensitive Dataflow Analysis (multi-relation workload)
  * ---------------------------------------------------------------- */
 
@@ -2305,8 +2681,8 @@ usage(const char *prog)
     fprintf(
         stderr,
         "Usage: %s --workload "
-        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|csda|galen|"
-        "polonius|ddisasm|crdt|doop|all} --data FILE\n"
+        "{tc|reach|cc|sssp|sg|bipartite|andersen|dyck|cspa|cspa_incr|csda|"
+        "galen|polonius|ddisasm|crdt|doop|all} --data FILE\n"
         "          [--data-weighted FILE] [--data-andersen DIR]\n"
         "          [--data-dyck DIR] [--data-cspa DIR]\n"
         "          [--data-csda DIR] [--data-galen DIR]\n"
@@ -2475,6 +2851,12 @@ main(int argc, char **argv)
             return 1;
         }
         rc = run_cspa_workload(data_cspa_path, workers, repeat);
+    } else if (strcmp(workload, "cspa_incr") == 0) {
+        if (!data_cspa_path) {
+            fprintf(stderr, "error: cspa_incr requires --data-cspa DIR\n");
+            return 1;
+        }
+        rc = run_cspa_incremental_workload(data_cspa_path, workers, repeat);
     } else if (strcmp(workload, "csda") == 0) {
         if (!data_csda_path) {
             fprintf(stderr, "error: csda requires --data-csda DIR\n");
@@ -2534,6 +2916,9 @@ main(int argc, char **argv)
         }
         if (data_cspa_path) {
             int r = run_cspa_workload(data_cspa_path, workers, repeat);
+            if (r != 0)
+                rc = r;
+            r = run_cspa_incremental_workload(data_cspa_path, workers, repeat);
             if (r != 0)
                 rc = r;
         }

@@ -709,6 +709,12 @@ typedef struct {
      * stratum i. This enables skipping redundant iterations when frontier
      * persists across session_step calls (incremental evaluation). */
     col_frontier_t frontiers[MAX_STRATA]; /* per-stratum frontier tracking */
+    /* Phase 4: tracks which relation was just inserted via
+     * col_session_insert_incremental, enables affected-stratum skip
+     * optimization. Borrowed pointer; lifetime: until next session_step.
+     * NULL when no incremental insert preceded the current step (all strata
+     * evaluated normally via affected_mask = UINT64_MAX). */
+    const char *last_inserted_relation;
 } wl_col_session_t;
 
 /*
@@ -1019,6 +1025,11 @@ col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
                                   const uint32_t *key_cols, uint32_t key_count);
 static void
 col_session_free_delta_arrangements(wl_col_session_t *cs);
+
+/* Forward declaration for Phase 4 affected-strata skip */
+uint64_t
+col_compute_affected_strata(wl_session_t *session,
+                            const char *inserted_relation);
 
 /* Helper: create a new owned relation with given ncols and auto-named cols. */
 static col_rel_t *
@@ -3186,11 +3197,12 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
         col_mat_cache_clear(&sess->mat_cache);
 
-        /* Non-recursive stratum frontier: initialize to UINT32_MAX (not set sentinel).
-         * Each stratum has its own frontier tracking. Frontier is set during evaluation
-         * if tuple-producing operators exist. Using UINT32_MAX prevents premature skip
-         * (since iter < MAX_ITERATIONS < UINT32_MAX). */
-        if (stratum_idx < MAX_STRATA) {
+        /* Non-recursive stratum frontier: initialize to UINT32_MAX (not set sentinel)
+         * only on the first evaluation (frontier==0 from calloc). If a prior
+         * col_session_insert_incremental call preserved a real convergence frontier,
+         * keep it so the skip logic in the recursive path can use it. */
+        if (stratum_idx < MAX_STRATA
+            && sess->frontiers[stratum_idx].iteration == 0) {
             sess->frontiers[stratum_idx].iteration = UINT32_MAX;
             sess->frontiers[stratum_idx].stratum = stratum_idx;
         }
@@ -3248,11 +3260,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
     }
 
-    /* Initialize recursive stratum frontier to UINT32_MAX (not set sentinel).
-     * Phase 4: Per-stratum frontier allows incremental re-evaluation by tracking
-     * the maximum iteration reached. UINT32_MAX indicates "not yet evaluated",
-     * preventing premature skip of iterations 1+ in single session_step calls. */
-    if (stratum_idx < MAX_STRATA) {
+    /* Initialize recursive stratum frontier to UINT32_MAX (not set sentinel)
+     * only on the first evaluation (frontier==0 from calloc). If a prior
+     * col_session_insert_incremental call preserved a real convergence frontier,
+     * keep it so the per-iteration skip condition fires for iterations beyond
+     * the prior convergence point. */
+    if (stratum_idx < MAX_STRATA
+        && sess->frontiers[stratum_idx].iteration == 0) {
         sess->frontiers[stratum_idx].iteration = UINT32_MAX;
         sess->frontiers[stratum_idx].stratum = stratum_idx;
     }
@@ -4220,6 +4234,10 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
         if (rc != 0)
             return rc;
     }
+
+    /* Record the inserted relation so col_session_step can skip unaffected
+     * strata (Phase 4 affected-stratum skip optimization). */
+    COL_SESSION(session)->last_inserted_relation = relation;
     return 0;
 }
 
@@ -4428,7 +4446,21 @@ col_session_step(wl_session_t *session)
     wl_col_session_t *sess = COL_SESSION(session);
     const wl_plan_t *plan = sess->plan;
 
+    /* Compute affected strata bitmask (Phase 4 incremental skip).
+     * When last_inserted_relation is set (incremental path), only evaluate
+     * strata that transitively depend on the inserted relation.  When NULL
+     * (regular step), UINT64_MAX means all strata are evaluated. */
+    uint64_t affected_mask = UINT64_MAX;
+    if (sess->last_inserted_relation != NULL) {
+        affected_mask = col_compute_affected_strata(
+            session, sess->last_inserted_relation);
+    }
+
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        /* Skip strata not affected by the last incremental insertion */
+        if ((affected_mask & ((uint64_t)1 << si)) == 0)
+            continue;
+
         const wl_plan_stratum_t *sp = &plan->strata[si];
         int rc = sess->delta_cb ? col_stratum_step_with_delta(sp, sess, si)
                                 : col_eval_stratum(sp, sess, si);
@@ -4438,6 +4470,9 @@ col_session_step(wl_session_t *session)
         if (sess->eval_arena)
             wl_arena_reset(sess->eval_arena);
     }
+
+    /* Reset after successful eval so next plain session_step runs all strata */
+    sess->last_inserted_relation = NULL;
     return 0;
 }
 
@@ -4498,12 +4533,28 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     sess->consolidation_ns = 0;
     sess->kfusion_ns = 0;
 
-    /* Execute all strata in order */
+    /* Phase 4 incremental skip: when last_inserted_relation is set, only
+     * re-evaluate strata that transitively depend on the inserted relation.
+     * Unaffected strata already hold converged results from the prior eval. */
+    uint64_t affected_mask = UINT64_MAX;
+    if (sess->last_inserted_relation != NULL) {
+        affected_mask = col_compute_affected_strata(
+            session, sess->last_inserted_relation);
+    }
+
+    /* Execute strata in order, skipping unaffected ones */
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        if ((affected_mask & ((uint64_t)1 << si)) == 0)
+            continue;
         int rc = col_eval_stratum(&plan->strata[si], sess, si);
         if (rc != 0)
             return rc;
+        if (sess->eval_arena)
+            wl_arena_reset(sess->eval_arena);
     }
+
+    /* Reset after successful eval so next plain snapshot runs all strata */
+    sess->last_inserted_relation = NULL;
 
     /* Invoke callback for every tuple in every IDB relation */
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
