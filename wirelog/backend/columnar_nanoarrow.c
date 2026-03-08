@@ -3529,6 +3529,48 @@ col_session_get_perf_stats(wl_session_t *sess, uint64_t *out_consolidation_ns,
         *out_kfusion_ns = cs->kfusion_ns;
 }
 
+/*
+ * col_frontier_compute:
+ *
+ * Compute the minimum (iteration, stratum) pair from a relation's timestamps.
+ * This represents the frontier: the lowest point that has been fully processed.
+ *
+ * Returns (0, 0) if:
+ *   - The relation is NULL or has no rows
+ *   - The relation has no timestamp tracking (timestamps == NULL)
+ *   - Timestamp array is empty
+ *
+ * Otherwise returns min(iteration, stratum) across all rows.
+ *
+ * @param rel  col_rel_t* to compute frontier from (NULL-safe)
+ * @return col_frontier_t with min (iteration, stratum) or (0, 0) if no data
+ */
+static col_frontier_t
+col_frontier_compute(const col_rel_t *rel)
+{
+    col_frontier_t f = { 0, 0 };
+
+    /* Handle NULL or empty relation */
+    if (!rel || rel->nrows == 0 || !rel->timestamps)
+        return f;
+
+    /* Initialize frontier to first row's timestamp */
+    f.iteration = rel->timestamps[0].iteration;
+    f.stratum = rel->timestamps[0].stratum;
+
+    /* Find minimum (iteration, stratum) */
+    for (uint32_t i = 1; i < rel->nrows; i++) {
+        const col_delta_timestamp_t *ts = &rel->timestamps[i];
+        if (ts->iteration < f.iteration
+            || (ts->iteration == f.iteration && ts->stratum < f.stratum)) {
+            f.iteration = ts->iteration;
+            f.stratum = ts->stratum;
+        }
+    }
+
+    return f;
+}
+
 /* ======================================================================== */
 /* Arrangement Accessors (Phase 3C)                                         */
 /* ======================================================================== */

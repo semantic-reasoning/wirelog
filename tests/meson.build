@@ -453,6 +453,18 @@ test_join_arrangement_exe = executable(
 test('join_arrangement', test_join_arrangement_exe)
 
 # ============================================================================
+# Frontier Tracking Tests (Phase 3B)
+# ============================================================================
+
+test_frontier_exe = executable(
+  'test_frontier',
+  files('test_frontier.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('frontier', test_frontier_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #

@@ -107,6 +107,29 @@ typedef struct {
 } col_delta_timestamp_t;
 
 /* ======================================================================== */
+/* Frontier Tracking (Phase 3B)                                             */
+/* ======================================================================== */
+
+/**
+ * col_frontier_t - Minimum processed (iteration, stratum) boundary.
+ *
+ * Frontier tracks the lowest (iteration, stratum) pair that has been fully
+ * processed. Data with (iter, strat) <= frontier can be skipped in evaluation.
+ *
+ * Used to:
+ *   - Skip redundant recalculation of old iterations
+ *   - Clean up old relation snapshots and arrangement entries
+ *   - Enable streaming consolidation (only process new deltas)
+ *
+ * Ordering: (iter1, strat1) <= (iter2, strat2) iff
+ *   iter1 < iter2 OR (iter1 == iter2 AND strat1 <= strat2)
+ */
+typedef struct {
+    uint32_t iteration;
+    uint32_t stratum;
+} col_frontier_t;
+
+/* ======================================================================== */
 /* Arrangement Layer (Phase 3C)                                             */
 /* ======================================================================== */
 
