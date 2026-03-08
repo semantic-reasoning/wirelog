@@ -4173,6 +4173,56 @@ col_session_insert(wl_session_t *session, const char *relation,
     return 0;
 }
 
+/*
+ * col_session_insert_incremental: Append facts to a session WITHOUT resetting
+ * the per-stratum frontier.
+ *
+ * Unlike col_session_insert(), this function preserves frontier[] state so
+ * that a subsequent col_session_step() call can perform incremental
+ * re-evaluation: only strata whose frontier has not yet converged past the
+ * current iteration are evaluated.
+ *
+ * Facts are appended to the existing relation; existing rows are kept.
+ * Schema is lazily initialised on the first call (same as col_session_insert).
+ *
+ * @param session:  Active wl_session_t created by col_session_create
+ * @param relation: Name of the EDB relation to append to
+ * @param data:     Row-major int64_t array, num_rows * num_cols elements
+ * @param num_rows: Number of rows to append (0 is a no-op and returns 0)
+ * @param num_cols: Number of columns per row
+ * @return 0 on success, EINVAL on bad args, ENOENT if relation unknown,
+ *         ENOMEM on allocation failure
+ */
+int
+col_session_insert_incremental(wl_session_t *session, const char *relation,
+                               const int64_t *data, uint32_t num_rows,
+                               uint32_t num_cols)
+{
+    if (!session || !relation || !data)
+        return EINVAL;
+
+    col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
+    if (!r)
+        return ENOENT;
+
+    /* Lazy schema initialisation on first insert */
+    if (r->ncols == 0) {
+        int rc = col_rel_set_schema(r, num_cols, NULL);
+        if (rc != 0)
+            return rc;
+    } else if (r->ncols != num_cols) {
+        return EINVAL; /* column count mismatch */
+    }
+
+    /* Append rows; frontier[] is intentionally NOT modified */
+    for (uint32_t i = 0; i < num_rows; i++) {
+        int rc = col_rel_append_row(r, data + (size_t)i * num_cols);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
 static int
 col_session_remove(wl_session_t *session, const char *relation,
                    const int64_t *data, uint32_t num_rows, uint32_t num_cols)
