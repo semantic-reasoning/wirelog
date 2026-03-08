@@ -576,6 +576,26 @@ test_affected_strata_exe = executable(
 test('affected_strata', test_affected_strata_exe)
 
 # ============================================================================
+# Phase 4: Per-Stratum Frontier Integration Tests (US-4-005)
+# ============================================================================
+
+test_phase4_frontier_integration_exe = executable(
+  'test_phase4_frontier_integration',
+  files('test_phase4_frontier_integration.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('phase4_frontier_integration', test_phase4_frontier_integration_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
