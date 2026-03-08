@@ -1,0 +1,82 @@
+DOOP Breakthrough Validation
+============================
+Date: 2026-03-08
+Mode: K-FUSION enabled (ENABLE_K_FUSION=1)
+K value: 8 (8-way joins in DOOP recursive rules)
+Target: < 300 seconds completion (5-minute breakthrough)
+
+EXECUTION
+---------
+Command: perl -e 'alarm 300; exec @ARGV' -- ./build/bench/bench_flowlog --workload doop --data-doop bench/data/doop
+Dataset: bench/data/doop/ — 34 CSV files, 83 MB total (DOOP zxing dataset)
+Execution time: TIMEOUT at 300s
+Status: FAIL — did not complete within 5-minute target
+
+RESULTS
+-------
+If completed:
+  N/A — benchmark did not finish within 300s timeout
+
+If timeout:
+  - Stopped at: 300.0 seconds (SIGALRM via perl alarm, exit code 142)
+  - Partial results: none printed to stdout before termination
+  - Analysis:
+      K-FUSION infrastructure is correct and reduces per-rule overhead by
+      fusing K sequential join steps into a single K-way merge pass, but
+      DOOP's recursive point-to analysis generates relation explosion at
+      scale (the zxing dataset has ~83 MB of EDB facts). The current
+      evaluator executes K-sequences sequentially within a single worker
+      thread — the workqueue infrastructure exists but parallel dispatch
+      across rules is not yet active. Without true parallel execution,
+      K-FUSION reduces constant-factor overhead but cannot change the
+      asymptotic bottleneck of DOOP's recursive fixed-point computation.
+
+ACCEPTANCE CRITERIA
+-------------------
+[FAIL] DOOP completes < 5 minutes  — timed out at 300s
+[N/A]  Output correctness           — benchmark did not complete
+
+DATASET
+-------
+Location: bench/data/doop/
+Files (34):
+  ActualParam.csv (3.6M), ApplicationClass.csv (4.9K), ArrayType.csv (584K),
+  AssignCast.csv (1.3M), AssignHeapAllocation.csv (3.7M),
+  AssignLocal.csv (10M), AssignReturnValue.csv (2.0M), ClassType.csv (51K),
+  ComponentType.csv (1.1M), DirectSuperclass.csv (99K),
+  DirectSuperinterface.csv (50K), Field.csv (5.7M), FormalParam.csv (1.3M),
+  HeapAllocation_Type.csv (1.0M), InterfaceType.csv (6.1K),
+  LoadArrayIndex.csv (561K), LoadInstanceField.csv (4.1M),
+  LoadStaticField.csv (955K), MainClass.csv (7B), Method_Descriptor.csv (1.0M),
+  Method_Modifier.csv (1.3M), Method.csv (3.2M), NormalHeap.csv (625K),
+  Return.csv (1.4M), SpecialMethodInvocation.csv (2.0M),
+  StaticMethodInvocation.csv (956K), StoreArrayIndex.csv (1.9M),
+  StoreInstanceField.csv (1.5M), StoreStaticField.csv (269K),
+  StringConstant.csv (336K), ThisVar.csv (875K), Var_DeclaringMethod.csv (13M),
+  Var_Type.csv (13M), VirtualMethodInvocation.csv (4.9M)
+Total: ~83 MB
+
+NEXT STEPS (Phase 2D)
+---------------------
+K-FUSION infrastructure is correct and complete. To achieve the DOOP
+breakthrough, the following additional optimizations are needed:
+
+1. Workqueue parallel dispatch — activate multi-rule parallel evaluation
+   so K-sequences run concurrently across worker threads. This is the
+   primary missing piece; K-FUSION was designed to feed this path.
+
+2. Demand-driven / semi-naive pruning — avoid re-deriving tuples already
+   in the IDB; verify that delta tracking is tight for large recursive rules.
+
+3. Relation-size-aware join ordering — for DOOP's call-graph construction
+   rules, join order has order-of-magnitude impact; static or adaptive
+   ordering could recover significant time.
+
+4. Incremental index construction — avoid rebuilding sorted indexes on
+   every iteration for stable EDB relations.
+
+CONTEXT
+-------
+- CSPA completed in 30.67s with K-FUSION (6 iterations, 20,381 tuples)
+- DOOP is substantially larger: ~83 MB EDB vs CSPA's small relation set
+- K-FUSION Phase 2C is architecturally complete; Phase 2D is parallelism
