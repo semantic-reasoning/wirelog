@@ -505,6 +505,7 @@ typedef struct {
     wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
     col_mat_cache_t mat_cache; /* materialization cache (US-006)        */
     uint32_t total_iterations; /* fixed-point iterations in last eval   */
+    wl_work_queue_t *wq;       /* reusable thread pool for K-fusion     */
 } wl_col_session_t;
 
 /*
@@ -2351,13 +2352,18 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
-    wl_work_queue_t *wq = wl_workqueue_create(k);
-    if (!wq) {
-        free(results);
-        free(workers);
-        free(worker_sess);
-        return ENOMEM;
+    /* Lazily create the session-level workqueue on first K-fusion call.
+     * Reusing across iterations avoids per-call thread spawn/join overhead. */
+    if (!sess->wq) {
+        sess->wq = wl_workqueue_create(k);
+        if (!sess->wq) {
+            free(results);
+            free(workers);
+            free(worker_sess);
+            return ENOMEM;
+        }
     }
+    wl_work_queue_t *wq = sess->wq;
 
     int rc = 0;
 
@@ -2454,7 +2460,7 @@ cleanup_results:
     }
 
 cleanup_wq:
-    wl_workqueue_destroy(wq);
+    /* wq is session-owned and reused across iterations — do not destroy here. */
     for (uint32_t d = 0; d < k; d++)
         col_mat_cache_clear(&worker_sess[d].mat_cache);
     free(worker_sess);
@@ -3258,6 +3264,7 @@ col_session_destroy(wl_session_t *session)
     if (sess->eval_arena)
         wl_arena_free(sess->eval_arena);
     col_mat_cache_clear(&sess->mat_cache);
+    wl_workqueue_destroy(sess->wq);
     free(sess);
 }
 
