@@ -3278,9 +3278,20 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         && sess->frontiers[stratum_idx].iteration == 0) {
         sess->frontiers[stratum_idx].iteration = UINT32_MAX;
         sess->frontiers[stratum_idx].stratum = stratum_idx;
+        fprintf(
+            stderr,
+            "[phase4-debug] stratum %u: frontier initialized to UINT32_MAX\n",
+            stratum_idx);
+    } else if (stratum_idx < MAX_STRATA) {
+        fprintf(stderr,
+                "[phase4-debug] stratum %u: using preserved frontier "
+                "(iter=%u, strat=%u)\n",
+                stratum_idx, sess->frontiers[stratum_idx].iteration,
+                sess->frontiers[stratum_idx].stratum);
     }
 
     uint32_t iter;
+    col_frontier_t strat_frontier = { UINT32_MAX, UINT32_MAX };
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
         /* Phase 3D-Ext-002 (DORMANT): Fine-grained frontier skip infrastructure.
          *
@@ -3325,9 +3336,21 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * avoiding cross-stratum iteration comparison bugs.
          * Currently dormant: frontier resets per session_step. Activated when
          * incremental fact insertion preserves frontier across calls. */
-        if (stratum_idx < MAX_STRATA
-            && iter > sess->frontiers[stratum_idx].iteration) {
-            continue; /* Skip this iteration: already processed in prior session_step */
+        if (stratum_idx < MAX_STRATA) {
+            if (iter > sess->frontiers[stratum_idx].iteration) {
+                fprintf(stderr,
+                        "[phase4-skip] stratum %u: skip iter %u (frontier "
+                        "iter=%u)\n",
+                        stratum_idx, iter,
+                        sess->frontiers[stratum_idx].iteration);
+                continue; /* Skip this iteration: already processed in prior session_step */
+            } else if (iter == 0) {
+                fprintf(stderr,
+                        "[phase4-skip] stratum %u: evaluating iter %u "
+                        "(frontier iter=%u)\n",
+                        stratum_idx, iter,
+                        sess->frontiers[stratum_idx].iteration);
+            }
         }
 
         /* Clear per-iteration delta arrangement cache (sequential eval path).
@@ -3477,14 +3500,27 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             session_remove_rel(sess, dname);
         }
 
+        /* Phase 4: Frontier is computed incrementally as deltas are created
+         * because delta_rels[ri] may be set to NULL in the next iteration's
+         * registration loop. strat_frontier is declared before the iteration loop. */
+
         /* Consolidate all IDB relations to remove duplicates and compute delta
          * as a byproduct.  snap[ri] marks the boundary between the already-
          * sorted prefix and unsorted new rows appended this iteration. */
         bool any_new = false;
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            if (!r || snap[ri] >= r->nrows)
+            fprintf(
+                stderr,
+                "[consolidate-loop] ri=%u rel=%s: r=%s snap=%u r->nrows=%u\n",
+                ri, sp->relations[ri].name, r ? "EXISTS" : "NULL", snap[ri],
+                r ? r->nrows : 0);
+            if (!r || snap[ri] >= r->nrows) {
+                fprintf(stderr,
+                        "[consolidate-loop] skipping ri=%u (no new rows)\n",
+                        ri);
                 continue; /* no new rows for this relation */
+            }
 
             char dname[256];
             snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
@@ -3559,6 +3595,26 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
                 delta_rels[ri] = delta;
                 any_new = true;
+
+                /* Phase 4: Compute frontier from this delta immediately.
+                 * This must happen before the next iteration's registration loop
+                 * sets delta_rels[ri] = NULL.
+                 * frontier = MAXIMUM iteration that produced facts. Enables skip
+                 * optimization in next session_step: skip iterations <= frontier. */
+                col_frontier_t rel_frontier = col_frontier_compute(delta);
+                fprintf(stderr,
+                        "[frontier-immediate] ri=%u: rel_frontier=(iter=%u, "
+                        "strat=%u)\n",
+                        ri, rel_frontier.iteration, rel_frontier.stratum);
+                if (rel_frontier.iteration > strat_frontier.iteration
+                    || (rel_frontier.iteration == strat_frontier.iteration
+                        && rel_frontier.stratum > strat_frontier.stratum)) {
+                    strat_frontier = rel_frontier;
+                    fprintf(stderr,
+                            "[frontier-immediate] updated strat_frontier to "
+                            "(iter=%u, strat=%u)\n",
+                            strat_frontier.iteration, strat_frontier.stratum);
+                }
             } else {
                 col_rel_free_contents(delta);
                 free(delta);
@@ -3577,7 +3633,30 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     }
     sess->total_iterations = iter;
 
-    /* Cleanup any remaining pending delta relations */
+    /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
+     * frontier was computed incrementally during consolidation, so just
+     * store it in the session. Each stratum independently tracks its
+     * convergence frontier for the skip optimization in the next session_step. */
+    fprintf(
+        stderr,
+        "[frontier-final] stratum %u: computed frontier=(iter=%u, strat=%u)\n",
+        stratum_idx, strat_frontier.iteration, strat_frontier.stratum);
+    if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
+        /* Set this stratum's frontier to the minimum (iteration, stratum) that
+         * was fully processed during iteration loop. This enables skipping
+         * iterations if frontier persists across session_step calls. */
+        sess->frontiers[stratum_idx] = strat_frontier;
+        fprintf(
+            stderr,
+            "[frontier-final] UPDATED frontier[%u] to (iter=%u, strat=%u)\n",
+            stratum_idx, strat_frontier.iteration, strat_frontier.stratum);
+    } else {
+        fprintf(stderr,
+                "[frontier-final] NOT updated (strat_frontier=UINT32_MAX or "
+                "stratum_idx out of range)\n");
+    }
+
+    /* Cleanup all delta relations after frontier has been computed */
     for (uint32_t ri = 0; ri < nrels; ri++) {
         if (delta_rels[ri]) {
             col_rel_free_contents(delta_rels[ri]);
@@ -3587,36 +3666,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
         session_remove_rel(sess, dname);
     }
-    /* Phase 4: Compute frontier BEFORE freeing delta relations.
-     * Only delta relations have timestamp information (provenance tracking).
-     * Final consolidated relations don't retain timestamps after merge. */
-    col_frontier_t strat_frontier = { UINT32_MAX, UINT32_MAX };
-    for (uint32_t ri = 0; ri < nrels; ri++) {
-        if (!delta_rels[ri])
-            continue;
-        col_frontier_t rel_frontier = col_frontier_compute(delta_rels[ri]);
-        /* Skip empty deltas (no frontier info) */
-        if (rel_frontier.iteration == 0 && rel_frontier.stratum == 0
-            && delta_rels[ri]->nrows == 0)
-            continue;
-        /* Update stratum frontier to minimum */
-        if (rel_frontier.iteration < strat_frontier.iteration
-            || (rel_frontier.iteration == strat_frontier.iteration
-                && rel_frontier.stratum < strat_frontier.stratum)) {
-            strat_frontier = rel_frontier;
-        }
-    }
-
     free(delta_rels);
     col_mat_cache_clear(&sess->mat_cache);
-    /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
-     * Each stratum independently tracks its convergence frontier. */
-    if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
-        /* Set this stratum's frontier to the minimum (iteration, stratum) that
-         * was fully processed during iteration loop. This enables skipping
-         * iterations if frontier persists across session_step calls. */
-        sess->frontiers[stratum_idx] = strat_frontier;
-    }
 
     return 0;
 }
