@@ -3235,6 +3235,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
     uint32_t iter;
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
+        /* Phase 3D-002: Frontier-based filtering — skip iteration if current
+         * iteration exceeds frontier.iteration.  Frontier (0,0) means
+         * uninitialized; guard on > 0 so fresh sessions evaluate normally. */
+        if (sess->frontier.iteration > 0
+            && iter > sess->frontier.iteration) {
+            break; /* All data up to frontier already processed */
+        }
+
         /* Clear per-iteration delta arrangement cache (sequential eval path).
          * K-fusion workers manage their own darr caches independently. */
         col_session_free_delta_arrangements(sess);
