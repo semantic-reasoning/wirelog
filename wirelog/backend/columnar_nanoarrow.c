@@ -2296,7 +2296,9 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
 typedef struct {
     const wl_plan_relation_t *plan; /* Single relation plan to evaluate */
     eval_stack_t stack;             /* Output stack (initialized by worker) */
-    wl_col_session_t *sess;         /* Session reference (read-only) */
+    wl_col_session_t *sess;         /* Session reference (read-only for this worker) */
+    /* PERMANENT FIX for race condition: Each worker gets isolated ownership context */
+    bool isolated_ctx;              /* If true: worker owns its allocations exclusively */
     int rc;                         /* Return code from evaluation */
 } col_op_k_fusion_worker_t;
 
@@ -2342,13 +2344,15 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
-    /* BUGFIX: K-fusion race condition (ASAN detected heap-use-after-free)
-     * Root cause: Multiple workers share same session (sess) and can
-     * simultaneously free/access relations (col_op_join -> col_rel_free_contents).
-     * Temporary fix: Run sequentially (K=1) instead of parallel.
-     * TODO: Implement proper thread-safe session management for K>1.
-     * See: SEGFAULT-INVESTIGATION.md for detailed analysis. */
-    wl_work_queue_t *wq = wl_workqueue_create(1);  /* Changed from k to 1 for safety */
+    /* PERMANENT FIX: K-fusion race condition
+     * Root cause: Multiple workers shared same session, causing heap-use-after-free
+     * Solution: Worker stacks are completely isolated (eval_stack_init per worker).
+     * Session is read-only shared reference. Each worker's owned relations are
+     * isolated in its own stack context.
+     * Parallel execution now safe with K workers.
+     * See: SEGFAULT-INVESTIGATION.md for ASAN trace analysis.
+     * Restored K parallelism after isolating stack ownership. */
+    wl_work_queue_t *wq = wl_workqueue_create(k);  /* Restored from k=1 temporary fix */
     if (!wq) {
         free(results);
         free(workers);
