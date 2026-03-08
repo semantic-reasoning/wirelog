@@ -2292,14 +2292,16 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
 
 /**
  * Worker task context for K-fusion evaluation.
+ * plan_data is embedded (not a pointer) so its lifetime matches the worker array.
+ * sess points to an isolated session wrapper with a per-worker mat_cache so
+ * concurrent col_op_join calls do not share the non-thread-safe cache.
  */
 typedef struct {
-    const wl_plan_relation_t *plan; /* Single relation plan to evaluate */
-    eval_stack_t stack;             /* Output stack (initialized by worker) */
-    wl_col_session_t *sess;         /* Session reference (read-only for this worker) */
-    /* PERMANENT FIX for race condition: Each worker gets isolated ownership context */
-    bool isolated_ctx;              /* If true: worker owns its allocations exclusively */
-    int rc;                         /* Return code from evaluation */
+    wl_plan_relation_t plan_data; /* Embedded plan (stable lifetime) */
+    eval_stack_t stack;           /* Output stack (initialized by worker) */
+    wl_col_session_t
+        *sess; /* Per-worker session wrapper (isolated mat_cache) */
+    int rc;    /* Return code from evaluation */
 } col_op_k_fusion_worker_t;
 
 /**
@@ -2311,7 +2313,7 @@ col_op_k_fusion_worker(void *ctx)
 {
     col_op_k_fusion_worker_t *wc = (col_op_k_fusion_worker_t *)ctx;
     eval_stack_init(&wc->stack);
-    wc->rc = col_eval_relation_plan(wc->plan, &wc->stack, wc->sess);
+    wc->rc = col_eval_relation_plan(&wc->plan_data, &wc->stack, wc->sess);
 }
 
 /**
@@ -2338,52 +2340,52 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
     col_op_k_fusion_worker_t *workers = (col_op_k_fusion_worker_t *)calloc(
         k, sizeof(col_op_k_fusion_worker_t));
-    if (!results || !workers) {
+    /* Per-worker session wrappers: shallow copy of sess with an isolated
+     * mat_cache so concurrent col_op_join calls do not race on the cache. */
+    wl_col_session_t *worker_sess
+        = (wl_col_session_t *)calloc(k, sizeof(wl_col_session_t));
+    if (!results || !workers || !worker_sess) {
         free(results);
         free(workers);
+        free(worker_sess);
         return ENOMEM;
     }
 
-    /* PERMANENT FIX: K-fusion race condition
-     * Root cause: Multiple workers shared same session, causing heap-use-after-free
-     * Solution: Worker stacks are completely isolated (eval_stack_init per worker).
-     * Session is read-only shared reference. Each worker's owned relations are
-     * isolated in its own stack context.
-     * Parallel execution now safe with K workers.
-     * See: SEGFAULT-INVESTIGATION.md for ASAN trace analysis.
-     * Restored K parallelism after isolating stack ownership. */
-    wl_work_queue_t *wq = wl_workqueue_create(k);  /* Restored from k=1 temporary fix */
+    wl_work_queue_t *wq = wl_workqueue_create(k);
     if (!wq) {
         free(results);
         free(workers);
+        free(worker_sess);
         return ENOMEM;
     }
 
     int rc = 0;
 
-    /* Prepare and execute K worker tasks sequentially */
+    /* Initialise per-worker session wrappers and submit all K tasks in one
+     * batch so workers execute in parallel. */
     for (uint32_t d = 0; d < k; d++) {
-        workers[d].plan = &(wl_plan_relation_t){
-            .name = "<k_fusion_copy>",
-            .ops = meta->k_ops[d],
-            .op_count = meta->k_op_counts[d],
-        };
-        workers[d].sess = sess;
+        /* Shallow copy shares rels[], plan, etc. (read-only during K-fusion). */
+        worker_sess[d] = *sess;
+        memset(&worker_sess[d].mat_cache, 0, sizeof(col_mat_cache_t));
+
+        workers[d].plan_data.name = "<k_fusion_copy>";
+        workers[d].plan_data.ops = meta->k_ops[d];
+        workers[d].plan_data.op_count = meta->k_op_counts[d];
+        workers[d].sess = &worker_sess[d];
         workers[d].rc = 0;
 
         if (wl_workqueue_submit(wq, col_op_k_fusion_worker, &workers[d]) != 0) {
             rc = ENOMEM;
-            /* Drain remaining tasks on submit failure */
+            /* Drain already-submitted tasks before cleanup. */
             wl_workqueue_drain(wq);
             goto cleanup_wq;
         }
+    }
 
-        /* Wait for each worker to complete before submitting next
-         * (sequential execution, not parallel) */
-        if (wl_workqueue_wait_all(wq) != 0) {
-            rc = -1;
-            goto cleanup_wq;
-        }
+    /* Single barrier: wait for all K workers to complete in parallel. */
+    if (wl_workqueue_wait_all(wq) != 0) {
+        rc = -1;
+        goto cleanup_wq;
     }
 
     /* Collect results from each worker's eval_stack */
@@ -2419,6 +2421,16 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         eval_stack_drain(&workers[d].stack);
     }
 
+    /* Sort each worker result before merge (col_rel_merge_k assumes sorted inputs) */
+    for (uint32_t d = 0; d < k; d++) {
+        if (results[d] && results[d]->nrows > 1) {
+            uint32_t nc = results[d]->ncols;
+            size_t row_bytes = (size_t)nc * sizeof(int64_t);
+            qsort_r(results[d]->data, results[d]->nrows, row_bytes, &nc,
+                    row_cmp_fn);
+        }
+    }
+
     /* Merge K results with deduplication */
     {
         col_rel_t *merged = col_rel_merge_k(results, k);
@@ -2443,6 +2455,9 @@ cleanup_results:
 
 cleanup_wq:
     wl_workqueue_destroy(wq);
+    for (uint32_t d = 0; d < k; d++)
+        col_mat_cache_clear(&worker_sess[d].mat_cache);
+    free(worker_sess);
     free(results);
     free(workers);
     return rc;
@@ -2873,6 +2888,22 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
     col_rel_t **delta_rels = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
     if (!delta_rels)
         return ENOMEM;
+
+    /* Sort pre-existing data in each IDB relation before iterating.
+     * Handles the EDB+IDB case: when base facts are pre-loaded into a
+     * relation that also appears as an IDB in a recursive rule, the loaded
+     * facts may be in insertion order (unsorted).
+     * col_op_consolidate_incremental_delta requires rel->data[0..snap) to be
+     * sorted; an unsorted prefix causes the 2-pointer merge to miss duplicates,
+     * producing spurious output rows. */
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+        if (r && r->nrows > 1) {
+            uint32_t nc = r->ncols;
+            size_t row_bytes = (size_t)nc * sizeof(int64_t);
+            qsort_r(r->data, r->nrows, row_bytes, &nc, row_cmp_fn);
+        }
+    }
 
     uint32_t iter;
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
