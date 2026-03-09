@@ -638,6 +638,20 @@ test_mobius_delta_formula_exe = executable(
 test('mobius_delta_formula', test_mobius_delta_formula_exe)
 
 # ============================================================================
+# Phase 3B End-to-End Integration Tests (US-3B-008)
+# ============================================================================
+
+test_phase3b_integration_exe = executable(
+  'test_phase3b_integration',
+  files('test_phase3b_integration.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('phase3b_integration', test_phase3b_integration_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
