@@ -89,8 +89,9 @@ typedef struct {
  *
  * RED phase: function does not exist yet -> link error (expected).
  */
-int col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
-                         uint32_t key_col, col_rel_t *dst);
+int
+col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
+                     uint32_t key_col, col_rel_t *dst);
 
 /* ----------------------------------------------------------------
  * Test framework  (matches wirelog convention: test_workqueue.c)
@@ -100,9 +101,9 @@ static int test_count = 0;
 static int pass_count = 0;
 static int fail_count = 0;
 
-#define TEST(name)                                       \
-    do {                                                 \
-        test_count++;                                    \
+#define TEST(name)                                      \
+    do {                                                \
+        test_count++;                                   \
         printf("TEST %d: %s ... ", test_count, (name)); \
     } while (0)
 
@@ -185,8 +186,8 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
 {
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
-        int64_t *nd = (int64_t *)realloc(r->data,
-                                         (size_t)cap * r->ncols * sizeof(int64_t));
+        int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
+                                                      * sizeof(int64_t));
         if (!nd)
             return -1;
         r->data = nd;
@@ -232,16 +233,17 @@ test_simple_join_mult_multiply(void)
 
     int64_t lrow[] = { 1 };
     int64_t rrow[] = { 1 };
-    ASSERT(test_rel_append_row_mult(lhs, lrow, 2) == 0, "append lhs row mult=2");
-    ASSERT(test_rel_append_row_mult(rhs, rrow, 3) == 0, "append rhs row mult=3");
+    ASSERT(test_rel_append_row_mult(lhs, lrow, 2) == 0,
+           "append lhs row mult=2");
+    ASSERT(test_rel_append_row_mult(rhs, rrow, 3) == 0,
+           "append rhs row mult=3");
 
     int rc = col_op_join_weighted(lhs, rhs, 0, dst);
 
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(dst->nrows == 1, "dst->nrows == 1 (one matching pair)");
     ASSERT(dst->timestamps != NULL, "dst->timestamps is non-NULL");
-    ASSERT(dst->timestamps[0].multiplicity == 6,
-           "output mult == 6 (2 * 3)");
+    ASSERT(dst->timestamps[0].multiplicity == 6, "output mult == 6 (2 * 3)");
 
     test_rel_free(lhs);
     test_rel_free(rhs);
@@ -291,9 +293,9 @@ test_multiple_keys_different_mults(void)
     /* Verify both expected multiplicities appear (order may vary). */
     int64_t m0 = dst->timestamps[0].multiplicity;
     int64_t m1 = dst->timestamps[1].multiplicity;
-    bool found6  = (m0 == 6  || m1 == 6);
+    bool found6 = (m0 == 6 || m1 == 6);
     bool found20 = (m0 == 20 || m1 == 20);
-    ASSERT(found6,  "output contains a row with mult=6  (2*3)");
+    ASSERT(found6, "output contains a row with mult=6  (2*3)");
     ASSERT(found20, "output contains a row with mult=20 (5*4)");
 
     test_rel_free(lhs);
@@ -315,7 +317,8 @@ test_multiple_keys_different_mults(void)
 static void
 test_output_multiplicity_is_product(void)
 {
-    TEST("output multiplicity = mult_left * mult_right (3*-2=-6, 3*0=0, 1*1=1)");
+    TEST(
+        "output multiplicity = mult_left * mult_right (3*-2=-6, 3*0=0, 1*1=1)");
 
     /* Sub-test A: mult=3 * mult=-2 -> -6 */
     {
@@ -326,8 +329,10 @@ test_output_multiplicity_is_product(void)
 
         int64_t lrow[] = { 7 };
         int64_t rrow[] = { 7 };
-        ASSERT(test_rel_append_row_mult(lhs, lrow,  3) == 0, "append lhs mult= 3");
-        ASSERT(test_rel_append_row_mult(rhs, rrow, -2) == 0, "append rhs mult=-2");
+        ASSERT(test_rel_append_row_mult(lhs, lrow, 3) == 0,
+               "append lhs mult= 3");
+        ASSERT(test_rel_append_row_mult(rhs, rrow, -2) == 0,
+               "append rhs mult=-2");
 
         int rc = col_op_join_weighted(lhs, rhs, 0, dst);
         ASSERT(rc == 0, "returns 0 (A)");
@@ -350,8 +355,10 @@ test_output_multiplicity_is_product(void)
 
         int64_t lrow[] = { 7 };
         int64_t rrow[] = { 7 };
-        ASSERT(test_rel_append_row_mult(lhs, lrow, 3) == 0, "append lhs mult=3");
-        ASSERT(test_rel_append_row_mult(rhs, rrow, 0) == 0, "append rhs mult=0");
+        ASSERT(test_rel_append_row_mult(lhs, lrow, 3) == 0,
+               "append lhs mult=3");
+        ASSERT(test_rel_append_row_mult(rhs, rrow, 0) == 0,
+               "append rhs mult=0");
 
         int rc = col_op_join_weighted(lhs, rhs, 0, dst);
         ASSERT(rc == 0, "returns 0 (B)");
@@ -374,8 +381,10 @@ test_output_multiplicity_is_product(void)
 
         int64_t lrow[] = { 7 };
         int64_t rrow[] = { 7 };
-        ASSERT(test_rel_append_row_mult(lhs, lrow, 1) == 0, "append lhs mult=1");
-        ASSERT(test_rel_append_row_mult(rhs, rrow, 1) == 0, "append rhs mult=1");
+        ASSERT(test_rel_append_row_mult(lhs, lrow, 1) == 0,
+               "append lhs mult=1");
+        ASSERT(test_rel_append_row_mult(rhs, rrow, 1) == 0,
+               "append rhs mult=1");
 
         int rc = col_op_join_weighted(lhs, rhs, 0, dst);
         ASSERT(rc == 0, "returns 0 (C)");

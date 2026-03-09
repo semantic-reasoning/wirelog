@@ -510,8 +510,7 @@ test_empty_incremental_insert_safe_frontier_unchanged(void)
     rc = col_session_insert_incremental(sess, "edge", dummy, 0, 2);
     if (rc != 0) {
         char msg[64];
-        snprintf(msg, sizeof(msg),
-                 "empty insert returned %d (expected 0)", rc);
+        snprintf(msg, sizeof(msg), "empty insert returned %d (expected 0)", rc);
         wl_session_destroy(sess);
         wl_plan_free(plan);
         FAIL(msg);
@@ -554,7 +553,8 @@ test_empty_incremental_insert_safe_frontier_unchanged(void)
 int
 main(void)
 {
-    printf("\n=== Incremental Fact Insertion Integration Tests (Phase 4) ===\n\n");
+    printf(
+        "\n=== Incremental Fact Insertion Integration Tests (Phase 4) ===\n\n");
 
     test_frontier_preserved_after_incremental_insert();
     test_incremental_insert_enables_affected_stratum_detection();
