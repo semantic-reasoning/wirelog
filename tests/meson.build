@@ -666,6 +666,39 @@ test_phase3c_join_integration_exe = executable(
 test('phase3c_join_integration', test_phase3c_join_integration_exe)
 
 # ============================================================================
+# Phase 3C REDUCE Integration Tests (US-3C-003 TDD)
+# ============================================================================
+#
+# Tests 1 and 2 (COUNT with multiplicities) call col_op_reduce_weighted directly
+# and pass.  Test 3 (SUM weighted) declares col_op_reduce_weighted_sum which is
+# not yet implemented; the executable is expected to fail at link time until the
+# function is added to columnar_nanoarrow.c.
+
+test_phase3c_reduce_integration_exe = executable(
+  'test_phase3c_reduce_integration',
+  files('test_phase3c_reduce_integration.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('phase3c_reduce_integration', test_phase3c_reduce_integration_exe)
+
+# ============================================================================
+# Phase 3C Full Integration Tests (US-3C-005)
+# ============================================================================
+
+test_phase3c_full_integration_exe = executable(
+  'test_phase3c_full_integration',
+  files('test_phase3c_full_integration.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('phase3c_full_integration', test_phase3c_full_integration_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
