@@ -191,10 +191,10 @@ test_frontier_array_multi_stratum_progression(void)
     }
 
     /* Stratum progression:
-	 * Stratum 0: 2 iterations (0, 1)
-	 * Stratum 1: 3 iterations (0, 1, 2)
-	 * Stratum 2: 1 iteration (0)
-	 */
+     * Stratum 0: 2 iterations (0, 1)
+     * Stratum 1: 3 iterations (0, 1, 2)
+     * Stratum 2: 1 iteration (0)
+     */
 
     frontiers[0].iteration = 1; /* Stratum 0 converged at iteration 1 */
     frontiers[1].iteration = 2; /* Stratum 1 converged at iteration 2 */
