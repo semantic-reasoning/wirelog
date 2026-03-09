@@ -301,6 +301,28 @@ col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
                          col_frontier_t *out_frontier);
 
 /**
+ * col_compute_affected_rules:
+ *
+ * Identify which rules need re-evaluation after new facts are inserted into
+ * `inserted_relation`.  Returns a uint64_t bitmask where bit i is set if
+ * rule i directly or transitively depends on that relation.
+ *
+ * Rules are enumerated globally across all strata in order: stratum 0
+ * relations first (in relation order), then stratum 1, etc.  Rule index i
+ * corresponds to the i-th relation encountered in this traversal.
+ *
+ * Uses SIMD (ARM NEON or SSE2) to accelerate bitmask union operations when
+ * more than 8 rules are present.  Supports up to 64 rules.
+ *
+ * @param session           Active session backed by the columnar backend.
+ * @param inserted_relation Name of the EDB relation receiving new facts.
+ * @return Bitmask of affected rule indices; 0 on invalid input.
+ */
+uint64_t
+col_compute_affected_rules(wl_session_t *session,
+                           const char *inserted_relation);
+
+/**
  * col_session_insert:
  *
  * Append facts to an EDB relation and enable incremental re-evaluation mode.
