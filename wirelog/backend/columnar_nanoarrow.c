@@ -674,6 +674,13 @@ typedef struct {
  */
 #define MAX_STRATA 32
 
+/*
+ * Phase 4 (US-4-002): Per-Rule Frontier Array Limit
+ * Max rules supported for rule-level incremental evaluation. Matches the
+ * uint64_t bitmask width used for rule dependency tracking.
+ */
+#define MAX_RULES 64
+
 typedef struct {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     const wl_plan_t *plan;     /* borrowed, lifetime: caller             */
@@ -709,6 +716,13 @@ typedef struct {
      * stratum i. This enables skipping redundant iterations when frontier
      * persists across session_step calls (incremental evaluation). */
     col_frontier_t frontiers[MAX_STRATA]; /* per-stratum frontier tracking */
+    /* Frontier tracking (Phase 4, US-4-002): per-rule frontier array for
+     * rule-level incremental re-evaluation. Each rule_frontiers[i] tracks the
+     * minimum (iteration, stratum) boundary fully processed for rule i.
+     * Initialized to (0, 0) via calloc. Reset to UINT32_MAX for affected
+     * rules on incremental insert (enables selective rule skipping in
+     * US-4-004). MAX_RULES=64 matches uint64_t bitmask width. */
+    col_frontier_t rule_frontiers[MAX_RULES]; /* per-rule frontier tracking */
     /* Per-phase K-fusion profiling (Phase 3A): breakdown of kfusion_ns into
      * four sub-phases accumulated across all col_op_k_fusion calls per eval.
      *   alloc_ns:    calloc of results/workers/worker_sess arrays
@@ -3309,6 +3323,21 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             sess->frontiers[stratum_idx].stratum = stratum_idx;
         }
 
+        /* Non-recursive rule frontiers: mark each rule fully evaluated.
+         * UINT32_MAX sentinel matches stratum frontier convention. */
+        if (sess->plan) {
+            uint32_t rule_base = 0;
+            for (uint32_t si = 0; si < stratum_idx; si++)
+                rule_base += sess->plan->strata[si].relation_count;
+            for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+                uint32_t rule_idx = rule_base + ri;
+                if (rule_idx < MAX_RULES) {
+                    sess->rule_frontiers[rule_idx].iteration = UINT32_MAX;
+                    sess->rule_frontiers[rule_idx].stratum = stratum_idx;
+                }
+            }
+        }
+
         return 0;
     }
 
@@ -3372,6 +3401,20 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         sess->frontiers[stratum_idx].iteration = UINT32_MAX;
         sess->frontiers[stratum_idx].stratum = stratum_idx;
     }
+
+    /* Phase 4 (US-4-004): Compute the base global rule index for this stratum.
+     * Rule indices are assigned by enumerating strata in order and relations
+     * within each stratum, matching col_compute_affected_rules convention. */
+    uint32_t rule_id_base = 0;
+    if (sess->plan) {
+        for (uint32_t si = 0;
+             si < stratum_idx && si < sess->plan->stratum_count; si++) {
+            rule_id_base += sess->plan->strata[si].relation_count;
+        }
+    }
+    /* Clamp so rule_id_base + ri never exceeds MAX_RULES - 1 */
+    if (rule_id_base >= MAX_RULES)
+        rule_id_base = MAX_RULES;
 
     uint32_t iter;
     col_frontier_t strat_frontier = { 0, 0 };
@@ -3494,6 +3537,18 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * left is full and a strictly-smaller right delta exists. */
         for (uint32_t ri = 0; ri < nrels; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
+
+            /* Phase 4 (US-4-004): Rule-level frontier skip.
+             * If the global rule index is within range and the current
+             * iteration has already been fully evaluated for this rule
+             * (iter > rule_frontiers[rule_id].iteration), skip it.
+             * UINT32_MAX sentinel (set on affected-rule reset) ensures
+             * iter > UINT32_MAX is always false, preventing premature skip. */
+            uint32_t rule_id = rule_id_base + ri;
+            if (rule_id < MAX_RULES
+                && iter > sess->rule_frontiers[rule_id].iteration) {
+                continue;
+            }
 
             /* Pre-scan skip: if a FORCE_DELTA op references an empty or
              * absent delta (iteration > 0), the plan would produce 0 rows.
@@ -3722,6 +3777,18 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
     }
     sess->total_iterations = iter;
+
+    /* Phase 4 (US-4-004): Update per-rule frontiers after convergence.
+     * Record the final iteration at which each rule in this stratum last
+     * produced new facts. On the next incremental snapshot call (if the
+     * frontier is preserved for unaffected rules), the skip check
+     * `iter > rule_frontiers[rule_id].iteration` will skip iterations
+     * already processed by the previous evaluation. */
+    for (uint32_t ri = 0; ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
+        uint32_t rule_id = rule_id_base + ri;
+        sess->rule_frontiers[rule_id].iteration = iter;
+        sess->rule_frontiers[rule_id].stratum = stratum_idx;
+    }
 
     /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
      * frontier was computed incrementally during consolidation, so just
@@ -4648,6 +4715,24 @@ col_session_step(wl_session_t *session)
             session, sess->last_inserted_relation);
     }
 
+    /* Phase 4 (US-4-004): Reset rule frontiers before evaluation.
+     * Full evaluation: reset all to UINT32_MAX so skip check never fires.
+     * Incremental evaluation: reset only affected rules; unaffected rules
+     * keep their frontier so the skip check can fire for them. */
+    if (affected_mask == UINT64_MAX) {
+        for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
+            sess->rule_frontiers[ri].iteration = UINT32_MAX;
+        }
+    } else {
+        uint64_t affected_rules
+            = col_compute_affected_rules(session, sess->last_inserted_relation);
+        for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
+            if ((affected_rules & ((uint64_t)1 << ri)) != 0) {
+                sess->rule_frontiers[ri].iteration = UINT32_MAX;
+            }
+        }
+    }
+
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         /* Skip strata not affected by the last incremental insertion */
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
@@ -4752,6 +4837,27 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                 sess->frontiers[si].iteration = UINT32_MAX;
             }
         }
+        /* Phase 4 (US-4-004): Reset per-rule frontiers only for affected
+         * rules, using col_compute_affected_rules bitmask. This is more
+         * precise than the prior conservative approach (resetting all rules).
+         * UINT32_MAX sentinel forces full re-evaluation of affected rules.
+         * Unaffected rules keep their frontier so the skip check fires. */
+        uint64_t affected_rules
+            = col_compute_affected_rules(session, sess->last_inserted_relation);
+        for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
+            if ((affected_rules & ((uint64_t)1 << ri)) != 0) {
+                sess->rule_frontiers[ri].iteration = UINT32_MAX;
+            }
+        }
+    } else {
+        /* Full re-evaluation (non-incremental call): reset ALL rule frontiers
+         * to UINT32_MAX so the skip check never fires within this evaluation.
+         * Without this reset, stale frontier values from a previous call would
+         * cause premature skip of needed iterations (e.g., iter > 0 skips
+         * iter=1+ after a single-step convergence). */
+        for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
+            sess->rule_frontiers[ri].iteration = UINT32_MAX;
+        }
     }
 
     /* Execute strata in order, skipping unaffected ones */
@@ -4819,7 +4925,8 @@ bitmask_or_simd(uint64_t dst, uint64_t src)
 
 /*
  * stratum_references_relation - Return true if any VARIABLE op in stratum sp
- * references the relation named `rel`.
+ * references the relation named `rel`, or if any JOIN/ANTIJOIN/SEMIJOIN op
+ * has right_relation matching `rel`.
  */
 static bool
 stratum_references_relation(const wl_plan_stratum_t *sp, const char *rel)
@@ -4830,6 +4937,13 @@ stratum_references_relation(const wl_plan_stratum_t *sp, const char *rel)
             if (pr->ops[oi].op == WL_PLAN_OP_VARIABLE
                 && pr->ops[oi].relation_name != NULL
                 && strcmp(pr->ops[oi].relation_name, rel) == 0) {
+                return true;
+            }
+            if ((pr->ops[oi].op == WL_PLAN_OP_JOIN
+                 || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
+                 || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
+                && pr->ops[oi].right_relation != NULL
+                && strcmp(pr->ops[oi].right_relation, rel) == 0) {
                 return true;
             }
         }
@@ -4922,6 +5036,156 @@ col_compute_affected_strata(wl_session_t *session,
                                                     produced)) {
                         affected = bitmask_or_simd(affected, (uint64_t)1 << sj);
                     }
+                }
+            }
+        }
+    }
+
+    return affected;
+}
+
+/* ======================================================================== */
+/* Affected Rule Detection (Phase 4, US-4-003)                              */
+/* ======================================================================== */
+
+/*
+ * rule_references_relation - Return true if any VARIABLE op in relation pr
+ * references the relation named `rel`.
+ */
+static bool
+rule_references_relation(const wl_plan_relation_t *pr, const char *rel)
+{
+    for (uint32_t oi = 0; oi < pr->op_count; oi++) {
+        /* Check VARIABLE ops (left child of joins) */
+        if (pr->ops[oi].op == WL_PLAN_OP_VARIABLE
+            && pr->ops[oi].relation_name != NULL
+            && strcmp(pr->ops[oi].relation_name, rel) == 0) {
+            return true;
+        }
+        /* Check JOIN/ANTIJOIN/SEMIJOIN right_relation (right child of joins) */
+        if ((pr->ops[oi].op == WL_PLAN_OP_JOIN
+             || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
+             || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
+            && pr->ops[oi].right_relation != NULL
+            && strcmp(pr->ops[oi].right_relation, rel) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * col_compute_affected_rules - Identify rules needing re-evaluation.
+ *
+ * Rules are enumerated globally across all strata in declaration order:
+ * stratum 0 relations first (by relation index), then stratum 1, etc.
+ * Rule index i corresponds to the i-th relation in this traversal.
+ *
+ * Algorithm (same iterative fixed-point BFS as col_compute_affected_strata):
+ *   1. Seed: mark every rule whose VARIABLE body references inserted_relation.
+ *   2. Propagate: for each newly-marked rule, find all rules whose body
+ *      references the head relation produced by the marked rule, and mark them.
+ *   3. Repeat until the bitmask stabilises.
+ *
+ * SIMD: bitmask union uses bitmask_or_simd() (same helper as strata version).
+ *
+ * Supports up to 64 rules (one uint64_t bitmask). Plans with more rules will
+ * have bits beyond 63 silently ignored (conservative: those rules are always
+ * re-evaluated by the caller's fallback via UINT64_MAX mask).
+ *
+ * @param session           Active session (must have a plan attached).
+ * @param inserted_relation Name of the EDB relation receiving new facts.
+ * @return Bitmask of affected rule indices; 0 on invalid input.
+ */
+uint64_t
+col_compute_affected_rules(wl_session_t *session, const char *inserted_relation)
+{
+    if (!session || !inserted_relation)
+        return 0;
+
+    wl_col_session_t *sess = COL_SESSION(session);
+    const wl_plan_t *plan = sess->plan;
+    if (!plan || plan->stratum_count == 0)
+        return 0;
+
+    /*
+     * Build a flat enumeration of (stratum_idx, relation_idx) pairs so each
+     * rule has a stable global index.  We clamp to MAX_RULES (64) to stay
+     * within the uint64_t bitmask.
+     */
+    uint32_t nrules = 0;
+    for (uint32_t si = 0; si < plan->stratum_count && nrules < MAX_RULES;
+         si++) {
+        uint32_t rc = plan->strata[si].relation_count;
+        if (nrules + rc > MAX_RULES)
+            rc = MAX_RULES - nrules;
+        nrules += rc;
+    }
+
+    if (nrules == 0)
+        return 0;
+
+    /*
+     * Store (stratum_idx, relation_idx) for each global rule index so we can
+     * look up the rule's head name and body ops later.
+     */
+    uint32_t rule_si[MAX_RULES]; /* stratum index for rule i  */
+    uint32_t rule_ri[MAX_RULES]; /* relation index for rule i */
+    {
+        uint32_t idx = 0;
+        for (uint32_t si = 0; si < plan->stratum_count && idx < MAX_RULES;
+             si++) {
+            for (uint32_t ri = 0;
+                 ri < plan->strata[si].relation_count && idx < MAX_RULES;
+                 ri++) {
+                rule_si[idx] = si;
+                rule_ri[idx] = ri;
+                idx++;
+            }
+        }
+    }
+
+    uint64_t affected = 0;
+
+    /* --- Pass 1: seed rules that directly reference inserted_relation --- */
+    for (uint32_t i = 0; i < nrules; i++) {
+        const wl_plan_relation_t *pr
+            = &plan->strata[rule_si[i]].relations[rule_ri[i]];
+        if (rule_references_relation(pr, inserted_relation)) {
+            affected = bitmask_or_simd(affected, (uint64_t)1 << i);
+        }
+    }
+
+    /* --- Pass 2: transitive propagation via fixed-point iteration --------- */
+    /*
+     * For every newly-marked rule, find all rules whose body references the
+     * head relation produced by the marked rule. Loop until stable.
+     */
+    uint64_t prev = 0;
+    while (prev != affected) {
+        prev = affected;
+        uint64_t pending = affected;
+        while (pending) {
+            uint32_t i = (uint32_t)__builtin_ctzll(pending);
+            pending &= pending - 1; /* clear lowest set bit */
+
+            if (i >= nrules)
+                break;
+
+            /* Head relation name produced by rule i */
+            const char *head
+                = plan->strata[rule_si[i]].relations[rule_ri[i]].name;
+            if (!head)
+                continue;
+
+            /* Mark any rule whose body references this head */
+            for (uint32_t j = 0; j < nrules; j++) {
+                if (affected & ((uint64_t)1 << j))
+                    continue; /* already marked */
+                const wl_plan_relation_t *pr
+                    = &plan->strata[rule_si[j]].relations[rule_ri[j]];
+                if (rule_references_relation(pr, head)) {
+                    affected = bitmask_or_simd(affected, (uint64_t)1 << j);
                 }
             }
         }

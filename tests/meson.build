@@ -576,6 +576,22 @@ test_affected_strata_exe = executable(
 test('affected_strata', test_affected_strata_exe)
 
 # ============================================================================
+# Phase 4: Affected Rule Detection Tests (US-4-003)
+# ============================================================================
+
+test_affected_rules_exe = executable(
+  'test_affected_rules',
+  files('test_affected_rules.c'),
+  backend_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('affected_rules', test_affected_rules_exe)
+
+# ============================================================================
 # Phase 4: Per-Stratum Frontier Integration Tests (US-4-005)
 # ============================================================================
 
@@ -594,6 +610,26 @@ test_phase4_frontier_integration_exe = executable(
 )
 
 test('phase4_frontier_integration', test_phase4_frontier_integration_exe)
+
+# ============================================================================
+# Rule-Level Frontier Integration Tests (Phase 4, US-4-006)
+# ============================================================================
+
+test_rule_level_frontier_exe = executable(
+  'test_rule_level_frontier',
+  files('test_rule_level_frontier.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('rule_level_frontier', test_rule_level_frontier_exe)
 
 # ============================================================================
 # Mobius COUNT Signed Multiplicity Tests (US-3B-002 TDD RED Phase)
