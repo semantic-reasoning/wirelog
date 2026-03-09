@@ -52,8 +52,9 @@
       "acceptanceCriteria": [
         "Changes committed with clear message",
         "Branch pushed to origin",
-        "All CI checks pass (clang-format, clang-tidy, Analyze, editorconfig)",
-        "PR #87 shows green checkmarks on all required checks"
+        "All linting CI checks pass (clang-format, clang-tidy, Analyze, editorconfig, cppcheck, scan-build)",
+        "PR #87 shows green checkmarks on all required linting checks",
+        "clang-tidy pattern fix: ^\\.\\./wirelog/.*\\.(c|h)$ excludes tests/ and subprojects/ from analysis"
       ]
     },
     {
