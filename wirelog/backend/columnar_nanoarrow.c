@@ -3600,11 +3600,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         bool any_new = false;
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            fprintf(
-                stderr,
-                "[consolidate-loop] ri=%u rel=%s: r=%s snap=%u r->nrows=%u\n",
-                ri, sp->relations[ri].name, r ? "EXISTS" : "NULL", snap[ri],
-                r ? r->nrows : 0);
             if (!r || snap[ri] >= r->nrows) {
                 continue; /* no new rows for this relation */
             }
@@ -3717,10 +3712,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * frontier was computed incrementally during consolidation, so just
      * store it in the session. Each stratum independently tracks its
      * convergence frontier for the skip optimization in the next session_step. */
-    fprintf(
-        stderr,
-        "[frontier-final] stratum %u: computed frontier=(iter=%u, strat=%u)\n",
-        stratum_idx, strat_frontier.iteration, strat_frontier.stratum);
     if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
         /* Set this stratum's frontier to the minimum (iteration, stratum) that
          * was fully processed during iteration loop. This enables skipping
