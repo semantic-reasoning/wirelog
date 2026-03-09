@@ -469,6 +469,26 @@ test_join_arrangement_exe = executable(
 test('join_arrangement', test_join_arrangement_exe)
 
 # ============================================================================
+# Arrangement Cache Reuse Tests (Phase 3C - cache reuse across rules)
+# ============================================================================
+
+test_arrangement_cache_reuse_exe = executable(
+  'test_arrangement_cache_reuse',
+  files('test_arrangement_cache_reuse.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('arrangement_cache_reuse', test_arrangement_cache_reuse_exe)
+
+# ============================================================================
 # Frontier Tracking Tests (Phase 3B)
 # ============================================================================
 
