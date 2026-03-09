@@ -652,6 +652,20 @@ test_phase3b_integration_exe = executable(
 test('phase3b_integration', test_phase3b_integration_exe)
 
 # ============================================================================
+# Phase 3C JOIN Integration Tests (US-3C-001 TDD RED)
+# ============================================================================
+
+test_phase3c_join_integration_exe = executable(
+  'test_phase3c_join_integration',
+  files('test_phase3c_join_integration.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('phase3c_join_integration', test_phase3c_join_integration_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
