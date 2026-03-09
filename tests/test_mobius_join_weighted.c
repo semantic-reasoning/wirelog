@@ -83,7 +83,7 @@ typedef struct {
  *   rhs        - right input relation with timestamps carrying multiplicities
  *   key_col    - column index used as the equi-join key (must exist in both)
  *   dst        - output relation (caller-allocated, empty on entry); ncols
- *                will be set to lhs->ncols + rhs->ncols - 1 (key deduplicated)
+ *                will be set to lhs->ncols + rhs->ncols (key is duplicated)
  *
  * Returns 0 on success, non-zero on error.
  *
