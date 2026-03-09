@@ -16,6 +16,9 @@
  *                 [--data-weighted FILE] [--workers N] [--repeat R]
  */
 
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200112L
+
 #include "bench_util.h"
 
 #include <inttypes.h>

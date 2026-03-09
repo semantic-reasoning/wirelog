@@ -36,6 +36,13 @@
 #include <arm_neon.h>
 #endif
 
+/* GCC/Clang extension not supported on MSVC */
+#ifdef _MSC_VER
+#define UNUSED
+#else
+#define UNUSED __attribute__((unused))
+#endif
+
 /* ======================================================================== */
 /* Relation Storage                                                          */
 /* ======================================================================== */
@@ -263,7 +270,7 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
  * col_materialized_join_create - Allocate and initialize a materialized join.
  * Memory limit defaults to 10MB if not specified.
  */
-static col_materialized_join_t *__attribute__((unused))
+static col_materialized_join_t *UNUSED
 col_materialized_join_create(uint32_t ncols, uint32_t memory_limit)
 {
     col_materialized_join_t *mj
@@ -292,7 +299,7 @@ col_materialized_join_create(uint32_t ncols, uint32_t memory_limit)
  * col_materialized_join_append - Add a row to materialized join.
  * Returns 0 on success, ENOMEM if materialized join would exceed memory limit.
  */
-static int __attribute__((unused))
+static int UNUSED
 col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row)
 {
     if (!mj || !mj->data || mj->ncols == 0)
@@ -322,7 +329,7 @@ col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row)
 /**
  * col_materialized_join_free - Free materialized join and release data.
  */
-static void __attribute__((unused))
+static void UNUSED
 col_materialized_join_free(col_materialized_join_t *mj)
 {
     if (!mj)
@@ -335,7 +342,7 @@ col_materialized_join_free(col_materialized_join_t *mj)
 /**
  * col_materialized_join_invalidate - Mark as invalid (expires at end of iteration).
  */
-static void __attribute__((unused))
+static void UNUSED
 col_materialized_join_invalidate(col_materialized_join_t *mj)
 {
     if (mj)
@@ -2129,7 +2136,7 @@ col_op_consolidate(eval_stack_t *stack)
  *
  * Total: O(D log D + N) vs O(N log N) for full re-sort.
  */
-static int __attribute__((unused))
+static int UNUSED
 col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
 {
     uint32_t nc = rel->ncols;
@@ -2212,7 +2219,7 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
  * Compares rows a and b with ncols columns using int64_t values (not bytes).
  * Required for correct little-endian int64_t comparisons.
  */
-static int __attribute__((unused))
+static int UNUSED
 row_cmp_lex(const int64_t *a, const int64_t *b, uint32_t ncols)
 {
     for (uint32_t c = 0; c < ncols; c++) {
@@ -2508,7 +2515,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
  * The output relation name is "<merged-k>" and contains all rows from
  * the K input relations with duplicates removed.
  */
-static col_rel_t *__attribute__((unused))
+static col_rel_t *UNUSED
 col_rel_merge_k(col_rel_t **relations, uint32_t k)
 {
     if (k == 0)
