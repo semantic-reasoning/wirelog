@@ -1,7 +1,7 @@
 {
   "title": "PR #87: Fix CI Linting Gate Failures",
   "description": "Diagnose and fix all CI linting gate failures in PR #87 (SSE2 and GNU_SOURCE includes). Goal: all CI checks pass.",
-  "status": "in_progress",
+  "status": "completed",
   "stories": [
     {
       "id": "US-001",
@@ -61,7 +61,7 @@
       "title": "Architect verification",
       "description": "Get architect review confirming linting fixes are correct.",
       "priority": "critical",
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Architect review completed (STANDARD tier)",
         "Code changes verified to be minimal and correct",
