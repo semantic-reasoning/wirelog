@@ -2,6 +2,8 @@
   "title": "PR #87: Fix CI Linting Gate Failures",
   "description": "Diagnose and fix all CI linting gate failures in PR #87 (SSE2 and GNU_SOURCE includes). Goal: all CI checks pass.",
   "status": "completed",
+  "completedAt": "2026-03-09T22:32:00Z",
+  "architectVerificationPassed": true,
   "stories": [
     {
       "id": "US-001",
