@@ -88,7 +88,8 @@ typedef struct {
  *
  * RED phase: function does not exist yet -> link error (expected).
  */
-int col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst);
+int
+col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst);
 
 /* ----------------------------------------------------------------
  * Test framework  (matches wirelog convention: test_workqueue.c)
@@ -98,9 +99,9 @@ static int test_count = 0;
 static int pass_count = 0;
 static int fail_count = 0;
 
-#define TEST(name)                                       \
-    do {                                                 \
-        test_count++;                                    \
+#define TEST(name)                                      \
+    do {                                                \
+        test_count++;                                   \
         printf("TEST %d: %s ... ", test_count, (name)); \
     } while (0)
 
@@ -183,8 +184,8 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
 {
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
-        int64_t *nd = (int64_t *)realloc(r->data,
-                                         (size_t)cap * r->ncols * sizeof(int64_t));
+        int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
+                                                      * sizeof(int64_t));
         if (!nd)
             return -1;
         r->data = nd;
@@ -320,7 +321,8 @@ int
 main(void)
 {
     printf("=== test_mobius_count_signed (TDD RED PHASE) ===\n\n");
-    printf("NOTE: Expected to FAIL at link time until col_op_reduce_weighted\n");
+    printf(
+        "NOTE: Expected to FAIL at link time until col_op_reduce_weighted\n");
     printf("      is implemented with extern linkage.\n\n");
 
     test_single_row_mult2();

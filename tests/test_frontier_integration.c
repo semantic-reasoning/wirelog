@@ -50,7 +50,7 @@ test_frontier_progression(void)
     TEST("frontier progresses through iterations");
 
     /* Simulate multiple iterations with increasing frontier */
-    col_frontier_t frontier = {0, 0};
+    col_frontier_t frontier = { 0, 0 };
 
     /* Iteration 1, stratum 0 */
     frontier.iteration = 1;
@@ -67,17 +67,19 @@ test_frontier_comparison_chain(void)
 {
     TEST("frontier ordering chain: (0,0) < (0,1) < (1,0)");
 
-    col_frontier_t f1 = {0, 0};
-    col_frontier_t f2 = {0, 1};
-    col_frontier_t f3 = {1, 0};
+    col_frontier_t f1 = { 0, 0 };
+    col_frontier_t f2 = { 0, 1 };
+    col_frontier_t f3 = { 1, 0 };
 
     /* Verify f1 < f2 */
-    int f1_less_f2 = (f1.iteration < f2.iteration)
-                     || (f1.iteration == f2.iteration && f1.stratum < f2.stratum);
+    int f1_less_f2
+        = (f1.iteration < f2.iteration)
+          || (f1.iteration == f2.iteration && f1.stratum < f2.stratum);
 
     /* Verify f2 < f3 */
-    int f2_less_f3 = (f2.iteration < f3.iteration)
-                     || (f2.iteration == f3.iteration && f2.stratum < f3.stratum);
+    int f2_less_f3
+        = (f2.iteration < f3.iteration)
+          || (f2.iteration == f3.iteration && f2.stratum < f3.stratum);
 
     if (f1_less_f2 && f2_less_f3) {
         PASS;
@@ -92,7 +94,7 @@ test_frontier_multistratum(void)
     TEST("frontier tracking across multiple strata");
 
     /* Simulate a 3-stratum evaluation */
-    col_frontier_t frontier = {0, 0};
+    col_frontier_t frontier = { 0, 0 };
 
     /* After stratum 0 completes iteration 0: frontier becomes (0, 0) */
     /* After stratum 1 completes iteration 0: if min is (0, 0), frontier stays (0,
@@ -101,12 +103,12 @@ test_frontier_multistratum(void)
      * min */
 
     /* Simulate progression */
-    col_frontier_t s0_frontier = {0, 0};
-    col_frontier_t s1_frontier = {0, 0};
-    col_frontier_t s2_frontier = {1, 0};
+    col_frontier_t s0_frontier = { 0, 0 };
+    col_frontier_t s1_frontier = { 0, 0 };
+    col_frontier_t s2_frontier = { 1, 0 };
 
     /* Overall minimum */
-    col_frontier_t overall = {0, 0};
+    col_frontier_t overall = { 0, 0 };
 
     if (s0_frontier.iteration <= overall.iteration
         && s1_frontier.iteration <= overall.iteration
@@ -122,8 +124,8 @@ test_frontier_boundary_conditions(void)
 {
     TEST("frontier handles boundary: max uint32 values");
 
-    col_frontier_t f_max = {UINT32_MAX - 1, UINT32_MAX - 1};
-    col_frontier_t f_next = {UINT32_MAX, 0};
+    col_frontier_t f_max = { UINT32_MAX - 1, UINT32_MAX - 1 };
+    col_frontier_t f_next = { UINT32_MAX, 0 };
 
     /* Verify f_max < f_next (iteration comparison wins) */
     int is_less = (f_max.iteration < f_next.iteration)
@@ -144,7 +146,7 @@ test_frontier_reachability(void)
 
     /* Test that frontier states form a total ordering */
     col_frontier_t states[5] = {
-        {0, 0},   {0, 5},   {1, 0},   {2, 3},   {3, 1},
+        { 0, 0 }, { 0, 5 }, { 1, 0 }, { 2, 3 }, { 3, 1 },
     };
 
     int consistent = 1;
@@ -152,8 +154,9 @@ test_frontier_reachability(void)
         col_frontier_t a = states[i];
         col_frontier_t b = states[i + 1];
         /* Each pair should satisfy a < b or a == b (never a > b) */
-        int a_less_eq_b = (a.iteration < b.iteration)
-                          || (a.iteration == b.iteration && a.stratum <= b.stratum);
+        int a_less_eq_b
+            = (a.iteration < b.iteration)
+              || (a.iteration == b.iteration && a.stratum <= b.stratum);
         if (!a_less_eq_b) {
             consistent = 0;
             break;

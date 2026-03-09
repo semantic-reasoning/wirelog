@@ -469,7 +469,7 @@ test_join_right_relation_dependency(void)
 
     memset(&ops[1], 0, sizeof(ops[1]));
     ops[1].op = WL_PLAN_OP_JOIN;
-    ops[1].right_relation = "edge";  /* Dependency via JOIN right_relation */
+    ops[1].right_relation = "edge"; /* Dependency via JOIN right_relation */
 
     memset(&rels[0], 0, sizeof(rels[0]));
     rels[0].name = "path";
