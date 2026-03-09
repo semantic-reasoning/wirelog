@@ -643,6 +643,8 @@ test_mobius_count_signed_exe = executable(
   'test_mobius_count_signed',
   files('test_mobius_count_signed.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -657,6 +659,8 @@ test_mobius_join_weighted_exe = executable(
   'test_mobius_join_weighted',
   files('test_mobius_join_weighted.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -671,6 +675,8 @@ test_mobius_delta_formula_exe = executable(
   'test_mobius_delta_formula',
   files('test_mobius_delta_formula.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -685,6 +691,8 @@ test_phase3b_integration_exe = executable(
   'test_phase3b_integration',
   files('test_phase3b_integration.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -699,6 +707,8 @@ test_phase3c_join_integration_exe = executable(
   'test_phase3c_join_integration',
   files('test_phase3c_join_integration.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -718,6 +728,8 @@ test_phase3c_reduce_integration_exe = executable(
   'test_phase3c_reduce_integration',
   files('test_phase3c_reduce_integration.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -732,6 +744,8 @@ test_phase3c_full_integration_exe = executable(
   'test_phase3c_full_integration',
   files('test_phase3c_full_integration.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -746,6 +760,8 @@ test_frontier_skip_mobius_exe = executable(
   'test_frontier_skip_mobius',
   files('test_frontier_skip_mobius.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -760,6 +776,8 @@ test_phase3d_frontier_skip_integration_exe = executable(
   'test_phase3d_frontier_skip_integration',
   files('test_phase3d_frontier_skip_integration.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
