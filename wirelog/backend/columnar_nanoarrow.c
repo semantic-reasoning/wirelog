@@ -1297,8 +1297,10 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
     /* Materialization cache: reuse previous join result when available.
-     * Only when left is borrowed (stable session pointer) so the key is stable. */
-    if (op->materialized && !left_e.owned) {
+     * Works with both stable (borrowed) and worker-owned relations since
+     * the cache key is based on content hash, not ownership. This enables
+     * cache reuse in K-fusion worker sessions, eliminating redundant joins. */
+    if (op->materialized) {
         col_rel_t *cached
             = col_mat_cache_lookup(&sess->mat_cache, left_e.rel, right);
         if (cached) {
@@ -1493,9 +1495,12 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
      * whether to apply right-delta (they should NOT if we already used one). */
     bool result_is_delta = left_e.is_delta || used_right_delta;
 
-    /* Populate materialization cache when hint is set and left was stable.
-     * Cache takes ownership of out; we push a borrowed reference. */
-    if (op->materialized && !left_e.owned) {
+    /* Populate materialization cache when hint is set.
+     * Works with both stable and worker-owned relations.
+     * Cache takes ownership of out; we push a borrowed reference.
+     * This enables K-fusion workers to cache and reuse intermediate joins,
+     * reducing redundant computation across the K worker copies. */
+    if (op->materialized) {
         col_mat_cache_insert(&sess->mat_cache, left, right, out);
         return eval_stack_push_delta(stack, out, false, result_is_delta);
     }
