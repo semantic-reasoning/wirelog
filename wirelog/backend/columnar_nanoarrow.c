@@ -3462,9 +3462,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * Skip logic only activates when frontier persists across multiple
          * incremental snapshots with small delta facts.
          *
-         * DISABLED for now: when affected_mask resets frontier, we need full
-         * re-evaluation to compute all new derivations from inserted facts. */
-        if (0 && stratum_idx < MAX_STRATA) { /* 0 && = DISABLED */
+         * ENABLED: for unaffected strata, skip iterations beyond frontier.
+         * Affected strata (frontier=UINT32_MAX) naturally re-evaluate all iterations. */
+        if (stratum_idx < MAX_STRATA) {
             if (iter > sess->frontiers[stratum_idx].iteration) {
                 continue; /* Skip this iteration: already processed in prior session_step */
             }
