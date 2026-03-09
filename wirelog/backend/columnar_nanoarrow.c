@@ -6,7 +6,9 @@
  * For commercial licenses, contact: inquiry@cleverplant.com
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include "columnar_nanoarrow.h"
 #include "memory.h"
