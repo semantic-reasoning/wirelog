@@ -13,6 +13,8 @@
  * Licensed under LGPL-3.0
  */
 
+#define _POSIX_C_SOURCE 200112L
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
