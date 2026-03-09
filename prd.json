@@ -1,178 +1,72 @@
 {
-  "title": "CONSOLIDATE Memory Optimization: Delta-Integrated Incremental Consolidation",
-  "description": "Eliminate per-iteration full-relation snapshot copies in col_eval_stratum. Implement delta-integrated consolidation that outputs truly-new rows as byproduct, eliminating O(N) malloc+memcpy + O(N+D) merge walk per iteration per relation. Target: 2-4× CSPA performance improvement, peak RSS reduction from 4.46GB to <500MB.",
-  "status": "complete",
+  "title": "PR #87: Fix CI Linting Gate Failures",
+  "description": "Diagnose and fix all CI linting gate failures in PR #87 (SSE2 and GNU_SOURCE includes). Goal: all CI checks pass.",
+  "status": "in_progress",
   "stories": [
     {
       "id": "US-001",
-      "title": "Phase A: Replace g_consolidate_ncols global with qsort_r context",
-      "description": "Prerequisite for thread-safe delta computation. Replace global state with context parameter.",
+      "title": "Diagnose PR #87 linting failures",
+      "description": "Check CI status, identify all failing linting gates, understand root causes.",
       "priority": "critical",
       "passes": true,
       "acceptanceCriteria": [
-        "g_consolidate_ncols global variable removed from columnar_nanoarrow.c",
-        "row_cmp() signature changed to row_cmp_fn(const void *a, const void *b, void *ctx)",
-        "All qsort() calls replaced with qsort_r() + context",
-        "All tests pass with -Wall -Wextra -Werror",
-        "Atomic commit: 'fix: replace g_consolidate_ncols global with qsort_r context'",
-        "clang-format applied and verified"
+        "PR #87 CI status checked via gh pr checks",
+        "All failing checks identified (clang-format, clang-tidy, editorconfig, Analyze)",
+        "Specific error messages captured from failed CI jobs",
+        "Root causes documented for each failure"
       ]
     },
     {
       "id": "US-002",
-      "title": "Design: col_op_consolidate_incremental_delta function specification",
-      "description": "Design new function that outputs delta as byproduct. TDD: Write specification before implementation.",
+      "title": "Fix identified linting issues",
+      "description": "Apply fixes to make all linting gates pass.",
       "priority": "critical",
       "passes": true,
       "acceptanceCriteria": [
-        "Function signature: col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows, col_rel_t *delta_out)",
-        "Pseudocode documented: Phase 1 (sort delta), Phase 1b (dedup), Phase 2 (merge + emit new rows)",
-        "Algorithm complexity analyzed: O(D log D + N + D) time, O(N+D) memory",
-        "Edge cases specified: old_nrows==0 (first iteration), delta empty, all-duplicate delta",
-        "Memory ownership documented: caller responsible for delta_out->data",
-        "Integration point documented: replaces old_data snapshot + merge walk in col_eval_stratum",
-        "Test cases designed: 4+ edge cases for TDD"
+        "Code formatted with clang-format",
+        "clang-tidy warnings/errors resolved",
+        "editorconfig compliance verified",
+        "SSE2 include properly conditional",
+        "GNU_SOURCE define in correct location"
       ]
     },
     {
       "id": "US-003",
-      "title": "TDD: Test harness for col_op_consolidate_incremental_delta",
-      "description": "Create comprehensive unit tests BEFORE implementing the function. TDD discipline.",
+      "title": "Verify local compilation",
+      "description": "Ensure code compiles successfully with -Wall -Wextra -Werror",
       "priority": "critical",
       "passes": true,
       "acceptanceCriteria": [
-        "Test file created: tests/test_consolidate_incremental_delta.c",
-        "Test cases: (1) empty old + delta → all new, (2) old + all-duplicate delta → unchanged, (3) old + unique delta → merged+new, (4) first iteration (old_nrows==0), (5) large random dataset",
-        "Correctness oracle: Verify merged result is sorted+unique, delta_out contains exactly R_new - R_old",
-        "Tests compile with -Wall -Wextra -Werror",
-        "Tests register in tests/meson.build",
-        "All tests currently FAIL (expected before implementation)",
-        "Test harness integrates into meson test -C build"
+        "Code compiles: meson compile -C build",
+        "All tests pass: meson test -C build",
+        "No new warnings introduced",
+        "lsp_diagnostics shows no new errors"
       ]
     },
     {
       "id": "US-004",
-      "title": "Implementation: col_op_consolidate_incremental_delta function",
-      "description": "Implement new consolidation function that outputs delta. Must pass all TDD tests.",
+      "title": "Push fixes and monitor CI",
+      "description": "Commit and push fixes, verify all CI gates pass on GitHub.",
       "priority": "critical",
       "passes": true,
       "acceptanceCriteria": [
-        "Function implemented in wirelog/backend/columnar_nanoarrow.c (after col_op_consolidate_incremental)",
-        "All 5 test cases in tests/test_consolidate_incremental_delta.c PASS",
-        "Code compiles with -Wall -Wextra -Werror",
-        "clang-format applied",
-        "Atomic commit: 'feat: implement col_op_consolidate_incremental_delta with delta output'",
-        "No global state used (uses qsort_r from Phase A)",
-        "Function handles NULL delta_out gracefully (optional output)"
+        "Changes committed with clear message",
+        "Branch pushed to origin",
+        "All CI checks pass (clang-format, clang-tidy, Analyze, editorconfig)",
+        "PR #87 shows green checkmarks on all required checks"
       ]
     },
     {
       "id": "US-005",
-      "title": "Integration: Replace old_data snapshot loop in col_eval_stratum",
-      "description": "Remove old_data snapshot pattern, integrate new delta-output consolidation. Eliminate O(N × iterations) memory traffic.",
+      "title": "Architect verification",
+      "description": "Get architect review confirming linting fixes are correct.",
       "priority": "critical",
-      "passes": true,
+      "passes": false,
       "acceptanceCriteria": [
-        "old_data malloc/memcpy loop (lines 1883-1900) REMOVED",
-        "snap[ri] row count only (O(1) snapshot)",
-        "col_op_consolidate_incremental_delta() call integrated (lines 2000-2070 replacement)",
-        "delta computation moves from separate merge walk to consolidate byproduct",
-        "All existing tests still pass",
-        "Compilation succeeds with -Wall -Wextra -Werror",
-        "clang-format applied",
-        "Atomic commit: 'fix: eliminate old_data snapshot, integrate delta-output consolidation'",
-        "No functional change to output (correctness gate)"
-      ]
-    },
-    {
-      "id": "US-006",
-      "title": "Validation: CSPA correctness after integration",
-      "description": "Verify CSPA produces identical output (20,381 tuples) after CONSOLIDATE optimization.",
-      "priority": "critical",
-      "passes": true,
-      "acceptanceCriteria": [
-        "CSPA benchmark compiles: meson compile -C build bench_flowlog",
-        "CSPA runs: ./build/bench/bench_flowlog --workload cspa",
-        "Output fact count: 20,381 tuples (matches baseline exactly)",
-        "All other workloads (TC, Reach, CC, SSSP, etc.) produce identical output",
-        "Atomic commit: 'test: verify CSPA correctness after CONSOLIDATE integration'",
-        "No regressions on non-CSPA workloads"
-      ]
-    },
-    {
-      "id": "US-007",
-      "title": "Performance: Peak RSS reduction measurement",
-      "description": "Measure peak RSS before/after. Target: 4.46GB → <500MB (90% reduction from old_data snapshots).",
-      "priority": "high",
-      "passes": true,
-      "acceptanceCriteria": [
-        "Baseline measurement recorded: /usr/bin/time -l ./build/bench/bench_flowlog --workload cspa (3 runs)",
-        "Peak RSS before optimization: documented as 4.46GB (known from earlier profiling)",
-        "Peak RSS after optimization: measured with /usr/bin/time -l",
-        "Target: <500MB (eliminating O(N × iterations × relations) snapshots)",
-        "Memory improvement documented: percentage reduction from baseline",
-        "Atomic commit: 'perf: document peak RSS reduction after CONSOLIDATE optimization'"
-      ]
-    },
-    {
-      "id": "US-008",
-      "title": "Performance: Wall time improvement measurement",
-      "description": "Measure wall time improvement. Target: 2-4× speedup from eliminating memory allocation overhead.",
-      "priority": "high",
-      "passes": true,
-      "acceptanceCriteria": [
-        "Baseline wall time recorded: 35.3s (median, from earlier profiling)",
-        "Wall time after optimization: measured (3 runs, median)",
-        "Speedup calculated: (baseline - optimized) / baseline × 100%",
-        "Target: 2-4× improvement (reducing per-iteration memory traffic impact)",
-        "Iteration count documented (unchanged, but per-iteration cost reduced)",
-        "Atomic commit: 'perf: document wall time improvement after CONSOLIDATE optimization'"
-      ]
-    },
-    {
-      "id": "US-009",
-      "title": "Regression: Full benchmark suite validation",
-      "description": "Verify all 15 workloads produce identical output and no performance regressions.",
-      "priority": "critical",
-      "passes": true,
-      "acceptanceCriteria": [
-        "Full benchmark run: ./build/bench/bench_flowlog --workload all",
-        "All 15 workloads complete without error",
-        "Output fact counts identical to baseline for all workloads",
-        "No workload regression (TC, Reach, CC, SSSP, Andersen, etc.)",
-        "Atomic commit: 'test: verify all 15 workloads pass regression suite'",
-        "Performance metrics recorded (median wall time, peak RSS for each)"
-      ]
-    },
-    {
-      "id": "US-010",
-      "title": "Architecture Verification: Architect review",
-      "description": "Architect (Opus) reviews implementation against acceptance criteria. Final gate before completion.",
-      "priority": "critical",
-      "passes": true,
-      "acceptanceCriteria": [
-        "Architect review completed against specific acceptance criteria (not generic)",
-        "Implementation approach verified: delta-integrated consolidation correct",
-        "Memory optimization validated: old_data snapshots eliminated",
-        "Thread safety verified: qsort_r context-based (no global state)",
-        "Edge cases checked: first iteration, empty delta, all-duplicate delta",
-        "Code quality verified: -Wall -Wextra -Werror, clang-format applied",
+        "Architect review completed (STANDARD tier)",
+        "Code changes verified to be minimal and correct",
+        "No regressions introduced",
         "Architect approval documented"
-      ]
-    },
-    {
-      "id": "US-011",
-      "title": "Documentation: Final report and cleanup",
-      "description": "Document implementation, performance results, and lessons learned. Clean up progress.txt.",
-      "priority": "high",
-      "passes": true,
-      "acceptanceCriteria": [
-        "Report created: docs/performance/CONSOLIDATE-COMPLETION.md with algorithm, metrics, and ROI analysis",
-        "Progress.txt updated: final summary of all iterations and commits",
-        "Git log clean: All commits atomic with clear messages (no merge, no fixup)",
-        "No TODO/FIXME left in code (unless documented in report)",
-        "Atomic commit: 'docs: CONSOLIDATE optimization completion report'",
-        "All files linted and formatted"
       ]
     }
   ]
