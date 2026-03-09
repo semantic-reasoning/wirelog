@@ -3442,6 +3442,37 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             snap[ri] = r ? r->nrows : 0; /* O(1) count only, no copy */
         }
 
+        /* Phase 3D: Frontier skip with multiplicities (US-3D-002)
+         * Skip iteration if all delta relations have zero net multiplicity.
+         * This optimizes away iterations where no new facts can be derived.
+         * Condition: sum of all multiplicities in all delta relations == 0. */
+        if (iter > 0) { /* Only skip from iteration 1 onward */
+            bool all_deltas_net_zero = true;
+            for (uint32_t ri = 0; ri < nrels; ri++) {
+                char dname[256];
+                snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+                col_rel_t *delta = session_find_rel(sess, dname);
+                if (!delta || delta->nrows == 0) {
+                    /* Empty delta: net multiplicity is zero */
+                    continue;
+                }
+                /* Compute net multiplicity for this delta relation */
+                int64_t net_mult = 0;
+                for (uint32_t row = 0; row < delta->nrows; row++) {
+                    net_mult += delta->timestamps[row].multiplicity;
+                }
+                if (net_mult != 0) {
+                    all_deltas_net_zero = false;
+                    break;
+                }
+            }
+            if (all_deltas_net_zero) {
+                /* All deltas have zero net multiplicity: skip evaluation */
+                free(snap);
+                continue;
+            }
+        }
+
         /* Single-pass semi-naive evaluation. VARIABLE prefers delta when it
          * is a strict subset of full (genuine new facts). JOIN propagates
          * the is_delta flag through results and applies right-delta when
