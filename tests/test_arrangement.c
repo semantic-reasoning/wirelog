@@ -44,9 +44,9 @@ static int test_count = 0;
 static int pass_count = 0;
 static int fail_count = 0;
 
-#define TEST(name)                                       \
-    do {                                                 \
-        test_count++;                                    \
+#define TEST(name)                                      \
+    do {                                                \
+        test_count++;                                   \
         printf("TEST %d: %s ... ", test_count, (name)); \
     } while (0)
 
@@ -92,7 +92,7 @@ static int fail_count = 0;
  *   uint32_t  capacity  → 4 bytes  (offset 28)
  */
 typedef struct {
-    char    *name;
+    char *name;
     uint32_t ncols;
     uint32_t _ncols_pad; /* explicit alignment padding */
     int64_t *data;
@@ -113,11 +113,11 @@ typedef struct {
  *   uint32_t       rel_cap  (4 bytes)
  */
 typedef struct {
-    wl_session_t   base;
-    const void    *plan;
+    wl_session_t base;
+    const void *plan;
     test_col_rel_mirror_t **rels;
-    uint32_t       nrels;
-    uint32_t       rel_cap;
+    uint32_t nrels;
+    uint32_t rel_cap;
     /* omitted: delta_cb, delta_data, eval_arena, mat_cache, etc. */
 } test_col_session_mirror_t;
 
@@ -137,8 +137,8 @@ noop_cb(const char *r, const int64_t *row, uint32_t nc, void *u)
 /* build and evaluate a simple program, return open session.
  * Caller owns *out_sess, *out_plan, *out_prog and must free them. */
 static int
-make_session(const char *src, wl_session_t **out_sess,
-             wl_plan_t **out_plan, wirelog_program_t **out_prog)
+make_session(const char *src, wl_session_t **out_sess, wl_plan_t **out_plan,
+             wirelog_program_t **out_prog)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -248,7 +248,8 @@ test_arrangement_struct_size(void)
 static void
 test_arrangement_creation(void)
 {
-    TEST("col_session_get_arrangement: creates index with correct indexed_rows");
+    TEST(
+        "col_session_get_arrangement: creates index with correct indexed_rows");
 
     /* 3 facts in edge, 2 columns (x, y) */
     const char *src = ".decl edge(x: int32, y: int32)\n"
@@ -264,12 +265,13 @@ test_arrangement_creation(void)
            "session creation failed");
 
     /* Arrange on col 0 of 'edge' */
-    uint32_t key_cols[] = {0};
+    uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
 
     ASSERT(arr != NULL, "arrangement must be non-NULL for existing relation");
-    ASSERT(arr->indexed_rows == 3, "indexed_rows must equal EDB fact count (3)");
+    ASSERT(arr->indexed_rows == 3,
+           "indexed_rows must equal EDB fact count (3)");
     ASSERT(arr->nbuckets > 0, "nbuckets must be > 0");
     ASSERT((arr->nbuckets & (arr->nbuckets - 1)) == 0,
            "nbuckets must be a power of 2");
@@ -300,7 +302,7 @@ test_arrangement_find_first_hit(void)
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
            "session creation failed");
 
-    uint32_t key_cols[] = {0};
+    uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr != NULL, "arrangement must be non-NULL");
@@ -310,9 +312,9 @@ test_arrangement_find_first_hit(void)
     ASSERT(rel->ncols == 2, "edge must have 2 columns");
 
     /* key_row: col 0 = 2 (any value in col 1 is ignored by find_first) */
-    int64_t key_row[2] = {2, 0};
-    uint32_t row_idx = col_arrangement_find_first(arr, rel->data, rel->ncols,
-                                                  key_row);
+    int64_t key_row[2] = { 2, 0 };
+    uint32_t row_idx
+        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
 
     ASSERT(row_idx != UINT32_MAX, "find_first must find row with key col0=2");
 
@@ -345,7 +347,7 @@ test_arrangement_find_first_miss(void)
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
            "session creation failed");
 
-    uint32_t key_cols[] = {0};
+    uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr != NULL, "arrangement must be non-NULL");
@@ -353,9 +355,9 @@ test_arrangement_find_first_miss(void)
     test_col_rel_mirror_t *rel = find_rel_mirror(sess, "edge");
     ASSERT(rel != NULL, "edge relation not found");
 
-    int64_t key_row[2] = {99, 0}; /* col0=99 does not exist */
-    uint32_t row_idx = col_arrangement_find_first(arr, rel->data, rel->ncols,
-                                                  key_row);
+    int64_t key_row[2] = { 99, 0 }; /* col0=99 does not exist */
+    uint32_t row_idx
+        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
 
     ASSERT(row_idx == UINT32_MAX,
            "find_first must return UINT32_MAX for non-existent key");
@@ -374,7 +376,8 @@ test_arrangement_find_first_miss(void)
 static void
 test_arrangement_find_next_singleton(void)
 {
-    TEST("col_arrangement_find_next: singleton chain terminates with UINT32_MAX");
+    TEST("col_arrangement_find_next: singleton chain terminates with "
+         "UINT32_MAX");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
                       "edge(1, 2). edge(2, 3). edge(3, 4).\n"
@@ -387,7 +390,7 @@ test_arrangement_find_next_singleton(void)
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
            "session creation failed");
 
-    uint32_t key_cols[] = {0};
+    uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr != NULL, "arrangement must be non-NULL");
@@ -395,9 +398,9 @@ test_arrangement_find_next_singleton(void)
     test_col_rel_mirror_t *rel = find_rel_mirror(sess, "edge");
     ASSERT(rel != NULL, "edge relation not found");
 
-    int64_t key_row[2] = {1, 0};
-    uint32_t first = col_arrangement_find_first(arr, rel->data, rel->ncols,
-                                                key_row);
+    int64_t key_row[2] = { 1, 0 };
+    uint32_t first
+        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
     ASSERT(first != UINT32_MAX, "find_first must find key col0=1");
 
     uint32_t next = col_arrangement_find_next(arr, first);
@@ -408,8 +411,9 @@ test_arrangement_find_next_singleton(void)
         /* If there's a collision, the next row's col 0 must NOT equal 1
          * (it's a false positive from a different key). */
         const int64_t *rp = rel->data + (size_t)next * rel->ncols;
-        ASSERT(rp[0] != 1,
-               "find_next continuation must be a hash-collision false positive");
+        ASSERT(
+            rp[0] != 1,
+            "find_next continuation must be a hash-collision false positive");
         next = col_arrangement_find_next(arr, next);
     }
 
@@ -440,7 +444,7 @@ test_arrangement_find_next_chain(void)
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
            "session creation failed");
 
-    uint32_t key_cols[] = {0};
+    uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
         = col_session_get_arrangement(sess, "r", key_cols, 1);
     ASSERT(arr != NULL, "arrangement must be non-NULL");
@@ -449,10 +453,10 @@ test_arrangement_find_next_chain(void)
     ASSERT(rel != NULL, "r relation not found");
     ASSERT(rel->nrows == 4, "r must have 4 rows");
 
-    int64_t key_row[2] = {1, 0};
+    int64_t key_row[2] = { 1, 0 };
     uint32_t count = 0;
-    uint32_t row = col_arrangement_find_first(arr, rel->data, rel->ncols,
-                                              key_row);
+    uint32_t row
+        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
     while (row != UINT32_MAX) {
         const int64_t *rp = rel->data + (size_t)row * rel->ncols;
         if (rp[0] == 1)
@@ -488,11 +492,12 @@ test_arrangement_invalidate(void)
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
            "session creation failed");
 
-    uint32_t key_cols[] = {0};
+    uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr != NULL, "arrangement must be non-NULL");
-    ASSERT(arr->indexed_rows == 3, "indexed_rows must be 3 before invalidation");
+    ASSERT(arr->indexed_rows == 3,
+           "indexed_rows must be 3 before invalidation");
 
     /* Invalidate */
     col_session_invalidate_arrangements(sess, "edge");
@@ -520,7 +525,8 @@ test_arrangement_invalidate(void)
 static void
 test_arrangement_registry_cache(void)
 {
-    TEST("col_session_get_arrangement: registry caches — same pointer returned");
+    TEST(
+        "col_session_get_arrangement: registry caches — same pointer returned");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
                       "edge(1, 2). edge(2, 3). edge(3, 4).\n"
@@ -533,7 +539,7 @@ test_arrangement_registry_cache(void)
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
            "session creation failed");
 
-    uint32_t key_cols[] = {0};
+    uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr1
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     col_arrangement_t *arr2
@@ -545,7 +551,7 @@ test_arrangement_registry_cache(void)
            "second call must return the same pointer (registry cache hit)");
 
     /* Different key_cols must produce a separate entry */
-    uint32_t key_cols2[] = {1};
+    uint32_t key_cols2[] = { 1 };
     col_arrangement_t *arr3
         = col_session_get_arrangement(sess, "edge", key_cols2, 1);
     ASSERT(arr3 != NULL, "arrangement on col 1 must be non-NULL");
