@@ -337,6 +337,18 @@ test_k_fusion_dispatch_exe = executable(
 test('k_fusion_dispatch', test_k_fusion_dispatch_exe)
 
 # ============================================================================
+# R9 Self-Join Delta Permutation Tests
+# ============================================================================
+
+test_r9_self_join_delta_exe = executable(
+  'test_r9_self_join_delta',
+  files('test_r9_self_join_delta.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('r9_self_join_delta', test_r9_self_join_delta_exe)
+
+# ============================================================================
 # Empty-Delta Skip Tests (US-006/US-007)
 # ============================================================================
 
