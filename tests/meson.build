@@ -276,6 +276,8 @@ test_consolidate_incremental_delta_exe = executable(
   'test_consolidate_incremental_delta',
   files('test_consolidate_incremental_delta.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
@@ -302,6 +304,8 @@ test_consolidate_kway_merge_exe = executable(
   'test_consolidate_kway_merge',
   files('test_consolidate_kway_merge.c'),
   backend_src,
+  arena_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
 )
