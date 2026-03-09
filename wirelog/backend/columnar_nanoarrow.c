@@ -4995,6 +4995,20 @@ col_compute_affected_strata(wl_session_t *session,
     if (nstrata > 64)
         nstrata = 64; /* clamp to bitmask width */
 
+    /* Fast path: base fact (EDB) insertion always affects all strata.
+     * Check if inserted_relation is in the edb_relations array. */
+    if (plan->edb_relations && plan->edb_count > 0) {
+        for (uint32_t ei = 0; ei < plan->edb_count; ei++) {
+            if (plan->edb_relations[ei] != NULL
+                && strcmp(plan->edb_relations[ei], inserted_relation) == 0) {
+                /* inserted_relation is a base fact → all strata affected. */
+                uint64_t full_mask
+                    = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
+                return full_mask;
+            }
+        }
+    }
+
     uint64_t affected = 0;
 
     /* --- Pass 1: seed with strata directly referencing inserted_relation --- */
@@ -5003,6 +5017,13 @@ col_compute_affected_strata(wl_session_t *session,
             affected = bitmask_or_simd(affected, (uint64_t)1 << si);
         }
     }
+
+    /* Early exit: if all strata are already marked, skip transitive closure.
+     * This occurs when inserted_relation is a base fact (referenced by many/all
+     * strata), avoiding O(nstrata^2) work in Pass 2. */
+    uint64_t full_mask = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
+    if (affected == full_mask)
+        return affected;
 
     /* --- Pass 2: transitive propagation via fixed-point iteration ---------- */
     /*
