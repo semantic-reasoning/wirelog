@@ -699,6 +699,20 @@ test_phase3c_full_integration_exe = executable(
 test('phase3c_full_integration', test_phase3c_full_integration_exe)
 
 # ============================================================================
+# Phase 3D Frontier Skip Tests (US-3D-001 TDD)
+# ============================================================================
+
+test_frontier_skip_mobius_exe = executable(
+  'test_frontier_skip_mobius',
+  files('test_frontier_skip_mobius.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('frontier_skip_mobius', test_frontier_skip_mobius_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
