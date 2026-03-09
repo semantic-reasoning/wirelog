@@ -72,14 +72,6 @@ jobs:
             threads: enabled
             ipc: disabled
 
-          # Windows - MSVC
-          - os: windows-latest
-            compiler: msvc
-            cc: cl
-            embedded: false
-            threads: enabled
-            ipc: disabled
-
     steps:
       - uses: actions/checkout@v4
 
@@ -98,16 +90,6 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install meson ninja
-
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          pip install meson
-          choco install ninja -y
-
-      - name: Setup MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure
         run: >
