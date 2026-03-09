@@ -624,6 +624,20 @@ test_mobius_join_weighted_exe = executable(
 test('mobius_join_weighted', test_mobius_join_weighted_exe)
 
 # ============================================================================
+# Mobius Delta Formula Tests (US-3B-006 TDD RED Phase)
+# ============================================================================
+
+test_mobius_delta_formula_exe = executable(
+  'test_mobius_delta_formula',
+  files('test_mobius_delta_formula.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('mobius_delta_formula', test_mobius_delta_formula_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #

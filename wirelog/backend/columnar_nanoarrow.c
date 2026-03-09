@@ -4963,6 +4963,122 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
 }
 
 /* ======================================================================== */
+/* Mobius / Z-set Delta Formula                                             */
+/* ======================================================================== */
+
+/*
+ * col_compute_delta_mobius:
+ * Compute the Mobius delta between prev_collection and curr_collection.
+ *
+ * For each unique key (column 0) in the union of both relations:
+ *   - key only in curr:  delta_mult = curr_mult
+ *   - key only in prev:  delta_mult = -prev_mult
+ *   - key in both:       delta_mult = curr_mult - prev_mult (skipped if 0)
+ *
+ * Both input relations must have timestamps != NULL.
+ * out_delta must be caller-allocated, empty (nrows==0) on entry.
+ *
+ * Returns 0 on success, EINVAL on bad arguments, ENOMEM on allocation failure.
+ */
+int
+col_compute_delta_mobius(const col_rel_t *prev_collection,
+                         const col_rel_t *curr_collection, col_rel_t *out_delta)
+{
+    if (!prev_collection || !curr_collection || !out_delta)
+        return EINVAL;
+    if (prev_collection->ncols == 0 || curr_collection->ncols == 0)
+        return EINVAL;
+    if (prev_collection->ncols != curr_collection->ncols)
+        return EINVAL;
+
+    uint32_t ncols = prev_collection->ncols;
+    out_delta->ncols = ncols;
+
+    /* Helper lambda (via inline block) to append a row+mult to out_delta. */
+#define DELTA_APPEND(row_ptr, mult_val)                                       \
+    do {                                                                      \
+        if (out_delta->nrows >= out_delta->capacity) {                        \
+            uint32_t new_cap                                                  \
+                = out_delta->capacity ? out_delta->capacity * 2 : 16;         \
+            int64_t *nd = (int64_t *)realloc(                                 \
+                out_delta->data, sizeof(int64_t) * (size_t)new_cap * ncols);  \
+            if (!nd)                                                          \
+                return ENOMEM;                                                \
+            out_delta->data = nd;                                             \
+            col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(     \
+                out_delta->timestamps,                                        \
+                (size_t)new_cap * sizeof(col_delta_timestamp_t));             \
+            if (!nt)                                                          \
+                return ENOMEM;                                                \
+            out_delta->timestamps = nt;                                       \
+            out_delta->capacity = new_cap;                                    \
+        }                                                                     \
+        memcpy(out_delta->data + (size_t)out_delta->nrows * ncols, (row_ptr), \
+               sizeof(int64_t) * ncols);                                      \
+        col_delta_timestamp_t ts_;                                            \
+        memset(&ts_, 0, sizeof(ts_));                                         \
+        ts_.multiplicity = (mult_val);                                        \
+        out_delta->timestamps[out_delta->nrows] = ts_;                        \
+        out_delta->nrows++;                                                   \
+    } while (0)
+
+    /* Pass 1: iterate over curr; for each key look up in prev. */
+    for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
+        const int64_t *crow = curr_collection->data + (size_t)ci * ncols;
+        int64_t cmult = curr_collection->timestamps
+                            ? curr_collection->timestamps[ci].multiplicity
+                            : 1;
+
+        /* Search prev for matching key (column 0). */
+        int64_t pmult = 0;
+        bool found_in_prev = false;
+        for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
+            const int64_t *prow = prev_collection->data + (size_t)pi * ncols;
+            if (prow[0] == crow[0]) {
+                pmult = prev_collection->timestamps
+                            ? prev_collection->timestamps[pi].multiplicity
+                            : 1;
+                found_in_prev = true;
+                break;
+            }
+        }
+
+        int64_t delta_mult = found_in_prev ? (cmult - pmult) : cmult;
+        if (delta_mult != 0) {
+            DELTA_APPEND(crow, delta_mult);
+        }
+    }
+
+    /* Pass 2: iterate over prev; emit -prev_mult for keys absent in curr. */
+    for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
+        const int64_t *prow = prev_collection->data + (size_t)pi * ncols;
+        int64_t pmult = prev_collection->timestamps
+                            ? prev_collection->timestamps[pi].multiplicity
+                            : 1;
+
+        bool found_in_curr = false;
+        for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
+            const int64_t *crow = curr_collection->data + (size_t)ci * ncols;
+            if (crow[0] == prow[0]) {
+                found_in_curr = true;
+                break;
+            }
+        }
+
+        if (!found_in_curr) {
+            int64_t delta_mult = -pmult;
+            if (delta_mult != 0) {
+                DELTA_APPEND(prow, delta_mult);
+            }
+        }
+    }
+
+#undef DELTA_APPEND
+
+    return 0;
+}
+
+/* ======================================================================== */
 /* Vtable Singleton                                                          */
 /* ======================================================================== */
 
