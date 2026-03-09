@@ -596,6 +596,20 @@ test_phase4_frontier_integration_exe = executable(
 test('phase4_frontier_integration', test_phase4_frontier_integration_exe)
 
 # ============================================================================
+# Mobius COUNT Signed Multiplicity Tests (US-3B-002 TDD RED Phase)
+# ============================================================================
+
+test_mobius_count_signed_exe = executable(
+  'test_mobius_count_signed',
+  files('test_mobius_count_signed.c'),
+  backend_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('mobius_count_signed', test_mobius_count_signed_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
