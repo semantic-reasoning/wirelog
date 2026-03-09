@@ -3116,6 +3116,14 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     for (uint32_t i = 0; i < rplan->op_count; i++) {
         const wl_plan_op_t *op = &rplan->ops[i];
         int rc = 0;
+
+        /* Phase 3C NOTE: Weighted operation cases (WL_PLAN_OP_JOIN_WEIGHTED,
+         * WL_PLAN_OP_REDUCE_WEIGHTED) are not yet present. These functions
+         * exist and are tested independently (col_op_join_weighted,
+         * col_op_reduce_weighted in columnar_nanoarrow.c). Integration into
+         * this switch will occur when the plan generator emits weighted opcodes
+         * for Z-set multiplicity evaluation. For now, col_op_join and
+         * col_op_reduce dispatch to their base (non-weighted) versions. */
         switch (op->op) {
         case WL_PLAN_OP_VARIABLE:
             rc = col_op_variable(op, stack, sess);
