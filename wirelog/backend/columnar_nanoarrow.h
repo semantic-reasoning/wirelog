@@ -316,7 +316,7 @@ col_compute_affected_strata(wl_session_t *session,
  */
 int
 col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
-                         col_frontier_t *out_frontier);
+                         col_frontier_2d_t *out_frontier);
 
 /**
  * col_compute_affected_rules:
