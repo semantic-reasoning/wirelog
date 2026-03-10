@@ -947,6 +947,23 @@ test_2d_frontier_init_exe = executable(
 
 test('2d_frontier_init', test_2d_frontier_init_exe)
 
+# Issue #104: 2D Frontier Skip Condition Tests
+test_2d_frontier_skip_exe = executable(
+  'test_2d_frontier_skip',
+  files('test_2d_frontier_skip.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('2d_frontier_skip', test_2d_frontier_skip_exe)
+
 test_selective_frontier_reset_exe = executable(
   'test_selective_frontier_reset',
   files('test_selective_frontier_reset.c'),

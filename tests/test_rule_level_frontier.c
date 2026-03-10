@@ -341,7 +341,7 @@ test_unaffected_stratum_frontier_preserved_after_insert(void)
         return;
     }
 
-    col_frontier_t f_before;
+    col_frontier_2d_t f_before;
     rc = col_session_get_frontier(sess, rec_si, &f_before);
     if (rc != 0) {
         wl_session_destroy(sess);
@@ -351,7 +351,7 @@ test_unaffected_stratum_frontier_preserved_after_insert(void)
     }
 
     /* Frontier must be set after evaluation (not the zero-init default) */
-    if (f_before.iteration == 0 && f_before.stratum == 0) {
+    if (f_before.iteration == 0 && f_before.outer_epoch == 0) {
         wl_session_destroy(sess);
         wl_plan_free(plan);
         FAIL("frontier not set after wl_session_step");
@@ -370,7 +370,7 @@ test_unaffected_stratum_frontier_preserved_after_insert(void)
         return;
     }
 
-    col_frontier_t f_after;
+    col_frontier_2d_t f_after;
     rc = col_session_get_frontier(sess, rec_si, &f_after);
     if (rc != 0) {
         wl_session_destroy(sess);
@@ -380,12 +380,12 @@ test_unaffected_stratum_frontier_preserved_after_insert(void)
     }
 
     if (f_after.iteration != f_before.iteration
-        || f_after.stratum != f_before.stratum) {
+        || f_after.outer_epoch != f_before.outer_epoch) {
         char msg[128];
         snprintf(msg, sizeof(msg),
                  "frontier changed by insert: before=(%u,%u) after=(%u,%u)",
-                 f_before.iteration, f_before.stratum, f_after.iteration,
-                 f_after.stratum);
+                 f_before.iteration, f_before.outer_epoch, f_after.iteration,
+                 f_after.outer_epoch);
         wl_session_destroy(sess);
         wl_plan_free(plan);
         FAIL(msg);
@@ -770,7 +770,7 @@ test_multiple_incremental_inserts_preserve_frontier(void)
         return;
     }
 
-    col_frontier_t f1;
+    col_frontier_2d_t f1;
     rc = col_session_get_frontier(sess, rec_si, &f1);
     if (rc != 0 || f1.iteration == UINT32_MAX) {
         wl_session_destroy(sess);
@@ -789,10 +789,10 @@ test_multiple_incremental_inserts_preserve_frontier(void)
         return;
     }
 
-    col_frontier_t f_mid;
+    col_frontier_2d_t f_mid;
     rc = col_session_get_frontier(sess, rec_si, &f_mid);
     if (rc != 0 || f_mid.iteration != f1.iteration
-        || f_mid.stratum != f1.stratum) {
+        || f_mid.outer_epoch != f1.outer_epoch) {
         wl_session_destroy(sess);
         wl_plan_free(plan);
         FAIL("frontier changed after incremental insert 1");
@@ -817,7 +817,7 @@ test_multiple_incremental_inserts_preserve_frontier(void)
         return;
     }
 
-    col_frontier_t f_final;
+    col_frontier_2d_t f_final;
     rc = col_session_get_frontier(sess, rec_si, &f_final);
     if (rc != 0 || f_final.iteration == UINT32_MAX) {
         wl_session_destroy(sess);

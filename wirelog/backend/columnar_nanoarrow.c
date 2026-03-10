@@ -747,12 +747,15 @@ typedef struct {
      * already processed in the SAME outer_epoch. This prevents incorrect skipping
      * when comparing across different insertion epochs. */
     uint32_t outer_epoch;
-    /* Frontier tracking (Phase 4): per-stratum frontier array for
-     * incremental re-evaluation. Each frontiers[i] tracks the minimum
-     * (iteration, stratum) boundary that has been fully processed for
-     * stratum i. This enables skipping redundant iterations when frontier
-     * persists across session_step calls (incremental evaluation). */
-    col_frontier_t frontiers[MAX_STRATA]; /* per-stratum frontier tracking */
+    /* Frontier tracking (Phase 4 / Issue #104): per-stratum 2D frontier array
+     * for epoch-aware incremental re-evaluation. Each frontiers[i] tracks the
+     * (outer_epoch, iteration) pair at which stratum i last converged.
+     * An iteration is skipped only when it was already processed in the SAME
+     * outer_epoch, preventing incorrect skipping across insertion epochs.
+     * This enables skipping redundant iterations when frontier persists across
+     * session_step calls (incremental evaluation). */
+    col_frontier_2d_t
+        frontiers[MAX_STRATA]; /* per-stratum 2D frontier tracking */
     /* Frontier tracking (Phase 4, US-4-002): per-rule frontier array for
      * rule-level incremental re-evaluation. Each rule_frontiers[i] tracks the
      * minimum (iteration, stratum) boundary fully processed for rule i.
@@ -3635,14 +3638,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
         col_mat_cache_clear(&sess->mat_cache);
 
-        /* Non-recursive stratum frontier: initialize to UINT32_MAX (not set sentinel)
-         * only on the first evaluation (frontier==0 from calloc). If a prior
-         * col_session_insert_incremental call preserved a real convergence frontier,
-         * keep it so the skip logic in the recursive path can use it. */
-        if (stratum_idx < MAX_STRATA
-            && sess->frontiers[stratum_idx].iteration == 0) {
-            sess->frontiers[stratum_idx].iteration = UINT32_MAX;
-            sess->frontiers[stratum_idx].stratum = stratum_idx;
+        /* Non-recursive stratum frontier: record convergence epoch and iteration.
+         * Non-recursive strata always converge at iteration UINT32_MAX (no loop),
+         * so store (outer_epoch, UINT32_MAX) to enable epoch-aware skip on next
+         * incremental call. Always update both fields so same-epoch skip logic
+         * fires correctly when the frontier persists across session_step calls. */
+        if (stratum_idx < MAX_STRATA) {
+            col_frontier_2d_t f2d = { sess->outer_epoch, UINT32_MAX };
+            sess->frontiers[stratum_idx] = f2d;
         }
 
         /* Non-recursive rule frontiers: mark each rule fully evaluated.
@@ -3722,7 +3725,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     if (stratum_idx < MAX_STRATA
         && sess->frontiers[stratum_idx].iteration == 0) {
         sess->frontiers[stratum_idx].iteration = UINT32_MAX;
-        sess->frontiers[stratum_idx].stratum = stratum_idx;
     }
 
     /* Phase 4 (US-4-004): Compute the base global rule index for this stratum.
@@ -3792,9 +3794,21 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          *
          * ENABLED: for unaffected strata, skip iterations beyond frontier.
          * Affected strata (frontier=UINT32_MAX) naturally re-evaluate all iterations. */
+        /* US-104-002: 2D frontier skip condition (epoch-aware).
+         * Skip only when BOTH conditions hold:
+         *   1. Same insertion epoch: frontier was set in this outer_epoch, so
+         *      the convergence point is still valid for the current data set.
+         *   2. Iteration beyond convergence: iter > frontier.iteration means
+         *      this stratum already converged at a lower iteration count.
+         * When epochs differ (new insertion cycle), outer_epoch mismatch means
+         * the frontier is stale — do NOT skip, always re-evaluate from iter 0. */
         if (stratum_idx < MAX_STRATA) {
-            if (iter > sess->frontiers[stratum_idx].iteration) {
-                continue; /* Skip this iteration: already processed in prior session_step */
+            bool same_epoch = (sess->outer_epoch
+                               == sess->frontiers[stratum_idx].outer_epoch);
+            bool beyond_convergence
+                = (iter > sess->frontiers[stratum_idx].iteration);
+            if (same_epoch && beyond_convergence) {
+                continue; /* Skip: already processed at this iter in same epoch */
             }
         }
 
@@ -4139,10 +4153,12 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * store it in the session. Each stratum independently tracks its
      * convergence frontier for the skip optimization in the next session_step. */
     if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
-        /* Set this stratum's frontier to the minimum (iteration, stratum) that
-         * was fully processed during iteration loop. This enables skipping
-         * iterations if frontier persists across session_step calls. */
-        sess->frontiers[stratum_idx] = strat_frontier;
+        /* Set this stratum's 2D frontier to the convergence point.
+         * outer_epoch tracks the insertion epoch; iteration tracks convergence.
+         * This enables skipping iterations if frontier persists across
+         * session_step calls (incremental evaluation). */
+        col_frontier_2d_t f2d = { sess->outer_epoch, strat_frontier.iteration };
+        sess->frontiers[stratum_idx] = f2d;
     }
 
     /* Cleanup all delta relations after frontier has been computed */
@@ -4627,7 +4643,7 @@ col_session_get_darr_count(wl_session_t *sess)
  */
 int
 col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
-                         col_frontier_t *out_frontier)
+                         col_frontier_2d_t *out_frontier)
 {
     if (!session || !out_frontier || stratum_idx >= MAX_STRATA)
         return EINVAL;
@@ -5291,7 +5307,8 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                  * the previous convergence point, making frontier skip unsafe.
                  * Current implementation: Always reset (safe but misses optimization).
                  * Future: Gate by is_monotone flag from exec_plan.h when available. */
-                sess->frontiers[si].iteration = UINT32_MAX;
+                sess->frontiers[si].outer_epoch = sess->outer_epoch;
+                sess->frontiers[si].iteration = 0;
             }
         }
         /* Phase 4 (US-4-004): Reset per-rule frontiers only for affected
