@@ -762,7 +762,9 @@ typedef struct {
      * Initialized to (0, 0) via calloc. Reset to UINT32_MAX for affected
      * rules on incremental insert (enables selective rule skipping in
      * US-4-004). MAX_RULES=64 matches uint64_t bitmask width. */
-    col_frontier_t rule_frontiers[MAX_RULES]; /* per-rule frontier tracking */
+    col_frontier_2d_t
+        rule_frontiers[MAX_RULES]; /* per-rule frontier tracking with
+                                                     (outer_epoch, iteration) pairs */
     /* Per-phase K-fusion profiling (Phase 3A): breakdown of kfusion_ns into
      * four sub-phases accumulated across all col_op_k_fusion calls per eval.
      *   alloc_ns:    calloc of results/workers/worker_sess arrays
@@ -3657,8 +3659,12 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
                 uint32_t rule_idx = rule_base + ri;
                 if (rule_idx < MAX_RULES) {
+                    /* Issue #106: Conservative approach - always reset rule frontiers
+                     * for affected strata to (current_epoch, UINT32_MAX) sentinel.
+                     * UINT32_MAX prevents premature skip during re-evaluation. */
+                    sess->rule_frontiers[rule_idx].outer_epoch
+                        = sess->outer_epoch;
                     sess->rule_frontiers[rule_idx].iteration = UINT32_MAX;
-                    sess->rule_frontiers[rule_idx].stratum = stratum_idx;
                 }
             }
         }
@@ -3896,14 +3902,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         for (uint32_t ri = 0; ri < nrels; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
 
-            /* Phase 4 (US-4-004): Rule-level frontier skip.
-             * If the global rule index is within range and the current
-             * iteration has already been fully evaluated for this rule
-             * (iter > rule_frontiers[rule_id].iteration), skip it.
-             * UINT32_MAX sentinel (set on affected-rule reset) ensures
-             * iter > UINT32_MAX is always false, preventing premature skip. */
+            /* Issue #106 (US-106-003): Rule-level frontier skip with epoch gating.
+             * Skip rule evaluation only when BOTH conditions hold:
+             * 1. Same outer_epoch (prevents cross-epoch incorrect skips)
+             * 2. Iteration > convergence point (rule already processed in this epoch)
+             * Across epoch boundaries, outer_epoch mismatch => skip condition false => re-eval. */
             uint32_t rule_id = rule_id_base + ri;
             if (rule_id < MAX_RULES
+                && sess->rule_frontiers[rule_id].outer_epoch
+                       == sess->outer_epoch
                 && iter > sess->rule_frontiers[rule_id].iteration) {
                 continue;
             }
@@ -4136,16 +4143,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     }
     sess->total_iterations = iter;
 
-    /* Phase 4 (US-4-004): Update per-rule frontiers after convergence.
-     * Record the final iteration at which each rule in this stratum last
-     * produced new facts. On the next incremental snapshot call (if the
-     * frontier is preserved for unaffected rules), the skip check
-     * `iter > rule_frontiers[rule_id].iteration` will skip iterations
-     * already processed by the previous evaluation. */
+    /* Issue #106 (US-106-005): Record per-rule frontier at convergence with epoch.
+     * When stratum converges at iteration I, record (outer_epoch, I) for each rule.
+     * On next incremental snapshot, skip condition checks epoch match AND iter > I.
+     * This preserves fine-grained rule convergence across insertions. */
     for (uint32_t ri = 0; ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
         uint32_t rule_id = rule_id_base + ri;
+        sess->rule_frontiers[rule_id].outer_epoch = sess->outer_epoch;
         sess->rule_frontiers[rule_id].iteration = iter;
-        sess->rule_frontiers[rule_id].stratum = stratum_idx;
     }
 
     /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
@@ -5118,20 +5123,34 @@ col_session_step(wl_session_t *session)
             session, sess->last_inserted_relation);
     }
 
-    /* Phase 4 (US-4-004): Reset rule frontiers before evaluation.
-     * Full evaluation: reset all to UINT32_MAX so skip check never fires.
-     * Incremental evaluation: reset only affected rules; unaffected rules
-     * keep their frontier so the skip check can fire for them. */
+    /* Issue #106 (US-106-004): Reset rule frontiers with stratum context awareness.
+     * Conservative approach: reset all rule frontiers for affected strata to
+     * (current_epoch, 0), forcing re-evaluation from iteration 0. Unaffected
+     * strata keep their frontiers, enabling skip optimization.
+     * Future enhancement: use rule-to-stratum mapping for selective reset. */
     if (affected_mask == UINT64_MAX) {
+        /* Full evaluation: reset all rules to (current_epoch, UINT32_MAX) sentinel
+         * UINT32_MAX ensures `iter > UINT32_MAX` is always false, preventing skip */
         for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
+            sess->rule_frontiers[ri].outer_epoch = sess->outer_epoch;
             sess->rule_frontiers[ri].iteration = UINT32_MAX;
         }
     } else {
-        uint64_t affected_rules
-            = col_compute_affected_rules(session, sess->last_inserted_relation);
-        for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
-            if ((affected_rules & ((uint64_t)1 << ri)) != 0) {
-                sess->rule_frontiers[ri].iteration = UINT32_MAX;
+        /* Incremental: reset affected strata's rules to (current_epoch, UINT32_MAX) */
+        for (uint32_t si = 0; si < plan->stratum_count; si++) {
+            if ((affected_mask & ((uint64_t)1 << si)) != 0) {
+                uint32_t rule_base = 0;
+                for (uint32_t j = 0; j < si; j++)
+                    rule_base += plan->strata[j].relation_count;
+                for (uint32_t ri = 0; ri < plan->strata[si].relation_count;
+                     ri++) {
+                    uint32_t rule_id = rule_base + ri;
+                    if (rule_id < MAX_RULES) {
+                        sess->rule_frontiers[rule_id].outer_epoch
+                            = sess->outer_epoch;
+                        sess->rule_frontiers[rule_id].iteration = UINT32_MAX;
+                    }
+                }
             }
         }
     }
@@ -5325,19 +5344,19 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
             = col_compute_affected_rules(session, sess->last_inserted_relation);
         for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
             if ((affected_rules & ((uint64_t)1 << ri)) != 0) {
-                /* Conservative: reset all affected rule frontiers when delta_seeded.
-                 * Could optimize to check rule's stratum for pre-seeded delta,
-                 * but rule-to-stratum mapping is not easily available. */
+                /* Issue #106: Reset affected rule frontiers to (current_epoch, UINT32_MAX).
+                 * UINT32_MAX sentinel prevents `iter > UINT32_MAX` skip condition from firing.
+                 * Conservative: reset all affected rules regardless of pre-seeded delta.
+                 * Future: check rule's stratum for pre-seeded delta to optimize. */
+                sess->rule_frontiers[ri].outer_epoch = sess->outer_epoch;
                 sess->rule_frontiers[ri].iteration = UINT32_MAX;
             }
         }
     } else {
         /* Full re-evaluation (non-incremental call): reset ALL rule frontiers
-         * to UINT32_MAX so the skip check never fires within this evaluation.
-         * Without this reset, stale frontier values from a previous call would
-         * cause premature skip of needed iterations (e.g., iter > 0 skips
-         * iter=1+ after a single-step convergence). */
+         * to (current_epoch, UINT32_MAX) sentinel. Prevents premature skip. */
         for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
+            sess->rule_frontiers[ri].outer_epoch = sess->outer_epoch;
             sess->rule_frontiers[ri].iteration = UINT32_MAX;
         }
     }

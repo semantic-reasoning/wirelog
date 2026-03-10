@@ -980,6 +980,23 @@ test_selective_frontier_reset_exe = executable(
 
 test('selective_frontier_reset', test_selective_frontier_reset_exe)
 
+# Issue #106: Multi-Stratum Rule Frontier Tracking Tests
+test_multi_stratum_rule_frontier_exe = executable(
+  'test_multi_stratum_rule_frontier',
+  files('test_multi_stratum_rule_frontier.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('multi_stratum_rule_frontier', test_multi_stratum_rule_frontier_exe)
+
 # ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
