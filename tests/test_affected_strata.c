@@ -386,6 +386,76 @@ test_simd_matches_scalar(void)
 }
 
 /* ======================================================================== */
+/* TEST 6: EDB insertion with edb_relations set yields targeted mask         */
+/* ======================================================================== */
+
+static void
+test_edb_targeted_mask(void)
+{
+    TEST("edb_targeted_mask: EDB insert with edb_relations yields targeted "
+         "mask");
+
+    /*
+     * Plan layout (issue #93 regression test):
+     *   stratum 0: "idb_A" depends on EDB "edge"
+     *   stratum 1: "idb_B" depends on EDB "node"  (unrelated to "edge")
+     *
+     * plan.edb_relations = {"edge", "node"}, plan.edb_count = 2
+     *
+     * Inserting into "edge" must set bit 0 only (NOT full_mask).
+     * Before issue #93 fix, the EDB fast path returned full_mask.
+     */
+    wl_plan_op_t ops0[1], ops1[1];
+    wl_plan_relation_t rels0[1], rels1[1];
+    wl_plan_stratum_t strata[2];
+    wl_plan_t plan;
+
+    init_relation(&rels0[0], "idb_A", "edge", ops0);
+    init_relation(&rels1[0], "idb_B", "node", ops1);
+
+    memset(&strata[0], 0, sizeof(strata[0]));
+    strata[0].stratum_id = 0;
+    strata[0].is_recursive = false;
+    strata[0].relations = rels0;
+    strata[0].relation_count = 1;
+
+    memset(&strata[1], 0, sizeof(strata[1]));
+    strata[1].stratum_id = 1;
+    strata[1].is_recursive = false;
+    strata[1].relations = rels1;
+    strata[1].relation_count = 1;
+
+    memset(&plan, 0, sizeof(plan));
+    plan.strata = strata;
+    plan.stratum_count = 2;
+
+    /* Set edb_relations — this triggers the (now-removed) fast path */
+    const char *edb_rels[2] = { "edge", "node" };
+    plan.edb_relations = edb_rels;
+    plan.edb_count = 2;
+
+    wl_session_t *sess = NULL;
+    const wl_compute_backend_t *backend = wl_backend_columnar();
+    int rc = backend->session_create(&plan, 1, &sess);
+    if (rc != 0 || !sess) {
+        FAIL("session_create failed");
+        return;
+    }
+
+    uint64_t mask = col_compute_affected_strata(sess, "edge");
+    backend->session_destroy(sess);
+
+    /* Only bit 0 should be set (stratum 0 depends on "edge") */
+    if (mask == (uint64_t)0x1) {
+        PASS;
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 0x1, got 0x%" PRIx64, mask);
+        FAIL(buf);
+    }
+}
+
+/* ======================================================================== */
 /* MAIN                                                                      */
 /* ======================================================================== */
 
@@ -399,6 +469,7 @@ main(void)
     test_transitive_dependency();
     test_unrelated_insertion();
     test_simd_matches_scalar();
+    test_edb_targeted_mask();
 
     printf("\n=== Results: %d/%d passed ===\n\n", tests_passed,
            tests_passed + tests_failed);
