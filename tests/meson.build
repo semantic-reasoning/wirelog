@@ -947,6 +947,22 @@ test_2d_frontier_init_exe = executable(
 
 test('2d_frontier_init', test_2d_frontier_init_exe)
 
+test_selective_frontier_reset_exe = executable(
+  'test_selective_frontier_reset',
+  files('test_selective_frontier_reset.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('selective_frontier_reset', test_selective_frontier_reset_exe)
+
 # ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
