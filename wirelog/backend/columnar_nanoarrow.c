@@ -5205,7 +5205,15 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
      * prematurely skip iterations needed to process newly inserted facts.
      * UINT32_MAX ensures `iter > UINT32_MAX` is always false, forcing full
      * re-evaluation of affected strata. IDB relations are intentionally kept:
-     * existing tuples act as seeds for semi-naive propagation. */
+     * existing tuples act as seeds for semi-naive propagation.
+     *
+     * IMPORTANT: We reset ALL affected strata (not just those with pre-seeded
+     * deltas) because transitively-affected strata receive new facts from
+     * upstream strata, and in recursive strata, these new facts may require
+     * iterations beyond the previous frontier to converge (e.g., cycles).
+     * Skipping iterations due to an old frontier can miss critical fact
+     * propagation steps. Issue #83 analysis was incomplete; correctness
+     * requires resetting all affected strata frontiers. */
     if (affected_mask != UINT64_MAX) {
         for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
              si++) {
