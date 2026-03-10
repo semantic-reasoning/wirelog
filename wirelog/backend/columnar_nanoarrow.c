@@ -79,6 +79,11 @@ typedef struct {
      * Grows via realloc as needed; freed only on relation destruction. */
     int64_t *merge_buf;
     uint32_t merge_buf_cap; /* capacity in rows */
+    /* Base row count for delta propagation (issue #83).
+     * After initial eval convergence, base_nrows == nrows. On incremental
+     * insert, nrows grows but base_nrows stays fixed. Rows[base_nrows..nrows)
+     * are the delta (new EDB facts not yet propagated). */
+    uint32_t base_nrows;
     /* Timestamp tracking (optional): NULL when disabled.
      * When non-NULL, timestamps[i] records the provenance of data row i.
      * Capacity tracks with the data array (capacity entries allocated). */
@@ -770,6 +775,12 @@ typedef struct {
      * iteration > 0 (FORCE_DELTA with absent delta → empty short-circuit).
      * Only valid during col_eval_stratum execution. */
     uint32_t current_iteration;
+    /* Delta-seeded incremental evaluation (issue #83).
+     * When true, EDB delta relations have been pre-seeded into the session
+     * before re-evaluation. FORCE_DELTA at iteration 0 pushes empty (not full)
+     * for relations without a pre-seeded delta, enabling delta-only propagation
+     * instead of full re-derivation. Cleared after eval completes. */
+    bool delta_seeded;
 } wl_col_session_t;
 
 /*
@@ -1153,6 +1164,20 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
             return eval_stack_push_delta(stack, delta, false, true);
         }
         if (sess->current_iteration == 0) {
+            if (sess->delta_seeded) {
+                /* Issue #83: delta-seeded incremental re-eval. No pre-seeded
+                 * delta means this relation has no new facts. Push empty so
+                 * only rules with actual deltas produce output. */
+                col_rel_t *empty = col_rel_new_like("$empty_delta", full_rel);
+                if (!empty)
+                    return ENOMEM;
+                int push_rc = eval_stack_push_delta(stack, empty, true, true);
+                if (push_rc != 0) {
+                    col_rel_free_contents(empty);
+                    free(empty);
+                }
+                return push_rc;
+            }
             /* Base-case iteration: no deltas exist yet, fall back to full
              * relation so EDB-grounded rules can still fire on iter 0. */
             return eval_stack_push_delta(stack, full_rel, false, false);
@@ -1346,10 +1371,11 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (rdelta && rdelta->nrows > 0) {
             right = rdelta;
             used_right_delta = true;
-        } else if (sess->current_iteration > 0) {
-            /* Iteration > 0: FORCE_DELTA required but delta absent/empty.
-             * Short-circuit to empty result — this rule copy produces no
-             * tuples from this permutation (correct semi-naive, issue #85). */
+        } else if (sess->current_iteration > 0 || sess->delta_seeded) {
+            /* Iteration > 0 or delta-seeded iter 0 (issue #83):
+             * FORCE_DELTA required but delta absent/empty. Short-circuit to
+             * empty result — this rule copy produces no tuples from this
+             * permutation (correct semi-naive, issue #85). */
             uint32_t ocols = left_e.rel->ncols + right->ncols;
             if (left_e.owned) {
                 col_rel_free_contents(left_e.rel);
@@ -3482,8 +3508,8 @@ static bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
                        uint32_t iteration)
 {
-    if (iteration == 0)
-        return false; /* Base case: no deltas exist yet */
+    if (iteration == 0 && !sess->delta_seeded)
+        return false; /* Base case: no deltas exist yet (non-incremental) */
 
     for (uint32_t oi = 0; oi < rp->op_count; oi++) {
         const wl_plan_op_t *op = &rp->ops[oi];
@@ -5126,6 +5152,31 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     if (sess->last_inserted_relation != NULL && sess->total_iterations > 0) {
         affected_mask = col_compute_affected_strata(
             session, sess->last_inserted_relation);
+
+        /* Issue #83: Pre-seed EDB delta relations for delta-only propagation.
+         * For each relation with nrows > base_nrows, create a $d$<name> delta
+         * containing only the new rows. This allows FORCE_DELTA at iteration 0
+         * to use the delta instead of the full relation, avoiding full
+         * re-derivation of existing IDB tuples. */
+        for (uint32_t i = 0; i < sess->nrels; i++) {
+            col_rel_t *r = sess->rels[i];
+            if (!r || r->base_nrows == 0 || r->nrows <= r->base_nrows)
+                continue;
+            /* Create delta relation with rows[base_nrows..nrows) */
+            char dname[256];
+            snprintf(dname, sizeof(dname), "$d$%s", r->name);
+            uint32_t delta_nrows = r->nrows - r->base_nrows;
+            col_rel_t *delta = col_rel_new_auto(dname, r->ncols);
+            if (!delta)
+                continue; /* best-effort; falls back to full eval */
+            for (uint32_t row = 0; row < delta_nrows; row++) {
+                col_rel_append_row(
+                    delta, r->data + (size_t)(r->base_nrows + row) * r->ncols);
+            }
+            session_remove_rel(sess, dname);
+            session_add_rel(sess, delta);
+        }
+        sess->delta_seeded = true;
     }
 
     /* For affected strata, RESET the per-stratum frontier to UINT32_MAX
@@ -5177,6 +5228,16 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
 
     /* Reset after successful eval so next plain snapshot runs all strata */
     sess->last_inserted_relation = NULL;
+    sess->delta_seeded = false;
+
+    /* Issue #83: Update base_nrows for all relations after convergence.
+     * This marks the current state as "stable" so the next incremental
+     * insert can compute the delta as rows[base_nrows..nrows). */
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        col_rel_t *r = sess->rels[i];
+        if (r)
+            r->base_nrows = r->nrows;
+    }
 
     /* Invoke callback for every tuple in every IDB relation */
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
