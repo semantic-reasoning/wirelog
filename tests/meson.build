@@ -857,6 +857,26 @@ test_consolidation_cow_exe = executable(
 test('consolidation_cow', test_consolidation_cow_exe)
 
 # ============================================================================
+# Arrangement Incremental Invalidation Tests (Issue #92)
+# ============================================================================
+
+test_arrangement_incr_invalidation_exe = executable(
+  'test_arrangement_incremental_invalidation',
+  files('test_arrangement_incremental_invalidation.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('arrangement_incr_invalidation', test_arrangement_incr_invalidation_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #

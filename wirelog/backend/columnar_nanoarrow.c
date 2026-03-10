@@ -4794,6 +4794,10 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
             return rc;
     }
 
+    /* Invalidate arrangement caches for the modified relation so subsequent
+     * re-evaluation rebuilds hash indices with the new rows (issue #92). */
+    col_session_invalidate_arrangements(session, relation);
+
     /* Record the inserted relation so col_session_step can skip unaffected
      * strata (Phase 4 affected-stratum skip optimization). */
     COL_SESSION(session)->last_inserted_relation = relation;
