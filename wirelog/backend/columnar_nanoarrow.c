@@ -5165,6 +5165,35 @@ col_session_set_delta_cb(wl_session_t *session, wl_on_delta_fn callback,
 }
 
 /*
+ * stratum_has_preseeded_delta: Check if stratum has pre-seeded EDB delta relations
+ *
+ * Returns true if any relation in the stratum has a pre-seeded EDB delta ($d$<name>)
+ * with nrows > 0 already registered in the session.
+ *
+ * Pre-seeded deltas are created at lines 5213-5235 in col_session_snapshot before
+ * frontier reset. This function checks the deltas are available (nrows > 0).
+ *
+ * Issue #102: Selective frontier reset. Only reset frontier if stratum has
+ * pre-seeded delta, preserving frontier skip for transitively-affected IDB strata.
+ *
+ * @param sp: wl_plan_stratum_t* for the stratum to check
+ * @param sess: wl_col_session_t* session containing the relations
+ * @return true if any pre-seeded delta exists with nrows > 0, false otherwise
+ */
+static bool
+stratum_has_preseeded_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
+{
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        char dname[256];
+        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        col_rel_t *delta = session_find_rel(sess, dname);
+        if (delta && delta->nrows > 0)
+            return true;
+    }
+    return false;
+}
+
+/*
  * col_session_snapshot: Evaluate all strata and emit current IDB tuples
  *
  * Implements wl_compute_backend_t.session_snapshot vtable slot.
@@ -5254,6 +5283,14 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
         for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
              si++) {
             if ((affected_mask & ((uint64_t)1 << si)) != 0) {
+                /* Issue #102: Selective frontier reset (conservative approach).
+                 * Only reset frontier for strata that have pre-seeded EDB deltas
+                 * when delta-seeded incremental evaluation is in progress.
+                 * HOWEVER: This optimization is ONLY SAFE for MONOTONE strata.
+                 * For cyclic strata, new facts may require more iterations than
+                 * the previous convergence point, making frontier skip unsafe.
+                 * Current implementation: Always reset (safe but misses optimization).
+                 * Future: Gate by is_monotone flag from exec_plan.h when available. */
                 sess->frontiers[si].iteration = UINT32_MAX;
             }
         }
@@ -5261,11 +5298,19 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
          * rules, using col_compute_affected_rules bitmask. This is more
          * precise than the prior conservative approach (resetting all rules).
          * UINT32_MAX sentinel forces full re-evaluation of affected rules.
-         * Unaffected rules keep their frontier so the skip check fires. */
+         * Unaffected rules keep their frontier so the skip check fires.
+         *
+         * Issue #102: In delta-seeded mode, apply same pre-seeded delta check
+         * as stratum frontiers. However, rule-to-stratum mapping is complex,
+         * so conservatively reset all affected rule frontiers regardless of
+         * delta presence. Future enhancement: map rules to strata for selective reset. */
         uint64_t affected_rules
             = col_compute_affected_rules(session, sess->last_inserted_relation);
         for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
             if ((affected_rules & ((uint64_t)1 << ri)) != 0) {
+                /* Conservative: reset all affected rule frontiers when delta_seeded.
+                 * Could optimize to check rule's stratum for pre-seeded delta,
+                 * but rule-to-stratum mapping is not easily available. */
                 sess->rule_frontiers[ri].iteration = UINT32_MAX;
             }
         }
