@@ -1151,7 +1151,12 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_t *empty = col_rel_new_like("$empty_delta", full_rel);
         if (!empty)
             return ENOMEM;
-        return eval_stack_push_delta(stack, empty, true, true);
+        int push_rc = eval_stack_push_delta(stack, empty, true, true);
+        if (push_rc != 0) {
+            col_rel_free_contents(empty);
+            free(empty);
+        }
+        return push_rc;
     }
 
     /* WL_DELTA_AUTO: original heuristic */
@@ -1341,7 +1346,12 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
             if (!empty)
                 return ENOMEM;
-            return eval_stack_push(stack, empty, true);
+            int push_rc = eval_stack_push(stack, empty, true);
+            if (push_rc != 0) {
+                col_rel_free_contents(empty);
+                free(empty);
+            }
+            return push_rc;
         }
         /* else: iteration 0 — no deltas yet, fall through to full right */
     } else if (op->delta_mode != WL_DELTA_FORCE_FULL && !left_e.is_delta
@@ -2898,8 +2908,16 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
 
         col_rel_t *merged;
         if (n_results == 0) {
-            /* All copies skipped: produce empty output */
-            merged = col_rel_new_auto("$kfusion_empty", 0);
+            /* All copies skipped: produce empty output.  Derive column
+             * count from the K-fusion target relation (op->relation_name)
+             * so the empty result has a matching schema. */
+            uint32_t ncols = 0;
+            if (op->relation_name) {
+                col_rel_t *target = session_find_rel(sess, op->relation_name);
+                if (target)
+                    ncols = target->ncols;
+            }
+            merged = col_rel_new_auto("$kfusion_empty", ncols);
         } else {
             merged = col_rel_merge_k(compact, n_results);
         }
