@@ -781,6 +781,11 @@ typedef struct {
      * for relations without a pre-seeded delta, enabling delta-only propagation
      * instead of full re-derivation. Cleared after eval completes. */
     bool delta_seeded;
+    /* Multi-worker support (issue #99).
+     * Stored from col_session_create num_workers parameter.
+     * When > 1, sess->wq is created at session init for parallel K-fusion.
+     * When == 1, K-fusion evaluates copies sequentially (no thread overhead). */
+    uint32_t num_workers;
 } wl_col_session_t;
 
 /*
@@ -2951,18 +2956,10 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
-    /* Lazily create the session-level workqueue on first K-fusion call.
-     * Reusing across iterations avoids per-call thread spawn/join overhead. */
-    if (!sess->wq) {
-        sess->wq = wl_workqueue_create(k);
-        if (!sess->wq) {
-            free(results);
-            free(workers);
-            free(worker_sess);
-            return ENOMEM;
-        }
-    }
-    wl_work_queue_t *wq = sess->wq;
+    /* Use session-level workqueue created at col_session_create (issue #99).
+     * When num_workers=1 (wq==NULL), K copies are evaluated sequentially
+     * below with no thread overhead. */
+    wl_work_queue_t *wq = sess->wq; /* NULL when num_workers=1 */
 
     int rc = 0;
 
@@ -3006,16 +3003,23 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
             continue;
         }
 
-        if (wl_workqueue_submit(wq, col_op_k_fusion_worker, &workers[d]) != 0) {
-            rc = ENOMEM;
-            /* Drain already-submitted tasks before cleanup. */
-            wl_workqueue_drain(wq);
-            goto cleanup_wq;
+        if (wq) {
+            /* Parallel path: submit to session workqueue (issue #99) */
+            if (wl_workqueue_submit(wq, col_op_k_fusion_worker, &workers[d])
+                != 0) {
+                rc = ENOMEM;
+                wl_workqueue_drain(wq);
+                goto cleanup_wq;
+            }
+        } else {
+            /* Sequential fallback: execute directly (num_workers=1) */
+            col_op_k_fusion_worker(&workers[d]);
         }
     }
 
-    /* Single barrier: wait for all K workers to complete in parallel. */
-    if (wl_workqueue_wait_all(wq) != 0) {
+    /* Barrier: wait for all parallel workers to complete.
+     * Skipped when wq is NULL (sequential path already finished). */
+    if (wq && wl_workqueue_wait_all(wq) != 0) {
         rc = -1;
         goto cleanup_wq;
     }
@@ -4646,8 +4650,6 @@ static int
 col_session_create(const wl_plan_t *plan, uint32_t num_workers,
                    wl_session_t **out)
 {
-    (void)num_workers; /* columnar backend is single-threaded */
-
     if (!plan || !out)
         return EINVAL;
 
@@ -4657,6 +4659,7 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         return ENOMEM;
 
     sess->plan = plan;
+    sess->num_workers = num_workers > 0 ? num_workers : 1;
     sess->rel_cap = 16;
     sess->rels = (col_rel_t **)calloc(sess->rel_cap, sizeof(col_rel_t *));
     if (!sess->rels) {
@@ -4670,6 +4673,19 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         free(sess->rels);
         free(sess);
         return ENOMEM;
+    }
+
+    /* Create workqueue for parallel K-fusion when num_workers > 1.
+     * Single-threaded mode (num_workers=1) leaves wq=NULL; K-fusion
+     * evaluates copies sequentially with no thread overhead. (Issue #99) */
+    if (sess->num_workers > 1) {
+        sess->wq = wl_workqueue_create(sess->num_workers);
+        if (!sess->wq) {
+            wl_arena_free(sess->eval_arena);
+            free(sess->rels);
+            free(sess);
+            return ENOMEM;
+        }
     }
 
     /* Pre-register EDB relations (ncols determined at first insert) */
@@ -4695,6 +4711,8 @@ oom:
         free(sess->rels[i]);
     }
     free(sess->rels);
+    wl_workqueue_destroy(sess->wq); /* NULL-safe */
+    wl_arena_free(sess->eval_arena);
     free(sess);
     return ENOMEM;
 }
