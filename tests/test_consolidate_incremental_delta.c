@@ -166,6 +166,7 @@ test_rel_free(col_rel_t *r)
         return;
     free(r->name);
     free(r->data);
+    free(r->merge_buf);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
             free(r->col_names[i]);
