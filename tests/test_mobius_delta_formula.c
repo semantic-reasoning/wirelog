@@ -76,6 +76,9 @@ typedef struct {
     char **col_names;          /* owned array of ncols owned strings   */
     struct ArrowSchema schema; /* owned Arrow schema (lazy-inited)     */
     bool schema_ok;            /* true after schema is initialised     */
+    uint32_t sorted_nrows;     /* sorted prefix row count (issue #94)   */
+    int64_t *merge_buf;        /* persistent merge buffer (issue #94)   */
+    uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
     col_delta_timestamp_t
         *timestamps; /* NULL when not tracking               */
 } col_rel_t;
