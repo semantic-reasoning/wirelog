@@ -877,6 +877,26 @@ test_arrangement_incr_invalidation_exe = executable(
 test('arrangement_incr_invalidation', test_arrangement_incr_invalidation_exe)
 
 # ============================================================================
+# Delta Propagation Tests (Issue #83)
+# ============================================================================
+
+test_delta_propagation_exe = executable(
+  'test_delta_propagation',
+  files('test_delta_propagation.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('delta_propagation', test_delta_propagation_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
