@@ -786,6 +786,12 @@ typedef struct {
      * When > 1, sess->wq is created at session init for parallel K-fusion.
      * When == 1, K-fusion evaluates copies sequentially (no thread overhead). */
     uint32_t num_workers;
+    /* Monotone property tracking (issue #105).
+     * stratum_is_monotone[si] = true if stratum si only derives facts
+     * (no deletion via negation/antijoin/subtraction). Used for DRedL-style
+     * deletion phase skip optimization. Populated from plan->strata[si].is_monotone
+     * during session_create. Conservative default: all false (no optimization). */
+    bool stratum_is_monotone[MAX_STRATA];
 } wl_col_session_t;
 
 /*
@@ -4703,6 +4709,14 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
             free(r);
             goto oom;
         }
+    }
+
+    /* Issue #105: Populate stratum_is_monotone from plan.
+     * Copy monotone property from each stratum in the plan.
+     * Conservative default (all false from calloc) is already set,
+     * so only copy if strata exist. */
+    for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA; si++) {
+        sess->stratum_is_monotone[si] = plan->strata[si].is_monotone;
     }
 
     *out = &sess->base;

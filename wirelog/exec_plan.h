@@ -277,12 +277,16 @@ typedef struct {
  *
  * @stratum_id:     Stratum index (0 = executed first).
  * @is_recursive:   True if this stratum requires fixed-point iteration.
+ * @is_monotone:    True if all rules in this stratum only derive facts
+ *                  (no deletion via negation/antijoin/subtraction).
+ *                  Used for DRedL-style deletion phase optimization.
  * @relations:      Array of per-relation plans (caller-owned).
  * @relation_count: Number of relations in this stratum.
  */
 typedef struct {
     uint32_t stratum_id;
     bool is_recursive;
+    bool is_monotone;
     const wl_plan_relation_t *relations;
     uint32_t relation_count;
 } wl_plan_stratum_t;
