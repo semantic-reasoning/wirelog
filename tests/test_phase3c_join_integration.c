@@ -72,6 +72,7 @@ typedef struct {
     uint32_t sorted_nrows;     /* sorted prefix row count (issue #94)   */
     int64_t *merge_buf;        /* persistent merge buffer (issue #94)   */
     uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
+    uint32_t base_nrows;       /* base row count for delta prop (#83)   */
     col_delta_timestamp_t
         *timestamps; /* NULL when not tracking               */
 } col_rel_t;
