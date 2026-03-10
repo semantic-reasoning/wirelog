@@ -3666,6 +3666,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             uint32_t nc = r->ncols;
             size_t row_bytes = (size_t)nc * sizeof(int64_t);
             QSORT_R_CALL(r->data, r->nrows, row_bytes, &nc, row_cmp_fn);
+            r->sorted_nrows = r->nrows;
         }
     }
 
