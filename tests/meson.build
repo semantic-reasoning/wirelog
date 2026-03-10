@@ -369,6 +369,26 @@ test_empty_delta_skip_exe = executable(
 test('empty_delta_skip', test_empty_delta_skip_exe)
 
 # ============================================================================
+# Delta Factoring E2E Tests (Issue #85)
+# ============================================================================
+
+test_delta_factoring_e2e_exe = executable(
+  'test_delta_factoring_e2e',
+  files('test_delta_factoring_e2e.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('delta_factoring_e2e', test_delta_factoring_e2e_exe)
+
+# ============================================================================
 # K-Fusion End-to-End Integration Tests (Phase 3A)
 # ============================================================================
 

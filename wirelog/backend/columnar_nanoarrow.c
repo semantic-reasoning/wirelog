@@ -752,6 +752,12 @@ typedef struct {
      * NULL when no incremental insert preceded the current step (all strata
      * evaluated normally via affected_mask = UINT64_MAX). */
     const char *last_inserted_relation;
+    /* Current fixed-point iteration counter within col_eval_stratum.
+     * Set at the start of each iteration; operators use this to distinguish
+     * iteration 0 (base case: FORCE_DELTA falls back to full relation) from
+     * iteration > 0 (FORCE_DELTA with absent delta → empty short-circuit).
+     * Only valid during col_eval_stratum execution. */
+    uint32_t current_iteration;
 } wl_col_session_t;
 
 /*
@@ -1055,6 +1061,11 @@ static int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                        wl_col_session_t *sess);
 
+/* Forward declaration for empty-delta pre-scan skip (issue #85) */
+static bool
+has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
+                       uint32_t iteration);
+
 /* Forward declarations for delta arrangement cache (Phase 3C-001-Ext) */
 static col_arrangement_t *
 col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
@@ -1129,9 +1140,18 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         if (delta && delta->nrows > 0) {
             return eval_stack_push_delta(stack, delta, false, true);
         }
-        /* No delta available (base-case iteration): fall back to full
-         * relation so EDB-grounded rules can still fire on iter 0. */
-        return eval_stack_push_delta(stack, full_rel, false, false);
+        if (sess->current_iteration == 0) {
+            /* Base-case iteration: no deltas exist yet, fall back to full
+             * relation so EDB-grounded rules can still fire on iter 0. */
+            return eval_stack_push_delta(stack, full_rel, false, false);
+        }
+        /* Iteration > 0: delta absent or empty means the relation has
+         * converged.  Push an empty relation so this rule copy produces
+         * no output (correct semi-naive semantics, issue #85). */
+        col_rel_t *empty = col_rel_new_like("$empty_delta", full_rel);
+        if (!empty)
+            return ENOMEM;
+        return eval_stack_push_delta(stack, empty, true, true);
     }
 
     /* WL_DELTA_AUTO: original heuristic */
@@ -1309,8 +1329,21 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (rdelta && rdelta->nrows > 0) {
             right = rdelta;
             used_right_delta = true;
+        } else if (sess->current_iteration > 0) {
+            /* Iteration > 0: FORCE_DELTA required but delta absent/empty.
+             * Short-circuit to empty result — this rule copy produces no
+             * tuples from this permutation (correct semi-naive, issue #85). */
+            uint32_t ocols = left_e.rel->ncols + right->ncols;
+            if (left_e.owned) {
+                col_rel_free_contents(left_e.rel);
+                free(left_e.rel);
+            }
+            col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
+            if (!empty)
+                return ENOMEM;
+            return eval_stack_push(stack, empty, true);
         }
-        /* else: no delta available - fall through using full right relation */
+        /* else: iteration 0 — no deltas yet, fall through to full right */
     } else if (op->delta_mode != WL_DELTA_FORCE_FULL && !left_e.is_delta
                && op->right_relation) {
         /* AUTO: original heuristic */
@@ -2680,8 +2713,9 @@ typedef struct {
     wl_plan_relation_t plan_data; /* Embedded plan (stable lifetime) */
     eval_stack_t stack;           /* Output stack (initialized by worker) */
     wl_col_session_t
-        *sess; /* Per-worker session wrapper (isolated mat_cache) */
-    int rc;    /* Return code from evaluation */
+        *sess;    /* Per-worker session wrapper (isolated mat_cache) */
+    int rc;       /* Return code from evaluation */
+    bool skipped; /* true if skipped due to empty forced delta (#85) */
 } col_op_k_fusion_worker_t;
 
 /**
@@ -2778,6 +2812,16 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         workers[d].sess = &worker_sess[d];
         workers[d].rc = 0;
 
+        /* Per-copy empty-delta skip (issue #85): if this copy's sub-plan
+         * has a FORCE_DELTA op referencing an empty/absent delta on
+         * iteration > 0, skip dispatching — the copy would produce 0 rows. */
+        if (has_empty_forced_delta(&workers[d].plan_data, sess,
+                                   sess->current_iteration)) {
+            workers[d].rc = 0; /* mark as succeeded with no output */
+            workers[d].skipped = true;
+            continue;
+        }
+
         if (wl_workqueue_submit(wq, col_op_k_fusion_worker, &workers[d]) != 0) {
             rc = ENOMEM;
             /* Drain already-submitted tasks before cleanup. */
@@ -2796,6 +2840,12 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Collect results from each worker's eval_stack */
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < k; d++) {
+        /* Skipped workers (empty forced delta) contribute an empty result */
+        if (workers[d].skipped) {
+            results[d] = NULL; /* NULL = no rows from this copy */
+            continue;
+        }
+
         if (workers[d].rc != 0) {
             rc = workers[d].rc;
             eval_stack_drain(&workers[d].stack);
@@ -2829,9 +2879,31 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
 
     /* Merge K results with deduplication.
      * Workers ran WL_PLAN_OP_CONSOLIDATE as the last plan op, so each
-     * result is already sorted+deduped — no qsort needed here. */
+     * result is already sorted+deduped — no qsort needed here.
+     * Skipped copies (empty forced delta) have NULL results — compact
+     * them out before merging. */
     {
-        col_rel_t *merged = col_rel_merge_k(results, k);
+        /* Compact non-NULL results (skipped copies have NULL). Use the
+         * existing results array as backing — we build compact in-place. */
+        col_rel_t **compact = (col_rel_t **)malloc(k * sizeof(col_rel_t *));
+        if (!compact) {
+            rc = ENOMEM;
+            goto cleanup_results;
+        }
+        uint32_t n_results = 0;
+        for (uint32_t d = 0; d < k; d++) {
+            if (results[d])
+                compact[n_results++] = results[d];
+        }
+
+        col_rel_t *merged;
+        if (n_results == 0) {
+            /* All copies skipped: produce empty output */
+            merged = col_rel_new_auto("$kfusion_empty", 0);
+        } else {
+            merged = col_rel_merge_k(compact, n_results);
+        }
+        free(compact);
         if (!merged) {
             rc = ENOMEM;
             goto cleanup_results;
@@ -3459,6 +3531,11 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t iter;
     col_frontier_t strat_frontier = { 0, 0 };
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
+        /* Publish current iteration so operators can distinguish base case
+         * (iter 0: FORCE_DELTA falls back to full) from delta case
+         * (iter > 0: FORCE_DELTA with absent delta → empty result). */
+        sess->current_iteration = iter;
+
         /* Phase 3D-Ext-002 (DORMANT): Fine-grained frontier skip infrastructure.
          *
          * STATUS: This optimization is currently unreachable in the single-call evaluation
