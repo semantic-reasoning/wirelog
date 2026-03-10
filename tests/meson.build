@@ -896,6 +896,23 @@ test_delta_propagation_exe = executable(
 
 test('delta_propagation', test_delta_propagation_exe)
 
+# Issue #105: Monotone stratum detection
+test_monotone_detection_exe = executable(
+  'test_monotone_detection',
+  files('test_monotone_detection.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('monotone_detection', test_monotone_detection_exe)
+
 # Issue #99: Multi-worker task dispatch
 test_multi_worker_exe = executable(
   'test_multi_worker',

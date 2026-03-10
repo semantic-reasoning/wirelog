@@ -1417,6 +1417,13 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         dst->stratum_id = src->stratum_id;
         dst->is_recursive = src->is_recursive;
 
+        /* Issue #105: Determine if stratum is monotone (derives facts only,
+         * no deletion via negation/antijoin). Conservative default: false.
+         * Future: analyze operator trees for antijoin/semijoin/subtract operations
+         * to set is_monotone = true when no negation is present. For now, we
+         * mark only strata with zero negation rules. */
+        dst->is_monotone = false; /* Conservative: requires operator analysis */
+
         /* Count unique relations in this stratum */
         /* Build per-relation plan from relation_irs[] */
         if (!src->rule_names || src->rule_count == 0) {
