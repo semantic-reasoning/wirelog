@@ -930,6 +930,23 @@ test_multi_worker_exe = executable(
 
 test('multi_worker', test_multi_worker_exe)
 
+# Issue #103: 2D Frontier Epoch Tracking Tests
+test_2d_frontier_init_exe = executable(
+  'test_2d_frontier_init',
+  files('test_2d_frontier_init.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('2d_frontier_init', test_2d_frontier_init_exe)
+
 # ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================

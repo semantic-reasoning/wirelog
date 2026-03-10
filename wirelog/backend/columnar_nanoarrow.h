@@ -133,6 +133,24 @@ typedef struct {
     uint32_t stratum;
 } col_frontier_t;
 
+/**
+ * col_frontier_2d_t - 2D frontier for epoch-aware incremental evaluation.
+ *
+ * Issue #103: Tracks both insertion epoch and iteration for convergence.
+ * Enables proper skip condition across multiple insertion epochs:
+ * an iteration is skipped only if it was ALREADY processed in the
+ * SAME outer_epoch.
+ *
+ * @outer_epoch: Insertion epoch at which convergence occurred.
+ *               Incremented by col_session_insert_incremental().
+ * @iteration:   Iteration within outer_epoch at which stratum converged
+ *               (UINT32_MAX if not yet converged in this epoch).
+ */
+typedef struct {
+    uint32_t outer_epoch;
+    uint32_t iteration;
+} col_frontier_2d_t;
+
 /* ======================================================================== */
 /* Arrangement Layer (Phase 3C)                                             */
 /* ======================================================================== */

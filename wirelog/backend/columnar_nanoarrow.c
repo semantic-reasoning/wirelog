@@ -740,6 +740,13 @@ typedef struct {
     col_arr_entry_t *darr_entries; /* owned flat array of delta arrs      */
     uint32_t darr_count;           /* number of active delta arrangements */
     uint32_t darr_cap;             /* allocated capacity                  */
+    /* 2D Frontier Epoch Tracking (Issue #103): Incremental insertion epoch counter.
+     * Incremented before each EDB insertion and stratum evaluation to distinguish
+     * between different insertion epochs. Used with frontiers[] to track
+     * (outer_epoch, iteration) pairs: an iteration is skipped only if it was
+     * already processed in the SAME outer_epoch. This prevents incorrect skipping
+     * when comparing across different insertion epochs. */
+    uint32_t outer_epoch;
     /* Frontier tracking (Phase 4): per-stratum frontier array for
      * incremental re-evaluation. Each frontiers[i] tracks the minimum
      * (iteration, stratum) boundary that has been fully processed for
@@ -4719,6 +4726,13 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         sess->stratum_is_monotone[si] = plan->strata[si].is_monotone;
     }
 
+    /* Issue #103: Initialize 2D frontier epoch tracking.
+     * outer_epoch is initialized to 0 by calloc (line 4673) and incremented
+     * before each EDB insertion via col_session_insert_incremental. This
+     * distinguishes different insertion epochs for 2D frontier (epoch, iteration)
+     * pairs to prevent incorrect skip-condition evaluation across epochs. */
+    /* outer_epoch = 0; */ /* Already zeroed by calloc */
+
     *out = &sess->base;
     return 0;
 
@@ -4859,9 +4873,17 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
      * re-evaluation rebuilds hash indices with the new rows (issue #92). */
     col_session_invalidate_arrangements(session, relation);
 
+    /* Issue #103: Increment outer_epoch to mark a new insertion epoch.
+     * This epoch counter distinguishes different insertion phases for 2D frontier
+     * tracking: (outer_epoch, iteration) pairs ensure iterations are skipped only
+     * within the same epoch. Wrapping at UINT32_MAX is acceptable (continues
+     * distinguishing epochs across multiple insertions). */
+    wl_col_session_t *sess = COL_SESSION(session);
+    sess->outer_epoch++;
+
     /* Record the inserted relation so col_session_step can skip unaffected
      * strata (Phase 4 affected-stratum skip optimization). */
-    COL_SESSION(session)->last_inserted_relation = relation;
+    sess->last_inserted_relation = relation;
     return 0;
 }
 
