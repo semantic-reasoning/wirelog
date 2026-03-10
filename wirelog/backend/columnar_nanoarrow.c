@@ -2980,6 +2980,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
          * cache independently (no sharing, no races). Lock-free: no mutex needed
          * because each worker owns its isolated cache. */
         worker_sess[d] = *sess;
+        worker_sess[d].wq = NULL; /* prevent nested K-fusion from workers */
         worker_sess[d].arr_entries = NULL;
         worker_sess[d].arr_count = 0;
         worker_sess[d].arr_cap = 0;
@@ -4631,7 +4632,9 @@ col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
  * Implements wl_compute_backend_t.session_create vtable slot.
  *
  * @param plan:        Execution plan (borrowed, must outlive session)
- * @param num_workers: Ignored; columnar backend is single-threaded
+ * @param num_workers: Thread pool size for parallel K-fusion. When > 1,
+ *                     creates a workqueue at session init. When 1, K-fusion
+ *                     evaluates copies sequentially (no thread overhead).
  * @param out:         (out) Receives &sess->base on success
  *
  * Memory initialization order:
