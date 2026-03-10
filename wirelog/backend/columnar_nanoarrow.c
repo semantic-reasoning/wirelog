@@ -68,6 +68,17 @@ typedef struct {
     char **col_names;          /* owned array of ncols owned strings    */
     struct ArrowSchema schema; /* owned Arrow schema (lazy-inited)      */
     bool schema_ok;            /* true after schema is initialised      */
+    /* Sorted-prefix tracking for incremental consolidation (issue #94).
+     * After consolidation, sorted_nrows == nrows (all rows sorted+unique).
+     * Appending new rows leaves sorted_nrows unchanged: data[0..sorted_nrows)
+     * is sorted, data[sorted_nrows..nrows) is an unsorted suffix.
+     * Enables O(D log D + N) merge instead of O(N log N) full sort. */
+    uint32_t sorted_nrows;
+    /* Persistent merge buffer for consolidation (issue #94).
+     * Reused across iterations to avoid per-consolidation malloc/free.
+     * Grows via realloc as needed; freed only on relation destruction. */
+    int64_t *merge_buf;
+    uint32_t merge_buf_cap; /* capacity in rows */
     /* Timestamp tracking (optional): NULL when disabled.
      * When non-NULL, timestamps[i] records the provenance of data row i.
      * Capacity tracks with the data array (capacity entries allocated). */
@@ -99,6 +110,7 @@ col_rel_free_contents(col_rel_t *r)
         return;
     free(r->name);
     free(r->data);
+    free(r->merge_buf);
     free(r->timestamps);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
@@ -2103,6 +2115,7 @@ col_op_consolidate(eval_stack_t *stack)
         /* Nothing to deduplicate */
         if (e.seg_boundaries)
             free(e.seg_boundaries);
+        in->sorted_nrows = nr;
         return eval_stack_push(stack, in, e.owned);
     }
 
@@ -2138,28 +2151,140 @@ col_op_consolidate(eval_stack_t *stack)
             }
             return rc;
         }
+        work->sorted_nrows = work->nrows;
         return eval_stack_push(stack, work, work_owned);
     }
 
-    /* Fallback: standard qsort + dedup */
     if (e.seg_boundaries)
         free(e.seg_boundaries);
 
-    QSORT_R_CALL(work->data, nr, sizeof(int64_t) * nc, &nc, row_cmp_fn);
+    size_t row_bytes = (size_t)nc * sizeof(int64_t);
+
+    /* Issue #94: Incremental merge when a sorted prefix exists.
+     * data[0..sorted_nrows) is already sorted+unique from a prior
+     * consolidation.  Sort only the unsorted suffix and merge. */
+    uint32_t sn = work->sorted_nrows;
+    if (sn > 0 && sn < nr) {
+        uint32_t delta_count = nr - sn;
+        int64_t *delta_start = work->data + (size_t)sn * nc;
+
+        /* Phase 1: sort only the unsorted suffix */
+        QSORT_R_CALL(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
+
+        /* Phase 1b: dedup within suffix */
+        uint32_t d_unique = 1;
+        for (uint32_t i = 1; i < delta_count; i++) {
+            if (memcmp(delta_start + (size_t)(i - 1) * nc,
+                       delta_start + (size_t)i * nc, row_bytes)
+                != 0) {
+                if (d_unique != i)
+                    memcpy(delta_start + (size_t)d_unique * nc,
+                           delta_start + (size_t)i * nc, row_bytes);
+                d_unique++;
+            }
+        }
+
+        /* Phase 2: merge sorted prefix with sorted suffix */
+        uint32_t max_rows = sn + d_unique;
+
+        /* Reuse persistent merge buffer when possible */
+        int64_t *merged;
+        bool used_merge_buf = false;
+        if (work->merge_buf && work->merge_buf_cap >= max_rows) {
+            merged = work->merge_buf;
+            used_merge_buf = true;
+        } else {
+            /* Grow persistent buffer */
+            uint32_t new_cap = max_rows > work->merge_buf_cap * 2
+                                   ? max_rows
+                                   : work->merge_buf_cap * 2;
+            if (new_cap < max_rows)
+                new_cap = max_rows;
+            int64_t *nb = (int64_t *)realloc(
+                work->merge_buf, (size_t)new_cap * nc * sizeof(int64_t));
+            if (!nb) {
+                if (work_owned && work != in) {
+                    col_rel_free_contents(work);
+                    free(work);
+                }
+                return ENOMEM;
+            }
+            work->merge_buf = nb;
+            work->merge_buf_cap = new_cap;
+            merged = nb;
+            used_merge_buf = true;
+        }
+
+        uint32_t oi = 0, di = 0, out = 0;
+        while (oi < sn && di < d_unique) {
+            const int64_t *orow = work->data + (size_t)oi * nc;
+            const int64_t *drow = delta_start + (size_t)di * nc;
+            int cmp = memcmp(orow, drow, row_bytes);
+            if (cmp < 0) {
+                memcpy(merged + (size_t)out * nc, orow, row_bytes);
+                oi++;
+            } else if (cmp == 0) {
+                memcpy(merged + (size_t)out * nc, orow, row_bytes);
+                oi++;
+                di++;
+            } else {
+                memcpy(merged + (size_t)out * nc, drow, row_bytes);
+                di++;
+            }
+            out++;
+        }
+        while (oi < sn) {
+            memcpy(merged + (size_t)out * nc, work->data + (size_t)oi * nc,
+                   row_bytes);
+            oi++;
+            out++;
+        }
+        while (di < d_unique) {
+            memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
+                   row_bytes);
+            di++;
+            out++;
+        }
+
+        /* Swap: merged data becomes work->data */
+        if (used_merge_buf) {
+            /* merge_buf holds the result; allocate new data, copy back */
+            if (work->capacity < out) {
+                int64_t *nd = (int64_t *)realloc(
+                    work->data, (size_t)out * nc * sizeof(int64_t));
+                if (!nd) {
+                    if (work_owned && work != in) {
+                        col_rel_free_contents(work);
+                        free(work);
+                    }
+                    return ENOMEM;
+                }
+                work->data = nd;
+                work->capacity = out;
+            }
+            memcpy(work->data, merged, (size_t)out * nc * sizeof(int64_t));
+        }
+        work->nrows = out;
+        work->sorted_nrows = out;
+        return eval_stack_push(stack, work, work_owned);
+    }
+
+    /* Fallback: standard qsort + dedup (sorted_nrows == 0 or full re-sort) */
+    QSORT_R_CALL(work->data, nr, row_bytes, &nc, row_cmp_fn);
 
     /* Compact: keep only unique rows */
     uint32_t out_r = 1; /* first row always kept */
     for (uint32_t r = 1; r < nr; r++) {
         const int64_t *prev = work->data + (size_t)(r - 1) * nc;
         const int64_t *cur = work->data + (size_t)r * nc;
-        if (memcmp(prev, cur, sizeof(int64_t) * nc) != 0) {
+        if (memcmp(prev, cur, row_bytes) != 0) {
             if (out_r != r)
-                memcpy(work->data + (size_t)out_r * nc, cur,
-                       sizeof(int64_t) * nc);
+                memcpy(work->data + (size_t)out_r * nc, cur, row_bytes);
             out_r++;
         }
     }
     work->nrows = out_r;
+    work->sorted_nrows = out_r;
 
     return eval_stack_push(stack, work, work_owned);
 }
@@ -2473,11 +2598,26 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     }
 
     /* Phase 2: merge sorted old [0..old_nrows) with sorted+unique delta.
-     * Rows present in delta but not in old are emitted into delta_out. */
-    size_t max_rows = (size_t)old_nrows + d_unique;
-    int64_t *merged = (int64_t *)malloc(max_rows * nc * sizeof(int64_t));
-    if (!merged)
-        return ENOMEM;
+     * Rows present in delta but not in old are emitted into delta_out.
+     *
+     * Issue #94: Reuse persistent merge buffer to avoid per-call malloc/free.
+     * The merge buffer lives in rel->merge_buf and grows via realloc. */
+    uint32_t max_rows = old_nrows + d_unique;
+
+    if (rel->merge_buf_cap < max_rows) {
+        uint32_t new_cap = max_rows > rel->merge_buf_cap * 2
+                               ? max_rows
+                               : rel->merge_buf_cap * 2;
+        if (new_cap < max_rows)
+            new_cap = max_rows;
+        int64_t *nb = (int64_t *)realloc(rel->merge_buf, (size_t)new_cap * nc
+                                                             * sizeof(int64_t));
+        if (!nb)
+            return ENOMEM;
+        rel->merge_buf = nb;
+        rel->merge_buf_cap = new_cap;
+    }
+    int64_t *merged = rel->merge_buf;
 
     uint32_t oi = 0, di = 0, out = 0;
     const int64_t *o_ptr = rel->data;
@@ -2525,11 +2665,19 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         out += remaining;
     }
 
-    /* Swap buffer */
-    free(rel->data);
-    rel->data = merged;
+    /* Copy merged result back into rel->data (merge_buf is persistent,
+     * cannot be swapped into data without losing merge_buf for next call). */
+    if (rel->capacity < out) {
+        int64_t *nd
+            = (int64_t *)realloc(rel->data, (size_t)out * nc * sizeof(int64_t));
+        if (!nd)
+            return ENOMEM;
+        rel->data = nd;
+        rel->capacity = out;
+    }
+    memcpy(rel->data, merged, (size_t)out * nc * sizeof(int64_t));
     rel->nrows = out;
-    rel->capacity = (uint32_t)max_rows;
+    rel->sorted_nrows = out;
 
     /* Phase 4: Update timestamp array to match consolidated data.
      * After merge, timestamps for old rows are still valid, but new rows

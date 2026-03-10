@@ -837,6 +837,26 @@ test_phase3d_frontier_skip_integration_exe = executable(
 test('phase3d_frontier_skip_integration', test_phase3d_frontier_skip_integration_exe)
 
 # ============================================================================
+# Consolidation CoW Tests (Issue #94)
+# ============================================================================
+
+test_consolidation_cow_exe = executable(
+  'test_consolidation_cow',
+  files('test_consolidation_cow.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('consolidation_cow', test_consolidation_cow_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
