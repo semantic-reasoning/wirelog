@@ -1,0 +1,161 @@
+name: Lint PR
+
+# PR-specific lint workflow with hard-gate semantics.
+# Runs 3 sequential checks: editorconfig -> clang-format -> clang-tidy
+# Each check must pass before the next runs (fail-fast).
+# This workflow is imported by ci-pr.yml as Phase 1.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # Phase 1a: EditorConfig check (fast, ~seconds)
+  # Hard gate: enforces whitespace, encoding, and line-ending consistency.
+  # ==========================================================================
+  editorconfig-check:
+    name: EditorConfig check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install editorconfig-checker
+        env:
+          EC_VERSION: "3.0.3"
+        run: |
+          wget -q "https://github.com/editorconfig-checker/editorconfig-checker/releases/download/v${EC_VERSION}/ec-linux-amd64.tar.gz" -O ec.tar.gz
+          tar xzf ec.tar.gz
+          sudo mv bin/ec-linux-amd64 /usr/local/bin/ec
+          ec --version
+
+      - name: Run editorconfig-checker
+        run: |
+          set -o pipefail
+          ec --disable-indent-size \
+            --exclude '(subprojects/.*|build.*)' \
+            wirelog/ tests/ *.md meson.build meson_options.txt 2>&1 | tee ec-results.txt
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## EditorConfig Results' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s ec-results.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat ec-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ==========================================================================
+  # Phase 1b: clang-format 18 check (fast-medium, ~1-2 min)
+  # Hard gate: formatting violations fail the PR.
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  clang-format-check:
+    name: clang-format 18 check
+    needs: [editorconfig-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+
+      - name: Verify tool version
+        run: clang-format-18 --version
+
+      - name: Run clang-format (hard gate)
+        run: |
+          set -o pipefail
+          find wirelog/ tests/ \
+            -name '*.c' -o -name '*.h' \
+            | xargs clang-format-18 --dry-run --Werror 2>&1 | tee format-results.txt
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## clang-format Results' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s format-results.txt ]; then
+            count=$(wc -l < format-results.txt | tr -d ' ')
+            echo "**${count} finding(s) — PR blocked**" >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -100 format-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No formatting issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ==========================================================================
+  # Phase 1c: clang-tidy 18 check (slow, up to 30 min, Linux only)
+  # Hard gate: tidy violations fail the PR.
+  # Excludes: subprojects/**, build/**
+  # Runs only after clang-format passes.
+  # ==========================================================================
+  clang-tidy-check:
+    name: clang-tidy 18 check
+    needs: [clang-format-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-18 clang-tools-18
+
+      - name: Verify tool version
+        run: clang-tidy-18 --version
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get install -y meson ninja-build
+
+      - name: Configure build (for compile_commands.json)
+        run: meson setup builddir-tidy -Dtests=true
+
+      - name: Run clang-tidy (hard gate)
+        run: |
+          set -o pipefail
+          run-clang-tidy-18 -p builddir-tidy \
+            "^\\.\\./wirelog/.*\\.(c|h)$" \
+            2>&1 | tee tidy-results.txt
+          if grep -qE '^.*\.(c|h):[0-9]+:[0-9]+: (warning|error):' tidy-results.txt; then
+            echo "clang-tidy found issues. PR blocked."
+            exit 1
+          fi
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## clang-tidy Results' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s tidy-results.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -50 tidy-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload tidy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidy-results-pr
+          path: tidy-results.txt

@@ -1,0 +1,132 @@
+name: CI PR
+
+# PR-specific CI workflow with 3-phase validation.
+#
+# Phase 1 (Lint):    lint-pr.yml — editorconfig -> clang-format -> clang-tidy
+# Phase 2 (Build):   Linux (GCC + Clang) + macOS (Clang), fail-fast
+# Phase 3 (Sanitizers): Linux ASan/UBSan (GCC + Clang), depends on build
+#
+# Execution order: lint -> build -> sanitizers
+# Any phase failure stops subsequent phases.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # Phase 1: Lint (import lint-pr.yml as prerequisite)
+  # editorconfig -> clang-format 18 -> clang-tidy 18 (sequential, hard gates)
+  # ==========================================================================
+  lint:
+    uses: ./.github/workflows/lint-pr.yml
+
+  # ==========================================================================
+  # Phase 2: Build & Test matrix
+  # Depends on all lint jobs passing.
+  # Linux: GCC + Clang; macOS: Clang
+  # fail-fast: true — first failure cancels remaining matrix jobs
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  build:
+    name: Build / ${{ matrix.os }} / ${{ matrix.compiler }}
+    needs: [lint]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux - GCC
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+
+          # Linux - Clang
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+
+          # macOS - Clang
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install meson ninja
+
+      - name: Configure
+        run: meson setup builddir -Dtests=true
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+
+  # ==========================================================================
+  # Phase 3: Sanitizers (ASan + UBSan)
+  # Depends on build matrix passing.
+  # Linux only: GCC + Clang
+  # fail-fast: true — first failure cancels remaining matrix jobs
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  sanitizers:
+    name: Sanitizers / ${{ matrix.compiler }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+          - compiler: clang
+            cc: clang
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Configure with sanitizers
+        run: >
+          meson setup builddir
+          -Db_sanitize=address,undefined
+          -Db_lundef=false
+          -Dtests=true
+          --buildtype=debug
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+        env:
+          ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
+          UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
