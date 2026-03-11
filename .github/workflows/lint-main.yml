@@ -1,0 +1,167 @@
+name: Lint Main
+
+# Non-blocking lint monitoring for main branch pushes.
+#
+# Strategy: all three checks run in parallel and report findings to the step
+# summary. No check blocks another; failures are informational only.
+#
+# Jobs:
+#   - editorconfig-check  : whitespace/encoding/line-ending consistency
+#   - clang-format-check  : formatting against LLVM 18 style
+#   - clang-tidy-check    : static analysis via LLVM 18 (Linux only, slow)
+#
+# All jobs have continue-on-error: true — issues are surfaced as annotations
+# and step summaries without failing the workflow run.
+# Excludes: subprojects/**, build/**
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # Check 1: EditorConfig (fast, ~seconds)
+  # Non-blocking: reports whitespace/encoding/line-ending issues.
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  editorconfig-check:
+    name: EditorConfig check (monitor)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install editorconfig-checker
+        env:
+          EC_VERSION: "3.0.3"
+        run: |
+          wget -q "https://github.com/editorconfig-checker/editorconfig-checker/releases/download/v${EC_VERSION}/ec-linux-amd64.tar.gz" -O ec.tar.gz
+          tar xzf ec.tar.gz
+          sudo mv bin/ec-linux-amd64 /usr/local/bin/ec
+          ec --version
+
+      - name: Run editorconfig-checker
+        run: |
+          set -o pipefail
+          ec --disable-indent-size \
+            --exclude '(subprojects/.*|build.*)' \
+            wirelog/ tests/ *.md meson.build meson_options.txt 2>&1 | tee ec-results.txt || true
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## EditorConfig Results (main monitor)' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s ec-results.txt ]; then
+            count=$(wc -l < ec-results.txt | tr -d ' ')
+            echo "**${count} finding(s) — non-blocking**" >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat ec-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ==========================================================================
+  # Check 2: clang-format 18 (fast-medium, ~1-2 min)
+  # Non-blocking: reports formatting violations against project .clang-format.
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  clang-format-check:
+    name: clang-format 18 check (monitor)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+
+      - name: Verify tool version
+        run: clang-format-18 --version
+
+      - name: Run clang-format
+        run: |
+          find wirelog/ tests/ \
+            -name '*.c' -o -name '*.h' \
+            | xargs clang-format-18 --dry-run --Werror 2>&1 | tee format-results.txt || true
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## clang-format Results (main monitor)' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s format-results.txt ]; then
+            count=$(wc -l < format-results.txt | tr -d ' ')
+            echo "**${count} finding(s) — non-blocking**" >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -100 format-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No formatting issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ==========================================================================
+  # Check 3: clang-tidy 18 (slow, up to 30 min, Linux only)
+  # Non-blocking: reports static analysis findings.
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  clang-tidy-check:
+    name: clang-tidy 18 check (monitor)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-18 clang-tools-18
+
+      - name: Verify tool version
+        run: clang-tidy-18 --version
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get install -y meson ninja-build
+
+      - name: Configure build (for compile_commands.json)
+        run: meson setup builddir-tidy -Dtests=true
+
+      - name: Run clang-tidy
+        run: |
+          run-clang-tidy-18 -p builddir-tidy \
+            "^\\.\\./wirelog/.*\\.(c|h)$" \
+            2>&1 | tee tidy-results.txt || true
+
+      - name: Publish results
+        if: always()
+        run: |
+          echo '## clang-tidy Results (main monitor)' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -s tidy-results.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -50 tidy-results.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload tidy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidy-results-main
+          path: tidy-results.txt
