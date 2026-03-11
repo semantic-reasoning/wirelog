@@ -6,7 +6,7 @@
  * deltas have their frontiers reset. Transitively-affected strata (IDB-only)
  * preserve their frontier for skip optimization.
  *
- * Issue #102: EDB/IDB-aware frontier reset with pre-seeded delta check.
+ * Issue #107: Selective rule frontier reset with pre-seeded delta optimization.
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
