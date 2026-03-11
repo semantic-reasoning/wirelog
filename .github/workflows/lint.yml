@@ -3,8 +3,7 @@ name: Lint
 on:
   push:
     branches: [main, next/pure-c11]
-  pull_request:
-    branches: [main, next/pure-c11]
+  # PR workflows delegated to lint-pr.yml (Issue #117)
   workflow_call:
 
 permissions:
