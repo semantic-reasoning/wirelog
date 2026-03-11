@@ -1,0 +1,184 @@
+name: CI Main
+
+# Non-blocking comprehensive monitoring for main branch pushes (Issue #116).
+#
+# Strategy: all jobs run to completion regardless of individual failures.
+# Results are collected in step summaries for visibility without blocking merges.
+# This workflow monitors health; ci-pr.yml enforces quality gates on PRs.
+#
+# Phases (all parallel, non-blocking):
+#   Phase 1 (Lint):       lint-main.yml — editorconfig, clang-format 18, clang-tidy 18
+#   Phase 2 (Build):      Linux GCC + Clang, macOS Clang, Windows MSVC
+#   Phase 3 (Sanitizers): Linux GCC + Clang ASan/UBSan, macOS Apple Clang ASan/UBSan
+#
+# All jobs have continue-on-error: true and fail-fast: false.
+# Excludes: subprojects/**, build/**
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # Phase 1: Lint monitoring (import lint-main.yml)
+  # editorconfig, clang-format 18, clang-tidy 18 — all parallel, non-blocking
+  # ==========================================================================
+  lint:
+    uses: ./.github/workflows/lint-main.yml
+
+  # ==========================================================================
+  # Phase 2: Build & Test matrix (parallel, non-blocking)
+  # Linux: GCC + Clang; macOS: Clang; Windows: MSVC
+  # fail-fast: false — all configurations run to completion
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  build:
+    name: Build / ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux - GCC
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+
+          # Linux - Clang
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+
+          # macOS - Clang
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+
+          # Windows - MSVC
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install meson ninja
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: pip install meson ninja
+
+      - name: Configure (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: meson setup builddir -Dtests=true
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Configure (Windows / MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson setup builddir -Dtests=true
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+
+      - name: Publish results
+        if: always()
+        shell: bash
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## Build Results: ${{ matrix.os }} / ${{ matrix.compiler }} (main monitor)" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}** (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # Phase 3: Sanitizers — ASan + UBSan (parallel, non-blocking)
+  # Linux: GCC + Clang; macOS: Apple Clang
+  # fail-fast: false — all configurations run to completion
+  # Excludes: subprojects/**, build/**
+  # ==========================================================================
+  sanitizers:
+    name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux - GCC with ASan/UBSan
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+
+          # Linux - Clang with ASan/UBSan
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+
+          # macOS - Apple Clang with ASan/UBSan
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install meson ninja
+
+      - name: Configure with sanitizers
+        run: >
+          meson setup builddir
+          -Db_sanitize=address,undefined
+          -Db_lundef=false
+          -Dtests=true
+          --buildtype=debug
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+        env:
+          ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
+          UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
+
+      - name: Publish results
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## Sanitizer Results: ${{ matrix.os }} / ${{ matrix.compiler }} (main monitor)" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}** (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
