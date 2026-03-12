@@ -64,7 +64,7 @@ jobs:
             cc: cl
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -157,7 +157,7 @@ jobs:
             cc: clang
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
