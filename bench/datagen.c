@@ -18,6 +18,16 @@
 extern int getopt(int argc, char *const argv[], const char *optstring);
 extern int optind;
 extern char *optarg;
+
+/* Stub struct option for MSVC compatibility (getopt_long not used) */
+struct option {
+    const char *name;
+    int has_arg;
+    int *flag;
+    int val;
+};
+#define no_argument 0
+#define required_argument 1
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -140,8 +150,14 @@ main(int argc, char **argv)
     };
 
     int opt;
+#ifndef _MSC_VER
     while ((opt = getopt_long(argc, argv, "n:e:t:s:wo:h", long_opts, NULL))
            != -1) {
+#else
+    /* MSVC: getopt_long not available; use simple getopt fallback */
+    while ((opt = getopt(argc, argv, "n:e:t:s:wo:h"))
+           != -1) {
+#endif
         switch (opt) {
         case 'n':
             nodes = (int32_t)strtol(optarg, NULL, 10);
