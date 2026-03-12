@@ -16,6 +16,8 @@ wirelog is a pure C11 Datalog engine with incremental evaluation. It compiles Da
 | Language | C11 (strict compliance) |
 | Build | Meson + Ninja |
 | Backend | Pure columnar (nanoarrow) |
+| Threading | Cross-platform abstraction (POSIX pthreads / MSVC) |
+| Platforms | Unix/Linux/macOS (primary), Windows (MSVC) |
 | Phase | 4 — Incremental evaluation with delta-seeded propagation |
 | Tests | 56+ passing |
 | CSPA benchmark | 2.82x speedup over baseline |

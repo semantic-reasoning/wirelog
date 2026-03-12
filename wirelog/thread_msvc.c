@@ -80,14 +80,14 @@ thread_create(thread_t *tid, void *(*fn)(void *arg), void *arg)
     args->ctx = arg;
 
     /* Create thread */
-    tid->handle = CreateThread(
-        NULL,                   /* lpThreadAttributes: use defaults */
-        0,                      /* dwStackSize: use default */
-        thread_wrapper,         /* lpStartAddress: thread function */
-        (LPVOID)args,           /* lpParameter: wrapper args */
-        0,                      /* dwCreationFlags: start immediately */
-        NULL                    /* lpThreadId: don't need the ID */
-    );
+    tid->handle
+        = CreateThread(NULL,           /* lpThreadAttributes: use defaults */
+                       0,              /* dwStackSize: use default */
+                       thread_wrapper, /* lpStartAddress: thread function */
+                       (LPVOID)args,   /* lpParameter: wrapper args */
+                       0,              /* dwCreationFlags: start immediately */
+                       NULL            /* lpThreadId: don't need the ID */
+        );
 
     if (!tid->handle) {
         free(args);
