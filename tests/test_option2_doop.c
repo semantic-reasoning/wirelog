@@ -56,6 +56,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+/* MSVC: S_ISDIR not available in sys/stat.h */
+#ifdef _MSC_VER
+#include <io.h>
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+
 /* ========================================================================
  * Test Framework
  * ======================================================================== */
