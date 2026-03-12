@@ -43,10 +43,10 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
 /**
  * wl_run_pipeline:
  * @source:      Datalog source text.
- * @num_workers: Number of DD worker threads.
+ * @num_workers: Number of worker threads.
  * @out:         Output stream for result tuples.
  *
- * Run the full Datalog pipeline: parse -> DD plan -> marshal ->
+ * Run the full Datalog pipeline: parse -> optimize -> plan ->
  * load inline facts -> execute -> print results.
  *
  * Returns: 0 on success, non-zero on error.
