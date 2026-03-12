@@ -45,6 +45,30 @@ static int tests_failed = 0;
         printf(" ... FAIL: %s\n", (msg)); \
     } while (0)
 
+/* Normalize line endings: convert CRLF to LF for cross-platform testing */
+static char *
+normalize_line_endings(const char *str)
+{
+    if (!str)
+        return NULL;
+    size_t len = strlen(str);
+    char *result = (char *)malloc(len + 1);
+    if (!result)
+        return NULL;
+    size_t out_idx = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] == '\r' && i + 1 < len && str[i + 1] == '\n') {
+            /* Skip \r, keep \n */
+            i++;
+            result[out_idx++] = '\n';
+        } else {
+            result[out_idx++] = str[i];
+        }
+    }
+    result[out_idx] = '\0';
+    return result;
+}
+
 /* ======================================================================== */
 /* CLI internals under test                                                 */
 /* ======================================================================== */
@@ -153,16 +177,26 @@ test_print_tuple_basic(void)
         return;
     }
 
-    if (strcmp(contents, "edge(1, 2)\n") != 0) {
+    char *normalized = normalize_line_endings(contents);
+    if (!normalized) {
+        free(contents);
+        remove(path);
+        FAIL("memory allocation failed");
+        return;
+    }
+
+    if (strcmp(normalized, "edge(1, 2)\n") != 0) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected 'edge(1, 2)\\n', got '%s'",
-                 contents);
+                 normalized);
+        free(normalized);
         free(contents);
         remove(path);
         FAIL(msg);
         return;
     }
 
+    free(normalized);
     free(contents);
     remove(path);
     PASS();
@@ -191,16 +225,26 @@ test_print_tuple_single_col(void)
         return;
     }
 
-    if (strcmp(contents, "node(42)\n") != 0) {
+    char *normalized = normalize_line_endings(contents);
+    if (!normalized) {
+        free(contents);
+        remove(path);
+        FAIL("memory allocation failed");
+        return;
+    }
+
+    if (strcmp(normalized, "node(42)\n") != 0) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected 'node(42)\\n', got '%s'",
-                 contents);
+                 normalized);
+        free(normalized);
         free(contents);
         remove(path);
         FAIL(msg);
         return;
     }
 
+    free(normalized);
     free(contents);
     remove(path);
     PASS();
