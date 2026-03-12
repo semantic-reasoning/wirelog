@@ -32,6 +32,10 @@ intern_src = files(
   '../wirelog/intern.c',
 )
 
+csv_src = files(
+  '../wirelog/io/csv_reader.c',
+)
+
 # ============================================================================
 # Test Executables
 # ============================================================================
@@ -55,6 +59,7 @@ test_ir_exe = executable(
   files('test_ir.c'),
   parser_src,
   ir_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
@@ -63,6 +68,7 @@ test_program_exe = executable(
   files('test_program.c'),
   parser_src,
   ir_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
@@ -71,6 +77,7 @@ test_stratify_exe = executable(
   files('test_stratify.c'),
   parser_src,
   ir_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
@@ -90,6 +97,7 @@ test_fusion_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
@@ -101,6 +109,7 @@ test_jpp_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
@@ -112,6 +121,7 @@ test_sip_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
 )
 
@@ -140,10 +150,6 @@ test('sip', test_sip_exe)
 # Columnar backend tests disabled in Phase 2C
 # test_session_columnar and test_delta_callback depend on deleted DD backend
 # These will be re-enabled when columnar backend provides equivalent functionality
-
-csv_src = files(
-  '../wirelog/io/csv_reader.c',
-)
 
 test_csv_exe = executable(
   'test_csv',

@@ -75,7 +75,8 @@ output_json_row(const char *wl_name, int32_t edges, uint32_t workers,
 #include <getopt.h>
 #else
 /* Windows MSVC: getopt/getopt_long not available */
-extern int getopt(int argc, char *const argv[], const char *optstring);
+extern int
+getopt(int argc, char *const argv[], const char *optstring);
 extern int optind;
 extern char *optarg;
 
@@ -88,6 +89,9 @@ struct option {
 };
 #define no_argument 0
 #define required_argument 1
+
+/* MSVC: strtok_r not available, use thread-local strtok fallback */
+#define strtok_r(str, delim, saveptr) strtok((str), (delim))
 #endif
 
 #include <inttypes.h>
@@ -907,25 +911,25 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
      * Kept for reference: Phase 4+ delta-only evaluation. */
     static const char *cspa_incr_source
 #ifndef _MSC_VER
-    __attribute__((unused))
+        __attribute__((unused))
 #endif
-    = ".decl assign(x: int32, y: int32)\n"
-      ".decl dereference(x: int32, y: int32)\n"
-      ".decl valueFlow(x: int32, y: int32)\n"
-      ".decl memoryAlias(x: int32, y: int32)\n"
-      ".decl valueAlias(x: int32, y: int32)\n"
-      "valueFlow(y, x) :- assign(y, x).\n"
-      "valueFlow(x, x) :- assign(x, _).\n"
-      "valueFlow(x, x) :- assign(_, x).\n"
-      "memoryAlias(x, x) :- assign(_, x).\n"
-      "memoryAlias(x, x) :- assign(x, _).\n"
-      "valueFlow(x, y) :- valueFlow(x, z), valueFlow(z, y).\n"
-      "valueFlow(x, y) :- assign(x, z), memoryAlias(z, y).\n"
-      "memoryAlias(x, w) :- dereference(y, x), valueAlias(y, z), "
-      "dereference(z, w).\n"
-      "valueAlias(x, y) :- valueFlow(z, x), valueFlow(z, y).\n"
-      "valueAlias(x, y) :- valueFlow(z, x), memoryAlias(z, w), "
-      "valueFlow(w, y).\n";
+        = ".decl assign(x: int32, y: int32)\n"
+          ".decl dereference(x: int32, y: int32)\n"
+          ".decl valueFlow(x: int32, y: int32)\n"
+          ".decl memoryAlias(x: int32, y: int32)\n"
+          ".decl valueAlias(x: int32, y: int32)\n"
+          "valueFlow(y, x) :- assign(y, x).\n"
+          "valueFlow(x, x) :- assign(x, _).\n"
+          "valueFlow(x, x) :- assign(_, x).\n"
+          "memoryAlias(x, x) :- assign(_, x).\n"
+          "memoryAlias(x, x) :- assign(x, _).\n"
+          "valueFlow(x, y) :- valueFlow(x, z), valueFlow(z, y).\n"
+          "valueFlow(x, y) :- assign(x, z), memoryAlias(z, y).\n"
+          "memoryAlias(x, w) :- dereference(y, x), valueAlias(y, z), "
+          "dereference(z, w).\n"
+          "valueAlias(x, y) :- valueFlow(z, x), valueFlow(z, y).\n"
+          "valueAlias(x, y) :- valueFlow(z, x), memoryAlias(z, w), "
+          "valueFlow(w, y).\n";
 
     /* Load assign.csv and dereference.csv */
     char assign_path[1024], deref_path[1024];
