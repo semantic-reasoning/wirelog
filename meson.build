@@ -36,8 +36,8 @@ else
   simd_flags = []
   if host_machine.cpu_family() == 'aarch64'
     simd_flags = ['-march=armv8-a+simd']  # ARM64: enable NEON
-  else
-    simd_flags = ['-march=native']  # x86/x64: enable AVX2/SSE via native
+  elif host_machine.cpu_family() == 'x86_64'
+    simd_flags = ['-mavx2']  # x86-64: enable AVX2 (portable base)
   endif
 
   add_project_arguments(
