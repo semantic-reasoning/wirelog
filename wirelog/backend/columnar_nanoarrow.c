@@ -2557,20 +2557,26 @@ row_cmp_simd_neon(const int64_t *a, const int64_t *b, uint32_t ncols)
         /* eq_mask: all-ones (0xFFFFFFFFFFFFFFFF) for equal lanes, 0 otherwise. */
         uint64x2_t eq_mask = vceqq_s64(va, vb);
 
+        /* Optimized lane extraction: check lane 0 first, avoid ternary operator.
+         * This improves instruction scheduling and reduces branch prediction stalls. */
         uint64_t eq0 = vgetq_lane_u64(eq_mask, 0);
-        uint64_t eq1 = vgetq_lane_u64(eq_mask, 1);
+        if (!eq0) {
+            /* Lane 0 differs; extract and compare. */
+            int64_t av = vgetq_lane_s64(va, 0);
+            int64_t bv = vgetq_lane_s64(vb, 0);
+            return (av < bv) ? -1 : 1;
+        }
 
-        if (eq0 && eq1) {
+        /* Lane 0 is equal; check lane 1. */
+        uint64_t eq1 = vgetq_lane_u64(eq_mask, 1);
+        if (eq1) {
             /* Both lanes equal; continue to next pair. */
             continue;
         }
 
-        /* First differing lane is 0 if lane 0 differs, else 1. */
-        int lane = eq0 ? 1 : 0;
-        int64_t av
-            = (lane == 0) ? vgetq_lane_s64(va, 0) : vgetq_lane_s64(va, 1);
-        int64_t bv
-            = (lane == 0) ? vgetq_lane_s64(vb, 0) : vgetq_lane_s64(vb, 1);
+        /* Lane 1 differs; extract and compare. */
+        int64_t av = vgetq_lane_s64(va, 1);
+        int64_t bv = vgetq_lane_s64(vb, 1);
         return (av < bv) ? -1 : 1;
     }
 
