@@ -12,7 +12,13 @@
  *           [--edges M] [--seed S] [--weighted] [--output path.csv]
  */
 
+#ifndef _MSC_VER
 #include <getopt.h>
+#else
+extern int getopt(int argc, char *const argv[], const char *optstring);
+extern int optind;
+extern char *optarg;
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
