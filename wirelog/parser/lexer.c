@@ -218,6 +218,8 @@ identifier_type(const char *start, uint32_t length)
         return WL_PARSER_LEXER_TOK_INT64;
     if (IS_KW("string"))
         return WL_PARSER_LEXER_TOK_STRING_TYPE;
+    if (IS_KW("symbol"))
+        return WL_PARSER_LEXER_TOK_SYMBOL_TYPE;
 
     return WL_PARSER_LEXER_TOK_IDENT;
 }
@@ -449,6 +451,8 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "INT64";
     case WL_PARSER_LEXER_TOK_STRING_TYPE:
         return "STRING_TYPE";
+    case WL_PARSER_LEXER_TOK_SYMBOL_TYPE:
+        return "SYMBOL_TYPE";
     case WL_PARSER_LEXER_TOK_LPAREN:
         return "LPAREN";
     case WL_PARSER_LEXER_TOK_RPAREN:
