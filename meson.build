@@ -203,7 +203,16 @@ pkg.generate(
 #CLI Driver
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-#Note : CLI driver is deferred to Phase 2A(columnar backend implementation)
+#Build wirelog-cli executable (wirelog_cli_src defined in wirelog/meson.build)
+wirelog_cli = executable(
+  'wirelog_cli',
+  wirelog_cli_src,
+  config_h_file,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  link_with: wirelog_static_lib,
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep],
+  install: true,
+)
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Benchmarks

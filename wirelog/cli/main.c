@@ -76,8 +76,14 @@ main(int argc, char *argv[])
         return 1;
     }
 
+    fprintf(stderr, "DEBUG: File read, source length=%zu\n", strlen(source));
+    fflush(stderr);
+
     int rc = wl_run_pipeline(source, num_workers, stdout);
     free(source);
+
+    fprintf(stderr, "DEBUG: wl_run_pipeline returned rc=%d\n", rc);
+    fflush(stderr);
 
     if (rc != 0) {
         fprintf(stderr, "error: execution failed\n");

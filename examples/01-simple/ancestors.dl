@@ -1,0 +1,11 @@
+// Load facts from CSV
+.input parent("ancestors_facts.csv")
+
+// Output results to CSV
+.output ancestor("ancestors_output.csv")
+
+// Base case: your parent is your ancestor
+ancestor(X, Y) :- parent(X, Y).
+
+// Recursive case: ancestor of your ancestor is your ancestor
+ancestor(X, Z) :- parent(X, Y), ancestor(Y, Z).
