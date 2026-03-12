@@ -40,6 +40,7 @@
 /* GCC/Clang extension not supported on MSVC */
 #ifdef _MSC_VER
 #define UNUSED
+#include <windows.h> /* For GetTickCount64() in now_ns() */
 #else
 #define UNUSED __attribute__((unused))
 #endif
@@ -2598,16 +2599,25 @@ row_cmp_simd_neon(const int64_t *a, const int64_t *b, uint32_t ncols)
 /* ---- profiling helper --------------------------------------------------- */
 
 /*
- * now_ns: return CLOCK_MONOTONIC time in nanoseconds.
- * Returns 0 on platforms where clock_gettime is unavailable (non-fatal).
+ * now_ns: return monotonic time in nanoseconds.
+ * Uses clock_gettime(CLOCK_MONOTONIC) on POSIX systems,
+ * GetTickCount64() on Windows MSVC.
+ * Returns 0 on platforms where time function is unavailable (non-fatal).
  */
 static uint64_t
 now_ns(void)
 {
+#ifdef _MSC_VER
+    /* Windows MSVC: use GetTickCount64() in milliseconds, convert to nanoseconds.
+     * Returns milliseconds since system startup (monotonic). */
+    return GetTickCount64() * 1000000ULL;
+#else
+    /* POSIX: use clock_gettime with CLOCK_MONOTONIC. */
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
         return 0;
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 /*
