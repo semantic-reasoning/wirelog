@@ -5,7 +5,6 @@ project(
   license: 'LGPL-3.0',
   meson_version: '>=0.62.0',
   default_options: [
-    'c_std=c99',
     'buildtype=release',
     'optimization=s',
     'b_lto=true',
@@ -27,11 +26,17 @@ wirelog_datadir = get_option('datadir') / project_name
 #Compiler settings
 cc = meson.get_compiler('c')
 if cc.get_id() == 'msvc'
+  # MSVC C11 atomics are incomplete; use default mode without forced C standard
   add_project_arguments(
     ['/W3'],
     language: 'c'
   )
 else
+  # GCC/Clang: enforce C11 standard
+  add_project_arguments(
+    ['-std=c11'],
+    language: 'c'
+  )
   # GCC/Clang: add SIMD support flags for AVX2 and NEON optimization
   simd_flags = []
   if host_machine.cpu_family() == 'aarch64'
