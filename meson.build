@@ -204,12 +204,13 @@ pkg.generate(
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 #Build wirelog-cli executable (wirelog_cli_src defined in wirelog/meson.build)
+#Include all wirelog sources to ensure proper linking with LTO
 wirelog_cli = executable(
   'wirelog_cli',
   wirelog_cli_src,
+  wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  link_with: wirelog_static_lib,
   dependencies: [threads_dep, zlib_dep, nanoarrow_dep],
   install: true,
 )
