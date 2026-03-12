@@ -27,7 +27,7 @@ jobs:
   # ==========================================================================
   # Phase 2: Build & Test matrix
   # Depends on all lint jobs passing.
-  # Linux: GCC + Clang; macOS: Clang
+  # Linux: GCC + Clang; macOS: Clang; Windows: MSVC
   # fail-fast: true — first failure cancels remaining matrix jobs
   # Excludes: subprojects/**, build/**
   # ==========================================================================
@@ -54,6 +54,11 @@ jobs:
             compiler: clang
             cc: clang
 
+          # Windows - MSVC
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+
     steps:
       - uses: actions/checkout@v5
 
@@ -70,16 +75,44 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install meson ninja
 
-      - name: Configure
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: pip install meson ninja
+
+      - name: Configure (Linux / macOS)
+        if: runner.os != 'Windows'
         run: meson setup builddir -Dtests=true
         env:
           CC: ${{ matrix.cc }}
 
-      - name: Build
+      - name: Configure (Windows / MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson setup builddir -Dtests=true
+
+      - name: Build (Linux / macOS)
+        if: runner.os != 'Windows'
         run: meson compile -C builddir
 
-      - name: Test
+      - name: Build (Windows / MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson compile -C builddir
+
+      - name: Test (Linux / macOS)
+        if: runner.os != 'Windows'
         run: meson test -C builddir --print-errorlogs
+
+      - name: Test (Windows / MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson test -C builddir --print-errorlogs
 
   # ==========================================================================
   # Phase 3: Sanitizers (ASan + UBSan)
