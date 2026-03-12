@@ -96,10 +96,26 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           meson setup builddir -Dtests=true
 
-      - name: Build
+      - name: Build (Windows / MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson compile -C builddir
+
+      - name: Build (Linux / macOS)
+        if: runner.os != 'Windows'
         run: meson compile -C builddir
 
-      - name: Test
+      - name: Test (Windows / MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson test -C builddir --print-errorlogs
+
+      - name: Test (Linux / macOS)
+        if: runner.os != 'Windows'
         run: meson test -C builddir --print-errorlogs
 
       - name: Publish results
