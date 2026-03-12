@@ -27,6 +27,7 @@ bench_optimizer_src = files(
 
 bench_backend_src = files(
   subdir_wirelog / 'backend/columnar_nanoarrow.c',
+  subdir_wirelog / 'backend/delta_pool.c',
 )
 
 bench_io_src = files(
