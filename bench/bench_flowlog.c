@@ -905,7 +905,10 @@ run_cspa_incremental_workload(const char *data_dir, uint32_t workers,
      * Facts are loaded via col_session_insert_incremental.
      * NOTE: Currently unused (incremental measurement disabled).
      * Kept for reference: Phase 4+ delta-only evaluation. */
-    static const char *cspa_incr_source __attribute__((unused))
+    static const char *cspa_incr_source
+#ifndef _MSC_VER
+    __attribute__((unused))
+#endif
     = ".decl assign(x: int32, y: int32)\n"
       ".decl dereference(x: int32, y: int32)\n"
       ".decl valueFlow(x: int32, y: int32)\n"
