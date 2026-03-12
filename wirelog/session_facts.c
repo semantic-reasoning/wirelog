@@ -111,8 +111,46 @@ wl_session_load_input_files(wl_session_t *sess,
         uint32_t nrows = 0;
         uint32_t ncols = 0;
 
-        int rc = wl_csv_read_file(resolved_path, delimiter, &data, &nrows,
+        /* Check if relation has any string/symbol columns */
+        bool has_string_cols = false;
+        for (uint32_t c = 0; c < rel->column_count; c++) {
+            if (rel->columns[c].type == WIRELOG_TYPE_STRING) {
+                has_string_cols = true;
+                break;
+            }
+        }
+
+        int rc;
+        if (has_string_cols) {
+            /* Use extended reader for mixed types */
+            if (!prog->intern) {
+                fprintf(stderr,
+                        "error: no intern table available for relation '%s'\n",
+                        rel->name);
+                return -1;
+            }
+
+            /* Extract column types from relation */
+            wirelog_column_type_t *col_types = (wirelog_column_type_t *)malloc(
+                rel->column_count * sizeof(wirelog_column_type_t));
+            if (!col_types) {
+                fprintf(stderr, "error: memory allocation failed\n");
+                return -1;
+            }
+            for (uint32_t c = 0; c < rel->column_count; c++) {
+                col_types[c] = rel->columns[c].type;
+            }
+
+            rc = wl_csv_read_file_ex(resolved_path, delimiter, col_types,
+                                     rel->column_count, &data, &nrows, &ncols,
+                                     prog->intern);
+            free(col_types);
+        } else {
+            /* Use basic reader for integer-only columns */
+            rc = wl_csv_read_file(resolved_path, delimiter, &data, &nrows,
                                   &ncols);
+        }
+
         if (rc != 0) {
             fprintf(stderr, "error: failed to read '%s' for relation '%s'\n",
                     filename, rel->name);

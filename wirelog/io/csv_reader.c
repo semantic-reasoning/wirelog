@@ -235,3 +235,79 @@ wl_csv_parse_line_ex(const char *line, char delimiter,
 
     return 0;
 }
+
+/* ======================================================================== */
+/* Extended File Reader (mixed int/string)                                  */
+/* ======================================================================== */
+
+int
+wl_csv_read_file_ex(const char *path, char delimiter,
+                    const wirelog_column_type_t *col_types, uint32_t num_cols,
+                    int64_t **data, uint32_t *nrows, uint32_t *ncols,
+                    wl_intern_t *intern)
+{
+    if (!path || !col_types || !data || !nrows || !ncols || num_cols == 0
+        || !intern)
+        return -1;
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    *data = NULL;
+    *nrows = 0;
+    *ncols = num_cols;
+
+    uint32_t capacity = CSV_INITIAL_CAPACITY;
+    int64_t *buf
+        = (int64_t *)malloc((size_t)capacity * num_cols * sizeof(int64_t));
+    if (!buf) {
+        fclose(f);
+        return -3;
+    }
+
+    char line[CSV_LINE_BUF];
+    while (fgets(line, sizeof(line), f)) {
+        /* Strip trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        /* Skip empty lines */
+        if (len == 0)
+            continue;
+
+        int64_t row_values[CSV_MAX_COLS];
+        uint32_t col_count = 0;
+        int rc = wl_csv_parse_line_ex(line, delimiter, col_types, num_cols,
+                                      row_values, &col_count, intern);
+        if (rc != 0 || col_count != num_cols) {
+            free(buf);
+            fclose(f);
+            return -2;
+        }
+
+        /* Grow buffer if needed */
+        if (*nrows >= capacity) {
+            capacity *= 2;
+            int64_t *tmp = (int64_t *)realloc(buf, (size_t)capacity * num_cols
+                                                       * sizeof(int64_t));
+            if (!tmp) {
+                free(buf);
+                fclose(f);
+                return -3;
+            }
+            buf = tmp;
+        }
+
+        /* Copy row into flat array */
+        memcpy(&buf[(size_t)*nrows * num_cols], row_values,
+               (size_t)num_cols * sizeof(int64_t));
+        (*nrows)++;
+    }
+
+    fclose(f);
+
+    *data = buf;
+    return 0;
+}

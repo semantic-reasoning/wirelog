@@ -1,16 +1,9 @@
 // Graph Reachability: Find all reachable cities from any starting city
-// Input: Direct flight routes (inline facts from flights.csv)
+// Input: Direct flight routes (loaded from flights.csv data)
 // Output: All pairs of cities connected (directly or via connections)
 
 .decl flight(from: symbol, to: symbol)
-
-// Direct flight routes
-flight("Seoul", "Busan").
-flight("Seoul", "Daejeon").
-flight("Busan", "Daegu").
-flight("Daejeon", "Gwangju").
-flight("Daegu", "Daejeon").
-flight("Gwangju", "Incheon").
+.input flight(filename="examples/02-graph-reachability/flights.csv", delimiter=",")
 
 .decl reachable(from: symbol, to: symbol)
 .output reachable(filename="examples/02-graph-reachability/reachable_routes.csv")
