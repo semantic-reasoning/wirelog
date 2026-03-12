@@ -61,3 +61,9 @@ wirelog_backend_src = files('backend/columnar_nanoarrow.c', 'backend/delta_pool.
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_io_src = files('io/csv_reader.c', )
+
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#CLI Driver Module
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+
+wirelog_cli_src = files('cli/driver.c', 'cli/main.c', )

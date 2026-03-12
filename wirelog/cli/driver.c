@@ -141,8 +141,10 @@ wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
     /* 1. Parse */
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(source, &err);
-    if (!prog)
+    if (!prog) {
+        fprintf(stderr, "Parse error\n");
         return -1;
+    }
 
     /* 2. Optimize */
     wl_fusion_apply(prog, NULL);
@@ -153,6 +155,7 @@ wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
     wl_plan_t *plan = NULL;
     int rc = wl_plan_from_program(prog, &plan);
     if (rc != 0) {
+        fprintf(stderr, "Plan generation failed: rc=%d\n", rc);
         wirelog_program_free(prog);
         return -1;
     }
