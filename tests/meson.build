@@ -170,6 +170,7 @@ test('intern', test_intern_exe)
 
 backend_src = files(
   '../wirelog/backend/columnar_nanoarrow.c',
+  '../wirelog/backend/delta_pool.c',
 )
 
 io_src = files(
