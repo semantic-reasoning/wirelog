@@ -32,13 +32,21 @@ if cc.get_id() == 'msvc'
     language: 'c'
   )
 else
+  # GCC/Clang: add SIMD support flags for AVX2 and NEON optimization
+  simd_flags = []
+  if host_machine.cpu_family() == 'aarch64'
+    simd_flags = ['-march=armv8-a+simd']  # ARM64: enable NEON
+  else
+    simd_flags = ['-march=native']  # x86/x64: enable AVX2/SSE via native
+  endif
+
   add_project_arguments(
     [
       '-Wall',
       '-Wextra',
       '-Wno-unused-parameter',
       '-Wno-missing-field-initializers',
-    ],
+    ] + simd_flags,
     language: 'c'
   )
 endif
