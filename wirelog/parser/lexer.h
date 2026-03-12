@@ -53,6 +53,7 @@ typedef enum {
     WL_PARSER_LEXER_TOK_INT32,       /* int32 */
     WL_PARSER_LEXER_TOK_INT64,       /* int64 */
     WL_PARSER_LEXER_TOK_STRING_TYPE, /* string (as type name, not literal) */
+    WL_PARSER_LEXER_TOK_SYMBOL_TYPE, /* symbol */
 
     /* Punctuation */
     WL_PARSER_LEXER_TOK_LPAREN, /* ( */

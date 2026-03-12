@@ -782,7 +782,7 @@ parse_declaration(wl_parser_t *parser)
                 return NULL;
             }
 
-            /* Type: int32, int64, or string */
+            /* Type: int32, int64, string, or symbol */
             const char *type_str = NULL;
             if (parser_match(parser, WL_PARSER_LEXER_TOK_INT32)) {
                 type_str = "int32";
@@ -790,8 +790,11 @@ parse_declaration(wl_parser_t *parser)
                 type_str = "int64";
             } else if (parser_match(parser, WL_PARSER_LEXER_TOK_STRING_TYPE)) {
                 type_str = "string";
+            } else if (parser_match(parser, WL_PARSER_LEXER_TOK_SYMBOL_TYPE)) {
+                type_str = "symbol";
             } else {
-                parser_error(parser, "expected type (int32, int64, or string)");
+                parser_error(parser,
+                             "expected type (int32, int64, string, or symbol)");
                 free(attr_name);
                 wl_parser_ast_node_free(decl);
                 return NULL;
@@ -901,6 +904,54 @@ parse_output_directive(wl_parser_t *parser)
     wl_parser_ast_node_t *output
         = wl_parser_ast_node_create(WL_PARSER_AST_NODE_OUTPUT, line, col);
     output->name = token_to_name(&parser->previous);
+
+    /* Optional: (.output relation(key="value", ...)) */
+    if (parser_match(parser, WL_PARSER_LEXER_TOK_LPAREN)) {
+        if (!parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
+            for (;;) {
+                uint32_t p_line = parser->current.line;
+                uint32_t p_col = parser->current.col;
+
+                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+                                    "expected parameter name")) {
+                    wl_parser_ast_node_free(output);
+                    return NULL;
+                }
+                char *param_name = token_to_name(&parser->previous);
+
+                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_EQ,
+                                    "expected '=' after parameter name")) {
+                    free(param_name);
+                    wl_parser_ast_node_free(output);
+                    return NULL;
+                }
+
+                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_STRING,
+                                    "expected string value")) {
+                    free(param_name);
+                    wl_parser_ast_node_free(output);
+                    return NULL;
+                }
+                char *param_value = token_to_str_value(&parser->previous);
+
+                wl_parser_ast_node_t *param = wl_parser_ast_node_create(
+                    WL_PARSER_AST_NODE_OUTPUT_PARAM, p_line, p_col);
+                param->name = param_name;
+                param->str_value = param_value;
+                wl_parser_ast_node_add_child(output, param);
+
+                if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
+                    break;
+            }
+        }
+
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                            "expected ')' after .output params")) {
+            wl_parser_ast_node_free(output);
+            return NULL;
+        }
+    }
+
     return output;
 }
 
