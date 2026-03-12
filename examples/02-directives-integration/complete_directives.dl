@@ -1,0 +1,10 @@
+.decl parent(x: symbol, y: symbol)
+.decl ancestor(x: symbol, y: symbol)
+.output ancestor(filename="ancestors.csv")
+
+parent("alice", "bob").
+parent("bob", "charlie").
+parent("charlie", "diana").
+
+ancestor(X, Y) :- parent(X, Y).
+ancestor(X, Z) :- parent(X, Y), ancestor(Y, Z).
