@@ -8,7 +8,7 @@ name: CI Main
 #
 # Phases (all parallel, non-blocking):
 #   Phase 1 (Lint):       lint-main.yml — editorconfig, clang-format 18, clang-tidy 18
-#   Phase 2 (Build):      Linux GCC + Clang, macOS Clang, Windows MSVC
+#   Phase 2 (Build):      Linux GCC + Clang, macOS Clang, Windows MSVC, ARM64 GCC (optional self-hosted)
 #   Phase 3 (Sanitizers): Linux GCC + Clang ASan/UBSan, macOS Apple Clang ASan/UBSan
 #
 # All jobs have continue-on-error: true and fail-fast: false.
@@ -36,8 +36,8 @@ jobs:
   # Excludes: subprojects/**, build/**
   # ==========================================================================
   build:
-    name: Build / ${{ matrix.os }} / ${{ matrix.compiler }}
-    runs-on: ${{ matrix.os }}
+    name: Build / ${{ matrix.os_display || matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os_runs_on || matrix.os }}
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -63,6 +63,15 @@ jobs:
             compiler: msvc
             cc: cl
 
+          # ARM64 - GCC (self-hosted runner)
+          # Configure a self-hosted ARM64 runner with -march=armv8-a+simd support
+          # This is optional and only runs if a self-hosted ARM64 runner is available
+          - os: arm64
+            os_display: arm64-self-hosted
+            os_runs_on: [self-hosted, arm64]
+            compiler: gcc
+            cc: gcc
+
     steps:
       - uses: actions/checkout@v5
 
@@ -73,6 +82,11 @@ jobs:
           sudo apt-get install -y meson ninja-build
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
+          fi
+          # ARM64 specific: verify NEON support
+          if [ "${{ matrix.os }}" = "arm64" ]; then
+            echo "ARM64 runner detected. Verifying NEON support..."
+            [ -f /proc/cpuinfo ] && grep -q "neon" /proc/cpuinfo && echo "NEON support verified" || echo "Warning: NEON support not detected"
           fi
 
       - name: Install dependencies (macOS)
