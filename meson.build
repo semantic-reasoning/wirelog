@@ -27,9 +27,9 @@ wirelog_datadir = get_option('datadir') / project_name
 cc = meson.get_compiler('c')
 if cc.get_id() == 'msvc'
   # MSVC C11 atomics are incomplete
-  # /wd1189: Suppress "C atomics require C11 or later" fatal error
+  # Define __STDC_NO_ATOMICS__ to skip C11 atomics declarations
   add_project_arguments(
-    ['/W3', '/wd1189'],
+    ['/W3', '/D__STDC_NO_ATOMICS__'],
     language: 'c'
   )
 else
