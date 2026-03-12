@@ -166,6 +166,8 @@ wl_parser_ast_node_type_str(wl_parser_ast_node_type_t type)
         return "TYPED_PARAM";
     case WL_PARSER_AST_NODE_INPUT_PARAM:
         return "INPUT_PARAM";
+    case WL_PARSER_AST_NODE_OUTPUT_PARAM:
+        return "OUTPUT_PARAM";
     }
     return "UNKNOWN";
 }

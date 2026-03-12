@@ -631,6 +631,164 @@ test_run_pipeline_mixed_type_output(void)
 }
 
 /* ======================================================================== */
+/* Test: pipeline with symbol-typed output (US-004)                         */
+/* ======================================================================== */
+
+static void
+test_run_pipeline_symbol_output(void)
+{
+    TEST("wl_run_pipeline outputs strings (not IDs) for symbol columns");
+
+    const char *src = ".decl parent(x: symbol, y: symbol)\n"
+                      "parent(\"alice\", \"bob\").\n"
+                      "parent(\"alice\", \"charlie\").\n"
+                      ".decl ancestor(x: symbol, y: symbol)\n"
+                      "ancestor(x, y) :- parent(x, y).\n"
+                      "ancestor(x, z) :- ancestor(x, y), parent(y, z).\n";
+
+    char outpath[512];
+    test_tmppath(outpath, sizeof(outpath), "wirelog_test_symbol_out.txt");
+    FILE *f = fopen(outpath, "w");
+    if (!f) {
+        FAIL("cannot create output file");
+        return;
+    }
+
+    int rc = wl_run_pipeline(src, 1, f);
+    fclose(f);
+
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "wl_run_pipeline returned %d", rc);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    char *output = wl_read_file(outpath);
+    if (!output) {
+        remove(outpath);
+        FAIL("cannot read output file");
+        return;
+    }
+
+    /* Output should contain string values, not integer IDs */
+    if (strstr(output, "\"alice\"") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "output should contain '\"alice\"' but got: %s", output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+    if (strstr(output, "\"bob\"") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "output should contain '\"bob\"' but got: %s", output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+    if (strstr(output, "\"charlie\"") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "output should contain '\"charlie\"' but got: %s", output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    /* Should NOT contain bare integer IDs for symbol columns */
+    if (strstr(output, "ancestor(0,") != NULL
+        || strstr(output, "ancestor(0, ") != NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "output should not contain integer IDs, got: %s", output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    free(output);
+    remove(outpath);
+    PASS();
+}
+
+static void
+test_run_pipeline_mixed_symbol_int_output(void)
+{
+    TEST("wl_run_pipeline outputs mixed symbol/int32/string columns correctly");
+
+    const char *src = ".decl mixed(a: symbol, b: int32, c: string)\n"
+                      "mixed(\"foo\", 42, \"bar\").\n"
+                      "mixed(\"baz\", 7, \"qux\").\n"
+                      ".decl result(a: symbol, b: int32, c: string)\n"
+                      "result(a, b, c) :- mixed(a, b, c).\n";
+
+    char outpath[512];
+    test_tmppath(outpath, sizeof(outpath), "wirelog_test_mixed_sym_out.txt");
+    FILE *f = fopen(outpath, "w");
+    if (!f) {
+        FAIL("cannot create output file");
+        return;
+    }
+
+    int rc = wl_run_pipeline(src, 1, f);
+    fclose(f);
+
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "wl_run_pipeline returned %d", rc);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    char *output = wl_read_file(outpath);
+    if (!output) {
+        remove(outpath);
+        FAIL("cannot read output file");
+        return;
+    }
+
+    /* Symbol column should be deinterned */
+    if (strstr(output, "\"foo\"") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "output should contain '\"foo\"' but got: %s", output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+    /* int32 column should be a plain integer */
+    if (strstr(output, "42") == NULL) {
+        free(output);
+        remove(outpath);
+        FAIL("output should contain integer 42");
+        return;
+    }
+    /* string column should be deinterned */
+    if (strstr(output, "\"bar\"") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "output should contain '\"bar\"' but got: %s", output);
+        free(output);
+        remove(outpath);
+        FAIL(msg);
+        return;
+    }
+
+    free(output);
+    remove(outpath);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Test: .output directive filters output to marked relations               */
 /* ======================================================================== */
 
@@ -751,6 +909,111 @@ test_run_pipeline_no_output_directive(void)
     PASS();
 }
 
+static void
+test_run_pipeline_output_to_file(void)
+{
+    TEST("wl_run_pipeline writes .output(filename=...) to CSV file");
+
+    char csv_out[512];
+    test_tmppath(csv_out, sizeof(csv_out), "wirelog_test_output_csv.csv");
+
+    char src[1024];
+    snprintf(src, sizeof(src),
+             ".decl edge(x: int32, y: int32)\n"
+             "edge(1, 2). edge(2, 3).\n"
+             ".decl tc(x: int32, y: int32)\n"
+             "tc(x, y) :- edge(x, y).\n"
+             "tc(x, z) :- tc(x, y), edge(y, z).\n"
+             ".output tc(filename=\"%s\")\n",
+             csv_out);
+
+    int rc = wl_run_pipeline(src, 1, stdout);
+    if (rc != 0) {
+        remove(csv_out);
+        FAIL("wl_run_pipeline failed");
+        return;
+    }
+
+    char *content = wl_read_file(csv_out);
+    if (!content) {
+        remove(csv_out);
+        FAIL("output CSV file was not created");
+        return;
+    }
+
+    /* tc(1,2), tc(2,3), tc(1,3) expected - check CSV rows present */
+    if (strstr(content, "1,2") == NULL || strstr(content, "2,3") == NULL
+        || strstr(content, "1,3") == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "CSV missing expected rows: %s", content);
+        free(content);
+        remove(csv_out);
+        FAIL(msg);
+        return;
+    }
+
+    free(content);
+    remove(csv_out);
+    PASS();
+}
+
+static void
+test_run_pipeline_output_file_not_printed_to_stdout(void)
+{
+    TEST(".output(filename=...) relation does not print to stdout stream");
+
+    char csv_out[512];
+    test_tmppath(csv_out, sizeof(csv_out), "wirelog_test_output_csv2.csv");
+
+    char src[1024];
+    snprintf(src, sizeof(src),
+             ".decl edge(x: int32, y: int32)\n"
+             "edge(1, 2). edge(2, 3).\n"
+             ".decl tc(x: int32, y: int32)\n"
+             "tc(x, y) :- edge(x, y).\n"
+             "tc(x, z) :- tc(x, y), edge(y, z).\n"
+             ".output tc(filename=\"%s\")\n",
+             csv_out);
+
+    char stream_out[512];
+    test_tmppath(stream_out, sizeof(stream_out),
+                 "wirelog_test_output_stream2.txt");
+    FILE *f = fopen(stream_out, "w");
+    if (!f) {
+        remove(csv_out);
+        FAIL("cannot create stream output file");
+        return;
+    }
+
+    int rc = wl_run_pipeline(src, 1, f);
+    fclose(f);
+
+    if (rc != 0) {
+        remove(csv_out);
+        remove(stream_out);
+        FAIL("wl_run_pipeline failed");
+        return;
+    }
+
+    /* Stream output should be empty (tc written to file, not stream) */
+    char *stream_content = wl_read_file(stream_out);
+    if (stream_content && strlen(stream_content) > 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "stream should be empty but got: %s",
+                 stream_content);
+        free(stream_content);
+        remove(csv_out);
+        remove(stream_out);
+        FAIL(msg);
+        return;
+    }
+
+    free(stream_content);
+    remove(csv_out);
+    remove(stream_out);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -783,9 +1046,17 @@ main(void)
     test_run_pipeline_string_output();
     test_run_pipeline_mixed_type_output();
 
+    printf("\n--- Pipeline with Symbol Output (US-004) ---\n");
+    test_run_pipeline_symbol_output();
+    test_run_pipeline_mixed_symbol_int_output();
+
     printf("\n--- Pipeline with .output Directive ---\n");
     test_run_pipeline_output_filter();
     test_run_pipeline_no_output_directive();
+
+    printf("\n--- Pipeline with .output filename ---\n");
+    test_run_pipeline_output_to_file();
+    test_run_pipeline_output_file_not_printed_to_stdout();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
            tests_passed, tests_failed, tests_run);

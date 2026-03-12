@@ -264,6 +264,106 @@ test_parse_input_directive(void)
 }
 
 static void
+test_parse_input_directive_filename_only(void)
+{
+    TEST(".input relation(filename=\"test.csv\") single param");
+    PARSE(".input Edge(filename=\"test.csv\")");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *inp = child(program, 0);
+    if (inp->type != WL_PARSER_AST_NODE_INPUT) {
+        CLEANUP();
+        FAIL("expected INPUT node");
+        return;
+    }
+    if (strcmp(inp->name, "Edge") != 0) {
+        CLEANUP();
+        FAIL("expected relation name 'Edge'");
+        return;
+    }
+    if (inp->child_count != 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 1 param child, got %u",
+                 inp->child_count);
+        CLEANUP();
+        FAIL(buf);
+        return;
+    }
+    const wl_parser_ast_node_t *p0 = child(inp, 0);
+    if (p0->type != WL_PARSER_AST_NODE_INPUT_PARAM) {
+        CLEANUP();
+        FAIL("child should be INPUT_PARAM node");
+        return;
+    }
+    if (strcmp(p0->name, "filename") != 0) {
+        CLEANUP();
+        FAIL("param name should be 'filename'");
+        return;
+    }
+    if (strcmp(p0->str_value, "test.csv") != 0) {
+        CLEANUP();
+        FAIL("param value should be 'test.csv'");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_input_directive_all_params_stored(void)
+{
+    TEST(".input relation(IO=\"file\", filename=\"test.csv\", delimiter=\",\") "
+         "all params stored");
+    PARSE(".input Node(IO=\"file\", filename=\"test.csv\", delimiter=\",\")");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *inp = child(program, 0);
+    if (inp->type != WL_PARSER_AST_NODE_INPUT) {
+        CLEANUP();
+        FAIL("expected INPUT node");
+        return;
+    }
+    if (inp->child_count != 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 3 param children, got %u",
+                 inp->child_count);
+        CLEANUP();
+        FAIL(buf);
+        return;
+    }
+    /* Verify all three params are INPUT_PARAM nodes with correct names/values */
+    const char *expected_names[] = { "IO", "filename", "delimiter" };
+    const char *expected_values[] = { "file", "test.csv", "," };
+    for (uint32_t i = 0; i < 3; i++) {
+        const wl_parser_ast_node_t *p = child(inp, i);
+        if (p->type != WL_PARSER_AST_NODE_INPUT_PARAM) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "child %u should be INPUT_PARAM", i);
+            CLEANUP();
+            FAIL(buf);
+            return;
+        }
+        if (strcmp(p->name, expected_names[i]) != 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "param %u name: expected '%s', got '%s'",
+                     i, expected_names[i], p->name ? p->name : "(null)");
+            CLEANUP();
+            FAIL(buf);
+            return;
+        }
+        if (strcmp(p->str_value, expected_values[i]) != 0) {
+            char buf[128];
+            snprintf(
+                buf, sizeof(buf), "param %u value: expected '%s', got '%s'", i,
+                expected_values[i], p->str_value ? p->str_value : "(null)");
+            CLEANUP();
+            FAIL(buf);
+            return;
+        }
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
 test_parse_output_directive(void)
 {
     TEST(".output directive");
@@ -274,6 +374,53 @@ test_parse_output_directive(void)
         || strcmp(out->name, "Reach") != 0) {
         CLEANUP();
         FAIL("expected OUTPUT 'Reach'");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_output_directive_with_filename(void)
+{
+    TEST(".output directive with filename parameter");
+    PARSE(".output Reach(filename=\"reach.csv\")");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *out = child(program, 0);
+    if (out->type != WL_PARSER_AST_NODE_OUTPUT
+        || strcmp(out->name, "Reach") != 0) {
+        CLEANUP();
+        FAIL("expected OUTPUT 'Reach'");
+        return;
+    }
+    if (out->child_count != 1) {
+        CLEANUP();
+        FAIL("expected 1 OUTPUT_PARAM child");
+        return;
+    }
+    const wl_parser_ast_node_t *param = out->children[0];
+    if (param->type != WL_PARSER_AST_NODE_OUTPUT_PARAM
+        || strcmp(param->name, "filename") != 0
+        || strcmp(param->str_value, "reach.csv") != 0) {
+        CLEANUP();
+        FAIL("expected OUTPUT_PARAM filename=\"reach.csv\"");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_output_directive_backward_compat(void)
+{
+    TEST(".output directive without params (backward compat)");
+    PARSE(".output Reach");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *out = child(program, 0);
+    if (out->type != WL_PARSER_AST_NODE_OUTPUT
+        || strcmp(out->name, "Reach") != 0 || out->child_count != 0) {
+        CLEANUP();
+        FAIL("expected OUTPUT 'Reach' with no children");
         return;
     }
     CLEANUP();
@@ -1334,7 +1481,11 @@ main(void)
 
     printf("\n--- Directives ---\n");
     test_parse_input_directive();
+    test_parse_input_directive_filename_only();
+    test_parse_input_directive_all_params_stored();
     test_parse_output_directive();
+    test_parse_output_directive_with_filename();
+    test_parse_output_directive_backward_compat();
     test_parse_printsize_directive();
 
     printf("\n--- Simple Rules ---\n");
