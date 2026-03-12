@@ -8,7 +8,7 @@
  * Reads a .dl file and executes it through the full Datalog pipeline.
  *
  * Usage: wirelog [options] <file.dl>
- *   --workers N   Number of DD worker threads (default: 1)
+ *   --workers N   Number of worker threads (default: 1)
  *   --help        Show usage information
  */
 
@@ -76,14 +76,8 @@ main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "DEBUG: File read, source length=%zu\n", strlen(source));
-    fflush(stderr);
-
     int rc = wl_run_pipeline(source, num_workers, stdout);
     free(source);
-
-    fprintf(stderr, "DEBUG: wl_run_pipeline returned rc=%d\n", rc);
-    fflush(stderr);
 
     if (rc != 0) {
         fprintf(stderr, "error: execution failed\n");
