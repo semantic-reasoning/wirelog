@@ -26,11 +26,13 @@ wirelog_datadir = get_option('datadir') / project_name
 #Compiler settings
 cc = meson.get_compiler('c')
 if cc.get_id() == 'msvc'
-  # MSVC C11 atomics are incomplete; use default mode without forced C standard
+  # MSVC C11 atomics are incomplete; add define to skip atomics in stdint/stdatomic
   add_project_arguments(
-    ['/W3'],
+    ['/W3', '/D_NO_CRT_STDIO_INLINE', '/DWIN32_LEAN_AND_MEAN'],
     language: 'c'
   )
+  # Suppress the atomics error by defining a workaround
+  add_project_arguments('/D__STDC_NO_ATOMICS__', language: 'c')
 else
   # GCC/Clang: enforce C11 standard
   add_project_arguments(
