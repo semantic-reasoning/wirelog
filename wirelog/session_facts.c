@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 int
 wl_session_load_facts(wl_session_t *sess, const struct wirelog_program *prog)
@@ -79,12 +80,39 @@ wl_session_load_input_files(wl_session_t *sess,
             return -1;
         }
 
+        /* Try to resolve file path:
+         * 1. If absolute path, use as-is
+         * 2. If relative path, try from current working directory
+         * 3. Try relative to cwd (fopen will do this automatically)
+         */
+        const char *resolved_path = filename;
+        char resolved_buf[4096];
+
+        /* Check if file exists at the given path */
+        FILE *test_f = fopen(filename, "r");
+        if (!test_f && filename[0] != '/') {
+            /* Relative path failed, try with current working directory */
+            char cwd[4096];
+            if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                snprintf(resolved_buf, sizeof(resolved_buf), "%s/%s", cwd,
+                         filename);
+                test_f = fopen(resolved_buf, "r");
+                if (test_f) {
+                    resolved_path = resolved_buf;
+                    fclose(test_f);
+                }
+            }
+        } else if (test_f) {
+            fclose(test_f);
+        }
+
         /* Read CSV file */
         int64_t *data = NULL;
         uint32_t nrows = 0;
         uint32_t ncols = 0;
 
-        int rc = wl_csv_read_file(filename, delimiter, &data, &nrows, &ncols);
+        int rc = wl_csv_read_file(resolved_path, delimiter, &data, &nrows,
+                                  &ncols);
         if (rc != 0) {
             fprintf(stderr, "error: failed to read '%s' for relation '%s'\n",
                     filename, rel->name);
