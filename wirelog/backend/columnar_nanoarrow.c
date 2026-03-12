@@ -89,6 +89,10 @@ typedef struct {
      * When non-NULL, timestamps[i] records the provenance of data row i.
      * Capacity tracks with the data array (capacity entries allocated). */
     col_delta_timestamp_t *timestamps;
+    /* Pool ownership flag (issue #123).
+     * true  = struct was allocated from delta_pool; do not free() the struct.
+     * false = struct was heap-allocated via calloc(); free() on destroy. */
+    bool pool_owned;
 } col_rel_t;
 
 /**
@@ -126,6 +130,24 @@ col_rel_free_contents(col_rel_t *r)
     if (r->schema_ok)
         ArrowSchemaRelease(&r->schema);
     memset(r, 0, sizeof(*r));
+}
+
+/*
+ * col_rel_destroy:
+ * Free contents and, if heap-allocated (pool_owned == false), the struct
+ * itself.  Pool-owned structs have their memory reclaimed on pool_reset();
+ * calling free() on them would corrupt the pool allocator.
+ */
+static void
+col_rel_destroy(col_rel_t *r)
+{
+    if (!r)
+        return;
+    bool from_pool = r->pool_owned;
+    col_rel_free_contents(r); /* memset zeroes pool_owned */
+    if (!from_pool)
+        free(r);
+    /* If pool_owned: struct memory freed on pool_reset(), skip free(). */
 }
 
 /*
@@ -205,6 +227,7 @@ col_rel_alloc(col_rel_t **out, const char *name)
         free(r);
         return ENOMEM;
     }
+    r->pool_owned = false;
     *out = r;
     return 0;
 }
@@ -432,10 +455,8 @@ typedef struct {
 static void
 col_mat_cache_clear(col_mat_cache_t *cache)
 {
-    for (uint32_t i = 0; i < cache->count; i++) {
-        col_rel_free_contents(cache->entries[i].result);
-        free(cache->entries[i].result);
-    }
+    for (uint32_t i = 0; i < cache->count; i++)
+        col_rel_destroy(cache->entries[i].result);
     cache->count = 0;
     cache->total_bytes = 0;
 }
@@ -476,8 +497,7 @@ col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
                 lru = i;
         }
         cache->total_bytes -= cache->entries[lru].mem_bytes;
-        col_rel_free_contents(cache->entries[lru].result);
-        free(cache->entries[lru].result);
+        col_rel_destroy(cache->entries[lru].result);
         memmove(&cache->entries[lru], &cache->entries[lru + 1],
                 (cache->count - lru - 1) * sizeof(col_mat_entry_t));
         cache->count--;
@@ -491,8 +511,7 @@ col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
                 lru = i;
         }
         cache->total_bytes -= cache->entries[lru].mem_bytes;
-        col_rel_free_contents(cache->entries[lru].result);
-        free(cache->entries[lru].result);
+        col_rel_destroy(cache->entries[lru].result);
         memmove(&cache->entries[lru], &cache->entries[lru + 1],
                 (cache->count - lru - 1) * sizeof(col_mat_entry_t));
         cache->count--;
@@ -831,6 +850,18 @@ session_find_rel(wl_col_session_t *sess, const char *name)
 static int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 {
+    /* Pool-owned structs must be promoted to heap before storing in the
+     * session, because col_session_destroy calls free() on each entry. */
+    if (r->pool_owned) {
+        col_rel_t *heap = (col_rel_t *)calloc(1, sizeof(col_rel_t));
+        if (!heap)
+            return ENOMEM;
+        *heap = *r;
+        heap->pool_owned = false;
+        /* Zero out source slot so pool_reset doesn't double-free contents */
+        memset(r, 0, sizeof(*r));
+        r = heap;
+    }
     if (sess->nrels >= sess->rel_cap) {
         uint32_t nc = sess->rel_cap ? sess->rel_cap * 2 : 16;
         col_rel_t **nr
@@ -849,8 +880,7 @@ session_remove_rel(wl_col_session_t *sess, const char *name)
 {
     for (uint32_t i = 0; i < sess->nrels; i++) {
         if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0) {
-            col_rel_free_contents(sess->rels[i]);
-            free(sess->rels[i]);
+            col_rel_destroy(sess->rels[i]);
             sess->rels[i] = NULL;
             return;
         }
@@ -1093,10 +1123,8 @@ eval_stack_drain(eval_stack_t *s)
         eval_entry_t e = eval_stack_pop(s);
         if (e.seg_boundaries)
             free(e.seg_boundaries);
-        if (e.owned) {
-            col_rel_free_contents(e.rel);
-            free(e.rel);
-        }
+        if (e.owned)
+            col_rel_destroy(e.rel);
     }
 }
 
@@ -1135,8 +1163,7 @@ col_rel_new_auto(const char *name, uint32_t ncols)
     if (col_rel_alloc(&r, name) != 0)
         return NULL;
     if (col_rel_set_schema(r, ncols, NULL) != 0) {
-        col_rel_free_contents(r);
-        free(r);
+        col_rel_destroy(r);
         return NULL;
     }
     return r;
@@ -1151,10 +1178,94 @@ col_rel_new_like(const char *name, const col_rel_t *src)
         return NULL;
     if (col_rel_set_schema(r, src->ncols, (const char *const *)src->col_names)
         != 0) {
-        col_rel_free_contents(r);
-        free(r);
+        col_rel_destroy(r);
         return NULL;
     }
+    return r;
+}
+
+/* Pool-aware col_rel constructor wrappers.
+ *
+ * The struct slot is allocated from the pool slab (O(1), no free needed).
+ * Data buffers and col_names are still heap-allocated so that realloc in
+ * col_rel_append_row remains safe and col_names are available for column
+ * lookup (col_rel_col_idx).  The pool_owned flag tells col_rel_destroy to
+ * skip free() on the struct itself while still freeing heap-allocated
+ * internals. */
+static col_rel_t *
+col_rel_pool_new_like(delta_pool_t *pool, const char *name,
+                      const col_rel_t *like)
+{
+    if (!pool)
+        return col_rel_new_like(name, like); /* Fallback to malloc */
+    col_rel_t *r = (col_rel_t *)delta_pool_alloc_slot(pool);
+    if (!r)
+        return col_rel_new_like(name, like); /* Pool exhausted, fallback */
+    r->pool_owned = true;
+    r->name = wl_strdup(name);
+    if (!r->name) {
+        memset(r, 0, sizeof(*r));
+        return col_rel_new_like(name, like);
+    }
+    r->ncols = like->ncols;
+    r->capacity = COL_REL_INIT_CAP;
+    if (like->ncols > 0) {
+        r->data
+            = (int64_t *)malloc(sizeof(int64_t) * r->capacity * like->ncols);
+        if (!r->data) {
+            free(r->name);
+            memset(r, 0, sizeof(*r));
+            return col_rel_new_like(name, like); /* Fallback */
+        }
+    }
+    /* Copy col_names so col_rel_col_idx works for downstream operators */
+    if (like->col_names && like->ncols > 0) {
+        r->col_names = (char **)calloc(like->ncols, sizeof(char *));
+        if (r->col_names) {
+            for (uint32_t i = 0; i < like->ncols; i++) {
+                if (like->col_names[i])
+                    r->col_names[i] = wl_strdup(like->col_names[i]);
+            }
+        }
+    }
+    r->nrows = 0;
+    return r;
+}
+
+static col_rel_t *
+col_rel_pool_new_auto(delta_pool_t *pool, const char *name, uint32_t ncols)
+{
+    if (!pool)
+        return col_rel_new_auto(name, ncols); /* Fallback */
+    col_rel_t *r = (col_rel_t *)delta_pool_alloc_slot(pool);
+    if (!r)
+        return col_rel_new_auto(name, ncols); /* Pool exhausted */
+    r->pool_owned = true;
+    r->name = wl_strdup(name);
+    if (!r->name) {
+        memset(r, 0, sizeof(*r));
+        return col_rel_new_auto(name, ncols);
+    }
+    r->ncols = ncols;
+    r->capacity = COL_REL_INIT_CAP;
+    if (ncols > 0) {
+        r->data = (int64_t *)malloc(sizeof(int64_t) * r->capacity * ncols);
+        if (!r->data) {
+            free(r->name);
+            memset(r, 0, sizeof(*r));
+            return col_rel_new_auto(name, ncols); /* Fallback */
+        }
+        /* Auto-generate col_names (col0, col1, ...) matching set_schema */
+        r->col_names = (char **)calloc(ncols, sizeof(char *));
+        if (r->col_names) {
+            for (uint32_t i = 0; i < ncols; i++) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "col%u", i);
+                r->col_names[i] = wl_strdup(buf);
+            }
+        }
+    }
+    r->nrows = 0;
     return r;
 }
 
@@ -1193,14 +1304,13 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
                 /* Issue #83: delta-seeded incremental re-eval. No pre-seeded
                  * delta means this relation has no new facts. Push empty so
                  * only rules with actual deltas produce output. */
-                col_rel_t *empty = col_rel_new_like("$empty_delta", full_rel);
+                col_rel_t *empty = col_rel_pool_new_like(
+                    sess->delta_pool, "$empty_delta", full_rel);
                 if (!empty)
                     return ENOMEM;
                 int push_rc = eval_stack_push_delta(stack, empty, true, true);
-                if (push_rc != 0) {
-                    col_rel_free_contents(empty);
-                    free(empty);
-                }
+                if (push_rc != 0)
+                    col_rel_destroy(empty);
                 return push_rc;
             }
             /* Base-case iteration: no deltas exist yet, fall back to full
@@ -1210,14 +1320,13 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         /* Iteration > 0: delta absent or empty means the relation has
          * converged.  Push an empty relation so this rule copy produces
          * no output (correct semi-naive semantics, issue #85). */
-        col_rel_t *empty = col_rel_new_like("$empty_delta", full_rel);
+        col_rel_t *empty
+            = col_rel_pool_new_like(sess->delta_pool, "$empty_delta", full_rel);
         if (!empty)
             return ENOMEM;
         int push_rc = eval_stack_push_delta(stack, empty, true, true);
-        if (push_rc != 0) {
-            col_rel_free_contents(empty);
-            free(empty);
-        }
+        if (push_rc != 0)
+            col_rel_destroy(empty);
         return push_rc;
     }
 
@@ -1232,30 +1341,25 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
 /* --- MAP ----------------------------------------------------------------- */
 
 static int
-col_op_map(const wl_plan_op_t *op, eval_stack_t *stack)
+col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
     eval_entry_t e = eval_stack_pop(stack);
     if (!e.rel)
         return EINVAL;
 
     uint32_t pc = op->project_count;
-    col_rel_t *out = col_rel_new_auto("$map", pc);
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$map", pc);
     if (!out) {
-        if (e.owned) {
-            col_rel_free_contents(e.rel);
-            free(e.rel);
-        }
+        if (e.owned)
+            col_rel_destroy(e.rel);
         return ENOMEM;
     }
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * pc);
     if (!tmp) {
-        col_rel_free_contents(out);
-        free(out);
-        if (e.owned) {
-            col_rel_free_contents(e.rel);
-            free(e.rel);
-        }
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(e.rel);
         return ENOMEM;
     }
 
@@ -1268,39 +1372,33 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack)
         int rc = col_rel_append_row(out, tmp);
         if (rc != 0) {
             free(tmp);
-            col_rel_free_contents(out);
-            free(out);
-            if (e.owned) {
-                col_rel_free_contents(e.rel);
-                free(e.rel);
-            }
+            col_rel_destroy(out);
+            if (e.owned)
+                col_rel_destroy(e.rel);
             return rc;
         }
     }
     free(tmp);
 
-    if (e.owned) {
-        col_rel_free_contents(e.rel);
-        free(e.rel);
-    }
+    if (e.owned)
+        col_rel_destroy(e.rel);
     return eval_stack_push(stack, out, true);
 }
 
 /* --- FILTER -------------------------------------------------------------- */
 
 static int
-col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack)
+col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
+              wl_col_session_t *sess)
 {
     eval_entry_t e = eval_stack_pop(stack);
     if (!e.rel)
         return EINVAL;
 
-    col_rel_t *out = col_rel_new_like("$filter", e.rel);
+    col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$filter", e.rel);
     if (!out) {
-        if (e.owned) {
-            col_rel_free_contents(e.rel);
-            free(e.rel);
-        }
+        if (e.owned)
+            col_rel_destroy(e.rel);
         return ENOMEM;
     }
 
@@ -1315,21 +1413,16 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack)
         if (pass) {
             int rc = col_rel_append_row(out, row);
             if (rc != 0) {
-                col_rel_free_contents(out);
-                free(out);
-                if (e.owned) {
-                    col_rel_free_contents(e.rel);
-                    free(e.rel);
-                }
+                col_rel_destroy(out);
+                if (e.owned)
+                    col_rel_destroy(e.rel);
                 return rc;
             }
         }
     }
 
-    if (e.owned) {
-        col_rel_free_contents(e.rel);
-        free(e.rel);
-    }
+    if (e.owned)
+        col_rel_destroy(e.rel);
     return eval_stack_push(stack, out, true);
 }
 
@@ -1374,10 +1467,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 
     col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right) {
-        if (left_e.owned) {
-            col_rel_free_contents(left_e.rel);
-            free(left_e.rel);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left_e.rel);
         return ENOENT;
     }
 
@@ -1402,18 +1493,14 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
              * empty result — this rule copy produces no tuples from this
              * permutation (correct semi-naive, issue #85). */
             uint32_t ocols = left_e.rel->ncols + right->ncols;
-            if (left_e.owned) {
-                col_rel_free_contents(left_e.rel);
-                free(left_e.rel);
-            }
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
             col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
             if (!empty)
                 return ENOMEM;
             int push_rc = eval_stack_push(stack, empty, true);
-            if (push_rc != 0) {
-                col_rel_free_contents(empty);
-                free(empty);
-            }
+            if (push_rc != 0)
+                col_rel_destroy(empty);
             return push_rc;
         }
         /* else: iteration 0 — no deltas yet, fall through to full right */
@@ -1451,10 +1538,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     if (!lk || !rk) {
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
     for (uint32_t k = 0; k < kc; k++) {
@@ -1468,27 +1553,22 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     /* Output: all left cols + all right cols (including key duplication).
      * Downstream MAP will project the desired output columns. */
     uint32_t ocols = left->ncols + right->ncols;
-    col_rel_t *out = col_rel_new_auto("$join", ocols);
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$join", ocols);
     if (!out) {
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {
-        col_rel_free_contents(out);
-        free(out);
+        col_rel_destroy(out);
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
 
@@ -1517,14 +1597,11 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             free(ht_head_ep);
             free(ht_next_ep);
             free(tmp);
-            col_rel_free_contents(out);
-            free(out);
+            col_rel_destroy(out);
             free(lk);
             free(rk);
-            if (left_e.owned) {
-                col_rel_free_contents(left);
-                free(left);
-            }
+            if (left_e.owned)
+                col_rel_destroy(left);
             return ENOMEM;
         }
         for (uint32_t rr = 0; rr < right->nrows; rr++) {
@@ -1545,14 +1622,11 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             free(ht_head_ep);
             free(ht_next_ep);
             free(tmp);
-            col_rel_free_contents(out);
-            free(out);
+            col_rel_destroy(out);
             free(lk);
             free(rk);
-            if (left_e.owned) {
-                col_rel_free_contents(left);
-                free(left);
-            }
+            if (left_e.owned)
+                col_rel_destroy(left);
             return ENOMEM;
         }
     }
@@ -1605,24 +1679,19 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     free(ht_next_ep);
     if (join_rc != 0) {
         free(tmp);
-        col_rel_free_contents(out);
-        free(out);
+        col_rel_destroy(out);
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return join_rc;
     }
 
     free(tmp);
     free(lk);
     free(rk);
-    if (left_e.owned) {
-        col_rel_free_contents(left);
-        free(left);
-    }
+    if (left_e.owned)
+        col_rel_destroy(left);
     /* Propagate delta flag: result is a delta if left was delta OR we used
      * right-delta. This ensures subsequent JOINs in the same rule plan know
      * whether to apply right-delta (they should NOT if we already used one). */
@@ -1664,10 +1733,8 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!lk || !rk) {
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
     for (uint32_t k = 0; k < kc; k++) {
@@ -1678,14 +1745,12 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
         rk[k] = (ri >= 0) ? (uint32_t)ri : 0;
     }
 
-    col_rel_t *out = col_rel_new_like("$antijoin", left);
+    col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$antijoin", left);
     if (!out) {
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
 
@@ -1697,14 +1762,11 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!aj_head || !aj_next) {
         free(aj_head);
         free(aj_next);
-        col_rel_free_contents(out);
-        free(out);
+        col_rel_destroy(out);
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
     for (uint32_t rr = 0; rr < right->nrows; rr++) {
@@ -1733,30 +1795,25 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     free(aj_head);
     free(aj_next);
     if (aj_rc != 0) {
-        col_rel_free_contents(out);
-        free(out);
+        col_rel_destroy(out);
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return aj_rc;
     }
 
     free(lk);
     free(rk);
-    if (left_e.owned) {
-        col_rel_free_contents(left);
-        free(left);
-    }
+    if (left_e.owned)
+        col_rel_destroy(left);
     return eval_stack_push(stack, out, true);
 }
 
 /* --- CONCAT -------------------------------------------------------------- */
 
 static int
-col_op_concat(eval_stack_t *stack)
+col_op_concat(eval_stack_t *stack, wl_col_session_t *sess)
 {
     if (stack->top < 2)
         return 0; /* single-item passthrough for K-copy boundary marker */
@@ -1767,27 +1824,19 @@ col_op_concat(eval_stack_t *stack)
     col_rel_t *b = b_e.rel;
 
     if (!a || !b || a->ncols != b->ncols) {
-        if (a_e.owned) {
-            col_rel_free_contents(a);
-            free(a);
-        }
-        if (b_e.owned) {
-            col_rel_free_contents(b);
-            free(b);
-        }
+        if (a_e.owned)
+            col_rel_destroy(a);
+        if (b_e.owned)
+            col_rel_destroy(b);
         return EINVAL;
     }
 
-    col_rel_t *out = col_rel_new_like("$concat", a);
+    col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$concat", a);
     if (!out) {
-        if (a_e.owned) {
-            col_rel_free_contents(a);
-            free(a);
-        }
-        if (b_e.owned) {
-            col_rel_free_contents(b);
-            free(b);
-        }
+        if (a_e.owned)
+            col_rel_destroy(a);
+        if (b_e.owned)
+            col_rel_destroy(b);
         return ENOMEM;
     }
 
@@ -1800,16 +1849,11 @@ col_op_concat(eval_stack_t *stack)
             free(a_e.seg_boundaries);
         if (b_e.seg_boundaries)
             free(b_e.seg_boundaries);
-        if (a_e.owned) {
-            col_rel_free_contents(a);
-            free(a);
-        }
-        if (b_e.owned) {
-            col_rel_free_contents(b);
-            free(b);
-        }
-        col_rel_free_contents(out);
-        free(out);
+        if (a_e.owned)
+            col_rel_destroy(a);
+        if (b_e.owned)
+            col_rel_destroy(b);
+        col_rel_destroy(out);
         return rc;
     }
 
@@ -1825,16 +1869,11 @@ col_op_concat(eval_stack_t *stack)
             free(a_e.seg_boundaries);
         if (b_e.seg_boundaries)
             free(b_e.seg_boundaries);
-        if (a_e.owned) {
-            col_rel_free_contents(a);
-            free(a);
-        }
-        if (b_e.owned) {
-            col_rel_free_contents(b);
-            free(b);
-        }
-        col_rel_free_contents(out);
-        free(out);
+        if (a_e.owned)
+            col_rel_destroy(a);
+        if (b_e.owned)
+            col_rel_destroy(b);
+        col_rel_destroy(out);
         return ENOMEM;
     }
 
@@ -1864,20 +1903,15 @@ col_op_concat(eval_stack_t *stack)
     if (b_e.seg_boundaries)
         free(b_e.seg_boundaries);
 
-    if (a_e.owned) {
-        col_rel_free_contents(a);
-        free(a);
-    }
-    if (b_e.owned) {
-        col_rel_free_contents(b);
-        free(b);
-    }
+    if (a_e.owned)
+        col_rel_destroy(a);
+    if (b_e.owned)
+        col_rel_destroy(b);
 
     rc = eval_stack_push(stack, out, true);
     if (rc != 0) {
         free(out_boundaries);
-        col_rel_free_contents(out);
-        free(out);
+        col_rel_destroy(out);
         return rc;
     }
 
@@ -2152,7 +2186,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 }
 
 static int
-col_op_consolidate(eval_stack_t *stack)
+col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
 {
     eval_entry_t e = eval_stack_pop(stack);
     if (!e.rel)
@@ -2174,15 +2208,14 @@ col_op_consolidate(eval_stack_t *stack)
     col_rel_t *work = in;
     bool work_owned = e.owned;
     if (!work_owned) {
-        work = col_rel_new_like("$consol", in);
+        work = col_rel_pool_new_like(sess->delta_pool, "$consol", in);
         if (!work) {
             if (e.seg_boundaries)
                 free(e.seg_boundaries);
             return ENOMEM;
         }
         if (col_rel_append_all(work, in) != 0) {
-            col_rel_free_contents(work);
-            free(work);
+            col_rel_destroy(work);
             if (e.seg_boundaries)
                 free(e.seg_boundaries);
             return ENOMEM;
@@ -2196,10 +2229,8 @@ col_op_consolidate(eval_stack_t *stack)
         int rc = col_op_consolidate_kway_merge(work, e.seg_boundaries, k);
         free(e.seg_boundaries);
         if (rc != 0) {
-            if (work_owned) {
-                col_rel_free_contents(work);
-                free(work);
-            }
+            if (work_owned)
+                col_rel_destroy(work);
             return rc;
         }
         work->sorted_nrows = work->nrows;
@@ -2254,10 +2285,8 @@ col_op_consolidate(eval_stack_t *stack)
             int64_t *nb = (int64_t *)realloc(
                 work->merge_buf, (size_t)new_cap * nc * sizeof(int64_t));
             if (!nb) {
-                if (work_owned && work != in) {
-                    col_rel_free_contents(work);
-                    free(work);
-                }
+                if (work_owned && work != in)
+                    col_rel_destroy(work);
                 return ENOMEM;
             }
             work->merge_buf = nb;
@@ -2304,10 +2333,8 @@ col_op_consolidate(eval_stack_t *stack)
                 int64_t *nd = (int64_t *)realloc(
                     work->data, (size_t)out * nc * sizeof(int64_t));
                 if (!nd) {
-                    if (work_owned && work != in) {
-                        col_rel_free_contents(work);
-                        free(work);
-                    }
+                    if (work_owned && work != in)
+                        col_rel_destroy(work);
                     return ENOMEM;
                 }
                 work->data = nd;
@@ -2790,8 +2817,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             const int64_t *row = src->data + (size_t)r * nc;
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
-                    col_rel_free_contents(out);
-                    free(out);
+                    col_rel_destroy(out);
                     return NULL;
                 }
                 last_row = out->data + (size_t)(out->nrows - 1) * nc;
@@ -2829,8 +2855,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             if (last_row == NULL
                 || kway_row_cmp(last_row, row_to_add, nc) != 0) {
                 if (col_rel_append_row(out, row_to_add) != 0) {
-                    col_rel_free_contents(out);
-                    free(out);
+                    col_rel_destroy(out);
                     return NULL;
                 }
                 last_row = out->data + (size_t)(out->nrows - 1) * nc;
@@ -2842,8 +2867,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             const int64_t *row = left->data + (size_t)li * nc;
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
-                    col_rel_free_contents(out);
-                    free(out);
+                    col_rel_destroy(out);
                     return NULL;
                 }
                 last_row = out->data + (size_t)(out->nrows - 1) * nc;
@@ -2856,8 +2880,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             const int64_t *row = right->data + (size_t)ri * nc;
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
-                    col_rel_free_contents(out);
-                    free(out);
+                    col_rel_destroy(out);
                     return NULL;
                 }
                 last_row = out->data + (size_t)(out->nrows - 1) * nc;
@@ -2874,18 +2897,13 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         col_rel_t *pair[2] = { temp, relations[i] };
         col_rel_t *merged = col_rel_merge_k(pair, 2);
         if (!merged) {
-            col_rel_free_contents(out);
-            free(out);
-            if (i > 1) {
-                col_rel_free_contents(temp);
-                free(temp);
-            }
+            col_rel_destroy(out);
+            if (i > 1)
+                col_rel_destroy(temp);
             return NULL;
         }
-        if (i > 1) {
-            col_rel_free_contents(temp);
-            free(temp);
-        }
+        if (i > 1)
+            col_rel_destroy(temp);
         temp = merged;
     }
 
@@ -2896,17 +2914,14 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             const int64_t *row = temp->data + (size_t)r * nc;
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
-                    col_rel_free_contents(out);
-                    free(out);
-                    col_rel_free_contents(temp);
-                    free(temp);
+                    col_rel_destroy(out);
+                    col_rel_destroy(temp);
                     return NULL;
                 }
                 last_row = out->data + (size_t)(out->nrows - 1) * nc;
             }
         }
-        col_rel_free_contents(temp);
-        free(temp);
+        col_rel_destroy(temp);
     }
 
     return out;
@@ -3072,7 +3087,8 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
 
         /* If not owned, make a copy we can hand to merge */
         if (!e.owned) {
-            col_rel_t *copy = col_rel_new_like("<k_fusion_copy>", e.rel);
+            col_rel_t *copy = col_rel_pool_new_like(worker_sess[d].delta_pool,
+                                                    "<k_fusion_copy>", e.rel);
             if (!copy) {
                 rc = ENOMEM;
                 eval_stack_drain(&workers[d].stack);
@@ -3128,20 +3144,16 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
             goto cleanup_results;
         }
         rc = eval_stack_push(stack, merged, true);
-        if (rc != 0) {
-            col_rel_free_contents(merged);
-            free(merged);
-        }
+        if (rc != 0)
+            col_rel_destroy(merged);
     }
     COL_SESSION(sess)->kfusion_merge_ns += now_ns() - _phase_t0;
 
 cleanup_results:
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < k; d++) {
-        if (results[d]) {
-            col_rel_free_contents(results[d]);
-            free(results[d]);
-        }
+        if (results[d])
+            col_rel_destroy(results[d]);
     }
 
 cleanup_wq:
@@ -3157,10 +3169,8 @@ cleanup_wq:
      * its isolated cache — no races at cleanup time. */
     for (uint32_t d = 0; d < k; d++) {
         col_mat_cache_t *wc = &worker_sess[d].mat_cache;
-        for (uint32_t i = base_count; i < wc->count; i++) {
-            col_rel_free_contents(wc->entries[i].result);
-            free(wc->entries[i].result);
-        }
+        for (uint32_t i = base_count; i < wc->count; i++)
+            col_rel_destroy(wc->entries[i].result);
         /* Free worker's private full-arrangement cache (arr_*). */
         for (uint32_t i = 0; i < worker_sess[d].arr_count; i++) {
             col_arr_entry_t *e = &worker_sess[d].arr_entries[i];
@@ -3202,10 +3212,8 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!lk || !rk) {
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
     for (uint32_t k = 0; k < kc; k++) {
@@ -3218,27 +3226,23 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
 
     /* Output: project_indices selects output columns from left */
     uint32_t ocols = op->project_count ? op->project_count : left->ncols;
-    col_rel_t *out = col_rel_new_auto("$semijoin", ocols);
+    col_rel_t *out
+        = col_rel_pool_new_auto(sess->delta_pool, "$semijoin", ocols);
     if (!out) {
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {
-        col_rel_free_contents(out);
-        free(out);
+        col_rel_destroy(out);
         free(lk);
         free(rk);
-        if (left_e.owned) {
-            col_rel_free_contents(left);
-            free(left);
-        }
+        if (left_e.owned)
+            col_rel_destroy(left);
         return ENOMEM;
     }
 
@@ -3265,14 +3269,11 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
                 free(tmp);
-                col_rel_free_contents(out);
-                free(out);
+                col_rel_destroy(out);
                 free(lk);
                 free(rk);
-                if (left_e.owned) {
-                    col_rel_free_contents(left);
-                    free(left);
-                }
+                if (left_e.owned)
+                    col_rel_destroy(left);
                 return rc;
             }
         }
@@ -3281,17 +3282,16 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     free(tmp);
     free(lk);
     free(rk);
-    if (left_e.owned) {
-        col_rel_free_contents(left);
-        free(left);
-    }
+    if (left_e.owned)
+        col_rel_destroy(left);
     return eval_stack_push(stack, out, true);
 }
 
 /* --- REDUCE (aggregate) -------------------------------------------------- */
 
 static int
-col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack)
+col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
+              wl_col_session_t *sess)
 {
     eval_entry_t e = eval_stack_pop(stack);
     if (!e.rel)
@@ -3302,23 +3302,18 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack)
 
     /* Output: group_by columns + 1 aggregate column */
     uint32_t ocols = gc + 1;
-    col_rel_t *out = col_rel_new_auto("$reduce", ocols);
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$reduce", ocols);
     if (!out) {
-        if (e.owned) {
-            col_rel_free_contents(in);
-            free(in);
-        }
+        if (e.owned)
+            col_rel_destroy(in);
         return ENOMEM;
     }
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {
-        col_rel_free_contents(out);
-        free(out);
-        if (e.owned) {
-            col_rel_free_contents(in);
-            free(in);
-        }
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(in);
         return ENOMEM;
     }
 
@@ -3373,22 +3368,17 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack)
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
                 free(tmp);
-                col_rel_free_contents(out);
-                free(out);
-                if (e.owned) {
-                    col_rel_free_contents(in);
-                    free(in);
-                }
+                col_rel_destroy(out);
+                if (e.owned)
+                    col_rel_destroy(in);
                 return rc;
             }
         }
     }
 
     free(tmp);
-    if (e.owned) {
-        col_rel_free_contents(in);
-        free(in);
-    }
+    if (e.owned)
+        col_rel_destroy(in);
     return eval_stack_push(stack, out, true);
 }
 
@@ -3480,10 +3470,10 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             rc = col_op_variable(op, stack, sess);
             break;
         case WL_PLAN_OP_MAP:
-            rc = col_op_map(op, stack);
+            rc = col_op_map(op, stack, sess);
             break;
         case WL_PLAN_OP_FILTER:
-            rc = col_op_filter(op, stack);
+            rc = col_op_filter(op, stack, sess);
             break;
         case WL_PLAN_OP_JOIN:
             rc = col_op_join(op, stack, sess);
@@ -3492,13 +3482,13 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             rc = col_op_antijoin(op, stack, sess);
             break;
         case WL_PLAN_OP_CONCAT:
-            rc = col_op_concat(stack);
+            rc = col_op_concat(stack, sess);
             break;
         case WL_PLAN_OP_CONSOLIDATE:
-            rc = col_op_consolidate(stack);
+            rc = col_op_consolidate(stack, sess);
             break;
         case WL_PLAN_OP_REDUCE:
-            rc = col_op_reduce(op, stack);
+            rc = col_op_reduce(op, stack, sess);
             break;
         case WL_PLAN_OP_SEMIJOIN:
             rc = col_op_semijoin(op, stack, sess);
@@ -3605,14 +3595,12 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     free(result.rel->name);
                     result.rel->name = wl_strdup(rp->name);
                     if (!result.rel->name) {
-                        col_rel_free_contents(result.rel);
-                        free(result.rel);
+                        col_rel_destroy(result.rel);
                         return ENOMEM;
                     }
                     rc = session_add_rel(sess, result.rel);
                     if (rc != 0) {
-                        col_rel_free_contents(result.rel);
-                        free(result.rel);
+                        col_rel_destroy(result.rel);
                         return rc;
                     }
                     result.owned = false;
@@ -3621,29 +3609,26 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     if (!copy)
                         return ENOMEM;
                     if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
-                        col_rel_free_contents(copy);
-                        free(copy);
+                        col_rel_destroy(copy);
                         return rc;
                     }
                     rc = session_add_rel(sess, copy);
                     if (rc != 0) {
-                        col_rel_free_contents(copy);
-                        free(copy);
+                        col_rel_destroy(copy);
                         return rc;
                     }
                 }
             } else {
                 /* Append new results to existing relation */
                 rc = col_rel_append_all(target, result.rel);
-                if (result.owned) {
-                    col_rel_free_contents(result.rel);
-                    free(result.rel);
-                }
+                if (result.owned)
+                    col_rel_destroy(result.rel);
                 if (rc != 0)
                     return rc;
             }
         }
         col_mat_cache_clear(&sess->mat_cache);
+        delta_pool_reset(sess->delta_pool);
 
         /* Non-recursive stratum frontier: record convergence epoch and iteration.
          * Non-recursive strata always converge at iteration UINT32_MAX (no loop),
@@ -3693,8 +3678,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 return ENOMEM;
             rc = session_add_rel(sess, empty);
             if (rc != 0) {
-                col_rel_free_contents(empty);
-                free(empty);
+                col_rel_destroy(empty);
                 return rc;
             }
         }
@@ -3835,10 +3819,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
             session_remove_rel(sess, dname);
             int rc = session_add_rel(sess, delta_rels[ri]);
-            if (rc != 0) {
-                col_rel_free_contents(delta_rels[ri]);
-                free(delta_rels[ri]);
-            }
+            if (rc != 0)
+                col_rel_destroy(delta_rels[ri]);
             delta_rels[ri] = NULL; /* session now owns it */
         }
 
@@ -3949,10 +3931,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
              * not caught by the pre-scan (e.g. filters that eliminate
              * all rows). */
             if (result.rel && result.rel->nrows == 0) {
-                if (result.owned) {
-                    col_rel_free_contents(result.rel);
-                    free(result.rel);
-                }
+                if (result.owned)
+                    col_rel_destroy(result.rel);
                 continue;
             }
 
@@ -3964,8 +3944,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     free(copy->name);
                     copy->name = wl_strdup(rp->name);
                     if (!copy->name) {
-                        col_rel_free_contents(copy);
-                        free(copy);
+                        col_rel_destroy(copy);
                         free(snap);
                         free(delta_rels);
                         return ENOMEM;
@@ -3979,8 +3958,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         return ENOMEM;
                     }
                     if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
-                        col_rel_free_contents(copy);
-                        free(copy);
+                        col_rel_destroy(copy);
                         free(snap);
                         free(delta_rels);
                         return rc;
@@ -3988,8 +3966,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 }
                 rc = session_add_rel(sess, copy);
                 if (rc != 0) {
-                    col_rel_free_contents(copy);
-                    free(copy);
+                    col_rel_destroy(copy);
                     free(snap);
                     free(delta_rels);
                     return rc;
@@ -4001,20 +3978,16 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         target, result.rel->ncols,
                         (const char *const *)result.rel->col_names);
                     if (rc != 0) {
-                        if (result.owned) {
-                            col_rel_free_contents(result.rel);
-                            free(result.rel);
-                        }
+                        if (result.owned)
+                            col_rel_destroy(result.rel);
                         free(snap);
                         free(delta_rels);
                         return rc;
                     }
                 }
                 rc = col_rel_append_all(target, result.rel);
-                if (result.owned) {
-                    col_rel_free_contents(result.rel);
-                    free(result.rel);
-                }
+                if (result.owned)
+                    col_rel_destroy(result.rel);
                 if (rc != 0) {
                     free(snap);
                     free(delta_rels);
@@ -4074,8 +4047,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                                      : 0.0);
             }
             if (rc2 != 0) {
-                col_rel_free_contents(delta);
-                free(delta);
+                col_rel_destroy(delta);
                 free(snap);
                 free(delta_rels);
                 return rc2;
@@ -4087,8 +4059,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 delta->timestamps = (col_delta_timestamp_t *)calloc(
                     delta->nrows, sizeof(col_delta_timestamp_t));
                 if (!delta->timestamps) {
-                    col_rel_free_contents(delta);
-                    free(delta);
+                    col_rel_destroy(delta);
                     free(snap);
                     free(delta_rels);
                     return ENOMEM;
@@ -4108,8 +4079,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         r->capacity, sizeof(col_delta_timestamp_t));
                     if (!r->timestamps) {
                         free(delta->timestamps);
-                        col_rel_free_contents(delta);
-                        free(delta);
+                        col_rel_destroy(delta);
                         free(snap);
                         free(delta_rels);
                         return ENOMEM;
@@ -4131,13 +4101,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     strat_frontier = rel_frontier;
                 }
             } else {
-                col_rel_free_contents(delta);
-                free(delta);
+                col_rel_destroy(delta);
             }
         }
 
         free(snap);
 
+        delta_pool_reset(sess->delta_pool);
         /* Clear materialization cache between iterations (relation data changed) */
         col_mat_cache_clear(&sess->mat_cache);
 
@@ -4173,15 +4143,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
     /* Cleanup all delta relations after frontier has been computed */
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        if (delta_rels[ri]) {
-            col_rel_free_contents(delta_rels[ri]);
-            free(delta_rels[ri]);
-        }
+        if (delta_rels[ri])
+            col_rel_destroy(delta_rels[ri]);
         char dname[256];
         snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
         session_remove_rel(sess, dname);
     }
     free(delta_rels);
+    delta_pool_reset(sess->delta_pool);
     col_mat_cache_clear(&sess->mat_cache);
 
     return 0;
@@ -4747,8 +4716,7 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
             goto oom;
         rc = session_add_rel(sess, r);
         if (rc != 0) {
-            col_rel_free_contents(r);
-            free(r);
+            col_rel_destroy(r);
             goto oom;
         }
     }
@@ -4999,14 +4967,14 @@ col_row_in_sorted(const int64_t *sorted_data, uint32_t nrows, uint32_t ncols,
  * is consistent with the rest of the evaluation pipeline.
  */
 static int
-col_idb_consolidate(col_rel_t *r)
+col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
 {
     eval_stack_t stk;
     eval_stack_init(&stk);
     int rc = eval_stack_push(&stk, r, false); /* borrowed */
     if (rc != 0)
         return rc;
-    col_op_consolidate(&stk);
+    col_op_consolidate(&stk, sess);
     if (stk.top > 0) {
         eval_entry_t ce = eval_stack_pop(&stk);
         if (ce.owned && ce.rel != r) {
@@ -5083,7 +5051,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             continue;
 
         /* Consolidate: sort + dedup so binary search is valid */
-        rc = col_idb_consolidate(r);
+        rc = col_idb_consolidate(r, sess);
         if (rc != 0)
             goto cleanup;
 
