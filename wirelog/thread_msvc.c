@@ -124,9 +124,11 @@ mutex_init(mutex_t *m)
     if (!m)
         return -1;
 
-    if (!InitializeCriticalSection(&m->cs))
-        return -1;
-
+    /* InitializeCriticalSection returns void on Windows Vista+.
+     * Since we require Vista+ for CONDITION_VARIABLE support,
+     * we call it without checking the return value.
+     */
+    InitializeCriticalSection(&m->cs);
     return 0;
 }
 

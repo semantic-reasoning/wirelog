@@ -13,10 +13,10 @@
  *
  * Minimal work-queue abstraction for parallelising non-recursive stratum
  * evaluation in the columnar backend.  Provides a task-submission
- * interface backed by a pthread thread pool (CPU backend).
+ * interface backed by a cross-platform thread pool (CPU backend).
  *
  * Design constraints:
- *   - Pure C11 + pthreads (no platform-specific extensions).
+ *   - Pure C11 + cross-platform thread abstraction (POSIX/MSVC compatible).
  *   - Synchronisation via mutex + condition variables only.
  *   - No async callbacks, no cancellation — thin enough for TSan/GDB.
  *   - Future FPGA backend can implement the same 5-function interface
@@ -26,7 +26,7 @@
  * Threading Model
  * ========================================================================
  *
- * The work queue owns a fixed-size pool of worker pthreads, created at
+ * The work queue owns a fixed-size pool of worker threads, created at
  * wl_workqueue_create() time and joined at wl_workqueue_destroy() time.
  *
  * Workers block on a condition variable until tasks are submitted.
@@ -80,7 +80,7 @@
 /**
  * wl_work_queue_t:
  *
- * Opaque handle to a work queue with a pthread thread pool.
+ * Opaque handle to a work queue with a cross-platform thread pool.
  * Created with wl_workqueue_create(), destroyed with wl_workqueue_destroy().
  */
 typedef struct wl_work_queue wl_work_queue_t;
@@ -89,14 +89,14 @@ typedef struct wl_work_queue wl_work_queue_t;
  * wl_workqueue_create:
  * @num_workers: Number of worker threads to spawn.  Must be >= 1.
  *
- * Create a work queue backed by a fixed-size pthread pool.
+ * Create a work queue backed by a fixed-size thread pool.
  * Worker threads are created immediately and block until work is
  * submitted.
  *
  * Returns:
  *   non-NULL: Opaque queue handle (caller must destroy with
  *             wl_workqueue_destroy).
- *   NULL:     Allocation or pthread_create failure.
+ *   NULL:     Allocation or thread creation failure.
  */
 wl_work_queue_t *
 wl_workqueue_create(uint32_t num_workers);
