@@ -90,8 +90,13 @@ typedef struct thread_t {
  * Mutex (mutual exclusion lock). Platform-specific
  * (pthread_mutex_t on POSIX, CRITICAL_SECTION on Windows).
  *
- * Non-recursive: attempting to lock a mutex held by the same thread
- * will deadlock (standard mutex semantics, not recursive mutex).
+ * Non-recursive on POSIX: attempting to lock a pthread_mutex_t held by
+ * the same thread will deadlock (standard mutex semantics).
+ *
+ * NOTE: Windows CRITICAL_SECTION is reentrant/recursive by default, but
+ * the public interface guarantees non-recursive semantics. Code must not
+ * rely on self-reentrance. If future code requires self-deadlock detection
+ * for safety, the MSVC backend can be enhanced with thread-ID tracking.
  */
 #if defined(_WIN32) || defined(_WIN64)
 typedef struct mutex_t {
