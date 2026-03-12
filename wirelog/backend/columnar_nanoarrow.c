@@ -4747,6 +4747,7 @@ oom:
     free(sess->rels);
     wl_workqueue_destroy(sess->wq); /* NULL-safe */
     wl_arena_free(sess->eval_arena);
+    delta_pool_destroy(sess->delta_pool); /* NULL-safe */
     free(sess);
     return ENOMEM;
 }
