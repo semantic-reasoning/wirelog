@@ -34,6 +34,17 @@ wirelog_optimizer_src = files('passes/fusion.c', 'passes/jpp.c', 'passes/sip.c',
 wirelog_arena_src = files('arena/arena.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Thread Backend Module(Issue #88 - Cross-Platform Threading)
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+
+# Select threading backend based on platform
+if host_machine.system() == 'windows'
+    wirelog_thread_src = files('thread_msvc.c', )
+else
+    wirelog_thread_src = files('thread_posix.c', )
+endif
+
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Work Queue Module(Phase B - lite)
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 

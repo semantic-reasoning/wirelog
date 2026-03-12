@@ -12,7 +12,7 @@
  *   wl_workqueue_drain, wl_workqueue_destroy.
  *
  * Thread pool design:
- *   - Fixed-size pool of pthreads, created at create() time.
+ *   - Fixed-size pool of threads, created at create() time.
  *   - Ring buffer of work items protected by a single mutex.
  *   - Workers block on a condition variable until work is available.
  *   - wait_all() blocks until all submitted items complete (barrier).
@@ -21,7 +21,7 @@
 
 #include "workqueue.h"
 
-#include <pthread.h>
+#include "thread.h"
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,9 +50,9 @@ struct wl_work_queue {
     uint32_t count; /* items currently in ring          */
 
     /* Synchronisation */
-    pthread_mutex_t mutex;
-    pthread_cond_t work_avail; /* signalled when items are enqueued   */
-    pthread_cond_t all_done;   /* signalled when in_flight reaches 0  */
+    mutex_t mutex;
+    cond_t work_avail; /* signalled when items are enqueued   */
+    cond_t all_done;   /* signalled when in_flight reaches 0  */
 
     /* Barrier tracking */
     uint32_t submitted; /* total items submitted in current batch */
@@ -62,7 +62,7 @@ struct wl_work_queue {
     bool shutdown;
 
     /* Thread pool */
-    pthread_t *threads;
+    thread_t *threads;
     uint32_t num_workers;
 };
 
@@ -78,14 +78,14 @@ worker_thread(void *arg)
     for (;;) {
         wl_work_item_t item;
 
-        pthread_mutex_lock(&wq->mutex);
+        mutex_lock(&wq->mutex);
 
         /* Wait for work or shutdown */
         while (wq->count == 0 && !wq->shutdown)
-            pthread_cond_wait(&wq->work_avail, &wq->mutex);
+            cond_wait(&wq->work_avail, &wq->mutex);
 
         if (wq->shutdown && wq->count == 0) {
-            pthread_mutex_unlock(&wq->mutex);
+            mutex_unlock(&wq->mutex);
             return NULL;
         }
 
@@ -94,17 +94,17 @@ worker_thread(void *arg)
         wq->head = (wq->head + 1) % WL_WQ_RING_CAP;
         wq->count--;
 
-        pthread_mutex_unlock(&wq->mutex);
+        mutex_unlock(&wq->mutex);
 
         /* Execute outside the lock */
         item.fn(item.ctx);
 
         /* Signal completion */
-        pthread_mutex_lock(&wq->mutex);
+        mutex_lock(&wq->mutex);
         wq->completed++;
         if (wq->completed == wq->submitted)
-            pthread_cond_signal(&wq->all_done);
-        pthread_mutex_unlock(&wq->mutex);
+            cond_signal(&wq->all_done);
+        mutex_unlock(&wq->mutex);
     }
 }
 
@@ -122,27 +122,27 @@ wl_workqueue_create(uint32_t num_workers)
     if (!wq)
         return NULL;
 
-    if (pthread_mutex_init(&wq->mutex, NULL) != 0) {
+    if (mutex_init(&wq->mutex) != 0) {
         free(wq);
         return NULL;
     }
-    if (pthread_cond_init(&wq->work_avail, NULL) != 0) {
-        pthread_mutex_destroy(&wq->mutex);
+    if (cond_init(&wq->work_avail) != 0) {
+        mutex_destroy(&wq->mutex);
         free(wq);
         return NULL;
     }
-    if (pthread_cond_init(&wq->all_done, NULL) != 0) {
-        pthread_cond_destroy(&wq->work_avail);
-        pthread_mutex_destroy(&wq->mutex);
+    if (cond_init(&wq->all_done) != 0) {
+        cond_destroy(&wq->work_avail);
+        mutex_destroy(&wq->mutex);
         free(wq);
         return NULL;
     }
 
-    wq->threads = (pthread_t *)calloc(num_workers, sizeof(pthread_t));
+    wq->threads = (thread_t *)calloc(num_workers, sizeof(thread_t));
     if (!wq->threads) {
-        pthread_cond_destroy(&wq->all_done);
-        pthread_cond_destroy(&wq->work_avail);
-        pthread_mutex_destroy(&wq->mutex);
+        cond_destroy(&wq->all_done);
+        cond_destroy(&wq->work_avail);
+        mutex_destroy(&wq->mutex);
         free(wq);
         return NULL;
     }
@@ -150,16 +150,16 @@ wl_workqueue_create(uint32_t num_workers)
     wq->num_workers = num_workers;
 
     for (uint32_t i = 0; i < num_workers; i++) {
-        if (pthread_create(&wq->threads[i], NULL, worker_thread, wq) != 0) {
+        if (thread_create(&wq->threads[i], worker_thread, wq) != 0) {
             /* Partial creation: shut down already-created threads */
             wq->shutdown = true;
-            pthread_cond_broadcast(&wq->work_avail);
+            cond_broadcast(&wq->work_avail);
             for (uint32_t j = 0; j < i; j++)
-                pthread_join(wq->threads[j], NULL);
+                thread_join(&wq->threads[j]);
             free(wq->threads);
-            pthread_cond_destroy(&wq->all_done);
-            pthread_cond_destroy(&wq->work_avail);
-            pthread_mutex_destroy(&wq->mutex);
+            cond_destroy(&wq->all_done);
+            cond_destroy(&wq->work_avail);
+            mutex_destroy(&wq->mutex);
             free(wq);
             return NULL;
         }
@@ -174,10 +174,10 @@ wl_workqueue_submit(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx)
     if (!wq || !work_fn)
         return -1;
 
-    pthread_mutex_lock(&wq->mutex);
+    mutex_lock(&wq->mutex);
 
     if (wq->count >= WL_WQ_RING_CAP) {
-        pthread_mutex_unlock(&wq->mutex);
+        mutex_unlock(&wq->mutex);
         return -1; /* ring full */
     }
 
@@ -187,8 +187,8 @@ wl_workqueue_submit(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx)
     wq->count++;
     wq->submitted++;
 
-    pthread_cond_signal(&wq->work_avail);
-    pthread_mutex_unlock(&wq->mutex);
+    cond_signal(&wq->work_avail);
+    mutex_unlock(&wq->mutex);
 
     return 0;
 }
@@ -199,16 +199,16 @@ wl_workqueue_wait_all(wl_work_queue_t *wq)
     if (!wq)
         return -1;
 
-    pthread_mutex_lock(&wq->mutex);
+    mutex_lock(&wq->mutex);
 
     while (wq->completed < wq->submitted)
-        pthread_cond_wait(&wq->all_done, &wq->mutex);
+        cond_wait(&wq->all_done, &wq->mutex);
 
     /* Reset counters for next batch */
     wq->submitted = 0;
     wq->completed = 0;
 
-    pthread_mutex_unlock(&wq->mutex);
+    mutex_unlock(&wq->mutex);
 
     return 0;
 }
@@ -227,19 +227,19 @@ wl_workqueue_drain(wl_work_queue_t *wq)
     for (;;) {
         wl_work_item_t item;
 
-        pthread_mutex_lock(&wq->mutex);
+        mutex_lock(&wq->mutex);
         if (wq->count == 0) {
             /* Reset counters */
             wq->submitted = 0;
             wq->completed = 0;
-            pthread_mutex_unlock(&wq->mutex);
+            mutex_unlock(&wq->mutex);
             return 0;
         }
 
         item = wq->ring[wq->head];
         wq->head = (wq->head + 1) % WL_WQ_RING_CAP;
         wq->count--;
-        pthread_mutex_unlock(&wq->mutex);
+        mutex_unlock(&wq->mutex);
 
         item.fn(item.ctx);
     }
@@ -252,18 +252,18 @@ wl_workqueue_destroy(wl_work_queue_t *wq)
         return;
 
     /* Signal shutdown to all workers */
-    pthread_mutex_lock(&wq->mutex);
+    mutex_lock(&wq->mutex);
     wq->shutdown = true;
-    pthread_cond_broadcast(&wq->work_avail);
-    pthread_mutex_unlock(&wq->mutex);
+    cond_broadcast(&wq->work_avail);
+    mutex_unlock(&wq->mutex);
 
     /* Join all worker threads */
     for (uint32_t i = 0; i < wq->num_workers; i++)
-        pthread_join(wq->threads[i], NULL);
+        thread_join(&wq->threads[i]);
 
     free(wq->threads);
-    pthread_cond_destroy(&wq->all_done);
-    pthread_cond_destroy(&wq->work_avail);
-    pthread_mutex_destroy(&wq->mutex);
+    cond_destroy(&wq->all_done);
+    cond_destroy(&wq->work_avail);
+    mutex_destroy(&wq->mutex);
     free(wq);
 }

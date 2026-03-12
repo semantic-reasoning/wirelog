@@ -42,6 +42,13 @@ bench_workqueue_src = files(
   subdir_wirelog / 'workqueue.c',
 )
 
+# Select threading backend based on platform
+if host_machine.system() == 'windows'
+  bench_thread_src = files(subdir_wirelog / 'thread_msvc.c')
+else
+  bench_thread_src = files(subdir_wirelog / 'thread_posix.c')
+endif
+
 bench_flowlog = executable(
   'bench_flowlog',
   files('bench_flowlog.c'),
@@ -51,6 +58,7 @@ bench_flowlog = executable(
   bench_backend_src,
   bench_io_src,
   bench_arena_src,
+  bench_thread_src,
   bench_workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
@@ -66,6 +74,7 @@ bench_flowlog_seq = executable(
   bench_backend_src,
   bench_io_src,
   bench_arena_src,
+  bench_thread_src,
   bench_workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep],
