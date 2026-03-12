@@ -79,11 +79,24 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
 /* Type-aware output callback                                               */
 /* ======================================================================== */
 
+/*
+ * Per-relation file accumulator for .output(filename=...) support.
+ * Holds the open FILE* and relation name so the snapshot callback can write
+ * matching tuples directly to the file in CSV format.
+ */
+typedef struct {
+    const char *relation; /* borrowed pointer to relation name */
+    FILE *file;           /* open for writing, NULL if open failed */
+} wl_output_file_entry_t;
+
 typedef struct {
     FILE *out;
     const wirelog_program_t *prog;
     const wl_intern_t *intern;
     bool has_any_output; /* true if any relation has .output */
+    /* Per-relation output files (for .output(filename=...)) */
+    wl_output_file_entry_t *output_files;
+    uint32_t output_file_count;
 } wl_output_ctx_t;
 
 /* Find the relation info for a given relation name */
@@ -96,6 +109,29 @@ find_relation(const wirelog_program_t *prog, const char *name)
             return &prog->relations[i];
     }
     return NULL;
+}
+
+/* Write a single tuple as a CSV row to the given file */
+static void
+write_tuple_csv(FILE *f, const wl_ir_relation_info_t *rel,
+                const wl_intern_t *intern, const int64_t *row, uint32_t ncols)
+{
+    for (uint32_t i = 0; i < ncols; i++) {
+        if (i > 0)
+            fprintf(f, ",");
+
+        if (rel && i < rel->column_count
+            && rel->columns[i].type == WIRELOG_TYPE_STRING && intern) {
+            const char *str = wl_intern_reverse(intern, row[i]);
+            if (str)
+                fprintf(f, "%s", str);
+            else
+                fprintf(f, "%" PRId64, row[i]);
+        } else {
+            fprintf(f, "%" PRId64, row[i]);
+        }
+    }
+    fprintf(f, "\n");
 }
 
 /* Callback adapter: type-aware output with string reverse-mapping */
@@ -112,6 +148,21 @@ print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
     /* Filter: if any relation has .output, only print those */
     if (ctx->has_any_output && rel && !rel->has_output)
         return;
+
+    /* Write to per-relation output file if configured */
+    if (rel && rel->output_file) {
+        for (uint32_t i = 0; i < ctx->output_file_count; i++) {
+            if (ctx->output_files[i].relation
+                && strcmp(ctx->output_files[i].relation, relation) == 0
+                && ctx->output_files[i].file) {
+                write_tuple_csv(ctx->output_files[i].file, rel, ctx->intern,
+                                row, ncols);
+                break;
+            }
+        }
+        /* Relations with output_file do not print to stdout */
+        return;
+    }
 
     fprintf(ctx->out, "%s(", relation);
     for (uint32_t i = 0; i < ncols; i++) {
@@ -196,16 +247,69 @@ wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
         }
     }
 
+    /* 5a. Open per-relation output files for .output(filename=...) */
+    wl_output_file_entry_t *output_files = NULL;
+    uint32_t output_file_count = 0;
+
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (prog->relations[i].has_output && prog->relations[i].output_file)
+            output_file_count++;
+    }
+
+    if (output_file_count > 0) {
+        output_files = (wl_output_file_entry_t *)calloc(
+            output_file_count, sizeof(wl_output_file_entry_t));
+        if (!output_files) {
+            wl_session_destroy(sess);
+            wl_plan_free(plan);
+            wirelog_program_free(prog);
+            return -1;
+        }
+        uint32_t fi = 0;
+        for (uint32_t i = 0; i < prog->relation_count; i++) {
+            wl_ir_relation_info_t *rel = &prog->relations[i];
+            if (!rel->has_output || !rel->output_file)
+                continue;
+            output_files[fi].relation = rel->name;
+            output_files[fi].file = fopen(rel->output_file, "w");
+            if (!output_files[fi].file) {
+                fprintf(stderr,
+                        "error: cannot open output file '%s' for '%s'\n",
+                        rel->output_file, rel->name);
+                /* Close already-opened files and fail */
+                for (uint32_t j = 0; j < fi; j++) {
+                    if (output_files[j].file)
+                        fclose(output_files[j].file);
+                }
+                free(output_files);
+                wl_session_destroy(sess);
+                wl_plan_free(plan);
+                wirelog_program_free(prog);
+                return -1;
+            }
+            fi++;
+        }
+    }
+
     /* 6. Execute with type-aware output callback */
     wl_output_ctx_t ctx = {
         .out = out,
         .prog = prog,
         .intern = prog->intern,
         .has_any_output = has_any_output,
+        .output_files = output_files,
+        .output_file_count = output_file_count,
     };
     rc = wl_session_snapshot(sess, print_tuple_cb, &ctx);
 
-    /* 7. Cleanup */
+    /* 7. Close per-relation output files */
+    for (uint32_t i = 0; i < output_file_count; i++) {
+        if (output_files[i].file)
+            fclose(output_files[i].file);
+    }
+    free(output_files);
+
+    /* 8. Cleanup */
     wl_session_destroy(sess);
     wl_plan_free(plan);
     wirelog_program_free(prog);

@@ -148,6 +148,75 @@ test_input_directive(void)
 }
 
 static void
+test_input_directive_param_names_values(void)
+{
+    TEST(
+        "wl_ir_from_program extracts input_param_names and input_param_values");
+
+    struct wirelog_program *prog = make_program(
+        ".decl Arc(x: int32, y: int32)\n"
+        ".input Arc(IO=\"file\", filename=\"test.csv\", delimiter=\",\")\n");
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    if (!prog->relations[0].has_input) {
+        wl_ir_program_free(prog);
+        FAIL("has_input should be true");
+        return;
+    }
+
+    if (prog->relations[0].input_param_count != 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 3 params, got %u",
+                 prog->relations[0].input_param_count);
+        wl_ir_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    /* Verify param names are stored */
+    const char *expected_names[] = { "IO", "filename", "delimiter" };
+    const char *expected_values[] = { "file", "test.csv", "," };
+    for (uint32_t i = 0; i < 3; i++) {
+        if (!prog->relations[0].input_param_names[i]
+            || strcmp(prog->relations[0].input_param_names[i],
+                      expected_names[i])
+                   != 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "param %u name: expected '%s', got '%s'",
+                     i, expected_names[i],
+                     prog->relations[0].input_param_names[i]
+                         ? prog->relations[0].input_param_names[i]
+                         : "(null)");
+            wl_ir_program_free(prog);
+            FAIL(buf);
+            return;
+        }
+        if (!prog->relations[0].input_param_values[i]
+            || strcmp(prog->relations[0].input_param_values[i],
+                      expected_values[i])
+                   != 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "param %u value: expected '%s', got '%s'", i,
+                     expected_values[i],
+                     prog->relations[0].input_param_values[i]
+                         ? prog->relations[0].input_param_values[i]
+                         : "(null)");
+            wl_ir_program_free(prog);
+            FAIL(buf);
+            return;
+        }
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
 test_output_directive(void)
 {
     TEST("Parse .output marks relation has_output");
@@ -164,6 +233,37 @@ test_output_directive(void)
     if (!prog->relations[0].has_output) {
         wl_ir_program_free(prog);
         FAIL("has_output should be true");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
+test_output_directive_with_filename(void)
+{
+    TEST("Parse .output(filename=...) stores output_file");
+
+    struct wirelog_program *prog
+        = make_program(".decl Reach(x: int32, y: int32)\n"
+                       ".output Reach(filename=\"reach.csv\")\n");
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    if (!prog->relations[0].has_output) {
+        wl_ir_program_free(prog);
+        FAIL("has_output should be true");
+        return;
+    }
+
+    if (!prog->relations[0].output_file
+        || strcmp(prog->relations[0].output_file, "reach.csv") != 0) {
+        wl_ir_program_free(prog);
+        FAIL("output_file should be \"reach.csv\"");
         return;
     }
 
@@ -1851,7 +1951,9 @@ main(void)
     /* Metadata collection */
     test_decl_single_relation();
     test_input_directive();
+    test_input_directive_param_names_values();
     test_output_directive();
+    test_output_directive_with_filename();
     test_printsize_directive();
     test_full_tc_metadata();
     test_no_rules_program();

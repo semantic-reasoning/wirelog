@@ -65,6 +65,7 @@ typedef enum {
     /* Declaration parts */
     WL_PARSER_AST_NODE_TYPED_PARAM, /* name=attr_name, type_name=data_type */
     WL_PARSER_AST_NODE_INPUT_PARAM, /* name=param_name, str_value=param_value */
+    WL_PARSER_AST_NODE_OUTPUT_PARAM, /* name=param_name, str_value=param_value */
 } wl_parser_ast_node_type_t;
 
 /* ======================================================================== */

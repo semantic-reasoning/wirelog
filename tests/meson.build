@@ -1050,6 +1050,32 @@ test_multi_stratum_rule_frontier_exe = executable(
 test('multi_stratum_rule_frontier', test_multi_stratum_rule_frontier_exe)
 
 # ============================================================================
+# CLI Driver Tests (Issue #137 - .output filename parameter support)
+# ============================================================================
+
+driver_src = files(
+  '../wirelog/cli/driver.c',
+)
+
+test_cli_exe = executable(
+  'test_cli',
+  files('test_cli.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  driver_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('cli', test_cli_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #

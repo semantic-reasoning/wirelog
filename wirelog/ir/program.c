@@ -40,6 +40,8 @@ type_name_to_column_type(const char *type_name)
         return WIRELOG_TYPE_FLOAT;
     if (strcmp(type_name, "string") == 0)
         return WIRELOG_TYPE_STRING;
+    if (strcmp(type_name, "symbol") == 0)
+        return WIRELOG_TYPE_STRING;
     if (strcmp(type_name, "bool") == 0)
         return WIRELOG_TYPE_BOOL;
 
@@ -88,6 +90,7 @@ relation_info_free(wl_ir_relation_info_t *info)
         free(info->input_param_names);
         free(info->input_param_values);
     }
+    free(info->output_file);
     free(info->fact_data);
 }
 
@@ -326,6 +329,18 @@ collect_output(struct wirelog_program *prog,
     }
 
     rel->has_output = true;
+
+    /* Extract optional filename from OUTPUT_PARAM children */
+    for (uint32_t i = 0; i < output_node->child_count; i++) {
+        const wl_parser_ast_node_t *param = output_node->children[i];
+        if (param->type == WL_PARSER_AST_NODE_OUTPUT_PARAM && param->name
+            && strcmp(param->name, "filename") == 0 && param->str_value) {
+            free(rel->output_file);
+            rel->output_file = strdup_safe(param->str_value);
+            break;
+        }
+    }
+
     return 0;
 }
 
