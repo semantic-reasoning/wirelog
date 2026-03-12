@@ -28,7 +28,7 @@ wirelog_datadir = get_option('datadir') / project_name
 cc = meson.get_compiler('c')
 if cc.get_id() == 'msvc'
   add_project_arguments(
-    ['/W3'],
+    ['/W3', '/D_CRT_SILENCE_NONCONFORMING_ATOMICS'],
     language: 'c'
   )
 else
