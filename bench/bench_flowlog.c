@@ -70,7 +70,16 @@ output_json_row(const char *wl_name, int32_t edges, uint32_t workers,
                 uint64_t kfusion_alloc_ns, uint64_t kfusion_dispatch_ns,
                 uint64_t kfusion_merge_ns, uint64_t kfusion_cleanup_ns);
 
+#ifndef _MSC_VER
+/* getopt.h is POSIX-only; not available on Windows MSVC */
 #include <getopt.h>
+#else
+/* Windows MSVC: getopt not available; use external implementation or skip */
+extern int getopt(int argc, char *const argv[], const char *optstring);
+extern int optind;
+extern char *optarg;
+#endif
+
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
