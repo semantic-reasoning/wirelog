@@ -82,8 +82,11 @@ bench_flowlog_seq = executable(
   install: false,
 )
 
-datagen = executable(
-  'datagen',
-  files('datagen.c'),
-  install: false,
-)
+# Skip datagen on Windows (uses POSIX getopt_long)
+if host_machine.system() != 'windows'
+  datagen = executable(
+    'datagen',
+    files('datagen.c'),
+    install: false,
+  )
+endif
