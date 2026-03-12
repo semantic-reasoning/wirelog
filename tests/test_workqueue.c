@@ -23,7 +23,16 @@
 #include "../wirelog/wirelog.h"
 
 #include <inttypes.h>
+#ifndef _MSC_VER
 #include <stdatomic.h>
+#else
+#include <windows.h>
+/* MSVC fallback: use volatile int with interlocked operations instead of C11 atomics */
+typedef volatile int atomic_int;
+#define atomic_store(ptr, val) InterlockedExchange((LONG *)(ptr), (LONG)(val))
+#define atomic_load(ptr) (*(ptr))
+#define atomic_fetch_add(ptr, val) InterlockedAdd((LONG *)(ptr), (LONG)(val))
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

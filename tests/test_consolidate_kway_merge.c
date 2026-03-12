@@ -23,12 +23,17 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200112L
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _MSC_VER
 #include <time.h>
+#else
+#include <windows.h>
+#endif
 
 /*
  * ArrowSchema stub: replicates the layout of struct ArrowSchema from
@@ -545,12 +550,21 @@ test_large_dataset_performance(void)
 
     uint32_t seg_boundaries[4] = { 0, boundary0, boundary1, total_rows };
 
+#ifndef _MSC_VER
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     int rc = col_op_consolidate_kway_merge(rel, seg_boundaries, 3);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t elapsed_ms = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000
+                          + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000;
+#else
+    DWORD t0 = GetTickCount();
+    int rc = col_op_consolidate_kway_merge(rel, seg_boundaries, 3);
+    DWORD t1 = GetTickCount();
+    uint64_t elapsed_ms = (uint64_t)(t1 - t0);
+#endif
 
     ASSERT(rc == 0, "returns 0 on success");
 
@@ -567,10 +581,9 @@ test_large_dataset_performance(void)
     ASSERT(test_rel_contains_row(rel, last_row), "last row present");
 
     /* Timing check: < 100ms */
-    long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L
-                      + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
     if (elapsed_ms >= 100) {
-        printf("WARN: merge took %ld ms (expected < 100ms)\n", elapsed_ms);
+        printf("WARN: merge took %" PRIu64 " ms (expected < 100ms)\n",
+               elapsed_ms);
     }
     ASSERT(elapsed_ms < 100, "merge completed in < 100ms (O(M log K))");
 

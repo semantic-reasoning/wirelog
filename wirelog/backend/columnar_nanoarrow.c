@@ -41,6 +41,18 @@
 #ifdef _MSC_VER
 #define UNUSED
 #include <windows.h> /* For GetTickCount64() in now_ns() */
+#include <intrin.h>  /* For _BitScanForward64 */
+/* MSVC: __builtin_ctzll not available; use _BitScanForward64 */
+static inline int
+ctzll(unsigned long long x)
+{
+    unsigned long index;
+    if (_BitScanForward64(&index, x)) {
+        return (int)index;
+    }
+    return 64; /* undefined for x=0, but we don't call it with x=0 */
+}
+#define __builtin_ctzll(x) ctzll(x)
 #else
 #define UNUSED __attribute__((unused))
 #endif
@@ -1947,6 +1959,23 @@ row_cmp_fn(const void *a, const void *b, void *ctx)
 }
 #define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
     qsort_r(base, nmemb, size, fn, ctx)
+#elif defined(_MSC_VER)
+/* MSVC qsort_s: context first, comparator last (same signature as BSD qsort_r) */
+static int __cdecl row_cmp_fn(void *ctx, const void *a, const void *b)
+{
+    const uint32_t ncols = *(const uint32_t *)ctx;
+    const int64_t *ra = (const int64_t *)a;
+    const int64_t *rb = (const int64_t *)b;
+    for (uint32_t c = 0; c < ncols; c++) {
+        if (ra[c] < rb[c])
+            return -1;
+        if (ra[c] > rb[c])
+            return 1;
+    }
+    return 0;
+}
+#define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
+    qsort_s(base, nmemb, size, fn, ctx)
 #else
 /* BSD qsort_r: context first, comparator last */
 static int

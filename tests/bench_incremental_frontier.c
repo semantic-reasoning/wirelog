@@ -20,7 +20,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _MSC_VER
 #include <time.h>
+#else
+#include <windows.h>
+#endif
 
 #include "../wirelog/backend/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan_gen.h"
@@ -33,9 +37,14 @@
 static uint64_t
 now_ns(void)
 {
+#ifndef _MSC_VER
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#else
+    /* MSVC: Use GetTickCount64 (returns ms since system start) */
+    return (uint64_t)GetTickCount64() * 1000000ULL;
+#endif
 }
 
 static wl_plan_t *

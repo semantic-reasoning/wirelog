@@ -15,7 +15,8 @@
 #ifndef _MSC_VER
 #include <getopt.h>
 #else
-extern int getopt(int argc, char *const argv[], const char *optstring);
+extern int
+getopt(int argc, char *const argv[], const char *optstring);
 extern int optind;
 extern char *optarg;
 
@@ -155,8 +156,7 @@ main(int argc, char **argv)
            != -1) {
 #else
     /* MSVC: getopt_long not available; use simple getopt fallback */
-    while ((opt = getopt(argc, argv, "n:e:t:s:wo:h"))
-           != -1) {
+    while ((opt = getopt(argc, argv, "n:e:t:s:wo:h")) != -1) {
 #endif
         switch (opt) {
         case 'n':
