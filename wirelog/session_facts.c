@@ -17,7 +17,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _MSC_VER
+#include <direct.h>
+#define getcwd _getcwd
+#else
 #include <unistd.h>
+#endif
 
 int
 wl_session_load_facts(wl_session_t *sess, const struct wirelog_program *prog)
