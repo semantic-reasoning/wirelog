@@ -17,6 +17,7 @@
 #include "arena/arena.h"
 
 #include "nanoarrow/nanoarrow.h"
+#include <xxhash.h>
 
 #include <errno.h>
 #include <stdint.h>
@@ -1044,6 +1045,11 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         case WL_PLAN_EXPR_ARITH_SHR: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
             filt_push(&s, a >> b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_HASH: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, (int64_t)XXH3_64bits(&a, sizeof(a)));
             break;
         }
 

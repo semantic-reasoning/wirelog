@@ -60,6 +60,7 @@ typedef enum {
     WIRELOG_ARITH_BNOT, /* bnot - bitwise NOT (unary) */
     WIRELOG_ARITH_SHL,  /* bshl - left shift */
     WIRELOG_ARITH_SHR,  /* bshr - right shift */
+    WIRELOG_ARITH_HASH, /* hash - xxHash3 64-bit (unary) */
 } wirelog_arith_op_t;
 
 /* ======================================================================== */

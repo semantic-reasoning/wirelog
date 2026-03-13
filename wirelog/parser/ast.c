@@ -218,6 +218,8 @@ wirelog_arith_op_str(wirelog_arith_op_t op)
         return "bshl";
     case WIRELOG_ARITH_SHR:
         return "bshr";
+    case WIRELOG_ARITH_HASH:
+        return "hash";
     }
     return "?";
 }
