@@ -39,6 +39,10 @@ demo_workqueue_src = files(
   subdir_wirelog / 'workqueue.c',
 )
 
+demo_csv_src = files(
+  subdir_wirelog / 'io/csv_reader.c',
+)
+
 if host_machine.system() == 'windows'
   demo_thread_src = files(subdir_wirelog / 'thread_msvc.c')
 else
@@ -57,6 +61,7 @@ delta_demo = executable(
   demo_arena_src,
   demo_thread_src,
   demo_workqueue_src,
+  demo_csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
   install: false,
