@@ -214,7 +214,8 @@ agg_to_tag(wirelog_agg_fn_t fn)
  * Walks the tree recursively: children first (postfix), then operator.
  */
 static int
-serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr)
+serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
+               uint32_t col_count)
 {
     if (!expr)
         return -1;
@@ -223,12 +224,24 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr)
     case WL_IR_EXPR_VAR: {
         if (!expr->var_name)
             return -1;
-        uint16_t len = (uint16_t)strlen(expr->var_name);
+        /* Resolve variable name to "colN" using column name context */
+        char resolved[32];
+        const char *emit_name = expr->var_name;
+        if (col_names && col_count > 0) {
+            for (uint32_t c = 0; c < col_count; c++) {
+                if (col_names[c] && strcmp(col_names[c], expr->var_name) == 0) {
+                    snprintf(resolved, sizeof(resolved), "col%u", c);
+                    emit_name = resolved;
+                    break;
+                }
+            }
+        }
+        uint16_t len = (uint16_t)strlen(emit_name);
         if (expr_buf_push_u8(buf, WL_PLAN_EXPR_VAR) != 0)
             return -1;
         if (expr_buf_push_u16(buf, len) != 0)
             return -1;
-        if (expr_buf_push_bytes(buf, (const uint8_t *)expr->var_name, len) != 0)
+        if (expr_buf_push_bytes(buf, (const uint8_t *)emit_name, len) != 0)
             return -1;
         return 0;
     }
@@ -258,21 +271,24 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr)
     case WL_IR_EXPR_ARITH:
         /* Serialize children first (postfix) */
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i]) != 0)
+            if (serialize_expr(buf, expr->children[i], col_names, col_count)
+                != 0)
                 return -1;
         }
         return expr_buf_push_u8(buf, arith_to_tag(expr->arith_op));
 
     case WL_IR_EXPR_CMP:
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i]) != 0)
+            if (serialize_expr(buf, expr->children[i], col_names, col_count)
+                != 0)
                 return -1;
         }
         return expr_buf_push_u8(buf, cmp_to_tag(expr->cmp_op));
 
     case WL_IR_EXPR_AGG:
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i]) != 0)
+            if (serialize_expr(buf, expr->children[i], col_names, col_count)
+                != 0)
                 return -1;
         }
         return expr_buf_push_u8(buf, agg_to_tag(expr->agg_fn));
@@ -283,11 +299,12 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr)
 
 /**
  * Serialize an IR expression into a wl_plan_expr_buffer_t.
+ * col_names/col_count provide variable name -> column index resolution.
  * Returns 0 on success. On NULL expr, produces empty buffer (valid no-op).
  */
 static int
-serialize_expr_to_buffer(const wl_ir_expr_t *expr,
-                         wl_plan_expr_buffer_t *out_buf)
+serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, char **col_names,
+                             uint32_t col_count, wl_plan_expr_buffer_t *out_buf)
 {
     out_buf->data = NULL;
     out_buf->size = 0;
@@ -299,7 +316,7 @@ serialize_expr_to_buffer(const wl_ir_expr_t *expr,
     if (expr_buf_init(&buf) != 0)
         return -1;
 
-    if (serialize_expr(&buf, expr) != 0) {
+    if (serialize_expr(&buf, expr, col_names, col_count) != 0) {
         free(buf.data);
         return -1;
     }
@@ -618,14 +635,28 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             if (!op->map_exprs)
                 return -1;
             op->map_expr_count = node->project_count;
+            /* Collect child column names for variable name resolution */
+            char **child_col_names = NULL;
+            uint32_t child_col_count = 0;
+            const wirelog_ir_node_t *child0
+                = (node->child_count > 0) ? node->children[0] : NULL;
+            collect_output_columns(child0, &child_col_names, &child_col_count);
             for (uint32_t i = 0; i < node->project_count; i++) {
                 if (node->project_exprs[i]) {
-                    if (serialize_expr_to_buffer(node->project_exprs[i],
-                                                 &op->map_exprs[i])
-                        != 0)
+                    if (serialize_expr_to_buffer_ctx(
+                            node->project_exprs[i], child_col_names,
+                            child_col_count, &op->map_exprs[i])
+                        != 0) {
+                        for (uint32_t c = 0; c < child_col_count; c++)
+                            free(child_col_names[c]);
+                        free((void *)child_col_names);
                         return -1;
+                    }
                 }
             }
+            for (uint32_t c = 0; c < child_col_count; c++)
+                free(child_col_names[c]);
+            free((void *)child_col_names);
         }
         return 0;
     }
@@ -640,8 +671,21 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
         if (!op)
             return -1;
         op->op = WL_PLAN_OP_FILTER;
-        if (serialize_expr_to_buffer(node->filter_expr, &op->filter_expr) != 0)
-            return -1;
+        {
+            char **filt_col_names = NULL;
+            uint32_t filt_col_count = 0;
+            const wirelog_ir_node_t *fchild
+                = (node->child_count > 0) ? node->children[0] : NULL;
+            collect_output_columns(fchild, &filt_col_names, &filt_col_count);
+            int rc = serialize_expr_to_buffer_ctx(
+                node->filter_expr, filt_col_names, filt_col_count,
+                &op->filter_expr);
+            for (uint32_t c = 0; c < filt_col_count; c++)
+                free(filt_col_names[c]);
+            free((void *)filt_col_names);
+            if (rc != 0)
+                return -1;
+        }
         return 0;
     }
 
@@ -774,8 +818,18 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             if (!filt)
                 return -1;
             filt->op = WL_PLAN_OP_FILTER;
-            if (serialize_expr_to_buffer(node->filter_expr, &filt->filter_expr)
-                != 0)
+            char **filt2_names = NULL;
+            uint32_t filt2_count = 0;
+            const wirelog_ir_node_t *fchild2
+                = (node->child_count > 0) ? node->children[0] : NULL;
+            collect_output_columns(fchild2, &filt2_names, &filt2_count);
+            int frc
+                = serialize_expr_to_buffer_ctx(node->filter_expr, filt2_names,
+                                               filt2_count, &filt->filter_expr);
+            for (uint32_t c = 0; c < filt2_count; c++)
+                free(filt2_names[c]);
+            free((void *)filt2_names);
+            if (frc != 0)
                 return -1;
         }
 
@@ -808,14 +862,29 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                 if (!map->map_exprs)
                     return -1;
                 map->map_expr_count = node->project_count;
+                /* Collect child column names for variable name resolution */
+                char **child_col_names2 = NULL;
+                uint32_t child_col_count2 = 0;
+                const wirelog_ir_node_t *child2
+                    = (node->child_count > 0) ? node->children[0] : NULL;
+                collect_output_columns(child2, &child_col_names2,
+                                       &child_col_count2);
                 for (uint32_t i = 0; i < node->project_count; i++) {
                     if (node->project_exprs[i]) {
-                        if (serialize_expr_to_buffer(node->project_exprs[i],
-                                                     &map->map_exprs[i])
-                            != 0)
+                        if (serialize_expr_to_buffer_ctx(
+                                node->project_exprs[i], child_col_names2,
+                                child_col_count2, &map->map_exprs[i])
+                            != 0) {
+                            for (uint32_t c = 0; c < child_col_count2; c++)
+                                free(child_col_names2[c]);
+                            free((void *)child_col_names2);
                             return -1;
+                        }
                     }
                 }
+                for (uint32_t c = 0; c < child_col_count2; c++)
+                    free(child_col_names2[c]);
+                free((void *)child_col_names2);
             }
         }
         return 0;

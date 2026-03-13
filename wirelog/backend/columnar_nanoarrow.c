@@ -923,14 +923,14 @@ filt_pop(filt_stack_t *s)
 }
 
 /*
- * col_eval_filter_row:
- * Evaluate the postfix expression buffer against a single row.
- * Variable names are assumed to be "col<N>" (rewritten by plan compiler).
- * Returns non-zero if the row passes the predicate, 0 if filtered out.
+ * col_eval_expr_run:
+ * Core postfix expression evaluator. Runs the bytecode against a row and
+ * stores the top-of-stack value in *out_val.
+ * Returns 0 on success, non-zero on malformed bytecode.
  */
 static int
-col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
-                    uint32_t ncols)
+col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
+                  uint32_t ncols, int64_t *out_val)
 {
     filt_stack_t s;
     s.top = 0;
@@ -1079,7 +1079,7 @@ col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
             break;
         }
 
-        /* Aggregates: not valid in row-level filter, skip */
+        /* Aggregates: not valid in row-level evaluation, skip */
         case WL_PLAN_EXPR_AGG_COUNT:
         case WL_PLAN_EXPR_AGG_SUM:
         case WL_PLAN_EXPR_AGG_MIN:
@@ -1090,10 +1090,42 @@ col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
             goto bad;
         }
     }
-    return s.top > 0 ? (int)(s.vals[s.top - 1] != 0) : 0;
+    *out_val = s.top > 0 ? s.vals[s.top - 1] : 0;
+    return 0;
 
 bad:
-    return 1; /* parse error: pass row through */
+    *out_val = 0;
+    return 1;
+}
+
+/*
+ * col_eval_filter_row:
+ * Evaluate the postfix expression buffer against a single row.
+ * Variable names are assumed to be "col<N>" (rewritten by plan compiler).
+ * Returns non-zero if the row passes the predicate, 0 if filtered out.
+ */
+static int
+col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
+                    uint32_t ncols)
+{
+    int64_t val;
+    int err = col_eval_expr_run(buf, size, row, ncols, &val);
+    return err ? 1 : (val != 0 ? 1 : 0); /* on error: pass row through */
+}
+
+/*
+ * col_eval_expr_i64:
+ * Evaluate the postfix expression buffer and return the computed int64 value.
+ * Used by MAP operations to compute head argument expressions.
+ * Returns 0 on empty expression or evaluation error.
+ */
+static int64_t
+col_eval_expr_i64(const uint8_t *buf, uint32_t size, const int64_t *row,
+                  uint32_t ncols)
+{
+    int64_t val;
+    col_eval_expr_run(buf, size, row, ncols, &val);
+    return val;
 }
 
 /* ======================================================================== */
@@ -1409,8 +1441,15 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         const int64_t *row = e.rel->data + (size_t)r * e.rel->ncols;
         for (uint32_t c = 0; c < pc; c++) {
-            uint32_t src = op->project_indices[c];
-            tmp[c] = (src < e.rel->ncols) ? row[src] : 0;
+            if (op->map_exprs && c < op->map_expr_count && op->map_exprs[c].data
+                && op->map_exprs[c].size > 0) {
+                tmp[c] = col_eval_expr_i64(op->map_exprs[c].data,
+                                           op->map_exprs[c].size, row,
+                                           e.rel->ncols);
+            } else {
+                uint32_t src = op->project_indices ? op->project_indices[c] : c;
+                tmp[c] = (src < e.rel->ncols) ? row[src] : 0;
+            }
         }
         int rc = col_rel_append_row(out, tmp);
         if (rc != 0) {

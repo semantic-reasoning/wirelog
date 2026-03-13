@@ -575,10 +575,8 @@ convert_expr(const wl_parser_ast_node_t *node)
         if (!e)
             return NULL;
         e->arith_op = node->arith_op;
-        if (node->child_count >= 2) {
-            wl_ir_expr_add_child(e, convert_expr(node->children[0]));
-            wl_ir_expr_add_child(e, convert_expr(node->children[1]));
-        }
+        for (uint32_t ci = 0; ci < node->child_count; ci++)
+            wl_ir_expr_add_child(e, convert_expr(node->children[ci]));
         return e;
     }
     case WL_PARSER_AST_NODE_COMPARISON: {
