@@ -5104,8 +5104,7 @@ col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
             r->nrows = ce.rel->nrows;
             r->capacity = ce.rel->capacity;
             ce.rel->data = NULL;
-            col_rel_free_contents(ce.rel);
-            free(ce.rel);
+            col_rel_destroy(ce.rel);
         }
     }
     return 0;

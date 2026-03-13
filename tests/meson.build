@@ -147,9 +147,6 @@ test('sip', test_sip_exe)
 # Columnar Backend Session Tests (no Rust required)
 # ============================================================================
 
-# Columnar backend tests disabled in Phase 2C
-# test_session_columnar and test_delta_callback depend on deleted DD backend
-# These will be re-enabled when columnar backend provides equivalent functionality
 
 test_csv_exe = executable(
   'test_csv',
@@ -214,6 +211,26 @@ test_plan_gen_exe = executable(
 )
 
 test('plan_gen', test_plan_gen_exe)
+
+# ============================================================================
+# Delta Callback Tests (re-enabled for columnar backend)
+# ============================================================================
+
+test_delta_callback_exe = executable(
+  'test_delta_callback',
+  files('test_delta_callback.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
+)
+
+test('delta_callback', test_delta_callback_exe)
 
 # ============================================================================
 # Workqueue Tests (Phase B-lite)
