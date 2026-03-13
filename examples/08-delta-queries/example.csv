@@ -1,0 +1,6 @@
+user,permission
+alice,read
+alice,write
+bob,read
+bob,admin
+carol,read

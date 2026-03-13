@@ -1,0 +1,21 @@
+/*
+ * access_control.dl - Access Control Rules for Example 08
+ *
+ * Demonstrates the delta-callback API: as can(user, permission) tuples are
+ * inserted via wl_session_insert(), the engine derives granted() tuples
+ * incrementally and fires the delta callback for each newly derived fact.
+ *
+ * Note: This file is a reference for the Datalog logic embedded in
+ * delta_demo.c. It cannot be run via wirelog_cli because the --delta
+ * flag is not yet implemented. Use the C demo instead:
+ *
+ *   meson compile -C build delta_demo
+ *   ./build/examples/08-delta-queries/delta_demo
+ */
+
+/* Base relation: explicit access grants (inserted via C API) */
+.decl can(user: symbol, perm: symbol)
+
+/* Derived: all granted permissions (mirrors can, extensible for roles) */
+.decl granted(user: symbol, perm: symbol)
+granted(U, P) :- can(U, P).
