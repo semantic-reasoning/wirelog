@@ -1,0 +1,29 @@
+// CRC-32 Frame Validation: Detect corrupt frames using checksum comparison
+//
+// This example demonstrates using crc32_ethernet() to validate frame integrity.
+// Each frame carries a stored CRC-32 checksum; we recompute it from the payload
+// and flag any frame where stored != computed as corrupt.
+//
+// CRC-32 variant used here: Ethernet (poly 0x04C11DB7, ISO 3309 / IEEE 802.3)
+// For iSCSI/SCTP workloads, substitute crc32_castagnoli() instead.
+
+// Load raw frame data: frame_id (symbol), payload (symbol), stored_crc32 (int64)
+.decl frame(frame_id: symbol, payload: symbol, stored_crc32: int64)
+.input frame(filename="examples/05-crc32-checksum/frames.csv", delimiter=",")
+
+// Recompute checksum from payload and compare against stored value.
+// A frame is valid when computed == stored.
+.decl valid_frame(frame_id: symbol, payload: symbol, stored_crc32: int64)
+.output valid_frame(filename="examples/05-crc32-checksum/valid_frames_output.csv")
+
+valid_frame(Id, Payload, Stored) :-
+    frame(Id, Payload, Stored),
+    crc32_ethernet(Payload) = Stored.
+
+// Flag frames where the stored checksum does not match the recomputed value.
+.decl corrupt_frame(frame_id: symbol, stored_crc32: int64, computed_crc32: int64)
+.output corrupt_frame(filename="examples/05-crc32-checksum/corrupt_frames_output.csv")
+
+corrupt_frame(Id, Stored, crc32_ethernet(Payload)) :-
+    frame(Id, Payload, Stored),
+    crc32_ethernet(Payload) != Stored.

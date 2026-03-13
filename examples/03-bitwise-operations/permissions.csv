@@ -1,0 +1,4 @@
+read,1
+write,2
+execute,4
+admin,8

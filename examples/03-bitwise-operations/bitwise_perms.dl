@@ -1,0 +1,53 @@
+// Bitwise Permission Checking with band, bor, bxor
+//
+// Each user has a bitmask of granted permissions.
+// Permission bits (stored in permissions.csv):
+//   bit 0 (mask 1)  = read
+//   bit 1 (mask 2)  = write
+//   bit 2 (mask 4)  = execute
+//   bit 3 (mask 8)  = admin
+//
+// band(bits, mask) != 0  checks whether a specific bit is set.
+// bor(bits_a, bits_b)    merges two permission sets (union).
+// bxor(bits_a, bits_b)   finds permissions held by exactly one of two users.
+
+// --- Input relations ---
+
+.decl user_perm(user_id: int64, permission_bits: int64)
+.input user_perm(filename="examples/03-bitwise-operations/users_sample.csv", delimiter=",")
+
+.decl permission_def(name: symbol, mask: int64)
+.input permission_def(filename="examples/03-bitwise-operations/permissions.csv", delimiter=",")
+
+// --- Derived: which users have which named permissions ---
+// A user has a permission when band(permission_bits, mask) is non-zero.
+
+.decl has_access(user_id: int64, perm_name: symbol)
+.output has_access(filename="examples/03-bitwise-operations/access_output.csv")
+
+has_access(U, P) :-
+    user_perm(U, Bits),
+    permission_def(P, Mask),
+    band(Bits, Mask) != 0.
+
+// --- Derived: combined permissions for pairs of users (bor) ---
+// Useful for: what would a merged role allow?
+
+.decl combined_perm(user_a: int64, user_b: int64, combined_bits: int64)
+.output combined_perm(filename="examples/03-bitwise-operations/combined_output.csv")
+
+combined_perm(A, B, bor(BitsA, BitsB)) :-
+    user_perm(A, BitsA),
+    user_perm(B, BitsB),
+    A != B.
+
+// --- Derived: permissions held by exactly one of two users (bxor) ---
+// Useful for: auditing permission differences between accounts.
+
+.decl exclusive_perm_bits(user_a: int64, user_b: int64, diff_bits: int64)
+.output exclusive_perm_bits(filename="examples/03-bitwise-operations/exclusive_output.csv")
+
+exclusive_perm_bits(A, B, bxor(BitsA, BitsB)) :-
+    user_perm(A, BitsA),
+    user_perm(B, BitsB),
+    A != B.

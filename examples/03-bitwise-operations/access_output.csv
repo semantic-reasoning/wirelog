@@ -1,0 +1,13 @@
+1,admin
+1,execute
+1,read
+2,write
+2,read
+3,execute
+3,write
+3,read
+4,admin
+4,execute
+4,write
+4,read
+5,admin

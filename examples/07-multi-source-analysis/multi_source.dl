@@ -1,0 +1,89 @@
+// Multi-Source Customer Data Integration
+//
+// Problem: Customer records arrive from two independent CRM systems (A and B).
+// Records may appear in one or both systems, and overlapping records may have
+// slight discrepancies (e.g., different name spelling or country code).
+//
+// Strategy: Source A is the system of record (primary). Source B fills gaps
+// for customers not present in A. For any customer_id that appears in both
+// sources, source A data wins.
+//
+// Input:  src_a(id, name, country) - customer records from CRM system A
+//         src_b(id, name, country) - customer records from CRM system B
+//
+// Output: integrated(id, name, country) - unified customer table (A-wins policy)
+//         a_only(id)                    - customers present only in source A
+//         b_only(id)                    - customers present only in source B
+//         conflict(id)                  - customers with differing data between sources
+
+.decl src_a(id: symbol, name: string, country: symbol)
+.input src_a(filename="examples/07-multi-source-analysis/source_a.csv", delimiter=",")
+
+.decl src_b(id: symbol, name: string, country: symbol)
+.input src_b(filename="examples/07-multi-source-analysis/source_b.csv", delimiter=",")
+
+// -------------------------------------------------------------------
+// Step 1: Integrated customer table — source A wins on conflict.
+// Customers in A are always included. Customers in B are included only
+// when they have no entry in A (B fills in missing records).
+// -------------------------------------------------------------------
+
+.decl integrated(id: symbol, name: string, country: symbol)
+.output integrated(filename="examples/07-multi-source-analysis/integrated_out.csv")
+
+// Source A records are always authoritative.
+integrated(Id, Name, Country) :- src_a(Id, Name, Country).
+
+// Source B records are included only when the customer_id is absent from A.
+integrated(Id, Name, Country) :-
+    src_b(Id, Name, Country),
+    !src_a(Id, _, _).
+
+// -------------------------------------------------------------------
+// Step 2: Identify customers that exist in only one source (coverage gaps).
+// -------------------------------------------------------------------
+
+.decl in_a(id: symbol)
+in_a(Id) :- src_a(Id, _, _).
+
+.decl in_b(id: symbol)
+in_b(Id) :- src_b(Id, _, _).
+
+.decl a_only(id: symbol)
+.output a_only(filename="examples/07-multi-source-analysis/a_only_out.csv")
+
+a_only(Id) :- in_a(Id), !in_b(Id).
+
+.decl b_only(id: symbol)
+.output b_only(filename="examples/07-multi-source-analysis/b_only_out.csv")
+
+b_only(Id) :- in_b(Id), !in_a(Id).
+
+// -------------------------------------------------------------------
+// Step 3: Flag conflicting records — same customer_id, different data.
+// A conflict occurs when A and B agree on the id but disagree on any
+// field. These records deserve human review before source B is retired.
+// -------------------------------------------------------------------
+
+.decl conflict(id: symbol)
+.output conflict(filename="examples/07-multi-source-analysis/conflict_out.csv")
+
+conflict(Id) :-
+    src_a(Id, NameA, _),
+    src_b(Id, NameB, _),
+    NameA != NameB.
+
+conflict(Id) :-
+    src_a(Id, _, CountryA),
+    src_b(Id, _, CountryB),
+    CountryA != CountryB.
+
+// -------------------------------------------------------------------
+// Step 4: Country-level customer counts from the integrated view.
+// Useful for regional reporting after integration.
+// -------------------------------------------------------------------
+
+.decl customers_per_country(country: symbol, n: int64)
+.output customers_per_country(filename="examples/07-multi-source-analysis/customers_per_country_out.csv")
+
+customers_per_country(Country, count(Id)) :- integrated(Id, _, Country).
