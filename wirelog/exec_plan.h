@@ -104,6 +104,9 @@ typedef enum {
     /* Unary bitwise NOT */
     WL_PLAN_EXPR_ARITH_BNOT = 0x1A,
 
+    /* Unary hash function (xxHash3 64-bit, pop 1 push 1) */
+    WL_PLAN_EXPR_ARITH_HASH = 0x1B,
+
     /* Comparison operators (binary, pop 2 push 1) */
     WL_PLAN_EXPR_CMP_EQ = 0x20,
     WL_PLAN_EXPR_CMP_NEQ = 0x21,

@@ -273,6 +273,28 @@ parse_factor(wl_parser_t *parser)
         return unary;
     }
 
+    /* Hash function: hash(expr) */
+    if (parser->current.type == WL_PARSER_LEXER_TOK_HASH) {
+        parser_advance(parser); /* consume hash */
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+                            "expected '(' after hash")) {
+            return NULL;
+        }
+        wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
+        if (!arg)
+            return NULL;
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                            "expected ')' after hash argument")) {
+            wl_parser_ast_node_free(arg);
+            return NULL;
+        }
+        wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        unary->arith_op = WIRELOG_ARITH_HASH;
+        wl_parser_ast_node_add_child(unary, arg);
+        return unary;
+    }
+
     parser_error(parser, "expected variable, integer, or string");
     return NULL;
 }
@@ -312,7 +334,8 @@ is_bitwise_token(wl_parser_lexer_token_type_t type)
            || type == WL_PARSER_LEXER_TOK_BXOR
            || type == WL_PARSER_LEXER_TOK_BNOT
            || type == WL_PARSER_LEXER_TOK_BSHL
-           || type == WL_PARSER_LEXER_TOK_BSHR;
+           || type == WL_PARSER_LEXER_TOK_BSHR
+           || type == WL_PARSER_LEXER_TOK_HASH;
 }
 
 static wl_parser_ast_node_t *

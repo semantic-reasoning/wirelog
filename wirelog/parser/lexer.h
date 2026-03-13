@@ -85,6 +85,9 @@ typedef enum {
     WL_PARSER_LEXER_TOK_BSHL, /* bshl */
     WL_PARSER_LEXER_TOK_BSHR, /* bshr */
 
+    /* Hash function keyword */
+    WL_PARSER_LEXER_TOK_HASH, /* hash */
+
     /* Directives (dot-prefixed keywords) */
     WL_PARSER_LEXER_TOK_DECL,      /* .decl */
     WL_PARSER_LEXER_TOK_INPUT,     /* .input */

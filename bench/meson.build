@@ -63,7 +63,7 @@ if host_machine.system() != 'windows'
     bench_thread_src,
     bench_workqueue_src,
     include_directories: [wirelog_inc, wirelog_src_inc],
-    dependencies: [nanoarrow_dep, threads_dep],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
     install: false,
   )
 
@@ -79,7 +79,7 @@ if host_machine.system() != 'windows'
     bench_thread_src,
     bench_workqueue_src,
     include_directories: [wirelog_inc, wirelog_src_inc],
-    dependencies: [nanoarrow_dep, threads_dep],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
     c_args: ['-DENABLE_K_FUSION=0', '-DWITH_K_FUSION=0'],
     install: false,
   )

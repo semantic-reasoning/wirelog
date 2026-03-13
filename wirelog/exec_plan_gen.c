@@ -165,6 +165,8 @@ arith_to_tag(wirelog_arith_op_t op)
         return WL_PLAN_EXPR_ARITH_SHL;
     case WIRELOG_ARITH_SHR:
         return WL_PLAN_EXPR_ARITH_SHR;
+    case WIRELOG_ARITH_HASH:
+        return WL_PLAN_EXPR_ARITH_HASH;
     }
     return WL_PLAN_EXPR_ARITH_ADD; /* fallback */
 }

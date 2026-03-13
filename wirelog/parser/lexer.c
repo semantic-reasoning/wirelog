@@ -235,6 +235,10 @@ identifier_type(const char *start, uint32_t length)
     if (IS_KW("bshr"))
         return WL_PARSER_LEXER_TOK_BSHR;
 
+    /* Hash function keyword */
+    if (IS_KW("hash"))
+        return WL_PARSER_LEXER_TOK_HASH;
+
     return WL_PARSER_LEXER_TOK_IDENT;
 }
 
@@ -515,6 +519,8 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "BSHL";
     case WL_PARSER_LEXER_TOK_BSHR:
         return "BSHR";
+    case WL_PARSER_LEXER_TOK_HASH:
+        return "HASH";
     case WL_PARSER_LEXER_TOK_DECL:
         return "DECL";
     case WL_PARSER_LEXER_TOK_INPUT:

@@ -105,6 +105,10 @@ endif
 nanoarrow_proj = subproject('nanoarrow', default_options: ['tests=disabled', 'apps=disabled', 'ipc=disabled', 'device=disabled', 'testing=disabled'])
 nanoarrow_dep = nanoarrow_proj.get_variable('nanoarrow_dep')
 
+#Built-in functions : xxHash3 for hash() function
+xxhash_proj = subproject('xxhash', default_options: [])
+xxhash_dep = xxhash_proj.get_variable('xxhash_dep')
+
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Configuration
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
@@ -168,7 +172,7 @@ wirelog_lib = library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep],
   install: true,
   version: project_version,
 )
@@ -179,7 +183,7 @@ wirelog_static_lib = static_library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep],
   install: false,  # Not installed by default
 )
 
@@ -211,7 +215,7 @@ wirelog_cli = executable(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep],
   install: true,
 )
 
