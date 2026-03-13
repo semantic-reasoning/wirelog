@@ -220,6 +220,10 @@ wirelog_arith_op_str(wirelog_arith_op_t op)
         return "bshr";
     case WIRELOG_ARITH_HASH:
         return "hash";
+    case WIRELOG_ARITH_CRC32_ETH:
+        return "crc32_ethernet";
+    case WIRELOG_ARITH_CRC32_CAST:
+        return "crc32_castagnoli";
     }
     return "?";
 }

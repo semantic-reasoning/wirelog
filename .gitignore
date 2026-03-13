@@ -60,6 +60,8 @@ bench/data/doop/*.csv
 # OS specific
 .DS_Store
 Thumbs.db
-subprojects/nanoarrow
-subprojects/packagecache/
+
+# Subproject dependencies (managed by wrap mechanism, not committed)
+subprojects/nanoarrow/
 subprojects/xxHash-0.8.3/
+subprojects/packagecache/

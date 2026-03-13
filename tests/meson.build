@@ -1200,6 +1200,64 @@ test_hash_integration_exe = executable(
 test('hash_integration', test_hash_integration_exe)
 
 # ============================================================================
+# CRC-32 Tests (Issue #145)
+# ============================================================================
+
+crc32_src = files(
+  '../wirelog/crc32.c',
+)
+
+# Architecture-specific flags to enable hardware CRC32 instructions.
+# Applied to all CRC-32 test executables so crc32.c compiles with the
+# correct feature macros on each platform.
+# Note: GCC/Clang only; MSVC doesn't support these flags and has built-in
+# support for CRC32 instructions without explicit flags.
+crc32_arch_c_args = []
+if cc.get_id() != 'msvc'
+  if host_machine.cpu_family() == 'x86_64'
+    crc32_arch_c_args = ['-msse4.2']
+  elif host_machine.cpu_family() == 'aarch64'
+    crc32_arch_c_args = ['-march=armv8-a+crc']
+  endif
+endif
+
+# CRC-32 tests (Issue #145)
+# Note: MSVC has internal compiler errors on these test files; skip on Windows
+if cc.get_id() != 'msvc'
+  test_crc32_ethernet_exe = executable(
+    'test_crc32_ethernet',
+    files('test_crc32_ethernet.c'),
+    crc32_src,
+    c_args: crc32_arch_c_args,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+  )
+
+  test('crc32_ethernet', test_crc32_ethernet_exe)
+
+  test_crc32_castagnoli_exe = executable(
+    'test_crc32_castagnoli',
+    files('test_crc32_castagnoli.c'),
+    crc32_src,
+    c_args: crc32_arch_c_args,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+  )
+
+  test('crc32_castagnoli', test_crc32_castagnoli_exe)
+
+  # CRC-32 hardware/software equivalence test (Issue #145, US-145-004)
+  # Reuses crc32_arch_c_args defined above for the same architecture flags.
+  test_crc32_hw_equivalence_exe = executable(
+    'test_crc32_hw_equivalence',
+    files('test_crc32_hw_equivalence.c'),
+    crc32_src,
+    c_args: crc32_arch_c_args,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+  )
+
+  test('crc32_hw_equivalence', test_crc32_hw_equivalence_exe)
+endif
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
