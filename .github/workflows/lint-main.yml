@@ -15,8 +15,6 @@ name: Lint Main
 # Excludes: subprojects/**, build/**
 
 on:
-  push:
-    branches: [main]
   workflow_call:
 
 permissions:
