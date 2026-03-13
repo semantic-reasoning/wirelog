@@ -1016,6 +1016,36 @@ col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
             filt_push(&s, b != 0 ? a % b : 0);
             break;
         }
+        case WL_PLAN_EXPR_ARITH_BAND: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a & b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_BOR: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a | b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_BXOR: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a ^ b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_BNOT: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, ~a);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_SHL: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a << b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_SHR: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a >> b);
+            break;
+        }
 
         /* Comparisons */
         case WL_PLAN_EXPR_CMP_EQ: {

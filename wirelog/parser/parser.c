@@ -194,6 +194,85 @@ parse_factor(wl_parser_t *parser)
         return node;
     }
 
+    /* Bitwise binary function calls: band(expr, expr), etc. */
+    if (parser->current.type == WL_PARSER_LEXER_TOK_BAND
+        || parser->current.type == WL_PARSER_LEXER_TOK_BOR
+        || parser->current.type == WL_PARSER_LEXER_TOK_BXOR
+        || parser->current.type == WL_PARSER_LEXER_TOK_BSHL
+        || parser->current.type == WL_PARSER_LEXER_TOK_BSHR) {
+        wirelog_arith_op_t op;
+        switch (parser->current.type) {
+        case WL_PARSER_LEXER_TOK_BAND:
+            op = WIRELOG_ARITH_BAND;
+            break;
+        case WL_PARSER_LEXER_TOK_BOR:
+            op = WIRELOG_ARITH_BOR;
+            break;
+        case WL_PARSER_LEXER_TOK_BXOR:
+            op = WIRELOG_ARITH_BXOR;
+            break;
+        case WL_PARSER_LEXER_TOK_BSHL:
+            op = WIRELOG_ARITH_SHL;
+            break;
+        default: /* BSHR */
+            op = WIRELOG_ARITH_SHR;
+            break;
+        }
+        parser_advance(parser); /* consume keyword */
+
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+                            "expected '(' after bitwise operator")) {
+            return NULL;
+        }
+        wl_parser_ast_node_t *left_arg = parse_arithmetic_expr(parser);
+        if (!left_arg)
+            return NULL;
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_COMMA,
+                            "expected ',' in bitwise binary operator")) {
+            wl_parser_ast_node_free(left_arg);
+            return NULL;
+        }
+        wl_parser_ast_node_t *right_arg = parse_arithmetic_expr(parser);
+        if (!right_arg) {
+            wl_parser_ast_node_free(left_arg);
+            return NULL;
+        }
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                            "expected ')' after bitwise operator arguments")) {
+            wl_parser_ast_node_free(left_arg);
+            wl_parser_ast_node_free(right_arg);
+            return NULL;
+        }
+        wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        bin->arith_op = op;
+        wl_parser_ast_node_add_child(bin, left_arg);
+        wl_parser_ast_node_add_child(bin, right_arg);
+        return bin;
+    }
+
+    /* Bitwise unary: bnot(expr) */
+    if (parser->current.type == WL_PARSER_LEXER_TOK_BNOT) {
+        parser_advance(parser); /* consume bnot */
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+                            "expected '(' after bnot")) {
+            return NULL;
+        }
+        wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
+        if (!arg)
+            return NULL;
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                            "expected ')' after bnot argument")) {
+            wl_parser_ast_node_free(arg);
+            return NULL;
+        }
+        wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        unary->arith_op = WIRELOG_ARITH_BNOT;
+        wl_parser_ast_node_add_child(unary, arg);
+        return unary;
+    }
+
     parser_error(parser, "expected variable, integer, or string");
     return NULL;
 }
@@ -224,6 +303,16 @@ is_arith_op(wl_parser_lexer_token_type_t type)
            || type == WL_PARSER_LEXER_TOK_STAR
            || type == WL_PARSER_LEXER_TOK_SLASH
            || type == WL_PARSER_LEXER_TOK_PERCENT;
+}
+
+static bool
+is_bitwise_token(wl_parser_lexer_token_type_t type)
+{
+    return type == WL_PARSER_LEXER_TOK_BAND || type == WL_PARSER_LEXER_TOK_BOR
+           || type == WL_PARSER_LEXER_TOK_BXOR
+           || type == WL_PARSER_LEXER_TOK_BNOT
+           || type == WL_PARSER_LEXER_TOK_BSHL
+           || type == WL_PARSER_LEXER_TOK_BSHR;
 }
 
 static wl_parser_ast_node_t *
@@ -524,6 +613,39 @@ parse_predicate(wl_parser_t *parser)
 
         if (!is_compare_op(parser->current.type)) {
             parser_error(parser, "expected comparison operator");
+            wl_parser_ast_node_free(left);
+            return NULL;
+        }
+
+        wirelog_cmp_op_t cmp_op = token_to_cmp_op(parser->current.type);
+        uint32_t cmp_line = parser->current.line;
+        uint32_t cmp_col = parser->current.col;
+        parser_advance(parser);
+
+        wl_parser_ast_node_t *right = parse_arithmetic_expr(parser);
+        if (!right) {
+            wl_parser_ast_node_free(left);
+            return NULL;
+        }
+
+        wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
+        cmp->cmp_op = cmp_op;
+        wl_parser_ast_node_add_child(cmp, left);
+        wl_parser_ast_node_add_child(cmp, right);
+        return cmp;
+    }
+
+    /* Comparison starting with bitwise expression: band(x,y) = z, etc. */
+    if (is_bitwise_token(parser->current.type)) {
+        wl_parser_ast_node_t *left = parse_arithmetic_expr(parser);
+        if (!left)
+            return NULL;
+
+        if (!is_compare_op(parser->current.type)) {
+            parser_error(
+                parser,
+                "expected comparison operator after bitwise expression");
             wl_parser_ast_node_free(left);
             return NULL;
         }
