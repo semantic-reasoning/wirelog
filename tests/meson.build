@@ -1258,6 +1258,49 @@ if cc.get_id() != 'msvc'
 endif
 
 # ============================================================================
+# Delta Callback Tests (Issue #153 - Re-enable session tests)
+# ============================================================================
+
+test_delta_callback_exe = executable(
+  'test_delta_callback',
+  files('test_delta_callback.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  csv_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
+)
+
+test('delta_callback', test_delta_callback_exe)
+
+# ============================================================================
+# Session Tests (Issue #153 - Persistent columnar session deltas)
+# ============================================================================
+
+test_session_exe = executable(
+  'test_session',
+  files('test_session.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
+)
+
+test('session', test_session_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
