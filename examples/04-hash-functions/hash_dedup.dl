@@ -1,0 +1,68 @@
+// Hash Functions Example: Deduplication and Checksum Validation
+//
+// Scenario: A user database populated from multiple registration sources.
+// The same person may have registered more than once, producing records
+// with different IDs but identical email addresses.
+//
+// hash() is used for three tasks:
+//   1. Email fingerprinting  -- hash(email) collapses duplicates to one integer
+//   2. Deduplication         -- records sharing a hash(email) are the same person;
+//                               keep only the record with the smallest id
+//   3. Checksum validation   -- hash(id) is stored at ingest time; a mismatch
+//                               signals that the record was corrupted in storage
+
+// Input: user records (id, name, email)
+.decl record(id: int64, name: symbol, email: symbol)
+.input record(filename="examples/04-hash-functions/records.csv", delimiter=",")
+
+// Input: stored per-record checksums (id, hash(id) captured at ingest)
+.decl checksum(id: int64, stored: int64)
+.input checksum(filename="examples/04-hash-functions/checksums.csv", delimiter=",")
+
+// --- Part 1: Email Fingerprints ---
+// Compute hash(email) for every record.  Records with the same fingerprint
+// have identical email addresses and represent the same physical person.
+
+.decl email_fp(id: int64, name: symbol, email: symbol, fp: int64)
+.output email_fp(filename="examples/04-hash-functions/fingerprints_output.csv")
+
+email_fp(id, name, email, hash(email)) :- record(id, name, email).
+
+// --- Part 2: Deduplication ---
+// A record is superseded when another record shares its email fingerprint
+// but carries a smaller id (i.e., it was registered earlier).
+// Keeping the smallest id per fingerprint gives a canonical representative.
+
+.decl superseded(id: int64)
+superseded(id) :-
+    email_fp(id,       _, _, fp),
+    email_fp(other_id, _, _, fp),
+    other_id < id.
+
+.decl unique_record(id: int64, name: symbol, email: symbol)
+.output unique_record(filename="examples/04-hash-functions/unique_records_output.csv")
+
+unique_record(id, name, email) :-
+    record(id, name, email),
+    !superseded(id).
+
+// --- Part 3: Checksum Validation ---
+// At ingest, hash(id) was recorded as the checksum for each row.
+// Re-computing hash(id) and comparing against the stored value detects
+// any row that was tampered with or corrupted after ingest.
+
+.decl valid_record(id: int64, name: symbol)
+.output valid_record(filename="examples/04-hash-functions/valid_records_output.csv")
+
+valid_record(id, name) :-
+    checksum(id, stored),
+    record(id, name, _),
+    hash(id) = stored.
+
+.decl corrupted_record(id: int64, name: symbol, stored: int64, computed: int64)
+.output corrupted_record(filename="examples/04-hash-functions/corrupted_records_output.csv")
+
+corrupted_record(id, name, stored, hash(id)) :-
+    checksum(id, stored),
+    record(id, name, _),
+    hash(id) != stored.

@@ -1,0 +1,30 @@
+// Last-Write-Wins (LWW) Conflict Resolution
+//
+// Problem: Multiple versions of the same record arrive with timestamps.
+// Goal: Keep only the version with the highest timestamp per record ID.
+//
+// Input: update(id, ts, value) - all received versions of each record
+//        Column order: id first, ts second, value third.
+//        ts must be adjacent to id so max() aggregation reads the correct
+//        column (the engine's REDUCE operator reads row[group_by_count]).
+// Output: latest_ts(id, ts)       - the winning timestamp per record
+//         latest(id, ts, value)   - the full winning record per record ID
+
+.decl update(id: symbol, ts: int64, value: string)
+.input update(filename="examples/06-timestamp-lww/updates.csv", delimiter=",")
+
+// Step 1: Find the maximum timestamp per record ID.
+// max() aggregation selects the highest ts across all versions of each id.
+.decl latest_ts(id: symbol, ts: int64)
+.output latest_ts(filename="examples/06-timestamp-lww/latest_ts_out.csv")
+
+latest_ts(Id, max(Ts)) :- update(Id, Ts, _).
+
+// Step 2: Join back to recover the full record at the winning timestamp.
+// If two updates share the exact same maximum timestamp (tie), both are
+// retained - the application layer must break ties deterministically
+// (e.g., by value ordering or node ID).
+.decl latest(id: symbol, ts: int64, value: string)
+.output latest(filename="examples/06-timestamp-lww/latest_out.csv")
+
+latest(Id, Ts, Val) :- latest_ts(Id, Ts), update(Id, Ts, Val).
