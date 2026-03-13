@@ -167,6 +167,10 @@ arith_to_tag(wirelog_arith_op_t op)
         return WL_PLAN_EXPR_ARITH_SHR;
     case WIRELOG_ARITH_HASH:
         return WL_PLAN_EXPR_ARITH_HASH;
+    case WIRELOG_ARITH_CRC32_ETH:
+        return WL_PLAN_EXPR_ARITH_CRC32_ETH;
+    case WIRELOG_ARITH_CRC32_CAST:
+        return WL_PLAN_EXPR_ARITH_CRC32_CAST;
     }
     return WL_PLAN_EXPR_ARITH_ADD; /* fallback */
 }

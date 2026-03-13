@@ -34,3 +34,11 @@ option(
   value: false,
   description: 'Build documentation (not yet implemented)'
 )
+
+option(
+  'crc32_variant',
+  type: 'combo',
+  choices: ['ethernet', 'castagnoli'],
+  value: 'ethernet',
+  description: 'Default CRC-32 variant: ethernet (standard) or castagnoli (iSCSI)'
+)
