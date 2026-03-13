@@ -1084,6 +1084,7 @@ test_bitwise_types_exe = executable(
   files('test_bitwise_types.c'),
   parser_src,
   ir_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep],
 )
@@ -1095,6 +1096,7 @@ test_bitwise_parser_exe = executable(
   files('test_bitwise_parser.c'),
   parser_src,
   ir_src,
+  csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep],
 )
