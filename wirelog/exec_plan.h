@@ -107,6 +107,12 @@ typedef enum {
     /* Unary hash function (xxHash3 64-bit, pop 1 push 1) */
     WL_PLAN_EXPR_ARITH_HASH = 0x1B,
 
+    /* Unary CRC-32 functions (pop 1 push 1) */
+    WL_PLAN_EXPR_ARITH_CRC32_ETH
+    = 0x1C, /* CRC-32 Ethernet/ISO (poly 0x04C11DB7) */
+    WL_PLAN_EXPR_ARITH_CRC32_CAST
+    = 0x1D, /* CRC-32C Castagnoli (poly 0x1EDC6F41) */
+
     /* Comparison operators (binary, pop 2 push 1) */
     WL_PLAN_EXPR_CMP_EQ = 0x20,
     WL_PLAN_EXPR_CMP_NEQ = 0x21,

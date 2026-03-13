@@ -23,19 +23,31 @@ wirelog_libdir = get_option('libdir')
 wirelog_includedir = get_option('includedir')
 wirelog_datadir = get_option('datadir') / project_name
 
+#Build options (must be read before compiler settings for CRC-32 variant)
+crc32_variant_option = get_option('crc32_variant')
+
 #Compiler settings
 cc = meson.get_compiler('c')
+
+# CRC-32 variant define
+crc32_defines = []
+if crc32_variant_option == 'ethernet'
+  crc32_defines = ['-DCRC32_DEFAULT_VARIANT_ETHERNET']
+elif crc32_variant_option == 'castagnoli'
+  crc32_defines = ['-DCRC32_DEFAULT_VARIANT_CASTAGNOLI']
+endif
+
 if cc.get_id() == 'msvc'
   # MSVC C11 atomics are incomplete
   # Define __STDC_NO_ATOMICS__ to skip C11 atomics declarations
   add_project_arguments(
-    ['/W3', '/D__STDC_NO_ATOMICS__'],
+    ['/W3', '/D__STDC_NO_ATOMICS__'] + crc32_defines,
     language: 'c'
   )
 else
   # GCC/Clang: enforce C11 standard
   add_project_arguments(
-    ['-std=c11'],
+    ['-std=c11'] + crc32_defines,
     language: 'c'
   )
   # GCC/Clang: add SIMD support flags for AVX2 and NEON optimization
@@ -69,12 +81,14 @@ ipc_option = get_option('ipc')
 threads_option = get_option('threads')
 tests_option = get_option('tests')
 docs_option = get_option('documentation')
+# crc32_variant_option already defined earlier before compiler settings
 
 message('wirelog ' + project_version)
 message('  Platform: ' + platform)
 message('  Embedded: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
+message('  CRC-32 variant: ' + crc32_variant_option)
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Dependencies
