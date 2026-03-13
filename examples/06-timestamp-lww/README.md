@@ -40,7 +40,7 @@ the same key. The rule is simple: the update with the highest timestamp wins.
 **Step 1: Find the winning timestamp per record**
 
 ```datalog
-latest_ts(Id, max(Ts)) :- update(Id, _, Ts).
+latest_ts(Id, max(Ts)) :- update(Id, Ts, _).
 ```
 
 The `max()` aggregate groups all update tuples by `Id` and keeps only the
@@ -49,7 +49,7 @@ highest `Ts` value. This is the LWW "write wins" rule.
 **Step 2: Recover the full record at the winning timestamp**
 
 ```datalog
-latest(Id, Val, Ts) :- latest_ts(Id, Ts), update(Id, Val, Ts).
+latest(Id, Ts, Val) :- latest_ts(Id, Ts), update(Id, Ts, Val).
 ```
 
 Joining `latest_ts` back against `update` filters out all older versions,
