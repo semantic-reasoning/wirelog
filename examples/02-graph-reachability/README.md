@@ -78,27 +78,12 @@ Gwangju,Incheon
 ... and more
 ```
 
-## Key Differences from Other Examples
-
-| Aspect | Example 01 (Ancestors) | Example 02 (Directives) | Example 03 (Reachability) |
-|--------|----------------------|------------------------|--------------------------|
-| Domain | Family relationships | Family relationships | Network/Graph analysis |
-| Input | External CSV file | Inline facts | External CSV file |
-| Data type | String (names) | Symbol type | Symbol type |
-| Purpose | Show .input/.output | Show symbol type | Show graph algorithms |
-| Complexity | Simple genealogy | Multi-fact inline | Large transitive closure |
-
 ## Running the Example
 
 ```bash
-cd examples/03-graph-reachability
+cd examples/02-graph-reachability
 wirelog-cli graph_reachability.dl
 # Output written to reachable_routes.csv
-```
-
-Or with the Python test harness:
-```bash
-python3 ../../scripts/test_example.py graph_reachability.dl
 ```
 
 ## Learning Points
