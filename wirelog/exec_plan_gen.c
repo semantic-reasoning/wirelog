@@ -153,6 +153,18 @@ arith_to_tag(wirelog_arith_op_t op)
         return WL_PLAN_EXPR_ARITH_DIV;
     case WIRELOG_ARITH_MOD:
         return WL_PLAN_EXPR_ARITH_MOD;
+    case WIRELOG_ARITH_BAND:
+        return WL_PLAN_EXPR_ARITH_BAND;
+    case WIRELOG_ARITH_BOR:
+        return WL_PLAN_EXPR_ARITH_BOR;
+    case WIRELOG_ARITH_BXOR:
+        return WL_PLAN_EXPR_ARITH_BXOR;
+    case WIRELOG_ARITH_BNOT:
+        return WL_PLAN_EXPR_ARITH_BNOT;
+    case WIRELOG_ARITH_SHL:
+        return WL_PLAN_EXPR_ARITH_SHL;
+    case WIRELOG_ARITH_SHR:
+        return WL_PLAN_EXPR_ARITH_SHR;
     }
     return WL_PLAN_EXPR_ARITH_ADD; /* fallback */
 }

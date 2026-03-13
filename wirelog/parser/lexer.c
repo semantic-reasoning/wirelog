@@ -221,6 +221,20 @@ identifier_type(const char *start, uint32_t length)
     if (IS_KW("symbol"))
         return WL_PARSER_LEXER_TOK_SYMBOL_TYPE;
 
+    /* Bitwise operator keywords */
+    if (IS_KW("band"))
+        return WL_PARSER_LEXER_TOK_BAND;
+    if (IS_KW("bor"))
+        return WL_PARSER_LEXER_TOK_BOR;
+    if (IS_KW("bxor"))
+        return WL_PARSER_LEXER_TOK_BXOR;
+    if (IS_KW("bnot"))
+        return WL_PARSER_LEXER_TOK_BNOT;
+    if (IS_KW("bshl"))
+        return WL_PARSER_LEXER_TOK_BSHL;
+    if (IS_KW("bshr"))
+        return WL_PARSER_LEXER_TOK_BSHR;
+
     return WL_PARSER_LEXER_TOK_IDENT;
 }
 
@@ -489,6 +503,18 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "SLASH";
     case WL_PARSER_LEXER_TOK_PERCENT:
         return "PERCENT";
+    case WL_PARSER_LEXER_TOK_BAND:
+        return "BAND";
+    case WL_PARSER_LEXER_TOK_BOR:
+        return "BOR";
+    case WL_PARSER_LEXER_TOK_BXOR:
+        return "BXOR";
+    case WL_PARSER_LEXER_TOK_BNOT:
+        return "BNOT";
+    case WL_PARSER_LEXER_TOK_BSHL:
+        return "BSHL";
+    case WL_PARSER_LEXER_TOK_BSHR:
+        return "BSHR";
     case WL_PARSER_LEXER_TOK_DECL:
         return "DECL";
     case WL_PARSER_LEXER_TOK_INPUT:

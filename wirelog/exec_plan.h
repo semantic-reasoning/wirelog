@@ -94,6 +94,16 @@ typedef enum {
     WL_PLAN_EXPR_ARITH_DIV = 0x13,
     WL_PLAN_EXPR_ARITH_MOD = 0x14,
 
+    /* Bitwise operators (binary, pop 2 push 1) */
+    WL_PLAN_EXPR_ARITH_BAND = 0x15,
+    WL_PLAN_EXPR_ARITH_BOR = 0x16,
+    WL_PLAN_EXPR_ARITH_BXOR = 0x17,
+    WL_PLAN_EXPR_ARITH_SHL = 0x18,
+    WL_PLAN_EXPR_ARITH_SHR = 0x19,
+
+    /* Unary bitwise NOT */
+    WL_PLAN_EXPR_ARITH_BNOT = 0x1A,
+
     /* Comparison operators (binary, pop 2 push 1) */
     WL_PLAN_EXPR_CMP_EQ = 0x20,
     WL_PLAN_EXPR_CMP_NEQ = 0x21,

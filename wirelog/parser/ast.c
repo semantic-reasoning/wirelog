@@ -206,6 +206,18 @@ wirelog_arith_op_str(wirelog_arith_op_t op)
         return "/";
     case WIRELOG_ARITH_MOD:
         return "%";
+    case WIRELOG_ARITH_BAND:
+        return "band";
+    case WIRELOG_ARITH_BOR:
+        return "bor";
+    case WIRELOG_ARITH_BXOR:
+        return "bxor";
+    case WIRELOG_ARITH_BNOT:
+        return "bnot";
+    case WIRELOG_ARITH_SHL:
+        return "bshl";
+    case WIRELOG_ARITH_SHR:
+        return "bshr";
     }
     return "?";
 }

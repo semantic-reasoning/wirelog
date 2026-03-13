@@ -49,11 +49,17 @@ typedef enum {
 /* ======================================================================== */
 
 typedef enum {
-    WIRELOG_ARITH_ADD, /* + */
-    WIRELOG_ARITH_SUB, /* - */
-    WIRELOG_ARITH_MUL, /* * */
-    WIRELOG_ARITH_DIV, /* / */
-    WIRELOG_ARITH_MOD, /* % */
+    WIRELOG_ARITH_ADD,  /* + */
+    WIRELOG_ARITH_SUB,  /* - */
+    WIRELOG_ARITH_MUL,  /* * */
+    WIRELOG_ARITH_DIV,  /* / */
+    WIRELOG_ARITH_MOD,  /* % */
+    WIRELOG_ARITH_BAND, /* band - bitwise AND */
+    WIRELOG_ARITH_BOR,  /* bor - bitwise OR */
+    WIRELOG_ARITH_BXOR, /* bxor - bitwise XOR */
+    WIRELOG_ARITH_BNOT, /* bnot - bitwise NOT (unary) */
+    WIRELOG_ARITH_SHL,  /* bshl - left shift */
+    WIRELOG_ARITH_SHR,  /* bshr - right shift */
 } wirelog_arith_op_t;
 
 /* ======================================================================== */

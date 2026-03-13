@@ -77,6 +77,14 @@ typedef enum {
     WL_PARSER_LEXER_TOK_SLASH,   /* / */
     WL_PARSER_LEXER_TOK_PERCENT, /* % */
 
+    /* Bitwise operator keywords */
+    WL_PARSER_LEXER_TOK_BAND, /* band */
+    WL_PARSER_LEXER_TOK_BOR,  /* bor */
+    WL_PARSER_LEXER_TOK_BXOR, /* bxor */
+    WL_PARSER_LEXER_TOK_BNOT, /* bnot */
+    WL_PARSER_LEXER_TOK_BSHL, /* bshl */
+    WL_PARSER_LEXER_TOK_BSHR, /* bshr */
+
     /* Directives (dot-prefixed keywords) */
     WL_PARSER_LEXER_TOK_DECL,      /* .decl */
     WL_PARSER_LEXER_TOK_INPUT,     /* .input */
