@@ -5142,21 +5142,37 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     /* Step 1: snapshot sorted prev state for each IDB relation */
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r || r->nrows == 0 || r->ncols == 0)
+        if (!r || r->ncols == 0)
             continue;
-        size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-        prev_data[ri] = (int64_t *)malloc(sz);
-        if (!prev_data[ri]) {
-            for (uint32_t i = 0; i < ri; i++)
-                free(prev_data[i]);
-            free(prev_data);
-            free(prev_nrows);
-            free(prev_ncols);
-            return ENOMEM;
+        /* Snapshot even if empty: needed to detect retractions via set-diff */
+        if (r->nrows > 0) {
+            size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
+            prev_data[ri] = (int64_t *)malloc(sz);
+            if (!prev_data[ri]) {
+                for (uint32_t i = 0; i < ri; i++)
+                    free(prev_data[i]);
+                free(prev_data);
+                free(prev_nrows);
+                free(prev_ncols);
+                return ENOMEM;
+            }
+            memcpy(prev_data[ri], r->data, sz);
+            prev_nrows[ri] = r->nrows;
+            prev_ncols[ri] = r->ncols;
+        } else {
+            /* Relation is empty, but mark it so we remember it existed */
+            prev_nrows[ri] = 0;
+            prev_ncols[ri] = r->ncols;
         }
-        memcpy(prev_data[ri], r->data, sz);
-        prev_nrows[ri] = r->nrows;
-        prev_ncols[ri] = r->ncols;
+    }
+
+    /* Step 1b: Clear IDB relations before re-evaluation to enable retraction
+     * detection */
+    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
+        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+        if (!r)
+            continue;
+        r->nrows = 0; /* Clear the relation for fresh derivation */
     }
 
     /* Step 2: evaluate stratum (appends new rows to IDB relations) */
@@ -5167,7 +5183,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     /* Steps 3-4: consolidate each IDB relation, fire callbacks for new rows */
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r || r->nrows == 0)
+        if (!r)
             continue;
 
         /* Consolidate: sort + dedup so binary search is valid */
@@ -5175,13 +5191,30 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         if (rc != 0)
             goto cleanup;
 
-        /* Fire delta_cb(+1) for rows not present in prev sorted state */
         uint32_t ncols = r->ncols;
-        for (uint32_t row = 0; row < r->nrows; row++) {
-            const int64_t *rowp = r->data + (size_t)row * ncols;
-            if (!col_row_in_sorted(prev_data[ri], prev_nrows[ri], ncols,
-                                   rowp)) {
-                sess->delta_cb(r->name, rowp, ncols, +1, sess->delta_data);
+
+        /* Fire delta_cb(+1) for rows not present in prev sorted state */
+        if (r->nrows > 0) {
+            for (uint32_t row = 0; row < r->nrows; row++) {
+                const int64_t *rowp = r->data + (size_t)row * ncols;
+                if (!col_row_in_sorted(prev_data[ri], prev_nrows[ri], ncols,
+                                       rowp)) {
+                    sess->delta_cb(r->name, rowp, ncols, +1, sess->delta_data);
+                }
+            }
+        }
+
+        /* Fire delta_cb(-1) for rows present in prev sorted state but not in new
+         */
+        if (prev_nrows[ri] > 0) {
+            for (uint32_t row = 0; row < prev_nrows[ri]; row++) {
+                const int64_t *rowp
+                    = prev_data[ri] + (size_t)row * prev_ncols[ri];
+                if (!col_row_in_sorted(r->data, r->nrows, prev_ncols[ri],
+                                       rowp)) {
+                    sess->delta_cb(r->name, rowp, prev_ncols[ri], -1,
+                                   sess->delta_data);
+                }
             }
         }
     }

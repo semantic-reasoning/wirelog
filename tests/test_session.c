@@ -522,7 +522,7 @@ test_session_step_no_change(void)
  * RED: currently fails because dd_session_remove returns -1 (not implemented).
  * GREEN: after TASK 2+3 wire wl_dd_session_remove through the vtable.
  */
-static void UNUSED
+static void
 test_session_remove_single_delta(void)
 {
     TEST("session: remove tuple produces diff=-1 delta");
@@ -617,7 +617,7 @@ test_session_remove_single_delta(void)
  * RED: currently fails because dd_session_remove returns -1.
  * GREEN: after TASK 2+3 remove returns 0 and produces no phantom deltas.
  */
-static void UNUSED
+static void
 test_session_remove_nonexistent(void)
 {
     TEST("session: remove non-existent tuple is no-op");
@@ -658,7 +658,7 @@ test_session_remove_nonexistent(void)
 /*
  * Test: snapshot on empty session returns 0 tuples with rc=0.
  */
-static void UNUSED
+static void
 test_session_snapshot_empty(void)
 {
     TEST("session: snapshot of empty session returns 0 tuples");
@@ -711,7 +711,7 @@ test_session_snapshot_empty(void)
  * RED: currently fails because dd_session_snapshot uses empty batch worker.
  * GREEN: after TASK 2+3 snapshot reads from persistent session state.
  */
-static void UNUSED
+static void
 test_session_snapshot_after_insert(void)
 {
     TEST("session: snapshot reflects current derived state");
@@ -790,7 +790,7 @@ test_session_snapshot_after_insert(void)
  * Test: duplicate insert of the same tuple produces exactly one positive delta.
  * DD set semantics via consolidate should not double-count.
  */
-static void UNUSED
+static void
 test_session_duplicate_insert(void)
 {
     TEST("session: duplicate insert produces single positive delta");
@@ -859,7 +859,7 @@ test_session_duplicate_insert(void)
 /* TEST: Transitive Closure Insert (RED phase - will FAIL)                 */
 /* ======================================================================== */
 
-static void UNUSED
+static void
 test_session_tc_insert(void)
 {
     TEST("session: transitive closure insert test (recursive iterate)");
@@ -974,10 +974,10 @@ main(void)
     test_session_step_incremental_delta();
     test_session_step_no_change();
 
-    /* RED: the following tests require TASK 2+3 (FFI bridge + C vtable) */
-    /* Disabled until wl_session_remove is implemented in columnar backend */
-    /* test_session_remove_single_delta(); */
+    /* GREEN: diff=-1 retraction deltas now implemented */
+    test_session_remove_single_delta();
     /* test_session_remove_nonexistent(); */
+    /* Blocked: col_session_remove returns ENOENT */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */
     /* test_session_duplicate_insert(); */
