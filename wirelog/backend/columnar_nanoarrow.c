@@ -5020,8 +5020,12 @@ col_session_remove(wl_session_t *session, const char *relation,
         return EINVAL;
 
     col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
-    if (!r || r->ncols != num_cols)
+    if (!r)
         return ENOENT;
+    if (r->ncols == 0)
+        return 0; /* uninitialized schema = nothing to remove */
+    if (r->ncols != num_cols)
+        return EINVAL;
 
     /* Compact: remove matching rows */
     for (uint32_t di = 0; di < num_rows; di++) {
