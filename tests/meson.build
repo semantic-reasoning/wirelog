@@ -1298,6 +1298,28 @@ test_delta_callback_exe = executable(
 test('delta_callback', test_delta_callback_exe)
 
 # ============================================================================
+# Delta Retraction Tests (Issue #158)
+# ============================================================================
+
+test_delta_retraction_exe = executable(
+  'test_delta_retraction',
+  files('test_delta_retraction.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  csv_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
+)
+
+test('delta_retraction', test_delta_retraction_exe)
+
+# ============================================================================
 # Session Tests (Issue #153 - Persistent columnar session deltas)
 # ============================================================================
 
