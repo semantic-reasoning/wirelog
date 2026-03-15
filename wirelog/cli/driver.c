@@ -27,6 +27,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Maximum number of columns supported in a single watch-mode tuple */
+#define WL_WATCH_MAX_COLS 64
+/* Maximum length of a relation name in watch-mode input lines */
+#define WL_WATCH_MAX_RELATION 256
+
 char *
 wl_read_file(const char *path)
 {
@@ -185,6 +190,121 @@ print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
 }
 
 /* ======================================================================== */
+/* Watch mode: stdin line parser                                            */
+/* ======================================================================== */
+
+/*
+ * parse_watch_line:
+ * @line:         NUL-terminated input line (may be modified in place).
+ * @relation_out: Buffer to receive the relation name.
+ * @rel_buf_size: Capacity of @relation_out.
+ * @values:       Output buffer for parsed int64_t column values.
+ * @ncols_out:    (out) Number of values parsed.
+ * @rel_info:     Relation schema for type-aware parsing (may be NULL).
+ * @intern:       Intern table for string columns (may be NULL).
+ *
+ * Parse a line of the form:
+ *   relation col1 col2 ...       (whitespace-separated)
+ *   relation,col1,col2,...       (comma-separated)
+ *
+ * Returns 0 on success, -1 on error or empty/comment line.
+ */
+static int
+parse_watch_line(char *line, char *relation_out, size_t rel_buf_size,
+                 int64_t *values, uint32_t *ncols_out,
+                 const wl_ir_relation_info_t *rel_info, wl_intern_t *intern)
+{
+    /* Strip trailing newline/carriage-return */
+    size_t len = strlen(line);
+    while (len > 0
+           && (line[len - 1] == '\n' || line[len - 1] == '\r'
+               || line[len - 1] == ' ' || line[len - 1] == '\t'))
+        line[--len] = '\0';
+
+    if (len == 0 || line[0] == '#')
+        return -1;
+
+    /* Detect delimiter: comma or whitespace */
+    char delim = ' ';
+    for (size_t i = 0; i < len; i++) {
+        if (line[i] == ',') {
+            delim = ',';
+            break;
+        }
+    }
+
+    /* Extract relation name (first token) */
+    char *saveptr = NULL;
+    char *token;
+    if (delim == ',') {
+        token = strtok_r(line, ",", &saveptr);
+    } else {
+        token = strtok_r(line, " \t", &saveptr);
+    }
+    if (!token)
+        return -1;
+
+    /* Trim leading/trailing whitespace from relation name */
+    while (*token == ' ' || *token == '\t')
+        token++;
+    size_t tlen = strlen(token);
+    while (tlen > 0 && (token[tlen - 1] == ' ' || token[tlen - 1] == '\t'))
+        token[--tlen] = '\0';
+
+    if (tlen == 0 || tlen >= rel_buf_size)
+        return -1;
+    memcpy(relation_out, token, tlen + 1);
+
+    /* Parse remaining tokens as column values */
+    uint32_t col = 0;
+    while (col < WL_WATCH_MAX_COLS) {
+        if (delim == ',') {
+            token = strtok_r(NULL, ",", &saveptr);
+        } else {
+            token = strtok_r(NULL, " \t", &saveptr);
+        }
+        if (!token)
+            break;
+
+        /* Trim whitespace */
+        while (*token == ' ' || *token == '\t')
+            token++;
+        size_t vlen = strlen(token);
+        while (vlen > 0 && (token[vlen - 1] == ' ' || token[vlen - 1] == '\t'))
+            token[--vlen] = '\0';
+        if (vlen == 0)
+            continue;
+
+        /* Type-aware parsing: intern strings when schema is known */
+        bool is_string = false;
+        if (rel_info && col < rel_info->column_count
+            && rel_info->columns[col].type == WIRELOG_TYPE_STRING)
+            is_string = true;
+
+        if (is_string && intern) {
+            /* Strip surrounding double-quotes if present */
+            if (vlen >= 2 && token[0] == '"' && token[vlen - 1] == '"') {
+                token[vlen - 1] = '\0';
+                token++;
+            }
+            int64_t id = wl_intern_put(intern, token);
+            if (id < 0)
+                return -1;
+            values[col] = id;
+        } else {
+            char *endptr = NULL;
+            values[col] = (int64_t)strtoll(token, &endptr, 10);
+            if (endptr == token)
+                return -1;
+        }
+        col++;
+    }
+
+    *ncols_out = col;
+    return (col == 0) ? -1 : 0;
+}
+
+/* ======================================================================== */
 /* Delta callback for delta-query mode                                      */
 /* ======================================================================== */
 
@@ -220,7 +340,7 @@ delta_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
 
 int
 wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
-                FILE *out)
+                bool watch_mode, uint32_t watch_interval_ms, FILE *out)
 {
     if (!source || !out)
         return -1;
@@ -337,13 +457,55 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
         .output_file_count = output_file_count,
     };
 
-    if (delta_mode) {
-        /* Delta mode: register delta callback and step through incremental evaluation */
+    if (delta_mode || watch_mode) {
+        /* Delta/watch mode: register delta callback and step through incremental
+         * evaluation */
         wl_session_set_delta_cb(sess, delta_tuple_cb, &ctx);
         rc = wl_session_step(sess);
     } else {
         /* Standard mode: snapshot entire state */
         rc = wl_session_snapshot(sess, print_tuple_cb, &ctx);
+    }
+
+    /* Watch mode: read facts from stdin and re-evaluate incrementally */
+    if (rc == 0 && watch_mode) {
+        (void)watch_interval_ms; /* reserved for future polling interval use */
+        fprintf(stderr, "Watch mode: reading from stdin...\n");
+
+        char line[4096];
+        char relation[WL_WATCH_MAX_RELATION] = { 0 };
+        int64_t values[WL_WATCH_MAX_COLS];
+
+        while (fgets(line, (int)sizeof(line), stdin)) {
+            uint32_t ncols = 0;
+            const wl_ir_relation_info_t *rel_info
+                = find_relation(prog, relation);
+
+            if (parse_watch_line(line, relation, sizeof(relation), values,
+                                 &ncols, rel_info, prog->intern)
+                != 0)
+                continue;
+
+            /* Re-fetch rel_info now that relation name is filled in */
+            rel_info = find_relation(prog, relation);
+
+            rc = wl_session_insert(sess, relation, values, 1, ncols);
+            if (rc != 0) {
+                fprintf(stderr, "error: insert failed for relation '%s'\n",
+                        relation);
+                continue;
+            }
+
+            rc = wl_session_step(sess);
+            if (rc != 0) {
+                fprintf(stderr, "error: step failed (rc=%d)\n", rc);
+                break;
+            }
+        }
+
+        /* Treat normal EOF as success */
+        if (feof(stdin))
+            rc = 0;
     }
 
     /* 7. Close per-relation output files */

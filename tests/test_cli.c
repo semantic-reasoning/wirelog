@@ -274,7 +274,7 @@ test_run_pipeline_tc(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -320,7 +320,7 @@ test_run_pipeline_null_source(void)
 {
     TEST("wl_run_pipeline rejects NULL source");
 
-    int rc = wl_run_pipeline(NULL, 1, false, stdout);
+    int rc = wl_run_pipeline(NULL, 1, false, false, 0, stdout);
     if (rc == 0) {
         FAIL("expected non-zero for NULL source");
         return;
@@ -334,8 +334,8 @@ test_run_pipeline_parse_error(void)
 {
     TEST("wl_run_pipeline returns error for invalid source");
 
-    int rc
-        = wl_run_pipeline("this is not valid datalog @@#$", 1, false, stdout);
+    int rc = wl_run_pipeline("this is not valid datalog @@#$", 1, false, false,
+                             0, stdout);
     if (rc == 0) {
         FAIL("expected non-zero for invalid source");
         return;
@@ -382,7 +382,7 @@ test_run_pipeline_csv_input(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -442,7 +442,7 @@ test_run_pipeline_csv_missing_file(void)
              "tc(x, y) :- edge(x, y).\n",
              nxcsv);
 
-    int rc = wl_run_pipeline(src, 1, false, stdout);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, stdout);
     if (rc == 0) {
         FAIL("should fail for missing CSV file");
         return;
@@ -482,7 +482,7 @@ test_run_pipeline_csv_tab_delimiter(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -551,7 +551,7 @@ test_run_pipeline_string_output(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -635,7 +635,7 @@ test_run_pipeline_mixed_type_output(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -699,7 +699,7 @@ test_run_pipeline_symbol_output(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -782,7 +782,7 @@ test_run_pipeline_mixed_symbol_int_output(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -861,7 +861,7 @@ test_run_pipeline_output_filter(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -925,7 +925,7 @@ test_run_pipeline_no_output_directive(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {
@@ -972,7 +972,7 @@ test_run_pipeline_output_to_file(void)
              ".output tc(filename=\"%s\")\n",
              csv_out);
 
-    int rc = wl_run_pipeline(src, 1, false, stdout);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, stdout);
     if (rc != 0) {
         remove(csv_out);
         FAIL("wl_run_pipeline failed");
@@ -1030,7 +1030,7 @@ test_run_pipeline_output_file_not_printed_to_stdout(void)
         return;
     }
 
-    int rc = wl_run_pipeline(src, 1, false, f);
+    int rc = wl_run_pipeline(src, 1, false, false, 0, f);
     fclose(f);
 
     if (rc != 0) {

@@ -43,10 +43,15 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
 
 /**
  * wl_run_pipeline:
- * @source:      Datalog source text.
- * @num_workers: Number of worker threads.
- * @delta_mode:  If true, execute in delta-query mode and emit delta tuples.
- * @out:         Output stream for result tuples.
+ * @source:            Datalog source text.
+ * @num_workers:       Number of worker threads.
+ * @delta_mode:        If true, execute in delta-query mode and emit delta
+ *                     tuples.
+ * @watch_mode:        If true, enter watch loop after initial evaluation,
+ *                     reading new facts from stdin and re-evaluating.
+ * @watch_interval_ms: Polling interval in milliseconds for watch mode
+ *                     (ignored when watch_mode is false).
+ * @out:               Output stream for result tuples.
  *
  * Run the full Datalog pipeline: parse -> optimize -> plan ->
  * load inline facts -> execute -> print results.
@@ -55,6 +60,6 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
  */
 int
 wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
-                FILE *out);
+                bool watch_mode, uint32_t watch_interval_ms, FILE *out);
 
 #endif /* WIRELOG_CLI_DRIVER_H */
