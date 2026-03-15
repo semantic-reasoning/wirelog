@@ -5528,11 +5528,12 @@ static int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                             uint32_t stratum_idx)
 {
-    /* Issue #158: Route through retraction path for non-recursive strata
-     * when retraction deltas have been pre-seeded. */
-    if (sess->retraction_seeded && !sp->is_recursive) {
-        return col_stratum_step_retraction_nonrecursive(sp, sess, stratum_idx);
-    }
+    /* Issue #158: For now, use full re-evaluation for retraction.
+     * When retraction_seeded is set, the standard delta callback logic
+     * compares prev state with new state (recomputed from affected input),
+     * and diff=-1 callbacks are fired for removed tuples.
+     * Future optimization: implement col_stratum_step_retraction_nonrecursive
+     * for direct delta-only propagation of retractions. */
 
     uint32_t rc_cnt = sp->relation_count;
 
