@@ -838,6 +838,16 @@ typedef struct {
      * deletion phase skip optimization. Populated from plan->strata[si].is_monotone
      * during session_create. Conservative default: all false (no optimization). */
     bool stratum_is_monotone[MAX_STRATA];
+    /* Retraction delta tracking (Issue #158): tracks which relation was just
+     * removed via col_session_remove_incremental, enables delta retraction path.
+     * Borrowed pointer; lifetime: until next session_step.
+     * NULL when no incremental remove preceded the current step. */
+    const char *last_removed_relation;
+    /* Retraction-seeded incremental evaluation (Issue #158).
+     * When true, EDB retraction delta relations have been pre-seeded into
+     * the session before re-evaluation. Similar to delta_seeded but for
+     * $r$<name> relations. Cleared after eval completes. */
+    bool retraction_seeded;
     delta_pool_t *delta_pool; /* Pool allocator for operator temporaries */
 } wl_col_session_t;
 
@@ -5012,6 +5022,12 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     return 0;
 }
 
+/* Forward declaration for col_session_remove_incremental */
+static int
+col_session_remove_incremental(wl_session_t *session, const char *relation,
+                               const int64_t *data, uint32_t num_rows,
+                               uint32_t num_cols);
+
 static int
 col_session_remove(wl_session_t *session, const char *relation,
                    const int64_t *data, uint32_t num_rows, uint32_t num_cols)
@@ -5019,7 +5035,12 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (!session || !relation || !data)
         return EINVAL;
 
-    col_rel_t *r = session_find_rel(COL_SESSION(session), relation);
+    wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->delta_cb != NULL)
+        return col_session_remove_incremental(session, relation, data, num_rows,
+                                              num_cols);
+
+    col_rel_t *r = session_find_rel(sess, relation);
     if (!r)
         return ENOENT;
     if (r->ncols == 0)
@@ -5052,6 +5073,112 @@ col_session_remove(wl_session_t *session, const char *relation,
         r->nrows = out_r;
     next_del:;
     }
+    return 0;
+}
+
+/*
+ * col_session_remove_incremental: Remove rows and pre-seed retraction deltas
+ *
+ * (Issue #158) Semi-naive delta retraction for non-recursive strata.
+ * When a delta callback is registered, this function:
+ *   1. Creates $r$<name> relation from removed rows
+ *   2. Registers it as a session relation (for VARIABLE ops to consume)
+ *   3. Removes rows from the EDB using existing compact logic
+ *   4. Records the removal for affected-stratum calculation
+ *
+ * The $r$<name> relation is used during the next session_step to seed
+ * the retraction evaluation, enabling delta-only propagation.
+ */
+static int
+col_session_remove_incremental(wl_session_t *session, const char *relation,
+                               const int64_t *data, uint32_t num_rows,
+                               uint32_t num_cols)
+{
+    if (!session || !relation || !data)
+        return EINVAL;
+
+    wl_col_session_t *sess = COL_SESSION(session);
+
+    /* Find EDB relation */
+    col_rel_t *r = session_find_rel(sess, relation);
+    if (!r)
+        return ENOENT;
+    if (r->ncols == 0)
+        return 0; /* uninitialized schema = nothing to remove */
+    if (r->ncols != num_cols)
+        return EINVAL;
+
+    /* Allocate $r$<name> delta relation to collect removed rows */
+    char rname[256];
+    snprintf(rname, sizeof(rname), "$r$%s", relation);
+
+    col_rel_t *rdelta = col_rel_new_auto(rname, num_cols);
+    if (!rdelta)
+        return ENOMEM;
+
+    /* Append each removed row to the delta relation.
+     * We need to track which rows are actually being removed from the EDB,
+     * then add them to rdelta. */
+    int rc = 0;
+    for (uint32_t di = 0; di < num_rows; di++) {
+        const int64_t *del = data + (size_t)di * num_cols;
+        /* Check if this row exists in EDB; if so, append to rdelta */
+        for (uint32_t ri = 0; ri < r->nrows; ri++) {
+            const int64_t *row = r->data + (size_t)ri * num_cols;
+            if (memcmp(row, del, sizeof(int64_t) * num_cols) == 0) {
+                /* Found matching row; add to retraction delta */
+                rc = col_rel_append_row(rdelta, del);
+                if (rc != 0) {
+                    col_rel_destroy(rdelta);
+                    return rc;
+                }
+                break; /* Only one copy per removal request */
+            }
+        }
+    }
+
+    /* Register $r$<name> in session (replacing any prior) */
+    session_remove_rel(sess, rname);
+    rc = session_add_rel(sess, rdelta);
+    if (rc != 0) {
+        col_rel_destroy(rdelta);
+        return rc;
+    }
+
+    /* Remove rows from the EDB using existing compact logic */
+    for (uint32_t di = 0; di < num_rows; di++) {
+        const int64_t *del = data + (size_t)di * num_cols;
+        uint32_t out_r = 0;
+        for (uint32_t ri = 0; ri < r->nrows; ri++) {
+            const int64_t *row = r->data + (size_t)ri * num_cols;
+            if (memcmp(row, del, sizeof(int64_t) * num_cols) != 0) {
+                if (out_r != ri)
+                    memcpy(r->data + (size_t)out_r * num_cols, row,
+                           sizeof(int64_t) * num_cols);
+                out_r++;
+            } else {
+                /* Remove first matching row only */
+                di = num_rows; /* break outer loop after this one */
+                for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
+                    memcpy(r->data + (size_t)out_r * num_cols,
+                           r->data + (size_t)rest * num_cols,
+                           sizeof(int64_t) * num_cols);
+                r->nrows = out_r;
+                goto next_del_incr;
+            }
+        }
+        r->nrows = out_r;
+    next_del_incr:;
+    }
+
+    /* Clamp base_nrows to current row count */
+    if (r->base_nrows > r->nrows)
+        r->base_nrows = r->nrows;
+
+    /* Mark removal for affected-stratum calculation */
+    sess->last_removed_relation = relation;
+    sess->outer_epoch++;
+
     return 0;
 }
 
