@@ -12,6 +12,7 @@
 #ifndef WIRELOG_CLI_DRIVER_H
 #define WIRELOG_CLI_DRIVER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -44,6 +45,7 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
  * wl_run_pipeline:
  * @source:      Datalog source text.
  * @num_workers: Number of worker threads.
+ * @delta_mode:  If true, execute in delta-query mode and emit delta tuples.
  * @out:         Output stream for result tuples.
  *
  * Run the full Datalog pipeline: parse -> optimize -> plan ->
@@ -52,6 +54,7 @@ wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
  * Returns: 0 on success, non-zero on error.
  */
 int
-wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out);
+wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
+                FILE *out);
 
 #endif /* WIRELOG_CLI_DRIVER_H */

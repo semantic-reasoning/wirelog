@@ -14,6 +14,7 @@
 
 #include "driver.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,8 @@ print_usage(const char *progname)
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr,
             "  --workers N   Number of DD worker threads (default: 1)\n");
+    fprintf(stderr, "  --delta       Execute in delta-query mode (emit delta "
+                    "tuples to stdout)\n");
     fprintf(stderr, "  --help        Show this help message\n");
 }
 
@@ -33,11 +36,16 @@ main(int argc, char *argv[])
 {
     const char *filepath = NULL;
     uint32_t num_workers = 1;
+    bool delta_mode = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
+        }
+        if (strcmp(argv[i], "--delta") == 0) {
+            delta_mode = true;
+            continue;
         }
         if (strcmp(argv[i], "--workers") == 0) {
             if (i + 1 >= argc) {
@@ -76,7 +84,7 @@ main(int argc, char *argv[])
         return 1;
     }
 
-    int rc = wl_run_pipeline(source, num_workers, stdout);
+    int rc = wl_run_pipeline(source, num_workers, delta_mode, stdout);
     free(source);
 
     if (rc != 0) {

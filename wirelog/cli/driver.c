@@ -23,6 +23,7 @@
 #include "../wirelog.h"
 
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -183,8 +184,43 @@ print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
     fprintf(ctx->out, ")\n");
 }
 
+/* ======================================================================== */
+/* Delta callback for delta-query mode                                      */
+/* ======================================================================== */
+
+static void
+delta_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
+               int32_t diff, void *user_data)
+{
+    wl_output_ctx_t *ctx = (wl_output_ctx_t *)user_data;
+    const wl_ir_relation_info_t *rel = NULL;
+
+    if (ctx->prog)
+        rel = find_relation(ctx->prog, relation);
+
+    /* Print delta prefix: + for insertion (diff > 0), - for retraction (diff < 0) */
+    fprintf(ctx->out, "%s%s(", diff > 0 ? "+" : "-", relation);
+    for (uint32_t i = 0; i < ncols; i++) {
+        if (i > 0)
+            fprintf(ctx->out, ", ");
+
+        if (rel && i < rel->column_count
+            && rel->columns[i].type == WIRELOG_TYPE_STRING && ctx->intern) {
+            const char *str = wl_intern_reverse(ctx->intern, row[i]);
+            if (str)
+                fprintf(ctx->out, "\"%s\"", str);
+            else
+                fprintf(ctx->out, "%" PRId64, row[i]);
+        } else {
+            fprintf(ctx->out, "%" PRId64, row[i]);
+        }
+    }
+    fprintf(ctx->out, ")\n");
+}
+
 int
-wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
+wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
+                FILE *out)
 {
     if (!source || !out)
         return -1;
@@ -300,7 +336,15 @@ wl_run_pipeline(const char *source, uint32_t num_workers, FILE *out)
         .output_files = output_files,
         .output_file_count = output_file_count,
     };
-    rc = wl_session_snapshot(sess, print_tuple_cb, &ctx);
+
+    if (delta_mode) {
+        /* Delta mode: register delta callback and step through incremental evaluation */
+        wl_session_set_delta_cb(sess, delta_tuple_cb, &ctx);
+        rc = wl_session_step(sess);
+    } else {
+        /* Standard mode: snapshot entire state */
+        rc = wl_session_snapshot(sess, print_tuple_cb, &ctx);
+    }
 
     /* 7. Close per-relation output files */
     for (uint32_t i = 0; i < output_file_count; i++) {
