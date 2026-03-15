@@ -234,12 +234,11 @@ parse_watch_line(char *line, char *relation_out, size_t rel_buf_size,
     }
 
     /* Extract relation name (first token) */
-    char *saveptr = NULL;
     char *token;
     if (delim == ',') {
-        token = strtok_r(line, ",", &saveptr);
+        token = strtok(line, ",");
     } else {
-        token = strtok_r(line, " \t", &saveptr);
+        token = strtok(line, " \t");
     }
     if (!token)
         return -1;
@@ -259,9 +258,9 @@ parse_watch_line(char *line, char *relation_out, size_t rel_buf_size,
     uint32_t col = 0;
     while (col < WL_WATCH_MAX_COLS) {
         if (delim == ',') {
-            token = strtok_r(NULL, ",", &saveptr);
+            token = strtok(NULL, ",");
         } else {
-            token = strtok_r(NULL, " \t", &saveptr);
+            token = strtok(NULL, " \t");
         }
         if (!token)
             break;
