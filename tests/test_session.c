@@ -976,8 +976,8 @@ main(void)
 
     /* GREEN: diff=-1 retraction deltas now implemented */
     test_session_remove_single_delta();
-    /* test_session_remove_nonexistent(); */
-    /* Blocked: col_session_remove returns ENOENT */
+    test_session_remove_nonexistent();
+    /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */
     /* test_session_duplicate_insert(); */
