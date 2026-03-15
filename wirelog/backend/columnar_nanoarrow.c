@@ -5410,6 +5410,12 @@ static int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                             uint32_t stratum_idx)
 {
+    /* Issue #158: Route through retraction path for non-recursive strata
+     * when retraction deltas have been pre-seeded. */
+    if (sess->retraction_seeded && !sp->is_recursive) {
+        return col_stratum_step_retraction_nonrecursive(sp, sess, stratum_idx);
+    }
+
     uint32_t rc_cnt = sp->relation_count;
 
     /* Allocate snapshot arrays */
@@ -5553,6 +5559,22 @@ col_session_step(wl_session_t *session)
             session, sess->last_inserted_relation);
     }
 
+    /* Issue #158: Pre-seed retraction deltas for affected strata.
+     * If last_removed_relation is set (removal via col_session_remove_incremental),
+     * check if $r$<name> exists for retractions, and set retraction_seeded. */
+    if (sess->last_removed_relation != NULL) {
+        affected_mask &= col_compute_affected_strata(
+            session, sess->last_removed_relation);
+        char rname[256];
+        if (retraction_rel_name(sess->last_removed_relation, rname,
+                                sizeof(rname))
+            == 0) {
+            col_rel_t *rdelta = session_find_rel(sess, rname);
+            if (rdelta && rdelta->nrows > 0)
+                sess->retraction_seeded = true;
+        }
+    }
+
     /* Issue #106 (US-106-004): Reset rule frontiers with stratum context awareness.
      * col_session_step is for delta callback mode (no pre-seeded deltas).
      * Always reset affected rules to force re-evaluation.
@@ -5600,6 +5622,20 @@ col_session_step(wl_session_t *session)
         /* Reset arena after stratum evaluation to free temporaries */
         if (sess->eval_arena)
             wl_arena_reset(sess->eval_arena);
+    }
+
+    /* Issue #158: Cleanup retraction state and delta relations after step */
+    sess->last_removed_relation = NULL;
+    sess->retraction_seeded = false;
+    /* Remove all $r$<name> relations from session */
+    for (uint32_t i = 0; i < sess->nrels;) {
+        col_rel_t *r = sess->rels[i];
+        if (r && strncmp(r->name, "$r$", 3) == 0) {
+            session_remove_rel(sess, r->name);
+            /* session_remove_rel shifts array, so don't increment i */
+        } else {
+            i++;
+        }
     }
 
     /* Reset after successful eval so next plain session_step runs all strata */
