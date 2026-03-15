@@ -1228,6 +1228,10 @@ static int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                        wl_col_session_t *sess);
 
+/* Forward declaration for retraction delta relation name formatting */
+static int
+retraction_rel_name(const char *rel, char *buf, size_t sz);
+
 /* Forward declaration for empty-delta pre-scan skip (issue #85) */
 static bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
@@ -1378,10 +1382,22 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
      *              it is empty, push an empty relation so that the rule
      *              copy produces no output (correct semi-naive behavior).
      * AUTO:        heuristic -- prefer delta only when it is a genuine
-     *              strict subset of the full relation (nrows < full). */
+     *              strict subset of the full relation (nrows < full).
+     *
+     * Issue #158 extension: When retraction_seeded and iteration == 0,
+     * look for $r$<name> (retraction delta) instead of $d$<name> */
     char dname[256];
-    snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
-    col_rel_t *delta = session_find_rel(sess, dname);
+    col_rel_t *delta = NULL;
+
+    if (sess->retraction_seeded && sess->current_iteration == 0) {
+        /* Retraction mode: look for $r$<name> retraction delta */
+        if (retraction_rel_name(op->relation_name, dname, sizeof(dname)) == 0)
+            delta = session_find_rel(sess, dname);
+    } else {
+        /* Normal mode: look for $d$<name> insertion delta */
+        snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
+        delta = session_find_rel(sess, dname);
+    }
 
     if (op->delta_mode == WL_DELTA_FORCE_FULL) {
         return eval_stack_push_delta(stack, full_rel, false, false);
@@ -1391,10 +1407,10 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
             return eval_stack_push_delta(stack, delta, false, true);
         }
         if (sess->current_iteration == 0) {
-            if (sess->delta_seeded) {
-                /* Issue #83: delta-seeded incremental re-eval. No pre-seeded
-                 * delta means this relation has no new facts. Push empty so
-                 * only rules with actual deltas produce output. */
+            if (sess->delta_seeded || sess->retraction_seeded) {
+                /* Issue #83 (delta-seeded) or #158 (retraction-seeded):
+                 * No pre-seeded delta means this relation has no new/removed facts.
+                 * Push empty so only rules with actual deltas produce output. */
                 col_rel_t *empty = col_rel_pool_new_like(
                     sess->delta_pool, "$empty_delta", full_rel);
                 if (!empty)
@@ -3639,6 +3655,17 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
 }
 
 /*
+ * Helper: Format retraction delta relation name ($r$<rel>)
+ * Returns 0 on success, ENOMEM if buffer too small.
+ */
+static int
+retraction_rel_name(const char *rel, char *buf, size_t sz)
+{
+    int n = snprintf(buf, sz, "$r$%s", rel);
+    return (n < 0 || (size_t)n >= sz) ? ENOMEM : 0;
+}
+
+/*
  * has_empty_forced_delta:
  * Check if a relation plan would produce empty output because it contains
  * a FORCE_DELTA op whose delta relation is empty or absent.
@@ -3651,12 +3678,15 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
  * we can safely skip evaluation.
  *
  * Returns true if the plan can be skipped (empty forced-delta found).
+ *
+ * Issue #158 extension: When retraction_seeded and iteration == 0, check
+ * $r$<name> relations instead of $d$<name>.
  */
 static bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
                        uint32_t iteration)
 {
-    if (iteration == 0 && !sess->delta_seeded)
+    if (iteration == 0 && !sess->delta_seeded && !sess->retraction_seeded)
         return false; /* Base case: no deltas exist yet (non-incremental) */
 
     for (uint32_t oi = 0; oi < rp->op_count; oi++) {
@@ -3672,7 +3702,14 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
 
         if (rel_name) {
             char dname[256];
-            snprintf(dname, sizeof(dname), "$d$%s", rel_name);
+            if (sess->retraction_seeded && iteration == 0) {
+                /* Retraction mode: look for $r$<name> */
+                if (retraction_rel_name(rel_name, dname, sizeof(dname)) != 0)
+                    return false; /* Buffer overflow, skip check */
+            } else {
+                /* Normal mode: look for $d$<name> */
+                snprintf(dname, sizeof(dname), "$d$%s", rel_name);
+            }
             col_rel_t *d = session_find_rel(sess, dname);
             if (!d || d->nrows == 0)
                 return true; /* Found empty forced-delta */
