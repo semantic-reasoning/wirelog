@@ -37,12 +37,17 @@ struct wirelog_program;
  *
  * Statistics from a single SIP pass invocation.
  *
- * @semijoins_inserted: Number of SEMIJOIN nodes inserted.
- * @chains_examined:    Number of join chains examined (>= 3 atoms).
+ * @semijoins_inserted:        Number of SEMIJOIN nodes inserted in chains
+ *                             of 3+ atoms (standard SIP).
+ * @chains_examined:           Number of join chains examined (>= 3 atoms).
+ * @demand_semijoins_inserted: Number of demand SEMIJOIN nodes inserted for
+ *                             2-atom joins with recursive left scans
+ *                             (demand-driven filtering, Issue #192).
  */
 typedef struct {
     uint32_t semijoins_inserted;
     uint32_t chains_examined;
+    uint32_t demand_semijoins_inserted;
 } wl_sip_stats_t;
 
 /**

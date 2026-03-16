@@ -97,6 +97,18 @@ descend_to_join(wirelog_ir_node_t *node)
 }
 
 /* ======================================================================== */
+/* Helper: skip through PROJECT wrapper nodes (inserted by JPP)            */
+/* ======================================================================== */
+
+static wirelog_ir_node_t *
+skip_project_wrapper(wirelog_ir_node_t *node)
+{
+    while (node && node->type == WIRELOG_IR_PROJECT && node->child_count > 0)
+        node = node->children[0];
+    return node;
+}
+
+/* ======================================================================== */
 /* Helper: count join depth of a left-deep chain                            */
 /* ======================================================================== */
 
@@ -110,6 +122,10 @@ count_join_depth(const wirelog_ir_node_t *node)
         /* Skip over any SEMIJOIN already inserted (for idempotency) */
         if (node && node->type == WIRELOG_IR_SEMIJOIN)
             node = (node->child_count > 0) ? node->children[0] : NULL;
+        /* Skip over any PROJECT inserted by JPP between joins */
+        while (node && node->type == WIRELOG_IR_PROJECT
+               && node->child_count > 0)
+            node = node->children[0];
     }
     return depth;
 }
@@ -142,8 +158,17 @@ insert_semijoins_in_chain(wirelog_ir_node_t *join_root)
             continue;
         }
 
-        /* Only insert if left child is a JOIN (chain of 3+ atoms) */
-        if (!left || left->type != WIRELOG_IR_JOIN)
+        /*
+         * Descend through any PROJECT node inserted by JPP between joins.
+         * JPP places PROJECT(intermediate_join) as the left child of the
+         * parent JOIN to drop columns that are not needed downstream.
+         * SIP must wrap the PROJECT (not just the inner JOIN) so that the
+         * projected column set is respected.
+         */
+        wirelog_ir_node_t *left_inner = skip_project_wrapper(left);
+
+        /* Only insert if there is a nested JOIN (chain of 3+ atoms) */
+        if (!left_inner || left_inner->type != WIRELOG_IR_JOIN)
             break;
 
         /* Right child must be a SCAN to clone */
@@ -176,7 +201,11 @@ insert_semijoins_in_chain(wirelog_ir_node_t *join_root)
             }
         }
 
-        /* SEMIJOIN child[0] = the left subtree (intermediate result) */
+        /*
+         * SEMIJOIN child[0] = the left subtree (may include a PROJECT
+         * wrapper inserted by JPP — we preserve it intact so column
+         * indices remain correct for downstream operators).
+         */
         wl_ir_node_add_child(sj, left);
 
         /* SEMIJOIN child[1] = clone of right SCAN (for relation name) */
@@ -195,8 +224,8 @@ insert_semijoins_in_chain(wirelog_ir_node_t *join_root)
 
         inserted++;
 
-        /* Move to the next level (the left child, which is a JOIN) */
-        node = left;
+        /* Move to the next level through any PROJECT wrapper */
+        node = left_inner;
     }
 
     return inserted;
@@ -227,7 +256,7 @@ sip_process_tree(wirelog_ir_node_t *ir, wl_sip_stats_t *stats)
     if (!join_root)
         return 0;
 
-    /* Need at least 2 JOINs (3+ atoms) to apply SIP */
+    /* Need at least 2 JOINs (3+ atoms) to apply standard SIP */
     uint32_t depth = count_join_depth(join_root);
     if (depth < 2)
         return 0;
@@ -258,6 +287,7 @@ wl_sip_apply(struct wirelog_program *prog, wl_sip_stats_t *stats)
     if (stats) {
         stats->semijoins_inserted = 0;
         stats->chains_examined = 0;
+        stats->demand_semijoins_inserted = 0;
     }
 
     if (!prog->relation_irs)
