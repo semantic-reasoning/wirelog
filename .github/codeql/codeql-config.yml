@@ -5,13 +5,14 @@ queries:
 
 paths:
   - wirelog
-  # - rust/wirelog-dd/src  # Disabled: Rust analysis not required for Phase 4+
   - tests
 
 paths-ignore:
   - bench
   - build*
-  - third_party
+  - scripts
+  - examples
+  - subprojects
 
 threat-models:
   - remote
