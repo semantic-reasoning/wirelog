@@ -244,6 +244,10 @@ identifier_type(const char *start, uint32_t length)
         return WL_PARSER_LEXER_TOK_MD5;
     if (IS_KW("sha1"))
         return WL_PARSER_LEXER_TOK_SHA1;
+    if (IS_KW("sha256"))
+        return WL_PARSER_LEXER_TOK_SHA256;
+    if (IS_KW("sha512"))
+        return WL_PARSER_LEXER_TOK_SHA512;
     if (IS_KW("hmac_sha256"))
         return WL_PARSER_LEXER_TOK_HMAC_SHA256;
 

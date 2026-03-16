@@ -146,56 +146,78 @@ run_program_full(const char *src, struct result_ctx *ctx)
 /* ======================================================================== */
 
 /*
- * sha256() and sha512() are tokenised by the lexer but not yet handled by
- * the parser.  wirelog_parse_string() fails for programs using them.
- * These tests are unconditional and document the current parse-level state.
+ * sha256() and sha512() are fully implemented: lexer, parser, and backend.
+ * These determinism tests are unconditional (run with or without mbedTLS).
+ * Without mbedTLS, parse/plan succeed but snapshot emits tuple value 0 (fallback).
  */
 static void
-test_sha256_parse_fails_not_implemented(void)
+test_sha256_determinism(void)
 {
-    TEST("sha256(): parser returns NULL (not yet implemented in parser)");
+    TEST("sha256(): two evaluations of sha256(0) produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
                       "a(0).\n"
                       ".decl r(z: int64)\n"
                       "r(sha256(x)) :- a(x).\n";
 
-    struct result_ctx ctx;
-    int rc = run_program_full(src, &ctx);
-    if (rc == -1) {
-        PASS(); /* parse failed as expected */
-    } else {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "expected parse failure (-1) for sha256(), got rc=%d "
-                 "snap_rc=%d count=%u",
-                 rc, ctx.snapshot_rc, ctx.count);
+    struct result_ctx ctx1, ctx2;
+    int rc1 = run_program_full(src, &ctx1);
+    int rc2 = run_program_full(src, &ctx2);
+    if (rc1 != 0) {
+        FAIL("first evaluation failed (parse/plan/session error)");
+    }
+    if (rc2 != 0) {
+        FAIL("second evaluation failed (parse/plan/session error)");
+    }
+    if (ctx1.count != 1 || ctx2.count != 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 1 tuple each run, got %u and %u",
+                 ctx1.count, ctx2.count);
         FAIL(buf);
     }
+    if (ctx1.col0[0] != ctx2.col0[0]) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "sha256(0) not deterministic: %" PRId64 " != %" PRId64,
+                 ctx1.col0[0], ctx2.col0[0]);
+        FAIL(buf);
+    }
+    PASS();
 }
 
 static void
-test_sha512_parse_fails_not_implemented(void)
+test_sha512_determinism(void)
 {
-    TEST("sha512(): parser returns NULL (not yet implemented in parser)");
+    TEST("sha512(): two evaluations of sha512(0) produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
                       "a(0).\n"
                       ".decl r(z: int64)\n"
                       "r(sha512(x)) :- a(x).\n";
 
-    struct result_ctx ctx;
-    int rc = run_program_full(src, &ctx);
-    if (rc == -1) {
-        PASS();
-    } else {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "expected parse failure (-1) for sha512(), got rc=%d "
-                 "snap_rc=%d count=%u",
-                 rc, ctx.snapshot_rc, ctx.count);
+    struct result_ctx ctx1, ctx2;
+    int rc1 = run_program_full(src, &ctx1);
+    int rc2 = run_program_full(src, &ctx2);
+    if (rc1 != 0) {
+        FAIL("first evaluation failed (parse/plan/session error)");
+    }
+    if (rc2 != 0) {
+        FAIL("second evaluation failed (parse/plan/session error)");
+    }
+    if (ctx1.count != 1 || ctx2.count != 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 1 tuple each run, got %u and %u",
+                 ctx1.count, ctx2.count);
         FAIL(buf);
     }
+    if (ctx1.col0[0] != ctx2.col0[0]) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "sha512(0) not deterministic: %" PRId64 " != %" PRId64,
+                 ctx1.col0[0], ctx2.col0[0]);
+        FAIL(buf);
+    }
+    PASS();
 }
 
 #ifdef WL_MBEDTLS_ENABLED
@@ -1008,9 +1030,9 @@ main(void)
     test_hmac_sha256_evaluates_with_zero_fallback_no_mbedtls();
 #endif
 
-    printf("\n--- sha256()/sha512() Parser State Tests (always run) ---\n");
-    test_sha256_parse_fails_not_implemented();
-    test_sha512_parse_fails_not_implemented();
+    printf("\n--- sha256()/sha512() Determinism Tests (always run) ---\n");
+    test_sha256_determinism();
+    test_sha512_determinism();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)
