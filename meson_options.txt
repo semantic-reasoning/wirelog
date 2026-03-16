@@ -42,3 +42,11 @@ option(
   value: 'ethernet',
   description: 'Default CRC-32 variant: ethernet (standard) or castagnoli (iSCSI)'
 )
+
+option(
+  'mbedTLS',
+  type: 'combo',
+  choices: ['disabled', 'enabled', 'auto'],
+  value: 'disabled',
+  description: 'Use system-installed mbedTLS for cryptographic functions. auto=enabled if found, else disabled'
+)
