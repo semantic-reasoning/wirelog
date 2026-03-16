@@ -93,7 +93,9 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
-        run: pip install meson ninja
+        run: |
+          pip install meson ninja
+          choco install pkgconfiglite -y
 
       - name: Configure (Linux / macOS)
         if: runner.os != 'Windows'

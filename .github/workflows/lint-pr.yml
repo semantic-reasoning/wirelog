@@ -6,8 +6,6 @@ name: Lint PR
 # This workflow is imported by ci-pr.yml as Phase 1.
 
 on:
-  pull_request:
-    branches: [main]
   workflow_call:
 
 permissions:
