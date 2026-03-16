@@ -27,6 +27,7 @@ optimizer_src = files(
   '../wirelog/passes/jpp.c',
   '../wirelog/passes/sip.c',
   '../wirelog/passes/subsumption.c',
+  '../wirelog/passes/magic_sets.c',
 )
 
 intern_src = files(
@@ -1380,3 +1381,19 @@ test('session', test_session_exe)
 #
 # test_recursive_agg_plan depends on deleted DD backend (dd_plan.h)
 # This test is disabled until columnar backend provides equivalent plan generation
+
+# ============================================================================
+# Magic Sets Optimization Pass Tests (Issue #206)
+# ============================================================================
+
+test_magic_sets_exe = executable(
+  'test_magic_sets',
+  files('test_magic_sets.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  csv_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('magic_sets', test_magic_sets_exe)

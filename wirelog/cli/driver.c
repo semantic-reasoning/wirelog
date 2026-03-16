@@ -15,8 +15,10 @@
 #include "../exec_plan_gen.h"
 #include "../intern.h"
 #include "../ir/program.h"
+#include "../ir/stratify.h"
 #include "../passes/fusion.h"
 #include "../passes/jpp.h"
+#include "../passes/magic_sets.h"
 #include "../passes/sip.h"
 #include "../passes/subsumption.h"
 #include "../session.h"
@@ -358,6 +360,14 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
     wl_fusion_apply(prog, NULL);
     wl_jpp_apply(prog, NULL);
     wl_sip_apply(prog, NULL);
+    wl_magic_sets_apply(prog, NULL);
+
+    /* 2a. Rebuild relation IR and re-stratify after magic sets */
+    if (prog->magic_sets_applied) {
+        wl_ir_program_rebuild_relation_irs(prog);
+        wl_ir_program_free_strata(prog);
+        wl_ir_stratify_program(prog);
+    }
 
     /* 3. Generate execution plan */
     wl_plan_t *plan = NULL;

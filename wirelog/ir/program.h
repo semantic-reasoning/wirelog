@@ -86,6 +86,10 @@ struct wirelog_program {
 
     /* Symbol intern table (string -> int64 mapping) */
     wl_intern_t *intern;
+
+    /* Magic Sets pass metadata */
+    bool magic_sets_applied;       /* True after magic sets pass */
+    uint32_t magic_relation_count; /* Number of magic relations added */
 };
 
 /* ======================================================================== */
@@ -112,5 +116,42 @@ void
 wl_ir_program_build_schemas(struct wirelog_program *program);
 void
 wl_ir_program_build_default_stratum(struct wirelog_program *program);
+
+/**
+ * wl_ir_program_add_magic_relation:
+ * Add a new relation with the given name and column count.
+ * No-ops if relation already exists.
+ * Returns 0 on success, -1 on memory error.
+ */
+int
+wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
+                                 uint32_t column_count);
+
+/**
+ * wl_ir_program_add_magic_rule:
+ * Add a new rule with the given head relation and IR tree.
+ * Takes ownership of ir_root.
+ * Returns 0 on success, -1 on memory error.
+ */
+int
+wl_ir_program_add_magic_rule(struct wirelog_program *prog,
+                             const char *head_relation,
+                             wirelog_ir_node_t *ir_root);
+
+/**
+ * wl_ir_program_rebuild_relation_irs:
+ * Free existing relation_irs and rebuild from current rules[].
+ * Must be called after adding magic rules/relations before plan generation.
+ * Returns 0 on success, -1 on memory error.
+ */
+int
+wl_ir_program_rebuild_relation_irs(struct wirelog_program *prog);
+
+/**
+ * wl_ir_program_free_strata:
+ * Free existing strata array (for re-stratification after magic sets).
+ */
+void
+wl_ir_program_free_strata(struct wirelog_program *prog);
 
 #endif /* WIRELOG_IR_PROGRAM_INTERNAL_H */

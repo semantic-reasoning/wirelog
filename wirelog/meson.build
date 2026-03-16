@@ -18,7 +18,7 @@ wirelog_ir_src = files('ir/ir.c', 'ir/program.c', 'ir/stratify.c', 'ir/api.c', '
 #Optimizer Module
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-wirelog_optimizer_src = files('passes/fusion.c', 'passes/jpp.c', 'passes/sip.c', 'passes/subsumption.c', )
+wirelog_optimizer_src = files('passes/fusion.c', 'passes/jpp.c', 'passes/sip.c', 'passes/subsumption.c', 'passes/magic_sets.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Pure C11 Backend(Columnar Nanoarrow Only)
