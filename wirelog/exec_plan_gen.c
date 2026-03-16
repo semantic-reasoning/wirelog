@@ -469,6 +469,32 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
     }
 
     case WIRELOG_IR_PROJECT:
+        /* Intermediate PROJECT nodes (inserted by jpp passes) have
+         * column_names set but no project_exprs. Return their projected
+         * output column layout so that downstream join key resolution
+         * sees the correct (narrowed) column set. */
+        if (!node->project_exprs && node->column_names
+            && node->column_count > 0) {
+            uint32_t nc = node->column_count;
+            char **names = (char **)calloc(nc ? nc : 1, sizeof(char *));
+            if (!names)
+                return -1;
+            for (uint32_t i = 0; i < nc; i++)
+                names[i] = dup_str(node->column_names[i]);
+            *out_names = names;
+            *out_count = nc;
+            return 0;
+        }
+        /* Head PROJECT nodes have project_exprs; delegate to child so
+         * resolve_project_indices can map expression variables to child
+         * column positions. */
+        if (node->child_count > 0)
+            return collect_output_columns(node->children[0], out_names,
+                                          out_count);
+        *out_names = NULL;
+        *out_count = 0;
+        return -1;
+
     case WIRELOG_IR_FILTER:
     case WIRELOG_IR_FLATMAP:
     case WIRELOG_IR_AGGREGATE:

@@ -672,12 +672,13 @@ test_jpp_antijoin_preserved(void)
 static void
 test_jpp_intermediate_projection(void)
 {
-    TEST("jpp: intermediate projection disabled (reorder-only mode)");
+    TEST("jpp: intermediate projection enabled (Issue #191)");
 
     /*
-     * Projection insertion is currently disabled pending dd_plan
-     * column-index propagation fix.  This test verifies that JPP
-     * succeeds without inserting any projections.
+     * Intermediate column projection elimination is now enabled.
+     * For a 3-atom rule with head needing {x, z}, projections are
+     * inserted after scans to eliminate unused columns.
+     * DD backend removed in Phase 2C - original blocking issue resolved.
      */
     wirelog_error_t err;
     wirelog_program_t *prog
@@ -702,8 +703,8 @@ test_jpp_intermediate_projection(void)
         return;
     }
 
-    if (stats.projections_inserted != 0) {
-        FAIL("expected projections_inserted == 0 (disabled)");
+    if (stats.projections_inserted == 0) {
+        FAIL("expected projections_inserted > 0 (now enabled)");
         wirelog_program_free(prog);
         return;
     }

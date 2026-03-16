@@ -457,6 +457,32 @@ collect_head_vars(wirelog_ir_node_t *ir, char **out, uint32_t max)
 }
 
 /* ======================================================================== */
+/* Internal: find physical column index in a join chain output              */
+/* ======================================================================== */
+
+/*
+ * The physical output of a left-deep join over scans[0..n-1] concatenates
+ * ALL scan column lists without deduplication (including duplicate join key
+ * columns). This function returns the physical column index of the first
+ * occurrence of var_name across the concatenated scan column lists.
+ */
+static uint32_t
+find_physical_column(wirelog_ir_node_t **scans, uint32_t n, const char *var)
+{
+    uint32_t offset = 0;
+    for (uint32_t s = 0; s < n; s++) {
+        uint32_t scount;
+        char **svars = scan_vars(scans[s], &scount);
+        for (uint32_t j = 0; j < scount; j++) {
+            if (svars[j] && var && strcmp(svars[j], var) == 0)
+                return offset + j;
+        }
+        offset += scount;
+    }
+    return 0; /* fallback */
+}
+
+/* ======================================================================== */
 /* Internal: insert intermediate projections in a join chain                */
 /* ======================================================================== */
 
@@ -581,7 +607,12 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     for (uint32_t v = 0; v < acc_count; v++) {
                         if (acc[v]
                             && var_in_set(acc[v], needed, needed_count)) {
-                            proj->project_indices[p] = v;
+                            /* Use physical column index: the join output
+                             * concatenates ALL scan columns (including
+                             * duplicate join keys), so acc[] indices (which
+                             * are deduplicated) do not match physical cols. */
+                            proj->project_indices[p]
+                                = find_physical_column(scans, i + 2, acc[v]);
                             proj->column_names[p] = strdup_safe(acc[v]);
                             p++;
                         }
@@ -591,15 +622,6 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                      *          proj->child = current_join */
                     wl_ir_node_add_child(proj, joins[i]);
                     joins[i + 1]->children[0] = proj;
-
-                    /* Save original acc before projection for join key setup */
-                    char **orig_acc
-                        = (char **)calloc(acc_count, sizeof(char *));
-                    uint32_t orig_acc_count = acc_count;
-                    if (orig_acc) {
-                        for (uint32_t v = 0; v < acc_count; v++)
-                            orig_acc[v] = acc[v];
-                    }
 
                     /* Update acc to reflect projection */
                     uint32_t new_acc = 0;
@@ -611,19 +633,16 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     }
                     acc_count = new_acc;
 
-                    /* Recalculate join keys for parent join using original acc
-                     * to get correct column index mappings */
+                    /* Recalculate join keys for parent join using PROJECTED acc.
+                     * After projection, column indices change, so join keys must
+                     * reference the projected columns in the PROJECT output. */
                     free_join_keys(joins[i + 1]);
                     uint32_t rscount;
                     char **rsvars = scan_vars(scans[i + 2], &rscount);
-                    if (orig_acc) {
-                        jpp_setup_join_keys(orig_acc, orig_acc_count, rsvars,
-                                            rscount, joins[i + 1]);
-                        free(orig_acc);
-                    } else {
-                        jpp_setup_join_keys(acc, acc_count, rsvars, rscount,
-                                            joins[i + 1]);
-                    }
+                    /* Use projected acc (current acc after shrinking) which has
+                     * correct indices for the columns in the PROJECT output */
+                    jpp_setup_join_keys(acc, acc_count, rsvars, rscount,
+                                        joins[i + 1]);
 
                     projections++;
                 } else {
@@ -724,18 +743,16 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
         result.reordered = true;
     }
 
+    /* Intermediate column projection elimination (Issue #191).
+     * Called AFTER join reordering so projection decisions reflect the
+     * final (possibly reordered) scan/join structure.
+     */
+    result.projections_inserted
+        = insert_projections(join_root, head_vars, head_var_count);
+
     free(scans);
     free(joins);
     free(order);
-
-    /* TODO: intermediate projection insertion is disabled pending
-     * dd_plan column-index propagation fix (causes index-out-of-bounds
-     * in the DD executor for multi-atom rules).  Join reordering alone
-     * is active and provides the primary optimisation benefit.
-     */
-    (void)insert_projections; /* suppress unused warning */
-    (void)head_vars;
-    (void)head_var_count;
 
     return result;
 }
