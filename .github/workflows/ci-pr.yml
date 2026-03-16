@@ -80,11 +80,10 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           pip install meson ninja
-          choco install mbedtls -y
 
       - name: Configure (Linux / macOS)
         if: runner.os != 'Windows'
-        run: meson setup builddir -Dtests=true
+        run: meson setup builddir -Dtests=true -DmbedTLS=disabled
         env:
           CC: ${{ matrix.cc }}
 
@@ -93,7 +92,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson setup builddir -Dtests=true
+          meson setup builddir -Dtests=true -DmbedTLS=disabled
 
       - name: Build (Linux / macOS)
         if: runner.os != 'Windows'
