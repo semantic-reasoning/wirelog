@@ -931,8 +931,27 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
             continue;
         int rc = col_eval_stratum(&plan->strata[si], sess, si);
-        if (rc != 0)
+        if (rc != 0) {
+            /* Issue #177: Cleanup pre-seeded $d$ deltas on error.
+             * If evaluation fails, remove temporary delta relations created
+             * during delta-seeded incremental eval. Benign to leave them
+             * (replaced on next snapshot), but cleaner to remove. */
+            for (uint32_t i = 0; i < sess->nrels; i++) {
+                col_rel_t *r = sess->rels[i];
+                if (r && strncmp(r->name, "$d$", 3) == 0) {
+                    col_rel_destroy(r);
+                    sess->rels[i] = NULL;
+                }
+            }
+            /* Compact rels[] to close holes */
+            uint32_t out = 0;
+            for (uint32_t in = 0; in < sess->nrels; in++) {
+                if (sess->rels[in] != NULL)
+                    sess->rels[out++] = sess->rels[in];
+            }
+            sess->nrels = out;
             return rc;
+        }
         if (sess->eval_arena)
             wl_arena_reset(sess->eval_arena);
     }

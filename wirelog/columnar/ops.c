@@ -2350,6 +2350,27 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     COL_SESSION(sess)->kfusion_dispatch_ns += now_ns() - _phase_t0;
 
+    /* Issue #177: Merge worker profile counters back to session.
+     * K-fusion workers accumulate profiling stats (join_calls, join_unary,
+     * etc.) during parallel evaluation. Aggregate these counters to the
+     * session profile for comprehensive profiling. */
+#ifdef WL_PROFILE
+    {
+        wl_profile_t base_profile = sess->profile;
+        for (uint32_t d = 0; d < k; d++) {
+            /* Merge counters: sum increments from baseline */
+            sess->profile.join_calls
+                += worker_sess[d].profile.join_calls - base_profile.join_calls;
+            sess->profile.join_unary
+                += worker_sess[d].profile.join_unary - base_profile.join_unary;
+            sess->profile.join_binary += worker_sess[d].profile.join_binary
+                                         - base_profile.join_binary;
+            sess->profile.seminaive_ops += worker_sess[d].profile.seminaive_ops
+                                           - base_profile.seminaive_ops;
+        }
+    }
+#endif
+
     /* Collect results from each worker's eval_stack */
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < k; d++) {
