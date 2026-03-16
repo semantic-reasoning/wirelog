@@ -592,6 +592,15 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     wl_ir_node_add_child(proj, joins[i]);
                     joins[i + 1]->children[0] = proj;
 
+                    /* Save original acc before projection for join key setup */
+                    char **orig_acc
+                        = (char **)calloc(acc_count, sizeof(char *));
+                    uint32_t orig_acc_count = acc_count;
+                    if (orig_acc) {
+                        for (uint32_t v = 0; v < acc_count; v++)
+                            orig_acc[v] = acc[v];
+                    }
+
                     /* Update acc to reflect projection */
                     uint32_t new_acc = 0;
                     for (uint32_t v = 0; v < acc_count; v++) {
@@ -602,13 +611,19 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     }
                     acc_count = new_acc;
 
-                    /* Recalculate join keys for parent join since
-                     * left column positions changed */
+                    /* Recalculate join keys for parent join using original acc
+                     * to get correct column index mappings */
                     free_join_keys(joins[i + 1]);
                     uint32_t rscount;
                     char **rsvars = scan_vars(scans[i + 2], &rscount);
-                    jpp_setup_join_keys(acc, acc_count, rsvars, rscount,
-                                        joins[i + 1]);
+                    if (orig_acc) {
+                        jpp_setup_join_keys(orig_acc, orig_acc_count, rsvars,
+                                            rscount, joins[i + 1]);
+                        free(orig_acc);
+                    } else {
+                        jpp_setup_join_keys(acc, acc_count, rsvars, rscount,
+                                            joins[i + 1]);
+                    }
 
                     projections++;
                 } else {
