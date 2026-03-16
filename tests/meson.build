@@ -26,6 +26,7 @@ optimizer_src = files(
   '../wirelog/passes/fusion.c',
   '../wirelog/passes/jpp.c',
   '../wirelog/passes/sip.c',
+  '../wirelog/passes/subsumption.c',
 )
 
 intern_src = files(
