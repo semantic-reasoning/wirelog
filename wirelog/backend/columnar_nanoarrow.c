@@ -23,6 +23,8 @@
 #include <mbedtls/md5.h>
 #include <mbedtls/sha1.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/sha512.h>
+#include <mbedtls/md.h>
 #endif
 
 #include <errno.h>
@@ -1102,6 +1104,68 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
 #else
             (void)filt_pop(&s);
             goto bad; /* sha1 requires mbedTLS (-DmbedTLS=enabled or auto) */
+#endif
+            break;
+        }
+
+        case WL_PLAN_EXPR_ARITH_SHA256: {
+#ifdef WL_MBEDTLS_ENABLED
+            int64_t a = filt_pop(&s);
+            unsigned char digest[32];
+            mbedtls_sha256_context sha256_ctx;
+            mbedtls_sha256_init(&sha256_ctx);
+            int ret = mbedtls_sha256_starts_ret(&sha256_ctx, 0);
+            if (ret != 0) {
+                mbedtls_sha256_free(&sha256_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha256_update_ret(
+                &sha256_ctx, (const unsigned char *)&a, sizeof(a));
+            if (ret != 0) {
+                mbedtls_sha256_free(&sha256_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha256_finish_ret(&sha256_ctx, digest);
+            if (ret != 0) {
+                mbedtls_sha256_free(&sha256_ctx);
+                goto bad;
+            }
+            mbedtls_sha256_free(&sha256_ctx);
+            filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
+#else
+            (void)filt_pop(&s);
+            goto bad; /* sha256 requires mbedTLS (-DmbedTLS=enabled or auto) */
+#endif
+            break;
+        }
+
+        case WL_PLAN_EXPR_ARITH_SHA512: {
+#ifdef WL_MBEDTLS_ENABLED
+            int64_t a = filt_pop(&s);
+            unsigned char digest[64];
+            mbedtls_sha512_context sha512_ctx;
+            mbedtls_sha512_init(&sha512_ctx);
+            int ret = mbedtls_sha512_starts_ret(&sha512_ctx, 0);
+            if (ret != 0) {
+                mbedtls_sha512_free(&sha512_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha512_update_ret(
+                &sha512_ctx, (const unsigned char *)&a, sizeof(a));
+            if (ret != 0) {
+                mbedtls_sha512_free(&sha512_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha512_finish_ret(&sha512_ctx, digest);
+            if (ret != 0) {
+                mbedtls_sha512_free(&sha512_ctx);
+                goto bad;
+            }
+            mbedtls_sha512_free(&sha512_ctx);
+            filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
+#else
+            (void)filt_pop(&s);
+            goto bad; /* sha512 requires mbedTLS (-DmbedTLS=enabled or auto) */
 #endif
             break;
         }
