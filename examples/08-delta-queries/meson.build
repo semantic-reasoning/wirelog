@@ -29,6 +29,8 @@ demo_optimizer_src = files(
 demo_backend_src = files(
   subdir_wirelog / 'backend/columnar_nanoarrow.c',
   subdir_wirelog / 'backend/delta_pool.c',
+  subdir_wirelog / 'columnar/relation.c',
+  subdir_wirelog / 'columnar/cache.c',
 )
 
 demo_arena_src = files(

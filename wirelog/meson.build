@@ -54,7 +54,8 @@ wirelog_workqueue_src = files('workqueue.c', )
 #Columnar Backend Module(Phase 2A)
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-wirelog_backend_src = files('backend/columnar_nanoarrow.c', 'backend/delta_pool.c', )
+wirelog_backend_src = files('backend/columnar_nanoarrow.c', 'backend/delta_pool.c',
+                           'columnar/relation.c', 'columnar/cache.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #I / O Module

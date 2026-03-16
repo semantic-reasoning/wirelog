@@ -356,4 +356,55 @@ typedef struct {
     uint32_t top;
 } eval_stack_t;
 
+/* ======================================================================== */
+/* Relation Storage (columnar/relation.c)                                   */
+/* ======================================================================== */
+
+void
+col_rel_free_contents(col_rel_t *r);
+void
+col_rel_destroy(col_rel_t *r);
+int
+col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names);
+int
+col_rel_alloc(col_rel_t **out, const char *name);
+int
+col_rel_append_row(col_rel_t *r, const int64_t *row);
+int
+col_rel_append_all(col_rel_t *dst, const col_rel_t *src);
+int
+col_rel_col_idx(const col_rel_t *r, const char *name);
+col_rel_t *
+col_rel_new_auto(const char *name, uint32_t ncols);
+col_rel_t *
+col_rel_new_like(const char *name, const col_rel_t *src);
+col_rel_t *
+col_rel_pool_new_like(delta_pool_t *pool, const char *name,
+                      const col_rel_t *like);
+col_rel_t *
+col_rel_pool_new_auto(delta_pool_t *pool, const char *name, uint32_t ncols);
+
+/* ======================================================================== */
+/* Cache & Materialized Join (columnar/cache.c)                             */
+/* ======================================================================== */
+
+col_materialized_join_t *
+col_materialized_join_create(uint32_t ncols, uint32_t memory_limit);
+int
+col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row);
+void
+col_materialized_join_free(col_materialized_join_t *mj);
+void
+col_materialized_join_invalidate(col_materialized_join_t *mj);
+uint64_t
+col_mat_cache_key_content(const col_rel_t *rel);
+void
+col_mat_cache_clear(col_mat_cache_t *cache);
+col_rel_t *
+col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
+                     const col_rel_t *right);
+void
+col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
+                     const col_rel_t *right, col_rel_t *result);
+
 #endif /* WL_COLUMNAR_INTERNAL_H */
