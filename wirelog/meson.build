@@ -58,7 +58,7 @@ wirelog_backend_src = files('columnar/relation.c', 'columnar/cache.c',
                            'columnar/ops.c', 'columnar/eval.c',
                            'columnar/arrangement.c', 'columnar/frontier.c',
                            'columnar/mobius.c', 'columnar/session.c',
-                           'columnar/delta_pool.c', )
+                           'columnar/delta_pool.c', 'columnar/lftj.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #I / O Module

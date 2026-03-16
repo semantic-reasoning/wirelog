@@ -186,6 +186,7 @@ backend_src = files(
   '../wirelog/columnar/mobius.c',
   '../wirelog/columnar/session.c',
   '../wirelog/columnar/delta_pool.c',
+  '../wirelog/columnar/lftj.c',
 )
 
 io_src = files(
@@ -523,6 +524,23 @@ test_join_arrangement_exe = executable(
 )
 
 test('join_arrangement', test_join_arrangement_exe)
+
+# ============================================================================
+# Leapfrog Triejoin Tests (Issue #194)
+# ============================================================================
+
+test_lftj_exe = executable(
+  'test_lftj',
+  files('test_lftj.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('lftj', test_lftj_exe)
 
 # ============================================================================
 # Arrangement Cache Reuse Tests (Phase 3C - cache reuse across rules)
