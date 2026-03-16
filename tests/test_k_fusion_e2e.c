@@ -17,7 +17,7 @@
  *   6. Convergence: K=2 produces no duplicate tuples
  */
 
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/passes/fusion.h"

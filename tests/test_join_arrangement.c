@@ -14,7 +14,7 @@
  *   7. After join, arrangement is populated for queried relation+key
  */
 
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"

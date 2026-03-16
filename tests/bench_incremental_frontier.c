@@ -26,7 +26,7 @@
 #include <windows.h>
 #endif
 
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"

@@ -24,7 +24,7 @@
 #include <inttypes.h>
 
 #include "../wirelog/backend.h"
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"

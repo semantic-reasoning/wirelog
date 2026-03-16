@@ -11,7 +11,7 @@
 
 #include "exec_plan_gen.h"
 
-#include "backend/columnar_nanoarrow.h"
+#include "columnar/columnar_nanoarrow.h"
 #include "ir/ir.h"
 #include "ir/program.h"
 #include "wirelog-ir.h"

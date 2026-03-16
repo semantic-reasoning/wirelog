@@ -175,8 +175,6 @@ test('intern', test_intern_exe)
 # ============================================================================
 
 backend_src = files(
-  '../wirelog/backend/columnar_nanoarrow.c',
-  '../wirelog/backend/delta_pool.c',
   '../wirelog/columnar/relation.c',
   '../wirelog/columnar/cache.c',
   '../wirelog/columnar/ops.c',
@@ -184,6 +182,8 @@ backend_src = files(
   '../wirelog/columnar/arrangement.c',
   '../wirelog/columnar/frontier.c',
   '../wirelog/columnar/mobius.c',
+  '../wirelog/columnar/session.c',
+  '../wirelog/columnar/delta_pool.c',
 )
 
 io_src = files(

@@ -10,7 +10,7 @@
  * Plan generation uses the DD marshal path (pure C, no Rust required).
  */
 
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"

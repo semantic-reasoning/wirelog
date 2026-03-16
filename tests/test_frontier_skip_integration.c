@@ -16,7 +16,7 @@
 #include <stdbool.h>
 
 /* Import frontier types */
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 
 /* ======================================================================== */
 /* TEST HARNESS MACROS */

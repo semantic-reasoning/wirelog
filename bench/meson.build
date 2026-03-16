@@ -26,8 +26,6 @@ bench_optimizer_src = files(
 )
 
 bench_backend_src = files(
-  subdir_wirelog / 'backend/columnar_nanoarrow.c',
-  subdir_wirelog / 'backend/delta_pool.c',
   subdir_wirelog / 'columnar/relation.c',
   subdir_wirelog / 'columnar/cache.c',
   subdir_wirelog / 'columnar/ops.c',
@@ -35,6 +33,8 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/arrangement.c',
   subdir_wirelog / 'columnar/frontier.c',
   subdir_wirelog / 'columnar/mobius.c',
+  subdir_wirelog / 'columnar/session.c',
+  subdir_wirelog / 'columnar/delta_pool.c',
 )
 
 bench_io_src = files(

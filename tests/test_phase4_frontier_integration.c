@@ -16,7 +16,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 
 /* Test harness */
 #define TEST(name)                       \

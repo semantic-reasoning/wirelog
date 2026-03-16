@@ -23,7 +23,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan.h"
 
 /* ======================================================================== */

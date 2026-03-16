@@ -14,8 +14,8 @@
 #ifndef WL_COLUMNAR_INTERNAL_H
 #define WL_COLUMNAR_INTERNAL_H
 
-#include "backend/columnar_nanoarrow.h"
-#include "backend/delta_pool.h"
+#include "columnar/columnar_nanoarrow.h"
+#include "columnar/delta_pool.h"
 #include "session.h"
 #include "workqueue.h"
 #include "arena/arena.h"

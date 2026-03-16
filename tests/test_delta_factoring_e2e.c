@@ -13,7 +13,7 @@
  *   4. Multi-way join (3-body) produces correct output
  */
 
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/passes/fusion.h"

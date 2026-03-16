@@ -16,7 +16,7 @@
 #include <string.h>
 
 /* Import frontier types */
-#include "../wirelog/backend/columnar_nanoarrow.h"
+#include "../wirelog/columnar/columnar_nanoarrow.h"
 
 /* Maximum strata for testing (dynamic in actual code, but bounded for test arrays) */
 #define MAX_STRATA 16
