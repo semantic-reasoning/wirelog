@@ -121,6 +121,22 @@ nanoarrow_dep = nanoarrow_proj.get_variable('nanoarrow_dep')
 
 #Built-in functions : xxHash3 for hash() function
 xxhash_proj = subproject('xxhash', default_options: [])
+
+#Optional : mbedTLS for cryptographic functions (Issue #73)
+mbedtls_option = get_option('mbedTLS')
+mbedtls_dep = []
+if mbedtls_option == 'auto'
+  _mbedtls = dependency('mbedtls', required: false)
+  if _mbedtls.found()
+    mbedtls_dep = [_mbedtls]
+    add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
+  endif
+elif mbedtls_option == 'enabled'
+  _mbedtls = dependency('mbedtls', required: true)
+  mbedtls_dep = [_mbedtls]
+  add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
+endif
+
 xxhash_dep = xxhash_proj.get_variable('xxhash_dep')
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
@@ -186,7 +202,7 @@ wirelog_lib = library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep],
   install: true,
   version: project_version,
 )
@@ -197,7 +213,7 @@ wirelog_static_lib = static_library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep],
   install: false,  # Not installed by default
 )
 
@@ -229,7 +245,7 @@ wirelog_cli = executable(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep],
   install: true,
 )
 
