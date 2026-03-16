@@ -128,12 +128,30 @@ mbedtls_dep = []
 if mbedtls_option == 'auto'
   _mbedtls = dependency('mbedtls', required: false)
   if _mbedtls.found()
+    # mbedTLS has private dependencies on mbedx509 and tfpsacrypto for linking
+    _mbedx509 = dependency('mbedx509', required: false)
+    _tfpsacrypto = dependency('tfpsacrypto', required: false)
     mbedtls_dep = [_mbedtls]
+    if _mbedx509.found()
+      mbedtls_dep += [_mbedx509]
+    endif
+    if _tfpsacrypto.found()
+      mbedtls_dep += [_tfpsacrypto]
+    endif
     add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
   endif
 elif mbedtls_option == 'enabled'
   _mbedtls = dependency('mbedtls', required: true)
+  # mbedTLS has private dependencies on mbedx509 and tfpsacrypto for linking
+  _mbedx509 = dependency('mbedx509', required: false)
+  _tfpsacrypto = dependency('tfpsacrypto', required: false)
   mbedtls_dep = [_mbedtls]
+  if _mbedx509.found()
+    mbedtls_dep += [_mbedx509]
+  endif
+  if _tfpsacrypto.found()
+    mbedtls_dep += [_tfpsacrypto]
+  endif
   add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
 endif
 

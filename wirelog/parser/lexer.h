@@ -95,6 +95,10 @@ typedef enum {
     WL_PARSER_LEXER_TOK_SHA512,      /* sha512 */
     WL_PARSER_LEXER_TOK_HMAC_SHA256, /* hmac_sha256 */
 
+    /* UUID function keywords (mbedTLS) */
+    WL_PARSER_LEXER_TOK_UUID4, /* uuid4 */
+    WL_PARSER_LEXER_TOK_UUID5, /* uuid5 */
+
     /* Directives (dot-prefixed keywords) */
     WL_PARSER_LEXER_TOK_DECL,      /* .decl */
     WL_PARSER_LEXER_TOK_INPUT,     /* .input */
