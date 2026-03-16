@@ -224,10 +224,22 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             unsigned char digest[20];
             mbedtls_sha1_context sha1_ctx;
             mbedtls_sha1_init(&sha1_ctx);
-            mbedtls_sha1_starts(&sha1_ctx);
-            mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&a,
-                                sizeof(a));
-            mbedtls_sha1_finish(&sha1_ctx, digest);
+            int ret = mbedtls_sha1_starts(&sha1_ctx);
+            if (ret != 0) {
+                mbedtls_sha1_free(&sha1_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&a,
+                                      sizeof(a));
+            if (ret != 0) {
+                mbedtls_sha1_free(&sha1_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha1_finish(&sha1_ctx, digest);
+            if (ret != 0) {
+                mbedtls_sha1_free(&sha1_ctx);
+                goto bad;
+            }
             mbedtls_sha1_free(&sha1_ctx);
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
