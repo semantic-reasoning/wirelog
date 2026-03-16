@@ -1167,3 +1167,121 @@ wl_ir_program_merge_unions(struct wirelog_program *program)
 
     return 0;
 }
+
+/* ======================================================================== */
+/* Magic Sets Support API                                                   */
+/* ======================================================================== */
+
+int
+wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
+                                 uint32_t column_count)
+{
+    if (!prog || !name)
+        return -1;
+
+    /* No-op if already exists */
+    if (find_relation(prog, name))
+        return 0;
+
+    wl_ir_relation_info_t *rel = add_relation(prog, name);
+    if (!rel)
+        return -1;
+
+    /* Keep relation_irs in sync with relation_count so wl_ir_program_free
+     * doesn't walk past the end of the array.  The new entry is NULL; it
+     * will be filled in by the subsequent wl_ir_program_rebuild_relation_irs
+     * call.  If realloc fails, NULL out relation_irs so free() is safe. */
+    if (prog->relation_irs) {
+        void *new_irs_v
+            = realloc((void *)prog->relation_irs,
+                      prog->relation_count * sizeof(wirelog_ir_node_t *));
+        if (new_irs_v) {
+            prog->relation_irs = (wirelog_ir_node_t **)new_irs_v;
+            prog->relation_irs[prog->relation_count - 1] = NULL;
+        } else {
+            free((void *)prog->relation_irs);
+            prog->relation_irs = NULL;
+        }
+    }
+
+    if (column_count > 0) {
+        rel->columns = (wirelog_column_t *)calloc(column_count,
+                                                  sizeof(wirelog_column_t));
+        if (!rel->columns)
+            return -1;
+        rel->column_count = column_count;
+        for (uint32_t i = 0; i < column_count; i++) {
+            char col_name[32];
+            snprintf(col_name, sizeof(col_name), "c%u", i);
+            rel->columns[i].name = strdup_safe(col_name);
+            rel->columns[i].type = WIRELOG_TYPE_INT64;
+        }
+    }
+
+    return 0;
+}
+
+int
+wl_ir_program_add_magic_rule(struct wirelog_program *prog,
+                             const char *head_relation,
+                             wirelog_ir_node_t *ir_root)
+{
+    if (!prog || !head_relation || !ir_root)
+        return -1;
+
+    if (prog->rule_count >= prog->rule_capacity) {
+        uint32_t new_cap = prog->rule_capacity == 0 ? INITIAL_CAPACITY
+                                                    : prog->rule_capacity * 2;
+        wl_ir_rule_ir_t *new_rules = (wl_ir_rule_ir_t *)realloc(
+            prog->rules, new_cap * sizeof(wl_ir_rule_ir_t));
+        if (!new_rules)
+            return -1;
+        prog->rules = new_rules;
+        prog->rule_capacity = new_cap;
+    }
+
+    wl_ir_rule_ir_t *rule = &prog->rules[prog->rule_count++];
+    memset(rule, 0, sizeof(wl_ir_rule_ir_t));
+    rule->head_relation = strdup_safe(head_relation);
+    rule->ir_root = ir_root;
+    return 0;
+}
+
+int
+wl_ir_program_rebuild_relation_irs(struct wirelog_program *prog)
+{
+    if (!prog)
+        return -1;
+
+    /* Free old relation_irs: UNION wrappers only, not rule ir_roots */
+    if (prog->relation_irs) {
+        for (uint32_t i = 0; i < prog->relation_count; i++) {
+            if (prog->relation_irs[i]
+                && prog->relation_irs[i]->type == WIRELOG_IR_UNION) {
+                free(prog->relation_irs[i]->children);
+                prog->relation_irs[i]->children = NULL;
+                prog->relation_irs[i]->child_count = 0;
+                wl_ir_node_free(prog->relation_irs[i]);
+            }
+        }
+        free(prog->relation_irs);
+        prog->relation_irs = NULL;
+    }
+
+    return wl_ir_program_merge_unions(prog);
+}
+
+void
+wl_ir_program_free_strata(struct wirelog_program *prog)
+{
+    if (!prog || !prog->strata)
+        return;
+
+    for (uint32_t i = 0; i < prog->stratum_count; i++)
+        free((void *)prog->strata[i].rule_names);
+
+    free(prog->strata);
+    prog->strata = NULL;
+    prog->stratum_count = 0;
+    prog->is_stratified = false;
+}
