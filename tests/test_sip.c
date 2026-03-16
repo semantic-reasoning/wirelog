@@ -6,6 +6,7 @@
  * For commercial licenses, contact: inquiry@cleverplant.com
  */
 
+#include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/ir/ir.h"
 #include "../wirelog/ir/program.h"
@@ -183,13 +184,19 @@ test_sip_no_ir_trees(void)
 static void
 test_sip_two_atom_noop(void)
 {
-    TEST("sip: two-atom rule is no-op (chain too short)");
+    TEST("sip: non-recursive 2-atom rule gets no SEMIJOIN");
 
+    /*
+     * A plain 2-atom rule with no self-recursion: neither standard SIP
+     * (depth < 2) nor demand-driven filtering (no recursive relation)
+     * should fire.
+     */
     wirelog_error_t err;
     wirelog_program_t *prog
-        = wirelog_parse_string(".decl edge(x: int32, y: int32)\n"
-                               ".decl tc(x: int32, y: int32)\n"
-                               "tc(x, z) :- tc(x, y), edge(y, z).\n",
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl b(y: int32, z: int32)\n"
+                               ".decl out(x: int32, z: int32)\n"
+                               "out(x, z) :- a(x, y), b(y, z).\n",
                                &err);
 
     if (!prog) {
@@ -197,7 +204,7 @@ test_sip_two_atom_noop(void)
         return;
     }
 
-    wl_sip_stats_t stats = { 0, 0 };
+    wl_sip_stats_t stats = { 0, 0, 0 };
     int rc = wl_sip_apply(prog, &stats);
 
     if (rc != 0) {
@@ -207,22 +214,28 @@ test_sip_two_atom_noop(void)
     }
 
     if (stats.semijoins_inserted != 0) {
-        FAIL("two-atom rule should not have semijoins inserted");
+        FAIL("non-recursive 2-atom rule should not have standard semijoins");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    if (stats.demand_semijoins_inserted != 0) {
+        FAIL("non-recursive 2-atom rule should not have demand semijoins");
         wirelog_program_free(prog);
         return;
     }
 
     /* Verify no SEMIJOIN nodes exist */
-    wirelog_ir_node_t *ir = find_relation_ir(prog, "tc");
+    wirelog_ir_node_t *ir = find_relation_ir(prog, "out");
     if (!ir) {
-        FAIL("no IR for 'tc'");
+        FAIL("no IR for 'out'");
         wirelog_program_free(prog);
         return;
     }
 
     uint32_t sj_count = count_type_in_tree(ir, WIRELOG_IR_SEMIJOIN);
     if (sj_count != 0) {
-        FAIL("expected 0 SEMIJOINs for two-atom rule");
+        FAIL("expected 0 SEMIJOINs for non-recursive 2-atom rule");
         wirelog_program_free(prog);
         return;
     }
@@ -691,6 +704,91 @@ test_sip_idempotent(void)
 }
 
 /* ======================================================================== */
+/* JPP interaction tests                                                    */
+/* ======================================================================== */
+
+static void
+test_sip_jpp_project_chain(void)
+{
+    TEST("sip: 3-atom chain gets SEMIJOIN after JPP inserts intermediate "
+         "PROJECT");
+
+    /*
+     * path(x, z) :- a(x, y), b(y, w), c(w, z).
+     *
+     * After JPP, the intermediate variable y is projected away between
+     * the inner and outer JOIN.  The chain becomes:
+     *
+     *   JOIN(key=w)
+     *     PROJECT(cols=[x,w])    <- JPP intermediate projection
+     *       JOIN(key=y)
+     *         SCAN(a)
+     *         SCAN(b)
+     *     SCAN(c)
+     *
+     * SIP must skip through the PROJECT to recognise the 3-atom chain
+     * and insert 1 SEMIJOIN.
+     */
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+                               ".decl b(y: int32, w: int32)\n"
+                               ".decl c(w: int32, z: int32)\n"
+                               ".decl path(x: int32, z: int32)\n"
+                               "path(x, z) :- a(x, y), b(y, w), c(w, z).\n",
+                               &err);
+
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    /* Apply JPP first — inserts intermediate PROJECT nodes */
+    wl_jpp_apply(prog, NULL);
+
+    /* Now apply SIP — must still insert SEMIJOINs despite PROJECT nodes */
+    wl_sip_stats_t stats = { 0, 0, 0 };
+    int rc = wl_sip_apply(prog, &stats);
+
+    if (rc != 0) {
+        FAIL("expected 0");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    if (stats.semijoins_inserted != 1) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "expected semijoins_inserted=1 after JPP, got %u",
+                 stats.semijoins_inserted);
+        FAIL(buf);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    /* Verify exactly 1 SEMIJOIN in tree */
+    wirelog_ir_node_t *ir = find_relation_ir(prog, "path");
+    if (!ir) {
+        FAIL("no IR for 'path'");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    uint32_t sj_count = count_type_in_tree(ir, WIRELOG_IR_SEMIJOIN);
+    if (sj_count != 1) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "expected 1 SEMIJOIN after JPP, got %u",
+                 sj_count);
+        FAIL(buf);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -717,6 +815,9 @@ main(void)
 
     /* Idempotency */
     test_sip_idempotent();
+
+    /* JPP interaction (Issue #192) */
+    test_sip_jpp_project_chain();
 
     printf("\n  Total: %d  Passed: %d  Failed: %d\n\n", tests_run, tests_passed,
            tests_failed);
