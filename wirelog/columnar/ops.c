@@ -18,10 +18,11 @@
 #include <xxhash.h>
 
 #ifdef WL_MBEDTLS_ENABLED
-#include <mbedtls/md5.h>
-#include <mbedtls/sha1.h>
-#include <mbedtls/sha256.h>
-#include <mbedtls/sha512.h>
+/* Issue #162: mbedTLS 4.0+ moved hash functions to private/ */
+#include <mbedtls/private/md5.h>
+#include <mbedtls/private/sha1.h>
+#include <mbedtls/private/sha256.h>
+#include <mbedtls/private/sha512.h>
 #include <mbedtls/md.h>
 #endif
 
@@ -201,9 +202,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             unsigned char digest[16];
             mbedtls_md5_context ctx;
             mbedtls_md5_init(&ctx);
-            mbedtls_md5_starts_ret(&ctx);
-            mbedtls_md5_update_ret(&ctx, (const unsigned char *)&a, sizeof(a));
-            mbedtls_md5_finish_ret(&ctx, digest);
+            mbedtls_md5_starts(&ctx);
+            mbedtls_md5_update(&ctx, (const unsigned char *)&a, sizeof(a));
+            mbedtls_md5_finish(&ctx, digest);
             mbedtls_md5_free(&ctx);
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
@@ -219,10 +220,10 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             unsigned char digest[20];
             mbedtls_sha1_context sha1_ctx;
             mbedtls_sha1_init(&sha1_ctx);
-            mbedtls_sha1_starts_ret(&sha1_ctx);
-            mbedtls_sha1_update_ret(&sha1_ctx, (const unsigned char *)&a,
-                                    sizeof(a));
-            mbedtls_sha1_finish_ret(&sha1_ctx, digest);
+            mbedtls_sha1_starts(&sha1_ctx);
+            mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&a,
+                                sizeof(a));
+            mbedtls_sha1_finish(&sha1_ctx, digest);
             mbedtls_sha1_free(&sha1_ctx);
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
@@ -238,18 +239,18 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             unsigned char digest[32];
             mbedtls_sha256_context sha256_ctx;
             mbedtls_sha256_init(&sha256_ctx);
-            int ret = mbedtls_sha256_starts_ret(&sha256_ctx, 0);
+            int ret = mbedtls_sha256_starts(&sha256_ctx, 0);
             if (ret != 0) {
                 mbedtls_sha256_free(&sha256_ctx);
                 goto bad;
             }
-            ret = mbedtls_sha256_update_ret(
-                &sha256_ctx, (const unsigned char *)&a, sizeof(a));
+            ret = mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)&a,
+                                        sizeof(a));
             if (ret != 0) {
                 mbedtls_sha256_free(&sha256_ctx);
                 goto bad;
             }
-            ret = mbedtls_sha256_finish_ret(&sha256_ctx, digest);
+            ret = mbedtls_sha256_finish(&sha256_ctx, digest);
             if (ret != 0) {
                 mbedtls_sha256_free(&sha256_ctx);
                 goto bad;
@@ -269,18 +270,18 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             unsigned char digest[64];
             mbedtls_sha512_context sha512_ctx;
             mbedtls_sha512_init(&sha512_ctx);
-            int ret = mbedtls_sha512_starts_ret(&sha512_ctx, 0);
+            int ret = mbedtls_sha512_starts(&sha512_ctx, 0);
             if (ret != 0) {
                 mbedtls_sha512_free(&sha512_ctx);
                 goto bad;
             }
-            ret = mbedtls_sha512_update_ret(
-                &sha512_ctx, (const unsigned char *)&a, sizeof(a));
+            ret = mbedtls_sha512_update(&sha512_ctx, (const unsigned char *)&a,
+                                        sizeof(a));
             if (ret != 0) {
                 mbedtls_sha512_free(&sha512_ctx);
                 goto bad;
             }
-            ret = mbedtls_sha512_finish_ret(&sha512_ctx, digest);
+            ret = mbedtls_sha512_finish(&sha512_ctx, digest);
             if (ret != 0) {
                 mbedtls_sha512_free(&sha512_ctx);
                 goto bad;
