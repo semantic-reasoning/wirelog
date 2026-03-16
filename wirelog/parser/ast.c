@@ -234,6 +234,10 @@ wirelog_arith_op_str(wirelog_arith_op_t op)
         return "sha512";
     case WIRELOG_ARITH_HMAC_SHA256:
         return "hmac_sha256";
+    case WIRELOG_ARITH_UUID4:
+        return "uuid4";
+    case WIRELOG_ARITH_UUID5:
+        return "uuid5";
     }
     return "?";
 }

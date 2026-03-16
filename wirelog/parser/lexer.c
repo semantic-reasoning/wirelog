@@ -251,6 +251,12 @@ identifier_type(const char *start, uint32_t length)
     if (IS_KW("hmac_sha256"))
         return WL_PARSER_LEXER_TOK_HMAC_SHA256;
 
+    /* UUID function keywords */
+    if (IS_KW("uuid4"))
+        return WL_PARSER_LEXER_TOK_UUID4;
+    if (IS_KW("uuid5"))
+        return WL_PARSER_LEXER_TOK_UUID5;
+
     return WL_PARSER_LEXER_TOK_IDENT;
 }
 
@@ -543,6 +549,10 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "SHA512";
     case WL_PARSER_LEXER_TOK_HMAC_SHA256:
         return "HMAC_SHA256";
+    case WL_PARSER_LEXER_TOK_UUID4:
+        return "UUID4";
+    case WL_PARSER_LEXER_TOK_UUID5:
+        return "UUID5";
     case WL_PARSER_LEXER_TOK_DECL:
         return "DECL";
     case WL_PARSER_LEXER_TOK_INPUT:

@@ -68,6 +68,8 @@ typedef enum {
     WIRELOG_ARITH_SHA256, /* sha256() - SHA-256 hex digest (unary, mbedTLS) */
     WIRELOG_ARITH_SHA512, /* sha512() - SHA-512 hex digest (unary, mbedTLS) */
     WIRELOG_ARITH_HMAC_SHA256, /* hmac_sha256(msg, key) - HMAC-SHA-256 hex digest (binary, mbedTLS) */
+    WIRELOG_ARITH_UUID4, /* uuid4() - random UUID v4 (mbedTLS CTR-DRBG) */
+    WIRELOG_ARITH_UUID5, /* uuid5(ns, name) - SHA-1 name-based UUID v5 (mbedTLS) */
 } wirelog_arith_op_t;
 
 /* ======================================================================== */

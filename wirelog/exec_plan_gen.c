@@ -181,6 +181,10 @@ arith_to_tag(wirelog_arith_op_t op)
         return WL_PLAN_EXPR_ARITH_SHA512;
     case WIRELOG_ARITH_HMAC_SHA256:
         return WL_PLAN_EXPR_ARITH_HMAC_SHA256;
+    case WIRELOG_ARITH_UUID4:
+        return WL_PLAN_EXPR_ARITH_UUID4;
+    case WIRELOG_ARITH_UUID5:
+        return WL_PLAN_EXPR_ARITH_UUID5;
     }
     return WL_PLAN_EXPR_ARITH_ADD; /* fallback */
 }

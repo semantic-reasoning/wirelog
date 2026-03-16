@@ -417,6 +417,58 @@ parse_factor(wl_parser_t *parser)
         return node;
     }
 
+    /* UUID4 function: uuid4() - nullary */
+    if (parser->current.type == WL_PARSER_LEXER_TOK_UUID4) {
+        parser_advance(parser); /* consume uuid4 */
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+                            "expected '(' after uuid4")) {
+            return NULL;
+        }
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                            "expected ')' after uuid4")) {
+            return NULL;
+        }
+        wl_parser_ast_node_t *node = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        node->arith_op = WIRELOG_ARITH_UUID4;
+        /* nullary: no child added (0-arg function) */
+        return node;
+    }
+
+    /* UUID5 function: uuid5(namespace, name) - binary */
+    if (parser->current.type == WL_PARSER_LEXER_TOK_UUID5) {
+        parser_advance(parser); /* consume uuid5 */
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+                            "expected '(' after uuid5")) {
+            return NULL;
+        }
+        wl_parser_ast_node_t *ns = parse_arithmetic_expr(parser);
+        if (!ns)
+            return NULL;
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_COMMA,
+                            "expected ',' between uuid5 arguments")) {
+            wl_parser_ast_node_free(ns);
+            return NULL;
+        }
+        wl_parser_ast_node_t *name = parse_arithmetic_expr(parser);
+        if (!name) {
+            wl_parser_ast_node_free(ns);
+            return NULL;
+        }
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+                            "expected ')' after uuid5 arguments")) {
+            wl_parser_ast_node_free(ns);
+            wl_parser_ast_node_free(name);
+            return NULL;
+        }
+        wl_parser_ast_node_t *node = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        node->arith_op = WIRELOG_ARITH_UUID5;
+        wl_parser_ast_node_add_child(node, ns);
+        wl_parser_ast_node_add_child(node, name);
+        return node;
+    }
+
     parser_error(parser, "expected variable, integer, or string");
     return NULL;
 }
@@ -462,7 +514,9 @@ is_bitwise_token(wl_parser_lexer_token_type_t type)
            || type == WL_PARSER_LEXER_TOK_SHA1
            || type == WL_PARSER_LEXER_TOK_SHA256
            || type == WL_PARSER_LEXER_TOK_SHA512
-           || type == WL_PARSER_LEXER_TOK_HMAC_SHA256;
+           || type == WL_PARSER_LEXER_TOK_HMAC_SHA256
+           || type == WL_PARSER_LEXER_TOK_UUID4
+           || type == WL_PARSER_LEXER_TOK_UUID5;
 }
 
 static wl_parser_ast_node_t *

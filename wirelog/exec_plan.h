@@ -125,6 +125,10 @@ typedef enum {
     WL_PLAN_EXPR_ARITH_HMAC_SHA256
     = 0x28, /* hmac_sha256(msg, key) - HMAC-SHA-256 64-char hex digest */
 
+    /* UUID functions (requires mbedTLS) */
+    WL_PLAN_EXPR_ARITH_UUID4 = 0x29, /* uuid4() - nullary, push 1 */
+    WL_PLAN_EXPR_ARITH_UUID5 = 0x2A, /* uuid5(ns, name) - pop 2 push 1 */
+
     /* Comparison operators (binary, pop 2 push 1) */
     WL_PLAN_EXPR_CMP_EQ = 0x22,
     WL_PLAN_EXPR_CMP_NEQ = 0x23,

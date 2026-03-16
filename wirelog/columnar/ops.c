@@ -19,11 +19,15 @@
 
 #ifdef WL_MBEDTLS_ENABLED
 /* Issue #162: mbedTLS 4.0+ moved hash functions to private/ */
+/* Must define MBEDTLS_ALLOW_PRIVATE_ACCESS before including private headers */
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
 #include <mbedtls/private/md5.h>
 #include <mbedtls/private/sha1.h>
 #include <mbedtls/private/sha256.h>
 #include <mbedtls/private/sha512.h>
 #include <mbedtls/md.h>
+#include <mbedtls/private/entropy.h>
+#include <mbedtls/private/ctr_drbg.h>
 #endif
 
 #include <errno.h>
@@ -309,6 +313,81 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             (void)filt_pop(&s);
             (void)filt_pop(&s);
             goto bad; /* hmac_sha256 requires mbedTLS (-DmbedTLS=enabled or auto) */
+#endif
+            break;
+        }
+
+        case WL_PLAN_EXPR_ARITH_UUID4: {
+#ifdef WL_MBEDTLS_ENABLED
+            unsigned char uuid[16];
+            mbedtls_entropy_context entropy;
+            mbedtls_ctr_drbg_context ctr_drbg;
+            mbedtls_entropy_init(&entropy);
+            mbedtls_ctr_drbg_init(&ctr_drbg);
+            int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
+                                            &entropy, NULL, 0);
+            if (ret != 0) {
+                mbedtls_ctr_drbg_free(&ctr_drbg);
+                mbedtls_entropy_free(&entropy);
+                goto bad;
+            }
+            ret = mbedtls_ctr_drbg_random(&ctr_drbg, uuid, 16);
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_entropy_free(&entropy);
+            if (ret != 0)
+                goto bad;
+            /* RFC 4122 v4: set version=4, variant=0b10 */
+            uuid[6] = (uuid[6] & 0x0F) | 0x40;
+            uuid[8] = (uuid[8] & 0x3F) | 0x80;
+            /* Return upper 64 bits as int64_t */
+            int64_t result;
+            memcpy(&result, uuid, sizeof(result));
+            filt_push(&s, result);
+#else
+            goto bad; /* uuid4 requires mbedTLS (-DmbedTLS=enabled or auto) */
+#endif
+            break;
+        }
+
+        case WL_PLAN_EXPR_ARITH_UUID5: {
+#ifdef WL_MBEDTLS_ENABLED
+            int64_t name = filt_pop(&s);
+            int64_t ns = filt_pop(&s);
+            unsigned char digest[20]; /* SHA-1 output */
+            mbedtls_sha1_context sha1_ctx;
+            mbedtls_sha1_init(&sha1_ctx);
+            int ret = mbedtls_sha1_starts(&sha1_ctx);
+            if (ret != 0) {
+                mbedtls_sha1_free(&sha1_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&ns,
+                                      sizeof(ns));
+            if (ret != 0) {
+                mbedtls_sha1_free(&sha1_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&name,
+                                      sizeof(name));
+            if (ret != 0) {
+                mbedtls_sha1_free(&sha1_ctx);
+                goto bad;
+            }
+            ret = mbedtls_sha1_finish(&sha1_ctx, digest);
+            mbedtls_sha1_free(&sha1_ctx);
+            if (ret != 0)
+                goto bad;
+            /* RFC 4122 v5: set version=5, variant=0b10 */
+            digest[6] = (digest[6] & 0x0F) | 0x50;
+            digest[8] = (digest[8] & 0x3F) | 0x80;
+            /* Return upper 64 bits as int64_t */
+            int64_t result;
+            memcpy(&result, digest, sizeof(result));
+            filt_push(&s, result);
+#else
+            (void)filt_pop(&s);
+            (void)filt_pop(&s);
+            goto bad; /* uuid5 requires mbedTLS (-DmbedTLS=enabled or auto) */
 #endif
             break;
         }

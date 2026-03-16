@@ -70,6 +70,6 @@ delta_demo = executable(
   demo_workqueue_src,
   demo_csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
   install: false,
 )
