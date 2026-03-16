@@ -270,21 +270,12 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         return ENOMEM;
     }
 
-    /* Allocate per-iteration arena (256MB for temporary evaluation data) */
-    sess->eval_arena = wl_arena_create(256 * 1024 * 1024);
-    if (!sess->eval_arena) {
-        free(sess->rels);
-        free(sess);
-        return ENOMEM;
-    }
-
     /* Create workqueue for parallel K-fusion when num_workers > 1.
      * Single-threaded mode (num_workers=1) leaves wq=NULL; K-fusion
      * evaluates copies sequentially with no thread overhead. (Issue #99) */
     if (sess->num_workers > 1) {
         sess->wq = wl_workqueue_create(sess->num_workers);
         if (!sess->wq) {
-            wl_arena_free(sess->eval_arena);
             free(sess->rels);
             free(sess);
             return ENOMEM;
@@ -337,8 +328,7 @@ oom:
         free(sess->rels[i]);
     }
     free(sess->rels);
-    wl_workqueue_destroy(sess->wq); /* NULL-safe */
-    wl_arena_free(sess->eval_arena);
+    wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
     free(sess);
     return ENOMEM;
@@ -364,8 +354,6 @@ col_session_destroy(wl_session_t *session)
         free(sess->rels[i]);
     }
     free(sess->rels);
-    if (sess->eval_arena)
-        wl_arena_free(sess->eval_arena);
     col_mat_cache_clear(&sess->mat_cache);
     wl_workqueue_destroy(sess->wq);
     /* Free arrangement registry (Phase 3C) */
@@ -735,9 +723,6 @@ col_session_step(wl_session_t *session)
                                 : col_eval_stratum(sp, sess, si);
         if (rc != 0)
             return rc;
-        /* Reset arena after stratum evaluation to free temporaries */
-        if (sess->eval_arena)
-            wl_arena_reset(sess->eval_arena);
     }
 
     /* Issue #158: Cleanup retraction state and delta relations after step */
