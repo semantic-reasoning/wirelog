@@ -1516,3 +1516,24 @@ test_compaction_exe = executable(
 )
 
 test('compaction', test_compaction_exe)
+
+# ============================================================================
+# Dynamic Join Output Limit Tests (Issue #221)
+# ============================================================================
+
+test_join_limit_exe = executable(
+  'test_join_limit',
+  files('test_join_limit.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('join_limit', test_join_limit_exe)
