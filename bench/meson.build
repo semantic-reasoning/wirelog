@@ -36,6 +36,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/session.c',
   subdir_wirelog / 'columnar/delta_pool.c',
   subdir_wirelog / 'columnar/lftj.c',
+  subdir_wirelog / 'columnar/mem_ledger.c',
 )
 
 bench_io_src = files(
