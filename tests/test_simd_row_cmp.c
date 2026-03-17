@@ -463,6 +463,70 @@ test_ncols16_large_row(void)
     PASS();
 }
 
+/*
+ * Test 11: K=1 single-segment dedup path.
+ * One segment with 4 rows containing duplicates. Dedup should remove them.
+ */
+static void
+test_k1_single_segment_dedup(void)
+{
+    TEST("K=1: single-segment dedup (scalar dedup path)");
+
+    col_rel_t *rel = test_rel_alloc(2);
+    ASSERT(rel != NULL, "alloc failed");
+
+    int64_t data[] = {
+        1, 10, /* row 0 */
+        1, 10, /* row 1 (dup) */
+        2, 20, /* row 2 */
+        2, 20  /* row 3 (dup) */
+    };
+    ASSERT(test_rel_set_rows(rel, data, 4) == 0, "set_rows failed");
+
+    uint32_t segs[] = { 0, 4 }; /* 1 segment: all 4 rows */
+    int rc = col_op_consolidate_kway_merge(rel, segs, 1);
+    ASSERT(rc == 0, "kway_merge returned error");
+    ASSERT(rel->nrows == 2, "expected 2 unique rows after K=1 dedup");
+    ASSERT(rel->data[0] == 1, "row0 col0 wrong");
+    ASSERT(rel->data[2] == 2, "row1 col0 wrong");
+
+    test_rel_free(rel);
+    PASS();
+}
+
+/*
+ * Test 12: K=3 heap merge path.
+ * Three segments merged via min-heap with deduplication.
+ */
+static void
+test_k3_heap_merge(void)
+{
+    TEST("K=3: heap merge with 3 segments");
+
+    col_rel_t *rel = test_rel_alloc(2);
+    ASSERT(rel != NULL, "alloc failed");
+
+    int64_t data[] = { 1, 10,        /* seg 0: rows 0-1 */
+                       3, 30, 2, 20, /* seg 1: rows 2-3 */
+                       5, 50, 1, 10, /* seg 2: rows 4-5 (dup of seg 0 row 0) */
+                       4, 40 };
+    ASSERT(test_rel_set_rows(rel, data, 6) == 0, "set_rows failed");
+
+    uint32_t segs[] = { 0, 2, 4, 6 }; /* 3 segments of 2 rows each */
+    int rc = col_op_consolidate_kway_merge(rel, segs, 3);
+    ASSERT(rc == 0, "kway_merge returned error");
+    ASSERT(rel->nrows == 5, "expected 5 unique rows after K=3 merge");
+    /* Verify sorted order: (1,10), (2,20), (3,30), (4,40), (5,50) */
+    ASSERT(rel->data[0] == 1, "row0 col0 wrong");
+    ASSERT(rel->data[2] == 2, "row1 col0 wrong");
+    ASSERT(rel->data[4] == 3, "row2 col0 wrong");
+    ASSERT(rel->data[6] == 4, "row3 col0 wrong");
+    ASSERT(rel->data[8] == 5, "row4 col0 wrong");
+
+    test_rel_free(rel);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -481,6 +545,8 @@ main(void)
     test_ncols8_full_avx2_width();
     test_negative_values_int64_extremes();
     test_ncols16_large_row();
+    test_k1_single_segment_dedup();
+    test_k3_heap_merge();
 
     printf("\n--- Results: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
