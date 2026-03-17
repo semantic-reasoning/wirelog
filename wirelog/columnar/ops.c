@@ -2413,8 +2413,18 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
             worker_sess[d].eval_arena = wl_arena_create(worker_cap);
             /* NULL arena is handled gracefully: operators check before use */
         }
-        worker_sess[d].delta_pool
-            = delta_pool_create(128, sizeof(col_rel_t), 32 * 1024 * 1024);
+        /* Issue #196: Scale per-worker delta_pool inversely with K to
+         * keep aggregate memory ~constant (32MB total vs K×32MB). */
+        {
+            size_t pool_arena = 32 * 1024 * 1024 / k;
+            if (pool_arena < 4 * 1024 * 1024)
+                pool_arena = 4 * 1024 * 1024; /* 4MB minimum */
+            uint32_t pool_slots = 128 / k;
+            if (pool_slots < 16)
+                pool_slots = 16;
+            worker_sess[d].delta_pool
+                = delta_pool_create(pool_slots, sizeof(col_rel_t), pool_arena);
+        }
 
         workers[d].plan_data.name = "<k_fusion_copy>";
         workers[d].plan_data.ops = meta->k_ops[d];
