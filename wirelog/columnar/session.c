@@ -371,6 +371,7 @@ col_session_destroy(wl_session_t *session)
     }
     free(sess->arr_entries);
     col_session_free_delta_arrangements(sess);
+    col_session_free_sorted_arrangements(sess);
     delta_pool_destroy(sess->delta_pool);
     free(sess);
 }
