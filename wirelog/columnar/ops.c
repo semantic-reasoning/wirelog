@@ -2254,21 +2254,14 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
             out++;
         }
 
-        /* Swap: merged data becomes work->data */
+        /* Swap merge_buf and data pointers to avoid O(N) memcpy (issue #218). */
         if (used_merge_buf) {
-            /* merge_buf holds the result; allocate new data, copy back */
-            if (work->capacity < out) {
-                int64_t *nd = (int64_t *)realloc(
-                    work->data, (size_t)out * nc * sizeof(int64_t));
-                if (!nd) {
-                    if (work_owned && work != in)
-                        col_rel_destroy(work);
-                    return ENOMEM;
-                }
-                work->data = nd;
-                work->capacity = out;
-            }
-            memcpy(work->data, merged, (size_t)out * nc * sizeof(int64_t));
+            int64_t *old_data = work->data;
+            uint32_t old_cap = work->capacity;
+            work->data = work->merge_buf;
+            work->capacity = work->merge_buf_cap;
+            work->merge_buf = old_data;
+            work->merge_buf_cap = old_cap;
         }
         work->nrows = out;
         work->sorted_nrows = out;
@@ -2522,17 +2515,16 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         out += remaining;
     }
 
-    /* Copy merged result back into rel->data (merge_buf is persistent,
-     * cannot be swapped into data without losing merge_buf for next call). */
-    if (rel->capacity < out) {
-        int64_t *nd
-            = (int64_t *)realloc(rel->data, (size_t)out * nc * sizeof(int64_t));
-        if (!nd)
-            return ENOMEM;
-        rel->data = nd;
-        rel->capacity = out;
+    /* Swap merge_buf and data pointers to avoid O(N) memcpy (issue #218).
+     * The old data buffer becomes the new merge_buf for reuse next call. */
+    {
+        int64_t *old_data = rel->data;
+        uint32_t old_cap = rel->capacity;
+        rel->data = rel->merge_buf;
+        rel->capacity = rel->merge_buf_cap;
+        rel->merge_buf = old_data;
+        rel->merge_buf_cap = old_cap;
     }
-    memcpy(rel->data, merged, (size_t)out * nc * sizeof(int64_t));
     rel->nrows = out;
     rel->sorted_nrows = out;
 
