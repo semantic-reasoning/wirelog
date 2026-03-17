@@ -2402,6 +2402,17 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].darr_entries = NULL;
         worker_sess[d].darr_count = 0;
         worker_sess[d].darr_cap = 0;
+        /* Issue #196: Per-worker arena isolation (arena.h contract: NOT
+         * thread-safe, each worker must own its arena). */
+        {
+            size_t parent_cap
+                = sess->eval_arena ? sess->eval_arena->capacity : 0;
+            size_t worker_cap = parent_cap / k;
+            if (worker_cap < 8 * 1024 * 1024)
+                worker_cap = 8 * 1024 * 1024; /* 8MB minimum */
+            worker_sess[d].eval_arena = wl_arena_create(worker_cap);
+            /* NULL arena is handled gracefully: operators check before use */
+        }
         worker_sess[d].delta_pool
             = delta_pool_create(128, sizeof(col_rel_t), 32 * 1024 * 1024);
 
@@ -2583,6 +2594,7 @@ cleanup_wq:
         /* Free worker's private delta-arrangement cache (darr_*). */
         col_session_free_delta_arrangements(&worker_sess[d]);
         delta_pool_destroy(worker_sess[d].delta_pool);
+        wl_arena_free(worker_sess[d].eval_arena);
     }
     free(worker_sess);
     free(results);
