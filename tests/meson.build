@@ -343,6 +343,23 @@ test_consolidate_kway_merge_exe = executable(
 test('consolidate_kway_merge', test_consolidate_kway_merge_exe)
 
 # ============================================================================
+# SIMD Row Comparison Tests (Issue #197)
+# ============================================================================
+
+test_simd_row_cmp_exe = executable(
+  'test_simd_row_cmp',
+  files('test_simd_row_cmp.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('simd_row_cmp', test_simd_row_cmp_exe)
+
+# ============================================================================
 # K-Fusion Merge Function Tests
 # ============================================================================
 
