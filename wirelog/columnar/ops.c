@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 
 #include "columnar/internal.h"
+#include "columnar/lftj.h"
 
 #include "../wirelog-internal.h"
 
@@ -2869,4 +2870,182 @@ col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst)
     dst->timestamps[0].multiplicity = total;
 
     return 0;
+}
+
+/* ======================================================================== */
+/* LFTJ Operator (Issue #195)                                               */
+/* ======================================================================== */
+
+/*
+ * lftj_binary_ctx_t: callback context for col_op_lftj.
+ *
+ * wl_lftj_join delivers rows in compact format:
+ *   [key, non_key_rel0..., non_key_rel1..., ...]
+ *
+ * This context reconstructs binary-join-compatible rows:
+ *   [all_rel0_cols, all_rel1_cols, ...]  (key duplicated per relation)
+ *
+ * The downstream WL_PLAN_OP_MAP project_indices are unchanged because the
+ * output column layout matches what a cascade of WL_PLAN_OP_JOIN produces.
+ */
+typedef struct {
+    uint32_t k;
+    uint32_t *ncols;          /* per-relation column count (k entries)    */
+    uint32_t *key_cols;       /* per-relation join key column (k entries) */
+    uint32_t *lftj_offsets;   /* start of Ri's non-key cols in LFTJ row  */
+    uint32_t *binary_offsets; /* start of Ri's cols in binary output     */
+    uint32_t total_binary_ncols;
+    int64_t *tmp;   /* scratch row buffer                       */
+    col_rel_t *out; /* destination relation                     */
+    int rc;         /* first error code encountered; 0 = ok    */
+} lftj_binary_ctx_t;
+
+/*
+ * lftj_binary_cb: output callback for col_op_lftj.
+ *
+ * Converts compact LFTJ output to binary-join-compatible format and appends
+ * the result to ctx->out.  Sets ctx->rc on allocation failure (subsequent
+ * calls are no-ops).
+ */
+static void
+lftj_binary_cb(const int64_t *row, uint32_t lftj_ncols, void *user)
+{
+    (void)lftj_ncols;
+    lftj_binary_ctx_t *ctx = (lftj_binary_ctx_t *)user;
+    if (ctx->rc)
+        return; /* already OOM; skip remaining rows */
+
+    const int64_t key = row[0];
+    for (uint32_t i = 0; i < ctx->k; i++) {
+        uint32_t nc = ctx->ncols[i];
+        uint32_t kc = ctx->key_cols[i];
+        uint32_t lo = ctx->lftj_offsets[i];
+        uint32_t bo = ctx->binary_offsets[i];
+        for (uint32_t c = 0; c < nc; c++) {
+            int64_t val;
+            if (c == kc)
+                val = key;
+            else if (c < kc)
+                val = row[lo + c];
+            else
+                val = row[lo + c - 1u];
+            ctx->tmp[bo + c] = val;
+        }
+    }
+    int rc = col_rel_append_row(ctx->out, ctx->tmp);
+    if (rc)
+        ctx->rc = rc;
+}
+
+/*
+ * col_op_lftj: execute a WL_PLAN_OP_LFTJ operator.
+ *
+ * Performs a multi-way leapfrog triejoin over the k EDB relations named in
+ * op->opaque_data.  Uses the sorted arrangement cache to avoid re-sorting
+ * on repeated calls (the sort inside wl_lftj_join degrades to O(N) when the
+ * input is already sorted).  Pushes binary-join-compatible result onto stack.
+ */
+int
+col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
+{
+    if (!op->opaque_data)
+        return EINVAL;
+    const wl_plan_op_lftj_t *meta = (const wl_plan_op_lftj_t *)op->opaque_data;
+    uint32_t k = meta->k;
+    if (k < 2u || !meta->rel_names || !meta->key_cols)
+        return EINVAL;
+
+    /* Allocate per-relation working arrays. */
+    wl_lftj_input_t *inputs
+        = (wl_lftj_input_t *)calloc(k, sizeof(wl_lftj_input_t));
+    uint32_t *ncols = (uint32_t *)malloc(k * sizeof(uint32_t));
+    uint32_t *lftj_offsets = (uint32_t *)malloc(k * sizeof(uint32_t));
+    uint32_t *binary_offsets = (uint32_t *)malloc(k * sizeof(uint32_t));
+    if (!inputs || !ncols || !lftj_offsets || !binary_offsets) {
+        free(inputs);
+        free(ncols);
+        free(lftj_offsets);
+        free(binary_offsets);
+        return ENOMEM;
+    }
+
+    /* Resolve each relation and populate LFTJ input descriptors. */
+    uint32_t total_binary_ncols = 0u;
+    uint32_t lftj_nk_total = 0u;
+    int rc = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        col_rel_t *rel = session_find_rel(sess, meta->rel_names[i]);
+        if (!rel) {
+            rc = ENOENT;
+            goto cleanup_arrays;
+        }
+        uint32_t kc = meta->key_cols[i];
+        if (kc >= rel->ncols) {
+            rc = EINVAL;
+            goto cleanup_arrays;
+        }
+
+        /* Use the pre-sorted arrangement when available: wl_lftj_join still
+         * copies and sorts internally, but starting from a sorted copy
+         * reduces its qsort from O(N log N) to O(N). */
+        col_sorted_arr_t *sarr
+            = col_session_get_sorted_arrangement(sess, meta->rel_names[i], kc);
+        if (sarr && sarr->indexed_rows == rel->nrows && sarr->nrows > 0) {
+            inputs[i].data = sarr->sorted;
+            inputs[i].nrows = sarr->nrows;
+        } else {
+            inputs[i].data = rel->data;
+            inputs[i].nrows = rel->nrows;
+        }
+        inputs[i].ncols = rel->ncols;
+        inputs[i].key_col = kc;
+
+        ncols[i] = rel->ncols;
+        binary_offsets[i] = total_binary_ncols;
+        lftj_offsets[i] = 1u + lftj_nk_total; /* 1: shared key lives at [0] */
+        total_binary_ncols += rel->ncols;
+        lftj_nk_total += rel->ncols - 1u;
+    }
+
+    {
+        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$lftj",
+                                               total_binary_ncols);
+        int64_t *tmp = (int64_t *)malloc(
+            (total_binary_ncols ? total_binary_ncols : 1u) * sizeof(int64_t));
+        if (!out || !tmp) {
+            free(tmp);
+            if (out)
+                col_rel_destroy(out);
+            rc = ENOMEM;
+            goto cleanup_arrays;
+        }
+
+        lftj_binary_ctx_t ctx = { k,
+                                  ncols,
+                                  meta->key_cols,
+                                  lftj_offsets,
+                                  binary_offsets,
+                                  total_binary_ncols,
+                                  tmp,
+                                  out,
+                                  0 };
+
+        rc = wl_lftj_join(inputs, k, lftj_binary_cb, &ctx);
+        if (rc == 0)
+            rc = ctx.rc;
+
+        free(tmp);
+        if (rc != 0) {
+            col_rel_destroy(out);
+            goto cleanup_arrays;
+        }
+        rc = eval_stack_push(stack, out, true);
+    }
+
+cleanup_arrays:
+    free(inputs);
+    free(ncols);
+    free(lftj_offsets);
+    free(binary_offsets);
+    return rc;
 }

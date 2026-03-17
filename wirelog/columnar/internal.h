@@ -637,6 +637,9 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
 int
 col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
                 wl_col_session_t *sess);
+int
+col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack,
+            wl_col_session_t *sess);
 
 /* ======================================================================== */
 /* Evaluator (columnar/eval.c)                                              */
