@@ -18,6 +18,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Platform-specific memory detection headers (Issue #221) */
+#ifdef __linux__
+#include <sys/sysinfo.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
+
 /* Relation storage and cache functions moved to columnar/relation.c and
  * columnar/cache.c; declarations in columnar/internal.h. */
 
@@ -227,6 +236,38 @@ col_session_cleanup_old_data(wl_session_t *sess, col_frontier_t frontier)
 /* ======================================================================== */
 
 /*
+ * col_detect_physical_memory: Detect total physical RAM in bytes (Issue #221).
+ *
+ * Uses platform-specific syscalls to query total installed RAM. Returns 0 if
+ * the platform is not supported or if detection fails. No /proc/meminfo used.
+ */
+static uint64_t
+col_detect_physical_memory(void)
+{
+#ifdef __linux__
+    struct sysinfo info;
+    if (sysinfo(&info) == 0)
+        return (uint64_t)info.totalram * (uint64_t)info.mem_unit;
+    return 0;
+#elif defined(__APPLE__)
+    int mib[2] = { CTL_HW, HW_MEMSIZE };
+    uint64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctl(mib, 2, &memsize, &len, NULL, 0) == 0)
+        return memsize;
+    return 0;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus))
+        return (uint64_t)memStatus.ullTotalPhys;
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+/*
  * col_session_create: Initialize a columnar backend session
  *
  * Implements wl_compute_backend_t.session_create vtable slot.
@@ -263,6 +304,37 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
 
     sess->plan = plan;
     sess->num_workers = num_workers > 0 ? num_workers : 1;
+
+    /* Dynamic join output limit (Issue #221) */
+    {
+        const char *join_limit_env = getenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+        bool env_valid = false;
+        if (join_limit_env && join_limit_env[0] != '\0') {
+            char *endp = NULL;
+            errno = 0;
+            uint64_t val = strtoull(join_limit_env, &endp, 10);
+            if (endp != join_limit_env && *endp == '\0' && errno != ERANGE) {
+                sess->join_output_limit = val;
+                env_valid = true;
+            }
+        }
+        if (!env_valid) {
+            uint64_t phys = col_detect_physical_memory();
+            if (phys > 0) {
+                /* 25% of RAM / (8 bytes * 5 avg cols * num_workers) */
+                sess->join_output_limit
+                    = (phys / 4)
+                      / (40ULL
+                         * (sess->num_workers > 0 ? sess->num_workers : 1));
+            } else {
+                sess->join_output_limit = COL_JOIN_OUTPUT_LIMIT_DEFAULT;
+            }
+        }
+        /* Clamp to UINT32_MAX since nrows is uint32_t */
+        if (sess->join_output_limit > UINT32_MAX)
+            sess->join_output_limit = UINT32_MAX;
+    }
+
     sess->rel_cap = 16;
     sess->rels = (col_rel_t **)calloc(sess->rel_cap, sizeof(col_rel_t *));
     if (!sess->rels) {

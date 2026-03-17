@@ -1362,12 +1362,13 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 join_rc = col_rel_append_row(out, tmp);
                 if (join_rc != 0)
                     break;
-                if (COL_JOIN_OUTPUT_LIMIT > 0
-                    && out->nrows >= COL_JOIN_OUTPUT_LIMIT) {
+                if (sess->join_output_limit > 0
+                    && out->nrows >= sess->join_output_limit) {
                     fprintf(stderr,
                             "join output limit reached: %u rows "
-                            "(COL_JOIN_OUTPUT_LIMIT=%u)\n",
-                            out->nrows, (uint32_t)COL_JOIN_OUTPUT_LIMIT);
+                            "(limit=%llu)\n",
+                            out->nrows,
+                            (unsigned long long)sess->join_output_limit);
                     join_rc = EOVERFLOW;
                     break;
                 }
@@ -1468,13 +1469,14 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         memcpy(tmp + left->ncols, rrow,
                                sizeof(int64_t) * right->ncols);
                         join_rc = col_rel_append_row(out, tmp);
-                        if (join_rc == 0 && COL_JOIN_OUTPUT_LIMIT > 0
-                            && out->nrows >= COL_JOIN_OUTPUT_LIMIT) {
-                            fprintf(stderr,
-                                    "join output limit reached: %u rows "
-                                    "(COL_JOIN_OUTPUT_LIMIT=%u)\n",
-                                    out->nrows,
-                                    (uint32_t)COL_JOIN_OUTPUT_LIMIT);
+                        if (join_rc == 0 && sess->join_output_limit > 0
+                            && out->nrows >= sess->join_output_limit) {
+                            fprintf(
+                                stderr,
+                                "join output limit reached: %u rows "
+                                "(limit=%llu)\n",
+                                out->nrows,
+                                (unsigned long long)sess->join_output_limit);
                             join_rc = EOVERFLOW;
                         }
                     }
@@ -1499,12 +1501,13 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     join_rc = col_rel_append_row(out, tmp);
                     if (join_rc != 0)
                         break;
-                    if (COL_JOIN_OUTPUT_LIMIT > 0
-                        && out->nrows >= COL_JOIN_OUTPUT_LIMIT) {
+                    if (sess->join_output_limit > 0
+                        && out->nrows >= sess->join_output_limit) {
                         fprintf(stderr,
                                 "join output limit reached: %u rows "
-                                "(COL_JOIN_OUTPUT_LIMIT=%u)\n",
-                                out->nrows, (uint32_t)COL_JOIN_OUTPUT_LIMIT);
+                                "(limit=%llu)\n",
+                                out->nrows,
+                                (unsigned long long)sess->join_output_limit);
                         join_rc = EOVERFLOW;
                         break;
                     }
