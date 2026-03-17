@@ -210,6 +210,8 @@ typedef enum {
  * WL_PLAN_OP_CONCAT:      Union of multiple collections.
  * WL_PLAN_OP_CONSOLIDATE: Deduplication / consolidation.
  * WL_PLAN_OP_SEMIJOIN:    Semijoin (SIP pre-filter).
+ * WL_PLAN_OP_LFTJ:        Multi-way leapfrog triejoin on a single shared key
+ *                          column across k >= 3 EDB relations (Issue #195).
  */
 typedef enum {
     WL_PLAN_OP_VARIABLE = 0,
@@ -222,6 +224,7 @@ typedef enum {
     WL_PLAN_OP_CONSOLIDATE = 7,
     WL_PLAN_OP_SEMIJOIN = 8,
     WL_PLAN_OP_K_FUSION = 9,
+    WL_PLAN_OP_LFTJ = 10,
 } wl_plan_op_type_t;
 
 /* ======================================================================== */
@@ -248,6 +251,7 @@ typedef enum {
  *   SEMIJOIN:    right_relation, left_keys, right_keys, key_count,
  *                project_indices, project_count
  *   K_FUSION:    opaque_data (points to wl_plan_op_k_fusion_t in columnar backend)
+ *   LFTJ:        opaque_data (points to wl_plan_op_lftj_t in columnar backend)
  */
 typedef struct {
     wl_plan_op_type_t op;

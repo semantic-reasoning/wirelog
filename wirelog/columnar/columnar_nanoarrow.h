@@ -70,6 +70,33 @@ typedef struct {
     uint32_t *k_op_counts;
 } wl_plan_op_k_fusion_t;
 
+/* ======================================================================== */
+/* LFTJ Metadata (Issue #195)                                               */
+/* ======================================================================== */
+
+/**
+ * wl_plan_op_lftj_t:
+ *
+ * Backend-specific metadata for a WL_PLAN_OP_LFTJ operator.
+ * Stored in wl_plan_op_t.opaque_data and owned by the plan.
+ *
+ * Encodes a multi-way leapfrog triejoin over k >= 3 EDB relations,
+ * all sharing a single join key column.  The operator produces output
+ * in binary-join-compatible format: all columns from each relation
+ * concatenated in order (key column duplicated per relation), matching
+ * what a cascade of WL_PLAN_OP_JOIN would produce.  This lets the
+ * downstream WL_PLAN_OP_MAP use its original project_indices unchanged.
+ *
+ * @k:         Number of input relations (>= 3).
+ * @rel_names: Owned array of k null-terminated relation name strings.
+ * @key_cols:  Owned array of k join key column indices (one per relation).
+ */
+typedef struct {
+    uint32_t k;
+    char **rel_names;
+    uint32_t *key_cols;
+} wl_plan_op_lftj_t;
+
 /*
  * NOTE: wl_col_session_t and COL_SESSION() are defined in columnar_nanoarrow.c
  * because col_rel_t (a private implementation type) cannot be declared in this
