@@ -2828,6 +2828,28 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
      * below with no thread overhead. */
     wl_work_queue_t *wq = sess->wq; /* NULL when num_workers=1 */
 
+    /* Budget-aware worker scaling (Issue #224, Step 4).
+     * When remaining budget < estimated per-worker cost, fall back to
+     * sequential evaluation (wq=NULL).  All K copies still evaluate,
+     * preserving correctness — only parallelism is reduced. */
+    if (wq && sess->num_workers > 1) {
+        /* Estimate: each worker needs ~(32MB/k arena + 4MB min pool) */
+        uint64_t per_worker_est
+            = (32ULL * 1024 * 1024) / (uint64_t)k + (4ULL * 1024 * 1024)
+              + (uint64_t)(128 / k) * sizeof(wl_col_session_t);
+        uint64_t remaining = wl_mem_ledger_bytes_remaining(&sess->ledger);
+        if (remaining != UINT64_MAX
+            && remaining < per_worker_est * (uint64_t)sess->num_workers) {
+            const char *mem_report_env = getenv("WL_MEM_REPORT");
+            if (mem_report_env && mem_report_env[0] == '1')
+                fprintf(stderr,
+                        "[wirelog mem] ARENA backpressure: reducing K-fusion "
+                        "to sequential (remaining=%llu bytes)\n",
+                        (unsigned long long)remaining);
+            wq = NULL; /* sequential fallback; all K copies still run */
+        }
+    }
+
     int rc = 0;
 
     /* Issue #196: Workers start with zeroed mat_cache (no shared entries).

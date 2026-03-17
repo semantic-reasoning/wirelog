@@ -12,6 +12,8 @@
 #include "columnar/internal.h"
 
 #include <errno.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -142,6 +144,10 @@ col_mat_cache_key_content(const col_rel_t *rel)
 void
 col_mat_cache_clear(col_mat_cache_t *cache)
 {
+    /* Track freed bytes before clearing (Issue #224) */
+    if (cache->ledger && cache->total_bytes > 0)
+        wl_mem_ledger_free(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                           (uint64_t)cache->total_bytes);
     for (uint32_t i = 0; i < cache->count; i++)
         col_rel_destroy(cache->entries[i].result);
     cache->count = 0;
@@ -169,6 +175,10 @@ col_mat_cache_evict_until(col_mat_cache_t *cache, size_t target_bytes)
             if (cache->entries[i].lru_clock < cache->entries[lru].lru_clock)
                 lru = i;
         }
+        /* Track evicted bytes under CACHE subsystem (Issue #224) */
+        if (cache->ledger && cache->entries[lru].mem_bytes > 0)
+            wl_mem_ledger_free(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                               (uint64_t)cache->entries[lru].mem_bytes);
         cache->total_bytes -= cache->entries[lru].mem_bytes;
         col_rel_destroy(cache->entries[lru].result);
         memmove(&cache->entries[lru], &cache->entries[lru + 1],
@@ -212,6 +222,9 @@ col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
             if (cache->entries[i].lru_clock < cache->entries[lru].lru_clock)
                 lru = i;
         }
+        if (cache->ledger && cache->entries[lru].mem_bytes > 0)
+            wl_mem_ledger_free(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                               (uint64_t)cache->entries[lru].mem_bytes);
         cache->total_bytes -= cache->entries[lru].mem_bytes;
         col_rel_destroy(cache->entries[lru].result);
         memmove(&cache->entries[lru], &cache->entries[lru + 1],
@@ -226,6 +239,9 @@ col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
             if (cache->entries[i].lru_clock < cache->entries[lru].lru_clock)
                 lru = i;
         }
+        if (cache->ledger && cache->entries[lru].mem_bytes > 0)
+            wl_mem_ledger_free(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                               (uint64_t)cache->entries[lru].mem_bytes);
         cache->total_bytes -= cache->entries[lru].mem_bytes;
         col_rel_destroy(cache->entries[lru].result);
         memmove(&cache->entries[lru], &cache->entries[lru + 1],
@@ -240,4 +256,33 @@ col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
     e->mem_bytes = result_bytes;
     e->lru_clock = ++cache->clock;
     cache->total_bytes += result_bytes;
+    /* Track new cache entry under CACHE subsystem (Issue #224) */
+    if (cache->ledger && result_bytes > 0)
+        wl_mem_ledger_alloc(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                            (uint64_t)result_bytes);
+
+    /* Backpressure: when CACHE subsystem > 80% cap, evict LRU to 50% cap
+     * (Issue #224, Step 4). Extends existing COL_MAT_CACHE_LIMIT_BYTES
+     * policy with budget-aware pressure response. */
+    if (cache->ledger
+        && wl_mem_ledger_should_backpressure(cache->ledger, WL_MEM_SUBSYS_CACHE,
+                                             80)) {
+        uint64_t budget = atomic_load_explicit(&cache->ledger->total_budget,
+                                               memory_order_relaxed);
+        if (budget > 0) {
+            /* Target: 50% of this subsystem's cap */
+            uint64_t cap
+                = (budget * wl_mem_subsys_pct[WL_MEM_SUBSYS_CACHE]) / 100;
+            size_t target = (size_t)(cap / 2);
+            if (target < cache->total_bytes) {
+                const char *mem_report_env = getenv("WL_MEM_REPORT");
+                if (mem_report_env && mem_report_env[0] == '1')
+                    fprintf(stderr,
+                            "[wirelog mem] CACHE backpressure: evicting LRU "
+                            "to 50%% of cap (%zu -> %zu bytes)\n",
+                            cache->total_bytes, target);
+                col_mat_cache_evict_until(cache, target);
+            }
+        }
+    }
 }
