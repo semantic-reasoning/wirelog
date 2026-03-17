@@ -79,6 +79,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             COL_SESSION(sess)->kfusion_ns += now_ns() - t0;
             break;
         }
+        case WL_PLAN_OP_LFTJ:
+            rc = col_op_lftj(op, stack, sess);
+            break;
         default:
             break;
         }

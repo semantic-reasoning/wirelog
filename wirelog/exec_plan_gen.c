@@ -17,6 +17,7 @@
 #include "wirelog-ir.h"
 #include "wirelog-types.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -948,6 +949,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
 static void
 free_k_fusion_opaque(wl_plan_op_t *op); /* forward declaration */
 #endif
+static void
+free_lftj_opaque(wl_plan_op_t *op); /* forward declaration */
 
 static void
 free_op(wl_plan_op_t *op)
@@ -976,10 +979,15 @@ free_op(wl_plan_op_t *op)
         free(op->map_exprs);
     }
 
+    if (op->opaque_data) {
 #if ENABLE_K_FUSION
-    if (op->opaque_data)
-        free_k_fusion_opaque(op);
+        if (op->op == WL_PLAN_OP_K_FUSION)
+            free_k_fusion_opaque(op);
+        else
 #endif
+            if (op->op == WL_PLAN_OP_LFTJ)
+            free_lftj_opaque(op);
+    }
 }
 
 /* ======================================================================== */
@@ -1025,6 +1033,47 @@ count_delta_positions(const wl_plan_op_t *ops, uint32_t op_count,
         }
     }
     return k;
+}
+
+/**
+ * Deep-copy LFTJ opaque metadata from src to dst->opaque_data.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int
+clone_lftj_opaque(const wl_plan_op_t *src, wl_plan_op_t *dst)
+{
+    const wl_plan_op_lftj_t *sm = (const wl_plan_op_lftj_t *)src->opaque_data;
+    if (!sm) {
+        dst->opaque_data = NULL;
+        return 0;
+    }
+    wl_plan_op_lftj_t *dm
+        = (wl_plan_op_lftj_t *)calloc(1, sizeof(wl_plan_op_lftj_t));
+    if (!dm)
+        return -1;
+    dm->k = sm->k;
+    dm->rel_names = (char **)malloc(sm->k * sizeof(char *));
+    dm->key_cols = (uint32_t *)malloc(sm->k * sizeof(uint32_t));
+    if (!dm->rel_names || !dm->key_cols) {
+        free(dm->rel_names);
+        free(dm->key_cols);
+        free(dm);
+        return -1;
+    }
+    memcpy(dm->key_cols, sm->key_cols, sm->k * sizeof(uint32_t));
+    for (uint32_t i = 0; i < sm->k; i++) {
+        dm->rel_names[i] = dup_str(sm->rel_names[i]);
+        if (!dm->rel_names[i]) {
+            for (uint32_t j = 0; j < i; j++)
+                free(dm->rel_names[j]);
+            free(dm->rel_names);
+            free(dm->key_cols);
+            free(dm);
+            return -1;
+        }
+    }
+    dst->opaque_data = dm;
+    return 0;
 }
 
 /**
@@ -1114,6 +1163,8 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
             }
         }
     }
+    if (src->op == WL_PLAN_OP_LFTJ)
+        return clone_lftj_opaque(src, dst);
     return 0;
 }
 
@@ -1235,7 +1286,28 @@ free_k_fusion_opaque(wl_plan_op_t *op)
     free(meta);
     op->opaque_data = NULL;
 }
+#endif /* ENABLE_K_FUSION */
 
+/**
+ * Free LFTJ metadata stored in op->opaque_data.
+ */
+static void
+free_lftj_opaque(wl_plan_op_t *op)
+{
+    if (!op->opaque_data)
+        return;
+    wl_plan_op_lftj_t *meta = (wl_plan_op_lftj_t *)op->opaque_data;
+    if (meta->rel_names) {
+        for (uint32_t i = 0; i < meta->k; i++)
+            free(meta->rel_names[i]);
+        free(meta->rel_names);
+    }
+    free(meta->key_cols);
+    free(meta);
+    op->opaque_data = NULL;
+}
+
+#if ENABLE_K_FUSION
 /**
  * Rewrite a single relation plan for K-fusion parallel execution.
  *
@@ -1411,6 +1483,202 @@ rewrite_multiway_delta(wl_plan_t *plan)
             free(dpos);
         }
         free(idb_names);
+    }
+}
+
+/* ======================================================================== */
+/* LFTJ Chain Detection and Rewriting                                       */
+/* ======================================================================== */
+
+/* Check whether a relation name appears in the plan's EDB list. */
+static bool
+is_edb_rel(const char *name, const wl_plan_t *plan)
+{
+    if (!name)
+        return false;
+    for (uint32_t i = 0; i < plan->edb_count; i++) {
+        if (plan->edb_relations[i] && strcmp(plan->edb_relations[i], name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Detect the length of an LFTJ-eligible chain starting at ops[start]:
+ *   ops[start]         : WL_PLAN_OP_VARIABLE, EDB relation
+ *   ops[start+1..j-1]  : WL_PLAN_OP_JOIN, key_count==1, EDB right_relation,
+ *                        consistent left_keys[0] and right_keys[0].
+ * Returns chain length (>= 3) if eligible, else 0.
+ * Sets *out_lk and *out_rk to the shared key column name strings.
+ */
+static uint32_t
+lftj_chain_len(const wl_plan_op_t *ops, uint32_t op_count, uint32_t start,
+               const wl_plan_t *plan, const char **out_lk, const char **out_rk)
+{
+    if (start >= op_count || ops[start].op != WL_PLAN_OP_VARIABLE)
+        return 0;
+    if (!is_edb_rel(ops[start].relation_name, plan))
+        return 0;
+
+    const char *lk0 = NULL;
+    const char *rk0 = NULL;
+    uint32_t j = start + 1;
+    while (j < op_count && ops[j].op == WL_PLAN_OP_JOIN && ops[j].key_count == 1
+           && ops[j].left_keys && ops[j].right_keys && ops[j].left_keys[0]
+           && ops[j].right_keys[0] && ops[j].right_relation
+           && is_edb_rel(ops[j].right_relation, plan)) {
+        if (!lk0) {
+            lk0 = ops[j].left_keys[0];
+            rk0 = ops[j].right_keys[0];
+        } else if (strcmp(ops[j].left_keys[0], lk0) != 0
+                   || strcmp(ops[j].right_keys[0], rk0) != 0) {
+            break;
+        }
+        j++;
+    }
+
+    uint32_t len = j - start;
+    if (len < 3 || !lk0)
+        return 0;
+    *out_lk = lk0;
+    *out_rk = rk0;
+    return len;
+}
+
+/*
+ * Build a WL_PLAN_OP_LFTJ operator for the chain ops[start..start+len-1].
+ * Returns 0 and fills new_op on success, -1 on allocation failure.
+ */
+static int
+build_lftj_op(const wl_plan_op_t *ops, uint32_t start, uint32_t len,
+              const char *lk0, const char *rk0, wl_plan_op_t *new_op)
+{
+    uint32_t k = len;
+    wl_plan_op_lftj_t *meta
+        = (wl_plan_op_lftj_t *)calloc(1, sizeof(wl_plan_op_lftj_t));
+    if (!meta)
+        return -1;
+
+    meta->k = k;
+    meta->rel_names = (char **)malloc(k * sizeof(char *));
+    meta->key_cols = (uint32_t *)malloc(k * sizeof(uint32_t));
+    if (!meta->rel_names || !meta->key_cols) {
+        free(meta->rel_names);
+        free(meta->key_cols);
+        free(meta);
+        return -1;
+    }
+
+    /* Validate "colN" format before parsing */
+    if (strncmp(lk0, "col", 3) != 0 || !isdigit((unsigned char)lk0[3])
+        || strncmp(rk0, "col", 3) != 0 || !isdigit((unsigned char)rk0[3])) {
+        free(meta->rel_names);
+        free(meta->key_cols);
+        free(meta);
+        return -1;
+    }
+
+    /* R0 comes from the VARIABLE op; key is left_keys[0] of the first JOIN */
+    meta->rel_names[0] = dup_str(ops[start].relation_name);
+    meta->key_cols[0] = (uint32_t)strtoul(lk0 + 3, NULL, 10);
+
+    /* R1..Rk-1 from JOIN right_relations; key from shared right_keys[0] */
+    uint32_t rk_col = (uint32_t)strtoul(rk0 + 3, NULL, 10);
+    for (uint32_t q = 1; q < k; q++) {
+        meta->rel_names[q] = dup_str(ops[start + q].right_relation);
+        meta->key_cols[q] = rk_col;
+    }
+
+    for (uint32_t q = 0; q < k; q++) {
+        if (!meta->rel_names[q]) {
+            for (uint32_t p = 0; p < k; p++)
+                free(meta->rel_names[p]);
+            free(meta->rel_names);
+            free(meta->key_cols);
+            free(meta);
+            return -1;
+        }
+    }
+
+    memset(new_op, 0, sizeof(wl_plan_op_t));
+    new_op->op = WL_PLAN_OP_LFTJ;
+    new_op->opaque_data = meta;
+    return 0;
+}
+
+/*
+ * Post-pass: replace EDB-only VARIABLE + (k-1) JOIN chains (k >= 3) with
+ * a single WL_PLAN_OP_LFTJ operator.  Run before rewrite_multiway_delta()
+ * so no K_FUSION ops are present during cloning.
+ */
+static void
+rewrite_lftj_chains(wl_plan_t *plan)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        wl_plan_stratum_t *st = (wl_plan_stratum_t *)&plan->strata[s];
+        if (!st->relations)
+            continue;
+
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            wl_plan_relation_t *rel = (wl_plan_relation_t *)&st->relations[r];
+            if (!rel->ops || rel->op_count < 3)
+                continue;
+
+            /* Quick scan: is there at least one eligible chain? */
+            bool has_chain = false;
+            for (uint32_t i = 0; i < rel->op_count && !has_chain; i++) {
+                const char *lk0 = NULL, *rk0 = NULL;
+                if (lftj_chain_len(rel->ops, rel->op_count, i, plan, &lk0, &rk0)
+                    >= 3)
+                    has_chain = true;
+            }
+            if (!has_chain)
+                continue;
+
+            /* Build replacement op list (at most rel->op_count entries) */
+            wl_plan_op_t *new_ops
+                = (wl_plan_op_t *)calloc(rel->op_count, sizeof(wl_plan_op_t));
+            if (!new_ops)
+                continue;
+
+            uint32_t ni = 0;
+            bool ok = true;
+            for (uint32_t i = 0; i < rel->op_count && ok;) {
+                const char *lk0 = NULL, *rk0 = NULL;
+                uint32_t clen = lftj_chain_len(rel->ops, rel->op_count, i, plan,
+                                               &lk0, &rk0);
+                if (clen >= 3) {
+                    if (build_lftj_op(rel->ops, i, clen, lk0, rk0, &new_ops[ni])
+                        != 0) {
+                        ok = false;
+                        break;
+                    }
+                    ni++;
+                    i += clen;
+                } else {
+                    if (clone_plan_op(&rel->ops[i], &new_ops[ni]) != 0) {
+                        ok = false;
+                        break;
+                    }
+                    ni++;
+                    i++;
+                }
+            }
+
+            if (!ok) {
+                for (uint32_t o = 0; o < ni; o++)
+                    free_op(&new_ops[o]);
+                free(new_ops);
+                continue;
+            }
+
+            /* Swap in the rewritten op list */
+            for (uint32_t o = 0; o < rel->op_count; o++)
+                free_op((wl_plan_op_t *)&rel->ops[o]);
+            free((void *)rel->ops);
+            rel->ops = new_ops;
+            rel->op_count = ni;
+        }
     }
 }
 
@@ -1670,6 +1938,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
     /* Rewrite K-atom recursive rules for complete semi-naive evaluation.
      * For rules with K >= 2 IDB body atoms, emit K copies with CSE
      * materialization hints to avoid the regression seen without CSE. */
+    rewrite_lftj_chains(plan);
     rewrite_multiway_delta(plan);
 
     *out = plan;
