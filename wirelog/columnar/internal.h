@@ -96,6 +96,12 @@ now_ns(void)
 #define COL_MAT_CACHE_MAX 64u
 #define COL_MAT_CACHE_LIMIT_BYTES (100ULL * 1024ULL * 1024ULL)
 
+/* Maximum output rows per single join operation (issue #218).
+ * Prevents unbounded memory growth from cardinality explosion in
+ * cross-product-heavy joins (e.g., DOOP VarPointsTo). When exceeded,
+ * the join returns ENOMEM. Set to 0 to disable the limit. */
+#define COL_JOIN_OUTPUT_LIMIT (50u * 1000u * 1000u) /* 50M rows */
+
 /* ======================================================================== */
 /* Relation Storage                                                         */
 /* ======================================================================== */
