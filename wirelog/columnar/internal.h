@@ -96,11 +96,13 @@ now_ns(void)
 #define COL_MAT_CACHE_MAX 64u
 #define COL_MAT_CACHE_LIMIT_BYTES (100ULL * 1024ULL * 1024ULL)
 
-/* Maximum output rows per single join operation (issue #218).
+/* Default maximum output rows per single join operation (issue #218, #221).
  * Prevents unbounded memory growth from cardinality explosion in
  * cross-product-heavy joins (e.g., DOOP VarPointsTo). When exceeded,
- * the join returns ENOMEM. Set to 0 to disable the limit. */
-#define COL_JOIN_OUTPUT_LIMIT (50u * 1000u * 1000u) /* 50M rows */
+ * the join returns EOVERFLOW. Set to 0 to disable the limit.
+ * At runtime, the session uses a dynamically computed limit based on
+ * available physical memory (see wl_col_session_t.join_output_limit). */
+#define COL_JOIN_OUTPUT_LIMIT_DEFAULT (50u * 1000u * 1000u) /* 50M rows */
 
 /* ======================================================================== */
 /* Relation Storage                                                         */
@@ -361,6 +363,11 @@ typedef struct {
      * When > 1, sess->wq is created at session init for parallel K-fusion.
      * When == 1, K-fusion evaluates copies sequentially (no thread overhead). */
     uint32_t num_workers;
+    /* Dynamic join output limit (Issue #221).
+     * Maximum output rows per single join operation. Computed at session init
+     * based on available physical memory, num_workers, and estimated row width.
+     * 0 = disabled (no limit). Overridable via WIRELOG_JOIN_OUTPUT_LIMIT env var. */
+    uint64_t join_output_limit;
     /* Monotone property tracking (issue #105).
      * stratum_is_monotone[si] = true if stratum si only derives facts
      * (no deletion via negation/antijoin/subtraction). Used for DRedL-style
