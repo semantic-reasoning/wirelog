@@ -446,3 +446,160 @@ col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
     *out_frontier = COL_SESSION(session)->frontiers[stratum_idx];
     return 0;
 }
+
+/* ======================================================================== */
+/* Sorted Arrangement Cache (Issue #195)                                    */
+/* ======================================================================== */
+
+/*
+ * sarr_row_cmp: qsort_r comparator that orders rows by a single key column.
+ * Context points to a uint32_t key_col value (matching QSORT_R_CALL signature
+ * in internal.h).
+ */
+#ifdef __GLIBC__
+static int
+sarr_row_cmp(const void *a, const void *b, void *ctx)
+{
+    const uint32_t kc = *(const uint32_t *)ctx;
+    const int64_t ka = ((const int64_t *)a)[kc];
+    const int64_t kb = ((const int64_t *)b)[kc];
+    return (ka > kb) - (ka < kb);
+}
+#elif defined(_MSC_VER)
+static int __cdecl sarr_row_cmp(void *ctx, const void *a, const void *b)
+{
+    const uint32_t kc = *(const uint32_t *)ctx;
+    const int64_t ka = ((const int64_t *)a)[kc];
+    const int64_t kb = ((const int64_t *)b)[kc];
+    return (ka > kb) - (ka < kb);
+}
+#else
+static int
+sarr_row_cmp(void *ctx, const void *a, const void *b)
+{
+    const uint32_t kc = *(const uint32_t *)ctx;
+    const int64_t ka = ((const int64_t *)a)[kc];
+    const int64_t kb = ((const int64_t *)b)[kc];
+    return (ka > kb) - (ka < kb);
+}
+#endif
+
+/*
+ * sarr_build: (re)build sorted copy from rel into sarr.
+ * Frees any previous sorted buffer and allocates a fresh one.
+ * Returns 0 on success, ENOMEM on allocation failure.
+ */
+static int
+sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
+{
+    free(sarr->sorted);
+    sarr->sorted = NULL;
+    sarr->nrows = 0;
+    sarr->ncols = rel->ncols;
+    sarr->key_col = key_col;
+    sarr->indexed_rows = 0;
+
+    if (rel->nrows == 0)
+        return 0;
+
+    size_t bytes = (size_t)rel->nrows * rel->ncols * sizeof(int64_t);
+    sarr->sorted = (int64_t *)malloc(bytes);
+    if (!sarr->sorted)
+        return ENOMEM;
+
+    memcpy(sarr->sorted, rel->data, bytes);
+    uint32_t kc = key_col;
+    QSORT_R_CALL(sarr->sorted, rel->nrows, rel->ncols * sizeof(int64_t), &kc,
+                 sarr_row_cmp);
+    sarr->nrows = rel->nrows;
+    sarr->indexed_rows = rel->nrows;
+    return 0;
+}
+
+/*
+ * col_session_get_sorted_arrangement:
+ *
+ * Return (or lazily build) a sorted arrangement for `rel_name` keyed on
+ * `key_col`.  Rebuilds the sorted copy when indexed_rows != rel->nrows
+ * (data was appended since last build).
+ *
+ * Returns NULL on allocation failure or if the relation is not found.
+ */
+col_sorted_arr_t *
+col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
+                                   uint32_t key_col)
+{
+    if (!cs || !rel_name)
+        return NULL;
+
+    /* Look up the source relation. */
+    col_rel_t *rel = session_find_rel(cs, rel_name);
+    if (!rel)
+        return NULL;
+
+    /* Search existing cache entries. */
+    for (uint32_t i = 0; i < cs->sarr_count; i++) {
+        col_sorted_arr_entry_t *e = &cs->sarr_entries[i];
+        if (e->key_col != key_col)
+            continue;
+        if (strcmp(e->rel_name, rel_name) != 0)
+            continue;
+        /* Found: rebuild if stale. */
+        if (e->sarr.indexed_rows != rel->nrows) {
+            if (sarr_build(&e->sarr, rel, key_col) != 0)
+                return NULL;
+        }
+        return &e->sarr;
+    }
+
+    /* Not found: grow cache and create new entry. */
+    if (cs->sarr_count >= cs->sarr_cap) {
+        uint32_t new_cap = cs->sarr_cap ? cs->sarr_cap * 2u : 4u;
+        col_sorted_arr_entry_t *ne = (col_sorted_arr_entry_t *)realloc(
+            cs->sarr_entries, new_cap * sizeof(col_sorted_arr_entry_t));
+        if (!ne)
+            return NULL;
+        cs->sarr_entries = ne;
+        cs->sarr_cap = new_cap;
+    }
+
+    col_sorted_arr_entry_t *e = &cs->sarr_entries[cs->sarr_count];
+    memset(e, 0, sizeof(*e));
+
+    e->rel_name = wl_strdup(rel_name);
+    if (!e->rel_name)
+        return NULL;
+
+    e->key_col = key_col;
+    e->sarr.key_col = key_col;
+    cs->sarr_count++;
+
+    if (sarr_build(&e->sarr, rel, key_col) != 0) {
+        cs->sarr_count--;
+        free(e->rel_name);
+        memset(e, 0, sizeof(*e));
+        return NULL;
+    }
+    return &e->sarr;
+}
+
+/*
+ * col_session_free_sorted_arrangements:
+ *
+ * Free all entries in the sorted arrangement cache and reset it.
+ * Called from col_session_destroy.
+ */
+void
+col_session_free_sorted_arrangements(wl_col_session_t *cs)
+{
+    if (!cs)
+        return;
+    for (uint32_t i = 0; i < cs->sarr_count; i++) {
+        free(cs->sarr_entries[i].rel_name);
+        free(cs->sarr_entries[i].sarr.sorted);
+    }
+    free(cs->sarr_entries);
+    cs->sarr_entries = NULL;
+    cs->sarr_count = 0;
+    cs->sarr_cap = 0;
+}

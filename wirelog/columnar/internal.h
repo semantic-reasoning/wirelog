@@ -14,6 +14,8 @@
 #ifndef WL_COLUMNAR_INTERNAL_H
 #define WL_COLUMNAR_INTERNAL_H
 
+#define _GNU_SOURCE
+
 #include "columnar/columnar_nanoarrow.h"
 #include "columnar/delta_pool.h"
 #include "session.h"
@@ -214,6 +216,31 @@ typedef struct {
     col_arrangement_t arr; /* embedded arrangement           */
 } col_arr_entry_t;
 
+/*
+ * col_sorted_arr_t: cached sorted copy of a relation by a single key column.
+ *
+ * Used by WL_PLAN_OP_LFTJ (Issue #195) to avoid re-sorting EDB relations
+ * on every semi-naive iteration.  sorted[] is rebuilt when indexed_rows
+ * differs from the source relation's nrows.
+ */
+typedef struct {
+    int64_t *sorted;       /* owned row-major sorted copy (nrows * ncols)  */
+    uint32_t nrows;        /* rows in sorted copy                          */
+    uint32_t ncols;        /* columns per row                              */
+    uint32_t key_col;      /* sort key column index                        */
+    uint32_t indexed_rows; /* source nrows at last build                  */
+} col_sorted_arr_t;
+
+/*
+ * col_sorted_arr_entry_t: one (rel_name, key_col) -> sorted arrangement entry.
+ * Stored in the session's flat sorted-arrangement registry.
+ */
+typedef struct {
+    char *rel_name; /* owned */
+    uint32_t key_col;
+    col_sorted_arr_t sarr;
+} col_sorted_arr_entry_t;
+
 /* ======================================================================== */
 /* Session                                                                  */
 /* ======================================================================== */
@@ -345,6 +372,15 @@ typedef struct {
      * $r$<name> relations. Cleared after eval completes. */
     bool retraction_seeded;
     delta_pool_t *delta_pool; /* Pool allocator for operator temporaries */
+    /* Sorted arrangement cache (Issue #195): per-key-column sorted copies of
+     * EDB relations for leapfrog triejoin (WL_PLAN_OP_LFTJ).  Unlike hash
+     * arrangements, these are sorted by a single key column and reused across
+     * semi-naive iterations (EDB relations are stable between iterations).
+     * Freed only on session destroy. */
+    col_sorted_arr_entry_t
+        *sarr_entries; /* flat array of sorted arrangements */
+    uint32_t sarr_count;
+    uint32_t sarr_cap;
 #ifdef WL_PROFILE
     wl_profile_stats_t profile; /* operator profiling counters */
 #endif
@@ -521,6 +557,11 @@ col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
                                   const uint32_t *key_cols, uint32_t key_count);
 void
 col_session_free_delta_arrangements(wl_col_session_t *cs);
+col_sorted_arr_t *
+col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
+                                   uint32_t key_col);
+void
+col_session_free_sorted_arrangements(wl_col_session_t *cs);
 
 /* ======================================================================== */
 /* Frontier & Affected Strata (columnar/frontier.c)                         */
