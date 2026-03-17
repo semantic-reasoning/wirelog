@@ -684,6 +684,374 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 
 /* --- FILTER -------------------------------------------------------------- */
 
+/*
+ * simple_filter_cmp_t:
+ * Decoded simple comparison predicate of the form:
+ *   colA CMP CONST   (b_is_const == true)
+ *   colA CMP colB    (b_is_const == false)
+ *
+ * Populated by filter_is_simple_cmp() when the bytecode matches one of
+ * these two patterns.  Used to bypass the full postfix interpreter.
+ */
+typedef struct {
+    uint32_t col_a;  /* first operand column index */
+    bool b_is_const; /* true: b is a constant; false: b is colB */
+    uint32_t col_b;  /* second operand column index (when !b_is_const) */
+    int64_t const_b; /* constant value (when b_is_const) */
+    wl_plan_expr_tag_t cmp_op; /* comparison opcode (EQ/NEQ/LT/LTE/GT/GTE) */
+} simple_filter_cmp_t;
+
+/*
+ * parse_var_col:
+ * Parse a WL_PLAN_EXPR_VAR token at buf[i] (not yet consumed; i points at
+ * the opcode byte itself).  If successful, advance *pos past the full token
+ * and store the extracted column index in *col_out.
+ * Returns true on success, false on malformed bytecode.
+ *
+ * VAR encoding: [0x01][name_len:u16 LE][name:u8*name_len]
+ * where name is "colN" (N is the decimal column index).
+ */
+static bool
+parse_var_col(const uint8_t *buf, uint32_t size, uint32_t *pos,
+              uint32_t *col_out)
+{
+    uint32_t i = *pos;
+    if (i >= size || buf[i] != (uint8_t)WL_PLAN_EXPR_VAR)
+        return false;
+    i++; /* consume opcode */
+    if (i + 2 > size)
+        return false;
+    uint16_t nlen;
+    memcpy(&nlen, buf + i, 2);
+    i += 2;
+    if (i + nlen > size)
+        return false;
+    /* name must start with "col" followed by decimal digits */
+    if (nlen < 4 || buf[i] != 'c' || buf[i + 1] != 'o' || buf[i + 2] != 'l')
+        return false;
+    /* parse digits */
+    uint32_t col = 0;
+    uint32_t digits = nlen - 3;
+    if (digits == 0 || digits > 9) /* no digits or overflow guard */
+        return false;
+    for (uint32_t d = 0; d < digits; d++) {
+        uint8_t ch = buf[i + 3 + d];
+        if (ch < '0' || ch > '9')
+            return false;
+        col = col * 10 + (uint32_t)(ch - '0');
+    }
+    i += nlen;
+    *pos = i;
+    *col_out = col;
+    return true;
+}
+
+/*
+ * filter_is_simple_cmp:
+ * Inspect the bytecode buffer and return true if it encodes exactly one
+ * of:
+ *   Pattern A: VAR("colA")  CONST_INT(k)  CMP_OP
+ *   Pattern B: VAR("colA")  VAR("colB")   CMP_OP
+ *
+ * On success, fill *out and return true.
+ * If the bytecode does not match (complex expression, string constants,
+ * arithmetic, etc.) return false so the caller falls back to the full
+ * interpreter.
+ */
+static bool
+filter_is_simple_cmp(const uint8_t *buf, uint32_t size,
+                     simple_filter_cmp_t *out)
+{
+    if (!buf || size == 0)
+        return false;
+
+    uint32_t pos = 0;
+
+    /* --- First operand: must be VAR("colA") --- */
+    uint32_t col_a = 0;
+    if (!parse_var_col(buf, size, &pos, &col_a))
+        return false;
+
+    /* --- Second operand: CONST_INT or VAR("colB") --- */
+    bool b_is_const = false;
+    int64_t const_b = 0;
+    uint32_t col_b = 0;
+
+    if (pos < size && buf[pos] == (uint8_t)WL_PLAN_EXPR_CONST_INT) {
+        pos++; /* consume opcode */
+        if (pos + 8 > size)
+            return false;
+        memcpy(&const_b, buf + pos, 8);
+        pos += 8;
+        b_is_const = true;
+    } else if (pos < size && buf[pos] == (uint8_t)WL_PLAN_EXPR_VAR) {
+        if (!parse_var_col(buf, size, &pos, &col_b))
+            return false;
+        b_is_const = false;
+    } else {
+        return false;
+    }
+
+    /* --- Third token: CMP opcode (no payload) --- */
+    if (pos >= size)
+        return false;
+    uint8_t cmp_tag = buf[pos++];
+    switch ((wl_plan_expr_tag_t)cmp_tag) {
+    case WL_PLAN_EXPR_CMP_EQ:
+    case WL_PLAN_EXPR_CMP_NEQ:
+    case WL_PLAN_EXPR_CMP_LT:
+    case WL_PLAN_EXPR_CMP_GT:
+    case WL_PLAN_EXPR_CMP_LTE:
+    case WL_PLAN_EXPR_CMP_GTE:
+        break;
+    default:
+        return false;
+    }
+
+    /* --- No remaining bytes --- */
+    if (pos != size)
+        return false;
+
+    out->col_a = col_a;
+    out->b_is_const = b_is_const;
+    out->col_b = col_b;
+    out->const_b = const_b;
+    out->cmp_op = (wl_plan_expr_tag_t)cmp_tag;
+    return true;
+}
+
+/*
+ * col_filter_cmp_row:
+ * Evaluate a simple_filter_cmp_t predicate against a single row.
+ * Inlined helper shared by the scalar fast-path and SIMD tail loops.
+ */
+static inline bool
+col_filter_cmp_row(const int64_t *row, uint32_t ncols,
+                   const simple_filter_cmp_t *cmp)
+{
+    if (cmp->col_a >= ncols)
+        return false;
+    int64_t a_val = row[cmp->col_a];
+    int64_t b_val = cmp->b_is_const
+                        ? cmp->const_b
+                        : (cmp->col_b < ncols ? row[cmp->col_b] : 0);
+    switch (cmp->cmp_op) {
+    case WL_PLAN_EXPR_CMP_EQ:
+        return a_val == b_val;
+    case WL_PLAN_EXPR_CMP_NEQ:
+        return a_val != b_val;
+    case WL_PLAN_EXPR_CMP_LT:
+        return a_val < b_val;
+    case WL_PLAN_EXPR_CMP_LTE:
+        return a_val <= b_val;
+    case WL_PLAN_EXPR_CMP_GT:
+        return a_val > b_val;
+    case WL_PLAN_EXPR_CMP_GTE:
+        return a_val >= b_val;
+    default:
+        return false;
+    }
+}
+
+/*
+ * col_filter_simple_scalar:
+ * Scalar fast-path filter: iterate rows and copy matching ones directly
+ * without per-row bytecode dispatch, strtol, or stack initialization.
+ *
+ * Returns the number of rows written to out_data.
+ * out_data must have capacity for nrows * ncols int64_t values.
+ */
+static uint32_t
+col_filter_simple_scalar(const int64_t *data, uint32_t nrows, uint32_t ncols,
+                         const simple_filter_cmp_t *cmp, int64_t *out_data)
+{
+    size_t row_bytes = (size_t)ncols * sizeof(int64_t);
+    uint32_t out_idx = 0;
+    for (uint32_t r = 0; r < nrows; r++) {
+        const int64_t *row = data + (size_t)r * ncols;
+        if (col_filter_cmp_row(row, ncols, cmp)) {
+            memcpy(out_data + (size_t)out_idx * ncols, row, row_bytes);
+            out_idx++;
+        }
+    }
+    return out_idx;
+}
+
+#ifdef __AVX2__
+/*
+ * col_filter_simd_avx2:
+ * AVX2 fast-path filter for const-compare predicates (b_is_const == true).
+ * Processes 4 rows per SIMD iteration using 256-bit integer vectors, then
+ * falls back to scalar for the tail.
+ *
+ * For col-col comparisons (b_is_const == false) this function delegates
+ * entirely to col_filter_simple_scalar.
+ *
+ * Returns the number of rows written to out_data.
+ */
+static uint32_t
+col_filter_simd_avx2(const int64_t *data, uint32_t nrows, uint32_t ncols,
+                     const simple_filter_cmp_t *cmp, int64_t *out_data)
+{
+    /* Only the const-compare branch benefits from SIMD gather+compare.
+     * Col-col compare requires two non-contiguous gathers; fall back. */
+    if (!cmp->b_is_const)
+        return col_filter_simple_scalar(data, nrows, ncols, cmp, out_data);
+
+    __m256i const_v = _mm256_set1_epi64x(cmp->const_b);
+    __m256i all_ones = _mm256_set1_epi64x(-1LL);
+    uint32_t out_idx = 0;
+    size_t row_bytes = (size_t)ncols * sizeof(int64_t);
+    uint32_t r = 0;
+
+    for (; r + 4 <= nrows; r += 4) {
+        /* Scalar gather: load col_a value from 4 consecutive rows */
+        int64_t v0 = data[(size_t)(r + 0) * ncols + cmp->col_a];
+        int64_t v1 = data[(size_t)(r + 1) * ncols + cmp->col_a];
+        int64_t v2 = data[(size_t)(r + 2) * ncols + cmp->col_a];
+        int64_t v3 = data[(size_t)(r + 3) * ncols + cmp->col_a];
+        /* _mm256_set_epi64x fills lanes in reverse: lane3,lane2,lane1,lane0 */
+        __m256i vals = _mm256_set_epi64x(v3, v2, v1, v0);
+
+        __m256i mask;
+        __m256i eq = _mm256_cmpeq_epi64(vals, const_v);
+        switch (cmp->cmp_op) {
+        case WL_PLAN_EXPR_CMP_EQ:
+            mask = eq;
+            break;
+        case WL_PLAN_EXPR_CMP_NEQ:
+            mask = _mm256_xor_si256(eq, all_ones);
+            break;
+        case WL_PLAN_EXPR_CMP_GT:
+            mask = _mm256_cmpgt_epi64(vals, const_v);
+            break;
+        case WL_PLAN_EXPR_CMP_LT:
+            mask = _mm256_cmpgt_epi64(const_v, vals);
+            break;
+        case WL_PLAN_EXPR_CMP_GTE:
+            mask = _mm256_or_si256(_mm256_cmpgt_epi64(vals, const_v), eq);
+            break;
+        case WL_PLAN_EXPR_CMP_LTE:
+            mask = _mm256_or_si256(_mm256_cmpgt_epi64(const_v, vals), eq);
+            break;
+        default:
+            continue;
+        }
+
+        /* movemask_epi8: 1 bit per byte, 8 bits per 64-bit lane.
+         * A lane fully set means all 8 bits for that lane are 1. */
+        int bits = _mm256_movemask_epi8(mask);
+        for (int lane = 0; lane < 4; lane++) {
+            if (((bits >> (lane * 8)) & 0xFF) == 0xFF) {
+                memcpy(out_data + (size_t)out_idx * ncols,
+                       data + (size_t)(r + (uint32_t)lane) * ncols, row_bytes);
+                out_idx++;
+            }
+        }
+    }
+
+    /* Scalar tail for remaining rows */
+    for (; r < nrows; r++) {
+        const int64_t *row = data + (size_t)r * ncols;
+        if (col_filter_cmp_row(row, ncols, cmp)) {
+            memcpy(out_data + (size_t)out_idx * ncols, row, row_bytes);
+            out_idx++;
+        }
+    }
+    return out_idx;
+}
+#endif /* __AVX2__ */
+
+#ifdef __ARM_NEON__
+/*
+ * col_filter_simd_neon:
+ * NEON fast-path filter for const-compare predicates (b_is_const == true).
+ * Processes 2 rows per SIMD iteration using 128-bit vectors, then falls
+ * back to scalar for the tail.
+ *
+ * For col-col comparisons (b_is_const == false) this function delegates
+ * to col_filter_simple_scalar.
+ *
+ * Returns the number of rows written to out_data.
+ */
+static uint32_t
+col_filter_simd_neon(const int64_t *data, uint32_t nrows, uint32_t ncols,
+                     const simple_filter_cmp_t *cmp, int64_t *out_data)
+{
+    if (!cmp->b_is_const)
+        return col_filter_simple_scalar(data, nrows, ncols, cmp, out_data);
+
+    int64x2_t const_v = vdupq_n_s64(cmp->const_b);
+    uint32_t out_idx = 0;
+    size_t row_bytes = (size_t)ncols * sizeof(int64_t);
+    uint32_t r = 0;
+
+    for (; r + 2 <= nrows; r += 2) {
+        int64_t v0 = data[(size_t)(r + 0) * ncols + cmp->col_a];
+        int64_t v1 = data[(size_t)(r + 1) * ncols + cmp->col_a];
+        int64x2_t vals = vcombine_s64(vcreate_s64((uint64_t)v0),
+                                      vcreate_s64((uint64_t)v1));
+
+        uint64x2_t pass_mask;
+        switch (cmp->cmp_op) {
+        case WL_PLAN_EXPR_CMP_EQ:
+            pass_mask = vceqq_s64(vals, const_v);
+            break;
+        case WL_PLAN_EXPR_CMP_NEQ:
+            pass_mask
+                = (uint64x2_t)vmvnq_u8((uint8x16_t)vceqq_s64(vals, const_v));
+            break;
+        case WL_PLAN_EXPR_CMP_GT:
+            pass_mask = (uint64x2_t)vcgtq_s64(vals, const_v);
+            break;
+        case WL_PLAN_EXPR_CMP_LT:
+            pass_mask = (uint64x2_t)vcltq_s64(vals, const_v);
+            break;
+        case WL_PLAN_EXPR_CMP_GTE:
+            pass_mask = (uint64x2_t)vcgeq_s64(vals, const_v);
+            break;
+        case WL_PLAN_EXPR_CMP_LTE:
+            pass_mask = (uint64x2_t)vcleq_s64(vals, const_v);
+            break;
+        default:
+            continue;
+        }
+
+        /* Lane 0 */
+        if (vgetq_lane_u64(pass_mask, 0) != 0) {
+            memcpy(out_data + (size_t)out_idx * ncols,
+                   data + (size_t)(r + 0) * ncols, row_bytes);
+            out_idx++;
+        }
+        /* Lane 1 */
+        if (vgetq_lane_u64(pass_mask, 1) != 0) {
+            memcpy(out_data + (size_t)out_idx * ncols,
+                   data + (size_t)(r + 1) * ncols, row_bytes);
+            out_idx++;
+        }
+    }
+
+    /* Scalar tail */
+    for (; r < nrows; r++) {
+        const int64_t *row = data + (size_t)r * ncols;
+        if (col_filter_cmp_row(row, ncols, cmp)) {
+            memcpy(out_data + (size_t)out_idx * ncols, row, row_bytes);
+            out_idx++;
+        }
+    }
+    return out_idx;
+}
+#endif /* __ARM_NEON__ */
+
+/* Dispatcher: Select best filter implementation at compile time. */
+#ifdef __AVX2__
+#define col_filter_fast col_filter_simd_avx2
+#elif defined(__ARM_NEON__)
+#define col_filter_fast col_filter_simd_neon
+#else
+#define col_filter_fast col_filter_simple_scalar
+#endif
+
 int
 col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
               wl_col_session_t *sess)
@@ -702,6 +1070,41 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
     const uint8_t *buf = op->filter_expr.data;
     uint32_t bsz = op->filter_expr.size;
 
+    /* Fast path: simple colA CMP CONST or colA CMP colB predicate.
+     * Bypasses per-row bytecode dispatch, strtol, and stack init. */
+    simple_filter_cmp_t cmp;
+    if (buf && bsz > 0 && e.rel->nrows > 0
+        && filter_is_simple_cmp(buf, bsz, &cmp) && cmp.col_a < e.rel->ncols
+        && (cmp.b_is_const || cmp.col_b < e.rel->ncols)) {
+        /* Pre-allocate output buffer sized for worst-case (all rows pass) */
+        size_t cap = (size_t)e.rel->nrows * e.rel->ncols;
+        int64_t *tmp = (int64_t *)malloc(cap * sizeof(int64_t));
+        if (!tmp) {
+            col_rel_destroy(out);
+            if (e.owned)
+                col_rel_destroy(e.rel);
+            return ENOMEM;
+        }
+        uint32_t nout = col_filter_fast(e.rel->data, e.rel->nrows, e.rel->ncols,
+                                        &cmp, tmp);
+        /* Bulk-copy the passing rows into the output relation */
+        for (uint32_t r = 0; r < nout; r++) {
+            int rc = col_rel_append_row(out, tmp + (size_t)r * e.rel->ncols);
+            if (rc != 0) {
+                free(tmp);
+                col_rel_destroy(out);
+                if (e.owned)
+                    col_rel_destroy(e.rel);
+                return rc;
+            }
+        }
+        free(tmp);
+        if (e.owned)
+            col_rel_destroy(e.rel);
+        return eval_stack_push(stack, out, true);
+    }
+
+    /* Slow path: full postfix bytecode interpreter */
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         const int64_t *row = e.rel->data + (size_t)r * e.rel->ncols;
         int pass = (!buf || bsz == 0)
