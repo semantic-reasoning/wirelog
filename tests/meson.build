@@ -1474,3 +1474,24 @@ test_lftj_integration_exe = executable(
 )
 
 test('lftj_integration', test_lftj_integration_exe)
+
+# ============================================================================
+# SIMD Filter Fast-Path Tests (Issue #214)
+# ============================================================================
+
+test_simd_filter_exe = executable(
+  'test_simd_filter',
+  files('test_simd_filter.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('simd_filter', test_simd_filter_exe)
