@@ -1415,3 +1415,24 @@ test_magic_sets_exe = executable(
 )
 
 test('magic_sets', test_magic_sets_exe)
+
+# ============================================================================
+# LFTJ Integration Tests (Issue #195)
+# ============================================================================
+
+test_lftj_integration_exe = executable(
+  'test_lftj_integration',
+  files('test_lftj_integration.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('lftj_integration', test_lftj_integration_exe)
