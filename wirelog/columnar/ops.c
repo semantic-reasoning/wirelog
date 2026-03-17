@@ -1548,7 +1548,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         for (uint32_t r = 1; r < nr; r++) {
             const int64_t *prev = rel->data + (size_t)(r - 1) * nc;
             const int64_t *cur = rel->data + (size_t)r * nc;
-            if (memcmp(prev, cur, row_bytes) != 0) {
+            if (row_cmp_optimized(prev, cur, nc) != 0) {
                 if (out_r != r)
                     memcpy(rel->data + (size_t)out_r * nc, cur, row_bytes);
                 out_r++;
@@ -1588,7 +1588,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
             }
 
             if (last_row == NULL
-                || memcmp(last_row, row_to_add, row_bytes) != 0) {
+                || row_cmp_optimized(last_row, row_to_add, nc) != 0) {
                 memcpy(merged + (size_t)out * nc, row_to_add, row_bytes);
                 last_row = merged + (size_t)out * nc;
                 out++;
@@ -1597,7 +1597,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 
         while (i < i_end) {
             int64_t *row = rel->data + (size_t)i * nc;
-            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+            if (last_row == NULL || row_cmp_optimized(last_row, row, nc) != 0) {
                 memcpy(merged + (size_t)out * nc, row, row_bytes);
                 last_row = merged + (size_t)out * nc;
                 out++;
@@ -1607,7 +1607,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 
         while (j < j_end) {
             int64_t *row = rel->data + (size_t)j * nc;
-            if (last_row == NULL || memcmp(last_row, row, row_bytes) != 0) {
+            if (last_row == NULL || row_cmp_optimized(last_row, row, nc) != 0) {
                 memcpy(merged + (size_t)out * nc, row, row_bytes);
                 last_row = merged + (size_t)out * nc;
                 out++;
@@ -1683,7 +1683,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         int64_t *min_row = HEAP_ROW(0);
 
         /* Dedup: skip if same as last emitted row */
-        if (last_row == NULL || memcmp(last_row, min_row, row_bytes) != 0) {
+        if (last_row == NULL || row_cmp_optimized(last_row, min_row, nc) != 0) {
             memcpy(merged + (size_t)out * nc, min_row, row_bytes);
             last_row = merged + (size_t)out * nc;
             out++;
@@ -1781,8 +1781,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         /* Phase 1b: dedup within suffix */
         uint32_t d_unique = 1;
         for (uint32_t i = 1; i < delta_count; i++) {
-            if (memcmp(delta_start + (size_t)(i - 1) * nc,
-                       delta_start + (size_t)i * nc, row_bytes)
+            if (row_cmp_optimized(delta_start + (size_t)(i - 1) * nc,
+                                  delta_start + (size_t)i * nc, nc)
                 != 0) {
                 if (d_unique != i)
                     memcpy(delta_start + (size_t)d_unique * nc,
@@ -1824,7 +1824,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         while (oi < sn && di < d_unique) {
             const int64_t *orow = work->data + (size_t)oi * nc;
             const int64_t *drow = delta_start + (size_t)di * nc;
-            int cmp = memcmp(orow, drow, row_bytes);
+            int cmp = row_cmp_optimized(orow, drow, nc);
             if (cmp < 0) {
                 memcpy(merged + (size_t)out * nc, orow, row_bytes);
                 oi++;
@@ -1880,7 +1880,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     for (uint32_t r = 1; r < nr; r++) {
         const int64_t *prev = work->data + (size_t)(r - 1) * nc;
         const int64_t *cur = work->data + (size_t)r * nc;
-        if (memcmp(prev, cur, row_bytes) != 0) {
+        if (row_cmp_optimized(prev, cur, nc) != 0) {
             if (out_r != r)
                 memcpy(work->data + (size_t)out_r * nc, cur, row_bytes);
             out_r++;
@@ -1926,8 +1926,8 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
     for (uint32_t i = 1; i < delta_count; i++) {
-        if (memcmp(delta_start + (size_t)(i - 1) * nc,
-                   delta_start + (size_t)i * nc, row_bytes)
+        if (row_cmp_optimized(delta_start + (size_t)(i - 1) * nc,
+                              delta_start + (size_t)i * nc, nc)
             != 0) {
             if (d_unique != i)
                 memcpy(delta_start + (size_t)d_unique * nc,
@@ -1947,7 +1947,7 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     while (oi < old_nrows && di < d_unique) {
         const int64_t *orow = rel->data + (size_t)oi * nc;
         const int64_t *drow = delta_start + (size_t)di * nc;
-        int cmp = memcmp(orow, drow, row_bytes);
+        int cmp = row_cmp_optimized(orow, drow, nc);
         if (cmp < 0) {
             memcpy(merged + (size_t)out * nc, orow, row_bytes);
             oi++;
