@@ -2532,11 +2532,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             oi++;
         } else {
             /* delta row not in old: new fact */
-            if (delta_out) {
-                int rc = col_rel_append_row(delta_out, d_ptr);
-                if (rc != 0)
-                    return rc;
-            }
+            if (delta_out)
+                col_rel_append_row(delta_out, d_ptr);
             d_ptr += nc;
             di++;
         }
@@ -2553,12 +2550,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     /* Remaining delta rows: all new */
     if (di < d_unique) {
         if (delta_out) {
-            for (uint32_t k = di; k < d_unique; k++) {
-                int rc = col_rel_append_row(delta_out,
-                                            delta_start + (size_t)k * nc);
-                if (rc != 0)
-                    return rc;
-            }
+            for (uint32_t k = di; k < d_unique; k++)
+                col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
         }
         uint32_t remaining = d_unique - di;
         memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
