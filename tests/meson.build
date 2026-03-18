@@ -1559,3 +1559,24 @@ test_simd_join_exe = executable(
 )
 
 test('simd_join', test_simd_join_exe)
+
+# ============================================================================
+# ARM NEON SIMD Hash and Key-Match Tests
+# ============================================================================
+
+test_simd_neon_exe = executable(
+  'test_simd_neon',
+  files('test_simd_neon.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('simd_neon', test_simd_neon_exe)
