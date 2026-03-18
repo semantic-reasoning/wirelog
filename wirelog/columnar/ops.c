@@ -1163,6 +1163,41 @@ hash_int64_keys(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
     return h;
 }
 
+#ifdef __ARM_NEON__
+/* Inline scalar hash for kc < 2: avoids function-call overhead on the hot
+ * single-key path (kc=1 accounts for ~98% of DOOP joins).  Identical
+ * algorithm to hash_int64_keys(); kept separate so the compiler can
+ * eliminate the loop entirely for kc=1 without affecting the non-inline
+ * path used on non-SIMD builds. */
+static inline uint32_t
+hash_int64_keys_scalar_inline(const int64_t *row, const uint32_t *key_cols,
+                              uint32_t kc)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < kc; i++) {
+        uint64_t v = (uint64_t)row[key_cols[i]];
+        h ^= (uint32_t)(v & 0xffffffff);
+        h *= 16777619u;
+        h ^= (uint32_t)(v >> 32);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Inline scalar key-match for kc < 2: avoids function-call overhead and
+ * correctly handles kc=0 (returns true -- cross product) via the loop. */
+static inline bool
+keys_match_scalar_inline(const int64_t *lrow, const uint32_t *lk,
+                         const int64_t *rrow, const uint32_t *rk, uint32_t kc)
+{
+    for (uint32_t k = 0; k < kc; k++) {
+        if (lrow[lk[k]] != rrow[rk[k]])
+            return false;
+    }
+    return true;
+}
+#endif /* __ARM_NEON__ */
+
 #if !defined(__AVX2__) && !defined(__ARM_NEON__)
 /* keys_match_scalar: scalar key equality check for JOIN probe.
  * Only compiled on non-AVX2, non-NEON builds where it is aliased by
@@ -1350,8 +1385,17 @@ keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
 #define hash_int64_keys_fast hash_int64_keys_avx2
 #define keys_match_fast keys_match_avx2
 #elif defined(__ARM_NEON__)
-#define hash_int64_keys_fast hash_int64_keys_neon
-#define keys_match_fast keys_match_neon
+/* For kc < 2 the NEON functions fall back to scalar anyway (no full SIMD
+ * lane to fill).  Bypass them via inline scalar helpers to eliminate the
+ * double function-call overhead on the hot kc=1 path (~98% of DOOP joins).
+ * keys_match_scalar_inline uses a loop so kc=0 (cross product) returns true
+ * correctly without out-of-bounds access. */
+#define hash_int64_keys_fast(row, key_cols, kc)                        \
+    ((kc) < 2 ? hash_int64_keys_scalar_inline((row), (key_cols), (kc)) \
+              : hash_int64_keys_neon((row), (key_cols), (kc)))
+#define keys_match_fast(lrow, lk, rrow, rk, kc)                            \
+    ((kc) < 2 ? keys_match_scalar_inline((lrow), (lk), (rrow), (rk), (kc)) \
+              : keys_match_neon((lrow), (lk), (rrow), (rk), (kc)))
 #else
 #define hash_int64_keys_fast hash_int64_keys
 #define keys_match_fast keys_match_scalar
