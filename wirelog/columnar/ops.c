@@ -11,6 +11,13 @@
 
 #define _GNU_SOURCE
 
+/* Minimum K to use parallel K-fusion dispatch.  For K below this threshold,
+ * thread-dispatch + per-worker setup overhead (arena alloc, delta pool,
+ * synchronization) exceeds the parallelisation benefit.
+ * Measured: DDISASM K=3 is 14% slower with 8-worker parallel than sequential.
+ * K < WL_KFUSION_MIN_PARALLEL_K falls back to sequential execution. */
+#define WL_KFUSION_MIN_PARALLEL_K 4
+
 #include "columnar/internal.h"
 #include "columnar/lftj.h"
 
@@ -2886,6 +2893,10 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
      * When num_workers=1 (wq==NULL), K copies are evaluated sequentially
      * below with no thread overhead. */
     wl_work_queue_t *wq = sess->wq; /* NULL when num_workers=1 */
+    /* Threshold: for small K, parallel dispatch costs more than it saves.
+     * Force sequential execution when K < WL_KFUSION_MIN_PARALLEL_K. */
+    if (wq && k < WL_KFUSION_MIN_PARALLEL_K)
+        wq = NULL;
 
     int rc = 0;
 
