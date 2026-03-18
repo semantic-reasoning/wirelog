@@ -1399,8 +1399,11 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                             join_rc);
                     break;
                 }
-                if (sess->join_output_limit > 0
-                    && out->nrows >= sess->join_output_limit) {
+                if ((sess->join_output_limit > 0
+                     && out->nrows >= sess->join_output_limit)
+                    || (out->nrows % 10000 == 0 && out->nrows > 0
+                        && wl_mem_ledger_should_backpressure(
+                            &sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 80))) {
                     fprintf(stderr,
                             "join output limit reached: %u rows "
                             "(limit=%llu)\n",
@@ -1415,13 +1418,16 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         free(ht_head);
         free(ht_next);
         if (join_rc != 0) {
-            free(tmp);
-            col_rel_destroy(out);
-            free(lk);
-            free(rk);
-            if (left_e.owned)
-                col_rel_destroy(left);
-            return join_rc;
+            if (join_rc != EOVERFLOW) {
+                free(tmp);
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (left_e.owned)
+                    col_rel_destroy(left);
+                return join_rc;
+            }
+            join_rc = 0; /* soft truncation: push partial result below */
         }
         fprintf(stderr, "DEBUG[JOIN]: Unary join completed, out->nrows=%u\n",
                 out->nrows);
@@ -1535,8 +1541,12 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                                     join_rc);
                             break;
                         }
-                        if (sess->join_output_limit > 0
-                            && out->nrows >= sess->join_output_limit) {
+                        if ((sess->join_output_limit > 0
+                             && out->nrows >= sess->join_output_limit)
+                            || (out->nrows % 10000 == 0 && out->nrows > 0
+                                && wl_mem_ledger_should_backpressure(
+                                    &sess->mem_ledger, WL_MEM_SUBSYS_RELATION,
+                                    80))) {
                             fprintf(
                                 stderr,
                                 "join output limit reached: %u rows "
@@ -1572,8 +1582,12 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                                 join_rc);
                         break;
                     }
-                    if (sess->join_output_limit > 0
-                        && out->nrows >= sess->join_output_limit) {
+                    if ((sess->join_output_limit > 0
+                         && out->nrows >= sess->join_output_limit)
+                        || (out->nrows % 10000 == 0 && out->nrows > 0
+                            && wl_mem_ledger_should_backpressure(
+                                &sess->mem_ledger, WL_MEM_SUBSYS_RELATION,
+                                80))) {
                         fprintf(stderr,
                                 "join output limit reached: %u rows "
                                 "(limit=%llu)\n",
@@ -1595,17 +1609,20 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         free(ht_head_ep);
         free(ht_next_ep);
         if (join_rc != 0) {
-            fprintf(
-                stderr,
-                "DEBUG[JOIN]: Merge-join failed with rc=%d, out->nrows=%u\n",
-                join_rc, out->nrows);
-            free(tmp);
-            col_rel_destroy(out);
-            free(lk);
-            free(rk);
-            if (left_e.owned)
-                col_rel_destroy(left);
-            return join_rc;
+            if (join_rc != EOVERFLOW) {
+                fprintf(stderr,
+                        "DEBUG[JOIN]: Merge-join failed with rc=%d, "
+                        "out->nrows=%u\n",
+                        join_rc, out->nrows);
+                free(tmp);
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (left_e.owned)
+                    col_rel_destroy(left);
+                return join_rc;
+            }
+            join_rc = 0; /* soft truncation: push partial result below */
         }
         fprintf(stderr, "DEBUG[JOIN]: Merge-join succeeded\n");
     }
