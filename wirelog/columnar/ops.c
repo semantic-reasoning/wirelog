@@ -1163,12 +1163,12 @@ hash_int64_keys(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
     return h;
 }
 
-#ifndef __AVX2__
+#if !defined(__AVX2__) && !defined(__ARM_NEON__)
 /* keys_match_scalar: scalar key equality check for JOIN probe.
- * Only compiled on non-AVX2 builds where it is aliased by keys_match_fast.
- * On AVX2 builds this function is replaced entirely by keys_match_avx2,
- * so it is excluded here to avoid unused-function warnings and MSVC
- * __attribute__ compatibility issues. */
+ * Only compiled on non-AVX2, non-NEON builds where it is aliased by
+ * keys_match_fast.  On AVX2/NEON builds this function is replaced entirely
+ * by keys_match_avx2/keys_match_neon, so it is excluded here to avoid
+ * unused-function warnings and MSVC __attribute__ compatibility issues. */
 static inline bool
 keys_match_scalar(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
                   const uint32_t *rk, uint32_t kc)
@@ -1179,7 +1179,7 @@ keys_match_scalar(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
     }
     return true;
 }
-#endif /* !__AVX2__ */
+#endif /* !__AVX2__ && !__ARM_NEON__ */
 
 #ifdef __AVX2__
 /*
@@ -1264,11 +1264,94 @@ keys_match_avx2(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
 }
 #endif /* __AVX2__ */
 
+#ifdef __ARM_NEON__
+/*
+ * hash_int64_keys_neon:
+ * NEON-accelerated hash for int64 key columns.
+ *
+ * For kc >= 2, loads key values two at a time into a 128-bit accumulator and
+ * XOR-reduces across lanes, then applies FNV-1a as a final 64->32-bit mix.
+ * Falls back to scalar FNV-1a for kc < 2 and for the tail.
+ *
+ * Both build and probe paths use the same dispatcher (hash_int64_keys_fast),
+ * so correctness is preserved even though output values differ from the
+ * scalar path for kc >= 2.
+ */
+static uint32_t
+hash_int64_keys_neon(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
+{
+    if (kc < 2)
+        return hash_int64_keys(row, key_cols, kc);
+
+    int64x2_t acc = vdupq_n_s64(0);
+    uint32_t k = 0;
+
+    for (; k + 2 <= kc; k += 2) {
+        int64x2_t v = vcombine_s64(vcreate_s64((uint64_t)row[key_cols[k]]),
+                                   vcreate_s64((uint64_t)row[key_cols[k + 1]]));
+        acc = veorq_s64(acc, v);
+    }
+
+    /* Horizontal XOR reduction: 2 x int64 lanes -> 1 uint64 */
+    uint64_t combined
+        = (uint64_t)vgetq_lane_s64(acc, 0) ^ (uint64_t)vgetq_lane_s64(acc, 1);
+
+    /* Scalar tail */
+    for (; k < kc; k++)
+        combined ^= (uint64_t)row[key_cols[k]];
+
+    /* FNV-1a final mix */
+    uint32_t h = 2166136261u;
+    h ^= (uint32_t)(combined & 0xffffffff);
+    h *= 16777619u;
+    h ^= (uint32_t)(combined >> 32);
+    h *= 16777619u;
+    return h;
+}
+
+/*
+ * keys_match_neon:
+ * NEON-accelerated key equality check for JOIN probe.
+ *
+ * Processes 2 key columns per SIMD iteration using vceqq_s64, with scalar
+ * fallback for the tail.  Returns true iff all kc keys match.
+ */
+static inline bool
+keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
+                const uint32_t *rk, uint32_t kc)
+{
+    uint32_t k = 0;
+
+    for (; k + 2 <= kc; k += 2) {
+        int64x2_t lv = vcombine_s64(vcreate_s64((uint64_t)lrow[lk[k]]),
+                                    vcreate_s64((uint64_t)lrow[lk[k + 1]]));
+        int64x2_t rv = vcombine_s64(vcreate_s64((uint64_t)rrow[rk[k]]),
+                                    vcreate_s64((uint64_t)rrow[rk[k + 1]]));
+        /* vceqq_s64 returns all-ones lanes for equal, zero for unequal */
+        uint64x2_t eq = vceqq_s64(lv, rv);
+        /* Both lanes must be all-ones (UINT64_MAX) for equality */
+        if (vgetq_lane_u64(eq, 0) != UINT64_MAX
+            || vgetq_lane_u64(eq, 1) != UINT64_MAX)
+            return false;
+    }
+
+    /* Scalar tail */
+    for (; k < kc; k++) {
+        if (lrow[lk[k]] != rrow[rk[k]])
+            return false;
+    }
+    return true;
+}
+#endif /* __ARM_NEON__ */
+
 /* Dispatcher: select best hash and key-match implementations at compile time.
- * Automatically uses AVX2 when available, otherwise scalar fallback. */
+ * Automatically uses AVX2 when available, NEON on ARM, otherwise scalar. */
 #ifdef __AVX2__
 #define hash_int64_keys_fast hash_int64_keys_avx2
 #define keys_match_fast keys_match_avx2
+#elif defined(__ARM_NEON__)
+#define hash_int64_keys_fast hash_int64_keys_neon
+#define keys_match_fast keys_match_neon
 #else
 #define hash_int64_keys_fast hash_int64_keys
 #define keys_match_fast keys_match_scalar
