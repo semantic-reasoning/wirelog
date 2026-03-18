@@ -14,8 +14,6 @@
 #include "../wirelog-internal.h"
 
 #include <errno.h>
-#include <stdatomic.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -349,26 +347,6 @@ col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
 {
     if (!cs || !rel_name || !delta_rel || !key_cols || key_count == 0)
         return NULL;
-
-    /* Arrangement eviction backpressure (Issue #224, Step 4):
-     * When total memory > 70% of budget, free all delta arrangements
-     * (they will be rebuilt on demand). Uses total pressure since
-     * ARRANGEMENT subsystem bytes are not individually tracked yet. */
-    if (cs->ledger.total_budget > 0 && cs->darr_count > 0) {
-        uint64_t cur = atomic_load_explicit(&cs->ledger.current_bytes,
-                                            memory_order_relaxed);
-        uint64_t budget = atomic_load_explicit(&cs->ledger.total_budget,
-                                               memory_order_relaxed);
-        if (cur * 100 > budget * 70) {
-            const char *mem_report_env = getenv("WL_MEM_REPORT");
-            if (mem_report_env && mem_report_env[0] == '1')
-                fprintf(stderr,
-                        "[wirelog mem] ARRANGEMENT backpressure: evicting "
-                        "%u delta arrangements\n",
-                        cs->darr_count);
-            col_session_free_delta_arrangements(cs);
-        }
-    }
 
     /* Search existing cache entries. */
     for (uint32_t i = 0; i < cs->darr_count; i++) {
