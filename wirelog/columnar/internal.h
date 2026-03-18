@@ -149,6 +149,11 @@ typedef struct {
      * true  = struct was allocated from delta_pool; do not free() the struct.
      * false = struct was heap-allocated via calloc(); free() on destroy. */
     bool pool_owned;
+    /* Memory ledger reference (Issue #224): when non-NULL, data buffer
+     * growth/free events are reported to this ledger under
+     * WL_MEM_SUBSYS_RELATION.  Set by operators that produce output
+     * relations (e.g. col_op_join).  NULL for EDB and pool temporaries. */
+    wl_mem_ledger_t *mem_ledger;
 } col_rel_t;
 
 /**

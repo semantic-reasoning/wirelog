@@ -1286,6 +1286,21 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             col_rel_destroy(left);
         return ENOMEM;
     }
+    /* Attach ledger so row growth is tracked under RELATION subsystem */
+    out->mem_ledger = &sess->mem_ledger;
+
+    /* Backpressure check (Issue #224): when RELATION subsystem reaches >= 80%
+     * of its budget, skip row generation and push an empty result instead of
+     * risking EOVERFLOW (rc=84).  Evaluation continues with gracefully
+     * degraded (incomplete) results rather than failing entirely. */
+    if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
+                                          WL_MEM_SUBSYS_RELATION, 80)) {
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return eval_stack_push(stack, out, true);
+    }
 
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {

@@ -25,6 +25,10 @@ col_rel_free_contents(col_rel_t *r)
 {
     if (!r)
         return;
+    /* Report data buffer deallocation to ledger before memset zeroes fields */
+    if (r->mem_ledger && r->data && r->capacity > 0 && r->ncols > 0)
+        wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
+                           (uint64_t)r->capacity * r->ncols * sizeof(int64_t));
     free(r->name);
     free(r->data);
     free(r->merge_buf);
@@ -160,6 +164,13 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
         if (!nd)
             return ENOMEM;
         r->data = nd;
+        /* Track capacity growth in ledger (Issue #224): only the delta bytes
+         * added by this growth event.  r->capacity is still the old value. */
+        if (r->mem_ledger && r->ncols > 0) {
+            uint64_t delta = (uint64_t)(new_cap - r->capacity) * r->ncols
+                             * sizeof(int64_t);
+            wl_mem_ledger_alloc(r->mem_ledger, WL_MEM_SUBSYS_RELATION, delta);
+        }
         r->capacity = new_cap;
     }
     if (r->timestamps)
