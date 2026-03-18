@@ -18,6 +18,7 @@
 
 #include "columnar/columnar_nanoarrow.h"
 #include "columnar/delta_pool.h"
+#include "columnar/mem_ledger.h"
 #include "session.h"
 #include "workqueue.h"
 #include "arena/arena.h"
@@ -397,6 +398,11 @@ typedef struct {
 #ifdef WL_PROFILE
     wl_profile_stats_t profile; /* operator profiling counters */
 #endif
+    /* Memory accounting ledger (Issue #224): thread-safe per-subsystem tracking.
+     * Embedded (not a pointer) so that the session owns the ledger lifetime.
+     * Initialized in col_session_create via wl_mem_ledger_init().
+     * Accessible to all columnar code via &COL_SESSION(sess)->mem_ledger. */
+    wl_mem_ledger_t mem_ledger;
 } wl_col_session_t;
 
 /*

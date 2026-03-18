@@ -125,19 +125,32 @@ wl_mem_ledger_free(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes)
     if (subsys < 0 || subsys >= WL_MEM_SUBSYS_COUNT)
         return;
 
-    /* Clamp-subtract subsystem: avoid wrapping below zero */
-    uint64_t old_s = atomic_load_explicit(&ledger->subsys_bytes[subsys],
-                                          memory_order_relaxed);
-    uint64_t sub_s = (bytes > old_s) ? old_s : bytes;
-    atomic_fetch_sub_explicit(&ledger->subsys_bytes[subsys], sub_s,
-                              memory_order_relaxed);
+    /* Clamp-subtract subsystem with CAS loop: avoids TOCTOU race between
+     * load and subtract under concurrent K-fusion worker teardown.
+     * Without CAS, two concurrent frees could both read the same old_s,
+     * both decide sub_s = bytes, and both subtract, causing underflow. */
+    {
+        uint64_t old_s = atomic_load_explicit(&ledger->subsys_bytes[subsys],
+                                              memory_order_relaxed);
+        uint64_t new_s;
+        do {
+            new_s = (bytes > old_s) ? 0 : old_s - bytes;
+        } while (!atomic_compare_exchange_weak_explicit(
+            &ledger->subsys_bytes[subsys], &old_s, new_s, memory_order_relaxed,
+            memory_order_relaxed));
+    }
 
-    /* Clamp-subtract total */
-    uint64_t old_t
-        = atomic_load_explicit(&ledger->current_bytes, memory_order_relaxed);
-    uint64_t sub_t = (bytes > old_t) ? old_t : bytes;
-    atomic_fetch_sub_explicit(&ledger->current_bytes, sub_t,
-                              memory_order_relaxed);
+    /* Clamp-subtract total with CAS loop (same race fix) */
+    {
+        uint64_t old_t = atomic_load_explicit(&ledger->current_bytes,
+                                              memory_order_relaxed);
+        uint64_t new_t;
+        do {
+            new_t = (bytes > old_t) ? 0 : old_t - bytes;
+        } while (!atomic_compare_exchange_weak_explicit(
+            &ledger->current_bytes, &old_t, new_t, memory_order_relaxed,
+            memory_order_relaxed));
+    }
 }
 
 bool

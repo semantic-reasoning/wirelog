@@ -363,6 +363,27 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         /* Non-fatal: pool allocation failed, fall back to malloc */
     }
 
+    /* Issue #224: Initialize memory accounting ledger.
+     * Budget: 75% of physical RAM, or from WIRELOG_MEMORY_BUDGET env var.
+     * 0 = unlimited (when physical memory detection fails). */
+    {
+        uint64_t budget = 0;
+        const char *budget_env = getenv("WIRELOG_MEMORY_BUDGET");
+        if (budget_env && budget_env[0] != '\0') {
+            char *endp = NULL;
+            errno = 0;
+            uint64_t val = strtoull(budget_env, &endp, 10);
+            if (endp != budget_env && *endp == '\0' && errno != ERANGE)
+                budget = val;
+        }
+        if (budget == 0) {
+            uint64_t phys = col_detect_physical_memory();
+            if (phys > 0)
+                budget = (phys / 4ULL) * 3ULL; /* 75% of RAM */
+        }
+        wl_mem_ledger_init(&sess->mem_ledger, budget);
+    }
+
     /* Issue #176: Configure per-iteration cache eviction threshold.
      * Default: 80% of COL_MAT_CACHE_LIMIT_BYTES (cache evicts when exceeding
      * this threshold). Users can override via environment variable or API.
