@@ -12,7 +12,9 @@
 
 #include "columnar/mem_ledger.h"
 
+#ifndef _MSC_VER
 #include <stdatomic.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 
