@@ -71,11 +71,6 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
         sess->rels = nr;
         sess->rel_cap = nc;
     }
-    /* Thread ledger pointer into newly registered relation (Issue #224).
-     * Only assigned once here; not re-assigned on re-promotion so that
-     * temporary pool-owned copies do not accidentally alias the ledger. */
-    if (r->ledger == NULL)
-        r->ledger = &sess->ledger;
     sess->rels[sess->nrels++] = r;
     return 0;
 }
@@ -273,39 +268,6 @@ col_detect_physical_memory(void)
 }
 
 /*
- * col_parse_budget_bytes: Parse WIRELOG_MEMORY_BUDGET string (Issue #224).
- *
- * Accepts:
- *   "48G" or "48GB"  -> 48 * 1024^3
- *   "512M" or "512MB" -> 512 * 1024^2
- *   "1073741824"      -> raw bytes
- *
- * Returns 0 on parse failure (unlimited budget).
- */
-static uint64_t
-col_parse_budget_bytes(const char *s)
-{
-    if (!s || s[0] == '\0')
-        return 0;
-    char *end = NULL;
-    errno = 0;
-    uint64_t val = strtoull(s, &end, 10);
-    if (end == s || errno == ERANGE)
-        return 0;
-    /* Skip optional space */
-    while (*end == ' ')
-        end++;
-    if (*end == 'G' || *end == 'g')
-        val *= (uint64_t)1024 * 1024 * 1024;
-    else if (*end == 'M' || *end == 'm')
-        val *= (uint64_t)1024 * 1024;
-    else if (*end == 'K' || *end == 'k')
-        val *= (uint64_t)1024;
-    /* else raw bytes or trailing "B"/"b" — use val as-is */
-    return val;
-}
-
-/*
  * col_session_create: Initialize a columnar backend session
  *
  * Implements wl_compute_backend_t.session_create vtable slot.
@@ -392,23 +354,6 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         }
     }
 
-    /* Initialize memory ledger (Issue #224).
-     * Must happen before any wl_mem_ledger_alloc calls below.
-     * Budget: WIRELOG_MEMORY_BUDGET env var if set, else 75% of physical RAM. */
-    {
-        uint64_t budget = 0;
-        const char *budget_env = getenv("WIRELOG_MEMORY_BUDGET");
-        if (budget_env && budget_env[0] != '\0')
-            budget = col_parse_budget_bytes(budget_env);
-        if (budget == 0) {
-            uint64_t phys = col_detect_physical_memory();
-            if (phys > 0)
-                budget = (phys * 3) / 4; /* 75% of RAM */
-        }
-        wl_mem_ledger_init(&sess->ledger, budget);
-        sess->mat_cache.ledger = &sess->ledger;
-    }
-
     /* Create delta pool for per-iteration temporaries.
      * Slab: 256 relations (cover ~20 rules x 5 ops + headroom)
      * Arena: 64MB initial (for row data buffers) */
@@ -416,12 +361,6 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         = delta_pool_create(256, sizeof(col_rel_t), 64 * 1024 * 1024);
     if (!sess->delta_pool) {
         /* Non-fatal: pool allocation failed, fall back to malloc */
-    } else {
-        /* Track pool allocation under ARENA subsystem (Issue #224) */
-        uint64_t pool_bytes
-            = sess->delta_pool->slot_cap * sess->delta_pool->slot_size
-              + sess->delta_pool->arena_cap;
-        wl_mem_ledger_alloc(&sess->ledger, WL_MEM_SUBSYS_ARENA, pool_bytes);
     }
 
     /* Issue #176: Configure per-iteration cache eviction threshold.
@@ -505,18 +444,7 @@ col_session_destroy(wl_session_t *session)
     free(sess->arr_entries);
     col_session_free_delta_arrangements(sess);
     col_session_free_sorted_arrangements(sess);
-    /* Track delta pool free before destroying (Issue #224) */
-    if (sess->delta_pool) {
-        uint64_t pool_bytes
-            = sess->delta_pool->slot_cap * sess->delta_pool->slot_size
-              + sess->delta_pool->arena_cap;
-        wl_mem_ledger_free(&sess->ledger, WL_MEM_SUBSYS_ARENA, pool_bytes);
-    }
     delta_pool_destroy(sess->delta_pool);
-    /* Print memory report on destroy when WL_MEM_REPORT=1 (Issue #224) */
-    const char *mem_report_env = getenv("WL_MEM_REPORT");
-    if (mem_report_env && mem_report_env[0] == '1')
-        wl_mem_ledger_report(&sess->ledger);
     free(sess);
 }
 

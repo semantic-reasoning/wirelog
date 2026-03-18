@@ -18,7 +18,6 @@
 
 #include "columnar/columnar_nanoarrow.h"
 #include "columnar/delta_pool.h"
-#include "columnar/mem_ledger.h"
 #include "session.h"
 #include "workqueue.h"
 #include "arena/arena.h"
@@ -149,11 +148,6 @@ typedef struct {
      * true  = struct was allocated from delta_pool; do not free() the struct.
      * false = struct was heap-allocated via calloc(); free() on destroy. */
     bool pool_owned;
-    /* Memory ledger (Issue #224): borrowed pointer to session ledger.
-     * NULL for temporary/pool-owned relations not registered with a session.
-     * When non-NULL, all data/timestamp/merge_buf allocations are tracked
-     * under WL_MEM_SUBSYS_RELATION and WL_MEM_SUBSYS_TIMESTAMP. */
-    wl_mem_ledger_t *ledger;
 } col_rel_t;
 
 /**
@@ -194,9 +188,8 @@ typedef struct {
     uint32_t count;
     size_t total_bytes;
     uint64_t clock;
-    uint64_t hits;           /* cache hit counter                           */
-    uint64_t misses;         /* cache miss counter                          */
-    wl_mem_ledger_t *ledger; /* borrowed from session; NULL if unset        */
+    uint64_t hits;   /* cache hit counter  */
+    uint64_t misses; /* cache miss counter */
 } col_mat_cache_t;
 
 /* ======================================================================== */
@@ -392,16 +385,6 @@ typedef struct {
      * $r$<name> relations. Cleared after eval completes. */
     bool retraction_seeded;
     delta_pool_t *delta_pool; /* Pool allocator for operator temporaries */
-    /* Memory ledger (Issue #224): session-lifetime accounting for all
-     * subsystems (relation, arena, cache, arrangement, timestamp).
-     * Embedded by value; initialised in col_session_create with the
-     * physical-RAM-derived budget.  Zero-budget = unlimited. */
-    wl_mem_ledger_t ledger;
-    /* Timestamp backpressure (Issue #224, Step 4):
-     * When true, timestamp allocation in col_eval_stratum is skipped to
-     * free memory pressure. Set automatically when the RELATION subsystem
-     * exceeds 90% of its budget cap. Cleared by col_session_create. */
-    bool disable_timestamps;
     /* Sorted arrangement cache (Issue #195): per-key-column sorted copies of
      * EDB relations for leapfrog triejoin (WL_PLAN_OP_LFTJ).  Unlike hash
      * arrangements, these are sorted by a single key column and reused across

@@ -25,23 +25,6 @@ col_rel_free_contents(col_rel_t *r)
 {
     if (!r)
         return;
-    /* Track freed relation memory before zeroing the struct (Issue #224).
-     * Capacity-based accounting mirrors the alloc sites in col_rel_set_schema
-     * and col_rel_append_row. merge_buf is tracked separately. */
-    if (r->ledger) {
-        if (r->data && r->capacity > 0 && r->ncols > 0)
-            wl_mem_ledger_free(r->ledger, WL_MEM_SUBSYS_RELATION,
-                               (uint64_t)r->capacity * r->ncols
-                                   * sizeof(int64_t));
-        if (r->timestamps && r->capacity > 0)
-            wl_mem_ledger_free(r->ledger, WL_MEM_SUBSYS_TIMESTAMP,
-                               (uint64_t)r->capacity
-                                   * sizeof(col_delta_timestamp_t));
-        if (r->merge_buf && r->merge_buf_cap > 0 && r->ncols > 0)
-            wl_mem_ledger_free(r->ledger, WL_MEM_SUBSYS_RELATION,
-                               (uint64_t)r->merge_buf_cap * r->ncols
-                                   * sizeof(int64_t));
-    }
     free(r->name);
     free(r->data);
     free(r->merge_buf);
@@ -118,10 +101,6 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
                 return ENOMEM;
             }
         }
-        /* Track initial data allocation under RELATION subsystem (Issue #224) */
-        if (r->ledger)
-            wl_mem_ledger_alloc(r->ledger, WL_MEM_SUBSYS_RELATION,
-                                sizeof(int64_t) * r->capacity * ncols);
     }
 
     /* Arrow schema: struct<col0:i64, col1:i64, ...> */
@@ -164,26 +143,9 @@ int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
     if (r->nrows >= r->capacity) {
-        uint32_t old_cap = r->capacity;
-        uint32_t new_cap = old_cap ? old_cap * 2 : COL_REL_INIT_CAP;
-        if (new_cap <= old_cap) /* overflow guard */
+        uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
+        if (new_cap <= r->capacity) /* overflow guard */
             return ENOMEM;
-        /* Budget check before realloc (Issue #224).
-         * Compute the incremental bytes and reject if over budget. */
-        if (r->ledger && r->ncols > 0) {
-            uint64_t delta_bytes
-                = (uint64_t)(new_cap - old_cap) * r->ncols * sizeof(int64_t);
-            uint64_t budget = atomic_load_explicit(&r->ledger->total_budget,
-                                                   memory_order_relaxed);
-            if (budget > 0) {
-                uint64_t cur = atomic_load_explicit(&r->ledger->current_bytes,
-                                                    memory_order_relaxed);
-                if (cur + delta_bytes > budget) {
-                    wl_mem_ledger_report(r->ledger);
-                    return ENOMEM;
-                }
-            }
-        }
         /* Grow timestamps first (if tracking) so we can roll back cleanly
          * on a subsequent data realloc failure. */
         if (r->timestamps) {
@@ -199,13 +161,6 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
             return ENOMEM;
         r->data = nd;
         r->capacity = new_cap;
-        /* Record the grown allocation under RELATION subsystem (Issue #224).
-         * Batch accounting: only at realloc boundaries (O(log N) overhead). */
-        if (r->ledger && r->ncols > 0) {
-            uint64_t delta_bytes
-                = (uint64_t)(new_cap - old_cap) * r->ncols * sizeof(int64_t);
-            wl_mem_ledger_alloc(r->ledger, WL_MEM_SUBSYS_RELATION, delta_bytes);
-        }
     }
     if (r->timestamps)
         memset(&r->timestamps[r->nrows], 0, sizeof(col_delta_timestamp_t));
@@ -276,7 +231,6 @@ col_rel_compact(col_rel_t *r)
         goto free_merge_buf;
 
     {
-        uint32_t old_cap = r->capacity;
         uint32_t tight = r->nrows * 2;
         if (tight < r->nrows) /* overflow guard */
             tight = UINT32_MAX;
@@ -289,12 +243,6 @@ col_rel_compact(col_rel_t *r)
             goto free_merge_buf; /* data shrink failed; skip timestamps too */
         r->data = nd;
         r->capacity = tight;
-        /* Record freed bytes from compaction (Issue #224) */
-        if (r->ledger && r->ncols > 0 && old_cap > tight) {
-            uint64_t freed
-                = (uint64_t)(old_cap - tight) * r->ncols * sizeof(int64_t);
-            wl_mem_ledger_free(r->ledger, WL_MEM_SUBSYS_RELATION, freed);
-        }
 
         /* Shrink timestamps to match new capacity (non-fatal on failure). */
         if (r->timestamps) {
@@ -307,11 +255,6 @@ col_rel_compact(col_rel_t *r)
     }
 
 free_merge_buf:
-    /* Track merge_buf free (Issue #224) */
-    if (r->ledger && r->merge_buf && r->merge_buf_cap > 0 && r->ncols > 0)
-        wl_mem_ledger_free(r->ledger, WL_MEM_SUBSYS_RELATION,
-                           (uint64_t)r->merge_buf_cap * r->ncols
-                               * sizeof(int64_t));
     free(r->merge_buf);
     r->merge_buf = NULL;
     r->merge_buf_cap = 0;
