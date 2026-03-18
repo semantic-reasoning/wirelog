@@ -991,18 +991,10 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
             col_rel_t *delta = col_rel_new_auto(dname, r->ncols);
             if (!delta)
                 continue; /* best-effort; falls back to full eval */
-            bool append_ok = true;
             for (uint32_t row = 0; row < delta_nrows; row++) {
-                int rc = col_rel_append_row(
+                col_rel_append_row(
                     delta, r->data + (size_t)(r->base_nrows + row) * r->ncols);
-                if (rc != 0) {
-                    col_rel_destroy(delta);
-                    append_ok = false;
-                    break;
-                }
             }
-            if (!append_ok)
-                continue; /* best-effort; falls back to full eval */
             session_remove_rel(sess, dname);
             session_add_rel(sess, delta);
         }
