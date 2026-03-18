@@ -342,374 +342,406 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
     uint32_t iter;
     col_frontier_t strat_frontier = { 0, 0 };
+    uint32_t final_eff_iter = 0; /* effective sub-pass index at convergence */
+
+    /*
+     * Stride-based semi-naive iteration (Issue #237).
+     * Each outer iteration runs EVAL_STRIDE sub-passes, chaining the delta
+     * from each sub-pass into the next.  Effective recursion depth covered:
+     *   MAX_ITERATIONS * EVAL_STRIDE = 4096 * 8 = 32768
+     * This allows deep-chain workloads (e.g. CRDT) to converge where they
+     * previously hit the MAX_ITERATIONS cap and produced incomplete results.
+     *
+     * When EVAL_STRIDE == 1 the behaviour is identical to the prior single-
+     * pass loop.
+     */
     for (iter = 0; iter < MAX_ITERATIONS; iter++) {
-        /* Publish current iteration so operators can distinguish base case
-         * (iter 0: FORCE_DELTA falls back to full) from delta case
-         * (iter > 0: FORCE_DELTA with absent delta → empty result). */
-        sess->current_iteration = iter;
+        bool outer_any_new = false; /* any sub-pass produced new tuples  */
+        int outer_rc = 0;           /* error propagated from inner loop  */
+        bool stride_all_skipped
+            = true; /* true until a sub-pass actually runs */
+        bool outer_continue_next
+            = false;            /* net-zero/all-empty: retry next outer */
+        bool converged = false; /* fixed point reached                */
 
-        /* Iteration skip based on frontier (convergence point of prior evaluation).
-         *
-         * Skip if both conditions hold:
-         * 1. Same outer_epoch: frontier is valid for this insertion epoch
-         * 2. Beyond convergence: iter > frontier.iteration
-         *
-         * Epoch check prevents skipping stale frontiers when base facts are inserted.
-         * Base fact insertion affects all strata, causing frontier reset to UINT32_MAX,
-         * which makes the skip ineffective (iter > UINT32_MAX is always false).
-         * Skip is beneficial only for derived-fact insertions (30-40% speedup). */
-        if (stratum_idx < MAX_STRATA) {
-            bool same_epoch = (sess->outer_epoch
-                               == sess->frontiers[stratum_idx].outer_epoch);
-            bool beyond_convergence
-                = (iter > sess->frontiers[stratum_idx].iteration);
-            if (same_epoch && beyond_convergence) {
-                continue; /* Skip: already processed at this iter in same epoch */
-            }
-        }
-
-        /* Clear per-iteration delta arrangement cache (sequential eval path).
-         * K-fusion workers manage their own darr caches independently. */
-        col_session_free_delta_arrangements(sess);
-
-        /* Register delta relations from previous iteration into session */
-        for (uint32_t ri = 0; ri < nrels; ri++) {
-            if (!delta_rels[ri])
-                continue;
-            char dname[256];
-            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
-            session_remove_rel(sess, dname);
-            int rc = session_add_rel(sess, delta_rels[ri]);
-            if (rc != 0)
-                col_rel_destroy(delta_rels[ri]);
-            delta_rels[ri] = NULL; /* session now owns it */
-        }
-
-        /* Record per-relation row counts (O(1) snapshot — no data copy). */
+        /* Allocate snap once per outer stride; re-filled at the start of each
+         * sub-pass since nrows grows as new tuples are appended. */
         uint32_t *snap = (uint32_t *)malloc(nrels * sizeof(uint32_t));
         if (!snap) {
             free(delta_rels);
             return ENOMEM;
         }
-        for (uint32_t ri = 0; ri < nrels; ri++) {
-            col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            snap[ri] = r ? r->nrows : 0; /* O(1) count only, no copy */
-        }
 
-        /* Phase 3D: Frontier skip with multiplicities (US-3D-002)
-         * Skip iteration if all delta relations have zero net multiplicity.
-         * This optimizes away iterations where no new facts can be derived.
-         * Condition: sum of all multiplicities in all delta relations == 0. */
-        if (iter > 0) { /* Only skip from iteration 1 onward */
-            bool all_deltas_net_zero = true;
+        /* ------------------------------------------------------------------ */
+        /* Inner sub-pass loop: EVAL_STRIDE semi-naive passes per outer iter.  */
+        /* ------------------------------------------------------------------ */
+        for (uint32_t sub = 0; sub < EVAL_STRIDE; sub++) {
+            uint32_t eff_iter = iter * EVAL_STRIDE + sub;
+
+            /* Publish effective iteration so operators can distinguish base case
+             * (eff_iter 0: FORCE_DELTA falls back to full) from delta case
+             * (eff_iter > 0: FORCE_DELTA with absent delta → empty result). */
+            sess->current_iteration = eff_iter;
+
+            /* Iteration skip based on frontier (convergence point of prior
+             * evaluation).  Skip sub-pass when both hold:
+             * 1. Same outer_epoch — frontier is valid for this insertion epoch
+             * 2. eff_iter > frontier.iteration — already processed in this epoch
+             * Once eff_iter exceeds the frontier for sub=0, it also exceeds for
+             * all higher sub values, so the entire outer iteration effectively
+             * continues to the next one. */
+            if (stratum_idx < MAX_STRATA) {
+                bool same_epoch = (sess->outer_epoch
+                                   == sess->frontiers[stratum_idx].outer_epoch);
+                bool beyond_convergence
+                    = (eff_iter > sess->frontiers[stratum_idx].iteration);
+                if (same_epoch && beyond_convergence) {
+                    continue; /* skip this sub-pass */
+                }
+            }
+
+            stride_all_skipped = false; /* at least one sub-pass runs */
+
+            /* Clear per-sub-pass delta arrangement cache (sequential eval path).
+             * K-fusion workers manage their own darr caches independently. */
+            col_session_free_delta_arrangements(sess);
+
+            /* Register delta relations from previous sub-pass into session */
+            for (uint32_t ri = 0; ri < nrels; ri++) {
+                if (!delta_rels[ri])
+                    continue;
+                char dname[256];
+                snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+                session_remove_rel(sess, dname);
+                int rc = session_add_rel(sess, delta_rels[ri]);
+                if (rc != 0)
+                    col_rel_destroy(delta_rels[ri]);
+                delta_rels[ri] = NULL; /* session now owns it */
+            }
+
+            /* Record per-relation row counts (O(1) snapshot — no data copy).
+             * Re-filled each sub-pass because nrows changes after each pass. */
+            for (uint32_t ri = 0; ri < nrels; ri++) {
+                col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+                snap[ri] = r ? r->nrows : 0; /* O(1) count only, no copy */
+            }
+
+            /* Phase 3D: Frontier skip with multiplicities (US-3D-002).
+             * Skip sub-pass if all delta relations have zero net multiplicity.
+             * When detected, retry with the next outer iteration (same as the
+             * prior single-pass behaviour). */
+            if (eff_iter
+                > 0) { /* only skip from effective iteration 1 onward */
+                bool all_deltas_net_zero = true;
+                for (uint32_t ri = 0; ri < nrels; ri++) {
+                    char dname[256];
+                    snprintf(dname, sizeof(dname), "$d$%s",
+                             sp->relations[ri].name);
+                    col_rel_t *delta = session_find_rel(sess, dname);
+                    if (!delta || delta->nrows == 0) {
+                        /* Empty delta: net multiplicity is zero */
+                        continue;
+                    }
+                    /* Compute net multiplicity for this delta relation */
+                    int64_t net_mult = 0;
+                    for (uint32_t row = 0; row < delta->nrows; row++) {
+                        net_mult += delta->timestamps[row].multiplicity;
+                    }
+                    if (net_mult != 0) {
+                        all_deltas_net_zero = false;
+                        break;
+                    }
+                }
+                if (all_deltas_net_zero) {
+                    /* All deltas zero net-multiplicity: skip to next outer iter */
+                    outer_continue_next = true;
+                    break;
+                }
+            }
+
+            /* Stratum-level early exit: if all rules have empty forced deltas,
+             * the sub-pass will produce no new facts. (Issue #81) */
+            if (eff_iter > 0) {
+                bool all_rules_empty = true;
+                for (uint32_t ri = 0; ri < nrels; ri++) {
+                    if (!has_empty_forced_delta(&sp->relations[ri], sess,
+                                                eff_iter)) {
+                        all_rules_empty = false;
+                        break;
+                    }
+                }
+                if (all_rules_empty) {
+                    outer_continue_next = true;
+                    break;
+                }
+            }
+
+            /* Single-pass semi-naive evaluation. VARIABLE prefers delta when it
+             * is a strict subset of full (genuine new facts). JOIN propagates
+             * the is_delta flag through results and applies right-delta when
+             * left is full and a strictly-smaller right delta exists. */
+            for (uint32_t ri = 0; ri < nrels; ri++) {
+                const wl_plan_relation_t *rp = &sp->relations[ri];
+
+                /* Issue #106 (US-106-003): Rule-level frontier skip with epoch
+                 * gating.  Skip rule evaluation only when BOTH hold:
+                 * 1. Same outer_epoch (prevents cross-epoch incorrect skips)
+                 * 2. eff_iter > convergence point (already processed in epoch)
+                 * Across epoch boundaries mismatch => always re-eval. */
+                uint32_t rule_id = rule_id_base + ri;
+                if (rule_id < MAX_RULES
+                    && sess->rule_frontiers[rule_id].outer_epoch
+                           == sess->outer_epoch
+                    && eff_iter > sess->rule_frontiers[rule_id].iteration) {
+                    continue;
+                }
+
+                /* Pre-scan skip: if a FORCE_DELTA op references an empty or
+                 * absent delta (eff_iter > 0), the plan produces 0 rows. */
+                if (has_empty_forced_delta(rp, sess, eff_iter)) {
+                    continue;
+                }
+
+                eval_stack_t stack;
+                eval_stack_init(&stack);
+
+                int rc = col_eval_relation_plan(rp, &stack, sess);
+                if (rc != 0) {
+                    eval_stack_drain(&stack);
+                    outer_rc = rc;
+                    goto stride_error;
+                }
+
+                if (stack.top == 0)
+                    continue;
+
+                eval_entry_t result = eval_stack_pop(&stack);
+                eval_stack_drain(&stack);
+
+                /* Post-eval skip: evaluation produced 0 rows — safety net for
+                 * cases not caught by pre-scan (e.g. filters eliminating all
+                 * rows). */
+                if (result.rel && result.rel->nrows == 0) {
+                    if (result.owned)
+                        col_rel_destroy(result.rel);
+                    continue;
+                }
+
+                col_rel_t *target = session_find_rel(sess, rp->name);
+                if (!target) {
+                    col_rel_t *copy;
+                    if (result.owned) {
+                        copy = result.rel;
+                        free(copy->name);
+                        copy->name = wl_strdup(rp->name);
+                        if (!copy->name) {
+                            col_rel_destroy(copy);
+                            outer_rc = ENOMEM;
+                            goto stride_error;
+                        }
+                        result.owned = false;
+                    } else {
+                        copy = col_rel_new_like(rp->name, result.rel);
+                        if (!copy) {
+                            outer_rc = ENOMEM;
+                            goto stride_error;
+                        }
+                        if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
+                            col_rel_destroy(copy);
+                            outer_rc = rc;
+                            goto stride_error;
+                        }
+                    }
+                    rc = session_add_rel(sess, copy);
+                    if (rc != 0) {
+                        col_rel_destroy(copy);
+                        outer_rc = rc;
+                        goto stride_error;
+                    }
+                } else {
+                    /* Adopt schema from result if target is still uninitialised */
+                    if (target->ncols == 0 && result.rel->ncols > 0) {
+                        rc = col_rel_set_schema(
+                            target, result.rel->ncols,
+                            (const char *const *)result.rel->col_names);
+                        if (rc != 0) {
+                            if (result.owned)
+                                col_rel_destroy(result.rel);
+                            outer_rc = rc;
+                            goto stride_error;
+                        }
+                    }
+                    rc = col_rel_append_all(target, result.rel);
+                    if (result.owned)
+                        col_rel_destroy(result.rel);
+                    if (rc != 0) {
+                        outer_rc = rc;
+                        goto stride_error;
+                    }
+                }
+            }
+
+            /* Remove delta relations from session (evaluation is complete) */
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 char dname[256];
                 snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
-                col_rel_t *delta = session_find_rel(sess, dname);
-                if (!delta || delta->nrows == 0) {
-                    /* Empty delta: net multiplicity is zero */
-                    continue;
-                }
-                /* Compute net multiplicity for this delta relation */
-                int64_t net_mult = 0;
-                for (uint32_t row = 0; row < delta->nrows; row++) {
-                    net_mult += delta->timestamps[row].multiplicity;
-                }
-                if (net_mult != 0) {
-                    all_deltas_net_zero = false;
-                    break;
-                }
+                session_remove_rel(sess, dname);
             }
-            if (all_deltas_net_zero) {
-                /* All deltas have zero net multiplicity: skip evaluation */
-                free(snap);
-                continue;
-            }
-        }
 
-        /* Stratum-level early exit: if all rules have empty forced deltas,
-         * the iteration will produce no new facts. Skip it. (Issue #81) */
-        if (iter > 0) {
-            bool all_rules_empty = true;
+            /* Phase 4: Frontier is computed incrementally as deltas are created
+             * because delta_rels[ri] may be set to NULL in the next sub-pass's
+             * registration loop.  strat_frontier declared before outer loop. */
+
+            /* Consolidate all IDB relations to remove duplicates and compute
+             * delta as a byproduct.  snap[ri] marks the boundary between the
+             * already-sorted prefix and unsorted new rows appended this pass. */
+            bool any_new = false;
             for (uint32_t ri = 0; ri < nrels; ri++) {
-                if (!has_empty_forced_delta(&sp->relations[ri], sess, iter)) {
-                    all_rules_empty = false;
-                    break;
+                col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+                if (!r || snap[ri] >= r->nrows) {
+                    continue; /* no new rows for this relation */
                 }
-            }
-            if (all_rules_empty) {
-                free(snap);
-                continue;
-            }
-        }
 
-        /* Single-pass semi-naive evaluation. VARIABLE prefers delta when it
-         * is a strict subset of full (genuine new facts). JOIN propagates
-         * the is_delta flag through results and applies right-delta when
-         * left is full and a strictly-smaller right delta exists. */
-        for (uint32_t ri = 0; ri < nrels; ri++) {
-            const wl_plan_relation_t *rp = &sp->relations[ri];
-
-            /* Issue #106 (US-106-003): Rule-level frontier skip with epoch gating.
-             * Skip rule evaluation only when BOTH conditions hold:
-             * 1. Same outer_epoch (prevents cross-epoch incorrect skips)
-             * 2. Iteration > convergence point (rule already processed in this epoch)
-             * Across epoch boundaries, outer_epoch mismatch => skip condition false => re-eval. */
-            uint32_t rule_id = rule_id_base + ri;
-            if (rule_id < MAX_RULES
-                && sess->rule_frontiers[rule_id].outer_epoch
-                       == sess->outer_epoch
-                && iter > sess->rule_frontiers[rule_id].iteration) {
-                continue;
-            }
-
-            /* Pre-scan skip: if a FORCE_DELTA op references an empty or
-             * absent delta (iteration > 0), the plan would produce 0 rows.
-             * Skip evaluation entirely to avoid unnecessary work. */
-            if (has_empty_forced_delta(rp, sess, iter)) {
-                continue;
-            }
-
-            eval_stack_t stack;
-            eval_stack_init(&stack);
-
-            int rc = col_eval_relation_plan(rp, &stack, sess);
-            if (rc != 0) {
-                eval_stack_drain(&stack);
-                free(snap);
-                free(delta_rels);
-                return rc;
-            }
-
-            if (stack.top == 0)
-                continue;
-
-            eval_entry_t result = eval_stack_pop(&stack);
-            eval_stack_drain(&stack);
-
-            /* Post-eval skip: if evaluation produced 0 rows, skip the
-             * append + consolidate path.  This is a safety net for cases
-             * not caught by the pre-scan (e.g. filters that eliminate
-             * all rows). */
-            if (result.rel && result.rel->nrows == 0) {
-                if (result.owned)
-                    col_rel_destroy(result.rel);
-                continue;
-            }
-
-            col_rel_t *target = session_find_rel(sess, rp->name);
-            if (!target) {
-                col_rel_t *copy;
-                if (result.owned) {
-                    copy = result.rel;
-                    free(copy->name);
-                    copy->name = wl_strdup(rp->name);
-                    if (!copy->name) {
-                        col_rel_destroy(copy);
-                        free(snap);
-                        free(delta_rels);
-                        return ENOMEM;
-                    }
-                    result.owned = false;
-                } else {
-                    copy = col_rel_new_like(rp->name, result.rel);
-                    if (!copy) {
-                        free(snap);
-                        free(delta_rels);
-                        return ENOMEM;
-                    }
-                    if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
-                        col_rel_destroy(copy);
-                        free(snap);
-                        free(delta_rels);
-                        return rc;
-                    }
+                char dname[256];
+                snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+                col_rel_t *delta = col_rel_new_like(dname, r);
+                if (!delta) {
+                    outer_rc = ENOMEM;
+                    goto stride_error;
                 }
-                rc = session_add_rel(sess, copy);
-                if (rc != 0) {
-                    col_rel_destroy(copy);
-                    free(snap);
-                    free(delta_rels);
-                    return rc;
+
+                /* Consolidate WITH delta output (no separate merge walk) */
+                uint32_t cons_old = snap[ri];
+                uint32_t cons_new = r->nrows - cons_old; /* delta count D */
+                uint64_t cons_t0 = now_ns();
+                int rc2
+                    = col_op_consolidate_incremental_delta(r, snap[ri], delta);
+                uint64_t cons_elapsed = now_ns() - cons_t0;
+                sess->consolidation_ns += cons_elapsed;
+                /* Invalidate arrangements for this relation (data changed). */
+                col_session_invalidate_arrangements(&sess->base,
+                                                    sp->relations[ri].name);
+                /* Per-call trace: WL_CONSOLIDATION_LOG=1 prints per-call info */
+                if (getenv("WL_CONSOLIDATION_LOG")) {
+                    fprintf(stderr,
+                            "CONS eff_iter=%u stratum=%u rel=%s N=%u D=%u "
+                            "time_us=%.1f ratio=%.4f\n",
+                            eff_iter, stratum_idx, sp->relations[ri].name,
+                            cons_old, cons_new, (double)cons_elapsed / 1000.0,
+                            cons_old > 0 ? (double)cons_new / (double)cons_old
+                                         : 0.0);
                 }
-            } else {
-                /* Adopt schema from result if target is still uninitialized */
-                if (target->ncols == 0 && result.rel->ncols > 0) {
-                    rc = col_rel_set_schema(
-                        target, result.rel->ncols,
-                        (const char *const *)result.rel->col_names);
-                    if (rc != 0) {
-                        if (result.owned)
-                            col_rel_destroy(result.rel);
-                        free(snap);
-                        free(delta_rels);
-                        return rc;
-                    }
-                }
-                rc = col_rel_append_all(target, result.rel);
-                if (result.owned)
-                    col_rel_destroy(result.rel);
-                if (rc != 0) {
-                    free(snap);
-                    free(delta_rels);
-                    return rc;
-                }
-            }
-        }
-
-        /* Remove delta relations from session (evaluation is complete) */
-        for (uint32_t ri = 0; ri < nrels; ri++) {
-            char dname[256];
-            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
-            session_remove_rel(sess, dname);
-        }
-
-        /* Phase 4: Frontier is computed incrementally as deltas are created
-         * because delta_rels[ri] may be set to NULL in the next iteration's
-         * registration loop. strat_frontier is declared before the iteration loop. */
-
-        /* Consolidate all IDB relations to remove duplicates and compute delta
-         * as a byproduct.  snap[ri] marks the boundary between the already-
-         * sorted prefix and unsorted new rows appended this iteration. */
-        bool any_new = false;
-        for (uint32_t ri = 0; ri < nrels; ri++) {
-            col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-            if (!r || snap[ri] >= r->nrows) {
-                continue; /* no new rows for this relation */
-            }
-
-            char dname[256];
-            snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
-            col_rel_t *delta = col_rel_new_like(dname, r);
-            if (!delta) {
-                free(snap);
-                free(delta_rels);
-                return ENOMEM;
-            }
-
-            /* Consolidate WITH delta output (no separate merge walk) */
-            uint32_t cons_old = snap[ri];
-            uint32_t cons_new = r->nrows - cons_old; /* delta count D */
-            uint64_t cons_t0 = now_ns();
-            int rc2 = col_op_consolidate_incremental_delta(r, snap[ri], delta);
-            uint64_t cons_elapsed = now_ns() - cons_t0;
-            sess->consolidation_ns += cons_elapsed;
-            /* Invalidate arrangements for this relation (data changed). */
-            col_session_invalidate_arrangements(&sess->base,
-                                                sp->relations[ri].name);
-            /* Per-call trace: WL_CONSOLIDATION_LOG=1 prints N/D/time per call */
-            if (getenv("WL_CONSOLIDATION_LOG")) {
-                fprintf(stderr,
-                        "CONS iter=%u stratum=%u rel=%s N=%u D=%u "
-                        "time_us=%.1f ratio=%.4f\n",
-                        iter, stratum_idx, sp->relations[ri].name, cons_old,
-                        cons_new, (double)cons_elapsed / 1000.0,
-                        cons_old > 0 ? (double)cons_new / (double)cons_old
-                                     : 0.0);
-            }
-            if (rc2 != 0) {
-                col_rel_destroy(delta);
-                free(snap);
-                free(delta_rels);
-                return rc2;
-            }
-
-            if (delta->nrows > 0) {
-                /* Stamp each new row with its provenance (iteration, stratum).
-                 * worker=0 indicates the sequential (non-K-fusion) path. */
-                delta->timestamps = (col_delta_timestamp_t *)calloc(
-                    delta->nrows, sizeof(col_delta_timestamp_t));
-                if (!delta->timestamps) {
+                if (rc2 != 0) {
                     col_rel_destroy(delta);
-                    free(snap);
-                    free(delta_rels);
-                    return ENOMEM;
-                }
-                for (uint32_t ti = 0; ti < delta->nrows; ti++) {
-                    delta->timestamps[ti].iteration = iter;
-                    delta->timestamps[ti].stratum = stratum_idx;
-                    /* worker left zero: sequential evaluation path */
-                    delta->timestamps[ti].multiplicity = 1;
+                    outer_rc = rc2;
+                    goto stride_error;
                 }
 
-                /* Phase 4: Enable timestamp tracking on target relation to preserve
-                 * provenance through consolidation. This enables frontier computation
-                 * to determine which iterations have converged. */
-                if (!r->timestamps && r->capacity > 0) {
-                    r->timestamps = (col_delta_timestamp_t *)calloc(
-                        r->capacity, sizeof(col_delta_timestamp_t));
-                    if (!r->timestamps) {
-                        free(delta->timestamps);
+                if (delta->nrows > 0) {
+                    /* Stamp each new row with its provenance (eff_iter, stratum).
+                     * worker=0 indicates the sequential (non-K-fusion) path. */
+                    delta->timestamps = (col_delta_timestamp_t *)calloc(
+                        delta->nrows, sizeof(col_delta_timestamp_t));
+                    if (!delta->timestamps) {
                         col_rel_destroy(delta);
-                        free(snap);
-                        free(delta_rels);
-                        return ENOMEM;
+                        outer_rc = ENOMEM;
+                        goto stride_error;
                     }
-                }
+                    for (uint32_t ti = 0; ti < delta->nrows; ti++) {
+                        delta->timestamps[ti].iteration = eff_iter;
+                        delta->timestamps[ti].stratum = stratum_idx;
+                        /* worker left zero: sequential evaluation path */
+                        delta->timestamps[ti].multiplicity = 1;
+                    }
 
-                delta_rels[ri] = delta;
-                any_new = true;
+                    /* Phase 4: Enable timestamp tracking on target relation to
+                     * preserve provenance through consolidation.  This enables
+                     * frontier computation to determine convergence. */
+                    if (!r->timestamps && r->capacity > 0) {
+                        r->timestamps = (col_delta_timestamp_t *)calloc(
+                            r->capacity, sizeof(col_delta_timestamp_t));
+                        if (!r->timestamps) {
+                            free(delta->timestamps);
+                            col_rel_destroy(delta);
+                            outer_rc = ENOMEM;
+                            goto stride_error;
+                        }
+                    }
 
-                /* Phase 4: Compute frontier from this delta immediately.
-                 * This must happen before the next iteration's registration loop
-                 * sets delta_rels[ri] = NULL.
-                 * frontier = MAXIMUM iteration that produced facts. Enables skip
-                 * optimization in next session_step: skip iterations <= frontier. */
-                col_frontier_t rel_frontier = col_frontier_compute(delta);
-                if (rel_frontier.iteration > strat_frontier.iteration
-                    || (rel_frontier.iteration == strat_frontier.iteration
-                        && rel_frontier.stratum > strat_frontier.stratum)) {
-                    strat_frontier = rel_frontier;
+                    delta_rels[ri] = delta;
+                    any_new = true;
+
+                    /* Phase 4: Compute frontier from this delta immediately.
+                     * Must happen before next sub-pass registration sets
+                     * delta_rels[ri]=NULL.
+                     * frontier = MAX eff_iter that produced facts. */
+                    col_frontier_t rel_frontier = col_frontier_compute(delta);
+                    if (rel_frontier.iteration > strat_frontier.iteration
+                        || (rel_frontier.iteration == strat_frontier.iteration
+                            && rel_frontier.stratum > strat_frontier.stratum)) {
+                        strat_frontier = rel_frontier;
+                    }
+                } else {
+                    col_rel_destroy(delta);
                 }
-            } else {
-                col_rel_destroy(delta);
             }
-        }
+
+            delta_pool_reset(sess->delta_pool);
+            /* Issue #176: Per-sub-pass cache eviction for recursive strata.
+             * Use configurable eviction threshold (cache_evict_threshold):
+             * - If 0: clear entire cache each sub-pass (backward compatible)
+             * - If > 0: evict LRU entries when cache exceeds threshold */
+            if (sess->cache_evict_threshold == 0) {
+                col_mat_cache_clear(&sess->mat_cache);
+            } else {
+                col_mat_cache_evict_until(&sess->mat_cache,
+                                          sess->cache_evict_threshold);
+            }
+
+            if (!any_new) {
+                /* Fixed point reached: no new tuples in this sub-pass. */
+                converged = true;
+                break;
+            }
+            outer_any_new = true;
+            final_eff_iter = eff_iter;
+            continue; /* next sub-pass */
+
+        stride_error:
+            break; /* exit inner loop; outer_rc carries the error */
+        } /* end inner sub-pass loop */
 
         free(snap);
 
-        delta_pool_reset(sess->delta_pool);
-        /* Issue #176: Per-iteration cache eviction for recursive strata.
-         * Use configurable eviction threshold (cache_evict_threshold):
-         * - If 0: disabled, cache cleared each iteration (backward compatible)
-         * - If > 0: evict LRU entries when cache size exceeds threshold
-         * This preserves hit rate for frequently accessed cached joins
-         * while bounding memory growth across deep recursion (100+ iterations). */
-        if (sess->cache_evict_threshold == 0) {
-            /* Legacy behavior: clear entire cache */
-            col_mat_cache_clear(&sess->mat_cache);
-        } else {
-            /* Smart eviction: remove only least-used entries */
-            col_mat_cache_evict_until(&sess->mat_cache,
-                                      sess->cache_evict_threshold);
+        if (outer_rc != 0) {
+            free(delta_rels);
+            return outer_rc;
         }
 
-        if (!any_new) {
-            sess->total_iterations = iter;
-            break;
-        }
-    }
-    sess->total_iterations = iter;
+        /* Dispatch on why the inner loop exited */
+        if (stride_all_skipped)
+            continue; /* all sub-passes were frontier-skipped: next outer iter */
+        if (outer_continue_next)
+            continue; /* net-zero or all-empty delta: retry next outer iter */
+        if (converged || !outer_any_new)
+            break; /* true convergence */
+    } /* end outer stride loop */
+
+    sess->total_iterations = final_eff_iter;
 
     /* Issue #106 (US-106-005): Record per-rule frontier at convergence with epoch.
-     * When stratum converges at iteration I, record (outer_epoch, I) for each rule.
-     * On next incremental snapshot, skip condition checks epoch match AND iter > I.
-     * This preserves fine-grained rule convergence across insertions. */
+     * When stratum converges at effective iteration I, record (outer_epoch, I).
+     * On next incremental snapshot, skip fires when eff_iter > I. */
     for (uint32_t ri = 0; ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
         uint32_t rule_id = rule_id_base + ri;
         sess->rule_frontiers[rule_id].outer_epoch = sess->outer_epoch;
-        sess->rule_frontiers[rule_id].iteration = iter;
+        sess->rule_frontiers[rule_id].iteration = final_eff_iter;
     }
 
     /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
-     * frontier was computed incrementally during consolidation, so just
-     * store it in the session. Each stratum independently tracks its
-     * convergence frontier for the skip optimization in the next session_step. */
+     * strat_frontier was computed incrementally via delta timestamps (eff_iter),
+     * so it already holds the effective iteration index at convergence. */
     if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
-        /* Set this stratum's 2D frontier to the convergence point.
-         * outer_epoch tracks the insertion epoch; iteration tracks convergence.
-         * This enables skipping iterations if frontier persists across
-         * session_step calls (incremental evaluation). */
         col_frontier_2d_t f2d = { sess->outer_epoch, strat_frontier.iteration };
         sess->frontiers[stratum_idx] = f2d;
     }

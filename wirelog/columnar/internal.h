@@ -92,6 +92,7 @@ now_ns(void)
 #define COL_STACK_MAX 32u
 #define COL_FILTER_STACK 64u
 #define MAX_ITERATIONS 4096u
+#define EVAL_STRIDE 8u /* sub-passes per outer iteration (Issue #237) */
 #define MAX_STRATA 32
 #define MAX_RULES 64
 #define COL_MAT_CACHE_MAX 64u
