@@ -30,9 +30,7 @@
 #include "../wirelog/wirelog.h"
 
 #include <errno.h>
-#ifndef _MSC_VER
 #include <stdatomic.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
