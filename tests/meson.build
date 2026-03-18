@@ -1538,3 +1538,24 @@ test_join_limit_exe = executable(
 )
 
 test('join_limit', test_join_limit_exe)
+
+# ============================================================================
+# SIMD JOIN Hash and Key-Match Tests (Issue #231)
+# ============================================================================
+
+test_simd_join_exe = executable(
+  'test_simd_join',
+  files('test_simd_join.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('simd_join', test_simd_join_exe)

@@ -1163,6 +1163,117 @@ hash_int64_keys(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
     return h;
 }
 
+#ifndef __AVX2__
+/* keys_match_scalar: scalar key equality check for JOIN probe.
+ * Only compiled on non-AVX2 builds where it is aliased by keys_match_fast.
+ * On AVX2 builds this function is replaced entirely by keys_match_avx2,
+ * so it is excluded here to avoid unused-function warnings and MSVC
+ * __attribute__ compatibility issues. */
+static inline bool
+keys_match_scalar(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
+                  const uint32_t *rk, uint32_t kc)
+{
+    for (uint32_t k = 0; k < kc; k++) {
+        if (lrow[lk[k]] != rrow[rk[k]])
+            return false;
+    }
+    return true;
+}
+#endif /* !__AVX2__ */
+
+#ifdef __AVX2__
+/*
+ * hash_int64_keys_avx2:
+ * AVX2-accelerated hash for int64 key columns.
+ *
+ * For kc >= 4, gathers key values four at a time with _mm256_set_epi64x and
+ * accumulates a XOR reduction across lanes, then applies FNV-1a as a final
+ * 64->32-bit mix.  Falls back to scalar FNV-1a for kc < 4 and for the tail.
+ *
+ * Both build and probe paths use the same dispatcher (hash_int64_keys_fast),
+ * so correctness is preserved even though output values differ from the
+ * scalar path for kc >= 4.
+ */
+static uint32_t
+hash_int64_keys_avx2(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
+{
+    if (kc < 4)
+        return hash_int64_keys(row, key_cols, kc);
+
+    __m256i acc = _mm256_setzero_si256();
+    uint32_t k = 0;
+
+    for (; k + 4 <= kc; k += 4) {
+        __m256i v
+            = _mm256_set_epi64x(row[key_cols[k + 3]], row[key_cols[k + 2]],
+                                row[key_cols[k + 1]], row[key_cols[k + 0]]);
+        acc = _mm256_xor_si256(acc, v);
+    }
+
+    /* Horizontal XOR reduction: 4 x int64 lanes -> 1 uint64 */
+    __m128i lo128 = _mm256_castsi256_si128(acc);
+    __m128i hi128 = _mm256_extracti128_si256(acc, 1);
+    __m128i xor128 = _mm_xor_si128(lo128, hi128);
+    int64_t v0 = _mm_cvtsi128_si64(xor128);
+    int64_t v1 = _mm_extract_epi64(xor128, 1);
+    uint64_t combined = (uint64_t)v0 ^ (uint64_t)v1;
+
+    /* Scalar tail */
+    for (; k < kc; k++)
+        combined ^= (uint64_t)row[key_cols[k]];
+
+    /* FNV-1a final mix */
+    uint32_t h = 2166136261u;
+    h ^= (uint32_t)(combined & 0xffffffff);
+    h *= 16777619u;
+    h ^= (uint32_t)(combined >> 32);
+    h *= 16777619u;
+    return h;
+}
+
+/*
+ * keys_match_avx2:
+ * AVX2-accelerated key equality check for JOIN probe.
+ *
+ * Processes 4 key columns per SIMD iteration using _mm256_cmpeq_epi64,
+ * with scalar fallback for the tail.  Returns true iff all kc keys match.
+ */
+static inline bool
+keys_match_avx2(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
+                const uint32_t *rk, uint32_t kc)
+{
+    uint32_t k = 0;
+
+    for (; k + 4 <= kc; k += 4) {
+        __m256i lv = _mm256_set_epi64x(lrow[lk[k + 3]], lrow[lk[k + 2]],
+                                       lrow[lk[k + 1]], lrow[lk[k + 0]]);
+        __m256i rv = _mm256_set_epi64x(rrow[rk[k + 3]], rrow[rk[k + 2]],
+                                       rrow[rk[k + 1]], rrow[rk[k + 0]]);
+        __m256i eq = _mm256_cmpeq_epi64(lv, rv);
+        /* All 4 lanes equal iff all 32 movemask bits are set (== -1 as int) */
+        if (_mm256_movemask_epi8(eq) != -1)
+            return false;
+    }
+
+    /* Scalar tail */
+    for (; k < kc; k++) {
+        if (lrow[lk[k]] != rrow[rk[k]])
+            return false;
+    }
+    return true;
+}
+#endif /* __AVX2__ */
+
+/* Dispatcher: select best hash and key-match implementations at compile time.
+ * Automatically uses AVX2 when available, otherwise scalar fallback. */
+#ifdef __AVX2__
+#define hash_int64_keys_fast hash_int64_keys_avx2
+#define keys_match_fast keys_match_avx2
+#else
+#define hash_int64_keys_fast hash_int64_keys
+#define keys_match_fast keys_match_scalar
+#endif
+
 /* --- JOIN ---------------------------------------------------------------- */
 
 int
@@ -1485,7 +1596,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     nbuckets_ep);
             for (uint32_t rr = 0; rr < right->nrows; rr++) {
                 const int64_t *rrow = right->data + (size_t)rr * right->ncols;
-                uint32_t h = hash_int64_keys(rrow, rk, kc) & (nbuckets_ep - 1);
+                uint32_t h
+                    = hash_int64_keys_fast(rrow, rk, kc) & (nbuckets_ep - 1);
                 ht_next_ep[rr] = ht_head_ep[h];
                 ht_head_ep[h] = rr + 1; /* 1-based; 0 = end of chain */
             }
@@ -1526,10 +1638,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     const int64_t *rrow
                         = right->data + (size_t)rr * right->ncols;
                     /* Verify key match: find_next may return collision rows. */
-                    bool match = true;
-                    for (uint32_t k = 0; k < kc && match; k++)
-                        match = (lrow[lk[k]] == rrow[rk[k]]);
-                    if (match) {
+                    if (keys_match_fast(lrow, lk, rrow, rk, kc)) {
                         memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
                         memcpy(tmp + left->ncols, rrow,
                                sizeof(int64_t) * right->ncols);
@@ -1560,16 +1669,14 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 }
             } else {
                 /* Ephemeral hash probe. */
-                uint32_t h = hash_int64_keys(lrow, lk, kc) & (nbuckets_ep - 1);
+                uint32_t h
+                    = hash_int64_keys_fast(lrow, lk, kc) & (nbuckets_ep - 1);
                 for (uint32_t e = ht_head_ep[h]; e != 0;
                      e = ht_next_ep[e - 1]) {
                     uint32_t rr = e - 1;
                     const int64_t *rrow
                         = right->data + (size_t)rr * right->ncols;
-                    bool match = true;
-                    for (uint32_t k = 0; k < kc && match; k++)
-                        match = (lrow[lk[k]] == rrow[rk[k]]);
-                    if (!match)
+                    if (!keys_match_fast(lrow, lk, rrow, rk, kc))
                         continue;
                     memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
                     memcpy(tmp + left->ncols, rrow,
@@ -1721,22 +1828,19 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     for (uint32_t rr = 0; rr < right->nrows; rr++) {
         const int64_t *rrow = right->data + (size_t)rr * right->ncols;
-        uint32_t h = hash_int64_keys(rrow, rk, kc) & (aj_nbuckets - 1);
+        uint32_t h = hash_int64_keys_fast(rrow, rk, kc) & (aj_nbuckets - 1);
         aj_next[rr] = aj_head[h];
         aj_head[h] = rr + 1;
     }
     int aj_rc = 0;
     for (uint32_t lr = 0; lr < left->nrows && aj_rc == 0; lr++) {
         const int64_t *lrow = left->data + (size_t)lr * left->ncols;
-        uint32_t h = hash_int64_keys(lrow, lk, kc) & (aj_nbuckets - 1);
+        uint32_t h = hash_int64_keys_fast(lrow, lk, kc) & (aj_nbuckets - 1);
         bool found = false;
         for (uint32_t e = aj_head[h]; e != 0 && !found; e = aj_next[e - 1]) {
             uint32_t rr = e - 1;
             const int64_t *rrow = right->data + (size_t)rr * right->ncols;
-            bool match = true;
-            for (uint32_t k = 0; k < kc && match; k++)
-                match = (lrow[lk[k]] == rrow[rk[k]]);
-            if (match)
+            if (keys_match_fast(lrow, lk, rrow, rk, kc))
                 found = true;
         }
         if (!found)
@@ -3243,7 +3347,7 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     for (uint32_t rr = 0; rr < right->nrows; rr++) {
         const int64_t *rrow = right->data + (size_t)rr * right->ncols;
-        uint32_t h = hash_int64_keys(rrow, rk, kc) & (nbuckets - 1);
+        uint32_t h = hash_int64_keys_fast(rrow, rk, kc) & (nbuckets - 1);
         ht_next[rr] = ht_head[h];
         ht_head[h] = rr + 1; /* 1-based; 0 = end of chain */
     }
@@ -3252,15 +3356,12 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     int sj_rc = 0;
     for (uint32_t lr = 0; lr < left->nrows && sj_rc == 0; lr++) {
         const int64_t *lrow = left->data + (size_t)lr * left->ncols;
-        uint32_t h = hash_int64_keys(lrow, lk, kc) & (nbuckets - 1);
+        uint32_t h = hash_int64_keys_fast(lrow, lk, kc) & (nbuckets - 1);
         bool found = false;
         for (uint32_t e = ht_head[h]; e != 0 && !found; e = ht_next[e - 1]) {
             uint32_t rr = e - 1;
             const int64_t *rrow = right->data + (size_t)rr * right->ncols;
-            bool match = true;
-            for (uint32_t k = 0; k < kc && match; k++)
-                match = (lrow[lk[k]] == rrow[rk[k]]);
-            if (match)
+            if (keys_match_fast(lrow, lk, rrow, rk, kc))
                 found = true;
         }
         if (found) {
