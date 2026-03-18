@@ -1167,9 +1167,19 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 
     col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right) {
+        /* If right relation doesn't exist, join produces empty result (cross-product with nothing).
+         * Similar to ANTIJOIN logic (which keeps all left rows on missing right).
+         * This can occur in generated plans where optional relations may not exist. */
+        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$join_empty",
+                                               left_e.rel->ncols);
+        if (!out) {
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
+            return ENOMEM;
+        }
         if (left_e.owned)
             col_rel_destroy(left_e.rel);
-        return ENOENT;
+        return eval_stack_push_delta(stack, out, true, false);
     }
 
 #ifdef WL_PROFILE
@@ -1360,8 +1370,13 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     memcpy(tmp + 1, prow, sizeof(int64_t) * probe->ncols);
                 }
                 join_rc = col_rel_append_row(out, tmp);
-                if (join_rc != 0)
+                if (join_rc != 0) {
+                    fprintf(stderr,
+                            "ERROR: col_rel_append_row failed with rc=%d at "
+                            "unary join\n",
+                            join_rc);
                     break;
+                }
                 if (sess->join_output_limit > 0
                     && out->nrows >= sess->join_output_limit) {
                     fprintf(stderr,
@@ -1386,6 +1401,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 col_rel_destroy(left);
             return join_rc;
         }
+        fprintf(stderr, "DEBUG[JOIN]: Unary join completed, out->nrows=%u\n",
+                out->nrows);
     } else {
         /* Standard merge-join for non-unary relations. */
         /* Hash join: use persistent arrangement for the full right relation;
@@ -1396,12 +1413,23 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t *ht_head_ep = NULL;
         uint32_t *ht_next_ep = NULL;
 
+        fprintf(stderr,
+                "DEBUG[JOIN]: Standard merge-join starting - left=%u rows, "
+                "right=%u rows, kc=%u\n",
+                left->nrows, right->nrows, kc);
+
         if (!used_right_delta && op->right_relation && kc > 0)
             arr = col_session_get_arrangement(&sess->base, op->right_relation,
                                               rk, kc);
         else if (used_right_delta && op->right_relation && kc > 0)
             arr = col_session_get_delta_arrangement(sess, op->right_relation,
                                                     right, rk, kc);
+
+        if (arr)
+            fprintf(stderr, "DEBUG[JOIN]: Using persistent arrangement\n");
+        else
+            fprintf(stderr, "DEBUG[JOIN]: No arrangement available, will use "
+                            "ephemeral hash table\n");
 
         if (!arr) {
             /* Ephemeral hash table (delta path or arrangement unavailable). */
@@ -1410,6 +1438,10 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             ht_next_ep = (uint32_t *)malloc(
                 (right->nrows > 0 ? right->nrows : 1) * sizeof(uint32_t));
             if (!ht_head_ep || !ht_next_ep) {
+                fprintf(stderr,
+                        "ERROR: Ephemeral hash table allocation failed "
+                        "(nbuckets=%u)\n",
+                        nbuckets_ep);
                 free(ht_head_ep);
                 free(ht_next_ep);
                 free(tmp);
@@ -1420,12 +1452,17 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     col_rel_destroy(left);
                 return ENOMEM;
             }
+            fprintf(stderr,
+                    "DEBUG[JOIN]: Ephemeral hash table created - nbuckets=%u\n",
+                    nbuckets_ep);
             for (uint32_t rr = 0; rr < right->nrows; rr++) {
                 const int64_t *rrow = right->data + (size_t)rr * right->ncols;
                 uint32_t h = hash_int64_keys(rrow, rk, kc) & (nbuckets_ep - 1);
                 ht_next_ep[rr] = ht_head_ep[h];
                 ht_head_ep[h] = rr + 1; /* 1-based; 0 = end of chain */
             }
+            fprintf(stderr,
+                    "DEBUG[JOIN]: Ephemeral hash table built successfully\n");
         }
 
         /* key_row scratch buffer for arrangement probe: values placed at rk[]
@@ -1469,7 +1506,14 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         memcpy(tmp + left->ncols, rrow,
                                sizeof(int64_t) * right->ncols);
                         join_rc = col_rel_append_row(out, tmp);
-                        if (join_rc == 0 && sess->join_output_limit > 0
+                        if (join_rc != 0) {
+                            fprintf(stderr,
+                                    "ERROR: col_rel_append_row failed in "
+                                    "arrangement probe with rc=%d\n",
+                                    join_rc);
+                            break;
+                        }
+                        if (sess->join_output_limit > 0
                             && out->nrows >= sess->join_output_limit) {
                             fprintf(
                                 stderr,
@@ -1499,8 +1543,13 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     memcpy(tmp + left->ncols, rrow,
                            sizeof(int64_t) * right->ncols);
                     join_rc = col_rel_append_row(out, tmp);
-                    if (join_rc != 0)
+                    if (join_rc != 0) {
+                        fprintf(stderr,
+                                "ERROR: col_rel_append_row failed in ephemeral "
+                                "hash probe with rc=%d\n",
+                                join_rc);
                         break;
+                    }
                     if (sess->join_output_limit > 0
                         && out->nrows >= sess->join_output_limit) {
                         fprintf(stderr,
@@ -1515,10 +1564,19 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             }
         }
 
+        fprintf(
+            stderr,
+            "DEBUG[JOIN]: Merge-join loop completed, out->nrows=%u, rc=%d\n",
+            out->nrows, join_rc);
+
         free(key_row);
         free(ht_head_ep);
         free(ht_next_ep);
         if (join_rc != 0) {
+            fprintf(
+                stderr,
+                "DEBUG[JOIN]: Merge-join failed with rc=%d, out->nrows=%u\n",
+                join_rc, out->nrows);
             free(tmp);
             col_rel_destroy(out);
             free(lk);
@@ -1527,6 +1585,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 col_rel_destroy(left);
             return join_rc;
         }
+        fprintf(stderr, "DEBUG[JOIN]: Merge-join succeeded\n");
     }
 
     free(tmp);
