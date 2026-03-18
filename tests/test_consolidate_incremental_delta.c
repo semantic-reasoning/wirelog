@@ -79,6 +79,8 @@ typedef struct {
     uint32_t base_nrows;       /* base row count for delta prop (#83)   */
     col_delta_timestamp_t
         *timestamps; /* NULL when not tracking               */
+    bool pool_owned; /* allocated from delta_pool (#123)      */
+    void *ledger;    /* borrowed ledger pointer (NULL ok, #224) */
 } col_rel_t;
 
 /*

@@ -14,11 +14,6 @@
 
 #ifndef _MSC_VER
 #include <stdatomic.h>
-#else
-/* MSVC: pragma intrinsic declarations in the translation unit that uses them */
-#pragma intrinsic(_InterlockedAdd64)
-#pragma intrinsic(_InterlockedCompareExchange64)
-#pragma intrinsic(_InterlockedExchange64)
 #endif
 #include <stdio.h>
 #include <string.h>

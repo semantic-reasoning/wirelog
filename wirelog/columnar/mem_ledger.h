@@ -23,12 +23,8 @@
 /* C11 atomics for lock-free thread safety */
 #ifdef _MSC_VER
 /* MSVC: Use intrinsic functions instead of <stdatomic.h> */
+#include <windows.h>
 #include <intrin.h>
-
-/* Tell MSVC to treat _Interlocked* functions as compiler intrinsics, not external symbols */
-#pragma intrinsic(_InterlockedAdd64)
-#pragma intrinsic(_InterlockedCompareExchange64)
-#pragma intrinsic(_InterlockedExchange64)
 
 /* MSVC does not support C11 _Atomic as a type qualifier or keyword.
  * Use volatile uint64_t as the atomic field type; all mutations go through
@@ -36,15 +32,38 @@
  * acquire/release semantics. */
 typedef volatile uint64_t wl_atomic_u64;
 
-/* MSVC atomic macros using intrinsics */
+/* MSVC atomic macros using intrinsics that are guaranteed to exist */
 #define atomic_load_explicit(ptr, order) (*(ptr))
 #define atomic_store_explicit(ptr, val, order) (*(ptr) = (val))
-#define atomic_fetch_add_explicit(ptr, inc, order)               \
-    _InterlockedAdd64((volatile __int64 *)(ptr), (__int64)(inc)) \
-        - (__int64)(inc)
-#define atomic_fetch_sub_explicit(ptr, dec, order)                \
-    _InterlockedAdd64((volatile __int64 *)(ptr), -(__int64)(dec)) \
-        + (__int64)(dec)
+
+/* Implement fetch_add/fetch_sub using compare-exchange loop since _InterlockedAdd64
+ * may not be available on all MSVC versions. This is slightly slower but portable. */
+static inline int64_t
+wl_atomic_fetch_add_internal(volatile __int64 *ptr, __int64 inc)
+{
+    __int64 old, updated;
+    do {
+        old = *ptr;
+        updated = old + inc;
+    } while (_InterlockedCompareExchange64(ptr, updated, old) != old);
+    return old;
+}
+
+static inline int64_t
+wl_atomic_fetch_sub_internal(volatile __int64 *ptr, __int64 dec)
+{
+    __int64 old, updated;
+    do {
+        old = *ptr;
+        updated = old - dec;
+    } while (_InterlockedCompareExchange64(ptr, updated, old) != old);
+    return old;
+}
+
+#define atomic_fetch_add_explicit(ptr, inc, order) \
+    wl_atomic_fetch_add_internal((volatile __int64 *)(ptr), (__int64)(inc))
+#define atomic_fetch_sub_explicit(ptr, dec, order) \
+    wl_atomic_fetch_sub_internal((volatile __int64 *)(ptr), (__int64)(dec))
 #define atomic_compare_exchange_weak_explicit(ptr, expected, desired,        \
                                               succ_order, fail_order)        \
     (_InterlockedCompareExchange64((volatile __int64 *)(ptr),                \
