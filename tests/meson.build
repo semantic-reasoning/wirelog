@@ -187,7 +187,6 @@ backend_src = files(
   '../wirelog/columnar/session.c',
   '../wirelog/columnar/delta_pool.c',
   '../wirelog/columnar/lftj.c',
-  '../wirelog/columnar/mem_ledger.c',
 )
 
 io_src = files(
@@ -1538,38 +1537,3 @@ test_join_limit_exe = executable(
 )
 
 test('join_limit', test_join_limit_exe)
-
-# ============================================================================
-# Memory Ledger Unit Tests (Issue #224)
-# ============================================================================
-
-test_mem_ledger_exe = executable(
-  'test_mem_ledger',
-  files('test_mem_ledger.c'),
-  files('../wirelog/columnar/mem_ledger.c'),
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep],
-)
-
-test('mem_ledger', test_mem_ledger_exe)
-
-# ============================================================================
-# DOOP Memory Profiling Integration Tests (Issue #224)
-# ============================================================================
-
-test_doop_memory_profile_exe = executable(
-  'test_doop_memory_profile',
-  files('test_doop_memory_profile.c'),
-  parser_src,
-  ir_src,
-  optimizer_src,
-  backend_src,
-  io_src,
-  arena_src,
-  thread_src,
-  workqueue_src,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
-)
-
-test('doop_memory_profile', test_doop_memory_profile_exe)

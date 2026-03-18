@@ -2817,19 +2817,18 @@ main(int argc, char **argv)
         { "workers", required_argument, NULL, 'j' },
         { "repeat", required_argument, NULL, 'r' },
         { "format", required_argument, NULL, 'F' },
-        { "mem-report", no_argument, NULL, 'm' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
 
     int opt;
 #ifndef _MSC_VER
-    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:P:I:R:O:j:r:F:mh",
+    while ((opt = getopt_long(argc, argv, "w:d:W:A:D:C:S:G:P:I:R:O:j:r:F:h",
                               long_opts, NULL))
            != -1) {
 #else
     /* MSVC: getopt_long not available; use simple getopt fallback */
-    while ((opt = getopt(argc, argv, "w:d:W:A:D:C:S:G:P:I:R:O:j:r:F:mh"))
+    while ((opt = getopt(argc, argv, "w:d:W:A:D:C:S:G:P:I:R:O:j:r:F:h"))
            != -1) {
 #endif
         switch (opt) {
@@ -2877,10 +2876,6 @@ main(int argc, char **argv)
             break;
         case 'F':
             g_format_json = (strcmp(optarg, "json") == 0);
-            break;
-        case 'm':
-            /* --mem-report: enable per-iteration memory reporting (Issue #224) */
-            setenv("WL_MEM_REPORT", "1", 1);
             break;
         case 'h':
         default:
