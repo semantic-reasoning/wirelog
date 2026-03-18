@@ -677,23 +677,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
                 /* Phase 4: Enable timestamp tracking on target relation to preserve
                  * provenance through consolidation. This enables frontier computation
-                 * to determine which iterations have converged.
-                 * Backpressure (Issue #224, Step 4): skip when disable_timestamps
-                 * is set (RELATION subsystem > 90% cap). Frontier uses conservative
-                 * defaults when timestamps are absent. */
-                /* Auto-disable timestamps when RELATION > 90% cap
-                 * (Issue #224, Step 4). Latches true and stays disabled. */
-                if (!sess->disable_timestamps
-                    && wl_mem_ledger_should_backpressure(
-                        &sess->ledger, WL_MEM_SUBSYS_RELATION, 90)) {
-                    sess->disable_timestamps = true;
-                    const char *mem_report_env = getenv("WL_MEM_REPORT");
-                    if (mem_report_env && mem_report_env[0] == '1')
-                        fprintf(stderr, "[wirelog mem] RELATION backpressure: "
-                                        "disabling timestamp tracking\n");
-                }
-                if (!r->timestamps && r->capacity > 0
-                    && !sess->disable_timestamps) {
+                 * to determine which iterations have converged. */
+                if (!r->timestamps && r->capacity > 0) {
                     r->timestamps = (col_delta_timestamp_t *)calloc(
                         r->capacity, sizeof(col_delta_timestamp_t));
                     if (!r->timestamps) {
@@ -740,40 +725,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             /* Smart eviction: remove only least-used entries */
             col_mat_cache_evict_until(&sess->mat_cache,
                                       sess->cache_evict_threshold);
-        }
-
-        /* Per-iteration memory report (Issue #224, Step 5).
-         * WL_MEM_REPORT=1 enables parseable per-iteration output:
-         * "MEM iter=X stratum=Y total=Z.1fGB rel=R.1fGB arena=A.1fGB cache=C.1fGB" */
-        {
-            const char *mem_report_env = getenv("WL_MEM_REPORT");
-            if (mem_report_env && mem_report_env[0] == '1') {
-                double gb = 1024.0 * 1024.0 * 1024.0;
-                double total_gb
-                    = (double)atomic_load_explicit(&sess->ledger.current_bytes,
-                                                   memory_order_relaxed)
-                      / gb;
-                double rel_gb
-                    = (double)atomic_load_explicit(
-                          &sess->ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION],
-                          memory_order_relaxed)
-                      / gb;
-                double arena_gb
-                    = (double)atomic_load_explicit(
-                          &sess->ledger.subsys_bytes[WL_MEM_SUBSYS_ARENA],
-                          memory_order_relaxed)
-                      / gb;
-                double cache_gb
-                    = (double)atomic_load_explicit(
-                          &sess->ledger.subsys_bytes[WL_MEM_SUBSYS_CACHE],
-                          memory_order_relaxed)
-                      / gb;
-                fprintf(stderr,
-                        "MEM iter=%u stratum=%u total=%.1fGB "
-                        "rel=%.1fGB arena=%.1fGB cache=%.1fGB\n",
-                        iter, stratum_idx, total_gb, rel_gb, arena_gb,
-                        cache_gb);
-            }
         }
 
         if (!any_new) {
