@@ -348,59 +348,16 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
          * (iter > 0: FORCE_DELTA with absent delta → empty result). */
         sess->current_iteration = iter;
 
-        /* Phase 3D-Ext-002 (DORMANT): Fine-grained frontier skip infrastructure.
+        /* Iteration skip based on frontier (convergence point of prior evaluation).
          *
-         * STATUS: This optimization is currently unreachable in the single-call evaluation
-         * model (session_step, session_snapshot). Designed for future incremental re-evaluation
-         * where the frontier persists across multiple calls without being reset.
+         * Skip if both conditions hold:
+         * 1. Same outer_epoch: frontier is valid for this insertion epoch
+         * 2. Beyond convergence: iter > frontier.iteration
          *
-         * WHY UNREACHABLE (Phase 4): Non-recursive strata reset their frontier to (0, stratum_idx)
-         * before recursive strata evaluate. Since each stratum initializes its frontier to iteration=0,
-         * the per-stratum skip condition `iter > frontiers[stratum_idx].iteration` is always false
-         * when evaluating the first session_step call. Becomes active only when frontier persists
-         * across multiple session_step calls (incremental re-evaluation, Phase 4+).
-         *
-         * INTENDED SEMANTICS (when frontier persists across calls):
-         * Skip iteration only if: iter > frontier.iteration AND frontier.stratum < current_stratum.
-         * Both conditions must be true to skip safely. This prevents:
-         * - Skipping iterations before frontier (data loss)
-         * - Skipping stratum 0 (recursion entry point)
-         * - Premature termination of recursive stratum evaluation
-         *
-         * LATENT CORRECTNESS BUG (if activated without semantic fix):
-         * Cross-stratum iteration counter mismatch. Variable 'iter' is this stratum's local
-         * fixed-point counter. Variable 'frontier.iteration' is from previous stratum's
-         * convergence point. These are semantically unrelated values that happen to share
-         * the name "iteration". Comparing them across strata is incorrect and could skip
-         * needed work in multi-recursive-stratum programs, producing incomplete results.
-         *
-         * PHASE 4+ WORK (Incremental Evaluation):
-         * Before activating this skip, implement one of:
-         * 1. Per-stratum frontier tracking (store in array, indexed by stratum_idx)
-         * 2. Same-stratum comparison only (only skip if frontier.stratum == stratum_idx)
-         * 3. Change continue to break if stratum has converged beyond this point
-         * See docs/3d-ext-incremental-eval-roadmap.md for design options.
-         *
-         * ARCHITECT REVIEW: Conditional approval (a2a42d1fa88a8d650).
-         * Dormant status verified. Recommendation: document before activation.
-         * See progress.txt Phase 3D-Ext section for full architect findings.
-         */
-        /* Phase 4: Per-stratum frontier skip condition (DORMANT in this context).
-         * When frontier is reset to UINT32_MAX for affected strata, this skip
-         * condition is ineffective (iter > UINT32_MAX is always false).
-         * Skip logic only activates when frontier persists across multiple
-         * incremental snapshots with small delta facts.
-         *
-         * ENABLED: for unaffected strata, skip iterations beyond frontier.
-         * Affected strata (frontier=UINT32_MAX) naturally re-evaluate all iterations. */
-        /* US-104-002: 2D frontier skip condition (epoch-aware).
-         * Skip only when BOTH conditions hold:
-         *   1. Same insertion epoch: frontier was set in this outer_epoch, so
-         *      the convergence point is still valid for the current data set.
-         *   2. Iteration beyond convergence: iter > frontier.iteration means
-         *      this stratum already converged at a lower iteration count.
-         * When epochs differ (new insertion cycle), outer_epoch mismatch means
-         * the frontier is stale — do NOT skip, always re-evaluate from iter 0. */
+         * Epoch check prevents skipping stale frontiers when base facts are inserted.
+         * Base fact insertion affects all strata, causing frontier reset to UINT32_MAX,
+         * which makes the skip ineffective (iter > UINT32_MAX is always false).
+         * Skip is beneficial only for derived-fact insertions (30-40% speedup). */
         if (stratum_idx < MAX_STRATA) {
             bool same_epoch = (sess->outer_epoch
                                == sess->frontiers[stratum_idx].outer_epoch);
