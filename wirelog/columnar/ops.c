@@ -86,7 +86,7 @@ filt_pop(filt_stack_t *s)
  */
 static int
 col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
-                  uint32_t ncols, int64_t *out_val)
+    uint32_t ncols, int64_t *out_val)
 {
     filt_stack_t s;
     s.top = 0;
@@ -238,7 +238,7 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
                 goto bad;
             }
             ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&a,
-                                      sizeof(a));
+                    sizeof(a));
             if (ret != 0) {
                 mbedtls_sha1_free(&sha1_ctx);
                 goto bad;
@@ -269,7 +269,7 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
                 goto bad;
             }
             ret = mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)&a,
-                                        sizeof(a));
+                    sizeof(a));
             if (ret != 0) {
                 mbedtls_sha256_free(&sha256_ctx);
                 goto bad;
@@ -300,7 +300,7 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
                 goto bad;
             }
             ret = mbedtls_sha512_update(&sha512_ctx, (const unsigned char *)&a,
-                                        sizeof(a));
+                    sizeof(a));
             if (ret != 0) {
                 mbedtls_sha512_free(&sha512_ctx);
                 goto bad;
@@ -325,9 +325,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             int64_t msg_val = filt_pop(&s);
             unsigned char digest[32];
             mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                            (const unsigned char *)&key_val, sizeof(key_val),
-                            (const unsigned char *)&msg_val, sizeof(msg_val),
-                            digest);
+                (const unsigned char *)&key_val, sizeof(key_val),
+                (const unsigned char *)&msg_val, sizeof(msg_val),
+                digest);
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
             (void)filt_pop(&s);
@@ -345,7 +345,7 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             mbedtls_entropy_init(&entropy);
             mbedtls_ctr_drbg_init(&ctr_drbg);
             int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
-                                            &entropy, NULL, 0);
+                    &entropy, NULL, 0);
             if (ret != 0) {
                 mbedtls_ctr_drbg_free(&ctr_drbg);
                 mbedtls_entropy_free(&entropy);
@@ -382,13 +382,13 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
                 goto bad;
             }
             ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&ns,
-                                      sizeof(ns));
+                    sizeof(ns));
             if (ret != 0) {
                 mbedtls_sha1_free(&sha1_ctx);
                 goto bad;
             }
             ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&name,
-                                      sizeof(name));
+                    sizeof(name));
             if (ret != 0) {
                 mbedtls_sha1_free(&sha1_ctx);
                 goto bad;
@@ -471,7 +471,7 @@ bad:
  */
 static int
 col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
-                    uint32_t ncols)
+    uint32_t ncols)
 {
     int64_t val;
     int err = col_eval_expr_run(buf, size, row, ncols, &val);
@@ -486,7 +486,7 @@ col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
  */
 static int64_t
 col_eval_expr_i64(const uint8_t *buf, uint32_t size, const int64_t *row,
-                  uint32_t ncols)
+    uint32_t ncols)
 {
     int64_t val;
     col_eval_expr_run(buf, size, row, ncols, &val);
@@ -558,7 +558,7 @@ eval_stack_drain(eval_stack_t *s)
 
 int
 col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess)
+    wl_col_session_t *sess)
 {
     if (!op->relation_name)
         return ENOENT;
@@ -666,8 +666,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             if (op->map_exprs && c < op->map_expr_count && op->map_exprs[c].data
                 && op->map_exprs[c].size > 0) {
                 tmp[c] = col_eval_expr_i64(op->map_exprs[c].data,
-                                           op->map_exprs[c].size, row,
-                                           e.rel->ncols);
+                        op->map_exprs[c].size, row,
+                        e.rel->ncols);
             } else {
                 uint32_t src = op->project_indices ? op->project_indices[c] : c;
                 tmp[c] = (src < e.rel->ncols) ? row[src] : 0;
@@ -720,7 +720,7 @@ typedef struct {
  */
 static bool
 parse_var_col(const uint8_t *buf, uint32_t size, uint32_t *pos,
-              uint32_t *col_out)
+    uint32_t *col_out)
 {
     uint32_t i = *pos;
     if (i >= size || buf[i] != (uint8_t)WL_PLAN_EXPR_VAR)
@@ -767,7 +767,7 @@ parse_var_col(const uint8_t *buf, uint32_t size, uint32_t *pos,
  */
 static bool
 filter_is_simple_cmp(const uint8_t *buf, uint32_t size,
-                     simple_filter_cmp_t *out)
+    simple_filter_cmp_t *out)
 {
     if (!buf || size == 0)
         return false;
@@ -834,7 +834,7 @@ filter_is_simple_cmp(const uint8_t *buf, uint32_t size,
  */
 static inline bool
 col_filter_cmp_row(const int64_t *row, uint32_t ncols,
-                   const simple_filter_cmp_t *cmp)
+    const simple_filter_cmp_t *cmp)
 {
     if (cmp->col_a >= ncols)
         return false;
@@ -870,7 +870,7 @@ col_filter_cmp_row(const int64_t *row, uint32_t ncols,
  */
 static uint32_t
 col_filter_simple_scalar(const int64_t *data, uint32_t nrows, uint32_t ncols,
-                         const simple_filter_cmp_t *cmp, int64_t *out_data)
+    const simple_filter_cmp_t *cmp, int64_t *out_data)
 {
     size_t row_bytes = (size_t)ncols * sizeof(int64_t);
     uint32_t out_idx = 0;
@@ -898,7 +898,7 @@ col_filter_simple_scalar(const int64_t *data, uint32_t nrows, uint32_t ncols,
  */
 static uint32_t
 col_filter_simd_avx2(const int64_t *data, uint32_t nrows, uint32_t ncols,
-                     const simple_filter_cmp_t *cmp, int64_t *out_data)
+    const simple_filter_cmp_t *cmp, int64_t *out_data)
 {
     /* Only the const-compare branch benefits from SIMD gather+compare.
      * Col-col compare requires two non-contiguous gathers; fall back. */
@@ -951,7 +951,7 @@ col_filter_simd_avx2(const int64_t *data, uint32_t nrows, uint32_t ncols,
         for (int lane = 0; lane < 4; lane++) {
             if (((bits >> (lane * 8)) & 0xFF) == 0xFF) {
                 memcpy(out_data + (size_t)out_idx * ncols,
-                       data + (size_t)(r + (uint32_t)lane) * ncols, row_bytes);
+                    data + (size_t)(r + (uint32_t)lane) * ncols, row_bytes);
                 out_idx++;
             }
         }
@@ -983,7 +983,7 @@ col_filter_simd_avx2(const int64_t *data, uint32_t nrows, uint32_t ncols,
  */
 static uint32_t
 col_filter_simd_neon(const int64_t *data, uint32_t nrows, uint32_t ncols,
-                     const simple_filter_cmp_t *cmp, int64_t *out_data)
+    const simple_filter_cmp_t *cmp, int64_t *out_data)
 {
     if (!cmp->b_is_const)
         return col_filter_simple_scalar(data, nrows, ncols, cmp, out_data);
@@ -997,7 +997,7 @@ col_filter_simd_neon(const int64_t *data, uint32_t nrows, uint32_t ncols,
         int64_t v0 = data[(size_t)(r + 0) * ncols + cmp->col_a];
         int64_t v1 = data[(size_t)(r + 1) * ncols + cmp->col_a];
         int64x2_t vals = vcombine_s64(vcreate_s64((uint64_t)v0),
-                                      vcreate_s64((uint64_t)v1));
+                vcreate_s64((uint64_t)v1));
 
         uint64x2_t pass_mask;
         switch (cmp->cmp_op) {
@@ -1027,13 +1027,13 @@ col_filter_simd_neon(const int64_t *data, uint32_t nrows, uint32_t ncols,
         /* Lane 0 */
         if (vgetq_lane_u64(pass_mask, 0) != 0) {
             memcpy(out_data + (size_t)out_idx * ncols,
-                   data + (size_t)(r + 0) * ncols, row_bytes);
+                data + (size_t)(r + 0) * ncols, row_bytes);
             out_idx++;
         }
         /* Lane 1 */
         if (vgetq_lane_u64(pass_mask, 1) != 0) {
             memcpy(out_data + (size_t)out_idx * ncols,
-                   data + (size_t)(r + 1) * ncols, row_bytes);
+                data + (size_t)(r + 1) * ncols, row_bytes);
             out_idx++;
         }
     }
@@ -1061,7 +1061,7 @@ col_filter_simd_neon(const int64_t *data, uint32_t nrows, uint32_t ncols,
 
 int
 col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
-              wl_col_session_t *sess)
+    wl_col_session_t *sess)
 {
     eval_entry_t e = eval_stack_pop(stack);
     if (!e.rel)
@@ -1093,7 +1093,7 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
             return ENOMEM;
         }
         uint32_t nout = col_filter_fast(e.rel->data, e.rel->nrows, e.rel->ncols,
-                                        &cmp, tmp);
+                &cmp, tmp);
         /* Bulk-copy the passing rows into the output relation */
         for (uint32_t r = 0; r < nout; r++) {
             int rc = col_rel_append_row(out, tmp + (size_t)r * e.rel->ncols);
@@ -1171,7 +1171,7 @@ hash_int64_keys(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
  * path used on non-SIMD builds. */
 static inline uint32_t
 hash_int64_keys_scalar_inline(const int64_t *row, const uint32_t *key_cols,
-                              uint32_t kc)
+    uint32_t kc)
 {
     uint32_t h = 2166136261u;
     for (uint32_t i = 0; i < kc; i++) {
@@ -1188,7 +1188,7 @@ hash_int64_keys_scalar_inline(const int64_t *row, const uint32_t *key_cols,
  * correctly handles kc=0 (returns true -- cross product) via the loop. */
 static inline bool
 keys_match_scalar_inline(const int64_t *lrow, const uint32_t *lk,
-                         const int64_t *rrow, const uint32_t *rk, uint32_t kc)
+    const int64_t *rrow, const uint32_t *rk, uint32_t kc)
 {
     for (uint32_t k = 0; k < kc; k++) {
         if (lrow[lk[k]] != rrow[rk[k]])
@@ -1206,7 +1206,7 @@ keys_match_scalar_inline(const int64_t *lrow, const uint32_t *lk,
  * unused-function warnings and MSVC __attribute__ compatibility issues. */
 static inline bool
 keys_match_scalar(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
-                  const uint32_t *rk, uint32_t kc)
+    const uint32_t *rk, uint32_t kc)
 {
     for (uint32_t k = 0; k < kc; k++) {
         if (lrow[lk[k]] != rrow[rk[k]])
@@ -1241,7 +1241,7 @@ hash_int64_keys_avx2(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
     for (; k + 4 <= kc; k += 4) {
         __m256i v
             = _mm256_set_epi64x(row[key_cols[k + 3]], row[key_cols[k + 2]],
-                                row[key_cols[k + 1]], row[key_cols[k + 0]]);
+                row[key_cols[k + 1]], row[key_cols[k + 0]]);
         acc = _mm256_xor_si256(acc, v);
     }
 
@@ -1275,15 +1275,15 @@ hash_int64_keys_avx2(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
  */
 static inline bool
 keys_match_avx2(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
-                const uint32_t *rk, uint32_t kc)
+    const uint32_t *rk, uint32_t kc)
 {
     uint32_t k = 0;
 
     for (; k + 4 <= kc; k += 4) {
         __m256i lv = _mm256_set_epi64x(lrow[lk[k + 3]], lrow[lk[k + 2]],
-                                       lrow[lk[k + 1]], lrow[lk[k + 0]]);
+                lrow[lk[k + 1]], lrow[lk[k + 0]]);
         __m256i rv = _mm256_set_epi64x(rrow[rk[k + 3]], rrow[rk[k + 2]],
-                                       rrow[rk[k + 1]], rrow[rk[k + 0]]);
+                rrow[rk[k + 1]], rrow[rk[k + 0]]);
         __m256i eq = _mm256_cmpeq_epi64(lv, rv);
         /* All 4 lanes equal iff all 32 movemask bits are set (== -1 as int) */
         if (_mm256_movemask_epi8(eq) != -1)
@@ -1323,7 +1323,7 @@ hash_int64_keys_neon(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
 
     for (; k + 2 <= kc; k += 2) {
         int64x2_t v = vcombine_s64(vcreate_s64((uint64_t)row[key_cols[k]]),
-                                   vcreate_s64((uint64_t)row[key_cols[k + 1]]));
+                vcreate_s64((uint64_t)row[key_cols[k + 1]]));
         acc = veorq_s64(acc, v);
     }
 
@@ -1353,7 +1353,7 @@ hash_int64_keys_neon(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
  */
 static inline bool
 keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
-                const uint32_t *rk, uint32_t kc)
+    const uint32_t *rk, uint32_t kc)
 {
     if (kc < 2)
         return keys_match_scalar_inline(lrow, lk, rrow, rk, kc);
@@ -1362,9 +1362,9 @@ keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
 
     for (; k + 2 <= kc; k += 2) {
         int64x2_t lv = vcombine_s64(vcreate_s64((uint64_t)lrow[lk[k]]),
-                                    vcreate_s64((uint64_t)lrow[lk[k + 1]]));
+                vcreate_s64((uint64_t)lrow[lk[k + 1]]));
         int64x2_t rv = vcombine_s64(vcreate_s64((uint64_t)rrow[rk[k]]),
-                                    vcreate_s64((uint64_t)rrow[rk[k + 1]]));
+                vcreate_s64((uint64_t)rrow[rk[k + 1]]));
         /* vceqq_s64 returns all-ones lanes for equal, zero for unequal */
         uint64x2_t eq = vceqq_s64(lv, rv);
         /* Both lanes must be all-ones (UINT64_MAX) for equality */
@@ -1412,7 +1412,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
          * Similar to ANTIJOIN logic (which keeps all left rows on missing right).
          * This can occur in generated plans where optional relations may not exist. */
         col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$join_empty",
-                                               left_e.rel->ncols);
+                left_e.rel->ncols);
         if (!out) {
             if (left_e.owned)
                 col_rel_destroy(left_e.rel);
@@ -1461,7 +1461,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
         /* else: iteration 0 — no deltas yet, fall through to full right */
     } else if (op->delta_mode != WL_DELTA_FORCE_FULL && !left_e.is_delta
-               && op->right_relation) {
+        && op->right_relation) {
         /* AUTO: original heuristic */
         char rdname[256];
         snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
@@ -1484,7 +1484,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             sess->profile.join_cache_hit_ns += now_ns() - _t0_join;
 #endif
             return eval_stack_push_delta(stack, cached, false,
-                                         left_e.is_delta || used_right_delta);
+                       left_e.is_delta || used_right_delta);
         }
     }
 
@@ -1528,7 +1528,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
      * risking EOVERFLOW (rc=84).  Evaluation continues with gracefully
      * degraded (incomplete) results rather than failing entirely. */
     if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
-                                          WL_MEM_SUBSYS_RELATION, 80)) {
+        WL_MEM_SUBSYS_RELATION, 80)) {
         free(lk);
         free(rk);
         if (left_e.owned)
@@ -1628,21 +1628,21 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 join_rc = col_rel_append_row(out, tmp);
                 if (join_rc != 0) {
                     fprintf(stderr,
-                            "ERROR: col_rel_append_row failed with rc=%d at "
-                            "unary join\n",
-                            join_rc);
+                        "ERROR: col_rel_append_row failed with rc=%d at "
+                        "unary join\n",
+                        join_rc);
                     break;
                 }
                 if ((sess->join_output_limit > 0
-                     && out->nrows >= sess->join_output_limit)
+                    && out->nrows >= sess->join_output_limit)
                     || (out->nrows % 10000 == 0 && out->nrows > 0
-                        && wl_mem_ledger_should_backpressure(
-                            &sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 80))) {
+                    && wl_mem_ledger_should_backpressure(
+                        &sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 80))) {
                     fprintf(stderr,
-                            "join output limit reached: %u rows "
-                            "(limit=%llu)\n",
-                            out->nrows,
-                            (unsigned long long)sess->join_output_limit);
+                        "join output limit reached: %u rows "
+                        "(limit=%llu)\n",
+                        out->nrows,
+                        (unsigned long long)sess->join_output_limit);
                     join_rc = EOVERFLOW;
                     break;
                 }
@@ -1664,7 +1664,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             join_rc = 0; /* soft truncation: push partial result below */
         }
         fprintf(stderr, "DEBUG[JOIN]: Unary join completed, out->nrows=%u\n",
-                out->nrows);
+            out->nrows);
     } else {
         /* Standard merge-join for non-unary relations. */
         /* Hash join: use persistent arrangement for the full right relation;
@@ -1676,22 +1676,22 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t *ht_next_ep = NULL;
 
         fprintf(stderr,
-                "DEBUG[JOIN]: Standard merge-join starting - left=%u rows, "
-                "right=%u rows, kc=%u\n",
-                left->nrows, right->nrows, kc);
+            "DEBUG[JOIN]: Standard merge-join starting - left=%u rows, "
+            "right=%u rows, kc=%u\n",
+            left->nrows, right->nrows, kc);
 
         if (!used_right_delta && op->right_relation && kc > 0)
             arr = col_session_get_arrangement(&sess->base, op->right_relation,
-                                              rk, kc);
+                    rk, kc);
         else if (used_right_delta && op->right_relation && kc > 0)
             arr = col_session_get_delta_arrangement(sess, op->right_relation,
-                                                    right, rk, kc);
+                    right, rk, kc);
 
         if (arr)
             fprintf(stderr, "DEBUG[JOIN]: Using persistent arrangement\n");
         else
             fprintf(stderr, "DEBUG[JOIN]: No arrangement available, will use "
-                            "ephemeral hash table\n");
+                "ephemeral hash table\n");
 
         if (!arr) {
             /* Ephemeral hash table (delta path or arrangement unavailable). */
@@ -1701,9 +1701,9 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 (right->nrows > 0 ? right->nrows : 1) * sizeof(uint32_t));
             if (!ht_head_ep || !ht_next_ep) {
                 fprintf(stderr,
-                        "ERROR: Ephemeral hash table allocation failed "
-                        "(nbuckets=%u)\n",
-                        nbuckets_ep);
+                    "ERROR: Ephemeral hash table allocation failed "
+                    "(nbuckets=%u)\n",
+                    nbuckets_ep);
                 free(ht_head_ep);
                 free(ht_next_ep);
                 free(tmp);
@@ -1715,8 +1715,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 return ENOMEM;
             }
             fprintf(stderr,
-                    "DEBUG[JOIN]: Ephemeral hash table created - nbuckets=%u\n",
-                    nbuckets_ep);
+                "DEBUG[JOIN]: Ephemeral hash table created - nbuckets=%u\n",
+                nbuckets_ep);
             for (uint32_t rr = 0; rr < right->nrows; rr++) {
                 const int64_t *rrow = right->data + (size_t)rr * right->ncols;
                 uint32_t h
@@ -1725,7 +1725,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 ht_head_ep[h] = rr + 1; /* 1-based; 0 = end of chain */
             }
             fprintf(stderr,
-                    "DEBUG[JOIN]: Ephemeral hash table built successfully\n");
+                "DEBUG[JOIN]: Ephemeral hash table built successfully\n");
         }
 
         /* key_row scratch buffer for arrangement probe: values placed at rk[]
@@ -1756,7 +1756,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 for (uint32_t k = 0; k < kc; k++)
                     key_row[rk[k]] = lrow[lk[k]];
                 uint32_t rr = col_arrangement_find_first(arr, right->data,
-                                                         right->ncols, key_row);
+                        right->ncols, key_row);
                 while (rr != UINT32_MAX && join_rc == 0) {
                     const int64_t *rrow
                         = right->data + (size_t)rr * right->ncols;
@@ -1764,21 +1764,21 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     if (keys_match_fast(lrow, lk, rrow, rk, kc)) {
                         memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
                         memcpy(tmp + left->ncols, rrow,
-                               sizeof(int64_t) * right->ncols);
+                            sizeof(int64_t) * right->ncols);
                         join_rc = col_rel_append_row(out, tmp);
                         if (join_rc != 0) {
                             fprintf(stderr,
-                                    "ERROR: col_rel_append_row failed in "
-                                    "arrangement probe with rc=%d\n",
-                                    join_rc);
+                                "ERROR: col_rel_append_row failed in "
+                                "arrangement probe with rc=%d\n",
+                                join_rc);
                             break;
                         }
                         if ((sess->join_output_limit > 0
-                             && out->nrows >= sess->join_output_limit)
+                            && out->nrows >= sess->join_output_limit)
                             || (out->nrows % 10000 == 0 && out->nrows > 0
-                                && wl_mem_ledger_should_backpressure(
-                                    &sess->mem_ledger, WL_MEM_SUBSYS_RELATION,
-                                    80))) {
+                            && wl_mem_ledger_should_backpressure(
+                                &sess->mem_ledger, WL_MEM_SUBSYS_RELATION,
+                                80))) {
                             fprintf(
                                 stderr,
                                 "join output limit reached: %u rows "
@@ -1795,7 +1795,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 uint32_t h
                     = hash_int64_keys_fast(lrow, lk, kc) & (nbuckets_ep - 1);
                 for (uint32_t e = ht_head_ep[h]; e != 0;
-                     e = ht_next_ep[e - 1]) {
+                    e = ht_next_ep[e - 1]) {
                     uint32_t rr = e - 1;
                     const int64_t *rrow
                         = right->data + (size_t)rr * right->ncols;
@@ -1803,26 +1803,26 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         continue;
                     memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
                     memcpy(tmp + left->ncols, rrow,
-                           sizeof(int64_t) * right->ncols);
+                        sizeof(int64_t) * right->ncols);
                     join_rc = col_rel_append_row(out, tmp);
                     if (join_rc != 0) {
                         fprintf(stderr,
-                                "ERROR: col_rel_append_row failed in ephemeral "
-                                "hash probe with rc=%d\n",
-                                join_rc);
+                            "ERROR: col_rel_append_row failed in ephemeral "
+                            "hash probe with rc=%d\n",
+                            join_rc);
                         break;
                     }
                     if ((sess->join_output_limit > 0
-                         && out->nrows >= sess->join_output_limit)
+                        && out->nrows >= sess->join_output_limit)
                         || (out->nrows % 10000 == 0 && out->nrows > 0
-                            && wl_mem_ledger_should_backpressure(
-                                &sess->mem_ledger, WL_MEM_SUBSYS_RELATION,
-                                80))) {
+                        && wl_mem_ledger_should_backpressure(
+                            &sess->mem_ledger, WL_MEM_SUBSYS_RELATION,
+                            80))) {
                         fprintf(stderr,
-                                "join output limit reached: %u rows "
-                                "(limit=%llu)\n",
-                                out->nrows,
-                                (unsigned long long)sess->join_output_limit);
+                            "join output limit reached: %u rows "
+                            "(limit=%llu)\n",
+                            out->nrows,
+                            (unsigned long long)sess->join_output_limit);
                         join_rc = EOVERFLOW;
                         break;
                     }
@@ -1841,9 +1841,9 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (join_rc != 0) {
             if (join_rc != EOVERFLOW) {
                 fprintf(stderr,
-                        "DEBUG[JOIN]: Merge-join failed with rc=%d, "
-                        "out->nrows=%u\n",
-                        join_rc, out->nrows);
+                    "DEBUG[JOIN]: Merge-join failed with rc=%d, "
+                    "out->nrows=%u\n",
+                    join_rc, out->nrows);
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1893,7 +1893,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 
 int
 col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess)
+    wl_col_session_t *sess)
 {
     eval_entry_t left_e = eval_stack_pop(stack);
     if (!left_e.rel)
@@ -2062,7 +2062,7 @@ col_op_concat(eval_stack_t *stack, wl_col_session_t *sess)
     /* Copy left boundaries */
     if (a_e.seg_boundaries != NULL) {
         memcpy(out_boundaries, a_e.seg_boundaries,
-               (left_segs + 1) * sizeof(uint32_t));
+            (left_segs + 1) * sizeof(uint32_t));
     } else {
         out_boundaries[0] = 0;
         out_boundaries[1] = a->nrows;
@@ -2281,7 +2281,7 @@ kway_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
  */
 int
 col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
-                              uint32_t seg_count)
+    uint32_t seg_count)
 {
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
@@ -2296,7 +2296,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         uint32_t end = seg_boundaries[s + 1];
         if (end > start + 1) {
             QSORT_R_CALL(rel->data + (size_t)start * nc, end - start, row_bytes,
-                         &nc, row_cmp_fn);
+                &nc, row_cmp_fn);
         }
     }
 
@@ -2411,21 +2411,21 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     /* Sift-down helper (inline macro for performance) */
 #define HEAP_ROW(idx) (rel->data + (size_t)heap[(idx)].cursor * nc)
 #define HEAP_SIFT_DOWN(start, size)                                      \
-    do {                                                                 \
-        uint32_t _p = (start);                                           \
-        while (2 * _p + 1 < (size)) {                                    \
-            uint32_t _c = 2 * _p + 1;                                    \
-            if (_c + 1 < (size)                                          \
-                && kway_row_cmp(HEAP_ROW(_c + 1), HEAP_ROW(_c), nc) < 0) \
+        do {                                                                 \
+            uint32_t _p = (start);                                           \
+            while (2 * _p + 1 < (size)) {                                    \
+                uint32_t _c = 2 * _p + 1;                                    \
+                if (_c + 1 < (size)                                          \
+                    && kway_row_cmp(HEAP_ROW(_c + 1), HEAP_ROW(_c), nc) < 0) \
                 _c++;                                                    \
-            if (kway_row_cmp(HEAP_ROW(_p), HEAP_ROW(_c), nc) <= 0)       \
+                if (kway_row_cmp(HEAP_ROW(_p), HEAP_ROW(_c), nc) <= 0)       \
                 break;                                                   \
-            heap_entry_t _tmp = heap[_p];                                \
-            heap[_p] = heap[_c];                                         \
-            heap[_c] = _tmp;                                             \
-            _p = _c;                                                     \
-        }                                                                \
-    } while (0)
+                heap_entry_t _tmp = heap[_p];                                \
+                heap[_p] = heap[_c];                                         \
+                heap[_c] = _tmp;                                             \
+                _p = _c;                                                     \
+            }                                                                \
+        } while (0)
 
     /* Build min-heap (heapify) */
     if (heap_size > 1) {
@@ -2540,11 +2540,11 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t d_unique = 1;
         for (uint32_t i = 1; i < delta_count; i++) {
             if (row_cmp_optimized(delta_start + (size_t)(i - 1) * nc,
-                                  delta_start + (size_t)i * nc, nc)
+                delta_start + (size_t)i * nc, nc)
                 != 0) {
                 if (d_unique != i)
                     memcpy(delta_start + (size_t)d_unique * nc,
-                           delta_start + (size_t)i * nc, row_bytes);
+                        delta_start + (size_t)i * nc, row_bytes);
                 d_unique++;
             }
         }
@@ -2598,13 +2598,13 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         }
         while (oi < sn) {
             memcpy(merged + (size_t)out * nc, work->data + (size_t)oi * nc,
-                   row_bytes);
+                row_bytes);
             oi++;
             out++;
         }
         while (di < d_unique) {
             memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
-                   row_bytes);
+                row_bytes);
             di++;
             out++;
         }
@@ -2692,11 +2692,11 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     uint32_t d_unique = 1;
     for (uint32_t i = 1; i < delta_count; i++) {
         if (row_cmp_optimized(delta_start + (size_t)(i - 1) * nc,
-                              delta_start + (size_t)i * nc, nc)
+            delta_start + (size_t)i * nc, nc)
             != 0) {
             if (d_unique != i)
                 memcpy(delta_start + (size_t)d_unique * nc,
-                       delta_start + (size_t)i * nc, row_bytes);
+                    delta_start + (size_t)i * nc, row_bytes);
             d_unique++;
         }
     }
@@ -2732,14 +2732,14 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     if (oi < old_nrows) {
         uint32_t remaining = old_nrows - oi;
         memcpy(merged + (size_t)out * nc, rel->data + (size_t)oi * nc,
-               (size_t)remaining * row_bytes);
+            (size_t)remaining * row_bytes);
         out += remaining;
     }
     /* Copy remaining from delta */
     if (di < d_unique) {
         uint32_t remaining = d_unique - di;
         memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
-               (size_t)remaining * row_bytes);
+            (size_t)remaining * row_bytes);
         out += remaining;
     }
 
@@ -2790,7 +2790,7 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
  */
 int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
-                                     col_rel_t *delta_out)
+    col_rel_t *delta_out)
 {
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
@@ -2809,11 +2809,11 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     uint32_t d_unique = 1;
     for (uint32_t i = 1; i < delta_count; i++) {
         if (row_cmp_optimized(delta_start + (size_t)(i - 1) * nc,
-                              delta_start + (size_t)i * nc, nc)
+            delta_start + (size_t)i * nc, nc)
             != 0) {
             if (d_unique != i)
                 memcpy(delta_start + (size_t)d_unique * nc,
-                       delta_start + (size_t)i * nc, row_bytes);
+                    delta_start + (size_t)i * nc, row_bytes);
             d_unique++;
         }
     }
@@ -2832,7 +2832,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         if (new_cap < max_rows)
             new_cap = max_rows;
         int64_t *nb = (int64_t *)realloc(rel->merge_buf, (size_t)new_cap * nc
-                                                             * sizeof(int64_t));
+                * sizeof(int64_t));
         if (!nb)
             return ENOMEM;
         rel->merge_buf = nb;
@@ -2862,12 +2862,12 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         fast_path = 1;
     } else {
         int cmp = row_cmp_optimized(rel->data + (size_t)(old_nrows - 1) * nc,
-                                    delta_start, nc);
+                delta_start, nc);
         if (cmp < 0) {
             /* All delta rows > all old rows: copy old then append delta */
             memcpy(merged, rel->data, (size_t)old_nrows * row_bytes);
             memcpy(merged + (size_t)old_nrows * nc, delta_start,
-                   (size_t)d_unique * row_bytes);
+                (size_t)d_unique * row_bytes);
             if (delta_out) {
                 for (uint32_t k = 0; k < d_unique; k++)
                     col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
@@ -2905,7 +2905,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         if (oi < old_nrows) {
             uint32_t remaining = old_nrows - oi;
             memcpy(merged + (size_t)out * nc, rel->data + (size_t)oi * nc,
-                   (size_t)remaining * row_bytes);
+                (size_t)remaining * row_bytes);
             out += remaining;
         }
         /* Remaining delta rows: all new */
@@ -2916,7 +2916,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             }
             uint32_t remaining = d_unique - di;
             memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
-                   (size_t)remaining * row_bytes);
+                (size_t)remaining * row_bytes);
             out += remaining;
         }
     }
@@ -2943,7 +2943,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         if (tight < COL_REL_INIT_CAP)
             tight = COL_REL_INIT_CAP;
         int64_t *shrunk = (int64_t *)realloc(rel->data, (size_t)tight * nc
-                                                            * sizeof(int64_t));
+                * sizeof(int64_t));
         if (shrunk) {
             rel->data = shrunk;
             rel->capacity = tight;
@@ -3122,6 +3122,113 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
 }
 
 /**
+ * col_arr_entry_clone - Deep-copy one arrangement registry entry (#260).
+ *
+ * All owned memory (rel_name, key_cols, ht_head, ht_next) is freshly
+ * allocated.  arr.key_cols is set to the new entry's key_cols (shared alias,
+ * not a separate allocation — matches arrangement.c creation convention).
+ * Returns 0 on success; dst is memset-zeroed before returning on failure.
+ */
+static int
+col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst)
+{
+    memset(dst, 0, sizeof(*dst));
+
+    dst->rel_name = wl_strdup(src->rel_name);
+    if (!dst->rel_name)
+        return ENOMEM;
+
+    if (src->key_count > 0) {
+        dst->key_cols = (uint32_t *)malloc(src->key_count * sizeof(uint32_t));
+        if (!dst->key_cols) {
+            free(dst->rel_name);
+            memset(dst, 0, sizeof(*dst));
+            return ENOMEM;
+        }
+        memcpy(dst->key_cols, src->key_cols, src->key_count * sizeof(uint32_t));
+    }
+    dst->key_count = src->key_count;
+
+    /* arr.key_cols is a shared alias of entry.key_cols (not separately owned).
+    * Mirrors the convention in col_session_get_arrangement (arrangement.c). */
+    dst->arr.key_cols = dst->key_cols;
+    dst->arr.key_count = src->arr.key_count;
+    dst->arr.indexed_rows = src->arr.indexed_rows;
+    dst->arr.content_hash = src->arr.content_hash;
+    dst->arr.nbuckets = src->arr.nbuckets;
+    dst->arr.ht_cap = src->arr.ht_cap;
+
+    if (src->arr.nbuckets > 0 && src->arr.ht_head) {
+        dst->arr.ht_head
+            = (uint32_t *)malloc(src->arr.nbuckets * sizeof(uint32_t));
+        if (!dst->arr.ht_head) {
+            free(dst->key_cols);
+            free(dst->rel_name);
+            memset(dst, 0, sizeof(*dst));
+            return ENOMEM;
+        }
+        memcpy(dst->arr.ht_head, src->arr.ht_head,
+            src->arr.nbuckets * sizeof(uint32_t));
+    }
+
+    if (src->arr.ht_cap > 0 && src->arr.ht_next) {
+        dst->arr.ht_next
+            = (uint32_t *)malloc(src->arr.ht_cap * sizeof(uint32_t));
+        if (!dst->arr.ht_next) {
+            free(dst->arr.ht_head);
+            free(dst->key_cols);
+            free(dst->rel_name);
+            memset(dst, 0, sizeof(*dst));
+            return ENOMEM;
+        }
+        memcpy(dst->arr.ht_next, src->arr.ht_next,
+            src->arr.ht_cap * sizeof(uint32_t));
+    }
+
+    return 0;
+}
+
+/**
+ * col_arr_entries_clone - Deep-copy an arrangement registry array (#260).
+ *
+ * Creates an independent copy of `count` entries for a K-fusion worker.
+ * On success, *out_entries owns all allocations and *out_cap equals count.
+ * On failure, *out_entries is NULL.
+ */
+static int
+col_arr_entries_clone(const col_arr_entry_t *src, uint32_t count,
+    col_arr_entry_t **out_entries, uint32_t *out_cap)
+{
+    *out_entries = NULL;
+    *out_cap = 0;
+
+    if (count == 0)
+        return 0;
+
+    col_arr_entry_t *cloned
+        = (col_arr_entry_t *)calloc(count, sizeof(col_arr_entry_t));
+    if (!cloned)
+        return ENOMEM;
+
+    for (uint32_t i = 0; i < count; i++) {
+        int clone_rc = col_arr_entry_clone(&src[i], &cloned[i]);
+        if (clone_rc != 0) {
+            for (uint32_t j = 0; j < i; j++) {
+                free(cloned[j].rel_name);
+                free(cloned[j].key_cols);
+                arr_free_contents(&cloned[j].arr);
+            }
+            free(cloned);
+            return clone_rc;
+        }
+    }
+
+    *out_entries = cloned;
+    *out_cap = count;
+    return 0;
+}
+
+/**
  * Worker task context for K-fusion evaluation.
  * plan_data is embedded (not a pointer) so its lifetime matches the worker array.
  * sess points to an isolated session wrapper with a per-worker mat_cache so
@@ -3131,7 +3238,7 @@ typedef struct {
     wl_plan_relation_t plan_data; /* Embedded plan (stable lifetime) */
     eval_stack_t stack;           /* Output stack (initialized by worker) */
     wl_col_session_t
-        *sess;    /* Per-worker session wrapper (isolated mat_cache) */
+    *sess;        /* Per-worker session wrapper (isolated mat_cache) */
     int rc;       /* Return code from evaluation */
     bool skipped; /* true if skipped due to empty forced delta (#85) */
 } col_op_k_fusion_worker_t;
@@ -3159,7 +3266,7 @@ col_op_k_fusion_worker(void *ctx)
  */
 int
 col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess)
+    wl_col_session_t *sess)
 {
     if (!op->opaque_data)
         return EINVAL;
@@ -3206,14 +3313,31 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     for (uint32_t d = 0; d < k; d++) {
         /* Shallow copy shares rels[], plan, etc. (read-only during K-fusion).
          * mat_cache is zeroed below (Issue #196): workers start fresh.
-         * arr_* and darr_* are zeroed: each worker builds its own arrangement
-         * cache independently (no sharing, no races). Lock-free: no mutex needed
-         * because each worker owns its isolated cache. */
+         * arr_* are deep-copied (#260): each worker gets an independent
+         * arrangement cache to probe without races (no shared mutable state).
+         * darr_* are zeroed: workers rebuild delta arrangements per-iteration. */
         worker_sess[d] = *sess;
         worker_sess[d].wq = NULL; /* prevent nested K-fusion from workers */
+        /* Issue #260: Deep-copy parent's full-arrangement cache so each worker
+         * has an independent copy.  arr.key_cols is a shared alias of
+         * entry.key_cols inside each clone (see col_arr_entry_clone). */
         worker_sess[d].arr_entries = NULL;
         worker_sess[d].arr_count = 0;
         worker_sess[d].arr_cap = 0;
+        {
+            uint32_t clone_cap = 0;
+            int clone_rc = col_arr_entries_clone(
+                sess->arr_entries, sess->arr_count,
+                &worker_sess[d].arr_entries, &clone_cap);
+            if (clone_rc != 0) {
+                rc = ENOMEM;
+                if (wq)
+                    wl_workqueue_drain(wq);
+                goto cleanup_wq;
+            }
+            worker_sess[d].arr_count = sess->arr_count;
+            worker_sess[d].arr_cap = clone_cap;
+        }
         worker_sess[d].darr_entries = NULL;
         worker_sess[d].darr_count = 0;
         worker_sess[d].darr_cap = 0;
@@ -3255,7 +3379,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
          * has a FORCE_DELTA op referencing an empty/absent delta on
          * iteration > 0, skip dispatching — the copy would produce 0 rows. */
         if (has_empty_forced_delta(&workers[d].plan_data, sess,
-                                   sess->current_iteration)) {
+            sess->current_iteration)) {
             workers[d].rc = 0; /* mark as succeeded with no output */
             workers[d].skipped = true;
             continue;
@@ -3297,9 +3421,9 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
             sess->profile.join_unary
                 += worker_sess[d].profile.join_unary - base_profile.join_unary;
             sess->profile.join_binary += worker_sess[d].profile.join_binary
-                                         - base_profile.join_binary;
+                - base_profile.join_binary;
             sess->profile.seminaive_ops += worker_sess[d].profile.seminaive_ops
-                                           - base_profile.seminaive_ops;
+                - base_profile.seminaive_ops;
         }
     }
 #endif
@@ -3329,7 +3453,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         /* If not owned, make a copy we can hand to merge */
         if (!e.owned) {
             col_rel_t *copy = col_rel_pool_new_like(worker_sess[d].delta_pool,
-                                                    "<k_fusion_copy>", e.rel);
+                    "<k_fusion_copy>", e.rel);
             if (!copy) {
                 rc = ENOMEM;
                 eval_stack_drain(&workers[d].stack);
@@ -3399,7 +3523,7 @@ cleanup_results:
 
 cleanup_wq:
     /* On early-exit paths (submit failure, wait failure) _phase_t0 may hold
-     * a stale dispatch value; reset it here so cleanup timing is correct. */
+    * a stale dispatch value; reset it here so cleanup timing is correct. */
     _phase_t0 = now_ns();
     /* wq is session-owned and reused across iterations — do not destroy here.
      * Workers start with empty mat_cache (Issue #196), so all entries are
@@ -3437,7 +3561,7 @@ cleanup_wq:
 
 int
 col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess)
+    wl_col_session_t *sess)
 {
     eval_entry_t left_e = eval_stack_pop(stack);
     if (!left_e.rel)
@@ -3493,7 +3617,7 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t nbuckets = next_pow2(right->nrows > 0 ? right->nrows * 2 : 1);
     uint32_t *ht_head = (uint32_t *)calloc(nbuckets, sizeof(uint32_t));
     uint32_t *ht_next = (uint32_t *)malloc((right->nrows > 0 ? right->nrows : 1)
-                                           * sizeof(uint32_t));
+            * sizeof(uint32_t));
     if (!ht_head || !ht_next) {
         free(ht_head);
         free(ht_next);
@@ -3561,7 +3685,7 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
 
 int
 col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
-              wl_col_session_t *sess)
+    wl_col_session_t *sess)
 {
     eval_entry_t e = eval_stack_pop(stack);
     if (!e.rel)
@@ -3848,7 +3972,7 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 
     {
         col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$lftj",
-                                               total_binary_ncols);
+                total_binary_ncols);
         int64_t *tmp = (int64_t *)malloc(
             (total_binary_ncols ? total_binary_ncols : 1u) * sizeof(int64_t));
         if (!out || !tmp) {
