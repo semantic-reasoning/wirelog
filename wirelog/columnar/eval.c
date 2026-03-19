@@ -32,7 +32,7 @@
  */
 int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
-                       wl_col_session_t *sess)
+    wl_col_session_t *sess)
 {
     for (uint32_t i = 0; i < rplan->op_count; i++) {
         const wl_plan_op_t *op = &rplan->ops[i];
@@ -121,7 +121,7 @@ retraction_rel_name(const char *rel, char *buf, size_t sz)
  */
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
-                       uint32_t iteration)
+    uint32_t iteration)
 {
     if (iteration == 0 && !sess->delta_seeded && !sess->retraction_seeded)
         return false; /* Base case: no deltas exist yet (non-incremental) */
@@ -169,7 +169,7 @@ col_frontier_compute(const col_rel_t *rel);
  */
 int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
-                 uint32_t stratum_idx)
+    uint32_t stratum_idx)
 {
     if (!sp->is_recursive) {
         /* Non-recursive: evaluate each relation plan once */
@@ -235,14 +235,12 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         delta_pool_reset(sess->delta_pool);
 
         /* Non-recursive stratum frontier: record convergence epoch and iteration.
-         * Non-recursive strata always converge at iteration UINT32_MAX (no loop),
-         * so store (outer_epoch, UINT32_MAX) to enable epoch-aware skip on next
-         * incremental call. Always update both fields so same-epoch skip logic
-         * fires correctly when the frontier persists across session_step calls. */
-        if (stratum_idx < MAX_STRATA) {
-            col_frontier_2d_t f2d = { sess->outer_epoch, UINT32_MAX };
-            sess->frontiers[stratum_idx] = f2d;
-        }
+        * Non-recursive strata always converge at iteration UINT32_MAX (no loop),
+        * so store (outer_epoch, UINT32_MAX) to enable epoch-aware skip on next
+        * incremental call. Always update both fields so same-epoch skip logic
+        * fires correctly when the frontier persists across session_step calls. */
+        sess->frontier_ops->record_stratum_convergence(sess, stratum_idx,
+            sess->outer_epoch, UINT32_MAX);
 
         /* Non-recursive rule frontiers: mark each rule fully evaluated.
          * UINT32_MAX sentinel matches stratum frontier convention. */
@@ -256,9 +254,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     /* Issue #106: Conservative approach - always reset rule frontiers
                      * for affected strata to (current_epoch, UINT32_MAX) sentinel.
                      * UINT32_MAX prevents premature skip during re-evaluation. */
-                    sess->rule_frontiers[rule_idx].outer_epoch
-                        = sess->outer_epoch;
-                    sess->rule_frontiers[rule_idx].iteration = UINT32_MAX;
+                    sess->frontier_ops->reset_rule_frontier(sess, rule_idx,
+                        sess->outer_epoch);
                 }
             }
         }
@@ -321,10 +318,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * col_session_insert_incremental call preserved a real convergence frontier,
      * keep it so the per-iteration skip condition fires for iterations beyond
      * the prior convergence point. */
-    if (stratum_idx < MAX_STRATA
-        && sess->frontiers[stratum_idx].iteration == 0) {
-        sess->frontiers[stratum_idx].iteration = UINT32_MAX;
-    }
+    sess->frontier_ops->init_stratum(sess, stratum_idx);
 
     /* Phase 4 (US-4-004): Compute the base global rule index for this stratum.
      * Rule indices are assigned by enumerating strata in order and relations
@@ -332,7 +326,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t rule_id_base = 0;
     if (sess->plan) {
         for (uint32_t si = 0;
-             si < stratum_idx && si < sess->plan->stratum_count; si++) {
+            si < stratum_idx && si < sess->plan->stratum_count; si++) {
             rule_id_base += sess->plan->strata[si].relation_count;
         }
     }
@@ -390,14 +384,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
              * Once eff_iter exceeds the frontier for sub=0, it also exceeds for
              * all higher sub values, so the entire outer iteration effectively
              * continues to the next one. */
-            if (stratum_idx < MAX_STRATA) {
-                bool same_epoch = (sess->outer_epoch
-                                   == sess->frontiers[stratum_idx].outer_epoch);
-                bool beyond_convergence
-                    = (eff_iter > sess->frontiers[stratum_idx].iteration);
-                if (same_epoch && beyond_convergence) {
-                    continue; /* skip this sub-pass */
-                }
+            if (sess->frontier_ops->should_skip_iteration(sess, stratum_idx,
+                eff_iter)) {
+                continue; /* skip this sub-pass */
             }
 
             stride_all_skipped = false; /* at least one sub-pass runs */
@@ -436,7 +425,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 for (uint32_t ri = 0; ri < nrels; ri++) {
                     char dname[256];
                     snprintf(dname, sizeof(dname), "$d$%s",
-                             sp->relations[ri].name);
+                        sp->relations[ri].name);
                     col_rel_t *delta = session_find_rel(sess, dname);
                     if (!delta || delta->nrows == 0) {
                         /* Empty delta: net multiplicity is zero */
@@ -465,7 +454,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 bool all_rules_empty = true;
                 for (uint32_t ri = 0; ri < nrels; ri++) {
                     if (!has_empty_forced_delta(&sp->relations[ri], sess,
-                                                eff_iter)) {
+                        eff_iter)) {
                         all_rules_empty = false;
                         break;
                     }
@@ -489,10 +478,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                  * 2. eff_iter > convergence point (already processed in epoch)
                  * Across epoch boundaries mismatch => always re-eval. */
                 uint32_t rule_id = rule_id_base + ri;
-                if (rule_id < MAX_RULES
-                    && sess->rule_frontiers[rule_id].outer_epoch
-                           == sess->outer_epoch
-                    && eff_iter > sess->rule_frontiers[rule_id].iteration) {
+                if (sess->frontier_ops->should_skip_rule(sess, rule_id,
+                    eff_iter)) {
                     continue;
                 }
 
@@ -620,15 +607,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 sess->consolidation_ns += cons_elapsed;
                 /* Invalidate arrangements for this relation (data changed). */
                 col_session_invalidate_arrangements(&sess->base,
-                                                    sp->relations[ri].name);
+                    sp->relations[ri].name);
                 /* Per-call trace: WL_CONSOLIDATION_LOG=1 prints per-call info */
                 if (getenv("WL_CONSOLIDATION_LOG")) {
                     fprintf(stderr,
-                            "CONS eff_iter=%u stratum=%u rel=%s N=%u D=%u "
-                            "time_us=%.1f ratio=%.4f\n",
-                            eff_iter, stratum_idx, sp->relations[ri].name,
-                            cons_old, cons_new, (double)cons_elapsed / 1000.0,
-                            cons_old > 0 ? (double)cons_new / (double)cons_old
+                        "CONS eff_iter=%u stratum=%u rel=%s N=%u D=%u "
+                        "time_us=%.1f ratio=%.4f\n",
+                        eff_iter, stratum_idx, sp->relations[ri].name,
+                        cons_old, cons_new, (double)cons_elapsed / 1000.0,
+                        cons_old > 0 ? (double)cons_new / (double)cons_old
                                          : 0.0);
                 }
                 if (rc2 != 0) {
@@ -678,7 +665,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     col_frontier_t rel_frontier = col_frontier_compute(delta);
                     if (rel_frontier.iteration > strat_frontier.iteration
                         || (rel_frontier.iteration == strat_frontier.iteration
-                            && rel_frontier.stratum > strat_frontier.stratum)) {
+                        && rel_frontier.stratum > strat_frontier.stratum)) {
                         strat_frontier = rel_frontier;
                     }
                 } else {
@@ -695,7 +682,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 col_mat_cache_clear(&sess->mat_cache);
             } else {
                 col_mat_cache_evict_until(&sess->mat_cache,
-                                          sess->cache_evict_threshold);
+                    sess->cache_evict_threshold);
             }
 
             if (!any_new) {
@@ -707,7 +694,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             final_eff_iter = eff_iter;
             continue; /* next sub-pass */
 
-        stride_error:
+stride_error:
             break; /* exit inner loop; outer_rc carries the error */
         } /* end inner sub-pass loop */
 
@@ -734,16 +721,16 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * On next incremental snapshot, skip fires when eff_iter > I. */
     for (uint32_t ri = 0; ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
         uint32_t rule_id = rule_id_base + ri;
-        sess->rule_frontiers[rule_id].outer_epoch = sess->outer_epoch;
-        sess->rule_frontiers[rule_id].iteration = final_eff_iter;
+        sess->frontier_ops->record_rule_convergence(sess, rule_id,
+            sess->outer_epoch, final_eff_iter);
     }
 
     /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
      * strat_frontier was computed incrementally via delta timestamps (eff_iter),
      * so it already holds the effective iteration index at convergence. */
-    if (strat_frontier.iteration != UINT32_MAX && stratum_idx < MAX_STRATA) {
-        col_frontier_2d_t f2d = { sess->outer_epoch, strat_frontier.iteration };
-        sess->frontiers[stratum_idx] = f2d;
+    if (strat_frontier.iteration != UINT32_MAX) {
+        sess->frontier_ops->record_stratum_convergence(sess, stratum_idx,
+            sess->outer_epoch, strat_frontier.iteration);
     }
 
     /* Cleanup all delta relations after frontier has been computed */
@@ -787,7 +774,7 @@ col_frontier_compute(const col_rel_t *rel)
 }
 static bool
 col_row_in_sorted(const int64_t *sorted_data, uint32_t nrows, uint32_t ncols,
-                  const int64_t *row)
+    const int64_t *row)
 {
     if (!sorted_data || nrows == 0 || ncols == 0)
         return false;
@@ -851,7 +838,7 @@ col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
 /* Forward declaration for col_stratum_step_with_delta (defined below) */
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
-                            uint32_t stratum_idx);
+    uint32_t stratum_idx);
 
 /*
  * col_stratum_step_retraction_nonrecursive: Retraction delta propagation
@@ -873,8 +860,8 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
  */
 static int
 col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
-                                         wl_col_session_t *sess,
-                                         uint32_t stratum_idx)
+    wl_col_session_t *sess,
+    uint32_t stratum_idx)
 {
     if (sp->is_recursive) {
         /* Recursive strata fall back to full re-eval */
@@ -1017,7 +1004,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                 r->capacity = saved_nrows[ri];
             }
             memcpy(r->data, saved_data[ri],
-                   saved_nrows[ri] * ncols * sizeof(int64_t));
+                saved_nrows[ri] * ncols * sizeof(int64_t));
             r->nrows = saved_nrows[ri];
         } else {
             r->nrows = 0;
@@ -1042,10 +1029,10 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                         found = true;
                         /* Copy remaining rows */
                         for (uint32_t rest = src_idx + 1; rest < r->nrows;
-                             rest++) {
+                            rest++) {
                             memcpy(r->data + (size_t)out_r * ncols,
-                                   r->data + (size_t)rest * ncols,
-                                   sizeof(int64_t) * ncols);
+                                r->data + (size_t)rest * ncols,
+                                sizeof(int64_t) * ncols);
                             out_r++;
                         }
                         r->nrows = out_r;
@@ -1054,7 +1041,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                         /* Keep this row */
                         if (out_r != src_idx)
                             memcpy(r->data + (size_t)out_r * ncols, src,
-                                   sizeof(int64_t) * ncols);
+                                sizeof(int64_t) * ncols);
                         out_r++;
                     }
                 }
@@ -1062,7 +1049,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                 /* Fire delta callback if row was actually removed */
                 if (found && sess->delta_cb) {
                     sess->delta_cb(r->name, to_remove, ncols, -1,
-                                   sess->delta_data);
+                        sess->delta_data);
                 }
             }
         }
@@ -1083,7 +1070,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
 
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
-                            uint32_t stratum_idx)
+    uint32_t stratum_idx)
 {
     /* Issue #158: For now, use full re-evaluation for retraction.
      * When retraction_seeded is set, the standard delta callback logic
@@ -1164,7 +1151,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             for (uint32_t row = 0; row < r->nrows; row++) {
                 const int64_t *rowp = r->data + (size_t)row * ncols;
                 if (!col_row_in_sorted(prev_data[ri], prev_nrows[ri], ncols,
-                                       rowp)) {
+                    rowp)) {
                     sess->delta_cb(r->name, rowp, ncols, +1, sess->delta_data);
                 }
             }
@@ -1177,9 +1164,9 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 const int64_t *rowp
                     = prev_data[ri] + (size_t)row * prev_ncols[ri];
                 if (!col_row_in_sorted(r->data, r->nrows, prev_ncols[ri],
-                                       rowp)) {
+                    rowp)) {
                     sess->delta_cb(r->name, rowp, prev_ncols[ri], -1,
-                                   sess->delta_data);
+                        sess->delta_data);
                 }
             }
         }
