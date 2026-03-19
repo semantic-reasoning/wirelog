@@ -30,7 +30,7 @@ Wirelog is a **declarative logic programming engine** that brings the power of D
 
 ### Production-Ready
 - **Strict C11 compliance** — no Rust, no virtual machines, no GC pauses
-- **Zero dependencies** (nanoarrow vendored) — single binary, deployable anywhere
+- **Minimal external dependencies** — core libs vendored (nanoarrow, xxHash); optional: mbedTLS, zlib, pthreads
 - **Cross-platform** — Unix/Linux/macOS/Windows with identical semantics
 - **Memory-safe** — AddressSanitizer + UndefinedBehaviorSanitizer validated
 - **CI/CD hardened** — three-phase PR gates (lint, build, sanitizers) + main branch monitoring
@@ -50,21 +50,25 @@ Wirelog is a **declarative logic programming engine** that brings the power of D
 | Backend | Pure columnar (nanoarrow) |
 | Threading | Cross-platform abstraction (POSIX pthreads / MSVC) |
 | Platforms | Unix/Linux/macOS (primary), Windows (MSVC) |
-| Phase | 4 — Incremental evaluation with delta-seeded propagation |
-| Tests | 56+ passing, ASan/UBSan validated |
-| CSPA benchmark | **2.82x speedup** (baseline 10.4s → incremental 3.7s) |
+| SIMD Support | AVX2 (x86-64), ARM NEON (ARM64) |
+| Phase | 4C — Incremental evaluation with SIMD + Memory backpressure |
+| Tests | 83/84 passing (1 expected failure), ASan/UBSan validated |
+| CSPA benchmark | **2.55x speedup** (baseline 36s → incremental 8.9s) with delta-seeding |
+| Latest Version | 0.30.0-dev (released 0.21.0 with SIMD + backpressure) |
 
 ## Core Features
 
 ### Incremental Evaluation Engine
-- **Delta-seeded propagation**: Only new facts propagate through the evaluation pipeline, avoiding redundant re-computation
-- **Per-stratum frontier tracking**: Each rule layer remembers its convergence point; unchanged strata skip unnecessary iterations
-- **Selective rule frontier reset**: Insert decisions based on data dependency graph; only affected rules re-evaluate
+- **Delta-seeded propagation**: Pre-seed `$d$<name>` delta relations from new rows only; avoids full IDB re-derivation
+- **Per-stratum frontier tracking**: Each rule layer remembers its convergence iteration; unchanged strata skip unnecessary re-evaluation
+- **Selective stratum frontier reset**: Compute affected strata via data dependency graph; only affected rules re-evaluate with reset frontier
 - **Semi-naive iteration**: Optimized delta computation strategy from Datalog theory
+- **Stride-based evaluation**: Efficient iteration over columnar arrangements in cache-friendly strides
 
-### Columnar Architecture
+### Columnar Architecture & SIMD
 - **Pure nanoarrow backend**: Apache Arrow columnar format for memory efficiency and SIMD friendliness
 - **Cache-efficient batching**: Columnar memory layout reduces cache misses and memory bandwidth
+- **SIMD vectorization**: AVX2 (x86-64) and ARM NEON (ARM64) for hash operations, key comparisons, and filter predicates
 - **No intermediate materialization**: Results computed on-demand without storing full intermediate relations
 
 ### Optimization Pipeline
@@ -75,7 +79,8 @@ Wirelog is a **declarative logic programming engine** that brings the power of D
 ### Reliability & Safety
 - **Memory safety guarantees**: AddressSanitizer + UndefinedBehaviorSanitizer pass on all platforms
 - **Portable C11**: No Rust, no vendored bytecode; single portable C codebase
-- **Comprehensive test suite**: 56+ unit tests, regression suite, and 15+ benchmarks
+- **Memory backpressure system**: Thread-safe memory ledger tracking with JOIN budget enforcement and graceful EOVERFLOW truncation
+- **Comprehensive test suite**: 83+ unit tests, regression suite, and 15+ benchmarks
 
 ### Production Features
 - **Symbol interning**: Efficient string→i64 mapping for large vocabularies (Issue #56)
@@ -97,28 +102,32 @@ meson compile -C build
 # Run all tests
 meson test -C build --print-errorlogs
 
-# Run the CSPA benchmark
+# Run a simple graph benchmark (transitive closure)
+./build/bench/bench_flowlog \
+  --workload tc \
+  --data bench/data/graph_100.csv
+
+# Run the CSPA (pointer analysis) benchmark
 ./build/bench/bench_flowlog \
   --workload cspa \
-  --data bench/data/graph_10.csv \
-  --data-weighted bench/data/graph_10_weighted.csv
+  --data-cspa bench/data/cspa
 ```
 
-### Performance: Incremental Speedup
+### Performance: Incremental Speedup with Delta-Seeding
 
-Wirelog's incremental evaluation shines when processing updates to derived relations. The **CSPA (Demand-Driven Context-Sensitive Pointer Analysis)** benchmark demonstrates real-world gains:
+Wirelog's incremental evaluation shines when processing updates to derived relations. The **CSPA (Demand-Driven Context-Sensitive Pointer Analysis)** benchmark demonstrates real-world gains with delta-seeded propagation:
 
-| Metric | Baseline | Incremental | Gain |
+| Metric | Baseline (Full Re-eval) | Incremental + Delta-Seeding | Gain |
 |--------|----------|-------------|------|
-| Evaluation time | 10.4s | 3.7s | **2.82x faster** |
+| Evaluation time | 36.0s | 8.9s | **2.55x faster** |
 | Peak memory | 13.5GB | 6.2GB | **54% reduction** |
 | Iterations evaluated | 6 | 5 | **1 iteration skipped** |
 
 **Why the speedup?** The CSPA workload inserts derived facts incrementally. Wirelog:
-1. Identifies affected strata (rules depending on inserted facts)
-2. Pre-seeds delta relations with only new tuples
+1. Pre-seeds delta relations (`$d$<name>`) with only new tuples (not full re-derivation)
+2. Identifies affected strata (rules depending on inserted facts)
 3. Re-evaluates only affected strata; unaffected rules skip to their frontier
-4. Result: Only the "new information" propagates, avoiding redundant computation
+4. Result: Only delta facts propagate through evaluation, avoiding full IDB recomputation
 
 **Workload portfolio**: 15+ benchmarks across graph analysis (TC, Reach, CC, SSSP), pointer analysis (Andersen, CSPA, CSDA), and program analysis (DOOP, Polonius, DDISASM)
 
@@ -147,16 +156,16 @@ Columnar Executor (nanoarrow)
 Result callback / output
 ```
 
-### Incremental Evaluation
+### Incremental Evaluation with Delta-Seeding
 
 After an initial `session_step()` call, wirelog tracks the frontier (convergence point) for each stratum. On subsequent calls with new EDB facts:
 
-1. **Affected strata detection**: Compute which strata depend on the inserted relations.
-2. **Delta pre-seeding**: Populate `$d$<name>` delta relations from `rows[base_nrows..nrows)`.
-3. **Selective frontier reset**: Reset only affected strata; unaffected strata retain their frontier and skip unnecessary iterations.
-4. **Semi-naive re-evaluation**: Only delta tuples propagate; no full IDB re-derivation.
+1. **Delta pre-seeding**: Populate `$d$<name>` delta relations from only new rows (not full re-derivation of entire IDB)
+2. **Affected strata detection**: Compute which strata depend on the inserted relations via data dependency graph
+3. **Selective frontier reset**: Reset only affected strata frontiers; unaffected strata retain convergence point and skip unnecessary iterations
+4. **Semi-naive re-evaluation**: Only delta tuples propagate through evaluation pipeline with selective frontier skipping
 
-This is what produces the 2.82x CSPA speedup: the delta path avoids re-computing tuples that did not change.
+This delta-seeding strategy produces the **2.55x CSPA speedup**: the delta path avoids re-computing the full IDB and only propagates new information through affected strata.
 
 ### Optimization Passes
 
@@ -165,6 +174,8 @@ This is what produces the 2.82x CSPA speedup: the delta path avoids re-computing
 | Fusion | Merge adjacent FILTER+PROJECT into FLATMAP |
 | JPP | Greedy join reorder for 3+ atom chains to minimize intermediate sizes |
 | SIP | Insert semijoin pre-filters in join chains to reduce intermediate cardinality |
+| Stride Evaluation | Iterate over arrangements in efficient strides to improve cache locality |
+| Magic Sets | Demand-driven optimization pass for bottom-up evaluation |
 
 ### Benchmark Workloads
 
