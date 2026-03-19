@@ -297,6 +297,20 @@ if docs_option
 endif
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Git Hooks Setup
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+
+# Setup uncrustify pre-commit hook (optional, non-blocking)
+python3 = find_program('python3', required: false)
+if python3.found()
+  run_command(
+    python3,
+    'scripts/setup_uncrustify_hook.py',
+    check: false  # Don't fail build if hook setup has issues
+  )
+endif
+
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Summary
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
@@ -309,3 +323,4 @@ message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
 message('  Tests: @0@'.format(tests_option))
 message('')
+message('Git Hooks: uncrustify pre-commit hook configured')
