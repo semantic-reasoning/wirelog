@@ -369,18 +369,104 @@ test_kc4_join_partial_match(void)
 }
 
 /* ================================================================
+ * Test 9: kc=1 JOIN with 3-cycle (Issue #234 dispatch)
+ *
+ * Validates that the internal scalar_inline fallback in NEON dispatch
+ * produces correct hash/match results for a recursive 3-cycle.
+ * This exercises the kc<2 branch inside hash_int64_keys_neon and
+ * keys_match_neon after Issue #234 moved dispatch from ternary macro
+ * to internal inline fallback.
+ * ================================================================ */
+static void
+test_kc1_join_3cycle_dispatch(void)
+{
+    TEST("kc=1 JOIN (Issue #234 dispatch): 3-cycle recursive join");
+
+    const char *src = ".decl r(x: int64, y: int64)\n"
+                      "r(100, 200). r(200, 300). r(300, 100).\n"
+                      "r(x, z) :- r(x, y), r(y, z).\n";
+
+    int64_t count = 0;
+    int rc = run_program(src, "r", &count);
+    ASSERT(rc == 0, "program failed");
+    /* 3-node cycle: 3 base + 3 one-hop + 3 two-hop = 9 tuples */
+    ASSERT(count == 9, "expected 9 tuples from 3-cycle");
+
+    PASS();
+}
+
+/* ================================================================
+ * Test 10: kc=1 JOIN with zero key (Issue #234 dispatch)
+ *
+ * Zero key has hi32=0, lo32=0, testing edge case of FNV-1a hash
+ * in the scalar_inline path. Must produce correct join results.
+ * ================================================================ */
+static void
+test_kc1_join_zero_key(void)
+{
+    TEST("kc=1 JOIN (Issue #234 dispatch): zero-value key hashes correctly");
+
+    const char *src = ".decl lhs(a: int64, b: int64)\n"
+                      ".decl rhs(a: int64, c: int64)\n"
+                      ".decl out(a: int64, b: int64, c: int64)\n"
+                      "lhs(0, 10). lhs(1, 20). lhs(0, 30).\n"
+                      "rhs(0, 100). rhs(2, 200).\n"
+                      "out(a, b, c) :- lhs(a, b), rhs(a, c).\n";
+
+    int64_t count = 0;
+    int rc = run_program(src, "out", &count);
+    ASSERT(rc == 0, "program failed");
+    /* lhs rows (0,10) and (0,30) match rhs (0,100) -> 2 tuples */
+    ASSERT(count == 2, "expected 2 tuples with zero key");
+
+    PASS();
+}
+
+/* ================================================================
+ * Test 11: kc=2 NEON boundary (Issue #234 dispatch)
+ *
+ * kc=2 is the exact boundary where NEON SIMD path activates
+ * (kc<2 uses scalar_inline, kc>=2 uses NEON vectorized).
+ * This test validates correctness at the boundary with a recursive
+ * join that exercises both hash and key-match paths extensively.
+ * ================================================================ */
+static void
+test_kc2_join_neon_boundary(void)
+{
+    TEST("kc=2 JOIN (NEON boundary): two-key recursive join");
+
+    const char *src = ".decl edge(x: int32, y: int32, w: int32)\n"
+                      ".decl path(x: int32, y: int32, w: int32)\n"
+                      "edge(1, 2, 10). edge(2, 3, 20). edge(3, 1, 30).\n"
+                      "path(x, y, w) :- edge(x, y, w).\n"
+                      "path(x, z, w) :- path(x, y, _), edge(y, z, w).\n";
+
+    int64_t count = 0;
+    int rc = run_program(src, "path", &count);
+    ASSERT(rc == 0, "program failed");
+    /* 3-node cycle with weights: 3 base + 3 one-hop + 3 two-hop = 9 paths */
+    ASSERT(count == 9, "expected 9 paths from 3-cycle with weights");
+
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
 int
 main(void)
 {
-    printf("\n=== SIMD JOIN Hash and Key-Match Tests (Issue #231) ===\n\n");
+    printf(
+        "\n=== SIMD JOIN Hash and Key-Match Tests (Issue #231, #234) ===\n\n");
 
 #ifdef __AVX2__
     printf("INFO: AVX2 available — SIMD paths will be exercised\n\n");
+#elif defined(__ARM_NEON__)
+    printf("INFO: ARM NEON available — NEON dispatch paths will be "
+           "exercised\n\n");
 #else
-    printf("INFO: AVX2 not available — scalar fallback paths will be used\n\n");
+    printf("INFO: No SIMD available — scalar fallback paths will be used\n\n");
 #endif
 
     test_kc1_join_tc_3edge();
@@ -391,6 +477,9 @@ main(void)
     test_kc4_join_no_match();
     test_kc1_join_large_values();
     test_kc4_join_partial_match();
+    test_kc1_join_3cycle_dispatch();
+    test_kc1_join_zero_key();
+    test_kc2_join_neon_boundary();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
