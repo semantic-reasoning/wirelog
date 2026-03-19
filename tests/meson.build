@@ -1740,3 +1740,24 @@ test_diff_consolidate_exe = executable(
 )
 
 test('diff_consolidate', test_diff_consolidate_exe)
+
+# ============================================================================
+# Differential Integration Tests (Issue #264)
+# ============================================================================
+
+test_diff_integration_exe = executable(
+  'test_diff_integration',
+  files('test_diff_integration.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('diff_integration', test_diff_integration_exe)
