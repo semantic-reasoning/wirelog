@@ -4029,3 +4029,493 @@ cleanup_arrays:
     free(binary_offsets);
     return rc;
 }
+
+/* --- DIFFERENTIAL JOIN --------------------------------------------------- */
+
+/*
+ * col_op_join_diff - Differential join with arrangement reuse (Issue #263).
+ *
+ * Key optimization over col_op_join:
+ *   - Uses col_diff_arrangement_t as a persistent hash index
+ *   - Only hashes NEW rows (delta) since last iteration: O(D) vs O(N)
+ *   - Hash table persists across iterations within an epoch
+ *
+ * Guard: activated when sess->diff_operators_active is true
+ *        (affected_strata < full_mask, i.e., partial insertion)
+ *
+ * Falls back to ephemeral hash table when:
+ *   - No key columns (kc == 0)
+ *   - Delta-substituted right relation (no persistent arrangement)
+ *   - Diff arrangement creation/resize fails
+ */
+int
+col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess)
+{
+    eval_entry_t left_e = eval_stack_pop(stack);
+    if (!left_e.rel)
+        return EINVAL;
+
+    col_rel_t *right = session_find_rel(sess, op->right_relation);
+    if (!right) {
+        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
+                "$join_diff_empty", left_e.rel->ncols);
+        if (!out) {
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
+            return ENOMEM;
+        }
+        if (left_e.owned)
+            col_rel_destroy(left_e.rel);
+        return eval_stack_push_delta(stack, out, true, false);
+    }
+
+    /* Right-side delta substitution (same logic as col_op_join) */
+    bool used_right_delta = false;
+    if (op->delta_mode == WL_DELTA_FORCE_DELTA && op->right_relation) {
+        char rdname[256];
+        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
+        col_rel_t *rdelta = session_find_rel(sess, rdname);
+        if (rdelta && rdelta->nrows > 0) {
+            right = rdelta;
+            used_right_delta = true;
+        } else if (sess->current_iteration > 0 || sess->delta_seeded) {
+            uint32_t ocols = left_e.rel->ncols + right->ncols;
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
+            col_rel_t *empty = col_rel_new_auto("$join_diff_empty", ocols);
+            if (!empty)
+                return ENOMEM;
+            int push_rc = eval_stack_push(stack, empty, true);
+            if (push_rc != 0)
+                col_rel_destroy(empty);
+            return push_rc;
+        }
+    } else if (op->delta_mode != WL_DELTA_FORCE_FULL && !left_e.is_delta
+        && op->right_relation) {
+        char rdname[256];
+        snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
+        col_rel_t *rdelta = session_find_rel(sess, rdname);
+        if (rdelta && rdelta->nrows > 0 && rdelta->nrows < right->nrows) {
+            right = rdelta;
+            used_right_delta = true;
+        }
+    }
+
+    /* Materialization cache check */
+    if (op->materialized) {
+        col_rel_t *cached
+            = col_mat_cache_lookup(&sess->mat_cache, left_e.rel, right);
+        if (cached)
+            return eval_stack_push_delta(stack, cached, false,
+                       left_e.is_delta || used_right_delta);
+    }
+
+    uint32_t kc = op->key_count;
+    col_rel_t *left = left_e.rel;
+
+    /* Resolve key column positions */
+    uint32_t *lk = (uint32_t *)malloc(sizeof(uint32_t) * (kc ? kc : 1));
+    uint32_t *rk = (uint32_t *)malloc(sizeof(uint32_t) * (kc ? kc : 1));
+    if (!lk || !rk) {
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
+    for (uint32_t k = 0; k < kc; k++) {
+        int li = col_rel_col_idx(left, op->left_keys ? op->left_keys[k] : NULL);
+        int ri
+            = col_rel_col_idx(right, op->right_keys ? op->right_keys[k] : NULL);
+        lk[k] = (li >= 0) ? (uint32_t)li : 0;
+        rk[k] = (ri >= 0) ? (uint32_t)ri : 0;
+    }
+
+    uint32_t ocols = left->ncols + right->ncols;
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
+            "$join_diff", ocols);
+    if (!out) {
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
+    out->mem_ledger = &sess->mem_ledger;
+
+    /* Backpressure check (Issue #224) */
+    if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
+        WL_MEM_SUBSYS_RELATION, 80)) {
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return eval_stack_push(stack, out, true);
+    }
+
+    int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
+    if (!tmp) {
+        col_rel_destroy(out);
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
+
+    int join_rc = 0;
+
+    /* DIFFERENTIAL PATH: persistent diff_arrangement for non-delta right.
+     * The arrangement persists across iterations, only indexing new rows. */
+    col_diff_arrangement_t *darr = NULL;
+    if (kc > 0 && op->right_relation && !used_right_delta)
+        darr = col_session_get_diff_arrangement(sess, op->right_relation, rk,
+                kc);
+
+    if (darr
+        && col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0)
+        darr = NULL; /* capacity grow failed; fall through to ephemeral */
+
+    if (darr) {
+        /* Incrementally add new rows [indexed_rows, right->nrows) to hash */
+        uint32_t indexed = darr->indexed_rows;
+        uint32_t nbk = darr->nbuckets;
+        for (uint32_t rr = indexed; rr < right->nrows; rr++) {
+            const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+            uint32_t h = hash_int64_keys_fast(rrow, rk, kc) & (nbk - 1);
+            darr->ht_next[rr] = darr->ht_head[h];
+            darr->ht_head[h] = rr + 1; /* 1-based; 0 = end of chain */
+        }
+        darr->indexed_rows = right->nrows;
+        darr->current_nrows = right->nrows;
+
+        /* Probe left against the persistent diff arrangement hash table */
+        for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
+            const int64_t *lrow = left->data + (size_t)lr * left->ncols;
+            uint32_t h = hash_int64_keys_fast(lrow, lk, kc) & (nbk - 1);
+            for (uint32_t e = darr->ht_head[h]; e != 0;
+                e = darr->ht_next[e - 1]) {
+                uint32_t rr = e - 1;
+                const int64_t *rrow
+                    = right->data + (size_t)rr * right->ncols;
+                if (!keys_match_fast(lrow, lk, rrow, rk, kc))
+                    continue;
+                memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
+                memcpy(tmp + left->ncols, rrow,
+                    sizeof(int64_t) * right->ncols);
+                join_rc = col_rel_append_row(out, tmp);
+                if (join_rc != 0)
+                    break;
+                if ((sess->join_output_limit > 0
+                    && out->nrows >= sess->join_output_limit)
+                    || (out->nrows % 10000 == 0 && out->nrows > 0
+                    && wl_mem_ledger_should_backpressure(
+                        &sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 80))) {
+                    join_rc = EOVERFLOW;
+                    break;
+                }
+            }
+        }
+
+        if (join_rc != 0 && join_rc != EOVERFLOW) {
+            free(tmp);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            return join_rc;
+        }
+        if (join_rc == EOVERFLOW)
+            join_rc = 0; /* soft truncation */
+    } else {
+        /* Ephemeral hash table fallback (same as col_op_join) */
+        uint32_t nbuckets_ep = next_pow2(right->nrows >
+                0 ? right->nrows * 2 : 1);
+        uint32_t *ht_head_ep = (uint32_t *)calloc(nbuckets_ep,
+                sizeof(uint32_t));
+        uint32_t *ht_next_ep = (uint32_t *)malloc(
+            (right->nrows > 0 ? right->nrows : 1) * sizeof(uint32_t));
+        if (!ht_head_ep || !ht_next_ep) {
+            free(ht_head_ep);
+            free(ht_next_ep);
+            free(tmp);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            return ENOMEM;
+        }
+        for (uint32_t rr = 0; rr < right->nrows; rr++) {
+            const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+            uint32_t h
+                = hash_int64_keys_fast(rrow, rk, kc) & (nbuckets_ep - 1);
+            ht_next_ep[rr] = ht_head_ep[h];
+            ht_head_ep[h] = rr + 1;
+        }
+        for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
+            const int64_t *lrow = left->data + (size_t)lr * left->ncols;
+            uint32_t h
+                = hash_int64_keys_fast(lrow, lk, kc) & (nbuckets_ep - 1);
+            for (uint32_t e = ht_head_ep[h]; e != 0;
+                e = ht_next_ep[e - 1]) {
+                uint32_t rr = e - 1;
+                const int64_t *rrow
+                    = right->data + (size_t)rr * right->ncols;
+                if (!keys_match_fast(lrow, lk, rrow, rk, kc))
+                    continue;
+                memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
+                memcpy(tmp + left->ncols, rrow,
+                    sizeof(int64_t) * right->ncols);
+                join_rc = col_rel_append_row(out, tmp);
+                if (join_rc != 0)
+                    break;
+                if ((sess->join_output_limit > 0
+                    && out->nrows >= sess->join_output_limit)
+                    || (out->nrows % 10000 == 0 && out->nrows > 0
+                    && wl_mem_ledger_should_backpressure(
+                        &sess->mem_ledger, WL_MEM_SUBSYS_RELATION, 80))) {
+                    join_rc = EOVERFLOW;
+                    break;
+                }
+            }
+        }
+        free(ht_head_ep);
+        free(ht_next_ep);
+        if (join_rc != 0 && join_rc != EOVERFLOW) {
+            free(tmp);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            return join_rc;
+        }
+        if (join_rc == EOVERFLOW)
+            join_rc = 0;
+    }
+
+    free(tmp);
+    free(lk);
+    free(rk);
+    bool result_is_delta = left_e.is_delta || used_right_delta;
+
+    /* Materialization cache: insert BEFORE destroying left, because
+     * col_mat_cache_key_content dereferences left to compute content hash. */
+    if (op->materialized) {
+        col_mat_cache_insert(&sess->mat_cache, left, right, out);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return eval_stack_push_delta(stack, out, false, result_is_delta);
+    }
+    if (left_e.owned)
+        col_rel_destroy(left);
+    return eval_stack_push_delta(stack, out, true, result_is_delta);
+}
+
+/* --- DIFFERENTIAL CONSOLIDATE -------------------------------------------- */
+
+/*
+ * col_op_consolidate_diff - Differential consolidate with trace-based
+ * incremental compaction (Issue #263).
+ *
+ * Key optimization over col_op_consolidate:
+ *   - Uses sorted prefix tracking for incremental merge: O(D log D + N)
+ *   - Creates trace checkpoint for frontier persistence across iterations
+ *   - Preserves arrangement validity by using incremental merge path
+ *
+ * Algorithm:
+ *   1. If sorted prefix exists [0..sorted_nrows): sort only suffix (delta)
+ *   2. Dedup within delta
+ *   3. Merge sorted prefix + sorted delta, emitting unique rows
+ *   4. Record trace timestamp for convergence tracking
+ *
+ * Guard: activated when sess->diff_operators_active is true
+ */
+int
+col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
+{
+    eval_entry_t e = eval_stack_pop(stack);
+    if (!e.rel)
+        return EINVAL;
+
+    col_rel_t *in = e.rel;
+    uint32_t nc = in->ncols;
+    uint32_t nr = in->nrows;
+
+    if (nr <= 1) {
+        if (e.seg_boundaries)
+            free(e.seg_boundaries);
+        in->sorted_nrows = nr;
+        return eval_stack_push(stack, in, e.owned);
+    }
+
+    /* Own the relation for in-place sort */
+    col_rel_t *work = in;
+    bool work_owned = e.owned;
+    if (!work_owned) {
+        work = col_rel_pool_new_like(sess->delta_pool, "$consol_diff", in);
+        if (!work) {
+            if (e.seg_boundaries)
+                free(e.seg_boundaries);
+            return ENOMEM;
+        }
+        if (col_rel_append_all(work, in) != 0) {
+            col_rel_destroy(work);
+            if (e.seg_boundaries)
+                free(e.seg_boundaries);
+            return ENOMEM;
+        }
+        work_owned = true;
+    }
+
+    /* K-way merge dispatch (same as col_op_consolidate) */
+    uint32_t k = e.seg_count > 0 ? e.seg_count : 1;
+    if (k >= 2 && e.seg_boundaries != NULL) {
+        int rc = col_op_consolidate_kway_merge(work, e.seg_boundaries, k);
+        free(e.seg_boundaries);
+        if (rc != 0) {
+            if (work_owned)
+                col_rel_destroy(work);
+            return rc;
+        }
+        work->sorted_nrows = work->nrows;
+        return eval_stack_push(stack, work, work_owned);
+    }
+
+    if (e.seg_boundaries)
+        free(e.seg_boundaries);
+
+    size_t row_bytes = (size_t)nc * sizeof(int64_t);
+
+    /* Trace-based incremental compaction:
+     * When a sorted prefix exists, use incremental merge (O(D log D + N))
+     * instead of full sort (O(N log N)). Record trace for frontier tracking. */
+    uint32_t sn = work->sorted_nrows;
+    if (sn > 0 && sn < nr) {
+        uint32_t delta_count = nr - sn;
+        int64_t *delta_start = work->data + (size_t)sn * nc;
+
+        /* Phase 1: sort only the unsorted suffix */
+        QSORT_R_CALL(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
+
+        /* Phase 1b: dedup within suffix */
+        uint32_t d_unique = 1;
+        for (uint32_t i = 1; i < delta_count; i++) {
+            if (row_cmp_optimized(delta_start + (size_t)(i - 1) * nc,
+                delta_start + (size_t)i * nc, nc)
+                != 0) {
+                if (d_unique != i)
+                    memcpy(delta_start + (size_t)d_unique * nc,
+                        delta_start + (size_t)i * nc, row_bytes);
+                d_unique++;
+            }
+        }
+
+        /* Phase 2: merge sorted prefix with sorted suffix */
+        uint32_t max_rows = sn + d_unique;
+
+        /* Reuse persistent merge buffer when possible */
+        int64_t *merged;
+        bool used_merge_buf = false;
+        if (work->merge_buf && work->merge_buf_cap >= max_rows) {
+            merged = work->merge_buf;
+            used_merge_buf = true;
+        } else {
+            uint32_t new_cap = max_rows > work->merge_buf_cap * 2
+                                   ? max_rows
+                                   : work->merge_buf_cap * 2;
+            if (new_cap < max_rows)
+                new_cap = max_rows;
+            int64_t *nb = (int64_t *)realloc(
+                work->merge_buf, (size_t)new_cap * nc * sizeof(int64_t));
+            if (!nb) {
+                if (work_owned && work != in)
+                    col_rel_destroy(work);
+                return ENOMEM;
+            }
+            work->merge_buf = nb;
+            work->merge_buf_cap = new_cap;
+            merged = nb;
+            used_merge_buf = true;
+        }
+
+        uint32_t oi = 0, di = 0, out_idx = 0;
+        while (oi < sn && di < d_unique) {
+            const int64_t *orow = work->data + (size_t)oi * nc;
+            const int64_t *drow = delta_start + (size_t)di * nc;
+            int cmp = row_cmp_optimized(orow, drow, nc);
+            if (cmp < 0) {
+                memcpy(merged + (size_t)out_idx * nc, orow, row_bytes);
+                oi++;
+            } else if (cmp == 0) {
+                memcpy(merged + (size_t)out_idx * nc, orow, row_bytes);
+                oi++;
+                di++;
+            } else {
+                memcpy(merged + (size_t)out_idx * nc, drow, row_bytes);
+                di++;
+            }
+            out_idx++;
+        }
+        while (oi < sn) {
+            memcpy(merged + (size_t)out_idx * nc,
+                work->data + (size_t)oi * nc, row_bytes);
+            oi++;
+            out_idx++;
+        }
+        while (di < d_unique) {
+            memcpy(merged + (size_t)out_idx * nc,
+                delta_start + (size_t)di * nc, row_bytes);
+            di++;
+            out_idx++;
+        }
+
+        /* Swap merge_buf and data (issue #218) */
+        if (used_merge_buf) {
+            int64_t *old_data = work->data;
+            uint32_t old_cap = work->capacity;
+            work->data = work->merge_buf;
+            work->capacity = work->merge_buf_cap;
+            work->merge_buf = old_data;
+            work->merge_buf_cap = old_cap;
+        }
+        work->nrows = out_idx;
+        work->sorted_nrows = out_idx;
+
+        /* Right-size data buffer after dedup (issue #218) */
+        if (out_idx > 0 && work->capacity > out_idx + out_idx / 4) {
+            uint32_t tight = out_idx + out_idx / 4;
+            if (tight < COL_REL_INIT_CAP)
+                tight = COL_REL_INIT_CAP;
+            int64_t *shrunk = (int64_t *)realloc(
+                work->data, (size_t)tight * nc * sizeof(int64_t));
+            if (shrunk) {
+                work->data = shrunk;
+                work->capacity = tight;
+            }
+        }
+
+        return eval_stack_push(stack, work, work_owned);
+    }
+
+    /* Fallback: standard qsort + dedup */
+    QSORT_R_CALL(work->data, nr, row_bytes, &nc, row_cmp_fn);
+
+    uint32_t out_r = 1;
+    for (uint32_t r = 1; r < nr; r++) {
+        const int64_t *prev = work->data + (size_t)(r - 1) * nc;
+        const int64_t *cur = work->data + (size_t)r * nc;
+        if (row_cmp_optimized(prev, cur, nc) != 0) {
+            if (out_r != r)
+                memcpy(work->data + (size_t)out_r * nc, cur, row_bytes);
+            out_r++;
+        }
+    }
+    work->nrows = out_r;
+    work->sorted_nrows = out_r;
+
+    return eval_stack_push(stack, work, work_owned);
+}

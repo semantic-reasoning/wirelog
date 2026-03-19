@@ -11,38 +11,10 @@
 
 #include "diff_arrangement.h"
 
+#include <errno.h>
 #include <string.h>
 
 #define DIFF_ARRANGEMENT_INITIAL_BUCKETS 1024
-
-/**
- * col_diff_arrangement - Internal structure for delta-aware hash indexing.
- *
- * Fields:
- *   key_cols[]: Array of column indices forming the key
- *   key_count: Number of key columns
- *   base_nrows: Row count at last reset_delta call (baseline for delta detection)
- *   current_nrows: Current total row count
- *   indexed_rows: Number of rows indexed in the hash table
- *   worker_id: K-fusion worker ID (0 = sequential path, >0 = parallel worker)
- *   ht_head[]: Hash bucket heads (indices into ht_next)
- *   ht_next[]: Hash chain links
- *   nbuckets: Current number of hash buckets
- *   ht_cap: Capacity of ht_head and ht_next arrays
- */
-struct col_diff_arrangement
-{
-    uint32_t *key_cols;
-    uint32_t key_count;
-    uint32_t base_nrows;
-    uint32_t current_nrows;
-    uint32_t indexed_rows;
-    uint32_t worker_id;
-    uint32_t *ht_head;
-    uint32_t *ht_next;
-    uint32_t nbuckets;
-    uint32_t ht_cap;
-};
 
 col_diff_arrangement_t *
 col_diff_arrangement_create(const uint32_t *key_cols, uint32_t key_count,
@@ -145,4 +117,41 @@ void
 col_diff_arrangement_reset_delta(col_diff_arrangement_t *arr)
 {
     arr->base_nrows = arr->current_nrows;
+}
+
+int
+col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
+    uint32_t nrows)
+{
+    if (nrows <= arr->ht_cap && nrows <= arr->nbuckets * 3 / 4)
+        return 0;
+
+    /* Grow ht_next capacity if needed */
+    if (nrows > arr->ht_cap) {
+        uint32_t new_cap = arr->ht_cap;
+        while (new_cap < nrows)
+            new_cap *= 2;
+        uint32_t *new_next = realloc(arr->ht_next,
+                new_cap * sizeof(uint32_t));
+        if (!new_next)
+            return ENOMEM;
+        arr->ht_next = new_next;
+        arr->ht_cap = new_cap;
+    }
+
+    /* Grow bucket array if load factor > 75% */
+    if (nrows > arr->nbuckets * 3 / 4) {
+        uint32_t new_nbuckets = arr->nbuckets;
+        while (nrows > new_nbuckets * 3 / 4)
+            new_nbuckets *= 2;
+        uint32_t *new_head = calloc(new_nbuckets, sizeof(uint32_t));
+        if (!new_head)
+            return ENOMEM;
+        free(arr->ht_head);
+        arr->ht_head = new_head;
+        arr->nbuckets = new_nbuckets;
+        arr->indexed_rows = 0; /* Force full re-index by caller */
+    }
+
+    return 0;
 }

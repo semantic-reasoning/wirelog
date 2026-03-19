@@ -17,6 +17,8 @@
 #define _GNU_SOURCE
 
 #include "columnar/columnar_nanoarrow.h"
+#include "columnar/diff_arrangement.h"
+#include "columnar/diff_trace.h"
 #include "columnar/delta_pool.h"
 #include "columnar/mem_ledger.h"
 #include "session.h"
@@ -257,6 +259,22 @@ typedef struct {
 } col_sorted_arr_entry_t;
 
 /* ======================================================================== */
+/* Differential Arrangement Registry (Issue #263)                           */
+/* ======================================================================== */
+
+/*
+ * col_diff_arr_entry_t: one (rel_name, key_cols) -> diff_arrangement mapping.
+ * Stored in the session's flat differential arrangement registry.
+ * Persists across iterations within an epoch for arrangement reuse.
+ */
+typedef struct {
+    char *rel_name;                    /* owned copy of relation name    */
+    uint32_t *key_cols;                /* owned copy of key column array */
+    uint32_t key_count;
+    col_diff_arrangement_t *diff_arr;  /* owned differential arrangement */
+} col_diff_arr_entry_t;
+
+/* ======================================================================== */
 /* Frontier Vtable (Issue #261)                                             */
 /* ======================================================================== */
 
@@ -456,6 +474,19 @@ typedef struct {
      * Initialized in col_session_create via wl_mem_ledger_init().
      * Accessible to all columnar code via &COL_SESSION(sess)->mem_ledger. */
     wl_mem_ledger_t mem_ledger;
+    /* Differential arrangement registry (Issue #263): persistent hash indices
+     * for arrangement reuse in differential join. Unlike darr_entries (per-iteration
+     * delta arrangements), these persist across iterations within an epoch.
+     * Only active when diff_operators_active is true. Freed on session destroy
+     * or when switching back to epoch-based evaluation. */
+    col_diff_arr_entry_t *diff_arr_entries;
+    uint32_t diff_arr_count;
+    uint32_t diff_arr_cap;
+    /* Guard flag for differential operator activation (Issue #263).
+     * Set to true when affected_strata < full_mask (partial insertion),
+     * enabling col_op_join_diff / col_op_consolidate_diff in eval dispatch.
+     * When false (bulk insert or full evaluation), epoch-based operators used. */
+    bool diff_operators_active;
 } wl_col_session_t;
 
 /*
@@ -631,6 +662,13 @@ col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count);
 void
 col_session_free_delta_arrangements(wl_col_session_t *cs);
+
+/* Differential arrangement registry (Issue #263) */
+col_diff_arrangement_t *
+col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
+    const uint32_t *key_cols, uint32_t key_count);
+void
+col_session_free_diff_arrangements(wl_col_session_t *cs);
 col_sorted_arr_t *
 col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
     uint32_t key_col);
@@ -714,6 +752,13 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
 int
 col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
+
+/* Differential operator variants (Issue #263) */
+int
+col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess);
 
 /* ======================================================================== */
 /* Evaluator (columnar/eval.c)                                              */

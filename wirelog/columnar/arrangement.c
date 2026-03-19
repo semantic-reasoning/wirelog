@@ -31,7 +31,7 @@
  */
 static uint32_t
 arr_hash_key(const int64_t *row, const uint32_t *key_cols, uint32_t key_count,
-             uint32_t nbuckets)
+    uint32_t nbuckets)
 {
     uint64_t h = 14695981039346656037ULL; /* FNV-1a basis */
     for (uint32_t k = 0; k < key_count; k++) {
@@ -125,7 +125,7 @@ arr_build_full(col_arrangement_t *arr, const col_rel_t *rel)
 /* Incremental update: index only rows [old_nrows..rel->nrows). */
 static int
 arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
-                       uint32_t old_nrows)
+    uint32_t old_nrows)
 {
     uint32_t nrows = rel->nrows;
     if (old_nrows >= nrows)
@@ -165,7 +165,7 @@ arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
 
 col_arrangement_t *
 col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
-                            const uint32_t *key_cols, uint32_t key_count)
+    const uint32_t *key_cols, uint32_t key_count)
 {
     if (!sess || !rel_name || !key_cols || key_count == 0)
         return NULL;
@@ -257,8 +257,8 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
 
 uint32_t
 col_arrangement_find_first(const col_arrangement_t *arr,
-                           const int64_t *rel_data, uint32_t rel_ncols,
-                           const int64_t *key_row)
+    const int64_t *rel_data, uint32_t rel_ncols,
+    const int64_t *key_row)
 {
     if (!arr || !rel_data || !key_row || arr->nbuckets == 0)
         return UINT32_MAX;
@@ -346,8 +346,8 @@ col_session_free_delta_arrangements(wl_col_session_t *cs)
  */
 col_arrangement_t *
 col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
-                                  const col_rel_t *delta_rel,
-                                  const uint32_t *key_cols, uint32_t key_count)
+    const col_rel_t *delta_rel,
+    const uint32_t *key_cols, uint32_t key_count)
 {
     if (!cs || !rel_name || !delta_rel || !key_cols || key_count == 0)
         return NULL;
@@ -443,7 +443,7 @@ col_session_get_darr_count(wl_session_t *sess)
  */
 int
 col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
-                         col_frontier_2d_t *out_frontier)
+    col_frontier_2d_t *out_frontier)
 {
     if (!session || !out_frontier || stratum_idx >= MAX_STRATA)
         return EINVAL;
@@ -514,7 +514,7 @@ sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
     memcpy(sarr->sorted, rel->data, bytes);
     uint32_t kc = key_col;
     QSORT_R_CALL(sarr->sorted, rel->nrows, rel->ncols * sizeof(int64_t), &kc,
-                 sarr_row_cmp);
+        sarr_row_cmp);
     sarr->nrows = rel->nrows;
     sarr->indexed_rows = rel->nrows;
     return 0;
@@ -531,7 +531,7 @@ sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
  */
 col_sorted_arr_t *
 col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
-                                   uint32_t key_col)
+    uint32_t key_col)
 {
     if (!cs || !rel_name)
         return NULL;
@@ -606,4 +606,102 @@ col_session_free_sorted_arrangements(wl_col_session_t *cs)
     cs->sarr_entries = NULL;
     cs->sarr_count = 0;
     cs->sarr_cap = 0;
+}
+
+/* ======================================================================== */
+/* Differential Arrangement Registry (Issue #263)                           */
+/* ======================================================================== */
+
+/*
+ * col_session_get_diff_arrangement:
+ *
+ * Return (or lazily create) a differential arrangement for `rel_name`
+ * keyed on `key_cols[0..key_count)`. The arrangement persists across
+ * iterations within an epoch, enabling incremental hash index reuse.
+ *
+ * Returns NULL on allocation failure.
+ */
+col_diff_arrangement_t *
+col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
+    const uint32_t *key_cols, uint32_t key_count)
+{
+    if (!cs || !rel_name || key_count == 0)
+        return NULL;
+
+    /* Search existing entries. */
+    for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
+        col_diff_arr_entry_t *e = &cs->diff_arr_entries[i];
+        if (e->key_count != key_count)
+            continue;
+        if (strcmp(e->rel_name, rel_name) != 0)
+            continue;
+        bool match = true;
+        for (uint32_t k = 0; k < key_count; k++) {
+            if (e->key_cols[k] != key_cols[k]) {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            return e->diff_arr;
+    }
+
+    /* Not found: grow registry and create new entry. */
+    if (cs->diff_arr_count >= cs->diff_arr_cap) {
+        uint32_t new_cap = cs->diff_arr_cap ? cs->diff_arr_cap * 2u : 4u;
+        col_diff_arr_entry_t *ne = (col_diff_arr_entry_t *)realloc(
+            cs->diff_arr_entries, new_cap * sizeof(col_diff_arr_entry_t));
+        if (!ne)
+            return NULL;
+        cs->diff_arr_entries = ne;
+        cs->diff_arr_cap = new_cap;
+    }
+
+    col_diff_arr_entry_t *e = &cs->diff_arr_entries[cs->diff_arr_count];
+    memset(e, 0, sizeof(*e));
+
+    e->rel_name = wl_strdup(rel_name);
+    if (!e->rel_name)
+        return NULL;
+
+    e->key_cols = (uint32_t *)malloc(key_count * sizeof(uint32_t));
+    if (!e->key_cols) {
+        free(e->rel_name);
+        e->rel_name = NULL;
+        return NULL;
+    }
+    memcpy(e->key_cols, key_cols, key_count * sizeof(uint32_t));
+    e->key_count = key_count;
+
+    e->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
+    if (!e->diff_arr) {
+        free(e->rel_name);
+        free(e->key_cols);
+        memset(e, 0, sizeof(*e));
+        return NULL;
+    }
+    cs->diff_arr_count++;
+    return e->diff_arr;
+}
+
+/*
+ * col_session_free_diff_arrangements:
+ *
+ * Free all entries in the differential arrangement registry and reset it.
+ * Called from col_session_destroy and when switching evaluation modes.
+ */
+void
+col_session_free_diff_arrangements(wl_col_session_t *cs)
+{
+    if (!cs)
+        return;
+    for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
+        free(cs->diff_arr_entries[i].rel_name);
+        free(cs->diff_arr_entries[i].key_cols);
+        col_diff_arrangement_destroy(cs->diff_arr_entries[i].diff_arr);
+    }
+    free(cs->diff_arr_entries);
+    cs->diff_arr_entries = NULL;
+    cs->diff_arr_count = 0;
+    cs->diff_arr_cap = 0;
 }

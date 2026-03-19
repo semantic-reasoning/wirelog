@@ -18,8 +18,33 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* Forward declaration */
-typedef struct col_diff_arrangement col_diff_arrangement_t;
+/**
+ * col_diff_arrangement - Delta-aware hash table for incremental indexing.
+ *
+ * Fields:
+ *   key_cols[]: Array of column indices forming the key
+ *   key_count: Number of key columns
+ *   base_nrows: Row count at last reset_delta call (baseline for delta detection)
+ *   current_nrows: Current total row count
+ *   indexed_rows: Number of rows indexed in the hash table
+ *   worker_id: K-fusion worker ID (0 = sequential path, >0 = parallel worker)
+ *   ht_head[]: Hash bucket heads (1-based indices into ht_next; 0 = empty)
+ *   ht_next[]: Hash chain links (1-based; 0 = end of chain)
+ *   nbuckets: Current number of hash buckets (power of 2)
+ *   ht_cap: Capacity of ht_next array
+ */
+typedef struct col_diff_arrangement {
+    uint32_t *key_cols;
+    uint32_t key_count;
+    uint32_t base_nrows;
+    uint32_t current_nrows;
+    uint32_t indexed_rows;
+    uint32_t worker_id;
+    uint32_t *ht_head;
+    uint32_t *ht_next;
+    uint32_t nbuckets;
+    uint32_t ht_cap;
+} col_diff_arrangement_t;
 
 /**
  * col_diff_arrangement_create - Create a new differential arrangement.
@@ -78,5 +103,16 @@ col_diff_arrangement_t *col_diff_arrangement_deep_copy(
  * Sets base_nrows = current_nrows so next iteration detects only new rows.
  */
 void col_diff_arrangement_reset_delta(col_diff_arrangement_t *arr);
+
+/**
+ * col_diff_arrangement_ensure_ht_capacity - Grow hash table for nrows.
+ *
+ * Ensures ht_next can hold at least nrows entries. If load factor exceeds
+ * 75%, rebuilds bucket array (sets indexed_rows = 0 to force full re-index).
+ *
+ * Returns: 0 on success, ENOMEM on allocation failure
+ */
+int col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
+    uint32_t nrows);
 
 #endif /* WL_COLUMNAR_DIFF_ARRANGEMENT_H */
