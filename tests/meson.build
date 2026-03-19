@@ -183,6 +183,7 @@ backend_src = files(
   '../wirelog/columnar/eval.c',
   '../wirelog/columnar/arrangement.c',
   '../wirelog/columnar/frontier.c',
+  '../wirelog/columnar/frontier_epoch.c',
   '../wirelog/columnar/mobius.c',
   '../wirelog/columnar/session.c',
   '../wirelog/columnar/delta_pool.c',
@@ -615,6 +616,27 @@ test_frontier_exe = executable(
 )
 
 test('frontier', test_frontier_exe)
+
+# ============================================================================
+# Frontier Vtable Tests (Issue #261)
+# ============================================================================
+
+test_frontier_vtable_exe = executable(
+  'test_frontier_vtable',
+  files('test_frontier_vtable.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('frontier_vtable', test_frontier_vtable_exe)
 
 # ============================================================================
 # Frontier Integration Tests (Phase 3B-005)
