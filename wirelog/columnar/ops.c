@@ -3330,6 +3330,11 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
          * darr_* are zeroed: workers rebuild delta arrangements per-iteration. */
         worker_sess[d] = *sess;
         worker_sess[d].wq = NULL; /* prevent nested K-fusion from workers */
+        /* NULL out owned resources before allocation so cleanup_wq is safe
+         * even if we abort early (e.g. clone failure).  Each owned pointer
+         * is replaced below; the parent session retains its own copies. */
+        worker_sess[d].eval_arena = NULL;
+        worker_sess[d].delta_pool = NULL;
         /* Issue #260: Deep-copy parent's full-arrangement cache so each worker
          * has an independent copy.  arr.key_cols is a shared alias of
          * entry.key_cols inside each clone (see col_arr_entry_clone). */
