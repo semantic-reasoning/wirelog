@@ -66,37 +66,35 @@ jobs:
           fi
 
   # ==========================================================================
-  # Check 2: clang-format 18 (fast-medium, ~1-2 min)
-  # Non-blocking: reports formatting violations against project .clang-format.
+  # Check 2: uncrustify (fast-medium, ~1-2 min)
+  # Non-blocking: reports formatting violations against uncrustify.cfg.
   # Excludes: subprojects/**, build/**
   # ==========================================================================
-  clang-format-check:
-    name: clang-format 18 check (monitor)
+  uncrustify-check:
+    name: uncrustify check (monitor)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install LLVM 18
+      - name: Install uncrustify
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
           sudo apt-get update
-          sudo apt-get install -y clang-format-18
+          sudo apt-get install -y uncrustify
 
       - name: Verify tool version
-        run: clang-format-18 --version
+        run: uncrustify --version
 
-      - name: Run clang-format
+      - name: Run uncrustify
         run: |
           find wirelog/ tests/ \
             -name '*.c' -o -name '*.h' \
-            | xargs clang-format-18 --dry-run --Werror 2>&1 | tee format-results.txt || true
+            | xargs uncrustify -c uncrustify.cfg --check 2>&1 | tee format-results.txt || true
 
       - name: Publish results
         if: always()
         run: |
-          echo '## clang-format Results (main monitor)' >> "$GITHUB_STEP_SUMMARY"
+          echo '## uncrustify Results (main monitor)' >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           if [ -s format-results.txt ]; then
             count=$(wc -l < format-results.txt | tr -d ' ')

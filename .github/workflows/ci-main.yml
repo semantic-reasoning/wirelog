@@ -7,7 +7,7 @@ name: CI Main
 # This workflow monitors health; ci-pr.yml enforces quality gates on PRs.
 #
 # Phases (all parallel, non-blocking):
-#   Phase 1 (Lint):       lint-main.yml — editorconfig, clang-format 18, clang-tidy 18
+#   Phase 1 (Lint):       lint-main.yml — editorconfig, uncrustify, clang-tidy 18
 #   Phase 2 (Build):      Linux GCC + Clang, macOS Clang, Windows MSVC, ARM64 GCC (optional self-hosted)
 #   Phase 3 (Sanitizers): Linux GCC + Clang ASan/UBSan, macOS Apple Clang ASan/UBSan
 #
@@ -24,7 +24,7 @@ permissions:
 jobs:
   # ==========================================================================
   # Phase 1: Lint monitoring (import lint-main.yml)
-  # editorconfig, clang-format 18, clang-tidy 18 — all parallel, non-blocking
+  # editorconfig, uncrustify, clang-tidy 18 — all parallel, non-blocking
   # ==========================================================================
   lint:
     uses: ./.github/workflows/lint-main.yml
