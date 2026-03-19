@@ -2,6 +2,8 @@
 
 All notable changes to wirelog are documented in this file.
 
+## [Unreleased]
+
 ## [0.21.0] - 2026-03-19
 
 ### Added
