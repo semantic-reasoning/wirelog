@@ -56,7 +56,7 @@ wirelog_workqueue_src = files('workqueue.c', )
 
 wirelog_backend_src = files('columnar/relation.c', 'columnar/cache.c',
                            'columnar/ops.c', 'columnar/eval.c',
-                           'columnar/arrangement.c', 'columnar/frontier.c',
+                           'columnar/arrangement.c', 'columnar/frontier.c', 'columnar/frontier_epoch.c',
                            'columnar/mobius.c', 'columnar/session.c',
                            'columnar/delta_pool.c', 'columnar/lftj.c',
                            'columnar/mem_ledger.c', )
