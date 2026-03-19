@@ -67,3 +67,4 @@ Thumbs.db
 subprojects/nanoarrow/
 subprojects/xxHash-0.8.3/
 subprojects/packagecache/
+*.uncrustify
