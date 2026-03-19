@@ -2978,7 +2978,19 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
  * The output relation name is "<merged-k>" and contains all rows from
  * the K input relations with duplicates removed.
  */
-static col_rel_t *UNUSED
+/*
+ * col_rel_merge_k - Deterministic K-way sorted merge with deduplication.
+ *
+ * Determinism guarantee (Issue #260):
+ *   - k=1: sequential copy, input order preserved
+ *   - k=2: two-pointer merge on sorted inputs, left-before-right tie-break
+ *   - k>=3: left-fold over pairs: merge(merge(r[0],r[1]),r[2]),...
+ *     Fixed input order + sorted inputs => identical output across runs.
+ *
+ * Precondition: each input relation is already sorted+deduped
+ *   (WL_PLAN_OP_CONSOLIDATE is the last K-fusion worker op).
+ */
+static col_rel_t *
 col_rel_merge_k(col_rel_t **relations, uint32_t k)
 {
     if (k == 0)
