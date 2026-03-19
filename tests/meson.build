@@ -1698,3 +1698,45 @@ test_diff_bridge_exe = executable(
 )
 
 test('diff_bridge', test_diff_bridge_exe)
+
+# ============================================================================
+# Differential Join Operator Tests (Issue #263)
+# ============================================================================
+
+test_diff_join_exe = executable(
+  'test_diff_join',
+  files('test_diff_join.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('diff_join', test_diff_join_exe)
+
+# ============================================================================
+# Differential Consolidate Operator Tests (Issue #263)
+# ============================================================================
+
+test_diff_consolidate_exe = executable(
+  'test_diff_consolidate',
+  files('test_diff_consolidate.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('diff_consolidate', test_diff_consolidate_exe)
