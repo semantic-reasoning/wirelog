@@ -1633,3 +1633,24 @@ test_diff_arrangement_exe = executable(
 )
 
 test('diff_arrangement', test_diff_arrangement_exe)
+
+# ============================================================================
+# Multi-Worker K-Fusion Validation Tests (Issue #260)
+# ============================================================================
+
+test_diff_multiworker_exe = executable(
+  'test_diff_multiworker',
+  files('test_diff_multiworker.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('diff_multiworker', test_diff_multiworker_exe)
