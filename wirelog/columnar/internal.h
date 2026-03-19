@@ -482,10 +482,17 @@ typedef struct {
     col_diff_arr_entry_t *diff_arr_entries;
     uint32_t diff_arr_count;
     uint32_t diff_arr_cap;
+    /* Session-level differential path master switch (Issue #264).
+     * When true, differential operators may be activated based on guard logic.
+     * When false, always use epoch-based operators regardless of affected_strata.
+     * Default: true. Overridable via WIRELOG_DIFF_ENABLED=0 env var. */
+    bool diff_enabled;
     /* Guard flag for differential operator activation (Issue #263).
-     * Set to true when affected_strata < full_mask (partial insertion),
-     * enabling col_op_join_diff / col_op_consolidate_diff in eval dispatch.
-     * When false (bulk insert or full evaluation), epoch-based operators used. */
+     * Set to true when diff_enabled is true AND affected_strata < full_mask
+     * (partial insertion), enabling col_op_join_diff / col_op_consolidate_diff
+     * in eval dispatch.
+     * When false (bulk insert, full evaluation, or diff_enabled=false),
+     * epoch-based operators used. */
     bool diff_operators_active;
 } wl_col_session_t;
 
