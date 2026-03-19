@@ -466,6 +466,7 @@ col_session_destroy(wl_session_t *session)
     free(sess->arr_entries);
     col_session_free_delta_arrangements(sess);
     col_session_free_sorted_arrangements(sess);
+    col_session_free_diff_arrangements(sess);
     delta_pool_destroy(sess->delta_pool);
     free(sess);
 }
@@ -781,6 +782,19 @@ col_session_step(wl_session_t *session)
         }
     }
 
+    /* Issue #263: Set differential operator guard based on affected strata.
+     * When only partial strata are affected, activate differential operators
+     * (col_op_join_diff, col_op_consolidate_diff) for arrangement reuse. */
+    {
+        uint32_t nstrata = plan->stratum_count;
+        if (nstrata > 64)
+            nstrata = 64;
+        uint64_t full_mask = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
+        sess->diff_operators_active = (affected_mask != UINT64_MAX
+            && affected_mask != 0
+            && affected_mask != full_mask);
+    }
+
     /* Issue #106 (US-106-004): Reset rule frontiers with stratum context awareness.
      * col_session_step is for delta callback mode (no pre-seeded deltas).
      * Always reset affected rules to force re-evaluation.
@@ -948,6 +962,17 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
             session_add_rel(sess, delta);
         }
         sess->delta_seeded = true;
+    }
+
+    /* Issue #263: Set differential operator guard based on affected strata. */
+    {
+        uint32_t nstrata = plan->stratum_count;
+        if (nstrata > 64)
+            nstrata = 64;
+        uint64_t full_mask = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
+        sess->diff_operators_active = (affected_mask != UINT64_MAX
+            && affected_mask != 0
+            && affected_mask != full_mask);
     }
 
     /* For affected strata, selectively reset the per-stratum frontier to UINT32_MAX
