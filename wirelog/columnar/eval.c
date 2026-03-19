@@ -56,7 +56,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             rc = col_op_filter(op, stack, sess);
             break;
         case WL_PLAN_OP_JOIN:
-            rc = col_op_join(op, stack, sess);
+            rc = sess->diff_operators_active
+                ? col_op_join_diff(op, stack, sess)
+                : col_op_join(op, stack, sess);
             break;
         case WL_PLAN_OP_ANTIJOIN:
             rc = col_op_antijoin(op, stack, sess);
@@ -65,7 +67,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
             rc = col_op_concat(stack, sess);
             break;
         case WL_PLAN_OP_CONSOLIDATE:
-            rc = col_op_consolidate(stack, sess);
+            rc = sess->diff_operators_active
+                ? col_op_consolidate_diff(stack, sess)
+                : col_op_consolidate(stack, sess);
             break;
         case WL_PLAN_OP_REDUCE:
             rc = col_op_reduce(op, stack, sess);
