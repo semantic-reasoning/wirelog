@@ -236,6 +236,31 @@ col_session_cleanup_old_data(wl_session_t *sess, col_frontier_t frontier)
 /* ======================================================================== */
 
 /*
+ * col_should_activate_diff: Determine whether differential operators should
+ * be used for this evaluation pass (Issue #264).
+ *
+ * Differential operators are activated only when ALL conditions hold:
+ *   1. diff_enabled is true (session-level master switch)
+ *   2. affected_mask is not UINT64_MAX (not a non-incremental full eval)
+ *   3. affected_mask is not 0 (at least one stratum affected)
+ *   4. affected_mask is not full_mask (not all strata affected)
+ *
+ * When any condition fails, epoch-based operators are used (safe fallback).
+ */
+static bool
+col_should_activate_diff(const wl_col_session_t *sess, uint64_t affected_mask)
+{
+    uint32_t nstrata = sess->plan->stratum_count;
+    if (nstrata > 64)
+        nstrata = 64;
+    uint64_t full_mask = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
+    return sess->diff_enabled
+           && affected_mask != UINT64_MAX
+           && affected_mask != 0
+           && affected_mask != full_mask;
+}
+
+/*
  * col_detect_physical_memory: Detect total physical RAM in bytes (Issue #221).
  *
  * Uses platform-specific syscalls to query total installed RAM. Returns 0 if
@@ -383,6 +408,17 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
                 budget = (phys / 4ULL) * 3ULL; /* 75% of RAM */
         }
         wl_mem_ledger_init(&sess->mem_ledger, budget);
+    }
+
+    /* Issue #264: Initialize differential path master switch.
+     * Default: enabled (true). Users can disable via WIRELOG_DIFF_ENABLED=0
+     * to force epoch-based evaluation regardless of affected_strata. */
+    {
+        const char *diff_env = getenv("WIRELOG_DIFF_ENABLED");
+        if (diff_env && diff_env[0] == '0' && diff_env[1] == '\0')
+            sess->diff_enabled = false;
+        else
+            sess->diff_enabled = true;
     }
 
     /* Issue #176: Configure per-iteration cache eviction threshold.
@@ -782,18 +818,9 @@ col_session_step(wl_session_t *session)
         }
     }
 
-    /* Issue #263: Set differential operator guard based on affected strata.
-     * When only partial strata are affected, activate differential operators
-     * (col_op_join_diff, col_op_consolidate_diff) for arrangement reuse. */
-    {
-        uint32_t nstrata = plan->stratum_count;
-        if (nstrata > 64)
-            nstrata = 64;
-        uint64_t full_mask = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
-        sess->diff_operators_active = (affected_mask != UINT64_MAX
-            && affected_mask != 0
-            && affected_mask != full_mask);
-    }
+    /* Issue #264: Activate differential operators when session toggle is on
+     * and only partial strata are affected (see col_should_activate_diff). */
+    sess->diff_operators_active = col_should_activate_diff(sess, affected_mask);
 
     /* Issue #106 (US-106-004): Reset rule frontiers with stratum context awareness.
      * col_session_step is for delta callback mode (no pre-seeded deltas).
@@ -964,16 +991,9 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
         sess->delta_seeded = true;
     }
 
-    /* Issue #263: Set differential operator guard based on affected strata. */
-    {
-        uint32_t nstrata = plan->stratum_count;
-        if (nstrata > 64)
-            nstrata = 64;
-        uint64_t full_mask = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
-        sess->diff_operators_active = (affected_mask != UINT64_MAX
-            && affected_mask != 0
-            && affected_mask != full_mask);
-    }
+    /* Issue #264: Activate differential operators when session toggle is on
+     * and only partial strata are affected (see col_should_activate_diff). */
+    sess->diff_operators_active = col_should_activate_diff(sess, affected_mask);
 
     /* For affected strata, selectively reset the per-stratum frontier to UINT32_MAX
      * (not-set sentinel) based on pre-seeded EDB delta presence.
