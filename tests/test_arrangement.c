@@ -45,29 +45,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Private struct mirrors
@@ -102,18 +102,20 @@ typedef struct {
 } test_col_rel_mirror_t;
 
 /*
- * Mirror of wl_col_session_t (first 6 fields only).
+ * Mirror of wl_col_session_t (first 7 fields only).
  * Full definition is in columnar_nanoarrow.c:670-690.
  *
  * Memory layout (x86-64):
- *   wl_session_t   base     (sizeof(wl_session_t) bytes, offset 0)
- *   const void    *plan     (8 bytes)
- *   col_rel_t    **rels     (8 bytes)
- *   uint32_t       nrels    (4 bytes)
- *   uint32_t       rel_cap  (4 bytes)
+ *   wl_session_t   base          (sizeof(wl_session_t) bytes, offset 0)
+ *   const void    *frontier_ops  (8 bytes, Issue #261)
+ *   const void    *plan          (8 bytes)
+ *   col_rel_t    **rels          (8 bytes)
+ *   uint32_t       nrels         (4 bytes)
+ *   uint32_t       rel_cap       (4 bytes)
  */
 typedef struct {
     wl_session_t base;
+    const void *frontier_ops;
     const void *plan;
     test_col_rel_mirror_t **rels;
     uint32_t nrels;
@@ -138,7 +140,7 @@ noop_cb(const char *r, const int64_t *row, uint32_t nc, void *u)
  * Caller owns *out_sess, *out_plan, *out_prog and must free them. */
 static int
 make_session(const char *src, wl_session_t **out_sess, wl_plan_t **out_plan,
-             wirelog_program_t **out_prog)
+    wirelog_program_t **out_prog)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -231,7 +233,7 @@ test_arrangement_struct_size(void)
 
     /* 48 bytes: 3 pointers (24) + 4 uint32 (16) + 1 uint64 (8) */
     ASSERT(sizeof(col_arrangement_t) == 48,
-           "col_arrangement_t must be 48 bytes; update if struct changes");
+        "col_arrangement_t must be 48 bytes; update if struct changes");
 
     PASS();
 }
@@ -253,16 +255,16 @@ test_arrangement_creation(void)
 
     /* 3 facts in edge, 2 columns (x, y) */
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n"
-                      "reach(x, z) :- reach(x, y), edge(y, z).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n"
+        "reach(x, z) :- reach(x, y), edge(y, z).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
-           "session creation failed");
+        "session creation failed");
 
     /* Arrange on col 0 of 'edge' */
     uint32_t key_cols[] = { 0 };
@@ -271,10 +273,10 @@ test_arrangement_creation(void)
 
     ASSERT(arr != NULL, "arrangement must be non-NULL for existing relation");
     ASSERT(arr->indexed_rows == 3,
-           "indexed_rows must equal EDB fact count (3)");
+        "indexed_rows must equal EDB fact count (3)");
     ASSERT(arr->nbuckets > 0, "nbuckets must be > 0");
     ASSERT((arr->nbuckets & (arr->nbuckets - 1)) == 0,
-           "nbuckets must be a power of 2");
+        "nbuckets must be a power of 2");
 
     free_session(sess, plan, prog);
     PASS();
@@ -292,15 +294,15 @@ test_arrangement_find_first_hit(void)
     TEST("col_arrangement_find_first: known key returns valid row index");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
-           "session creation failed");
+        "session creation failed");
 
     uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
@@ -337,15 +339,15 @@ test_arrangement_find_first_miss(void)
     TEST("col_arrangement_find_first: unknown key returns UINT32_MAX");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
-           "session creation failed");
+        "session creation failed");
 
     uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
@@ -360,7 +362,7 @@ test_arrangement_find_first_miss(void)
         = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
 
     ASSERT(row_idx == UINT32_MAX,
-           "find_first must return UINT32_MAX for non-existent key");
+        "find_first must return UINT32_MAX for non-existent key");
 
     free_session(sess, plan, prog);
     PASS();
@@ -377,18 +379,18 @@ static void
 test_arrangement_find_next_singleton(void)
 {
     TEST("col_arrangement_find_next: singleton chain terminates with "
-         "UINT32_MAX");
+        "UINT32_MAX");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
-           "session creation failed");
+        "session creation failed");
 
     uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
@@ -434,15 +436,15 @@ test_arrangement_find_next_chain(void)
     TEST("col_arrangement_find_next: multi-row key traverses full chain");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(1, 3). r(1, 4). r(2, 5).\n"
-                      ".decl s(x: int32, y: int32)\n"
-                      "s(x, y) :- r(x, y).\n";
+        "r(1, 2). r(1, 3). r(1, 4). r(2, 5).\n"
+        ".decl s(x: int32, y: int32)\n"
+        "s(x, y) :- r(x, y).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
-           "session creation failed");
+        "session creation failed");
 
     uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
@@ -482,34 +484,34 @@ test_arrangement_invalidate(void)
     TEST("col_session_invalidate_arrangements: resets indexed_rows to 0");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
-           "session creation failed");
+        "session creation failed");
 
     uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr != NULL, "arrangement must be non-NULL");
     ASSERT(arr->indexed_rows == 3,
-           "indexed_rows must be 3 before invalidation");
+        "indexed_rows must be 3 before invalidation");
 
     /* Invalidate */
     col_session_invalidate_arrangements(sess, "edge");
     ASSERT(arr->indexed_rows == 0,
-           "indexed_rows must be 0 immediately after invalidation");
+        "indexed_rows must be 0 immediately after invalidation");
 
     /* Re-request: should trigger full rebuild */
     col_arrangement_t *arr2
         = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr2 != NULL, "arrangement must be non-NULL after rebuild");
     ASSERT(arr2->indexed_rows == 3,
-           "indexed_rows must be restored to 3 after rebuild");
+        "indexed_rows must be restored to 3 after rebuild");
 
     free_session(sess, plan, prog);
     PASS();
@@ -529,15 +531,15 @@ test_arrangement_registry_cache(void)
         "col_session_get_arrangement: registry caches — same pointer returned");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
-                      "edge(1, 2). edge(2, 3). edge(3, 4).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- edge(x, y).\n";
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n";
 
     wl_session_t *sess = NULL;
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
     ASSERT(make_session(src, &sess, &plan, &prog) == 0,
-           "session creation failed");
+        "session creation failed");
 
     uint32_t key_cols[] = { 0 };
     col_arrangement_t *arr1
@@ -548,7 +550,7 @@ test_arrangement_registry_cache(void)
     ASSERT(arr1 != NULL, "first arrangement must be non-NULL");
     ASSERT(arr2 != NULL, "second arrangement must be non-NULL");
     ASSERT(arr1 == arr2,
-           "second call must return the same pointer (registry cache hit)");
+        "second call must return the same pointer (registry cache hit)");
 
     /* Different key_cols must produce a separate entry */
     uint32_t key_cols2[] = { 1 };
