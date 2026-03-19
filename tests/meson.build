@@ -191,6 +191,8 @@ backend_src = files(
   '../wirelog/columnar/mem_ledger.c',
   '../wirelog/columnar/diff_trace.c',
   '../wirelog/columnar/diff_arrangement.c',
+  '../wirelog/columnar/diff_vtable.c',
+  '../wirelog/columnar/diff_bridge.c',
 )
 
 io_src = files(
@@ -637,6 +639,27 @@ test_frontier_vtable_exe = executable(
 )
 
 test('frontier_vtable', test_frontier_vtable_exe)
+
+# ============================================================================
+# Differential Frontier Vtable Tests (Issue #262)
+# ============================================================================
+
+test_diff_vtable_exe = executable(
+  'test_diff_vtable',
+  files('test_diff_vtable.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('diff_vtable', test_diff_vtable_exe)
 
 # ============================================================================
 # Frontier Integration Tests (Phase 3B-005)
@@ -1654,3 +1677,24 @@ test_diff_multiworker_exe = executable(
 )
 
 test('diff_multiworker', test_diff_multiworker_exe)
+
+# ============================================================================
+# Differential Bridge Tests (Issue #262)
+# ============================================================================
+
+test_diff_bridge_exe = executable(
+  'test_diff_bridge',
+  files('test_diff_bridge.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('diff_bridge', test_diff_bridge_exe)
