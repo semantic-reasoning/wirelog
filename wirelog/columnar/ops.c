@@ -1312,11 +1312,11 @@ keys_match_avx2(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
  * so correctness is preserved even though output values differ from the
  * scalar path for kc >= 2.
  */
-static uint32_t
+static inline uint32_t
 hash_int64_keys_neon(const int64_t *row, const uint32_t *key_cols, uint32_t kc)
 {
     if (kc < 2)
-        return hash_int64_keys(row, key_cols, kc);
+        return hash_int64_keys_scalar_inline(row, key_cols, kc);
 
     int64x2_t acc = vdupq_n_s64(0);
     uint32_t k = 0;
@@ -1355,6 +1355,9 @@ static inline bool
 keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
                 const uint32_t *rk, uint32_t kc)
 {
+    if (kc < 2)
+        return keys_match_scalar_inline(lrow, lk, rrow, rk, kc);
+
     uint32_t k = 0;
 
     for (; k + 2 <= kc; k += 2) {
@@ -1385,17 +1388,10 @@ keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
 #define hash_int64_keys_fast hash_int64_keys_avx2
 #define keys_match_fast keys_match_avx2
 #elif defined(__ARM_NEON__)
-/* For kc < 2 the NEON functions fall back to scalar anyway (no full SIMD
- * lane to fill).  Bypass them via inline scalar helpers to eliminate the
- * double function-call overhead on the hot kc=1 path (~98% of DOOP joins).
- * keys_match_scalar_inline uses a loop so kc=0 (cross product) returns true
- * correctly without out-of-bounds access. */
-#define hash_int64_keys_fast(row, key_cols, kc)                        \
-    ((kc) < 2 ? hash_int64_keys_scalar_inline((row), (key_cols), (kc)) \
-              : hash_int64_keys_neon((row), (key_cols), (kc)))
-#define keys_match_fast(lrow, lk, rrow, rk, kc)                            \
-    ((kc) < 2 ? keys_match_scalar_inline((lrow), (lk), (rrow), (rk), (kc)) \
-              : keys_match_neon((lrow), (lk), (rrow), (rk), (kc)))
+/* NEON functions now handle kc < 2 internally via scalar_inline fallback,
+ * eliminating per-call-site ternary dispatch overhead (Issue #234). */
+#define hash_int64_keys_fast hash_int64_keys_neon
+#define keys_match_fast keys_match_neon
 #else
 #define hash_int64_keys_fast hash_int64_keys
 #define keys_match_fast keys_match_scalar
