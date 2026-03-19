@@ -257,6 +257,49 @@ typedef struct {
 } col_sorted_arr_entry_t;
 
 /* ======================================================================== */
+/* Frontier Vtable (Issue #261)                                             */
+/* ======================================================================== */
+
+/*
+ * col_frontier_ops_t: vtable interface for frontier skip/convergence logic.
+ *
+ * Abstracts the frontier mechanism behind function pointers to support
+ * multiple frontier models (epoch-based, differential, etc.) without
+ * changing eval.c or session.c callsites.
+ *
+ * All methods receive the columnar session as first argument (void* to
+ * avoid circular dependency with wl_col_session_t).
+ */
+typedef struct col_frontier_ops col_frontier_ops_t;
+
+struct col_frontier_ops {
+    bool (*should_skip_iteration)(void *sess, uint32_t stratum_idx,
+        uint32_t eff_iter);
+
+    bool (*should_skip_rule)(void *sess, uint32_t rule_id,
+        uint32_t eff_iter);
+
+    void (*record_stratum_convergence)(void *sess, uint32_t stratum_idx,
+        uint32_t outer_epoch,
+        uint32_t iteration);
+
+    void (*record_rule_convergence)(void *sess, uint32_t rule_id,
+        uint32_t outer_epoch,
+        uint32_t iteration);
+
+    void (*reset_stratum_frontier)(void *sess, uint32_t stratum_idx,
+        uint32_t outer_epoch);
+
+    void (*reset_rule_frontier)(void *sess, uint32_t rule_id,
+        uint32_t outer_epoch);
+
+    void (*init_stratum)(void *sess, uint32_t stratum_idx);
+};
+
+/* Default epoch-based frontier vtable (defined in frontier_epoch.c). */
+extern const col_frontier_ops_t col_frontier_epoch_ops;
+
+/* ======================================================================== */
 /* Session                                                                  */
 /* ======================================================================== */
 
@@ -279,6 +322,7 @@ typedef struct {
  */
 typedef struct {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
+    const col_frontier_ops_t *frontier_ops; /* frontier vtable (#261)   */
     const wl_plan_t *plan;     /* borrowed, lifetime: caller             */
     col_rel_t **rels;          /* owned array of owned col_rel_t*        */
     uint32_t nrels;            /* current number of registered relations */
@@ -338,11 +382,11 @@ typedef struct {
         rule_frontiers[MAX_RULES]; /* per-rule frontier tracking with
                                                      (outer_epoch, iteration) pairs */
     /* Per-phase K-fusion profiling (Phase 3A): breakdown of kfusion_ns into
-     * four sub-phases accumulated across all col_op_k_fusion calls per eval.
-     *   alloc_ns:    calloc of results/workers/worker_sess arrays
-     *   dispatch_ns: submit loop + wl_workqueue_wait_all barrier
-     *   merge_ns:    col_rel_merge_k + eval_stack_push
-     *   cleanup_ns:  result/worker mat_cache/arr/darr free loops + free() */
+    * four sub-phases accumulated across all col_op_k_fusion calls per eval.
+    *   alloc_ns:    calloc of results/workers/worker_sess arrays
+    *   dispatch_ns: submit loop + wl_workqueue_wait_all barrier
+    *   merge_ns:    col_rel_merge_k + eval_stack_push
+    *   cleanup_ns:  result/worker mat_cache/arr/darr free loops + free() */
     uint64_t kfusion_alloc_ns;
     uint64_t kfusion_dispatch_ns;
     uint64_t kfusion_merge_ns;
@@ -398,7 +442,7 @@ typedef struct {
      * semi-naive iterations (EDB relations are stable between iterations).
      * Freed only on session destroy. */
     col_sorted_arr_entry_t
-        *sarr_entries; /* flat array of sorted arrangements */
+    *sarr_entries;     /* flat array of sorted arrangements */
     uint32_t sarr_count;
     uint32_t sarr_cap;
 #ifdef WL_PROFILE
@@ -434,7 +478,7 @@ typedef struct {
     bool owned;
     bool is_delta; /* true when rel is a delta (DR) relation, not the full */
     uint32_t
-        *seg_boundaries; /* Array of K+1 boundary row indices (K-way merge) */
+    *seg_boundaries;     /* Array of K+1 boundary row indices (K-way merge) */
     uint32_t seg_count;  /* Number of segments (0 = no segmentation) */
 } eval_entry_t;
 
@@ -467,7 +511,7 @@ col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
-                      const col_rel_t *like);
+    const col_rel_t *like);
 col_rel_t *
 col_rel_pool_new_auto(delta_pool_t *pool, const char *name, uint32_t ncols);
 void
@@ -493,10 +537,10 @@ void
 col_mat_cache_evict_until(col_mat_cache_t *cache, size_t target_bytes);
 col_rel_t *
 col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
-                     const col_rel_t *right);
+    const col_rel_t *right);
 void
 col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
-                     const col_rel_t *right, col_rel_t *result);
+    const col_rel_t *right, col_rel_t *result);
 
 /* ======================================================================== */
 /* qsort_r Compatibility                                                    */
@@ -523,7 +567,7 @@ row_cmp_fn(const void *a, const void *b, void *ctx)
     return 0;
 }
 #define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
-    qsort_r(base, nmemb, size, fn, ctx)
+        qsort_r(base, nmemb, size, fn, ctx)
 #elif defined(_MSC_VER)
 /* MSVC qsort_s: context first, comparator last */
 static inline int __cdecl row_cmp_fn(void *ctx, const void *a, const void *b)
@@ -540,7 +584,7 @@ static inline int __cdecl row_cmp_fn(void *ctx, const void *a, const void *b)
     return 0;
 }
 #define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
-    qsort_s(base, nmemb, size, fn, ctx)
+        qsort_s(base, nmemb, size, fn, ctx)
 #else
 /* BSD qsort_r: context first, comparator last */
 static inline int
@@ -558,7 +602,7 @@ row_cmp_fn(void *ctx, const void *a, const void *b)
     return 0;
 }
 #define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
-    qsort_r(base, nmemb, size, ctx, fn)
+        qsort_r(base, nmemb, size, ctx, fn)
 #endif
 
 /* ======================================================================== */
@@ -580,13 +624,13 @@ void
 arr_free_contents(col_arrangement_t *arr);
 col_arrangement_t *
 col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
-                                  const col_rel_t *delta_rel,
-                                  const uint32_t *key_cols, uint32_t key_count);
+    const col_rel_t *delta_rel,
+    const uint32_t *key_cols, uint32_t key_count);
 void
 col_session_free_delta_arrangements(wl_col_session_t *cs);
 col_sorted_arr_t *
 col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
-                                   uint32_t key_col);
+    uint32_t key_col);
 void
 col_session_free_sorted_arrangements(wl_col_session_t *cs);
 
@@ -596,10 +640,10 @@ col_session_free_sorted_arrangements(wl_col_session_t *cs);
 
 uint64_t
 col_compute_affected_strata(wl_session_t *session,
-                            const char *inserted_relation);
+    const char *inserted_relation);
 uint64_t
 col_compute_affected_rules(wl_session_t *session,
-                           const char *inserted_relation);
+    const char *inserted_relation);
 
 /* ======================================================================== */
 /* Mobius / Z-set (columnar/mobius.c)                                        */
@@ -607,8 +651,8 @@ col_compute_affected_rules(wl_session_t *session,
 
 int
 col_compute_delta_mobius(const col_rel_t *prev_collection,
-                         const col_rel_t *curr_collection,
-                         col_rel_t *out_delta);
+    const col_rel_t *curr_collection,
+    col_rel_t *out_delta);
 
 /* ======================================================================== */
 /* Eval Stack & Operators (columnar/ops.c)                                  */
@@ -628,45 +672,45 @@ int
 col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess);
 int
 col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
-                              uint32_t seg_count);
+    uint32_t seg_count);
 int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
-                                     col_rel_t *delta_out);
+    col_rel_t *delta_out);
 int
 col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst);
 int
 col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
-                     uint32_t key_col, col_rel_t *dst);
+    uint32_t key_col, col_rel_t *dst);
 
 /* Individual operator functions (columnar/ops.c, called by eval.c) */
 int
 col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess);
 int
 col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
-              wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 col_op_join(const wl_plan_op_t *op, eval_stack_t *stack,
-            wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 col_op_concat(eval_stack_t *stack, wl_col_session_t *sess);
 int
 col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
-              wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
-                wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack,
-            wl_col_session_t *sess);
+    wl_col_session_t *sess);
 
 /* ======================================================================== */
 /* Evaluator (columnar/eval.c)                                              */
@@ -674,21 +718,21 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack,
 
 int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
-                       wl_col_session_t *sess);
+    wl_col_session_t *sess);
 int
 retraction_rel_name(const char *rel, char *buf, size_t sz);
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
-                       uint32_t iteration);
+    uint32_t iteration);
 int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
-                 uint32_t stratum_idx);
+    uint32_t stratum_idx);
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
-                            uint32_t stratum_idx);
+    uint32_t stratum_idx);
 bool
 stratum_has_preseeded_delta(const wl_plan_stratum_t *sp,
-                            wl_col_session_t *sess);
+    wl_col_session_t *sess);
 uint32_t
 rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id);
 
