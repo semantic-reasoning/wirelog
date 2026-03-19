@@ -8,8 +8,8 @@ When committing to this project:
 - Do NOT add "Co-Authored-By: Claude" lines
 - Commit message format should be clean author attribution only
 - Do NOT use emojis in commit messages (clean text only)
-- **MANDATORY: Run clang-format linting before every commit**
-  - `clang-format --style=file -i <modified .c files>`
+- **MANDATORY: Run uncrustify linting before every commit**
+  - `uncrustify -c uncrustify.cfg -i <modified .c files>`
   - Verify: `git diff` shows no formatting changes after linting
 
 ### Reason
@@ -29,7 +29,7 @@ Commit messages should be professional and emoji-free.
 - Each commit should be logically independent and compilable
 - Include test changes in the same commit as implementation
 - Before committing:
-  1. Run `clang-format --style=file -i <modified .c files>` (llvm@18)
+  1. Run `uncrustify -c uncrustify.cfg -i <modified .c files>`
   2. Verify `git diff` shows no formatting-only changes
   3. Run full test suite: `meson test -C build`
   4. Confirm TSan/ASAN clean (when applicable)
@@ -45,6 +45,6 @@ Commit messages should be professional and emoji-free.
 - Language: C11 (strict C11 compliance)
 - Build: Meson
 - License: LGPL-3.0 + Commercial dual license
-- Code Quality: llvm@18 clang-format (mandatory per commit)
+- Code Quality: uncrustify (mandatory per commit)
 
 See `docs/ARCHITECTURE.md` for design details and `AGENTS.md` for agent-specific guidelines (Python, linting).

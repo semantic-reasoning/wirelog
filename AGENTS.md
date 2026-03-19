@@ -80,10 +80,12 @@ When writing tests for recursive aggregations (MIN, MAX in recursive strata):
 
 ## Linting
 
-Always use **clang-format version 18** for C code formatting.
-Run `clang-format --version` and verify it starts with `18.` before formatting.
+Always use **uncrustify** for C code formatting.
+Configuration is defined in `uncrustify.cfg` (checked into repository).
 
 ```bash
-clang-format --version   # must start with "clang-format version 18."
-clang-format --style=file -i <files>
+uncrustify --version   # verify uncrustify is installed
+uncrustify -c uncrustify.cfg -i <files>
 ```
+
+Uncrustify is also integrated as a pre-commit hook via meson (see `wirelog/meson.build`).
