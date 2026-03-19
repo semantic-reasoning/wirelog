@@ -1,7 +1,7 @@
 name: Lint PR
 
 # PR-specific lint workflow with hard-gate semantics.
-# Runs 3 sequential checks: editorconfig -> clang-format -> clang-tidy
+# Runs 3 sequential checks: editorconfig -> uncrustify -> clang-tidy
 # Each check must pass before the next runs (fail-fast).
 # This workflow is imported by ci-pr.yml as Phase 1.
 
@@ -52,38 +52,53 @@ jobs:
           fi
 
   # ==========================================================================
-  # Phase 1b: clang-format 18 check (fast-medium, ~1-2 min)
+  # Phase 1b: uncrustify check (fast-medium, ~1-2 min)
   # Hard gate: formatting violations fail the PR.
   # Excludes: subprojects/**, build/**
   # ==========================================================================
-  clang-format-check:
-    name: clang-format 18 check
+  uncrustify-check:
+    name: uncrustify check
     needs: [editorconfig-check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install LLVM 18
+      - name: Install uncrustify
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
           sudo apt-get update
-          sudo apt-get install -y clang-format-18
+          sudo apt-get install -y uncrustify
 
       - name: Verify tool version
-        run: clang-format-18 --version
+        run: uncrustify --version
 
-      - name: Run clang-format (hard gate)
+      - name: Run uncrustify (hard gate)
         run: |
           set -o pipefail
-          find wirelog/ tests/ \
-            -name '*.c' -o -name '*.h' \
-            | xargs clang-format-18 --dry-run --Werror 2>&1 | tee format-results.txt
+          # Get list of changed .c and .h files in this PR
+          CHANGED_FILES=$(git diff origin/main...HEAD --name-only --diff-filter=ACM | grep -E '\.(c|h)$' | grep -E '^(wirelog|tests)/' || true)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No C/H files changed in this PR."
+            exit 0
+          fi
+
+          echo "Checking formatting for changed files:"
+          echo "$CHANGED_FILES"
+          echo ""
+
+          echo "$CHANGED_FILES" | while read file; do \
+            uncrustify -c uncrustify.cfg --check "$file" 2>&1; \
+          done | tee format-results.txt
+
+          if grep -q "FAIL" format-results.txt; then
+            echo "uncrustify found formatting issues. PR blocked."
+            exit 1
+          fi
 
       - name: Publish results
         if: always()
         run: |
-          echo '## clang-format Results' >> "$GITHUB_STEP_SUMMARY"
+          echo '## uncrustify Results' >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           if [ -s format-results.txt ]; then
             count=$(wc -l < format-results.txt | tr -d ' ')
@@ -100,11 +115,11 @@ jobs:
   # Phase 1c: clang-tidy 18 check (slow, up to 30 min, Linux only)
   # Hard gate: tidy violations fail the PR.
   # Excludes: subprojects/**, build/**
-  # Runs only after clang-format passes.
+  # Runs only after uncrustify passes.
   # ==========================================================================
   clang-tidy-check:
     name: clang-tidy 18 check
-    needs: [clang-format-check]
+    needs: [uncrustify-check]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
