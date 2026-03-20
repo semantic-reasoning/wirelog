@@ -494,6 +494,10 @@ typedef struct {
      * When false (bulk insert, full evaluation, or diff_enabled=false),
      * epoch-based operators used. */
     bool diff_operators_active;
+    /* Issue #277: Cache debug/log env vars at session init to avoid repeated
+     * getenv() calls in hot paths. */
+    bool debug_join;         /* WL_DEBUG_JOIN=1 enables DEBUG[JOIN] output  */
+    bool consolidation_log;  /* WL_CONSOLIDATION_LOG=1 enables CONS output  */
 } wl_col_session_t;
 
 /*

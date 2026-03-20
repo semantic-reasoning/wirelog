@@ -613,7 +613,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 col_session_invalidate_arrangements(&sess->base,
                     sp->relations[ri].name);
                 /* Per-call trace: WL_CONSOLIDATION_LOG=1 prints per-call info */
-                if (getenv("WL_CONSOLIDATION_LOG")) {
+                if (sess->consolidation_log) {
                     fprintf(stderr,
                         "CONS eff_iter=%u stratum=%u rel=%s N=%u D=%u "
                         "time_us=%.1f ratio=%.4f\n",

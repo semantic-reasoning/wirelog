@@ -243,7 +243,6 @@ col_session_cleanup_old_data(wl_session_t *sess, col_frontier_t frontier)
  *   1. diff_enabled is true (session-level master switch)
  *   2. affected_mask is not UINT64_MAX (not a non-incremental full eval)
  *   3. affected_mask is not 0 (at least one stratum affected)
- *   4. affected_mask is not full_mask (not all strata affected)
  *
  * When any condition fails, epoch-based operators are used (safe fallback).
  */
@@ -415,6 +414,11 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         else
             sess->diff_enabled = true;
     }
+
+    /* Issue #277: Cache debug/log env vars at session init to avoid repeated
+     * getenv() calls in hot paths. */
+    sess->debug_join = (getenv("WL_DEBUG_JOIN") != NULL);
+    sess->consolidation_log = (getenv("WL_CONSOLIDATION_LOG") != NULL);
 
     /* Issue #176: Configure per-iteration cache eviction threshold.
      * Default: 80% of COL_MAT_CACHE_LIMIT_BYTES (cache evicts when exceeding
