@@ -153,6 +153,7 @@ test_basic_join_correctness(void)
     ASSERT_TRUE(result.rel->data[2] == 1, "right x=1");
     ASSERT_TRUE(result.rel->data[3] == 100, "right y=100");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -193,6 +194,7 @@ test_empty_left(void)
     eval_entry_t result = eval_stack_pop(&stack);
     ASSERT_TRUE(result.rel->nrows == 0, "empty left => empty output");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -230,6 +232,7 @@ test_empty_right(void)
     eval_entry_t result = eval_stack_pop(&stack);
     ASSERT_TRUE(result.rel->nrows == 0, "missing right => empty output");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -273,6 +276,7 @@ test_no_matching_keys(void)
     eval_entry_t result = eval_stack_pop(&stack);
     ASSERT_TRUE(result.rel->nrows == 0, "disjoint keys => empty output");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -320,6 +324,7 @@ test_all_rows_match(void)
     eval_entry_t result = eval_stack_pop(&stack);
     ASSERT_TRUE(result.rel->nrows == 4, "2x2 matching => 4 output rows");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -378,8 +383,10 @@ test_multi_key_columns(void)
         "diff join matches std join nrows");
     ASSERT_TRUE(result.rel->ncols == 6, "output should have 6 cols");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
+    free(std_result.seg_boundaries);
     if (std_result.owned)
         col_rel_destroy(std_result.rel);
     col_rel_destroy(left);
@@ -428,6 +435,7 @@ test_duplicate_keys_in_right(void)
     eval_entry_t result = eval_stack_pop(&stack);
     ASSERT_TRUE(result.rel->nrows == 3, "1 left x 3 right => 3 rows");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -489,8 +497,10 @@ test_arrangement_reuse(void)
     ASSERT_TRUE(sess->diff_arr_count == 1,
         "still one diff arrangement (reused)");
 
+    free(r1.seg_boundaries);
     if (r1.owned)
         col_rel_destroy(r1.rel);
+    free(r2.seg_boundaries);
     if (r2.owned)
         col_rel_destroy(r2.rel);
     col_rel_destroy(left1);
@@ -553,8 +563,10 @@ test_arrangement_incremental(void)
     eval_entry_t r2 = eval_stack_pop(&stack);
     ASSERT_TRUE(r2.rel->nrows == 2, "second join: x=1 and x=2 match");
 
+    free(r1.seg_boundaries);
     if (r1.owned)
         col_rel_destroy(r1.rel);
+    free(r2.seg_boundaries);
     if (r2.owned)
         col_rel_destroy(r2.rel);
     col_rel_destroy(left1);
@@ -599,6 +611,7 @@ test_result_is_delta_flag(void)
     eval_entry_t result = eval_stack_pop(&stack);
     ASSERT_TRUE(result.is_delta == true, "result should inherit delta flag");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -652,6 +665,7 @@ test_large_dataset(void)
     ASSERT_TRUE(output_contains_row(result.rel, expected),
         "should contain [75,750,75,7500]");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -721,6 +735,7 @@ test_force_full_mode(void)
     ASSERT_TRUE(result.rel->nrows == 1, "one match from full right");
     ASSERT_TRUE(result.rel->data[0] == 1, "matched full right x=1");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -775,6 +790,7 @@ test_delta_substitution(void)
     ASSERT_TRUE(result.rel->data[0] == 2, "matched delta x=2");
     ASSERT_TRUE(result.is_delta == true, "result is delta");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -832,6 +848,7 @@ test_single_key_column(void)
     ASSERT_TRUE(output_contains_row(result.rel, exp1), "row [20,2,20,200]");
     ASSERT_TRUE(output_contains_row(result.rel, exp2), "row [30,3,30,300]");
 
+    free(result.seg_boundaries);
     if (result.owned)
         col_rel_destroy(result.rel);
     col_rel_destroy(left);
@@ -873,6 +890,7 @@ test_diff_arr_entry_cleanup(void)
 
     ASSERT_TRUE(sess->diff_arr_count == 1, "1 diff arrangement");
 
+    free(r.seg_boundaries);
     if (r.owned)
         col_rel_destroy(r.rel);
     col_rel_destroy(left);
