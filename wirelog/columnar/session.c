@@ -250,14 +250,9 @@ col_session_cleanup_old_data(wl_session_t *sess, col_frontier_t frontier)
 static bool
 col_should_activate_diff(const wl_col_session_t *sess, uint64_t affected_mask)
 {
-    uint32_t nstrata = sess->plan->stratum_count;
-    if (nstrata > 64)
-        nstrata = 64;
-    uint64_t full_mask = (nstrata == 64) ? ~0ULL : ((1ULL << nstrata) - 1);
     return sess->diff_enabled
            && affected_mask != UINT64_MAX
-           && affected_mask != 0
-           && affected_mask != full_mask;
+           && affected_mask != 0;
 }
 
 /*

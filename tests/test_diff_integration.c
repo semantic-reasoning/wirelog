@@ -513,7 +513,8 @@ test_guard_false_before_any_snapshot(void)
 static void
 test_guard_false_full_mask(void)
 {
-    TEST("guard false when affected_mask == full_mask (TC 2-strata insert)");
+    TEST(
+        "diff operators can activate when affected_mask == full_mask (Issue #275)");
 
     wirelog_program_t *prog;
     wl_plan_t *plan;
@@ -529,7 +530,9 @@ test_guard_false_full_mask(void)
     ASSERT(rc == 0, "initial snapshot failed");
 
     /* Insert into edge: affects stratum 0 (edge EDB) + stratum 1 (tc IDB)
-     * = full_mask for a 2-stratum program => diff_operators_active = false */
+     * = full_mask for a 2-stratum program.
+     * Issue #275: Removed full_mask guard, so diff_operators_active can now be true.
+     * Verify that delta-seeded incremental path produces correct results. */
     int64_t new_edge[2] = { 3, 4 };
     rc = col_session_insert_incremental(sess, "edge", new_edge, 1, 2);
     ASSERT(rc == 0, "incremental insert failed");
@@ -538,8 +541,9 @@ test_guard_false_full_mask(void)
     ASSERT(rc == 0, "snapshot after insert failed");
 
     printf("(diff_active=%d) ", (int)cs->diff_operators_active);
-    ASSERT(cs->diff_operators_active == false,
-        "guard must be false when affected_mask == full_mask");
+    /* After Issue #275: diff_operators_active should be true (guard removed) */
+    ASSERT(cs->diff_operators_active == true,
+        "diff operators should activate even when affected_mask == full_mask");
 
     teardown(sess, plan, prog);
     PASS();
