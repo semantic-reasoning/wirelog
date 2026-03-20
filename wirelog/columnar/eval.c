@@ -342,6 +342,11 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     col_frontier_t strat_frontier = { 0, 0 };
     uint32_t final_eff_iter = 0; /* effective sub-pass index at convergence */
 
+    /* Issue #282: Save the session-level diff_operators_active so we can
+     * restore it after the recursive stratum evaluation completes.
+     * Within the iteration loop, we override it per sub-pass. */
+    bool saved_diff_operators_active = sess->diff_operators_active;
+
     /*
      * Stride-based semi-naive iteration (Issue #237).
      * Each outer iteration runs EVAL_STRIDE sub-passes, chaining the delta
@@ -380,6 +385,19 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
              * (eff_iter 0: FORCE_DELTA falls back to full) from delta case
              * (eff_iter > 0: FORCE_DELTA with absent delta → empty result). */
             sess->current_iteration = eff_iter;
+
+            /* Issue #282: Enable differential operators for recursive iterations
+             * > 0.  At eff_iter 0, we seed from full EDB relations (base case)
+             * so arrangement reuse is not applicable.  From eff_iter 1 onward,
+             * only the delta is processed (semi-naive), so col_op_join_diff can
+             * build the hash table incrementally: O(D) instead of O(N).
+             * diff_arr_entries persist across sub-passes and are invalidated by
+             * col_session_invalidate_arrangements when the underlying relation
+             * changes (called after consolidation each sub-pass).
+             * The saved value is restored after the recursive stratum completes
+             * so non-recursive strata and the outer session logic are unaffected. */
+            sess->diff_operators_active
+                = sess->diff_enabled && eff_iter > 0;
 
             /* Iteration skip based on frontier (convergence point of prior
              * evaluation).  Skip sub-pass when both hold:
@@ -720,6 +738,12 @@ stride_error:
         if (converged || !outer_any_new)
             break; /* true convergence */
     } /* end outer stride loop */
+
+    /* Issue #282: Restore session-level diff_operators_active.
+     * The per-iteration override above applies only within the recursive
+     * fixed-point loop.  Restoring the saved value ensures subsequent
+     * non-recursive strata and outer session logic see the correct state. */
+    sess->diff_operators_active = saved_diff_operators_active;
 
     sess->total_iterations = final_eff_iter;
 
