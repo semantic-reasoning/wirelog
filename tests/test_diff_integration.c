@@ -2309,6 +2309,7 @@ test_edge_no_insert_guard_stays_false(void)
             "guard must stay false with no incremental inserts");
     }
 
+    teardown(sess, plan, prog);
     PASS();
 }
 
