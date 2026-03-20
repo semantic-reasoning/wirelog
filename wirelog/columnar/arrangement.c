@@ -300,6 +300,24 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
         if (strcmp(cs->arr_entries[i].rel_name, rel_name) == 0)
             cs->arr_entries[i].arr.indexed_rows = 0; /* force full rebuild */
     }
+
+    /* Issue #275: Also invalidate differential arrangement cache.
+     * After consolidation permutes physical row order, row-index-based
+     * hash tables in diff_arr become stale. Reset indexed_rows and
+     * hash table state to force re-indexing on next access. */
+    for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
+        if (strcmp(cs->diff_arr_entries[i].rel_name, rel_name) == 0) {
+            col_diff_arrangement_t *darr = cs->diff_arr_entries[i].diff_arr;
+            if (darr) {
+                darr->indexed_rows = 0;
+                darr->base_nrows = 0;
+                darr->current_nrows = 0;
+                if (darr->ht_head) {
+                    memset(darr->ht_head, 0, darr->nbuckets * sizeof(uint32_t));
+                }
+            }
+        }
+    }
 }
 
 /* ======================================================================== */
