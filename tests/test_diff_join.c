@@ -70,6 +70,13 @@ destroy_mock_session(wl_col_session_t *s)
         free(s->rels[i]);
     }
     free(s->rels);
+    /* Free arrangement registry (matches real session destroy) */
+    for (uint32_t i = 0; i < s->arr_count; i++) {
+        free(s->arr_entries[i].rel_name);
+        free(s->arr_entries[i].key_cols);
+        arr_free_contents(&s->arr_entries[i].arr);
+    }
+    free(s->arr_entries);
     col_session_free_diff_arrangements(s);
     delta_pool_destroy(s->delta_pool);
     free(s);
