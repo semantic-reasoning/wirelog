@@ -78,7 +78,7 @@ typedef struct {
     uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
     uint32_t base_nrows;       /* base row count for delta prop (#83)   */
     col_delta_timestamp_t
-        *timestamps; /* NULL when not tracking               */
+    *timestamps;     /* NULL when not tracking               */
     bool pool_owned; /* allocated from delta_pool (#123)      */
     void *ledger;    /* borrowed ledger pointer (NULL ok, #224) */
 } col_rel_t;
@@ -91,7 +91,8 @@ typedef struct {
  */
 int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
-                                     col_rel_t *delta_out);
+    col_rel_t *delta_out,
+    int *out_fast_path);
 
 /* ----------------------------------------------------------------
  * Test framework  (matches wirelog convention: test_workqueue.c)
@@ -102,29 +103,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helper: allocate col_rel_t with ncols columns and no rows.
@@ -188,14 +189,14 @@ test_rel_append_row(col_rel_t *r, const int64_t *row)
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
         int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
-                                                      * sizeof(int64_t));
+                * sizeof(int64_t));
         if (!nd)
             return -1;
         r->data = nd;
         r->capacity = cap;
     }
     memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-           r->ncols * sizeof(int64_t));
+        r->ncols * sizeof(int64_t));
     r->nrows++;
     return 0;
 }
@@ -223,15 +224,15 @@ test_rel_is_sorted(const col_rel_t *r)
         return 1;
     for (uint32_t i = 1; i < r->nrows; i++) {
         int cmp = test_row_cmp(r->data + (size_t)(i - 1) * r->ncols,
-                               r->data + (size_t)i * r->ncols, r->ncols);
+                r->data + (size_t)i * r->ncols, r->ncols);
         if (cmp >= 0) {
             /* Debug: report first sort failure */
             if (r->ncols == 2) {
                 fprintf(stderr,
-                        "SORT FAIL @ row %u: [%lld,%lld] >= [%lld,%lld]\n", i,
-                        r->data[(size_t)(i - 1) * 2],
-                        r->data[(size_t)(i - 1) * 2 + 1],
-                        r->data[(size_t)i * 2], r->data[(size_t)i * 2 + 1]);
+                    "SORT FAIL @ row %u: [%lld,%lld] >= [%lld,%lld]\n", i,
+                    r->data[(size_t)(i - 1) * 2],
+                    r->data[(size_t)(i - 1) * 2 + 1],
+                    r->data[(size_t)i * 2], r->data[(size_t)i * 2 + 1]);
             }
             return 0;
         }
@@ -249,7 +250,7 @@ test_rel_is_unique(const col_rel_t *r)
         return 1;
     for (uint32_t i = 1; i < r->nrows; i++) {
         if (test_row_cmp(r->data + (size_t)(i - 1) * r->ncols,
-                         r->data + (size_t)i * r->ncols, r->ncols)
+            r->data + (size_t)i * r->ncols, r->ncols)
             == 0)
             return 0;
     }
@@ -291,7 +292,7 @@ test_empty_old_all_new(void)
     ASSERT(test_rel_append_row(rel, r0) == 0, "append row(1,2)");
     ASSERT(test_rel_append_row(rel, r1) == 0, "append row(3,4)");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(rel->nrows == 2, "rel->nrows == 2");
@@ -331,7 +332,7 @@ test_all_duplicate_delta_no_change(void)
     ASSERT(test_rel_append_row(rel, r0) == 0, "append dup row(1,2)");
     ASSERT(test_rel_append_row(rel, r1) == 0, "append dup row(3,4)");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(rel->nrows == 2, "rel->nrows == 2 (no new rows)");
@@ -358,7 +359,7 @@ static void
 test_partial_delta_merged_and_new(void)
 {
     TEST("old + unique delta (unsorted) -> sorted merged result + new in "
-         "delta_out");
+        "delta_out");
 
     col_rel_t *rel = test_rel_alloc(2);
     col_rel_t *delta_out = test_rel_alloc(2);
@@ -375,7 +376,7 @@ test_partial_delta_merged_and_new(void)
     ASSERT(test_rel_append_row(rel, r_d1) == 0, "append delta row(5,6) first");
     ASSERT(test_rel_append_row(rel, r_d0) == 0, "append delta row(2,3) second");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(rel->nrows == 4, "rel->nrows == 4 after merge");
@@ -386,15 +387,15 @@ test_partial_delta_merged_and_new(void)
     int64_t expected[][2] = { { 1, 2 }, { 2, 3 }, { 3, 4 }, { 5, 6 } };
     for (int i = 0; i < 4; i++)
         ASSERT(test_rel_contains_row(rel, expected[i]),
-               "merged rel missing expected row");
+            "merged rel missing expected row");
 
     ASSERT(delta_out->nrows == 2, "delta_out->nrows == 2");
     ASSERT(test_rel_contains_row(delta_out, r_d0), "delta_out has row(2,3)");
     ASSERT(test_rel_contains_row(delta_out, r_d1), "delta_out has row(5,6)");
     ASSERT(!test_rel_contains_row(delta_out, r_old0),
-           "delta_out must not contain old row(1,2)");
+        "delta_out must not contain old row(1,2)");
     ASSERT(!test_rel_contains_row(delta_out, r_old1),
-           "delta_out must not contain old row(3,4)");
+        "delta_out must not contain old row(3,4)");
 
     test_rel_free(rel);
     test_rel_free(delta_out);
@@ -414,7 +415,7 @@ static void
 test_first_iteration_dedup_all_new(void)
 {
     TEST("first iter (old_nrows=0): unsorted+dup delta -> sorted unique, all "
-         "in delta_out");
+        "in delta_out");
 
     col_rel_t *rel = test_rel_alloc(2);
     col_rel_t *delta_out = test_rel_alloc(2);
@@ -424,7 +425,7 @@ test_first_iteration_dedup_all_new(void)
     for (int i = 0; i < 5; i++)
         ASSERT(test_rel_append_row(rel, rows[i]) == 0, "append row");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(rel->nrows == 4, "rel->nrows == 4 (dup removed)");
@@ -437,9 +438,9 @@ test_first_iteration_dedup_all_new(void)
     int64_t expected[][2] = { { 1, 2 }, { 3, 4 }, { 5, 6 }, { 7, 8 } };
     for (int i = 0; i < 4; i++) {
         ASSERT(test_rel_contains_row(rel, expected[i]),
-               "rel missing expected row");
+            "rel missing expected row");
         ASSERT(test_rel_contains_row(delta_out, expected[i]),
-               "delta_out missing expected row");
+            "delta_out missing expected row");
     }
 
     test_rel_free(rel);
@@ -499,28 +500,28 @@ test_large_dataset_correctness(void)
 
     ASSERT(rel->nrows == OLD + DUPS + NEW, "pre-consolidate count correct");
 
-    int rc = col_op_consolidate_incremental_delta(rel, OLD, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, OLD, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0 on success");
 
     char msg[128];
     snprintf(msg, sizeof(msg), "rel->nrows: expected %u, got %u", OLD + NEW,
-             rel->nrows);
+        rel->nrows);
     ASSERT(rel->nrows == OLD + NEW, msg);
     ASSERT(test_rel_is_sorted(rel), "merged rel is sorted");
     ASSERT(test_rel_is_unique(rel), "merged rel has no duplicates");
 
     snprintf(msg, sizeof(msg), "delta_out->nrows: expected %u, got %u", NEW,
-             delta_out->nrows);
+        delta_out->nrows);
     ASSERT(delta_out->nrows == NEW, msg);
 
     /* Oracle A+B */
     for (uint32_t i = 0; i < delta_out->nrows; i++) {
         const int64_t *dr = delta_out->data + (size_t)i * 2;
         ASSERT(test_rel_contains_row(rel, dr),
-               "oracle A: delta_out row missing from merged rel");
+            "oracle A: delta_out row missing from merged rel");
         ASSERT(dr[0] >= (int64_t)(OLD * 2),
-               "oracle B: delta_out row col0 in old range");
+            "oracle B: delta_out row col0 in old range");
     }
 
     /* Oracle C: every new row appears in delta_out */
@@ -528,14 +529,14 @@ test_large_dataset_correctness(void)
         int64_t nr[2]
             = { (int64_t)(OLD * 2 + i * 2), (int64_t)(OLD * 2 + i * 2 + 1) };
         ASSERT(test_rel_contains_row(delta_out, nr),
-               "oracle C: new row missing from delta_out");
+            "oracle C: new row missing from delta_out");
     }
 
     /* Oracle D: no old/duplicate row in delta_out */
     for (uint32_t i = 0; i < DUPS; i++) {
         int64_t dr[2] = { (int64_t)(i * 2), (int64_t)(i * 2 + 1) };
         ASSERT(!test_rel_contains_row(delta_out, dr),
-               "oracle D: old row incorrectly in delta_out");
+            "oracle D: old row incorrectly in delta_out");
     }
 
     test_rel_free(rel);
@@ -570,7 +571,7 @@ test_fast_path_hit_append(void)
     ASSERT(test_rel_append_row(rel, d1) == 0, "append delta 50");
     ASSERT(test_rel_append_row(rel, d2) == 0, "append delta 60");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 3, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 3, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0");
     ASSERT(rel->nrows == 6, "rel->nrows == 6");
@@ -581,7 +582,7 @@ test_fast_path_hit_append(void)
     ASSERT(test_rel_contains_row(delta_out, d1), "delta_out has 50");
     ASSERT(test_rel_contains_row(delta_out, d2), "delta_out has 60");
     ASSERT(!test_rel_contains_row(delta_out, old0),
-           "delta_out must not have 10");
+        "delta_out must not have 10");
 
     /* Verify exact order */
     int64_t expected[] = { 10, 20, 30, 40, 50, 60 };
@@ -619,7 +620,7 @@ test_fast_path_miss_interleaved(void)
     ASSERT(test_rel_append_row(rel, d0) == 0, "append delta 20");
     ASSERT(test_rel_append_row(rel, d1) == 0, "append delta 40");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 3, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 3, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0");
     ASSERT(rel->nrows == 5, "rel->nrows == 5");
@@ -660,7 +661,7 @@ test_fast_path_no_old_rows(void)
     ASSERT(test_rel_append_row(rel, r1) == 0, "append 2");
     ASSERT(test_rel_append_row(rel, r2) == 0, "append 3");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0");
     ASSERT(rel->nrows == 3, "rel->nrows == 3");
@@ -695,7 +696,7 @@ test_no_delta_early_return(void)
     ASSERT(test_rel_append_row(rel, r1) == 0, "append 2");
     ASSERT(test_rel_append_row(rel, r2) == 0, "append 3");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 3, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 3, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0");
     ASSERT(rel->nrows == 3, "rel->nrows unchanged == 3");
@@ -727,7 +728,7 @@ test_fast_path_single_row_each(void)
     ASSERT(test_rel_append_row(rel, old0) == 0, "append old 10");
     ASSERT(test_rel_append_row(rel, d0) == 0, "append delta 20");
 
-    int rc = col_op_consolidate_incremental_delta(rel, 1, delta_out);
+    int rc = col_op_consolidate_incremental_delta(rel, 1, delta_out, NULL);
 
     ASSERT(rc == 0, "returns 0");
     ASSERT(rel->nrows == 2, "rel->nrows == 2");
@@ -778,7 +779,8 @@ test_fast_path_chain_hit_rate(void)
         }
 
         int rc
-            = col_op_consolidate_incremental_delta(rel, old_nrows, delta_out);
+            = col_op_consolidate_incremental_delta(rel, old_nrows, delta_out,
+                NULL);
         ASSERT(rc == 0, "consolidate returns 0");
 
         /* Correctness: all old+new rows present, sorted, unique */
@@ -789,12 +791,147 @@ test_fast_path_chain_hit_rate(void)
 
         /* All BATCH rows are new */
         ASSERT(delta_out->nrows == (uint32_t)BATCH,
-               "delta_out has exactly BATCH new rows");
+            "delta_out has exactly BATCH new rows");
 
         test_rel_free(delta_out);
     }
 
     test_rel_free(rel);
+    PASS();
+}
+
+/* ================================================================
+ * Test 12: out_fast_path reports 1 for empty-old fast path (Issue #278)
+ *
+ * When old_nrows == 0, fast path sub-case (a) is taken.
+ * out_fast_path must be set to 1.
+ * ================================================================ */
+static void
+test_fastpath_counter_empty_old(void)
+{
+    TEST("out_fast_path==1 when old_nrows==0 (sub-case a)");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(rel && delta_out, "test_rel_alloc failed");
+
+    int64_t r0[] = { 10 }, r1[] = { 20 };
+    ASSERT(test_rel_append_row(rel, r0) == 0, "append 10");
+    ASSERT(test_rel_append_row(rel, r1) == 0, "append 20");
+
+    int fast_flag = -1;
+    int rc = col_op_consolidate_incremental_delta(rel, 0, delta_out,
+            &fast_flag);
+    ASSERT(rc == 0, "returns 0");
+    ASSERT(fast_flag == 1, "out_fast_path == 1 for empty-old case");
+
+    test_rel_free(rel);
+    test_rel_free(delta_out);
+    PASS();
+}
+
+/* ================================================================
+ * Test 13: out_fast_path reports 1 when delta sorts after all old (Issue #278)
+ *
+ * Sub-case (b): last old row < first delta row.
+ * out_fast_path must be set to 1.
+ * ================================================================ */
+static void
+test_fastpath_counter_sorted_after(void)
+{
+    TEST("out_fast_path==1 when delta > all old rows (sub-case b)");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(rel && delta_out, "test_rel_alloc failed");
+
+    int64_t old0[] = { 10 }, old1[] = { 20 }, d0[] = { 30 };
+    ASSERT(test_rel_append_row(rel, old0) == 0, "append 10");
+    ASSERT(test_rel_append_row(rel, old1) == 0, "append 20");
+    ASSERT(test_rel_append_row(rel, d0) == 0, "append 30");
+
+    int fast_flag = -1;
+    int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out,
+            &fast_flag);
+    ASSERT(rc == 0, "returns 0");
+    ASSERT(fast_flag == 1, "out_fast_path == 1 for sorted-after case");
+
+    test_rel_free(rel);
+    test_rel_free(delta_out);
+    PASS();
+}
+
+/* ================================================================
+ * Test 14: out_fast_path reports 0 for interleaved (slow path) (Issue #278)
+ *
+ * When delta interleaves with old rows, the O(N) merge walk is used.
+ * out_fast_path must be set to 0.
+ * ================================================================ */
+static void
+test_fastpath_counter_interleaved(void)
+{
+    TEST("out_fast_path==0 when delta interleaves old (slow path)");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(rel && delta_out, "test_rel_alloc failed");
+
+    int64_t old0[] = { 10 }, old1[] = { 30 }, d0[] = { 20 };
+    ASSERT(test_rel_append_row(rel, old0) == 0, "append 10");
+    ASSERT(test_rel_append_row(rel, old1) == 0, "append 30");
+    ASSERT(test_rel_append_row(rel, d0) == 0, "append 20");
+
+    int fast_flag = -1;
+    int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out,
+            &fast_flag);
+    ASSERT(rc == 0, "returns 0");
+    ASSERT(fast_flag == 0, "out_fast_path == 0 for interleaved case");
+
+    test_rel_free(rel);
+    test_rel_free(delta_out);
+    PASS();
+}
+
+/* ================================================================
+ * Test 15: NULL out_fast_path does not crash (Issue #278)
+ *
+ * Both fast and slow paths must be NULL-safe.
+ * ================================================================ */
+static void
+test_fastpath_counter_null_safe(void)
+{
+    TEST("NULL out_fast_path: no crash on fast path");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(rel && delta_out, "test_rel_alloc failed");
+
+    int64_t old0[] = { 10 }, d0[] = { 20 };
+    ASSERT(test_rel_append_row(rel, old0) == 0, "append 10");
+    ASSERT(test_rel_append_row(rel, d0) == 0, "append 20");
+
+    /* Should not crash with NULL out_fast_path (fast path taken) */
+    int rc = col_op_consolidate_incremental_delta(rel, 1, delta_out, NULL);
+    ASSERT(rc == 0, "returns 0 with NULL out_fast_path");
+
+    test_rel_free(rel);
+    test_rel_free(delta_out);
+
+    /* Also test slow path with NULL */
+    col_rel_t *rel2 = test_rel_alloc(1);
+    col_rel_t *delta_out2 = test_rel_alloc(1);
+    ASSERT(rel2 && delta_out2, "test_rel_alloc failed (2)");
+
+    int64_t a[] = { 10 }, b[] = { 30 }, c[] = { 20 };
+    ASSERT(test_rel_append_row(rel2, a) == 0, "append 10");
+    ASSERT(test_rel_append_row(rel2, b) == 0, "append 30");
+    ASSERT(test_rel_append_row(rel2, c) == 0, "append 20");
+
+    rc = col_op_consolidate_incremental_delta(rel2, 2, delta_out2, NULL);
+    ASSERT(rc == 0, "returns 0 with NULL out_fast_path (slow path)");
+
+    test_rel_free(rel2);
+    test_rel_free(delta_out2);
     PASS();
 }
 
@@ -820,8 +957,14 @@ main(void)
     test_fast_path_single_row_each();
     test_fast_path_chain_hit_rate();
 
+    /* Fast-path counter tests (Issue #278) */
+    test_fastpath_counter_empty_old();
+    test_fastpath_counter_sorted_after();
+    test_fastpath_counter_interleaved();
+    test_fastpath_counter_null_safe();
+
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
-           fail_count, test_count);
+        fail_count, test_count);
 
     return fail_count > 0 ? 1 : 0;
 }

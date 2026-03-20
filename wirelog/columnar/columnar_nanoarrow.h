@@ -225,7 +225,7 @@ typedef struct {
  */
 col_arrangement_t *
 col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
-                            const uint32_t *key_cols, uint32_t key_count);
+    const uint32_t *key_cols, uint32_t key_count);
 
 /**
  * col_arrangement_find_first:
@@ -235,8 +235,8 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
  */
 uint32_t
 col_arrangement_find_first(const col_arrangement_t *arr,
-                           const int64_t *rel_data, uint32_t rel_ncols,
-                           const int64_t *key_row);
+    const int64_t *rel_data, uint32_t rel_ncols,
+    const int64_t *key_row);
 
 /**
  * col_arrangement_find_next:
@@ -289,11 +289,27 @@ col_session_get_iteration_count(wl_session_t *sess);
  */
 void
 col_session_get_perf_stats(wl_session_t *sess, uint64_t *out_consolidation_ns,
-                           uint64_t *out_kfusion_ns,
-                           uint64_t *out_kfusion_alloc_ns,
-                           uint64_t *out_kfusion_dispatch_ns,
-                           uint64_t *out_kfusion_merge_ns,
-                           uint64_t *out_kfusion_cleanup_ns);
+    uint64_t *out_kfusion_ns,
+    uint64_t *out_kfusion_alloc_ns,
+    uint64_t *out_kfusion_dispatch_ns,
+    uint64_t *out_kfusion_merge_ns,
+    uint64_t *out_kfusion_cleanup_ns);
+
+/**
+ * col_session_get_consolidation_stats:
+ *
+ * Return fast-path and slow-path hit counts for incremental consolidation
+ * accumulated across the last wl_session_snapshot() call.
+ * All out-parameters are NULL-safe.
+ *
+ * @param sess           A wl_session_t* backed by the columnar backend.
+ * @param out_fast_hits  Calls where all delta > all old (O(D) fast path).
+ * @param out_slow_hits  Calls requiring O(N+D) merge walk (interleaved).
+ */
+void
+col_session_get_consolidation_stats(wl_session_t *sess,
+    uint64_t *out_fast_hits,
+    uint64_t *out_slow_hits);
 
 /**
  * col_session_get_darr_count:
@@ -324,7 +340,7 @@ col_session_get_darr_count(wl_session_t *sess);
  */
 uint64_t
 col_compute_affected_strata(wl_session_t *session,
-                            const char *inserted_relation);
+    const char *inserted_relation);
 
 /**
  * col_session_get_frontier:
@@ -343,7 +359,7 @@ col_compute_affected_strata(wl_session_t *session,
  */
 int
 col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
-                         col_frontier_2d_t *out_frontier);
+    col_frontier_2d_t *out_frontier);
 
 /**
  * col_compute_affected_rules:
@@ -365,7 +381,7 @@ col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
  */
 uint64_t
 col_compute_affected_rules(wl_session_t *session,
-                           const char *inserted_relation);
+    const char *inserted_relation);
 
 /**
  * col_session_insert:
@@ -393,7 +409,7 @@ col_compute_affected_rules(wl_session_t *session,
  */
 int
 col_session_insert(wl_session_t *session, const char *relation,
-                   const int64_t *data, uint32_t num_rows, uint32_t num_cols);
+    const int64_t *data, uint32_t num_rows, uint32_t num_cols);
 
 /**
  * col_session_insert_incremental:
@@ -419,7 +435,7 @@ col_session_insert(wl_session_t *session, const char *relation,
  */
 int
 col_session_insert_incremental(wl_session_t *session, const char *relation,
-                               const int64_t *data, uint32_t num_rows,
-                               uint32_t num_cols);
+    const int64_t *data, uint32_t num_rows,
+    uint32_t num_cols);
 
 #endif /* WL_BACKEND_COLUMNAR_NANOARROW_H */

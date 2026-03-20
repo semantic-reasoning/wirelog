@@ -2801,13 +2801,16 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
  */
 int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
-    col_rel_t *delta_out)
+    col_rel_t *delta_out, int *out_fast_path)
 {
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
 
-    if (nr <= 1 || old_nrows >= nr)
-        return 0; /* nothing new */
+    if (nr <= 1 || old_nrows >= nr) {
+        if (out_fast_path)
+            *out_fast_path = 1; /* trivially fast: no data to process */
+        return 0;              /* nothing new */
+    }
 
     uint32_t delta_count = nr - old_nrows;
     int64_t *delta_start = rel->data + (size_t)old_nrows * nc;
@@ -2970,6 +2973,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         free(rel->timestamps);
         rel->timestamps = NULL;
     }
+    if (out_fast_path)
+        *out_fast_path = fast_path;
     return 0;
 }
 

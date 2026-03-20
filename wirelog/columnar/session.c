@@ -165,6 +165,28 @@ col_session_get_perf_stats(wl_session_t *sess, uint64_t *out_consolidation_ns,
 }
 
 /*
+ * col_session_get_consolidation_stats:
+ *
+ * Return fast-path and slow-path hit counts accumulated across all
+ * consolidation calls in the last wl_session_snapshot().
+ * Both out-parameters are NULL-safe.
+ *
+ * @param sess            A wl_session_t* backed by the columnar backend.
+ * @param out_fast_hits   Count of calls that took the O(D) fast path.
+ * @param out_slow_hits   Count of calls that took the O(N+D) merge walk.
+ */
+void
+col_session_get_consolidation_stats(wl_session_t *sess,
+    uint64_t *out_fast_hits, uint64_t *out_slow_hits)
+{
+    wl_col_session_t *cs = COL_SESSION(sess);
+    if (out_fast_hits)
+        *out_fast_hits = cs->consolidate_fast_hits;
+    if (out_slow_hits)
+        *out_slow_hits = cs->consolidate_slow_hits;
+}
+
+/*
  * col_session_cleanup_old_data:
  *
  * Remove data that is entirely before the frontier (iteration, stratum).
@@ -954,6 +976,8 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     sess->kfusion_dispatch_ns = 0;
     sess->kfusion_merge_ns = 0;
     sess->kfusion_cleanup_ns = 0;
+    sess->consolidate_fast_hits = 0;
+    sess->consolidate_slow_hits = 0;
 
     /* Phase 4 incremental skip: when last_inserted_relation is set, only
      * re-evaluate strata that transitively depend on the inserted relation.

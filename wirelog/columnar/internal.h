@@ -364,6 +364,11 @@ typedef struct {
     uint64_t
         consolidation_ns; /* time in col_op_consolidate_incremental_delta */
     uint64_t kfusion_ns;  /* time in col_op_k_fusion                */
+    /* Fast-path hit/miss counters for incremental consolidation (Issue #278).
+    * consolidate_fast_hits: calls where all delta > all old (sub-cases a/b).
+    * consolidate_slow_hits: calls requiring O(N) merge walk (interleaved). */
+    uint64_t consolidate_fast_hits;
+    uint64_t consolidate_slow_hits;
     /* Arrangement registry (Phase 3C): persistent hash indices           */
     col_arr_entry_t *arr_entries; /* owned flat array of arrangements     */
     uint32_t arr_count;           /* number of active arrangements        */
@@ -731,7 +736,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     uint32_t seg_count);
 int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
-    col_rel_t *delta_out);
+    col_rel_t *delta_out, int *out_fast_path);
 int
 col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst);
 int

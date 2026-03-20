@@ -604,11 +604,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 /* Consolidate WITH delta output (no separate merge walk) */
                 uint32_t cons_old = snap[ri];
                 uint32_t cons_new = r->nrows - cons_old; /* delta count D */
+                int fast_flag = 0;
                 uint64_t cons_t0 = now_ns();
-                int rc2
-                    = col_op_consolidate_incremental_delta(r, snap[ri], delta);
+                int rc2 = col_op_consolidate_incremental_delta(r, snap[ri],
+                        delta, &fast_flag);
                 uint64_t cons_elapsed = now_ns() - cons_t0;
                 sess->consolidation_ns += cons_elapsed;
+                sess->consolidate_fast_hits += (uint64_t)fast_flag;
+                sess->consolidate_slow_hits += (uint64_t)(1 - fast_flag);
                 /* Invalidate arrangements for this relation (data changed). */
                 col_session_invalidate_arrangements(&sess->base,
                     sp->relations[ri].name);
