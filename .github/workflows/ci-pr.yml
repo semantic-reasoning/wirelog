@@ -120,33 +120,44 @@ jobs:
   # ==========================================================================
   # Phase 3: Sanitizers (ASan + UBSan)
   # Depends on build matrix passing.
-  # Linux only: GCC + Clang
-  # fail-fast: true — first failure cancels remaining matrix jobs
+  # Linux: GCC + Clang; macOS: Clang
+  # fail-fast: false — run all sanitizer jobs in parallel (non-blocking)
   # Excludes: subprojects/**, build/**
   # ==========================================================================
   sanitizers:
-    name: Sanitizers / ${{ matrix.compiler }}
+    name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
-          - compiler: gcc
+          - os: ubuntu-latest
+            compiler: gcc
             cc: gcc
-          - compiler: clang
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+          - os: macos-latest
+            compiler: clang
             cc: clang
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y meson ninja-build
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install meson ninja
 
       - name: Configure with sanitizers
         run: >
