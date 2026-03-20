@@ -36,7 +36,7 @@ jobs:
     needs: [lint]
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           # Linux - GCC
@@ -117,51 +117,15 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           meson test -C builddir --print-errorlogs
 
-  # ==========================================================================
-  # Phase 3: Sanitizers (ASan + UBSan)
-  # Depends on build matrix passing.
-  # Linux: GCC + Clang; macOS: Clang
-  # fail-fast: false — run all sanitizer jobs in parallel (non-blocking)
-  # Excludes: subprojects/**, build/**
-  # ==========================================================================
-  sanitizers:
-    name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [build]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            compiler: gcc
-            cc: gcc
-          - os: ubuntu-latest
-            compiler: clang
-            cc: clang
-          - os: macos-latest
-            compiler: clang
-            cc: clang
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            sudo apt-get install -y clang
-          fi
-
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install meson ninja
-
+      # =======================================================================
+      # Phase 3: Sanitizers (ASan + UBSan) — runs on same platform after build
+      # Linux: GCC + Clang; macOS: Clang (Windows: skipped)
+      # =======================================================================
       - name: Configure with sanitizers
+        if: runner.os != 'Windows'
         run: >
-          meson setup builddir
+          rm -rf builddir-san &&
+          meson setup builddir-san
           -Db_sanitize=address,undefined
           -Db_lundef=false
           -Dtests=true
@@ -169,11 +133,13 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
 
-      - name: Build
-        run: meson compile -C builddir
+      - name: Build with sanitizers
+        if: runner.os != 'Windows'
+        run: meson compile -C builddir-san
 
-      - name: Test
-        run: meson test -C builddir --print-errorlogs
+      - name: Test with sanitizers
+        if: runner.os != 'Windows'
+        run: meson test -C builddir-san --print-errorlogs
         env:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
