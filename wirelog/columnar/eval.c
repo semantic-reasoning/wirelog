@@ -726,6 +726,8 @@ stride_error:
         free(snap);
 
         if (outer_rc != 0) {
+            /* Issue #282: Restore diff_operators_active on error path */
+            sess->diff_operators_active = saved_diff_operators_active;
             free(delta_rels);
             return outer_rc;
         }
