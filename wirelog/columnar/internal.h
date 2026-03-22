@@ -608,6 +608,25 @@ row_cmp_fn(const void *a, const void *b, void *ctx)
     const uint32_t ncols = *(const uint32_t *)ctx;
     const int64_t *ra = (const int64_t *)a;
     const int64_t *rb = (const int64_t *)b;
+    /* Issue #279: fast path for the two most common relation widths. */
+    if (ncols == 2) {
+        if (ra[0] != rb[0])
+            return (ra[0] < rb[0]) ? -1 : 1;
+        if (ra[1] != rb[1])
+            return (ra[1] < rb[1]) ? -1 : 1;
+        return 0;
+    }
+    if (ncols == 4) {
+        if (ra[0] != rb[0])
+            return (ra[0] < rb[0]) ? -1 : 1;
+        if (ra[1] != rb[1])
+            return (ra[1] < rb[1]) ? -1 : 1;
+        if (ra[2] != rb[2])
+            return (ra[2] < rb[2]) ? -1 : 1;
+        if (ra[3] != rb[3])
+            return (ra[3] < rb[3]) ? -1 : 1;
+        return 0;
+    }
     for (uint32_t c = 0; c < ncols; c++) {
         if (ra[c] < rb[c])
             return -1;
@@ -625,6 +644,25 @@ static inline int __cdecl row_cmp_fn(void *ctx, const void *a, const void *b)
     const uint32_t ncols = *(const uint32_t *)ctx;
     const int64_t *ra = (const int64_t *)a;
     const int64_t *rb = (const int64_t *)b;
+    /* Issue #279: fast path for the two most common relation widths. */
+    if (ncols == 2) {
+        if (ra[0] != rb[0])
+            return (ra[0] < rb[0]) ? -1 : 1;
+        if (ra[1] != rb[1])
+            return (ra[1] < rb[1]) ? -1 : 1;
+        return 0;
+    }
+    if (ncols == 4) {
+        if (ra[0] != rb[0])
+            return (ra[0] < rb[0]) ? -1 : 1;
+        if (ra[1] != rb[1])
+            return (ra[1] < rb[1]) ? -1 : 1;
+        if (ra[2] != rb[2])
+            return (ra[2] < rb[2]) ? -1 : 1;
+        if (ra[3] != rb[3])
+            return (ra[3] < rb[3]) ? -1 : 1;
+        return 0;
+    }
     for (uint32_t c = 0; c < ncols; c++) {
         if (ra[c] < rb[c])
             return -1;
@@ -643,6 +681,25 @@ row_cmp_fn(void *ctx, const void *a, const void *b)
     const uint32_t ncols = *(const uint32_t *)ctx;
     const int64_t *ra = (const int64_t *)a;
     const int64_t *rb = (const int64_t *)b;
+    /* Issue #279: fast path for the two most common relation widths. */
+    if (ncols == 2) {
+        if (ra[0] != rb[0])
+            return (ra[0] < rb[0]) ? -1 : 1;
+        if (ra[1] != rb[1])
+            return (ra[1] < rb[1]) ? -1 : 1;
+        return 0;
+    }
+    if (ncols == 4) {
+        if (ra[0] != rb[0])
+            return (ra[0] < rb[0]) ? -1 : 1;
+        if (ra[1] != rb[1])
+            return (ra[1] < rb[1]) ? -1 : 1;
+        if (ra[2] != rb[2])
+            return (ra[2] < rb[2]) ? -1 : 1;
+        if (ra[3] != rb[3])
+            return (ra[3] < rb[3]) ? -1 : 1;
+        return 0;
+    }
     for (uint32_t c = 0; c < ncols; c++) {
         if (ra[c] < rb[c])
             return -1;
