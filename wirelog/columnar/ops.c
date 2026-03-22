@@ -3082,6 +3082,82 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                     }
                     fast_path = 1;
                 }
+            } else if (cmp_dlo_olo <= 0 && cmp_dhi_ohi >= 0) {
+                /* Case G: Delta contains old (D_lo <= O_lo, D_hi >= O_hi).
+                 * Binary search delta for the range bracketing old. */
+                uint32_t d_lo_idx = row_lower_bound(
+                    delta_start, d_unique, nc, old_first);
+                uint32_t d_hi_idx = row_upper_bound(
+                    delta_start, d_unique, nc, old_last);
+
+                /* Prefix: delta[0..d_lo_idx) -- all new, before old */
+                if (d_lo_idx > 0) {
+                    memcpy(merged, delta_start,
+                        (size_t)d_lo_idx * row_bytes);
+                    if (delta_out) {
+                        for (uint32_t k = 0; k < d_lo_idx; k++)
+                            col_rel_append_row(
+                                delta_out, delta_start + (size_t)k * nc);
+                    }
+                    out = d_lo_idx;
+                }
+                /* Overlap zone: old[0..old_nrows) vs delta[d_lo_idx..d_hi_idx) */
+                uint32_t o_i = 0, d_i = d_lo_idx;
+                const int64_t *op = rel->data;
+                const int64_t *dp = delta_start + (size_t)d_lo_idx * nc;
+                int64_t *mp = merged + (size_t)out * nc;
+                while (o_i < old_nrows && d_i < d_hi_idx) {
+                    int c = row_cmp_optimized(op, dp, nc);
+                    if (c < 0) {
+                        memcpy(mp, op, row_bytes);
+                        op += nc;
+                        o_i++;
+                    } else if (c == 0) {
+                        memcpy(mp, op, row_bytes);
+                        op += nc;
+                        o_i++;
+                        dp += nc;
+                        d_i++;
+                    } else {
+                        memcpy(mp, dp, row_bytes);
+                        if (delta_out)
+                            col_rel_append_row(delta_out, dp);
+                        dp += nc;
+                        d_i++;
+                    }
+                    mp += nc;
+                    out++;
+                }
+                while (o_i < old_nrows) {
+                    memcpy(mp, op, row_bytes);
+                    op += nc;
+                    o_i++;
+                    mp += nc;
+                    out++;
+                }
+                while (d_i < d_hi_idx) {
+                    memcpy(mp, dp, row_bytes);
+                    if (delta_out)
+                        col_rel_append_row(delta_out, dp);
+                    dp += nc;
+                    d_i++;
+                    mp += nc;
+                    out++;
+                }
+                /* Suffix: delta[d_hi_idx..d_unique) -- all new, after old */
+                if (d_hi_idx < d_unique) {
+                    uint32_t suffix_n = d_unique - d_hi_idx;
+                    memcpy(merged + (size_t)out * nc,
+                        delta_start + (size_t)d_hi_idx * nc,
+                        (size_t)suffix_n * row_bytes);
+                    if (delta_out) {
+                        for (uint32_t k = d_hi_idx; k < d_unique; k++)
+                            col_rel_append_row(
+                                delta_out, delta_start + (size_t)k * nc);
+                    }
+                    out += suffix_n;
+                }
+                fast_path = 1;
             }
         }
     }
