@@ -82,7 +82,7 @@ typedef struct {
     uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
     uint32_t base_nrows;       /* base row count for delta prop (#83)   */
     col_delta_timestamp_t
-        *timestamps; /* NULL when not tracking               */
+    *timestamps;     /* NULL when not tracking               */
 } col_rel_t;
 
 /*
@@ -100,7 +100,7 @@ typedef struct {
  */
 int
 col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
-                              uint32_t seg_count);
+    uint32_t seg_count);
 
 /* ----------------------------------------------------------------
  * Test framework (matches wirelog convention: test_consolidate_incremental_delta.c)
@@ -111,29 +111,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helper: allocate col_rel_t with ncols columns and no rows.
@@ -195,14 +195,14 @@ test_rel_append_row(col_rel_t *r, const int64_t *row)
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
         int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
-                                                      * sizeof(int64_t));
+                * sizeof(int64_t));
         if (!nd)
             return -1;
         r->data = nd;
         r->capacity = cap;
     }
     memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-           r->ncols * sizeof(int64_t));
+        r->ncols * sizeof(int64_t));
     r->nrows++;
     return 0;
 }
@@ -232,7 +232,7 @@ test_rel_is_sorted_unique(const col_rel_t *r)
         return 1;
     for (uint32_t i = 1; i < r->nrows; i++) {
         int cmp = test_row_cmp(r->data + (size_t)(i - 1) * r->ncols,
-                               r->data + (size_t)i * r->ncols, r->ncols);
+                r->data + (size_t)i * r->ncols, r->ncols);
         if (cmp >= 0)
             return 0;
     }
@@ -261,7 +261,7 @@ test_rel_equals(const col_rel_t *a, const col_rel_t *b)
     if (a->nrows != b->nrows || a->ncols != b->ncols)
         return 0;
     return memcmp(a->data, b->data,
-                  (size_t)a->nrows * a->ncols * sizeof(int64_t))
+               (size_t)a->nrows * a->ncols * sizeof(int64_t))
            == 0;
 }
 
@@ -346,7 +346,7 @@ test_two_copies_direct_merge(void)
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(rel->nrows == 5, "rel->nrows == 5 after 2-way merge");
     ASSERT(test_rel_is_sorted_unique(rel),
-           "merged output is sorted and unique");
+        "merged output is sorted and unique");
 
     /* Verify exact merged order */
     int64_t expected[5][2]
@@ -354,7 +354,7 @@ test_two_copies_direct_merge(void)
     for (int i = 0; i < 5; i++) {
         int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
-               "row at position i has wrong value");
+            "row at position i has wrong value");
         (void)test_rel_equals; /* suppress unused warning */
     }
 
@@ -398,14 +398,14 @@ test_three_copies_heap_merge(void)
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(rel->nrows == 6, "rel->nrows == 6 after 3-way merge");
     ASSERT(test_rel_is_sorted_unique(rel),
-           "merged output is sorted and unique");
+        "merged output is sorted and unique");
 
     int64_t expected[6][2]
         = { { 1, 1 }, { 2, 2 }, { 3, 3 }, { 4, 4 }, { 5, 5 }, { 6, 6 } };
     for (int i = 0; i < 6; i++) {
         int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
-               "row at position i has wrong value");
+            "row at position i has wrong value");
     }
 
     test_rel_free(rel);
@@ -427,7 +427,7 @@ static void
 test_per_segment_sort_before_merge(void)
 {
     TEST("per-segment qsort before merge produces lexicographically sorted "
-         "output");
+        "output");
 
     col_rel_t *rel = test_rel_alloc(2);
     ASSERT(rel != NULL, "test_rel_alloc failed");
@@ -453,7 +453,7 @@ test_per_segment_sort_before_merge(void)
     for (int i = 0; i < 4; i++) {
         int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
-               "row at position i has wrong value after sort+merge");
+            "row at position i has wrong value after sort+merge");
     }
 
     test_rel_free(rel);
@@ -494,13 +494,13 @@ test_cross_segment_dedup(void)
     ASSERT(rc == 0, "returns 0 on success");
     ASSERT(rel->nrows == 3, "rel->nrows == 3 (one dup removed)");
     ASSERT(test_rel_is_sorted_unique(rel),
-           "output is sorted and unique (no dups)");
+        "output is sorted and unique (no dups)");
 
     int64_t expected[3][2] = { { 1, 1 }, { 3, 3 }, { 5, 5 } };
     for (int i = 0; i < 3; i++) {
         int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
-               "row at position i has wrong value after dedup");
+            "row at position i has wrong value after dedup");
     }
 
     test_rel_free(rel);
@@ -557,8 +557,9 @@ test_large_dataset_performance(void)
     int rc = col_op_consolidate_kway_merge(rel, seg_boundaries, 3);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    uint64_t elapsed_ms = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000
-                          + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000;
+    uint64_t elapsed_ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
+        + (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec;
+    uint64_t elapsed_ms = elapsed_ns / 1000000;
 #else
     DWORD t0 = GetTickCount();
     int rc = col_op_consolidate_kway_merge(rel, seg_boundaries, 3);
@@ -570,7 +571,7 @@ test_large_dataset_performance(void)
 
     /* All 3*ROWS_PER_COPY rows are unique (stride-3 interleaved), expect all present */
     ASSERT(rel->nrows == 3 * ROWS_PER_COPY,
-           "rel->nrows == 3*ROWS_PER_COPY (all unique)");
+        "rel->nrows == 3*ROWS_PER_COPY (all unique)");
     ASSERT(test_rel_is_sorted_unique(rel), "output is sorted and unique");
 
     /* Spot-check first, middle, and last rows */
@@ -583,7 +584,7 @@ test_large_dataset_performance(void)
     /* Timing check: < 100ms */
     if (elapsed_ms >= 100) {
         printf("WARN: merge took %" PRIu64 " ms (expected < 100ms)\n",
-               elapsed_ms);
+            elapsed_ms);
     }
     ASSERT(elapsed_ms < 100, "merge completed in < 100ms (O(M log K))");
 
@@ -633,7 +634,7 @@ test_empty_middle_segment(void)
     for (int i = 0; i < 3; i++) {
         int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
-               "row at position i has wrong value (empty segment case)");
+            "row at position i has wrong value (empty segment case)");
     }
 
     test_rel_free(rel);
@@ -659,7 +660,7 @@ main(void)
     test_empty_middle_segment();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
-           fail_count, test_count);
+        fail_count, test_count);
 
     return fail_count > 0 ? 1 : 0;
 }
