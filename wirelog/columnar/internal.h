@@ -348,6 +348,13 @@ typedef struct {
     col_rel_t **rels;          /* owned array of owned col_rel_t*        */
     uint32_t nrels;            /* current number of registered relations */
     uint32_t rel_cap;          /* allocated capacity of rels[]           */
+    /* Relation name hash table (Issue #281): O(1) lookup for session_find_rel.
+     * Uses FNV-1a hash (arrangement.c pattern) with chaining. Built lazily on
+     * first lookup, rebuilt when load factor exceeds 50%.  */
+    uint32_t *rel_hash_head;      /* owned bucket heads array (UINT32_MAX = empty) */
+    uint32_t *rel_hash_next;      /* owned collision chain pointers           */
+    uint32_t rel_hash_nbuckets;   /* current bucket count (power of 2)       */
+    uint32_t rel_hash_chain_cap;  /* allocated capacity of rel_hash_next[]  */
     wl_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
     void *delta_data;          /* opaque user context for delta_cb       */
     wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
@@ -722,6 +729,21 @@ int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r);
 void
 session_remove_rel(wl_col_session_t *sess, const char *name);
+
+/* ======================================================================== */
+/* Session Hash Table Helpers (columnar/session_hash.c - Issue #281)       */
+/* ======================================================================== */
+
+int
+session_rel_build_hash(wl_col_session_t *sess);
+col_rel_t *
+session_rel_hash_lookup(wl_col_session_t *sess, const char *name);
+int
+session_rel_hash_insert(wl_col_session_t *sess, uint32_t idx);
+int
+session_rel_hash_remove(wl_col_session_t *sess, uint32_t idx);
+void
+session_rel_free_hash(wl_col_session_t *sess);
 
 /* ======================================================================== */
 /* Arrangement Layer (columnar/arrangement.c)                               */

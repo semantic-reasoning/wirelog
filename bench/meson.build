@@ -35,6 +35,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/frontier_epoch.c',
   subdir_wirelog / 'columnar/mobius.c',
   subdir_wirelog / 'columnar/session.c',
+  subdir_wirelog / 'columnar/session_hash.c',
   subdir_wirelog / 'columnar/delta_pool.c',
   subdir_wirelog / 'columnar/lftj.c',
   subdir_wirelog / 'columnar/mem_ledger.c',
