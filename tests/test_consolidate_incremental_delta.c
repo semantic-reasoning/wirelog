@@ -854,7 +854,8 @@ test_fastpath_counter_sorted_after(void)
     int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out,
             &fast_flag);
     ASSERT(rc == 0, "returns 0");
-    ASSERT(fast_flag == 1, "out_fast_path == 1 for sorted-after case");
+    /* Issue #280: path code 2 = CONS_PATH_APPEND (was binary 1) */
+    ASSERT(fast_flag == 2, "out_fast_path == 2 for sorted-after case");
 
     test_rel_free(rel);
     test_rel_free(delta_out);
@@ -862,15 +863,15 @@ test_fastpath_counter_sorted_after(void)
 }
 
 /* ================================================================
- * Test 14: out_fast_path reports fast for contained delta (Issue #278, #280)
+ * Test 14: out_fast_path reports 0 for interleaved (slow path) (Issue #278)
  *
- * When delta is contained within old range, Case F fast-path handles it.
- * out_fast_path must be set to non-zero (fast path).
+ * When delta interleaves with old rows, the O(N) merge walk is used.
+ * out_fast_path must be set to 0.
  * ================================================================ */
 static void
 test_fastpath_counter_interleaved(void)
 {
-    TEST("out_fast_path!=0 when delta contained in old (Case F)");
+    TEST("out_fast_path==0 when delta interleaves old (slow path)");
 
     col_rel_t *rel = test_rel_alloc(1);
     col_rel_t *delta_out = test_rel_alloc(1);
@@ -885,7 +886,10 @@ test_fastpath_counter_interleaved(void)
     int rc = col_op_consolidate_incremental_delta(rel, 2, delta_out,
             &fast_flag);
     ASSERT(rc == 0, "returns 0");
-    ASSERT(fast_flag == 1, "out_fast_path != 0 for contained case (Case F)");
+    /* Issue #280: Case F (delta contained in old) now handles this as a
+     * fast-path.  Delta [20] is within old range [10,30], so Case F fires. */
+    ASSERT(fast_flag == 5,
+        "out_fast_path == 5 for contained case (Issue #280)");
 
     test_rel_free(rel);
     test_rel_free(delta_out);

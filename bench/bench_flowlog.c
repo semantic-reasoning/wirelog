@@ -56,9 +56,10 @@ static uint64_t g_last_kfusion_alloc_ns = 0;
 static uint64_t g_last_kfusion_dispatch_ns = 0;
 static uint64_t g_last_kfusion_merge_ns = 0;
 static uint64_t g_last_kfusion_cleanup_ns = 0;
-/* Fast-path profiling counters (Issue #278) */
+/* Fast-path profiling counters (Issue #278, #280) */
 static uint64_t g_last_consolidate_fast_hits = 0;
 static uint64_t g_last_consolidate_slow_hits = 0;
+static uint64_t g_last_consolidate_path_hits[CONS_PATH_COUNT] = {0};
 
 #ifndef WITH_K_FUSION
 #define WITH_K_FUSION 1
@@ -345,6 +346,8 @@ run_pipeline_count(const char *source, uint32_t num_workers, int64_t *out_count,
         &g_last_kfusion_merge_ns, &g_last_kfusion_cleanup_ns);
     col_session_get_consolidation_stats(sess, &g_last_consolidate_fast_hits,
         &g_last_consolidate_slow_hits);
+    col_session_get_consolidation_path_stats(sess,
+        g_last_consolidate_path_hits);
 
     wl_session_destroy(sess);
     wl_plan_free(plan);
@@ -2755,6 +2758,14 @@ output_json_row(const char *wl_name, int32_t edges, uint32_t workers,
     printf("  \"consolidation_slow_hits\": %" PRIu64 ",\n",
         g_last_consolidate_slow_hits);
     printf("  \"consolidation_fast_pct\": %.1f,\n", fast_pct);
+    /* Per-path breakdown (Issue #280) */
+    printf("  \"consolidation_path_hits\": [%" PRIu64 ", %" PRIu64
+        ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64
+        ", %" PRIu64 "],\n",
+        g_last_consolidate_path_hits[0], g_last_consolidate_path_hits[1],
+        g_last_consolidate_path_hits[2], g_last_consolidate_path_hits[3],
+        g_last_consolidate_path_hits[4], g_last_consolidate_path_hits[5],
+        g_last_consolidate_path_hits[6]);
     printf("  \"profiling_from_last_run\": true\n");
     printf("}\n");
 }
