@@ -311,21 +311,6 @@ col_session_get_consolidation_stats(wl_session_t *sess,
     uint64_t *out_fast_hits,
     uint64_t *out_slow_hits);
 
-/** Number of consolidation path codes (0=slow, 1-6=fast-path cases). */
-#define CONS_PATH_COUNT 7
-
-/**
- * col_session_get_consolidation_path_stats:
- *
- * Return per-path hit counts for incremental consolidation (Issue #280).
- * out_path_hits must point to an array of at least CONS_PATH_COUNT uint64_t.
- * Index: 0=slow, 1=empty-old(A), 2=append(B), 3=prepend(D),
- *        4=suffix-overlap(E), 5=contained(F), 6=contains(G).
- */
-void
-col_session_get_consolidation_path_stats(wl_session_t *sess,
-    uint64_t out_path_hits[CONS_PATH_COUNT]);
-
 /**
  * col_session_get_darr_count:
  *

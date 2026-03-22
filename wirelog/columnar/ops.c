@@ -2762,17 +2762,6 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     return 0;
 }
 
-/* Consolidation path classification (Issue #280) */
-typedef enum {
-    CONS_PATH_SLOW = 0,      /* full O(N+D) merge walk */
-    CONS_PATH_EMPTY_OLD = 1, /* case A: old_nrows == 0 */
-    CONS_PATH_APPEND = 2,    /* case B: all delta after old */
-    CONS_PATH_PREPEND = 3,   /* case D: all delta before old */
-    CONS_PATH_SUFFIX_OL = 4, /* case E: suffix overlap */
-    CONS_PATH_CONTAINED = 5, /* case F: delta contained in old */
-    CONS_PATH_CONTAINS = 6 /* case G: delta contains old */
-} cons_path_t;
-
 /*
  * row_lower_bound: find first row in sorted array where row >= key.
  * Returns index in [0, nrows]. Standard lower_bound semantics.
@@ -2861,7 +2850,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
 
     if (nr <= 1 || old_nrows >= nr) {
         if (out_fast_path)
-            *out_fast_path = CONS_PATH_EMPTY_OLD; /* trivially fast */
+            *out_fast_path = 1; /* trivially fast: no data to process */
         return 0;              /* nothing new */
     }
 
@@ -2927,7 +2916,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                 col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
         }
         out = d_unique;
-        fast_path = CONS_PATH_EMPTY_OLD;
+        fast_path = 1;
     } else {
         const int64_t *old_first = rel->data;
         const int64_t *old_last = rel->data + (size_t)(old_nrows - 1) * nc;
@@ -2948,7 +2937,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                         delta_out, delta_start + (size_t)k * nc);
             }
             out = old_nrows + d_unique;
-            fast_path = CONS_PATH_APPEND;
+            fast_path = 1;
         } else if (cmp_dhi_olo < 0) {
             /* Case D: All delta before old -- copy delta + append old */
             memcpy(merged, delta_start, (size_t)d_unique * row_bytes);
@@ -2960,7 +2949,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                         delta_out, delta_start + (size_t)k * nc);
             }
             out = d_unique + old_nrows;
-            fast_path = CONS_PATH_PREPEND;
+            fast_path = 1;
         } else {
             /* Overlapping ranges -- check partial-overlap fast-paths */
             int cmp_dlo_olo = row_cmp_optimized(delta_first, old_first, nc);
@@ -3032,7 +3021,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                             (size_t)suffix_n * row_bytes);
                         out += suffix_n;
                     }
-                    fast_path = CONS_PATH_CONTAINED;
+                    fast_path = 1;
                 }
             } else if (cmp_dlo_olo > 0 && cmp_dhi_ohi > 0) {
                 /* Case E: Suffix overlap (O_lo < D_lo <= O_hi < D_hi).
@@ -3091,7 +3080,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                         mp += nc;
                         out++;
                     }
-                    fast_path = CONS_PATH_SUFFIX_OL;
+                    fast_path = 1;
                 }
             } else if (cmp_dlo_olo <= 0 && cmp_dhi_ohi >= 0) {
                 /* Case G: Delta contains old (D_lo <= O_lo, D_hi >= O_hi).
@@ -3168,7 +3157,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                     }
                     out += suffix_n;
                 }
-                fast_path = CONS_PATH_CONTAINS;
+                fast_path = 1;
             }
         }
     }

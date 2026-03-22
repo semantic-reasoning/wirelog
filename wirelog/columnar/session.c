@@ -180,32 +180,10 @@ col_session_get_consolidation_stats(wl_session_t *sess,
     uint64_t *out_fast_hits, uint64_t *out_slow_hits)
 {
     wl_col_session_t *cs = COL_SESSION(sess);
-    if (out_fast_hits) {
-        /* Backward compat: fast = sum of all non-slow paths (1-6) */
-        uint64_t sum = 0;
-        for (int i = 1; i < CONS_PATH_COUNT; i++)
-            sum += cs->consolidate_path_hits[i];
-        *out_fast_hits = sum;
-    }
+    if (out_fast_hits)
+        *out_fast_hits = cs->consolidate_fast_hits;
     if (out_slow_hits)
-        *out_slow_hits = cs->consolidate_path_hits[0];
-}
-
-/*
- * col_session_get_consolidation_path_stats:
- *
- * Return per-path hit counts for incremental consolidation (Issue #280).
- * out_path_hits must point to an array of at least CONS_PATH_COUNT uint64_t.
- * Index 0 = slow path, 1-6 = fast-path cases A-G.
- */
-void
-col_session_get_consolidation_path_stats(wl_session_t *sess,
-    uint64_t out_path_hits[CONS_PATH_COUNT])
-{
-    wl_col_session_t *cs = COL_SESSION(sess);
-    if (out_path_hits)
-        memcpy(out_path_hits, cs->consolidate_path_hits,
-            CONS_PATH_COUNT * sizeof(uint64_t));
+        *out_slow_hits = cs->consolidate_slow_hits;
 }
 
 /*
@@ -998,8 +976,8 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     sess->kfusion_dispatch_ns = 0;
     sess->kfusion_merge_ns = 0;
     sess->kfusion_cleanup_ns = 0;
-    memset(sess->consolidate_path_hits, 0,
-        sizeof(sess->consolidate_path_hits));
+    sess->consolidate_fast_hits = 0;
+    sess->consolidate_slow_hits = 0;
 
     /* Phase 4 incremental skip: when last_inserted_relation is set, only
      * re-evaluate strata that transitively depend on the inserted relation.
