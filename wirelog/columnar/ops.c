@@ -2950,6 +2950,80 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             }
             out = d_unique + old_nrows;
             fast_path = 1;
+        } else {
+            /* Overlapping ranges -- check partial-overlap fast-paths */
+            int cmp_dlo_olo = row_cmp_optimized(delta_first, old_first, nc);
+            int cmp_dhi_ohi = row_cmp_optimized(delta_last, old_last, nc);
+
+            if (cmp_dlo_olo >= 0 && cmp_dhi_ohi <= 0) {
+                /* Case F: Delta contained in old (D_lo >= O_lo, D_hi <= O_hi).
+                 * Binary search old for [lo_idx, hi_idx) bracketing delta. */
+                uint32_t lo_idx = row_lower_bound(
+                    rel->data, old_nrows, nc, delta_first);
+                uint32_t hi_idx = row_upper_bound(
+                    rel->data, old_nrows, nc, delta_last);
+
+                if (lo_idx > 0 || hi_idx < old_nrows) {
+                    /* Prefix: old[0..lo_idx) */
+                    if (lo_idx > 0) {
+                        memcpy(merged, rel->data,
+                            (size_t)lo_idx * row_bytes);
+                        out = lo_idx;
+                    }
+                    /* Overlap zone: old[lo_idx..hi_idx) vs delta[0..d_unique) */
+                    uint32_t o_i = lo_idx, d_i = 0;
+                    const int64_t *op = rel->data + (size_t)lo_idx * nc;
+                    const int64_t *dp = delta_start;
+                    int64_t *mp = merged + (size_t)out * nc;
+                    while (o_i < hi_idx && d_i < d_unique) {
+                        int c = row_cmp_optimized(op, dp, nc);
+                        if (c < 0) {
+                            memcpy(mp, op, row_bytes);
+                            op += nc;
+                            o_i++;
+                        } else if (c == 0) {
+                            memcpy(mp, op, row_bytes);
+                            op += nc;
+                            o_i++;
+                            dp += nc;
+                            d_i++;
+                        } else {
+                            memcpy(mp, dp, row_bytes);
+                            if (delta_out)
+                                col_rel_append_row(delta_out, dp);
+                            dp += nc;
+                            d_i++;
+                        }
+                        mp += nc;
+                        out++;
+                    }
+                    while (o_i < hi_idx) {
+                        memcpy(mp, op, row_bytes);
+                        op += nc;
+                        o_i++;
+                        mp += nc;
+                        out++;
+                    }
+                    while (d_i < d_unique) {
+                        memcpy(mp, dp, row_bytes);
+                        if (delta_out)
+                            col_rel_append_row(delta_out, dp);
+                        dp += nc;
+                        d_i++;
+                        mp += nc;
+                        out++;
+                    }
+                    /* Suffix: old[hi_idx..old_nrows) */
+                    if (hi_idx < old_nrows) {
+                        uint32_t suffix_n = old_nrows - hi_idx;
+                        memcpy(merged + (size_t)out * nc,
+                            rel->data + (size_t)hi_idx * nc,
+                            (size_t)suffix_n * row_bytes);
+                        out += suffix_n;
+                    }
+                    fast_path = 1;
+                }
+            }
         }
     }
 
