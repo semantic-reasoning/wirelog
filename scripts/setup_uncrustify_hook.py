@@ -80,7 +80,7 @@ FORMATTED_FILES=0
 for file in $STAGED_FILES; do
     if [ -f "$file" ]; then
         # Create temp formatted version
-        uncrustify -c "$UNCRUSTIFY_CONFIG" "$file" > /tmp/uncrustify_formatted.tmp 2>/dev/null
+        uncrustify -c "$UNCRUSTIFY_CONFIG" -f "$file" > /tmp/uncrustify_formatted.tmp 2>/dev/null
 
         # Check if formatting changed
         if ! diff -q "$file" /tmp/uncrustify_formatted.tmp > /dev/null 2>&1; then
