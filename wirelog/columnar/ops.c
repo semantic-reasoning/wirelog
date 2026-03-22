@@ -2901,14 +2901,15 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     const int64_t *d_ptr = delta_start;
     int64_t *merged_ptr = merged;
 
-    /* Fast-path (Issue #239): if all delta rows sort after all old rows, skip
-     * the O(N) merge walk and directly copy old then append delta.
-     * Sub-cases:
-     *   (a) old_nrows == 0: no old rows, all delta rows are new
-     *   (b) last old row < first delta row: no interleaving possible */
+    /* Fast-path cascade (Issue #239, #280).
+     *
+     * Cases A-B (existing), D (new: delta-before-old).
+     * Each case decomposes the merge into non-overlapping segments
+     * joined by memcpy, avoiding per-row comparison where possible.
+     */
     int fast_path = 0;
     if (old_nrows == 0) {
-        /* No old rows: delta rows are all new */
+        /* Case A: No old rows -- delta rows are all new */
         memcpy(merged, delta_start, (size_t)d_unique * row_bytes);
         if (delta_out) {
             for (uint32_t k = 0; k < d_unique; k++)
@@ -2917,18 +2918,37 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         out = d_unique;
         fast_path = 1;
     } else {
-        int cmp = row_cmp_optimized(rel->data + (size_t)(old_nrows - 1) * nc,
-                delta_start, nc);
-        if (cmp < 0) {
-            /* All delta rows > all old rows: copy old then append delta */
+        const int64_t *old_first = rel->data;
+        const int64_t *old_last = rel->data + (size_t)(old_nrows - 1) * nc;
+        const int64_t *delta_first = delta_start;
+        const int64_t *delta_last = delta_start + (size_t)(d_unique - 1) * nc;
+
+        int cmp_ohi_dlo = row_cmp_optimized(old_last, delta_first, nc);
+        int cmp_dhi_olo = row_cmp_optimized(delta_last, old_first, nc);
+
+        if (cmp_ohi_dlo < 0) {
+            /* Case B: All delta after old -- copy old + append delta */
             memcpy(merged, rel->data, (size_t)old_nrows * row_bytes);
             memcpy(merged + (size_t)old_nrows * nc, delta_start,
                 (size_t)d_unique * row_bytes);
             if (delta_out) {
                 for (uint32_t k = 0; k < d_unique; k++)
-                    col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
+                    col_rel_append_row(
+                        delta_out, delta_start + (size_t)k * nc);
             }
             out = old_nrows + d_unique;
+            fast_path = 1;
+        } else if (cmp_dhi_olo < 0) {
+            /* Case D: All delta before old -- copy delta + append old */
+            memcpy(merged, delta_start, (size_t)d_unique * row_bytes);
+            memcpy(merged + (size_t)d_unique * nc, rel->data,
+                (size_t)old_nrows * row_bytes);
+            if (delta_out) {
+                for (uint32_t k = 0; k < d_unique; k++)
+                    col_rel_append_row(
+                        delta_out, delta_start + (size_t)k * nc);
+            }
+            out = d_unique + old_nrows;
             fast_path = 1;
         }
     }
