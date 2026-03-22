@@ -81,7 +81,7 @@ typedef struct {
  */
 int
 col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
-                              uint32_t seg_count);
+    uint32_t seg_count);
 
 /* ----------------------------------------------------------------
  * Test framework (matches wirelog convention)
@@ -92,29 +92,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helper: allocate col_rel_t with ncols columns.
@@ -528,6 +528,142 @@ test_k3_heap_merge(void)
 }
 
 /* ----------------------------------------------------------------
+ * Issue #279: ncols=2/4 dispatch specialization tests
+ * ---------------------------------------------------------------- */
+
+/*
+ * Test 13: ncols=2, equal rows dedup (dispatch specialization).
+ * Two segments each with row {5, 10}. K=2 merge should dedup to 1 row.
+ */
+static void
+test_ncols2_equal_rows(void)
+{
+    TEST("ncols=2: equal rows dedup to 1 (dispatch path)");
+
+    col_rel_t *rel = test_rel_alloc(2);
+    ASSERT(rel != NULL, "alloc failed");
+
+    int64_t data[] = { 5, 10, 5, 10 }; /* 2 rows, 2 cols */
+    ASSERT(test_rel_set_rows(rel, data, 2) == 0, "set_rows failed");
+
+    uint32_t segs[] = { 0, 1, 2 };
+    int rc = col_op_consolidate_kway_merge(rel, segs, 2);
+    ASSERT(rc == 0, "kway_merge returned error");
+    ASSERT(rel->nrows == 1, "expected 1 deduplicated row");
+    ASSERT(rel->data[0] == 5, "col0 wrong");
+    ASSERT(rel->data[1] == 10, "col1 wrong");
+
+    test_rel_free(rel);
+    PASS();
+}
+
+/*
+ * Test 14: ncols=2, differ at col0 (dispatch specialization).
+ * Rows {1, 0} and {2, 0}. Sorted order: {1,0} then {2,0}.
+ */
+static void
+test_ncols2_differ_col0(void)
+{
+    TEST("ncols=2: sorted order on col0 difference (dispatch path)");
+
+    col_rel_t *rel = test_rel_alloc(2);
+    ASSERT(rel != NULL, "alloc failed");
+
+    int64_t data[] = { 1, 0, 2, 0 };
+    ASSERT(test_rel_set_rows(rel, data, 2) == 0, "set_rows failed");
+
+    uint32_t segs[] = { 0, 1, 2 };
+    int rc = col_op_consolidate_kway_merge(rel, segs, 2);
+    ASSERT(rc == 0, "kway_merge returned error");
+    ASSERT(rel->nrows == 2, "expected 2 distinct rows");
+    ASSERT(rel->data[0] == 1, "row0 col0 wrong");
+    ASSERT(rel->data[2] == 2, "row1 col0 wrong");
+
+    test_rel_free(rel);
+    PASS();
+}
+
+/*
+ * Test 15: ncols=2, equal col0 differ at col1 (dispatch specialization).
+ * Rows {5, 1} and {5, 2}. col0 equal; order determined by col1.
+ */
+static void
+test_ncols2_differ_col1(void)
+{
+    TEST("ncols=2: equal col0, differ col1 (dispatch path)");
+
+    col_rel_t *rel = test_rel_alloc(2);
+    ASSERT(rel != NULL, "alloc failed");
+
+    int64_t data[] = { 5, 1, 5, 2 };
+    ASSERT(test_rel_set_rows(rel, data, 2) == 0, "set_rows failed");
+
+    uint32_t segs[] = { 0, 1, 2 };
+    int rc = col_op_consolidate_kway_merge(rel, segs, 2);
+    ASSERT(rc == 0, "kway_merge returned error");
+    ASSERT(rel->nrows == 2, "expected 2 distinct rows");
+    ASSERT(rel->data[1] == 1, "row0 col1 wrong");
+    ASSERT(rel->data[3] == 2, "row1 col1 wrong");
+
+    test_rel_free(rel);
+    PASS();
+}
+
+/*
+ * Test 16: ncols=4, equal cols 0-1 differ at col2 (dispatch specialization).
+ * Rows {1,2,3,4} and {1,2,9,4}. Differ only at col2.
+ */
+static void
+test_ncols4_differ_col2(void)
+{
+    TEST("ncols=4: equal cols 0-1, differ at col2 (dispatch path)");
+
+    col_rel_t *rel = test_rel_alloc(4);
+    ASSERT(rel != NULL, "alloc failed");
+
+    int64_t data[] = { 1, 2, 3, 4, 1, 2, 9, 4 };
+    ASSERT(test_rel_set_rows(rel, data, 2) == 0, "set_rows failed");
+
+    uint32_t segs[] = { 0, 1, 2 };
+    int rc = col_op_consolidate_kway_merge(rel, segs, 2);
+    ASSERT(rc == 0, "kway_merge returned error");
+    ASSERT(rel->nrows == 2, "expected 2 distinct rows");
+    ASSERT(rel->data[2] == 3, "row0 col2 wrong");
+    ASSERT(rel->data[6] == 9, "row1 col2 wrong");
+
+    test_rel_free(rel);
+    PASS();
+}
+
+/*
+ * Test 17: ncols=4, equal rows dedup (dispatch specialization).
+ * Two segments each with row {10, 20, 30, 40}. Should dedup to 1 row.
+ */
+static void
+test_ncols4_equal_rows_dispatch(void)
+{
+    TEST("ncols=4: equal rows dedup to 1 (dispatch path)");
+
+    col_rel_t *rel = test_rel_alloc(4);
+    ASSERT(rel != NULL, "alloc failed");
+
+    int64_t data[] = { 10, 20, 30, 40, 10, 20, 30, 40 };
+    ASSERT(test_rel_set_rows(rel, data, 2) == 0, "set_rows failed");
+
+    uint32_t segs[] = { 0, 1, 2 };
+    int rc = col_op_consolidate_kway_merge(rel, segs, 2);
+    ASSERT(rc == 0, "kway_merge returned error");
+    ASSERT(rel->nrows == 1, "expected 1 deduplicated row");
+    ASSERT(rel->data[0] == 10, "col0 wrong");
+    ASSERT(rel->data[1] == 20, "col1 wrong");
+    ASSERT(rel->data[2] == 30, "col2 wrong");
+    ASSERT(rel->data[3] == 40, "col3 wrong");
+
+    test_rel_free(rel);
+    PASS();
+}
+
+/* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
 int
@@ -547,6 +683,13 @@ main(void)
     test_ncols16_large_row();
     test_k1_single_segment_dedup();
     test_k3_heap_merge();
+
+    printf("\n--- Issue #279: ncols=2/4 dispatch specialization ---\n");
+    test_ncols2_equal_rows();
+    test_ncols2_differ_col0();
+    test_ncols2_differ_col1();
+    test_ncols4_differ_col2();
+    test_ncols4_equal_rows_dispatch();
 
     printf("\n--- Results: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
