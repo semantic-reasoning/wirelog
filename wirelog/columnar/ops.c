@@ -3600,6 +3600,8 @@ cleanup_wq:
         free(worker_sess[d].arr_entries);
         /* Free worker's private delta-arrangement cache (darr_*). */
         col_session_free_delta_arrangements(&worker_sess[d]);
+        /* Free worker's private diff-arrangement cache (diff_arr_*). */
+        col_session_free_diff_arrangements(&worker_sess[d]);
         delta_pool_destroy(worker_sess[d].delta_pool);
         wl_arena_free(worker_sess[d].eval_arena);
     }
