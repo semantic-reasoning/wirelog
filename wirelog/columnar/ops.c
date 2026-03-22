@@ -2763,48 +2763,6 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
 }
 
 /*
- * row_lower_bound: find first row in sorted array where row >= key.
- * Returns index in [0, nrows]. Standard lower_bound semantics.
- */
-static uint32_t
-row_lower_bound(const int64_t *data, uint32_t nrows, uint32_t ncols,
-    const int64_t *key)
-{
-    uint32_t lo = 0, hi = nrows;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (row_cmp_optimized(
-                data + (size_t)mid * ncols, key, ncols)
-            < 0)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo;
-}
-
-/*
- * row_upper_bound: find first row in sorted array where row > key.
- * Returns index in [0, nrows]. Standard upper_bound semantics.
- */
-static uint32_t
-row_upper_bound(const int64_t *data, uint32_t nrows, uint32_t ncols,
-    const int64_t *key)
-{
-    uint32_t lo = 0, hi = nrows;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (row_cmp_optimized(
-                data + (size_t)mid * ncols, key, ncols)
-            <= 0)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo;
-}
-
-/*
  * col_op_consolidate_incremental_delta - Incremental consolidation with delta output
  *
  * PURPOSE:
