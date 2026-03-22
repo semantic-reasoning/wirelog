@@ -1778,3 +1778,20 @@ test_diff_recursive_arrangement_exe = executable(
 )
 
 test('diff_recursive_arrangement', test_diff_recursive_arrangement_exe)
+
+# ============================================================================
+# Partial-Overlap Consolidation Fast-Path Tests (Issue #280)
+# ============================================================================
+
+test_consolidate_partial_overlap_exe = executable(
+  'test_consolidate_partial_overlap',
+  files('test_consolidate_partial_overlap.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('consolidate_partial_overlap', test_consolidate_partial_overlap_exe)
