@@ -186,6 +186,7 @@ backend_src = files(
   '../wirelog/columnar/frontier_epoch.c',
   '../wirelog/columnar/mobius.c',
   '../wirelog/columnar/session.c',
+  '../wirelog/columnar/session_hash.c',
   '../wirelog/columnar/delta_pool.c',
   '../wirelog/columnar/lftj.c',
   '../wirelog/columnar/mem_ledger.c',

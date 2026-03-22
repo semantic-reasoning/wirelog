@@ -40,6 +40,24 @@ session_find_rel(wl_col_session_t *sess, const char *name)
 {
     if (!name)
         return NULL;
+
+    /* Fast path: try hash lookup first (O(1)) */
+    if (sess->rel_hash_nbuckets > 0) {
+        col_rel_t *rel = session_rel_hash_lookup(sess, name);
+        if (rel)
+            return rel;
+    }
+
+    /* Lazy initialization: build hash on first use */
+    if (sess->rel_hash_nbuckets == 0 && sess->nrels > 0) {
+        if (session_rel_build_hash(sess) == 0) {
+            /* Retry lookup after rebuild */
+            return session_rel_hash_lookup(sess, name);
+        }
+        /* On malloc failure, fall back to linear search below */
+    }
+
+    /* Fallback: linear search (used when hash not available or error) */
     for (uint32_t i = 0; i < sess->nrels; i++) {
         if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0)
             return sess->rels[i];
@@ -71,7 +89,17 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
         sess->rels = nr;
         sess->rel_cap = nc;
     }
+    uint32_t idx = sess->nrels;
     sess->rels[sess->nrels++] = r;
+
+    /* Update hash table for O(1) lookup (Issue #281).
+     * May rebuild if load factor exceeded or rebuild on first insert. */
+    int hash_ret = session_rel_hash_insert(sess, idx);
+    if (hash_ret != 0 && hash_ret != ENOMEM)
+        return hash_ret;
+    /* ENOMEM in hash insert is non-fatal; fallback to linear search in
+     * session_find_rel. Continue adding relation. */
+
     return 0;
 }
 
@@ -82,6 +110,9 @@ session_remove_rel(wl_col_session_t *sess, const char *name)
         if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0) {
             col_rel_destroy(sess->rels[i]);
             sess->rels[i] = NULL;
+            /* Update hash table: mark as removed (Issue #281).
+             * Chain walk will see NULL rels[i] and skip. */
+            session_rel_hash_remove(sess, i);
             return;
         }
     }
@@ -512,6 +543,8 @@ col_session_destroy(wl_session_t *session)
         free(sess->rels[i]);
     }
     free(sess->rels);
+    /* Free relation name hash table (Issue #281) */
+    session_rel_free_hash(sess);
     col_mat_cache_clear(&sess->mat_cache);
     wl_workqueue_destroy(sess->wq);
     /* Free arrangement registry (Phase 3C) */
