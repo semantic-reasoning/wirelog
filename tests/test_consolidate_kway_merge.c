@@ -641,6 +641,164 @@ test_empty_middle_segment(void)
     PASS();
 }
 
+/* ================================================================
+ * Test 8: Large unsorted K=2 - verifies sort phase correctness
+ *
+ * Input: two segments of 3000 unique rows each, intentionally shuffled
+ *        (not pre-sorted) to explicitly exercise the per-segment qsort.
+ *        ncols=4 to match typical CRDT tuple width and SIMD lane width.
+ *
+ * Expected: all 6000 unique rows present, output sorted and unique.
+ *
+ * TDD note: this test is written BEFORE the SIMD sort optimisation
+ * (issue #300) to guard against correctness regressions.
+ * ================================================================ */
+#define T8_NCOLS 4
+#define T8_ROWS_PER_SEG 3000
+static void
+test_large_unsorted_k2_sort_correctness(void)
+{
+    TEST("large unsorted K=2 sort correctness (nc=4, 3000 rows/seg)");
+
+    col_rel_t *rel = test_rel_alloc(T8_NCOLS);
+    ASSERT(rel != NULL, "test_rel_alloc failed");
+
+    /* Build two segments with non-overlapping rows, each shuffled.
+     * seg0: rows with col[0] in [0, T8_ROWS_PER_SEG)
+     * seg1: rows with col[0] in [T8_ROWS_PER_SEG, 2*T8_ROWS_PER_SEG)
+     * Shuffle each using simple LCG so qsort is forced to reorder them.
+     */
+    const uint32_t N = T8_ROWS_PER_SEG;
+
+    /* Allocate scratch arrays for shuffled indices */
+    uint32_t *idx0 = (uint32_t *)malloc(N * sizeof(uint32_t));
+    uint32_t *idx1 = (uint32_t *)malloc(N * sizeof(uint32_t));
+    ASSERT(idx0 != NULL && idx1 != NULL, "scratch alloc failed");
+
+    for (uint32_t i = 0; i < N; i++) {
+        idx0[i] = i;
+        idx1[i] = i;
+    }
+
+    /* Fisher-Yates with fixed seed for reproducibility */
+    uint64_t rng = 0xDEADBEEFCAFEBABEULL;
+#define LCG_NEXT(r) ((r) = (r) * 6364136223846793005ULL + \
+        1442695040888963407ULL)
+    for (uint32_t i = N - 1; i > 0; i--) {
+        LCG_NEXT(rng);
+        uint32_t j = (uint32_t)(rng >> 33) % (i + 1);
+        uint32_t tmp = idx0[i]; idx0[i] = idx0[j]; idx0[j] = tmp;
+    }
+    for (uint32_t i = N - 1; i > 0; i--) {
+        LCG_NEXT(rng);
+        uint32_t j = (uint32_t)(rng >> 33) % (i + 1);
+        uint32_t tmp = idx1[i]; idx1[i] = idx1[j]; idx1[j] = tmp;
+    }
+#undef LCG_NEXT
+
+    /* Append seg0 rows in shuffled order */
+    for (uint32_t i = 0; i < N; i++) {
+        int64_t row[T8_NCOLS];
+        int64_t v = (int64_t)idx0[i];
+        for (uint32_t c = 0; c < T8_NCOLS; c++)
+            row[c] = v + (int64_t)c;
+        ASSERT(test_rel_append_row(rel, row) == 0, "append seg0 row");
+    }
+
+    /* Append seg1 rows in shuffled order */
+    for (uint32_t i = 0; i < N; i++) {
+        int64_t row[T8_NCOLS];
+        int64_t v = (int64_t)N + (int64_t)idx1[i];
+        for (uint32_t c = 0; c < T8_NCOLS; c++)
+            row[c] = v + (int64_t)c;
+        ASSERT(test_rel_append_row(rel, row) == 0, "append seg1 row");
+    }
+
+    free(idx0);
+    free(idx1);
+
+    uint32_t seg_boundaries[3] = { 0, N, 2 * N };
+    int rc = col_op_consolidate_kway_merge(rel, seg_boundaries, 2);
+
+    ASSERT(rc == 0, "returns 0 on success");
+    ASSERT(rel->nrows == 2 * N, "all 6000 unique rows preserved");
+    ASSERT(test_rel_is_sorted_unique(rel), "output is sorted and unique");
+
+    /* Spot-check: first row should be (0,1,2,3) */
+    int64_t expected_first[T8_NCOLS] = { 0, 1, 2, 3 };
+    ASSERT(test_row_cmp(rel->data, expected_first, T8_NCOLS) == 0,
+        "first row is (0,1,2,3)");
+
+    /* Spot-check: last row should be (2*N-1, 2*N, 2*N+1, 2*N+2) */
+    int64_t expected_last[T8_NCOLS];
+    for (uint32_t c = 0; c < T8_NCOLS; c++)
+        expected_last[c] = (int64_t)(2 * N - 1) + (int64_t)c;
+    ASSERT(test_row_cmp(rel->data + (size_t)(rel->nrows - 1) * T8_NCOLS,
+        expected_last, T8_NCOLS) == 0,
+        "last row is (2N-1, 2N, 2N+1, 2N+2)");
+
+    test_rel_free(rel);
+    PASS();
+}
+
+/* ================================================================
+ * Test 9: Wide rows K=4 unsorted - exercises SIMD with nc=8
+ *
+ * Input: four segments of 500 unique rows each, unsorted, ncols=8.
+ *        Wide rows (8 int64_t = 64 bytes) stress the SIMD lane
+ *        utilisation in both qsort and merge compare paths.
+ *
+ * Expected: all 2000 unique rows present, output sorted and unique.
+ * ================================================================ */
+#define T9_NCOLS 8
+#define T9_ROWS_PER_SEG 500
+static void
+test_wide_rows_k4_sort_correctness(void)
+{
+    TEST("wide rows K=4 sort correctness (nc=8, 500 rows/seg)");
+
+    col_rel_t *rel = test_rel_alloc(T9_NCOLS);
+    ASSERT(rel != NULL, "test_rel_alloc failed");
+
+    const uint32_t N = T9_ROWS_PER_SEG;
+    const uint32_t K = 4;
+
+    /* Each segment has rows with col[0] in [k*N, (k+1)*N), shuffled */
+    uint64_t rng = 0xFEEDFACEDEADC0DEULL;
+#define LCG_NEXT(r) ((r) = (r) * 6364136223846793005ULL + \
+        1442695040888963407ULL)
+    for (uint32_t k = 0; k < K; k++) {
+        uint32_t *idx = (uint32_t *)malloc(N * sizeof(uint32_t));
+        ASSERT(idx != NULL, "scratch alloc failed");
+        for (uint32_t i = 0; i < N; i++)
+            idx[i] = i;
+        for (uint32_t i = N - 1; i > 0; i--) {
+            LCG_NEXT(rng);
+            uint32_t j = (uint32_t)(rng >> 33) % (i + 1);
+            uint32_t tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+        }
+        for (uint32_t i = 0; i < N; i++) {
+            int64_t row[T9_NCOLS];
+            int64_t base = (int64_t)k * (int64_t)N + (int64_t)idx[i];
+            for (uint32_t c = 0; c < T9_NCOLS; c++)
+                row[c] = base + (int64_t)c;
+            ASSERT(test_rel_append_row(rel, row) == 0, "append row");
+        }
+        free(idx);
+    }
+#undef LCG_NEXT
+
+    uint32_t seg_boundaries[5] = { 0, N, 2*N, 3*N, 4*N };
+    int rc = col_op_consolidate_kway_merge(rel, seg_boundaries, K);
+
+    ASSERT(rc == 0, "returns 0 on success");
+    ASSERT(rel->nrows == K * N, "all 2000 unique rows preserved");
+    ASSERT(test_rel_is_sorted_unique(rel), "output is sorted and unique");
+
+    test_rel_free(rel);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -658,6 +816,8 @@ main(void)
     test_cross_segment_dedup();
     test_large_dataset_performance();
     test_empty_middle_segment();
+    test_large_unsorted_k2_sort_correctness();
+    test_wide_rows_k4_sort_correctness();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);
