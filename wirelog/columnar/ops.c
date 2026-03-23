@@ -2644,6 +2644,48 @@ kway_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
     return row_cmp_dispatch(a, b, ncols);
 }
 
+/* Issue #300: SIMD-accelerated qsort_r comparator for the kway_merge sort
+ * phase.  row_cmp_fn in internal.h uses scalar-only comparison (it must work
+ * across all translation units that do not include the SIMD helpers).  Here we
+ * wrap row_cmp_optimized — the compile-time SIMD dispatcher — with the correct
+ * platform-specific qsort_r signature so that the per-segment sort in
+ * col_op_consolidate_kway_merge also benefits from SIMD acceleration.
+ *
+ * The sort phase accounts for ~40% of kway_merge time with a 12:1
+ * sort-to-merge comparison ratio, making this the highest-ROI optimisation.
+ */
+#ifdef __GLIBC__
+/* GNU glibc qsort_r: comparator(a, b, ctx) */
+static inline int
+row_cmp_fn_kway(const void *a, const void *b, void *ctx)
+{
+    const uint32_t ncols = *(const uint32_t *)ctx;
+    return row_cmp_optimized((const int64_t *)a, (const int64_t *)b, ncols);
+}
+#define QSORT_R_KWAY(base, nmemb, size, ctx) \
+        qsort_r(base, nmemb, size, row_cmp_fn_kway, ctx)
+#elif defined(_MSC_VER)
+/* MSVC qsort_s: comparator(ctx, a, b) */
+static int __cdecl
+row_cmp_fn_kway(void *ctx, const void *a, const void *b)
+{
+    const uint32_t ncols = *(const uint32_t *)ctx;
+    return row_cmp_optimized((const int64_t *)a, (const int64_t *)b, ncols);
+}
+#define QSORT_R_KWAY(base, nmemb, size, ctx) \
+        qsort_s(base, nmemb, size, row_cmp_fn_kway, ctx)
+#else
+/* BSD qsort_r: comparator(ctx, a, b) */
+static inline int
+row_cmp_fn_kway(void *ctx, const void *a, const void *b)
+{
+    const uint32_t ncols = *(const uint32_t *)ctx;
+    return row_cmp_optimized((const int64_t *)a, (const int64_t *)b, ncols);
+}
+#define QSORT_R_KWAY(base, nmemb, size, ctx) \
+        qsort_r(base, nmemb, size, ctx, row_cmp_fn_kway)
+#endif
+
 /*
  * col_op_consolidate_kway_merge - K-way merge with per-segment sort and dedup.
  *
@@ -2670,13 +2712,13 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     if (nr <= 1)
         return 0;
 
-    /* Sort each segment in-place */
+    /* Sort each segment in-place using SIMD-accelerated comparator (#300) */
     for (uint32_t s = 0; s < seg_count; s++) {
         uint32_t start = seg_boundaries[s];
         uint32_t end = seg_boundaries[s + 1];
         if (end > start + 1) {
-            QSORT_R_CALL(rel->data + (size_t)start * nc, end - start, row_bytes,
-                &nc, row_cmp_fn);
+            QSORT_R_KWAY(rel->data + (size_t)start * nc, end - start,
+                row_bytes, &nc);
         }
     }
 
