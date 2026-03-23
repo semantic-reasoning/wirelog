@@ -494,6 +494,286 @@ col_eval_expr_i64(const uint8_t *buf, uint32_t size, const int64_t *row,
 }
 
 /* ======================================================================== */
+/* Pre-compiled expression evaluator                                        */
+/* ======================================================================== */
+
+/* Forward declaration: parse_var_col is defined in the FILTER section. */
+static bool parse_var_col(const uint8_t *buf, uint32_t size, uint32_t *pos,
+    uint32_t *col_out);
+
+/*
+ * col_expr_instr_t: single decoded instruction.
+ *
+ * op   — WL_PLAN_EXPR_* opcode.
+ * iarg — for WL_PLAN_EXPR_VAR: column index pre-parsed from "colN".
+ * larg — for WL_PLAN_EXPR_CONST_INT / BOOL: immediate int64 value.
+ * Operator opcodes (arithmetic, comparison, aggregate) leave iarg/larg at 0.
+ */
+typedef struct {
+    uint8_t op;
+    uint32_t iarg;
+    int64_t larg;
+} col_expr_instr_t;
+
+typedef struct {
+    col_expr_instr_t *instrs;
+    uint32_t ninstr;
+} col_expr_compiled_t;
+
+static void
+col_expr_compiled_free(col_expr_compiled_t *c)
+{
+    if (c) {
+        free(c->instrs);
+        free(c);
+    }
+}
+
+/*
+ * col_expr_compile:
+ * Walk the bytecode buffer once and produce a pre-compiled instruction array.
+ * Variable names ("colN") are resolved to column indices here so that the
+ * per-row evaluator (col_eval_expr_compiled) never calls strtol.
+ *
+ * Returns NULL if the expression contains unsupported opcodes (CONST_STR,
+ * hash/crypto functions) or if allocation fails.  Callers fall back to
+ * col_eval_expr_run in that case.
+ */
+static col_expr_compiled_t *
+col_expr_compile(const uint8_t *buf, uint32_t size)
+{
+    if (!buf || size == 0)
+        return NULL;
+
+    /* Pass 1: validate bytecode and count instructions. */
+    uint32_t ninstr = 0;
+    uint32_t i = 0;
+    while (i < size) {
+        uint8_t tag = buf[i];
+        switch ((wl_plan_expr_tag_t)tag) {
+        case WL_PLAN_EXPR_VAR: {
+            uint32_t pos = i;
+            uint32_t col = 0;
+            if (!parse_var_col(buf, size, &pos, &col))
+                return NULL;
+            i = pos;
+            break;
+        }
+        case WL_PLAN_EXPR_CONST_INT:
+            i++;
+            if (i + 8 > size)
+                return NULL;
+            i += 8;
+            break;
+        case WL_PLAN_EXPR_BOOL:
+            i++;
+            if (i + 1 > size)
+                return NULL;
+            i++;
+            break;
+        case WL_PLAN_EXPR_CONST_STR:
+            return NULL; /* unsupported: fall back to slow path */
+        /* Arithmetic operators (no payload) */
+        case WL_PLAN_EXPR_ARITH_ADD:
+        case WL_PLAN_EXPR_ARITH_SUB:
+        case WL_PLAN_EXPR_ARITH_MUL:
+        case WL_PLAN_EXPR_ARITH_DIV:
+        case WL_PLAN_EXPR_ARITH_MOD:
+        case WL_PLAN_EXPR_ARITH_BAND:
+        case WL_PLAN_EXPR_ARITH_BOR:
+        case WL_PLAN_EXPR_ARITH_BXOR:
+        case WL_PLAN_EXPR_ARITH_BNOT:
+        case WL_PLAN_EXPR_ARITH_SHL:
+        case WL_PLAN_EXPR_ARITH_SHR:
+        /* Comparison operators (no payload) */
+        case WL_PLAN_EXPR_CMP_EQ:
+        case WL_PLAN_EXPR_CMP_NEQ:
+        case WL_PLAN_EXPR_CMP_LT:
+        case WL_PLAN_EXPR_CMP_GT:
+        case WL_PLAN_EXPR_CMP_LTE:
+        case WL_PLAN_EXPR_CMP_GTE:
+        /* Aggregate operators (no payload) */
+        case WL_PLAN_EXPR_AGG_COUNT:
+        case WL_PLAN_EXPR_AGG_SUM:
+        case WL_PLAN_EXPR_AGG_MIN:
+        case WL_PLAN_EXPR_AGG_MAX:
+            i++;
+            break;
+        default:
+            return NULL; /* hash/UUID/crypto: unsupported, use slow path */
+        }
+        ninstr++;
+    }
+
+    if (ninstr == 0)
+        return NULL;
+
+    col_expr_compiled_t *c =
+        (col_expr_compiled_t *)malloc(sizeof(col_expr_compiled_t));
+    if (!c)
+        return NULL;
+    c->instrs =
+        (col_expr_instr_t *)malloc(ninstr * sizeof(col_expr_instr_t));
+    if (!c->instrs) {
+        free(c);
+        return NULL;
+    }
+    c->ninstr = ninstr;
+
+    /* Pass 2: fill instruction array. */
+    uint32_t j = 0;
+    i = 0;
+    while (i < size && j < ninstr) {
+        col_expr_instr_t *instr = &c->instrs[j++];
+        instr->op = buf[i];
+        instr->iarg = 0;
+        instr->larg = 0;
+        switch ((wl_plan_expr_tag_t)buf[i]) {
+        case WL_PLAN_EXPR_VAR: {
+            uint32_t pos = i;
+            parse_var_col(buf, size, &pos, &instr->iarg);
+            i = pos;
+            break;
+        }
+        case WL_PLAN_EXPR_CONST_INT:
+            i++; /* skip opcode */
+            memcpy(&instr->larg, buf + i, 8);
+            i += 8;
+            break;
+        case WL_PLAN_EXPR_BOOL:
+            i++; /* skip opcode */
+            instr->larg = buf[i++] ? 1 : 0;
+            break;
+        default:
+            i++; /* operator: consume opcode byte only */
+            break;
+        }
+    }
+    return c;
+}
+
+/*
+ * col_eval_expr_compiled:
+ * Fast postfix evaluator using a pre-compiled instruction array.
+ * VAR instructions use pre-parsed column indices — no strtol per row.
+ * Returns 0 on success with result in *out_val, non-zero on error.
+ */
+static int
+col_eval_expr_compiled(const col_expr_compiled_t *c, const int64_t *row,
+    uint32_t ncols, int64_t *out_val)
+{
+    filt_stack_t s;
+    s.top = 0;
+    for (uint32_t k = 0; k < c->ninstr; k++) {
+        const col_expr_instr_t *in = &c->instrs[k];
+        switch ((wl_plan_expr_tag_t)in->op) {
+        case WL_PLAN_EXPR_VAR:
+            filt_push(&s, (in->iarg < ncols) ? row[in->iarg] : 0);
+            break;
+        case WL_PLAN_EXPR_CONST_INT:
+        case WL_PLAN_EXPR_BOOL:
+            filt_push(&s, in->larg);
+            break;
+        case WL_PLAN_EXPR_ARITH_ADD: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a + b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_SUB: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a - b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_MUL: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a * b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_DIV: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, b != 0 ? a / b : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_MOD: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, b != 0 ? a % b : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_BAND: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a & b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_BOR: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a | b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_BXOR: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a ^ b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_BNOT: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, ~a);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_SHL: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a << b);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_SHR: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a >> b);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_EQ: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a == b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_NEQ: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a != b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_LT: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a < b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_GT: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a > b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_LTE: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a <= b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_GTE: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, a >= b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_AGG_COUNT:
+        case WL_PLAN_EXPR_AGG_SUM:
+        case WL_PLAN_EXPR_AGG_MIN:
+        case WL_PLAN_EXPR_AGG_MAX:
+            break;
+        default:
+            *out_val = 0;
+            return 1;
+        }
+    }
+    *out_val = s.top > 0 ? s.vals[s.top - 1] : 0;
+    return 0;
+}
+
+/* ======================================================================== */
 /* Eval Stack                                                                */
 /* ======================================================================== */
 
@@ -660,14 +940,37 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         return ENOMEM;
     }
 
+    /* Pre-compile map expressions once to avoid per-row strtol. */
+    col_expr_compiled_t **ce_map = NULL;
+    uint32_t ce_map_count = 0;
+    if (op->map_exprs && op->map_expr_count > 0) {
+        ce_map = (col_expr_compiled_t **)calloc(pc,
+                sizeof(col_expr_compiled_t *));
+        if (ce_map) {
+            ce_map_count = pc;
+            for (uint32_t c = 0; c < op->map_expr_count && c < pc; c++) {
+                if (op->map_exprs[c].data && op->map_exprs[c].size > 0)
+                    ce_map[c] = col_expr_compile(op->map_exprs[c].data,
+                            op->map_exprs[c].size);
+            }
+        }
+    }
+
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         const int64_t *row = e.rel->data + (size_t)r * e.rel->ncols;
         for (uint32_t c = 0; c < pc; c++) {
             if (op->map_exprs && c < op->map_expr_count && op->map_exprs[c].data
                 && op->map_exprs[c].size > 0) {
-                tmp[c] = col_eval_expr_i64(op->map_exprs[c].data,
-                        op->map_exprs[c].size, row,
-                        e.rel->ncols);
+                if (ce_map && c < ce_map_count && ce_map[c]) {
+                    int64_t val = 0;
+                    col_eval_expr_compiled(ce_map[c], row, e.rel->ncols,
+                        &val);
+                    tmp[c] = val;
+                } else {
+                    tmp[c] = col_eval_expr_i64(op->map_exprs[c].data,
+                            op->map_exprs[c].size, row,
+                            e.rel->ncols);
+                }
             } else {
                 uint32_t src = op->project_indices ? op->project_indices[c] : c;
                 tmp[c] = (src < e.rel->ncols) ? row[src] : 0;
@@ -675,12 +978,23 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
         int rc = col_rel_append_row(out, tmp);
         if (rc != 0) {
+            if (ce_map) {
+                for (uint32_t c = 0; c < ce_map_count; c++)
+                    col_expr_compiled_free(ce_map[c]);
+                free(ce_map);
+            }
             free(tmp);
             col_rel_destroy(out);
             if (e.owned)
                 col_rel_destroy(e.rel);
             return rc;
         }
+    }
+
+    if (ce_map) {
+        for (uint32_t c = 0; c < ce_map_count; c++)
+            col_expr_compiled_free(ce_map[c]);
+        free(ce_map);
     }
     free(tmp);
 
@@ -1111,15 +1425,26 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
         return eval_stack_push(stack, out, true);
     }
 
-    /* Slow path: full postfix bytecode interpreter */
+    /* Slow path: pre-compile expression once, then evaluate per row. */
+    col_expr_compiled_t *ce =
+        (buf && bsz > 0) ? col_expr_compile(buf, bsz) : NULL;
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         const int64_t *row = e.rel->data + (size_t)r * e.rel->ncols;
-        int pass = (!buf || bsz == 0)
-                       ? 1
-                       : col_eval_filter_row(buf, bsz, row, e.rel->ncols);
+        int pass;
+        if (!buf || bsz == 0) {
+            pass = 1;
+        } else if (ce) {
+            int64_t val = 0;
+            pass = (col_eval_expr_compiled(ce, row, e.rel->ncols, &val) == 0)
+                       ? (val != 0 ? 1 : 0)
+                       : 1; /* on error: pass row through */
+        } else {
+            pass = col_eval_filter_row(buf, bsz, row, e.rel->ncols);
+        }
         if (pass) {
             int rc = col_rel_append_row(out, row);
             if (rc != 0) {
+                col_expr_compiled_free(ce);
                 col_rel_destroy(out);
                 if (e.owned)
                     col_rel_destroy(e.rel);
@@ -1127,6 +1452,7 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
             }
         }
     }
+    col_expr_compiled_free(ce);
 
     if (e.owned)
         col_rel_destroy(e.rel);
