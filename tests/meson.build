@@ -1779,3 +1779,24 @@ test_diff_recursive_arrangement_exe = executable(
 )
 
 test('diff_recursive_arrangement', test_diff_recursive_arrangement_exe)
+
+# ============================================================================
+# Pre-compiled Expression Evaluator Tests (Issue #298)
+# ============================================================================
+
+test_expr_compile_exe = executable(
+  'test_expr_compile',
+  files('test_expr_compile.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('expr_compile', test_expr_compile_exe)
