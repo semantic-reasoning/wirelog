@@ -1,0 +1,20 @@
+{
+  "issue": "#298",
+  "description": "Pre-compiled expression evaluator (col_expr_compile) - eliminates per-row strtol",
+  "date": "2026-03-23",
+  "baseline_ms": 263400,
+  "optimized_ms": 195024,
+  "improvement_pct": 26.0,
+  "target_pct": 3.0,
+  "workload": "crdt",
+  "workers": 1,
+  "repeat": 3,
+  "min_ms": 193738.9,
+  "median_ms": 195024.1,
+  "max_ms": 195959.1,
+  "peak_rss_kb": 366032,
+  "tuples": 2156530,
+  "iterations": 14148,
+  "status": "OK",
+  "commits": ["1b6e19a (tests)", "a90af7a (implementation)"]
+}
