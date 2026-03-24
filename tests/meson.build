@@ -1800,3 +1800,20 @@ test_expr_compile_exe = executable(
 )
 
 test('expr_compile', test_expr_compile_exe)
+
+# ============================================================================
+# Pointer Swap Tests (Issue #300)
+# ============================================================================
+
+test_pointer_swap_exe = executable(
+  'test_pointer_swap',
+  files('test_pointer_swap.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('pointer_swap', test_pointer_swap_exe)
