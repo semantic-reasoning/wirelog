@@ -903,199 +903,159 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
 
     uint32_t rc_cnt = sp->relation_count;
 
-    /* Step 0: Save current state of each IDB relation and rows to retract */
-    int64_t **saved_data = (int64_t **)calloc(rc_cnt, sizeof(int64_t *));
-    uint32_t *saved_nrows = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
-    uint32_t *saved_ncols = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
+    /* retract_data[ri] will hold the stolen post-consolidation pointer;
+     * no malloc/memcpy needed — ownership is transferred from r->data. */
     int64_t **retract_data = (int64_t **)calloc(rc_cnt, sizeof(int64_t *));
     uint32_t *retract_nrows = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
-    if (!saved_data || !saved_nrows || !saved_ncols || !retract_data
-        || !retract_nrows) {
-        free(saved_data);
-        free(saved_nrows);
-        free(saved_ncols);
+    if (!retract_data || !retract_nrows) {
         free(retract_data);
         free(retract_nrows);
         return ENOMEM;
     }
 
+    /* Step 0: Pointer-swap original data into retract_backup fields (O(1))
+     * and clear relation for retraction evaluation. */
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
         if (!r || r->ncols == 0)
             continue;
-        if (r->nrows > 0) {
-            size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-            saved_data[ri] = (int64_t *)malloc(sz);
-            if (!saved_data[ri]) {
-                for (uint32_t i = 0; i < ri; i++)
-                    free(saved_data[i]);
-                free(saved_data);
-                free(saved_nrows);
-                free(saved_ncols);
-                free(retract_data);
-                free(retract_nrows);
-                return ENOMEM;
-            }
-            memcpy(saved_data[ri], r->data, sz);
-            saved_nrows[ri] = r->nrows;
-            saved_ncols[ri] = r->ncols;
-        }
-    }
-
-    /* Step 1: Clear IDB relations before evaluation */
-    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
-        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r)
-            continue;
+        r->retract_backup = r->data;
+        r->retract_backup_nrows = r->nrows;
+        r->retract_backup_capacity = r->capacity;
+        r->retract_backup_sorted_nrows = r->sorted_nrows;
+        r->data = NULL;
+        r->capacity = 0;
         r->nrows = 0;
+        r->sorted_nrows = 0;
     }
 
-    /* Step 2: Enable retraction-seeded mode and evaluate stratum */
+    /* Step 1: Enable retraction-seeded mode and evaluate stratum */
     sess->retraction_seeded = true;
     int rc = col_eval_stratum(sp, sess, stratum_idx);
     sess->retraction_seeded = false;
     if (rc != 0) {
-        for (uint32_t i = 0; i < rc_cnt; i++)
-            free(saved_data[i]);
-        free(saved_data);
-        free(saved_nrows);
-        free(saved_ncols);
+        /* Restore all backup pointers; free any eval-allocated buffers */
+        for (uint32_t i = 0; i < rc_cnt; i++) {
+            col_rel_t *r = session_find_rel(sess, sp->relations[i].name);
+            if (!r || r->ncols == 0)
+                continue;
+            free(r->data);
+            r->data = r->retract_backup;
+            r->nrows = r->retract_backup_nrows;
+            r->capacity = r->retract_backup_capacity;
+            r->sorted_nrows = r->retract_backup_sorted_nrows;
+            r->retract_backup = NULL;
+            r->retract_backup_nrows = 0;
+            r->retract_backup_capacity = 0;
+            r->retract_backup_sorted_nrows = 0;
+        }
         free(retract_data);
         free(retract_nrows);
         return rc;
     }
 
-    /* Step 3: Save retraction candidates before consolidation overwrites them */
-    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
-        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r || r->ncols == 0 || r->nrows == 0)
-            continue;
-        size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-        retract_data[ri] = (int64_t *)malloc(sz);
-        if (!retract_data[ri]) {
-            for (uint32_t i = 0; i < rc_cnt; i++) {
-                free(saved_data[i]);
-                free(retract_data[i]);
-            }
-            free(saved_data);
-            free(saved_nrows);
-            free(saved_ncols);
-            free(retract_data);
-            free(retract_nrows);
-            return ENOMEM;
-        }
-        memcpy(retract_data[ri], r->data, sz);
-        retract_nrows[ri] = r->nrows;
-    }
-
-    /* Step 4: Consolidate retraction rows (for proper dedup) */
+    /* Steps 2+3: Per-relation: consolidate retraction candidates, steal the
+     * buffer pointer (no malloc/memcpy), then swap back the original (O(1)). */
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
         if (!r || r->ncols == 0)
             continue;
-        rc = col_idb_consolidate(r, sess);
-        if (rc != 0) {
-            for (uint32_t i = 0; i < rc_cnt; i++) {
-                free(saved_data[i]);
-                free(retract_data[i]);
+
+        if (r->nrows > 0) {
+            rc = col_idb_consolidate(r, sess);
+            if (rc != 0) {
+                /* Restore any relations still holding backup state */
+                for (uint32_t i = 0; i < rc_cnt; i++) {
+                    col_rel_t *r2
+                        = session_find_rel(sess, sp->relations[i].name);
+                    if (!r2 || r2->ncols == 0)
+                        continue;
+                    if (r2->retract_backup != NULL) {
+                        free(r2->data);
+                        r2->data = r2->retract_backup;
+                        r2->nrows = r2->retract_backup_nrows;
+                        r2->capacity = r2->retract_backup_capacity;
+                        r2->sorted_nrows = r2->retract_backup_sorted_nrows;
+                        r2->retract_backup = NULL;
+                        r2->retract_backup_nrows = 0;
+                        r2->retract_backup_capacity = 0;
+                        r2->retract_backup_sorted_nrows = 0;
+                    }
+                    free(retract_data[i]);
+                }
+                free(retract_data);
+                free(retract_nrows);
+                return rc;
             }
-            free(saved_data);
-            free(saved_nrows);
-            free(saved_ncols);
-            free(retract_data);
-            free(retract_nrows);
-            return rc;
+            /* Steal the consolidated buffer — no malloc, no memcpy */
+            retract_data[ri] = r->data;
+            retract_nrows[ri] = r->nrows;
+            r->data = NULL;
+            r->capacity = 0;
+            r->nrows = 0;
         }
+
+        /* Swap back original data (O(1)) */
+        r->data = r->retract_backup;
+        r->nrows = r->retract_backup_nrows;
+        r->capacity = r->retract_backup_capacity;
+        r->sorted_nrows = r->retract_backup_sorted_nrows;
+        r->retract_backup = NULL;
+        r->retract_backup_nrows = 0;
+        r->retract_backup_capacity = 0;
+        r->retract_backup_sorted_nrows = 0;
     }
 
-    /* Step 5: Restore saved state and remove retracted rows */
+    /* Step 4: Remove retracted rows and fire delta callbacks */
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r || r->ncols == 0)
+        if (!r || r->ncols == 0 || retract_nrows[ri] == 0)
             continue;
 
         uint32_t ncols = r->ncols;
 
-        /* Restore saved state */
-        if (saved_nrows[ri] > 0) {
-            if (r->capacity < saved_nrows[ri]) {
-                int64_t *new_data = (int64_t *)realloc(
-                    r->data, saved_nrows[ri] * ncols * sizeof(int64_t));
-                if (!new_data) {
-                    for (uint32_t i = 0; i < rc_cnt; i++) {
-                        free(saved_data[i]);
-                        free(retract_data[i]);
-                    }
-                    free(saved_data);
-                    free(saved_nrows);
-                    free(saved_ncols);
-                    free(retract_data);
-                    free(retract_nrows);
-                    return ENOMEM;
-                }
-                r->data = new_data;
-                r->capacity = saved_nrows[ri];
-            }
-            memcpy(r->data, saved_data[ri],
-                saved_nrows[ri] * ncols * sizeof(int64_t));
-            r->nrows = saved_nrows[ri];
-        } else {
-            r->nrows = 0;
-        }
+        for (uint32_t del_idx = 0; del_idx < retract_nrows[ri]; del_idx++) {
+            const int64_t *to_remove
+                = retract_data[ri] + (size_t)del_idx * ncols;
 
-        /* Remove each retracted row from the current state */
-        if (retract_nrows[ri] > 0) {
-            /* Use consolidated retraction data */
-            for (uint32_t del_idx = 0; del_idx < retract_nrows[ri]; del_idx++) {
-                const int64_t *to_remove = r->data + (size_t)del_idx * ncols;
-                if (retract_data[ri]) {
-                    to_remove = retract_data[ri] + (size_t)del_idx * ncols;
-                }
-
-                /* Find and remove this row in-place */
-                uint32_t out_r = 0;
-                bool found = false;
-                for (uint32_t src_idx = 0; src_idx < r->nrows; src_idx++) {
-                    const int64_t *src = r->data + (size_t)src_idx * ncols;
-                    if (memcmp(src, to_remove, sizeof(int64_t) * ncols) == 0) {
-                        /* Found matching row; skip it (removal) */
-                        found = true;
-                        /* Copy remaining rows */
-                        for (uint32_t rest = src_idx + 1; rest < r->nrows;
-                            rest++) {
-                            memcpy(r->data + (size_t)out_r * ncols,
-                                r->data + (size_t)rest * ncols,
-                                sizeof(int64_t) * ncols);
-                            out_r++;
-                        }
-                        r->nrows = out_r;
-                        break;
-                    } else {
-                        /* Keep this row */
-                        if (out_r != src_idx)
-                            memcpy(r->data + (size_t)out_r * ncols, src,
-                                sizeof(int64_t) * ncols);
+            /* Find and remove this row in-place */
+            uint32_t out_r = 0;
+            bool found = false;
+            for (uint32_t src_idx = 0; src_idx < r->nrows; src_idx++) {
+                const int64_t *src = r->data + (size_t)src_idx * ncols;
+                if (memcmp(src, to_remove, sizeof(int64_t) * ncols) == 0) {
+                    /* Found matching row; skip it (removal) */
+                    found = true;
+                    /* Copy remaining rows forward */
+                    for (uint32_t rest = src_idx + 1; rest < r->nrows;
+                        rest++) {
+                        memcpy(r->data + (size_t)out_r * ncols,
+                            r->data + (size_t)rest * ncols,
+                            sizeof(int64_t) * ncols);
                         out_r++;
                     }
+                    r->nrows = out_r;
+                    break;
+                } else {
+                    /* Keep this row */
+                    if (out_r != src_idx)
+                        memcpy(r->data + (size_t)out_r * ncols, src,
+                            sizeof(int64_t) * ncols);
+                    out_r++;
                 }
+            }
 
-                /* Fire delta callback if row was actually removed */
-                if (found && sess->delta_cb) {
-                    sess->delta_cb(r->name, to_remove, ncols, -1,
-                        sess->delta_data);
-                }
+            /* Fire delta callback if row was actually removed */
+            if (found && sess->delta_cb) {
+                sess->delta_cb(r->name, to_remove, ncols, -1,
+                    sess->delta_data);
             }
         }
     }
 
-    /* Cleanup */
-    for (uint32_t i = 0; i < rc_cnt; i++) {
-        free(saved_data[i]);
+    /* Cleanup: free stolen retraction buffers */
+    for (uint32_t i = 0; i < rc_cnt; i++)
         free(retract_data[i]);
-    }
-    free(saved_data);
-    free(saved_nrows);
-    free(saved_ncols);
     free(retract_data);
     free(retract_nrows);
     return 0;
