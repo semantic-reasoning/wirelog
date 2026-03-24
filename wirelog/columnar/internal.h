@@ -573,7 +573,7 @@ col_rel_alloc(col_rel_t **out, const char *name);
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
 int
-col_rel_append_all(col_rel_t *dst, const col_rel_t *src);
+col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 int
 col_rel_col_idx(const col_rel_t *r, const char *name);
 col_rel_t *

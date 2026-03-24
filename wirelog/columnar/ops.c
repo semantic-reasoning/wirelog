@@ -2362,9 +2362,9 @@ col_op_concat(eval_stack_t *stack, wl_col_session_t *sess)
         return ENOMEM;
     }
 
-    int rc = col_rel_append_all(out, a);
+    int rc = col_rel_append_all(out, a, NULL);
     if (rc == 0)
-        rc = col_rel_append_all(out, b);
+        rc = col_rel_append_all(out, b, NULL);
 
     if (rc != 0) {
         if (a_e.seg_boundaries)
@@ -2922,7 +2922,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
                 free(e.seg_boundaries);
             return ENOMEM;
         }
-        if (col_rel_append_all(work, in) != 0) {
+        if (col_rel_append_all(work, in, NULL) != 0) {
             col_rel_destroy(work);
             if (e.seg_boundaries)
                 free(e.seg_boundaries);
@@ -4818,7 +4818,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
                 free(e.seg_boundaries);
             return ENOMEM;
         }
-        if (col_rel_append_all(work, in) != 0) {
+        if (col_rel_append_all(work, in, NULL) != 0) {
             col_rel_destroy(work);
             if (e.seg_boundaries)
                 free(e.seg_boundaries);

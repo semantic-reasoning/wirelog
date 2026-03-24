@@ -197,21 +197,82 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
 }
 
 /* Copy all rows from src into dst (must have same ncols).
-* If src has timestamps and dst has timestamp tracking enabled, the source
-* timestamps are propagated to the newly appended rows. */
+ * If src has timestamps and dst has timestamp tracking enabled, the source
+ * timestamps are propagated to the newly appended rows.
+ * Optimized (Issue #300): bulk memcpy instead of per-row append. */
 int
-col_rel_append_all(col_rel_t *dst, const col_rel_t *src)
+col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 {
+    if (src->nrows == 0)
+        return 0;
+
     uint32_t dst_base = dst->nrows;
-    for (uint32_t i = 0; i < src->nrows; i++) {
-        int rc = col_rel_append_row(dst, src->data + (size_t)i * src->ncols);
-        if (rc != 0)
-            return rc;
+    uint32_t new_nrows = dst->nrows + src->nrows;
+
+    /* Ensure dst has sufficient capacity */
+    if (new_nrows > dst->capacity) {
+        uint32_t new_cap = dst->capacity ? dst->capacity * 2 : COL_REL_INIT_CAP;
+        while (new_cap < new_nrows) {
+            uint32_t next_cap = new_cap * 2;
+            if (next_cap <= new_cap) /* overflow guard */
+                return ENOMEM;
+            new_cap = next_cap;
+        }
+
+        /* Grow timestamps first (if tracking) */
+        if (dst->timestamps) {
+            col_delta_timestamp_t *new_ts = (col_delta_timestamp_t *)realloc(
+                dst->timestamps, new_cap * sizeof(col_delta_timestamp_t));
+            if (!new_ts)
+                return ENOMEM;
+            dst->timestamps = new_ts;
+        }
+
+        int64_t *nd;
+        if (dst->arena_owned) {
+            /* Arena data: allocate from same arena, preserve arena_owned flag */
+            size_t data_bytes = (size_t)new_cap * dst->ncols * sizeof(int64_t);
+            if (arena) {
+                nd = (int64_t *)wl_arena_alloc(arena, data_bytes);
+                if (!nd)
+                    return ENOMEM;
+            } else {
+                /* Fallback to heap if arena unavailable */
+                nd = (int64_t *)malloc(data_bytes);
+                if (!nd)
+                    return ENOMEM;
+                dst->arena_owned = false;
+            }
+            memcpy(nd, dst->data,
+                sizeof(int64_t) * (size_t)dst->nrows * dst->ncols);
+        } else {
+            nd = (int64_t *)realloc(
+                dst->data, sizeof(int64_t) * (size_t)new_cap * dst->ncols);
+            if (!nd)
+                return ENOMEM;
+        }
+        dst->data = nd;
+
+        /* Track capacity growth in ledger */
+        if (dst->mem_ledger && dst->ncols > 0) {
+            uint64_t delta = (uint64_t)(new_cap - dst->capacity) * dst->ncols
+                * sizeof(int64_t);
+            wl_mem_ledger_alloc(dst->mem_ledger, WL_MEM_SUBSYS_RELATION, delta);
+        }
+        dst->capacity = new_cap;
     }
-    /* Overwrite the zero-initialized timestamps with src provenance. */
+
+    /* Bulk copy all rows in one memcpy (O(1) syscall vs O(src->nrows)) */
+    memcpy(dst->data + (size_t)dst_base * dst->ncols,
+        src->data,
+        (size_t)src->nrows * dst->ncols * sizeof(int64_t));
+    dst->nrows = new_nrows;
+
+    /* Copy timestamps if both have tracking enabled */
     if (src->timestamps && dst->timestamps)
         memcpy(&dst->timestamps[dst_base], src->timestamps,
             src->nrows * sizeof(col_delta_timestamp_t));
+
     return 0;
 }
 

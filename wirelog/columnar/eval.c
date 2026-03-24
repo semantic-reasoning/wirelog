@@ -217,7 +217,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         sess->delta_pool, rp->name, result.rel);
                     if (!copy)
                         return ENOMEM;
-                    if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
+                    if ((rc = col_rel_append_all(copy, result.rel,
+                        sess->eval_arena)) != 0) {
                         col_rel_destroy(copy);
                         return rc;
                     }
@@ -229,7 +230,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 }
             } else {
                 /* Append new results to existing relation */
-                rc = col_rel_append_all(target, result.rel);
+                rc = col_rel_append_all(target, result.rel, sess->eval_arena);
                 if (result.owned)
                     col_rel_destroy(result.rel);
                 if (rc != 0)
@@ -558,7 +559,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                             outer_rc = ENOMEM;
                             goto stride_error;
                         }
-                        if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
+                        if ((rc = col_rel_append_all(copy, result.rel,
+                            sess->eval_arena)) != 0) {
                             col_rel_destroy(copy);
                             outer_rc = rc;
                             goto stride_error;
@@ -583,7 +585,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                             goto stride_error;
                         }
                     }
-                    rc = col_rel_append_all(target, result.rel);
+                    rc = col_rel_append_all(target, result.rel,
+                            sess->eval_arena);
                     if (result.owned)
                         col_rel_destroy(result.rel);
                     if (rc != 0) {
