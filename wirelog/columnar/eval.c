@@ -1094,40 +1094,26 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         return ENOMEM;
     }
 
-    /* Step 1: snapshot sorted prev state for each IDB relation */
+    /* Step 1: pointer-swap snapshot for each IDB relation (issue #300).
+     * Instead of malloc+memcpy, save the live data pointer and give the
+     * relation a NULL buffer.  col_eval_stratum will allocate a fresh
+     * buffer via append, so the old pointer stays valid for comparison. */
     for (uint32_t ri = 0; ri < rc_cnt; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
         if (!r || r->ncols == 0)
             continue;
-        /* Snapshot even if empty: needed to detect retractions via set-diff */
+        prev_ncols[ri] = r->ncols;
         if (r->nrows > 0) {
-            size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-            prev_data[ri] = (int64_t *)malloc(sz);
-            if (!prev_data[ri]) {
-                for (uint32_t i = 0; i < ri; i++)
-                    free(prev_data[i]);
-                free(prev_data);
-                free(prev_nrows);
-                free(prev_ncols);
-                return ENOMEM;
-            }
-            memcpy(prev_data[ri], r->data, sz);
+            prev_data[ri] = r->data;
             prev_nrows[ri] = r->nrows;
-            prev_ncols[ri] = r->ncols;
+            /* Detach buffer from relation; eval will allocate fresh */
+            r->data = NULL;
+            r->nrows = 0;
+            r->capacity = 0;
+            r->sorted_nrows = 0;
         } else {
-            /* Relation is empty, but mark it so we remember it existed */
             prev_nrows[ri] = 0;
-            prev_ncols[ri] = r->ncols;
         }
-    }
-
-    /* Step 1b: Clear IDB relations before re-evaluation to enable retraction
-     * detection */
-    for (uint32_t ri = 0; ri < rc_cnt; ri++) {
-        col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r)
-            continue;
-        r->nrows = 0; /* Clear the relation for fresh derivation */
     }
 
     /* Step 2: evaluate stratum (appends new rows to IDB relations) */
@@ -1175,8 +1161,20 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     }
 
 cleanup:
-    for (uint32_t i = 0; i < rc_cnt; i++)
+    for (uint32_t i = 0; i < rc_cnt; i++) {
+        if (rc != 0 && prev_data[i]) {
+            /* Error path: restore original data pointer to avoid leak/NULL */
+            col_rel_t *r = session_find_rel(sess, sp->relations[i].name);
+            if (r && !r->data) {
+                r->data = prev_data[i];
+                r->nrows = prev_nrows[i];
+                r->capacity = prev_nrows[i];
+                r->sorted_nrows = prev_nrows[i];
+                prev_data[i] = NULL;
+            }
+        }
         free(prev_data[i]);
+    }
     free(prev_data);
     free(prev_nrows);
     free(prev_ncols);
