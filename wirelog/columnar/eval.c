@@ -995,6 +995,9 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             r->nrows = 0;
         }
 
+        /* Free any eval-allocated buffer not stolen above (nrows==0 case) */
+        free(r->data); /* NULL-safe; already NULL when nrows>0 path ran */
+
         /* Swap back original data (O(1)) */
         r->data = r->retract_backup;
         r->nrows = r->retract_backup_nrows;
