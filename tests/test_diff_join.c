@@ -78,6 +78,7 @@ destroy_mock_session(wl_col_session_t *s)
     }
     free(s->arr_entries);
     col_session_free_diff_arrangements(s);
+    session_rel_free_hash(s);
     delta_pool_destroy(s->delta_pool);
     free(s);
 }
