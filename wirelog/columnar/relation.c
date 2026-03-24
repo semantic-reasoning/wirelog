@@ -28,9 +28,10 @@ col_rel_free_contents(col_rel_t *r)
     /* Report data buffer deallocation to ledger before memset zeroes fields */
     if (r->mem_ledger && r->data && r->capacity > 0 && r->ncols > 0)
         wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
-                           (uint64_t)r->capacity * r->ncols * sizeof(int64_t));
+            (uint64_t)r->capacity * r->ncols * sizeof(int64_t));
     free(r->name);
     free(r->data);
+    free(r->retract_backup); /* safety: non-NULL only if destroyed mid-retraction */
     free(r->merge_buf);
     free(r->timestamps);
     if (r->col_names) {
@@ -165,10 +166,10 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
             return ENOMEM;
         r->data = nd;
         /* Track capacity growth in ledger (Issue #224): only the delta bytes
-         * added by this growth event.  r->capacity is still the old value. */
+        * added by this growth event.  r->capacity is still the old value. */
         if (r->mem_ledger && r->ncols > 0) {
             uint64_t delta = (uint64_t)(new_cap - r->capacity) * r->ncols
-                             * sizeof(int64_t);
+                * sizeof(int64_t);
             wl_mem_ledger_alloc(r->mem_ledger, WL_MEM_SUBSYS_RELATION, delta);
         }
         r->capacity = new_cap;
@@ -176,14 +177,14 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
     if (r->timestamps)
         memset(&r->timestamps[r->nrows], 0, sizeof(col_delta_timestamp_t));
     memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-           sizeof(int64_t) * r->ncols);
+        sizeof(int64_t) * r->ncols);
     r->nrows++;
     return 0;
 }
 
 /* Copy all rows from src into dst (must have same ncols).
- * If src has timestamps and dst has timestamp tracking enabled, the source
- * timestamps are propagated to the newly appended rows. */
+* If src has timestamps and dst has timestamp tracking enabled, the source
+* timestamps are propagated to the newly appended rows. */
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src)
 {
@@ -196,7 +197,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src)
     /* Overwrite the zero-initialized timestamps with src provenance. */
     if (src->timestamps && dst->timestamps)
         memcpy(&dst->timestamps[dst_base], src->timestamps,
-               src->nrows * sizeof(col_delta_timestamp_t));
+            src->nrows * sizeof(col_delta_timestamp_t));
     return 0;
 }
 
@@ -249,7 +250,7 @@ col_rel_compact(col_rel_t *r)
             tight = COL_REL_INIT_CAP;
 
         int64_t *nd = (int64_t *)realloc(r->data, (size_t)tight * r->ncols
-                                                      * sizeof(int64_t));
+                * sizeof(int64_t));
         if (!nd)
             goto free_merge_buf; /* data shrink failed; skip timestamps too */
         r->data = nd;
@@ -338,7 +339,7 @@ col_rel_new_like(const char *name, const col_rel_t *src)
  * internals. */
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
-                      const col_rel_t *like)
+    const col_rel_t *like)
 {
     if (!pool)
         return col_rel_new_like(name, like); /* Fallback to malloc */

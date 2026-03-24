@@ -157,6 +157,15 @@ typedef struct {
      * WL_MEM_SUBSYS_RELATION.  Set by operators that produce output
      * relations (e.g. col_op_join).  NULL for EDB and pool temporaries. */
     wl_mem_ledger_t *mem_ledger;
+    /* Zero-copy retraction backup (issue #300).
+     * col_stratum_step_retraction_nonrecursive saves the live data pointer
+     * here before clearing the relation for retraction evaluation, then
+     * restores it afterwards without any memcpy.  All four fields are
+     * NULL/0 at all times outside retraction evaluation. */
+    int64_t *retract_backup;
+    uint32_t retract_backup_nrows;
+    uint32_t retract_backup_capacity;
+    uint32_t retract_backup_sorted_nrows;
 } col_rel_t;
 
 /**
