@@ -152,6 +152,11 @@ typedef struct {
      * true  = struct was allocated from delta_pool; do not free() the struct.
      * false = struct was heap-allocated via calloc(); free() on destroy. */
     bool pool_owned;
+    /* Arena ownership flag for data buffer.
+     * true  = r->data was allocated from wl_arena_t; do not free() or realloc().
+     *         On growth (append_row), data is migrated to heap (malloc+memcpy).
+     * false = r->data was heap-allocated via malloc(); normal free()/realloc(). */
+    bool arena_owned;
     /* Memory ledger reference (Issue #224): when non-NULL, data buffer
      * growth/free events are reported to this ledger under
      * WL_MEM_SUBSYS_RELATION.  Set by operators that produce output
@@ -579,7 +584,8 @@ col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like);
 col_rel_t *
-col_rel_pool_new_auto(delta_pool_t *pool, const char *name, uint32_t ncols);
+col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
+    const char *name, uint32_t ncols);
 void
 col_rel_compact(col_rel_t *r);
 

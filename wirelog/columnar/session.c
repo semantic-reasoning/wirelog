@@ -80,6 +80,17 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
         memset(r, 0, sizeof(*r));
         r = heap;
     }
+    /* Arena-owned data must be promoted to heap before storing in the
+     * session, because arena_reset invalidates all arena pointers. */
+    if (r->arena_owned && r->data && r->ncols > 0) {
+        size_t bytes = sizeof(int64_t) * (size_t)r->capacity * r->ncols;
+        int64_t *heap_data = (int64_t *)malloc(bytes);
+        if (!heap_data)
+            return ENOMEM;
+        memcpy(heap_data, r->data, bytes);
+        r->data = heap_data;
+        r->arena_owned = false;
+    }
     if (sess->nrels >= sess->rel_cap) {
         uint32_t nc = sess->rel_cap ? sess->rel_cap * 2 : 16;
         col_rel_t **nr
@@ -436,6 +447,14 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         /* Non-fatal: pool allocation failed, fall back to malloc */
     }
 
+    /* Create per-iteration arena for operator data buffers.
+     * 64MB capacity covers typical operator output allocations
+     * (COL_REL_INIT_CAP * ncols * sizeof(int64_t) per operator).
+     * Reset at each iteration boundary alongside delta_pool_reset.
+     * NULL arena is handled gracefully: operators fall back to malloc. */
+    sess->eval_arena = wl_arena_create(64 * 1024 * 1024);
+    /* Non-fatal if NULL: col_rel_pool_new_auto falls back to malloc */
+
     /* Issue #224: Initialize memory accounting ledger.
      * Budget: 75% of physical RAM, or from WIRELOG_MEMORY_BUDGET env var.
      * 0 = unlimited (when physical memory detection fails). */
@@ -558,6 +577,7 @@ col_session_destroy(wl_session_t *session)
     col_session_free_sorted_arrangements(sess);
     col_session_free_diff_arrangements(sess);
     delta_pool_destroy(sess->delta_pool);
+    wl_arena_free(sess->eval_arena);
     free(sess);
 }
 

@@ -1817,3 +1817,20 @@ test_pointer_swap_exe = executable(
 )
 
 test('pointer_swap', test_pointer_swap_exe)
+
+# ============================================================================
+# Malloc Optimization Tests (Arena Allocation)
+# ============================================================================
+
+test_malloc_optimization_exe = executable(
+  'test_malloc_optimization',
+  files('test_malloc_optimization.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('malloc_optimization', test_malloc_optimization_exe)

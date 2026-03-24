@@ -30,7 +30,9 @@ col_rel_free_contents(col_rel_t *r)
         wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
             (uint64_t)r->capacity * r->ncols * sizeof(int64_t));
     free(r->name);
-    free(r->data);
+    if (!r->arena_owned)
+        free(r->data);
+    /* arena_owned data is freed on wl_arena_reset/free; skip free() */
     free(r->retract_backup); /* safety: non-NULL only if destroyed mid-retraction */
     free(r->merge_buf);
     free(r->timestamps);
@@ -160,10 +162,22 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
                 return ENOMEM;
             r->timestamps = new_ts;
         }
-        int64_t *nd = (int64_t *)realloc(
-            r->data, sizeof(int64_t) * (size_t)new_cap * r->ncols);
-        if (!nd)
-            return ENOMEM;
+        int64_t *nd;
+        if (r->arena_owned) {
+            /* Arena data cannot be realloc'd; migrate to heap */
+            nd = (int64_t *)malloc(sizeof(int64_t) * (size_t)new_cap *
+                    r->ncols);
+            if (!nd)
+                return ENOMEM;
+            memcpy(nd, r->data,
+                sizeof(int64_t) * (size_t)r->nrows * r->ncols);
+            r->arena_owned = false;
+        } else {
+            nd = (int64_t *)realloc(
+                r->data, sizeof(int64_t) * (size_t)new_cap * r->ncols);
+            if (!nd)
+                return ENOMEM;
+        }
         r->data = nd;
         /* Track capacity growth in ledger (Issue #224): only the delta bytes
         * added by this growth event.  r->capacity is still the old value. */
@@ -224,9 +238,11 @@ col_rel_compact(col_rel_t *r)
         return;
 
     if (r->nrows == 0) {
-        free(r->data);
+        if (!r->arena_owned)
+            free(r->data);
         r->data = NULL;
         r->capacity = 0;
+        r->arena_owned = false;
         free(r->merge_buf);
         r->merge_buf = NULL;
         r->merge_buf_cap = 0;
@@ -249,10 +265,22 @@ col_rel_compact(col_rel_t *r)
         if (tight < COL_REL_INIT_CAP)
             tight = COL_REL_INIT_CAP;
 
-        int64_t *nd = (int64_t *)realloc(r->data, (size_t)tight * r->ncols
-                * sizeof(int64_t));
-        if (!nd)
-            goto free_merge_buf; /* data shrink failed; skip timestamps too */
+        int64_t *nd;
+        if (r->arena_owned) {
+            /* Arena data: allocate new heap buffer and copy */
+            nd = (int64_t *)malloc(
+                (size_t)tight * r->ncols * sizeof(int64_t));
+            if (!nd)
+                goto free_merge_buf;
+            memcpy(nd, r->data,
+                (size_t)r->nrows * r->ncols * sizeof(int64_t));
+            r->arena_owned = false;
+        } else {
+            nd = (int64_t *)realloc(r->data, (size_t)tight * r->ncols
+                    * sizeof(int64_t));
+            if (!nd)
+                goto free_merge_buf;
+        }
         r->data = nd;
         r->capacity = tight;
 
@@ -378,7 +406,8 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
 }
 
 col_rel_t *
-col_rel_pool_new_auto(delta_pool_t *pool, const char *name, uint32_t ncols)
+col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
+    const char *name, uint32_t ncols)
 {
     if (!pool)
         return col_rel_new_auto(name, ncols); /* Fallback */
@@ -394,7 +423,18 @@ col_rel_pool_new_auto(delta_pool_t *pool, const char *name, uint32_t ncols)
     r->ncols = ncols;
     r->capacity = COL_REL_INIT_CAP;
     if (ncols > 0) {
-        r->data = (int64_t *)malloc(sizeof(int64_t) * r->capacity * ncols);
+        size_t data_bytes = sizeof(int64_t) * r->capacity * ncols;
+        /* Try arena allocation first; fall back to malloc */
+        if (arena) {
+            r->data = (int64_t *)wl_arena_alloc(arena, data_bytes);
+            if (r->data) {
+                r->arena_owned = true;
+            }
+        }
+        if (!r->data) {
+            r->data = (int64_t *)malloc(data_bytes);
+            r->arena_owned = false;
+        }
         if (!r->data) {
             free(r->name);
             memset(r, 0, sizeof(*r));

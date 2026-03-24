@@ -925,7 +925,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         return EINVAL;
 
     uint32_t pc = op->project_count;
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$map", pc);
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+            "$map", pc);
     if (!out) {
         if (e.owned)
             col_rel_destroy(e.rel);
@@ -1737,7 +1738,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         /* If right relation doesn't exist, join produces empty result (cross-product with nothing).
          * Similar to ANTIJOIN logic (which keeps all left rows on missing right).
          * This can occur in generated plans where optional relations may not exist. */
-        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$join_empty",
+        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
+                sess->eval_arena, "$join_empty",
                 left_e.rel->ncols);
         if (!out) {
             if (left_e.owned)
@@ -1838,7 +1840,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     /* Output: all left cols + all right cols (including key duplication).
      * Downstream MAP will project the desired output columns. */
     uint32_t ocols = left->ncols + right->ncols;
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$join", ocols);
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+            "$join", ocols);
     if (!out) {
         free(lk);
         free(rk);
@@ -4060,7 +4063,8 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Output: project_indices selects output columns from left */
     uint32_t ocols = op->project_count ? op->project_count : left->ncols;
     col_rel_t *out
-        = col_rel_pool_new_auto(sess->delta_pool, "$semijoin", ocols);
+        = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena, "$semijoin",
+            ocols);
     if (!out) {
         free(lk);
         free(rk);
@@ -4162,7 +4166,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
 
     /* Output: group_by columns + 1 aggregate column */
     uint32_t ocols = gc + 1;
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$reduce", ocols);
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+            "$reduce", ocols);
     if (!out) {
         if (e.owned)
             col_rel_destroy(in);
@@ -4437,7 +4442,8 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
     {
-        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, "$lftj",
+        col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
+                sess->eval_arena, "$lftj",
                 total_binary_ncols);
         int64_t *tmp = (int64_t *)malloc(
             (total_binary_ncols ? total_binary_ncols : 1u) * sizeof(int64_t));
@@ -4508,6 +4514,7 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right) {
         col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
+                sess->eval_arena,
                 "$join_diff_empty", left_e.rel->ncols);
         if (!out) {
             if (left_e.owned)
@@ -4582,7 +4589,7 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     uint32_t ocols = left->ncols + right->ncols;
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool,
+    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$join_diff", ocols);
     if (!out) {
         free(lk);

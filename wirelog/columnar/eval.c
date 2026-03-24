@@ -213,7 +213,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     }
                     result.owned = false;
                 } else {
-                    col_rel_t *copy = col_rel_new_like(rp->name, result.rel);
+                    col_rel_t *copy = col_rel_pool_new_like(
+                        sess->delta_pool, rp->name, result.rel);
                     if (!copy)
                         return ENOMEM;
                     if ((rc = col_rel_append_all(copy, result.rel)) != 0) {
@@ -237,6 +238,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
         col_mat_cache_clear(&sess->mat_cache);
         delta_pool_reset(sess->delta_pool);
+        wl_arena_reset(sess->eval_arena);
 
         /* Non-recursive stratum frontier: record convergence epoch and iteration.
         * Non-recursive strata always converge at iteration UINT32_MAX (no loop),
@@ -550,7 +552,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         }
                         result.owned = false;
                     } else {
-                        copy = col_rel_new_like(rp->name, result.rel);
+                        copy = col_rel_pool_new_like(
+                            sess->delta_pool, rp->name, result.rel);
                         if (!copy) {
                             outer_rc = ENOMEM;
                             goto stride_error;
@@ -613,7 +616,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
                 char dname[256];
                 snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
-                col_rel_t *delta = col_rel_new_like(dname, r);
+                col_rel_t *delta = col_rel_pool_new_like(
+                    sess->delta_pool, dname, r);
                 if (!delta) {
                     outer_rc = ENOMEM;
                     goto stride_error;
@@ -699,6 +703,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             }
 
             delta_pool_reset(sess->delta_pool);
+            wl_arena_reset(sess->eval_arena);
             /* Issue #176: Per-sub-pass cache eviction for recursive strata.
              * Use configurable eviction threshold (cache_evict_threshold):
              * - If 0: clear entire cache each sub-pass (backward compatible)
@@ -776,6 +781,7 @@ stride_error:
     }
     free(delta_rels);
     delta_pool_reset(sess->delta_pool);
+    wl_arena_reset(sess->eval_arena);
     col_mat_cache_clear(&sess->mat_cache);
 
     return 0;
