@@ -518,42 +518,30 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
 /* ---- radix sort ---------------------------------------------------------- */
 
 /*
- * col_rel_radix_sort_int64: sort all rows of r in-place using LSD radix sort.
+ * col_radix_sort_rows: sort nrows rows of ncols int64_t columns in-place
+ * using LSD radix sort.  Works on a raw pointer (no col_rel_t needed).
  *
- * Sorts lexicographically by all ncols columns (column 0 is most significant).
- * Handles signed int64_t by flipping the sign bit on the MSB of each column
- * so that unsigned byte comparison yields the correct signed ordering.
- *
- * Complexity: O(ncols * 8 * nrows) time, O(nrows * ncols) extra space.
- * Sets r->sorted_nrows = r->nrows on completion.
- * Falls back to qsort on allocation failure.
+ * Falls back to qsort_r on allocation failure.
+ * Returns 0 on success, -1 on fallback (still sorted, just via qsort).
  */
-void
-col_rel_radix_sort_int64(col_rel_t *r)
+int
+col_radix_sort_rows(int64_t *data, uint32_t nrows, uint32_t ncols)
 {
-    if (!r || r->ncols == 0) {
-        if (r)
-            r->sorted_nrows = r->nrows;
-        return;
-    }
-    if (r->nrows <= 1) {
-        r->sorted_nrows = r->nrows;
-        return;
-    }
+    if (!data || ncols == 0 || nrows <= 1)
+        return 0;
 
-    uint32_t nr = r->nrows;
-    uint32_t nc = r->ncols;
+    uint32_t nr = nrows;
+    uint32_t nc = ncols;
     size_t row_bytes = (size_t)nc * sizeof(int64_t);
 
     int64_t *tmp = (int64_t *)malloc((size_t)nr * row_bytes);
     if (!tmp) {
         /* Fallback to comparison sort on allocation failure */
-        QSORT_R_CALL(r->data, nr, row_bytes, &nc, row_cmp_fn);
-        r->sorted_nrows = nr;
-        return;
+        QSORT_R_CALL(data, nr, row_bytes, &nc, row_cmp_fn);
+        return -1;
     }
 
-    int64_t *src = r->data;
+    int64_t *src = data;
     int64_t *dst = tmp;
 
     /* count[b] = frequency of byte value b in current pass.
@@ -605,9 +593,37 @@ col_rel_radix_sort_int64(col_rel_t *r)
     }
 
     /* After nc*8 passes the result is in src.  Copy back if needed. */
-    if (src != r->data)
-        memcpy(r->data, src, (size_t)nr * row_bytes);
+    if (src != data)
+        memcpy(data, src, (size_t)nr * row_bytes);
 
     free(tmp);
-    r->sorted_nrows = nr;
+    return 0;
+}
+
+/*
+ * col_rel_radix_sort_int64: sort all rows of r in-place using LSD radix sort.
+ *
+ * Sorts lexicographically by all ncols columns (column 0 is most significant).
+ * Handles signed int64_t by flipping the sign bit on the MSB of each column
+ * so that unsigned byte comparison yields the correct signed ordering.
+ *
+ * Complexity: O(ncols * 8 * nrows) time, O(nrows * ncols) extra space.
+ * Sets r->sorted_nrows = r->nrows on completion.
+ * Falls back to qsort on allocation failure.
+ */
+void
+col_rel_radix_sort_int64(col_rel_t *r)
+{
+    if (!r || r->ncols == 0) {
+        if (r)
+            r->sorted_nrows = r->nrows;
+        return;
+    }
+    if (r->nrows <= 1) {
+        r->sorted_nrows = r->nrows;
+        return;
+    }
+
+    col_radix_sort_rows(r->data, r->nrows, r->ncols);
+    r->sorted_nrows = r->nrows;
 }
