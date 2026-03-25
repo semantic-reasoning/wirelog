@@ -590,6 +590,8 @@ void
 col_rel_compact(col_rel_t *r);
 void
 col_rel_radix_sort_int64(col_rel_t *r);
+int
+col_radix_sort_rows(int64_t *data, uint32_t nrows, uint32_t ncols);
 
 /* ======================================================================== */
 /* Cache & Materialized Join (columnar/cache.c)                             */

@@ -2647,48 +2647,6 @@ kway_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
     return row_cmp_dispatch(a, b, ncols);
 }
 
-/* Issue #300: SIMD-accelerated qsort_r comparator for the kway_merge sort
- * phase.  row_cmp_fn in internal.h uses scalar-only comparison (it must work
- * across all translation units that do not include the SIMD helpers).  Here we
- * wrap row_cmp_optimized — the compile-time SIMD dispatcher — with the correct
- * platform-specific qsort_r signature so that the per-segment sort in
- * col_op_consolidate_kway_merge also benefits from SIMD acceleration.
- *
- * The sort phase accounts for ~40% of kway_merge time with a 12:1
- * sort-to-merge comparison ratio, making this the highest-ROI optimisation.
- */
-#ifdef __GLIBC__
-/* GNU glibc qsort_r: comparator(a, b, ctx) */
-static inline int
-row_cmp_fn_kway(const void *a, const void *b, void *ctx)
-{
-    const uint32_t ncols = *(const uint32_t *)ctx;
-    return row_cmp_optimized((const int64_t *)a, (const int64_t *)b, ncols);
-}
-#define QSORT_R_KWAY(base, nmemb, size, ctx) \
-        qsort_r(base, nmemb, size, row_cmp_fn_kway, ctx)
-#elif defined(_MSC_VER)
-/* MSVC qsort_s: comparator(ctx, a, b) */
-static int __cdecl
-row_cmp_fn_kway(void *ctx, const void *a, const void *b)
-{
-    const uint32_t ncols = *(const uint32_t *)ctx;
-    return row_cmp_optimized((const int64_t *)a, (const int64_t *)b, ncols);
-}
-#define QSORT_R_KWAY(base, nmemb, size, ctx) \
-        qsort_s(base, nmemb, size, row_cmp_fn_kway, ctx)
-#else
-/* BSD qsort_r: comparator(ctx, a, b) */
-static inline int
-row_cmp_fn_kway(void *ctx, const void *a, const void *b)
-{
-    const uint32_t ncols = *(const uint32_t *)ctx;
-    return row_cmp_optimized((const int64_t *)a, (const int64_t *)b, ncols);
-}
-#define QSORT_R_KWAY(base, nmemb, size, ctx) \
-        qsort_r(base, nmemb, size, ctx, row_cmp_fn_kway)
-#endif
-
 /*
  * col_op_consolidate_kway_merge - K-way merge with per-segment sort and dedup.
  *
@@ -2715,13 +2673,13 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     if (nr <= 1)
         return 0;
 
-    /* Sort each segment in-place using SIMD-accelerated comparator (#300) */
+    /* Sort each segment in-place using radix sort */
     for (uint32_t s = 0; s < seg_count; s++) {
         uint32_t start = seg_boundaries[s];
         uint32_t end = seg_boundaries[s + 1];
         if (end > start + 1) {
-            QSORT_R_KWAY(rel->data + (size_t)start * nc, end - start,
-                row_bytes, &nc);
+            col_radix_sort_rows(rel->data + (size_t)start * nc,
+                end - start, nc);
         }
     }
 
@@ -2958,8 +2916,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t delta_count = nr - sn;
         int64_t *delta_start = work->data + (size_t)sn * nc;
 
-        /* Phase 1: sort only the unsorted suffix */
-        QSORT_R_CALL(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
+        /* Phase 1: sort only the unsorted suffix using radix sort */
+        col_radix_sort_rows(delta_start, delta_count, nc);
 
         /* Phase 1b: dedup within suffix */
         uint32_t d_unique = 1;
@@ -3110,8 +3068,8 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     int64_t *delta_start = rel->data + (size_t)old_nrows * nc;
     size_t row_bytes = (size_t)nc * sizeof(int64_t);
 
-    /* Phase 1: sort only the new delta rows */
-    QSORT_R_CALL(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
+    /* Phase 1: sort only the new delta rows using radix sort */
+    col_radix_sort_rows(delta_start, delta_count, nc);
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
@@ -3230,8 +3188,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     int64_t *delta_start = rel->data + (size_t)old_nrows * nc;
     size_t row_bytes = (size_t)nc * sizeof(int64_t);
 
-    /* Phase 1: sort only the new delta rows */
-    QSORT_R_CALL(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
+    /* Phase 1: sort only the new delta rows using radix sort */
+    col_radix_sort_rows(delta_start, delta_count, nc);
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
@@ -4854,8 +4812,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t delta_count = nr - sn;
         int64_t *delta_start = work->data + (size_t)sn * nc;
 
-        /* Phase 1: sort only the unsorted suffix */
-        QSORT_R_CALL(delta_start, delta_count, row_bytes, &nc, row_cmp_fn);
+        /* Phase 1: sort only the unsorted suffix using radix sort */
+        col_radix_sort_rows(delta_start, delta_count, nc);
 
         /* Phase 1b: dedup within suffix */
         uint32_t d_unique = 1;
