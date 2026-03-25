@@ -514,3 +514,100 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     r->nrows = 0;
     return r;
 }
+
+/* ---- radix sort ---------------------------------------------------------- */
+
+/*
+ * col_rel_radix_sort_int64: sort all rows of r in-place using LSD radix sort.
+ *
+ * Sorts lexicographically by all ncols columns (column 0 is most significant).
+ * Handles signed int64_t by flipping the sign bit on the MSB of each column
+ * so that unsigned byte comparison yields the correct signed ordering.
+ *
+ * Complexity: O(ncols * 8 * nrows) time, O(nrows * ncols) extra space.
+ * Sets r->sorted_nrows = r->nrows on completion.
+ * Falls back to qsort on allocation failure.
+ */
+void
+col_rel_radix_sort_int64(col_rel_t *r)
+{
+    if (!r || r->ncols == 0) {
+        if (r)
+            r->sorted_nrows = r->nrows;
+        return;
+    }
+    if (r->nrows <= 1) {
+        r->sorted_nrows = r->nrows;
+        return;
+    }
+
+    uint32_t nr = r->nrows;
+    uint32_t nc = r->ncols;
+    size_t row_bytes = (size_t)nc * sizeof(int64_t);
+
+    int64_t *tmp = (int64_t *)malloc((size_t)nr * row_bytes);
+    if (!tmp) {
+        /* Fallback to comparison sort on allocation failure */
+        QSORT_R_CALL(r->data, nr, row_bytes, &nc, row_cmp_fn);
+        r->sorted_nrows = nr;
+        return;
+    }
+
+    int64_t *src = r->data;
+    int64_t *dst = tmp;
+
+    /* count[b] = frequency of byte value b in current pass.
+     * prefix[b] = output index for next element with byte value b. */
+    uint32_t count[256];
+    uint32_t prefix[256];
+
+    /*
+     * LSD radix sort: process from least significant sort key to most
+     * significant.  Column nc-1 is least significant, column 0 is most
+     * significant.  Within each column, byte 0 (LSB) is processed first
+     * and byte 7 (MSB) last.  The sign bit (bit 7 of byte 7) is flipped
+     * so that unsigned bucket ordering matches signed int64 ordering.
+     */
+    for (int c = (int)nc - 1; c >= 0; c--) {
+        for (int b = 0; b < 8; b++) {
+            int shift = b * 8;
+            int is_sign_byte = (b == 7);
+
+            memset(count, 0, sizeof(count));
+            for (uint32_t row = 0; row < nr; row++) {
+                uint8_t bv = (uint8_t)((uint64_t)src[(size_t)row * nc + c] >>
+                    shift);
+                if (is_sign_byte)
+                    bv ^= 0x80u;
+                count[bv]++;
+            }
+
+            prefix[0] = 0;
+            for (int i = 1; i < 256; i++)
+                prefix[i] = prefix[i - 1] + count[i - 1];
+
+            for (uint32_t row = 0; row < nr; row++) {
+                uint8_t bv = (uint8_t)((uint64_t)src[(size_t)row * nc + c] >>
+                    shift);
+                if (is_sign_byte)
+                    bv ^= 0x80u;
+                uint32_t out_pos = prefix[bv]++;
+                memcpy(dst + (size_t)out_pos * nc,
+                    src + (size_t)row * nc,
+                    row_bytes);
+            }
+
+            /* Swap buffers: output of this pass is input of next */
+            int64_t *t = src;
+            src = dst;
+            dst = t;
+        }
+    }
+
+    /* After nc*8 passes the result is in src.  Copy back if needed. */
+    if (src != r->data)
+        memcpy(r->data, src, (size_t)nr * row_bytes);
+
+    free(tmp);
+    r->sorted_nrows = nr;
+}

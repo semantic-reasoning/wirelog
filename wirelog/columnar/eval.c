@@ -313,10 +313,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     for (uint32_t ri = 0; ri < nrels; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
         if (r && r->nrows > 1) {
-            uint32_t nc = r->ncols;
-            size_t row_bytes = (size_t)nc * sizeof(int64_t);
-            QSORT_R_CALL(r->data, r->nrows, row_bytes, &nc, row_cmp_fn);
-            r->sorted_nrows = r->nrows;
+            col_rel_radix_sort_int64(r);
         }
     }
 

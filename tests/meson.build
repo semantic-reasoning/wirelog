@@ -1834,3 +1834,20 @@ test_malloc_optimization_exe = executable(
 )
 
 test('malloc_optimization', test_malloc_optimization_exe)
+
+# ============================================================================
+# Radix Sort Tests (Issue #308)
+# ============================================================================
+
+test_radix_sort_exe = executable(
+  'test_radix_sort',
+  files('test_radix_sort.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('radix_sort', test_radix_sort_exe)

@@ -588,6 +588,8 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     const char *name, uint32_t ncols);
 void
 col_rel_compact(col_rel_t *r);
+void
+col_rel_radix_sort_int64(col_rel_t *r);
 
 /* ======================================================================== */
 /* Cache & Materialized Join (columnar/cache.c)                             */

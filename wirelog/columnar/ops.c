@@ -3062,8 +3062,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         return eval_stack_push(stack, work, work_owned);
     }
 
-    /* Fallback: standard qsort + dedup (sorted_nrows == 0 or full re-sort) */
-    QSORT_R_CALL(work->data, nr, row_bytes, &nc, row_cmp_fn);
+    /* Fallback: radix sort + dedup (sorted_nrows == 0 or full re-sort) */
+    col_rel_radix_sort_int64(work);
 
     /* Compact: keep only unique rows */
     uint32_t out_r = 1; /* first row always kept */
@@ -4957,8 +4957,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         return eval_stack_push(stack, work, work_owned);
     }
 
-    /* Fallback: standard qsort + dedup */
-    QSORT_R_CALL(work->data, nr, row_bytes, &nc, row_cmp_fn);
+    /* Fallback: radix sort + dedup */
+    col_rel_radix_sort_int64(work);
 
     uint32_t out_r = 1;
     for (uint32_t r = 1; r < nr; r++) {
