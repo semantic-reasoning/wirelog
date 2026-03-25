@@ -902,4 +902,37 @@ stratum_has_preseeded_delta(const wl_plan_stratum_t *sp,
 uint32_t
 rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id);
 
+/* ======================================================================== */
+/* Relation Partitioning (columnar/partition.c)                             */
+/* ======================================================================== */
+
+/*
+ * col_rel_partition_by_key:
+ * Partition src into num_workers disjoint sub-relations by hashing
+ * the specified key columns with XXH3_64bits.
+ *
+ * Two-pass algorithm: count rows per bucket, allocate exact-sized
+ * partitions, then scatter.  out_parts must point to an array of
+ * num_workers col_rel_t* slots (caller-provided).  On success each
+ * slot holds a newly allocated relation; caller owns all.
+ *
+ * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
+ */
+int
+col_rel_partition_by_key(const col_rel_t *src,
+    const uint32_t *key_cols, uint32_t key_count,
+    uint32_t num_workers, col_rel_t **out_parts);
+
+/*
+ * col_rel_merge_partitions:
+ * Concatenate num_workers partition relations into a single output.
+ * Rows are appended in partition order.  Schema copied from parts[0].
+ * Input partitions are NOT destroyed (caller retains ownership).
+ *
+ * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
+ */
+int
+col_rel_merge_partitions(col_rel_t **parts, uint32_t num_workers,
+    col_rel_t **out);
+
 #endif /* WL_COLUMNAR_INTERNAL_H */

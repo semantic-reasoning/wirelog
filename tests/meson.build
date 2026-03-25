@@ -194,6 +194,7 @@ backend_src = files(
   '../wirelog/columnar/diff_arrangement.c',
   '../wirelog/columnar/diff_vtable.c',
   '../wirelog/columnar/diff_bridge.c',
+  '../wirelog/columnar/partition.c',
 )
 
 io_src = files(
@@ -1851,3 +1852,20 @@ test_radix_sort_exe = executable(
 )
 
 test('radix_sort', test_radix_sort_exe)
+
+# ============================================================================
+# Hash-Partitioned Relation Storage (Issue #314)
+# ============================================================================
+
+test_partition_exe = executable(
+  'test_partition',
+  files('test_partition.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('partition', test_partition_exe)
