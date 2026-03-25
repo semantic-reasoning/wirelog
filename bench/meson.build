@@ -43,6 +43,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/diff_arrangement.c',
   subdir_wirelog / 'columnar/diff_vtable.c',
   subdir_wirelog / 'columnar/diff_bridge.c',
+  subdir_wirelog / 'columnar/partition.c',
 )
 
 bench_io_src = files(
@@ -99,6 +100,19 @@ if host_machine.system() != 'windows'
     install: false,
   )
 endif
+
+# Column-major migration baseline benchmark (Issue #327)
+bench_col_layout = executable(
+  'bench_col_layout',
+  files('bench_col_layout.c'),
+  bench_backend_src,
+  bench_arena_src,
+  bench_thread_src,
+  bench_workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  install: false,
+)
 
 # Skip datagen on Windows (uses POSIX getopt_long)
 if host_machine.system() != 'windows'
