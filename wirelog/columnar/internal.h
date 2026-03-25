@@ -355,6 +355,19 @@ extern const col_frontier_ops_t col_frontier_diff_ops;
  * wl_session_t* to wl_col_session_t* is valid per C11 pointer
  * compatibility (address of struct == address of first member).
  */
+/* EDB Partition-at-Ingest cache entry (Issue #320).
+ * Stores partition key metadata and cached partitions for one EDB relation.
+ * Partitions are lazily computed via col_rel_partition_by_key at TDD dispatch
+ * time; the dirty flag is set by col_session_insert to trigger re-partition. */
+typedef struct {
+    uint32_t *key_cols;         /* resolved column indices for partition keys */
+    uint32_t key_count;         /* number of partition key columns            */
+    col_rel_t **partitions;     /* cached partition results [num_workers]     */
+    uint32_t num_partitions;    /* == sess->num_workers at init time          */
+    bool dirty;                 /* true after insert; cleared after partition */
+    bool keys_resolved;         /* true after key_cols resolved from plan     */
+} col_edb_partition_t;
+
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     const col_frontier_ops_t *frontier_ops; /* frontier vtable (#261)   */
@@ -534,6 +547,12 @@ typedef struct wl_col_session_t {
      *               resources (plan, frontier_ops) in worker destroy. */
     uint32_t worker_id;
     struct wl_col_session_t *coordinator;
+    /* EDB partition-at-ingest cache (Issue #320).
+     * One entry per plan->edb_count.  NULL when num_workers <= 1 (no TDD).
+     * Populated lazily at TDD dispatch via col_session_partition_edb_for_tdd.
+     * Dirty flag set by col_session_insert / col_session_insert_incremental. */
+    col_edb_partition_t *edb_parts;
+    uint32_t edb_part_count;
 } wl_col_session_t;
 
 /*
@@ -921,6 +940,16 @@ rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id);
 /* ======================================================================== */
 
 /*
+ * col_row_partition:
+ * Compute partition index for a single row by hashing key columns
+ * with XXH3_64bits.  key_buf is a caller-provided scratch buffer of
+ * at least key_count entries.  Returns index in [0, num_workers).
+ */
+uint32_t
+col_row_partition(const int64_t *row, const uint32_t *key_cols,
+    uint32_t key_count, uint32_t num_workers, int64_t *key_buf);
+
+/*
  * col_rel_partition_by_key:
  * Partition src into num_workers disjoint sub-relations by hashing
  * the specified key columns with XXH3_64bits.
@@ -980,5 +1009,32 @@ col_worker_session_create(wl_col_session_t *coordinator,
  */
 void
 col_worker_session_destroy(wl_col_session_t *worker);
+
+/* ======================================================================== */
+/* EDB Partition-at-Ingest (columnar/session.c, Issue #320)                 */
+/* ======================================================================== */
+
+/*
+ * col_edb_discover_partition_keys:
+ * Scan plan operator sequences to find the first JOIN/SEMIJOIN/ANTIJOIN
+ * that references edb_name.  Resolve join key columns to physical
+ * indices.  Stores results in *out_key_cols / *out_key_count.
+ *
+ * Returns 0 on success, ENOENT if no JOIN references this EDB.
+ */
+int
+col_edb_discover_partition_keys(const wl_plan_t *plan,
+    const char *edb_name, uint32_t *out_key_cols,
+    uint32_t *out_key_count, uint32_t max_keys);
+
+/*
+ * col_session_partition_edb_for_tdd:
+ * Batch-partition all dirty EDB relations using col_rel_partition_by_key.
+ * Called before TDD stratum evaluation.  Clears dirty flags on success.
+ *
+ * Returns 0 on success, ENOMEM on allocation failure.
+ */
+int
+col_session_partition_edb_for_tdd(wl_col_session_t *sess);
 
 #endif /* WL_COLUMNAR_INTERNAL_H */

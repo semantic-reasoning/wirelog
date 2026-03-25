@@ -34,8 +34,8 @@
  * key_buf is a caller-provided scratch buffer of at least key_count
  * entries, used to concatenate the key column values before hashing.
  */
-static uint32_t
-row_partition(const int64_t *row, const uint32_t *key_cols,
+uint32_t
+col_row_partition(const int64_t *row, const uint32_t *key_cols,
     uint32_t key_count, uint32_t num_workers, int64_t *key_buf)
 {
     if (num_workers == 1)
@@ -109,7 +109,7 @@ col_rel_partition_by_key(const col_rel_t *src,
     /* Pass 1: count rows per partition */
     for (uint32_t i = 0; i < nrows; i++) {
         const int64_t *row = src->data + (size_t)i * ncols;
-        uint32_t p = row_partition(row, key_cols, key_count, num_workers,
+        uint32_t p = col_row_partition(row, key_cols, key_count, num_workers,
                 key_buf);
         counts[p]++;
     }
@@ -160,7 +160,7 @@ col_rel_partition_by_key(const col_rel_t *src,
     /* Pass 2: scatter rows into partitions */
     for (uint32_t i = 0; i < nrows; i++) {
         const int64_t *row = src->data + (size_t)i * ncols;
-        uint32_t p = row_partition(row, key_cols, key_count, num_workers,
+        uint32_t p = col_row_partition(row, key_cols, key_count, num_workers,
                 key_buf);
         memcpy(out_parts[p]->data + (size_t)offsets[p] * ncols,
             row, row_bytes);

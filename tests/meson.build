@@ -1890,3 +1890,24 @@ test_worker_session_exe = executable(
 )
 
 test('worker_session', test_worker_session_exe)
+
+# ============================================================================
+# EDB Partition-at-Ingest (Issue #320)
+# ============================================================================
+
+test_edb_partition_ingest_exe = executable(
+  'test_edb_partition_ingest',
+  files('test_edb_partition_ingest.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('edb_partition_ingest', test_edb_partition_ingest_exe)

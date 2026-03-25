@@ -512,6 +512,22 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         }
     }
 
+    /* Issue #320: Allocate EDB partition cache for TDD multi-worker.
+     * Only when num_workers > 1 and plan has EDB relations. */
+    if (sess->num_workers > 1 && plan->edb_count > 0) {
+        sess->edb_parts = (col_edb_partition_t *)calloc(
+            plan->edb_count, sizeof(col_edb_partition_t));
+        if (sess->edb_parts) {
+            sess->edb_part_count = plan->edb_count;
+            for (uint32_t i = 0; i < plan->edb_count; i++) {
+                sess->edb_parts[i].num_partitions = sess->num_workers;
+                sess->edb_parts[i].dirty = true;
+            }
+        }
+        /* Non-fatal if allocation fails: TDD falls back to dispatch-time
+         * partitioning via col_rel_partition_by_key directly. */
+    }
+
     /* Issue #105: Populate stratum_is_monotone from plan.
      * Copy monotone property from each stratum in the plan.
      * Conservative default (all false from calloc) is already set,
@@ -536,6 +552,7 @@ oom:
         free(sess->rels[i]);
     }
     free(sess->rels);
+    free(sess->edb_parts);                /* Issue #320: NULL-safe */
     wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
     free(sess);
@@ -578,6 +595,19 @@ col_session_destroy(wl_session_t *session)
     col_session_free_diff_arrangements(sess);
     delta_pool_destroy(sess->delta_pool);
     wl_arena_free(sess->eval_arena);
+    /* Free EDB partition cache (Issue #320) */
+    for (uint32_t i = 0; i < sess->edb_part_count; i++) {
+        col_edb_partition_t *ep = &sess->edb_parts[i];
+        if (ep->partitions) {
+            for (uint32_t w = 0; w < ep->num_partitions; w++) {
+                if (ep->partitions[w])
+                    col_rel_destroy(ep->partitions[w]);
+            }
+            free(ep->partitions);
+        }
+        free(ep->key_cols);
+    }
+    free(sess->edb_parts);
     free(sess);
 }
 
@@ -633,6 +663,10 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->sarr_count = 0;
     out_worker->sarr_cap = 0;
     memset(&out_worker->mat_cache, 0, sizeof(col_mat_cache_t));
+
+    /* EDB partition cache is coordinator-only (#320) */
+    out_worker->edb_parts = NULL;
+    out_worker->edb_part_count = 0;
 
     /* Step 4: NULL borrowed fields that workers must not use */
     out_worker->delta_cb = NULL;
@@ -757,6 +791,154 @@ col_worker_session_destroy(wl_col_session_t *worker)
     memset(worker, 0, sizeof(*worker));
 }
 
+/* ======================================================================== */
+/* EDB Partition-at-Ingest (Issue #320)                                     */
+/* ======================================================================== */
+
+/*
+ * col_edb_discover_partition_keys:
+ * Scan plan for the first JOIN/SEMIJOIN/ANTIJOIN that references edb_name
+ * as its right_relation.  Extract join key column indices from the "colN"
+ * formatted key strings (e.g. "col0" -> 0, "col2" -> 2).
+ */
+int
+col_edb_discover_partition_keys(const wl_plan_t *plan,
+    const char *edb_name, uint32_t *out_key_cols,
+    uint32_t *out_key_count, uint32_t max_keys)
+{
+    if (!plan || !edb_name || !out_key_cols || !out_key_count)
+        return EINVAL;
+
+    *out_key_count = 0;
+
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *st = &plan->strata[s];
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            const wl_plan_relation_t *rp = &st->relations[r];
+            for (uint32_t o = 0; o < rp->op_count; o++) {
+                const wl_plan_op_t *op = &rp->ops[o];
+
+                /* Match JOIN, SEMIJOIN, ANTIJOIN referencing this EDB */
+                if (op->op != WL_PLAN_OP_JOIN
+                    && op->op != WL_PLAN_OP_SEMIJOIN
+                    && op->op != WL_PLAN_OP_ANTIJOIN)
+                    continue;
+                if (!op->right_relation
+                    || strcmp(op->right_relation, edb_name) != 0)
+                    continue;
+                if (op->key_count == 0 || !op->right_keys)
+                    continue;
+
+                /* Parse "colN" strings to integer indices */
+                uint32_t count = op->key_count;
+                if (count > max_keys)
+                    count = max_keys;
+                for (uint32_t k = 0; k < count; k++) {
+                    const char *key = op->right_keys[k];
+                    if (key && key[0] == 'c' && key[1] == 'o'
+                        && key[2] == 'l') {
+                        out_key_cols[k] = (uint32_t)atoi(key + 3);
+                    } else {
+                        out_key_cols[k] = 0; /* fallback */
+                    }
+                }
+                *out_key_count = count;
+                return 0; /* first match wins */
+            }
+        }
+    }
+
+    return ENOENT; /* no JOIN references this EDB */
+}
+
+/*
+ * col_session_partition_edb_for_tdd:
+ * Batch-partition all dirty EDB relations using col_rel_partition_by_key.
+ * Called before TDD stratum evaluation.
+ */
+int
+col_session_partition_edb_for_tdd(wl_col_session_t *sess)
+{
+    if (!sess || !sess->edb_parts)
+        return 0; /* no-op for W=1 or uninitialized */
+
+    const wl_plan_t *plan = sess->plan;
+
+    for (uint32_t i = 0; i < sess->edb_part_count; i++) {
+        col_edb_partition_t *ep = &sess->edb_parts[i];
+        if (!ep->dirty)
+            continue;
+
+        /* Lazy key discovery on first partition */
+        if (!ep->keys_resolved) {
+            uint32_t keys[COL_STACK_MAX];
+            uint32_t key_count = 0;
+            int rc = col_edb_discover_partition_keys(plan,
+                    plan->edb_relations[i], keys, &key_count, COL_STACK_MAX);
+            if (rc == 0 && key_count > 0) {
+                ep->key_cols
+                    = (uint32_t *)malloc(key_count * sizeof(uint32_t));
+                if (!ep->key_cols)
+                    return ENOMEM;
+                memcpy(ep->key_cols, keys,
+                    key_count * sizeof(uint32_t));
+                ep->key_count = key_count;
+            } else {
+                /* No JOIN found: fall back to column 0 */
+                ep->key_cols
+                    = (uint32_t *)malloc(sizeof(uint32_t));
+                if (!ep->key_cols)
+                    return ENOMEM;
+                ep->key_cols[0] = 0;
+                ep->key_count = 1;
+            }
+            ep->keys_resolved = true;
+        }
+
+        /* Skip EDBs with no partition keys (will be broadcast) */
+        if (ep->key_count == 0) {
+            ep->dirty = false;
+            continue;
+        }
+
+        /* Find the EDB relation in session */
+        col_rel_t *edb_rel = session_find_rel(sess, plan->edb_relations[i]);
+        if (!edb_rel || edb_rel->nrows == 0) {
+            ep->dirty = false;
+            continue;
+        }
+
+        /* Free old partitions */
+        if (ep->partitions) {
+            for (uint32_t w = 0; w < ep->num_partitions; w++) {
+                if (ep->partitions[w])
+                    col_rel_destroy(ep->partitions[w]);
+            }
+            free(ep->partitions);
+            ep->partitions = NULL;
+        }
+
+        /* Allocate partition array */
+        ep->partitions = (col_rel_t **)calloc(
+            ep->num_partitions, sizeof(col_rel_t *));
+        if (!ep->partitions)
+            return ENOMEM;
+
+        /* Batch partition via two-pass count+scatter */
+        int rc = col_rel_partition_by_key(edb_rel, ep->key_cols,
+                ep->key_count, ep->num_partitions, ep->partitions);
+        if (rc != 0) {
+            free(ep->partitions);
+            ep->partitions = NULL;
+            return rc;
+        }
+
+        ep->dirty = false;
+    }
+
+    return 0;
+}
+
 int
 col_session_insert(wl_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols)
@@ -788,6 +970,20 @@ col_session_insert(wl_session_t *session, const char *relation,
      * frontier persistence in col_session_snapshot, enabling the per-iteration
      * skip condition to reduce iterations on subsequent snapshots. */
     COL_SESSION(session)->last_inserted_relation = relation;
+
+    /* Issue #320: Mark EDB partitions as dirty for TDD re-partition */
+    {
+        wl_col_session_t *sess = COL_SESSION(session);
+        if (sess->edb_parts) {
+            const wl_plan_t *p = sess->plan;
+            for (uint32_t i = 0; i < p->edb_count; i++) {
+                if (strcmp(relation, p->edb_relations[i]) == 0) {
+                    sess->edb_parts[i].dirty = true;
+                    break;
+                }
+            }
+        }
+    }
 
     return 0;
 }
@@ -858,6 +1054,18 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     /* Record the inserted relation so col_session_step can skip unaffected
      * strata (Phase 4 affected-stratum skip optimization). */
     sess->last_inserted_relation = relation;
+
+    /* Issue #320: Mark EDB partitions as dirty for TDD re-partition */
+    if (sess->edb_parts) {
+        const wl_plan_t *p = sess->plan;
+        for (uint32_t i = 0; i < p->edb_count; i++) {
+            if (strcmp(relation, p->edb_relations[i]) == 0) {
+                sess->edb_parts[i].dirty = true;
+                break;
+            }
+        }
+    }
+
     return 0;
 }
 
