@@ -958,7 +958,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
-        const int64_t *row = e.rel->data + (size_t)r * e.rel->ncols;
+        const int64_t *row = col_rel_row(e.rel, r);
         for (uint32_t c = 0; c < pc; c++) {
             if (op->map_exprs && c < op->map_expr_count && op->map_exprs[c].data
                 && op->map_exprs[c].size > 0) {
@@ -1430,7 +1430,7 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
     col_expr_compiled_t *ce =
         (buf && bsz > 0) ? col_expr_compile(buf, bsz) : NULL;
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
-        const int64_t *row = e.rel->data + (size_t)r * e.rel->ncols;
+        const int64_t *row = col_rel_row(e.rel, r);
         int pass;
         if (!buf || bsz == 0) {
             pass = 1;
@@ -1911,7 +1911,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             return ENOMEM;
         }
         for (uint32_t bi = 0; bi < build->nrows; bi++) {
-            int64_t key = build->data[(size_t)bi * build->ncols + build_kcol];
+            int64_t key = col_rel_get(build, bi, build_kcol);
             /* Inline FNV-1a hash for single int64 value */
             uint32_t h = 2166136261u;
             uint64_t v = (uint64_t)key;
@@ -1927,7 +1927,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         /* Probe: iterate non-unary side, test membership in hash set. */
         int join_rc = 0;
         for (uint32_t pr = 0; pr < probe->nrows && join_rc == 0; pr++) {
-            const int64_t *prow = probe->data + (size_t)pr * probe->ncols;
+            const int64_t *prow = col_rel_row(probe, pr);
             int64_t pkey = prow[probe_kcol];
             /* Inline FNV-1a hash for single int64 value */
             uint32_t h = 2166136261u;
@@ -1941,7 +1941,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             for (uint32_t e = ht_head[h]; e != 0; e = ht_next[e - 1]) {
                 uint32_t bi = e - 1;
                 int64_t bkey
-                    = build->data[(size_t)bi * build->ncols + build_kcol];
+                    = col_rel_get(build, bi, build_kcol);
                 if (pkey != bkey)
                     continue;
                 /* Match: emit output in [left cols | right cols] order. */
@@ -2054,7 +2054,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     "DEBUG[JOIN]: Ephemeral hash table created - nbuckets=%u\n",
                     nbuckets_ep);
             for (uint32_t rr = 0; rr < right->nrows; rr++) {
-                const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+                const int64_t *rrow = col_rel_row(right, rr);
                 uint32_t h
                     = hash_int64_keys_fast(rrow, rk, kc) & (nbuckets_ep - 1);
                 ht_next_ep[rr] = ht_head_ep[h];
@@ -2086,7 +2086,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 
         int join_rc = 0;
         for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
-            const int64_t *lrow = left->data + (size_t)lr * left->ncols;
+            const int64_t *lrow = col_rel_row(left, lr);
 
             if (arr) {
                 /* Arrangement probe: fill key_row at right-side positions. */
@@ -2096,7 +2096,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         right->ncols, key_row);
                 while (rr != UINT32_MAX && join_rc == 0) {
                     const int64_t *rrow
-                        = right->data + (size_t)rr * right->ncols;
+                        = col_rel_row(right, rr);
                     /* Verify key match: find_next may return collision rows. */
                     if (keys_match_fast(lrow, lk, rrow, rk, kc)) {
                         memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
@@ -2135,7 +2135,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     e = ht_next_ep[e - 1]) {
                     uint32_t rr = e - 1;
                     const int64_t *rrow
-                        = right->data + (size_t)rr * right->ncols;
+                        = col_rel_row(right, rr);
                     if (!keys_match_fast(lrow, lk, rrow, rk, kc))
                         continue;
                     memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
@@ -2290,19 +2290,19 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
     for (uint32_t rr = 0; rr < right->nrows; rr++) {
-        const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+        const int64_t *rrow = col_rel_row(right, rr);
         uint32_t h = hash_int64_keys_fast(rrow, rk, kc) & (aj_nbuckets - 1);
         aj_next[rr] = aj_head[h];
         aj_head[h] = rr + 1;
     }
     int aj_rc = 0;
     for (uint32_t lr = 0; lr < left->nrows && aj_rc == 0; lr++) {
-        const int64_t *lrow = left->data + (size_t)lr * left->ncols;
+        const int64_t *lrow = col_rel_row(left, lr);
         uint32_t h = hash_int64_keys_fast(lrow, lk, kc) & (aj_nbuckets - 1);
         bool found = false;
         for (uint32_t e = aj_head[h]; e != 0 && !found; e = aj_next[e - 1]) {
             uint32_t rr = e - 1;
-            const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+            const int64_t *rrow = col_rel_row(right, rr);
             if (keys_match_fast(lrow, lk, rrow, rk, kc))
                 found = true;
         }
@@ -2687,11 +2687,11 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     if (seg_count == 1) {
         uint32_t out_r = 1;
         for (uint32_t r = 1; r < nr; r++) {
-            const int64_t *prev = rel->data + (size_t)(r - 1) * nc;
-            const int64_t *cur = rel->data + (size_t)r * nc;
+            const int64_t *prev = col_rel_row(rel, r - 1);
+            const int64_t *cur = col_rel_row(rel, r);
             if (row_cmp_dispatch(prev, cur, nc) != 0) {
                 if (out_r != r)
-                    memcpy(rel->data + (size_t)out_r * nc, cur, row_bytes);
+                    memcpy(col_rel_row_mut(rel, out_r), cur, row_bytes);
                 out_r++;
             }
         }
@@ -2963,7 +2963,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
 
         uint32_t oi = 0, di = 0, out = 0;
         while (oi < sn && di < d_unique) {
-            const int64_t *orow = work->data + (size_t)oi * nc;
+            const int64_t *orow = col_rel_row(work, oi);
             const int64_t *drow = delta_start + (size_t)di * nc;
             int cmp = row_cmp_dispatch(orow, drow, nc);
             if (cmp < 0) {
@@ -2980,7 +2980,7 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
             out++;
         }
         while (oi < sn) {
-            memcpy(merged + (size_t)out * nc, work->data + (size_t)oi * nc,
+            memcpy(merged + (size_t)out * nc, col_rel_row(work, oi),
                 row_bytes);
             oi++;
             out++;
@@ -3026,11 +3026,11 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     /* Compact: keep only unique rows */
     uint32_t out_r = 1; /* first row always kept */
     for (uint32_t r = 1; r < nr; r++) {
-        const int64_t *prev = work->data + (size_t)(r - 1) * nc;
-        const int64_t *cur = work->data + (size_t)r * nc;
+        const int64_t *prev = col_rel_row(work, r - 1);
+        const int64_t *cur = col_rel_row(work, r);
         if (row_cmp_dispatch(prev, cur, nc) != 0) {
             if (out_r != r)
-                memcpy(work->data + (size_t)out_r * nc, cur, row_bytes);
+                memcpy(col_rel_row_mut(work, out_r), cur, row_bytes);
             out_r++;
         }
     }
@@ -3093,7 +3093,7 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
 
     uint32_t oi = 0, di = 0, out = 0;
     while (oi < old_nrows && di < d_unique) {
-        const int64_t *orow = rel->data + (size_t)oi * nc;
+        const int64_t *orow = col_rel_row(rel, oi);
         const int64_t *drow = delta_start + (size_t)di * nc;
         int cmp = row_cmp_dispatch(orow, drow, nc);
         if (cmp < 0) {
@@ -3114,7 +3114,7 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     /* Copy remaining from old */
     if (oi < old_nrows) {
         uint32_t remaining = old_nrows - oi;
-        memcpy(merged + (size_t)out * nc, rel->data + (size_t)oi * nc,
+        memcpy(merged + (size_t)out * nc, col_rel_row(rel, oi),
             (size_t)remaining * row_bytes);
         out += remaining;
     }
@@ -3247,7 +3247,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         out = d_unique;
         fast_path = 1;
     } else {
-        int cmp = row_cmp_dispatch(rel->data + (size_t)(old_nrows - 1) * nc,
+        int cmp = row_cmp_dispatch(col_rel_row(rel, old_nrows - 1),
                 delta_start, nc);
         if (cmp < 0) {
             /* All delta rows > all old rows: copy old then append delta */
@@ -3290,7 +3290,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         /* Remaining old rows */
         if (oi < old_nrows) {
             uint32_t remaining = old_nrows - oi;
-            memcpy(merged + (size_t)out * nc, rel->data + (size_t)oi * nc,
+            memcpy(merged + (size_t)out * nc, col_rel_row(rel, oi),
                 (size_t)remaining * row_bytes);
             out += remaining;
         }
@@ -3408,13 +3408,13 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         col_rel_t *src = relations[0];
         const int64_t *last_row = NULL;
         for (uint32_t r = 0; r < src->nrows; r++) {
-            const int64_t *row = src->data + (size_t)r * nc;
+            const int64_t *row = col_rel_row(src, r);
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
                     col_rel_destroy(out);
                     return NULL;
                 }
-                last_row = out->data + (size_t)(out->nrows - 1) * nc;
+                last_row = col_rel_row(out, out->nrows - 1);
             }
         }
         return out;
@@ -3428,8 +3428,8 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         const int64_t *last_row = NULL;
 
         while (li < left->nrows && ri < right->nrows) {
-            const int64_t *lrow = left->data + (size_t)li * nc;
-            const int64_t *rrow = right->data + (size_t)ri * nc;
+            const int64_t *lrow = col_rel_row(left, li);
+            const int64_t *rrow = col_rel_row(right, ri);
             int cmp = kway_row_cmp(lrow, rrow, nc);
 
             const int64_t *row_to_add = NULL;
@@ -3452,32 +3452,32 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
                     col_rel_destroy(out);
                     return NULL;
                 }
-                last_row = out->data + (size_t)(out->nrows - 1) * nc;
+                last_row = col_rel_row(out, out->nrows - 1);
             }
         }
 
         /* Drain remaining rows from left */
         while (li < left->nrows) {
-            const int64_t *row = left->data + (size_t)li * nc;
+            const int64_t *row = col_rel_row(left, li);
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
                     col_rel_destroy(out);
                     return NULL;
                 }
-                last_row = out->data + (size_t)(out->nrows - 1) * nc;
+                last_row = col_rel_row(out, out->nrows - 1);
             }
             li++;
         }
 
         /* Drain remaining rows from right */
         while (ri < right->nrows) {
-            const int64_t *row = right->data + (size_t)ri * nc;
+            const int64_t *row = col_rel_row(right, ri);
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
                     col_rel_destroy(out);
                     return NULL;
                 }
-                last_row = out->data + (size_t)(out->nrows - 1) * nc;
+                last_row = col_rel_row(out, out->nrows - 1);
             }
             ri++;
         }
@@ -3505,14 +3505,14 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
     {
         const int64_t *last_row = NULL;
         for (uint32_t r = 0; r < temp->nrows; r++) {
-            const int64_t *row = temp->data + (size_t)r * nc;
+            const int64_t *row = col_rel_row(temp, r);
             if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
                 if (col_rel_append_row(out, row) != 0) {
                     col_rel_destroy(out);
                     col_rel_destroy(temp);
                     return NULL;
                 }
-                last_row = out->data + (size_t)(out->nrows - 1) * nc;
+                last_row = col_rel_row(out, out->nrows - 1);
             }
         }
         col_rel_destroy(temp);
@@ -4058,7 +4058,7 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
     for (uint32_t rr = 0; rr < right->nrows; rr++) {
-        const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+        const int64_t *rrow = col_rel_row(right, rr);
         uint32_t h = hash_int64_keys_fast(rrow, rk, kc) & (nbuckets - 1);
         ht_next[rr] = ht_head[h];
         ht_head[h] = rr + 1; /* 1-based; 0 = end of chain */
@@ -4067,12 +4067,12 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Probe: for each left row test membership, emit if found: O(|L|) */
     int sj_rc = 0;
     for (uint32_t lr = 0; lr < left->nrows && sj_rc == 0; lr++) {
-        const int64_t *lrow = left->data + (size_t)lr * left->ncols;
+        const int64_t *lrow = col_rel_row(left, lr);
         uint32_t h = hash_int64_keys_fast(lrow, lk, kc) & (nbuckets - 1);
         bool found = false;
         for (uint32_t e = ht_head[h]; e != 0 && !found; e = ht_next[e - 1]) {
             uint32_t rr = e - 1;
-            const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+            const int64_t *rrow = col_rel_row(right, rr);
             if (keys_match_fast(lrow, lk, rrow, rk, kc))
                 found = true;
         }
@@ -4143,12 +4143,12 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Sort by group key for group-by */
     /* (Simple O(n^2) implementation; sufficient for Phase 2A) */
     for (uint32_t r = 0; r < in->nrows; r++) {
-        const int64_t *row = in->data + (size_t)r * in->ncols;
+        const int64_t *row = col_rel_row(in, r);
 
         /* Check if this group key already exists in output */
         bool found = false;
         for (uint32_t o = 0; o < out->nrows; o++) {
-            int64_t *orow = out->data + (size_t)o * ocols;
+            int64_t *orow = col_rel_row_mut(out, o);
             bool match = true;
             for (uint32_t k = 0; k < gc && match; k++) {
                 uint32_t gi
@@ -4254,7 +4254,7 @@ col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst)
     }
 
     /* Write the single aggregate row. */
-    dst->data[0] = total;
+    col_rel_set(dst, 0, 0, total);
     dst->nrows = 1;
 
     /* Set output row multiplicity. */
@@ -4596,7 +4596,7 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
         uint32_t indexed = darr->indexed_rows;
         uint32_t nbk = darr->nbuckets;
         for (uint32_t rr = indexed; rr < right->nrows; rr++) {
-            const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+            const int64_t *rrow = col_rel_row(right, rr);
             uint32_t h = hash_int64_keys_fast(rrow, rk, kc) & (nbk - 1);
             darr->ht_next[rr] = darr->ht_head[h];
             darr->ht_head[h] = rr + 1; /* 1-based; 0 = end of chain */
@@ -4606,13 +4606,13 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
 
         /* Probe left against the persistent diff arrangement hash table */
         for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
-            const int64_t *lrow = left->data + (size_t)lr * left->ncols;
+            const int64_t *lrow = col_rel_row(left, lr);
             uint32_t h = hash_int64_keys_fast(lrow, lk, kc) & (nbk - 1);
             for (uint32_t e = darr->ht_head[h]; e != 0;
                 e = darr->ht_next[e - 1]) {
                 uint32_t rr = e - 1;
                 const int64_t *rrow
-                    = right->data + (size_t)rr * right->ncols;
+                    = col_rel_row(right, rr);
                 if (!keys_match_fast(lrow, lk, rrow, rk, kc))
                     continue;
                 memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
@@ -4663,21 +4663,21 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
             return ENOMEM;
         }
         for (uint32_t rr = 0; rr < right->nrows; rr++) {
-            const int64_t *rrow = right->data + (size_t)rr * right->ncols;
+            const int64_t *rrow = col_rel_row(right, rr);
             uint32_t h
                 = hash_int64_keys_fast(rrow, rk, kc) & (nbuckets_ep - 1);
             ht_next_ep[rr] = ht_head_ep[h];
             ht_head_ep[h] = rr + 1;
         }
         for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
-            const int64_t *lrow = left->data + (size_t)lr * left->ncols;
+            const int64_t *lrow = col_rel_row(left, lr);
             uint32_t h
                 = hash_int64_keys_fast(lrow, lk, kc) & (nbuckets_ep - 1);
             for (uint32_t e = ht_head_ep[h]; e != 0;
                 e = ht_next_ep[e - 1]) {
                 uint32_t rr = e - 1;
                 const int64_t *rrow
-                    = right->data + (size_t)rr * right->ncols;
+                    = col_rel_row(right, rr);
                 if (!keys_match_fast(lrow, lk, rrow, rk, kc))
                     continue;
                 memcpy(tmp, lrow, sizeof(int64_t) * left->ncols);
@@ -4858,7 +4858,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
 
         uint32_t oi = 0, di = 0, out_idx = 0;
         while (oi < sn && di < d_unique) {
-            const int64_t *orow = work->data + (size_t)oi * nc;
+            const int64_t *orow = col_rel_row(work, oi);
             const int64_t *drow = delta_start + (size_t)di * nc;
             int cmp = row_cmp_dispatch(orow, drow, nc);
             if (cmp < 0) {
@@ -4876,7 +4876,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         }
         while (oi < sn) {
             memcpy(merged + (size_t)out_idx * nc,
-                work->data + (size_t)oi * nc, row_bytes);
+                col_rel_row(work, oi), row_bytes);
             oi++;
             out_idx++;
         }
@@ -4920,11 +4920,11 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
 
     uint32_t out_r = 1;
     for (uint32_t r = 1; r < nr; r++) {
-        const int64_t *prev = work->data + (size_t)(r - 1) * nc;
-        const int64_t *cur = work->data + (size_t)r * nc;
+        const int64_t *prev = col_rel_row(work, r - 1);
+        const int64_t *cur = col_rel_row(work, r);
         if (row_cmp_dispatch(prev, cur, nc) != 0) {
             if (out_r != r)
-                memcpy(work->data + (size_t)out_r * nc, cur, row_bytes);
+                memcpy(col_rel_row_mut(work, out_r), cur, row_bytes);
             out_r++;
         }
     }
