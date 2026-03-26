@@ -2217,6 +2217,21 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
 }
 
 /*
+ * tdd_check_convergence:
+ * Returns true if global fixed-point reached: no worker produced new tuples.
+ * Called after each sub-pass barrier, before the exchange step.
+ */
+static bool
+tdd_check_convergence(const col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
+{
+    for (uint32_t w = 0; w < W; w++) {
+        if (ctxs[w].any_new)
+            return false;
+    }
+    return true;
+}
+
+/*
  * col_eval_stratum_tdd_recursive:
  * Coordinator-driven semi-naive fixed-point for recursive strata.
  *
@@ -2442,15 +2457,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * any_new flags is both necessary and sufficient for fixed-point
              * detection.
              */
-            bool any_new = false;
-            for (uint32_t w = 0; w < W; w++) {
-                if (ctxs[w].any_new) {
-                    any_new = true;
-                    break;
-                }
-            }
-
-            if (!any_new) {
+            if (tdd_check_convergence(ctxs, W)) {
                 for (uint32_t w = 0; w < W; w++) {
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
