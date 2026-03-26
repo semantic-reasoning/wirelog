@@ -108,7 +108,7 @@ col_rel_partition_by_key(const col_rel_t *src,
 
     /* Pass 1: count rows per partition */
     for (uint32_t i = 0; i < nrows; i++) {
-        const int64_t *row = src->data + (size_t)i * ncols;
+        const int64_t *row = col_rel_row(src, i);
         uint32_t p = row_partition(row, key_cols, key_count, num_workers,
                 key_buf);
         counts[p]++;
@@ -159,10 +159,10 @@ col_rel_partition_by_key(const col_rel_t *src,
 
     /* Pass 2: scatter rows into partitions */
     for (uint32_t i = 0; i < nrows; i++) {
-        const int64_t *row = src->data + (size_t)i * ncols;
+        const int64_t *row = col_rel_row(src, i);
         uint32_t p = row_partition(row, key_cols, key_count, num_workers,
                 key_buf);
-        memcpy(out_parts[p]->data + (size_t)offsets[p] * ncols,
+        memcpy(col_rel_row_mut(out_parts[p], offsets[p]),
             row, row_bytes);
         offsets[p]++;
     }
