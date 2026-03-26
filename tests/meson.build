@@ -1967,6 +1967,23 @@ test_tdd_exchange_exe = executable(
 
 test('tdd_exchange', test_tdd_exchange_exe)
 
+test_tdd_convergence_exe = executable(
+  'test_tdd_convergence',
+  files('test_tdd_convergence.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('tdd_convergence', test_tdd_convergence_exe)
+
 # ============================================================================
 # Per-Worker Frontier Progress Protocol (Issue #317)
 # ============================================================================
