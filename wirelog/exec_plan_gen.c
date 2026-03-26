@@ -1963,3 +1963,66 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
     *out = plan;
     return 0;
 }
+
+/* ======================================================================== */
+/* Plan Segment Split (Issue #316)                                          */
+/* ======================================================================== */
+
+/*
+ * col_plan_split_at_exchange:
+ * Split a relation plan at WL_PLAN_OP_EXCHANGE boundaries.
+ *
+ * N exchanges produce N+1 segments.  Each EXCHANGE op is consumed as a
+ * boundary marker and does NOT appear in any segment.  The returned
+ * segments are non-owning views: their ops and name pointers reference
+ * the caller's original data and must not be freed via free_op().
+ *
+ * Returns {0, NULL} on allocation failure.
+ */
+wl_plan_segment_array_t
+col_plan_split_at_exchange(const wl_plan_relation_t *rplan)
+{
+    wl_plan_segment_array_t result = { 0, NULL };
+
+    if (!rplan)
+        return result;
+
+    /* Count exchange boundaries to determine segment count. */
+    uint32_t nseg = 1;
+
+    for (uint32_t i = 0; i < rplan->op_count; i++) {
+        if (rplan->ops[i].op == WL_PLAN_OP_EXCHANGE)
+            nseg++;
+    }
+
+    result.segments = (wl_plan_relation_t *)calloc(
+        nseg, sizeof(wl_plan_relation_t));
+    if (!result.segments)
+        return result;
+
+    uint32_t seg = 0;
+    uint32_t seg_start = 0;
+
+    for (uint32_t i = 0; i <= rplan->op_count; i++) {
+        bool at_boundary = (i == rplan->op_count)
+            || (rplan->ops[i].op == WL_PLAN_OP_EXCHANGE);
+
+        if (at_boundary) {
+            result.segments[seg].name = rplan->name;
+            result.segments[seg].ops = rplan->ops + seg_start;
+            result.segments[seg].op_count = i - seg_start;
+            seg++;
+            seg_start = i + 1; /* skip the EXCHANGE op */
+        }
+    }
+
+    result.num_segments = nseg;
+    return result;
+}
+
+void
+wl_plan_segment_array_free(wl_plan_segment_array_t *sa)
+{
+    if (sa)
+        free(sa->segments);
+}

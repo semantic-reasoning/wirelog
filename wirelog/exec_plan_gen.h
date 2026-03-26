@@ -59,4 +59,41 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out);
 void
 wl_plan_free(wl_plan_t *plan);
 
+/* ======================================================================== */
+/* Plan Segment Split (Issue #316)                                          */
+/* ======================================================================== */
+
+/**
+ * wl_plan_segment_array_t:
+ *
+ * Array of plan segments produced by col_plan_split_at_exchange().
+ * Each segment is a non-owning view into the original relation plan's
+ * op array (ops and name are NOT copies; do not free them).
+ *
+ * @num_segments: Number of segments (0 on allocation failure).
+ * @segments:     Owned array of wl_plan_relation_t views (free with
+ *                wl_plan_segment_array_free()).
+ */
+typedef struct {
+    uint32_t num_segments;
+    wl_plan_relation_t *segments; /* owned array; ops/name point into original */
+} wl_plan_segment_array_t;
+
+/**
+ * col_plan_split_at_exchange:
+ * Split @rplan at each WL_PLAN_OP_EXCHANGE boundary.
+ * N exchanges → N+1 segments; each EXCHANGE op is consumed (not included
+ * in any segment).  Returns {0, NULL} on allocation failure.
+ */
+wl_plan_segment_array_t
+col_plan_split_at_exchange(const wl_plan_relation_t *rplan);
+
+/**
+ * wl_plan_segment_array_free:
+ * Free the segment array allocated by col_plan_split_at_exchange().
+ * NULL-safe.
+ */
+void
+wl_plan_segment_array_free(wl_plan_segment_array_t *sa);
+
 #endif /* WL_EXEC_PLAN_GEN_H */
