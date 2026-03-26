@@ -2647,6 +2647,24 @@ kway_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
     return row_cmp_dispatch(a, b, ncols);
 }
 
+/* Compare a relation row against a raw row buffer (for merge operations
+ * where one operand is in a temp buffer). Phase B, Issue #330. */
+static inline int
+col_rel_row_cmp_raw(const col_rel_t *r, uint32_t row_idx,
+    const int64_t *raw_row)
+{
+    uint32_t ncols = r->ncols;
+    for (uint32_t c = 0; c < ncols; c++) {
+        int64_t va = col_rel_get(r, row_idx, c);
+        int64_t vb = raw_row[c];
+        if (va < vb)
+            return -1;
+        if (va > vb)
+            return 1;
+    }
+    return 0;
+}
+
 /*
  * col_op_consolidate_kway_merge - K-way merge with per-segment sort and dedup.
  *
@@ -2668,7 +2686,6 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 {
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
 
     if (nr <= 1)
         return 0;
@@ -2678,8 +2695,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         uint32_t start = seg_boundaries[s];
         uint32_t end = seg_boundaries[s + 1];
         if (end > start + 1) {
-            col_radix_sort_rows(rel->data + (size_t)start * nc,
-                end - start, nc);
+            col_rel_radix_sort(rel, start, end - start);
         }
     }
 
@@ -2687,11 +2703,8 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     if (seg_count == 1) {
         uint32_t out_r = 1;
         for (uint32_t r = 1; r < nr; r++) {
-            const int64_t *prev = col_rel_row(rel, r - 1);
-            const int64_t *cur = col_rel_row(rel, r);
-            if (row_cmp_dispatch(prev, cur, nc) != 0) {
-                if (out_r != r)
-                    memcpy(col_rel_row_mut(rel, out_r), cur, row_bytes);
+            if (col_rel_row_cmp(rel, r - 1, r) != 0) {
+                col_rel_row_move(rel, out_r, r);
                 out_r++;
             }
         }
@@ -2713,33 +2726,33 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         int64_t *last_row = NULL;
 
         while (i < i_end && j < j_end) {
-            int64_t *row_i = rel->data + (size_t)i * nc;
-            int64_t *row_j = rel->data + (size_t)j * nc;
-            int cmp = kway_row_cmp(row_i, row_j, nc);
-            int64_t *row_to_add;
+            int cmp = col_rel_row_cmp(rel, i, j);
+            uint32_t row_to_add_idx;
 
             if (cmp <= 0) {
-                row_to_add = row_i;
+                row_to_add_idx = i;
                 i++;
                 if (cmp == 0)
                     j++; /* skip duplicate */
             } else {
-                row_to_add = row_j;
+                row_to_add_idx = j;
                 j++;
             }
 
             if (last_row == NULL
-                || row_cmp_dispatch(last_row, row_to_add, nc) != 0) {
-                memcpy(merged + (size_t)out * nc, row_to_add, row_bytes);
+                || col_rel_row_cmp_raw(rel, row_to_add_idx, last_row)
+                != 0) {
+                col_rel_row_copy_out(rel, row_to_add_idx,
+                    merged + (size_t)out * nc);
                 last_row = merged + (size_t)out * nc;
                 out++;
             }
         }
 
         while (i < i_end) {
-            int64_t *row = rel->data + (size_t)i * nc;
-            if (last_row == NULL || row_cmp_dispatch(last_row, row, nc) != 0) {
-                memcpy(merged + (size_t)out * nc, row, row_bytes);
+            if (last_row == NULL
+                || col_rel_row_cmp_raw(rel, i, last_row) != 0) {
+                col_rel_row_copy_out(rel, i, merged + (size_t)out * nc);
                 last_row = merged + (size_t)out * nc;
                 out++;
             }
@@ -2747,9 +2760,9 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         }
 
         while (j < j_end) {
-            int64_t *row = rel->data + (size_t)j * nc;
-            if (last_row == NULL || row_cmp_dispatch(last_row, row, nc) != 0) {
-                memcpy(merged + (size_t)out * nc, row, row_bytes);
+            if (last_row == NULL
+                || col_rel_row_cmp_raw(rel, j, last_row) != 0) {
+                col_rel_row_copy_out(rel, j, merged + (size_t)out * nc);
                 last_row = merged + (size_t)out * nc;
                 out++;
             }
@@ -2791,17 +2804,20 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         }
     }
 
-    /* Sift-down helper (inline macro for performance) */
-#define HEAP_ROW(idx) (rel->data + (size_t)heap[(idx)].cursor * nc)
-#define HEAP_SIFT_DOWN(start, size)                                      \
+    /* Sift-down helper using col_rel_row_cmp (Phase B, Issue #330) */
+#define HEAP_SIFT_DOWN(start, size)                                          \
         do {                                                                 \
             uint32_t _p = (start);                                           \
             while (2 * _p + 1 < (size)) {                                    \
                 uint32_t _c = 2 * _p + 1;                                    \
                 if (_c + 1 < (size)                                          \
-                    && kway_row_cmp(HEAP_ROW(_c + 1), HEAP_ROW(_c), nc) < 0) \
+                    && col_rel_row_cmp(rel, heap[_c + 1].cursor,             \
+                    heap[_c].cursor)                                  \
+                    < 0)                                              \
                 _c++;                                                    \
-                if (kway_row_cmp(HEAP_ROW(_p), HEAP_ROW(_c), nc) <= 0)       \
+                if (col_rel_row_cmp(rel, heap[_p].cursor,                    \
+                    heap[_c].cursor)                                     \
+                    <= 0)                                                    \
                 break;                                                   \
                 heap_entry_t _tmp = heap[_p];                                \
                 heap[_p] = heap[_c];                                         \
@@ -2821,11 +2837,11 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     int64_t *last_row = NULL;
 
     while (heap_size > 0) {
-        int64_t *min_row = HEAP_ROW(0);
-
         /* Dedup: skip if same as last emitted row */
-        if (last_row == NULL || row_cmp_dispatch(last_row, min_row, nc) != 0) {
-            memcpy(merged + (size_t)out * nc, min_row, row_bytes);
+        if (last_row == NULL
+            || col_rel_row_cmp_raw(rel, heap[0].cursor, last_row) != 0) {
+            col_rel_row_copy_out(rel, heap[0].cursor,
+                merged + (size_t)out * nc);
             last_row = merged + (size_t)out * nc;
             out++;
         }
@@ -2841,7 +2857,6 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
             HEAP_SIFT_DOWN(0, heap_size);
     }
 
-#undef HEAP_ROW
 #undef HEAP_SIFT_DOWN
 
     memcpy(rel->data, merged, (size_t)out * nc * sizeof(int64_t));
@@ -2906,28 +2921,21 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     if (e.seg_boundaries)
         free(e.seg_boundaries);
 
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
-
     /* Issue #94: Incremental merge when a sorted prefix exists.
      * data[0..sorted_nrows) is already sorted+unique from a prior
      * consolidation.  Sort only the unsorted suffix and merge. */
     uint32_t sn = work->sorted_nrows;
     if (sn > 0 && sn < nr) {
         uint32_t delta_count = nr - sn;
-        int64_t *delta_start = work->data + (size_t)sn * nc;
 
         /* Phase 1: sort only the unsorted suffix using radix sort */
-        col_radix_sort_rows(delta_start, delta_count, nc);
+        col_rel_radix_sort(work, sn, delta_count);
 
         /* Phase 1b: dedup within suffix */
         uint32_t d_unique = 1;
         for (uint32_t i = 1; i < delta_count; i++) {
-            if (row_cmp_dispatch(delta_start + (size_t)(i - 1) * nc,
-                delta_start + (size_t)i * nc, nc)
-                != 0) {
-                if (d_unique != i)
-                    memcpy(delta_start + (size_t)d_unique * nc,
-                        delta_start + (size_t)i * nc, row_bytes);
+            if (col_rel_row_cmp(work, sn + i - 1, sn + i) != 0) {
+                col_rel_row_move(work, sn + d_unique, sn + i);
                 d_unique++;
             }
         }
@@ -2963,31 +2971,29 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
 
         uint32_t oi = 0, di = 0, out = 0;
         while (oi < sn && di < d_unique) {
-            const int64_t *orow = col_rel_row(work, oi);
-            const int64_t *drow = delta_start + (size_t)di * nc;
-            int cmp = row_cmp_dispatch(orow, drow, nc);
+            int cmp = col_rel_row_cmp(work, oi, sn + di);
             if (cmp < 0) {
-                memcpy(merged + (size_t)out * nc, orow, row_bytes);
+                col_rel_row_copy_out(work, oi, merged + (size_t)out * nc);
                 oi++;
             } else if (cmp == 0) {
-                memcpy(merged + (size_t)out * nc, orow, row_bytes);
+                col_rel_row_copy_out(work, oi, merged + (size_t)out * nc);
                 oi++;
                 di++;
             } else {
-                memcpy(merged + (size_t)out * nc, drow, row_bytes);
+                col_rel_row_copy_out(work, sn + di,
+                    merged + (size_t)out * nc);
                 di++;
             }
             out++;
         }
         while (oi < sn) {
-            memcpy(merged + (size_t)out * nc, col_rel_row(work, oi),
-                row_bytes);
+            col_rel_row_copy_out(work, oi, merged + (size_t)out * nc);
             oi++;
             out++;
         }
         while (di < d_unique) {
-            memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
-                row_bytes);
+            col_rel_row_copy_out(work, sn + di,
+                merged + (size_t)out * nc);
             di++;
             out++;
         }
@@ -3026,11 +3032,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     /* Compact: keep only unique rows */
     uint32_t out_r = 1; /* first row always kept */
     for (uint32_t r = 1; r < nr; r++) {
-        const int64_t *prev = col_rel_row(work, r - 1);
-        const int64_t *cur = col_rel_row(work, r);
-        if (row_cmp_dispatch(prev, cur, nc) != 0) {
-            if (out_r != r)
-                memcpy(col_rel_row_mut(work, out_r), cur, row_bytes);
+        if (col_rel_row_cmp(work, r - 1, r) != 0) {
+            col_rel_row_move(work, out_r, r);
             out_r++;
         }
     }
@@ -3065,21 +3068,15 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
         return 0; /* nothing new or trivially sorted */
 
     uint32_t delta_count = nr - old_nrows;
-    int64_t *delta_start = rel->data + (size_t)old_nrows * nc;
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
 
     /* Phase 1: sort only the new delta rows using radix sort */
-    col_radix_sort_rows(delta_start, delta_count, nc);
+    col_rel_radix_sort(rel, old_nrows, delta_count);
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
     for (uint32_t i = 1; i < delta_count; i++) {
-        if (row_cmp_dispatch(delta_start + (size_t)(i - 1) * nc,
-            delta_start + (size_t)i * nc, nc)
-            != 0) {
-            if (d_unique != i)
-                memcpy(delta_start + (size_t)d_unique * nc,
-                    delta_start + (size_t)i * nc, row_bytes);
+        if (col_rel_row_cmp(rel, old_nrows + i - 1, old_nrows + i) != 0) {
+            col_rel_row_move(rel, old_nrows + d_unique, old_nrows + i);
             d_unique++;
         }
     }
@@ -3093,37 +3090,35 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
 
     uint32_t oi = 0, di = 0, out = 0;
     while (oi < old_nrows && di < d_unique) {
-        const int64_t *orow = col_rel_row(rel, oi);
-        const int64_t *drow = delta_start + (size_t)di * nc;
-        int cmp = row_cmp_dispatch(orow, drow, nc);
+        int cmp = col_rel_row_cmp(rel, oi, old_nrows + di);
         if (cmp < 0) {
-            memcpy(merged + (size_t)out * nc, orow, row_bytes);
+            col_rel_row_copy_out(rel, oi, merged + (size_t)out * nc);
             oi++;
             out++;
         } else if (cmp == 0) {
-            memcpy(merged + (size_t)out * nc, orow, row_bytes);
+            col_rel_row_copy_out(rel, oi, merged + (size_t)out * nc);
             oi++;
             di++;
             out++; /* skip duplicate from delta */
         } else {
-            memcpy(merged + (size_t)out * nc, drow, row_bytes);
+            col_rel_row_copy_out(rel, old_nrows + di,
+                merged + (size_t)out * nc);
             di++;
             out++;
         }
     }
     /* Copy remaining from old */
-    if (oi < old_nrows) {
-        uint32_t remaining = old_nrows - oi;
-        memcpy(merged + (size_t)out * nc, col_rel_row(rel, oi),
-            (size_t)remaining * row_bytes);
-        out += remaining;
+    while (oi < old_nrows) {
+        col_rel_row_copy_out(rel, oi, merged + (size_t)out * nc);
+        oi++;
+        out++;
     }
     /* Copy remaining from delta */
-    if (di < d_unique) {
-        uint32_t remaining = d_unique - di;
-        memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
-            (size_t)remaining * row_bytes);
-        out += remaining;
+    while (di < d_unique) {
+        col_rel_row_copy_out(rel, old_nrows + di,
+            merged + (size_t)out * nc);
+        di++;
+        out++;
     }
 
     /* Swap buffer */
@@ -3185,21 +3180,15 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     }
 
     uint32_t delta_count = nr - old_nrows;
-    int64_t *delta_start = rel->data + (size_t)old_nrows * nc;
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
 
     /* Phase 1: sort only the new delta rows using radix sort */
-    col_radix_sort_rows(delta_start, delta_count, nc);
+    col_rel_radix_sort(rel, old_nrows, delta_count);
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
     for (uint32_t i = 1; i < delta_count; i++) {
-        if (row_cmp_dispatch(delta_start + (size_t)(i - 1) * nc,
-            delta_start + (size_t)i * nc, nc)
-            != 0) {
-            if (d_unique != i)
-                memcpy(delta_start + (size_t)d_unique * nc,
-                    delta_start + (size_t)i * nc, row_bytes);
+        if (col_rel_row_cmp(rel, old_nrows + i - 1, old_nrows + i) != 0) {
+            col_rel_row_move(rel, old_nrows + d_unique, old_nrows + i);
             d_unique++;
         }
     }
@@ -3227,9 +3216,6 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     int64_t *merged = rel->merge_buf;
 
     uint32_t oi = 0, di = 0, out = 0;
-    const int64_t *o_ptr = rel->data;
-    const int64_t *d_ptr = delta_start;
-    int64_t *merged_ptr = merged;
 
     /* Fast-path (Issue #239): if all delta rows sort after all old rows, skip
      * the O(N) merge walk and directly copy old then append delta.
@@ -3239,24 +3225,26 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     int fast_path = 0;
     if (old_nrows == 0) {
         /* No old rows: delta rows are all new */
-        memcpy(merged, delta_start, (size_t)d_unique * row_bytes);
-        if (delta_out) {
-            for (uint32_t k = 0; k < d_unique; k++)
-                col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
+        for (uint32_t k = 0; k < d_unique; k++) {
+            col_rel_row_copy_out(rel, old_nrows + k,
+                merged + (size_t)k * nc);
+            if (delta_out)
+                col_rel_append_row(delta_out, merged + (size_t)k * nc);
         }
         out = d_unique;
         fast_path = 1;
     } else {
-        int cmp = row_cmp_dispatch(col_rel_row(rel, old_nrows - 1),
-                delta_start, nc);
+        int cmp = col_rel_row_cmp(rel, old_nrows - 1, old_nrows);
         if (cmp < 0) {
             /* All delta rows > all old rows: copy old then append delta */
-            memcpy(merged, rel->data, (size_t)old_nrows * row_bytes);
-            memcpy(merged + (size_t)old_nrows * nc, delta_start,
-                (size_t)d_unique * row_bytes);
-            if (delta_out) {
-                for (uint32_t k = 0; k < d_unique; k++)
-                    col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
+            for (uint32_t k = 0; k < old_nrows; k++)
+                col_rel_row_copy_out(rel, k, merged + (size_t)k * nc);
+            for (uint32_t k = 0; k < d_unique; k++) {
+                col_rel_row_copy_out(rel, old_nrows + k,
+                    merged + (size_t)(old_nrows + k) * nc);
+                if (delta_out)
+                    col_rel_append_row(delta_out,
+                        merged + (size_t)(old_nrows + k) * nc);
             }
             out = old_nrows + d_unique;
             fast_path = 1;
@@ -3265,45 +3253,43 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
 
     if (!fast_path) {
         while (oi < old_nrows && di < d_unique) {
-            int cmp = row_cmp_dispatch(o_ptr, d_ptr, nc);
-            const int64_t *row_to_copy = (cmp < 0) ? o_ptr : d_ptr;
-            memcpy(merged_ptr, row_to_copy, row_bytes);
+            int cmp = col_rel_row_cmp(rel, oi, old_nrows + di);
 
             if (cmp == 0) {
-                /* duplicate: skip delta row */
-                d_ptr += nc;
+                /* duplicate: emit old row, skip delta row */
+                col_rel_row_copy_out(rel, oi,
+                    merged + (size_t)out * nc);
+                oi++;
                 di++;
-            }
-            if (cmp <= 0) {
-                o_ptr += nc;
+            } else if (cmp < 0) {
+                col_rel_row_copy_out(rel, oi,
+                    merged + (size_t)out * nc);
                 oi++;
             } else {
                 /* delta row not in old: new fact */
+                col_rel_row_copy_out(rel, old_nrows + di,
+                    merged + (size_t)out * nc);
                 if (delta_out)
-                    col_rel_append_row(delta_out, d_ptr);
-                d_ptr += nc;
+                    col_rel_append_row(delta_out,
+                        merged + (size_t)out * nc);
                 di++;
             }
-            merged_ptr += nc;
             out++;
         }
         /* Remaining old rows */
-        if (oi < old_nrows) {
-            uint32_t remaining = old_nrows - oi;
-            memcpy(merged + (size_t)out * nc, col_rel_row(rel, oi),
-                (size_t)remaining * row_bytes);
-            out += remaining;
+        while (oi < old_nrows) {
+            col_rel_row_copy_out(rel, oi, merged + (size_t)out * nc);
+            oi++;
+            out++;
         }
         /* Remaining delta rows: all new */
-        if (di < d_unique) {
-            if (delta_out) {
-                for (uint32_t k = di; k < d_unique; k++)
-                    col_rel_append_row(delta_out, delta_start + (size_t)k * nc);
-            }
-            uint32_t remaining = d_unique - di;
-            memcpy(merged + (size_t)out * nc, delta_start + (size_t)di * nc,
-                (size_t)remaining * row_bytes);
-            out += remaining;
+        while (di < d_unique) {
+            col_rel_row_copy_out(rel, old_nrows + di,
+                merged + (size_t)out * nc);
+            if (delta_out)
+                col_rel_append_row(delta_out, merged + (size_t)out * nc);
+            di++;
+            out++;
         }
     }
 
@@ -3403,19 +3389,38 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
     if (!out)
         return NULL;
 
+    /* Helper: copy row from relation into temp buf, append to out, dedup
+     * against last_row in out. Returns 0 on success, -1 on failure. */
+#define MERGE_K_APPEND(rel_ptr, row_idx)                                     \
+        do {                                                                     \
+            int64_t _rbuf[COL_STACK_MAX];                                        \
+            int64_t *_rb = nc <= COL_STACK_MAX ? _rbuf                           \
+            : (int64_t *)malloc((size_t)nc * sizeof(int64_t));               \
+            if (!_rb) {                                                          \
+                col_rel_destroy(out);                                            \
+                return NULL;                                                     \
+            }                                                                    \
+            col_rel_row_copy_out((rel_ptr), (row_idx), _rb);                     \
+            if (last_row == NULL                                                 \
+                || row_cmp_dispatch(last_row, _rb, nc) != 0) {                   \
+                if (col_rel_append_row(out, _rb) != 0) {                         \
+                    if (_rb != _rbuf) free(_rb);                                 \
+                    col_rel_destroy(out);                                        \
+                    return NULL;                                                 \
+                }                                                                \
+                col_rel_row_copy_out(out, out->nrows - 1, last_row_buf);         \
+                last_row = last_row_buf;                                         \
+            }                                                                    \
+            if (_rb != _rbuf) free(_rb);                                         \
+        } while (0)
+
     /* K=1: Copy with dedup using append (handles dynamic growth) */
     if (k == 1) {
         col_rel_t *src = relations[0];
+        int64_t last_row_buf[COL_STACK_MAX];
         const int64_t *last_row = NULL;
         for (uint32_t r = 0; r < src->nrows; r++) {
-            const int64_t *row = col_rel_row(src, r);
-            if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
-                if (col_rel_append_row(out, row) != 0) {
-                    col_rel_destroy(out);
-                    return NULL;
-                }
-                last_row = col_rel_row(out, out->nrows - 1);
-            }
+            MERGE_K_APPEND(src, r);
         }
         return out;
     }
@@ -3425,60 +3430,35 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         col_rel_t *left = relations[0];
         col_rel_t *right = relations[1];
         uint32_t li = 0, ri = 0;
+        int64_t last_row_buf[COL_STACK_MAX];
         const int64_t *last_row = NULL;
 
         while (li < left->nrows && ri < right->nrows) {
-            const int64_t *lrow = col_rel_row(left, li);
-            const int64_t *rrow = col_rel_row(right, ri);
-            int cmp = kway_row_cmp(lrow, rrow, nc);
+            int cmp = col_rel_row_cmp2(left, li, right, ri);
 
-            const int64_t *row_to_add = NULL;
             if (cmp < 0) {
-                row_to_add = lrow;
+                MERGE_K_APPEND(left, li);
                 li++;
             } else if (cmp > 0) {
-                row_to_add = rrow;
+                MERGE_K_APPEND(right, ri);
                 ri++;
             } else {
                 /* Equal rows: add once, skip both */
-                row_to_add = lrow;
+                MERGE_K_APPEND(left, li);
                 li++;
                 ri++;
-            }
-
-            if (last_row == NULL
-                || kway_row_cmp(last_row, row_to_add, nc) != 0) {
-                if (col_rel_append_row(out, row_to_add) != 0) {
-                    col_rel_destroy(out);
-                    return NULL;
-                }
-                last_row = col_rel_row(out, out->nrows - 1);
             }
         }
 
         /* Drain remaining rows from left */
         while (li < left->nrows) {
-            const int64_t *row = col_rel_row(left, li);
-            if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
-                if (col_rel_append_row(out, row) != 0) {
-                    col_rel_destroy(out);
-                    return NULL;
-                }
-                last_row = col_rel_row(out, out->nrows - 1);
-            }
+            MERGE_K_APPEND(left, li);
             li++;
         }
 
         /* Drain remaining rows from right */
         while (ri < right->nrows) {
-            const int64_t *row = col_rel_row(right, ri);
-            if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
-                if (col_rel_append_row(out, row) != 0) {
-                    col_rel_destroy(out);
-                    return NULL;
-                }
-                last_row = col_rel_row(out, out->nrows - 1);
-            }
+            MERGE_K_APPEND(right, ri);
             ri++;
         }
 
@@ -3503,21 +3483,15 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
 
     /* Move final result into output using append */
     {
+        int64_t last_row_buf[COL_STACK_MAX];
         const int64_t *last_row = NULL;
         for (uint32_t r = 0; r < temp->nrows; r++) {
-            const int64_t *row = col_rel_row(temp, r);
-            if (last_row == NULL || kway_row_cmp(last_row, row, nc) != 0) {
-                if (col_rel_append_row(out, row) != 0) {
-                    col_rel_destroy(out);
-                    col_rel_destroy(temp);
-                    return NULL;
-                }
-                last_row = col_rel_row(out, out->nrows - 1);
-            }
+            MERGE_K_APPEND(temp, r);
         }
         col_rel_destroy(temp);
     }
 
+#undef MERGE_K_APPEND
     return out;
 }
 
@@ -4802,28 +4776,21 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     if (e.seg_boundaries)
         free(e.seg_boundaries);
 
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
-
     /* Trace-based incremental compaction:
      * When a sorted prefix exists, use incremental merge (O(D log D + N))
      * instead of full sort (O(N log N)). Record trace for frontier tracking. */
     uint32_t sn = work->sorted_nrows;
     if (sn > 0 && sn < nr) {
         uint32_t delta_count = nr - sn;
-        int64_t *delta_start = work->data + (size_t)sn * nc;
 
         /* Phase 1: sort only the unsorted suffix using radix sort */
-        col_radix_sort_rows(delta_start, delta_count, nc);
+        col_rel_radix_sort(work, sn, delta_count);
 
         /* Phase 1b: dedup within suffix */
         uint32_t d_unique = 1;
         for (uint32_t i = 1; i < delta_count; i++) {
-            if (row_cmp_dispatch(delta_start + (size_t)(i - 1) * nc,
-                delta_start + (size_t)i * nc, nc)
-                != 0) {
-                if (d_unique != i)
-                    memcpy(delta_start + (size_t)d_unique * nc,
-                        delta_start + (size_t)i * nc, row_bytes);
+            if (col_rel_row_cmp(work, sn + i - 1, sn + i) != 0) {
+                col_rel_row_move(work, sn + d_unique, sn + i);
                 d_unique++;
             }
         }
@@ -4858,31 +4825,32 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
 
         uint32_t oi = 0, di = 0, out_idx = 0;
         while (oi < sn && di < d_unique) {
-            const int64_t *orow = col_rel_row(work, oi);
-            const int64_t *drow = delta_start + (size_t)di * nc;
-            int cmp = row_cmp_dispatch(orow, drow, nc);
+            int cmp = col_rel_row_cmp(work, oi, sn + di);
             if (cmp < 0) {
-                memcpy(merged + (size_t)out_idx * nc, orow, row_bytes);
+                col_rel_row_copy_out(work, oi,
+                    merged + (size_t)out_idx * nc);
                 oi++;
             } else if (cmp == 0) {
-                memcpy(merged + (size_t)out_idx * nc, orow, row_bytes);
+                col_rel_row_copy_out(work, oi,
+                    merged + (size_t)out_idx * nc);
                 oi++;
                 di++;
             } else {
-                memcpy(merged + (size_t)out_idx * nc, drow, row_bytes);
+                col_rel_row_copy_out(work, sn + di,
+                    merged + (size_t)out_idx * nc);
                 di++;
             }
             out_idx++;
         }
         while (oi < sn) {
-            memcpy(merged + (size_t)out_idx * nc,
-                col_rel_row(work, oi), row_bytes);
+            col_rel_row_copy_out(work, oi,
+                merged + (size_t)out_idx * nc);
             oi++;
             out_idx++;
         }
         while (di < d_unique) {
-            memcpy(merged + (size_t)out_idx * nc,
-                delta_start + (size_t)di * nc, row_bytes);
+            col_rel_row_copy_out(work, sn + di,
+                merged + (size_t)out_idx * nc);
             di++;
             out_idx++;
         }
@@ -4920,11 +4888,8 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
 
     uint32_t out_r = 1;
     for (uint32_t r = 1; r < nr; r++) {
-        const int64_t *prev = col_rel_row(work, r - 1);
-        const int64_t *cur = col_rel_row(work, r);
-        if (row_cmp_dispatch(prev, cur, nc) != 0) {
-            if (out_r != r)
-                memcpy(col_rel_row_mut(work, out_r), cur, row_bytes);
+        if (col_rel_row_cmp(work, r - 1, r) != 0) {
+            col_rel_row_move(work, out_r, r);
             out_r++;
         }
     }
