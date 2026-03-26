@@ -1320,19 +1320,6 @@ col_eval_stratum_worker_fn(void *arg)
     col_eval_stratum_worker_ctx_t *ctx = (col_eval_stratum_worker_ctx_t *)arg;
 
     ctx->rc = col_eval_stratum(ctx->sp, ctx->worker_sess, ctx->stratum_idx);
-
-    /* Issue #317: Report convergence frontier to coordinator's progress
-     * tracker after col_eval_stratum completes.  The local frontier is
-     * already updated by col_eval_stratum via record_stratum_convergence;
-     * here we also write the (outer_epoch, iteration) pair to the shared
-     * progress slot so the coordinator can compute the global minimum. */
-    if (ctx->rc == 0 && ctx->worker_sess->coordinator) {
-        uint32_t iter
-            = ctx->worker_sess->frontiers[ctx->stratum_idx].iteration;
-        uint32_t epoch = ctx->worker_sess->outer_epoch;
-        wl_frontier_progress_record(&ctx->worker_sess->coordinator->progress,
-            ctx->worker_sess->worker_id, ctx->stratum_idx, epoch, iter);
-    }
 }
 
 /*
@@ -1378,19 +1365,26 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
     if (!ctxs)
         return ENOMEM;
 
+    int rc = 0;
     for (uint32_t w = 0; w < num_workers; w++) {
         ctxs[w].sp = sp;
         ctxs[w].worker_sess = &workers[w];
         ctxs[w].stratum_idx = stratum_idx;
         ctxs[w].rc = 0;
-        wl_workqueue_submit(coord->wq, col_eval_stratum_worker_fn, &ctxs[w]);
+        if (wl_workqueue_submit(coord->wq, col_eval_stratum_worker_fn,
+            &ctxs[w])
+            != 0) {
+            rc = ENOMEM;
+            wl_workqueue_drain(coord->wq);
+            free(ctxs);
+            return rc;
+        }
     }
 
     /* Step 3: Barrier — wait for all workers to complete and report */
     wl_workqueue_wait_all(coord->wq);
 
     /* Collect first worker error (if any) */
-    int rc = 0;
     for (uint32_t w = 0; w < num_workers; w++) {
         if (ctxs[w].rc != 0 && rc == 0)
             rc = ctxs[w].rc;
