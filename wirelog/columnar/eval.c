@@ -2277,10 +2277,17 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         }
     }
 
-    /* Init frontier on coordinator (eval.c:336) */
+    /* Phase 4: Frontier Initialization (eval.c:336)
+     * Initialize per-stratum frontier tracking for convergence detection.
+     * Frontier records the iteration at which each stratum converged
+     * (fixed-point reached with no new tuples).
+     */
     coord->frontier_ops->init_stratum(coord, stratum_idx);
 
-    /* Compute rule_id_base for per-rule frontier recording */
+    /* Compute rule_id_base for per-rule frontier recording
+     * Each rule (IDB relation) gets a unique frontier slot indexed by
+     * rule_id_base + relation_index within stratum.
+     */
     uint32_t rule_id_base = 0;
     if (coord->plan) {
         for (uint32_t si = 0;
@@ -2294,6 +2301,21 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     uint32_t final_eff_iter = 0;
     bool saved_diff = coord->diff_operators_active;
 
+    /* Phase 4: Iteration Loop Control
+     * Semi-naive fixed-point computation with two nested loops:
+     *  - outer loop: tracks global convergence across all sub-passes
+     *  - inner sub loop: one EVAL_STRIDE sub-iteration per outer iteration
+     *
+     * Terminates when:
+     *  1. Fixed-point reached: no worker produced new tuples in iteration
+     *  2. Coordinator-level frontier skip: iteration > stratum frontier
+     *
+     * Each iteration:
+     *  - DISPATCH W workers to evaluate sub-pass
+     *  - BARRIER to wait for all workers
+     *  - CONVERGENCE CHECK: if all workers have empty delta → fixed point
+     *  - EXCHANGE: broadcast/hash-partition deltas to next iteration
+     */
     for (uint32_t iter = 0; iter < MAX_ITERATIONS; iter++) {
         bool outer_any_new = false;
         bool converged = false;
@@ -2303,7 +2325,12 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         for (uint32_t sub = 0; sub < EVAL_STRIDE; sub++) {
             uint32_t eff_iter = iter * EVAL_STRIDE + sub;
 
-            /* Coordinator-level frontier skip (eval.c:420-423) */
+            /* Phase 4: Frontier Skip Optimization (eval.c:420-423)
+             * Skip this iteration if frontier has already been recorded
+             * at a lower or equal iteration number. This optimization
+             * reduces redundant computation when a stratum has converged
+             * in a previous session snapshot.
+             */
             if (coord->frontier_ops->should_skip_iteration(coord,
                 stratum_idx, eff_iter)) {
                 continue;
@@ -2401,7 +2428,20 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 break;
             }
 
-            /* CONVERGENCE: fixed point if no worker produced new tuples */
+            /* Phase 4: Global Convergence Detection
+             * CONVERGENCE: fixed point if no worker produced new tuples.
+             *
+             * Each worker tracks any_new = true if its partition produced
+             * at least one new tuple during this sub-pass. Global convergence
+             * occurs when ALL workers have any_new = false.
+             *
+             * Correctness: Under distributed execution with hash-partitioned
+             * exchange, each worker independently computes new tuples from
+             * its partition. No tuple can be created without appearing in
+             * at least one worker's delta. Therefore, checking all workers'
+             * any_new flags is both necessary and sufficient for fixed-point
+             * detection.
+             */
             bool any_new = false;
             for (uint32_t w = 0; w < W; w++) {
                 if (ctxs[w].any_new) {
@@ -2451,7 +2491,22 @@ done:
     coord->total_iterations = final_eff_iter;
 
     if (rc == 0) {
-        /* Record per-rule frontiers (eval.c:771-775) */
+        /* Phase 4: Frontier Persistence Across Iterations
+         * RECORD PER-RULE FRONTIERS (eval.c:771-775)
+         *
+         * After convergence, record the iteration at which each IDB
+         * relation (rule) converged. On subsequent session snapshots
+         * with incremental updates, frontier skip optimization will
+         * prevent redundant re-evaluation of already-converged rules.
+         *
+         * Each rule gets a unique frontier slot indexed by:
+         *   rule_id = rule_id_base + relation_index_in_stratum
+         *
+         * The frontier stores the effective iteration number (final_eff_iter)
+         * at which this stratum reached fixed-point. This allows future
+         * iterations to skip: if iter > frontier[rule_id], the rule has
+         * already converged and no new facts are possible.
+         */
         for (uint32_t ri = 0;
             ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
             coord->frontier_ops->record_rule_convergence(coord,
