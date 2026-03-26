@@ -743,6 +743,13 @@ typedef struct wl_col_session_t {
      *               resources (plan, frontier_ops) in worker destroy. */
     uint32_t worker_id;
     struct wl_col_session_t *coordinator;
+    /* Exchange operator state (Issue #316): W x W partition buffer matrix.
+     * Allocated by coordinator before exchange scatter dispatch.
+     * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
+     * NULL when no exchange is in progress.  Owned by coordinator only;
+     * worker sessions inherit a borrowed pointer (not freed on worker destroy). */
+    col_rel_t ***exchange_bufs;
+    uint32_t exchange_num_workers; /* W dimension of the matrix */
 } wl_col_session_t;
 
 /*
@@ -1098,6 +1105,9 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int
 col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 
 /* Differential operator variants (Issue #263) */

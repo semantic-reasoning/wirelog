@@ -176,6 +176,26 @@ col_rel_partition_by_key(const col_rel_t *src,
             offsets[p]++;
         }
     }
+    /* Pass 4: scatter timestamps if present (Issue #316) */
+    if (src->timestamps && nrows > 0) {
+        for (uint32_t w = 0; w < num_workers; w++) {
+            if (counts[w] == 0)
+                continue;
+            out_parts[w]->timestamps = (col_delta_timestamp_t *)calloc(
+                counts[w], sizeof(col_delta_timestamp_t));
+            if (!out_parts[w]->timestamps) {
+                rc = ENOMEM;
+                goto cleanup;
+            }
+        }
+        memset(offsets, 0, num_workers * sizeof(uint32_t));
+        for (uint32_t i = 0; i < nrows; i++) {
+            uint32_t p = part_idx[i];
+            out_parts[p]->timestamps[offsets[p]] = src->timestamps[i];
+            offsets[p]++;
+        }
+    }
+
     free(part_idx);
     part_idx = NULL;
 
