@@ -34,7 +34,7 @@
  */
 int
 col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
-                     uint32_t key_col, col_rel_t *dst)
+    uint32_t key_col, col_rel_t *dst)
 {
     if (!lhs || !rhs || !dst)
         return EINVAL;
@@ -50,11 +50,11 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
 
     int rc = 0;
     for (uint32_t li = 0; li < lhs->nrows && rc == 0; li++) {
-        const int64_t *lrow = lhs->data + (size_t)li * lhs->ncols;
+        const int64_t *lrow = col_rel_row(lhs, li);
         int64_t lmult = lhs->timestamps ? lhs->timestamps[li].multiplicity : 1;
 
         for (uint32_t ri = 0; ri < rhs->nrows && rc == 0; ri++) {
-            const int64_t *rrow = rhs->data + (size_t)ri * rhs->ncols;
+            const int64_t *rrow = col_rel_row(rhs, ri);
 
             if (lrow[key_col] != rrow[key_col])
                 continue;
@@ -85,10 +85,10 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
                 dst->timestamps = nt;
                 dst->capacity = new_cap;
             }
-            memcpy(dst->data + (size_t)dst->nrows * ocols, tmp,
-                   sizeof(int64_t) * ocols);
+            memcpy(col_rel_row_mut(dst, dst->nrows), tmp,
+                sizeof(int64_t) * ocols);
             memset(&dst->timestamps[dst->nrows], 0,
-                   sizeof(col_delta_timestamp_t));
+                sizeof(col_delta_timestamp_t));
             dst->timestamps[dst->nrows].multiplicity = lmult * rmult;
             dst->nrows++;
         }
@@ -118,7 +118,7 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
  */
 int
 col_compute_delta_mobius(const col_rel_t *prev_collection,
-                         const col_rel_t *curr_collection, col_rel_t *out_delta)
+    const col_rel_t *curr_collection, col_rel_t *out_delta)
 {
     if (!prev_collection || !curr_collection || !out_delta)
         return EINVAL;
@@ -132,35 +132,36 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 
     /* Helper lambda (via inline block) to append a row+mult to out_delta. */
 #define DELTA_APPEND(row_ptr, mult_val)                                       \
-    do {                                                                      \
-        if (out_delta->nrows >= out_delta->capacity) {                        \
-            uint32_t new_cap                                                  \
-                = out_delta->capacity ? out_delta->capacity * 2 : 16;         \
-            int64_t *nd = (int64_t *)realloc(                                 \
-                out_delta->data, sizeof(int64_t) * (size_t)new_cap * ncols);  \
-            if (!nd)                                                          \
+        do {                                                                      \
+            if (out_delta->nrows >= out_delta->capacity) {                        \
+                uint32_t new_cap                                                  \
+                    = out_delta->capacity ? out_delta->capacity * 2 : 16;         \
+                int64_t *nd = (int64_t *)realloc(                                 \
+                    out_delta->data, sizeof(int64_t) * (size_t)new_cap * ncols);  \
+                if (!nd)                                                          \
                 return ENOMEM;                                                \
-            out_delta->data = nd;                                             \
-            col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(     \
-                out_delta->timestamps,                                        \
-                (size_t)new_cap * sizeof(col_delta_timestamp_t));             \
-            if (!nt)                                                          \
+                out_delta->data = nd;                                             \
+                col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(     \
+                    out_delta->timestamps,                                        \
+                    (size_t)new_cap * sizeof(col_delta_timestamp_t));             \
+                if (!nt)                                                          \
                 return ENOMEM;                                                \
-            out_delta->timestamps = nt;                                       \
-            out_delta->capacity = new_cap;                                    \
-        }                                                                     \
-        memcpy(out_delta->data + (size_t)out_delta->nrows * ncols, (row_ptr), \
-               sizeof(int64_t) * ncols);                                      \
-        col_delta_timestamp_t ts_;                                            \
-        memset(&ts_, 0, sizeof(ts_));                                         \
-        ts_.multiplicity = (mult_val);                                        \
-        out_delta->timestamps[out_delta->nrows] = ts_;                        \
-        out_delta->nrows++;                                                   \
-    } while (0)
+                out_delta->timestamps = nt;                                       \
+                out_delta->capacity = new_cap;                                    \
+            }                                                                     \
+            memcpy(out_delta->data + (size_t)out_delta->nrows * ncols, \
+                (row_ptr), \
+                sizeof(int64_t) * ncols);                                      \
+            col_delta_timestamp_t ts_;                                            \
+            memset(&ts_, 0, sizeof(ts_));                                         \
+            ts_.multiplicity = (mult_val);                                        \
+            out_delta->timestamps[out_delta->nrows] = ts_;                        \
+            out_delta->nrows++;                                                   \
+        } while (0)
 
     /* Pass 1: iterate over curr; for each key look up in prev. */
     for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
-        const int64_t *crow = curr_collection->data + (size_t)ci * ncols;
+        const int64_t *crow = col_rel_row(curr_collection, ci);
         int64_t cmult = curr_collection->timestamps
                             ? curr_collection->timestamps[ci].multiplicity
                             : 1;
@@ -169,7 +170,7 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
         int64_t pmult = 0;
         bool found_in_prev = false;
         for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
-            const int64_t *prow = prev_collection->data + (size_t)pi * ncols;
+            const int64_t *prow = col_rel_row(prev_collection, pi);
             if (prow[0] == crow[0]) {
                 pmult = prev_collection->timestamps
                             ? prev_collection->timestamps[pi].multiplicity
@@ -187,14 +188,14 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 
     /* Pass 2: iterate over prev; emit -prev_mult for keys absent in curr. */
     for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
-        const int64_t *prow = prev_collection->data + (size_t)pi * ncols;
+        const int64_t *prow = col_rel_row(prev_collection, pi);
         int64_t pmult = prev_collection->timestamps
                             ? prev_collection->timestamps[pi].multiplicity
                             : 1;
 
         bool found_in_curr = false;
         for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
-            const int64_t *crow = curr_collection->data + (size_t)ci * ncols;
+            const int64_t *crow = col_rel_row(curr_collection, ci);
             if (crow[0] == prow[0]) {
                 found_in_curr = true;
                 break;
