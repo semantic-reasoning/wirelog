@@ -235,7 +235,7 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
  */
 uint32_t
 col_arrangement_find_first(const col_arrangement_t *arr,
-    const int64_t *rel_data, uint32_t rel_ncols,
+    int64_t *const *columns, uint32_t rel_ncols,
     const int64_t *key_row);
 
 /**

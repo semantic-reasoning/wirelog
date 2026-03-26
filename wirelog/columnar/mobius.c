@@ -50,11 +50,14 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
 
     int rc = 0;
     for (uint32_t li = 0; li < lhs->nrows && rc == 0; li++) {
-        const int64_t *lrow = col_rel_row(lhs, li);
+        int64_t lrow_buf[COL_STACK_MAX];
+        col_rel_row_copy_out(lhs, li, lrow_buf); const int64_t *lrow = lrow_buf;
         int64_t lmult = lhs->timestamps ? lhs->timestamps[li].multiplicity : 1;
 
         for (uint32_t ri = 0; ri < rhs->nrows && rc == 0; ri++) {
-            const int64_t *rrow = col_rel_row(rhs, ri);
+            int64_t rrow_buf[COL_STACK_MAX];
+            col_rel_row_copy_out(rhs, ri, rrow_buf);
+            const int64_t *rrow = rrow_buf;
 
             if (lrow[key_col] != rrow[key_col])
                 continue;
@@ -68,13 +71,19 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
             /* Grow dst manually to keep data and timestamps in sync. */
             if (dst->nrows >= dst->capacity) {
                 uint32_t new_cap = dst->capacity ? dst->capacity * 2 : 16;
-                int64_t *nd = (int64_t *)realloc(
-                    dst->data, sizeof(int64_t) * (size_t)new_cap * ocols);
-                if (!nd) {
-                    rc = ENOMEM;
-                    break;
+                if (dst->columns) {
+                    if (col_columns_realloc(dst->columns, ocols,
+                        new_cap) != 0) {
+                        rc = ENOMEM;
+                        break;
+                    }
+                } else {
+                    dst->columns = col_columns_alloc(ocols, new_cap);
+                    if (!dst->columns) {
+                        rc = ENOMEM;
+                        break;
+                    }
                 }
-                dst->data = nd;
                 col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(
                     dst->timestamps,
                     (size_t)new_cap * sizeof(col_delta_timestamp_t));
@@ -85,8 +94,7 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
                 dst->timestamps = nt;
                 dst->capacity = new_cap;
             }
-            memcpy(col_rel_row_mut(dst, dst->nrows), tmp,
-                sizeof(int64_t) * ocols);
+            col_rel_row_copy_in(dst, dst->nrows, tmp);
             memset(&dst->timestamps[dst->nrows], 0,
                 sizeof(col_delta_timestamp_t));
             dst->timestamps[dst->nrows].multiplicity = lmult * rmult;
@@ -136,11 +144,15 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
             if (out_delta->nrows >= out_delta->capacity) {                        \
                 uint32_t new_cap                                                  \
                     = out_delta->capacity ? out_delta->capacity * 2 : 16;         \
-                int64_t *nd = (int64_t *)realloc(                                 \
-                    out_delta->data, sizeof(int64_t) * (size_t)new_cap * ncols);  \
-                if (!nd)                                                          \
-                return ENOMEM;                                                \
-                out_delta->data = nd;                                             \
+                if (out_delta->columns) {                                         \
+                    if (col_columns_realloc(out_delta->columns, ncols,             \
+                        new_cap) != 0)                                            \
+                    return ENOMEM;                                            \
+                } else {                                                          \
+                    out_delta->columns = col_columns_alloc(ncols, new_cap);        \
+                    if (!out_delta->columns)                                       \
+                    return ENOMEM;                                            \
+                }                                                                 \
                 col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(     \
                     out_delta->timestamps,                                        \
                     (size_t)new_cap * sizeof(col_delta_timestamp_t));             \
@@ -149,9 +161,7 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
                 out_delta->timestamps = nt;                                       \
                 out_delta->capacity = new_cap;                                    \
             }                                                                     \
-            memcpy(out_delta->data + (size_t)out_delta->nrows * ncols, \
-                (row_ptr), \
-                sizeof(int64_t) * ncols);                                      \
+            col_rel_row_copy_in(out_delta, out_delta->nrows, (row_ptr));          \
             col_delta_timestamp_t ts_;                                            \
             memset(&ts_, 0, sizeof(ts_));                                         \
             ts_.multiplicity = (mult_val);                                        \
@@ -161,7 +171,9 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 
     /* Pass 1: iterate over curr; for each key look up in prev. */
     for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
-        const int64_t *crow = col_rel_row(curr_collection, ci);
+        int64_t crow_buf[COL_STACK_MAX];
+        col_rel_row_copy_out(curr_collection, ci, crow_buf);
+        const int64_t *crow = crow_buf;
         int64_t cmult = curr_collection->timestamps
                             ? curr_collection->timestamps[ci].multiplicity
                             : 1;
@@ -170,7 +182,9 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
         int64_t pmult = 0;
         bool found_in_prev = false;
         for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
-            const int64_t *prow = col_rel_row(prev_collection, pi);
+            int64_t prow_buf[COL_STACK_MAX];
+            col_rel_row_copy_out(prev_collection, pi, prow_buf);
+            const int64_t *prow = prow_buf;
             if (prow[0] == crow[0]) {
                 pmult = prev_collection->timestamps
                             ? prev_collection->timestamps[pi].multiplicity
@@ -188,14 +202,18 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 
     /* Pass 2: iterate over prev; emit -prev_mult for keys absent in curr. */
     for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
-        const int64_t *prow = col_rel_row(prev_collection, pi);
+        int64_t prow_buf[COL_STACK_MAX];
+        col_rel_row_copy_out(prev_collection, pi, prow_buf);
+        const int64_t *prow = prow_buf;
         int64_t pmult = prev_collection->timestamps
                             ? prev_collection->timestamps[pi].multiplicity
                             : 1;
 
         bool found_in_curr = false;
         for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
-            const int64_t *crow = col_rel_row(curr_collection, ci);
+            int64_t crow_buf[COL_STACK_MAX];
+            col_rel_row_copy_out(curr_collection, ci, crow_buf);
+            const int64_t *crow = crow_buf;
             if (crow[0] == prow[0]) {
                 found_in_curr = true;
                 break;

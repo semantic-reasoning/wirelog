@@ -71,7 +71,6 @@ col_rel_partition_by_key(const col_rel_t *src,
 
     const uint32_t ncols = src->ncols;
     const uint32_t nrows = src->nrows;
-    const size_t row_bytes = (size_t)ncols * sizeof(int64_t);
 
     /* Allocate counts and offsets arrays (stack if small, heap otherwise) */
     uint32_t counts_stack[PARTITION_STACK_MAX];
@@ -138,19 +137,16 @@ col_rel_partition_by_key(const col_rel_t *src,
         assert(!part->arena_owned);
         assert(!part->pool_owned);
         if (counts[w] != part->capacity && counts[w] > 0) {
-            int64_t *exact = (int64_t *)realloc(
-                part->data, (size_t)counts[w] * ncols * sizeof(int64_t));
-            if (!exact) {
+            if (col_columns_realloc(part->columns, ncols, counts[w]) != 0) {
                 col_rel_destroy(part);
                 rc = ENOMEM;
                 goto cleanup;
             }
-            part->data = exact;
             part->capacity = counts[w];
         } else if (counts[w] == 0) {
             /* Empty partition: free the default allocation */
-            free(part->data);
-            part->data = NULL;
+            col_columns_free(part->columns, ncols);
+            part->columns = NULL;
             part->capacity = 0;
         }
 
@@ -162,8 +158,7 @@ col_rel_partition_by_key(const col_rel_t *src,
         const int64_t *row = col_rel_row(src, i);
         uint32_t p = row_partition(row, key_cols, key_count, num_workers,
                 key_buf);
-        memcpy(col_rel_row_mut(out_parts[p], offsets[p]),
-            row, row_bytes);
+        col_rel_row_copy_in(out_parts[p], offsets[p], row);
         offsets[p]++;
     }
 
@@ -227,28 +222,26 @@ col_rel_merge_partitions(col_rel_t **parts, uint32_t num_workers,
     assert(!merged->arena_owned);
     assert(!merged->pool_owned);
     if (total_rows > 0 && total_rows != merged->capacity) {
-        int64_t *exact = (int64_t *)realloc(
-            merged->data, (size_t)total_rows * ncols * sizeof(int64_t));
-        if (!exact) {
+        if (col_columns_realloc(merged->columns, ncols, total_rows) != 0) {
             col_rel_destroy(merged);
             return ENOMEM;
         }
-        merged->data = exact;
         merged->capacity = total_rows;
     } else if (total_rows == 0) {
-        free(merged->data);
-        merged->data = NULL;
+        col_columns_free(merged->columns, ncols);
+        merged->columns = NULL;
         merged->capacity = 0;
     }
 
-    /* Copy partition data contiguously */
-    size_t offset = 0;
+    /* Copy partition data contiguously per column */
+    uint32_t row_offset = 0;
     for (uint32_t w = 0; w < num_workers; w++) {
         if (parts[w]->nrows > 0) {
-            memcpy(merged->data + offset,
-                parts[w]->data,
-                (size_t)parts[w]->nrows * ncols * sizeof(int64_t));
-            offset += (size_t)parts[w]->nrows * ncols;
+            for (uint32_t c = 0; c < ncols; c++)
+                memcpy(merged->columns[c] + row_offset,
+                    parts[w]->columns[c],
+                    (size_t)parts[w]->nrows * sizeof(int64_t));
+            row_offset += parts[w]->nrows;
         }
     }
     merged->nrows = total_rows;

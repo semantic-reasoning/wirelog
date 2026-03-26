@@ -82,13 +82,16 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
     }
     /* Arena-owned data must be promoted to heap before storing in the
      * session, because arena_reset invalidates all arena pointers. */
-    if (r->arena_owned && r->data && r->ncols > 0) {
-        size_t bytes = sizeof(int64_t) * (size_t)r->capacity * r->ncols;
-        int64_t *heap_data = (int64_t *)malloc(bytes);
-        if (!heap_data)
+    if (r->arena_owned && r->columns && r->ncols > 0) {
+        /* Promote arena columns to heap: per-column malloc + memcpy */
+        int64_t **heap_cols = col_columns_alloc(r->ncols, r->capacity);
+        if (!heap_cols)
             return ENOMEM;
-        memcpy(heap_data, r->data, bytes);
-        r->data = heap_data;
+        for (uint32_t c = 0; c < r->ncols; c++)
+            memcpy(heap_cols[c], r->columns[c],
+                sizeof(int64_t) * r->capacity);
+        free(r->columns); /* free old columns array (arena owns buffers) */
+        r->columns = heap_cols;
         r->arena_owned = false;
     }
     if (sess->nrels >= sess->rel_cap) {
@@ -274,17 +277,17 @@ col_session_cleanup_old_data(wl_session_t *sess, col_frontier_t frontier)
             rel->timestamps = NULL;
             rel->nrows = 0;
             rel->capacity = 0;
-            free(rel->data);
-            rel->data = NULL;
+            col_columns_free(rel->columns, rel->ncols);
+            rel->columns = NULL;
             /* Invalidate arrangements (data changed) */
             col_session_invalidate_arrangements(sess, rel->name);
         } else if (keep_from > 0) {
             /* Shift rows forward and update timestamps */
             uint32_t new_nrows = rel->nrows - keep_from;
-            size_t row_bytes = (size_t)rel->ncols * sizeof(int64_t);
 
-            memmove(rel->data, rel->data + (size_t)keep_from * rel->ncols,
-                new_nrows * row_bytes);
+            for (uint32_t c = 0; c < rel->ncols; c++)
+                memmove(rel->columns[c], rel->columns[c] + keep_from,
+                    new_nrows * sizeof(int64_t));
             memmove(rel->timestamps, rel->timestamps + keep_from,
                 new_nrows * sizeof(col_delta_timestamp_t));
 
@@ -892,19 +895,24 @@ col_session_remove(wl_session_t *session, const char *relation,
         const int64_t *del = data + (size_t)di * num_cols;
         uint32_t out_r = 0;
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            const int64_t *row = col_rel_row(r, ri);
-            if (memcmp(row, del, sizeof(int64_t) * num_cols) != 0) {
+            int64_t rbuf[COL_STACK_MAX];
+            int64_t *row_buf = rbuf;
+            if (num_cols > COL_STACK_MAX)
+                row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
+            col_rel_row_copy_out(r, ri, row_buf);
+            if (memcmp(row_buf, del, sizeof(int64_t) * num_cols) != 0) {
                 if (out_r != ri)
-                    memcpy(col_rel_row_mut(r, out_r), row,
-                        sizeof(int64_t) * num_cols);
+                    col_rel_row_copy_in(r, out_r, row_buf);
                 out_r++;
+                if (row_buf != rbuf)
+                    free(row_buf);
             } else {
+                if (row_buf != rbuf)
+                    free(row_buf);
                 /* Remove first matching row only */
                 di = num_rows; /* break outer loop after this one */
                 for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
-                    memcpy(col_rel_row_mut(r, out_r),
-                        col_rel_row(r, rest),
-                        sizeof(int64_t) * num_cols);
+                    col_rel_row_move(r, out_r, rest);
                 r->nrows = out_r;
                 goto next_del;
             }
@@ -989,19 +997,24 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         const int64_t *del = data + (size_t)di * num_cols;
         uint32_t out_r = 0;
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            const int64_t *row = col_rel_row(r, ri);
-            if (memcmp(row, del, sizeof(int64_t) * num_cols) != 0) {
+            int64_t rbuf[COL_STACK_MAX];
+            int64_t *row_buf = rbuf;
+            if (num_cols > COL_STACK_MAX)
+                row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
+            col_rel_row_copy_out(r, ri, row_buf);
+            if (memcmp(row_buf, del, sizeof(int64_t) * num_cols) != 0) {
                 if (out_r != ri)
-                    memcpy(col_rel_row_mut(r, out_r), row,
-                        sizeof(int64_t) * num_cols);
+                    col_rel_row_copy_in(r, out_r, row_buf);
                 out_r++;
+                if (row_buf != rbuf)
+                    free(row_buf);
             } else {
+                if (row_buf != rbuf)
+                    free(row_buf);
                 /* Remove first matching row only */
                 di = num_rows; /* break outer loop after this one */
                 for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
-                    memcpy(col_rel_row_mut(r, out_r),
-                        col_rel_row(r, rest),
-                        sizeof(int64_t) * num_cols);
+                    col_rel_row_move(r, out_r, rest);
                 r->nrows = out_r;
                 goto next_del_incr;
             }

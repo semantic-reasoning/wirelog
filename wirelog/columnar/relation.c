@@ -26,15 +26,19 @@ col_rel_free_contents(col_rel_t *r)
     if (!r)
         return;
     /* Report data buffer deallocation to ledger before memset zeroes fields */
-    if (r->mem_ledger && r->data && r->capacity > 0 && r->ncols > 0)
+    if (r->mem_ledger && r->columns && r->capacity > 0 && r->ncols > 0)
         wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
             (uint64_t)r->capacity * r->ncols * sizeof(int64_t));
     free(r->name);
     if (!r->arena_owned)
-        free(r->data);
-    /* arena_owned data is freed on wl_arena_reset/free; skip free() */
-    free(r->retract_backup); /* safety: non-NULL only if destroyed mid-retraction */
-    free(r->merge_buf);
+        col_columns_free(r->columns, r->ncols);
+    else {
+        /* Arena owns column buffers; only free the columns array itself */
+        free(r->columns);
+    }
+    col_columns_free(r->retract_backup_columns, r->ncols);
+    col_columns_free(r->merge_columns, r->ncols);
+    free(r->row_scratch);
     free(r->timestamps);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
@@ -80,14 +84,14 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
 
     if (ncols > 0) {
         r->capacity = COL_REL_INIT_CAP;
-        r->data = (int64_t *)malloc(sizeof(int64_t) * r->capacity * ncols);
-        if (!r->data)
+        r->columns = col_columns_alloc(ncols, r->capacity);
+        if (!r->columns)
             return ENOMEM;
 
         r->col_names = (char **)calloc(ncols, sizeof(char *));
         if (!r->col_names) {
-            free(r->data);
-            r->data = NULL;
+            col_columns_free(r->columns, ncols);
+            r->columns = NULL;
             return ENOMEM;
         }
         for (uint32_t i = 0; i < ncols; i++) {
@@ -102,9 +106,9 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
                 for (uint32_t j = 0; j < i; j++)
                     free(r->col_names[j]);
                 free(r->col_names);
-                free(r->data);
+                col_columns_free(r->columns, ncols);
                 r->col_names = NULL;
-                r->data = NULL;
+                r->columns = NULL;
                 return ENOMEM;
             }
         }
@@ -162,23 +166,26 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
                 return ENOMEM;
             r->timestamps = new_ts;
         }
-        int64_t *nd;
         if (r->arena_owned) {
             /* Arena data cannot be realloc'd; migrate to heap */
-            nd = (int64_t *)malloc(sizeof(int64_t) * (size_t)new_cap *
-                    r->ncols);
-            if (!nd)
+            int64_t **new_cols = col_columns_alloc(r->ncols, new_cap);
+            if (!new_cols)
                 return ENOMEM;
-            memcpy(nd, r->data,
-                sizeof(int64_t) * (size_t)r->nrows * r->ncols);
+            for (uint32_t c = 0; c < r->ncols; c++)
+                memcpy(new_cols[c], r->columns[c],
+                    sizeof(int64_t) * r->nrows);
+            /* Don't free arena columns; just free the columns array */
+            free(r->columns);
+            r->columns = new_cols;
             r->arena_owned = false;
+        } else if (r->columns) {
+            if (col_columns_realloc(r->columns, r->ncols, new_cap) != 0)
+                return ENOMEM;
         } else {
-            nd = (int64_t *)realloc(
-                r->data, sizeof(int64_t) * (size_t)new_cap * r->ncols);
-            if (!nd)
+            r->columns = col_columns_alloc(r->ncols, new_cap);
+            if (!r->columns)
                 return ENOMEM;
         }
-        r->data = nd;
         /* Track capacity growth in ledger (Issue #224): only the delta bytes
         * added by this growth event.  r->capacity is still the old value. */
         if (r->mem_ledger && r->ncols > 0) {
@@ -190,8 +197,7 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
     }
     if (r->timestamps)
         memset(&r->timestamps[r->nrows], 0, sizeof(col_delta_timestamp_t));
-    memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-        sizeof(int64_t) * r->ncols);
+    col_rel_row_copy_in(r, r->nrows, row);
     r->nrows++;
     return 0;
 }
@@ -228,30 +234,52 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             dst->timestamps = new_ts;
         }
 
-        int64_t *nd;
         if (dst->arena_owned) {
             /* Arena data: allocate from same arena, preserve arena_owned flag */
-            size_t data_bytes = (size_t)new_cap * dst->ncols * sizeof(int64_t);
             if (arena) {
-                nd = (int64_t *)wl_arena_alloc(arena, data_bytes);
-                if (!nd)
+                int64_t **new_cols
+                    = (int64_t **)calloc(dst->ncols, sizeof(int64_t *));
+                if (!new_cols)
                     return ENOMEM;
+                bool ok = true;
+                for (uint32_t c = 0; c < dst->ncols; c++) {
+                    new_cols[c] = (int64_t *)wl_arena_alloc(arena,
+                            (size_t)new_cap * sizeof(int64_t));
+                    if (!new_cols[c]) {
+                        ok = false;
+                        break;
+                    }
+                    memcpy(new_cols[c], dst->columns[c],
+                        sizeof(int64_t) * dst->nrows);
+                }
+                if (!ok) {
+                    /* Arena alloc failed; don't free arena columns */
+                    free(new_cols);
+                    return ENOMEM;
+                }
+                free(dst->columns); /* free old columns array only */
+                dst->columns = new_cols;
             } else {
                 /* Fallback to heap if arena unavailable */
-                nd = (int64_t *)malloc(data_bytes);
-                if (!nd)
+                int64_t **new_cols
+                    = col_columns_alloc(dst->ncols, new_cap);
+                if (!new_cols)
                     return ENOMEM;
+                for (uint32_t c = 0; c < dst->ncols; c++)
+                    memcpy(new_cols[c], dst->columns[c],
+                        sizeof(int64_t) * dst->nrows);
+                free(dst->columns);
+                dst->columns = new_cols;
                 dst->arena_owned = false;
             }
-            memcpy(nd, dst->data,
-                sizeof(int64_t) * (size_t)dst->nrows * dst->ncols);
+        } else if (dst->columns) {
+            if (col_columns_realloc(dst->columns, dst->ncols, new_cap) != 0)
+                return ENOMEM;
         } else {
-            nd = (int64_t *)realloc(
-                dst->data, sizeof(int64_t) * (size_t)new_cap * dst->ncols);
-            if (!nd)
+            dst->columns = col_columns_alloc(dst->ncols, new_cap);
+            if (!dst->columns)
                 return ENOMEM;
         }
-        dst->data = nd;
 
         /* Track capacity growth in ledger */
         if (dst->mem_ledger && dst->ncols > 0) {
@@ -262,10 +290,10 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
         dst->capacity = new_cap;
     }
 
-    /* Bulk copy all rows in one memcpy (O(1) syscall vs O(src->nrows)) */
-    memcpy(dst->data + (size_t)dst_base * dst->ncols,
-        src->data,
-        (size_t)src->nrows * dst->ncols * sizeof(int64_t));
+    /* Bulk copy all rows per-column */
+    for (uint32_t c = 0; c < dst->ncols; c++)
+        memcpy(dst->columns[c] + dst_base, src->columns[c],
+            (size_t)src->nrows * sizeof(int64_t));
     dst->nrows = new_nrows;
 
     /* Copy timestamps if both have tracking enabled */
@@ -300,12 +328,14 @@ col_rel_compact(col_rel_t *r)
 
     if (r->nrows == 0) {
         if (!r->arena_owned)
-            free(r->data);
-        r->data = NULL;
+            col_columns_free(r->columns, r->ncols);
+        else
+            free(r->columns);
+        r->columns = NULL;
         r->capacity = 0;
         r->arena_owned = false;
-        free(r->merge_buf);
-        r->merge_buf = NULL;
+        col_columns_free(r->merge_columns, r->ncols);
+        r->merge_columns = NULL;
         r->merge_buf_cap = 0;
         free(r->timestamps);
         r->timestamps = NULL;
@@ -326,23 +356,21 @@ col_rel_compact(col_rel_t *r)
         if (tight < COL_REL_INIT_CAP)
             tight = COL_REL_INIT_CAP;
 
-        int64_t *nd;
         if (r->arena_owned) {
-            /* Arena data: allocate new heap buffer and copy */
-            nd = (int64_t *)malloc(
-                (size_t)tight * r->ncols * sizeof(int64_t));
-            if (!nd)
+            /* Arena data: allocate new heap columns and copy */
+            int64_t **new_cols = col_columns_alloc(r->ncols, tight);
+            if (!new_cols)
                 goto free_merge_buf;
-            memcpy(nd, r->data,
-                (size_t)r->nrows * r->ncols * sizeof(int64_t));
+            for (uint32_t c = 0; c < r->ncols; c++)
+                memcpy(new_cols[c], r->columns[c],
+                    (size_t)r->nrows * sizeof(int64_t));
+            free(r->columns);
+            r->columns = new_cols;
             r->arena_owned = false;
         } else {
-            nd = (int64_t *)realloc(r->data, (size_t)tight * r->ncols
-                    * sizeof(int64_t));
-            if (!nd)
+            if (col_columns_realloc(r->columns, r->ncols, tight) != 0)
                 goto free_merge_buf;
         }
-        r->data = nd;
         r->capacity = tight;
 
         /* Shrink timestamps to match new capacity (non-fatal on failure). */
@@ -356,8 +384,8 @@ col_rel_compact(col_rel_t *r)
     }
 
 free_merge_buf:
-    free(r->merge_buf);
-    r->merge_buf = NULL;
+    col_columns_free(r->merge_columns, r->ncols);
+    r->merge_columns = NULL;
     r->merge_buf_cap = 0;
 
     if (r->sorted_nrows > r->nrows)
@@ -444,9 +472,8 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     r->ncols = like->ncols;
     r->capacity = COL_REL_INIT_CAP;
     if (like->ncols > 0) {
-        r->data
-            = (int64_t *)malloc(sizeof(int64_t) * r->capacity * like->ncols);
-        if (!r->data) {
+        r->columns = col_columns_alloc(like->ncols, r->capacity);
+        if (!r->columns) {
             free(r->name);
             memset(r, 0, sizeof(*r));
             return col_rel_new_like(name, like); /* Fallback */
@@ -484,19 +511,37 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     r->ncols = ncols;
     r->capacity = COL_REL_INIT_CAP;
     if (ncols > 0) {
-        size_t data_bytes = sizeof(int64_t) * r->capacity * ncols;
-        /* Try arena allocation first; fall back to malloc */
+        /* Try arena allocation first; fall back to malloc.
+         * The columns array itself is always heap-allocated.
+         * Individual column buffers may be from arena. */
+        bool use_arena = false;
         if (arena) {
-            r->data = (int64_t *)wl_arena_alloc(arena, data_bytes);
-            if (r->data) {
-                r->arena_owned = true;
+            r->columns = (int64_t **)calloc(ncols, sizeof(int64_t *));
+            if (r->columns) {
+                bool ok = true;
+                for (uint32_t c = 0; c < ncols; c++) {
+                    r->columns[c] = (int64_t *)wl_arena_alloc(arena,
+                            (size_t)r->capacity * sizeof(int64_t));
+                    if (!r->columns[c]) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    use_arena = true;
+                    r->arena_owned = true;
+                } else {
+                    /* Arena alloc failed for some columns; free and retry */
+                    free(r->columns);
+                    r->columns = NULL;
+                }
             }
         }
-        if (!r->data) {
-            r->data = (int64_t *)malloc(data_bytes);
+        if (!use_arena) {
+            r->columns = col_columns_alloc(ncols, r->capacity);
             r->arena_owned = false;
         }
-        if (!r->data) {
+        if (!r->columns) {
             free(r->name);
             memset(r, 0, sizeof(*r));
             return col_rel_new_auto(name, ncols); /* Fallback */

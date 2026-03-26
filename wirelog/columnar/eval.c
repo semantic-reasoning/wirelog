@@ -850,11 +850,11 @@ col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
     if (stk.top > 0) {
         eval_entry_t ce = eval_stack_pop(&stk);
         if (ce.owned && ce.rel != r) {
-            free(r->data);
-            r->data = ce.rel->data;
+            col_columns_free(r->columns, r->ncols);
+            r->columns = ce.rel->columns;
             r->nrows = ce.rel->nrows;
             r->capacity = ce.rel->capacity;
-            ce.rel->data = NULL;
+            ce.rel->columns = NULL;
             col_rel_destroy(ce.rel);
         }
     }
@@ -925,11 +925,11 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
         if (!r || r->ncols == 0)
             continue;
-        r->retract_backup = r->data;
+        r->retract_backup_columns = r->columns;
         r->retract_backup_nrows = r->nrows;
         r->retract_backup_capacity = r->capacity;
         r->retract_backup_sorted_nrows = r->sorted_nrows;
-        r->data = NULL;
+        r->columns = NULL;
         r->capacity = 0;
         r->nrows = 0;
         r->sorted_nrows = 0;
@@ -945,12 +945,12 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             col_rel_t *r = session_find_rel(sess, sp->relations[i].name);
             if (!r || r->ncols == 0)
                 continue;
-            free(r->data);
-            r->data = r->retract_backup;
+            col_columns_free(r->columns, r->ncols);
+            r->columns = r->retract_backup_columns;
             r->nrows = r->retract_backup_nrows;
             r->capacity = r->retract_backup_capacity;
             r->sorted_nrows = r->retract_backup_sorted_nrows;
-            r->retract_backup = NULL;
+            r->retract_backup_columns = NULL;
             r->retract_backup_nrows = 0;
             r->retract_backup_capacity = 0;
             r->retract_backup_sorted_nrows = 0;
@@ -976,13 +976,13 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                         = session_find_rel(sess, sp->relations[i].name);
                     if (!r2 || r2->ncols == 0)
                         continue;
-                    if (r2->retract_backup != NULL) {
-                        free(r2->data);
-                        r2->data = r2->retract_backup;
+                    if (r2->retract_backup_columns != NULL) {
+                        col_columns_free(r2->columns, r2->ncols);
+                        r2->columns = r2->retract_backup_columns;
                         r2->nrows = r2->retract_backup_nrows;
                         r2->capacity = r2->retract_backup_capacity;
                         r2->sorted_nrows = r2->retract_backup_sorted_nrows;
-                        r2->retract_backup = NULL;
+                        r2->retract_backup_columns = NULL;
                         r2->retract_backup_nrows = 0;
                         r2->retract_backup_capacity = 0;
                         r2->retract_backup_sorted_nrows = 0;
@@ -993,23 +993,32 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                 free(retract_nrows);
                 return rc;
             }
-            /* Steal the consolidated buffer — no malloc, no memcpy */
-            retract_data[ri] = r->data;
-            retract_nrows[ri] = r->nrows;
-            r->data = NULL;
+            /* Steal: gather into flat buffer for col_row_in_sorted */
+            uint32_t nc = r->ncols;
+            int64_t *flat = (int64_t *)malloc(
+                (size_t)r->nrows * nc * sizeof(int64_t));
+            if (flat) {
+                for (uint32_t row = 0; row < r->nrows; row++)
+                    col_rel_row_copy_out(r, row, flat + (size_t)row * nc);
+            }
+            retract_data[ri] = flat;
+            retract_nrows[ri] = flat ? r->nrows : 0;
+            col_columns_free(r->columns, r->ncols);
+            r->columns = NULL;
             r->capacity = 0;
             r->nrows = 0;
         }
 
         /* Free any eval-allocated buffer not stolen above (nrows==0 case) */
-        free(r->data); /* NULL-safe; already NULL when nrows>0 path ran */
+        col_columns_free(r->columns, r->ncols);
+        r->columns = NULL;
 
         /* Swap back original data (O(1)) */
-        r->data = r->retract_backup;
+        r->columns = r->retract_backup_columns;
         r->nrows = r->retract_backup_nrows;
         r->capacity = r->retract_backup_capacity;
         r->sorted_nrows = r->retract_backup_sorted_nrows;
-        r->retract_backup = NULL;
+        r->retract_backup_columns = NULL;
         r->retract_backup_nrows = 0;
         r->retract_backup_capacity = 0;
         r->retract_backup_sorted_nrows = 0;
@@ -1031,16 +1040,21 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             uint32_t out_r = 0;
             bool found = false;
             for (uint32_t src_idx = 0; src_idx < r->nrows; src_idx++) {
-                const int64_t *src = col_rel_row(r, src_idx);
-                if (memcmp(src, to_remove, sizeof(int64_t) * ncols) == 0) {
+                int64_t sbuf[COL_STACK_MAX];
+                int64_t *src_buf = sbuf;
+                if (ncols > COL_STACK_MAX)
+                    src_buf = (int64_t *)malloc(ncols * sizeof(int64_t));
+                col_rel_row_copy_out(r, src_idx, src_buf);
+                if (memcmp(src_buf, to_remove, sizeof(int64_t) * ncols)
+                    == 0) {
+                    if (src_buf != sbuf)
+                        free(src_buf);
                     /* Found matching row; skip it (removal) */
                     found = true;
                     /* Copy remaining rows forward */
                     for (uint32_t rest = src_idx + 1; rest < r->nrows;
                         rest++) {
-                        memcpy(col_rel_row_mut(r, out_r),
-                            col_rel_row(r, rest),
-                            sizeof(int64_t) * ncols);
+                        col_rel_row_move(r, out_r, rest);
                         out_r++;
                     }
                     r->nrows = out_r;
@@ -1048,9 +1062,10 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                 } else {
                     /* Keep this row */
                     if (out_r != src_idx)
-                        memcpy(col_rel_row_mut(r, out_r), src,
-                            sizeof(int64_t) * ncols);
+                        col_rel_row_copy_in(r, out_r, src_buf);
                     out_r++;
+                    if (src_buf != sbuf)
+                        free(src_buf);
                 }
             }
 
@@ -1104,10 +1119,19 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             continue;
         prev_ncols[ri] = r->ncols;
         if (r->nrows > 0) {
-            prev_data[ri] = r->data;
-            prev_nrows[ri] = r->nrows;
-            /* Detach buffer from relation; eval will allocate fresh */
-            r->data = NULL;
+            /* Gather into flat buffer for col_row_in_sorted */
+            uint32_t nc = r->ncols;
+            int64_t *flat = (int64_t *)malloc(
+                (size_t)r->nrows * nc * sizeof(int64_t));
+            if (flat) {
+                for (uint32_t row = 0; row < r->nrows; row++)
+                    col_rel_row_copy_out(r, row, flat + (size_t)row * nc);
+            }
+            prev_data[ri] = flat;
+            prev_nrows[ri] = flat ? r->nrows : 0;
+            /* Free and detach columns; eval will allocate fresh */
+            col_columns_free(r->columns, r->ncols);
+            r->columns = NULL;
             r->nrows = 0;
             r->capacity = 0;
             r->sorted_nrows = 0;
@@ -1134,10 +1158,22 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
         uint32_t ncols = r->ncols;
 
+        /* Gather current state into flat buffer for col_row_in_sorted */
+        int64_t *cur_flat = NULL;
+        if (r->nrows > 0 && ncols > 0) {
+            cur_flat = (int64_t *)malloc(
+                (size_t)r->nrows * ncols * sizeof(int64_t));
+            if (cur_flat) {
+                for (uint32_t row = 0; row < r->nrows; row++)
+                    col_rel_row_copy_out(r, row,
+                        cur_flat + (size_t)row * ncols);
+            }
+        }
+
         /* Fire delta_cb(+1) for rows not present in prev sorted state */
-        if (r->nrows > 0) {
+        if (r->nrows > 0 && cur_flat) {
             for (uint32_t row = 0; row < r->nrows; row++) {
-                const int64_t *rowp = col_rel_row(r, row);
+                const int64_t *rowp = cur_flat + (size_t)row * ncols;
                 if (!col_row_in_sorted(prev_data[ri], prev_nrows[ri], ncols,
                     rowp)) {
                     sess->delta_cb(r->name, rowp, ncols, +1, sess->delta_data);
@@ -1151,25 +1187,36 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             for (uint32_t row = 0; row < prev_nrows[ri]; row++) {
                 const int64_t *rowp
                     = prev_data[ri] + (size_t)row * prev_ncols[ri];
-                if (!col_row_in_sorted(r->data, r->nrows, prev_ncols[ri],
+                if (!col_row_in_sorted(cur_flat, r->nrows, prev_ncols[ri],
                     rowp)) {
                     sess->delta_cb(r->name, rowp, prev_ncols[ri], -1,
                         sess->delta_data);
                 }
             }
         }
+        free(cur_flat);
     }
 
 cleanup:
     for (uint32_t i = 0; i < rc_cnt; i++) {
         if (rc != 0 && prev_data[i]) {
-            /* Error path: restore original data pointer to avoid leak/NULL */
+            /* Error path: restore from flat snapshot into column-major */
             col_rel_t *r = session_find_rel(sess, sp->relations[i].name);
-            if (r && !r->data) {
-                r->data = prev_data[i];
-                r->nrows = prev_nrows[i];
-                r->capacity = prev_nrows[i];
-                r->sorted_nrows = prev_nrows[i];
+            if (r && !r->columns) {
+                uint32_t nc = prev_ncols[i];
+                uint32_t nr = prev_nrows[i];
+                r->columns = col_columns_alloc(nc, nr > 0 ? nr : 1);
+                if (r->columns) {
+                    for (uint32_t row = 0; row < nr; row++) {
+                        const int64_t *rowp
+                            = prev_data[i] + (size_t)row * nc;
+                        col_rel_row_copy_in(r, row, rowp);
+                    }
+                    r->nrows = nr;
+                    r->capacity = nr > 0 ? nr : 1;
+                    r->sorted_nrows = nr;
+                }
+                free(prev_data[i]);
                 prev_data[i] = NULL;
             }
         }

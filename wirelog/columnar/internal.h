@@ -27,9 +27,11 @@
 
 #include "nanoarrow/nanoarrow.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -109,20 +111,80 @@ now_ns(void)
 #define COL_JOIN_OUTPUT_LIMIT_DEFAULT (50u * 1000u * 1000u) /* 50M rows */
 
 /* ======================================================================== */
+/* Column-Major Allocation Helpers (Phase C, Issue #332)                    */
+/* ======================================================================== */
+
+/** Allocate a column-major buffer: columns[col][row]. Returns NULL on failure. */
+static inline int64_t **
+col_columns_alloc(uint32_t ncols, uint32_t capacity)
+{
+    if (ncols == 0)
+        return NULL;
+    int64_t **cols = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    if (!cols)
+        return NULL;
+    for (uint32_t c = 0; c < ncols; c++) {
+        cols[c] = (int64_t *)malloc(capacity > 0
+            ? (size_t)capacity * sizeof(int64_t) : sizeof(int64_t));
+        if (!cols[c]) {
+            for (uint32_t j = 0; j < c; j++)
+                free(cols[j]);
+            free(cols);
+            return NULL;
+        }
+    }
+    return cols;
+}
+
+/** Free a column-major buffer. */
+static inline void
+col_columns_free(int64_t **cols, uint32_t ncols)
+{
+    if (!cols)
+        return;
+    for (uint32_t c = 0; c < ncols; c++)
+        free(cols[c]);
+    free(cols);
+}
+
+/** Realloc each column to new_cap. Returns 0 on success, ENOMEM on failure. */
+static inline int
+col_columns_realloc(int64_t **cols, uint32_t ncols, uint32_t new_cap)
+{
+    for (uint32_t c = 0; c < ncols; c++) {
+        int64_t *nc = (int64_t *)realloc(cols[c],
+                (size_t)new_cap * sizeof(int64_t));
+        if (!nc)
+            return ENOMEM;
+        cols[c] = nc;
+    }
+    return 0;
+}
+
+/** Copy one row from a col_rel_t into a column-major destination buffer. */
+static inline void
+col_columns_copy_row(int64_t **dst_cols, uint32_t dst_row,
+    int64_t *const *src_cols, uint32_t src_row, uint32_t ncols)
+{
+    for (uint32_t c = 0; c < ncols; c++)
+        dst_cols[c][dst_row] = src_cols[c][src_row];
+}
+
+/* ======================================================================== */
 /* Relation Storage                                                         */
 /* ======================================================================== */
 
 /*
  * col_rel_t: in-memory columnar relation.
  *
- * Tuples are stored row-major: data[row * ncols + col].
+ * Tuples are stored column-major: columns[col][row] (Phase C, Issue #332).
  * Column names enable JOIN key resolution (variable name -> position).
  * The ArrowSchema provides Arrow-compatible type metadata.
  */
 typedef struct {
     char *name;                /* owned, null-terminated                */
     uint32_t ncols;            /* columns per tuple (0 = unset)         */
-    int64_t *data;             /* owned, row-major int64 buffer         */
+    int64_t **columns;         /* owned, column-major: columns[col][row] */
     uint32_t nrows;            /* current row count                     */
     uint32_t capacity;         /* allocated row capacity                */
     char **col_names;          /* owned array of ncols owned strings    */
@@ -130,14 +192,14 @@ typedef struct {
     bool schema_ok;            /* true after schema is initialised      */
     /* Sorted-prefix tracking for incremental consolidation (issue #94).
      * After consolidation, sorted_nrows == nrows (all rows sorted+unique).
-     * Appending new rows leaves sorted_nrows unchanged: data[0..sorted_nrows)
-     * is sorted, data[sorted_nrows..nrows) is an unsorted suffix.
+     * Appending new rows leaves sorted_nrows unchanged: rows [0..sorted_nrows)
+     * are sorted, rows [sorted_nrows..nrows) are an unsorted suffix.
      * Enables O(D log D + N) merge instead of O(N log N) full sort. */
     uint32_t sorted_nrows;
     /* Persistent merge buffer for consolidation (issue #94).
      * Reused across iterations to avoid per-consolidation malloc/free.
      * Grows via realloc as needed; freed only on relation destruction. */
-    int64_t *merge_buf;
+    int64_t **merge_columns;
     uint32_t merge_buf_cap; /* capacity in rows */
     /* Base row count for delta propagation (issue #83).
      * After initial eval convergence, base_nrows == nrows. On incremental
@@ -153,80 +215,83 @@ typedef struct {
      * false = struct was heap-allocated via calloc(); free() on destroy. */
     bool pool_owned;
     /* Arena ownership flag for data buffer.
-     * true  = r->data was allocated from wl_arena_t; do not free() or realloc().
+     * true  = column buffers were allocated from wl_arena_t; do not free().
      *         On growth (append_row), data is migrated to heap (malloc+memcpy).
-     * false = r->data was heap-allocated via malloc(); normal free()/realloc(). */
+     * false = column buffers were heap-allocated via malloc(); normal free(). */
     bool arena_owned;
     /* Memory ledger reference (Issue #224): when non-NULL, data buffer
      * growth/free events are reported to this ledger under
      * WL_MEM_SUBSYS_RELATION.  Set by operators that produce output
      * relations (e.g. col_op_join).  NULL for EDB and pool temporaries. */
     wl_mem_ledger_t *mem_ledger;
+    /* Scratch buffer for col_rel_row() gather (Phase C, Issue #332).
+     * Lazily allocated on first col_rel_row() call. Freed in free_contents. */
+    int64_t *row_scratch;
     /* Zero-copy retraction backup (issue #300).
-     * col_stratum_step_retraction_nonrecursive saves the live data pointer
+     * col_stratum_step_retraction_nonrecursive saves the live columns pointer
      * here before clearing the relation for retraction evaluation, then
      * restores it afterwards without any memcpy.  All four fields are
      * NULL/0 at all times outside retraction evaluation. */
-    int64_t *retract_backup;
+    int64_t **retract_backup_columns;
     uint32_t retract_backup_nrows;
     uint32_t retract_backup_capacity;
     uint32_t retract_backup_sorted_nrows;
 } col_rel_t;
 
 /* ======================================================================== */
-/* col_rel_t Accessor Layer (Phase 0, Issue #326)                           */
+/* col_rel_t Accessor Layer (Phase C, Issue #332)                           */
 /*                                                                          */
-/* All row-major access to r->data SHOULD go through these accessors.       */
-/* Phase 5 (#332) will flip the internal layout to column-major; these      */
-/* functions are the ONLY place that needs to change.                       */
-/*                                                                          */
-/* Target layout: int64_t **columns; columns[col][row]                      */
+/* All cell access to r->columns goes through these accessors.              */
+/* Layout: int64_t **columns; columns[col][row]                             */
 /* ======================================================================== */
 
 /** Read a single cell value at (row, col). */
 static inline int64_t
 col_rel_get(const col_rel_t *r, uint32_t row, uint32_t col)
 {
-    return r->data[(size_t)row * r->ncols + col];
+    return r->columns[col][row];
 }
 
 /** Write a single cell value at (row, col). */
 static inline void
 col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
 {
-    r->data[(size_t)row * r->ncols + col] = val;
+    r->columns[col][row] = val;
 }
 
-/** Const pointer to the start of a row (row-major: contiguous ncols elements).
- *  NOTE: In column-major (Phase 5), this returns a gathered scratch buffer
- *  or must be replaced with col_rel_get() per-cell access. */
+/** Gather a row into an internal scratch buffer and return const pointer.
+ *  WARNING: returns pointer to internal scratch buffer -- invalidated
+ *  by the next col_rel_row() call on the SAME relation. */
 static inline const int64_t *
 col_rel_row(const col_rel_t *r, uint32_t row)
 {
-    return r->data + (size_t)row * r->ncols;
+    col_rel_t *mr = (col_rel_t *)(uintptr_t)r; /* cast away const for scratch */
+    if (!mr->row_scratch) {
+        mr->row_scratch = (int64_t *)malloc(r->ncols * sizeof(int64_t));
+        if (!mr->row_scratch)
+            return NULL;
+    }
+    for (uint32_t c = 0; c < r->ncols; c++)
+        mr->row_scratch[c] = r->columns[c][row];
+    return mr->row_scratch;
 }
 
-/** Mutable pointer to the start of a row. */
-static inline int64_t *
-col_rel_row_mut(col_rel_t *r, uint32_t row)
-{
-    return r->data + (size_t)row * r->ncols;
-}
+/* col_rel_row_mut: REMOVED -- use col_rel_set() or col_rel_row_copy_in() */
 
 /** Copy one row out into a caller-provided buffer. */
 static inline void
 col_rel_row_copy_out(const col_rel_t *r, uint32_t row, int64_t *dst)
 {
-    memcpy(dst, r->data + (size_t)row * r->ncols,
-        (size_t)r->ncols * sizeof(int64_t));
+    for (uint32_t c = 0; c < r->ncols; c++)
+        dst[c] = r->columns[c][row];
 }
 
 /** Copy one row in from a caller-provided buffer. */
 static inline void
 col_rel_row_copy_in(col_rel_t *r, uint32_t row, const int64_t *src)
 {
-    memcpy(r->data + (size_t)row * r->ncols, src,
-        (size_t)r->ncols * sizeof(int64_t));
+    for (uint32_t c = 0; c < r->ncols; c++)
+        r->columns[c][row] = src[c];
 }
 
 /** Compute buffer size in bytes for row_count rows. */
@@ -302,23 +367,14 @@ col_rel_row_cmp2(const col_rel_t *ra, uint32_t row_a,
 }
 
 /** Copy row src_row to dst_row within the same relation.
- *  Safe for any layout (uses temp buffer for independence). */
+ *  Column-major: each column copy is independent, no temp buffer needed. */
 static inline void
 col_rel_row_move(col_rel_t *r, uint32_t dst_row, uint32_t src_row)
 {
     if (dst_row == src_row)
         return;
-    int64_t tmp[COL_STACK_MAX];
-    int64_t *buf = tmp;
-    if (r->ncols > COL_STACK_MAX) {
-        buf = (int64_t *)malloc((size_t)r->ncols * sizeof(int64_t));
-        if (!buf)
-            return; /* silent fail -- callers check row counts */
-    }
-    col_rel_row_copy_out(r, src_row, buf);
-    col_rel_row_copy_in(r, dst_row, buf);
-    if (buf != tmp)
-        free(buf);
+    for (uint32_t c = 0; c < r->ncols; c++)
+        r->columns[c][dst_row] = r->columns[c][src_row];
 }
 
 /**

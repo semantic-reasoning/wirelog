@@ -255,20 +255,22 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
 
 uint32_t
 col_arrangement_find_first(const col_arrangement_t *arr,
-    const int64_t *rel_data, uint32_t rel_ncols,
+    int64_t *const *columns, uint32_t rel_ncols,
     const int64_t *key_row)
 {
-    if (!arr || !rel_data || !key_row || arr->nbuckets == 0)
+    if (!arr || !columns || !key_row || arr->nbuckets == 0)
         return UINT32_MAX;
+
+    (void)rel_ncols; /* used for bounds checking in debug builds */
 
     uint32_t bucket
         = arr_hash_key(key_row, arr->key_cols, arr->key_count, arr->nbuckets);
     uint32_t row = arr->ht_head[bucket];
     while (row != UINT32_MAX) {
-        const int64_t *rp = rel_data + (size_t)row * rel_ncols;
         bool match = true;
         for (uint32_t k = 0; k < arr->key_count; k++) {
-            if (rp[arr->key_cols[k]] != key_row[arr->key_cols[k]]) {
+            if (columns[arr->key_cols[k]][row]
+                != key_row[arr->key_cols[k]]) {
                 match = false;
                 break;
             }
