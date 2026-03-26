@@ -110,9 +110,8 @@ arr_build_full(col_arrangement_t *arr, const col_rel_t *rel)
         arr->ht_cap = new_cap;
     }
 
-    uint32_t nc = rel->ncols;
     for (uint32_t row = 0; row < nrows; row++) {
-        const int64_t *rp = rel->data + (size_t)row * nc;
+        const int64_t *rp = col_rel_row(rel, row);
         uint32_t bucket
             = arr_hash_key(rp, arr->key_cols, arr->key_count, nbuckets);
         arr->ht_next[row] = arr->ht_head[bucket];
@@ -147,10 +146,9 @@ arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
         arr->ht_cap = new_cap;
     }
 
-    uint32_t nc = rel->ncols;
     uint32_t nb = arr->nbuckets;
     for (uint32_t row = old_nrows; row < nrows; row++) {
-        const int64_t *rp = rel->data + (size_t)row * nc;
+        const int64_t *rp = col_rel_row(rel, row);
         uint32_t bucket = arr_hash_key(rp, arr->key_cols, arr->key_count, nb);
         arr->ht_next[row] = arr->ht_head[bucket];
         arr->ht_head[bucket] = row;
