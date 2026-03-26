@@ -252,6 +252,14 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         sess->frontier_ops->record_stratum_convergence(sess, stratum_idx,
             sess->outer_epoch, UINT32_MAX);
 
+        /* Issue #317: Report non-recursive convergence to coordinator's
+         * progress tracker.  Non-recursive strata always converge at
+         * UINT32_MAX (no iteration loop), matching the sentinel convention. */
+        if (sess->coordinator) {
+            wl_frontier_progress_record(&sess->coordinator->progress,
+                sess->worker_id, stratum_idx, sess->outer_epoch, UINT32_MAX);
+        }
+
         /* Non-recursive rule frontiers: mark each rule fully evaluated.
          * UINT32_MAX sentinel matches stratum frontier convention. */
         if (sess->plan) {
@@ -772,6 +780,15 @@ stride_error:
     if (strat_frontier.iteration != UINT32_MAX) {
         sess->frontier_ops->record_stratum_convergence(sess, stratum_idx,
             sess->outer_epoch, strat_frontier.iteration);
+
+        /* Issue #317: Report recursive convergence to coordinator's progress
+         * tracker so col_eval_stratum_multiworker can compute the global
+         * minimum frontier after the workqueue barrier. */
+        if (sess->coordinator) {
+            wl_frontier_progress_record(&sess->coordinator->progress,
+                sess->worker_id, stratum_idx, sess->outer_epoch,
+                strat_frontier.iteration);
+        }
     }
 
     /* Cleanup all delta relations after frontier has been computed */
@@ -1271,4 +1288,130 @@ rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id)
         offset = next_offset;
     }
     return UINT32_MAX;
+}
+
+/* ======================================================================== */
+/* Multi-Worker Stratum Evaluation (Issue #317)                             */
+/* ======================================================================== */
+
+/*
+ * col_eval_stratum_worker_ctx_t:
+ * Per-worker context for col_eval_stratum_multiworker dispatch.
+ */
+typedef struct {
+    const wl_plan_stratum_t *sp;   /* borrowed: stratum plan */
+    wl_col_session_t *worker_sess; /* borrowed: isolated worker session */
+    uint32_t stratum_idx;
+    int rc; /* return code from col_eval_stratum */
+} col_eval_stratum_worker_ctx_t;
+
+/*
+ * col_eval_stratum_worker_fn:
+ * Work function executed by each worker thread.  Runs col_eval_stratum on
+ * the worker's partition, then reports the resulting frontier to the
+ * coordinator's progress tracker (Issue #317).
+ *
+ * Thread safety: writes only to its own progress slot (worker_id dimension),
+ * so no synchronization is needed during the scatter phase.
+ */
+static void
+col_eval_stratum_worker_fn(void *arg)
+{
+    col_eval_stratum_worker_ctx_t *ctx = (col_eval_stratum_worker_ctx_t *)arg;
+
+    ctx->rc = col_eval_stratum(ctx->sp, ctx->worker_sess, ctx->stratum_idx);
+
+    /* Issue #317: Report convergence frontier to coordinator's progress
+     * tracker after col_eval_stratum completes.  The local frontier is
+     * already updated by col_eval_stratum via record_stratum_convergence;
+     * here we also write the (outer_epoch, iteration) pair to the shared
+     * progress slot so the coordinator can compute the global minimum. */
+    if (ctx->rc == 0 && ctx->worker_sess->coordinator) {
+        uint32_t iter
+            = ctx->worker_sess->frontiers[ctx->stratum_idx].iteration;
+        uint32_t epoch = ctx->worker_sess->outer_epoch;
+        wl_frontier_progress_record(&ctx->worker_sess->coordinator->progress,
+            ctx->worker_sess->worker_id, ctx->stratum_idx, epoch, iter);
+    }
+}
+
+/*
+ * col_eval_stratum_multiworker:
+ * Evaluate one stratum in parallel across num_workers pre-created worker
+ * sessions.  After wl_workqueue_wait_all(), merges per-worker frontier
+ * progress reports into the coordinator's global frontier.
+ *
+ * Protocol (Issue #317):
+ *   1. Reset progress for this stratum (stale epoch entries cleared).
+ *   2. Submit num_workers tasks; each runs col_eval_stratum + progress_record.
+ *   3. wl_workqueue_wait_all() barrier: all workers complete.
+ *   4. If all workers converged, update coordinator's frontier with the
+ *      global minimum iteration (conservative lower bound for skip logic).
+ *
+ * Preconditions:
+ *   - coord->wq is non-NULL (thread pool created at col_session_create)
+ *   - workers[0..num_workers-1] are valid worker sessions with coordinator
+ *     pointer set to coord
+ *   - coord->progress is initialized (done in col_session_create)
+ *
+ * Returns 0 on success, EINVAL on bad arguments, or the first non-zero
+ * error code returned by a worker.
+ */
+int
+col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t stratum_idx,
+    wl_col_session_t *workers, uint32_t num_workers)
+{
+    if (!sp || !coord || !workers || num_workers == 0)
+        return EINVAL;
+
+    /* Step 1: Reset this stratum's progress slots for the current epoch.
+     * Prevents stale convergence reports from a previous epoch blocking
+     * the all_converged check after the barrier. */
+    wl_frontier_progress_reset_stratum(&coord->progress, stratum_idx,
+        coord->outer_epoch);
+
+    /* Step 2: Allocate per-worker contexts and submit to workqueue */
+    col_eval_stratum_worker_ctx_t *ctxs
+        = (col_eval_stratum_worker_ctx_t *)calloc(
+            num_workers, sizeof(col_eval_stratum_worker_ctx_t));
+    if (!ctxs)
+        return ENOMEM;
+
+    for (uint32_t w = 0; w < num_workers; w++) {
+        ctxs[w].sp = sp;
+        ctxs[w].worker_sess = &workers[w];
+        ctxs[w].stratum_idx = stratum_idx;
+        ctxs[w].rc = 0;
+        wl_workqueue_submit(coord->wq, col_eval_stratum_worker_fn, &ctxs[w]);
+    }
+
+    /* Step 3: Barrier — wait for all workers to complete and report */
+    wl_workqueue_wait_all(coord->wq);
+
+    /* Collect first worker error (if any) */
+    int rc = 0;
+    for (uint32_t w = 0; w < num_workers; w++) {
+        if (ctxs[w].rc != 0 && rc == 0)
+            rc = ctxs[w].rc;
+    }
+    free(ctxs);
+    if (rc != 0)
+        return rc;
+
+    /* Step 4: Merge per-worker frontiers into coordinator's global frontier.
+     * The global minimum iteration is the conservative bound: the coordinator
+     * can safely claim "all workers have processed up to iteration min_iter",
+     * enabling the frontier skip optimization for subsequent incremental eval. */
+    if (wl_frontier_progress_all_converged(&coord->progress, stratum_idx,
+        coord->outer_epoch)) {
+        uint32_t min_iter = wl_frontier_progress_min_iteration(
+            &coord->progress, stratum_idx, coord->outer_epoch);
+        if (min_iter != UINT32_MAX) {
+            coord->frontier_ops->record_stratum_convergence(coord,
+                stratum_idx, coord->outer_epoch, min_iter);
+        }
+    }
+
+    return 0;
 }
