@@ -63,7 +63,8 @@ wirelog_backend_src = files('columnar/relation.c', 'columnar/cache.c',
                            'columnar/diff_arrangement.c',
                            'columnar/diff_vtable.c',
                            'columnar/diff_bridge.c',
-                           'columnar/partition.c', )
+                           'columnar/partition.c',
+                           'columnar/progress.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #I / O Module
