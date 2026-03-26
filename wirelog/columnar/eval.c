@@ -1291,6 +1291,38 @@ rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id)
 }
 
 /* ======================================================================== */
+/* Distributed Stratum Evaluator (Issue #318)                               */
+/* ======================================================================== */
+
+/*
+ * col_eval_stratum_tdd:
+ * Distributed stratum evaluator with 7-phase pipeline.
+ *
+ * For W=1: delegates to col_eval_stratum() (zero overhead).
+ * For W>1: orchestrates PARTITION → DISPATCH → BARRIER →
+ *          EXCHANGE → BARRIER → CONSOLIDATE → CONVERGENCE
+ *          per iteration of the semi-naive fixed-point loop.
+ *
+ * Called from col_session_step() in place of col_eval_stratum()
+ * when distributed evaluation is possible.
+ */
+int
+col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t stratum_idx)
+{
+    if (!sp || !coord)
+        return EINVAL;
+
+    /* Single-worker fast path: zero overhead delegation */
+    if (coord->num_workers <= 1 || !coord->tdd_workers
+        || coord->tdd_workers_count == 0)
+        return col_eval_stratum(sp, coord, stratum_idx);
+
+    /* TODO(#318): non-recursive and recursive distributed paths */
+    return col_eval_stratum(sp, coord, stratum_idx);
+}
+
+/* ======================================================================== */
 /* Multi-Worker Stratum Evaluation (Issue #317)                             */
 /* ======================================================================== */
 

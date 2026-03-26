@@ -760,6 +760,12 @@ typedef struct wl_col_session_t {
      * Worker sessions must zero progress.entries in col_worker_session_create
      * to prevent double-free of the coordinator's entries array. */
     wl_frontier_progress_t progress;
+    /* Distributed stratum evaluator state (Issue #318).
+     * Worker sessions created once at col_session_create for multi-worker use.
+     * NULL when num_workers <= 1 (single-worker fast path).
+     * Owned by coordinator; worker sessions set tdd_workers = NULL. */
+    struct wl_col_session_t *tdd_workers; /* owned array [num_workers] */
+    uint32_t tdd_workers_count;         /* number of initialized workers */
 } wl_col_session_t;
 
 /*
@@ -1146,6 +1152,9 @@ int
 col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t stratum_idx,
     wl_col_session_t *workers, uint32_t num_workers);
+int
+col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t stratum_idx);
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);

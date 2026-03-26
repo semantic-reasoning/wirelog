@@ -441,6 +441,21 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         }
     }
 
+    /* Issue #318: Pre-allocate TDD worker sessions array for distributed eval.
+     * Workers are initialized lazily (tdd_workers_count == 0 until first use).
+     * num_workers > 1 check matches the workqueue creation guard above. */
+    if (sess->num_workers > 1) {
+        sess->tdd_workers = (wl_col_session_t *)calloc(
+            sess->num_workers, sizeof(wl_col_session_t));
+        if (!sess->tdd_workers) {
+            wl_workqueue_destroy(sess->wq);
+            free(sess->rels);
+            free(sess);
+            return ENOMEM;
+        }
+        sess->tdd_workers_count = 0; /* populated lazily */
+    }
+
     /* Create delta pool for per-iteration temporaries.
      * Slab: 256 relations (cover ~20 rules x 5 ops + headroom)
      * Arena: 64MB initial (for row data buffers) */
@@ -604,6 +619,15 @@ col_session_destroy(wl_session_t *session)
      * Worker sessions have progress.entries == NULL (set in col_worker_session_create)
      * so this is safe to call on both coordinator and worker sessions. */
     wl_frontier_progress_destroy(&sess->progress);
+    /* Issue #318: Free TDD worker sessions array.
+     * Workers that have been initialized (w < tdd_workers_count) are destroyed
+     * first, then the array itself is freed.  Worker sessions that were
+     * initialized via col_worker_session_create own their own arena/pool/rels. */
+    if (sess->tdd_workers) {
+        for (uint32_t w = 0; w < sess->tdd_workers_count; w++)
+            col_worker_session_destroy(&sess->tdd_workers[w]);
+        free(sess->tdd_workers);
+    }
     free(sess);
 }
 
@@ -662,6 +686,9 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Exchange buffers are owned by coordinator; worker inherits borrowed ptr */
     out_worker->exchange_bufs = NULL;
     out_worker->exchange_num_workers = 0;
+    /* Issue #318: TDD workers array is owned by coordinator; workers have none */
+    out_worker->tdd_workers = NULL;
+    out_worker->tdd_workers_count = 0;
     /* Issue #317: Worker does not own the progress tracker.
      * NULL entries so col_session_destroy (if called on worker) does not
      * double-free the coordinator's entries array. */
@@ -1157,7 +1184,7 @@ col_session_step(wl_session_t *session)
 
         const wl_plan_stratum_t *sp = &plan->strata[si];
         int rc = sess->delta_cb ? col_stratum_step_with_delta(sp, sess, si)
-                                : col_eval_stratum(sp, sess, si);
+                                : col_eval_stratum_tdd(sp, sess, si);
         if (rc != 0)
             return rc;
     }
