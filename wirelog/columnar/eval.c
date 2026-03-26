@@ -2217,6 +2217,57 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
 }
 
 /*
+ * tdd_record_recursive_convergence:
+ * After recursive fixed-point convergence, record stratum and per-rule
+ * frontiers on the coordinator.  Mirrors eval.c:768-791 for the TDD path.
+ */
+static void
+tdd_record_recursive_convergence(wl_col_session_t *coord,
+    const wl_plan_stratum_t *sp, uint32_t stratum_idx,
+    uint32_t rule_id_base, uint32_t final_eff_iter)
+{
+    uint32_t nrels = sp->relation_count;
+
+    /* Per-rule frontier (eval.c:771-775) */
+    for (uint32_t ri = 0; ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
+        coord->frontier_ops->record_rule_convergence(coord,
+            rule_id_base + ri, coord->outer_epoch, final_eff_iter);
+    }
+
+    /* Stratum frontier (eval.c:780-782) */
+    coord->frontier_ops->record_stratum_convergence(coord,
+        stratum_idx, coord->outer_epoch, final_eff_iter);
+}
+
+/*
+ * tdd_record_nonrecursive_convergence:
+ * After non-recursive stratum dispatch, record stratum and per-rule frontiers.
+ * Non-recursive strata always converge in one step; uses UINT32_MAX sentinel.
+ * Mirrors eval.c:247-279 for the TDD coordinator path.
+ */
+static void
+tdd_record_nonrecursive_convergence(wl_col_session_t *coord,
+    const wl_plan_stratum_t *sp, uint32_t stratum_idx)
+{
+    /* Stratum frontier: UINT32_MAX sentinel (eval.c:252-253) */
+    coord->frontier_ops->record_stratum_convergence(coord,
+        stratum_idx, coord->outer_epoch, UINT32_MAX);
+
+    /* Per-rule frontiers (eval.c:265-279) */
+    if (coord->plan) {
+        uint32_t rule_base = 0;
+        for (uint32_t si = 0; si < stratum_idx; si++)
+            rule_base += coord->plan->strata[si].relation_count;
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            uint32_t rule_idx = rule_base + ri;
+            if (rule_idx < MAX_RULES)
+                coord->frontier_ops->reset_rule_frontier(coord, rule_idx,
+                    coord->outer_epoch);
+        }
+    }
+}
+
+/*
  * tdd_check_convergence:
  * Returns true if global fixed-point reached: no worker produced new tuples.
  * Called after each sub-pass barrier, before the exchange step.
@@ -2498,27 +2549,9 @@ done:
     coord->total_iterations = final_eff_iter;
 
     if (rc == 0) {
-        /* Phase 4: Frontier Persistence Across Iterations
-         * RECORD PER-RULE FRONTIERS (eval.c:771-775)
-         *
-         * After convergence, record the iteration at which each IDB
-         * relation (rule) converged. On subsequent session snapshots
-         * with incremental updates, frontier skip optimization will
-         * prevent redundant re-evaluation of already-converged rules.
-         *
-         * Each rule gets a unique frontier slot indexed by:
-         *   rule_id = rule_id_base + relation_index_in_stratum
-         *
-         * The frontier stores the effective iteration number (final_eff_iter)
-         * at which this stratum reached fixed-point. This allows future
-         * iterations to skip: if iter > frontier[rule_id], the rule has
-         * already converged and no new facts are possible.
-         */
-        for (uint32_t ri = 0;
-            ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
-            coord->frontier_ops->record_rule_convergence(coord,
-                rule_id_base + ri, coord->outer_epoch, final_eff_iter);
-        }
+        /* Record stratum and per-rule frontiers (mirrors eval.c:768-791) */
+        tdd_record_recursive_convergence(coord, sp, stratum_idx,
+            rule_id_base, final_eff_iter);
 
         /* Merge worker IDB into coordinator */
         rc = tdd_merge_worker_results(sp, coord);
@@ -2595,7 +2628,11 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
     if (rc == 0)
         rc = tdd_merge_worker_results(sp, coord);
 
-    /* Phase 7: Cleanup worker state */
+    /* Phase 7: Record stratum and per-rule frontiers (mirrors eval.c:247-279) */
+    if (rc == 0)
+        tdd_record_nonrecursive_convergence(coord, sp, stratum_idx);
+
+    /* Phase 8: Cleanup worker state */
     tdd_cleanup_workers(coord);
 
     return rc;
