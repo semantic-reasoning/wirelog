@@ -28,61 +28,18 @@
  * nanoarrow.h so that col_rel_t has the correct field offsets without
  * pulling in the nanoarrow dependency.
  */
-struct ArrowSchema {
-    const char *format;
-    const char *name;
-    const char *metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema **children;
-    struct ArrowSchema *dictionary;
-    void (*release)(struct ArrowSchema *);
-    void *private_data;
-};
-
-/*
- * col_delta_timestamp_t - mirrors the public definition in columnar_nanoarrow.h.
- * Must match exactly (4 x uint32_t + int64_t = 24 bytes).
- */
-typedef struct {
-    uint32_t iteration;
-    uint32_t stratum;
-    uint32_t worker;
-    uint32_t _reserved;
-    int64_t multiplicity;
-} col_delta_timestamp_t;
-
-/*
- * col_rel_t - mirrors the private definition in columnar_nanoarrow.c.
- * Field order and layout must match the implementation exactly.
- */
-typedef struct {
-    char *name;                /* owned, null-terminated               */
-    uint32_t ncols;            /* columns per tuple (0 = unset)        */
-    int64_t *data;             /* owned, row-major int64 buffer        */
-    uint32_t nrows;            /* current row count                    */
-    uint32_t capacity;         /* allocated row capacity               */
-    char **col_names;          /* owned array of ncols owned strings   */
-    struct ArrowSchema schema; /* owned Arrow schema (lazy-inited)     */
-    bool schema_ok;            /* true after schema is initialised     */
-    uint32_t sorted_nrows;     /* sorted prefix row count (issue #94)   */
-    int64_t *merge_buf;        /* persistent merge buffer (issue #94)   */
-    uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
-    uint32_t base_nrows;       /* base row count for delta prop (#83)   */
-    col_delta_timestamp_t
-        *timestamps; /* NULL when not tracking               */
-} col_rel_t;
+#include "../wirelog/columnar/internal.h"
 
 /* Phase 3B operation declarations */
 int
 col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
-                     uint32_t key_col, col_rel_t *dst);
+    uint32_t key_col, col_rel_t *dst);
 int
 col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst);
 int
 col_compute_delta_mobius(const col_rel_t *prev_collection,
-                         const col_rel_t *curr_collection,
-                         col_rel_t *out_delta);
+    const col_rel_t *curr_collection,
+    col_rel_t *out_delta);
 
 /* ----------------------------------------------------------------
  * Test framework  (matches wirelog convention)
@@ -93,29 +50,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helper: allocate col_rel_t with ncols columns, no rows, no timestamps.
@@ -149,6 +106,21 @@ test_rel_alloc(uint32_t ncols)
     return r;
 }
 
+static int test_row_match(const col_rel_t *r, uint32_t row,
+    const int64_t *target)
+{
+    for (uint32_t c = 0; c < r->ncols;
+        c++) if (col_rel_get(r, row, c) != target[c]) return 0; return 1;
+}
+static int test_flat_cmp(const col_rel_t *a, const col_rel_t *b)
+{
+    if (a->nrows != b->nrows || a->ncols != b->ncols) return 1;
+    for (uint32_t i = 0; i < a->nrows; i++) for (uint32_t c = 0; c < a->ncols;
+            c++)
+            if (col_rel_get(a, i, c) != col_rel_get(b, i, c)) return 1;
+    return 0;
+}
+
 /* ----------------------------------------------------------------
  * Helper: free col_rel_t (data, timestamps, col_names, struct).
  * ---------------------------------------------------------------- */
@@ -158,7 +130,8 @@ test_rel_free(col_rel_t *r)
     if (!r)
         return;
     free(r->name);
-    free(r->data);
+    col_columns_free(r->columns, r->ncols);
+    free(r->row_scratch);
     free(r->timestamps);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
@@ -177,11 +150,13 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
 {
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
-        int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
-                                                      * sizeof(int64_t));
-        if (!nd)
-            return -1;
-        r->data = nd;
+        if (r->columns) {
+            if (col_columns_realloc(r->columns, r->ncols, cap) != 0)
+                return -1;
+        } else {
+            r->columns = col_columns_alloc(r->ncols, cap);
+            if (!r->columns) return -1;
+        }
 
         col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(
             r->timestamps, (size_t)cap * sizeof(col_delta_timestamp_t));
@@ -191,8 +166,7 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
         r->capacity = cap;
     }
     if (r->ncols > 0)
-        memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-               r->ncols * sizeof(int64_t));
+        col_rel_row_copy_in(r, r->nrows, row);
     col_delta_timestamp_t ts;
     memset(&ts, 0, sizeof(ts));
     ts.multiplicity = multiplicity;
@@ -221,24 +195,26 @@ test_build_relations_with_multiplicities(void)
     int64_t p0[] = { 1 };
     int64_t p1[] = { 2 };
     ASSERT(test_rel_append_row_mult(parent, p0, 2) == 0,
-           "append parent person_id=1 mult=2");
+        "append parent person_id=1 mult=2");
     ASSERT(test_rel_append_row_mult(parent, p1, 3) == 0,
-           "append parent person_id=2 mult=3");
+        "append parent person_id=2 mult=3");
 
     int64_t c0[] = { 1 };
     int64_t c1[] = { 2 };
     ASSERT(test_rel_append_row_mult(child, c0, 4) == 0,
-           "append child person_id=1 mult=4");
+        "append child person_id=1 mult=4");
     ASSERT(test_rel_append_row_mult(child, c1, 1) == 0,
-           "append child person_id=2 mult=1");
+        "append child person_id=2 mult=1");
 
     /* Verify parent relation */
     ASSERT(parent->nrows == 2, "parent has 2 rows");
     ASSERT(parent->timestamps != NULL, "parent timestamps non-NULL");
     ASSERT(parent->timestamps[0].multiplicity == 2, "parent[0] mult=2");
     ASSERT(parent->timestamps[1].multiplicity == 3, "parent[1] mult=3");
-    ASSERT(parent->data[0] == 1, "parent[0] person_id=1");
-    ASSERT(parent->data[1] == 2, "parent[1] person_id=2");
+    ASSERT(parent->columns[(0) % parent->ncols][(0) / parent->ncols] == 1,
+        "parent[0] person_id=1");
+    ASSERT(parent->columns[(1) % parent->ncols][(1) / parent->ncols] == 2,
+        "parent[1] person_id=2");
 
     /* Verify child relation */
     ASSERT(child->nrows == 2, "child has 2 rows");
@@ -278,13 +254,13 @@ test_join_multiplies_multiplicities(void)
     int64_t c0[] = { 1 };
     int64_t c1[] = { 2 };
     ASSERT(test_rel_append_row_mult(parent, p0, 2) == 0,
-           "parent person_id=1 mult=2");
+        "parent person_id=1 mult=2");
     ASSERT(test_rel_append_row_mult(parent, p1, 3) == 0,
-           "parent person_id=2 mult=3");
+        "parent person_id=2 mult=3");
     ASSERT(test_rel_append_row_mult(child, c0, 4) == 0,
-           "child  person_id=1 mult=4");
+        "child  person_id=1 mult=4");
     ASSERT(test_rel_append_row_mult(child, c1, 1) == 0,
-           "child  person_id=2 mult=1");
+        "child  person_id=2 mult=1");
 
     int rc = col_op_join_weighted(parent, child, 0, joined);
 
@@ -316,7 +292,7 @@ test_join_multiplies_multiplicities(void)
  * col_op_reduce_weighted sums all multiplicities:
  *   total = 8 + 3 = 11
  *
- * Expected: dst->nrows == 1, dst->data[0] == 11.
+ * Expected: dst->nrows == 1, dst->columns[(0) % dst->ncols][(0) / dst->ncols] == 11.
  * ================================================================ */
 static void
 test_aggregate_join_result(void)
@@ -332,19 +308,20 @@ test_aggregate_join_result(void)
     int64_t row0[] = { 1 };
     int64_t row1[] = { 2 };
     ASSERT(test_rel_append_row_mult(joined, row0, 8) == 0,
-           "append joined row person_id=1 mult=8");
+        "append joined row person_id=1 mult=8");
     ASSERT(test_rel_append_row_mult(joined, row1, 3) == 0,
-           "append joined row person_id=2 mult=3");
+        "append joined row person_id=2 mult=3");
 
     int rc = col_op_reduce_weighted(joined, agg);
 
     ASSERT(rc == 0, "reduce returns 0 on success");
     ASSERT(agg->nrows == 1, "agg has 1 output row");
-    ASSERT(agg->data != NULL, "agg data non-NULL");
-    ASSERT(agg->data[0] == 11, "COUNT = 11 (8 + 3)");
+    ASSERT(agg->columns != NULL, "agg data non-NULL");
+    ASSERT(agg->columns[(0) % agg->ncols][(0) / agg->ncols] == 11,
+        "COUNT = 11 (8 + 3)");
     ASSERT(agg->timestamps != NULL, "agg timestamps non-NULL");
     ASSERT(agg->timestamps[0].multiplicity == 11,
-           "agg output multiplicity = 11");
+        "agg output multiplicity = 11");
 
     test_rel_free(joined);
     test_rel_free(agg);
@@ -381,27 +358,27 @@ test_compute_delta_between_snapshots(void)
     int64_t key3[] = { 3 };
 
     ASSERT(test_rel_append_row_mult(prev, key1, 6) == 0,
-           "prev person_id=1 mult=6");
+        "prev person_id=1 mult=6");
     ASSERT(test_rel_append_row_mult(prev, key2, 3) == 0,
-           "prev person_id=2 mult=3");
+        "prev person_id=2 mult=3");
     ASSERT(test_rel_append_row_mult(curr, key1, 8) == 0,
-           "curr person_id=1 mult=8");
+        "curr person_id=1 mult=8");
     ASSERT(test_rel_append_row_mult(curr, key3, 5) == 0,
-           "curr person_id=3 mult=5");
+        "curr person_id=3 mult=5");
 
     int rc = col_compute_delta_mobius(prev, curr, delta);
 
     ASSERT(rc == 0, "delta returns 0 on success");
     ASSERT(delta->nrows == 3, "delta has 3 rows (changed, vanished, appeared)");
     ASSERT(delta->timestamps != NULL, "delta timestamps non-NULL");
-    ASSERT(delta->data != NULL, "delta data non-NULL");
+    ASSERT(delta->columns != NULL, "delta data non-NULL");
 
     /* Verify all three expected changes appear (order may vary). */
     bool found_plus2 = false;
     bool found_minus3 = false;
     bool found_plus5 = false;
     for (uint32_t i = 0; i < delta->nrows; i++) {
-        int64_t key = delta->data[i];
+        int64_t key = delta->columns[(i) % delta->ncols][(i) / delta->ncols];
         int64_t mult = delta->timestamps[i].multiplicity;
         if (key == 1 && mult == 2)
             found_plus2 = true;
@@ -467,7 +444,7 @@ test_full_pipeline_join_agg_delta(void)
     rc = col_op_reduce_weighted(joined, agg);
     ASSERT(rc == 0, "reduce step returns 0");
     ASSERT(agg->nrows == 1, "reduce produces 1 row");
-    ASSERT(agg->data[0] == 6, "COUNT = 6");
+    ASSERT(agg->columns[(0) % agg->ncols][(0) / agg->ncols] == 6, "COUNT = 6");
     ASSERT(agg->timestamps[0].multiplicity == 6, "agg output multiplicity = 6");
 
     test_rel_free(joined);
@@ -481,9 +458,9 @@ test_full_pipeline_join_agg_delta(void)
     col_rel_t *delta = test_rel_alloc(1);
     ASSERT(prev_agg && delta, "test_rel_alloc failed (delta)");
 
-    int64_t prev_row[] = { 6 }; /* same key as curr_agg->data[0] */
+    int64_t prev_row[] = { 6 }; /* same key as curr_agg->columns[(0) % curr_agg->ncols][(0) / curr_agg->ncols] */
     ASSERT(test_rel_append_row_mult(prev_agg, prev_row, 4) == 0,
-           "prev_agg key=6 mult=4");
+        "prev_agg key=6 mult=4");
 
     rc = col_compute_delta_mobius(prev_agg, agg, delta);
     ASSERT(rc == 0, "delta step returns 0");
@@ -511,7 +488,7 @@ main(void)
     test_full_pipeline_join_agg_delta();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
-           fail_count, test_count);
+        fail_count, test_count);
 
     return fail_count > 0 ? 1 : 0;
 }

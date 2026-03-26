@@ -40,50 +40,7 @@
  * nanoarrow.h so that col_rel_t has the correct field offsets without
  * pulling in the nanoarrow dependency.
  */
-struct ArrowSchema {
-    const char *format;
-    const char *name;
-    const char *metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema **children;
-    struct ArrowSchema *dictionary;
-    void (*release)(struct ArrowSchema *);
-    void *private_data;
-};
-
-/*
- * col_delta_timestamp_t - mirrors the public definition in columnar_nanoarrow.h.
- * Must match exactly (4 x uint32_t + int64_t = 24 bytes).
- */
-typedef struct {
-    uint32_t iteration;
-    uint32_t stratum;
-    uint32_t worker;
-    uint32_t _reserved;
-    int64_t multiplicity;
-} col_delta_timestamp_t;
-
-/*
- * col_rel_t - mirrors the private definition in columnar_nanoarrow.c.
- * Field order and layout must match the implementation exactly.
- */
-typedef struct {
-    char *name;                /* owned, null-terminated               */
-    uint32_t ncols;            /* columns per tuple (0 = unset)        */
-    int64_t *data;             /* owned, row-major int64 buffer        */
-    uint32_t nrows;            /* current row count                    */
-    uint32_t capacity;         /* allocated row capacity               */
-    char **col_names;          /* owned array of ncols owned strings   */
-    struct ArrowSchema schema; /* owned Arrow schema (lazy-inited)     */
-    bool schema_ok;            /* true after schema is initialised     */
-    uint32_t sorted_nrows;     /* sorted prefix row count (issue #94)   */
-    int64_t *merge_buf;        /* persistent merge buffer (issue #94)   */
-    uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
-    uint32_t base_nrows;       /* base row count for delta prop (#83)   */
-    col_delta_timestamp_t
-    *timestamps;     /* NULL when not tracking               */
-} col_rel_t;
+#include "../wirelog/columnar/internal.h"
 
 /*
  * Forward declaration of the function under test.
@@ -166,6 +123,30 @@ test_rel_alloc(uint32_t ncols)
     }
     return r;
 }
+static int test_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols);
+
+static int test_row_cmp_rel(const col_rel_t *r, uint32_t row, const int64_t *b,
+    uint32_t ncols)
+{
+    int64_t buf[64]; col_rel_row_copy_out(r, row, buf);
+    return test_row_cmp(buf, b, ncols);
+}
+
+static int test_flat_cmp(const col_rel_t *a, const col_rel_t *b)
+{
+    if (a->nrows != b->nrows || a->ncols != b->ncols) return 1;
+    for (uint32_t i = 0; i < a->nrows; i++) for (uint32_t c = 0; c < a->ncols;
+            c++)
+            if (col_rel_get(a, i, c) != col_rel_get(b, i, c)) return 1;
+    return 0;
+}
+
+static int test_row_match(const col_rel_t *r, uint32_t row,
+    const int64_t *target)
+{
+    for (uint32_t c = 0; c < r->ncols;
+        c++) if (col_rel_get(r, row, c) != target[c]) return 0; return 1;
+}
 
 /* ----------------------------------------------------------------
  * Helper: free col_rel_t.
@@ -176,7 +157,8 @@ test_rel_free(col_rel_t *r)
     if (!r)
         return;
     free(r->name);
-    free(r->data);
+    col_columns_free(r->columns, r->ncols);
+    free(r->row_scratch);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
             free(r->col_names[i]);
@@ -194,15 +176,16 @@ test_rel_append_row(col_rel_t *r, const int64_t *row)
 {
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
-        int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
-                * sizeof(int64_t));
-        if (!nd)
-            return -1;
-        r->data = nd;
+        if (r->columns) {
+            if (col_columns_realloc(r->columns, r->ncols, cap) != 0)
+                return -1;
+        } else {
+            r->columns = col_columns_alloc(r->ncols, cap);
+            if (!r->columns) return -1;
+        }
         r->capacity = cap;
     }
-    memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-        r->ncols * sizeof(int64_t));
+    col_rel_row_copy_in(r, r->nrows, row);
     r->nrows++;
     return 0;
 }
@@ -231,8 +214,10 @@ test_rel_is_sorted_unique(const col_rel_t *r)
     if (r->nrows <= 1)
         return 1;
     for (uint32_t i = 1; i < r->nrows; i++) {
-        int cmp = test_row_cmp(r->data + (size_t)(i - 1) * r->ncols,
-                r->data + (size_t)i * r->ncols, r->ncols);
+        int cmp;
+        { int64_t _a[32], _b[32]; col_rel_row_copy_out(r, i-1, _a);
+          col_rel_row_copy_out(r, i, _b); cmp = test_row_cmp(_a, _b, r->ncols);
+        };
         if (cmp >= 0)
             return 0;
     }
@@ -246,7 +231,7 @@ static int
 test_rel_contains_row(const col_rel_t *r, const int64_t *row)
 {
     for (uint32_t i = 0; i < r->nrows; i++) {
-        if (test_row_cmp(r->data + (size_t)i * r->ncols, row, r->ncols) == 0)
+        if ((test_row_match(r, i, row)))
             return 1;
     }
     return 0;
@@ -260,9 +245,7 @@ test_rel_equals(const col_rel_t *a, const col_rel_t *b)
 {
     if (a->nrows != b->nrows || a->ncols != b->ncols)
         return 0;
-    return memcmp(a->data, b->data,
-               (size_t)a->nrows * a->ncols * sizeof(int64_t))
-           == 0;
+    return (test_flat_cmp(a, b) == 0);
 }
 
 /* ================================================================
@@ -352,7 +335,8 @@ test_two_copies_direct_merge(void)
     int64_t expected[5][2]
         = { { 1, 1 }, { 2, 2 }, { 3, 3 }, { 4, 4 }, { 5, 5 } };
     for (int i = 0; i < 5; i++) {
-        int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
+        int64_t _rp[32]; col_rel_row_copy_out(rel, i, _rp);
+        int64_t *row_ptr = _rp;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
             "row at position i has wrong value");
         (void)test_rel_equals; /* suppress unused warning */
@@ -403,7 +387,8 @@ test_three_copies_heap_merge(void)
     int64_t expected[6][2]
         = { { 1, 1 }, { 2, 2 }, { 3, 3 }, { 4, 4 }, { 5, 5 }, { 6, 6 } };
     for (int i = 0; i < 6; i++) {
-        int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
+        int64_t _rp[32]; col_rel_row_copy_out(rel, i, _rp);
+        int64_t *row_ptr = _rp;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
             "row at position i has wrong value");
     }
@@ -451,7 +436,8 @@ test_per_segment_sort_before_merge(void)
 
     int64_t expected[4][2] = { { 1, 1 }, { 2, 2 }, { 4, 4 }, { 5, 5 } };
     for (int i = 0; i < 4; i++) {
-        int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
+        int64_t _rp[32]; col_rel_row_copy_out(rel, i, _rp);
+        int64_t *row_ptr = _rp;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
             "row at position i has wrong value after sort+merge");
     }
@@ -498,7 +484,8 @@ test_cross_segment_dedup(void)
 
     int64_t expected[3][2] = { { 1, 1 }, { 3, 3 }, { 5, 5 } };
     for (int i = 0; i < 3; i++) {
-        int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
+        int64_t _rp[32]; col_rel_row_copy_out(rel, i, _rp);
+        int64_t *row_ptr = _rp;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
             "row at position i has wrong value after dedup");
     }
@@ -632,7 +619,8 @@ test_empty_middle_segment(void)
 
     int64_t expected[3][2] = { { 1, 1 }, { 2, 2 }, { 3, 3 } };
     for (int i = 0; i < 3; i++) {
-        int64_t *row_ptr = rel->data + (size_t)i * rel->ncols;
+        int64_t _rp[32]; col_rel_row_copy_out(rel, i, _rp);
+        int64_t *row_ptr = _rp;
         ASSERT(test_row_cmp(row_ptr, expected[i], rel->ncols) == 0,
             "row at position i has wrong value (empty segment case)");
     }
@@ -726,14 +714,14 @@ test_large_unsorted_k2_sort_correctness(void)
 
     /* Spot-check: first row should be (0,1,2,3) */
     int64_t expected_first[T8_NCOLS] = { 0, 1, 2, 3 };
-    ASSERT(test_row_cmp(rel->data, expected_first, T8_NCOLS) == 0,
+    ASSERT(test_row_cmp_rel(rel, 0, expected_first, T8_NCOLS) == 0,
         "first row is (0,1,2,3)");
 
     /* Spot-check: last row should be (2*N-1, 2*N, 2*N+1, 2*N+2) */
     int64_t expected_last[T8_NCOLS];
     for (uint32_t c = 0; c < T8_NCOLS; c++)
         expected_last[c] = (int64_t)(2 * N - 1) + (int64_t)c;
-    ASSERT(test_row_cmp(rel->data + (size_t)(rel->nrows - 1) * T8_NCOLS,
+    ASSERT(test_row_cmp_rel(rel, rel->nrows - 1,
         expected_last, T8_NCOLS) == 0,
         "last row is (2N-1, 2N, 2N+1, 2N+2)");
 

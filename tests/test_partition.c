@@ -105,8 +105,17 @@ verify_partition_coverage(const col_rel_t *src, col_rel_t **parts,
     if (col_rel_merge_partitions(parts, num_workers, &merged) != 0)
         return 0;
 
-    /* Create sorted copies for order-independent comparison */
-    col_rel_t *src_copy = make_rel(src->ncols, src->data, src->nrows);
+    /* Create sorted copy of src for order-independent comparison */
+    int64_t *src_flat = (int64_t *)malloc(
+        (size_t)src->nrows * src->ncols * sizeof(int64_t));
+    if (!src_flat) {
+        col_rel_destroy(merged);
+        return 0;
+    }
+    for (uint32_t i = 0; i < src->nrows; i++)
+        col_rel_row_copy_out(src, i, src_flat + (size_t)i * src->ncols);
+    col_rel_t *src_copy = make_rel(src->ncols, src_flat, src->nrows);
+    free(src_flat);
     if (!src_copy) {
         col_rel_destroy(merged);
         return 0;
@@ -115,10 +124,11 @@ verify_partition_coverage(const col_rel_t *src, col_rel_t **parts,
     col_rel_radix_sort_int64(src_copy);
     col_rel_radix_sort_int64(merged);
 
-    int ok = (src_copy->nrows == merged->nrows)
-        && (memcmp(src_copy->data, merged->data,
-        (size_t)src_copy->nrows * src_copy->ncols * sizeof(int64_t))
-        == 0);
+    int ok = (src_copy->nrows == merged->nrows);
+    for (uint32_t i = 0; i < src_copy->nrows && ok; i++)
+        for (uint32_t c = 0; c < src_copy->ncols && ok; c++)
+            if (col_rel_get(src_copy, i, c) != col_rel_get(merged, i, c))
+                ok = 0;
 
     col_rel_destroy(src_copy);
     col_rel_destroy(merged);
@@ -204,7 +214,13 @@ test_single_worker(void)
         return 1;
     }
 
-    if (memcmp(parts[0]->data, src->data, 12 * sizeof(int64_t)) != 0) {
+    /* Compare per-cell instead of flat memcmp */
+    int data_match = 1;
+    for (uint32_t i = 0; i < 4 && data_match; i++)
+        for (uint32_t c = 0; c < 3 && data_match; c++)
+            if (col_rel_get(parts[0], i, c) != col_rel_get(src, i, c))
+                data_match = 0;
+    if (!data_match) {
         FAIL("data mismatch");
         destroy_parts(parts, 1);
         col_rel_destroy(src);
@@ -338,10 +354,13 @@ test_deterministic_hash(void)
             ok = 0;
             break;
         }
-        if (parts1[w]->nrows > 0
-            && memcmp(parts1[w]->data, parts2[w]->data,
-            (size_t)parts1[w]->nrows * 3 * sizeof(int64_t))
-            != 0) {
+        int parts_match = 1;
+        for (uint32_t i = 0; i < parts1[w]->nrows && parts_match; i++)
+            for (uint32_t c = 0; c < 3 && parts_match; c++)
+                if (col_rel_get(parts1[w], i, c)
+                    != col_rel_get(parts2[w], i, c))
+                    parts_match = 0;
+        if (parts1[w]->nrows > 0 && !parts_match) {
             ok = 0;
             break;
         }
@@ -442,7 +461,9 @@ test_multi_column_key(void)
     /* Find which partition row 0 is in, verify row 1 is also there */
     for (uint32_t w = 0; w < 4; w++) {
         for (uint32_t i = 0; i < parts[w]->nrows; i++) {
-            int64_t *r = parts[w]->data + (size_t)i * 3;
+            int64_t rbuf[3];
+            col_rel_row_copy_out(parts[w], i, rbuf);
+            int64_t *r = rbuf;
             /* If we find key (1, 100), the partner row (col1 differs) must
              * also be in this partition */
             if (r[0] == 1 && r[2] == 100) {
@@ -450,7 +471,9 @@ test_multi_column_key(void)
                 for (uint32_t j = 0; j < parts[w]->nrows; j++) {
                     if (j == i)
                         continue;
-                    int64_t *r2 = parts[w]->data + (size_t)j * 3;
+                    int64_t r2buf[3];
+                    col_rel_row_copy_out(parts[w], j, r2buf);
+                    int64_t *r2 = r2buf;
                     if (r2[0] == 1 && r2[2] == 100) {
                         found_partner = 1;
                         break;
@@ -528,13 +551,20 @@ test_merge_roundtrip(void)
     }
 
     /* Sort both for order-independent comparison */
-    col_rel_t *src_copy = make_rel(4, src->data, src->nrows);
+    int64_t *src_flat2 = (int64_t *)malloc(
+        (size_t)src->nrows * 4 * sizeof(int64_t));
+    for (uint32_t i = 0; i < src->nrows; i++)
+        col_rel_row_copy_out(src, i, src_flat2 + (size_t)i * 4);
+    col_rel_t *src_copy = make_rel(4, src_flat2, src->nrows);
+    free(src_flat2);
     col_rel_radix_sort_int64(src_copy);
     col_rel_radix_sort_int64(merged);
 
-    int ok = memcmp(src_copy->data, merged->data,
-            (size_t)src_copy->nrows * 4 * sizeof(int64_t))
-        == 0;
+    int ok = (src_copy->nrows == merged->nrows);
+    for (uint32_t i = 0; i < src_copy->nrows && ok; i++)
+        for (uint32_t c = 0; c < 4 && ok; c++)
+            if (col_rel_get(src_copy, i, c) != col_rel_get(merged, i, c))
+                ok = 0;
 
     col_rel_destroy(src_copy);
     col_rel_destroy(merged);
@@ -683,13 +713,14 @@ test_preserves_all_columns(void)
             break;
         }
         for (uint32_t i = 0; i < parts[w]->nrows && ok; i++) {
-            int64_t *pr = parts[w]->data + (size_t)i * 5;
+            int64_t pr[5];
+            col_rel_row_copy_out(parts[w], i, pr);
             /* Find this row in src */
             int found = 0;
             for (uint32_t j = 0; j < 4; j++) {
-                if (memcmp(pr, src->data + (size_t)j * 5,
-                    5 * sizeof(int64_t))
-                    == 0) {
+                int64_t sr[5];
+                col_rel_row_copy_out(src, j, sr);
+                if (memcmp(pr, sr, 5 * sizeof(int64_t)) == 0) {
                     found = 1;
                     break;
                 }

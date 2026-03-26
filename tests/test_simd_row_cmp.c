@@ -59,22 +59,72 @@ typedef struct {
 
 /*
  * col_rel_t stub - must match the private implementation layout.
+ * Updated for column-major (Phase C, Issue #332).
  */
 typedef struct {
     char *name;
     uint32_t ncols;
-    int64_t *data;
+    int64_t **columns;
     uint32_t nrows;
     uint32_t capacity;
     char **col_names;
     struct ArrowSchema schema;
     bool schema_ok;
     uint32_t sorted_nrows;
-    int64_t *merge_buf;
+    int64_t **merge_columns;
     uint32_t merge_buf_cap;
     uint32_t base_nrows;
     col_delta_timestamp_t *timestamps;
+    bool pool_owned;
+    bool arena_owned;
+    void *mem_ledger;
+    int64_t *row_scratch;
 } col_rel_t;
+
+/* Column-major helpers (inline, matching internal.h) */
+static inline int64_t **
+col_columns_alloc(uint32_t ncols, uint32_t capacity)
+{
+    if (ncols == 0)
+        return NULL;
+    int64_t **cols = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    if (!cols)
+        return NULL;
+    for (uint32_t c = 0; c < ncols; c++) {
+        cols[c] = (int64_t *)malloc(capacity > 0
+            ? (size_t)capacity * sizeof(int64_t) : sizeof(int64_t));
+        if (!cols[c]) {
+            for (uint32_t j = 0; j < c; j++)
+                free(cols[j]);
+            free(cols);
+            return NULL;
+        }
+    }
+    return cols;
+}
+
+static inline void
+col_columns_free(int64_t **cols, uint32_t ncols)
+{
+    if (!cols)
+        return;
+    for (uint32_t c = 0; c < ncols; c++)
+        free(cols[c]);
+    free(cols);
+}
+
+static inline int64_t
+col_rel_get(const col_rel_t *r, uint32_t row, uint32_t col)
+{
+    return r->columns[col][row];
+}
+
+static inline void
+col_rel_row_copy_out(const col_rel_t *r, uint32_t row, int64_t *dst)
+{
+    for (uint32_t c = 0; c < r->ncols; c++)
+        dst[c] = r->columns[c][row];
+}
 
 /*
  * Forward declaration of the function under test.
@@ -154,8 +204,9 @@ test_rel_free(col_rel_t *r)
     if (!r)
         return;
     free(r->name);
-    free(r->data);
-    free(r->merge_buf);
+    col_columns_free(r->columns, r->ncols);
+    col_columns_free(r->merge_columns, r->ncols);
+    free(r->row_scratch);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
             free(r->col_names[i]);
@@ -171,15 +222,15 @@ test_rel_free(col_rel_t *r)
 static int
 test_rel_set_rows(col_rel_t *r, const int64_t *data_vals, uint32_t nrows)
 {
-    size_t total = (size_t)nrows * r->ncols;
-    int64_t *buf = (int64_t *)malloc(total * sizeof(int64_t));
-    if (!buf)
+    col_columns_free(r->columns, r->ncols);
+    r->columns = col_columns_alloc(r->ncols, nrows > 0 ? nrows : 1);
+    if (!r->columns)
         return -1;
-    memcpy(buf, data_vals, total * sizeof(int64_t));
-    free(r->data);
-    r->data = buf;
+    for (uint32_t row = 0; row < nrows; row++)
+        for (uint32_t c = 0; c < r->ncols; c++)
+            r->columns[c][row] = data_vals[(size_t)row * r->ncols + c];
     r->nrows = nrows;
-    r->capacity = nrows;
+    r->capacity = nrows > 0 ? nrows : 1;
     return 0;
 }
 
@@ -206,7 +257,7 @@ test_ncols1_equal_rows(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 1, "expected 1 deduplicated row");
-    ASSERT(rel->data[0] == 42, "wrong value after dedup");
+    ASSERT(col_rel_get(rel, 0, 0) == 42, "wrong value after dedup");
 
     test_rel_free(rel);
     PASS();
@@ -231,8 +282,8 @@ test_ncols1_a_lt_b(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 rows");
-    ASSERT(rel->data[0] == 10, "first row wrong");
-    ASSERT(rel->data[1] == 20, "second row wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 10, "first row wrong");
+    ASSERT(col_rel_get(rel, 1, 0) == 20, "second row wrong");
 
     test_rel_free(rel);
     PASS();
@@ -257,8 +308,8 @@ test_ncols1_a_gt_b(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 rows");
-    ASSERT(rel->data[0] == 10, "first row wrong");
-    ASSERT(rel->data[1] == 20, "second row wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 10, "first row wrong");
+    ASSERT(col_rel_get(rel, 1, 0) == 20, "second row wrong");
 
     test_rel_free(rel);
     PASS();
@@ -283,10 +334,10 @@ test_ncols4_equal_rows(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 1, "expected 1 deduplicated row");
-    ASSERT(rel->data[0] == 1, "col0 wrong");
-    ASSERT(rel->data[1] == 2, "col1 wrong");
-    ASSERT(rel->data[2] == 3, "col2 wrong");
-    ASSERT(rel->data[3] == 4, "col3 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 1, "col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 1) == 2, "col1 wrong");
+    ASSERT(col_rel_get(rel, 0, 2) == 3, "col2 wrong");
+    ASSERT(col_rel_get(rel, 0, 3) == 4, "col3 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -311,8 +362,8 @@ test_ncols4_differ_first_col(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 rows");
-    ASSERT(rel->data[0] == 1, "row0 col0 wrong");
-    ASSERT(rel->data[4] == 2, "row1 col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 1, "row0 col0 wrong");
+    ASSERT(col_rel_get(rel, 1, 0) == 2, "row1 col0 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -337,8 +388,8 @@ test_ncols4_differ_last_col(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 rows");
-    ASSERT(rel->data[3] == 4, "row0 col3 wrong");
-    ASSERT(rel->data[7] == 5, "row1 col3 wrong");
+    ASSERT(col_rel_get(rel, 0, 3) == 4, "row0 col3 wrong");
+    ASSERT(col_rel_get(rel, 1, 3) == 5, "row1 col3 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -363,8 +414,8 @@ test_ncols5_simd_scalar_tail(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 rows");
-    ASSERT(rel->data[4] == 5, "row0 col4 wrong");
-    ASSERT(rel->data[9] == 6, "row1 col4 wrong");
+    ASSERT(col_rel_get(rel, 0, 4) == 5, "row0 col4 wrong");
+    ASSERT(col_rel_get(rel, 1, 4) == 6, "row1 col4 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -392,8 +443,8 @@ test_ncols8_full_avx2_width(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 1, "expected 1 deduplicated row");
-    ASSERT(rel->data[0] == 10, "col0 wrong");
-    ASSERT(rel->data[7] == 80, "col7 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 10, "col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 7) == 80, "col7 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -421,8 +472,10 @@ test_negative_values_int64_extremes(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 rows");
-    ASSERT(rel->data[0] == INT64_MIN, "first row should be INT64_MIN");
-    ASSERT(rel->data[2] == INT64_MAX, "second row should be INT64_MAX");
+    ASSERT(col_rel_get(rel, 0, 0) == INT64_MIN,
+        "first row should be INT64_MIN");
+    ASSERT(col_rel_get(rel, 1, 0) == INT64_MAX,
+        "second row should be INT64_MAX");
 
     test_rel_free(rel);
     PASS();
@@ -456,8 +509,8 @@ test_ncols16_large_row(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 distinct rows");
-    ASSERT(rel->data[15] == 100, "row0 col15 wrong");
-    ASSERT(rel->data[31] == 200, "row1 col15 wrong");
+    ASSERT(col_rel_get(rel, 0, 15) == 100, "row0 col15 wrong");
+    ASSERT(col_rel_get(rel, 1, 15) == 200, "row1 col15 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -487,8 +540,8 @@ test_k1_single_segment_dedup(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 1);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 unique rows after K=1 dedup");
-    ASSERT(rel->data[0] == 1, "row0 col0 wrong");
-    ASSERT(rel->data[2] == 2, "row1 col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 1, "row0 col0 wrong");
+    ASSERT(col_rel_get(rel, 1, 0) == 2, "row1 col0 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -517,11 +570,11 @@ test_k3_heap_merge(void)
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 5, "expected 5 unique rows after K=3 merge");
     /* Verify sorted order: (1,10), (2,20), (3,30), (4,40), (5,50) */
-    ASSERT(rel->data[0] == 1, "row0 col0 wrong");
-    ASSERT(rel->data[2] == 2, "row1 col0 wrong");
-    ASSERT(rel->data[4] == 3, "row2 col0 wrong");
-    ASSERT(rel->data[6] == 4, "row3 col0 wrong");
-    ASSERT(rel->data[8] == 5, "row4 col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 1, "row0 col0 wrong");
+    ASSERT(col_rel_get(rel, 1, 0) == 2, "row1 col0 wrong");
+    ASSERT(col_rel_get(rel, 2, 0) == 3, "row2 col0 wrong");
+    ASSERT(col_rel_get(rel, 3, 0) == 4, "row3 col0 wrong");
+    ASSERT(col_rel_get(rel, 4, 0) == 5, "row4 col0 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -550,8 +603,8 @@ test_ncols2_equal_rows(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 1, "expected 1 deduplicated row");
-    ASSERT(rel->data[0] == 5, "col0 wrong");
-    ASSERT(rel->data[1] == 10, "col1 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 5, "col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 1) == 10, "col1 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -576,8 +629,8 @@ test_ncols2_differ_col0(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 distinct rows");
-    ASSERT(rel->data[0] == 1, "row0 col0 wrong");
-    ASSERT(rel->data[2] == 2, "row1 col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 1, "row0 col0 wrong");
+    ASSERT(col_rel_get(rel, 1, 0) == 2, "row1 col0 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -602,8 +655,8 @@ test_ncols2_differ_col1(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 distinct rows");
-    ASSERT(rel->data[1] == 1, "row0 col1 wrong");
-    ASSERT(rel->data[3] == 2, "row1 col1 wrong");
+    ASSERT(col_rel_get(rel, 0, 1) == 1, "row0 col1 wrong");
+    ASSERT(col_rel_get(rel, 1, 1) == 2, "row1 col1 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -628,8 +681,8 @@ test_ncols4_differ_col2(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 2, "expected 2 distinct rows");
-    ASSERT(rel->data[2] == 3, "row0 col2 wrong");
-    ASSERT(rel->data[6] == 9, "row1 col2 wrong");
+    ASSERT(col_rel_get(rel, 0, 2) == 3, "row0 col2 wrong");
+    ASSERT(col_rel_get(rel, 1, 2) == 9, "row1 col2 wrong");
 
     test_rel_free(rel);
     PASS();
@@ -654,10 +707,10 @@ test_ncols4_equal_rows_dispatch(void)
     int rc = col_op_consolidate_kway_merge(rel, segs, 2);
     ASSERT(rc == 0, "kway_merge returned error");
     ASSERT(rel->nrows == 1, "expected 1 deduplicated row");
-    ASSERT(rel->data[0] == 10, "col0 wrong");
-    ASSERT(rel->data[1] == 20, "col1 wrong");
-    ASSERT(rel->data[2] == 30, "col2 wrong");
-    ASSERT(rel->data[3] == 40, "col3 wrong");
+    ASSERT(col_rel_get(rel, 0, 0) == 10, "col0 wrong");
+    ASSERT(col_rel_get(rel, 0, 1) == 20, "col1 wrong");
+    ASSERT(col_rel_get(rel, 0, 2) == 30, "col2 wrong");
+    ASSERT(col_rel_get(rel, 0, 3) == 40, "col3 wrong");
 
     test_rel_free(rel);
     PASS();

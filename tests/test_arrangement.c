@@ -84,18 +84,18 @@ static int fail_count = 0;
  * Full definition is in columnar_nanoarrow.c:49-62.
  *
  * Memory layout (x86-64, LP64):
- *   char     *name      → 8 bytes  (offset  0)
- *   uint32_t  ncols     → 4 bytes  (offset  8)
- *   [padding            → 4 bytes  (offset 12)]
- *   int64_t  *data      → 8 bytes  (offset 16)
- *   uint32_t  nrows     → 4 bytes  (offset 24)
- *   uint32_t  capacity  → 4 bytes  (offset 28)
+ *   char      *name      -> 8 bytes  (offset  0)
+ *   uint32_t   ncols     -> 4 bytes  (offset  8)
+ *   [padding             -> 4 bytes  (offset 12)]
+ *   int64_t  **columns   -> 8 bytes  (offset 16)
+ *   uint32_t   nrows     -> 4 bytes  (offset 24)
+ *   uint32_t   capacity  -> 4 bytes  (offset 28)
  */
 typedef struct {
     char *name;
     uint32_t ncols;
     uint32_t _ncols_pad; /* explicit alignment padding */
-    int64_t *data;
+    int64_t **columns;
     uint32_t nrows;
     uint32_t capacity;
     /* omitted: col_names, schema, schema_ok, timestamps */
@@ -316,13 +316,13 @@ test_arrangement_find_first_hit(void)
     /* key_row: col 0 = 2 (any value in col 1 is ignored by find_first) */
     int64_t key_row[2] = { 2, 0 };
     uint32_t row_idx
-        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
+        = col_arrangement_find_first(arr, rel->columns, rel->ncols, key_row);
 
     ASSERT(row_idx != UINT32_MAX, "find_first must find row with key col0=2");
 
     /* Verify the returned row actually has col 0 == 2 */
-    const int64_t *rp = rel->data + (size_t)row_idx * rel->ncols;
-    ASSERT(rp[0] == 2, "returned row must have col 0 == 2");
+    ASSERT(rel->columns[0][row_idx] == 2,
+        "returned row must have col 0 == 2");
 
     free_session(sess, plan, prog);
     PASS();
@@ -359,7 +359,7 @@ test_arrangement_find_first_miss(void)
 
     int64_t key_row[2] = { 99, 0 }; /* col0=99 does not exist */
     uint32_t row_idx
-        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
+        = col_arrangement_find_first(arr, rel->columns, rel->ncols, key_row);
 
     ASSERT(row_idx == UINT32_MAX,
         "find_first must return UINT32_MAX for non-existent key");
@@ -402,7 +402,7 @@ test_arrangement_find_next_singleton(void)
 
     int64_t key_row[2] = { 1, 0 };
     uint32_t first
-        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
+        = col_arrangement_find_first(arr, rel->columns, rel->ncols, key_row);
     ASSERT(first != UINT32_MAX, "find_first must find key col0=1");
 
     uint32_t next = col_arrangement_find_next(arr, first);
@@ -412,9 +412,8 @@ test_arrangement_find_next_singleton(void)
     while (next != UINT32_MAX) {
         /* If there's a collision, the next row's col 0 must NOT equal 1
          * (it's a false positive from a different key). */
-        const int64_t *rp = rel->data + (size_t)next * rel->ncols;
         ASSERT(
-            rp[0] != 1,
+            rel->columns[0][next] != 1,
             "find_next continuation must be a hash-collision false positive");
         next = col_arrangement_find_next(arr, next);
     }
@@ -458,10 +457,9 @@ test_arrangement_find_next_chain(void)
     int64_t key_row[2] = { 1, 0 };
     uint32_t count = 0;
     uint32_t row
-        = col_arrangement_find_first(arr, rel->data, rel->ncols, key_row);
+        = col_arrangement_find_first(arr, rel->columns, rel->ncols, key_row);
     while (row != UINT32_MAX) {
-        const int64_t *rp = rel->data + (size_t)row * rel->ncols;
-        if (rp[0] == 1)
+        if (rel->columns[0][row] == 1)
             count++;
         row = col_arrangement_find_next(arr, row);
     }

@@ -617,48 +617,66 @@ test_arena_pointer_swap_no_change(void)
     col_rel_t *r = col_rel_new_auto("t_arena", ncols);
     ASSERT_MSG(r != NULL, "col_rel_new_auto failed");
 
-    /* Replace r->data with arena-allocated buffer */
-    free(r->data); /* free the default malloc'd buffer */
-    r->data = (int64_t *)wl_arena_alloc(arena, sz);
-    ASSERT_MSG(r->data != NULL, "arena alloc for r->data failed");
+    /* Replace r->columns with arena-allocated column buffers */
+    col_columns_free(r->columns, ncols);
+    free(r->row_scratch);
+    r->columns = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    ASSERT_MSG(r->columns != NULL, "calloc columns array failed");
+    for (uint32_t c = 0; c < ncols; c++) {
+        r->columns[c] = (int64_t *)wl_arena_alloc(arena,
+                nrows * sizeof(int64_t));
+        ASSERT_MSG(r->columns[c] != NULL, "arena alloc for column failed");
+    }
+    r->arena_owned = true;
     r->nrows = nrows;
     r->capacity = nrows;
 
-    fill_rel_data(r->data, nrows, ncols, 42);
+    /* Fill with values using accessors */
+    for (uint32_t row = 0; row < nrows; row++)
+        for (uint32_t c = 0; c < ncols; c++)
+            col_rel_set(r, row, c, 42 + (int64_t)(row * ncols + c));
 
     /* Snapshot first/last values */
-    int64_t first = r->data[0];
-    int64_t last = r->data[(nrows - 1) * ncols + (ncols - 1)];
+    int64_t first = col_rel_get(r, 0, 0);
+    int64_t last = col_rel_get(r, nrows - 1, ncols - 1);
 
     /* Save backup (pointer swap: save phase) */
-    int64_t *backup_data = r->data;
+    int64_t **backup_cols = r->columns;
     uint32_t backup_nrows = r->nrows;
     uint32_t backup_capacity = r->capacity;
 
-    /* Allocate fresh buffer from arena for evaluation output */
-    int64_t *fresh = (int64_t *)wl_arena_alloc(arena, sz);
-    ASSERT_MSG(fresh != NULL, "arena alloc for fresh buffer failed");
-    memcpy(fresh, backup_data, sz); /* simulate evaluation producing same data */
+    /* Allocate fresh columns from arena for evaluation output */
+    int64_t **fresh = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    ASSERT_MSG(fresh != NULL, "calloc fresh columns failed");
+    for (uint32_t c = 0; c < ncols; c++) {
+        fresh[c] = (int64_t *)wl_arena_alloc(arena,
+                nrows * sizeof(int64_t));
+        ASSERT_MSG(fresh[c] != NULL, "arena alloc for fresh col failed");
+        memcpy(fresh[c], backup_cols[c], nrows * sizeof(int64_t));
+    }
 
-    r->data = fresh;
+    r->columns = fresh;
     r->nrows = backup_nrows;
     r->capacity = backup_capacity;
 
     /* No-change path: restore original (note: with arena, we skip free()) */
-    r->data = backup_data;
+    free(r->columns); /* free columns array only, arena owns buffers */
+    r->columns = backup_cols;
     r->nrows = backup_nrows;
     r->capacity = backup_capacity;
 
     /* Verify data is intact */
-    ASSERT_MSG(r->data == backup_data, "data pointer not restored");
-    ASSERT_MSG(r->data[0] == first, "first value changed after restore");
-    ASSERT_MSG(r->data[(nrows - 1) * ncols + (ncols - 1)] == last,
+    ASSERT_MSG(r->columns == backup_cols, "columns pointer not restored");
+    ASSERT_MSG(col_rel_get(r, 0, 0) == first, "first value changed");
+    ASSERT_MSG(col_rel_get(r, nrows - 1, ncols - 1) == last,
         "last value changed after restore");
 
-    /* Null out data before col_rel_destroy so it does not free arena memory */
-    r->data = NULL;
+    /* Null out columns before col_rel_destroy so it does not free arena memory */
+    free(r->columns); /* free columns array */
+    r->columns = NULL;
     r->nrows = 0;
     r->capacity = 0;
+    r->arena_owned = false;
     col_rel_destroy(r);
 
     wl_arena_free(arena); /* releases all arena-allocated data at once */
@@ -686,39 +704,56 @@ test_arena_pointer_swap_changed(void)
     col_rel_t *r = col_rel_new_auto("t_changed", ncols);
     ASSERT_MSG(r != NULL, "col_rel_new_auto failed");
 
-    free(r->data);
-    r->data = (int64_t *)wl_arena_alloc(arena, sz);
-    ASSERT_MSG(r->data != NULL, "arena alloc failed");
+    col_columns_free(r->columns, ncols);
+    free(r->row_scratch);
+    r->columns = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    ASSERT_MSG(r->columns != NULL, "calloc columns failed");
+    for (uint32_t c = 0; c < ncols; c++) {
+        r->columns[c] = (int64_t *)wl_arena_alloc(arena,
+                nrows * sizeof(int64_t));
+        ASSERT_MSG(r->columns[c] != NULL, "arena alloc failed");
+    }
+    r->arena_owned = true;
     r->nrows = nrows;
     r->capacity = nrows;
 
-    fill_rel_data(r->data, nrows, ncols, 100);
+    for (uint32_t row = 0; row < nrows; row++)
+        for (uint32_t c = 0; c < ncols; c++)
+            col_rel_set(r, row, c, 100 + (int64_t)(row * ncols + c));
 
     /* Save backup */
-    int64_t *backup_data = r->data;
+    int64_t **backup_cols = r->columns;
     uint32_t backup_nrows = r->nrows;
     uint32_t backup_capacity = r->capacity;
 
-    /* Allocate fresh buffer: evaluation produced different rows */
-    int64_t *fresh = (int64_t *)wl_arena_alloc(arena, sz);
-    ASSERT_MSG(fresh != NULL, "arena alloc for fresh failed");
-    fill_rel_data(fresh, nrows, ncols, 9000); /* different values */
+    /* Allocate fresh columns: evaluation produced different rows */
+    int64_t **fresh = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    ASSERT_MSG(fresh != NULL, "calloc fresh failed");
+    for (uint32_t c = 0; c < ncols; c++) {
+        fresh[c] = (int64_t *)wl_arena_alloc(arena,
+                nrows * sizeof(int64_t));
+        ASSERT_MSG(fresh[c] != NULL, "arena alloc for fresh failed");
+        for (uint32_t row = 0; row < nrows; row++)
+            fresh[c][row] = 9000;
+    }
 
-    r->data = fresh;
+    r->columns = fresh;
     r->nrows = backup_nrows;
     r->capacity = backup_capacity;
 
     /* Changed path: keep fresh, drop backup (no free needed with arena) */
-    /* backup_data is now a dangling stale reference — do not access it */
-    (void)backup_data;
+    free(backup_cols); /* free old columns array, arena owns buffers */
 
     /* Verify new data is in place */
-    ASSERT_MSG(r->data == fresh, "data pointer should be fresh");
-    ASSERT_MSG(r->data[0] == 9000, "first value should be from fresh buffer");
+    ASSERT_MSG(r->columns == fresh, "columns pointer should be fresh");
+    ASSERT_MSG(col_rel_get(r, 0, 0) == 9000,
+        "first value should be from fresh buffer");
 
-    r->data = NULL;
+    free(r->columns); /* free columns array */
+    r->columns = NULL;
     r->nrows = 0;
     r->capacity = 0;
+    r->arena_owned = false;
     col_rel_destroy(r);
 
     wl_arena_free(arena);

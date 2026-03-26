@@ -8,8 +8,8 @@
  * Verifies that the zero-copy pointer swap pattern used in
  * col_stratum_step_retraction_nonrecursive is safe and correct:
  *
- *   1. Save r->data pointer as backup (O(1), no memcpy)
- *   2. Allocate fresh buffer, assign to r->data
+ *   1. Save r->columns pointer as backup (O(1), no memcpy)
+ *   2. Allocate fresh buffer, assign to r->columns
  *   3. Evaluate into fresh buffer
  *   4a. No change: free new buffer, restore backup pointer
  *   4b. Changed:   free backup, keep new buffer
@@ -76,14 +76,30 @@ fill_rel(col_rel_t *r, uint32_t nrows, int64_t val_base)
 }
 
 /*
- * data_equal: byte-wise comparison of r->data against expected buffer.
+ * data_equal: per-cell comparison of r->columns against expected flat buffer.
  * Returns true if identical.
  */
 static bool
 data_equal(const col_rel_t *r, const int64_t *expected)
 {
+    for (uint32_t i = 0; i < r->nrows; i++)
+        for (uint32_t c = 0; c < r->ncols; c++)
+            if (col_rel_get(r, i, c) != expected[i * r->ncols + c])
+                return false;
+    return true;
+}
+
+/* Snapshot relation data into a flat buffer for comparison */
+static int64_t *
+snapshot_flat(const col_rel_t *r)
+{
     size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-    return memcmp(r->data, expected, sz) == 0;
+    int64_t *buf = (int64_t *)malloc(sz);
+    if (!buf)
+        return NULL;
+    for (uint32_t i = 0; i < r->nrows; i++)
+        col_rel_row_copy_out(r, i, buf + (size_t)i * r->ncols);
+    return buf;
 }
 
 /* ======================================================================== */
@@ -91,7 +107,7 @@ data_equal(const col_rel_t *r, const int64_t *expected)
 /* ======================================================================== */
 
 /*
- * Allocate a relation with 5 rows. Save r->data, allocate a fresh buffer,
+ * Allocate a relation with 5 rows. Save r->columns, allocate a fresh buffer,
  * copy rows into it (simulating evaluation into new buffer), then restore
  * the original pointer. Verify the original data is still accessible and
  * unchanged. The fresh buffer is freed.
@@ -114,41 +130,41 @@ test_basic_save_restore(void)
     }
 
     /* Snapshot expected data before swap */
-    size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-    int64_t *expected = (int64_t *)malloc(sz);
+    int64_t *expected = snapshot_flat(r);
     if (!expected) {
         col_rel_destroy(r);
         FAIL("malloc expected failed");
         return 1;
     }
-    memcpy(expected, r->data, sz);
 
     /* --- pointer swap: save --- */
-    int64_t    *backup_data = r->data;
+    int64_t **backup_columns = r->columns;
     uint32_t backup_nrows = r->nrows;
     uint32_t backup_capacity = r->capacity;
 
-    /* Allocate fresh buffer and copy rows in (simulates evaluation output) */
-    int64_t *fresh = (int64_t *)malloc(sz);
+    /* Allocate fresh columns and copy rows in (simulates evaluation output) */
+    int64_t **fresh = col_columns_alloc(r->ncols, r->capacity);
     if (!fresh) {
         free(expected);
         col_rel_destroy(r);
-        FAIL("malloc fresh failed");
+        FAIL("col_columns_alloc fresh failed");
         return 1;
     }
-    memcpy(fresh, backup_data, sz);
-    r->data = fresh;
+    for (uint32_t c = 0; c < r->ncols; c++)
+        memcpy(fresh[c], backup_columns[c], backup_nrows * sizeof(int64_t));
+    r->columns = fresh;
     r->nrows = backup_nrows;
     r->capacity = backup_capacity;
 
     /* --- pointer swap: restore (no-change path) --- */
-    free(r->data);          /* free the fresh buffer  */
-    r->data = backup_data;
+    col_columns_free(r->columns, r->ncols);
+    free(r->row_scratch);
+    r->columns = backup_columns;
     r->nrows = backup_nrows;
     r->capacity = backup_capacity;
 
     /* Verify original pointer is back and data is unchanged */
-    bool ptr_ok = (r->data == backup_data);
+    bool ptr_ok = (r->columns == backup_columns);
     bool data_ok = data_equal(r, expected);
 
     free(expected);
@@ -205,43 +221,41 @@ test_multiple_relations(void)
     /* Snapshot expected data */
     int64_t *expected[3];
     for (int i = 0; i < 3; i++) {
-        size_t sz = (size_t)rels[i]->nrows * rels[i]->ncols * sizeof(int64_t);
-        expected[i] = (int64_t *)malloc(sz);
+        expected[i] = snapshot_flat(rels[i]);
         if (!expected[i]) {
             for (int j = 0; j < i; j++) free(expected[j]);
             for (int j = 0; j < 3; j++) col_rel_destroy(rels[j]);
-            FAIL("malloc expected failed");
+            FAIL("snapshot_flat failed");
             return 1;
         }
-        memcpy(expected[i], rels[i]->data, sz);
     }
 
     /* Save all 3 pointers */
-    int64_t *backups[3];
+    int64_t **backups[3];
     uint32_t backup_nrows[3], backup_cap[3];
-    int64_t *fresh[3];
+    int64_t **fresh[3];
     for (int i = 0; i < 3; i++) {
-        backups[i] = rels[i]->data;
+        backups[i] = rels[i]->columns;
         backup_nrows[i] = rels[i]->nrows;
         backup_cap[i] = rels[i]->capacity;
-        size_t sz = (size_t)backup_cap[i] * rels[i]->ncols * sizeof(int64_t);
-        fresh[i] = (int64_t *)malloc(sz);
+        fresh[i] = col_columns_alloc(rels[i]->ncols, backup_cap[i]);
         if (!fresh[i]) {
-            for (int j = 0; j < i; j++) free(fresh[j]);
+            for (int j = 0; j < i; j++)
+                col_columns_free(fresh[j], rels[j]->ncols);
             for (int j = 0; j < 3; j++) free(expected[j]);
             for (int j = 0; j < 3; j++) col_rel_destroy(rels[j]);
-            FAIL("malloc fresh failed");
+            FAIL("col_columns_alloc fresh failed");
             return 1;
         }
-        rels[i]->data = fresh[i];
+        rels[i]->columns = fresh[i];
         rels[i]->nrows = backup_nrows[i];
         rels[i]->capacity = backup_cap[i];
     }
 
     /* Restore all 3 (no-change path) */
     for (int i = 0; i < 3; i++) {
-        free(rels[i]->data);
-        rels[i]->data = backups[i];
+        col_columns_free(rels[i]->columns, rels[i]->ncols);
+        rels[i]->columns = backups[i];
         rels[i]->nrows = backup_nrows[i];
         rels[i]->capacity = backup_cap[i];
     }
@@ -292,32 +306,32 @@ test_zero_rows(void)
          * capacity may be 0 — that is fine for this test. */
     }
 
-    int64_t *backup_data = r->data;
+    int64_t **backup_columns = r->columns;
     uint32_t backup_nrows = r->nrows;      /* 0 */
     uint32_t backup_capacity = r->capacity;
 
     /* Pointer swap: allocate a minimal fresh buffer (or NULL if capacity==0) */
-    int64_t *fresh = NULL;
+    int64_t **fresh = NULL;
     if (backup_capacity > 0 && r->ncols > 0) {
-        size_t sz = (size_t)backup_capacity * r->ncols * sizeof(int64_t);
-        fresh = (int64_t *)malloc(sz);
+        fresh = col_columns_alloc(r->ncols, backup_capacity);
         if (!fresh) {
             col_rel_destroy(r);
-            FAIL("malloc fresh failed");
+            FAIL("col_columns_alloc fresh failed");
             return 1;
         }
     }
-    r->data = fresh;       /* may be NULL — that is valid when nrows==0 */
+    r->columns = fresh;       /* may be NULL -- that is valid when nrows==0 */
     r->nrows = 0;
     r->capacity = backup_capacity;
 
     /* Restore */
-    free(r->data);
-    r->data = backup_data;
+    col_columns_free(r->columns, r->ncols);
+    free(r->row_scratch);
+    r->columns = backup_columns;
     r->nrows = backup_nrows;
     r->capacity = backup_capacity;
 
-    bool ptr_ok = (r->data == backup_data);
+    bool ptr_ok = (r->columns == backup_columns);
     bool nrows_ok = (r->nrows == 0);
 
     col_rel_destroy(r);
@@ -362,39 +376,38 @@ test_large_buffer(void)
         return 1;
     }
 
-    size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-    size_t sz_cap = (size_t)r->capacity * r->ncols * sizeof(int64_t);
-
-    /* Snapshot spot-checks: first, mid, last */
-    int64_t first = r->data[0];
-    int64_t mid = r->data[LARGE_NROWS / 2];
-    int64_t last = r->data[r->nrows - 1];
+    /* Snapshot spot-checks: first, mid, last (1-col relation) */
+    int64_t first = col_rel_get(r, 0, 0);
+    int64_t mid = col_rel_get(r, LARGE_NROWS / 2, 0);
+    int64_t last = col_rel_get(r, r->nrows - 1, 0);
 
     /* Pointer swap */
-    int64_t *backup = r->data;
+    int64_t **backup = r->columns;
     uint32_t b_nrows = r->nrows;
     uint32_t b_capacity = r->capacity;
 
-    int64_t *fresh = (int64_t *)malloc(sz_cap);
+    int64_t **fresh = col_columns_alloc(r->ncols, b_capacity);
     if (!fresh) {
         col_rel_destroy(r);
-        FAIL("malloc fresh (>10MB) failed");
+        FAIL("col_columns_alloc fresh (>10MB) failed");
         return 1;
     }
-    memcpy(fresh, backup, sz); /* simulate eval output */
-    r->data = fresh;
+    for (uint32_t c = 0; c < r->ncols; c++)
+        memcpy(fresh[c], backup[c], b_nrows * sizeof(int64_t));
+    r->columns = fresh;
     r->nrows = b_nrows;
     r->capacity = b_capacity;
 
     /* Restore */
-    free(r->data);
-    r->data = backup;
+    col_columns_free(r->columns, r->ncols);
+    free(r->row_scratch);
+    r->columns = backup;
     r->nrows = b_nrows;
     r->capacity = b_capacity;
 
-    bool ok = (r->data[0] == first)
-        && (r->data[LARGE_NROWS / 2] == mid)
-        && (r->data[r->nrows - 1] == last);
+    bool ok = (col_rel_get(r, 0, 0) == first)
+        && (col_rel_get(r, LARGE_NROWS / 2, 0) == mid)
+        && (col_rel_get(r, r->nrows - 1, 0) == last);
 
     col_rel_destroy(r);
 
@@ -436,36 +449,35 @@ test_data_integrity(void)
     }
 
     /* Snapshot full expected buffer */
-    size_t sz = (size_t)r->nrows * r->ncols * sizeof(int64_t);
-    size_t sz_cap = (size_t)r->capacity * r->ncols * sizeof(int64_t);
-    int64_t *expected = (int64_t *)malloc(sz);
+    int64_t *expected = snapshot_flat(r);
     if (!expected) {
         col_rel_destroy(r);
-        FAIL("malloc expected failed");
+        FAIL("snapshot_flat failed");
         return 1;
     }
-    memcpy(expected, r->data, sz);
 
     /* Pointer swap + restore */
-    int64_t *backup = r->data;
+    int64_t **backup = r->columns;
     uint32_t b_nrows = r->nrows;
     uint32_t b_capacity = r->capacity;
 
-    int64_t *fresh = (int64_t *)malloc(sz_cap);
+    int64_t **fresh = col_columns_alloc(r->ncols, b_capacity);
     if (!fresh) {
         free(expected);
         col_rel_destroy(r);
-        FAIL("malloc fresh failed");
+        FAIL("col_columns_alloc fresh failed");
         return 1;
     }
-    memcpy(fresh, backup, sz);
-    r->data = fresh;
+    for (uint32_t c = 0; c < r->ncols; c++)
+        memcpy(fresh[c], backup[c], b_nrows * sizeof(int64_t));
+    r->columns = fresh;
     r->nrows = b_nrows;
     r->capacity = b_capacity;
 
     /* No-change path: restore */
-    free(r->data);
-    r->data = backup;
+    col_columns_free(r->columns, r->ncols);
+    free(r->row_scratch);
+    r->columns = backup;
     r->nrows = b_nrows;
     r->capacity = b_capacity;
 
@@ -473,7 +485,7 @@ test_data_integrity(void)
     bool ok = true;
     for (uint32_t row = 0; row < r->nrows && ok; row++) {
         for (uint32_t col = 0; col < r->ncols && ok; col++) {
-            int64_t got = r->data[row * r->ncols + col];
+            int64_t got = col_rel_get(r, row, col);
             int64_t want = expected[row * r->ncols + col];
             if (got != want) {
                 ok = false;
@@ -507,8 +519,8 @@ test_data_integrity(void)
  * any double-free or use-after-free; valgrind will catch leaks.
  *
  * Pattern:
- *   backup = r->data;      // save old
- *   r->data = fresh;       // assign new (evaluation result)
+ *   backup = r->columns;      // save old
+ *   r->columns = fresh;       // assign new (evaluation result)
  *   // data changed — keep fresh, discard backup
  *   free(backup);          // ← this is the critical path
  */
@@ -529,36 +541,36 @@ test_backup_cleanup_changed_path(void)
         return 1;
     }
 
-    size_t sz_cap = (size_t)r->capacity * r->ncols * sizeof(int64_t);
-
     /* Save old pointer */
-    int64_t *backup = r->data;
+    int64_t **backup = r->columns;
     uint32_t b_nrows = r->nrows;
     uint32_t b_capacity = r->capacity;
 
-    /* Allocate fresh buffer with different (changed) values */
-    int64_t *fresh = (int64_t *)malloc(sz_cap);
+    /* Allocate fresh columns with different (changed) values */
+    int64_t **fresh = col_columns_alloc(r->ncols, b_capacity);
     if (!fresh) {
         col_rel_destroy(r);
-        FAIL("malloc fresh failed");
+        FAIL("col_columns_alloc fresh failed");
         return 1;
     }
-    /* Write distinct sentinel: every element = 9999 */
-    for (size_t i = 0; i < (size_t)b_nrows * r->ncols; i++)
-        fresh[i] = 9999;
+    /* Write distinct sentinel: every cell = 9999 */
+    for (uint32_t row = 0; row < b_nrows; row++)
+        for (uint32_t c = 0; c < r->ncols; c++)
+            fresh[c][row] = 9999;
 
-    r->data = fresh;
+    r->columns = fresh;
     r->nrows = b_nrows;
     r->capacity = b_capacity;
 
     /* Changed path: free the backup, keep fresh */
-    free(backup);
+    col_columns_free(backup, r->ncols);
 
     /* Verify new data is what we wrote */
     bool ok = true;
-    for (uint32_t i = 0; i < r->nrows * r->ncols && ok; i++) {
-        if (r->data[i] != 9999) {
-            ok = false;
+    for (uint32_t row = 0; row < r->nrows && ok; row++) {
+        for (uint32_t c = 0; c < r->ncols && ok; c++) {
+            if (col_rel_get(r, row, c) != 9999)
+                ok = false;
         }
     }
 

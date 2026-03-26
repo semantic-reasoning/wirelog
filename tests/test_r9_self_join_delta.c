@@ -39,29 +39,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* -------------------------------------------------------------------------
  * Minimal mock of delta_mode enum (mirrors exec_plan.h wl_delta_mode_t)
@@ -90,10 +90,54 @@ typedef struct {
 
 typedef struct {
     const char *name;
-    int64_t *data; /* row-major: nrows * ncols int64_t values */
+    int64_t **columns; /* column-major */ /* row-major: nrows * ncols int64_t values */
     uint32_t nrows;
     uint32_t ncols;
 } mock_rel_t;
+/* Column-major helpers for test (Phase C, Issue #332) */
+static inline int64_t **
+test_cols_alloc(uint32_t ncols, uint32_t cap)
+{
+    if (ncols == 0) return NULL;
+    int64_t **c = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    if (!c) return NULL;
+    for (uint32_t i = 0; i < ncols; i++) {
+        c[i] = (int64_t *)malloc((cap > 0 ? cap : 1) * sizeof(int64_t));
+        if (!c[i]) {
+            for (uint32_t j = 0; j < i; j++) free(c[j]); free(c); return NULL;
+        }
+    }
+    return c;
+}
+static inline void test_cols_free(int64_t **c, uint32_t ncols)
+{
+    if (!c) return; for (uint32_t i = 0; i < ncols; i++) free(c[i]); free(c);
+}
+static inline int test_cols_realloc(int64_t **c, uint32_t ncols, uint32_t cap)
+{
+    for (uint32_t i = 0; i < ncols; i++) {
+        int64_t *n = (int64_t *)realloc(c[i], (size_t)cap * sizeof(int64_t));
+        if (!n) return -1; c[i] = n;
+    }
+    return 0;
+}
+static inline int64_t test_get(const mock_rel_t *r, uint32_t row, uint32_t col)
+{
+    return r->columns[col][row];
+}
+static inline void test_set(mock_rel_t *r, uint32_t row, uint32_t col,
+    int64_t v)
+{
+    r->columns[col][row] = v;
+}
+static inline void test_row_out(const mock_rel_t *r, uint32_t row, int64_t *dst)
+{
+    for (uint32_t c = 0; c < r->ncols; c++) dst[c] = r->columns[c][row];
+}
+static inline void test_row_in(mock_rel_t *r, uint32_t row, const int64_t *src)
+{
+    for (uint32_t c = 0; c < r->ncols; c++) r->columns[c][row] = src[c];
+}
 
 static mock_rel_t *
 mock_rel_new(const char *name, uint32_t ncols, uint32_t capacity)
@@ -104,8 +148,8 @@ mock_rel_new(const char *name, uint32_t ncols, uint32_t capacity)
     r->name = name;
     r->ncols = ncols;
     r->nrows = 0;
-    r->data = (int64_t *)malloc((size_t)capacity * ncols * sizeof(int64_t));
-    if (!r->data) {
+    r->columns = test_cols_alloc(ncols, capacity);
+    if (!r->columns) {
         free(r);
         return NULL;
     }
@@ -117,8 +161,7 @@ mock_rel_add_row(mock_rel_t *r, const int64_t *row, uint32_t capacity)
 {
     if (r->nrows >= capacity)
         return; /* guard: capacity already checked by caller */
-    memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-           (size_t)r->ncols * sizeof(int64_t));
+    test_row_in(r, r->nrows, row);
     r->nrows++;
 }
 
@@ -127,7 +170,7 @@ mock_rel_free(mock_rel_t *r)
 {
     if (!r)
         return;
-    free(r->data);
+    test_cols_free(r->columns, r->ncols);
     free(r);
 }
 
@@ -144,7 +187,7 @@ mock_rel_free(mock_rel_t *r)
 
 static void
 apply_delta_permutation(mock_plan_op_t *ops, uint32_t op_count,
-                        const uint32_t *delta_pos, uint32_t k, uint32_t copy)
+    const uint32_t *delta_pos, uint32_t k, uint32_t copy)
 {
     for (uint32_t i = 0; i < op_count; i++) {
         int is_delta_pos = 0;
@@ -164,7 +207,7 @@ apply_delta_permutation(mock_plan_op_t *ops, uint32_t op_count,
 /* Count ops in copy that have a given delta_mode */
 static uint32_t
 count_delta_mode(const mock_plan_op_t *ops, uint32_t op_count,
-                 mock_delta_mode_t mode)
+    mock_delta_mode_t mode)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < op_count; i++) {
@@ -233,11 +276,11 @@ test_copy0_pos0_delta_pos1_full(void)
     apply_delta_permutation(ops, 3, delta_pos, k, copy);
 
     ASSERT(ops[0].delta_mode == MOCK_DELTA_FORCE_DELTA,
-           "copy 0: op[0] must be FORCE_DELTA");
+        "copy 0: op[0] must be FORCE_DELTA");
     ASSERT(ops[1].delta_mode == MOCK_DELTA_FORCE_FULL,
-           "copy 0: op[1] must be FORCE_FULL");
+        "copy 0: op[1] must be FORCE_FULL");
     ASSERT(ops[2].delta_mode == MOCK_DELTA_AUTO,
-           "copy 0: op[2] (MAP) must remain AUTO");
+        "copy 0: op[2] (MAP) must remain AUTO");
 
     PASS();
 }
@@ -268,11 +311,11 @@ test_copy1_pos1_delta_pos0_full(void)
     apply_delta_permutation(ops, 3, delta_pos, k, copy);
 
     ASSERT(ops[0].delta_mode == MOCK_DELTA_FORCE_FULL,
-           "copy 1: op[0] must be FORCE_FULL");
+        "copy 1: op[0] must be FORCE_FULL");
     ASSERT(ops[1].delta_mode == MOCK_DELTA_FORCE_DELTA,
-           "copy 1: op[1] must be FORCE_DELTA");
+        "copy 1: op[1] must be FORCE_DELTA");
     ASSERT(ops[2].delta_mode == MOCK_DELTA_AUTO,
-           "copy 1: op[2] (MAP) must remain AUTO");
+        "copy 1: op[2] (MAP) must remain AUTO");
 
     PASS();
 }
@@ -310,13 +353,13 @@ test_exactly_one_force_delta_per_copy(void)
 
         if (n_force_delta != 1) {
             printf("FAIL: copy %u has %u FORCE_DELTA ops (expected 1)\n", copy,
-                   n_force_delta);
+                n_force_delta);
             fail_count++;
             return;
         }
         if (n_force_full != 1) {
             printf("FAIL: copy %u has %u FORCE_FULL ops (expected 1 for K=2)\n",
-                   copy, n_force_full);
+                copy, n_force_full);
             fail_count++;
             return;
         }
@@ -358,7 +401,7 @@ test_non_delta_positions_stay_auto(void)
         for (uint32_t i = 2; i < op_count; i++) {
             if (ops[i].delta_mode != MOCK_DELTA_AUTO) {
                 printf("FAIL: copy %u op[%u] should be AUTO but got mode %d\n",
-                       copy, i, (int)ops[i].delta_mode);
+                    copy, i, (int)ops[i].delta_mode);
                 fail_count++;
                 return;
             }
@@ -402,19 +445,19 @@ test_self_join_identical_names_distinguished_by_index(void)
 
     /* Copy 0 and Copy 1 must differ */
     ASSERT(ops_copy0[0].delta_mode != ops_copy1[0].delta_mode,
-           "op[0] must differ between copy 0 and copy 1");
+        "op[0] must differ between copy 0 and copy 1");
     ASSERT(ops_copy0[1].delta_mode != ops_copy1[1].delta_mode,
-           "op[1] must differ between copy 0 and copy 1");
+        "op[1] must differ between copy 0 and copy 1");
 
     /* Verify the exact assignment */
     ASSERT(ops_copy0[0].delta_mode == MOCK_DELTA_FORCE_DELTA,
-           "copy 0 op[0] must be FORCE_DELTA");
+        "copy 0 op[0] must be FORCE_DELTA");
     ASSERT(ops_copy0[1].delta_mode == MOCK_DELTA_FORCE_FULL,
-           "copy 0 op[1] must be FORCE_FULL");
+        "copy 0 op[1] must be FORCE_FULL");
     ASSERT(ops_copy1[0].delta_mode == MOCK_DELTA_FORCE_FULL,
-           "copy 1 op[0] must be FORCE_FULL");
+        "copy 1 op[0] must be FORCE_FULL");
     ASSERT(ops_copy1[1].delta_mode == MOCK_DELTA_FORCE_DELTA,
-           "copy 1 op[1] must be FORCE_DELTA");
+        "copy 1 op[1] must be FORCE_DELTA");
 
     /* Verify mock relation with 2 rows exercises both permutations */
     mock_rel_t *vf = mock_rel_new("valueFlow", 2, 4);
@@ -427,14 +470,14 @@ test_self_join_identical_names_distinguished_by_index(void)
 
     ASSERT(vf->nrows == 2, "valueFlow should have 2 rows");
     ASSERT(strcmp(vf->name, "valueFlow") == 0,
-           "relation name must be valueFlow");
+        "relation name must be valueFlow");
 
     /* For the self-join valueAlias(x,y) :- valueFlow(z,x), valueFlow(z,y):
      * with z=1, x=10, y=20 produces (10,20); and (20,10); and (10,10);
      * and (20,20). Each permutation handles one half of this product. */
     uint32_t expected_input_rows = 2;
     ASSERT(vf->nrows == expected_input_rows,
-           "input cardinality for self-join must be 2");
+        "input cardinality for self-join must be 2");
 
     mock_rel_free(vf);
     PASS();

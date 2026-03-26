@@ -87,12 +87,19 @@ check_sorted(col_rel_t *r, const int64_t *expected, uint32_t nrows,
         FAIL(msg);
         return 0;
     }
-    if (!rows_equal(r->data, expected, nrows, ncols)) {
+    /* Gather into flat buffer for comparison */
+    int64_t *flat = (int64_t *)malloc((size_t)nrows * ncols * sizeof(int64_t));
+    if (flat) {
+        for (uint32_t row = 0; row < nrows; row++)
+            col_rel_row_copy_out(r, row, flat + (size_t)row * ncols);
+    }
+    if (!flat || !rows_equal(flat, expected, nrows, ncols)) {
+        free(flat);
         FAIL(label);
         /* Print first mismatch for debugging */
         for (uint32_t row = 0; row < nrows; row++) {
             for (uint32_t c = 0; c < ncols; c++) {
-                int64_t got = r->data[(size_t)row * ncols + c];
+                int64_t got = col_rel_get(r, row, c);
                 int64_t exp = expected[(size_t)row * ncols + c];
                 if (got != exp) {
                     printf("      row %u col %u: got %lld expected %lld\n",
@@ -103,6 +110,7 @@ check_sorted(col_rel_t *r, const int64_t *expected, uint32_t nrows,
         }
         return 0;
     }
+    free(flat);
     return 1;
 }
 

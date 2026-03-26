@@ -98,7 +98,7 @@ output_contains_row(const col_rel_t *r, const int64_t *row)
     for (uint32_t i = 0; i < r->nrows; i++) {
         bool match = true;
         for (uint32_t c = 0; c < r->ncols; c++) {
-            if (r->data[(size_t)i * r->ncols + c] != row[c]) {
+            if (col_rel_get(r, i, c) != row[c]) {
                 match = false;
                 break;
             }
@@ -156,10 +156,10 @@ test_basic_join_correctness(void)
     ASSERT_TRUE(result.rel->ncols == 4, "output should have 4 cols");
 
     /* Output: [1, 10, 1, 100] */
-    ASSERT_TRUE(result.rel->data[0] == 1, "left x=1");
-    ASSERT_TRUE(result.rel->data[1] == 10, "left y=10");
-    ASSERT_TRUE(result.rel->data[2] == 1, "right x=1");
-    ASSERT_TRUE(result.rel->data[3] == 100, "right y=100");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 0) == 1, "left x=1");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 1) == 10, "left y=10");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 2) == 1, "right x=1");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 3) == 100, "right y=100");
 
     free(result.seg_boundaries);
     if (result.owned)
@@ -741,7 +741,7 @@ test_force_full_mode(void)
     eval_entry_t result = eval_stack_pop(&stack);
     /* Should match on x=1 from full right, not x=99 from delta */
     ASSERT_TRUE(result.rel->nrows == 1, "one match from full right");
-    ASSERT_TRUE(result.rel->data[0] == 1, "matched full right x=1");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 0) == 1, "matched full right x=1");
 
     free(result.seg_boundaries);
     if (result.owned)
@@ -795,7 +795,7 @@ test_delta_substitution(void)
     eval_entry_t result = eval_stack_pop(&stack);
     /* Delta has x=2, so should match only left x=2 */
     ASSERT_TRUE(result.rel->nrows == 1, "one match from delta");
-    ASSERT_TRUE(result.rel->data[0] == 2, "matched delta x=2");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 0) == 2, "matched delta x=2");
     ASSERT_TRUE(result.is_delta == true, "result is delta");
 
     free(result.seg_boundaries);

@@ -75,8 +75,8 @@ is_sorted(const col_rel_t *r)
 {
     for (uint32_t i = 1; i < r->nrows; i++) {
         for (uint32_t c = 0; c < r->ncols; c++) {
-            int64_t prev = r->data[(size_t)(i - 1) * r->ncols + c];
-            int64_t curr = r->data[(size_t)i * r->ncols + c];
+            int64_t prev = col_rel_get(r, i - 1, c);
+            int64_t curr = col_rel_get(r, i, c);
             if (prev < curr)
                 break;
             if (prev > curr)
@@ -92,8 +92,7 @@ is_unique(const col_rel_t *r)
     for (uint32_t i = 1; i < r->nrows; i++) {
         bool same = true;
         for (uint32_t c = 0; c < r->ncols; c++) {
-            if (r->data[(size_t)(i - 1) * r->ncols + c]
-                != r->data[(size_t)i * r->ncols + c]) {
+            if (col_rel_get(r, i - 1, c) != col_rel_get(r, i, c)) {
                 same = false;
                 break;
             }
@@ -110,7 +109,7 @@ contains_row(const col_rel_t *r, const int64_t *row)
     for (uint32_t i = 0; i < r->nrows; i++) {
         bool match = true;
         for (uint32_t c = 0; c < r->ncols; c++) {
-            if (r->data[(size_t)i * r->ncols + c] != row[c]) {
+            if (col_rel_get(r, i, c) != row[c]) {
                 match = false;
                 break;
             }
@@ -170,8 +169,8 @@ test_single_row(void)
     eval_entry_t result = eval_stack_pop(&stack);
     ASSERT_TRUE(result.rel->nrows == 1, "1 row");
     ASSERT_TRUE(result.rel->sorted_nrows == 1, "sorted_nrows == 1");
-    ASSERT_TRUE(result.rel->data[0] == 5, "data preserved");
-    ASSERT_TRUE(result.rel->data[1] == 10, "data preserved");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 0) == 5, "data preserved");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 1) == 10, "data preserved");
 
     if (result.owned)
         col_rel_destroy(result.rel);
@@ -342,11 +341,11 @@ test_incremental_merge_basic(void)
     ASSERT_TRUE(is_unique(result.rel), "should be unique");
 
     /* Verify order: 1,2,3,4,5 */
-    ASSERT_TRUE(result.rel->data[0] == 1, "first row key=1");
-    ASSERT_TRUE(result.rel->data[2] == 2, "second row key=2");
-    ASSERT_TRUE(result.rel->data[4] == 3, "third row key=3");
-    ASSERT_TRUE(result.rel->data[6] == 4, "fourth row key=4");
-    ASSERT_TRUE(result.rel->data[8] == 5, "fifth row key=5");
+    ASSERT_TRUE(col_rel_get(result.rel, 0, 0) == 1, "first row key=1");
+    ASSERT_TRUE(col_rel_get(result.rel, 1, 0) == 2, "second row key=2");
+    ASSERT_TRUE(col_rel_get(result.rel, 2, 0) == 3, "third row key=3");
+    ASSERT_TRUE(col_rel_get(result.rel, 3, 0) == 4, "fourth row key=4");
+    ASSERT_TRUE(col_rel_get(result.rel, 4, 0) == 5, "fifth row key=5");
 
     if (result.owned)
         col_rel_destroy(result.rel);
@@ -429,7 +428,8 @@ test_incremental_merge_suffix_only_new(void)
 
     /* Values should be 1,2,3,4,5 in order */
     for (uint32_t i = 0; i < 5; i++)
-        ASSERT_TRUE(result.rel->data[i] == (int64_t)(i + 1), "sequential");
+        ASSERT_TRUE(col_rel_get(result.rel, i, 0) == (int64_t)(i + 1),
+            "sequential");
 
     if (result.owned)
         col_rel_destroy(result.rel);
@@ -507,7 +507,7 @@ test_merge_buffer_reuse(void)
 
     eval_entry_t r1 = eval_stack_pop(&stack);
     ASSERT_TRUE(r1.rel->nrows == 3, "3 rows after first");
-    ASSERT_TRUE(r1.rel->merge_buf != NULL, "merge_buf allocated");
+    ASSERT_TRUE(r1.rel->merge_columns != NULL, "merge_columns allocated");
 
     /* Second consolidation on same relation: add more data */
     int64_t v4 = 4;

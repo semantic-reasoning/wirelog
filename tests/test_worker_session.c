@@ -514,8 +514,8 @@ test_coordinator_readonly(void)
 
     int64_t *orig_data = (int64_t *)malloc(
         (size_t)orig_nrows * 2 * sizeof(int64_t));
-    memcpy(orig_data, coord_edge->data,
-        (size_t)orig_nrows * 2 * sizeof(int64_t));
+    for (uint32_t i = 0; i < orig_nrows; i++)
+        col_rel_row_copy_out(coord_edge, i, orig_data + (size_t)i * 2);
 
     for (uint32_t w = 0; w < 2; w++) {
         col_rel_t **parts = NULL;
@@ -531,10 +531,21 @@ test_coordinator_readonly(void)
 
     coord_edge = session_find_rel(coord, "edge");
     int ok = (coord_edge != NULL)
-        && (coord_edge->nrows == orig_nrows)
-        && (memcmp(coord_edge->data, orig_data,
-        (size_t)orig_nrows * 2 * sizeof(int64_t))
-        == 0);
+        && (coord_edge->nrows == orig_nrows);
+    if (ok) {
+        int64_t *cur_data = (int64_t *)malloc(
+            (size_t)orig_nrows * 2 * sizeof(int64_t));
+        if (cur_data) {
+            for (uint32_t i = 0; i < orig_nrows; i++)
+                col_rel_row_copy_out(coord_edge, i,
+                    cur_data + (size_t)i * 2);
+            ok = (memcmp(cur_data, orig_data,
+                (size_t)orig_nrows * 2 * sizeof(int64_t)) == 0);
+            free(cur_data);
+        } else {
+            ok = 0;
+        }
+    }
 
     free(orig_data);
     cleanup_coordinator(coord, plan, prog);

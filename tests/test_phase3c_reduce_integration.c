@@ -30,50 +30,7 @@
  * nanoarrow.h so that col_rel_t has the correct field offsets without
  * pulling in the nanoarrow dependency.
  */
-struct ArrowSchema {
-    const char *format;
-    const char *name;
-    const char *metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema **children;
-    struct ArrowSchema *dictionary;
-    void (*release)(struct ArrowSchema *);
-    void *private_data;
-};
-
-/*
- * col_delta_timestamp_t - mirrors the public definition in columnar_nanoarrow.h.
- * Must match exactly (4 x uint32_t + int64_t = 24 bytes).
- */
-typedef struct {
-    uint32_t iteration;
-    uint32_t stratum;
-    uint32_t worker;
-    uint32_t _reserved;
-    int64_t multiplicity;
-} col_delta_timestamp_t;
-
-/*
- * col_rel_t - mirrors the private definition in columnar_nanoarrow.c.
- * Field order and layout must match the implementation exactly.
- */
-typedef struct {
-    char *name;                /* owned, null-terminated               */
-    uint32_t ncols;            /* columns per tuple (0 = unset)        */
-    int64_t *data;             /* owned, row-major int64 buffer        */
-    uint32_t nrows;            /* current row count                    */
-    uint32_t capacity;         /* allocated row capacity               */
-    char **col_names;          /* owned array of ncols owned strings   */
-    struct ArrowSchema schema; /* owned Arrow schema (lazy-inited)     */
-    bool schema_ok;            /* true after schema is initialised     */
-    uint32_t sorted_nrows;     /* sorted prefix row count (issue #94)   */
-    int64_t *merge_buf;        /* persistent merge buffer (issue #94)   */
-    uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
-    uint32_t base_nrows;       /* base row count for delta prop (#83)   */
-    col_delta_timestamp_t
-        *timestamps; /* NULL when not tracking               */
-} col_rel_t;
+#include "../wirelog/columnar/internal.h"
 
 /*
  * col_op_reduce_weighted: COUNT aggregation via Z-set multiplicities.
@@ -93,29 +50,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helper: allocate col_rel_t with ncols columns, no rows, no timestamps.
@@ -150,6 +107,21 @@ test_rel_alloc(uint32_t ncols)
     return r;
 }
 
+static int test_row_match(const col_rel_t *r, uint32_t row,
+    const int64_t *target)
+{
+    for (uint32_t c = 0; c < r->ncols;
+        c++) if (col_rel_get(r, row, c) != target[c]) return 0; return 1;
+}
+static int test_flat_cmp(const col_rel_t *a, const col_rel_t *b)
+{
+    if (a->nrows != b->nrows || a->ncols != b->ncols) return 1;
+    for (uint32_t i = 0; i < a->nrows; i++) for (uint32_t c = 0; c < a->ncols;
+            c++)
+            if (col_rel_get(a, i, c) != col_rel_get(b, i, c)) return 1;
+    return 0;
+}
+
 /* ----------------------------------------------------------------
  * Helper: free col_rel_t (data, timestamps, col_names, struct).
  * ---------------------------------------------------------------- */
@@ -159,7 +131,8 @@ test_rel_free(col_rel_t *r)
     if (!r)
         return;
     free(r->name);
-    free(r->data);
+    col_columns_free(r->columns, r->ncols);
+    free(r->row_scratch);
     free(r->timestamps);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
@@ -178,11 +151,13 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
 {
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
-        int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
-                                                      * sizeof(int64_t));
-        if (!nd)
-            return -1;
-        r->data = nd;
+        if (r->columns) {
+            if (col_columns_realloc(r->columns, r->ncols, cap) != 0)
+                return -1;
+        } else {
+            r->columns = col_columns_alloc(r->ncols, cap);
+            if (!r->columns) return -1;
+        }
 
         col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(
             r->timestamps, (size_t)cap * sizeof(col_delta_timestamp_t));
@@ -192,8 +167,7 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
         r->capacity = cap;
     }
     if (r->ncols > 0)
-        memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-               r->ncols * sizeof(int64_t));
+        col_rel_row_copy_in(r, r->nrows, row);
     col_delta_timestamp_t ts;
     memset(&ts, 0, sizeof(ts));
     ts.multiplicity = multiplicity;
@@ -209,7 +183,7 @@ test_rel_append_row_mult(col_rel_t *r, const int64_t *row, int64_t multiplicity)
  * One physical row with mult=2 contributes 2 to the count, not 1.
  *
  * src: (value=42, mult=2)
- * Expected: dst->nrows == 1, dst->data[0] == 2
+ * Expected: dst->nrows == 1, dst->columns[(0) % dst->ncols][(0) / dst->ncols] == 2
  * ================================================================ */
 static void
 test_count_single_row_mult2(void)
@@ -222,15 +196,15 @@ test_count_single_row_mult2(void)
 
     int64_t row[] = { 42 };
     ASSERT(test_rel_append_row_mult(src, row, 2) == 0,
-           "append row value=42 mult=2");
+        "append row value=42 mult=2");
 
     int rc = col_op_reduce_weighted(src, dst);
 
     ASSERT(rc == 0, "col_op_reduce_weighted returns 0 on success");
     ASSERT(dst->nrows == 1, "dst has exactly 1 output row");
-    ASSERT(dst->data != NULL, "dst->data non-NULL");
-    ASSERT(dst->data[0] == 2,
-           "COUNT result = 2 (sum of multiplicities, not row count)");
+    ASSERT(dst->columns != NULL, "dst->columns non-NULL");
+    ASSERT(dst->columns[(0) % dst->ncols][(0) / dst->ncols] == 2,
+        "COUNT result = 2 (sum of multiplicities, not row count)");
     ASSERT(dst->timestamps != NULL, "dst->timestamps non-NULL");
     ASSERT(dst->timestamps[0].multiplicity == 2, "output multiplicity = 2");
 
@@ -247,7 +221,7 @@ test_count_single_row_mult2(void)
  * Naive row count would give 2 (WRONG).
  *
  * src: (value=10, mult=2), (value=20, mult=-1)
- * Expected: dst->nrows == 1, dst->data[0] == 1
+ * Expected: dst->nrows == 1, dst->columns[(0) % dst->ncols][(0) / dst->ncols] == 1
  * ================================================================ */
 static void
 test_count_two_rows_net_one(void)
@@ -261,17 +235,17 @@ test_count_two_rows_net_one(void)
     int64_t r0[] = { 10 };
     int64_t r1[] = { 20 };
     ASSERT(test_rel_append_row_mult(src, r0, 2) == 0,
-           "append row value=10 mult=2");
+        "append row value=10 mult=2");
     ASSERT(test_rel_append_row_mult(src, r1, -1) == 0,
-           "append row value=20 mult=-1");
+        "append row value=20 mult=-1");
 
     int rc = col_op_reduce_weighted(src, dst);
 
     ASSERT(rc == 0, "col_op_reduce_weighted returns 0 on success");
     ASSERT(dst->nrows == 1, "dst has exactly 1 output row");
-    ASSERT(dst->data != NULL, "dst->data non-NULL");
-    ASSERT(dst->data[0] == 1,
-           "COUNT result = 1 (2 + (-1)), not naive row count 2");
+    ASSERT(dst->columns != NULL, "dst->columns non-NULL");
+    ASSERT(dst->columns[(0) % dst->ncols][(0) / dst->ncols] == 1,
+        "COUNT result = 1 (2 + (-1)), not naive row count 2");
     ASSERT(dst->timestamps != NULL, "dst->timestamps non-NULL");
     ASSERT(dst->timestamps[0].multiplicity == 1, "output multiplicity = 1");
 
@@ -309,9 +283,9 @@ test_sum_weighted_multiplicities(void)
     int64_t r0[] = { 10 };
     int64_t r1[] = { 5 };
     ASSERT(test_rel_append_row_mult(src, r0, 3) == 0,
-           "append row value=10 mult=3");
+        "append row value=10 mult=3");
     ASSERT(test_rel_append_row_mult(src, r1, -1) == 0,
-           "append row value=5 mult=-1");
+        "append row value=5 mult=-1");
 
     /* col_op_reduce_weighted computes COUNT = sum of multiplicities = 2.
      * Full SUM(value * mult) = 10*3 + 5*(-1) = 25 requires the future
@@ -320,9 +294,10 @@ test_sum_weighted_multiplicities(void)
 
     ASSERT(rc == 0, "col_op_reduce_weighted returns 0 on success");
     ASSERT(dst->nrows == 1, "dst has exactly 1 output row");
-    ASSERT(dst->data != NULL, "dst->data non-NULL");
-    ASSERT(dst->data[0] == 2, "COUNT result = 2 (sum of mults: 3 + (-1)); "
-                              "SUM(value*mult)=25 deferred");
+    ASSERT(dst->columns != NULL, "dst->columns non-NULL");
+    ASSERT(dst->columns[(0) % dst->ncols][(0) / dst->ncols] == 2,
+        "COUNT result = 2 (sum of mults: 3 + (-1)); "
+        "SUM(value*mult)=25 deferred");
     ASSERT(dst->timestamps != NULL, "dst->timestamps non-NULL");
     ASSERT(dst->timestamps[0].multiplicity == 2, "output multiplicity = 2");
 
@@ -344,7 +319,7 @@ main(void)
     test_sum_weighted_multiplicities();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
-           fail_count, test_count);
+        fail_count, test_count);
 
     return fail_count > 0 ? 1 : 0;
 }

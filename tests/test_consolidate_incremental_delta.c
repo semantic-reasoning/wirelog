@@ -36,52 +36,7 @@
  * access schema or schema_ok; fields before those (name, ncols, data,
  * nrows, capacity, col_names) are identical in both layouts.
  */
-struct ArrowSchema {
-    const char *format;
-    const char *name;
-    const char *metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema **children;
-    struct ArrowSchema *dictionary;
-    void (*release)(struct ArrowSchema *);
-    void *private_data;
-};
-
-/*
- * col_delta_timestamp_t - mirrors the public definition in columnar_nanoarrow.h.
- * Must match exactly (4 x uint32_t + int64_t = 24 bytes).
- */
-typedef struct {
-    uint32_t iteration;
-    uint32_t stratum;
-    uint32_t worker;
-    uint32_t _reserved;
-    int64_t multiplicity;
-} col_delta_timestamp_t;
-
-/*
- * col_rel_t - mirrors the private definition in columnar_nanoarrow.c.
- * Field order and layout must match the implementation exactly.
- */
-typedef struct {
-    char *name;                /* owned, null-terminated               */
-    uint32_t ncols;            /* columns per tuple (0 = unset)        */
-    int64_t *data;             /* owned, row-major int64 buffer        */
-    uint32_t nrows;            /* current row count                    */
-    uint32_t capacity;         /* allocated row capacity               */
-    char **col_names;          /* owned array of ncols owned strings   */
-    struct ArrowSchema schema; /* owned Arrow schema (lazy-inited)     */
-    bool schema_ok;            /* true after schema is initialised     */
-    uint32_t sorted_nrows;     /* sorted prefix row count (issue #94)   */
-    int64_t *merge_buf;        /* persistent merge buffer (issue #94)   */
-    uint32_t merge_buf_cap;    /* merge buffer capacity in rows         */
-    uint32_t base_nrows;       /* base row count for delta prop (#83)   */
-    col_delta_timestamp_t
-    *timestamps;     /* NULL when not tracking               */
-    bool pool_owned; /* allocated from delta_pool (#123)      */
-    void *ledger;    /* borrowed ledger pointer (NULL ok, #224) */
-} col_rel_t;
+#include "../wirelog/columnar/internal.h"
 
 /*
  * Forward declaration of the function under test.
@@ -160,6 +115,13 @@ test_rel_alloc(uint32_t ncols)
     return r;
 }
 
+static int test_row_match(const col_rel_t *r, uint32_t row,
+    const int64_t *target)
+{
+    for (uint32_t c = 0; c < r->ncols;
+        c++) if (col_rel_get(r, row, c) != target[c]) return 0; return 1;
+}
+
 /* ----------------------------------------------------------------
  * Helper: free col_rel_t (handles data replaced by the function).
  * ---------------------------------------------------------------- */
@@ -169,8 +131,9 @@ test_rel_free(col_rel_t *r)
     if (!r)
         return;
     free(r->name);
-    free(r->data);
-    free(r->merge_buf);
+    col_columns_free(r->columns, r->ncols);
+    col_columns_free(r->merge_columns, r->ncols);
+    free(r->row_scratch);
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
             free(r->col_names[i]);
@@ -188,15 +151,16 @@ test_rel_append_row(col_rel_t *r, const int64_t *row)
 {
     if (r->nrows >= r->capacity) {
         uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
-        int64_t *nd = (int64_t *)realloc(r->data, (size_t)cap * r->ncols
-                * sizeof(int64_t));
-        if (!nd)
-            return -1;
-        r->data = nd;
+        if (r->columns) {
+            if (col_columns_realloc(r->columns, r->ncols, cap) != 0)
+                return -1;
+        } else {
+            r->columns = col_columns_alloc(r->ncols, cap);
+            if (!r->columns) return -1;
+        }
         r->capacity = cap;
     }
-    memcpy(r->data + (size_t)r->nrows * r->ncols, row,
-        r->ncols * sizeof(int64_t));
+    col_rel_row_copy_in(r, r->nrows, row);
     r->nrows++;
     return 0;
 }
@@ -217,22 +181,42 @@ test_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
     return 0;
 }
 
+static int test_row_cmp_idx(const col_rel_t *r, uint32_t a, uint32_t b)
+{
+    int64_t ba[64], bb[64]; col_rel_row_copy_out(r, a, ba);
+    col_rel_row_copy_out(r, b, bb); return test_row_cmp(ba, bb, r->ncols);
+}
+
+static int test_row_cmp_to(const col_rel_t *r, uint32_t row,
+    const int64_t *target)
+{
+    int64_t buf[64]; col_rel_row_copy_out(r, row, buf);
+    return test_row_cmp(buf, target, r->ncols);
+}
+
 static int
 test_rel_is_sorted(const col_rel_t *r)
 {
     if (r->nrows <= 1)
         return 1;
     for (uint32_t i = 1; i < r->nrows; i++) {
-        int cmp = test_row_cmp(r->data + (size_t)(i - 1) * r->ncols,
-                r->data + (size_t)i * r->ncols, r->ncols);
+        int cmp;
+        { int64_t _a[32], _b[32]; col_rel_row_copy_out(r, i-1, _a);
+          col_rel_row_copy_out(r, i, _b); cmp = test_row_cmp(_a, _b, r->ncols);
+        };
         if (cmp >= 0) {
             /* Debug: report first sort failure */
             if (r->ncols == 2) {
                 fprintf(stderr,
                     "SORT FAIL @ row %u: [%lld,%lld] >= [%lld,%lld]\n", i,
-                    r->data[(size_t)(i - 1) * 2],
-                    r->data[(size_t)(i - 1) * 2 + 1],
-                    r->data[(size_t)i * 2], r->data[(size_t)i * 2 + 1]);
+                    r->columns[((size_t)(i - 1) * 2) %
+                    r->ncols][((size_t)(i - 1) * 2) / r->ncols],
+                    r->columns[((size_t)(i - 1) * 2 + 1) %
+                    r->ncols][((size_t)(i - 1) * 2 + 1) / r->ncols],
+                    r->columns[((size_t)i * 2) % r->ncols][((size_t)i * 2) /
+                    r->ncols],
+                    r->columns[((size_t)i * 2 + 1) %
+                    r->ncols][((size_t)i * 2 + 1) / r->ncols]);
             }
             return 0;
         }
@@ -249,8 +233,7 @@ test_rel_is_unique(const col_rel_t *r)
     if (r->nrows <= 1)
         return 1;
     for (uint32_t i = 1; i < r->nrows; i++) {
-        if (test_row_cmp(r->data + (size_t)(i - 1) * r->ncols,
-            r->data + (size_t)i * r->ncols, r->ncols)
+        if (test_row_cmp_idx(r, i-1, i)
             == 0)
             return 0;
     }
@@ -264,7 +247,7 @@ static int
 test_rel_contains_row(const col_rel_t *r, const int64_t *row)
 {
     for (uint32_t i = 0; i < r->nrows; i++) {
-        if (test_row_cmp(r->data + (size_t)i * r->ncols, row, r->ncols) == 0)
+        if ((test_row_match(r, i, row)))
             return 1;
     }
     return 0;
@@ -517,7 +500,8 @@ test_large_dataset_correctness(void)
 
     /* Oracle A+B */
     for (uint32_t i = 0; i < delta_out->nrows; i++) {
-        const int64_t *dr = delta_out->data + (size_t)i * 2;
+        int64_t _dr[2]; col_rel_row_copy_out(delta_out, i, _dr);
+        const int64_t *dr = _dr;
         ASSERT(test_rel_contains_row(rel, dr),
             "oracle A: delta_out row missing from merged rel");
         ASSERT(dr[0] >= (int64_t)(OLD * 2),
@@ -587,7 +571,8 @@ test_fast_path_hit_append(void)
     /* Verify exact order */
     int64_t expected[] = { 10, 20, 30, 40, 50, 60 };
     for (int i = 0; i < 6; i++)
-        ASSERT(rel->data[i] == expected[i], "merged row order mismatch");
+        ASSERT(rel->columns[(i) % rel->ncols][(i) / rel->ncols] == expected[i],
+            "merged row order mismatch");
 
     test_rel_free(rel);
     test_rel_free(delta_out);
@@ -632,7 +617,8 @@ test_fast_path_miss_interleaved(void)
 
     int64_t expected[] = { 10, 20, 30, 40, 50 };
     for (int i = 0; i < 5; i++)
-        ASSERT(rel->data[i] == expected[i], "merged row order mismatch");
+        ASSERT(rel->columns[(i) % rel->ncols][(i) / rel->ncols] == expected[i],
+            "merged row order mismatch");
 
     test_rel_free(rel);
     test_rel_free(delta_out);
@@ -735,8 +721,10 @@ test_fast_path_single_row_each(void)
     ASSERT(test_rel_is_sorted(rel), "rel is sorted");
     ASSERT(delta_out->nrows == 1, "delta_out->nrows == 1");
     ASSERT(test_rel_contains_row(delta_out, d0), "delta_out has 20");
-    ASSERT(rel->data[0] == 10, "first row is 10");
-    ASSERT(rel->data[1] == 20, "second row is 20");
+    ASSERT(rel->columns[(0) % rel->ncols][(0) / rel->ncols] == 10,
+        "first row is 10");
+    ASSERT(rel->columns[(1) % rel->ncols][(1) / rel->ncols] == 20,
+        "second row is 20");
 
     test_rel_free(rel);
     test_rel_free(delta_out);

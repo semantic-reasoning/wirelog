@@ -35,20 +35,20 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Plan Helper                                                             */
@@ -88,8 +88,8 @@ test_compact_basic(void)
     TEST("Basic compaction after bulk retraction");
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not generate plan");
         return 1;
@@ -175,8 +175,8 @@ test_compact_basic(void)
     if (a_rel->nrows > 0 && a_rel->capacity > a_rel->nrows * 4) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "capacity %u still > nrows*4 (%u) after compaction",
-                 a_rel->capacity, a_rel->nrows * 4);
+            "capacity %u still > nrows*4 (%u) after compaction",
+            a_rel->capacity, a_rel->nrows * 4);
         FAIL(msg);
         ok = false;
     }
@@ -263,8 +263,8 @@ test_compact_merge_buf_freed(void)
     TEST("merge_buf freed; subsequent insert+consolidation works");
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not generate plan");
         return 1;
@@ -324,10 +324,10 @@ test_compact_merge_buf_freed(void)
             break;
         }
     }
-    if (a_rel && a_rel->merge_buf != NULL) {
+    if (a_rel && a_rel->merge_columns != NULL) {
         wl_session_destroy(session);
         wl_plan_free(plan);
-        FAIL("merge_buf not NULL after compaction");
+        FAIL("merge_columns not NULL after compaction");
         return 1;
     }
 
@@ -358,8 +358,8 @@ test_compact_empty_relation(void)
     TEST("Empty relation: capacity zeroed, re-insert works");
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not generate plan");
         return 1;
@@ -424,7 +424,7 @@ test_compact_empty_relation(void)
     if (a_rel && a_rel->nrows == 0 && a_rel->capacity != 0) {
         char msg[128];
         snprintf(msg, sizeof(msg), "capacity %u != 0 after full retraction",
-                 a_rel->capacity);
+            a_rel->capacity);
         wl_session_destroy(session);
         wl_plan_free(plan);
         FAIL(msg);
@@ -459,8 +459,8 @@ test_compact_insert_retract_cycle(void)
     TEST("Insert-retract cycle: capacity stays bounded");
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not generate plan");
         return 1;
@@ -526,8 +526,8 @@ test_compact_insert_retract_cycle(void)
         if (a_rel->capacity > bound) {
             char msg[128];
             snprintf(msg, sizeof(msg),
-                     "capacity %u unbounded (nrows=%u, bound=%u)",
-                     a_rel->capacity, a_rel->nrows, bound);
+                "capacity %u unbounded (nrows=%u, bound=%u)",
+                a_rel->capacity, a_rel->nrows, bound);
             FAIL(msg);
             ok = false;
         }
