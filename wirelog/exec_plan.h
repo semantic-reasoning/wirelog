@@ -109,21 +109,21 @@ typedef enum {
 
     /* Unary CRC-32 functions (pop 1 push 1) */
     WL_PLAN_EXPR_ARITH_CRC32_ETH
-    = 0x1C, /* CRC-32 Ethernet/ISO (poly 0x04C11DB7) */
+        = 0x1C, /* CRC-32 Ethernet/ISO (poly 0x04C11DB7) */
     WL_PLAN_EXPR_ARITH_CRC32_CAST
-    = 0x1D, /* CRC-32C Castagnoli (poly 0x1EDC6F41) */
+        = 0x1D, /* CRC-32C Castagnoli (poly 0x1EDC6F41) */
 
     /* Unary cryptographic hash functions (pop 1 push 1, requires mbedTLS) */
     WL_PLAN_EXPR_ARITH_MD5 = 0x1E,  /* md5() - MD5 32-char hex digest */
     WL_PLAN_EXPR_ARITH_SHA1 = 0x1F, /* sha1() - SHA-1 40-char hex digest */
     WL_PLAN_EXPR_ARITH_SHA256
-    = 0x20, /* sha256() - SHA-256 64-char hex digest */
+        = 0x20, /* sha256() - SHA-256 64-char hex digest */
     WL_PLAN_EXPR_ARITH_SHA512
-    = 0x21, /* sha512() - SHA-512 128-char hex digest */
+        = 0x21, /* sha512() - SHA-512 128-char hex digest */
 
     /* Binary cryptographic hash functions (pop 2 push 1, requires mbedTLS) */
     WL_PLAN_EXPR_ARITH_HMAC_SHA256
-    = 0x28, /* hmac_sha256(msg, key) - HMAC-SHA-256 64-char hex digest */
+        = 0x28, /* hmac_sha256(msg, key) - HMAC-SHA-256 64-char hex digest */
 
     /* UUID functions (requires mbedTLS) */
     WL_PLAN_EXPR_ARITH_UUID4 = 0x29, /* uuid4() - nullary, push 1 */
@@ -212,6 +212,10 @@ typedef enum {
  * WL_PLAN_OP_SEMIJOIN:    Semijoin (SIP pre-filter).
  * WL_PLAN_OP_LFTJ:        Multi-way leapfrog triejoin on a single shared key
  *                          column across k >= 3 EDB relations (Issue #195).
+ * WL_PLAN_OP_EXCHANGE:    Redistribute tuples by hash(key_columns) % W across
+ *                          workers for partition-correct parallel evaluation
+ *                          (Issue #316).  opaque_data points to
+ *                          wl_plan_op_exchange_t.
  */
 typedef enum {
     WL_PLAN_OP_VARIABLE = 0,
@@ -225,6 +229,7 @@ typedef enum {
     WL_PLAN_OP_SEMIJOIN = 8,
     WL_PLAN_OP_K_FUSION = 9,
     WL_PLAN_OP_LFTJ = 10,
+    WL_PLAN_OP_EXCHANGE = 11, /* Redistribute tuples by hash(key) % W */
 } wl_plan_op_type_t;
 
 /* ======================================================================== */
@@ -252,6 +257,7 @@ typedef enum {
  *                project_indices, project_count
  *   K_FUSION:    opaque_data (points to wl_plan_op_k_fusion_t in columnar backend)
  *   LFTJ:        opaque_data (points to wl_plan_op_lftj_t in columnar backend)
+ *   EXCHANGE:    opaque_data (points to wl_plan_op_exchange_t in columnar backend)
  */
 typedef struct {
     wl_plan_op_type_t op;

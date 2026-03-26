@@ -236,7 +236,7 @@ agg_to_tag(wirelog_agg_fn_t fn)
  */
 static int
 serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
-               uint32_t col_count)
+    uint32_t col_count)
 {
     if (!expr)
         return -1;
@@ -325,7 +325,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
  */
 static int
 serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, char **col_names,
-                             uint32_t col_count, wl_plan_expr_buffer_t *out_buf)
+    uint32_t col_count, wl_plan_expr_buffer_t *out_buf)
 {
     out_buf->data = NULL;
     out_buf->size = 0;
@@ -412,7 +412,7 @@ dup_indices(const uint32_t *src, uint32_t count)
  */
 static int
 collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
-                       uint32_t *out_count)
+    uint32_t *out_count)
 {
     if (!node) {
         *out_names = NULL;
@@ -445,7 +445,7 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
             collect_output_columns(node->children[0], &left_names, &left_count);
         if (node->child_count > 1)
             collect_output_columns(node->children[1], &right_names,
-                                   &right_count);
+                &right_count);
 
         uint32_t total = left_count + right_count;
         char **names = (char **)calloc(total ? total : 1, sizeof(char *));
@@ -491,7 +491,7 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
          * column positions. */
         if (node->child_count > 0)
             return collect_output_columns(node->children[0], out_names,
-                                          out_count);
+                       out_count);
         *out_names = NULL;
         *out_count = 0;
         return -1;
@@ -503,7 +503,7 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
         /* Delegate to first child */
         if (node->child_count > 0)
             return collect_output_columns(node->children[0], out_names,
-                                          out_count);
+                       out_count);
         *out_names = NULL;
         *out_count = 0;
         return -1;
@@ -601,7 +601,7 @@ resolve_key_to_colN(const char *key_name, const wirelog_ir_node_t *child)
  */
 static char **
 resolve_keys_to_colN(char **keys, uint32_t count,
-                     const wirelog_ir_node_t *child)
+    const wirelog_ir_node_t *child)
 {
     if (!keys || count == 0)
         return NULL;
@@ -667,7 +667,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             } else {
                 /* Fallback: synthesize identity [0..n-1] */
                 uint32_t *ids = (uint32_t *)malloc(node->project_count
-                                                   * sizeof(uint32_t));
+                        * sizeof(uint32_t));
                 if (!ids)
                     return -1;
                 for (uint32_t pi = 0; pi < node->project_count; pi++)
@@ -872,7 +872,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             collect_output_columns(fchild2, &filt2_names, &filt2_count);
             int frc
                 = serialize_expr_to_buffer_ctx(node->filter_expr, filt2_names,
-                                               filt2_count, &filt->filter_expr);
+                    filt2_count, &filt->filter_expr);
             for (uint32_t c = 0; c < filt2_count; c++)
                 free(filt2_names[c]);
             free((void *)filt2_names);
@@ -895,7 +895,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             } else {
                 /* Synthesize identity indices */
                 uint32_t *ids = (uint32_t *)malloc(node->project_count
-                                                   * sizeof(uint32_t));
+                        * sizeof(uint32_t));
                 if (!ids)
                     return -1;
                 for (uint32_t pi = 0; pi < node->project_count; pi++)
@@ -915,7 +915,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                 const wirelog_ir_node_t *child2
                     = (node->child_count > 0) ? node->children[0] : NULL;
                 collect_output_columns(child2, &child_col_names2,
-                                       &child_col_count2);
+                    &child_col_count2);
                 for (uint32_t i = 0; i < node->project_count; i++) {
                     if (node->project_exprs[i]) {
                         if (serialize_expr_to_buffer_ctx(
@@ -951,6 +951,8 @@ free_k_fusion_opaque(wl_plan_op_t *op); /* forward declaration */
 #endif
 static void
 free_lftj_opaque(wl_plan_op_t *op); /* forward declaration */
+static void
+free_exchange_opaque(wl_plan_op_t *op); /* forward declaration */
 
 static void
 free_op(wl_plan_op_t *op)
@@ -981,12 +983,15 @@ free_op(wl_plan_op_t *op)
 
     if (op->opaque_data) {
 #if ENABLE_K_FUSION
-        if (op->op == WL_PLAN_OP_K_FUSION)
+        if (op->op == WL_PLAN_OP_K_FUSION) {
             free_k_fusion_opaque(op);
-        else
+        } else
 #endif
-            if (op->op == WL_PLAN_OP_LFTJ)
+        if (op->op == WL_PLAN_OP_LFTJ) {
             free_lftj_opaque(op);
+        } else if (op->op == WL_PLAN_OP_EXCHANGE) {
+            free_exchange_opaque(op);
+        }
     }
 }
 
@@ -1003,8 +1008,8 @@ free_op(wl_plan_op_t *op)
  */
 static uint32_t
 count_delta_positions(const wl_plan_op_t *ops, uint32_t op_count,
-                      const char *const *idb_names, uint32_t idb_count,
-                      uint32_t *delta_pos)
+    const char *const *idb_names, uint32_t idb_count,
+    uint32_t *delta_pos)
 {
     uint32_t k = 0;
     for (uint32_t i = 0; i < op_count; i++) {
@@ -1142,7 +1147,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
         if (!dst->filter_expr.data)
             return -1;
         memcpy(dst->filter_expr.data, src->filter_expr.data,
-               src->filter_expr.size);
+            src->filter_expr.size);
         dst->filter_expr.size = src->filter_expr.size;
     }
 
@@ -1158,7 +1163,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
                 if (!dst->map_exprs[i].data)
                     return -1;
                 memcpy(dst->map_exprs[i].data, src->map_exprs[i].data,
-                       src->map_exprs[i].size);
+                    src->map_exprs[i].size);
                 dst->map_exprs[i].size = src->map_exprs[i].size;
             }
         }
@@ -1187,8 +1192,8 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
  */
 static wl_plan_op_t *
 expand_multiway_delta(const wl_plan_op_t *ops, uint32_t op_count,
-                      const uint32_t *delta_pos, uint32_t k,
-                      uint32_t *out_count)
+    const uint32_t *delta_pos, uint32_t k,
+    uint32_t *out_count)
 {
     /* Total ops: K copies of original + K CONCATs + 1 CONSOLIDATE
      * (each copy followed by a CONCAT, then CONSOLIDATE at the end) */
@@ -1209,7 +1214,7 @@ expand_multiway_delta(const wl_plan_op_t *ops, uint32_t op_count,
             }
 
             /* Set delta_mode: position d gets FORCE_DELTA, all other
-             * IDB positions get FORCE_FULL, non-IDB ops stay AUTO. */
+            * IDB positions get FORCE_FULL, non-IDB ops stay AUTO. */
             bool is_delta_pos = false;
             for (uint32_t p = 0; p < k; p++) {
                 if (delta_pos[p] == i) {
@@ -1307,6 +1312,20 @@ free_lftj_opaque(wl_plan_op_t *op)
     op->opaque_data = NULL;
 }
 
+/**
+ * Free Exchange metadata stored in op->opaque_data.
+ */
+static void
+free_exchange_opaque(wl_plan_op_t *op)
+{
+    if (!op->opaque_data)
+        return;
+    wl_plan_op_exchange_t *meta = (wl_plan_op_exchange_t *)op->opaque_data;
+    free(meta->key_col_idxs);
+    free(meta);
+    op->opaque_data = NULL;
+}
+
 #if ENABLE_K_FUSION
 /**
  * Rewrite a single relation plan for K-fusion parallel execution.
@@ -1324,8 +1343,8 @@ free_lftj_opaque(wl_plan_op_t *op)
  */
 static wl_plan_op_t *
 expand_multiway_k_fusion(const wl_plan_op_t *ops, uint32_t op_count,
-                         const uint32_t *delta_pos, uint32_t k,
-                         uint32_t *out_count)
+    const uint32_t *delta_pos, uint32_t k,
+    uint32_t *out_count)
 {
     wl_plan_op_t *result = (wl_plan_op_t *)calloc(1, sizeof(wl_plan_op_t));
     if (!result)
@@ -1351,8 +1370,8 @@ expand_multiway_k_fusion(const wl_plan_op_t *ops, uint32_t op_count,
 
     for (uint32_t d = 0; d < k; d++) {
         /* Allocate op_count + 1: the extra slot holds a CONSOLIDATE op
-         * so each worker produces sorted+deduped output, enabling the
-         * K-fusion merge to skip an expensive post-completion qsort. */
+        * so each worker produces sorted+deduped output, enabling the
+        * K-fusion merge to skip an expensive post-completion qsort. */
         wl_plan_op_t *seq
             = (wl_plan_op_t *)calloc(op_count + 1, sizeof(wl_plan_op_t));
         if (!seq)
@@ -1467,10 +1486,10 @@ rewrite_multiway_delta(wl_plan_t *plan)
                 wl_plan_op_t *new_ops;
 #if ENABLE_K_FUSION
                 new_ops = expand_multiway_k_fusion(rel->ops, rel->op_count,
-                                                   dpos, k, &new_count);
+                        dpos, k, &new_count);
 #else
                 new_ops = expand_multiway_delta(rel->ops, rel->op_count, dpos,
-                                                k, &new_count);
+                        k, &new_count);
 #endif
                 if (new_ops) {
                     for (uint32_t o = 0; o < rel->op_count; o++)
@@ -1513,7 +1532,7 @@ is_edb_rel(const char *name, const wl_plan_t *plan)
  */
 static uint32_t
 lftj_chain_len(const wl_plan_op_t *ops, uint32_t op_count, uint32_t start,
-               const wl_plan_t *plan, const char **out_lk, const char **out_rk)
+    const wl_plan_t *plan, const char **out_lk, const char **out_rk)
 {
     if (start >= op_count || ops[start].op != WL_PLAN_OP_VARIABLE)
         return 0;
@@ -1524,14 +1543,14 @@ lftj_chain_len(const wl_plan_op_t *ops, uint32_t op_count, uint32_t start,
     const char *rk0 = NULL;
     uint32_t j = start + 1;
     while (j < op_count && ops[j].op == WL_PLAN_OP_JOIN && ops[j].key_count == 1
-           && ops[j].left_keys && ops[j].right_keys && ops[j].left_keys[0]
-           && ops[j].right_keys[0] && ops[j].right_relation
-           && is_edb_rel(ops[j].right_relation, plan)) {
+        && ops[j].left_keys && ops[j].right_keys && ops[j].left_keys[0]
+        && ops[j].right_keys[0] && ops[j].right_relation
+        && is_edb_rel(ops[j].right_relation, plan)) {
         if (!lk0) {
             lk0 = ops[j].left_keys[0];
             rk0 = ops[j].right_keys[0];
         } else if (strcmp(ops[j].left_keys[0], lk0) != 0
-                   || strcmp(ops[j].right_keys[0], rk0) != 0) {
+            || strcmp(ops[j].right_keys[0], rk0) != 0) {
             break;
         }
         j++;
@@ -1551,7 +1570,7 @@ lftj_chain_len(const wl_plan_op_t *ops, uint32_t op_count, uint32_t start,
  */
 static int
 build_lftj_op(const wl_plan_op_t *ops, uint32_t start, uint32_t len,
-              const char *lk0, const char *rk0, wl_plan_op_t *new_op)
+    const char *lk0, const char *rk0, wl_plan_op_t *new_op)
 {
     uint32_t k = len;
     wl_plan_op_lftj_t *meta
@@ -1646,7 +1665,7 @@ rewrite_lftj_chains(wl_plan_t *plan)
             for (uint32_t i = 0; i < rel->op_count && ok;) {
                 const char *lk0 = NULL, *rk0 = NULL;
                 uint32_t clen = lftj_chain_len(rel->ops, rel->op_count, i, plan,
-                                               &lk0, &rk0);
+                        &lk0, &rk0);
                 if (clen >= 3) {
                     if (build_lftj_op(rel->ops, i, clen, lk0, rk0, &new_ops[ni])
                         != 0) {

@@ -97,6 +97,30 @@ typedef struct {
     uint32_t *key_cols;
 } wl_plan_op_lftj_t;
 
+/* ======================================================================== */
+/* Exchange Metadata (Issue #316)                                           */
+/* ======================================================================== */
+
+/**
+ * wl_plan_op_exchange_t:
+ *
+ * Backend-specific metadata for a WL_PLAN_OP_EXCHANGE operator.
+ * Stored in wl_plan_op_t.opaque_data and owned by the plan.
+ *
+ * Specifies the key columns used for hash-based redistribution across
+ * workers.  The hash function matches col_rel_partition_by_key
+ * (XXH3_64bits over concatenated key column values).
+ *
+ * @num_workers:     Number of target workers (W).
+ * @key_col_idxs:    Physical column indices to hash on (owned array).
+ * @key_col_count:   Number of key columns.
+ */
+typedef struct {
+    uint32_t num_workers;
+    uint32_t *key_col_idxs; /* owned: physical column indices to hash */
+    uint32_t key_col_count;
+} wl_plan_op_exchange_t;
+
 /*
  * NOTE: wl_col_session_t and COL_SESSION() are defined in columnar_nanoarrow.c
  * because col_rel_t (a private implementation type) cannot be declared in this
