@@ -581,6 +581,17 @@ col_session_destroy(wl_session_t *session)
     col_session_free_diff_arrangements(sess);
     delta_pool_destroy(sess->delta_pool);
     wl_arena_free(sess->eval_arena);
+    /* Free exchange buffer matrix (Issue #316): coordinator-owned W x W grid */
+    if (sess->exchange_bufs) {
+        for (uint32_t src = 0; src < sess->exchange_num_workers; src++) {
+            if (sess->exchange_bufs[src]) {
+                for (uint32_t dst = 0; dst < sess->exchange_num_workers; dst++)
+                    col_rel_destroy(sess->exchange_bufs[src][dst]);
+                free(sess->exchange_bufs[src]);
+            }
+        }
+        free(sess->exchange_bufs);
+    }
     free(sess);
 }
 
@@ -636,6 +647,9 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->sarr_count = 0;
     out_worker->sarr_cap = 0;
     memset(&out_worker->mat_cache, 0, sizeof(col_mat_cache_t));
+    /* Exchange buffers are owned by coordinator; worker inherits borrowed ptr */
+    out_worker->exchange_bufs = NULL;
+    out_worker->exchange_num_workers = 0;
 
     /* Step 4: NULL borrowed fields that workers must not use */
     out_worker->delta_cb = NULL;
