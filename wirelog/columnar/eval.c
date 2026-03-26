@@ -86,6 +86,9 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         case WL_PLAN_OP_LFTJ:
             rc = col_op_lftj(op, stack, sess);
             break;
+        case WL_PLAN_OP_EXCHANGE:
+            rc = col_op_exchange(op, stack, sess);
+            break;
         default:
             break;
         }

@@ -1890,3 +1890,20 @@ test_worker_session_exe = executable(
 )
 
 test('worker_session', test_worker_session_exe)
+
+# ============================================================================
+# Exchange Operator (Issue #316)
+# ============================================================================
+
+test_td_exchange_exe = executable(
+  'test_td_exchange',
+  files('test_td_exchange.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('td_exchange', test_td_exchange_exe)
