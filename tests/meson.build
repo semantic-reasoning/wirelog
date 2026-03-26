@@ -195,6 +195,7 @@ backend_src = files(
   '../wirelog/columnar/diff_vtable.c',
   '../wirelog/columnar/diff_bridge.c',
   '../wirelog/columnar/partition.c',
+  '../wirelog/columnar/progress.c',
 )
 
 io_src = files(
@@ -1907,3 +1908,20 @@ test_td_exchange_exe = executable(
 )
 
 test('td_exchange', test_td_exchange_exe)
+
+# ============================================================================
+# Per-Worker Frontier Progress Protocol (Issue #317)
+# ============================================================================
+
+test_frontier_progress_exe = executable(
+  'test_frontier_progress',
+  files('test_frontier_progress.c'),
+  backend_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('frontier_progress', test_frontier_progress_exe)
