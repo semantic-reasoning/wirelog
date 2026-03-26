@@ -1929,6 +1929,23 @@ test_tdd_nonrecursive_exe = executable(
 
 test('tdd_nonrecursive', test_tdd_nonrecursive_exe)
 
+test_tdd_recursive_exe = executable(
+  'test_tdd_recursive',
+  files('test_tdd_recursive.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('tdd_recursive', test_tdd_recursive_exe)
+
 # ============================================================================
 # Per-Worker Frontier Progress Protocol (Issue #317)
 # ============================================================================

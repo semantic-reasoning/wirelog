@@ -907,9 +907,11 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         return push_rc;
     }
 
-    /* WL_DELTA_AUTO: original heuristic */
-    bool use_delta
-        = (delta && delta->nrows > 0 && delta->nrows < full_rel->nrows);
+    /* WL_DELTA_AUTO: use delta if strictly smaller than full relation.
+     * Exception: inside a TDD worker sub-pass the broadcast $d$<rel> may be
+     * >= the local partition, so we must use it whenever it is non-empty. */
+    bool use_delta = (delta && delta->nrows > 0
+        && (delta->nrows < full_rel->nrows || sess->tdd_subpass_active));
     col_rel_t *rel = use_delta ? delta : full_rel;
     /* push borrowed reference - session owns the relation */
     return eval_stack_push_delta(stack, rel, false, use_delta);
@@ -3230,7 +3232,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
 
-    if (nr <= 1 || old_nrows >= nr) {
+    if (nr == 0 || old_nrows >= nr) {
         if (out_fast_path)
             *out_fast_path = 1; /* trivially fast: no data to process */
         return 0;              /* nothing new */
