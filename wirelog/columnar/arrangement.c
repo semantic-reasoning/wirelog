@@ -527,7 +527,8 @@ sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
     if (!sarr->sorted)
         return ENOMEM;
 
-    memcpy(sarr->sorted, rel->data, bytes);
+    for (uint32_t r = 0; r < rel->nrows; r++)
+        col_rel_row_copy_out(rel, r, sarr->sorted + (size_t)r * rel->ncols);
     uint32_t kc = key_col;
     QSORT_R_CALL(sarr->sorted, rel->nrows, rel->ncols * sizeof(int64_t), &kc,
         sarr_row_cmp);
