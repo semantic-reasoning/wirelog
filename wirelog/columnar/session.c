@@ -892,18 +892,18 @@ col_session_remove(wl_session_t *session, const char *relation,
         const int64_t *del = data + (size_t)di * num_cols;
         uint32_t out_r = 0;
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            const int64_t *row = r->data + (size_t)ri * num_cols;
+            const int64_t *row = col_rel_row(r, ri);
             if (memcmp(row, del, sizeof(int64_t) * num_cols) != 0) {
                 if (out_r != ri)
-                    memcpy(r->data + (size_t)out_r * num_cols, row,
+                    memcpy(col_rel_row_mut(r, out_r), row,
                         sizeof(int64_t) * num_cols);
                 out_r++;
             } else {
                 /* Remove first matching row only */
                 di = num_rows; /* break outer loop after this one */
                 for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
-                    memcpy(r->data + (size_t)out_r * num_cols,
-                        r->data + (size_t)rest * num_cols,
+                    memcpy(col_rel_row_mut(r, out_r),
+                        col_rel_row(r, rest),
                         sizeof(int64_t) * num_cols);
                 r->nrows = out_r;
                 goto next_del;
@@ -963,7 +963,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         const int64_t *del = data + (size_t)di * num_cols;
         /* Check if this row exists in EDB; if so, append to rdelta */
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            const int64_t *row = r->data + (size_t)ri * num_cols;
+            const int64_t *row = col_rel_row(r, ri);
             if (memcmp(row, del, sizeof(int64_t) * num_cols) == 0) {
                 /* Found matching row; add to retraction delta */
                 rc = col_rel_append_row(rdelta, del);
@@ -989,18 +989,18 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         const int64_t *del = data + (size_t)di * num_cols;
         uint32_t out_r = 0;
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            const int64_t *row = r->data + (size_t)ri * num_cols;
+            const int64_t *row = col_rel_row(r, ri);
             if (memcmp(row, del, sizeof(int64_t) * num_cols) != 0) {
                 if (out_r != ri)
-                    memcpy(r->data + (size_t)out_r * num_cols, row,
+                    memcpy(col_rel_row_mut(r, out_r), row,
                         sizeof(int64_t) * num_cols);
                 out_r++;
             } else {
                 /* Remove first matching row only */
                 di = num_rows; /* break outer loop after this one */
                 for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
-                    memcpy(r->data + (size_t)out_r * num_cols,
-                        r->data + (size_t)rest * num_cols,
+                    memcpy(col_rel_row_mut(r, out_r),
+                        col_rel_row(r, rest),
                         sizeof(int64_t) * num_cols);
                 r->nrows = out_r;
                 goto next_del_incr;
@@ -1235,7 +1235,7 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                 continue; /* best-effort; falls back to full eval */
             for (uint32_t row = 0; row < delta_nrows; row++) {
                 col_rel_append_row(
-                    delta, r->data + (size_t)(r->base_nrows + row) * r->ncols);
+                    delta, col_rel_row(r, r->base_nrows + row));
             }
             session_remove_rel(sess, dname);
             session_add_rel(sess, delta);
@@ -1387,7 +1387,7 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
             if (!r || r->nrows == 0)
                 continue;
             for (uint32_t row = 0; row < r->nrows; row++) {
-                callback(rname, r->data + (size_t)row * r->ncols, r->ncols,
+                callback(rname, col_rel_row(r, row), r->ncols,
                     user_data);
             }
         }
