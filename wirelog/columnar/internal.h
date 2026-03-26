@@ -766,6 +766,10 @@ typedef struct wl_col_session_t {
      * Owned by coordinator; worker sessions set tdd_workers = NULL. */
     struct wl_col_session_t *tdd_workers; /* owned array [num_workers] */
     uint32_t tdd_workers_count;         /* number of initialized workers */
+    /* Set true inside tdd_worker_subpass_fn so col_op_variable AUTO heuristic
+     * always uses the broadcast delta (which may be >= local partition size).
+     * False everywhere else, including retraction paths. */
+    bool tdd_subpass_active;
 } wl_col_session_t;
 
 /*
