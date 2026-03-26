@@ -1489,6 +1489,11 @@ tdd_worker_subpass_fn(void *arg)
      * Mirrors eval.c:410-411 / Clarification 3. */
     bool saved_diff = sess->diff_operators_active;
     sess->diff_operators_active = sess->diff_enabled && eff_iter > 0;
+    /* Issue #318: Signal to col_op_variable AUTO heuristic that we are inside
+     * a TDD worker sub-pass.  Broadcast $d$<rel> may be >= local partition
+     * size, so the normal "delta < full" guard must be bypassed. */
+    bool saved_tdd_subpass = sess->tdd_subpass_active;
+    sess->tdd_subpass_active = true;
     sess->current_iteration = eff_iter;
 
     /* Free per-sub-pass delta arrangements (eval.c:429) */
@@ -1506,6 +1511,7 @@ tdd_worker_subpass_fn(void *arg)
         }
         if (all_empty) {
             ctx->all_empty_delta = true;
+            sess->tdd_subpass_active = saved_tdd_subpass;
             sess->diff_operators_active = saved_diff;
             return;
         }
@@ -1515,6 +1521,7 @@ tdd_worker_subpass_fn(void *arg)
     uint32_t *snap = (uint32_t *)calloc(nrels, sizeof(uint32_t));
     if (!snap) {
         ctx->rc = ENOMEM;
+        sess->tdd_subpass_active = saved_tdd_subpass;
         sess->diff_operators_active = saved_diff;
         return;
     }
@@ -1538,6 +1545,7 @@ tdd_worker_subpass_fn(void *arg)
             eval_stack_drain(&stack);
             ctx->rc = rc;
             free(snap);
+            sess->tdd_subpass_active = saved_tdd_subpass;
             sess->diff_operators_active = saved_diff;
             return;
         }
@@ -1565,6 +1573,7 @@ tdd_worker_subpass_fn(void *arg)
                     col_rel_destroy(copy);
                     ctx->rc = ENOMEM;
                     free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
                     sess->diff_operators_active = saved_diff;
                     return;
                 }
@@ -1575,6 +1584,7 @@ tdd_worker_subpass_fn(void *arg)
                 if (!copy) {
                     ctx->rc = ENOMEM;
                     free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
                     sess->diff_operators_active = saved_diff;
                     return;
                 }
@@ -1583,6 +1593,7 @@ tdd_worker_subpass_fn(void *arg)
                     col_rel_destroy(copy);
                     ctx->rc = rc;
                     free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
                     sess->diff_operators_active = saved_diff;
                     return;
                 }
@@ -1592,6 +1603,7 @@ tdd_worker_subpass_fn(void *arg)
                 col_rel_destroy(copy);
                 ctx->rc = rc;
                 free(snap);
+                sess->tdd_subpass_active = saved_tdd_subpass;
                 sess->diff_operators_active = saved_diff;
                 return;
             }
@@ -1604,6 +1616,7 @@ tdd_worker_subpass_fn(void *arg)
                         col_rel_destroy(result.rel);
                     ctx->rc = rc;
                     free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
                     sess->diff_operators_active = saved_diff;
                     return;
                 }
@@ -1614,6 +1627,7 @@ tdd_worker_subpass_fn(void *arg)
             if (rc != 0) {
                 ctx->rc = rc;
                 free(snap);
+                sess->tdd_subpass_active = saved_tdd_subpass;
                 sess->diff_operators_active = saved_diff;
                 return;
             }
@@ -1643,6 +1657,7 @@ tdd_worker_subpass_fn(void *arg)
         if (!delta) {
             ctx->rc = ENOMEM;
             free(snap);
+            sess->tdd_subpass_active = saved_tdd_subpass;
             sess->diff_operators_active = saved_diff;
             return;
         }
@@ -1657,6 +1672,7 @@ tdd_worker_subpass_fn(void *arg)
             col_rel_destroy(delta);
             ctx->rc = rc2;
             free(snap);
+            sess->tdd_subpass_active = saved_tdd_subpass;
             sess->diff_operators_active = saved_diff;
             return;
         }
@@ -1669,6 +1685,7 @@ tdd_worker_subpass_fn(void *arg)
                 col_rel_destroy(delta);
                 ctx->rc = ENOMEM;
                 free(snap);
+                sess->tdd_subpass_active = saved_tdd_subpass;
                 sess->diff_operators_active = saved_diff;
                 return;
             }
@@ -1688,6 +1705,7 @@ tdd_worker_subpass_fn(void *arg)
                     col_rel_destroy(delta);
                     ctx->rc = ENOMEM;
                     free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
                     sess->diff_operators_active = saved_diff;
                     return;
                 }
@@ -1713,6 +1731,7 @@ tdd_worker_subpass_fn(void *arg)
     }
 
     ctx->any_new = any_new;
+    sess->tdd_subpass_active = saved_tdd_subpass;
     sess->diff_operators_active = saved_diff;
 }
 
@@ -1769,6 +1788,14 @@ tdd_merge_worker_results(const wl_plan_stratum_t *sp,
                     target = NULL;
                     break;
                 }
+            }
+
+            /* Set schema if coordinator relation was pre-registered with 0 cols */
+            if (target->ncols == 0 && wrel->ncols > 0) {
+                rc = col_rel_set_schema(target, wrel->ncols,
+                        (const char *const *)wrel->col_names);
+                if (rc != 0)
+                    break;
             }
 
             rc = col_rel_append_all(target, wrel, NULL);
