@@ -1400,8 +1400,17 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
     if (buf && bsz > 0 && e.rel->nrows > 0
         && filter_is_simple_cmp(buf, bsz, &cmp) && cmp.col_a < e.rel->ncols
         && (cmp.b_is_const || cmp.col_b < e.rel->ncols)) {
+        /* Column-native filter: read directly from contiguous columns[col_a]
+         * instead of gathering rows into a flat buffer (6D optimization). */
+        const uint32_t ncols = e.rel->ncols;
+        const uint32_t nrows = e.rel->nrows;
+        int64_t *const *columns = e.rel->columns;
+        const int64_t *col_a = columns[cmp.col_a];
+        const int64_t *col_b_ptr = (!cmp.b_is_const && cmp.col_b < ncols)
+            ? columns[cmp.col_b] : NULL;
+
         /* Pre-allocate output buffer sized for worst-case (all rows pass) */
-        size_t cap = (size_t)e.rel->nrows * e.rel->ncols;
+        size_t cap = (size_t)nrows * ncols;
         int64_t *tmp = (int64_t *)malloc(cap * sizeof(int64_t));
         if (!tmp) {
             col_rel_destroy(out);
@@ -1409,25 +1418,33 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(e.rel);
             return ENOMEM;
         }
-        /* Gather column-major into flat buffer for filter */
-        int64_t *flat_in = (int64_t *)malloc(
-            (size_t)e.rel->nrows * e.rel->ncols * sizeof(int64_t));
-        if (!flat_in) {
-            free(tmp);
-            col_rel_destroy(out);
-            if (e.owned)
-                col_rel_destroy(e.rel);
-            return ENOMEM;
+
+        /* Scan col_a (contiguous), gather passing rows into flat output */
+        uint32_t nout = 0;
+        for (uint32_t r = 0; r < nrows; r++) {
+            int64_t a_val = col_a[r];
+            int64_t b_val = cmp.b_is_const ? cmp.const_b
+                : (col_b_ptr ? col_b_ptr[r] : 0);
+            bool pass = false;
+            switch (cmp.cmp_op) {
+            case WL_PLAN_EXPR_CMP_EQ:  pass = (a_val == b_val); break;
+            case WL_PLAN_EXPR_CMP_NEQ: pass = (a_val != b_val); break;
+            case WL_PLAN_EXPR_CMP_LT:  pass = (a_val < b_val); break;
+            case WL_PLAN_EXPR_CMP_LTE: pass = (a_val <= b_val); break;
+            case WL_PLAN_EXPR_CMP_GT:  pass = (a_val > b_val); break;
+            case WL_PLAN_EXPR_CMP_GTE: pass = (a_val >= b_val); break;
+            default: break;
+            }
+            if (pass) {
+                for (uint32_t c = 0; c < ncols; c++)
+                    tmp[nout * ncols + c] = columns[c][r];
+                nout++;
+            }
         }
-        for (uint32_t ri = 0; ri < e.rel->nrows; ri++)
-            col_rel_row_copy_out(e.rel, ri,
-                flat_in + (size_t)ri * e.rel->ncols);
-        uint32_t nout = col_filter_fast(flat_in, e.rel->nrows, e.rel->ncols,
-                &cmp, tmp);
-        free(flat_in);
+
         /* Bulk-copy the passing rows into the output relation */
         for (uint32_t r = 0; r < nout; r++) {
-            int rc = col_rel_append_row(out, tmp + (size_t)r * e.rel->ncols);
+            int rc = col_rel_append_row(out, tmp + (size_t)r * ncols);
             if (rc != 0) {
                 free(tmp);
                 col_rel_destroy(out);
@@ -2680,14 +2697,15 @@ kway_row_cmp(const int64_t *a, const int64_t *b, uint32_t ncols)
 }
 
 /* Compare a relation row against a raw row buffer (for merge operations
- * where one operand is in a temp buffer). Phase B, Issue #330. */
+ * where one operand is in a temp buffer). Phase B, Issue #330.
+ * Direct column access for cache efficiency (Issue #334). */
 static inline int
 col_rel_row_cmp_raw(const col_rel_t *r, uint32_t row_idx,
     const int64_t *raw_row)
 {
     uint32_t ncols = r->ncols;
     for (uint32_t c = 0; c < ncols; c++) {
-        int64_t va = col_rel_get(r, row_idx, c);
+        int64_t va = r->columns[c][row_idx];
         int64_t vb = raw_row[c];
         if (va < vb)
             return -1;
@@ -3901,7 +3919,8 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
             goto cleanup_results;
         }
 
-        /* If not owned, make a copy we can hand to merge */
+        /* If not owned, share columns zero-copy (6B optimization).
+         * The source relation outlives the merge, so borrowing is safe. */
         if (!e.owned) {
             col_rel_t *copy = col_rel_pool_new_like(worker_sess[d].delta_pool,
                     "<k_fusion_copy>", e.rel);
@@ -3910,9 +3929,19 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
                 eval_stack_drain(&workers[d].stack);
                 goto cleanup_results;
             }
-            for (uint32_t c = 0; c < e.rel->ncols; c++)
-                memcpy(copy->columns[c], e.rel->columns[c],
-                    (size_t)e.rel->nrows * sizeof(int64_t));
+            copy->col_shared = (bool *)calloc(e.rel->ncols, sizeof(bool));
+            if (copy->col_shared) {
+                for (uint32_t c = 0; c < e.rel->ncols; c++) {
+                    free(copy->columns[c]); /* free pool-allocated column */
+                    copy->columns[c] = e.rel->columns[c];
+                    copy->col_shared[c] = true;
+                }
+            } else {
+                /* Fallback: deep copy on alloc failure */
+                for (uint32_t c = 0; c < e.rel->ncols; c++)
+                    memcpy(copy->columns[c], e.rel->columns[c],
+                        (size_t)e.rel->nrows * sizeof(int64_t));
+            }
             copy->nrows = e.rel->nrows;
             results[d] = copy;
         } else {
