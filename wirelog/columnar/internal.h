@@ -236,6 +236,10 @@ typedef struct {
     uint32_t retract_backup_nrows;
     uint32_t retract_backup_capacity;
     uint32_t retract_backup_sorted_nrows;
+    /* Zero-copy column sharing for worker sessions (Issue #334, 6B).
+     * When col_shared[c] is true, columns[c] is borrowed (not owned) and
+     * must NOT be freed on destroy. NULL when no sharing is active. */
+    bool *col_shared;
 } col_rel_t;
 
 /* ======================================================================== */
@@ -302,34 +306,34 @@ col_rel_buf_bytes(const col_rel_t *r, uint32_t row_count)
 }
 
 /* ======================================================================== */
-/* Row Comparison Accessor (Phase B, Issue #330)                            */
+/* Row Comparison (Phase B, Issue #330; optimized Issue #334)                */
 /*                                                                          */
-/* Compare two rows using col_rel_get() for per-cell access.                */
-/* Phase C: only this function changes (column-batch SIMD).                 */
+/* Compare two rows using direct column access for cache efficiency.         */
 /* ======================================================================== */
 
 /** Compare two rows within the same relation lexicographically.
- *  Returns -1, 0, or +1. Uses col_rel_get() for layout-independent access. */
+ *  Returns -1, 0, or +1. Direct column access for cache efficiency
+ *  (Issue #334). */
 static inline int
 col_rel_row_cmp(const col_rel_t *r, uint32_t row_a, uint32_t row_b)
 {
     uint32_t ncols = r->ncols;
     /* Unrolled fast paths for common widths (ncols=2,4) */
     if (ncols == 2) {
-        int64_t a0 = col_rel_get(r, row_a, 0);
-        int64_t b0 = col_rel_get(r, row_b, 0);
+        int64_t a0 = r->columns[0][row_a];
+        int64_t b0 = r->columns[0][row_b];
         if (a0 != b0)
             return (a0 < b0) ? -1 : 1;
-        int64_t a1 = col_rel_get(r, row_a, 1);
-        int64_t b1 = col_rel_get(r, row_b, 1);
+        int64_t a1 = r->columns[1][row_a];
+        int64_t b1 = r->columns[1][row_b];
         if (a1 != b1)
             return (a1 < b1) ? -1 : 1;
         return 0;
     }
     if (ncols == 4) {
         for (uint32_t c = 0; c < 4; c++) {
-            int64_t va = col_rel_get(r, row_a, c);
-            int64_t vb = col_rel_get(r, row_b, c);
+            int64_t va = r->columns[c][row_a];
+            int64_t vb = r->columns[c][row_b];
             if (va < vb)
                 return -1;
             if (va > vb)
@@ -339,8 +343,8 @@ col_rel_row_cmp(const col_rel_t *r, uint32_t row_a, uint32_t row_b)
     }
     /* General scalar path */
     for (uint32_t c = 0; c < ncols; c++) {
-        int64_t va = col_rel_get(r, row_a, c);
-        int64_t vb = col_rel_get(r, row_b, c);
+        int64_t va = r->columns[c][row_a];
+        int64_t vb = r->columns[c][row_b];
         if (va < vb)
             return -1;
         if (va > vb)
@@ -349,15 +353,16 @@ col_rel_row_cmp(const col_rel_t *r, uint32_t row_a, uint32_t row_b)
     return 0;
 }
 
-/** Compare rows from two different relations. Both must have same ncols. */
+/** Compare rows from two different relations. Both must have same ncols.
+ *  Direct column access for cache efficiency (Issue #334). */
 static inline int
 col_rel_row_cmp2(const col_rel_t *ra, uint32_t row_a,
     const col_rel_t *rb, uint32_t row_b)
 {
     uint32_t ncols = ra->ncols;
     for (uint32_t c = 0; c < ncols; c++) {
-        int64_t va = col_rel_get(ra, row_a, c);
-        int64_t vb = col_rel_get(rb, row_b, c);
+        int64_t va = ra->columns[c][row_a];
+        int64_t vb = rb->columns[c][row_b];
         if (va < vb)
             return -1;
         if (va > vb)

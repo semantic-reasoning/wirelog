@@ -30,12 +30,22 @@ col_rel_free_contents(col_rel_t *r)
         wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
             (uint64_t)r->capacity * r->ncols * sizeof(int64_t));
     free(r->name);
-    if (!r->arena_owned)
-        col_columns_free(r->columns, r->ncols);
-    else {
+    if (!r->arena_owned) {
+        if (r->col_shared && r->columns) {
+            /* Free only non-shared columns (6B zero-copy sharing) */
+            for (uint32_t c = 0; c < r->ncols; c++) {
+                if (!r->col_shared[c])
+                    free(r->columns[c]);
+            }
+            free(r->columns);
+        } else {
+            col_columns_free(r->columns, r->ncols);
+        }
+    } else {
         /* Arena owns column buffers; only free the columns array itself */
         free(r->columns);
     }
+    free(r->col_shared);
     col_columns_free(r->retract_backup_columns, r->ncols);
     col_columns_free(r->merge_columns, r->ncols);
     free(r->row_scratch);
@@ -717,16 +727,18 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     uint32_t prefix[256];
 
     /* LSD radix sort: column nc-1 (LSB) to column 0 (MSB),
-     * byte 0 (LSB) to byte 7 (MSB) within each column. */
+     * byte 0 (LSB) to byte 7 (MSB) within each column.
+     * Optimization (Issue #334): direct column pointer avoids accessor
+     * overhead in the hot loop. */
     for (int c = (int)nc - 1; c >= 0; c--) {
+        const int64_t *col_data = r->columns[c]; /* contiguous column */
         for (int b = 0; b < 8; b++) {
             int shift = b * 8;
             int is_sign_byte = (b == 7);
 
             memset(count, 0, sizeof(count));
             for (uint32_t i = 0; i < nrows; i++) {
-                int64_t val = col_rel_get(r, start_row + src[i],
-                        (uint32_t)c);
+                int64_t val = col_data[start_row + src[i]];
                 uint8_t bv = (uint8_t)((uint64_t)val >> shift);
                 if (is_sign_byte)
                     bv ^= 0x80u;
@@ -738,8 +750,7 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
                 prefix[i] = prefix[i - 1] + count[i - 1];
 
             for (uint32_t i = 0; i < nrows; i++) {
-                int64_t val = col_rel_get(r, start_row + src[i],
-                        (uint32_t)c);
+                int64_t val = col_data[start_row + src[i]];
                 uint8_t bv = (uint8_t)((uint64_t)val >> shift);
                 if (is_sign_byte)
                     bv ^= 0x80u;
@@ -752,26 +763,26 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         }
     }
 
-    /* Apply permutation: gather rows into temp buffer, then scatter back.
-     * Uses col_rel_row_copy_out/in for layout independence. */
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
-    int64_t *temp = (int64_t *)malloc((size_t)nrows * row_bytes);
-    if (!temp) {
+    /* Apply permutation per-column (Issue #334): contiguous access pattern.
+     * Each column is gathered independently, which is cache-friendly for
+     * column-major layout. */
+    int64_t *temp_col = (int64_t *)malloc(nrows * sizeof(int64_t));
+    if (!temp_col) {
         free(perm_a);
         free(perm_b);
         return ENOMEM;
     }
 
-    /* Gather: copy rows in permuted order into temp */
-    for (uint32_t i = 0; i < nrows; i++)
-        col_rel_row_copy_out(r, start_row + src[i],
-            temp + (size_t)i * nc);
+    for (uint32_t c = 0; c < nc; c++) {
+        int64_t *col = r->columns[c];
+        /* Gather: copy in permuted order */
+        for (uint32_t i = 0; i < nrows; i++)
+            temp_col[i] = col[start_row + src[i]];
+        /* Scatter back */
+        memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
+    }
 
-    /* Scatter: write back in order */
-    for (uint32_t i = 0; i < nrows; i++)
-        col_rel_row_copy_in(r, start_row + i, temp + (size_t)i * nc);
-
-    free(temp);
+    free(temp_col);
     free(perm_a);
     free(perm_b);
     return 0;
