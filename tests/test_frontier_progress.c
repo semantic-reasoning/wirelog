@@ -281,6 +281,49 @@ test_min_iteration_null_safe(void)
     PASS();
 }
 
+static void
+test_W1_min_and_converged(void)
+{
+    TEST("W=1: min_iteration and all_converged (production default path)");
+    wl_frontier_progress_t p;
+    wl_frontier_progress_init(&p, 1, 2);
+
+    /* Before any report: no convergence */
+    if (wl_frontier_progress_all_converged(&p, 0, 1)) {
+        FAIL("should not be converged before any record");
+        wl_frontier_progress_destroy(&p);
+        return;
+    }
+    if (wl_frontier_progress_min_iteration(&p, 0, 1) != UINT32_MAX) {
+        FAIL("min should be UINT32_MAX before any record");
+        wl_frontier_progress_destroy(&p);
+        return;
+    }
+
+    /* After single worker reports stratum 0 */
+    wl_frontier_progress_record(&p, 0, 0, 1, 7);
+    if (!wl_frontier_progress_all_converged(&p, 0, 1)) {
+        FAIL("single worker should satisfy all_converged");
+        wl_frontier_progress_destroy(&p);
+        return;
+    }
+    if (wl_frontier_progress_min_iteration(&p, 0, 1) != 7) {
+        FAIL("min_iteration should return worker's iteration");
+        wl_frontier_progress_destroy(&p);
+        return;
+    }
+
+    /* Stratum 1 still not reported */
+    if (wl_frontier_progress_all_converged(&p, 1, 1)) {
+        FAIL("stratum 1 not reported, should not be converged");
+        wl_frontier_progress_destroy(&p);
+        return;
+    }
+
+    wl_frontier_progress_destroy(&p);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Tests: All Converged                                                     */
 /* ======================================================================== */
@@ -470,6 +513,9 @@ main(void)
     test_record_basic();
     test_record_out_of_range();
     test_record_overwrite();
+
+    /* W=1 single-worker (production default path) */
+    test_W1_min_and_converged();
 
     /* Min iteration */
     test_min_iteration_all_same();
