@@ -236,6 +236,91 @@ col_rel_buf_bytes(const col_rel_t *r, uint32_t row_count)
     return (size_t)row_count * (size_t)r->ncols * sizeof(int64_t);
 }
 
+/* ======================================================================== */
+/* Row Comparison Accessor (Phase B, Issue #330)                            */
+/*                                                                          */
+/* Compare two rows using col_rel_get() for per-cell access.                */
+/* Phase C: only this function changes (column-batch SIMD).                 */
+/* ======================================================================== */
+
+/** Compare two rows within the same relation lexicographically.
+ *  Returns -1, 0, or +1. Uses col_rel_get() for layout-independent access. */
+static inline int
+col_rel_row_cmp(const col_rel_t *r, uint32_t row_a, uint32_t row_b)
+{
+    uint32_t ncols = r->ncols;
+    /* Unrolled fast paths for common widths (ncols=2,4) */
+    if (ncols == 2) {
+        int64_t a0 = col_rel_get(r, row_a, 0);
+        int64_t b0 = col_rel_get(r, row_b, 0);
+        if (a0 != b0)
+            return (a0 < b0) ? -1 : 1;
+        int64_t a1 = col_rel_get(r, row_a, 1);
+        int64_t b1 = col_rel_get(r, row_b, 1);
+        if (a1 != b1)
+            return (a1 < b1) ? -1 : 1;
+        return 0;
+    }
+    if (ncols == 4) {
+        for (uint32_t c = 0; c < 4; c++) {
+            int64_t va = col_rel_get(r, row_a, c);
+            int64_t vb = col_rel_get(r, row_b, c);
+            if (va < vb)
+                return -1;
+            if (va > vb)
+                return 1;
+        }
+        return 0;
+    }
+    /* General scalar path */
+    for (uint32_t c = 0; c < ncols; c++) {
+        int64_t va = col_rel_get(r, row_a, c);
+        int64_t vb = col_rel_get(r, row_b, c);
+        if (va < vb)
+            return -1;
+        if (va > vb)
+            return 1;
+    }
+    return 0;
+}
+
+/** Compare rows from two different relations. Both must have same ncols. */
+static inline int
+col_rel_row_cmp2(const col_rel_t *ra, uint32_t row_a,
+    const col_rel_t *rb, uint32_t row_b)
+{
+    uint32_t ncols = ra->ncols;
+    for (uint32_t c = 0; c < ncols; c++) {
+        int64_t va = col_rel_get(ra, row_a, c);
+        int64_t vb = col_rel_get(rb, row_b, c);
+        if (va < vb)
+            return -1;
+        if (va > vb)
+            return 1;
+    }
+    return 0;
+}
+
+/** Copy row src_row to dst_row within the same relation.
+ *  Safe for any layout (uses temp buffer for independence). */
+static inline void
+col_rel_row_move(col_rel_t *r, uint32_t dst_row, uint32_t src_row)
+{
+    if (dst_row == src_row)
+        return;
+    int64_t tmp[COL_STACK_MAX];
+    int64_t *buf = tmp;
+    if (r->ncols > COL_STACK_MAX) {
+        buf = (int64_t *)malloc((size_t)r->ncols * sizeof(int64_t));
+        if (!buf)
+            return; /* silent fail -- callers check row counts */
+    }
+    col_rel_row_copy_out(r, src_row, buf);
+    col_rel_row_copy_in(r, dst_row, buf);
+    if (buf != tmp)
+        free(buf);
+}
+
 /**
  * col_materialized_join_t - Cached intermediate join result for CSE
  *
@@ -665,6 +750,12 @@ void
 col_rel_radix_sort_int64(col_rel_t *r);
 int
 col_radix_sort_rows(int64_t *data, uint32_t nrows, uint32_t ncols);
+
+/** Index-permutation radix sort on sub-range [start_row, start_row+nrows).
+ *  Uses col_rel_get() for key extraction -- layout independent.
+ *  Phase C: permutation-apply uses col_rel_row_copy_out/in. */
+int
+col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows);
 
 /* ======================================================================== */
 /* Cache & Materialized Join (columnar/cache.c)                             */
