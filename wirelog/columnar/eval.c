@@ -1031,15 +1031,15 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             uint32_t out_r = 0;
             bool found = false;
             for (uint32_t src_idx = 0; src_idx < r->nrows; src_idx++) {
-                const int64_t *src = r->data + (size_t)src_idx * ncols;
+                const int64_t *src = col_rel_row(r, src_idx);
                 if (memcmp(src, to_remove, sizeof(int64_t) * ncols) == 0) {
                     /* Found matching row; skip it (removal) */
                     found = true;
                     /* Copy remaining rows forward */
                     for (uint32_t rest = src_idx + 1; rest < r->nrows;
                         rest++) {
-                        memcpy(r->data + (size_t)out_r * ncols,
-                            r->data + (size_t)rest * ncols,
+                        memcpy(col_rel_row_mut(r, out_r),
+                            col_rel_row(r, rest),
                             sizeof(int64_t) * ncols);
                         out_r++;
                     }
@@ -1048,7 +1048,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                 } else {
                     /* Keep this row */
                     if (out_r != src_idx)
-                        memcpy(r->data + (size_t)out_r * ncols, src,
+                        memcpy(col_rel_row_mut(r, out_r), src,
                             sizeof(int64_t) * ncols);
                     out_r++;
                 }
@@ -1137,7 +1137,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         /* Fire delta_cb(+1) for rows not present in prev sorted state */
         if (r->nrows > 0) {
             for (uint32_t row = 0; row < r->nrows; row++) {
-                const int64_t *rowp = r->data + (size_t)row * ncols;
+                const int64_t *rowp = col_rel_row(r, row);
                 if (!col_row_in_sorted(prev_data[ri], prev_nrows[ri], ncols,
                     rowp)) {
                     sess->delta_cb(r->name, rowp, ncols, +1, sess->delta_data);
