@@ -62,6 +62,11 @@ typedef struct {
  * num_strata strata.  All entries are initialized to the "not yet
  * recorded" sentinel: outer_epoch=0, iteration=UINT32_MAX.
  *
+ * Note: callers should pass num_strata <= MAX_STRATA (32, defined in
+ * internal.h) to stay consistent with the session's frontiers[] arrays.
+ * This module does not enforce the upper bound to remain independent of
+ * internal.h.
+ *
  * Returns 0 on success, EINVAL if arguments are invalid, ENOMEM on
  * allocation failure.
  */
@@ -79,7 +84,9 @@ void wl_frontier_progress_destroy(wl_frontier_progress_t *p);
  * wl_frontier_progress_record:
  * Called by a worker after stratum stratum_idx converges at (outer_epoch,
  * iteration).  Thread-safe during scatter phase: each worker writes only
- * to its own slot (worker_id * num_strata offset).
+ * to its own slot at entries[stratum_idx * num_workers + worker_id].
+ * Slots for the same worker_id are strided by num_workers (not contiguous),
+ * so there are no data races between workers writing different stratum slots.
  *
  * No-op if p is NULL, entries is NULL, or indices are out of range.
  */
