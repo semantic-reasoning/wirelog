@@ -1910,6 +1910,26 @@ test_td_exchange_exe = executable(
 test('td_exchange', test_td_exchange_exe)
 
 # ============================================================================
+# Distributed Stratum Evaluator Non-Recursive Path (Issue #318)
+
+test_tdd_nonrecursive_exe = executable(
+  'test_tdd_nonrecursive',
+  files('test_tdd_nonrecursive.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('tdd_nonrecursive', test_tdd_nonrecursive_exe)
+
+# ============================================================================
 # Per-Worker Frontier Progress Protocol (Issue #317)
 # ============================================================================
 
