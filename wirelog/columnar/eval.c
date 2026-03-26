@@ -1295,6 +1295,283 @@ rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id)
 /* ======================================================================== */
 
 /*
+ * col_eval_tdd_worker_ctx_t:
+ * Per-worker context for one sub-pass of distributed stratum evaluation.
+ */
+typedef struct {
+    const wl_plan_stratum_t *sp;  /* borrowed: stratum plan          */
+    wl_col_session_t *worker_sess; /* borrowed: isolated worker       */
+    uint32_t stratum_idx;
+    int rc;                        /* OUT: return code */
+} col_eval_tdd_worker_ctx_t;
+
+/*
+ * tdd_cleanup_workers:
+ * Destroy and zero all initialized TDD worker sessions.
+ * Safe to call on a coordinator with no workers (tdd_workers_count == 0).
+ */
+static void
+tdd_cleanup_workers(wl_col_session_t *coord)
+{
+    for (uint32_t w = 0; w < coord->tdd_workers_count; w++) {
+        if (coord->tdd_workers[w].coordinator != NULL)
+            col_worker_session_destroy(&coord->tdd_workers[w]);
+        memset(&coord->tdd_workers[w], 0, sizeof(wl_col_session_t));
+    }
+    coord->tdd_workers_count = 0;
+}
+
+/*
+ * tdd_init_workers:
+ * Partition all coordinator relations across W worker sessions.
+ * Each worker gets 1/W rows of each relation, partitioned by column 0.
+ * Empty/zero-column relations are replicated as empty copies.
+ *
+ * Any previously initialized workers are destroyed first.
+ * On failure, any partially-created workers are destroyed.
+ */
+static int
+tdd_init_workers(wl_col_session_t *coord)
+{
+    tdd_cleanup_workers(coord);
+
+    uint32_t W = coord->num_workers;
+    uint32_t nrels = coord->nrels;
+
+    /* No relations: create empty worker sessions */
+    if (nrels == 0) {
+        for (uint32_t w = 0; w < W; w++) {
+            int rc = col_worker_session_create(coord, w, NULL, 0,
+                    &coord->tdd_workers[w]);
+            if (rc != 0) {
+                tdd_cleanup_workers(coord);
+                return rc;
+            }
+            coord->tdd_workers_count = w + 1;
+        }
+        return 0;
+    }
+
+    /* Allocate W x nrels partition matrix */
+    col_rel_t ***worker_parts = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
+    if (!worker_parts)
+        return ENOMEM;
+
+    int rc = 0;
+    for (uint32_t w = 0; w < W; w++) {
+        worker_parts[w] = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
+        if (!worker_parts[w]) {
+            for (uint32_t j = 0; j < w; j++)
+                free(worker_parts[j]);
+            free(worker_parts);
+            return ENOMEM;
+        }
+    }
+
+    /* Partition each coordinator relation by column 0 */
+    uint32_t key_cols[] = { 0 };
+    uint32_t parts_built = 0;
+
+    for (uint32_t r = 0; r < nrels && rc == 0; r++) {
+        col_rel_t *rel = coord->rels[r];
+        if (!rel)
+            continue;
+
+        const char *name = rel->name;
+
+        if (rel->ncols == 0 || rel->nrows == 0) {
+            /* Empty: give each worker an empty relation */
+            for (uint32_t w = 0; w < W && rc == 0; w++) {
+                worker_parts[w][parts_built]
+                    = col_rel_new_auto(name, rel->ncols);
+                if (!worker_parts[w][parts_built])
+                    rc = ENOMEM;
+            }
+        } else {
+            col_rel_t **parts = (col_rel_t **)calloc(W, sizeof(col_rel_t *));
+            if (!parts) {
+                rc = ENOMEM;
+            } else {
+                rc = col_rel_partition_by_key(rel, key_cols, 1, W, parts);
+                if (rc == 0) {
+                    for (uint32_t w = 0; w < W && rc == 0; w++) {
+                        free(parts[w]->name);
+                        parts[w]->name = wl_strdup(name);
+                        if (!parts[w]->name) {
+                            rc = ENOMEM;
+                        } else {
+                            worker_parts[w][parts_built] = parts[w];
+                            parts[w] = NULL; /* ownership transferred */
+                        }
+                    }
+                }
+                /* Free any unowned partition slots on error */
+                for (uint32_t w = 0; w < W; w++)
+                    col_rel_destroy(parts[w]); /* NULL-safe */
+                free(parts);
+            }
+        }
+
+        if (rc == 0)
+            parts_built++;
+    }
+
+    /* Create worker sessions */
+    uint32_t created = 0;
+    if (rc == 0) {
+        for (uint32_t w = 0; w < W; w++) {
+            rc = col_worker_session_create(coord, w,
+                    worker_parts[w], parts_built, &coord->tdd_workers[w]);
+            if (rc != 0)
+                break;
+            created++;
+        }
+    }
+
+    /* On failure: destroy successfully-created workers; free unclaimed partitions */
+    if (rc != 0) {
+        for (uint32_t w = created; w < W; w++) {
+            for (uint32_t p = 0; p < parts_built; p++)
+                col_rel_destroy(worker_parts[w][p]);
+        }
+        coord->tdd_workers_count = created;
+        tdd_cleanup_workers(coord);
+    } else {
+        coord->tdd_workers_count = W;
+    }
+
+    for (uint32_t w = 0; w < W; w++)
+        free(worker_parts[w]);
+    free(worker_parts);
+
+    return rc;
+}
+
+/*
+ * tdd_worker_nonrecursive_fn:
+ * Work function for non-recursive distributed stratum evaluation.
+ * Each worker evaluates the stratum on its local data partition.
+ */
+static void
+tdd_worker_nonrecursive_fn(void *arg)
+{
+    col_eval_tdd_worker_ctx_t *ctx = (col_eval_tdd_worker_ctx_t *)arg;
+
+    ctx->rc = col_eval_stratum(ctx->sp, ctx->worker_sess, ctx->stratum_idx);
+}
+
+/*
+ * tdd_merge_worker_results:
+ * After workers complete evaluation, merge their derived IDB relations
+ * back into the coordinator session.
+ *
+ * For each relation in the stratum plan, collects all worker outputs
+ * and appends them into a single coordinator-owned relation.
+ */
+static int
+tdd_merge_worker_results(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord)
+{
+    uint32_t W = coord->tdd_workers_count;
+    int rc = 0;
+
+    for (uint32_t ri = 0; ri < sp->relation_count && rc == 0; ri++) {
+        const char *rel_name = sp->relations[ri].name;
+
+        /* Find or create target relation in coordinator */
+        col_rel_t *target = session_find_rel(coord, rel_name);
+
+        for (uint32_t w = 0; w < W && rc == 0; w++) {
+            col_rel_t *wrel
+                = session_find_rel(&coord->tdd_workers[w], rel_name);
+            if (!wrel || wrel->nrows == 0)
+                continue;
+
+            if (!target) {
+                /* First non-empty result: move to coordinator */
+                target = col_rel_new_auto(rel_name, wrel->ncols);
+                if (!target) {
+                    rc = ENOMEM;
+                    break;
+                }
+                rc = session_add_rel(coord, target);
+                if (rc != 0) {
+                    col_rel_destroy(target);
+                    target = NULL;
+                    break;
+                }
+            }
+
+            rc = col_rel_append_all(target, wrel, NULL);
+        }
+    }
+
+    return rc;
+}
+
+/*
+ * col_eval_stratum_tdd_nonrecursive:
+ * Non-recursive distributed path: PARTITION → DISPATCH → BARRIER →
+ * CONSOLIDATE (no exchange needed for non-recursive rules).
+ */
+static int
+col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t stratum_idx)
+{
+    uint32_t W = coord->num_workers;
+    int rc;
+
+    /* Phase 1: PARTITION — partition all coordinator relations to workers */
+    rc = tdd_init_workers(coord);
+    if (rc != 0)
+        return rc;
+
+    /* Phase 2: DISPATCH — submit W workers */
+    col_eval_tdd_worker_ctx_t *ctxs
+        = (col_eval_tdd_worker_ctx_t *)calloc(
+            W, sizeof(col_eval_tdd_worker_ctx_t));
+    if (!ctxs) {
+        tdd_cleanup_workers(coord);
+        return ENOMEM;
+    }
+
+    for (uint32_t w = 0; w < W; w++) {
+        ctxs[w].sp = sp;
+        ctxs[w].worker_sess = &coord->tdd_workers[w];
+        ctxs[w].stratum_idx = stratum_idx;
+        ctxs[w].rc = 0;
+        if (wl_workqueue_submit(coord->wq, tdd_worker_nonrecursive_fn,
+            &ctxs[w])
+            != 0) {
+            rc = ENOMEM;
+            wl_workqueue_drain(coord->wq);
+            free(ctxs);
+            tdd_cleanup_workers(coord);
+            return rc;
+        }
+    }
+
+    /* Phase 3: BARRIER */
+    wl_workqueue_wait_all(coord->wq);
+
+    /* Collect first worker error */
+    for (uint32_t w = 0; w < W; w++) {
+        if (ctxs[w].rc != 0 && rc == 0)
+            rc = ctxs[w].rc;
+    }
+    free(ctxs);
+
+    /* Phase 6: CONSOLIDATE — merge worker IDB results to coordinator */
+    if (rc == 0)
+        rc = tdd_merge_worker_results(sp, coord);
+
+    /* Phase 7: Cleanup worker state */
+    tdd_cleanup_workers(coord);
+
+    return rc;
+}
+
+/*
  * col_eval_stratum_tdd:
  * Distributed stratum evaluator with 7-phase pipeline.
  *
@@ -1314,11 +1591,13 @@ col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
         return EINVAL;
 
     /* Single-worker fast path: zero overhead delegation */
-    if (coord->num_workers <= 1 || !coord->tdd_workers
-        || coord->tdd_workers_count == 0)
+    if (coord->num_workers <= 1 || !coord->tdd_workers)
         return col_eval_stratum(sp, coord, stratum_idx);
 
-    /* TODO(#318): non-recursive and recursive distributed paths */
+    if (!sp->is_recursive)
+        return col_eval_stratum_tdd_nonrecursive(sp, coord, stratum_idx);
+
+    /* TODO(#318): recursive distributed path (Phase 2) */
     return col_eval_stratum(sp, coord, stratum_idx);
 }
 
