@@ -656,6 +656,54 @@ col_radix_sort_rows(int64_t *data, uint32_t nrows, uint32_t ncols)
 }
 
 /*
+ * col_rel_insertion_sort: insertion sort for small segments (Issue #343).
+ *
+ * Sort sub-range [start_row, start_row + nrows) of r in-place.
+ * O(n^2) but low constant overhead — faster than radix sort for small N.
+ */
+static int
+col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+{
+    uint32_t nc = r->ncols;
+
+    for (uint32_t i = 1; i < nrows; i++) {
+        int64_t tmp[COL_STACK_MAX];
+        int64_t *tbuf = nc <= COL_STACK_MAX ? tmp
+            : (int64_t *)malloc((size_t)nc * sizeof(int64_t));
+        if (!tbuf)
+            return ENOMEM;
+        col_rel_row_copy_out(r, start_row + i, tbuf);
+        uint32_t j = i;
+        while (j > 0) {
+            /* Compare r[start_row + j - 1] against saved key
+             * in tbuf (not the relation -- row i is overwritten
+             * after the first shift). */
+            int cmp = 0;
+            for (uint32_t c = 0; c < nc; c++) {
+                int64_t va = col_rel_get(r, start_row + j - 1, c);
+                int64_t vb = tbuf[c];
+                if (va > vb) {
+                    cmp = 1;
+                    break;
+                }
+                if (va < vb) {
+                    cmp = -1;
+                    break;
+                }
+            }
+            if (cmp <= 0)
+                break;
+            col_rel_row_move(r, start_row + j, start_row + j - 1);
+            j--;
+        }
+        col_rel_row_copy_in(r, start_row + j, tbuf);
+        if (tbuf != tmp)
+            free(tbuf);
+    }
+    return 0;
+}
+
+/*
  * col_rel_radix_sort: index-permutation LSD radix sort (Phase B, Issue #330).
  *
  * Sort sub-range [start_row, start_row + nrows) of r in-place.
@@ -663,7 +711,12 @@ col_radix_sort_rows(int64_t *data, uint32_t nrows, uint32_t ncols)
  * Sorts a permutation array instead of scattering full rows.
  * Permutation is applied once at the end via col_rel_row_copy_out/in.
  *
- * Falls back to insertion sort (via col_rel_row_cmp) on allocation failure.
+ * Optimizations (Issue #343):
+ *   - Hybrid threshold: insertion sort for nrows <= 32
+ *   - Skip-pass: skip byte positions where all values have the same byte
+ *   - Byte-value cache: read column data once per pass, reuse for scatter
+ *
+ * Falls back to insertion sort on allocation failure.
  */
 int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
@@ -671,50 +724,23 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     if (nrows <= 1)
         return 0;
 
+    /* Hybrid threshold: insertion sort for small segments (Issue #343) */
+    if (nrows <= 32)
+        return col_rel_insertion_sort(r, start_row, nrows);
+
     uint32_t nc = r->ncols;
 
-    /* Allocate permutation arrays (double-buffered for radix scatter) */
+    /* Allocate permutation arrays (double-buffered for radix scatter)
+     * and byte-value cache (Issue #343) */
     uint32_t *perm_a = (uint32_t *)malloc(nrows * sizeof(uint32_t));
     uint32_t *perm_b = (uint32_t *)malloc(nrows * sizeof(uint32_t));
-    if (!perm_a || !perm_b) {
-        /* Fallback: insertion sort using col_rel_row_cmp */
+    uint8_t *bv_cache = (uint8_t *)malloc(nrows);
+    if (!perm_a || !perm_b || !bv_cache) {
+        /* Fallback: insertion sort */
         free(perm_a);
         free(perm_b);
-        for (uint32_t i = 1; i < nrows; i++) {
-            int64_t tmp[COL_STACK_MAX];
-            int64_t *tbuf = nc <= COL_STACK_MAX ? tmp
-                : (int64_t *)malloc((size_t)nc * sizeof(int64_t));
-            if (!tbuf)
-                return ENOMEM;
-            col_rel_row_copy_out(r, start_row + i, tbuf);
-            uint32_t j = i;
-            while (j > 0) {
-                /* Compare r[start_row + j - 1] against saved key
-                 * in tbuf (not the relation — row i is overwritten
-                 * after the first shift). */
-                int cmp = 0;
-                for (uint32_t c = 0; c < nc; c++) {
-                    int64_t va = col_rel_get(r, start_row + j - 1, c);
-                    int64_t vb = tbuf[c];
-                    if (va > vb) {
-                        cmp = 1;
-                        break;
-                    }
-                    if (va < vb) {
-                        cmp = -1;
-                        break;
-                    }
-                }
-                if (cmp <= 0)
-                    break;
-                col_rel_row_move(r, start_row + j, start_row + j - 1);
-                j--;
-            }
-            col_rel_row_copy_in(r, start_row + j, tbuf);
-            if (tbuf != tmp)
-                free(tbuf);
-        }
-        return 0;
+        free(bv_cache);
+        return col_rel_insertion_sort(r, start_row, nrows);
     }
 
     /* Initialize identity permutation */
@@ -736,12 +762,37 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
             int shift = b * 8;
             int is_sign_byte = (b == 7);
 
+            /* Skip-pass optimization (Issue #343): check if all values
+             * produce the same byte at this position.  For typical Datalog
+             * data (small integers), upper bytes are all zero, allowing
+             * 50-75% of passes to be skipped entirely. */
+            uint8_t first_bv;
+            {
+                int64_t val = col_data[start_row + src[0]];
+                first_bv = (uint8_t)((uint64_t)val >> shift);
+                if (is_sign_byte)
+                    first_bv ^= 0x80u;
+            }
+            bool uniform = true;
+            for (uint32_t i = 1; i < nrows && uniform; i++) {
+                int64_t val = col_data[start_row + src[i]];
+                uint8_t bv = (uint8_t)((uint64_t)val >> shift);
+                if (is_sign_byte)
+                    bv ^= 0x80u;
+                if (bv != first_bv)
+                    uniform = false;
+            }
+            if (uniform)
+                continue; /* all values identical at this byte — skip */
+
+            /* Count pass: read once, cache byte value (Issue #343) */
             memset(count, 0, sizeof(count));
             for (uint32_t i = 0; i < nrows; i++) {
                 int64_t val = col_data[start_row + src[i]];
                 uint8_t bv = (uint8_t)((uint64_t)val >> shift);
                 if (is_sign_byte)
                     bv ^= 0x80u;
+                bv_cache[i] = bv;
                 count[bv]++;
             }
 
@@ -749,13 +800,9 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
             for (int i = 1; i < 256; i++)
                 prefix[i] = prefix[i - 1] + count[i - 1];
 
-            for (uint32_t i = 0; i < nrows; i++) {
-                int64_t val = col_data[start_row + src[i]];
-                uint8_t bv = (uint8_t)((uint64_t)val >> shift);
-                if (is_sign_byte)
-                    bv ^= 0x80u;
-                dst[prefix[bv]++] = src[i];
-            }
+            /* Scatter pass: use cached byte values (Issue #343) */
+            for (uint32_t i = 0; i < nrows; i++)
+                dst[prefix[bv_cache[i]]++] = src[i];
 
             uint32_t *t = src;
             src = dst;
@@ -770,6 +817,7 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     if (!temp_col) {
         free(perm_a);
         free(perm_b);
+        free(bv_cache);
         return ENOMEM;
     }
 
@@ -785,6 +833,7 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     free(temp_col);
     free(perm_a);
     free(perm_b);
+    free(bv_cache);
     return 0;
 }
 
