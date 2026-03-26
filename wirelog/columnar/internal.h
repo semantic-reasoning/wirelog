@@ -21,6 +21,7 @@
 #include "columnar/diff_trace.h"
 #include "columnar/delta_pool.h"
 #include "columnar/mem_ledger.h"
+#include "columnar/progress.h"
 #include "session.h"
 #include "workqueue.h"
 #include "arena/arena.h"
@@ -750,6 +751,15 @@ typedef struct wl_col_session_t {
      * worker sessions inherit a borrowed pointer (not freed on worker destroy). */
     col_rel_t ***exchange_bufs;
     uint32_t exchange_num_workers; /* W dimension of the matrix */
+    /* Per-worker frontier progress tracker (Issue #317): coordinator-owned.
+     * Collects each worker's convergence report (outer_epoch, iteration)
+     * after parallel stratum evaluation.  Workers write to their own slot
+     * (thread-safe during scatter); coordinator reads after the workqueue
+     * barrier to compute the global minimum frontier.
+     * Embedded (not a pointer) so the coordinator session owns the lifetime.
+     * Worker sessions must zero progress.entries in col_worker_session_create
+     * to prevent double-free of the coordinator's entries array. */
+    wl_frontier_progress_t progress;
 } wl_col_session_t;
 
 /*
@@ -1132,6 +1142,10 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
 int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);
+int
+col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t stratum_idx,
+    wl_col_session_t *workers, uint32_t num_workers);
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);

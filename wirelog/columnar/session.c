@@ -530,6 +530,14 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
      * pairs to prevent incorrect skip-condition evaluation across epochs. */
     /* outer_epoch = 0; */ /* Already zeroed by calloc */
 
+    /* Issue #317: Initialize per-worker frontier progress tracker.
+     * Uses MAX_STRATA so the tracker is valid without knowing the plan's
+     * stratum count at init time.  Failure is non-fatal: progress tracking
+     * degrades gracefully (all_converged returns false, min returns UINT32_MAX).
+     * The oom label does NOT free progress.entries because wl_frontier_progress_init
+     * only sets entries on success; on ENOMEM entries remains NULL so destroy is safe. */
+    wl_frontier_progress_init(&sess->progress, sess->num_workers, MAX_STRATA);
+
     *out = &sess->base;
     return 0;
 
@@ -592,6 +600,10 @@ col_session_destroy(wl_session_t *session)
         }
         free(sess->exchange_bufs);
     }
+    /* Issue #317: Free per-worker frontier progress tracker.
+     * Worker sessions have progress.entries == NULL (set in col_worker_session_create)
+     * so this is safe to call on both coordinator and worker sessions. */
+    wl_frontier_progress_destroy(&sess->progress);
     free(sess);
 }
 
@@ -650,6 +662,12 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Exchange buffers are owned by coordinator; worker inherits borrowed ptr */
     out_worker->exchange_bufs = NULL;
     out_worker->exchange_num_workers = 0;
+    /* Issue #317: Worker does not own the progress tracker.
+     * NULL entries so col_session_destroy (if called on worker) does not
+     * double-free the coordinator's entries array. */
+    out_worker->progress.entries = NULL;
+    out_worker->progress.num_workers = 0;
+    out_worker->progress.num_strata = 0;
 
     /* Step 4: NULL borrowed fields that workers must not use */
     out_worker->delta_cb = NULL;
@@ -1307,6 +1325,11 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                  * Test coverage: test_delta_propagation validates cyclic correctness. */
                 if (stratum_has_preseeded_delta(&plan->strata[si], sess)) {
                     sess->frontier_ops->reset_stratum_frontier(sess, si,
+                        sess->outer_epoch);
+                    /* Issue #317: Reset per-worker progress for this stratum
+                     * so stale reports from the previous epoch do not block
+                     * convergence detection in col_eval_stratum_multiworker. */
+                    wl_frontier_progress_reset_stratum(&sess->progress, si,
                         sess->outer_epoch);
                 }
                 /* Else: stratum affected but no pre-seeded delta → KEEP frontier */
