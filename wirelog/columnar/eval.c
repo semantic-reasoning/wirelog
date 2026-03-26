@@ -1875,6 +1875,241 @@ tdd_preregister_idb_on_workers(const wl_plan_stratum_t *sp,
     return 0;
 }
 
+/* Forward declaration — defined below tdd_exchange_deltas. */
+static int tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W);
+
+/*
+ * tdd_alloc_exchange_bufs:
+ * Allocate the W x W mailbox matrix on the coordinator session.
+ * exchange_bufs[src][dst] will hold rows that worker src sends to dst.
+ * On failure, exchange_bufs remains NULL.
+ */
+static int
+tdd_alloc_exchange_bufs(wl_col_session_t *coord, uint32_t W)
+{
+    coord->exchange_bufs
+        = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
+    if (!coord->exchange_bufs)
+        return ENOMEM;
+
+    for (uint32_t w = 0; w < W; w++) {
+        coord->exchange_bufs[w]
+            = (col_rel_t **)calloc(W, sizeof(col_rel_t *));
+        if (!coord->exchange_bufs[w]) {
+            for (uint32_t j = 0; j < w; j++)
+                free((void *)coord->exchange_bufs[j]);
+            free((void *)coord->exchange_bufs);
+            coord->exchange_bufs = NULL;
+            return ENOMEM;
+        }
+    }
+
+    coord->exchange_num_workers = W;
+    return 0;
+}
+
+/*
+ * tdd_free_exchange_bufs:
+ * Destroy all relations held in the W x W mailbox matrix, free the
+ * matrix, and clear the coordinator fields.
+ */
+static void
+tdd_free_exchange_bufs(wl_col_session_t *coord)
+{
+    if (!coord->exchange_bufs)
+        return;
+
+    uint32_t W = coord->exchange_num_workers;
+
+    for (uint32_t src = 0; src < W; src++) {
+        if (!coord->exchange_bufs[src])
+            continue;
+        for (uint32_t dst = 0; dst < W; dst++)
+            col_rel_destroy(coord->exchange_bufs[src][dst]);
+        free((void *)coord->exchange_bufs[src]);
+    }
+
+    free((void *)coord->exchange_bufs);
+    coord->exchange_bufs = NULL;
+    coord->exchange_num_workers = 0;
+}
+
+/*
+ * tdd_gather_for_worker:
+ * Merge exchange_bufs[0..W-1][dst] into a single heap-allocated relation
+ * named dname.  Returns NULL in *out_gathered when all source partitions
+ * are empty (no new tuples for this worker).
+ */
+static int
+tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
+    const char *dname, col_rel_t **out_gathered)
+{
+    uint32_t total_rows = 0;
+    uint32_t ncols = 0;
+
+    for (uint32_t src = 0; src < W; src++) {
+        col_rel_t *part = coord->exchange_bufs[src][dst];
+        if (part && part->nrows > 0) {
+            total_rows += part->nrows;
+            if (ncols == 0)
+                ncols = part->ncols;
+        }
+    }
+
+    *out_gathered = NULL;
+
+    if (total_rows == 0 || ncols == 0)
+        return 0;
+
+    col_rel_t *gathered = col_rel_new_auto(dname, ncols);
+    if (!gathered)
+        return ENOMEM;
+
+    for (uint32_t src = 0; src < W; src++) {
+        col_rel_t *part = coord->exchange_bufs[src][dst];
+        if (!part || part->nrows == 0)
+            continue;
+        int rc = col_rel_append_all(gathered, part, NULL);
+        if (rc != 0) {
+            col_rel_destroy(gathered);
+            return rc;
+        }
+    }
+
+    *out_gathered = gathered;
+    return 0;
+}
+
+/*
+ * tdd_exchange_deltas:
+ * After a sub-pass barrier, redistribute worker deltas using
+ * hash-partitioned scatter/gather.
+ *
+ * If the stratum plan contains WL_PLAN_OP_EXCHANGE ops, uses the
+ * key column metadata from those ops to hash-partition each worker's
+ * delta into exchange_bufs[w][*], then gathers exchange_bufs[*][dst]
+ * for each destination worker and installs the result as $d$<relname>.
+ * This eliminates broadcast duplicates for plans that carry EXCHANGE ops.
+ *
+ * If no EXCHANGE ops are present (e.g. transitive closure with a join
+ * key that differs from the partition key), falls back to
+ * tdd_broadcast_deltas to preserve correctness.
+ *
+ * Ownership of ctxs[w].delta_rels[ri] entries transfers here;
+ * all entries are consumed (freed or moved) before return.
+ */
+static int
+tdd_exchange_deltas(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
+{
+    uint32_t nrels = sp->relation_count;
+
+    /* Check whether any relation plan carries EXCHANGE op metadata. */
+    bool has_exchange = false;
+    for (uint32_t ri = 0; ri < nrels && !has_exchange; ri++) {
+        for (uint32_t oi = 0; oi < sp->relations[ri].op_count; oi++) {
+            if (sp->relations[ri].ops[oi].op == WL_PLAN_OP_EXCHANGE) {
+                has_exchange = true;
+                break;
+            }
+        }
+    }
+
+    /* No EXCHANGE metadata: broadcast is correct (e.g. TC). */
+    if (!has_exchange)
+        return tdd_broadcast_deltas(sp, coord, ctxs, W);
+
+    /* Hash-partitioned scatter/gather exchange. */
+    int rc = tdd_alloc_exchange_bufs(coord, W);
+    if (rc != 0) {
+        for (uint32_t w = 0; w < W; w++)
+            for (uint32_t ri = 0; ri < nrels; ri++) {
+                col_rel_destroy(ctxs[w].delta_rels[ri]);
+                ctxs[w].delta_rels[ri] = NULL;
+            }
+        return rc;
+    }
+
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        char dname[256];
+        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+
+        /* Locate EXCHANGE key columns for this relation (if any). */
+        const uint32_t *key_cols = NULL;
+        uint32_t key_count = 0;
+        for (uint32_t oi = 0; oi < sp->relations[ri].op_count; oi++) {
+            if (sp->relations[ri].ops[oi].op == WL_PLAN_OP_EXCHANGE) {
+                const wl_plan_op_exchange_t *meta
+                    = (const wl_plan_op_exchange_t *)
+                    sp->relations[ri].ops[oi].opaque_data;
+                if (meta && meta->key_col_count > 0) {
+                    key_cols = meta->key_col_idxs;
+                    key_count = meta->key_col_count;
+                }
+                break;
+            }
+        }
+
+        /* Remove stale $d$ from every worker before scatter. */
+        for (uint32_t w = 0; w < W; w++)
+            session_remove_rel(&coord->tdd_workers[w], dname);
+
+        /* Scatter: worker w partitions its delta into exchange_bufs[w][*]. */
+        uint32_t default_key[] = { 0 };
+        const uint32_t *eff_key = (key_cols && key_count > 0)
+            ? key_cols : default_key;
+        uint32_t eff_key_count
+            = (key_cols && key_count > 0) ? key_count : 1u;
+
+        for (uint32_t w = 0; w < W; w++) {
+            col_rel_t *d = ctxs[w].delta_rels[ri];
+            ctxs[w].delta_rels[ri] = NULL;
+
+            if (!d || d->nrows == 0 || d->ncols == 0) {
+                col_rel_destroy(d);
+                continue;
+            }
+
+            rc = col_rel_partition_by_key(d, eff_key, eff_key_count,
+                    W, coord->exchange_bufs[w]);
+            col_rel_destroy(d);
+
+            if (rc != 0)
+                goto exchange_done;
+        }
+
+        /* Gather: worker dst receives exchange_bufs[*][dst]. */
+        for (uint32_t dst = 0; dst < W; dst++) {
+            col_rel_t *gathered = NULL;
+            rc = tdd_gather_for_worker(coord, dst, W, dname, &gathered);
+            if (rc != 0)
+                goto exchange_done;
+
+            if (gathered) {
+                rc = session_add_rel(&coord->tdd_workers[dst], gathered);
+                if (rc != 0) {
+                    col_rel_destroy(gathered);
+                    goto exchange_done;
+                }
+            }
+        }
+
+        /* Release exchange_bufs[*][*] for this relation — data was copied
+         * into the gathered relations above. */
+        for (uint32_t src = 0; src < W; src++) {
+            for (uint32_t dst = 0; dst < W; dst++) {
+                col_rel_destroy(coord->exchange_bufs[src][dst]);
+                coord->exchange_bufs[src][dst] = NULL;
+            }
+        }
+    }
+
+exchange_done:
+    tdd_free_exchange_bufs(coord);
+    return rc;
+}
+
 /*
  * tdd_broadcast_deltas:
  * After a sub-pass barrier, union all worker deltas for each IDB
@@ -2186,8 +2421,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 break;
             }
 
-            /* BROADCAST EXCHANGE: union worker deltas → install on all workers */
-            int brc = tdd_broadcast_deltas(sp, coord, ctxs, W);
+            /* EXCHANGE: hash-partitioned scatter/gather when plan carries
+             * EXCHANGE ops; broadcast otherwise (e.g. transitive closure). */
+            int brc = tdd_exchange_deltas(sp, coord, ctxs, W);
 
             for (uint32_t w = 0; w < W; w++)
                 free((void *)ctxs[w].delta_rels);

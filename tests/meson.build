@@ -1947,6 +1947,27 @@ test_tdd_recursive_exe = executable(
 test('tdd_recursive', test_tdd_recursive_exe)
 
 # ============================================================================
+# TDD Exchange Operator Integration (Issue #318 Phase 3)
+# ============================================================================
+
+test_tdd_exchange_exe = executable(
+  'test_tdd_exchange',
+  files('test_tdd_exchange.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('tdd_exchange', test_tdd_exchange_exe)
+
+# ============================================================================
 # Per-Worker Frontier Progress Protocol (Issue #317)
 # ============================================================================
 
