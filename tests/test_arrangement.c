@@ -16,7 +16,7 @@
  *
  * Private struct access:
  *   col_rel_t and wl_col_session_t are private to columnar_nanoarrow.c.
- *   We mirror only the first few stable fields needed to obtain rel->data
+ *   We mirror only the first few stable fields needed to obtain rel->columns
  *   and rel->ncols for passing to col_arrangement_find_first.
  *   If the private struct layout changes, update the mirrors below.
  */
@@ -73,7 +73,7 @@ static int fail_count = 0;
  * Private struct mirrors
  *
  * We mirror only the initial, stable fields of col_rel_t and
- * wl_col_session_t to extract rel->data and rel->ncols.
+ * wl_col_session_t to extract rel->columns and rel->ncols.
  *
  * Layout must match columnar_nanoarrow.c exactly.
  * Keep in sync when those structs change.

@@ -68,7 +68,7 @@ rows_equal(const int64_t *a, const int64_t *b, uint32_t nrows, uint32_t ncols)
     return memcmp(a, b, (size_t)nrows * ncols * sizeof(int64_t)) == 0;
 }
 
-/* Verify r->data matches expected rows (row-major). */
+/* Verify r->columns matches expected rows. */
 static int
 check_sorted(col_rel_t *r, const int64_t *expected, uint32_t nrows,
     uint32_t ncols, const char *label)

@@ -598,7 +598,7 @@ test_arena_eval_iteration_lifecycle(void)
 /*
  * E1: Pointer swap pattern with arena-backed data buffer.
  *     The arena owns the backing memory; the col_rel_t struct tracks it
- *     via r->data. After arena reset, the pointer is stale — this test
+ *     via r->columns. After arena reset, the pointer is stale — this test
  *     verifies the pattern works BEFORE the reset.
  */
 static int
