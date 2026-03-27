@@ -2147,8 +2147,10 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
         /* Free all worker deltas for this relation and clear $d$ from workers */
         for (uint32_t w = 0; w < W; w++) {
             if (ctxs[w].delta_rels[ri]) {
-                if (total_rows == 0)
+                if (total_rows == 0) {
                     col_rel_destroy(ctxs[w].delta_rels[ri]);
+                    ctxs[w].delta_rels[ri] = NULL;
+                }
                 /* non-zero case: freed below after appending */
             }
             session_remove_rel(&coord->tdd_workers[w], dname);
