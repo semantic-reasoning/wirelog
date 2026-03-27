@@ -127,6 +127,7 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
     /* Arrow schema: struct<col0:i64, col1:i64, ...> */
     ArrowSchemaInit(&r->schema);
     if (ArrowSchemaSetTypeStruct(&r->schema, (int64_t)ncols) != NANOARROW_OK) {
+        ArrowSchemaRelease(&r->schema);
         /* cleanup names/data done by caller via col_rel_free_contents */
         return EINVAL;
     }
