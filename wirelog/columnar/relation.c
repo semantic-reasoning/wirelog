@@ -886,6 +886,183 @@ radix_uniform_check_neon(const int64_t *col_data, uint32_t start_row,
 #define radix_uniform_check_fast radix_uniform_check_scalar
 #endif
 
+/* ------------------------------------------------------------------------ */
+/* Count Pass SIMD Helpers (Issue #363)                                      */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Count pass: gather permuted int64 values, extract the target byte, cache
+ * it in bv_cache[], then build the histogram in count[].
+ *
+ * The pass is split into two sub-passes:
+ *   1. Vectorized gather + byte extraction + bv_cache write
+ *   2. Serial histogram update from bv_cache (sequential read, random write)
+ *
+ * Splitting avoids the interleaved random-write (count[bv]++) inside the
+ * SIMD loop and lets the CPU pipeline the serial histogram from L1-cached
+ * bv_cache values after the gather phase completes.
+ */
+
+#ifdef __AVX2__
+/*
+ * radix_count_pass_avx2:
+ * Processes 8 elements per iteration using two _mm256_i32gather_epi64 calls.
+ * SIMD gather issues two independent 4-way load requests per iteration,
+ * letting the memory subsystem service them in parallel.
+ */
+static void
+radix_count_pass_avx2(const int64_t *col_data, uint32_t start_row,
+    const uint32_t *src, uint32_t nrows, int shift, int is_sign_byte,
+    uint8_t *bv_cache, uint32_t *count)
+{
+    uint8_t xmask = is_sign_byte ? 0x80u : 0u;
+    __m256i vshift = _mm256_set1_epi64x(shift);
+    uint32_t i = 0;
+
+    /* Phase 1: vectorized gather + byte extract + bv_cache write */
+    for (; i + 8 <= nrows; i += 8) {
+        __m128i vidx0 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i vidx1 = _mm_loadu_si128((const __m128i *)(src + i + 4));
+        __m256i vals0 = _mm256_i32gather_epi64(
+            (const long long *)(col_data + start_row), vidx0, 8);
+        __m256i vals1 = _mm256_i32gather_epi64(
+            (const long long *)(col_data + start_row), vidx1, 8);
+        __m256i sh0 = _mm256_srlv_epi64(vals0, vshift);
+        __m256i sh1 = _mm256_srlv_epi64(vals1, vshift);
+
+        bv_cache[i + 0] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh0,
+                0) ^ xmask;
+        bv_cache[i + 1] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh0,
+                1) ^ xmask;
+        bv_cache[i + 2] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh0,
+                2) ^ xmask;
+        bv_cache[i + 3] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh0,
+                3) ^ xmask;
+        bv_cache[i + 4] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh1,
+                0) ^ xmask;
+        bv_cache[i + 5] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh1,
+                1) ^ xmask;
+        bv_cache[i + 6] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh1,
+                2) ^ xmask;
+        bv_cache[i + 7] = (uint8_t)(uint64_t)_mm256_extract_epi64(sh1,
+                3) ^ xmask;
+    }
+
+    /* Scalar tail */
+    for (; i < nrows; i++) {
+        uint8_t bv = (uint8_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_byte)
+            bv ^= 0x80u;
+        bv_cache[i] = bv;
+    }
+
+    /* Phase 2: histogram from bv_cache */
+    memset(count, 0, 256 * sizeof(uint32_t));
+    for (uint32_t j = 0; j < nrows; j++)
+        count[bv_cache[j]]++;
+}
+#endif /* __AVX2__ */
+
+#ifdef __ARM_NEON__
+/*
+ * radix_count_pass_neon:
+ * Processes 8 elements per iteration using four int64x2_t registers.
+ * Variable right-shift via vshlq_u64 isolates the target byte; vst1_u8
+ * writes all 8 extracted bytes to bv_cache in one store.
+ */
+static void
+radix_count_pass_neon(const int64_t *col_data, uint32_t start_row,
+    const uint32_t *src, uint32_t nrows, int shift, int is_sign_byte,
+    uint8_t *bv_cache, uint32_t *count)
+{
+    uint8_t xmask = is_sign_byte ? 0x80u : 0u;
+    int64x2_t vneg_shift = vdupq_n_s64(-(int64_t)shift);
+    uint32_t i = 0;
+
+    /* Phase 1: vectorized gather + byte extract + bv_cache write */
+    for (; i + 8 <= nrows; i += 8) {
+        int64_t v0 = col_data[start_row + src[i + 0]];
+        int64_t v1 = col_data[start_row + src[i + 1]];
+        int64_t v2 = col_data[start_row + src[i + 2]];
+        int64_t v3 = col_data[start_row + src[i + 3]];
+        int64_t v4 = col_data[start_row + src[i + 4]];
+        int64_t v5 = col_data[start_row + src[i + 5]];
+        int64_t v6 = col_data[start_row + src[i + 6]];
+        int64_t v7 = col_data[start_row + src[i + 7]];
+
+        int64x2_t vec01 = vcombine_s64(
+            vcreate_s64((uint64_t)v0), vcreate_s64((uint64_t)v1));
+        int64x2_t vec23 = vcombine_s64(
+            vcreate_s64((uint64_t)v2), vcreate_s64((uint64_t)v3));
+        int64x2_t vec45 = vcombine_s64(
+            vcreate_s64((uint64_t)v4), vcreate_s64((uint64_t)v5));
+        int64x2_t vec67 = vcombine_s64(
+            vcreate_s64((uint64_t)v6), vcreate_s64((uint64_t)v7));
+
+        uint64x2_t sv01 = vshlq_u64(vreinterpretq_u64_s64(vec01), vneg_shift);
+        uint64x2_t sv23 = vshlq_u64(vreinterpretq_u64_s64(vec23), vneg_shift);
+        uint64x2_t sv45 = vshlq_u64(vreinterpretq_u64_s64(vec45), vneg_shift);
+        uint64x2_t sv67 = vshlq_u64(vreinterpretq_u64_s64(vec67), vneg_shift);
+
+        uint8_t bvals[8] = {
+            (uint8_t)vgetq_lane_u64(sv01, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv01, 1) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv23, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv23, 1) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv45, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv45, 1) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv67, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv67, 1) ^ xmask,
+        };
+        vst1_u8(bv_cache + i, vld1_u8(bvals));
+    }
+
+    /* Scalar tail */
+    for (; i < nrows; i++) {
+        uint8_t bv = (uint8_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_byte)
+            bv ^= 0x80u;
+        bv_cache[i] = bv;
+    }
+
+    /* Phase 2: histogram from bv_cache */
+    memset(count, 0, 256 * sizeof(uint32_t));
+    for (uint32_t j = 0; j < nrows; j++)
+        count[bv_cache[j]]++;
+}
+#endif /* __ARM_NEON__ */
+
+#if !defined(__AVX2__) && !defined(__ARM_NEON__)
+/*
+ * radix_count_pass_scalar:
+ * Single-pass gather + byte extract + bv_cache write + histogram.
+ * Only compiled on non-SIMD targets to avoid unused-function warnings.
+ */
+static void
+radix_count_pass_scalar(const int64_t *col_data, uint32_t start_row,
+    const uint32_t *src, uint32_t nrows, int shift, int is_sign_byte,
+    uint8_t *bv_cache, uint32_t *count)
+{
+    memset(count, 0, 256 * sizeof(uint32_t));
+    for (uint32_t i = 0; i < nrows; i++) {
+        uint8_t bv = (uint8_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_byte)
+            bv ^= 0x80u;
+        bv_cache[i] = bv;
+        count[bv]++;
+    }
+}
+#endif /* !__AVX2__ && !__ARM_NEON__ */
+
+/* Compile-time dispatch: AVX2 > NEON > scalar */
+#ifdef __AVX2__
+#define radix_count_pass_fast radix_count_pass_avx2
+#elif defined(__ARM_NEON__)
+#define radix_count_pass_fast radix_count_pass_neon
+#else
+#define radix_count_pass_fast radix_count_pass_scalar
+#endif
+
 /*
  * col_rel_radix_sort: index-permutation LSD radix sort (Phase B, Issue #330).
  *
@@ -961,16 +1138,9 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
                 shift, is_sign_byte, first_bv))
                 continue; /* all values identical at this byte — skip */
 
-            /* Count pass: read once, cache byte value (Issue #343) */
-            memset(count, 0, sizeof(count));
-            for (uint32_t i = 0; i < nrows; i++) {
-                int64_t val = col_data[start_row + src[i]];
-                uint8_t bv = (uint8_t)((uint64_t)val >> shift);
-                if (is_sign_byte)
-                    bv ^= 0x80u;
-                bv_cache[i] = bv;
-                count[bv]++;
-            }
+            /* Count pass + histogram: SIMD-accelerated (Issue #363) */
+            radix_count_pass_fast(col_data, start_row, src, nrows,
+                shift, is_sign_byte, bv_cache, count);
 
             prefix[0] = 0;
             for (int i = 1; i < 256; i++)
