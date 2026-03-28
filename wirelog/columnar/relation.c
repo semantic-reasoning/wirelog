@@ -30,6 +30,28 @@
 #include <arm_neon.h>
 #endif
 
+/*
+ * Portable software-prefetch macros (Issue #363).
+ *
+ * WL_PREFETCH_R(addr) — read prefetch, L2 temporal (gather source).
+ * WL_PREFETCH_W(addr) — write prefetch, L2 temporal (scatter destination).
+ *
+ * MSVC does not support __builtin_prefetch; map to _mm_prefetch with
+ * _MM_HINT_T1 (L2 locality) for both read and write variants since MSVC
+ * does not expose a write-intent hint via _mm_prefetch.
+ */
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#define WL_PREFETCH_R(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T1)
+#define WL_PREFETCH_W(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T1)
+#elif defined(__GNUC__) || defined(__clang__)
+#define WL_PREFETCH_R(addr) __builtin_prefetch((addr), 0, 1)
+#define WL_PREFETCH_W(addr) __builtin_prefetch((addr), 1, 1)
+#else
+#define WL_PREFETCH_R(addr) ((void)(addr))
+#define WL_PREFETCH_W(addr) ((void)(addr))
+#endif
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 void
@@ -756,7 +778,7 @@ radix_uniform_count_fused_avx2(const int64_t *col_data, uint32_t start_row,
      * latency (Issue #363 Phase 2). */
     for (; i + 8 <= nrows; i += 8) {
         if (i + 16u < nrows)
-            __builtin_prefetch(col_data + start_row + src[i + 16], 0, 1);
+            WL_PREFETCH_R(col_data + start_row + src[i + 16]);
         __m128i vidx0 = _mm_loadu_si128((const __m128i *)(src + i));
         __m128i vidx1 = _mm_loadu_si128((const __m128i *)(src + i + 4));
         __m256i vals0 = _mm256_i32gather_epi64(
@@ -829,7 +851,7 @@ radix_uniform_count_fused_neon(const int64_t *col_data, uint32_t start_row,
      * latency (Issue #363 Phase 2). */
     for (; i + 8 <= nrows; i += 8) {
         if (i + 16u < nrows)
-            __builtin_prefetch(col_data + start_row + src[i + 16], 0, 1);
+            WL_PREFETCH_R(col_data + start_row + src[i + 16]);
         int64_t v0 = col_data[start_row + src[i + 0]];
         int64_t v1 = col_data[start_row + src[i + 1]];
         int64_t v2 = col_data[start_row + src[i + 2]];
@@ -979,8 +1001,13 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     uint32_t prefix[256];
 
 #ifdef WL_RADIX_BENCH
-    /* Phase 0: per-pass timing accumulators (Issue #363). */
-    uint64_t _tU = 0, _tC = 0, _tS = 0, _tA = 0, _t0 = 0;
+    /* Phase 0: per-pass timing accumulators (Issue #363).
+     * _tU = uniform check + count pass (fused in radix_uniform_count_fused_fast)
+     * _tS = scatter pass (including prefix scan)
+     * _tA = apply permutation per-column
+     * _nSk = number of passes skipped (uniform)
+     * _nPs = number of passes processed (non-uniform) */
+    uint64_t _tU = 0, _tS = 0, _tA = 0, _t0 = 0;
     uint32_t _nSk = 0, _nPs = 0;
 #endif
 
