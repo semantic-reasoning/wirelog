@@ -751,8 +751,12 @@ radix_uniform_count_fused_avx2(const int64_t *col_data, uint32_t start_row,
     uint8_t uniform = 1; /* bitwise-AND accumulator; 0 once any mismatch seen */
     uint32_t i = 0;
 
-    /* SIMD gather + byte extract + bv_cache write + uniformity tracking */
+    /* SIMD gather + byte extract + bv_cache write + uniformity tracking.
+     * Prefetch col_data 16 elements (2 iterations) ahead to hide L3 gather
+     * latency (Issue #363 Phase 2). */
     for (; i + 8 <= nrows; i += 8) {
+        if (i + 16u < nrows)
+            __builtin_prefetch(col_data + start_row + src[i + 16], 0, 1);
         __m128i vidx0 = _mm_loadu_si128((const __m128i *)(src + i));
         __m128i vidx1 = _mm_loadu_si128((const __m128i *)(src + i + 4));
         __m256i vals0 = _mm256_i32gather_epi64(
@@ -820,8 +824,12 @@ radix_uniform_count_fused_neon(const int64_t *col_data, uint32_t start_row,
     uint64_t uniform_mask = UINT64_MAX;
     uint32_t i = 0;
 
-    /* NEON gather + byte extract + bv_cache write + uniformity tracking */
+    /* NEON gather + byte extract + bv_cache write + uniformity tracking.
+     * Prefetch col_data 16 elements (2 iterations) ahead to hide L3 gather
+     * latency (Issue #363 Phase 2). */
     for (; i + 8 <= nrows; i += 8) {
+        if (i + 16u < nrows)
+            __builtin_prefetch(col_data + start_row + src[i + 16], 0, 1);
         int64_t v0 = col_data[start_row + src[i + 0]];
         int64_t v1 = col_data[start_row + src[i + 1]];
         int64_t v2 = col_data[start_row + src[i + 2]];
