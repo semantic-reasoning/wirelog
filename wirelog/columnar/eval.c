@@ -1461,6 +1461,117 @@ tdd_init_workers(wl_col_session_t *coord)
 }
 
 /*
+ * tdd_replicate_workers:
+ * Give every worker a FULL COPY of all coordinator relations.
+ *
+ * Unlike tdd_init_workers (which partitions by column 0), this function
+ * replicates each relation to every worker.  Required for recursive strata
+ * where multi-way joins may reference columns other than the partition key
+ * (e.g. the same-generation self-join on parent.col1).
+ *
+ * Issue #352: partitioning by col0 breaks self-joins on non-col0 columns
+ * and 3-body recursive rules where IDB appears in the middle of the join.
+ */
+static int
+tdd_replicate_workers(wl_col_session_t *coord)
+{
+    tdd_cleanup_workers(coord);
+
+    uint32_t W = coord->num_workers;
+    uint32_t nrels = coord->nrels;
+
+    /* No relations: create empty worker sessions */
+    if (nrels == 0) {
+        for (uint32_t w = 0; w < W; w++) {
+            int rc = col_worker_session_create(coord, w, NULL, 0,
+                    &coord->tdd_workers[w]);
+            if (rc != 0) {
+                tdd_cleanup_workers(coord);
+                return rc;
+            }
+            coord->tdd_workers_count = w + 1;
+        }
+        return 0;
+    }
+
+    /* Allocate W x nrels relation matrix */
+    col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
+    if (!worker_rels)
+        return ENOMEM;
+
+    int rc = 0;
+    for (uint32_t w = 0; w < W; w++) {
+        worker_rels[w] = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
+        if (!worker_rels[w]) {
+            for (uint32_t j = 0; j < w; j++)
+                free((void *)worker_rels[j]);
+            free((void *)worker_rels);
+            return ENOMEM;
+        }
+    }
+
+    /* Replicate each coordinator relation to every worker */
+    uint32_t rels_built = 0;
+
+    for (uint32_t r = 0; r < nrels && rc == 0; r++) {
+        col_rel_t *rel = coord->rels[r];
+        if (!rel)
+            continue;
+
+        const char *name = rel->name;
+
+        for (uint32_t w = 0; w < W && rc == 0; w++) {
+            col_rel_t *copy = col_rel_new_auto(name, rel->ncols);
+            if (!copy) {
+                rc = ENOMEM;
+                break;
+            }
+            if (rel->nrows > 0) {
+                rc = col_rel_append_all(copy, rel, NULL);
+                if (rc != 0) {
+                    col_rel_destroy(copy);
+                    break;
+                }
+            }
+            worker_rels[w][rels_built] = copy;
+        }
+
+        if (rc == 0)
+            rels_built++;
+    }
+
+    /* Create worker sessions */
+    uint32_t created = 0;
+    if (rc == 0) {
+        for (uint32_t w = 0; w < W; w++) {
+            rc = col_worker_session_create(coord, w,
+                    worker_rels[w], rels_built, &coord->tdd_workers[w]);
+            if (rc != 0)
+                break;
+            created++;
+        }
+    }
+
+    /* On failure: destroy successfully-created workers; free unclaimed rels */
+    if (rc != 0) {
+        for (uint32_t w = created; w < W; w++) {
+            for (uint32_t p = 0; p < rels_built; p++)
+                col_rel_destroy(worker_rels[w][p]);
+        }
+        coord->tdd_workers_count = created;
+        tdd_cleanup_workers(coord);
+    } else {
+        coord->tdd_workers_count = W;
+    }
+
+    for (uint32_t w = 0; w < W; w++)
+        free((void *)worker_rels[w]);
+    free((void *)worker_rels);
+
+    return rc;
+}
+
+/*
  * tdd_worker_subpass_fn:
  * Execute one sub-pass of the semi-naive iteration on a worker's partition.
  *
@@ -2343,8 +2454,14 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             coord->outer_epoch);
     }
 
-    /* Partition coordinator relations to workers */
-    rc = tdd_init_workers(coord);
+    /* Issue #352: Replicate (not partition) coordinator relations to workers.
+     * Recursive strata may contain multi-way joins on columns other than
+     * col0 (e.g. same-generation self-join on parent.col1).  Partitioning
+     * by col0 would split rows that share the same join key across workers,
+     * causing missed joins.  Replication ensures every worker can evaluate
+     * complete joins at the cost of redundant computation; the final
+     * merge+dedup step eliminates duplicates. */
+    rc = tdd_replicate_workers(coord);
     if (rc != 0)
         return rc;
 
