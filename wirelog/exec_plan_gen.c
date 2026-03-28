@@ -1676,13 +1676,17 @@ parse_col_index(const char *key)
 }
 
 /*
- * Post-pass: insert WL_PLAN_OP_EXCHANGE after the last JOIN in each
- * relation plan within a recursive stratum.  Conservative strategy for
- * Issue #319: always correct, may over-communicate.
+ * Post-pass: append a top-level WL_PLAN_OP_EXCHANGE at the end of each
+ * recursive relation's ops array.  The EXCHANGE carries key_col_idxs
+ * derived from the last JOIN's left_keys, enabling tdd_exchange_deltas
+ * to hash-partition deltas instead of broadcasting.
  *
- * Run AFTER rewrite_lftj_chains (LFTJ replaces EDB-only chains that
- * should not get EXCHANGE) and BEFORE rewrite_multiway_delta (so
- * EXCHANGE ops get cloned into K delta copies).
+ * Must run AFTER rewrite_multiway_delta / K-fusion so that the EXCHANGE
+ * op ends up as a top-level op visible to tdd_exchange_deltas's linear
+ * scan.  When K-fusion is active, JOINs are buried inside the K_FUSION
+ * op's internal sequences — we peek into k_ops[0] to extract metadata.
+ *
+ * Issue #319 / #361: conservative strategy (one EXCHANGE per relation).
  */
 static void
 rewrite_insert_exchanges(wl_plan_t *plan)
@@ -1697,91 +1701,112 @@ rewrite_insert_exchanges(wl_plan_t *plan)
             if (!rel->ops || rel->op_count == 0)
                 continue;
 
-            /* Find the last JOIN in this relation plan */
-            int last_join = -1;
+            /* Find the best JOIN for EXCHANGE key: prefer a JOIN whose
+             * right_relation is IDB in this stratum (correct partition key
+             * for 3-body rules like SG); fall back to last JOIN. */
+            const wl_plan_op_t *best_join = NULL;
+
+            /* 1) Scan top-level ops backward for JOINs. */
             for (int i = (int)rel->op_count - 1; i >= 0; i--) {
-                if (rel->ops[i].op == WL_PLAN_OP_JOIN) {
-                    last_join = i;
-                    break;
+                if (rel->ops[i].op != WL_PLAN_OP_JOIN)
+                    continue;
+                if (!best_join)
+                    best_join = &rel->ops[i]; /* fallback: last JOIN */
+                /* Prefer JOIN whose right_relation is IDB in stratum */
+                if (rel->ops[i].right_relation) {
+                    bool is_idb = false;
+                    for (uint32_t rj = 0; rj < st->relation_count; rj++) {
+                        if (strcmp(rel->ops[i].right_relation,
+                            st->relations[rj].name) == 0) {
+                            is_idb = true;
+                            break;
+                        }
+                    }
+                    if (is_idb) {
+                        best_join = &rel->ops[i];
+                        break;
+                    }
                 }
             }
-            if (last_join < 0)
-                continue; /* no JOINs, nothing to do */
 
-            /* Build new ops array: original ops + 1 EXCHANGE after last JOIN */
-            uint32_t new_count = rel->op_count + 1;
-            wl_plan_op_t *new_ops
-                = (wl_plan_op_t *)calloc(new_count, sizeof(wl_plan_op_t));
-            if (!new_ops)
+            /* 2) If no top-level JOIN, peek inside K_FUSION sequence 0. */
+            if (!best_join
+                && rel->op_count >= 1
+                && rel->ops[0].op == WL_PLAN_OP_K_FUSION) {
+                const wl_plan_op_k_fusion_t *kf
+                    = (const wl_plan_op_k_fusion_t *)rel->ops[0].opaque_data;
+                if (kf && kf->k > 0 && kf->k_ops && kf->k_ops[0]) {
+                    for (int i = (int)kf->k_op_counts[0] - 1; i >= 0; i--) {
+                        if (kf->k_ops[0][i].op != WL_PLAN_OP_JOIN)
+                            continue;
+                        if (!best_join)
+                            best_join = &kf->k_ops[0][i];
+                        if (kf->k_ops[0][i].right_relation) {
+                            bool is_idb = false;
+                            for (uint32_t rj = 0;
+                                rj < st->relation_count; rj++) {
+                                if (strcmp(kf->k_ops[0][i].right_relation,
+                                    st->relations[rj].name) == 0) {
+                                    is_idb = true;
+                                    break;
+                                }
+                            }
+                            if (is_idb) {
+                                best_join = &kf->k_ops[0][i];
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!best_join || best_join->key_count == 0
+                || !best_join->left_keys)
                 continue;
 
-            uint32_t ni = 0;
+            /* Build EXCHANGE metadata from the JOIN's left_keys. */
+            wl_plan_op_exchange_t *meta
+                = (wl_plan_op_exchange_t *)calloc(
+                    1, sizeof(wl_plan_op_exchange_t));
+            if (!meta)
+                continue;
+            meta->num_workers = 0; /* plan is W-agnostic; eval uses actual W */
+            meta->key_col_count = best_join->key_count;
+            meta->key_col_idxs = (uint32_t *)malloc(
+                meta->key_col_count * sizeof(uint32_t));
+            if (!meta->key_col_idxs) {
+                free(meta);
+                continue;
+            }
             bool ok = true;
-            for (uint32_t i = 0; i < rel->op_count && ok; i++) {
-                if (clone_plan_op(&rel->ops[i], &new_ops[ni]) != 0) {
+            for (uint32_t k = 0; k < meta->key_col_count; k++) {
+                uint32_t idx = parse_col_index(best_join->left_keys[k]);
+                if (idx == UINT32_MAX) {
                     ok = false;
                     break;
                 }
-                ni++;
-
-                if ((int)i == last_join) {
-                    /* Insert EXCHANGE op after this JOIN */
-                    const wl_plan_op_t *join_op = &rel->ops[i];
-
-                    wl_plan_op_exchange_t *meta
-                        = (wl_plan_op_exchange_t *)calloc(
-                            1, sizeof(wl_plan_op_exchange_t));
-                    if (!meta) {
-                        ok = false;
-                        break;
-                    }
-                    meta->num_workers = 0; /* set at eval time */
-                    meta->key_col_count = join_op->key_count;
-                    if (meta->key_col_count > 0 && join_op->left_keys) {
-                        meta->key_col_idxs = (uint32_t *)malloc(
-                            meta->key_col_count * sizeof(uint32_t));
-                        if (!meta->key_col_idxs) {
-                            free(meta);
-                            ok = false;
-                            break;
-                        }
-                        for (uint32_t k = 0; k < meta->key_col_count; k++) {
-                            uint32_t idx
-                                = parse_col_index(join_op->left_keys[k]);
-                            if (idx == UINT32_MAX) {
-                                free(meta->key_col_idxs);
-                                free(meta);
-                                ok = false;
-                                break;
-                            }
-                            meta->key_col_idxs[k] = idx;
-                        }
-                        if (!ok)
-                            break;
-                    }
-
-                    if (!ok)
-                        break;
-                    memset(&new_ops[ni], 0, sizeof(wl_plan_op_t));
-                    new_ops[ni].op = WL_PLAN_OP_EXCHANGE;
-                    new_ops[ni].opaque_data = meta;
-                    ni++;
-                }
+                meta->key_col_idxs[k] = idx;
             }
-
             if (!ok) {
-                for (uint32_t o = 0; o < ni; o++)
-                    free_op(&new_ops[o]);
-                free(new_ops);
+                free(meta->key_col_idxs);
+                free(meta);
                 continue;
             }
 
-            /* Swap in the rewritten op list */
-            for (uint32_t o = 0; o < rel->op_count; o++)
-                free_op((wl_plan_op_t *)&rel->ops[o]);
-            free((void *)rel->ops);
+            /* Append EXCHANGE as new top-level op at end of ops array. */
+            wl_plan_op_t *new_ops = (wl_plan_op_t *)realloc(
+                (void *)rel->ops,
+                (rel->op_count + 1) * sizeof(wl_plan_op_t));
+            if (!new_ops) {
+                free(meta->key_col_idxs);
+                free(meta);
+                continue;
+            }
+            memset(&new_ops[rel->op_count], 0, sizeof(wl_plan_op_t));
+            new_ops[rel->op_count].op = WL_PLAN_OP_EXCHANGE;
+            new_ops[rel->op_count].opaque_data = meta;
             rel->ops = new_ops;
-            rel->op_count = ni;
+            rel->op_count++;
         }
     }
 }
@@ -2119,8 +2144,8 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
      * For rules with K >= 2 IDB body atoms, emit K copies with CSE
      * materialization hints to avoid the regression seen without CSE. */
     rewrite_lftj_chains(plan);
-    rewrite_insert_exchanges(plan);
     rewrite_multiway_delta(plan);
+    rewrite_insert_exchanges(plan);
 
     *out = plan;
     return 0;
