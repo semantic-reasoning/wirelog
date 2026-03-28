@@ -1146,9 +1146,16 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
             for (int i = 1; i < 256; i++)
                 prefix[i] = prefix[i - 1] + count[i - 1];
 
-            /* Scatter pass: use cached byte values (Issue #343) */
-            for (uint32_t i = 0; i < nrows; i++)
+            /* Scatter pass with software prefetch for random write (Issue #363).
+             * dst[prefix[bv_cache[i]]] is a scattered write; prefetching 8
+             * elements ahead hides L2 miss latency on the destination cache
+             * line before it is written. bv_cache and src are sequential so
+             * the hardware prefetcher covers them automatically. */
+            for (uint32_t i = 0; i < nrows; i++) {
+                if (i + 8u < nrows)
+                    __builtin_prefetch(dst + prefix[bv_cache[i + 8u]], 1, 0);
                 dst[prefix[bv_cache[i]]++] = src[i];
+            }
 
             uint32_t *t = src;
             src = dst;
