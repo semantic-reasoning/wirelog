@@ -1060,17 +1060,19 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
                 prefix[i] = prefix[i - 1] + count[i - 1];
 
             /* Scatter pass with software prefetch for random write (Issue #363).
-             * dst[prefix[bv_cache[i]]] is a scattered write; prefetching 8
-             * elements ahead hides L2 miss latency on the destination cache
-             * line before it is written. bv_cache and src are sequential so
-             * the hardware prefetcher covers them automatically.
+             * dst[prefix[bv_cache[i]]] is a scattered write; prefetching 16
+             * elements ahead hides L3 miss latency on the destination cache
+             * line before it is written (Issue #363 Phase 2: distance 16
+             * targets ~35-cycle L3 latency on Apple M-series; was 8 which
+             * only covered L2). bv_cache and src are sequential so the
+             * hardware prefetcher covers them automatically.
              *
              * Prefetch notes (code review feedback):
              * - Guard uses strict < not <= : bv_cache has exactly nrows
              *   elements so bv_cache[nrows] is out of bounds; < is correct.
-             * - Address dst+prefix[bv_cache[i+8]] is approximate: prefix[]
+             * - Address dst+prefix[bv_cache[i+16]] is approximate: prefix[]
              *   slots have already been incremented by earlier elements in the
-             *   same bucket, so the prefetch may be up to 8 positions ahead of
+             *   same bucket, so the prefetch may be up to 16 positions ahead of
              *   the actual write target for skewed distributions. This is an
              *   approximation, not a correctness bug; the cache line granularity
              *   makes it effective in practice.
@@ -1078,8 +1080,8 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
              *   next radix pass; retaining it in L2 avoids an extra DRAM fetch
              *   on ARM (locality=0/NTA would bypass L2 on Apple M-series). */
             for (uint32_t i = 0; i < nrows; i++) {
-                if (i + 8u < nrows)
-                    __builtin_prefetch(dst + prefix[bv_cache[i + 8u]], 1, 1);
+                if (i + 16u < nrows)
+                    WL_PREFETCH_W(dst + prefix[bv_cache[i + 16u]]);
                 dst[prefix[bv_cache[i]]++] = src[i];
             }
 

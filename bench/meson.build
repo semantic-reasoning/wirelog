@@ -81,6 +81,7 @@ if host_machine.system() != 'windows'
     bench_workqueue_src,
     include_directories: [wirelog_inc, wirelog_src_inc],
     dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+    c_args: ['-DWL_RADIX_BENCH'],
     install: false,
   )
 
