@@ -636,6 +636,171 @@ test_tc_determinism_w2(void)
 }
 
 /* ======================================================================== */
+/* Incremental and Multi-Stratum Tests                                      */
+/* ======================================================================== */
+
+/*
+ * test_td_incremental_w1:
+ * Incremental TDD: insert edges, step, insert more edges, step again.
+ * Chain built in two batches: 1->2->3 then 3->4->5.
+ * Final TC must equal full chain result: C(5,2) = 10 tuples.
+ *
+ * Note: multiworker incremental (W>1) is a known evaluator limitation;
+ * this test verifies the incremental pipeline at W=1.
+ */
+static int
+test_td_incremental_w1(void)
+{
+    TEST("W=1 incremental: two insert+step rounds yield 10 tuples");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_tc_session(1, &plan, &prog);
+    if (!sess) {
+        FAIL("session create");
+        return 1;
+    }
+
+    /* Round 1: edges 1->2, 2->3 */
+    int64_t batch1[] = { 1, 2, 2, 3 };
+    if (insert_edges(sess, batch1, 2) != 0) {
+        cleanup_session(sess, plan, prog);
+        FAIL("insert batch 1");
+        return 1;
+    }
+
+    int rc = wl_session_step(&sess->base);
+    if (rc != 0) {
+        cleanup_session(sess, plan, prog);
+        FAIL("step 1 failed");
+        return 1;
+    }
+
+    /* Round 2: edges 3->4, 4->5 */
+    int64_t batch2[] = { 3, 4, 4, 5 };
+    if (insert_edges(sess, batch2, 2) != 0) {
+        cleanup_session(sess, plan, prog);
+        FAIL("insert batch 2");
+        return 1;
+    }
+
+    rc = wl_session_step(&sess->base);
+    if (rc != 0) {
+        cleanup_session(sess, plan, prog);
+        FAIL("step 2 failed");
+        return 1;
+    }
+
+    uint32_t nrows = count_rows(sess, "tc");
+    cleanup_session(sess, plan, prog);
+
+    if (nrows != 10) {
+        FAIL("expected 10 tc tuples after incremental build of 5-node chain");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/*
+ * test_td_multi_stratum_w2:
+ * TC-based multi-stratum: non-recursive edge_copy feeds recursive tc.
+ *   edge_copy(x, y) :- edge(x, y).
+ *   tc(x, y) :- edge_copy(x, y).
+ *   tc(x, z) :- tc(x, y), edge_copy(y, z).
+ * Chain 1->2->3->4: W=2 must match W=1.
+ */
+static int
+test_td_multi_stratum_w2(void)
+{
+    TEST("W=2 multi-stratum (edge_copy + tc) matches W=1");
+
+    static const char prog_src[] =
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl edge_copy(x: int32, y: int32)\n"
+        "edge_copy(x, y) :- edge(x, y).\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x, y) :- edge_copy(x, y).\n"
+        "tc(x, z) :- tc(x, y), edge_copy(y, z).\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog1 = wirelog_parse_string(prog_src, &err);
+    wirelog_program_t *prog2 = wirelog_parse_string(prog_src, &err);
+    if (!prog1 || !prog2) {
+        if (prog1) wirelog_program_free(prog1);
+        if (prog2) wirelog_program_free(prog2);
+        FAIL("parse");
+        return 1;
+    }
+
+    wl_fusion_apply(prog1, NULL);
+    wl_jpp_apply(prog1, NULL);
+    wl_sip_apply(prog1, NULL);
+    wl_fusion_apply(prog2, NULL);
+    wl_jpp_apply(prog2, NULL);
+    wl_sip_apply(prog2, NULL);
+
+    wl_plan_t *plan1 = NULL, *plan2 = NULL;
+    if (wl_plan_from_program(prog1, &plan1) != 0 ||
+        wl_plan_from_program(prog2, &plan2) != 0) {
+        wirelog_program_free(prog1);
+        wirelog_program_free(prog2);
+        if (plan1) wl_plan_free(plan1);
+        if (plan2) wl_plan_free(plan2);
+        FAIL("plan");
+        return 1;
+    }
+
+    wl_session_t *s1 = NULL, *s2 = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), plan1, 1, &s1);
+    int rc2 = wl_session_create(wl_backend_columnar(), plan2, 2, &s2);
+    if (rc != 0 || rc2 != 0 || !s1 || !s2) {
+        if (s1) wl_session_destroy(s1);
+        if (s2) wl_session_destroy(s2);
+        wl_plan_free(plan1);
+        wl_plan_free(plan2);
+        wirelog_program_free(prog1);
+        wirelog_program_free(prog2);
+        FAIL("session create");
+        return 1;
+    }
+
+    int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
+    wl_session_insert(s1, "edge", edges, 3, 2);
+    wl_session_insert(s2, "edge", edges, 3, 2);
+
+    int rc_s1 = wl_session_step(s1);
+    int rc_s2 = wl_session_step(s2);
+
+    wl_col_session_t *cs1 = COL_SESSION(s1);
+    wl_col_session_t *cs2 = COL_SESSION(s2);
+    uint32_t cnt1 = count_rows(cs1, "tc");
+    uint32_t cnt2 = count_rows(cs2, "tc");
+
+    wl_session_destroy(s1);
+    wl_session_destroy(s2);
+    wl_plan_free(plan1);
+    wl_plan_free(plan2);
+    wirelog_program_free(prog1);
+    wirelog_program_free(prog2);
+
+    if (rc_s1 != 0 || rc_s2 != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (cnt1 == 0) {
+        FAIL("W=1 produced 0 tc rows");
+        return 1;
+    }
+    if (cnt2 != cnt1) {
+        FAIL("W=2 multi-stratum tc count differs from W=1");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -660,6 +825,10 @@ main(void)
     printf("\n-- Determinism --\n");
     test_tc_determinism_w4();
     test_tc_determinism_w2();
+
+    printf("\n-- Incremental / Multi-Stratum --\n");
+    test_td_incremental_w1();
+    test_td_multi_stratum_w2();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
     if (tests_failed > 0)
