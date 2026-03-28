@@ -952,36 +952,17 @@ radix_uniform_count_fused_scalar(const int64_t *col_data, uint32_t start_row,
 #endif
 
 /*
- * col_rel_radix_sort: index-permutation LSD radix sort (Phase B, Issue #330).
+ * radix_sort_k16: LSD radix sort using 16-bit radix (Issue #363 Phase 5b/5c).
  *
- * Sort sub-range [start_row, start_row + nrows) of r in-place.
- * Uses col_rel_get() for key extraction (layout-independent).
- * Sorts a permutation array instead of scattering full rows.
- * Permutation is applied once at the end via col_rel_row_copy_out/in.
- *
- * Optimizations (Issue #343):
- *   - Hybrid threshold: insertion sort for nrows <= 32
- *   - Skip-pass: skip byte positions where all values have the same byte
- *   - Byte-value cache: read column data once per pass, reuse for scatter
- *
- * Falls back to insertion sort on allocation failure.
+ * 4 passes × 65536 buckets.  Scalar fused uniform+count loop with
+ * WL_PREFETCH_R; in-place prefix sum avoids a separate 256KB prefix[].
+ * Called for nrows >= 50000 where fewer passes justify the larger histogram.
  */
-int
-col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+static int
+radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 {
-    if (nrows <= 1)
-        return 0;
-
-    /* Hybrid threshold: insertion sort for small segments (Issue #343) */
-    if (nrows <= 32)
-        return col_rel_insertion_sort(r, start_row, nrows);
-
     uint32_t nc = r->ncols;
 
-    /* Allocate permutation arrays (double-buffered for radix scatter)
-     * and byte-value cache (Issue #343) */
-    /* Parameterized radix width (Issue #363 Phase 5b).
-     * radix_bits=16: 4 passes × 65536 buckets (256KB histogram). */
     const uint32_t radix_bits = 16u;
     const uint32_t num_passes = 64u / radix_bits;  /* 4 for k=16 */
     const uint32_t hist_size = 1u << radix_bits;   /* 65536 for k=16 */
@@ -991,7 +972,6 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     uint16_t *bv_cache = (uint16_t *)malloc(nrows * sizeof(uint16_t));
     uint32_t *count = (uint32_t *)malloc(hist_size * sizeof(uint32_t));
     if (!perm_a || !perm_b || !bv_cache || !count) {
-        /* Fallback: insertion sort */
         free(perm_a);
         free(perm_b);
         free(bv_cache);
@@ -999,7 +979,6 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         return col_rel_insertion_sort(r, start_row, nrows);
     }
 
-    /* Initialize identity permutation */
     for (uint32_t i = 0; i < nrows; i++)
         perm_a[i] = i;
 
@@ -1007,30 +986,16 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     uint32_t *dst = perm_b;
 
 #ifdef WL_RADIX_BENCH
-    /* Phase 0: per-pass timing accumulators (Issue #363).
-     * _tU = uniform check + count pass (fused in radix_uniform_count_fused_fast)
-     * _tS = scatter pass (including prefix scan)
-     * _tA = apply permutation per-column
-     * _nSk = number of passes skipped (uniform)
-     * _nPs = number of passes processed (non-uniform) */
     uint64_t _tU = 0, _tS = 0, _tA = 0, _t0 = 0;
     uint32_t _nSk = 0, _nPs = 0;
 #endif
 
-    /* LSD radix sort: column nc-1 (LSB) to column 0 (MSB),
-     * pass 0 (LSB) to pass num_passes-1 (MSB) within each column.
-     * Optimization (Issue #334): direct column pointer avoids accessor
-     * overhead in the hot loop. */
     for (int c = (int)nc - 1; c >= 0; c--) {
-        const int64_t *col_data = r->columns[c]; /* contiguous column */
+        const int64_t *col_data = r->columns[c];
         for (uint32_t pass = 0; pass < num_passes; pass++) {
             int shift = (int)(pass * radix_bits);
             int is_sign_pass = (pass == num_passes - 1);
 
-            /* Skip-pass optimization (Issue #343): check if all values
-             * produce the same k-bit word at this position.  For typical
-             * Datalog data (small integers), upper passes are all zero,
-             * allowing 50-75% of passes to be skipped entirely. */
             uint16_t first_bv;
             {
                 int64_t val = col_data[start_row + src[0]];
@@ -1038,9 +1003,6 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
                 if (is_sign_pass)
                     first_bv ^= 0x8000u;
             }
-            /* Scalar 16-bit fused uniform check + count pass (Issue #363
-             * Phase 5b): XOR accumulator detects non-uniformity in a single
-             * gather pass; WL_PREFETCH_R hides L3 gather latency. */
 #ifdef WL_RADIX_BENCH
             _t0 = now_ns();
 #endif
@@ -1063,54 +1025,27 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
                     _tU += now_ns() - _t0;
                     _nSk++;
 #endif
-                    continue; /* all values identical at this pass — skip */
+                    continue;
                 }
             }
 #ifdef WL_RADIX_BENCH
             _tU += now_ns() - _t0;
             _nPs++;
-#endif
-
-#ifdef WL_RADIX_BENCH
             _t0 = now_ns();
 #endif
-            /* In-place prefix sum: convert count[] from histogram to scatter
-             * destinations (avoids a separate 256KB prefix[] allocation). */
             {
                 uint32_t running = 0;
                 for (uint32_t i = 0; i < hist_size; i++) {
-                    uint32_t c = count[i];
+                    uint32_t cnt = count[i];
                     count[i] = running;
-                    running += c;
+                    running += cnt;
                 }
             }
-
-            /* Scatter pass with software prefetch for random write (Issue #363).
-             * dst[count[bv_cache[i]]] is a scattered write; prefetching 16
-             * elements ahead hides L3 miss latency on the destination cache
-             * line before it is written (Issue #363 Phase 2: distance 16
-             * targets ~35-cycle L3 latency on Apple M-series; was 8 which
-             * only covered L2). bv_cache and src are sequential so the
-             * hardware prefetcher covers them automatically.
-             *
-             * Prefetch notes (code review feedback):
-             * - Guard uses strict < not <= : bv_cache has exactly nrows
-             *   elements so bv_cache[nrows] is out of bounds; < is correct.
-             * - Address dst+count[bv_cache[i+16]] is approximate: count[]
-             *   slots have already been incremented by earlier elements in the
-             *   same bucket, so the prefetch may be up to 16 positions ahead of
-             *   the actual write target for skewed distributions. This is an
-             *   approximation, not a correctness bug; the cache line granularity
-             *   makes it effective in practice.
-             * - locality=1 (L2 temporal): dst is re-read sequentially in the
-             *   next radix pass; retaining it in L2 avoids an extra DRAM fetch
-             *   on ARM (locality=0/NTA would bypass L2 on Apple M-series). */
             for (uint32_t i = 0; i < nrows; i++) {
                 if (i + 16u < nrows)
                     WL_PREFETCH_W(dst + count[bv_cache[i + 16u]]);
                 dst[count[bv_cache[i]]++] = src[i];
             }
-
             uint32_t *t = src;
             src = dst;
             dst = t;
@@ -1123,9 +1058,6 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 #ifdef WL_RADIX_BENCH
     _t0 = now_ns();
 #endif
-    /* Apply permutation per-column (Issue #334): contiguous access pattern.
-     * Each column is gathered independently, which is cache-friendly for
-     * column-major layout. */
     int64_t *temp_col = (int64_t *)malloc(nrows * sizeof(int64_t));
     if (!temp_col) {
         free(perm_a);
@@ -1134,26 +1066,184 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         free(count);
         return ENOMEM;
     }
-
     for (uint32_t c = 0; c < nc; c++) {
         int64_t *col = r->columns[c];
-        /* Gather: copy in permuted order.  Prefetch 8 elements ahead to
-         * hide L3 gather latency (Issue #363 Phase 3): 1 element per
-         * iteration × 8 = 64 bytes = 1 cache line ahead. */
         for (uint32_t i = 0; i < nrows; i++) {
             if (i + 8u < nrows)
                 WL_PREFETCH_R(col + start_row + src[i + 8u]);
             temp_col[i] = col[start_row + src[i]];
         }
-        /* Scatter back */
         memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
     }
-
     free(temp_col);
     free(perm_a);
     free(perm_b);
     free(bv_cache);
     free(count);
+#ifdef WL_RADIX_BENCH
+    _tA = now_ns() - _t0;
+    {
+        uint64_t _tot = _tU + _tS + _tA;
+        fprintf(stderr,
+            "[radix-bench] nrows=%u nc=%u pass=%u skip=%u "
+            "uniform_+_count=%.0f%% scatter=%.0f%% apply=%.0f%% "
+            "total_ms=%.3f\n",
+            nrows, nc, _nPs, _nSk,
+            100.0 * _tU / (_tot + 1),
+            100.0 * _tS / (_tot + 1), 100.0 * _tA / (_tot + 1),
+            (double)_tot * 1e-6);
+    }
+#endif
+    return 0;
+}
+
+/*
+ * col_rel_radix_sort: index-permutation LSD radix sort (Phase B, Issue #330).
+ *
+ * Sort sub-range [start_row, start_row + nrows) of r in-place.
+ * Uses col_rel_get() for key extraction (layout-independent).
+ * Sorts a permutation array instead of scattering full rows.
+ * Permutation is applied once at the end via col_rel_row_copy_out/in.
+ *
+ * Optimizations (Issue #343):
+ *   - Hybrid threshold: insertion sort for nrows <= 32
+ *   - Skip-pass: skip byte positions where all values have the same byte
+ *   - Byte-value cache: read column data once per pass, reuse for scatter
+ *
+ * Adaptive radix width (Issue #363 Phase 5c):
+ *   - nrows >= 50000: k=16 via radix_sort_k16() — 4 passes × 65536 buckets
+ *   - nrows <  50000: k=8  with SIMD fused uniform+count — 8 passes × 256 buckets
+ *
+ * Falls back to insertion sort on allocation failure.
+ */
+int
+col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+{
+    if (nrows <= 1)
+        return 0;
+
+    /* Hybrid threshold: insertion sort for small segments (Issue #343) */
+    if (nrows <= 32)
+        return col_rel_insertion_sort(r, start_row, nrows);
+
+    /* Adaptive radix width (Issue #363 Phase 5c): dispatch to k=16 for large
+     * arrays where fewer passes outweigh the larger histogram cost. */
+    if (nrows >= 50000u)
+        return radix_sort_k16(r, start_row, nrows);
+
+    /* k=8 SIMD path: 8 passes × 256 buckets (1KB histogram, stack-allocated).
+     * SIMD-dispatched fused uniform+count avoids a separate gather loop. */
+    uint32_t nc = r->ncols;
+
+    const uint32_t radix_bits = 8u;
+    const uint32_t num_passes = 64u / radix_bits;  /* 8 for k=8 */
+
+    uint32_t *perm_a = (uint32_t *)malloc(nrows * sizeof(uint32_t));
+    uint32_t *perm_b = (uint32_t *)malloc(nrows * sizeof(uint32_t));
+    uint8_t  *bv_cache = (uint8_t *)malloc(nrows);
+    if (!perm_a || !perm_b || !bv_cache) {
+        free(perm_a);
+        free(perm_b);
+        free(bv_cache);
+        return col_rel_insertion_sort(r, start_row, nrows);
+    }
+
+    for (uint32_t i = 0; i < nrows; i++)
+        perm_a[i] = i;
+
+    uint32_t *src = perm_a;
+    uint32_t *dst = perm_b;
+    uint32_t count[256];
+    uint32_t prefix[256];
+
+#ifdef WL_RADIX_BENCH
+    /* _tU = fused uniform+count (radix_uniform_count_fused_fast)
+     * _tS = scatter (prefix scan + scatter loop)
+     * _tA = apply permutation per-column */
+    uint64_t _tU = 0, _tS = 0, _tA = 0, _t0 = 0;
+    uint32_t _nSk = 0, _nPs = 0;
+#endif
+
+    /* LSD radix sort: column nc-1 (LSB) to column 0 (MSB),
+     * pass 0 (LSB) to pass num_passes-1 (MSB) within each column. */
+    for (int c = (int)nc - 1; c >= 0; c--) {
+        const int64_t *col_data = r->columns[c];
+        for (uint32_t pass = 0; pass < num_passes; pass++) {
+            int shift = (int)(pass * radix_bits);
+            int is_sign_pass = (pass == num_passes - 1);
+
+            /* Skip-pass: if all values identical at this byte position, skip. */
+            uint8_t first_bv;
+            {
+                int64_t val = col_data[start_row + src[0]];
+                first_bv = (uint8_t)((uint64_t)val >> shift);
+                if (is_sign_pass)
+                    first_bv ^= 0x80u;
+            }
+            /* Fused uniform check + count pass: single gather traversal
+             * (Issue #363 Phase 1).  Returns true if all nrows bytes at
+             * this position are identical (skip); returns false with
+             * bv_cache[] and count[] populated when not uniform. */
+#ifdef WL_RADIX_BENCH
+            _t0 = now_ns();
+#endif
+            if (radix_uniform_count_fused_fast(col_data, start_row, src,
+                nrows, shift, is_sign_pass, first_bv, bv_cache, count)) {
+#ifdef WL_RADIX_BENCH
+                _tU += now_ns() - _t0;
+                _nSk++;
+#endif
+                continue;
+            }
+#ifdef WL_RADIX_BENCH
+            _tU += now_ns() - _t0;
+            _nPs++;
+            _t0 = now_ns();
+#endif
+            prefix[0] = 0;
+            for (int i = 1; i < 256; i++)
+                prefix[i] = prefix[i - 1] + count[i - 1];
+
+            /* Scatter pass with software prefetch (Issue #363 Phase 2). */
+            for (uint32_t i = 0; i < nrows; i++) {
+                if (i + 16u < nrows)
+                    WL_PREFETCH_W(dst + prefix[bv_cache[i + 16u]]);
+                dst[prefix[bv_cache[i]]++] = src[i];
+            }
+            uint32_t *t = src;
+            src = dst;
+            dst = t;
+#ifdef WL_RADIX_BENCH
+            _tS += now_ns() - _t0;
+#endif
+        }
+    }
+
+#ifdef WL_RADIX_BENCH
+    _t0 = now_ns();
+#endif
+    /* Apply permutation per-column (Issue #334): contiguous access pattern. */
+    int64_t *temp_col = (int64_t *)malloc(nrows * sizeof(int64_t));
+    if (!temp_col) {
+        free(perm_a);
+        free(perm_b);
+        free(bv_cache);
+        return ENOMEM;
+    }
+    for (uint32_t c = 0; c < nc; c++) {
+        int64_t *col = r->columns[c];
+        /* Gather: prefetch 8 elements ahead (Issue #363 Phase 3). */
+        for (uint32_t i = 0; i < nrows; i++) {
+            if (i + 8u < nrows)
+                WL_PREFETCH_R(col + start_row + src[i + 8u]);
+            temp_col[i] = col[start_row + src[i]];
+        }
+        memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
+    }
+    free(temp_col);
+    free(perm_a);
+    free(perm_b);
+    free(bv_cache);
 #ifdef WL_RADIX_BENCH
     _tA = now_ns() - _t0;
     {
