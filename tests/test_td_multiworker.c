@@ -641,17 +641,16 @@ test_tc_determinism_w2(void)
 
 /*
  * test_td_incremental_w1:
- * Incremental TDD: insert edges, step, insert more edges, step again.
- * Chain built in two batches: 1->2->3 then 3->4->5.
- * Final TC must equal full chain result: C(5,2) = 10 tuples.
+ * Incremental TDD: insert 3 edges, step, insert 2 more, step.
+ * Batch 1: 1->2, 2->3, 3->4. Batch 2: 4->5, 5->6.
+ * Full chain 1->6: TC = C(6,2) = 15 tuples.
  *
- * Note: multiworker incremental (W>1) is a known evaluator limitation;
- * this test verifies the incremental pipeline at W=1.
+ * Multiworker incremental is a known limitation (see #350).
  */
 static int
 test_td_incremental_w1(void)
 {
-    TEST("W=1 incremental: two insert+step rounds yield 10 tuples");
+    TEST("W=1 incremental: 3+2 edge batches yield 15 tuples");
 
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
@@ -661,9 +660,9 @@ test_td_incremental_w1(void)
         return 1;
     }
 
-    /* Round 1: edges 1->2, 2->3 */
-    int64_t batch1[] = { 1, 2, 2, 3 };
-    if (insert_edges(sess, batch1, 2) != 0) {
+    /* Batch 1: 3 edges */
+    int64_t batch1[] = { 1, 2, 2, 3, 3, 4 };
+    if (insert_edges(sess, batch1, 3) != 0) {
         cleanup_session(sess, plan, prog);
         FAIL("insert batch 1");
         return 1;
@@ -676,8 +675,8 @@ test_td_incremental_w1(void)
         return 1;
     }
 
-    /* Round 2: edges 3->4, 4->5 */
-    int64_t batch2[] = { 3, 4, 4, 5 };
+    /* Batch 2: 2 edges */
+    int64_t batch2[] = { 4, 5, 5, 6 };
     if (insert_edges(sess, batch2, 2) != 0) {
         cleanup_session(sess, plan, prog);
         FAIL("insert batch 2");
@@ -694,8 +693,8 @@ test_td_incremental_w1(void)
     uint32_t nrows = count_rows(sess, "tc");
     cleanup_session(sess, plan, prog);
 
-    if (nrows != 10) {
-        FAIL("expected 10 tc tuples after incremental build of 5-node chain");
+    if (nrows != 15) {
+        FAIL("expected 15 tc tuples after incremental build of 6-node chain");
         return 1;
     }
     PASS();
