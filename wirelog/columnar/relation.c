@@ -1122,13 +1122,13 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 #ifdef WL_RADIX_BENCH
     _tA = now_ns() - _t0;
     {
-        uint64_t _tot = _tU + _tC + _tS + _tA;
+        uint64_t _tot = _tU + _tS + _tA;
         fprintf(stderr,
             "[radix-bench] nrows=%u nc=%u pass=%u skip=%u "
-            "uniform=%.0f%% count=%.0f%% scatter=%.0f%% apply=%.0f%% "
+            "uniform_+_count=%.0f%% scatter=%.0f%% apply=%.0f%% "
             "total_ms=%.3f\n",
             nrows, nc, _nPs, _nSk,
-            100.0 * _tU / (_tot + 1), 100.0 * _tC / (_tot + 1),
+            100.0 * _tU / (_tot + 1),
             100.0 * _tS / (_tot + 1), 100.0 * _tA / (_tot + 1),
             (double)_tot * 1e-6);
     }
