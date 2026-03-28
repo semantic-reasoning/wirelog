@@ -724,6 +724,168 @@ col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     return 0;
 }
 
+/* ======================================================================== */
+/* Radix Sort SIMD Helpers (Issue #363)                                      */
+/* ======================================================================== */
+
+#if !defined(__AVX2__) && !defined(__ARM_NEON__)
+/*
+ * radix_uniform_check_scalar:
+ * Check whether all nrows permuted values produce the same byte at 'shift'.
+ * Returns true if uniform (pass can be skipped), false otherwise.
+ * Only compiled on non-AVX2, non-NEON builds; on SIMD builds this function
+ * is replaced entirely by the SIMD variants to avoid unused-function warnings.
+ */
+static bool
+radix_uniform_check_scalar(const int64_t *col_data, uint32_t start_row,
+    const uint32_t *src, uint32_t nrows, int shift, int is_sign_byte,
+    uint8_t first_bv)
+{
+    for (uint32_t i = 1; i < nrows; i++) {
+        uint8_t bv = (uint8_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_byte)
+            bv ^= 0x80u;
+        if (bv != first_bv)
+            return false;
+    }
+    return true;
+}
+#endif /* !__AVX2__ && !__ARM_NEON__ */
+
+#ifdef __AVX2__
+/*
+ * radix_uniform_check_avx2:
+ * AVX2 fast-path uniform check using _mm256_i32gather_epi64.
+ * Gathers 4 int64 values per iteration via SIMD gather, shifts and
+ * extracts the target byte, then compares against first_bv.
+ * Reduces branch count from nrows to nrows/4 for the common uniform case.
+ */
+static bool
+radix_uniform_check_avx2(const int64_t *col_data, uint32_t start_row,
+    const uint32_t *src, uint32_t nrows, int shift, int is_sign_byte,
+    uint8_t first_bv)
+{
+    uint8_t xmask = is_sign_byte ? 0x80u : 0u;
+    __m256i vshift = _mm256_set1_epi64x(shift);
+    uint32_t i = 1;
+
+    /* Process 4 elements per AVX2 gather iteration */
+    for (; i + 4 <= nrows; i += 4) {
+        __m128i vidx = _mm_loadu_si128((const __m128i *)(src + i));
+        __m256i vals = _mm256_i32gather_epi64(
+            (const long long *)(col_data + start_row), vidx, 8);
+        __m256i shifted = _mm256_srlv_epi64(vals, vshift);
+
+        uint8_t bv0 = (uint8_t)(uint64_t)_mm256_extract_epi64(shifted,
+                0) ^ xmask;
+        uint8_t bv1 = (uint8_t)(uint64_t)_mm256_extract_epi64(shifted,
+                1) ^ xmask;
+        uint8_t bv2 = (uint8_t)(uint64_t)_mm256_extract_epi64(shifted,
+                2) ^ xmask;
+        uint8_t bv3 = (uint8_t)(uint64_t)_mm256_extract_epi64(shifted,
+                3) ^ xmask;
+
+        if (bv0 != first_bv || bv1 != first_bv ||
+            bv2 != first_bv || bv3 != first_bv)
+            return false;
+    }
+
+    /* Scalar tail */
+    for (; i < nrows; i++) {
+        uint8_t bv = (uint8_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_byte)
+            bv ^= 0x80u;
+        if (bv != first_bv)
+            return false;
+    }
+    return true;
+}
+#endif /* __AVX2__ */
+
+#ifdef __ARM_NEON__
+/*
+ * radix_uniform_check_neon:
+ * NEON fast-path uniform check processing 8 elements per iteration.
+ * Packs 8 gathered int64 values into four int64x2_t registers, right-shifts
+ * to isolate the target byte, and compares all 8 against first_bv using
+ * vceq_u8 in a single SIMD comparison.
+ * Reduces branch count from nrows to nrows/8 for the common uniform case.
+ */
+static bool
+radix_uniform_check_neon(const int64_t *col_data, uint32_t start_row,
+    const uint32_t *src, uint32_t nrows, int shift, int is_sign_byte,
+    uint8_t first_bv)
+{
+    uint8_t xmask = is_sign_byte ? 0x80u : 0u;
+    int64x2_t vneg_shift = vdupq_n_s64(-(int64_t)shift);
+    uint32_t i = 1;
+
+    /* Process 8 elements per iteration (four int64x2_t lanes) */
+    for (; i + 8 <= nrows; i += 8) {
+        int64_t v0 = col_data[start_row + src[i + 0]];
+        int64_t v1 = col_data[start_row + src[i + 1]];
+        int64_t v2 = col_data[start_row + src[i + 2]];
+        int64_t v3 = col_data[start_row + src[i + 3]];
+        int64_t v4 = col_data[start_row + src[i + 4]];
+        int64_t v5 = col_data[start_row + src[i + 5]];
+        int64_t v6 = col_data[start_row + src[i + 6]];
+        int64_t v7 = col_data[start_row + src[i + 7]];
+
+        int64x2_t vec01 = vcombine_s64(
+            vcreate_s64((uint64_t)v0), vcreate_s64((uint64_t)v1));
+        int64x2_t vec23 = vcombine_s64(
+            vcreate_s64((uint64_t)v2), vcreate_s64((uint64_t)v3));
+        int64x2_t vec45 = vcombine_s64(
+            vcreate_s64((uint64_t)v4), vcreate_s64((uint64_t)v5));
+        int64x2_t vec67 = vcombine_s64(
+            vcreate_s64((uint64_t)v6), vcreate_s64((uint64_t)v7));
+
+        /* Variable right-shift: isolate target byte in low position */
+        uint64x2_t sv01 = vshlq_u64(vreinterpretq_u64_s64(vec01), vneg_shift);
+        uint64x2_t sv23 = vshlq_u64(vreinterpretq_u64_s64(vec23), vneg_shift);
+        uint64x2_t sv45 = vshlq_u64(vreinterpretq_u64_s64(vec45), vneg_shift);
+        uint64x2_t sv67 = vshlq_u64(vreinterpretq_u64_s64(vec67), vneg_shift);
+
+        /* Extract low byte from each lane, apply sign XOR, and pack */
+        uint8_t bvals[8] = {
+            (uint8_t)vgetq_lane_u64(sv01, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv01, 1) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv23, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv23, 1) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv45, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv45, 1) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv67, 0) ^ xmask,
+            (uint8_t)vgetq_lane_u64(sv67, 1) ^ xmask,
+        };
+        uint8x8_t bvec = vld1_u8(bvals);
+        uint8x8_t cmp = vceq_u8(bvec, vdup_n_u8(first_bv));
+
+        /* All 8 lanes equal → all bytes 0xFF → reinterp as uint64 == UINT64_MAX */
+        if (vget_lane_u64(vreinterpret_u64_u8(cmp), 0) != UINT64_MAX)
+            return false;
+    }
+
+    /* Scalar tail */
+    for (; i < nrows; i++) {
+        uint8_t bv = (uint8_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_byte)
+            bv ^= 0x80u;
+        if (bv != first_bv)
+            return false;
+    }
+    return true;
+}
+#endif /* __ARM_NEON__ */
+
+/* Compile-time dispatch: AVX2 > NEON > scalar */
+#ifdef __AVX2__
+#define radix_uniform_check_fast radix_uniform_check_avx2
+#elif defined(__ARM_NEON__)
+#define radix_uniform_check_fast radix_uniform_check_neon
+#else
+#define radix_uniform_check_fast radix_uniform_check_scalar
+#endif
+
 /*
  * col_rel_radix_sort: index-permutation LSD radix sort (Phase B, Issue #330).
  *
@@ -794,16 +956,9 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
                 if (is_sign_byte)
                     first_bv ^= 0x80u;
             }
-            bool uniform = true;
-            for (uint32_t i = 1; i < nrows && uniform; i++) {
-                int64_t val = col_data[start_row + src[i]];
-                uint8_t bv = (uint8_t)((uint64_t)val >> shift);
-                if (is_sign_byte)
-                    bv ^= 0x80u;
-                if (bv != first_bv)
-                    uniform = false;
-            }
-            if (uniform)
+            /* SIMD-accelerated uniform check (Issue #363) */
+            if (radix_uniform_check_fast(col_data, start_row, src, nrows,
+                shift, is_sign_byte, first_bv))
                 continue; /* all values identical at this byte — skip */
 
             /* Count pass: read once, cache byte value (Issue #343) */
