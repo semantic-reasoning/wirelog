@@ -3722,6 +3722,12 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     if (k == 0)
         return EINVAL;
 
+    /* Issue #361: TDD Mode 2 K-copy range — only evaluate assigned copies.
+     * When kfusion_k_end == 0, evaluate all copies (default). */
+    uint32_t kf_start = sess->kfusion_k_start;
+    uint32_t kf_end = (sess->kfusion_k_end > 0 && sess->kfusion_k_end <= k)
+        ? sess->kfusion_k_end : k;
+
     uint64_t _phase_t0 = now_ns();
     col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
     col_op_k_fusion_worker_t *workers = (col_op_k_fusion_worker_t *)calloc(
@@ -3757,6 +3763,14 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
      * batch so workers execute in parallel. */
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < k; d++) {
+        /* Issue #361: TDD Mode 2 — skip copies outside assigned range.
+         * Check BEFORE expensive worker session initialization. */
+        if (d < kf_start || d >= kf_end) {
+            workers[d].skipped = true;
+            memset(&worker_sess[d], 0, sizeof(wl_col_session_t));
+            continue;
+        }
+
         /* Shallow copy shares rels[], plan, etc. (read-only during K-fusion).
          * mat_cache is zeroed below (Issue #196): workers start fresh.
          * arr_* are deep-copied (#260): each worker gets an independent

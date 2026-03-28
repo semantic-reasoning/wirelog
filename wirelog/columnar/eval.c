@@ -1318,6 +1318,8 @@ typedef struct {
     int rc;                        /* OUT: return code                */
     uint32_t copy_start;           /* Mode 2: first relation plan index */
     uint32_t copy_end;             /* Mode 2: one-past-last plan index  */
+    uint32_t *k_copy_starts;      /* Mode 2: per-relation K-copy start [nrels] */
+    uint32_t *k_copy_ends;        /* Mode 2: per-relation K-copy end [nrels]   */
 } col_eval_tdd_worker_ctx_t;
 
 /*
@@ -1645,11 +1647,23 @@ tdd_worker_subpass_fn(void *arg)
 
     /* Evaluate all relation plans (eval.c:505-604).
      * Mode 2 (work partitioning): only evaluate copies in [copy_start, copy_end).
-     * copy_end == 0 means evaluate all (Mode 1 or single-worker). */
+     * copy_end == 0 means evaluate all (Mode 1 or single-worker).
+     * K-copy assignment: skip relations with k_copy_ends[ri]==0, and set
+     * kfusion_k_start/k_end on session for col_op_k_fusion to use. */
     for (uint32_t ri = 0; ri < nrels; ri++) {
         if (ctx->copy_end > 0
             && (ri < ctx->copy_start || ri >= ctx->copy_end))
             continue;
+
+        /* Mode 2 K-copy assignment: skip unassigned relations */
+        if (ctx->k_copy_ends && ctx->k_copy_ends[ri] == 0)
+            continue;
+
+        /* Set K-copy range on session for col_op_k_fusion */
+        if (ctx->k_copy_ends) {
+            sess->kfusion_k_start = ctx->k_copy_starts[ri];
+            sess->kfusion_k_end = ctx->k_copy_ends[ri];
+        }
 
         const wl_plan_relation_t *rp = &sp->relations[ri];
 
@@ -1750,6 +1764,12 @@ tdd_worker_subpass_fn(void *arg)
                 sess->diff_operators_active = saved_diff;
                 return;
             }
+        }
+
+        /* Reset K-copy range after each relation */
+        if (ctx->k_copy_ends) {
+            sess->kfusion_k_start = 0;
+            sess->kfusion_k_end = 0;
         }
     }
 
@@ -2335,47 +2355,76 @@ exchange_done:
 }
 
 /*
+ * is_stratum_idb:
+ * Returns true if the given relation name is an IDB in this stratum.
+ */
+static bool
+is_stratum_idb(const wl_plan_stratum_t *sp, const char *name)
+{
+    if (!name)
+        return false;
+    for (uint32_t rj = 0; rj < sp->relation_count; rj++) {
+        if (strcmp(name, sp->relations[rj].name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * ops_have_idb_idb_join:
+ * Walk an op sequence tracking whether the eval stack top derives from IDB.
+ * Returns true if any JOIN has BOTH IDB-derived left input AND IDB right.
+ * VARIABLE resets the tracker; JOIN with IDB right propagates it.
+ */
+static bool
+ops_have_idb_idb_join(const wl_plan_op_t *ops, uint32_t op_count,
+    const wl_plan_stratum_t *sp)
+{
+    bool stack_has_idb = false;
+    for (uint32_t oi = 0; oi < op_count; oi++) {
+        const wl_plan_op_t *op = &ops[oi];
+        if (op->op == WL_PLAN_OP_VARIABLE) {
+            stack_has_idb = is_stratum_idb(sp, op->relation_name);
+        } else if (op->op == WL_PLAN_OP_JOIN && op->right_relation) {
+            bool right_idb = is_stratum_idb(sp, op->right_relation);
+            if (right_idb && stack_has_idb)
+                return true;
+            if (right_idb)
+                stack_has_idb = true;
+        }
+    }
+    return false;
+}
+
+/*
  * tdd_stratum_has_idb_self_join:
- * Returns true if any JOIN in the stratum has a right_relation that is
- * also an IDB relation in this stratum (i.e., appears in sp->relations[]).
- * Strata with IDB-IDB self-joins (e.g. CSPA's valueFlow ⋈ valueFlow)
- * require full replication (Mode 2) instead of data partitioning (Mode 1).
+ * Returns true if any rule in the stratum has a JOIN where BOTH the left
+ * input (from VARIABLE or previous JOIN) AND the right_relation are IDB.
+ * Only these true IDB-IDB joins (e.g. CSPA's valueFlow ⋈ valueFlow)
+ * require Mode 2 (full replication).  EDB-IDB joins (e.g. CRDT's
+ * insert ⋈ nextSiblingAnc) work correctly with Mode 1 (partition IDB,
+ * replicate EDB).
  */
 static bool
 tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp)
 {
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         const wl_plan_relation_t *rel = &sp->relations[ri];
+
+        /* Check top-level ops */
+        if (ops_have_idb_idb_join(rel->ops, rel->op_count, sp))
+            return true;
+
+        /* Check ops inside K_FUSION */
         for (uint32_t oi = 0; oi < rel->op_count; oi++) {
-            const wl_plan_op_t *op = &rel->ops[oi];
-
-            /* Check top-level JOINs */
-            if (op->op == WL_PLAN_OP_JOIN && op->right_relation) {
-                for (uint32_t rj = 0; rj < sp->relation_count; rj++) {
-                    if (strcmp(op->right_relation,
-                        sp->relations[rj].name) == 0)
-                        return true;
-                }
-            }
-
-            /* Check JOINs inside K_FUSION */
-            if (op->op == WL_PLAN_OP_K_FUSION && op->opaque_data) {
+            if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION
+                && rel->ops[oi].opaque_data) {
                 const wl_plan_op_k_fusion_t *kf =
-                    (const wl_plan_op_k_fusion_t *)op->opaque_data;
+                    (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
                 for (uint32_t ki = 0; ki < kf->k; ki++) {
-                    for (uint32_t koi = 0; koi < kf->k_op_counts[ki];
-                        koi++) {
-                        const wl_plan_op_t *kop = &kf->k_ops[ki][koi];
-                        if (kop->op == WL_PLAN_OP_JOIN
-                            && kop->right_relation) {
-                            for (uint32_t rj = 0;
-                                rj < sp->relation_count; rj++) {
-                                if (strcmp(kop->right_relation,
-                                    sp->relations[rj].name) == 0)
-                                    return true;
-                            }
-                        }
-                    }
+                    if (ops_have_idb_idb_join(kf->k_ops[ki],
+                        kf->k_op_counts[ki], sp))
+                        return true;
                 }
             }
         }
@@ -2706,6 +2755,27 @@ tdd_record_nonrecursive_convergence(wl_col_session_t *coord,
 }
 
 /*
+ * tdd_relation_k_count:
+ * Returns the number of K-copies in a relation plan.
+ * If the relation has a K_FUSION op, returns kf->k.
+ * Otherwise returns 1 (single work unit).
+ */
+static uint32_t
+tdd_relation_k_count(const wl_plan_stratum_t *sp, uint32_t ri)
+{
+    const wl_plan_relation_t *rel = &sp->relations[ri];
+    for (uint32_t oi = 0; oi < rel->op_count; oi++) {
+        if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION &&
+            rel->ops[oi].opaque_data) {
+            const wl_plan_op_k_fusion_t *kf =
+                (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
+            return kf->k;
+        }
+    }
+    return 1;
+}
+
+/*
  * tdd_check_convergence:
  * Returns true if global fixed-point reached: no worker produced new tuples.
  * Called after each sub-pass barrier, before the exchange step.
@@ -2787,7 +2857,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      * When no new EDB was inserted (frontier-skip path), use replicate
      * to preserve frontier skip semantics — the stratum will reconverge
      * within the recorded frontier iterations regardless. */
-    bool replicate_mode = tdd_stratum_has_idb_self_join(sp)
+    bool self_join_mode = tdd_stratum_has_idb_self_join(sp);
+    bool replicate_mode = self_join_mode
         || (coord->last_inserted_relation == NULL);
     if (replicate_mode)
         rc = tdd_replicate_workers(coord);
@@ -2897,11 +2968,70 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
 
             if (!alloc_ok) {
-                for (uint32_t w = 0; w < W; w++)
+                for (uint32_t w = 0; w < W; w++) {
+                    free((void *)ctxs[w].k_copy_starts);
+                    free((void *)ctxs[w].k_copy_ends);
                     free((void *)ctxs[w].delta_rels);
+                }
                 free(ctxs);
                 rc = ENOMEM;
                 goto done;
+            }
+
+            /* Issue #361: Mode 2 K-copy work partitioning.
+             * Flatten K-copies across all relations into a linear work
+             * space and assign contiguous ranges to each worker. */
+            if (self_join_mode) {
+                uint32_t total_units = 0;
+                uint32_t rel_k[64]; /* nrels << 64 for any real program */
+                for (uint32_t ri = 0; ri < nrels && ri < 64; ri++) {
+                    rel_k[ri] = tdd_relation_k_count(sp, ri);
+                    total_units += rel_k[ri];
+                }
+
+                for (uint32_t w = 0; w < W; w++) {
+                    ctxs[w].k_copy_starts
+                        = (uint32_t *)calloc(nrels, sizeof(uint32_t));
+                    ctxs[w].k_copy_ends
+                        = (uint32_t *)calloc(nrels, sizeof(uint32_t));
+                    if (!ctxs[w].k_copy_starts || !ctxs[w].k_copy_ends) {
+                        alloc_ok = false;
+                        break;
+                    }
+
+                    uint32_t u_start = (w * total_units) / W;
+                    uint32_t u_end = ((w + 1) * total_units) / W;
+                    uint32_t u_off = 0;
+                    for (uint32_t ri = 0; ri < nrels && ri < 64; ri++) {
+                        uint32_t k = rel_k[ri];
+                        uint32_t r_start = u_off;
+                        uint32_t r_end = u_off + k;
+                        if (u_start >= r_end || u_end <= r_start) {
+                            /* Worker doesn't touch this relation */
+                            ctxs[w].k_copy_starts[ri] = 0;
+                            ctxs[w].k_copy_ends[ri] = 0;
+                        } else {
+                            uint32_t ks = (u_start > r_start)
+                                ? (u_start - r_start) : 0;
+                            uint32_t ke = (u_end < r_end)
+                                ? (u_end - r_start) : k;
+                            ctxs[w].k_copy_starts[ri] = ks;
+                            ctxs[w].k_copy_ends[ri] = ke;
+                        }
+                        u_off += k;
+                    }
+                }
+
+                if (!alloc_ok) {
+                    for (uint32_t w = 0; w < W; w++) {
+                        free((void *)ctxs[w].k_copy_starts);
+                        free((void *)ctxs[w].k_copy_ends);
+                        free((void *)ctxs[w].delta_rels);
+                    }
+                    free(ctxs);
+                    rc = ENOMEM;
+                    goto done;
+                }
             }
 
             /* DISPATCH */
@@ -2919,6 +3049,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 for (uint32_t w = 0; w < W; w++) {
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
+                    free((void *)ctxs[w].k_copy_starts);
+                    free((void *)ctxs[w].k_copy_ends);
                     free((void *)ctxs[w].delta_rels);
                 }
                 free(ctxs);
@@ -2939,6 +3071,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 for (uint32_t w = 0; w < W; w++) {
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
+                    free((void *)ctxs[w].k_copy_starts);
+                    free((void *)ctxs[w].k_copy_ends);
                     free((void *)ctxs[w].delta_rels);
                 }
                 free(ctxs);
@@ -2957,6 +3091,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 for (uint32_t w = 0; w < W; w++) {
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
+                    free((void *)ctxs[w].k_copy_starts);
+                    free((void *)ctxs[w].k_copy_ends);
                     free((void *)ctxs[w].delta_rels);
                 }
                 free(ctxs);
@@ -2982,6 +3118,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 for (uint32_t w = 0; w < W; w++) {
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
+                    free((void *)ctxs[w].k_copy_starts);
+                    free((void *)ctxs[w].k_copy_ends);
                     free((void *)ctxs[w].delta_rels);
                 }
                 free(ctxs);
@@ -2989,15 +3127,18 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 break;
             }
 
-            /* EXCHANGE: hash-partitioned scatter/gather when the plan
-             * carries EXCHANGE ops; broadcast fallback otherwise.
-             * Mode 2 (replicate) also uses hash exchange: all workers
-             * produce identical deltas, exchange gives each 1/W of
-             * deltas to join against full IDB on subsequent iterations. */
-            int brc = tdd_exchange_deltas(sp, coord, ctxs, W);
+            /* EXCHANGE: Mode 2 (self-join) uses broadcast so all workers
+             * maintain full IDB for IDB-IDB joins.  Mode 1 uses
+             * hash-partitioned scatter/gather via EXCHANGE ops. */
+            int brc = self_join_mode
+                ? tdd_broadcast_deltas(sp, coord, ctxs, W)
+                : tdd_exchange_deltas(sp, coord, ctxs, W);
 
-            for (uint32_t w = 0; w < W; w++)
+            for (uint32_t w = 0; w < W; w++) {
+                free((void *)ctxs[w].k_copy_starts);
+                free((void *)ctxs[w].k_copy_ends);
                 free((void *)ctxs[w].delta_rels);
+            }
             free(ctxs);
 
             if (brc != 0) {

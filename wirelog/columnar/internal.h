@@ -660,6 +660,11 @@ typedef struct wl_col_session_t {
      * iteration > 0 (FORCE_DELTA with absent delta -> empty short-circuit).
      * Only valid during col_eval_stratum execution. */
     uint32_t current_iteration;
+    /* Issue #361: TDD Mode 2 K-copy range for col_op_k_fusion.
+     * When kfusion_k_end > 0, only evaluate copies [k_start, k_end).
+     * When kfusion_k_end == 0, evaluate all copies (default). */
+    uint32_t kfusion_k_start;
+    uint32_t kfusion_k_end;
     /* Delta-seeded incremental evaluation (issue #83).
      * When true, EDB delta relations have been pre-seeded into the session
      * before re-evaluation. FORCE_DELTA at iteration 0 pushes empty (not full)
