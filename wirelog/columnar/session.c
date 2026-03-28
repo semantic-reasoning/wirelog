@@ -645,7 +645,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     uint32_t worker_id, col_rel_t **partitions,
     uint32_t num_partitions, wl_col_session_t *out_worker)
 {
-    if (!coordinator || !out_worker || !partitions)
+    if (!coordinator || !out_worker || (!partitions && num_partitions > 0))
         return EINVAL;
 
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
@@ -707,13 +707,15 @@ col_worker_session_create(wl_col_session_t *coordinator,
         coordinator->mem_ledger.total_budget);
 
     /* Step 6: Populate rels[] with partition relations (ownership transfer) */
-    out_worker->rels
-        = (col_rel_t **)calloc(num_partitions, sizeof(col_rel_t *));
-    if (!out_worker->rels)
-        goto cleanup;
-    for (uint32_t i = 0; i < num_partitions; i++) {
-        out_worker->rels[i] = partitions[i];
-        partitions[i] = NULL; /* Mark as transferred */
+    if (num_partitions > 0) {
+        out_worker->rels
+            = (col_rel_t **)calloc(num_partitions, sizeof(col_rel_t *));
+        if (!out_worker->rels)
+            goto cleanup;
+        for (uint32_t i = 0; i < num_partitions; i++) {
+            out_worker->rels[i] = partitions[i];
+            partitions[i] = NULL; /* Mark as transferred */
+        }
     }
     out_worker->nrels = num_partitions;
     out_worker->rel_cap = num_partitions;

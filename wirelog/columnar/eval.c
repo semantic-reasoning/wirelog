@@ -1911,6 +1911,24 @@ tdd_merge_worker_results(const wl_plan_stratum_t *sp,
 
             rc = col_rel_append_all(target, wrel, NULL);
         }
+
+        /* Issue #353: When all workers produced empty results, the relation
+         * was never registered on the coordinator.  Subsequent strata that
+         * reference it (e.g. recursive stratum reading non-recursive output)
+         * would fail with ENOENT.  Register an empty relation so downstream
+         * strata can find it. */
+        if (!target && rc == 0) {
+            target = col_rel_new_auto(rel_name, 0);
+            if (!target) {
+                rc = ENOMEM;
+            } else {
+                rc = session_add_rel(coord, target);
+                if (rc != 0) {
+                    col_rel_destroy(target);
+                    target = NULL;
+                }
+            }
+        }
     }
 
     return rc;

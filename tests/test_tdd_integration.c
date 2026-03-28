@@ -518,19 +518,19 @@ test_single_tuple_w2(void)
 }
 
 /*
- * test_empty_multi_stratum_w1:
- * Multi-stratum program with empty EDB and W=1.
+ * test_empty_multi_stratum_w2:
+ * Multi-stratum program with empty EDB and W=2.
  * All relations must be empty, no error.
- * Verifies multi-stratum empty path through the integration pipeline.
+ * Verifies multi-stratum empty path through the TDD integration pipeline.
  */
 static int
-test_empty_multi_stratum_w1(void)
+test_empty_multi_stratum_w2(void)
 {
-    TEST("Empty multi-stratum W=1: all relations empty");
+    TEST("Empty multi-stratum W=2: all relations empty");
 
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
-    wl_col_session_t *sess = make_session(PROG_MULTI_STRATUM, 1, &plan, &prog);
+    wl_col_session_t *sess = make_session(PROG_MULTI_STRATUM, 2, &plan, &prog);
     if (!sess) {
         FAIL("session create");
         return 1;
@@ -617,7 +617,7 @@ main(void)
 
     printf("\n-- Edge Cases --\n");
     test_single_tuple_w2();
-    test_empty_multi_stratum_w1();
+    test_empty_multi_stratum_w2();
     test_w1_fallback_api();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
