@@ -442,6 +442,79 @@ test_sorted_nrows_set(void)
 }
 
 /* ======================================================================== */
+/* Tests 12-14: Adaptive k=8/k=16 dispatch boundary (Issue #363 Phase 5c)  */
+/* ======================================================================== */
+
+/* Generic large-nrows helper: fill with deterministic random int64_t,
+ * sort via col_rel_radix_sort_int64, compare against qsort reference. */
+static int
+test_boundary_nrows(uint32_t nrows, const char *label)
+{
+    TEST(label);
+
+    int64_t *rows = (int64_t *)malloc(nrows * sizeof(int64_t));
+    int64_t *expected = (int64_t *)malloc(nrows * sizeof(int64_t));
+    if (!rows || !expected) {
+        free(rows);
+        free(expected);
+        FAIL("alloc");
+        return 1;
+    }
+
+    /* Deterministic LCG covering the full int64 range (exercises sign pass). */
+    uint64_t state = 0xc0ffee12deadULL ^ (uint64_t)nrows;
+    for (uint32_t i = 0; i < nrows; i++) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        rows[i] = (int64_t)state;
+    }
+    memcpy(expected, rows, nrows * sizeof(int64_t));
+    qsort(expected, nrows, sizeof(int64_t), cmp_int64);
+
+    col_rel_t *r = make_rel(1, rows, nrows);
+    free(rows);
+    if (!r) {
+        free(expected);
+        FAIL("alloc");
+        return 1;
+    }
+
+    col_rel_radix_sort_int64(r);
+
+    int ok = check_sorted(r, expected, nrows, 1, label);
+    col_rel_destroy(r);
+    free(expected);
+    if (ok)
+        PASS();
+    return ok ? 0 : 1;
+}
+
+/* nrows=49999: just below threshold → k=8 SIMD path */
+static int
+test_k8_path(void)
+{
+    return test_boundary_nrows(49999,
+               "k=8 path: nrows=49999 (below threshold) matches qsort");
+}
+
+/* nrows=50000: exactly at threshold → k=16 path */
+static int
+test_k16_boundary(void)
+{
+    return test_boundary_nrows(50000,
+               "k=16 path: nrows=50000 (at threshold) matches qsort");
+}
+
+/* nrows=50001: just above threshold → k=16 path */
+static int
+test_k16_path(void)
+{
+    return test_boundary_nrows(50001,
+               "k=16 path: nrows=50001 (above threshold) matches qsort");
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -462,6 +535,9 @@ main(void)
     test_multi_col_neg();
     test_random_1col();
     test_sorted_nrows_set();
+    test_k8_path();
+    test_k16_boundary();
+    test_k16_path();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);

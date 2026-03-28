@@ -1085,7 +1085,7 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     {
         uint64_t _tot = _tU + _tS + _tA;
         fprintf(stderr,
-            "[radix-bench] nrows=%u nc=%u pass=%u skip=%u "
+            "[radix-bench k=16] nrows=%u nc=%u pass=%u skip=%u "
             "uniform_+_count=%.0f%% scatter=%.0f%% apply=%.0f%% "
             "total_ms=%.3f\n",
             nrows, nc, _nPs, _nSk,
@@ -1127,7 +1127,21 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         return col_rel_insertion_sort(r, start_row, nrows);
 
     /* Adaptive radix width (Issue #363 Phase 5c): dispatch to k=16 for large
-     * arrays where fewer passes outweigh the larger histogram cost. */
+     * arrays where fewer passes outweigh the larger histogram cost.
+     *
+     * Empirical threshold (Apple M-series, 1-col, 64-bit uniform-random keys):
+     *   nrows=10K: k8=0.66ms  k16=0.81ms  k8 faster by 1.23x
+     *   nrows=20K: k8=0.81ms  k16=0.91ms  k8 faster by 1.12x
+     *   nrows=30K: k8=0.83ms  k16=0.89ms  k8 faster by 1.08x
+     *   nrows=40K: k8=0.81ms  k16=0.82ms  near parity
+     *   nrows=50K: k8=0.79ms  k16=0.78ms  k16 faster by 1.01x
+     *   nrows=60K: k8=0.82ms  k16=0.80ms  k16 faster by 1.02x
+     *   nrows=100K: k8=1.41ms k16=1.32ms  k16 faster by 1.07x
+     * Crossover at ~40-50K rows; 50000 is a conservative round boundary.
+     *
+     * k=16 uses a scalar fused loop (not SIMD): the 4-pass reduction
+     * already yields fewer total iterations than 8-pass k=8+SIMD, and a
+     * 256KB histogram makes SIMD gather impractical (cache pressure). */
     if (nrows >= 50000u)
         return radix_sort_k16(r, start_row, nrows);
 
@@ -1249,7 +1263,7 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     {
         uint64_t _tot = _tU + _tS + _tA;
         fprintf(stderr,
-            "[radix-bench] nrows=%u nc=%u pass=%u skip=%u "
+            "[radix-bench k=8] nrows=%u nc=%u pass=%u skip=%u "
             "uniform_+_count=%.0f%% scatter=%.0f%% apply=%.0f%% "
             "total_ms=%.3f\n",
             nrows, nc, _nPs, _nSk,
