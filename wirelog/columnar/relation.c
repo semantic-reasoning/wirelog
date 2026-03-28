@@ -125,6 +125,14 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
     }
 
     /* Arrow schema: struct<col0:i64, col1:i64, ...> */
+    /* Release any prior schema (handles ncols==0 → ncols>0 upgrade;
+     * col_rel_new_auto with ncols=0 sets schema_ok=true with an empty
+     * struct schema, and a later set_schema with ncols>0 must release
+     * the old schema before reinitializing). */
+    if (r->schema_ok) {
+        ArrowSchemaRelease(&r->schema);
+        r->schema_ok = false;
+    }
     ArrowSchemaInit(&r->schema);
     if (ArrowSchemaSetTypeStruct(&r->schema, (int64_t)ncols) != NANOARROW_OK) {
         ArrowSchemaRelease(&r->schema);
