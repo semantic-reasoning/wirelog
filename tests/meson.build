@@ -235,6 +235,27 @@ test_plan_gen_exe = executable(
 test('plan_gen', test_plan_gen_exe)
 
 # ============================================================================
+# Plan Exchange Insertion Tests (Issue #319)
+# ============================================================================
+
+test_plan_exchange_exe = executable(
+  'test_plan_exchange',
+  files('test_plan_exchange.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('plan_exchange', test_plan_exchange_exe)
+
+# ============================================================================
 # Workqueue Tests (Phase B-lite)
 # ============================================================================
 
