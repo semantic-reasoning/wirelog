@@ -951,6 +951,211 @@ radix_uniform_count_fused_scalar(const int64_t *col_data, uint32_t start_row,
 #define radix_uniform_count_fused_fast radix_uniform_count_fused_scalar
 #endif
 
+/* ======================================================================== */
+/* Fused Uniform Check + Count Pass for k=16 (Issue #363 Phase 5c ext.)    */
+/* ======================================================================== */
+
+/*
+ * k=16 variants: same two-pass strategy as the k=8 functions above, but
+ * operating on uint16_t bucket values and a 65536-entry count[] histogram.
+ *
+ * Pass 1 (SIMD): gather int64_t, extract 16-bit bucket, write bv_cache[],
+ *   accumulate uniformity check.  Return true immediately if uniform.
+ * Pass 2 (scalar, only when not uniform): memset(count, 0, 256KB) + histogram.
+ */
+
+#ifdef __AVX2__
+static bool
+radix_uniform_count_fused_k16_avx2(const int64_t *col_data,
+    uint32_t start_row, const uint32_t *src, uint32_t nrows, int shift,
+    int is_sign_pass, uint16_t first_bv, uint16_t *bv_cache, uint32_t *count)
+{
+    uint16_t xmask = is_sign_pass ? 0x8000u : 0u;
+    __m256i vshift = _mm256_set1_epi64x(shift);
+    __m256i vmask16 = _mm256_set1_epi64x(0xFFFF);
+    uint8_t uniform = 1;
+    uint32_t i = 0;
+
+    for (; i + 8 <= nrows; i += 8) {
+        if (i + 16u < nrows)
+            WL_PREFETCH_R(col_data + start_row + src[i + 16]);
+        __m128i vidx0 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i vidx1 = _mm_loadu_si128((const __m128i *)(src + i + 4));
+        __m256i vals0 = _mm256_i32gather_epi64(
+            (const long long *)(col_data + start_row), vidx0, 8);
+        __m256i vals1 = _mm256_i32gather_epi64(
+            (const long long *)(col_data + start_row), vidx1, 8);
+        __m256i sh0 = _mm256_and_si256(
+            _mm256_srlv_epi64(vals0, vshift), vmask16);
+        __m256i sh1 = _mm256_and_si256(
+            _mm256_srlv_epi64(vals1, vshift), vmask16);
+
+        uint16_t b0 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh0,
+                0) ^ xmask;
+        uint16_t b1 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh0,
+                1) ^ xmask;
+        uint16_t b2 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh0,
+                2) ^ xmask;
+        uint16_t b3 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh0,
+                3) ^ xmask;
+        uint16_t b4 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh1,
+                0) ^ xmask;
+        uint16_t b5 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh1,
+                1) ^ xmask;
+        uint16_t b6 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh1,
+                2) ^ xmask;
+        uint16_t b7 = (uint16_t)(uint64_t)_mm256_extract_epi64(sh1,
+                3) ^ xmask;
+
+        bv_cache[i + 0] = b0;
+        bv_cache[i + 1] = b1;
+        bv_cache[i + 2] = b2;
+        bv_cache[i + 3] = b3;
+        bv_cache[i + 4] = b4;
+        bv_cache[i + 5] = b5;
+        bv_cache[i + 6] = b6;
+        bv_cache[i + 7] = b7;
+
+        uniform &= (b0 == first_bv) & (b1 == first_bv) &
+            (b2 == first_bv) & (b3 == first_bv) &
+            (b4 == first_bv) & (b5 == first_bv) &
+            (b6 == first_bv) & (b7 == first_bv);
+    }
+
+    for (; i < nrows; i++) {
+        uint16_t bv =
+            (uint16_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_pass)
+            bv ^= 0x8000u;
+        bv_cache[i] = bv;
+        uniform &= (uint8_t)(bv == first_bv);
+    }
+
+    if (uniform)
+        return true;
+
+    memset(count, 0, 65536u * sizeof(uint32_t));
+    for (uint32_t j = 0; j < nrows; j++)
+        count[bv_cache[j]]++;
+    return false;
+}
+#endif /* __AVX2__ */
+
+#ifdef __ARM_NEON__
+static bool
+radix_uniform_count_fused_k16_neon(const int64_t *col_data,
+    uint32_t start_row, const uint32_t *src, uint32_t nrows, int shift,
+    int is_sign_pass, uint16_t first_bv, uint16_t *bv_cache, uint32_t *count)
+{
+    uint16_t xmask = is_sign_pass ? 0x8000u : 0u;
+    int64x2_t vneg_shift = vdupq_n_s64(-(int64_t)shift);
+    uint16x8_t vfirst = vdupq_n_u16(first_bv);
+    uint64_t uniform_mask = UINT64_MAX;
+    uint32_t i = 0;
+
+    for (; i + 8 <= nrows; i += 8) {
+        if (i + 16u < nrows)
+            WL_PREFETCH_R(col_data + start_row + src[i + 16]);
+
+        int64_t v0 = col_data[start_row + src[i + 0]];
+        int64_t v1 = col_data[start_row + src[i + 1]];
+        int64_t v2 = col_data[start_row + src[i + 2]];
+        int64_t v3 = col_data[start_row + src[i + 3]];
+        int64_t v4 = col_data[start_row + src[i + 4]];
+        int64_t v5 = col_data[start_row + src[i + 5]];
+        int64_t v6 = col_data[start_row + src[i + 6]];
+        int64_t v7 = col_data[start_row + src[i + 7]];
+
+        int64x2_t vec01 = vcombine_s64(
+            vcreate_s64((uint64_t)v0), vcreate_s64((uint64_t)v1));
+        int64x2_t vec23 = vcombine_s64(
+            vcreate_s64((uint64_t)v2), vcreate_s64((uint64_t)v3));
+        int64x2_t vec45 = vcombine_s64(
+            vcreate_s64((uint64_t)v4), vcreate_s64((uint64_t)v5));
+        int64x2_t vec67 = vcombine_s64(
+            vcreate_s64((uint64_t)v6), vcreate_s64((uint64_t)v7));
+
+        uint64x2_t sv01 = vshlq_u64(
+            vreinterpretq_u64_s64(vec01), vneg_shift);
+        uint64x2_t sv23 = vshlq_u64(
+            vreinterpretq_u64_s64(vec23), vneg_shift);
+        uint64x2_t sv45 = vshlq_u64(
+            vreinterpretq_u64_s64(vec45), vneg_shift);
+        uint64x2_t sv67 = vshlq_u64(
+            vreinterpretq_u64_s64(vec67), vneg_shift);
+
+        uint16_t bvals[8] = {
+            (uint16_t)vgetq_lane_u64(sv01, 0) ^ xmask,
+            (uint16_t)vgetq_lane_u64(sv01, 1) ^ xmask,
+            (uint16_t)vgetq_lane_u64(sv23, 0) ^ xmask,
+            (uint16_t)vgetq_lane_u64(sv23, 1) ^ xmask,
+            (uint16_t)vgetq_lane_u64(sv45, 0) ^ xmask,
+            (uint16_t)vgetq_lane_u64(sv45, 1) ^ xmask,
+            (uint16_t)vgetq_lane_u64(sv67, 0) ^ xmask,
+            (uint16_t)vgetq_lane_u64(sv67, 1) ^ xmask,
+        };
+        uint16x8_t bvec = vld1q_u16(bvals);
+        vst1q_u16(bv_cache + i, bvec);
+
+        uint16x8_t cmp = vceqq_u16(bvec, vfirst);
+        uint64x2_t c64 = vreinterpretq_u64_u16(cmp);
+        uniform_mask &= vgetq_lane_u64(c64, 0) & vgetq_lane_u64(c64, 1);
+    }
+
+    bool uniform_tail = true;
+    for (; i < nrows; i++) {
+        uint16_t bv =
+            (uint16_t)((uint64_t)col_data[start_row + src[i]] >> shift);
+        if (is_sign_pass)
+            bv ^= 0x8000u;
+        bv_cache[i] = bv;
+        if (bv != first_bv)
+            uniform_tail = false;
+    }
+
+    if (uniform_mask == UINT64_MAX && uniform_tail)
+        return true;
+
+    memset(count, 0, 65536u * sizeof(uint32_t));
+    for (uint32_t j = 0; j < nrows; j++)
+        count[bv_cache[j]]++;
+    return false;
+}
+#endif /* __ARM_NEON__ */
+
+#if !defined(__AVX2__) && !defined(__ARM_NEON__)
+static bool
+radix_uniform_count_fused_k16_scalar(const int64_t *col_data,
+    uint32_t start_row, const uint32_t *src, uint32_t nrows, int shift,
+    int is_sign_pass, uint16_t first_bv, uint16_t *bv_cache, uint32_t *count)
+{
+    uint16_t uacc = 0;
+
+    memset(count, 0, 65536u * sizeof(uint32_t));
+    for (uint32_t i = 0; i < nrows; i++) {
+        if (i + 16u < nrows)
+            WL_PREFETCH_R(col_data + start_row + src[i + 16u]);
+        int64_t v = col_data[start_row + src[i]];
+        uint16_t bv = (uint16_t)((uint64_t)v >> shift);
+        if (is_sign_pass)
+            bv ^= 0x8000u;
+        bv_cache[i] = bv;
+        uacc |= (uint16_t)(bv ^ first_bv);
+        count[bv]++;
+    }
+    return uacc == 0;
+}
+#endif /* !__AVX2__ && !__ARM_NEON__ */
+
+/* Compile-time dispatch for k=16: AVX2 > NEON > scalar */
+#ifdef __AVX2__
+#define radix_uniform_count_fused_k16_fast radix_uniform_count_fused_k16_avx2
+#elif defined(__ARM_NEON__)
+#define radix_uniform_count_fused_k16_fast radix_uniform_count_fused_k16_neon
+#else
+#define radix_uniform_count_fused_k16_fast radix_uniform_count_fused_k16_scalar
+#endif
+
 /*
  * radix_sort_k16: LSD radix sort using 16-bit radix (Issue #363 Phase 5b/5c).
  *
@@ -1006,27 +1211,16 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 #ifdef WL_RADIX_BENCH
             _t0 = now_ns();
 #endif
-            {
-                uint16_t uacc = 0;
-                memset(count, 0, hist_size * sizeof(uint32_t));
-                for (uint32_t i = 0; i < nrows; i++) {
-                    if (i + 16u < nrows)
-                        WL_PREFETCH_R(col_data + start_row + src[i + 16u]);
-                    int64_t v = col_data[start_row + src[i]];
-                    uint16_t bv = (uint16_t)((uint64_t)v >> shift);
-                    if (is_sign_pass)
-                        bv ^= 0x8000u;
-                    bv_cache[i] = bv;
-                    uacc |= (uint16_t)(bv ^ first_bv);
-                    count[bv]++;
-                }
-                if (uacc == 0) {
+            /* SIMD-dispatched fused uniform check + count pass for k=16
+             * (Issue #363 Phase 5c extension). */
+            if (radix_uniform_count_fused_k16_fast(col_data, start_row,
+                src, nrows, shift, is_sign_pass, first_bv,
+                bv_cache, count)) {
 #ifdef WL_RADIX_BENCH
-                    _tU += now_ns() - _t0;
-                    _nSk++;
+                _tU += now_ns() - _t0;
+                _nSk++;
 #endif
-                    continue;
-                }
+                continue;
             }
 #ifdef WL_RADIX_BENCH
             _tU += now_ns() - _t0;
