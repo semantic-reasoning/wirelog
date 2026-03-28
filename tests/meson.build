@@ -2021,3 +2021,24 @@ test_frontier_progress_exe = executable(
 )
 
 test('frontier_progress', test_frontier_progress_exe)
+
+# ============================================================================
+# Multiworker Integration Tests (Issue #321)
+# ============================================================================
+
+test_td_multiworker_exe = executable(
+  'test_td_multiworker',
+  files('test_td_multiworker.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('td_multiworker', test_td_multiworker_exe)
