@@ -1661,14 +1661,18 @@ build_lftj_op(const wl_plan_op_t *ops, uint32_t start, uint32_t len,
 
 /*
  * Parse a "colN" key string to a physical column index.
- * Returns 0 as fallback if the string is malformed.
+ * Returns UINT32_MAX on malformed input (caller must check).
  */
 static uint32_t
 parse_col_index(const char *key)
 {
-    if (!key || strncmp(key, "col", 3) != 0)
-        return 0;
-    return (uint32_t)strtoul(key + 3, NULL, 10);
+    if (!key || strncmp(key, "col", 3) != 0 || key[3] == '\0')
+        return UINT32_MAX;
+    char *end = NULL;
+    unsigned long val = strtoul(key + 3, &end, 10);
+    if (end == key + 3 || *end != '\0')
+        return UINT32_MAX;
+    return (uint32_t)val;
 }
 
 /*
@@ -1741,11 +1745,23 @@ rewrite_insert_exchanges(wl_plan_t *plan)
                             ok = false;
                             break;
                         }
-                        for (uint32_t k = 0; k < meta->key_col_count; k++)
-                            meta->key_col_idxs[k]
+                        for (uint32_t k = 0; k < meta->key_col_count; k++) {
+                            uint32_t idx
                                 = parse_col_index(join_op->left_keys[k]);
+                            if (idx == UINT32_MAX) {
+                                free(meta->key_col_idxs);
+                                free(meta);
+                                ok = false;
+                                break;
+                            }
+                            meta->key_col_idxs[k] = idx;
+                        }
+                        if (!ok)
+                            break;
                     }
 
+                    if (!ok)
+                        break;
                     memset(&new_ops[ni], 0, sizeof(wl_plan_op_t));
                     new_ops[ni].op = WL_PLAN_OP_EXCHANGE;
                     new_ops[ni].opaque_data = meta;
