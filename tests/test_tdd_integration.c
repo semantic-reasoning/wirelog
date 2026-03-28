@@ -129,6 +129,13 @@ static const char PROG_TC[] =
     "tc(x, y) :- edge(x, y).\n"
     "tc(x, z) :- tc(x, y), edge(y, z).\n";
 
+/* Same-generation: 3-body recursive join (Issue #352) */
+static const char PROG_SAME_GEN[] =
+    ".decl parent(x: int32, y: int32)\n"
+    ".decl sg(x: int32, y: int32)\n"
+    "sg(x, y) :- parent(x, p), parent(y, p).\n"
+    "sg(x, y) :- parent(x, xp), sg(xp, yp), parent(y, yp).\n";
+
 /* Multi-stratum: non-recursive edge_sym feeds recursive reach */
 static const char PROG_MULTI_STRATUM[] =
     ".decl edge(x: int32, y: int32)\n"
@@ -302,6 +309,61 @@ test_multi_stratum_multiworker(void)
     }
     if (reach2 != reach1 || reach4 != reach1) {
         FAIL("W=2 or W=4 reach count differs from W=1 baseline");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/*
+ * test_same_generation_multiworker:
+ * Issue #352: 3-body recursive join with self-join on non-col0 column.
+ * sg(x,y) :- parent(x,p), parent(y,p).
+ * sg(x,y) :- parent(x,xp), sg(xp,yp), parent(y,yp).
+ * Parent edges: (1,0),(2,0),(3,1),(4,1),(5,2).
+ * W=1 baseline: 13 sg rows. W=2 must match.
+ */
+static int
+test_same_generation_multiworker(void)
+{
+    TEST("Same-generation 3-body join: W=2 matches W=1 (Issue #352)");
+
+    wl_plan_t *p1 = NULL, *p2 = NULL;
+    wirelog_program_t *g1 = NULL, *g2 = NULL;
+
+    wl_col_session_t *s1 = make_session(PROG_SAME_GEN, 1, &p1, &g1);
+    wl_col_session_t *s2 = make_session(PROG_SAME_GEN, 2, &p2, &g2);
+
+    if (!s1 || !s2) {
+        if (s1) cleanup_session(s1, p1, g1);
+        if (s2) cleanup_session(s2, p2, g2);
+        FAIL("session create");
+        return 1;
+    }
+
+    int64_t parents[] = { 1, 0, 2, 0, 3, 1, 4, 1, 5, 2 };
+    insert_facts(s1, "parent", parents, 5);
+    insert_facts(s2, "parent", parents, 5);
+
+    int rc1 = wl_session_step(&s1->base);
+    int rc2 = wl_session_step(&s2->base);
+
+    uint32_t cnt1 = count_rows(s1, "sg");
+    uint32_t cnt2 = count_rows(s2, "sg");
+
+    cleanup_session(s1, p1, g1);
+    cleanup_session(s2, p2, g2);
+
+    if (rc1 != 0 || rc2 != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (cnt1 != 13) {
+        FAIL("W=1 baseline: expected 13 sg rows");
+        return 1;
+    }
+    if (cnt2 != cnt1) {
+        FAIL("W=2 sg count differs from W=1 baseline");
         return 1;
     }
     PASS();
@@ -546,6 +608,7 @@ main(void)
     printf("\n-- Correctness --\n");
     test_reachability_w2();
     test_tc_diamond_multiworker();
+    test_same_generation_multiworker();
     test_multi_stratum_multiworker();
 
     printf("\n-- Determinism --\n");
