@@ -144,22 +144,20 @@ static const char PROG_MULTI_STRATUM[] =
 /* ======================================================================== */
 
 /*
- * test_reachability_w1:
+ * test_reachability_w2:
  * Multi-rule non-recursive: two rules produce `node`.
  * Edges {(1,2),(2,3),(3,4)} -> node should have 4 distinct entries.
- * Tests multi-rule merge correctness at W=1.
- *
- * Note: multiworker dedup for multi-rule non-recursive strata is a
- * known limitation; this test verifies the W=1 baseline.
+ * Uses W=2 to verify that multiworker dedup for non-recursive strata
+ * correctly eliminates overlapping tuples from different partitions.
  */
 static int
-test_reachability_w1(void)
+test_reachability_w2(void)
 {
-    TEST("Reachability multi-rule W=1: 3 edges yield 4 nodes");
+    TEST("Reachability multi-rule W=2: 3 edges yield 4 nodes");
 
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
-    wl_col_session_t *sess = make_session(PROG_REACHABILITY, 1, &plan, &prog);
+    wl_col_session_t *sess = make_session(PROG_REACHABILITY, 2, &plan, &prog);
     if (!sess) {
         FAIL("session create");
         return 1;
@@ -546,7 +544,7 @@ main(void)
     printf("===================================\n");
 
     printf("\n-- Correctness --\n");
-    test_reachability_w1();
+    test_reachability_w2();
     test_tc_diamond_multiworker();
     test_multi_stratum_multiworker();
 

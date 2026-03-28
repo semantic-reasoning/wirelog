@@ -2650,6 +2650,17 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
     if (rc == 0)
         rc = tdd_merge_worker_results(sp, coord);
 
+    /* Dedup coordinator IDB (multiple workers evaluating the same rules on
+     * different partitions may produce overlapping tuples). */
+    if (rc == 0) {
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            col_rel_t *r = session_find_rel(coord,
+                    sp->relations[ri].name);
+            if (r && r->nrows > 1)
+                tdd_dedup_rel(r);
+        }
+    }
+
     /* Phase 7: Record stratum and per-rule frontiers (mirrors eval.c:247-279) */
     if (rc == 0)
         tdd_record_nonrecursive_convergence(coord, sp, stratum_idx);
