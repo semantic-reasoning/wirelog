@@ -20,6 +20,104 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <xxhash.h>
+
+/* ======================================================================== */
+/* Hash-Set Dedup for TDD Workers (Issue #361)                               */
+/* ======================================================================== */
+
+/*
+ * O(1) dedup using an open-addressing hash set with linear probing.
+ * Replaces the O(N) merge walk in col_op_consolidate_incremental_delta
+ * for TDD worker IDB relations, giving true parallel scaling.
+ *
+ * Hash set lives in col_rel_t::dedup_slots (NULL for non-TDD relations).
+ * Slot value 0 = empty; real hashes are forced non-zero (h | 1).
+ */
+
+/* Hash all columns of a single row using XXH3. */
+static inline uint64_t
+dedup_row_hash(const col_rel_t *r, uint32_t row)
+{
+    int64_t buf[8];
+    int64_t *p = r->ncols <= 8 ? buf
+        : (int64_t *)malloc((size_t)r->ncols * sizeof(int64_t));
+    if (!p)
+        return 1; /* fallback: treat as unique */
+    for (uint32_t c = 0; c < r->ncols; c++)
+        p[c] = r->columns[c][row];
+    uint64_t h = XXH3_64bits(p, (size_t)r->ncols * sizeof(int64_t));
+    if (p != buf)
+        free(p);
+    return h ? h : 1; /* avoid 0 sentinel */
+}
+
+/* Grow the hash set to double capacity. */
+static int
+dedup_set_grow(col_rel_t *r)
+{
+    uint32_t old_cap = r->dedup_cap;
+    uint32_t new_cap = old_cap ? old_cap * 2 : 1024;
+    uint64_t *new_slots = (uint64_t *)calloc(new_cap, sizeof(uint64_t));
+    if (!new_slots)
+        return ENOMEM;
+    uint32_t mask = new_cap - 1;
+    /* Rehash existing entries. */
+    for (uint32_t i = 0; i < old_cap; i++) {
+        uint64_t h = r->dedup_slots[i];
+        if (h == 0)
+            continue;
+        uint32_t pos = (uint32_t)(h & mask);
+        while (new_slots[pos] != 0)
+            pos = (pos + 1) & mask;
+        new_slots[pos] = h;
+    }
+    free(r->dedup_slots);
+    r->dedup_slots = new_slots;
+    r->dedup_cap = new_cap;
+    return 0;
+}
+
+/* Insert hash into set.  Returns true if newly inserted (not a dup). */
+static inline bool
+dedup_set_insert(col_rel_t *r, uint64_t h)
+{
+    if (r->dedup_count * 10 >= r->dedup_cap * 7) { /* >70% load */
+        if (dedup_set_grow(r) != 0)
+            return true; /* OOM: treat as unique (safe fallback) */
+    }
+    uint32_t mask = r->dedup_cap - 1;
+    uint32_t pos = (uint32_t)(h & mask);
+    while (r->dedup_slots[pos] != 0) {
+        if (r->dedup_slots[pos] == h)
+            return false; /* duplicate */
+        pos = (pos + 1) & mask;
+    }
+    r->dedup_slots[pos] = h;
+    r->dedup_count++;
+    return true;
+}
+
+/* Initialize dedup set from existing rows [0..nrows). */
+static int
+dedup_set_init_from_rel(col_rel_t *r)
+{
+    /* Size: next power-of-2 >= 2 * nrows, min 1024. */
+    uint32_t target = r->nrows > 512 ? r->nrows * 2 : 1024;
+    uint32_t cap = 1024;
+    while (cap < target)
+        cap *= 2;
+    r->dedup_slots = (uint64_t *)calloc(cap, sizeof(uint64_t));
+    if (!r->dedup_slots)
+        return ENOMEM;
+    r->dedup_cap = cap;
+    r->dedup_count = 0;
+    for (uint32_t i = 0; i < r->nrows; i++) {
+        uint64_t h = dedup_row_hash(r, i);
+        dedup_set_insert(r, h);
+    }
+    return 0;
+}
 
 /* ======================================================================== */
 /* Stratum Evaluator                                                         */
@@ -45,6 +143,66 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
          * this switch will occur when the plan generator emits weighted opcodes
          * for Z-set multiplicity evaluation. For now, col_op_join and
          * col_op_reduce dispatch to their base (non-weighted) versions. */
+        /* Issue #361: Skip base-case EDB VARIABLEs in TDD workers at iter > 0.
+         * A base-case VARIABLE references a static EDB (no delta) and is NOT
+         * followed by JOIN (it feeds CONCAT via MAP). The base-case tuples are
+         * already in the IDB from iter 0, so re-loading them every sub-pass
+         * wastes O(N_base) work per sub-pass. Push empty instead. */
+        if (op->op == WL_PLAN_OP_VARIABLE
+            && sess->tdd_subpass_active && sess->current_iteration > 0
+            && op->delta_mode == WL_DELTA_AUTO && op->relation_name) {
+            /* Look ahead: base-case VARIABLE is followed by MAP (not JOIN). */
+            bool next_is_join = (i + 1 < rplan->op_count
+                && (rplan->ops[i + 1].op == WL_PLAN_OP_JOIN
+                || rplan->ops[i + 1].op == WL_PLAN_OP_SEMIJOIN
+                || rplan->ops[i + 1].op == WL_PLAN_OP_ANTIJOIN));
+            if (!next_is_join) {
+                char dname[256];
+                snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
+                col_rel_t *d = session_find_rel(sess, dname);
+                if (!d || d->nrows == 0) {
+                    /* Check: is this relation also used as a JOIN right_relation
+                     * anywhere in this plan? If so, it's a shared EDB (e.g.
+                     * 'edge' in TC) and must not be skipped. */
+                    bool used_in_join = false;
+                    for (uint32_t j = 0; j < rplan->op_count; j++) {
+                        const wl_plan_op_t *oj = &rplan->ops[j];
+                        if ((oj->op == WL_PLAN_OP_JOIN
+                            || oj->op == WL_PLAN_OP_SEMIJOIN
+                            || oj->op == WL_PLAN_OP_ANTIJOIN)
+                            && oj->right_relation
+                            && strcmp(oj->right_relation,
+                            op->relation_name) == 0) {
+                            used_in_join = true;
+                            break;
+                        }
+                    }
+                    if (used_in_join)
+                        goto normal_eval;
+                    /* Static EDB with no delta, not used in any JOIN →
+                     * pure base case. Push empty and skip the MAP that
+                     * follows, so the CONCAT still gets two stack entries
+                     * (empty base + recursive result). */
+                    col_rel_t *full = session_find_rel(sess, op->relation_name);
+                    col_rel_t *empty = col_rel_pool_new_like(
+                        sess->delta_pool, "$base_skip", full ? full : NULL);
+                    if (!empty) {
+                        rc = ENOMEM; break;
+                    }
+                    rc = eval_stack_push(stack, empty, true);
+                    if (rc != 0) {
+                        col_rel_destroy(empty); break;
+                    }
+                    /* Skip the subsequent MAP (MAP on empty = empty). */
+                    if (i + 1 < rplan->op_count
+                        && rplan->ops[i + 1].op == WL_PLAN_OP_MAP)
+                        i++;
+                    continue;
+                }
+            }
+        }
+normal_eval:
+
         switch (op->op) {
         case WL_PLAN_OP_VARIABLE:
             rc = col_op_variable(op, stack, sess);
@@ -756,7 +914,6 @@ stride_error:
         if (converged || !outer_any_new)
             break; /* true convergence */
     } /* end outer stride loop */
-
     /* Issue #282: Restore session-level diff_operators_active.
      * The per-iteration override above applies only within the recursive
      * fixed-point loop.  Restoring the saved value ensures subsequent
@@ -1316,10 +1473,6 @@ typedef struct {
     bool all_empty_delta;          /* OUT: all FORCE_DELTA empty, skipped */
     col_rel_t **delta_rels;        /* OUT: produced deltas [nrels], coord frees */
     int rc;                        /* OUT: return code                */
-    uint32_t copy_start;           /* Mode 2: first relation plan index */
-    uint32_t copy_end;             /* Mode 2: one-past-last plan index  */
-    uint32_t *k_copy_starts;      /* Mode 2: per-relation K-copy start [nrels] */
-    uint32_t *k_copy_ends;        /* Mode 2: per-relation K-copy end [nrels]   */
 } col_eval_tdd_worker_ctx_t;
 
 /*
@@ -1645,26 +1798,8 @@ tdd_worker_subpass_fn(void *arg)
         snap[ri] = r ? r->nrows : 0;
     }
 
-    /* Evaluate all relation plans (eval.c:505-604).
-     * Mode 2 (work partitioning): only evaluate copies in [copy_start, copy_end).
-     * copy_end == 0 means evaluate all (Mode 1 or single-worker).
-     * K-copy assignment: skip relations with k_copy_ends[ri]==0, and set
-     * kfusion_k_start/k_end on session for col_op_k_fusion to use. */
+    /* Evaluate all relation plans (eval.c:505-604) */
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        if (ctx->copy_end > 0
-            && (ri < ctx->copy_start || ri >= ctx->copy_end))
-            continue;
-
-        /* Mode 2 K-copy assignment: skip unassigned relations */
-        if (ctx->k_copy_ends && ctx->k_copy_ends[ri] == 0)
-            continue;
-
-        /* Set K-copy range on session for col_op_k_fusion */
-        if (ctx->k_copy_ends) {
-            sess->kfusion_k_start = ctx->k_copy_starts[ri];
-            sess->kfusion_k_end = ctx->k_copy_ends[ri];
-        }
-
         const wl_plan_relation_t *rp = &sp->relations[ri];
 
         if (has_empty_forced_delta(rp, sess, eff_iter))
@@ -1765,19 +1900,20 @@ tdd_worker_subpass_fn(void *arg)
                 return;
             }
         }
-
-        /* Reset K-copy range after each relation */
-        if (ctx->k_copy_ends) {
-            sess->kfusion_k_start = 0;
-            sess->kfusion_k_end = 0;
-        }
     }
 
-    /* Remove delta relations from session after evaluation (eval.c:607-612) */
+    /* Issue #361: Clear delta relations instead of removing them.
+     * Pre-installed $d$ persists across iterations; nrows=0 triggers
+     * has_empty_forced_delta skip, same as absent $d$. */
     for (uint32_t ri = 0; ri < nrels; ri++) {
         char dname[256];
         snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
-        session_remove_rel(sess, dname);
+        col_rel_t *d = session_find_rel(sess, dname);
+        if (d) {
+            d->nrows = 0;
+            free(d->timestamps);
+            d->timestamps = NULL;
+        }
     }
 
     /* Consolidate + produce deltas (eval.c:621-713).
@@ -1801,9 +1937,44 @@ tdd_worker_subpass_fn(void *arg)
             return;
         }
 
-        int fast_flag = 0;
-        int rc2 = col_op_consolidate_incremental_delta(r, snap[ri], delta,
-                &fast_flag);
+        int rc2 = 0;
+        if (r->dedup_slots) {
+            /* Hash-set dedup: O(D) per subpass instead of O(N) merge.
+             * For each new row, check the hash set. Keep only truly
+             * new rows in the relation and emit them to delta. */
+            int64_t row_buf[8];
+            int64_t *rbuf = r->ncols <= 8 ? row_buf
+                : (int64_t *)malloc((size_t)r->ncols * sizeof(int64_t));
+            if (!rbuf) {
+                col_rel_destroy(delta);
+                ctx->rc = ENOMEM;
+                free(snap);
+                sess->tdd_subpass_active = saved_tdd_subpass;
+                sess->diff_operators_active = saved_diff;
+                return;
+            }
+            uint32_t keep = snap[ri];
+            for (uint32_t i = snap[ri]; i < r->nrows; i++) {
+                uint64_t h = dedup_row_hash(r, i);
+                if (dedup_set_insert(r, h)) {
+                    /* New row: compact into [keep] and emit to delta. */
+                    if (keep != i)
+                        col_rel_row_move(r, keep, i);
+                    for (uint32_t c = 0; c < r->ncols; c++)
+                        rbuf[c] = r->columns[c][keep];
+                    col_rel_append_row(delta, rbuf);
+                    keep++;
+                }
+            }
+            r->nrows = keep;
+            r->sorted_nrows = keep; /* not truly sorted but OK for hash joins */
+            if (rbuf != row_buf)
+                free(rbuf);
+        } else {
+            int fast_flag = 0;
+            rc2 = col_op_consolidate_incremental_delta(r, snap[ri], delta,
+                    &fast_flag);
+        }
         col_session_invalidate_arrangements(&sess->base,
             sp->relations[ri].name);
 
@@ -2245,7 +2416,8 @@ tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
  */
 static int
 tdd_exchange_deltas(const wl_plan_stratum_t *sp,
-    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
+    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
+    bool default_hash)
 {
     uint32_t nrels = sp->relation_count;
 
@@ -2260,8 +2432,8 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
         }
     }
 
-    /* No EXCHANGE metadata: broadcast is correct (e.g. TC). */
-    if (!has_exchange)
+    /* No EXCHANGE metadata and no default hash: broadcast (replicate mode). */
+    if (!has_exchange && !default_hash)
         return tdd_broadcast_deltas(sp, coord, ctxs, W);
 
     /* Hash-partitioned scatter/gather exchange. */
@@ -2299,42 +2471,104 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
         for (uint32_t w = 0; w < W; w++)
             session_remove_rel(&coord->tdd_workers[w], dname);
 
-        /* Scatter: worker w partitions its delta into exchange_bufs[w][*]. */
+        /* Issue #361: Relations without EXCHANGE ops use default col0
+         * hash-exchange when default_hash is set (hybrid init partitions
+         * IDB by col0).  EDB is replicated, so joins against partitioned
+         * $d$ are complete within each worker. */
         uint32_t default_key[] = { 0 };
-        const uint32_t *eff_key = (key_cols && key_count > 0)
-            ? key_cols : default_key;
-        uint32_t eff_key_count
-            = (key_cols && key_count > 0) ? key_count : 1u;
-
-        for (uint32_t w = 0; w < W; w++) {
-            col_rel_t *d = ctxs[w].delta_rels[ri];
-            ctxs[w].delta_rels[ri] = NULL;
-
-            if (!d || d->nrows == 0 || d->ncols == 0) {
-                col_rel_destroy(d);
-                continue;
-            }
-
-            rc = col_rel_partition_by_key(d, eff_key, eff_key_count,
-                    W, coord->exchange_bufs[w]);
-            col_rel_destroy(d);
-
-            if (rc != 0)
-                goto exchange_done;
+        if ((!key_cols || key_count == 0) && default_hash) {
+            key_cols = default_key;
+            key_count = 1;
         }
 
-        /* Gather: worker dst receives exchange_bufs[*][dst]. */
-        for (uint32_t dst = 0; dst < W; dst++) {
-            col_rel_t *gathered = NULL;
-            rc = tdd_gather_for_worker(coord, dst, W, dname, &gathered);
-            if (rc != 0)
-                goto exchange_done;
+        if (!key_cols || key_count == 0) {
+            /* Broadcast: union worker deltas, install on every worker.
+             * Used for replicate-mode strata where IDB is not partitioned. */
+            uint32_t total = 0, ncols = 0;
+            for (uint32_t w = 0; w < W; w++) {
+                col_rel_t *d = ctxs[w].delta_rels[ri];
+                if (d && d->nrows > 0) {
+                    total += d->nrows;
+                    if (ncols == 0) ncols = d->ncols;
+                }
+            }
+            if (total == 0) {
+                for (uint32_t w = 0; w < W; w++) {
+                    col_rel_destroy(ctxs[w].delta_rels[ri]);
+                    ctxs[w].delta_rels[ri] = NULL;
+                }
+            } else {
+                col_rel_t *union_d = col_rel_new_auto(dname, ncols);
+                if (!union_d) {
+                    rc = ENOMEM; goto exchange_done;
+                }
+                for (uint32_t w = 0; w < W; w++) {
+                    col_rel_t *d = ctxs[w].delta_rels[ri];
+                    ctxs[w].delta_rels[ri] = NULL;
+                    if (d && d->nrows > 0)
+                        rc = col_rel_append_all(union_d, d, NULL);
+                    col_rel_destroy(d);
+                    if (rc != 0) {
+                        col_rel_destroy(union_d); goto exchange_done;
+                    }
+                }
+                for (uint32_t dst = 0; dst < W; dst++) {
+                    col_rel_t *copy;
+                    if (dst < W - 1) {
+                        copy = col_rel_new_auto(dname, ncols);
+                        if (!copy) {
+                            col_rel_destroy(union_d); rc = ENOMEM;
+                            goto exchange_done;
+                        }
+                        rc = col_rel_append_all(copy, union_d, NULL);
+                        if (rc != 0) {
+                            col_rel_destroy(copy); col_rel_destroy(union_d);
+                            goto exchange_done;
+                        }
+                    } else {
+                        copy = union_d;
+                        union_d = NULL;
+                    }
+                    rc = session_add_rel(&coord->tdd_workers[dst], copy);
+                    if (rc != 0) {
+                        col_rel_destroy(copy);
+                        if (union_d) col_rel_destroy(union_d);
+                        goto exchange_done;
+                    }
+                }
+            }
+        } else {
+            /* Hash-partitioned scatter/gather for EXCHANGE-keyed relations */
+            for (uint32_t w = 0; w < W; w++) {
+                col_rel_t *d = ctxs[w].delta_rels[ri];
+                ctxs[w].delta_rels[ri] = NULL;
 
-            if (gathered) {
-                rc = session_add_rel(&coord->tdd_workers[dst], gathered);
-                if (rc != 0) {
-                    col_rel_destroy(gathered);
+                if (!d || d->nrows == 0 || d->ncols == 0) {
+                    col_rel_destroy(d);
+                    continue;
+                }
+
+                rc = col_rel_partition_by_key(d, key_cols, key_count,
+                        W, coord->exchange_bufs[w]);
+                col_rel_destroy(d);
+
+                if (rc != 0)
                     goto exchange_done;
+            }
+
+            /* Gather: worker dst receives exchange_bufs[*][dst]. */
+            for (uint32_t dst = 0; dst < W; dst++) {
+                col_rel_t *gathered = NULL;
+                rc = tdd_gather_for_worker(coord, dst, W, dname, &gathered);
+                if (rc != 0)
+                    goto exchange_done;
+
+                if (gathered) {
+                    rc = session_add_rel(&coord->tdd_workers[dst], gathered);
+                    if (rc != 0) {
+                        col_rel_destroy(gathered);
+                        goto exchange_done;
+                    }
                 }
             }
         }
@@ -2353,6 +2587,19 @@ exchange_done:
     tdd_free_exchange_bufs(coord);
     return rc;
 }
+
+/*
+ * tdd_broadcast_deltas:
+ * After a sub-pass barrier, union all worker deltas for each IDB
+ * relation and install the union as $d$<relname> on EVERY worker.
+ *
+ * Ownership of entries in ctxs[w].delta_rels[ri] transfers here;
+ * all entries are consumed (freed or moved to a worker session).
+ * After return, ctxs[w].delta_rels[ri] == NULL for all w, ri.
+ *
+ * Workers with no delta for a relation receive no $d$ entry, so
+ * has_empty_forced_delta fires and skips that rule next sub-pass.
+ */
 
 /*
  * is_stratum_idb:
@@ -2400,12 +2647,12 @@ ops_have_idb_idb_join(const wl_plan_op_t *ops, uint32_t op_count,
  * tdd_stratum_has_idb_self_join:
  * Returns true if any rule in the stratum has a JOIN where BOTH the left
  * input (from VARIABLE or previous JOIN) AND the right_relation are IDB.
- * Only these true IDB-IDB joins (e.g. CSPA's valueFlow ⋈ valueFlow)
- * require Mode 2 (full replication).  EDB-IDB joins (e.g. CRDT's
- * insert ⋈ nextSiblingAnc) work correctly with Mode 1 (partition IDB,
+ * Only these true IDB-IDB joins (e.g. CSPA's valueFlow join valueFlow)
+ * require full replication.  EDB-IDB joins (e.g. CRDT's insert join
+ * nextSiblingAnc) work correctly with data partitioning (partition IDB,
  * replicate EDB).
  */
-static bool
+bool
 tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp)
 {
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
@@ -2434,7 +2681,7 @@ tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp)
 
 /*
  * tdd_init_workers_hybrid:
- * Hybrid initialization for Mode 1 (data partitioning) strata.
+ * Hybrid initialization for data-partitioned strata.
  *
  * IDB relations (those in sp->relations[]) are partitioned across workers
  * by their EXCHANGE key columns.  Non-IDB relations (EDB, earlier-stratum
@@ -2480,6 +2727,34 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
         }
     }
 
+    /* Pre-scan stratum EXCHANGE ops for EDB partition info.
+     * If an EXCHANGE specifies edb_rel_name + edb_key_col_idxs, we can
+     * hash-partition that EDB instead of replicating it, reducing each
+     * worker's scan from O(|EDB|) to O(|EDB|/W). */
+    const char *edb_part_name = NULL;
+    const uint32_t *edb_part_keys = NULL;
+    uint32_t edb_part_key_count = 0;
+
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        for (uint32_t oi = 0; oi < sp->relations[ri].op_count; oi++) {
+            if (sp->relations[ri].ops[oi].op == WL_PLAN_OP_EXCHANGE) {
+                const wl_plan_op_exchange_t *meta =
+                    (const wl_plan_op_exchange_t *)
+                    sp->relations[ri].ops[oi].opaque_data;
+                if (meta && meta->edb_rel_name
+                    && meta->edb_key_col_idxs
+                    && meta->edb_key_col_count > 0) {
+                    edb_part_name = meta->edb_rel_name;
+                    edb_part_keys = meta->edb_key_col_idxs;
+                    edb_part_key_count = meta->edb_key_col_count;
+                }
+                break;
+            }
+        }
+        if (edb_part_name)
+            break;
+    }
+
     uint32_t rels_built = 0;
 
     for (uint32_t r = 0; r < nrels && rc == 0; r++) {
@@ -2489,8 +2764,6 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
 
         const char *name = rel->name;
 
-        /* Check if this relation is IDB in the current stratum and
-         * extract its EXCHANGE key for partitioning. */
         bool is_idb = false;
         const uint32_t *exchange_key = NULL;
         uint32_t exchange_key_count = 0;
@@ -2515,7 +2788,6 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
         }
 
         if (is_idb && rel->nrows > 0 && rel->ncols > 0) {
-            /* Partition IDB by EXCHANGE key (col0 fallback) */
             uint32_t default_key[] = { 0 };
             const uint32_t *key = (exchange_key && exchange_key_count > 0)
                 ? exchange_key : default_key;
@@ -2534,6 +2806,38 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
                         if (!parts[w]->name) {
                             rc = ENOMEM;
                         } else {
+                            /* Init hash-set dedup for O(1) consolidation. */
+                            dedup_set_init_from_rel(parts[w]);
+                            worker_rels[w][rels_built] = parts[w];
+                            parts[w] = NULL;
+                        }
+                    }
+                }
+                for (uint32_t w = 0; w < W; w++)
+                    col_rel_destroy(parts[w]);
+                free(parts);
+            }
+        } else if (edb_part_name && rel->nrows > 0
+            && strcmp(name, edb_part_name) == 0
+            && edb_part_key_count > 0
+            && rel->ncols > 0) {
+            /* EDB partitioning: hash-partition this EDB by the join key
+             * so each worker scans only ~1/W of the rows.  The partition
+             * key (edb_part_keys) matches the IDB exchange key through
+             * the join condition, ensuring local join completeness. */
+            col_rel_t **parts = (col_rel_t **)calloc(W, sizeof(col_rel_t *));
+            if (!parts) {
+                rc = ENOMEM;
+            } else {
+                rc = col_rel_partition_by_key(rel, edb_part_keys,
+                        edb_part_key_count, W, parts);
+                if (rc == 0) {
+                    for (uint32_t w = 0; w < W && rc == 0; w++) {
+                        free(parts[w]->name);
+                        parts[w]->name = wl_strdup(name);
+                        if (!parts[w]->name) {
+                            rc = ENOMEM;
+                        } else {
                             worker_rels[w][rels_built] = parts[w];
                             parts[w] = NULL;
                         }
@@ -2544,21 +2848,41 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
                 free(parts);
             }
         } else {
-            /* Non-IDB or empty IDB: replicate to all workers */
+            /* Zero-copy EDB sharing: workers borrow the coordinator's
+             * column buffers instead of deep-copying.  The coordinator
+             * relation outlives the workers, so borrowing is safe.
+             * This eliminates W× memory duplication and cache thrashing. */
             for (uint32_t w = 0; w < W && rc == 0; w++) {
-                col_rel_t *copy = col_rel_new_auto(name, rel->ncols);
-                if (!copy) {
+                col_rel_t *view = col_rel_new_auto(name, rel->ncols);
+                if (!view) {
                     rc = ENOMEM;
                     break;
                 }
                 if (rel->nrows > 0) {
-                    rc = col_rel_append_all(copy, rel, NULL);
-                    if (rc != 0) {
-                        col_rel_destroy(copy);
-                        break;
+                    view->col_shared = (bool *)calloc(rel->ncols, sizeof(bool));
+                    if (!view->col_shared) {
+                        /* Fallback: deep copy on alloc failure */
+                        rc = col_rel_append_all(view, rel, NULL);
+                        if (rc != 0) {
+                            col_rel_destroy(view);
+                            break;
+                        }
+                    } else {
+                        for (uint32_t c = 0; c < rel->ncols; c++) {
+                            free(view->columns[c]);
+                            view->columns[c] = rel->columns[c];
+                            view->col_shared[c] = true;
+                        }
+                        view->nrows = rel->nrows;
+                        view->capacity = rel->capacity;
+                        view->sorted_nrows = rel->sorted_nrows;
                     }
                 }
-                worker_rels[w][rels_built] = copy;
+                /* Init hash-set dedup for empty IDB workers so
+                 * consolidation uses O(D) instead of O(N) merge. */
+                if (is_idb && rel->nrows == 0)
+                    dedup_set_init_from_rel(view);
+                worker_rels[w][rels_built] = view;
             }
         }
 
@@ -2595,18 +2919,6 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
     return rc;
 }
 
-/*
- * tdd_broadcast_deltas:
- * After a sub-pass barrier, union all worker deltas for each IDB
- * relation and install the union as $d$<relname> on EVERY worker.
- *
- * Ownership of entries in ctxs[w].delta_rels[ri] transfers here;
- * all entries are consumed (freed or moved to a worker session).
- * After return, ctxs[w].delta_rels[ri] == NULL for all w, ri.
- *
- * Workers with no delta for a relation receive no $d$ entry, so
- * has_empty_forced_delta fires and skips that rule next sub-pass.
- */
 static int
 tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
@@ -2629,29 +2941,35 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
             }
         }
 
-        /* Free all worker deltas for this relation and clear $d$ from workers */
-        for (uint32_t w = 0; w < W; w++) {
-            if (ctxs[w].delta_rels[ri]) {
-                if (total_rows == 0) {
-                    col_rel_destroy(ctxs[w].delta_rels[ri]);
-                    ctxs[w].delta_rels[ri] = NULL;
-                }
-                /* non-zero case: freed below after appending */
-            }
-            session_remove_rel(&coord->tdd_workers[w], dname);
-        }
-
-        if (total_rows == 0)
-            continue; /* no new tuples: all ctxs[w].delta_rels[ri] freed */
-
-        /* Build union delta */
-        col_rel_t *union_d = col_rel_new_auto(dname, ncols);
-        if (!union_d) {
+        /* Issue #361: Reuse pre-installed $d$ on workers when available.
+         * Avoids per-iteration alloc/free/session_remove/session_add. */
+        if (total_rows == 0) {
             for (uint32_t w = 0; w < W; w++) {
                 col_rel_destroy(ctxs[w].delta_rels[ri]);
                 ctxs[w].delta_rels[ri] = NULL;
+                /* Existing $d$ already cleared by worker (nrows=0) */
             }
-            return ENOMEM;
+            continue;
+        }
+
+        /* Build union delta: try reusing worker 0's existing $d$ as union buf */
+        col_rel_t *union_d = NULL;
+        bool union_from_session = false;
+        col_rel_t *slot0 = session_find_rel(&coord->tdd_workers[0], dname);
+        if (slot0 && slot0->ncols == ncols) {
+            /* Reuse pre-installed $d$ on worker 0 as union buffer */
+            slot0->nrows = 0;
+            union_d = slot0;
+            union_from_session = true;
+        } else {
+            union_d = col_rel_new_auto(dname, ncols);
+            if (!union_d) {
+                for (uint32_t w = 0; w < W; w++) {
+                    col_rel_destroy(ctxs[w].delta_rels[ri]);
+                    ctxs[w].delta_rels[ri] = NULL;
+                }
+                return ENOMEM;
+            }
         }
 
         int append_rc = 0;
@@ -2665,39 +2983,61 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
         }
 
         if (append_rc != 0) {
-            col_rel_destroy(union_d);
+            if (!union_from_session)
+                col_rel_destroy(union_d);
             return append_rc;
         }
 
-        /* Broadcast: worker 0..W-2 get copies; worker W-1 gets ownership */
+        /* Broadcast: refill existing $d$ on workers (reuses capacity) */
         for (uint32_t w = 0; w < W; w++) {
-            col_rel_t *worker_d;
-            if (w < W - 1) {
-                worker_d = col_rel_new_auto(dname, union_d->ncols);
-                if (!worker_d) {
-                    col_rel_destroy(union_d);
-                    return ENOMEM;
-                }
+            if (union_from_session && w == 0)
+                continue; /* worker 0 already holds the union */
+
+            col_rel_t *worker_d = session_find_rel(
+                &coord->tdd_workers[w], dname);
+            if (worker_d && worker_d->ncols == ncols) {
+                /* Reuse: clear and refill (capacity preserved) */
+                worker_d->nrows = 0;
                 int rc = col_rel_append_all(worker_d, union_d, NULL);
                 if (rc != 0) {
-                    col_rel_destroy(worker_d);
-                    col_rel_destroy(union_d);
+                    if (!union_from_session)
+                        col_rel_destroy(union_d);
                     return rc;
                 }
             } else {
-                worker_d = union_d;
-                union_d = NULL;
-            }
-            int rc = session_add_rel(&coord->tdd_workers[w], worker_d);
-            if (rc != 0) {
-                col_rel_destroy(worker_d);
-                if (union_d) {
-                    col_rel_destroy(union_d);
+                /* Fallback: create new (first iteration or schema mismatch) */
+                col_rel_t *new_d;
+                if (!union_from_session && w == W - 1) {
+                    new_d = union_d;
                     union_d = NULL;
+                } else {
+                    new_d = col_rel_new_auto(dname, union_d->ncols);
+                    if (!new_d) {
+                        if (!union_from_session)
+                            col_rel_destroy(union_d);
+                        return ENOMEM;
+                    }
+                    int rc = col_rel_append_all(new_d, union_d, NULL);
+                    if (rc != 0) {
+                        col_rel_destroy(new_d);
+                        if (!union_from_session)
+                            col_rel_destroy(union_d);
+                        return rc;
+                    }
                 }
-                return rc;
+                int rc = session_add_rel(&coord->tdd_workers[w], new_d);
+                if (rc != 0) {
+                    col_rel_destroy(new_d);
+                    if (!union_from_session && union_d)
+                        col_rel_destroy(union_d);
+                    return rc;
+                }
             }
         }
+
+        /* Free union if it was heap-allocated and not transferred */
+        if (!union_from_session && union_d)
+            col_rel_destroy(union_d);
     }
 
     return 0;
@@ -2755,27 +3095,6 @@ tdd_record_nonrecursive_convergence(wl_col_session_t *coord,
 }
 
 /*
- * tdd_relation_k_count:
- * Returns the number of K-copies in a relation plan.
- * If the relation has a K_FUSION op, returns kf->k.
- * Otherwise returns 1 (single work unit).
- */
-static uint32_t
-tdd_relation_k_count(const wl_plan_stratum_t *sp, uint32_t ri)
-{
-    const wl_plan_relation_t *rel = &sp->relations[ri];
-    for (uint32_t oi = 0; oi < rel->op_count; oi++) {
-        if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION &&
-            rel->ops[oi].opaque_data) {
-            const wl_plan_op_k_fusion_t *kf =
-                (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
-            return kf->k;
-        }
-    }
-    return 1;
-}
-
-/*
  * tdd_check_convergence:
  * Returns true if global fixed-point reached: no worker produced new tuples.
  * Called after each sub-pass barrier, before the exchange step.
@@ -2794,19 +3113,17 @@ tdd_check_convergence(const col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
  * col_eval_stratum_tdd_recursive:
  * Coordinator-driven semi-naive fixed-point for recursive strata.
  *
- * Issue #361: Two parallelism modes selected per-stratum:
- *
- * Mode 1 (data partitioning) — no IDB-IDB self-joins:
- *   tdd_init_workers_hybrid partitions IDB by EXCHANGE key, replicates EDB.
- *   Hash-partitioned delta exchange maintains the partition invariant.
- *   Each worker evaluates 1/W of IDB data.
- *
- * Mode 2 (work partitioning) — IDB-IDB self-joins (e.g. CSPA):
- *   tdd_replicate_workers gives every worker full data.
- *   Workers evaluate disjoint subsets of relation plan copies.
- *   Broadcast delta exchange keeps IDB synchronized across workers.
+ * Pipeline per sub-pass:
+ *   DISPATCH (W workers via workqueue) → BARRIER → CONVERGENCE CHECK
+ *   → BROADCAST EXCHANGE (tdd_broadcast_deltas) → next sub-pass
  *
  * After convergence, merges worker IDB into coordinator and deduplicates.
+ * Broadcast exchange may produce the same derived tuple on multiple workers
+ * (when multiple equal-length paths lead to the same conclusion); the final
+ * sort+dedup step removes these.
+ *
+ * Phase 3 will replace the broadcast with a hash-partitioned scatter/gather
+ * exchange that eliminates cross-worker duplicates and improves scalability.
  */
 static int
 col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
@@ -2851,12 +3168,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             coord->outer_epoch);
     }
 
-    /* Issue #361: Select parallelism mode based on join structure.
-     * Mode 2 (replicate) for strata with IDB-IDB self-joins (CSPA).
-     * Mode 1 (hybrid partition) for all other recursive strata.
-     * When no new EDB was inserted (frontier-skip path), use replicate
-     * to preserve frontier skip semantics — the stratum will reconverge
-     * within the recorded frontier iterations regardless. */
+    /* Issue #361: Use hybrid init (partition IDB by EXCHANGE key, replicate
+     * EDB) for non-self-join strata when new EDB was inserted.  Self-join
+     * strata and frontier-skip strata use full replication for correctness.
+     * Hash exchange is now per-relation: relations with EXCHANGE ops get
+     * hash-partitioned, others get broadcast. */
     bool self_join_mode = tdd_stratum_has_idb_self_join(sp);
     bool replicate_mode = self_join_mode
         || (coord->last_inserted_relation == NULL);
@@ -2881,6 +3197,31 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     sp->relations[ri].name);
             if (r && r->nrows > 1)
                 col_rel_radix_sort_int64(r);
+        }
+    }
+
+    /* Issue #361: Pre-install empty $d$ delta relations on each worker.
+     * Persistent across iterations — worker clears (nrows=0) instead of
+     * session_remove_rel, and broadcast refills instead of create+add.
+     * Eliminates per-iteration alloc/free/session-ops (14k iters for CRDT). */
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        char dname[256];
+        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        col_rel_t *coord_rel = session_find_rel(coord,
+                sp->relations[ri].name);
+        uint32_t ncols_ri = coord_rel ? coord_rel->ncols : 0;
+        for (uint32_t w = 0; w < W; w++) {
+            col_rel_t *slot = col_rel_new_auto(dname, ncols_ri);
+            if (!slot) {
+                tdd_cleanup_workers(coord);
+                return ENOMEM;
+            }
+            rc = session_add_rel(&coord->tdd_workers[w], slot);
+            if (rc != 0) {
+                col_rel_destroy(slot);
+                tdd_cleanup_workers(coord);
+                return rc;
+            }
         }
     }
 
@@ -2923,6 +3264,30 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      *  - CONVERGENCE CHECK: if all workers have empty delta → fixed point
      *  - EXCHANGE: broadcast/hash-partition deltas to next iteration
      */
+
+    /* Issue #361: Pre-allocate worker contexts and delta_rels arrays once.
+     * Reuse across iterations to avoid calloc/free overhead per sub-pass
+     * (~14k iterations for CRDT). */
+    col_eval_tdd_worker_ctx_t *ctxs
+        = (col_eval_tdd_worker_ctx_t *)calloc(
+            W, sizeof(col_eval_tdd_worker_ctx_t));
+    if (!ctxs) {
+        rc = ENOMEM;
+        goto done;
+    }
+    for (uint32_t w = 0; w < W; w++) {
+        ctxs[w].delta_rels = (col_rel_t **)calloc(
+            nrels, sizeof(col_rel_t *));
+        if (!ctxs[w].delta_rels) {
+            for (uint32_t j = 0; j < w; j++)
+                free((void *)ctxs[j].delta_rels);
+            free(ctxs);
+            ctxs = NULL;
+            rc = ENOMEM;
+            goto done;
+        }
+    }
+
     for (uint32_t iter = 0; iter < MAX_ITERATIONS; iter++) {
         bool outer_any_new = false;
         bool converged = false;
@@ -2932,106 +3297,23 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         for (uint32_t sub = 0; sub < EVAL_STRIDE; sub++) {
             uint32_t eff_iter = iter * EVAL_STRIDE + sub;
 
-            /* Phase 4: Frontier Skip Optimization (eval.c:420-423)
-             * Skip this iteration if frontier has already been recorded
-             * at a lower or equal iteration number. This optimization
-             * reduces redundant computation when a stratum has converged
-             * in a previous session snapshot.
-             */
+            /* Phase 4: Frontier Skip Optimization (eval.c:420-423) */
             if (coord->frontier_ops->should_skip_iteration(coord,
                 stratum_idx, eff_iter)) {
                 continue;
             }
             stride_all_skipped = false;
 
-            /* Allocate worker contexts + delta_rels arrays */
-            col_eval_tdd_worker_ctx_t *ctxs
-                = (col_eval_tdd_worker_ctx_t *)calloc(
-                    W, sizeof(col_eval_tdd_worker_ctx_t));
-            if (!ctxs) {
-                rc = ENOMEM;
-                goto done;
-            }
-
-            bool alloc_ok = true;
+            /* Reset worker contexts for this sub-pass (reuse allocation) */
             for (uint32_t w = 0; w < W; w++) {
-                ctxs[w].delta_rels = (col_rel_t **)calloc(
-                    nrels, sizeof(col_rel_t *));
-                if (!ctxs[w].delta_rels) {
-                    alloc_ok = false;
-                    break;
-                }
+                memset(ctxs[w].delta_rels, 0, nrels * sizeof(col_rel_t *));
                 ctxs[w].sp = sp;
                 ctxs[w].worker_sess = &coord->tdd_workers[w];
                 ctxs[w].stratum_idx = stratum_idx;
                 ctxs[w].eff_iter = eff_iter;
-            }
-
-            if (!alloc_ok) {
-                for (uint32_t w = 0; w < W; w++) {
-                    free((void *)ctxs[w].k_copy_starts);
-                    free((void *)ctxs[w].k_copy_ends);
-                    free((void *)ctxs[w].delta_rels);
-                }
-                free(ctxs);
-                rc = ENOMEM;
-                goto done;
-            }
-
-            /* Issue #361: Mode 2 K-copy work partitioning.
-             * Flatten K-copies across all relations into a linear work
-             * space and assign contiguous ranges to each worker. */
-            if (self_join_mode) {
-                uint32_t total_units = 0;
-                uint32_t rel_k[64]; /* nrels << 64 for any real program */
-                for (uint32_t ri = 0; ri < nrels && ri < 64; ri++) {
-                    rel_k[ri] = tdd_relation_k_count(sp, ri);
-                    total_units += rel_k[ri];
-                }
-
-                for (uint32_t w = 0; w < W; w++) {
-                    ctxs[w].k_copy_starts
-                        = (uint32_t *)calloc(nrels, sizeof(uint32_t));
-                    ctxs[w].k_copy_ends
-                        = (uint32_t *)calloc(nrels, sizeof(uint32_t));
-                    if (!ctxs[w].k_copy_starts || !ctxs[w].k_copy_ends) {
-                        alloc_ok = false;
-                        break;
-                    }
-
-                    uint32_t u_start = (w * total_units) / W;
-                    uint32_t u_end = ((w + 1) * total_units) / W;
-                    uint32_t u_off = 0;
-                    for (uint32_t ri = 0; ri < nrels && ri < 64; ri++) {
-                        uint32_t k = rel_k[ri];
-                        uint32_t r_start = u_off;
-                        uint32_t r_end = u_off + k;
-                        if (u_start >= r_end || u_end <= r_start) {
-                            /* Worker doesn't touch this relation */
-                            ctxs[w].k_copy_starts[ri] = 0;
-                            ctxs[w].k_copy_ends[ri] = 0;
-                        } else {
-                            uint32_t ks = (u_start > r_start)
-                                ? (u_start - r_start) : 0;
-                            uint32_t ke = (u_end < r_end)
-                                ? (u_end - r_start) : k;
-                            ctxs[w].k_copy_starts[ri] = ks;
-                            ctxs[w].k_copy_ends[ri] = ke;
-                        }
-                        u_off += k;
-                    }
-                }
-
-                if (!alloc_ok) {
-                    for (uint32_t w = 0; w < W; w++) {
-                        free((void *)ctxs[w].k_copy_starts);
-                        free((void *)ctxs[w].k_copy_ends);
-                        free((void *)ctxs[w].delta_rels);
-                    }
-                    free(ctxs);
-                    rc = ENOMEM;
-                    goto done;
-                }
+                ctxs[w].any_new = false;
+                ctxs[w].all_empty_delta = false;
+                ctxs[w].rc = 0;
             }
 
             /* DISPATCH */
@@ -3046,14 +3328,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
 
             if (!submit_ok) {
-                for (uint32_t w = 0; w < W; w++) {
+                for (uint32_t w = 0; w < W; w++)
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
-                    free((void *)ctxs[w].k_copy_starts);
-                    free((void *)ctxs[w].k_copy_ends);
-                    free((void *)ctxs[w].delta_rels);
-                }
-                free(ctxs);
                 rc = ENOMEM;
                 goto done;
             }
@@ -3068,14 +3345,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
 
             if (rc != 0) {
-                for (uint32_t w = 0; w < W; w++) {
+                for (uint32_t w = 0; w < W; w++)
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
-                    free((void *)ctxs[w].k_copy_starts);
-                    free((void *)ctxs[w].k_copy_ends);
-                    free((void *)ctxs[w].delta_rels);
-                }
-                free(ctxs);
                 goto done;
             }
 
@@ -3088,14 +3360,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 }
             }
             if (all_workers_empty) {
-                for (uint32_t w = 0; w < W; w++) {
+                for (uint32_t w = 0; w < W; w++)
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
-                    free((void *)ctxs[w].k_copy_starts);
-                    free((void *)ctxs[w].k_copy_ends);
-                    free((void *)ctxs[w].delta_rels);
-                }
-                free(ctxs);
                 outer_continue_next = true;
                 break;
             }
@@ -3115,31 +3382,17 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * detection.
              */
             if (tdd_check_convergence(ctxs, W)) {
-                for (uint32_t w = 0; w < W; w++) {
+                for (uint32_t w = 0; w < W; w++)
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
-                    free((void *)ctxs[w].k_copy_starts);
-                    free((void *)ctxs[w].k_copy_ends);
-                    free((void *)ctxs[w].delta_rels);
-                }
-                free(ctxs);
                 converged = true;
                 break;
             }
 
-            /* EXCHANGE: Mode 2 (self-join) uses broadcast so all workers
-             * maintain full IDB for IDB-IDB joins.  Mode 1 uses
-             * hash-partitioned scatter/gather via EXCHANGE ops. */
-            int brc = self_join_mode
-                ? tdd_broadcast_deltas(sp, coord, ctxs, W)
-                : tdd_exchange_deltas(sp, coord, ctxs, W);
-
-            for (uint32_t w = 0; w < W; w++) {
-                free((void *)ctxs[w].k_copy_starts);
-                free((void *)ctxs[w].k_copy_ends);
-                free((void *)ctxs[w].delta_rels);
-            }
-            free(ctxs);
+            /* EXCHANGE: hash-partitioned scatter/gather when plan carries
+             * EXCHANGE ops; broadcast otherwise (e.g. transitive closure). */
+            int brc = tdd_exchange_deltas(sp, coord, ctxs, W,
+                    !replicate_mode);
 
             if (brc != 0) {
                 rc = brc;
@@ -3159,6 +3412,12 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     } /* end outer loop */
 
 done:
+    /* Free pre-allocated worker contexts */
+    if (ctxs) {
+        for (uint32_t w = 0; w < W; w++)
+            free((void *)ctxs[w].delta_rels);
+        free(ctxs);
+    }
     coord->diff_operators_active = saved_diff;
     coord->total_iterations = final_eff_iter;
 

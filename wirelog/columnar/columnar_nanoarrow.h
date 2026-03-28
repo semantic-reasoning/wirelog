@@ -111,14 +111,26 @@ typedef struct {
  * workers.  The hash function matches col_rel_partition_by_key
  * (XXH3_64bits over concatenated key column values).
  *
- * @num_workers:     Number of target workers (W).
- * @key_col_idxs:    Physical column indices to hash on (owned array).
- * @key_col_count:   Number of key columns.
+ * @num_workers:       Number of target workers (W).
+ * @key_col_idxs:      IDB partition key columns (owned array).
+ * @key_col_count:     Number of IDB key columns.
+ * @edb_key_col_idxs:  EDB-side join columns matching key_col_idxs (owned).
+ *                      Used by tdd_init_workers_hybrid to partition the
+ *                      joinable EDB by the join key for work splitting.
+ *                      NULL when no EDB partition info is available.
+ * @edb_key_col_count: Number of EDB key columns.
+ * @edb_rel_name:      Name of the EDB relation to partition (owned string).
+ *                      Only this relation is hash-partitioned; all other
+ *                      non-IDB relations are replicated for correctness
+ *                      (e.g. anti-join tables need full copies).
  */
 typedef struct {
     uint32_t num_workers;
-    uint32_t *key_col_idxs; /* owned: physical column indices to hash */
+    uint32_t *key_col_idxs;     /* owned: IDB partition key columns */
     uint32_t key_col_count;
+    uint32_t *edb_key_col_idxs; /* owned: EDB-side join columns */
+    uint32_t edb_key_col_count;
+    char *edb_rel_name;         /* owned: EDB relation to partition */
 } wl_plan_op_exchange_t;
 
 /*

@@ -1109,6 +1109,21 @@ clone_exchange_opaque(const wl_plan_op_t *src, wl_plan_op_t *dst)
         memcpy(dm->key_col_idxs, sm->key_col_idxs,
             sm->key_col_count * sizeof(uint32_t));
     }
+    if (sm->edb_key_col_idxs && sm->edb_key_col_count > 0) {
+        dm->edb_key_col_count = sm->edb_key_col_count;
+        dm->edb_key_col_idxs
+            = (uint32_t *)malloc(sm->edb_key_col_count * sizeof(uint32_t));
+        if (dm->edb_key_col_idxs) {
+            memcpy(dm->edb_key_col_idxs, sm->edb_key_col_idxs,
+                sm->edb_key_col_count * sizeof(uint32_t));
+        } else {
+            dm->edb_key_col_count = 0; /* non-fatal: replicate fallback */
+        }
+    }
+    if (sm->edb_rel_name) {
+        dm->edb_rel_name = strdup_safe(sm->edb_rel_name);
+        /* non-fatal: replicate fallback if strdup fails */
+    }
     dst->opaque_data = dm;
     return 0;
 }
@@ -1356,6 +1371,8 @@ free_exchange_opaque(wl_plan_op_t *op)
         return;
     wl_plan_op_exchange_t *meta = (wl_plan_op_exchange_t *)op->opaque_data;
     free(meta->key_col_idxs);
+    free(meta->edb_key_col_idxs);
+    free(meta->edb_rel_name);
     free(meta);
     op->opaque_data = NULL;
 }
@@ -1703,8 +1720,15 @@ rewrite_insert_exchanges(wl_plan_t *plan)
 
             /* Find the best JOIN for EXCHANGE key: prefer a JOIN whose
              * right_relation is IDB in this stratum (correct partition key
-             * for 3-body rules like SG); fall back to last JOIN. */
+             * for 3-body rules like SG); fall back to last JOIN.
+             *
+             * Track whether IDB is the right operand (idb_on_right):
+             *   - IDB on RIGHT (e.g. nsa :- insert × nsa): use right_keys
+             *   - IDB on LEFT  (e.g. vbs :- vbs × blankStep): use left_keys
+             * The EXCHANGE key must match the IDB columns used in the join,
+             * since those are the probe columns in the next iteration. */
             const wl_plan_op_t *best_join = NULL;
+            bool idb_on_right = false;
 
             /* 1) Scan top-level ops backward for JOINs. */
             for (int i = (int)rel->op_count - 1; i >= 0; i--) {
@@ -1724,6 +1748,7 @@ rewrite_insert_exchanges(wl_plan_t *plan)
                     }
                     if (is_idb) {
                         best_join = &rel->ops[i];
+                        idb_on_right = true;
                         break;
                     }
                 }
@@ -1753,6 +1778,7 @@ rewrite_insert_exchanges(wl_plan_t *plan)
                             }
                             if (is_idb) {
                                 best_join = &kf->k_ops[0][i];
+                                idb_on_right = true;
                                 break;
                             }
                         }
@@ -1760,11 +1786,23 @@ rewrite_insert_exchanges(wl_plan_t *plan)
                 }
             }
 
-            if (!best_join || best_join->key_count == 0
-                || !best_join->left_keys)
+            if (!best_join || best_join->key_count == 0)
                 continue;
 
-            /* Build EXCHANGE metadata from the JOIN's left_keys. */
+            /* Select the correct key source based on IDB position:
+             * IDB on right → right_keys (IDB join columns)
+             * IDB on left  → left_keys  (IDB join columns) */
+            const char *const *exch_keys = idb_on_right
+                ? best_join->right_keys : best_join->left_keys;
+            if (!exch_keys)
+                continue;
+
+            /* Build EXCHANGE metadata from the selected join keys.
+             * The keys are columns of the IDB operand that participate
+             * in the join.  Since the EXCHANGE partitions the output
+             * relation (same schema as IDB), this ensures the partition
+             * key matches the recursive join probe key, giving each
+             * worker a complete local join. */
             wl_plan_op_exchange_t *meta
                 = (wl_plan_op_exchange_t *)calloc(
                     1, sizeof(wl_plan_op_exchange_t));
@@ -1780,7 +1818,7 @@ rewrite_insert_exchanges(wl_plan_t *plan)
             }
             bool ok = true;
             for (uint32_t k = 0; k < meta->key_col_count; k++) {
-                uint32_t idx = parse_col_index(best_join->left_keys[k]);
+                uint32_t idx = parse_col_index(exch_keys[k]);
                 if (idx == UINT32_MAX) {
                     ok = false;
                     break;
@@ -1791,6 +1829,123 @@ rewrite_insert_exchanges(wl_plan_t *plan)
                 free(meta->key_col_idxs);
                 free(meta);
                 continue;
+            }
+
+            /* Store EDB-side join columns (the OTHER side from exch_keys).
+             * When IDB is on right, EDB keys = left_keys.
+             * When IDB is on left, EDB keys = right_keys.
+             * tdd_init_workers_hybrid uses these to partition EDB by the
+             * join key so each worker scans only 1/W of the EDB. */
+            const char *const *edb_keys = idb_on_right
+                ? best_join->left_keys : best_join->right_keys;
+            if (edb_keys && best_join->key_count > 0) {
+                meta->edb_key_col_idxs = (uint32_t *)malloc(
+                    best_join->key_count * sizeof(uint32_t));
+                if (meta->edb_key_col_idxs) {
+                    meta->edb_key_col_count = best_join->key_count;
+                    bool edb_ok = true;
+                    for (uint32_t k = 0; k < meta->edb_key_col_count; k++) {
+                        uint32_t idx = parse_col_index(edb_keys[k]);
+                        if (idx == UINT32_MAX) {
+                            edb_ok = false;
+                            break;
+                        }
+                        meta->edb_key_col_idxs[k] = idx;
+                    }
+                    if (!edb_ok) {
+                        free(meta->edb_key_col_idxs);
+                        meta->edb_key_col_idxs = NULL;
+                        meta->edb_key_col_count = 0;
+                    }
+                }
+            }
+
+            /* Identify the EDB relation to partition.
+             * IDB on right → EDB is the left operand (find first non-IDB
+             *   VARIABLE in the ops feeding the JOIN).
+             * IDB on left  → EDB is best_join->right_relation. */
+            if (meta->edb_key_col_idxs) {
+                const char *edb_name = NULL;
+                if (!idb_on_right) {
+                    edb_name = best_join->right_relation;
+                } else {
+                    /* Walk backward from best_join to find the nearest
+                     * non-IDB VARIABLE that feeds the JOIN's left side.
+                     * Forward scanning picks up base-case VARIABLEs that
+                     * feed CONCAT, not the recursive JOIN. */
+                    const wl_plan_op_t *scan = rel->ops;
+                    uint32_t scan_n = rel->op_count;
+                    if (rel->op_count >= 1
+                        && rel->ops[0].op == WL_PLAN_OP_K_FUSION) {
+                        const wl_plan_op_k_fusion_t *kf =
+                            (const wl_plan_op_k_fusion_t *)
+                            rel->ops[0].opaque_data;
+                        if (kf && kf->k > 0 && kf->k_ops && kf->k_ops[0]) {
+                            scan = kf->k_ops[0];
+                            scan_n = kf->k_op_counts[0];
+                        }
+                    }
+                    /* Find best_join position in the scan array. */
+                    int join_pos = -1;
+                    for (uint32_t j = 0; j < scan_n; j++) {
+                        if (&scan[j] == best_join) {
+                            join_pos = (int)j;
+                            break;
+                        }
+                    }
+                    if (join_pos < 0)
+                        join_pos = (int)scan_n; /* fallback */
+                    /* Walk backward from JOIN to find nearest non-IDB
+                     * VARIABLE (the EDB that feeds the JOIN). */
+                    for (int j = join_pos - 1; j >= 0; j--) {
+                        if (scan[j].op != WL_PLAN_OP_VARIABLE
+                            || !scan[j].relation_name)
+                            continue;
+                        bool is_stratum_idb = false;
+                        for (uint32_t rj = 0; rj < st->relation_count; rj++) {
+                            if (strcmp(scan[j].relation_name,
+                                st->relations[rj].name) == 0) {
+                                is_stratum_idb = true;
+                                break;
+                            }
+                        }
+                        if (!is_stratum_idb) {
+                            edb_name = scan[j].relation_name;
+                            break;
+                        }
+                    }
+                }
+                /* Only partition if EDB appears exactly once in the
+                 * rule body.  Multi-use EDB (e.g. parent in SG 3-body
+                 * rules) must remain replicated for correctness. */
+                if (edb_name) {
+                    uint32_t edb_refs = 0;
+                    const wl_plan_op_t *scan2 = rel->ops;
+                    uint32_t scan2_n = rel->op_count;
+                    if (rel->op_count >= 1
+                        && rel->ops[0].op == WL_PLAN_OP_K_FUSION) {
+                        const wl_plan_op_k_fusion_t *kf2 =
+                            (const wl_plan_op_k_fusion_t *)
+                            rel->ops[0].opaque_data;
+                        if (kf2 && kf2->k > 0
+                            && kf2->k_ops && kf2->k_ops[0]) {
+                            scan2 = kf2->k_ops[0];
+                            scan2_n = kf2->k_op_counts[0];
+                        }
+                    }
+                    for (uint32_t j = 0; j < scan2_n; j++) {
+                        if (scan2[j].relation_name
+                            && strcmp(scan2[j].relation_name,
+                            edb_name) == 0)
+                            edb_refs++;
+                        if (scan2[j].right_relation
+                            && strcmp(scan2[j].right_relation,
+                            edb_name) == 0)
+                            edb_refs++;
+                    }
+                    if (edb_refs <= 1)
+                        meta->edb_rel_name = strdup_safe(edb_name);
+                }
             }
 
             /* Append EXCHANGE as new top-level op at end of ops array. */

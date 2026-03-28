@@ -1405,11 +1405,25 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
         }
     }
 
-    /* Execute strata in order, skipping unaffected ones */
+    /* Issue #361: Use TDD parallel evaluation in snapshot when workers are
+     * available and facts have been loaded (initial non-incremental eval).
+     * col_eval_stratum_tdd falls back to single-threaded when W<=1. */
+    bool snapshot_tdd_eligible = (affected_mask == UINT64_MAX
+        && sess->num_workers > 1 && sess->tdd_workers
+        && sess->last_inserted_relation != NULL);
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
             continue;
-        int rc = col_eval_stratum(&plan->strata[si], sess, si);
+        /* Issue #361: Only use TDD for recursive, non-self-join strata
+         * in snapshot.  Non-recursive TDD partitions all relations by
+         * col0, breaking EDB joins.  Self-join TDD clears IDB which
+         * deletes base facts when EDB and IDB share a relation. */
+        bool use_tdd = snapshot_tdd_eligible
+            && plan->strata[si].is_recursive
+            && !tdd_stratum_has_idb_self_join(&plan->strata[si]);
+        int rc = use_tdd
+            ? col_eval_stratum_tdd(&plan->strata[si], sess, si)
+            : col_eval_stratum(&plan->strata[si], sess, si);
         if (rc != 0) {
             /* Issue #177: Cleanup pre-seeded $d$ deltas on error.
              * If evaluation fails, remove temporary delta relations created

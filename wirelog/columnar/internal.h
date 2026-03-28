@@ -241,6 +241,13 @@ typedef struct {
      * When col_shared[c] is true, columns[c] is borrowed (not owned) and
      * must NOT be freed on destroy. NULL when no sharing is active. */
     bool *col_shared;
+    /* Hash-set dedup for TDD worker IDB (Issue #361).
+     * When non-NULL, consolidation uses O(D) hash lookup instead of O(N)
+     * merge walk.  Allocated by tdd_init_workers_hybrid for IDB relations,
+     * freed on relation destruction.  NULL for non-TDD relations. */
+    uint64_t *dedup_slots;     /* open-addressing hash table (0 = empty) */
+    uint32_t dedup_cap;        /* power of 2 */
+    uint32_t dedup_count;
 } col_rel_t;
 
 /* ======================================================================== */
@@ -660,11 +667,6 @@ typedef struct wl_col_session_t {
      * iteration > 0 (FORCE_DELTA with absent delta -> empty short-circuit).
      * Only valid during col_eval_stratum execution. */
     uint32_t current_iteration;
-    /* Issue #361: TDD Mode 2 K-copy range for col_op_k_fusion.
-     * When kfusion_k_end > 0, only evaluate copies [k_start, k_end).
-     * When kfusion_k_end == 0, evaluate all copies (default). */
-    uint32_t kfusion_k_start;
-    uint32_t kfusion_k_end;
     /* Delta-seeded incremental evaluation (issue #83).
      * When true, EDB delta relations have been pre-seeded into the session
      * before re-evaluation. FORCE_DELTA at iteration 0 pushes empty (not full)
@@ -1164,6 +1166,8 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
 int
 col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t stratum_idx);
+bool
+tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp);
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);
