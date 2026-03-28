@@ -1957,10 +1957,97 @@ tdd_dedup_rel(col_rel_t *r)
     if (!r || r->nrows <= 1 || r->ncols == 0)
         return;
 
-    col_rel_radix_sort_int64(r);
-
-    uint32_t out = 1;
     uint32_t ncols = r->ncols;
+    uint32_t nrows = r->nrows;
+
+    /* Presort check: O(n) scan avoids sort for already-ordered input
+     * (e.g. single-worker runs or pre-sorted merge results). */
+    bool sorted = true;
+    for (uint32_t i = 1; i < nrows && sorted; i++) {
+        for (uint32_t c = 0; c < ncols; c++) {
+            int64_t a = r->columns[c][i - 1];
+            int64_t b = r->columns[c][i];
+            if (a < b)
+                break;         /* this pair is in order */
+            if (a > b) {
+                sorted = false;
+                break;
+            }
+        }
+    }
+
+    if (!sorted) {
+        /* Hash-based dedup: O(n), avoids O(n log n) sort.
+         * Open-addressing table with FNV-1a row hashing, load <= 0.5.
+         * Two-pass: first pass marks unique rows (read-only on columns),
+         * second pass compacts in-place. */
+        uint32_t cap = 4;
+        while (cap < nrows * 2)
+            cap <<= 1;
+        uint32_t mask = cap - 1;
+        uint32_t *ht = (uint32_t *)malloc(cap * sizeof(uint32_t));
+        uint8_t  *keep = (uint8_t *)malloc(nrows);
+
+        if (!ht || !keep) {
+            /* Allocation failure: fall back to sort-based path */
+            free(ht);
+            free(keep);
+            col_rel_radix_sort_int64(r);
+            sorted = true; /* fall through to sorted dedup below */
+        } else {
+            memset(ht, 0xFF, cap * sizeof(uint32_t)); /* 0xFF = UINT32_MAX */
+            memset(keep, 0, nrows);
+
+            /* First pass: build hash table, mark unique rows */
+            for (uint32_t i = 0; i < nrows; i++) {
+                uint64_t h = 14695981039346656037ULL; /* FNV-1a offset basis */
+                for (uint32_t c = 0; c < ncols; c++) {
+                    h ^= (uint64_t)r->columns[c][i];
+                    h *= 1099511628211ULL; /* FNV prime */
+                }
+                uint32_t slot = (uint32_t)(h & mask);
+                for (;;) {
+                    uint32_t ex = ht[slot];
+                    if (ex == UINT32_MAX) {
+                        ht[slot] = i;
+                        keep[i] = 1;
+                        break;
+                    }
+                    bool eq = true;
+                    for (uint32_t c = 0; c < ncols; c++) {
+                        if (r->columns[c][ex] != r->columns[c][i]) {
+                            eq = false;
+                            break;
+                        }
+                    }
+                    if (eq)
+                        break; /* duplicate */
+                    slot = (slot + 1) & mask;
+                }
+            }
+            free(ht);
+
+            /* Second pass: compact columns in-place */
+            uint32_t out = 0;
+            for (uint32_t i = 0; i < nrows; i++) {
+                if (!keep[i])
+                    continue;
+                if (out != i) {
+                    col_columns_copy_row(r->columns, out,
+                        (int64_t *const *)r->columns, i, ncols);
+                    if (r->timestamps)
+                        r->timestamps[out] = r->timestamps[i];
+                }
+                out++;
+            }
+            free(keep);
+            r->nrows = out;
+            return;
+        }
+    }
+
+    /* Sorted path: linear scan dedup (input sorted, no sort needed) */
+    uint32_t out = 1;
     for (uint32_t i = 1; i < r->nrows; i++) {
         bool dup = true;
         for (uint32_t c = 0; c < ncols; c++) {
