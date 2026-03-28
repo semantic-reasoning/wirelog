@@ -1316,6 +1316,8 @@ typedef struct {
     bool all_empty_delta;          /* OUT: all FORCE_DELTA empty, skipped */
     col_rel_t **delta_rels;        /* OUT: produced deltas [nrels], coord frees */
     int rc;                        /* OUT: return code                */
+    uint32_t copy_start;           /* Mode 2: first relation plan index */
+    uint32_t copy_end;             /* Mode 2: one-past-last plan index  */
 } col_eval_tdd_worker_ctx_t;
 
 /*
@@ -1641,8 +1643,14 @@ tdd_worker_subpass_fn(void *arg)
         snap[ri] = r ? r->nrows : 0;
     }
 
-    /* Evaluate all relation plans (eval.c:505-604) */
+    /* Evaluate all relation plans (eval.c:505-604).
+     * Mode 2 (work partitioning): only evaluate copies in [copy_start, copy_end).
+     * copy_end == 0 means evaluate all (Mode 1 or single-worker). */
     for (uint32_t ri = 0; ri < nrels; ri++) {
+        if (ctx->copy_end > 0
+            && (ri < ctx->copy_start || ri >= ctx->copy_end))
+            continue;
+
         const wl_plan_relation_t *rp = &sp->relations[ri];
 
         if (has_empty_forced_delta(rp, sess, eff_iter))
@@ -2240,6 +2248,218 @@ exchange_done:
 }
 
 /*
+ * tdd_stratum_has_idb_self_join:
+ * Returns true if any JOIN in the stratum has a right_relation that is
+ * also an IDB relation in this stratum (i.e., appears in sp->relations[]).
+ * Strata with IDB-IDB self-joins (e.g. CSPA's valueFlow ⋈ valueFlow)
+ * require full replication (Mode 2) instead of data partitioning (Mode 1).
+ */
+static bool
+tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp)
+{
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const wl_plan_relation_t *rel = &sp->relations[ri];
+        for (uint32_t oi = 0; oi < rel->op_count; oi++) {
+            const wl_plan_op_t *op = &rel->ops[oi];
+
+            /* Check top-level JOINs */
+            if (op->op == WL_PLAN_OP_JOIN && op->right_relation) {
+                for (uint32_t rj = 0; rj < sp->relation_count; rj++) {
+                    if (strcmp(op->right_relation,
+                        sp->relations[rj].name) == 0)
+                        return true;
+                }
+            }
+
+            /* Check JOINs inside K_FUSION */
+            if (op->op == WL_PLAN_OP_K_FUSION && op->opaque_data) {
+                const wl_plan_op_k_fusion_t *kf =
+                    (const wl_plan_op_k_fusion_t *)op->opaque_data;
+                for (uint32_t ki = 0; ki < kf->k; ki++) {
+                    for (uint32_t koi = 0; koi < kf->k_op_counts[ki];
+                        koi++) {
+                        const wl_plan_op_t *kop = &kf->k_ops[ki][koi];
+                        if (kop->op == WL_PLAN_OP_JOIN
+                            && kop->right_relation) {
+                            for (uint32_t rj = 0;
+                                rj < sp->relation_count; rj++) {
+                                if (strcmp(kop->right_relation,
+                                    sp->relations[rj].name) == 0)
+                                    return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * tdd_init_workers_hybrid:
+ * Hybrid initialization for Mode 1 (data partitioning) strata.
+ *
+ * IDB relations (those in sp->relations[]) are partitioned across workers
+ * by their EXCHANGE key columns.  Non-IDB relations (EDB, earlier-stratum
+ * derived) are replicated to every worker.
+ *
+ * This gives each worker ~1/W of the IDB while ensuring complete join
+ * coverage: IDB-EDB joins are always complete because EDB is replicated.
+ * The hash-partitioned delta exchange maintains the partition invariant.
+ */
+static int
+tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
+{
+    tdd_cleanup_workers(coord);
+
+    uint32_t W = coord->num_workers;
+    uint32_t nrels = coord->nrels;
+
+    if (nrels == 0) {
+        for (uint32_t w = 0; w < W; w++) {
+            int rc = col_worker_session_create(coord, w, NULL, 0,
+                    &coord->tdd_workers[w]);
+            if (rc != 0) {
+                tdd_cleanup_workers(coord);
+                return rc;
+            }
+            coord->tdd_workers_count = w + 1;
+        }
+        return 0;
+    }
+
+    col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
+    if (!worker_rels)
+        return ENOMEM;
+
+    int rc = 0;
+    for (uint32_t w = 0; w < W; w++) {
+        worker_rels[w] = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
+        if (!worker_rels[w]) {
+            for (uint32_t j = 0; j < w; j++)
+                free((void *)worker_rels[j]);
+            free((void *)worker_rels);
+            return ENOMEM;
+        }
+    }
+
+    uint32_t rels_built = 0;
+
+    for (uint32_t r = 0; r < nrels && rc == 0; r++) {
+        col_rel_t *rel = coord->rels[r];
+        if (!rel)
+            continue;
+
+        const char *name = rel->name;
+
+        /* Check if this relation is IDB in the current stratum and
+         * extract its EXCHANGE key for partitioning. */
+        bool is_idb = false;
+        const uint32_t *exchange_key = NULL;
+        uint32_t exchange_key_count = 0;
+
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            if (strcmp(name, sp->relations[ri].name) != 0)
+                continue;
+            is_idb = true;
+            for (uint32_t oi = 0; oi < sp->relations[ri].op_count; oi++) {
+                if (sp->relations[ri].ops[oi].op == WL_PLAN_OP_EXCHANGE) {
+                    const wl_plan_op_exchange_t *meta =
+                        (const wl_plan_op_exchange_t *)
+                        sp->relations[ri].ops[oi].opaque_data;
+                    if (meta && meta->key_col_count > 0) {
+                        exchange_key = meta->key_col_idxs;
+                        exchange_key_count = meta->key_col_count;
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+
+        if (is_idb && rel->nrows > 0 && rel->ncols > 0) {
+            /* Partition IDB by EXCHANGE key (col0 fallback) */
+            uint32_t default_key[] = { 0 };
+            const uint32_t *key = (exchange_key && exchange_key_count > 0)
+                ? exchange_key : default_key;
+            uint32_t key_count = (exchange_key && exchange_key_count > 0)
+                ? exchange_key_count : 1u;
+
+            col_rel_t **parts = (col_rel_t **)calloc(W, sizeof(col_rel_t *));
+            if (!parts) {
+                rc = ENOMEM;
+            } else {
+                rc = col_rel_partition_by_key(rel, key, key_count, W, parts);
+                if (rc == 0) {
+                    for (uint32_t w = 0; w < W && rc == 0; w++) {
+                        free(parts[w]->name);
+                        parts[w]->name = wl_strdup(name);
+                        if (!parts[w]->name) {
+                            rc = ENOMEM;
+                        } else {
+                            worker_rels[w][rels_built] = parts[w];
+                            parts[w] = NULL;
+                        }
+                    }
+                }
+                for (uint32_t w = 0; w < W; w++)
+                    col_rel_destroy(parts[w]);
+                free(parts);
+            }
+        } else {
+            /* Non-IDB or empty IDB: replicate to all workers */
+            for (uint32_t w = 0; w < W && rc == 0; w++) {
+                col_rel_t *copy = col_rel_new_auto(name, rel->ncols);
+                if (!copy) {
+                    rc = ENOMEM;
+                    break;
+                }
+                if (rel->nrows > 0) {
+                    rc = col_rel_append_all(copy, rel, NULL);
+                    if (rc != 0) {
+                        col_rel_destroy(copy);
+                        break;
+                    }
+                }
+                worker_rels[w][rels_built] = copy;
+            }
+        }
+
+        if (rc == 0)
+            rels_built++;
+    }
+
+    uint32_t created = 0;
+    if (rc == 0) {
+        for (uint32_t w = 0; w < W; w++) {
+            rc = col_worker_session_create(coord, w,
+                    worker_rels[w], rels_built, &coord->tdd_workers[w]);
+            if (rc != 0)
+                break;
+            created++;
+        }
+    }
+
+    if (rc != 0) {
+        for (uint32_t w = created; w < W; w++) {
+            for (uint32_t p = 0; p < rels_built; p++)
+                col_rel_destroy(worker_rels[w][p]);
+        }
+        coord->tdd_workers_count = created;
+        tdd_cleanup_workers(coord);
+    } else {
+        coord->tdd_workers_count = W;
+    }
+
+    for (uint32_t w = 0; w < W; w++)
+        free((void *)worker_rels[w]);
+    free((void *)worker_rels);
+
+    return rc;
+}
+
+/*
  * tdd_broadcast_deltas:
  * After a sub-pass barrier, union all worker deltas for each IDB
  * relation and install the union as $d$<relname> on EVERY worker.
@@ -2417,17 +2637,19 @@ tdd_check_convergence(const col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
  * col_eval_stratum_tdd_recursive:
  * Coordinator-driven semi-naive fixed-point for recursive strata.
  *
- * Pipeline per sub-pass:
- *   DISPATCH (W workers via workqueue) → BARRIER → CONVERGENCE CHECK
- *   → BROADCAST EXCHANGE (tdd_broadcast_deltas) → next sub-pass
+ * Issue #361: Two parallelism modes selected per-stratum:
+ *
+ * Mode 1 (data partitioning) — no IDB-IDB self-joins:
+ *   tdd_init_workers_hybrid partitions IDB by EXCHANGE key, replicates EDB.
+ *   Hash-partitioned delta exchange maintains the partition invariant.
+ *   Each worker evaluates 1/W of IDB data.
+ *
+ * Mode 2 (work partitioning) — IDB-IDB self-joins (e.g. CSPA):
+ *   tdd_replicate_workers gives every worker full data.
+ *   Workers evaluate disjoint subsets of relation plan copies.
+ *   Broadcast delta exchange keeps IDB synchronized across workers.
  *
  * After convergence, merges worker IDB into coordinator and deduplicates.
- * Broadcast exchange may produce the same derived tuple on multiple workers
- * (when multiple equal-length paths lead to the same conclusion); the final
- * sort+dedup step removes these.
- *
- * Phase 3 will replace the broadcast with a hash-partitioned scatter/gather
- * exchange that eliminates cross-worker duplicates and improves scalability.
  */
 static int
 col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
@@ -2472,14 +2694,18 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             coord->outer_epoch);
     }
 
-    /* Issue #352: Replicate (not partition) coordinator relations to workers.
-     * Recursive strata may contain multi-way joins on columns other than
-     * col0 (e.g. same-generation self-join on parent.col1).  Partitioning
-     * by col0 would split rows that share the same join key across workers,
-     * causing missed joins.  Replication ensures every worker can evaluate
-     * complete joins at the cost of redundant computation; the final
-     * merge+dedup step eliminates duplicates. */
-    rc = tdd_replicate_workers(coord);
+    /* Issue #361: Select parallelism mode based on join structure.
+     * Mode 2 (replicate) for strata with IDB-IDB self-joins (CSPA).
+     * Mode 1 (hybrid partition) for all other recursive strata.
+     * When no new EDB was inserted (frontier-skip path), use replicate
+     * to preserve frontier skip semantics — the stratum will reconverge
+     * within the recorded frontier iterations regardless. */
+    bool replicate_mode = tdd_stratum_has_idb_self_join(sp)
+        || (coord->last_inserted_relation == NULL);
+    if (replicate_mode)
+        rc = tdd_replicate_workers(coord);
+    else
+        rc = tdd_init_workers_hybrid(sp, coord);
     if (rc != 0)
         return rc;
 
@@ -2676,8 +2902,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 break;
             }
 
-            /* EXCHANGE: hash-partitioned scatter/gather when plan carries
-             * EXCHANGE ops; broadcast otherwise (e.g. transitive closure). */
+            /* EXCHANGE: hash-partitioned scatter/gather when the plan
+             * carries EXCHANGE ops; broadcast fallback otherwise.
+             * Mode 2 (replicate) also uses hash exchange: all workers
+             * produce identical deltas, exchange gives each 1/W of
+             * deltas to join against full IDB on subsequent iterations. */
             int brc = tdd_exchange_deltas(sp, coord, ctxs, W);
 
             for (uint32_t w = 0; w < W; w++)
