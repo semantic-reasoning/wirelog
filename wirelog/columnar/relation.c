@@ -1000,6 +1000,13 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     uint32_t count[256];
     uint32_t prefix[256];
 
+    /* Parameterized radix width (Issue #363 Phase 5a).
+     * radix_bits controls pass count and histogram size.
+     * k=8: 8 passes × 256 buckets (current, 1KB histogram).
+     * k=16 (Phase 5c): 4 passes × 65536 buckets (256KB histogram). */
+    const uint32_t radix_bits = 8u;
+    const uint32_t num_passes = 64u / radix_bits;  /* 8 for k=8 */
+
 #ifdef WL_RADIX_BENCH
     /* Phase 0: per-pass timing accumulators (Issue #363).
      * _tU = uniform check + count pass (fused in radix_uniform_count_fused_fast)
@@ -1012,24 +1019,24 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 #endif
 
     /* LSD radix sort: column nc-1 (LSB) to column 0 (MSB),
-     * byte 0 (LSB) to byte 7 (MSB) within each column.
+     * pass 0 (LSB) to pass num_passes-1 (MSB) within each column.
      * Optimization (Issue #334): direct column pointer avoids accessor
      * overhead in the hot loop. */
     for (int c = (int)nc - 1; c >= 0; c--) {
         const int64_t *col_data = r->columns[c]; /* contiguous column */
-        for (int b = 0; b < 8; b++) {
-            int shift = b * 8;
-            int is_sign_byte = (b == 7);
+        for (uint32_t pass = 0; pass < num_passes; pass++) {
+            int shift = (int)(pass * radix_bits);
+            int is_sign_pass = (pass == num_passes - 1);
 
             /* Skip-pass optimization (Issue #343): check if all values
-             * produce the same byte at this position.  For typical Datalog
-             * data (small integers), upper bytes are all zero, allowing
-             * 50-75% of passes to be skipped entirely. */
+             * produce the same k-bit word at this position.  For typical
+             * Datalog data (small integers), upper passes are all zero,
+             * allowing 50-75% of passes to be skipped entirely. */
             uint8_t first_bv;
             {
                 int64_t val = col_data[start_row + src[0]];
                 first_bv = (uint8_t)((uint64_t)val >> shift);
-                if (is_sign_byte)
+                if (is_sign_pass)
                     first_bv ^= 0x80u;
             }
             /* Fused uniform check + count pass: single gather traversal
@@ -1040,12 +1047,12 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
             _t0 = now_ns();
 #endif
             if (radix_uniform_count_fused_fast(col_data, start_row, src,
-                nrows, shift, is_sign_byte, first_bv, bv_cache, count)) {
+                nrows, shift, is_sign_pass, first_bv, bv_cache, count)) {
 #ifdef WL_RADIX_BENCH
                 _tU += now_ns() - _t0;
                 _nSk++;
 #endif
-                continue; /* all values identical at this byte — skip */
+                continue; /* all values identical at this pass — skip */
             }
 #ifdef WL_RADIX_BENCH
             _tU += now_ns() - _t0;
