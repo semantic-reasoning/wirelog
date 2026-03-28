@@ -1110,9 +1110,14 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 
     for (uint32_t c = 0; c < nc; c++) {
         int64_t *col = r->columns[c];
-        /* Gather: copy in permuted order */
-        for (uint32_t i = 0; i < nrows; i++)
+        /* Gather: copy in permuted order.  Prefetch 8 elements ahead to
+         * hide L3 gather latency (Issue #363 Phase 3): 1 element per
+         * iteration × 8 = 64 bytes = 1 cache line ahead. */
+        for (uint32_t i = 0; i < nrows; i++) {
+            if (i + 8u < nrows)
+                WL_PREFETCH_R(col + start_row + src[i + 8u]);
             temp_col[i] = col[start_row + src[i]];
+        }
         /* Scatter back */
         memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
     }
