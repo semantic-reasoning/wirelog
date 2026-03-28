@@ -18,6 +18,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
+
+#ifdef __ARM_NEON__
+#include <arm_neon.h>
+#endif
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 void
