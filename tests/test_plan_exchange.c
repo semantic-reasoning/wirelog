@@ -277,21 +277,46 @@ test_plan_exchange_key_metadata(void)
 }
 
 /* ----------------------------------------------------------------
- * Test 4: Multiple JOINs each relation gets EXCHANGE
+ * Helper: count EXCHANGE ops in a relation plan, including those
+ * inside K_FUSION operator sequences.
+ * ---------------------------------------------------------------- */
+
+static uint32_t
+count_exchanges_deep(const wl_plan_relation_t *rel)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < rel->op_count; i++) {
+        if (rel->ops[i].op == WL_PLAN_OP_EXCHANGE) {
+            n++;
+        } else if (rel->ops[i].op == WL_PLAN_OP_K_FUSION
+            && rel->ops[i].opaque_data) {
+            /* Search inside K_FUSION sequences */
+            const wl_plan_op_k_fusion_t *kf
+                = (const wl_plan_op_k_fusion_t *)rel->ops[i].opaque_data;
+            for (uint32_t d = 0; d < kf->k; d++) {
+                for (uint32_t j = 0; j < kf->k_op_counts[d]; j++) {
+                    if (kf->k_ops[d][j].op == WL_PLAN_OP_EXCHANGE)
+                        n++;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+/* ----------------------------------------------------------------
+ * Test 4: Multiple recursive rules - each gets EXCHANGE
  *
- * A rule with multiple body atoms (3-way join) should still get
- * at least one EXCHANGE in the recursive relation plan.
+ * Multiple recursive rules (K >= 2 delta copies) will be wrapped in
+ * K_FUSION by rewrite_multiway_delta.  The EXCHANGE ops inserted
+ * before K_FUSION expansion should be cloned into each sequence.
  * ---------------------------------------------------------------- */
 
 static void
 test_plan_multi_join_exchange(void)
 {
-    TEST("multi-join recursive rule gets EXCHANGE");
+    TEST("multi-rule recursive relation gets EXCHANGE (including K_FUSION)");
 
-    /* Three relations with a recursive rule involving multiple joins:
-     * reach(a, c) :- reach(a, b), link(b, c).
-     * reach(a, c) :- reach(a, b), hop(b, c).
-     * This produces a plan with multiple join operators for reach. */
     const char *src = ".decl link(x: int32, y: int32)\n"
         "link(1, 2). link(2, 3).\n"
         ".decl hop(x: int32, y: int32)\n"
@@ -316,14 +341,13 @@ test_plan_multi_join_exchange(void)
             if (!rel->name || strcmp(rel->name, "reach") != 0)
                 continue;
 
-            uint32_t exchange_count
-                = count_ops(rel, WL_PLAN_OP_EXCHANGE);
+            uint32_t exchange_count = count_exchanges_deep(rel);
             if (exchange_count >= 1)
                 found_recursive_with_exchange = true;
         }
     }
     ASSERT(found_recursive_with_exchange,
-        "recursive reach with multiple JOINs must have EXCHANGE");
+        "recursive reach must have EXCHANGE (top-level or inside K_FUSION)");
 
     wl_plan_free(plan);
     PASS();

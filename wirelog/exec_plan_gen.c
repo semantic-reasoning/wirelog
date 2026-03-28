@@ -1082,6 +1082,38 @@ clone_lftj_opaque(const wl_plan_op_t *src, wl_plan_op_t *dst)
 }
 
 /**
+ * Deep-copy EXCHANGE opaque_data (wl_plan_op_exchange_t + key_col_idxs).
+ */
+static int
+clone_exchange_opaque(const wl_plan_op_t *src, wl_plan_op_t *dst)
+{
+    const wl_plan_op_exchange_t *sm
+        = (const wl_plan_op_exchange_t *)src->opaque_data;
+    if (!sm) {
+        dst->opaque_data = NULL;
+        return 0;
+    }
+    wl_plan_op_exchange_t *dm
+        = (wl_plan_op_exchange_t *)calloc(1, sizeof(wl_plan_op_exchange_t));
+    if (!dm)
+        return -1;
+    dm->num_workers = sm->num_workers;
+    dm->key_col_count = sm->key_col_count;
+    if (sm->key_col_idxs && sm->key_col_count > 0) {
+        dm->key_col_idxs
+            = (uint32_t *)malloc(sm->key_col_count * sizeof(uint32_t));
+        if (!dm->key_col_idxs) {
+            free(dm);
+            return -1;
+        }
+        memcpy(dm->key_col_idxs, sm->key_col_idxs,
+            sm->key_col_count * sizeof(uint32_t));
+    }
+    dst->opaque_data = dm;
+    return 0;
+}
+
+/**
  * Deep-copy a single plan op (duplicates all owned strings/buffers).
  */
 static int
@@ -1170,6 +1202,8 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
     }
     if (src->op == WL_PLAN_OP_LFTJ)
         return clone_lftj_opaque(src, dst);
+    if (src->op == WL_PLAN_OP_EXCHANGE)
+        return clone_exchange_opaque(src, dst);
     return 0;
 }
 
@@ -1626,6 +1660,117 @@ build_lftj_op(const wl_plan_op_t *ops, uint32_t start, uint32_t len,
 }
 
 /*
+ * Parse a "colN" key string to a physical column index.
+ * Returns 0 as fallback if the string is malformed.
+ */
+static uint32_t
+parse_col_index(const char *key)
+{
+    if (!key || strncmp(key, "col", 3) != 0)
+        return 0;
+    return (uint32_t)strtoul(key + 3, NULL, 10);
+}
+
+/*
+ * Post-pass: insert WL_PLAN_OP_EXCHANGE after the last JOIN in each
+ * relation plan within a recursive stratum.  Conservative strategy for
+ * Issue #319: always correct, may over-communicate.
+ *
+ * Run AFTER rewrite_lftj_chains (LFTJ replaces EDB-only chains that
+ * should not get EXCHANGE) and BEFORE rewrite_multiway_delta (so
+ * EXCHANGE ops get cloned into K delta copies).
+ */
+static void
+rewrite_insert_exchanges(wl_plan_t *plan)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        wl_plan_stratum_t *st = (wl_plan_stratum_t *)&plan->strata[s];
+        if (!st->is_recursive || !st->relations)
+            continue;
+
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            wl_plan_relation_t *rel = (wl_plan_relation_t *)&st->relations[r];
+            if (!rel->ops || rel->op_count == 0)
+                continue;
+
+            /* Find the last JOIN in this relation plan */
+            int last_join = -1;
+            for (int i = (int)rel->op_count - 1; i >= 0; i--) {
+                if (rel->ops[i].op == WL_PLAN_OP_JOIN) {
+                    last_join = i;
+                    break;
+                }
+            }
+            if (last_join < 0)
+                continue; /* no JOINs, nothing to do */
+
+            /* Build new ops array: original ops + 1 EXCHANGE after last JOIN */
+            uint32_t new_count = rel->op_count + 1;
+            wl_plan_op_t *new_ops
+                = (wl_plan_op_t *)calloc(new_count, sizeof(wl_plan_op_t));
+            if (!new_ops)
+                continue;
+
+            uint32_t ni = 0;
+            bool ok = true;
+            for (uint32_t i = 0; i < rel->op_count && ok; i++) {
+                if (clone_plan_op(&rel->ops[i], &new_ops[ni]) != 0) {
+                    ok = false;
+                    break;
+                }
+                ni++;
+
+                if ((int)i == last_join) {
+                    /* Insert EXCHANGE op after this JOIN */
+                    const wl_plan_op_t *join_op = &rel->ops[i];
+
+                    wl_plan_op_exchange_t *meta
+                        = (wl_plan_op_exchange_t *)calloc(
+                            1, sizeof(wl_plan_op_exchange_t));
+                    if (!meta) {
+                        ok = false;
+                        break;
+                    }
+                    meta->num_workers = 0; /* set at eval time */
+                    meta->key_col_count = join_op->key_count;
+                    if (meta->key_col_count > 0 && join_op->left_keys) {
+                        meta->key_col_idxs = (uint32_t *)malloc(
+                            meta->key_col_count * sizeof(uint32_t));
+                        if (!meta->key_col_idxs) {
+                            free(meta);
+                            ok = false;
+                            break;
+                        }
+                        for (uint32_t k = 0; k < meta->key_col_count; k++)
+                            meta->key_col_idxs[k]
+                                = parse_col_index(join_op->left_keys[k]);
+                    }
+
+                    memset(&new_ops[ni], 0, sizeof(wl_plan_op_t));
+                    new_ops[ni].op = WL_PLAN_OP_EXCHANGE;
+                    new_ops[ni].opaque_data = meta;
+                    ni++;
+                }
+            }
+
+            if (!ok) {
+                for (uint32_t o = 0; o < ni; o++)
+                    free_op(&new_ops[o]);
+                free(new_ops);
+                continue;
+            }
+
+            /* Swap in the rewritten op list */
+            for (uint32_t o = 0; o < rel->op_count; o++)
+                free_op((wl_plan_op_t *)&rel->ops[o]);
+            free((void *)rel->ops);
+            rel->ops = new_ops;
+            rel->op_count = ni;
+        }
+    }
+}
+
+/*
  * Post-pass: replace EDB-only VARIABLE + (k-1) JOIN chains (k >= 3) with
  * a single WL_PLAN_OP_LFTJ operator.  Run before rewrite_multiway_delta()
  * so no K_FUSION ops are present during cloning.
@@ -1958,6 +2103,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
      * For rules with K >= 2 IDB body atoms, emit K copies with CSE
      * materialization hints to avoid the regression seen without CSE. */
     rewrite_lftj_chains(plan);
+    rewrite_insert_exchanges(plan);
     rewrite_multiway_delta(plan);
 
     *out = plan;
