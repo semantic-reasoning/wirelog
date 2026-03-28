@@ -187,7 +187,10 @@ wl_workqueue_submit(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx)
     wq->count++;
     wq->submitted++;
 
-    cond_signal(&wq->work_avail);
+    /* Do NOT signal workers here — wl_workqueue_wait_all() broadcasts
+     * once all items are queued.  This ensures that wl_workqueue_drain()
+     * can dequeue every item on the calling thread without workers racing
+     * to steal from the ring between submit() and drain(). */
     mutex_unlock(&wq->mutex);
 
     return 0;
@@ -200,6 +203,9 @@ wl_workqueue_wait_all(wl_work_queue_t *wq)
         return -1;
 
     mutex_lock(&wq->mutex);
+
+    /* Wake all workers now that the batch is fully queued. */
+    cond_broadcast(&wq->work_avail);
 
     while (wq->completed < wq->submitted)
         cond_wait(&wq->all_done, &wq->mutex);
