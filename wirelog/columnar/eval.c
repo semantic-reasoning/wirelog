@@ -2323,6 +2323,26 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         }
     }
 
+    /* Issue #350: On incremental steps (new EDB inserted), clear pre-existing
+     * IDB rows so workers recompute from scratch.  Without this, stale IDB
+     * partitioned by col0 prevents cross-partition recursive joins
+     * (e.g. tc(1,3) on worker 1 cannot join edge(3,4) on worker 3).
+     * Also reset stratum frontier so should_skip_iteration does not skip
+     * iterations beyond the previous step's convergence point.
+     * When no new EDB was inserted, skip clearing to preserve frontier skip. */
+    if (coord->last_inserted_relation != NULL) {
+        for (uint32_t ri = 0; ri < nrels; ri++) {
+            col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
+            if (r && r->nrows > 0) {
+                r->nrows = 0;
+                col_session_invalidate_arrangements(&coord->base,
+                    sp->relations[ri].name);
+            }
+        }
+        coord->frontier_ops->reset_stratum_frontier(coord, stratum_idx,
+            coord->outer_epoch);
+    }
+
     /* Partition coordinator relations to workers */
     rc = tdd_init_workers(coord);
     if (rc != 0)

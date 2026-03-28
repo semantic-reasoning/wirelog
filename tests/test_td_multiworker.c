@@ -640,21 +640,22 @@ test_tc_determinism_w2(void)
 /* ======================================================================== */
 
 /*
- * test_td_incremental_w1:
+ * test_td_incremental_w4:
  * Incremental TDD: insert 3 edges, step, insert 2 more, step.
  * Batch 1: 1->2, 2->3, 3->4. Batch 2: 4->5, 5->6.
  * Full chain 1->6: TC = C(6,2) = 15 tuples.
  *
- * Multiworker incremental is a known limitation (see #350).
+ * Issue #350: W=4 validates that multiworker incremental correctly
+ * recomputes IDB across step boundaries.
  */
 static int
-test_td_incremental_w1(void)
+test_td_incremental_w4(void)
 {
-    TEST("W=1 incremental: 3+2 edge batches yield 15 tuples");
+    TEST("W=4 incremental: 3+2 edge batches yield 15 tuples");
 
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
-    wl_col_session_t *sess = make_tc_session(1, &plan, &prog);
+    wl_col_session_t *sess = make_tc_session(4, &plan, &prog);
     if (!sess) {
         FAIL("session create");
         return 1;
@@ -826,7 +827,7 @@ main(void)
     test_tc_determinism_w2();
 
     printf("\n-- Incremental / Multi-Stratum --\n");
-    test_td_incremental_w1();
+    test_td_incremental_w4();
     test_td_multi_stratum_w2();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
