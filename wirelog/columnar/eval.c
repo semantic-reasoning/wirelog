@@ -32,7 +32,7 @@
  * for TDD worker IDB relations, giving true parallel scaling.
  *
  * Hash set lives in col_rel_t::dedup_slots (NULL for non-TDD relations).
- * Slot value 0 = empty; real hashes are forced non-zero (h | 1).
+ * Slot value 0 = empty; real hashes are forced non-zero (h ? h : 1).
  */
 
 /* Hash all columns of a single row using XXH3. */
@@ -78,7 +78,10 @@ dedup_set_grow(col_rel_t *r)
     return 0;
 }
 
-/* Insert hash into set.  Returns true if newly inserted (not a dup). */
+/* Probabilistic dedup using 64-bit XXH3 hashes only (no full row comparison).
+ * Birthday-bound collision probability: ~N^2 / 2^65.
+ * For N=1M rows: P < 10^-7 (negligible).
+ * Exact dedup is performed by tdd_dedup_rel after merge. */
 static inline bool
 dedup_set_insert(col_rel_t *r, uint64_t h)
 {
@@ -2434,6 +2437,11 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
 
     /* No EXCHANGE metadata and no default hash: broadcast (replicate mode). */
     if (!has_exchange && !default_hash)
+        return tdd_broadcast_deltas(sp, coord, ctxs, W);
+
+    /* Replicate mode: all workers hold identical data, so hash scatter/gather
+     * would produce W× duplicate deltas.  Force broadcast to avoid bloat. */
+    if (!default_hash)
         return tdd_broadcast_deltas(sp, coord, ctxs, W);
 
     /* Hash-partitioned scatter/gather exchange. */
