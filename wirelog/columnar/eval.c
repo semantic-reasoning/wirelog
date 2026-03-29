@@ -1109,10 +1109,14 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
         r->retract_backup_nrows = r->nrows;
         r->retract_backup_capacity = r->capacity;
         r->retract_backup_sorted_nrows = r->sorted_nrows;
+        r->retract_backup_run_count = r->run_count;
+        memcpy(r->retract_backup_run_ends, r->run_ends,
+            sizeof(r->run_ends));
         r->columns = NULL;
         r->capacity = 0;
         r->nrows = 0;
         r->sorted_nrows = 0;
+        r->run_count = 0;
     }
 
     /* Step 1: Enable retraction-seeded mode and evaluate stratum */
@@ -1130,10 +1134,14 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             r->nrows = r->retract_backup_nrows;
             r->capacity = r->retract_backup_capacity;
             r->sorted_nrows = r->retract_backup_sorted_nrows;
+            r->run_count = r->retract_backup_run_count;
+            memcpy(r->run_ends, r->retract_backup_run_ends,
+                sizeof(r->run_ends));
             r->retract_backup_columns = NULL;
             r->retract_backup_nrows = 0;
             r->retract_backup_capacity = 0;
             r->retract_backup_sorted_nrows = 0;
+            r->retract_backup_run_count = 0;
         }
         free(retract_data);
         free(retract_nrows);
@@ -1162,10 +1170,14 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                         r2->nrows = r2->retract_backup_nrows;
                         r2->capacity = r2->retract_backup_capacity;
                         r2->sorted_nrows = r2->retract_backup_sorted_nrows;
+                        r2->run_count = r2->retract_backup_run_count;
+                        memcpy(r2->run_ends, r2->retract_backup_run_ends,
+                            sizeof(r2->run_ends));
                         r2->retract_backup_columns = NULL;
                         r2->retract_backup_nrows = 0;
                         r2->retract_backup_capacity = 0;
                         r2->retract_backup_sorted_nrows = 0;
+                        r2->retract_backup_run_count = 0;
                     }
                     free(retract_data[i]);
                 }
@@ -1198,10 +1210,14 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
         r->nrows = r->retract_backup_nrows;
         r->capacity = r->retract_backup_capacity;
         r->sorted_nrows = r->retract_backup_sorted_nrows;
+        r->run_count = r->retract_backup_run_count;
+        memcpy(r->run_ends, r->retract_backup_run_ends,
+            sizeof(r->run_ends));
         r->retract_backup_columns = NULL;
         r->retract_backup_nrows = 0;
         r->retract_backup_capacity = 0;
         r->retract_backup_sorted_nrows = 0;
+        r->retract_backup_run_count = 0;
     }
 
     /* Step 4: Remove retracted rows and fire delta callbacks */
@@ -1395,6 +1411,8 @@ cleanup:
                     r->nrows = nr;
                     r->capacity = nr > 0 ? nr : 1;
                     r->sorted_nrows = nr;
+                    r->run_count = 1;
+                    r->run_ends[0] = nr;
                 }
                 free(prev_data[i]);
                 prev_data[i] = NULL;
