@@ -323,7 +323,6 @@ test_option2_doop_exe = executable(
 
 test('option2_doop', test_option2_doop_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
-  should_fail: true,
 )
 
 # ============================================================================
