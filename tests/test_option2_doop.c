@@ -73,37 +73,37 @@ static int fail_count = 0;
 static int skip_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+        } while (0)
 
 #define SKIP(reason)                    \
-    do {                                \
-        skip_count++;                   \
-        printf("SKIP: %s\n", (reason)); \
-        return;                         \
-    } while (0)
+        do {                                \
+            skip_count++;                   \
+            printf("SKIP: %s\n", (reason)); \
+            return;                         \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond)) {    \
-            FAIL(msg);    \
-            return;       \
-        }                 \
-    } while (0)
+        do {                  \
+            if (!(cond)) {    \
+                FAIL(msg);    \
+                return;       \
+            }                 \
+        } while (0)
 
 /* ========================================================================
  * DOOP EDB catalogue: the 34 CSV files expected in the data directory.
@@ -186,40 +186,23 @@ resolve_doop_data_dir(void)
 }
 
 /* ========================================================================
- * Helper: count-all snapshot callback
+ * Helper: count total and by relation name (single snapshot)
  * ======================================================================== */
 
-struct count_ctx {
-    int64_t count;
-};
-
-static void
-count_cb(const char *relation, const int64_t *row, uint32_t ncols,
-         void *user_data)
-{
-    struct count_ctx *ctx = (struct count_ctx *)user_data;
-    ctx->count++;
-    (void)relation;
-    (void)row;
-    (void)ncols;
-}
-
-/* ========================================================================
- * Helper: count by relation name
- * ======================================================================== */
-
-struct rel_count_ctx {
+struct combined_count_ctx {
     const char *target;
-    int64_t count;
+    int64_t total;
+    int64_t rel_count;
 };
 
 static void
-rel_count_cb(const char *relation, const int64_t *row, uint32_t ncols,
-             void *user_data)
+combined_count_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
 {
-    struct rel_count_ctx *ctx = (struct rel_count_ctx *)user_data;
-    if (strcmp(relation, ctx->target) == 0)
-        ctx->count++;
+    struct combined_count_ctx *ctx = (struct combined_count_ctx *)user_data;
+    ctx->total++;
+    if (ctx->target && strcmp(relation, ctx->target) == 0)
+        ctx->rel_count++;
     (void)row;
     (void)ncols;
 }
@@ -232,7 +215,7 @@ rel_count_cb(const char *relation, const int64_t *row, uint32_t ncols,
 
 static int64_t
 run_program_count_rel(const char *src, uint32_t num_workers,
-                      const char *rel_name, int64_t *rel_count_out)
+    const char *rel_name, int64_t *rel_count_out)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -266,12 +249,9 @@ run_program_count_rel(const char *src, uint32_t num_workers,
         return -1;
     }
 
-    struct count_ctx total_ctx = { 0 };
-    struct rel_count_ctx rel_ctx = { rel_name, 0 };
+    struct combined_count_ctx ctx = { rel_name, 0, 0 };
 
-    rc = wl_session_snapshot(sess, count_cb, &total_ctx);
-    if (rc == 0)
-        wl_session_snapshot(sess, rel_count_cb, &rel_ctx);
+    rc = wl_session_snapshot(sess, combined_count_cb, &ctx);
 
     wl_session_destroy(sess);
     wl_plan_free(plan);
@@ -280,8 +260,8 @@ run_program_count_rel(const char *src, uint32_t num_workers,
     if (rc != 0)
         return -1;
     if (rel_count_out)
-        *rel_count_out = rel_ctx.count;
-    return total_ctx.count;
+        *rel_count_out = ctx.rel_count;
+    return ctx.total;
 }
 
 /* ========================================================================
@@ -302,7 +282,7 @@ test_doop_data_dir_accessible(void)
     const char *dir = resolve_doop_data_dir();
     if (!dir)
         SKIP("DOOP data dir not found (set DOOP_DATA_DIR or install "
-             "bench/data/doop)");
+            "bench/data/doop)");
 
     printf("[dir=%s] ", dir);
     PASS();
@@ -342,7 +322,7 @@ test_doop_all_csv_files_exist(void)
     char msg[128];
     if (missing > 0) {
         snprintf(msg, sizeof(msg), "%d of %d CSV files missing", missing,
-                 DOOP_NCSV);
+            DOOP_NCSV);
         FAIL(msg);
         return;
     }
@@ -409,56 +389,56 @@ test_doop_edb_declarations_parse(void)
     /* Minimal EDB schema — the 10 direct-input relations from doop.dl */
     const char *src
         = ".decl DirectSuperclass(class: int32, superclass: int32)\n"
-          ".decl DirectSuperinterface(ref: int32, interface: int32)\n"
-          ".decl MainClass(class: int32)\n"
-          ".decl FormalParam(index: int32, method: int32, var: int32)\n"
-          ".decl ComponentType(arrayType: int32, componentType: int32)\n"
-          ".decl AssignReturnValue(invocation: int32, to: int32)\n"
-          ".decl ActualParam(index: int32, invocation: int32, var: int32)\n"
-          ".decl Method_Modifier(mod: int32, method: int32)\n"
-          ".decl Var_Type(var: int32, type: int32)\n"
-          ".decl HeapAllocation_Type(heap: int32, type: int32)\n"
-          /* staging inputs */
-          ".decl _ClassType(class: int32)\n"
-          ".decl _ArrayType(arrayType: int32)\n"
-          ".decl _InterfaceType(interface: int32)\n"
-          ".decl _Var_DeclaringMethod(var: int32, method: int32)\n"
-          ".decl _ApplicationClass(type: int32)\n"
-          ".decl _ThisVar(method: int32, var: int32)\n"
-          ".decl _NormalHeap(id: int32, type: int32)\n"
-          ".decl _StringConstant(id: int32)\n"
-          ".decl _AssignHeapAllocation(instruction: int32, idx: int32, "
-          "heap: int32, to: int32, inmethod: int32, linenumber: int32)\n"
-          ".decl _AssignLocal(instruction: int32, idx: int32, from: int32, "
-          "to: int32, inmethod: int32)\n"
-          ".decl _AssignCast(instruction: int32, idx: int32, from: int32, "
-          "to: int32, type: int32, inmethod: int32)\n"
-          ".decl _Field(signature: int32, declaringClass: int32, "
-          "simplename: int32, type: int32)\n"
-          ".decl _StaticMethodInvocation(instruction: int32, idx: int32, "
-          "signature: int32, method: int32)\n"
-          ".decl _SpecialMethodInvocation(instruction: int32, idx: int32, "
-          "signature: int32, base: int32, method: int32)\n"
-          ".decl _VirtualMethodInvocation(instruction: int32, idx: int32, "
-          "signature: int32, base: int32, method: int32)\n"
-          ".decl _Method(method: int32, simplename: int32, params: int32, "
-          "declaringType: int32, returnType: int32, jvmDescriptor: int32, "
-          "arity: int32)\n"
-          ".decl Method_Descriptor(method: int32, descriptor: int32)\n"
-          ".decl _StoreInstanceField(instruction: int32, idx: int32, "
-          "from: int32, base: int32, signature: int32, method: int32)\n"
-          ".decl _LoadInstanceField(instruction: int32, idx: int32, "
-          "to: int32, base: int32, signature: int32, method: int32)\n"
-          ".decl _StoreStaticField(instruction: int32, idx: int32, "
-          "from: int32, signature: int32, method: int32)\n"
-          ".decl _LoadStaticField(instruction: int32, idx: int32, "
-          "to: int32, signature: int32, method: int32)\n"
-          ".decl _StoreArrayIndex(instruction: int32, idx: int32, "
-          "from: int32, base: int32, method: int32)\n"
-          ".decl _LoadArrayIndex(instruction: int32, idx: int32, "
-          "to: int32, base: int32, method: int32)\n"
-          ".decl _Return(instruction: int32, idx: int32, "
-          "var: int32, method: int32)\n";
+        ".decl DirectSuperinterface(ref: int32, interface: int32)\n"
+        ".decl MainClass(class: int32)\n"
+        ".decl FormalParam(index: int32, method: int32, var: int32)\n"
+        ".decl ComponentType(arrayType: int32, componentType: int32)\n"
+        ".decl AssignReturnValue(invocation: int32, to: int32)\n"
+        ".decl ActualParam(index: int32, invocation: int32, var: int32)\n"
+        ".decl Method_Modifier(mod: int32, method: int32)\n"
+        ".decl Var_Type(var: int32, type: int32)\n"
+        ".decl HeapAllocation_Type(heap: int32, type: int32)\n"
+        /* staging inputs */
+        ".decl _ClassType(class: int32)\n"
+        ".decl _ArrayType(arrayType: int32)\n"
+        ".decl _InterfaceType(interface: int32)\n"
+        ".decl _Var_DeclaringMethod(var: int32, method: int32)\n"
+        ".decl _ApplicationClass(type: int32)\n"
+        ".decl _ThisVar(method: int32, var: int32)\n"
+        ".decl _NormalHeap(id: int32, type: int32)\n"
+        ".decl _StringConstant(id: int32)\n"
+        ".decl _AssignHeapAllocation(instruction: int32, idx: int32, "
+        "heap: int32, to: int32, inmethod: int32, linenumber: int32)\n"
+        ".decl _AssignLocal(instruction: int32, idx: int32, from: int32, "
+        "to: int32, inmethod: int32)\n"
+        ".decl _AssignCast(instruction: int32, idx: int32, from: int32, "
+        "to: int32, type: int32, inmethod: int32)\n"
+        ".decl _Field(signature: int32, declaringClass: int32, "
+        "simplename: int32, type: int32)\n"
+        ".decl _StaticMethodInvocation(instruction: int32, idx: int32, "
+        "signature: int32, method: int32)\n"
+        ".decl _SpecialMethodInvocation(instruction: int32, idx: int32, "
+        "signature: int32, base: int32, method: int32)\n"
+        ".decl _VirtualMethodInvocation(instruction: int32, idx: int32, "
+        "signature: int32, base: int32, method: int32)\n"
+        ".decl _Method(method: int32, simplename: int32, params: int32, "
+        "declaringType: int32, returnType: int32, jvmDescriptor: int32, "
+        "arity: int32)\n"
+        ".decl Method_Descriptor(method: int32, descriptor: int32)\n"
+        ".decl _StoreInstanceField(instruction: int32, idx: int32, "
+        "from: int32, base: int32, signature: int32, method: int32)\n"
+        ".decl _LoadInstanceField(instruction: int32, idx: int32, "
+        "to: int32, base: int32, signature: int32, method: int32)\n"
+        ".decl _StoreStaticField(instruction: int32, idx: int32, "
+        "from: int32, signature: int32, method: int32)\n"
+        ".decl _LoadStaticField(instruction: int32, idx: int32, "
+        "to: int32, signature: int32, method: int32)\n"
+        ".decl _StoreArrayIndex(instruction: int32, idx: int32, "
+        "from: int32, base: int32, method: int32)\n"
+        ".decl _LoadArrayIndex(instruction: int32, idx: int32, "
+        "to: int32, base: int32, method: int32)\n"
+        ".decl _Return(instruction: int32, idx: int32, "
+        "var: int32, method: int32)\n";
 
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -477,7 +457,7 @@ static void
 test_doop_mutual_recursion_parses(void)
 {
     TEST("doop_parse: mutual recursion (VarPointsTo/CallGraphEdge/Reachable) "
-         "parses");
+        "parses");
 
     const char *src =
         /* minimal EDB stubs */
@@ -684,7 +664,7 @@ test_doop_8way_virtual_dispatch_join(void)
      */
     char msg[128];
     snprintf(msg, sizeof(msg),
-             "expected CallGraphEdge count == 1, got %" PRId64, cge_count);
+        "expected CallGraphEdge count == 1, got %" PRId64, cge_count);
     ASSERT(cge_count == 1, msg);
 
     PASS();
@@ -808,8 +788,8 @@ test_doop_reachable_propagates_through_virtual_chain(void)
      */
     char msg[128];
     snprintf(msg, sizeof(msg),
-             "expected Reachable count == 3 (main,m1,m2), got %" PRId64,
-             reach_count);
+        "expected Reachable count == 3 (main,m1,m2), got %" PRId64,
+        reach_count);
     ASSERT(reach_count == 3, msg);
 
     PASS();
@@ -833,22 +813,22 @@ test_doop_stratified_negation_excludes_abstract(void)
 
     const char *src
         = ".decl Method_SimpleName(method: int32, sn: int32)\n"
-          "Method_SimpleName(1, 10).\n"
-          "Method_SimpleName(2, 20).\n"
-          ".decl Method_Descriptor(method: int32, d: int32)\n"
-          "Method_Descriptor(1, 30).\n"
-          "Method_Descriptor(2, 40).\n"
-          ".decl Method_DeclaringType(method: int32, type: int32)\n"
-          "Method_DeclaringType(1, 100).\n"
-          "Method_DeclaringType(2, 200).\n"
-          ".decl Method_Modifier(mod: int32, method: int32)\n"
-          "Method_Modifier(1928492, 2).\n" /* method 2 is abstract */
-          ".decl MethodImplemented(sn: int32, d: int32, type: int32, method: "
-          "int32)\n"
-          "MethodImplemented(sn, d, type, method) :- "
-          "Method_SimpleName(method, sn), Method_Descriptor(method, d), "
-          "Method_DeclaringType(method, type), !Method_Modifier(1928492, "
-          "method).\n";
+        "Method_SimpleName(1, 10).\n"
+        "Method_SimpleName(2, 20).\n"
+        ".decl Method_Descriptor(method: int32, d: int32)\n"
+        "Method_Descriptor(1, 30).\n"
+        "Method_Descriptor(2, 40).\n"
+        ".decl Method_DeclaringType(method: int32, type: int32)\n"
+        "Method_DeclaringType(1, 100).\n"
+        "Method_DeclaringType(2, 200).\n"
+        ".decl Method_Modifier(mod: int32, method: int32)\n"
+        "Method_Modifier(1928492, 2).\n"   /* method 2 is abstract */
+        ".decl MethodImplemented(sn: int32, d: int32, type: int32, method: "
+        "int32)\n"
+        "MethodImplemented(sn, d, type, method) :- "
+        "Method_SimpleName(method, sn), Method_Descriptor(method, d), "
+        "Method_DeclaringType(method, type), !Method_Modifier(1928492, "
+        "method).\n";
 
     int64_t impl_count = 0;
     int64_t total
@@ -861,8 +841,8 @@ test_doop_stratified_negation_excludes_abstract(void)
      */
     char msg[128];
     snprintf(msg, sizeof(msg),
-             "expected MethodImplemented == 1 (concrete only), got %" PRId64,
-             impl_count);
+        "expected MethodImplemented == 1 (concrete only), got %" PRId64,
+        impl_count);
     ASSERT(impl_count == 1, msg);
 
     PASS();
@@ -901,7 +881,7 @@ main(void)
     test_doop_stratified_negation_excludes_abstract();
 
     printf("\n=== Results: %d passed, %d failed, %d skipped (of %d) ===\n",
-           pass_count, fail_count, skip_count, test_count);
+        pass_count, fail_count, skip_count, test_count);
 
     return fail_count > 0 ? 1 : 0;
 }
