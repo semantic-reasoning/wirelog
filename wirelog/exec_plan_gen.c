@@ -621,6 +621,20 @@ resolve_keys_to_colN(char **keys, uint32_t count,
 }
 
 /**
+ * Traverse FILTER wrappers to find the underlying SCAN node.
+ * build_atom_scan wraps SCANs in FILTER nodes when an atom has constant
+ * arguments.  Returns the base SCAN node, or the input node if it is
+ * already a SCAN or a non-FILTER node.
+ */
+static const wirelog_ir_node_t *
+unwrap_filters(const wirelog_ir_node_t *node)
+{
+    while (node && node->type == WIRELOG_IR_FILTER && node->child_count > 0)
+        node = node->children[0];
+    return node;
+}
+
+/**
  * Recursively translate an IR node tree into plan operators.
  * Operators are emitted in post-order (children first) to form a
  * stack-machine sequence.
@@ -746,9 +760,10 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
         if (!op)
             return -1;
         op->op = WL_PLAN_OP_JOIN;
-        /* Right relation is the second child's relation name */
         if (node->child_count > 1 && node->children[1]) {
-            op->right_relation = dup_str(node->children[1]->relation_name);
+            const wirelog_ir_node_t *rn
+                = unwrap_filters(node->children[1]);
+            op->right_relation = dup_str(rn ? rn->relation_name : NULL);
         }
         /* Resolve join key variable names to "colN" positional format */
         op->left_keys = (const char *const *)resolve_keys_to_colN(
@@ -771,8 +786,14 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
         if (!op)
             return -1;
         op->op = WL_PLAN_OP_ANTIJOIN;
+        /* NOTE: The right child's FILTER predicates (constants in negated
+         * atoms) are not pushed into the antijoin execution.  Correct when
+         * the constant filters a non-key column that is uniform (DOOP
+         * pattern), but loses precision otherwise.  See issue #380. */
         if (node->child_count > 1 && node->children[1]) {
-            op->right_relation = dup_str(node->children[1]->relation_name);
+            const wirelog_ir_node_t *rn
+                = unwrap_filters(node->children[1]);
+            op->right_relation = dup_str(rn ? rn->relation_name : NULL);
         }
         op->left_keys = (const char *const *)resolve_keys_to_colN(
             node->join_left_keys, node->join_key_count,
@@ -795,7 +816,9 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             return -1;
         op->op = WL_PLAN_OP_SEMIJOIN;
         if (node->child_count > 1 && node->children[1]) {
-            op->right_relation = dup_str(node->children[1]->relation_name);
+            const wirelog_ir_node_t *rn
+                = unwrap_filters(node->children[1]);
+            op->right_relation = dup_str(rn ? rn->relation_name : NULL);
         }
         op->left_keys = (const char *const *)resolve_keys_to_colN(
             node->join_left_keys, node->join_key_count,
