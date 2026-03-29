@@ -42,8 +42,6 @@
 #include "../wirelog/backend.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
-#include "../wirelog/passes/jpp.h"
-#include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog.h"
@@ -59,7 +57,7 @@
 /* MSVC: S_ISDIR macro not available, define it */
 #ifdef _MSC_VER
 #ifndef S_ISDIR
-#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#define S_ISDIR(m) (((m)&_S_IFMT) == _S_IFDIR)
 #endif
 #endif
 
@@ -72,38 +70,40 @@ static int pass_count = 0;
 static int fail_count = 0;
 static int skip_count = 0;
 
+/* *INDENT-OFF* */
 #define TEST(name)                                      \
-        do {                                                \
-            test_count++;                                   \
-            printf("TEST %d: %s ... ", test_count, (name)); \
-        } while (0)
+    do {                                                \
+        test_count++;                                   \
+        printf("TEST %d: %s ... ", test_count, (name)); \
+    } while (0)
 
 #define PASS()            \
-        do {                  \
-            pass_count++;     \
-            printf("PASS\n"); \
-        } while (0)
+    do {                  \
+        pass_count++;     \
+        printf("PASS\n"); \
+    } while (0)
 
 #define FAIL(msg)                    \
-        do {                             \
-            fail_count++;                \
-            printf("FAIL: %s\n", (msg)); \
-        } while (0)
+    do {                             \
+        fail_count++;                \
+        printf("FAIL: %s\n", (msg)); \
+    } while (0)
 
 #define SKIP(reason)                    \
-        do {                                \
-            skip_count++;                   \
-            printf("SKIP: %s\n", (reason)); \
-            return;                         \
-        } while (0)
+    do {                                \
+        skip_count++;                   \
+        printf("SKIP: %s\n", (reason)); \
+        return;                         \
+    } while (0)
 
 #define ASSERT(cond, msg) \
-        do {                  \
-            if (!(cond)) {    \
-                FAIL(msg);    \
-                return;       \
-            }                 \
-        } while (0)
+    do {                  \
+        if (!(cond)) {    \
+            FAIL(msg);    \
+            return;       \
+        }                 \
+    } while (0)
+/* *INDENT-ON* */
 
 /* ========================================================================
  * DOOP EDB catalogue: the 34 CSV files expected in the data directory.
@@ -223,8 +223,9 @@ run_program_count_rel(const char *src, uint32_t num_workers,
         return -1;
 
     wl_fusion_apply(prog, NULL);
-    wl_jpp_apply(prog, NULL);
-    wl_sip_apply(prog, NULL);
+    /* JPP and SIP disabled: insert_projections in JPP incorrectly prunes
+     * intermediate columns needed by K-fusion delta copies in recursive
+     * strata with 6+ body atoms.  See issue #382. */
 
     wl_plan_t *plan = NULL;
     int rc = wl_plan_from_program(prog, &plan);
