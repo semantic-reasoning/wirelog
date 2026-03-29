@@ -184,11 +184,17 @@ typedef struct {
  * WL_DELTA_FORCE_FULL:  Force full version of the relation.
  *                       VARIABLE always selects the full relation.
  *                       JOIN skips right-delta substitution.
+ * WL_DELTA_FORCE_EMPTY: Force empty result unconditionally (#370).
+ *                       Used to neuter UNION child segments in
+ *                       multiway delta expansion when the segment
+ *                       contains no FORCE_DELTA op, preventing
+ *                       wasteful full-join computation.
  */
 typedef enum {
     WL_DELTA_AUTO = 0,
     WL_DELTA_FORCE_DELTA = 1,
     WL_DELTA_FORCE_FULL = 2,
+    WL_DELTA_FORCE_EMPTY = 3,
 } wl_delta_mode_t;
 
 /* ======================================================================== */

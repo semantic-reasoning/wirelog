@@ -869,6 +869,17 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
         delta = session_find_rel(sess, dname);
     }
 
+    if (op->delta_mode == WL_DELTA_FORCE_EMPTY) {
+        /* Issue #370: segment has no FORCE_DELTA — push empty to skip. */
+        col_rel_t *empty = col_rel_pool_new_like(
+            sess->delta_pool, "$empty_skip", full_rel);
+        if (!empty)
+            return ENOMEM;
+        int push_rc = eval_stack_push_delta(stack, empty, true, false);
+        if (push_rc != 0)
+            col_rel_destroy(empty);
+        return push_rc;
+    }
     if (op->delta_mode == WL_DELTA_FORCE_FULL) {
         return eval_stack_push_delta(stack, full_rel, false, false);
     }

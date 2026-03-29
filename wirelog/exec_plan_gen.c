@@ -1309,6 +1309,46 @@ expand_multiway_delta(const wl_plan_op_t *ops, uint32_t op_count,
     new_ops[wi].op = WL_PLAN_OP_CONSOLIDATE;
     wi++;
 
+    /* Per-copy segment skip (issue #370): same logic as K-fusion path.
+     * Within each copy's op_count ops, neuter UNION child segments that
+     * have FORCE_FULL (IDB ops from wrong rule) but no FORCE_DELTA.
+     * EDB-only segments (all AUTO) are preserved for base-case seeding. */
+    for (uint32_t d = 0; d < k; d++) {
+        uint32_t base = d * (op_count + 1); /* +1 for CONCAT after copy */
+        uint32_t depth = 0;
+        uint32_t seg_var_idx = UINT32_MAX;
+        bool seg_has_delta = false;
+        bool seg_has_full = false;
+
+        for (uint32_t i = 0; i < op_count; i++) {
+            wl_plan_op_t *op = &new_ops[base + i];
+
+            if (op->op == WL_PLAN_OP_VARIABLE && depth >= 1) {
+                if (seg_var_idx != UINT32_MAX && !seg_has_delta
+                    && seg_has_full)
+                    new_ops[seg_var_idx].delta_mode = WL_DELTA_FORCE_EMPTY;
+                seg_var_idx = base + i;
+                seg_has_delta = false;
+                seg_has_full = false;
+            }
+
+            if (op->delta_mode == WL_DELTA_FORCE_DELTA)
+                seg_has_delta = true;
+            if (op->delta_mode == WL_DELTA_FORCE_FULL)
+                seg_has_full = true;
+
+            if (op->op == WL_PLAN_OP_VARIABLE) {
+                if (seg_var_idx == UINT32_MAX)
+                    seg_var_idx = base + i;
+                depth++;
+            } else if (op->op == WL_PLAN_OP_CONCAT) {
+                depth--;
+            }
+        }
+        if (seg_var_idx != UINT32_MAX && !seg_has_delta && seg_has_full)
+            new_ops[seg_var_idx].delta_mode = WL_DELTA_FORCE_EMPTY;
+    }
+
     *out_count = wi;
     return new_ops;
 }
@@ -1474,6 +1514,58 @@ expand_multiway_k_fusion(const wl_plan_op_t *ops, uint32_t op_count,
         /* Append CONSOLIDATE so each worker produces sorted+deduped output.
          * This allows col_op_k_fusion to skip the post-completion qsort. */
         seq[op_count].op = WL_PLAN_OP_CONSOLIDATE;
+    }
+
+    /* Per-worker segment skip (issue #370): in UNION'd relation plans,
+     * each K-fusion worker's ops contain interleaved rule segments
+     * delimited by CONCAT/CONSOLIDATE.  When a segment contains no
+     * FORCE_DELTA op, its evaluation produces only redundant tuples
+     * (full join instead of delta join).  Neuter such segments by
+     * setting their leading VARIABLE to FORCE_EMPTY, which pushes
+     * an empty relation and causes downstream JOINs to produce nothing.
+     *
+     * Segment boundaries are detected via stack-depth tracking:
+     * each UNION child starts with a VARIABLE that increases depth. */
+    for (uint32_t d = 0; d < k; d++) {
+        wl_plan_op_t *seq = meta->k_ops[d];
+        uint32_t depth = 0;
+        uint32_t seg_var_idx = UINT32_MAX;
+        bool seg_has_delta = false;
+        bool seg_has_full = false;
+
+        for (uint32_t i = 0; i < op_count; i++) {
+            /* Detect UNION child boundary: a VARIABLE at depth >= 1
+             * means a new child is starting (the previous child already
+             * pushed one result onto the stack). */
+            if (seq[i].op == WL_PLAN_OP_VARIABLE && depth >= 1) {
+                /* Finalize previous segment: neuter only if the segment
+                 * has IDB ops (FORCE_FULL) but none are delta-active.
+                 * EDB-only segments (all AUTO) are preserved for
+                 * base-case seeding at iteration 0. */
+                if (seg_var_idx != UINT32_MAX && !seg_has_delta
+                    && seg_has_full)
+                    seq[seg_var_idx].delta_mode = WL_DELTA_FORCE_EMPTY;
+                seg_var_idx = i;
+                seg_has_delta = false;
+                seg_has_full = false;
+            }
+
+            if (seq[i].delta_mode == WL_DELTA_FORCE_DELTA)
+                seg_has_delta = true;
+            if (seq[i].delta_mode == WL_DELTA_FORCE_FULL)
+                seg_has_full = true;
+
+            if (seq[i].op == WL_PLAN_OP_VARIABLE) {
+                if (seg_var_idx == UINT32_MAX)
+                    seg_var_idx = i; /* first child's leading VARIABLE */
+                depth++;
+            } else if (seq[i].op == WL_PLAN_OP_CONCAT) {
+                depth--;
+            }
+        }
+        /* Finalize last segment */
+        if (seg_var_idx != UINT32_MAX && !seg_has_delta && seg_has_full)
+            seq[seg_var_idx].delta_mode = WL_DELTA_FORCE_EMPTY;
     }
 
     result->op = WL_PLAN_OP_K_FUSION;
