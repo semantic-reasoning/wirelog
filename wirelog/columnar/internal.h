@@ -241,6 +241,17 @@ typedef struct {
      * When col_shared[c] is true, columns[c] is borrowed (not owned) and
      * must NOT be freed on destroy. NULL when no sharing is active. */
     bool *col_shared;
+    /* Tiered sorted-run tracking for incremental consolidation (#369).
+     * Instead of one sorted prefix, maintain up to COL_MAX_RUNS independently
+     * sorted+unique segments. Dedup checks all runs via binary search.
+     * Compaction merges all runs when count exceeds threshold.
+     * run_count == 0 means legacy single-prefix mode (sorted_nrows only). */
+#define COL_MAX_RUNS 8
+    uint32_t run_count;
+    uint32_t run_ends[COL_MAX_RUNS]; /* run i spans [run_ends[i-1]..run_ends[i]) */
+    /* Retraction backup for run tracking (#369). */
+    uint32_t retract_backup_run_count;
+    uint32_t retract_backup_run_ends[COL_MAX_RUNS];
     /* Hash-set dedup for TDD worker IDB (Issue #361).
      * When non-NULL, consolidation uses O(D) hash lookup instead of O(N)
      * merge walk.  Allocated by tdd_init_workers_hybrid for IDB relations,
@@ -377,6 +388,25 @@ col_rel_row_cmp2(const col_rel_t *ra, uint32_t row_a,
             return 1;
     }
     return 0;
+}
+
+/** Binary search for a row in a sorted region of a relation (#369).
+ *  Returns true if an equal row exists in [lo..hi). O(log(hi-lo)). */
+static inline bool
+col_rel_binary_search_row(const col_rel_t *rel, uint32_t lo, uint32_t hi,
+    uint32_t needle)
+{
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        int cmp = col_rel_row_cmp(rel, mid, needle);
+        if (cmp == 0)
+            return true;
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return false;
 }
 
 /** Copy row src_row to dst_row within the same relation.
