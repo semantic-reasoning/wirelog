@@ -408,11 +408,14 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         if (!env_valid) {
             uint64_t phys = col_detect_physical_memory();
             if (phys > 0) {
-                /* 25% of RAM / (8 bytes * 5 avg cols * num_workers) */
-                sess->join_output_limit
-                    = (phys / 4)
-                    / (40ULL
-                    * (sess->num_workers > 0 ? sess->num_workers : 1));
+                /* 25% of RAM / (8 bytes * 5 avg cols).  The per-worker
+                 * divisor was removed (Issue #386): in timely-differential
+                 * evaluation workers do not simultaneously produce peak
+                 * join output, and dividing by num_workers made the limit
+                 * unusably small on high-core machines (e.g. 196 cores
+                 * → <1M rows).  Runtime backpressure via mem_ledger
+                 * handles actual memory pressure instead. */
+                sess->join_output_limit = (phys / 4) / 40ULL;
             } else {
                 sess->join_output_limit = COL_JOIN_OUTPUT_LIMIT_DEFAULT;
             }

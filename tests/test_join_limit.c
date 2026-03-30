@@ -54,20 +54,20 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Plan Helper                                                             */
@@ -106,8 +106,8 @@ test_default_limit(void)
     unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not generate plan");
         return 1;
@@ -127,8 +127,8 @@ test_default_limit(void)
     if (!ok) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "join_output_limit == 0 (expected > 0), got %llu",
-                 (unsigned long long)sess->join_output_limit);
+            "join_output_limit == 0 (expected > 0), got %llu",
+            (unsigned long long)sess->join_output_limit);
         FAIL(msg);
     }
 
@@ -152,8 +152,8 @@ test_env_override(void)
     setenv("WIRELOG_JOIN_OUTPUT_LIMIT", "12345", 1);
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
         FAIL("could not generate plan");
@@ -175,7 +175,7 @@ test_env_override(void)
     if (!ok) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected join_output_limit=12345, got %llu",
-                 (unsigned long long)sess->join_output_limit);
+            (unsigned long long)sess->join_output_limit);
         FAIL(msg);
     }
 
@@ -200,8 +200,8 @@ test_env_disable(void)
     setenv("WIRELOG_JOIN_OUTPUT_LIMIT", "0", 1);
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
         FAIL("could not generate plan");
@@ -223,7 +223,7 @@ test_env_disable(void)
     if (!ok) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected join_output_limit=0, got %llu",
-                 (unsigned long long)sess->join_output_limit);
+            (unsigned long long)sess->join_output_limit);
         FAIL(msg);
     }
 
@@ -237,20 +237,20 @@ test_env_disable(void)
 }
 
 /* ======================================================================== */
-/* Test 4: Limit scales inversely with num_workers                         */
+/* Test 4: Limit is independent of num_workers (Issue #386)                */
 /* ======================================================================== */
 
 static int
 test_limit_scales_with_workers(void)
 {
-    TEST("join_output_limit scales inversely with num_workers");
+    TEST("join_output_limit is independent of num_workers (Issue #386)");
 
     /* Remove env override to exercise auto-detection path */
     unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
-                                 ".decl r(x: int32)\n"
-                                 "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!plan) {
         FAIL("could not generate plan");
         return 1;
@@ -276,15 +276,16 @@ test_limit_scales_with_workers(void)
     uint64_t limit1 = ((wl_col_session_t *)sess1)->join_output_limit;
     uint64_t limit8 = ((wl_col_session_t *)sess8)->join_output_limit;
 
-    /* With 8 workers, limit should be ~1/8 of 1-worker limit.
-     * Allow tolerance: limit8 should be < limit1 / 4 (strictly less). */
-    bool ok = (limit1 > 0 && limit8 > 0 && limit8 < limit1 / 4);
+    /* Issue #386: join_output_limit no longer scales with num_workers.
+    * In timely-differential evaluation, workers do not simultaneously
+    * produce peak join output; runtime backpressure handles memory. */
+    bool ok = (limit1 > 0 && limit8 > 0 && limit1 == limit8);
 
     if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg),
-                 "limit1=%llu limit8=%llu: expected limit8 < limit1/4",
-                 (unsigned long long)limit1, (unsigned long long)limit8);
+            "limit1=%llu limit8=%llu: expected equal",
+            (unsigned long long)limit1, (unsigned long long)limit8);
         FAIL(msg);
     }
 
