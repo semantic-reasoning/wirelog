@@ -1817,9 +1817,11 @@ apply_right_filter(const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel,
             int64_t val = 0;
             pass = (col_eval_expr_compiled(ce, row_buf, rel->ncols, &val) == 0)
                        ? (val != 0 ? 1 : 0)
-                       : 1;
+                       : 0; /* fail-closed: reject row on eval error */
         } else {
-            pass = col_eval_filter_row(buf, bsz, row_buf, rel->ncols);
+            int64_t val = 0;
+            int err = col_eval_expr_run(buf, bsz, row_buf, rel->ncols, &val);
+            pass = (err == 0) ? (val != 0 ? 1 : 0) : 0; /* fail-closed */
         }
         if (pass && col_rel_append_row(out, row_buf) != 0) {
             col_expr_compiled_free(ce);
@@ -2135,7 +2137,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 "right=%u rows, kc=%u\n",
                 left->nrows, right->nrows, kc);
 
-        if (!used_right_delta && op->right_relation && kc > 0)
+        if (!used_right_delta && op->right_relation && kc > 0
+            && op->right_filter_expr.size == 0)
             arr = col_session_get_arrangement(&sess->base, op->right_relation,
                     rk, kc);
         else if (used_right_delta && op->right_relation && kc > 0)

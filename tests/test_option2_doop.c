@@ -42,6 +42,7 @@
 #include "../wirelog/backend.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
+#include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog.h"
@@ -226,6 +227,61 @@ run_program_count_rel(const char *src, uint32_t num_workers,
     /* JPP and SIP disabled: insert_projections in JPP incorrectly prunes
      * intermediate columns needed by K-fusion delta copies in recursive
      * strata with 6+ body atoms.  See issue #382. */
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        return -1;
+    }
+
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, num_workers, &sess);
+    if (rc != 0) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return -1;
+    }
+
+    rc = wl_session_load_facts(sess, prog);
+    if (rc != 0) {
+        wl_session_destroy(sess);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return -1;
+    }
+
+    struct combined_count_ctx ctx = { rel_name, 0, 0 };
+
+    rc = wl_session_snapshot(sess, combined_count_cb, &ctx);
+
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+
+    if (rc != 0)
+        return -1;
+    if (rel_count_out)
+        *rel_count_out = ctx.rel_count;
+    return ctx.total;
+}
+
+/*
+ * Like run_program_count_rel but also applies the SIP pass to generate
+ * SEMIJOIN nodes for join chains of 3+ atoms.  Safe for simple non-recursive
+ * rules where issue #382 (JPP + SIP interaction) does not apply.
+ */
+static int64_t
+run_program_count_rel_with_sip(const char *src, uint32_t num_workers,
+    const char *rel_name, int64_t *rel_count_out)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return -1;
+
+    wl_fusion_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
 
     wl_plan_t *plan = NULL;
     int rc = wl_plan_from_program(prog, &plan);
@@ -942,6 +998,57 @@ test_antijoin_constant_bearing_right_child(void)
     PASS();
 }
 
+/*
+ * Test 11: SEMIJOIN with constant-bearing right child (issue #381).
+ *
+ * R(x, y) :- A(x), B(x, y), C(42, y).
+ *
+ * SIP inserts a SEMIJOIN(right=C) before the A-B join to pre-filter the
+ * intermediate result using C.  C has a row (99, 20) where col0!=42; with
+ * right_filter_expr applied in SEMIJOIN, only C rows where col0==42 are used
+ * as semijoin candidates, correctly excluding y=20.
+ *
+ * Facts: A(1),A(2),A(3); B(1,10),B(2,20),B(3,30); C(42,10),C(99,20),C(42,30)
+ * Expected: R = {(1,10),(3,30)}, count == 2.
+ */
+static void
+test_semijoin_constant_bearing_right_child(void)
+{
+    TEST("issue#381: SEMIJOIN filters constant-bearing right child (SIP)");
+
+/* *INDENT-OFF* */
+    const char *src =
+        ".decl A(x: int32)\n"
+        "A(1).\n"
+        "A(2).\n"
+        "A(3).\n"
+        ".decl B(x: int32, y: int32)\n"
+        "B(1, 10).\n"
+        "B(2, 20).\n"
+        "B(3, 30).\n"
+        ".decl C(tag: int32, y: int32)\n"
+        "C(42, 10).\n"  /* tag==42, y==10 -> (x=1,y=10) qualifies */
+        "C(99, 20).\n"  /* tag!=42, must NOT qualify (x=2,y=20) */
+        "C(42, 30).\n"  /* tag==42, y==30 -> (x=3,y=30) qualifies */
+        ".decl R(x: int32, y: int32)\n"
+        "R(x, y) :- A(x), B(x, y), C(42, y).\n";
+/* *INDENT-ON* */
+
+    int64_t r_count = 0;
+    int64_t total
+        = run_program_count_rel_with_sip(src, 1, "R", &r_count);
+
+    ASSERT(total >= 0, "evaluation failed");
+
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+        "expected R count == 2 (x=1,y=10 and x=3,y=30 only), got %" PRId64,
+        r_count);
+    ASSERT(r_count == 2, msg);
+
+    PASS();
+}
+
 /* ========================================================================
  * main
  * ======================================================================== */
@@ -978,6 +1085,7 @@ main(void)
     printf("\n--- Issue #381: Constant-Bearing Right Child Filter ---\n");
     test_join_constant_bearing_right_child();
     test_antijoin_constant_bearing_right_child();
+    test_semijoin_constant_bearing_right_child();
 
     printf("\n=== Results: %d passed, %d failed, %d skipped (of %d) ===\n",
         pass_count, fail_count, skip_count, test_count);

@@ -639,8 +639,15 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
     uint32_t nfilts = 0;
 
     while (node && node->type == WIRELOG_IR_FILTER && node->child_count > 0) {
-        if (node->filter_expr && nfilts < 32)
-            filt_exprs[nfilts++] = node->filter_expr;
+        if (node->filter_expr) {
+            if (nfilts < 32) {
+                filt_exprs[nfilts++] = node->filter_expr;
+            } else {
+                fprintf(stderr,
+                    "warning: right_filter: >32 nested FILTERs, "
+                    "truncating\n");
+            }
+        }
         node = node->children[0];
     }
 
