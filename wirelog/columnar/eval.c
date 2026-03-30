@@ -3014,6 +3014,13 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
             return append_rc;
         }
 
+        /* Issue #388: Dedup broadcast union to prevent W-fold amplification.
+         * In replicate mode, all W workers derive the same tuples from
+         * identical data. Without dedup, the union contains W copies of
+         * each new tuple, compounding exponentially across iterations. */
+        if (union_d->nrows > 1)
+            tdd_dedup_rel(union_d);
+
         /* Broadcast: refill existing $d$ on workers (reuses capacity) */
         for (uint32_t w = 0; w < W; w++) {
             if (union_from_session && w == 0)
