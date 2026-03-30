@@ -807,6 +807,20 @@ typedef struct wl_col_session_t {
      * always uses the broadcast delta (which may be >= local partition size).
      * False everywhere else, including retraction paths. */
     bool tdd_subpass_active;
+    /* Filtered relation cache (Issue #386): caches apply_right_filter results
+     * keyed by (relation_name, filter_expr hash). Prevents redundant O(N) filter
+     * scans on each fixpoint iteration when right_filter_expr is present.
+     * Each entry owns rel_name (strdup) and filtered (col_rel_new_like).
+     * Entries are invalidated when source_nrows changes (relation grew).
+     * Freed on session destroy. Workers get NULL cache (zeroed at create). */
+    struct {
+        char *rel_name;          /* owned: base relation name */
+        uint64_t filter_hash;    /* FNV-1a hash of right_filter_expr.data */
+        uint32_t source_nrows;   /* nrows of source rel when entry was built */
+        col_rel_t *filtered;     /* owned: the filtered relation */
+    } *filt_cache;
+    uint32_t filt_cache_count;
+    uint32_t filt_cache_cap;
 } wl_col_session_t;
 
 /*

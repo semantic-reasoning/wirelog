@@ -628,6 +628,13 @@ col_session_destroy(wl_session_t *session)
             col_worker_session_destroy(&sess->tdd_workers[w]);
         free(sess->tdd_workers);
     }
+    /* Issue #386: Free filtered relation cache */
+    for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
+        free(sess->filt_cache[i].rel_name);
+        if (sess->filt_cache[i].filtered)
+            col_rel_destroy(sess->filt_cache[i].filtered);
+    }
+    free(sess->filt_cache);
     free(sess);
 }
 
@@ -682,6 +689,9 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->sarr_entries = NULL;
     out_worker->sarr_count = 0;
     out_worker->sarr_cap = 0;
+    out_worker->filt_cache = NULL;
+    out_worker->filt_cache_count = 0;
+    out_worker->filt_cache_cap = 0;
     memset(&out_worker->mat_cache, 0, sizeof(col_mat_cache_t));
     /* Exchange buffers are owned by coordinator; worker inherits borrowed ptr */
     out_worker->exchange_bufs = NULL;
@@ -816,6 +826,14 @@ col_worker_session_destroy(wl_col_session_t *worker)
     wl_workqueue_destroy(worker->wq);
     delta_pool_destroy(worker->delta_pool);
     wl_arena_free(worker->eval_arena);
+
+    /* Issue #386: Free filtered relation cache (workers own their own copy) */
+    for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
+        free(worker->filt_cache[i].rel_name);
+        if (worker->filt_cache[i].filtered)
+            col_rel_destroy(worker->filt_cache[i].filtered);
+    }
+    free(worker->filt_cache);
 
     /* Zero the struct to prevent dangling pointer use */
     memset(worker, 0, sizeof(*worker));
