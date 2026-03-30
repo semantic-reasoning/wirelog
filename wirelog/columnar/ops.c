@@ -2018,7 +2018,11 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     if (!left_e.rel)
         return EINVAL;
 
-    col_rel_t *right_filtered = NULL; /* tracks pool-allocated filtered rel */
+    /* right_filtered: non-NULL only when right was pool-allocated by
+     * apply_right_filter (non-cached path: antijoin/semijoin callers).
+     * For col_op_join we use apply_right_filter_cached; the cache owns
+     * the filtered relation and we must NOT destroy it here. */
+    col_rel_t *right_filtered = NULL;
     col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right) {
         /* If right relation doesn't exist, join produces empty result (cross-product with nothing).
@@ -2087,11 +2091,23 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
     /* Apply constant filter on right child (from FILTER wrappers collected
-     * during plan generation).  Pool-allocated struct; heap internals freed
-     * via col_rel_destroy before return. */
-    if (op->right_filter_expr.size > 0) {
-        col_rel_t *filtered
-            = apply_right_filter(&op->right_filter_expr, right,
+     * during plan generation).  Use session-level cache (Issue #386): the
+     * filtered relation is owned by sess->filt_cache and must NOT be
+     * destroyed here.  right_filtered remains NULL for the cached path. */
+    if (op->right_filter_expr.size > 0 && op->right_relation
+        && !used_right_delta) {
+        col_rel_t *filtered = apply_right_filter_cached(sess,
+                &op->right_filter_expr, op->right_relation, right);
+        if (!filtered) {
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
+            return ENOMEM;
+        }
+        right = filtered;
+        /* right_filtered stays NULL: cache owns the relation */
+    } else if (op->right_filter_expr.size > 0) {
+        /* Delta path or no relation name: fall back to pool-allocated filter */
+        col_rel_t *filtered = apply_right_filter(&op->right_filter_expr, right,
                 sess->delta_pool);
         if (!filtered) {
             if (left_e.owned)
