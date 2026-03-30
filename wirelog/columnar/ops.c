@@ -1833,6 +1833,182 @@ apply_right_filter(const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel,
     return out;
 }
 
+/**
+ * FNV-1a hash over a byte buffer.  Used to key the filtered-relation cache
+ * by filter expression content (Issue #386).
+ */
+static uint64_t
+fnv1a_hash(const uint8_t *buf, uint32_t len)
+{
+    uint64_t h = UINT64_C(14695981039346656037); /* FNV offset basis */
+    for (uint32_t i = 0; i < len; i++) {
+        h ^= (uint64_t)buf[i];
+        h *= UINT64_C(1099511628211); /* FNV prime */
+    }
+    return h;
+}
+
+/**
+ * apply_right_filter_cached: session-level cached variant of apply_right_filter.
+ *
+ * Looks up (rel_name, filter_hash) in sess->filt_cache.  If found and the
+ * source relation has not grown since the entry was built, returns the cached
+ * filtered relation (owned by the cache; caller must NOT destroy it).
+ *
+ * If the source grew, the stale entry is replaced.  If no entry exists, one
+ * is created.  On any allocation failure the function falls back to returning
+ * NULL (caller handles ENOMEM).
+ *
+ * The returned pointer is valid until the cache entry is evicted (i.e., until
+ * source_nrows changes or the session is destroyed).  Callers that hold it
+ * across iterations should re-call each iteration (cheap: cache hit = O(N)
+ * linear scan over filt_cache, typically 1-2 entries per session).
+ */
+static col_rel_t *
+apply_right_filter_cached(wl_col_session_t *sess,
+    const wl_plan_expr_buffer_t *fexpr, const char *rel_name,
+    col_rel_t *rel)
+{
+    uint64_t fhash = fnv1a_hash(fexpr->data, fexpr->size);
+
+    /* Linear scan: filt_cache is tiny (one entry per unique filter predicate) */
+    for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
+        if (sess->filt_cache[i].filter_hash != fhash)
+            continue;
+        if (strcmp(sess->filt_cache[i].rel_name, rel_name) != 0)
+            continue;
+        /* Cache hit */
+        if (sess->filt_cache[i].source_nrows == rel->nrows)
+            return sess->filt_cache[i].filtered; /* still valid */
+        /* Source grew — rebuild */
+        if (sess->filt_cache[i].filtered)
+            col_rel_destroy(sess->filt_cache[i].filtered);
+        sess->filt_cache[i].filtered = col_rel_new_like("$rfilter_cache", rel);
+        if (!sess->filt_cache[i].filtered)
+            return NULL;
+        /* Apply filter into the heap-allocated relation */
+        const uint8_t *buf = fexpr->data;
+        uint32_t bsz = fexpr->size;
+        simple_filter_cmp_t cmp;
+        col_rel_t *out = sess->filt_cache[i].filtered;
+        if (filter_is_simple_cmp(buf, bsz, &cmp)) {
+            for (uint32_t r = 0; r < rel->nrows; r++) {
+                int64_t row_buf[COL_STACK_MAX];
+                col_rel_row_copy_out(rel, r, row_buf);
+                if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
+                    if (col_rel_append_row(out, row_buf) != 0) {
+                        col_rel_destroy(out);
+                        sess->filt_cache[i].filtered = NULL;
+                        return NULL;
+                    }
+                }
+            }
+        } else {
+            col_expr_compiled_t *ce = col_expr_compile(buf, bsz);
+            for (uint32_t r = 0; r < rel->nrows; r++) {
+                int64_t row_buf[COL_STACK_MAX];
+                col_rel_row_copy_out(rel, r, row_buf);
+                int pass;
+                if (ce) {
+                    int64_t val = 0;
+                    pass = (col_eval_expr_compiled(ce, row_buf, rel->ncols,
+                        &val) == 0)
+                               ? (val != 0 ? 1 : 0)
+                               : 0;
+                } else {
+                    int64_t val = 0;
+                    int err = col_eval_expr_run(buf, bsz, row_buf, rel->ncols,
+                            &val);
+                    pass = (err == 0) ? (val != 0 ? 1 : 0) : 0;
+                }
+                if (pass && col_rel_append_row(out, row_buf) != 0) {
+                    col_expr_compiled_free(ce);
+                    col_rel_destroy(out);
+                    sess->filt_cache[i].filtered = NULL;
+                    return NULL;
+                }
+            }
+            col_expr_compiled_free(ce);
+        }
+        sess->filt_cache[i].source_nrows = rel->nrows;
+        return out;
+    }
+
+    /* Cache miss — build a new entry */
+    if (sess->filt_cache_count == sess->filt_cache_cap) {
+        uint32_t new_cap = sess->filt_cache_cap == 0 ? 4
+                                                      : sess->filt_cache_cap *
+            2;
+        void *tmp = realloc(sess->filt_cache,
+                new_cap * sizeof(*sess->filt_cache));
+        if (!tmp)
+            return NULL;
+        sess->filt_cache = tmp;
+        sess->filt_cache_cap = new_cap;
+    }
+
+    uint32_t idx = sess->filt_cache_count;
+    sess->filt_cache[idx].rel_name = strdup(rel_name);
+    if (!sess->filt_cache[idx].rel_name)
+        return NULL;
+    sess->filt_cache[idx].filter_hash = fhash;
+    sess->filt_cache[idx].source_nrows = 0; /* will be set after fill */
+    sess->filt_cache[idx].filtered = col_rel_new_like("$rfilter_cache", rel);
+    if (!sess->filt_cache[idx].filtered) {
+        free(sess->filt_cache[idx].rel_name);
+        return NULL;
+    }
+    sess->filt_cache_count++;
+
+    /* Fill the new entry */
+    const uint8_t *buf = fexpr->data;
+    uint32_t bsz = fexpr->size;
+    simple_filter_cmp_t cmp;
+    col_rel_t *out = sess->filt_cache[idx].filtered;
+    if (filter_is_simple_cmp(buf, bsz, &cmp)) {
+        for (uint32_t r = 0; r < rel->nrows; r++) {
+            int64_t row_buf[COL_STACK_MAX];
+            col_rel_row_copy_out(rel, r, row_buf);
+            if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
+                if (col_rel_append_row(out, row_buf) != 0) {
+                    col_rel_destroy(out);
+                    sess->filt_cache[idx].filtered = NULL;
+                    /* Leave the entry in cache with NULL; harmless */
+                    return NULL;
+                }
+            }
+        }
+    } else {
+        col_expr_compiled_t *ce = col_expr_compile(buf, bsz);
+        for (uint32_t r = 0; r < rel->nrows; r++) {
+            int64_t row_buf[COL_STACK_MAX];
+            col_rel_row_copy_out(rel, r, row_buf);
+            int pass;
+            if (ce) {
+                int64_t val = 0;
+                pass = (col_eval_expr_compiled(ce, row_buf, rel->ncols,
+                    &val) == 0)
+                           ? (val != 0 ? 1 : 0)
+                           : 0;
+            } else {
+                int64_t val = 0;
+                int err = col_eval_expr_run(buf, bsz, row_buf, rel->ncols,
+                        &val);
+                pass = (err == 0) ? (val != 0 ? 1 : 0) : 0;
+            }
+            if (pass && col_rel_append_row(out, row_buf) != 0) {
+                col_expr_compiled_free(ce);
+                col_rel_destroy(out);
+                sess->filt_cache[idx].filtered = NULL;
+                return NULL;
+            }
+        }
+        col_expr_compiled_free(ce);
+    }
+    sess->filt_cache[idx].source_nrows = rel->nrows;
+    return out;
+}
+
 /* --- JOIN ---------------------------------------------------------------- */
 
 int
