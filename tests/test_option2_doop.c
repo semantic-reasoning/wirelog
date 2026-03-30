@@ -42,6 +42,7 @@
 #include "../wirelog/backend.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
+#include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_facts.h"
@@ -308,6 +309,59 @@ run_program_count_rel_with_sip(const char *src, uint32_t num_workers,
 
     struct combined_count_ctx ctx = { rel_name, 0, 0 };
 
+    rc = wl_session_snapshot(sess, combined_count_cb, &ctx);
+
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+
+    if (rc != 0)
+        return -1;
+    if (rel_count_out)
+        *rel_count_out = ctx.rel_count;
+    return ctx.total;
+}
+
+/*
+ * Like run_program_count_rel but applies JPP to exercise intermediate
+ * projection insertion.  Used for issue #382 regression tests.
+ */
+static int64_t
+run_program_count_rel_with_jpp(const char *src, uint32_t num_workers,
+    const char *rel_name, int64_t *rel_count_out)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return -1;
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0 || !plan) {
+        wirelog_program_free(prog);
+        return -1;
+    }
+
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, num_workers, &sess);
+    if (rc != 0) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return -1;
+    }
+
+    rc = wl_session_load_facts(sess, prog);
+    if (rc != 0) {
+        wl_session_destroy(sess);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return -1;
+    }
+
+    struct combined_count_ctx ctx = { rel_name, 0, 0 };
     rc = wl_session_snapshot(sess, combined_count_cb, &ctx);
 
     wl_session_destroy(sess);
@@ -1095,6 +1149,62 @@ test_recursive_constant_bearing_right_child(void)
 }
 
 /* ========================================================================
+ * REGRESSION TESTS: Issue #382 — JPP multi-way recursive join
+ * ======================================================================== */
+
+/*
+ * Test 13: 6-way join chain with JPP enabled (issue #382).
+ *
+ * R(x, z) :- A(x, a), B(a, b), C(b, c), D(c, d), E(d, e), F(e, z).
+ *
+ * With 6 body atoms, JPP inserts 2+ intermediate PROJECT nodes.  The bug
+ * in insert_projections calls find_physical_column with the original scan
+ * layout even after a prior PROJECT changed the physical column layout.
+ * This causes wrong project_indices for the 2nd+ projection, producing
+ * zero or garbage results.
+ *
+ * Facts (single join path):
+ *   A(1,10), B(10,20), C(20,30), D(30,40), E(40,50), F(50,99)
+ * Expected: R = {(1,99)}, count == 1.
+ */
+static void
+test_jpp_6way_join_projections(void)
+{
+    TEST("issue#382: 6-way join with JPP inserts correct projection indices");
+
+/* *INDENT-OFF* */
+    const char *src =
+        ".decl A(x: int32, a: int32)\n"
+        "A(1, 10).\n"
+        ".decl B(a: int32, b: int32)\n"
+        "B(10, 20).\n"
+        ".decl C(b: int32, c: int32)\n"
+        "C(20, 30).\n"
+        ".decl D(c: int32, d: int32)\n"
+        "D(30, 40).\n"
+        ".decl E(d: int32, e: int32)\n"
+        "E(40, 50).\n"
+        ".decl F(e: int32, z: int32)\n"
+        "F(50, 99).\n"
+        ".decl R(x: int32, z: int32)\n"
+        "R(x, z) :- A(x, a), B(a, b), C(b, c), D(c, d), E(d, e), F(e, z).\n";
+/* *INDENT-ON* */
+
+    int64_t r_count = 0;
+    int64_t total = run_program_count_rel_with_jpp(src, 1, "R", &r_count);
+
+    ASSERT(total >= 0, "evaluation failed");
+
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+        "expected R count == 1 (single chain A->B->C->D->E->F), got %" PRId64,
+        r_count);
+    ASSERT(r_count == 1, msg);
+
+    PASS();
+}
+
+/* ========================================================================
  * main
  * ======================================================================== */
 
@@ -1132,6 +1242,10 @@ main(void)
     test_antijoin_constant_bearing_right_child();
     test_semijoin_constant_bearing_right_child();
     test_recursive_constant_bearing_right_child();
+
+    /* --- Issue #382: JPP multi-way recursive join projection indices --- */
+    printf("\n--- Issue #382: JPP Multi-Way Join Projection ---\n");
+    test_jpp_6way_join_projections();
 
     printf("\n=== Results: %d passed, %d failed, %d skipped (of %d) ===\n",
         pass_count, fail_count, skip_count, test_count);
