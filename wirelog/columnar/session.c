@@ -1437,15 +1437,28 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
             continue;
-        /* Issue #361, #388: TDD hybrid init partitions IDB by hash key,
-         * but recursive strata may require cross-partition data that is
-         * unavailable on individual workers (e.g. DOOP SubtypeOf at iter1
-         * returns EINVAL because partitioned IDB is incomplete).
-         * Disable TDD for recursive strata in snapshot until hybrid init
-         * correctly replicates all IDB dependencies.  Non-recursive strata
-         * are safe because they only read EDB (replicated). */
+        /* Issue #361, #388, #372: TDD hybrid init partitions IDB by hash key.
+         * Recursive strata with EXCHANGE ops can use TDD: the asymmetric
+         * partition-replicate scheme handles IDB self-joins correctly (each
+         * worker holds 1/W of the IDB, delta is broadcast).  Recursive strata
+         * without EXCHANGE ops (e.g. DOOP SubtypeOf) still fall back to
+         * single-threaded to avoid cross-partition data unavailability. */
+        bool recursive_has_exchange = false;
+        if (plan->strata[si].is_recursive) {
+            const wl_plan_stratum_t *rsp = &plan->strata[si];
+            for (uint32_t ri = 0;
+                ri < rsp->relation_count && !recursive_has_exchange; ri++) {
+                const wl_plan_relation_t *rp = &rsp->relations[ri];
+                for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+                    if (rp->ops[oi].op == WL_PLAN_OP_EXCHANGE) {
+                        recursive_has_exchange = true;
+                        break;
+                    }
+                }
+            }
+        }
         bool use_tdd = snapshot_tdd_eligible
-            && !plan->strata[si].is_recursive;
+            && (plan->strata[si].is_recursive ? recursive_has_exchange : true);
         int rc = use_tdd
             ? col_eval_stratum_tdd(&plan->strata[si], sess, si)
             : col_eval_stratum(&plan->strata[si], sess, si);
