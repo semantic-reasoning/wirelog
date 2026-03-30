@@ -856,6 +856,92 @@ test_doop_stratified_negation_excludes_abstract(void)
     PASS();
 }
 
+/*
+ * Test 9: JOIN with constant-bearing right child (issue #381).
+ *
+ * R(x, y) :- A(x), B(42, x, y).
+ *
+ * B has rows with different values in col0.  Only rows where col0==42 may
+ * participate in the join.  Without the fix (right_filter_expr not applied),
+ * B(99, 1, 300) would incorrectly join with A(1) and produce R(1, 300).
+ *
+ * Expected: R = {(1,100), (2,200)}, count == 2.
+ */
+static void
+test_join_constant_bearing_right_child(void)
+{
+    TEST("issue#381: JOIN filters constant-bearing right child");
+
+/* *INDENT-OFF* */
+    const char *src =
+        ".decl A(x: int32)\n"
+        "A(1).\n"
+        "A(2).\n"
+        ".decl B(tag: int32, x: int32, y: int32)\n"
+        "B(42, 1, 100).\n"  /* tag==42, should join with A(1) */
+        "B(42, 2, 200).\n"  /* tag==42, should join with A(2) */
+        "B(99, 1, 300).\n"  /* tag!=42, must NOT join with A(1) */
+        ".decl R(x: int32, y: int32)\n"
+        "R(x, y) :- A(x), B(42, x, y).\n";
+/* *INDENT-ON* */
+
+    int64_t r_count = 0;
+    int64_t total = run_program_count_rel(src, 1, "R", &r_count);
+
+    ASSERT(total >= 0, "evaluation failed");
+
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+        "expected R count == 2 (only tag==42 rows), got %" PRId64, r_count);
+    ASSERT(r_count == 2, msg);
+
+    PASS();
+}
+
+/*
+ * Test 10: ANTIJOIN with constant-bearing right child (issue #381).
+ *
+ * R(x, y) :- A(x, y), !B(42, x).
+ *
+ * B has a row (99, 2) where the constant argument tag!=42.  Without the fix,
+ * this row would incorrectly participate in the antijoin, excluding A(2,20)
+ * from R.  With the fix, only B rows where col0==42 are antijoin candidates.
+ *
+ * Expected: R = {(2,20)}, count == 1.
+ */
+static void
+test_antijoin_constant_bearing_right_child(void)
+{
+    TEST("issue#381: ANTIJOIN filters constant-bearing right child");
+
+/* *INDENT-OFF* */
+    const char *src =
+        ".decl A(x: int32, y: int32)\n"
+        "A(1, 10).\n"
+        "A(2, 20).\n"
+        "A(3, 30).\n"
+        ".decl B(tag: int32, x: int32)\n"
+        "B(42, 1).\n"  /* tag==42, x==1 -> A(1,10) must be excluded */
+        "B(99, 2).\n"  /* tag!=42, must NOT exclude A(2,20) */
+        "B(42, 3).\n"  /* tag==42, x==3 -> A(3,30) must be excluded */
+        ".decl R(x: int32, y: int32)\n"
+        "R(x, y) :- A(x, y), !B(42, x).\n";
+/* *INDENT-ON* */
+
+    int64_t r_count = 0;
+    int64_t total = run_program_count_rel(src, 1, "R", &r_count);
+
+    ASSERT(total >= 0, "evaluation failed");
+
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+        "expected R count == 1 (only A(2,20) survives), got %" PRId64,
+        r_count);
+    ASSERT(r_count == 1, msg);
+
+    PASS();
+}
+
 /* ========================================================================
  * main
  * ======================================================================== */
@@ -887,6 +973,11 @@ main(void)
     test_doop_8way_virtual_dispatch_join();
     test_doop_reachable_propagates_through_virtual_chain();
     test_doop_stratified_negation_excludes_abstract();
+
+    /* --- Issue #381: constant-bearing right child filter --- */
+    printf("\n--- Issue #381: Constant-Bearing Right Child Filter ---\n");
+    test_join_constant_bearing_right_child();
+    test_antijoin_constant_bearing_right_child();
 
     printf("\n=== Results: %d passed, %d failed, %d skipped (of %d) ===\n",
         pass_count, fail_count, skip_count, test_count);
