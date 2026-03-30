@@ -2952,7 +2952,7 @@ idb_idb_join_right_keys_match_exchange(const wl_plan_op_t *ops,
  * r(x,z):-r(x,y),r(y,z) where join is on col1=col0), cross-partition joins
  * would occur with partitioned IDB, so replicate_mode must be used instead.
  */
-static bool
+bool
 tdd_stratum_idb_self_join_exchange_aligned(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord)
 {

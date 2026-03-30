@@ -1438,12 +1438,16 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
             continue;
         /* Issue #361, #388, #372: TDD hybrid init partitions IDB by hash key.
-         * Recursive strata with EXCHANGE ops can use TDD: the asymmetric
-         * partition-replicate scheme handles IDB self-joins correctly (each
-         * worker holds 1/W of the IDB, delta is broadcast).  Recursive strata
-         * without EXCHANGE ops (e.g. DOOP SubtypeOf) still fall back to
-         * single-threaded to avoid cross-partition data unavailability. */
+         * Recursive strata with EXCHANGE ops can use TDD when:
+         *   (a) no IDB self-join exists (safe to partition without replication), OR
+         *   (b) IDB self-join is exchange-aligned (join key == EXCHANGE key, so
+         *       each worker can serve joins locally with delta broadcast).
+         * Strata with non-exchange-aligned IDB self-joins (e.g. TC r(x,z):-r(x,y),
+         * r(y,z) where join key col1≠partition key col0) or without EXCHANGE ops
+         * fall back to single-threaded to avoid cross-partition data unavailability
+         * or W-fold redundant work in replicate_mode. */
         bool recursive_has_exchange = false;
+        bool recursive_tdd_safe = true;
         if (plan->strata[si].is_recursive) {
             const wl_plan_stratum_t *rsp = &plan->strata[si];
             for (uint32_t ri = 0;
@@ -1456,9 +1460,19 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                     }
                 }
             }
+            /* TDD is only beneficial for recursive strata when there is no
+             * IDB self-join OR the IDB self-join is exchange-aligned.  A
+             * non-aligned self-join forces replicate_mode (all W workers do
+             * the full join), which is worse than single-threaded. */
+            if (recursive_has_exchange && tdd_stratum_has_idb_self_join(rsp)) {
+                recursive_tdd_safe =
+                    tdd_stratum_idb_self_join_exchange_aligned(rsp, sess);
+            }
         }
         bool use_tdd = snapshot_tdd_eligible
-            && (plan->strata[si].is_recursive ? recursive_has_exchange : true);
+            && (plan->strata[si].is_recursive
+                ? (recursive_has_exchange && recursive_tdd_safe)
+                : true);
         int rc = use_tdd
             ? col_eval_stratum_tdd(&plan->strata[si], sess, si)
             : col_eval_stratum(&plan->strata[si], sess, si);
