@@ -1437,13 +1437,15 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
             continue;
-        /* Issue #361: Only use TDD for recursive, non-self-join strata
-         * in snapshot.  Non-recursive TDD partitions all relations by
-         * col0, breaking EDB joins.  Self-join TDD clears IDB which
-         * deletes base facts when EDB and IDB share a relation. */
+        /* Issue #361, #388: TDD hybrid init partitions IDB by hash key,
+         * but recursive strata may require cross-partition data that is
+         * unavailable on individual workers (e.g. DOOP SubtypeOf at iter1
+         * returns EINVAL because partitioned IDB is incomplete).
+         * Disable TDD for recursive strata in snapshot until hybrid init
+         * correctly replicates all IDB dependencies.  Non-recursive strata
+         * are safe because they only read EDB (replicated). */
         bool use_tdd = snapshot_tdd_eligible
-            && plan->strata[si].is_recursive
-            && !tdd_stratum_has_idb_self_join(&plan->strata[si]);
+            && !plan->strata[si].is_recursive;
         int rc = use_tdd
             ? col_eval_stratum_tdd(&plan->strata[si], sess, si)
             : col_eval_stratum(&plan->strata[si], sess, si);
