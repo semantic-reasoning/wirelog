@@ -1049,6 +1049,51 @@ test_semijoin_constant_bearing_right_child(void)
     PASS();
 }
 
+/*
+ * Test 12: Recursive rule with constant-bearing right child (issue #381).
+ *
+ * Edge(src, tag, dst) with tag==42 edges only.
+ * Reach(x,y) :- Edge(x, 42, y).
+ * Reach(x,y) :- Reach(x, z), Edge(z, 42, y).
+ *
+ * Exercises col_op_join_diff (recursive strata, iterations > 0) and the
+ * diff_arrangement path with right_filter_expr active.
+ *
+ * Facts: Edge(1,42,2), Edge(2,42,3), Edge(1,99,4).
+ * Expected: Reach = {(1,2),(2,3),(1,3)}, count == 3.
+ * Edge(1,99,4) has tag!=42 so (1,4) must NOT appear.
+ */
+static void
+test_recursive_constant_bearing_right_child(void)
+{
+    TEST(
+        "issue#381: recursive rule filters constant-bearing right child (diff-join)");
+
+/* *INDENT-OFF* */
+    const char *src =
+        ".decl Edge(src: int32, tag: int32, dst: int32)\n"
+        "Edge(1, 42, 2).\n"
+        "Edge(2, 42, 3).\n"
+        "Edge(1, 99, 4).\n"  /* tag!=42: must be excluded */
+        ".decl Reach(x: int32, y: int32)\n"
+        "Reach(x, y) :- Edge(x, 42, y).\n"
+        "Reach(x, y) :- Reach(x, z), Edge(z, 42, y).\n";
+/* *INDENT-ON* */
+
+    int64_t reach_count = 0;
+    int64_t total = run_program_count_rel(src, 1, "Reach", &reach_count);
+
+    ASSERT(total >= 0, "evaluation failed");
+
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+        "expected Reach count == 3 (pairs (1,2),(2,3),(1,3) only), got %" PRId64,
+        reach_count);
+    ASSERT(reach_count == 3, msg);
+
+    PASS();
+}
+
 /* ========================================================================
  * main
  * ======================================================================== */
@@ -1086,6 +1131,7 @@ main(void)
     test_join_constant_bearing_right_child();
     test_antijoin_constant_bearing_right_child();
     test_semijoin_constant_bearing_right_child();
+    test_recursive_constant_bearing_right_child();
 
     printf("\n=== Results: %d passed, %d failed, %d skipped (of %d) ===\n",
         pass_count, fail_count, skip_count, test_count);

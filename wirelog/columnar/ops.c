@@ -5184,6 +5184,20 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
+    /* Apply constant filter on right child (from FILTER wrappers collected
+     * during plan generation).  Pool-allocated: freed with the pool. */
+    if (op->right_filter_expr.size > 0) {
+        col_rel_t *filtered
+            = apply_right_filter(&op->right_filter_expr, right,
+                sess->delta_pool);
+        if (!filtered) {
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
+            return ENOMEM;
+        }
+        right = filtered;
+    }
+
     /* Materialization cache check */
     if (op->materialized) {
         col_rel_t *cached
@@ -5251,7 +5265,8 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     /* DIFFERENTIAL PATH: persistent diff_arrangement for non-delta right.
      * The arrangement persists across iterations, only indexing new rows. */
     col_diff_arrangement_t *darr = NULL;
-    if (kc > 0 && op->right_relation && !used_right_delta)
+    if (kc > 0 && op->right_relation && !used_right_delta
+        && op->right_filter_expr.size == 0)
         darr = col_session_get_diff_arrangement(sess, op->right_relation, rk,
                 kc);
 

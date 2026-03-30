@@ -683,7 +683,8 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
             free(combined.data);
             combined = tmp;
         } else {
-            /* Subsequent predicate: append bytes then BAND to form conjunction */
+            /* Subsequent predicate: append bytes then BAND to form conjunction.
+             * BAND combines predicates: correct because comparisons return {0,1} */
             if (expr_buf_push_bytes(&combined, tmp.data, tmp.size) != 0
                 || expr_buf_push_u8(
                     &combined, (uint8_t)WL_PLAN_EXPR_ARITH_BAND)
@@ -1797,7 +1798,8 @@ lftj_chain_len(const wl_plan_op_t *ops, uint32_t op_count, uint32_t start,
     while (j < op_count && ops[j].op == WL_PLAN_OP_JOIN && ops[j].key_count == 1
         && ops[j].left_keys && ops[j].right_keys && ops[j].left_keys[0]
         && ops[j].right_keys[0] && ops[j].right_relation
-        && is_edb_rel(ops[j].right_relation, plan)) {
+        && is_edb_rel(ops[j].right_relation, plan)
+        && ops[j].right_filter_expr.size == 0) {
         if (!lk0) {
             lk0 = ops[j].left_keys[0];
             rk0 = ops[j].right_keys[0];
