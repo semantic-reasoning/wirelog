@@ -113,7 +113,7 @@ var_in_set(const char *var, char **set, uint32_t nset)
  */
 static void
 jpp_setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
-                    uint32_t right_count, wirelog_ir_node_t *join)
+    uint32_t right_count, wirelog_ir_node_t *join)
 {
     uint32_t key_count
         = count_shared_vars(left_vars, left_count, right_vars, right_count);
@@ -312,7 +312,7 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order)
  */
 static void
 rebuild_chain(wirelog_ir_node_t **join_nodes, uint32_t njoin,
-              wirelog_ir_node_t **ordered_scans, uint32_t nscan)
+    wirelog_ir_node_t **ordered_scans, uint32_t nscan)
 {
     if (njoin == 0 || nscan < 2)
         return;
@@ -385,7 +385,7 @@ collect_joins(wirelog_ir_node_t *node, wirelog_ir_node_t **out, uint32_t max)
  */
 static void
 collect_head_vars_from_expr(const wl_ir_expr_t *expr, char **out,
-                            uint32_t *count, uint32_t max)
+    uint32_t *count, uint32_t max)
 {
     if (!expr || *count >= max)
         return;
@@ -414,7 +414,7 @@ collect_head_vars(wirelog_ir_node_t *ir, char **out, uint32_t max)
             if (node->project_exprs) {
                 for (uint32_t i = 0; i < node->project_count; i++) {
                     collect_head_vars_from_expr(node->project_exprs[i], out,
-                                                &count, max);
+                        &count, max);
                 }
             }
         } else if (node->type == WIRELOG_IR_FLATMAP) {
@@ -422,17 +422,17 @@ collect_head_vars(wirelog_ir_node_t *ir, char **out, uint32_t max)
             if (node->project_exprs) {
                 for (uint32_t i = 0; i < node->project_count; i++) {
                     collect_head_vars_from_expr(node->project_exprs[i], out,
-                                                &count, max);
+                        &count, max);
                 }
             }
             if (node->filter_expr) {
                 collect_head_vars_from_expr(node->filter_expr, out, &count,
-                                            max);
+                    max);
             }
         } else if (node->type == WIRELOG_IR_FILTER) {
             if (node->filter_expr) {
                 collect_head_vars_from_expr(node->filter_expr, out, &count,
-                                            max);
+                    max);
             }
         } else if (node->type == WIRELOG_IR_ANTIJOIN) {
             /* ANTIJOIN join keys reference variables that must survive */
@@ -457,32 +457,6 @@ collect_head_vars(wirelog_ir_node_t *ir, char **out, uint32_t max)
 }
 
 /* ======================================================================== */
-/* Internal: find physical column index in a join chain output              */
-/* ======================================================================== */
-
-/*
- * The physical output of a left-deep join over scans[0..n-1] concatenates
- * ALL scan column lists without deduplication (including duplicate join key
- * columns). This function returns the physical column index of the first
- * occurrence of var_name across the concatenated scan column lists.
- */
-static uint32_t
-find_physical_column(wirelog_ir_node_t **scans, uint32_t n, const char *var)
-{
-    uint32_t offset = 0;
-    for (uint32_t s = 0; s < n; s++) {
-        uint32_t scount;
-        char **svars = scan_vars(scans[s], &scount);
-        for (uint32_t j = 0; j < scount; j++) {
-            if (svars[j] && var && strcmp(svars[j], var) == 0)
-                return offset + j;
-        }
-        offset += scount;
-    }
-    return 0; /* fallback */
-}
-
-/* ======================================================================== */
 /* Internal: insert intermediate projections in a join chain                */
 /* ======================================================================== */
 
@@ -495,7 +469,7 @@ find_physical_column(wirelog_ir_node_t **scans, uint32_t n, const char *var)
  */
 static uint32_t
 insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
-                   uint32_t head_var_count)
+    uint32_t head_var_count)
 {
     if (!join_root || join_root->type != WIRELOG_IR_JOIN)
         return 0;
@@ -554,6 +528,32 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
         }
     }
 
+    /* Track the actual physical column layout of the current join output.
+     * Unlike acc[] (which is deduplicated), phys_names[] mirrors the true
+     * columnar output: scan columns concatenated in order, join-key columns
+     * appearing in both children.  When a PROJECT is inserted it shrinks the
+     * layout; subsequent scans are appended on top.  This is the layout that
+     * project_indices must reference. */
+    char **phys_names = (char **)calloc(nscan * 32, sizeof(char *));
+    uint32_t phys_count = 0;
+    if (!phys_names) {
+        free(acc);
+        free(scans);
+        free(joins);
+        return 0;
+    }
+    /* Initial physical layout: S0 columns || S1 columns (with duplicates) */
+    {
+        uint32_t s0c;
+        char **s0v = scan_vars(scans[0], &s0c);
+        for (uint32_t j = 0; j < s0c; j++)
+            phys_names[phys_count++] = s0v[j];
+        uint32_t s1c;
+        char **s1v = scan_vars(scans[1], &s1c);
+        for (uint32_t j = 0; j < s1c; j++)
+            phys_names[phys_count++] = s1v[j];
+    }
+
     /* Now acc has the result of joins[0] (deepest join).
      * For each intermediate join i (0 to depth-2):
      *   - acc has the accumulated vars after joins[i]
@@ -607,12 +607,20 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     for (uint32_t v = 0; v < acc_count; v++) {
                         if (acc[v]
                             && var_in_set(acc[v], needed, needed_count)) {
-                            /* Use physical column index: the join output
-                             * concatenates ALL scan columns (including
-                             * duplicate join keys), so acc[] indices (which
-                             * are deduplicated) do not match physical cols. */
-                            proj->project_indices[p]
-                                = find_physical_column(scans, i + 2, acc[v]);
+                            /* Find the first occurrence of acc[v] in the
+                             * tracked physical column layout.  phys_names[]
+                             * reflects the true columnar output after any
+                             * prior PROJECTs, so indices are correct even
+                             * when 2+ projections are inserted in one chain. */
+                            uint32_t phys_idx = 0;
+                            for (uint32_t ph = 0; ph < phys_count; ph++) {
+                                if (phys_names[ph] && acc[v]
+                                    && strcmp(phys_names[ph], acc[v]) == 0) {
+                                    phys_idx = ph;
+                                    break;
+                                }
+                            }
+                            proj->project_indices[p] = phys_idx;
                             proj->column_names[p] = strdup_safe(acc[v]);
                             p++;
                         }
@@ -633,6 +641,12 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     }
                     acc_count = new_acc;
 
+                    /* Update physical layout to match PROJECT output: the
+                     * live acc columns, in order, with no duplicates. */
+                    phys_count = 0;
+                    for (uint32_t v = 0; v < acc_count; v++)
+                        phys_names[phys_count++] = acc[v];
+
                     /* Recalculate join keys for parent join using PROJECTED acc.
                      * After projection, column indices change, so join keys must
                      * reference the projected columns in the PROJECT output. */
@@ -642,7 +656,7 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     /* Use projected acc (current acc after shrinking) which has
                      * correct indices for the columns in the PROJECT output */
                     jpp_setup_join_keys(acc, acc_count, rsvars, rscount,
-                                        joins[i + 1]);
+                        joins[i + 1]);
 
                     projections++;
                 } else {
@@ -653,17 +667,21 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
 
         free(needed);
 
-        /* Merge next scan's vars into acc for the next iteration */
+        /* Merge next scan's vars into acc and physical layout for the next
+         * iteration.  phys_names gets ALL scan columns (join-key duplicates
+         * included); acc gets only new (deduplicated) names. */
         if (i + 2 < nscan) {
             uint32_t scount;
             char **svars = scan_vars(scans[i + 2], &scount);
             for (uint32_t j = 0; j < scount; j++) {
+                phys_names[phys_count++] = svars[j];
                 if (svars[j] && !var_in_set(svars[j], acc, acc_count))
                     acc[acc_count++] = svars[j];
             }
         }
     }
 
+    free(phys_names);
     free(acc);
     free(scans);
     free(joins);
@@ -681,7 +699,7 @@ typedef struct {
 
 static jpp_chain_result_t
 optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
-               uint32_t head_var_count)
+    uint32_t head_var_count)
 {
     jpp_chain_result_t result = { false, 0 };
 
@@ -794,7 +812,7 @@ find_join_chain(wirelog_ir_node_t *node)
 
 static void
 optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
-              uint32_t *joins_reordered, uint32_t *projections_inserted)
+    uint32_t *joins_reordered, uint32_t *projections_inserted)
 {
     if (!ir)
         return;
@@ -803,7 +821,7 @@ optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
     if (ir->type == WIRELOG_IR_UNION) {
         for (uint32_t i = 0; i < ir->child_count; i++) {
             optimize_tree(ir->children[i], chains_examined, joins_reordered,
-                          projections_inserted);
+                projections_inserted);
         }
         return;
     }
@@ -851,7 +869,7 @@ wl_jpp_apply(struct wirelog_program *prog, wl_jpp_stats_t *stats)
 
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         optimize_tree(prog->relation_irs[i], &chains_examined, &joins_reordered,
-                      &projections_inserted);
+            &projections_inserted);
     }
 
     if (stats) {
