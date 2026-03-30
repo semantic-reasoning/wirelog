@@ -1775,22 +1775,21 @@ keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
 /* --- Right-child filter helper ------------------------------------------- */
 
 /**
- * Apply a serialized filter expression to a relation, returning a new
- * pool-allocated relation containing only the passing rows.
- * The returned relation is owned by pool and freed when the pool resets.
- * Returns NULL on allocation failure.
+ * fill_filtered_rel: apply a serialized filter expression to @rel, appending
+ * passing rows into the already-allocated (empty) relation @out.
+ *
+ * @buf  raw filter expression bytes
+ * @bsz  length of @buf
+ * @rel  source relation (read-only)
+ * @out  destination relation (caller-allocated, must be empty on entry)
+ *
+ * Returns 0 on success, non-zero (ENOMEM) on allocation failure.
+ * On failure @out may be partially filled; caller should destroy it.
  */
-static col_rel_t *
-apply_right_filter(const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel,
-    delta_pool_t *pool)
+static int
+fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
+    col_rel_t *out)
 {
-    const uint8_t *buf = fexpr->data;
-    uint32_t bsz = fexpr->size;
-
-    col_rel_t *out = col_rel_pool_new_like(pool, "$rfilter", rel);
-    if (!out)
-        return NULL;
-
     /* Fast path: simple colA CMP CONST or colA CMP colB predicate */
     simple_filter_cmp_t cmp;
     if (filter_is_simple_cmp(buf, bsz, &cmp)) {
@@ -1798,13 +1797,11 @@ apply_right_filter(const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel,
             int64_t row_buf[COL_STACK_MAX];
             col_rel_row_copy_out(rel, r, row_buf);
             if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
-                if (col_rel_append_row(out, row_buf) != 0) {
-                    col_rel_destroy(out);
-                    return NULL;
-                }
+                if (col_rel_append_row(out, row_buf) != 0)
+                    return ENOMEM;
             }
         }
-        return out;
+        return 0;
     }
 
     /* Slow path: compile once, evaluate per row */
@@ -1825,11 +1822,31 @@ apply_right_filter(const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel,
         }
         if (pass && col_rel_append_row(out, row_buf) != 0) {
             col_expr_compiled_free(ce);
-            col_rel_destroy(out);
-            return NULL;
+            return ENOMEM;
         }
     }
     col_expr_compiled_free(ce);
+    return 0;
+}
+
+/**
+ * Apply a serialized filter expression to a relation, returning a new
+ * pool-allocated relation containing only the passing rows.
+ * The returned relation is owned by pool and freed when the pool resets.
+ * Returns NULL on allocation failure.
+ */
+static col_rel_t *
+apply_right_filter(const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel,
+    delta_pool_t *pool)
+{
+    col_rel_t *out = col_rel_pool_new_like(pool, "$rfilter", rel);
+    if (!out)
+        return NULL;
+
+    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out) != 0) {
+        col_rel_destroy(out);
+        return NULL;
+    }
     return out;
 }
 
@@ -1851,12 +1868,14 @@ fnv1a_hash(const uint8_t *buf, uint32_t len)
 /**
  * apply_right_filter_cached: session-level cached variant of apply_right_filter.
  *
- * Looks up (rel_name, filter_hash) in sess->filt_cache.  If found and the
- * source relation has not grown since the entry was built, returns the cached
- * filtered relation (owned by the cache; caller must NOT destroy it).
+ * Looks up (rel_name, filter_hash) in sess->filt_cache.  On hash match a
+ * full memcmp of filter bytes is performed to guard against hash collisions.
+ * If found and the source relation has not grown since the entry was built,
+ * returns the cached filtered relation (owned by the cache; caller must NOT
+ * destroy it).
  *
- * If the source grew, the stale entry is replaced.  If no entry exists, one
- * is created.  On any allocation failure the function falls back to returning
+ * If the source grew, the stale entry is rebuilt in-place.  If no entry
+ * exists, one is created.  On any allocation failure the function returns
  * NULL (caller handles ENOMEM).
  *
  * The returned pointer is valid until the cache entry is evicted (i.e., until
@@ -1877,61 +1896,28 @@ apply_right_filter_cached(wl_col_session_t *sess,
             continue;
         if (strcmp(sess->filt_cache[i].rel_name, rel_name) != 0)
             continue;
+        /* Full content comparison to guard against hash collisions */
+        if (sess->filt_cache[i].filter_size != fexpr->size
+            || memcmp(sess->filt_cache[i].filter_data, fexpr->data,
+            fexpr->size) != 0)
+            continue;
         /* Cache hit */
         if (sess->filt_cache[i].source_nrows == rel->nrows)
             return sess->filt_cache[i].filtered; /* still valid */
-        /* Source grew — rebuild */
+        /* Source grew — rebuild in-place */
         if (sess->filt_cache[i].filtered)
             col_rel_destroy(sess->filt_cache[i].filtered);
         sess->filt_cache[i].filtered = col_rel_new_like("$rfilter_cache", rel);
         if (!sess->filt_cache[i].filtered)
             return NULL;
-        /* Apply filter into the heap-allocated relation */
-        const uint8_t *buf = fexpr->data;
-        uint32_t bsz = fexpr->size;
-        simple_filter_cmp_t cmp;
-        col_rel_t *out = sess->filt_cache[i].filtered;
-        if (filter_is_simple_cmp(buf, bsz, &cmp)) {
-            for (uint32_t r = 0; r < rel->nrows; r++) {
-                int64_t row_buf[COL_STACK_MAX];
-                col_rel_row_copy_out(rel, r, row_buf);
-                if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
-                    if (col_rel_append_row(out, row_buf) != 0) {
-                        col_rel_destroy(out);
-                        sess->filt_cache[i].filtered = NULL;
-                        return NULL;
-                    }
-                }
-            }
-        } else {
-            col_expr_compiled_t *ce = col_expr_compile(buf, bsz);
-            for (uint32_t r = 0; r < rel->nrows; r++) {
-                int64_t row_buf[COL_STACK_MAX];
-                col_rel_row_copy_out(rel, r, row_buf);
-                int pass;
-                if (ce) {
-                    int64_t val = 0;
-                    pass = (col_eval_expr_compiled(ce, row_buf, rel->ncols,
-                        &val) == 0)
-                               ? (val != 0 ? 1 : 0)
-                               : 0;
-                } else {
-                    int64_t val = 0;
-                    int err = col_eval_expr_run(buf, bsz, row_buf, rel->ncols,
-                            &val);
-                    pass = (err == 0) ? (val != 0 ? 1 : 0) : 0;
-                }
-                if (pass && col_rel_append_row(out, row_buf) != 0) {
-                    col_expr_compiled_free(ce);
-                    col_rel_destroy(out);
-                    sess->filt_cache[i].filtered = NULL;
-                    return NULL;
-                }
-            }
-            col_expr_compiled_free(ce);
+        if (fill_filtered_rel(fexpr->data, fexpr->size, rel,
+            sess->filt_cache[i].filtered) != 0) {
+            col_rel_destroy(sess->filt_cache[i].filtered);
+            sess->filt_cache[i].filtered = NULL;
+            return NULL;
         }
         sess->filt_cache[i].source_nrows = rel->nrows;
-        return out;
+        return sess->filt_cache[i].filtered;
     }
 
     /* Cache miss — build a new entry */
@@ -1951,59 +1937,31 @@ apply_right_filter_cached(wl_col_session_t *sess,
     sess->filt_cache[idx].rel_name = strdup(rel_name);
     if (!sess->filt_cache[idx].rel_name)
         return NULL;
+    /* Store an owned copy of the filter expression bytes for full key compare */
+    sess->filt_cache[idx].filter_data = (uint8_t *)malloc(fexpr->size);
+    if (!sess->filt_cache[idx].filter_data) {
+        free(sess->filt_cache[idx].rel_name);
+        return NULL;
+    }
+    memcpy(sess->filt_cache[idx].filter_data, fexpr->data, fexpr->size);
+    sess->filt_cache[idx].filter_size = fexpr->size;
     sess->filt_cache[idx].filter_hash = fhash;
     sess->filt_cache[idx].source_nrows = 0; /* will be set after fill */
     sess->filt_cache[idx].filtered = col_rel_new_like("$rfilter_cache", rel);
     if (!sess->filt_cache[idx].filtered) {
+        free(sess->filt_cache[idx].filter_data);
         free(sess->filt_cache[idx].rel_name);
         return NULL;
     }
     sess->filt_cache_count++;
 
     /* Fill the new entry */
-    const uint8_t *buf = fexpr->data;
-    uint32_t bsz = fexpr->size;
-    simple_filter_cmp_t cmp;
     col_rel_t *out = sess->filt_cache[idx].filtered;
-    if (filter_is_simple_cmp(buf, bsz, &cmp)) {
-        for (uint32_t r = 0; r < rel->nrows; r++) {
-            int64_t row_buf[COL_STACK_MAX];
-            col_rel_row_copy_out(rel, r, row_buf);
-            if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
-                if (col_rel_append_row(out, row_buf) != 0) {
-                    col_rel_destroy(out);
-                    sess->filt_cache[idx].filtered = NULL;
-                    /* Leave the entry in cache with NULL; harmless */
-                    return NULL;
-                }
-            }
-        }
-    } else {
-        col_expr_compiled_t *ce = col_expr_compile(buf, bsz);
-        for (uint32_t r = 0; r < rel->nrows; r++) {
-            int64_t row_buf[COL_STACK_MAX];
-            col_rel_row_copy_out(rel, r, row_buf);
-            int pass;
-            if (ce) {
-                int64_t val = 0;
-                pass = (col_eval_expr_compiled(ce, row_buf, rel->ncols,
-                    &val) == 0)
-                           ? (val != 0 ? 1 : 0)
-                           : 0;
-            } else {
-                int64_t val = 0;
-                int err = col_eval_expr_run(buf, bsz, row_buf, rel->ncols,
-                        &val);
-                pass = (err == 0) ? (val != 0 ? 1 : 0) : 0;
-            }
-            if (pass && col_rel_append_row(out, row_buf) != 0) {
-                col_expr_compiled_free(ce);
-                col_rel_destroy(out);
-                sess->filt_cache[idx].filtered = NULL;
-                return NULL;
-            }
-        }
-        col_expr_compiled_free(ce);
+    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out) != 0) {
+        col_rel_destroy(out);
+        sess->filt_cache[idx].filtered = NULL;
+        /* Leave the entry in cache with NULL filtered; harmless on next lookup */
+        return NULL;
     }
     sess->filt_cache[idx].source_nrows = rel->nrows;
     return out;
@@ -2577,8 +2535,10 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
         return eval_stack_push(stack, left_e.rel, left_e.owned);
     }
 
-    /* Apply constant filter on right child (pool-allocated struct; heap
-     * internals freed via col_rel_destroy before return). */
+    /* Issue #386: antijoin filter caching is not yet implemented.
+     * Antijoin always uses an ephemeral pool-allocated filtered relation, so
+     * the per-iteration filter cost is O(N) — acceptable for current workloads
+     * but a candidate for follow-up optimization. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,
@@ -4812,8 +4772,10 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!right)
         return eval_stack_push(stack, left_e.rel, left_e.owned);
 
-    /* Apply constant filter on right child (pool-allocated struct; heap
-     * internals freed via col_rel_destroy before return). */
+    /* Issue #386: semijoin filter caching is not yet implemented.
+     * Semijoin always uses an ephemeral pool-allocated filtered relation, so
+     * the per-iteration filter cost is O(N) — acceptable for current workloads
+     * but a candidate for follow-up optimization. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,

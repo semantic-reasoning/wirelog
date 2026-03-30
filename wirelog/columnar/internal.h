@@ -586,6 +586,22 @@ extern const col_frontier_ops_t col_frontier_diff_ops;
 /* ======================================================================== */
 
 /*
+ * col_filt_cache_entry_t: one entry in the filtered-relation cache (Issue #386).
+ *
+ * The cache is keyed by (rel_name, filter_hash) with filter_data used for
+ * full content comparison on hash-match to guard against collisions.
+ * All pointer fields are owned by the entry and freed on eviction/destroy.
+ */
+typedef struct col_filt_cache_entry {
+    char *rel_name;          /* owned: base relation name */
+    uint64_t filter_hash;    /* FNV-1a hash of right_filter_expr.data */
+    uint8_t *filter_data;    /* owned copy of filter expression bytes */
+    uint32_t filter_size;    /* byte length of filter_data */
+    uint32_t source_nrows;   /* nrows of source rel when entry was built */
+    col_rel_t *filtered;     /* owned: the filtered relation */
+} col_filt_cache_entry_t;
+
+/*
  * wl_col_session_t: Columnar backend session state
  *
  * Memory layout (C11 6.7.2.1 P15 - pointer compatibility):
@@ -808,17 +824,14 @@ typedef struct wl_col_session_t {
      * False everywhere else, including retraction paths. */
     bool tdd_subpass_active;
     /* Filtered relation cache (Issue #386): caches apply_right_filter results
-     * keyed by (relation_name, filter_expr hash). Prevents redundant O(N) filter
-     * scans on each fixpoint iteration when right_filter_expr is present.
-     * Each entry owns rel_name (strdup) and filtered (col_rel_new_like).
-     * Entries are invalidated when source_nrows changes (relation grew).
+     * keyed by (relation_name, filter_expr hash + full content). Prevents
+     * redundant O(N) filter scans on each fixpoint iteration when
+     * right_filter_expr is present.  Each entry owns rel_name (strdup),
+     * filter_data (malloc copy of expression bytes), and filtered
+     * (col_rel_new_like).  Entries are invalidated when source_nrows changes
+     * (relation grew) or filter content differs (hash collision guard).
      * Freed on session destroy. Workers get NULL cache (zeroed at create). */
-    struct {
-        char *rel_name;          /* owned: base relation name */
-        uint64_t filter_hash;    /* FNV-1a hash of right_filter_expr.data */
-        uint32_t source_nrows;   /* nrows of source rel when entry was built */
-        col_rel_t *filtered;     /* owned: the filtered relation */
-    } *filt_cache;
+    col_filt_cache_entry_t *filt_cache;
     uint32_t filt_cache_count;
     uint32_t filt_cache_cap;
 } wl_col_session_t;

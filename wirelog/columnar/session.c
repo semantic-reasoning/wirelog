@@ -631,6 +631,7 @@ col_session_destroy(wl_session_t *session)
     /* Issue #386: Free filtered relation cache */
     for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
         free(sess->filt_cache[i].rel_name);
+        free(sess->filt_cache[i].filter_data);
         if (sess->filt_cache[i].filtered)
             col_rel_destroy(sess->filt_cache[i].filtered);
     }
@@ -830,6 +831,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
     /* Issue #386: Free filtered relation cache (workers own their own copy) */
     for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
         free(worker->filt_cache[i].rel_name);
+        free(worker->filt_cache[i].filter_data);
         if (worker->filt_cache[i].filtered)
             col_rel_destroy(worker->filt_cache[i].filtered);
     }
