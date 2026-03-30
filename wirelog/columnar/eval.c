@@ -1999,6 +1999,10 @@ tdd_worker_subpass_fn(void *arg)
         col_session_invalidate_arrangements(&sess->base,
             sp->relations[ri].name);
 
+        /* Issue #388: rc2 != 0 (including EOVERFLOW from join truncation)
+         * propagates as a worker error, so any_new is not set on truncation.
+         * This is correct: EOVERFLOW is a hard error requiring coordinator
+         * intervention, not a soft truncation that should continue. */
         if (rc2 != 0) {
             col_rel_destroy(delta);
             ctx->rc = rc2;
