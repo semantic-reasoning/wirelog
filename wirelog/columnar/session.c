@@ -1447,7 +1447,7 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
          * fall back to single-threaded to avoid cross-partition data unavailability
          * or W-fold redundant work in replicate_mode. */
         bool recursive_has_exchange = false;
-        bool recursive_tdd_safe = true;
+        bool recursive_tdd_safe = false; /* default: no TDD for recursive */
         if (plan->strata[si].is_recursive) {
             const wl_plan_stratum_t *rsp = &plan->strata[si];
             for (uint32_t ri = 0;
