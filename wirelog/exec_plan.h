@@ -254,13 +254,15 @@ typedef enum {
  *   VARIABLE:    relation_name
  *   MAP:         project_indices, project_count  (and/or map_exprs)
  *   FILTER:      filter_expr
- *   JOIN:        right_relation, left_keys, right_keys, key_count
- *   ANTIJOIN:    right_relation, left_keys, right_keys, key_count
+ *   JOIN:        right_relation, right_filter_expr, left_keys, right_keys,
+ *                key_count
+ *   ANTIJOIN:    right_relation, right_filter_expr, left_keys, right_keys,
+ *                key_count
  *   REDUCE:      agg_fn, group_by_indices, group_by_count
  *   CONCAT:      (no fields used)
  *   CONSOLIDATE: (no fields used)
- *   SEMIJOIN:    right_relation, left_keys, right_keys, key_count,
- *                project_indices, project_count
+ *   SEMIJOIN:    right_relation, right_filter_expr, left_keys, right_keys,
+ *                key_count, project_indices, project_count
  *   K_FUSION:    opaque_data (points to wl_plan_op_k_fusion_t in columnar backend)
  *   LFTJ:        opaque_data (points to wl_plan_op_lftj_t in columnar backend)
  *   EXCHANGE:    opaque_data (points to wl_plan_op_exchange_t in columnar backend)
@@ -279,6 +281,7 @@ typedef struct {
     uint32_t project_count;
 
     wl_plan_expr_buffer_t filter_expr;
+    wl_plan_expr_buffer_t right_filter_expr;
 
     wirelog_agg_fn_t agg_fn;
     const uint32_t *group_by_indices;

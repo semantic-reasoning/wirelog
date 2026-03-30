@@ -996,6 +996,7 @@ free_op(wl_plan_op_t *op)
 
     free((void *)op->project_indices);
     free(op->filter_expr.data);
+    free(op->right_filter_expr.data);
     free((void *)op->group_by_indices);
 
     if (op->map_exprs) {
@@ -1219,6 +1220,16 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
         memcpy(dst->filter_expr.data, src->filter_expr.data,
             src->filter_expr.size);
         dst->filter_expr.size = src->filter_expr.size;
+    }
+
+    if (src->right_filter_expr.data && src->right_filter_expr.size > 0) {
+        dst->right_filter_expr.data
+            = (uint8_t *)malloc(src->right_filter_expr.size);
+        if (!dst->right_filter_expr.data)
+            return -1;
+        memcpy(dst->right_filter_expr.data, src->right_filter_expr.data,
+            src->right_filter_expr.size);
+        dst->right_filter_expr.size = src->right_filter_expr.size;
     }
 
     if (src->map_exprs && src->map_expr_count > 0) {
