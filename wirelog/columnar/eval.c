@@ -2320,6 +2320,88 @@ static int tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W);
 
 /*
+ * tdd_broadcast_relation_delta:
+ * Union all worker deltas for relation index ri and install the union as
+ * $d$<relname> on every worker.  Used by tdd_exchange_deltas for relations
+ * that require broadcast (e.g. IDB self-join strata in asymmetric mode).
+ *
+ * Ownership of ctxs[w].delta_rels[ri] transfers here; all entries are
+ * consumed (freed or moved) before return.
+ */
+static int
+tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
+    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
+{
+    char dname[256];
+    snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+
+    for (uint32_t w = 0; w < W; w++)
+        session_remove_rel(&coord->tdd_workers[w], dname);
+
+    uint32_t total = 0, ncols = 0;
+    for (uint32_t w = 0; w < W; w++) {
+        col_rel_t *d = ctxs[w].delta_rels[ri];
+        if (d && d->nrows > 0) {
+            total += d->nrows;
+            if (ncols == 0)
+                ncols = d->ncols;
+        }
+    }
+    if (total == 0) {
+        for (uint32_t w = 0; w < W; w++) {
+            col_rel_destroy(ctxs[w].delta_rels[ri]);
+            ctxs[w].delta_rels[ri] = NULL;
+        }
+        return 0;
+    }
+
+    col_rel_t *union_d = col_rel_new_auto(dname, ncols);
+    if (!union_d)
+        return ENOMEM;
+
+    int rc = 0;
+    for (uint32_t w = 0; w < W; w++) {
+        col_rel_t *d = ctxs[w].delta_rels[ri];
+        ctxs[w].delta_rels[ri] = NULL;
+        if (d && d->nrows > 0)
+            rc = col_rel_append_all(union_d, d, NULL);
+        col_rel_destroy(d);
+        if (rc != 0) {
+            col_rel_destroy(union_d);
+            return rc;
+        }
+    }
+
+    for (uint32_t dst = 0; dst < W; dst++) {
+        col_rel_t *copy;
+        if (dst < W - 1) {
+            copy = col_rel_new_auto(dname, ncols);
+            if (!copy) {
+                col_rel_destroy(union_d);
+                return ENOMEM;
+            }
+            rc = col_rel_append_all(copy, union_d, NULL);
+            if (rc != 0) {
+                col_rel_destroy(copy);
+                col_rel_destroy(union_d);
+                return rc;
+            }
+        } else {
+            copy = union_d;
+            union_d = NULL;
+        }
+        rc = session_add_rel(&coord->tdd_workers[dst], copy);
+        if (rc != 0) {
+            col_rel_destroy(copy);
+            if (union_d)
+                col_rel_destroy(union_d);
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/*
  * tdd_alloc_exchange_bufs:
  * Allocate the W x W mailbox matrix on the coordinator session.
  * exchange_bufs[src][dst] will hold rows that worker src sends to dst.
@@ -2436,15 +2518,32 @@ tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
  * key that differs from the partition key), falls back to
  * tdd_broadcast_deltas to preserve correctness.
  *
+ * Issue #372: When self_join_mode is true (IDB self-join stratum using
+ * asymmetric partition-replicate), all relation deltas are broadcast to
+ * every worker.  Each worker holds 1/W of the IDB (partitioned by hash)
+ * and needs the full delta to probe against its local partition.
+ * Hash-partitioning the delta would send each worker only 1/W of the new
+ * tuples, causing missed joins with the complementary IDB partition.
+ *
  * Ownership of ctxs[w].delta_rels[ri] entries transfers here;
  * all entries are consumed (freed or moved) before return.
  */
 static int
 tdd_exchange_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
-    bool default_hash)
+    bool default_hash, bool self_join_mode)
 {
     uint32_t nrels = sp->relation_count;
+
+    /* Issue #372: Self-join strata use asymmetric partition-replicate.
+     * IDB is partitioned (via hybrid init); deltas are broadcast so each
+     * worker can probe its 1/W IDB partition with the full delta. */
+    if (self_join_mode && default_hash) {
+        int rc = 0;
+        for (uint32_t ri = 0; rc == 0 && ri < nrels; ri++)
+            rc = tdd_broadcast_relation_delta(sp, ri, coord, ctxs, W);
+        return rc;
+    }
 
     /* Check whether any relation plan carries EXCHANGE op metadata. */
     bool has_exchange = false;
@@ -2707,6 +2806,181 @@ tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp)
         }
     }
     return false;
+}
+
+/*
+ * idb_idb_join_right_keys_match_exchange:
+ * Walk an op sequence.  For each IDB-IDB JOIN found, verify that every
+ * right_key column name resolves to a column index that is listed in the
+ * EXCHANGE key_col_idxs of the right relation.
+ *
+ * Returns false as soon as any IDB-IDB JOIN is found whose right_keys do
+ * NOT match the EXCHANGE partition key — meaning cross-partition joins would
+ * occur and asymmetric init is unsafe.
+ *
+ * Returns true if every IDB-IDB JOIN in this op sequence is exchange-aligned
+ * (or if there are no IDB-IDB JOINs at all).
+ */
+static bool
+idb_idb_join_right_keys_match_exchange(const wl_plan_op_t *ops,
+    uint32_t op_count, const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord)
+{
+    bool stack_has_idb = false;
+    for (uint32_t oi = 0; oi < op_count; oi++) {
+        const wl_plan_op_t *op = &ops[oi];
+        if (op->op == WL_PLAN_OP_VARIABLE) {
+            stack_has_idb = is_stratum_idb(sp, op->relation_name);
+        } else if (op->op == WL_PLAN_OP_JOIN && op->right_relation) {
+            bool right_idb = is_stratum_idb(sp, op->right_relation);
+            if (right_idb && stack_has_idb) {
+                /* Found an IDB-IDB join.  For asymmetric partition-replicate to
+                 * be correct, BOTH the left join key AND the right join key
+                 * must equal the EXCHANGE partition key.  If left_keys and
+                 * right_keys are both "col0" (e.g. vA:-vF(z,x),vF(z,y)),
+                 * each worker's partition is self-contained.  If left_key
+                 * is "col1" and right_key is "col0" (e.g. TC r:-r(x,y),r(y,z)),
+                 * cross-partition joins are needed and replication is required.
+                 */
+                if (!op->right_keys || !op->left_keys || op->key_count == 0)
+                    return false;
+
+                /* Find the EXCHANGE key for the right relation. */
+                const uint32_t *xkey = NULL;
+                uint32_t xkey_count = 0;
+                for (uint32_t rj = 0; rj < sp->relation_count; rj++) {
+                    if (strcmp(sp->relations[rj].name, op->right_relation) != 0)
+                        continue;
+                    for (uint32_t oj = 0; oj < sp->relations[rj].op_count;
+                        oj++) {
+                        if (sp->relations[rj].ops[oj].op ==
+                            WL_PLAN_OP_EXCHANGE) {
+                            const wl_plan_op_exchange_t *meta =
+                                (const wl_plan_op_exchange_t *)
+                                sp->relations[rj].ops[oj].opaque_data;
+                            if (meta && meta->key_col_count > 0) {
+                                xkey = meta->key_col_idxs;
+                                xkey_count = meta->key_col_count;
+                            }
+                            break;
+                        }
+                    }
+                    break;
+                }
+
+                if (!xkey || xkey_count == 0)
+                    return false; /* No EXCHANGE key: cannot verify alignment */
+                if (xkey_count != op->key_count)
+                    return false; /* Key count mismatch */
+
+                /* Resolve right_keys (column names) to indices via the
+                 * coordinator's relation schema, then compare to xkey.
+                 * Also verify left_keys against the same xkey: for the join
+                 * to be fully local, BOTH left and right join keys must match
+                 * the EXCHANGE partition key.  Example: for TC r:-r(x,y),r(y,z)
+                 * right_key="col0" matches but left_key="col1" does not, so
+                 * workers would need cross-partition data. */
+                col_rel_t *rrel = session_find_rel(coord, op->right_relation);
+                if (!rrel || !rrel->col_names || rrel->ncols == 0)
+                    return false; /* No schema: cannot verify */
+
+                for (uint32_t k = 0; k < op->key_count; k++) {
+                    /* Check right_key against EXCHANGE key */
+                    const char *rkname = op->right_keys[k];
+                    uint32_t rcidx = UINT32_MAX;
+                    for (uint32_t c = 0; c < rrel->ncols; c++) {
+                        if (rrel->col_names[c]
+                            && strcmp(rrel->col_names[c], rkname) == 0) {
+                            rcidx = c;
+                            break;
+                        }
+                    }
+                    if (rcidx == UINT32_MAX)
+                        return false; /* Right column not found */
+                    bool rfound = false;
+                    for (uint32_t xk = 0; xk < xkey_count; xk++) {
+                        if (xkey[xk] == rcidx) {
+                            rfound = true;
+                            break;
+                        }
+                    }
+                    if (!rfound)
+                        return false; /* Right join key not in EXCHANGE key */
+
+                    /* Check left_key against xkey (using same column index
+                     * space — left relation is the same IDB, same schema). */
+                    const char *lkname = op->left_keys[k];
+                    uint32_t lcidx = UINT32_MAX;
+                    for (uint32_t c = 0; c < rrel->ncols; c++) {
+                        if (rrel->col_names[c]
+                            && strcmp(rrel->col_names[c], lkname) == 0) {
+                            lcidx = c;
+                            break;
+                        }
+                    }
+                    if (lcidx == UINT32_MAX)
+                        return false; /* Left column not found */
+                    bool lfound = false;
+                    for (uint32_t xk = 0; xk < xkey_count; xk++) {
+                        if (xkey[xk] == lcidx) {
+                            lfound = true;
+                            break;
+                        }
+                    }
+                    if (!lfound)
+                        return false; /* Left join key not in EXCHANGE key */
+                }
+            }
+            if (right_idb)
+                stack_has_idb = true;
+        }
+    }
+    return true;
+}
+
+/*
+ * tdd_stratum_idb_self_join_exchange_aligned:
+ * Returns true if the stratum has IDB self-joins AND all of them are
+ * exchange-aligned (right_keys match the EXCHANGE partition key).
+ *
+ * When true, the stratum can use asymmetric partition-replicate:
+ * each worker holds 1/W of the IDB (partitioned by EXCHANGE key),
+ * and the delta is broadcast.  Joins are fully local because the join
+ * key == partition key on both sides.
+ *
+ * When false (join key differs from partition key, e.g. transitive closure
+ * r(x,z):-r(x,y),r(y,z) where join is on col1=col0), cross-partition joins
+ * would occur with partitioned IDB, so replicate_mode must be used instead.
+ */
+static bool
+tdd_stratum_idb_self_join_exchange_aligned(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord)
+{
+    if (!tdd_stratum_has_idb_self_join(sp))
+        return false;
+
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const wl_plan_relation_t *rel = &sp->relations[ri];
+
+        if (!idb_idb_join_right_keys_match_exchange(
+                rel->ops, rel->op_count, sp, coord))
+            return false;
+
+        /* Check inside K_FUSION */
+        for (uint32_t oi = 0; oi < rel->op_count; oi++) {
+            if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION
+                && rel->ops[oi].opaque_data) {
+                const wl_plan_op_k_fusion_t *kf =
+                    (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
+                for (uint32_t ki = 0; ki < kf->k; ki++) {
+                    if (!idb_idb_join_right_keys_match_exchange(
+                            kf->k_ops[ki], kf->k_op_counts[ki], sp, coord))
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 /*
@@ -3209,17 +3483,24 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             coord->outer_epoch);
     }
 
-    /* Issue #361: Use hybrid init (partition IDB by EXCHANGE key, replicate
-     * EDB) for non-self-join strata when new EDB was inserted.  Self-join
-     * strata and frontier-skip strata use full replication for correctness.
-     * Hash exchange is now per-relation: relations with EXCHANGE ops get
-     * hash-partitioned, others get broadcast. */
-    bool self_join_mode = tdd_stratum_has_idb_self_join(sp);
-    bool replicate_mode = self_join_mode
-        || (coord->last_inserted_relation == NULL);
-    /* Issue #388: Optional fallback to single-worker for self-join strata.
-     * Replicate mode with W>1 causes W-fold delta amplification even with
-     * broadcast dedup. Single-worker avoids replication overhead entirely. */
+    /* Issue #361, #372: Determine init strategy:
+     *
+     *   self_join_mode (asymmetric partition-replicate): IDB self-join strata
+     *   where the join key == EXCHANGE partition key on both sides (e.g. CSPA
+     *   valueAlias: vA(x,y):-vF(z,x),vF(z,y) joins on col0 which is the
+     *   EXCHANGE key).  Workers hold 1/W of the IDB; delta is broadcast.
+     *   Each join is fully local because the join key equals the partition key.
+     *
+     *   replicate_mode (full replication): used when:
+     *     - No new EDB inserted (frontier-skip path), OR
+     *     - Stratum has IDB self-join but join key != EXCHANGE key (e.g.
+     *       transitive closure r(x,z):-r(x,y),r(y,z) where join is on
+     *       col1=col0 but partition is by col0 — cross-partition joins needed).
+     *
+     * Issue #388: Optional W=1 fallback for replicate mode only. */
+    bool self_join_mode = tdd_stratum_idb_self_join_exchange_aligned(sp, coord);
+    bool replicate_mode = (coord->last_inserted_relation == NULL)
+        || (tdd_stratum_has_idb_self_join(sp) && !self_join_mode);
     if (replicate_mode) {
         const char *env = getenv("WIRELOG_TDD_REPLICATE_W1");
         if (env && env[0] == '1')
@@ -3439,9 +3720,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
 
             /* EXCHANGE: hash-partitioned scatter/gather when plan carries
-             * EXCHANGE ops; broadcast otherwise (e.g. transitive closure). */
+             * EXCHANGE ops; broadcast otherwise (e.g. transitive closure).
+             * Issue #372: pass self_join_mode so asymmetric strata broadcast
+             * deltas to all workers (each holds 1/W IDB, needs full delta). */
             int brc = tdd_exchange_deltas(sp, coord, ctxs, W,
-                    !replicate_mode);
+                    !replicate_mode, self_join_mode);
 
             if (brc != 0) {
                 rc = brc;
