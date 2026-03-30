@@ -631,6 +631,27 @@ test_arrangement_cache_reuse_exe = executable(
 test('arrangement_cache_reuse', test_arrangement_cache_reuse_exe)
 
 # ============================================================================
+# Filtered Relation Cache Tests (Issue #386)
+# ============================================================================
+
+test_filt_cache_exe = executable(
+  'test_filt_cache',
+  files('test_filt_cache.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('filt_cache', test_filt_cache_exe)
+
+# ============================================================================
 # Frontier Tracking Tests (Phase 3B)
 # ============================================================================
 
