@@ -1842,6 +1842,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     if (!left_e.rel)
         return EINVAL;
 
+    col_rel_t *right_filtered = NULL; /* tracks pool-allocated filtered rel */
     col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right) {
         /* If right relation doesn't exist, join produces empty result (cross-product with nothing).
@@ -1910,7 +1911,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
     /* Apply constant filter on right child (from FILTER wrappers collected
-     * during plan generation).  Pool-allocated: freed with the pool. */
+     * during plan generation).  Pool-allocated struct; heap internals freed
+     * via col_rel_destroy before return. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,
@@ -1921,6 +1923,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             return ENOMEM;
         }
         right = filtered;
+        right_filtered = filtered;
     }
 
     /* Materialization cache: reuse previous join result when available.
@@ -2351,6 +2354,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             sess->profile.join_empty_out++;
         sess->profile.join_compute_ns += now_ns() - _t0_join;
 #endif
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         return eval_stack_push_delta(stack, out, false, result_is_delta);
     }
 #ifdef WL_PROFILE
@@ -2358,6 +2363,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         sess->profile.join_empty_out++;
     sess->profile.join_compute_ns += now_ns() - _t0_join;
 #endif
+    if (right_filtered)
+        col_rel_destroy(right_filtered);
     return eval_stack_push_delta(stack, out, true, result_is_delta);
 }
 
@@ -2371,13 +2378,15 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!left_e.rel)
         return EINVAL;
 
+    col_rel_t *right_filtered = NULL;
     col_rel_t *right = session_find_rel(sess, op->right_relation);
     if (!right) {
         /* If right relation doesn't exist, antijoin keeps all left rows */
         return eval_stack_push(stack, left_e.rel, left_e.owned);
     }
 
-    /* Apply constant filter on right child (pool-allocated: freed with pool) */
+    /* Apply constant filter on right child (pool-allocated struct; heap
+     * internals freed via col_rel_destroy before return). */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,
@@ -2388,6 +2397,7 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
             return ENOMEM;
         }
         right = filtered;
+        right_filtered = filtered;
     }
 
     col_rel_t *left = left_e.rel;
@@ -2475,6 +2485,8 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     free(rk);
     if (left_e.owned)
         col_rel_destroy(left);
+    if (right_filtered)
+        col_rel_destroy(right_filtered);
     return eval_stack_push(stack, out, true);
 }
 
@@ -4599,6 +4611,7 @@ int
 col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    col_rel_t *right_filtered = NULL;
     eval_entry_t left_e = eval_stack_pop(stack);
     if (!left_e.rel)
         return EINVAL;
@@ -4607,7 +4620,8 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!right)
         return eval_stack_push(stack, left_e.rel, left_e.owned);
 
-    /* Apply constant filter on right child (pool-allocated: freed with pool) */
+    /* Apply constant filter on right child (pool-allocated struct; heap
+     * internals freed via col_rel_destroy before return). */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,
@@ -4618,6 +4632,7 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
             return ENOMEM;
         }
         right = filtered;
+        right_filtered = filtered;
     }
 
     col_rel_t *left = left_e.rel;
@@ -4734,6 +4749,8 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     free(rk);
     if (left_e.owned)
         col_rel_destroy(left);
+    if (right_filtered)
+        col_rel_destroy(right_filtered);
     return eval_stack_push(stack, out, true);
 }
 
@@ -5133,6 +5150,7 @@ int
 col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    col_rel_t *right_filtered = NULL;
     eval_entry_t left_e = eval_stack_pop(stack);
     if (!left_e.rel)
         return EINVAL;
@@ -5185,7 +5203,8 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     /* Apply constant filter on right child (from FILTER wrappers collected
-     * during plan generation).  Pool-allocated: freed with the pool. */
+     * during plan generation).  Pool-allocated struct; heap internals freed
+     * via col_rel_destroy before return. */
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,
@@ -5196,6 +5215,7 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
             return ENOMEM;
         }
         right = filtered;
+        right_filtered = filtered;
     }
 
     /* Materialization cache check */
@@ -5415,10 +5435,14 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
         col_mat_cache_insert(&sess->mat_cache, left, right, out);
         if (left_e.owned)
             col_rel_destroy(left);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         return eval_stack_push_delta(stack, out, false, result_is_delta);
     }
     if (left_e.owned)
         col_rel_destroy(left);
+    if (right_filtered)
+        col_rel_destroy(right_filtered);
     return eval_stack_push_delta(stack, out, true, result_is_delta);
 }
 

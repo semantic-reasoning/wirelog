@@ -281,7 +281,6 @@ typedef struct {
     uint32_t project_count;
 
     wl_plan_expr_buffer_t filter_expr;
-    wl_plan_expr_buffer_t right_filter_expr;
 
     wirelog_agg_fn_t agg_fn;
     const uint32_t *group_by_indices;
@@ -299,6 +298,11 @@ typedef struct {
      * for parallel semi-naive evaluation.  Owned by the plan; freed
      * via wl_plan_free() -> free_op() path. */
     void *opaque_data;
+
+    /* Filter predicate applied to right-child tuples before join probe.
+    * Placed after opaque_data to avoid shifting hot fields (delta_mode,
+    * opaque_data) that were present in the original 136-byte layout. */
+    wl_plan_expr_buffer_t right_filter_expr;
 } wl_plan_op_t;
 
 /* ======================================================================== */
