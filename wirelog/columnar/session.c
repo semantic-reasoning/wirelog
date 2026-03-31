@@ -1464,9 +1464,15 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
              * IDB self-join OR the IDB self-join is exchange-aligned.  A
              * non-aligned self-join forces replicate_mode (all W workers do
              * the full join), which is worse than single-threaded. */
-            if (recursive_has_exchange && tdd_stratum_has_idb_self_join(rsp)) {
-                recursive_tdd_safe =
-                    tdd_stratum_idb_self_join_exchange_aligned(rsp, sess);
+            if (recursive_has_exchange) {
+                if (!tdd_stratum_has_idb_self_join(rsp)) {
+                    /* Category A: no IDB-IDB joins — safe for hybrid
+                     * init + hash-partitioned delta exchange. */
+                    recursive_tdd_safe = true;
+                } else {
+                    recursive_tdd_safe =
+                        tdd_stratum_idb_self_join_exchange_aligned(rsp, sess);
+                }
             }
         }
         bool use_tdd = snapshot_tdd_eligible
