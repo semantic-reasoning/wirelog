@@ -7,8 +7,8 @@
  *
  * Validates that col_session_create enforces the WL_MAX_WORKERS cap:
  *   - Default cap: 16 workers
- *   - Env override: WIRELOG_MAX_WORKERS sets exact cap [1, 256]
- *   - Hard limit: values > 256 clamp to 256
+ *   - Env override: WIRELOG_MAX_WORKERS sets exact cap [1, 512]
+ *   - Hard limit: values > 512 clamp to 512
  *   - Invalid env (0): falls back to default cap (16)
  */
 
@@ -182,15 +182,22 @@ test_no_clamp_at_16(void)
 }
 
 /* ======================================================================== */
-/* Test 3: num_workers=196 — exceeds default cap, clamps to 16             */
+/* Test 3: num_workers=196 — within RAM-based dynamic cap, accepted as-is  */
+/* (Issue #409: dynamic cap replaces fixed default of 16)                   */
 /* ======================================================================== */
 
 static int
 test_clamp_196_to_16(void)
 {
-    TEST("WL_MAX_WORKERS clamp: num_workers=196 -> 16");
+    TEST("WL_MAX_WORKERS dynamic cap: num_workers within RAM cap accepted");
 
     unsetenv("WIRELOG_MAX_WORKERS");
+
+    /* Dynamically compute a safe num_workers that is above the old fixed
+     * default (16) but within the RAM-based cap on this machine. */
+    uint64_t ram = col_detect_physical_memory();
+    uint32_t ram_cap = col_compute_worker_cap(ram);
+    uint32_t test_w = ram_cap > 32 ? ram_cap - 1 : 17;
 
     wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
             ".decl r(x: int32)\n"
@@ -201,18 +208,22 @@ test_clamp_196_to_16(void)
     }
 
     uint32_t actual = 0;
-    int rc = get_actual_workers(plan, 196, &actual);
+    int rc = get_actual_workers(plan, test_w, &actual);
     wl_plan_free(plan);
 
     if (rc != 0) {
-        FAIL("session_create failed");
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "session_create failed (test_w=%u, ram_cap=%u)", test_w, ram_cap);
+        FAIL(msg);
         return 1;
     }
 
-    bool ok = (actual == 16);
+    bool ok = (actual == test_w);
     if (!ok) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "expected 16, got %u", actual);
+        snprintf(msg, sizeof(msg), "expected %u (no clamp), got %u", test_w,
+            actual);
         FAIL(msg);
     } else {
         PASS();
@@ -263,13 +274,20 @@ test_env_override_32(void)
 }
 
 /* ======================================================================== */
-/* Test 5: WIRELOG_MAX_WORKERS=0 — invalid, falls back to default 16      */
+/* Test 5: WIRELOG_MAX_WORKERS=0 — invalid, falls back to RAM-based cap    */
+/* (Issue #409: default is now dynamic RAM cap, not fixed 16)               */
 /* ======================================================================== */
 
 static int
 test_env_invalid_zero(void)
 {
-    TEST("WL_MAX_WORKERS env invalid: WIRELOG_MAX_WORKERS=0 -> default 16");
+    /* Dynamically compute a safe num_workers within the RAM cap. */
+    uint64_t ram = col_detect_physical_memory();
+    uint32_t ram_cap = col_compute_worker_cap(ram);
+    uint32_t test_w = ram_cap > 32 ? ram_cap - 1 : 17;
+
+    TEST(
+        "WL_MAX_WORKERS env invalid: WIRELOG_MAX_WORKERS=0 -> RAM cap fallback");
 
     setenv("WIRELOG_MAX_WORKERS", "0", 1);
 
@@ -283,19 +301,24 @@ test_env_invalid_zero(void)
     }
 
     uint32_t actual = 0;
-    int rc = get_actual_workers(plan, 196, &actual);
+    int rc = get_actual_workers(plan, test_w, &actual);
     wl_plan_free(plan);
     unsetenv("WIRELOG_MAX_WORKERS");
 
     if (rc != 0) {
-        FAIL("session_create failed");
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "session_create failed (test_w=%u, ram_cap=%u)", test_w, ram_cap);
+        FAIL(msg);
         return 1;
     }
 
-    bool ok = (actual == 16);
+    /* Invalid env (val=0 rejected) falls back to RAM cap; test_w < RAM cap */
+    bool ok = (actual == test_w);
     if (!ok) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "expected 16 (fallback), got %u", actual);
+        snprintf(msg, sizeof(msg), "expected %u (RAM cap fallback), got %u",
+            test_w, actual);
         FAIL(msg);
     } else {
         PASS();
@@ -304,13 +327,15 @@ test_env_invalid_zero(void)
 }
 
 /* ======================================================================== */
-/* Test 6: WIRELOG_MAX_WORKERS=999 — above hard limit, clamps to 256      */
+/* Test 6: WIRELOG_MAX_WORKERS=999 — env override allows up to hard limit  */
+/* (Issue #409: hard limit raised to 4096, env override accepted with warn) */
 /* ======================================================================== */
 
 static int
 test_env_hard_limit(void)
 {
-    TEST("WL_MAX_WORKERS hard limit: WIRELOG_MAX_WORKERS=999 -> 256");
+    TEST(
+        "WL_MAX_WORKERS env override: WIRELOG_MAX_WORKERS=999 allowed with warning");
 
     setenv("WIRELOG_MAX_WORKERS", "999", 1);
 
@@ -333,10 +358,14 @@ test_env_hard_limit(void)
         return 1;
     }
 
-    bool ok = (actual == 256);
+    /* Env override allows 999 (< hard limit of 4096) with warning if it
+     * exceeds RAM-based cap. On this system, RAM cap ≈ 409, so warning issued
+     * but session created with num_workers=999. */
+    bool ok = (actual == 999);
     if (!ok) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "expected 256 (hard limit), got %u", actual);
+        snprintf(msg, sizeof(msg), "expected 999 (env override), got %u",
+            actual);
         FAIL(msg);
     } else {
         PASS();

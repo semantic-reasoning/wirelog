@@ -328,7 +328,7 @@ col_should_activate_diff(const wl_col_session_t *sess, uint64_t affected_mask)
  * Uses platform-specific syscalls to query total installed RAM. Returns 0 if
  * the platform is not supported or if detection fails. No /proc/meminfo used.
  */
-static uint64_t
+uint64_t
 col_detect_physical_memory(void)
 {
 #ifdef __linux__

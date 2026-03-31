@@ -1307,6 +1307,13 @@ void
 col_worker_session_destroy(wl_col_session_t *worker);
 
 /*
+ * col_detect_physical_memory: Detect total physical RAM in bytes (Issue #221).
+ * Returns 0 if the platform is not supported or detection fails.
+ */
+uint64_t
+col_detect_physical_memory(void);
+
+/*
  * col_compute_worker_cap: RAM-aware worker cap formula (Issue #409).
  *
  * Returns the maximum safe number of workers for a system with ram_bytes of
