@@ -6,10 +6,10 @@
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
  * Validates that join_output_limit is correctly computed at session init:
- *   - Default: auto-detected from physical RAM / num_workers
+ *   - Default: auto-detected from physical RAM (global per-join cap)
  *   - Env override: WIRELOG_JOIN_OUTPUT_LIMIT sets exact value
  *   - Disable: WIRELOG_JOIN_OUTPUT_LIMIT=0 disables the limit
- *   - Scaling: 8-worker limit is ~1/8 of 1-worker limit
+ *   - Consistency: limit is constant regardless of num_workers
  *
  * Issue #221: Dynamic join output limit based on available memory
  */
@@ -241,9 +241,9 @@ test_env_disable(void)
 /* ======================================================================== */
 
 static int
-test_limit_scales_with_workers(void)
+test_limit_constant_across_workers(void)
 {
-    TEST("join_output_limit is independent of num_workers (Issue #386)");
+    TEST("join_output_limit is constant regardless of num_workers");
 
     /* Remove env override to exercise auto-detection path */
     unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
@@ -264,9 +264,19 @@ test_limit_scales_with_workers(void)
         return 1;
     }
 
+    wl_session_t *sess4 = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 4, &sess4);
+    if (rc != 0 || !sess4) {
+        wl_session_destroy(sess1);
+        wl_plan_free(plan);
+        FAIL("session_create (4 workers) failed");
+        return 1;
+    }
+
     wl_session_t *sess8 = NULL;
     rc = wl_session_create(wl_backend_columnar(), plan, 8, &sess8);
     if (rc != 0 || !sess8) {
+        wl_session_destroy(sess4);
         wl_session_destroy(sess1);
         wl_plan_free(plan);
         FAIL("session_create (8 workers) failed");
@@ -274,23 +284,27 @@ test_limit_scales_with_workers(void)
     }
 
     uint64_t limit1 = ((wl_col_session_t *)sess1)->join_output_limit;
+    uint64_t limit4 = ((wl_col_session_t *)sess4)->join_output_limit;
     uint64_t limit8 = ((wl_col_session_t *)sess8)->join_output_limit;
 
-    /* Issue #386: join_output_limit no longer scales with num_workers.
-    * In timely-differential evaluation, workers do not simultaneously
-    * produce peak join output; runtime backpressure handles memory. */
-    bool ok = (limit1 > 0 && limit8 > 0 && limit1 == limit8);
+    /* join_output_limit is a global per-join cap independent of num_workers.
+     * Multi-worker coordination is handled by wl_mem_ledger_should_backpressure.
+     * All three sessions must share the same positive limit. */
+    bool ok = (limit1 > 0 && limit1 == limit4 && limit1 == limit8);
 
     if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg),
-            "limit1=%llu limit8=%llu: expected equal",
-            (unsigned long long)limit1, (unsigned long long)limit8);
+            "limit1=%llu limit4=%llu limit8=%llu: expected all equal",
+            (unsigned long long)limit1,
+            (unsigned long long)limit4,
+            (unsigned long long)limit8);
         FAIL(msg);
     }
 
-    wl_session_destroy(sess1);
     wl_session_destroy(sess8);
+    wl_session_destroy(sess4);
+    wl_session_destroy(sess1);
     wl_plan_free(plan);
 
     if (ok)
@@ -310,7 +324,7 @@ main(void)
     test_default_limit();
     test_env_override();
     test_env_disable();
-    test_limit_scales_with_workers();
+    test_limit_constant_across_workers();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
