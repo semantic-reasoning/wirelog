@@ -13,6 +13,7 @@
 #include "../wirelog-internal.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -354,6 +355,25 @@ col_detect_physical_memory(void)
 }
 
 /*
+ * col_compute_worker_cap: RAM-aware worker cap formula (Issue #409).
+ * See declaration in internal.h for full rationale and examples.
+ */
+uint32_t
+col_compute_worker_cap(uint64_t ram_bytes)
+{
+    if (ram_bytes == 0)
+        return 16u;
+    uint64_t ram_linear = ram_bytes / (40ULL * 1024 * 1024);
+    uint64_t ram_sqrt = (uint64_t)sqrt((double)ram_bytes / 8.0);
+    uint64_t dyn = ram_linear < ram_sqrt ? ram_linear : ram_sqrt;
+    if (dyn < 16u)
+        dyn = 16u;
+    if (dyn > 4096u)
+        dyn = 4096u;
+    return (uint32_t)dyn;
+}
+
+/*
  * col_session_create: Initialize a columnar backend session
  *
  * Implements wl_compute_backend_t.session_create vtable slot.
@@ -393,44 +413,76 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     sess->num_workers = num_workers > 0 ? num_workers : 1;
 
     /*
-     * WL_MAX_WORKERS: Per-worker fixed allocation cap
+     * WL_MAX_WORKERS: Per-worker and W² exchange buffer cost cap
      *
      * Rationale:
      * - K-fusion k is bounded by max IDB body atoms per recursive rule.
      *   For all known workloads (DOOP k=8-9, CSPA k=5), max k < 16.
-     * - TDD semi-naive evaluation with W>16 has diminishing returns vs
-     *   per-worker memory cost: 20MB per worker (8MB arena + 4MB pool +
-     *   8MB thread stack + arrangement clones).
-     * - W=16 on 256GB RAM: ~320MB infrastructure + data = sustainable
-     * - W=196: 3.9GB infrastructure alone = unsustainable
+     * - TDD distributed eval uses W×W exchange buffer matrix: W² × 8B
+     *   allocated by coordinator (Issue #318). Total infra cost per W:
+     *   Per-worker linear: 20MB (8MB arena + 4MB pool + 8MB thread stack
+     *   + arrangement clones).
+     *   Exchange matrix overhead: 8B × W × W (partition buffers sent from
+     *   each worker to each other worker).
      *
-     * Environment variable WIRELOG_MAX_WORKERS allows override [1, 256].
+     * Total memory for W workers: W × 20MB + W² × 8B
+     * Examples:
+     *   W=16:  320MB + 2KB ≈ 320MB
+     *   W=512: 10.2GB + 2MB ≈ 10.2GB
+     *   W=1024: 20.4GB + 8MB ≈ 20.4GB
+     *
+     * Environment variable WIRELOG_MAX_WORKERS allows override [1, 512].
      * Default 16 covers all known workloads with safety margin.
      * Set WL_MEM_REPORT=1 for clamping diagnostics.
      */
-#define WL_MAX_WORKERS_DEFAULT   16u
-#define WL_MAX_WORKERS_HARD_LIMIT 256u
+#define WL_MAX_WORKERS_HARD_LIMIT 4096u
     {
-        uint32_t cap = WL_MAX_WORKERS_DEFAULT;
+        /* Dynamic cap: reject num_workers exceeding the RAM-based safe limit
+         * (Issue #409). WIRELOG_MAX_WORKERS env override is accepted up to the
+         * hard limit with a warning; without override, requests above the
+         * RAM-based cap are rejected so callers get a clear error (not silent
+         * truncation). See col_compute_worker_cap() for the formula. */
+        uint32_t ram_cap = col_compute_worker_cap(col_detect_physical_memory());
+
+        bool has_env_override = false;
+        uint32_t env_cap = 0;
         const char *env = getenv("WIRELOG_MAX_WORKERS");
         if (env && env[0] != '\0') {
             char *endp = NULL;
             unsigned long val = strtoul(env, &endp, 10);
             if (endp != env && *endp == '\0' && val > 0) {
-                cap = (val <= WL_MAX_WORKERS_HARD_LIMIT)
+                has_env_override = true;
+                env_cap = (val <= WL_MAX_WORKERS_HARD_LIMIT)
                     ? (uint32_t)val
                     : WL_MAX_WORKERS_HARD_LIMIT;
+                if (env_cap > ram_cap)
+                    fprintf(stderr,
+                        "[wirelog] WIRELOG_MAX_WORKERS=%u overrides "
+                        "RAM-based cap %u; ensure sufficient memory\n",
+                        env_cap, ram_cap);
             }
         }
-        if (sess->num_workers > cap) {
+
+        uint32_t effective_cap = has_env_override ? env_cap : ram_cap;
+
+        if (sess->num_workers > effective_cap) {
+            if (!has_env_override) {
+                fprintf(stderr,
+                    "[wirelog] num_workers %u exceeds RAM-based cap %u "
+                    "(set WIRELOG_MAX_WORKERS to override, max %u)\n",
+                    sess->num_workers, effective_cap,
+                    WL_MAX_WORKERS_HARD_LIMIT);
+                free(sess);
+                return EINVAL;
+            }
+            /* Env override active: clamp to the explicit cap */
             if (getenv("WL_MEM_REPORT"))
                 fprintf(stderr,
                     "[wirelog] clamping num_workers %u -> %u\n",
-                    sess->num_workers, cap);
-            sess->num_workers = cap;
+                    sess->num_workers, effective_cap);
+            sess->num_workers = effective_cap;
         }
     }
-#undef WL_MAX_WORKERS_DEFAULT
 #undef WL_MAX_WORKERS_HARD_LIMIT
 
     /* Dynamic join output limit (Issue #221) */

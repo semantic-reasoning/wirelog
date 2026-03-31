@@ -229,7 +229,7 @@ test_plan_gen_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('plan_gen', test_plan_gen_exe)
@@ -250,7 +250,7 @@ test_plan_exchange_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('plan_exchange', test_plan_exchange_exe)
@@ -271,7 +271,7 @@ test_workqueue_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('workqueue', test_workqueue_exe)
@@ -311,7 +311,7 @@ test_option2_cse_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DENABLE_K_FUSION=1'],
 )
 
@@ -337,7 +337,7 @@ test_option2_doop_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('option2_doop', test_option2_doop_exe,
@@ -356,7 +356,7 @@ test_consolidate_incremental_delta_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('consolidate_incremental_delta', test_consolidate_incremental_delta_exe)
@@ -385,7 +385,7 @@ test_consolidate_kway_merge_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('consolidate_kway_merge', test_consolidate_kway_merge_exe)
@@ -402,7 +402,7 @@ test_simd_row_cmp_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('simd_row_cmp', test_simd_row_cmp_exe)
@@ -459,7 +459,7 @@ test_empty_delta_skip_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('empty_delta_skip', test_empty_delta_skip_exe)
@@ -480,7 +480,7 @@ test_delta_factoring_e2e_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('delta_factoring_e2e', test_delta_factoring_e2e_exe)
@@ -501,7 +501,7 @@ test_k_fusion_e2e_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('k_fusion_e2e', test_k_fusion_e2e_exe)
@@ -522,7 +522,7 @@ test_k_fusion_memory_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('k_fusion_memory', test_k_fusion_memory_exe)
@@ -543,7 +543,7 @@ test_delta_timestamp_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('delta_timestamp', test_delta_timestamp_exe)
@@ -564,7 +564,7 @@ test_arrangement_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('arrangement', test_arrangement_exe)
@@ -585,7 +585,7 @@ test_delta_arrangement_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('delta_arrangement', test_delta_arrangement_exe)
@@ -606,7 +606,7 @@ test_join_arrangement_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('join_arrangement', test_join_arrangement_exe)
@@ -623,7 +623,7 @@ test_lftj_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('lftj', test_lftj_exe)
@@ -644,7 +644,7 @@ test_arrangement_cache_reuse_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('arrangement_cache_reuse', test_arrangement_cache_reuse_exe)
@@ -665,7 +665,7 @@ test_filt_cache_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('filt_cache', test_filt_cache_exe)
@@ -698,7 +698,7 @@ test_frontier_vtable_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('frontier_vtable', test_frontier_vtable_exe)
@@ -719,7 +719,7 @@ test_diff_vtable_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_vtable', test_diff_vtable_exe)
@@ -800,7 +800,7 @@ test_incremental_insertion_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('incremental_insertion', test_incremental_insertion_exe)
@@ -817,7 +817,7 @@ bench_incremental_frontier_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 
@@ -833,7 +833,7 @@ test_affected_strata_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('affected_strata', test_affected_strata_exe)
@@ -850,7 +850,7 @@ test_affected_rules_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('affected_rules', test_affected_rules_exe)
@@ -871,7 +871,7 @@ test_phase4_frontier_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('phase4_frontier_integration', test_phase4_frontier_integration_exe)
@@ -892,7 +892,7 @@ test_rule_level_frontier_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('rule_level_frontier', test_rule_level_frontier_exe)
@@ -909,7 +909,7 @@ test_mobius_count_signed_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('mobius_count_signed', test_mobius_count_signed_exe)
@@ -926,7 +926,7 @@ test_mobius_join_weighted_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('mobius_join_weighted', test_mobius_join_weighted_exe)
@@ -943,7 +943,7 @@ test_mobius_delta_formula_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('mobius_delta_formula', test_mobius_delta_formula_exe)
@@ -960,7 +960,7 @@ test_phase3b_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('phase3b_integration', test_phase3b_integration_exe)
@@ -977,7 +977,7 @@ test_phase3c_join_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('phase3c_join_integration', test_phase3c_join_integration_exe)
@@ -999,7 +999,7 @@ test_phase3c_reduce_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('phase3c_reduce_integration', test_phase3c_reduce_integration_exe)
@@ -1016,7 +1016,7 @@ test_phase3c_full_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('phase3c_full_integration', test_phase3c_full_integration_exe)
@@ -1033,7 +1033,7 @@ test_frontier_skip_mobius_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('frontier_skip_mobius', test_frontier_skip_mobius_exe)
@@ -1050,7 +1050,7 @@ test_phase3d_frontier_skip_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('phase3d_frontier_skip_integration', test_phase3d_frontier_skip_integration_exe)
@@ -1071,7 +1071,7 @@ test_consolidation_cow_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('consolidation_cow', test_consolidation_cow_exe)
@@ -1092,7 +1092,7 @@ test_arrangement_incr_invalidation_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('arrangement_incr_invalidation', test_arrangement_incr_invalidation_exe)
@@ -1113,7 +1113,7 @@ test_delta_propagation_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('delta_propagation', test_delta_propagation_exe)
@@ -1131,7 +1131,7 @@ test_monotone_detection_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('monotone_detection', test_monotone_detection_exe)
@@ -1149,7 +1149,7 @@ test_multi_worker_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('multi_worker', test_multi_worker_exe)
@@ -1167,7 +1167,7 @@ test_2d_frontier_init_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('2d_frontier_init', test_2d_frontier_init_exe)
@@ -1185,7 +1185,7 @@ test_2d_frontier_skip_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('2d_frontier_skip', test_2d_frontier_skip_exe)
@@ -1202,7 +1202,7 @@ test_selective_frontier_reset_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('selective_frontier_reset', test_selective_frontier_reset_exe)
@@ -1220,7 +1220,7 @@ test_multi_stratum_rule_frontier_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('multi_stratum_rule_frontier', test_multi_stratum_rule_frontier_exe)
@@ -1246,7 +1246,7 @@ test_cli_exe = executable(
   workqueue_src,
   driver_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('cli', test_cli_exe)
@@ -1264,7 +1264,7 @@ test_cli_delta_exe = executable(
   workqueue_src,
   driver_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('cli_delta', test_cli_delta_exe)
@@ -1309,7 +1309,7 @@ test_bitwise_eval_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('bitwise_eval', test_bitwise_eval_exe)
@@ -1326,7 +1326,7 @@ test_bitwise_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('bitwise_integration', test_bitwise_integration_exe)
@@ -1371,7 +1371,7 @@ test_hash_eval_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('hash_eval', test_hash_eval_exe)
@@ -1388,7 +1388,7 @@ test_hash_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('hash_integration', test_hash_integration_exe)
@@ -1414,7 +1414,7 @@ test_cryptographic_hashes_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('cryptographic_hashes', test_cryptographic_hashes_exe)
@@ -1494,7 +1494,7 @@ test_delta_callback_exe = executable(
   workqueue_src,
   csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('delta_callback', test_delta_callback_exe)
@@ -1516,7 +1516,7 @@ test_delta_retraction_exe = executable(
   workqueue_src,
   csv_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('delta_retraction', test_delta_retraction_exe)
@@ -1537,7 +1537,7 @@ test_session_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('session', test_session_exe)
@@ -1581,7 +1581,7 @@ test_lftj_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('lftj_integration', test_lftj_integration_exe)
@@ -1602,7 +1602,7 @@ test_simd_filter_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('simd_filter', test_simd_filter_exe)
@@ -1623,7 +1623,7 @@ test_compaction_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('compaction', test_compaction_exe)
@@ -1644,7 +1644,7 @@ test_join_limit_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('join_limit', test_join_limit_exe)
@@ -1665,7 +1665,7 @@ test_max_workers_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('max_workers', test_max_workers_exe)
@@ -1686,7 +1686,7 @@ test_simd_join_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('simd_join', test_simd_join_exe)
@@ -1707,7 +1707,7 @@ test_simd_neon_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('simd_neon', test_simd_neon_exe)
@@ -1736,7 +1736,7 @@ test_diff_arrangement_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_arrangement', test_diff_arrangement_exe)
@@ -1757,7 +1757,7 @@ test_diff_multiworker_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_multiworker', test_diff_multiworker_exe)
@@ -1778,7 +1778,7 @@ test_diff_bridge_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_bridge', test_diff_bridge_exe)
@@ -1799,7 +1799,7 @@ test_diff_join_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_join', test_diff_join_exe)
@@ -1820,7 +1820,7 @@ test_diff_consolidate_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_consolidate', test_diff_consolidate_exe)
@@ -1841,7 +1841,7 @@ test_diff_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_integration', test_diff_integration_exe)
@@ -1858,7 +1858,7 @@ test_diff_recursive_arrangement_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('diff_recursive_arrangement', test_diff_recursive_arrangement_exe)
@@ -1879,7 +1879,7 @@ test_expr_compile_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('expr_compile', test_expr_compile_exe)
@@ -1896,7 +1896,7 @@ test_pointer_swap_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('pointer_swap', test_pointer_swap_exe)
@@ -1913,7 +1913,7 @@ test_malloc_optimization_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('malloc_optimization', test_malloc_optimization_exe)
@@ -1930,7 +1930,7 @@ test_radix_sort_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('radix_sort', test_radix_sort_exe)
@@ -1947,7 +1947,7 @@ test_partition_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('partition', test_partition_exe)
@@ -1968,7 +1968,7 @@ test_worker_session_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('worker_session', test_worker_session_exe)
@@ -1985,7 +1985,7 @@ test_td_exchange_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('td_exchange', test_td_exchange_exe)
@@ -2005,7 +2005,7 @@ test_tdd_nonrecursive_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('tdd_nonrecursive', test_tdd_nonrecursive_exe)
@@ -2022,7 +2022,7 @@ test_tdd_recursive_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('tdd_recursive', test_tdd_recursive_exe)
@@ -2043,7 +2043,7 @@ test_tdd_exchange_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('tdd_exchange', test_tdd_exchange_exe)
@@ -2060,7 +2060,7 @@ test_tdd_convergence_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('tdd_convergence', test_tdd_convergence_exe)
@@ -2081,7 +2081,7 @@ test_tdd_integration_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('tdd_integration', test_tdd_integration_exe)
@@ -2098,7 +2098,7 @@ test_frontier_progress_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('frontier_progress', test_frontier_progress_exe)
@@ -2119,7 +2119,7 @@ test_td_multiworker_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('td_multiworker', test_td_multiworker_exe)
@@ -2140,7 +2140,7 @@ test_tdd_multiworker_exe = executable(
   thread_src,
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('tdd_multiworker', test_tdd_multiworker_exe)
