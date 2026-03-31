@@ -157,6 +157,17 @@ endif
 
 xxhash_dep = xxhash_proj.get_variable('xxhash_dep')
 
+# Math library for col_compute_worker_cap (Issue #409)
+# On most POSIX systems libm is separate; on some (musl, glibc 2.38+) it is
+# part of libc and find_library may return not-found.  Fall back to a raw
+# -lm link_args which is harmless when libm is folded into libc.
+_math_lib = cc.find_library('m', required: false)
+if _math_lib.found()
+  math_dep = [_math_lib]
+else
+  math_dep = [declare_dependency(link_args: '-lm')]
+endif
+
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Configuration
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
@@ -220,7 +231,7 @@ wirelog_lib = library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: true,
   version: project_version,
 )
@@ -231,7 +242,7 @@ wirelog_static_lib = static_library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: false,  # Not installed by default
 )
 
@@ -263,7 +274,7 @@ wirelog_cli = executable(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep],
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: true,
 )
 
