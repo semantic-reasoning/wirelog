@@ -1306,4 +1306,27 @@ col_worker_session_create(wl_col_session_t *coordinator,
 void
 col_worker_session_destroy(wl_col_session_t *worker);
 
+/*
+ * col_compute_worker_cap: RAM-aware worker cap formula (Issue #409).
+ *
+ * Returns the maximum safe number of workers for a system with ram_bytes of
+ * physical RAM, using the formula:
+ *
+ *   cap = min((uint32_t)sqrt(ram_bytes / 8), ram_bytes / 40MB, 4096)
+ *
+ * Rationale:
+ *   - sqrt(RAM/8): keeps W^2 * 8B exchange matrix below RAM/8.
+ *   - RAM/40MB:    keeps per-worker linear cost (20MB arena + overhead) below
+ *                  half of RAM, leaving headroom for data.
+ *   - 4096:        absolute ceiling (W^2 * 8B = 128MB at W=4096; manageable).
+ *
+ * Returns 1 when ram_bytes == 0 (undetected RAM; caller falls back to env or
+ * default).
+ *
+ * This function is pure (no side effects) and intended for unit testing.
+ * col_session_create calls it internally via col_detect_physical_memory().
+ */
+uint32_t
+col_compute_worker_cap(uint64_t ram_bytes);
+
 #endif /* WL_COLUMNAR_INTERNAL_H */
