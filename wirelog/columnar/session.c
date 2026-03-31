@@ -408,20 +408,15 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         if (!env_valid) {
             uint64_t phys = col_detect_physical_memory();
             if (phys > 0) {
-                /* 25% of RAM / (8 bytes * 5 avg cols).
-                 *
-                 * This is a global per-join safety cap shared by all workers.
-                 * We do NOT divide by num_workers here: each K-fusion worker
-                 * operates on a 1/K partition of the data, so the individual
-                 * join output grows proportionally to the partition, not to
-                 * the total. Dividing by num_workers was too aggressive —
-                 * it shrunk each worker's cap to 1/K of what a single-worker
-                 * run would allow, causing EOVERFLOW on valid large joins and
-                 * OOM from the resulting fallback materialisation paths.
-                 *
-                 * Multi-worker memory coordination is handled dynamically by
-                 * wl_mem_ledger_should_backpressure() in the join hot path. */
-                sess->join_output_limit = (phys / 4) / 40ULL;
+                /* 25% of RAM / (8 bytes * 5 avg cols * num_workers).
+                 * Each K-fusion worker processes a 1/K data partition, so
+                 * per-worker output rows scale with partition size.  Dividing
+                 * by num_workers keeps the aggregate output within 25% RAM
+                 * across all concurrent workers. */
+                sess->join_output_limit
+                    = (phys / 4)
+                    / (40ULL
+                    * (sess->num_workers > 0 ? sess->num_workers : 1));
             } else {
                 sess->join_output_limit = COL_JOIN_OUTPUT_LIMIT_DEFAULT;
             }
@@ -497,8 +492,23 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         }
         if (budget == 0) {
             uint64_t phys = col_detect_physical_memory();
-            if (phys > 0)
-                budget = (phys / 4ULL) * 3ULL; /* 75% of RAM */
+            if (phys > 0) {
+                uint64_t total = (phys / 4ULL) * 3ULL; /* 75% of RAM */
+                uint32_t nw = sess->num_workers;
+                if (nw > 1) {
+                    /* Mode 2 (TDD replicate): coordinator + W workers each
+                     * hold a full IDB copy in memory simultaneously.
+                     * Divide the total budget across W+1 parties so that
+                     * aggregate usage stays within 75% RAM.
+                     * Workers inherit this per-party budget via
+                     * col_worker_session_init (session.c:715).
+                     * TODO: For W > 64 on large-RAM systems a 1 GB minimum
+                     * floor may be needed to avoid over-restriction. */
+                    budget = total / (uint64_t)(nw + 1);
+                } else {
+                    budget = total;
+                }
+            }
         }
         wl_mem_ledger_init(&sess->mem_ledger, budget);
     }
