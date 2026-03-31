@@ -237,13 +237,13 @@ test_env_disable(void)
 }
 
 /* ======================================================================== */
-/* Test 4: Limit is independent of num_workers (Issue #386)                */
+/* Test 4: Limit is constant regardless of num_workers (Issue #404)        */
 /* ======================================================================== */
 
 static int
-test_limit_scales_with_workers(void)
+test_limit_constant_across_workers(void)
 {
-    TEST("join_output_limit scales inversely with num_workers");
+    TEST("join_output_limit is constant across W=1, W=4, W=8 (Issue #404)");
 
     /* Remove env override to exercise auto-detection path */
     unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
@@ -264,31 +264,46 @@ test_limit_scales_with_workers(void)
         return 1;
     }
 
+    wl_session_t *sess4 = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 4, &sess4);
+    if (rc != 0 || !sess4) {
+        wl_session_destroy(sess1);
+        wl_plan_free(plan);
+        FAIL("session_create (4 workers) failed");
+        return 1;
+    }
+
     wl_session_t *sess8 = NULL;
     rc = wl_session_create(wl_backend_columnar(), plan, 8, &sess8);
     if (rc != 0 || !sess8) {
         wl_session_destroy(sess1);
+        wl_session_destroy(sess4);
         wl_plan_free(plan);
         FAIL("session_create (8 workers) failed");
         return 1;
     }
 
     uint64_t limit1 = ((wl_col_session_t *)sess1)->join_output_limit;
+    uint64_t limit4 = ((wl_col_session_t *)sess4)->join_output_limit;
     uint64_t limit8 = ((wl_col_session_t *)sess8)->join_output_limit;
 
-    /* With 8 workers, limit should be ~1/8 of 1-worker limit.
-     * Allow tolerance: limit8 should be < limit1 / 4 (strictly less). */
-    bool ok = (limit1 > 0 && limit8 > 0 && limit8 < limit1 / 4);
+    /* Global per-join cap: limit must be identical for W=1, W=4, W=8.
+     * Regression check for Issue #404: commit 6929689 divided by num_workers,
+     * causing silent data loss in multi-worker mode. */
+    bool ok = (limit1 > 0 && limit1 == limit4 && limit1 == limit8);
 
     if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg),
-            "limit1=%llu limit8=%llu: expected limit8 < limit1/4",
-            (unsigned long long)limit1, (unsigned long long)limit8);
+            "limit1=%llu limit4=%llu limit8=%llu: expected all equal",
+            (unsigned long long)limit1,
+            (unsigned long long)limit4,
+            (unsigned long long)limit8);
         FAIL(msg);
     }
 
     wl_session_destroy(sess1);
+    wl_session_destroy(sess4);
     wl_session_destroy(sess8);
     wl_plan_free(plan);
 
@@ -309,7 +324,7 @@ main(void)
     test_default_limit();
     test_env_override();
     test_env_disable();
-    test_limit_scales_with_workers();
+    test_limit_constant_across_workers();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

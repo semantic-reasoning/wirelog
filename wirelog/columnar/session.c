@@ -449,15 +449,13 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         if (!env_valid) {
             uint64_t phys = col_detect_physical_memory();
             if (phys > 0) {
-                /* 25% of RAM / (8 bytes * 5 avg cols * num_workers).
+                /* Global per-join cap: 25% of RAM / (8 bytes * 5 avg cols).
                  * Each K-fusion worker processes a 1/K data partition, so
-                 * per-worker output rows scale with partition size.  Dividing
-                 * by num_workers keeps the aggregate output within 25% RAM
-                 * across all concurrent workers. */
-                sess->join_output_limit
-                    = (phys / 4)
-                    / (40ULL
-                    * (sess->num_workers > 0 ? sess->num_workers : 1));
+                 * per-partition join output does NOT scale with K.  Dividing
+                 * by num_workers here was a regression (commit 6929689) that
+                 * caused silent data loss in multi-worker mode (Issue #404).
+                 * Dynamic mem_ledger backpressure handles runtime coordination. */
+                sess->join_output_limit = (phys / 4) / 40ULL;
             } else {
                 sess->join_output_limit = COL_JOIN_OUTPUT_LIMIT_DEFAULT;
             }
