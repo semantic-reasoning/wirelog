@@ -3661,7 +3661,11 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
                 return rc;
             }
             /* Re-sort coordinator IDB to maintain sorted invariant
-             * for next iteration's merge-diff. */
+             * for next iteration's merge-diff.
+             * TODO(#390): This is O(N log N) per iteration.  Since
+             * combined_delta is already deduped against coord_idb,
+             * a merge-append that maintains sorted order would be
+             * O(N + D) where D = |combined_delta|. */
             if (coord_idb->nrows > 1)
                 tdd_dedup_rel(coord_idb);
         }
@@ -3718,12 +3722,9 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
                     rc = col_rel_append_all(widb, parts[w], NULL);
                     /* Step 7: Insert hashes of new rows into dedup_set */
                     if (rc == 0) {
-                        for (uint32_t r = 0; r < parts[w]->nrows; r++) {
-                            uint64_t h = 0;
-                            for (uint32_t c = 0; c < parts[w]->ncols; c++) {
-                                int64_t v = parts[w]->columns[c][r];
-                                h = XXH3_64bits_withSeed(&v, sizeof(v), h);
-                            }
+                        for (uint32_t row = 0; row < parts[w]->nrows;
+                            row++) {
+                            uint64_t h = dedup_row_hash(parts[w], row);
                             dedup_set_insert(widb, h);
                         }
                     }
@@ -3850,12 +3851,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     bool bdx_mode = tdd_stratum_has_idb_self_join(sp) && !self_join_mode;
     bool replicate_mode = (coord->last_inserted_relation == NULL)
         || (bdx_mode && stratum_max_idb_body_atoms(sp) > 2);
-    if (bdx_mode && !replicate_mode) {
-        /* BDX uses hybrid init (partition IDB), not replicate */
-        bdx_mode = true;
-    } else {
-        bdx_mode = false;
-    }
+    bdx_mode = bdx_mode && !replicate_mode;
     if (replicate_mode) {
         const char *env = getenv("WIRELOG_TDD_REPLICATE_W1");
         if (env && env[0] == '1')

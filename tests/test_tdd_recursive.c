@@ -571,6 +571,140 @@ test_triple_idb_guard(void)
 }
 
 /* ======================================================================== */
+/* BDX integration tests                                                    */
+/* ======================================================================== */
+
+/*
+ * Self-join TC program:
+ *   .decl edge(x: int32, y: int32)
+ *   .decl r(x: int32, y: int32)
+ *   r(x, y) :- edge(x, y).
+ *   r(x, z) :- r(x, y), r(y, z).
+ *
+ * The second rule is an IDB-IDB self-join (Category C) → triggers BDX mode.
+ */
+static wl_col_session_t *
+make_selfjoin_tc_session(uint32_t num_workers, wl_plan_t **plan_out,
+    wirelog_program_t **prog_out)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl r(x: int32, y: int32)\n"
+        "r(x, y) :- edge(x, y).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n",
+        &err);
+    if (!prog)
+        return NULL;
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    wl_session_t *session = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, num_workers, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    *plan_out = plan;
+    *prog_out = prog;
+    return COL_SESSION(session);
+}
+
+/*
+ * 5-node chain: 1→2→3→4→5   ⇒  TC has 10 tuples (4+3+2+1).
+ */
+static int
+test_bdx_selfjoin_w2(void)
+{
+    TEST("BDX self-join W=2 correctness");
+
+    wl_plan_t *p1, *p2;
+    wirelog_program_t *pr1, *pr2;
+    wl_col_session_t *s1 = make_selfjoin_tc_session(1, &p1, &pr1);
+    wl_col_session_t *s2 = make_selfjoin_tc_session(2, &p2, &pr2);
+    if (!s1 || !s2) {
+        FAIL("session creation failed");
+        return 1;
+    }
+
+    /* 5-node chain */
+    int64_t edges[] = {1, 2, 2, 3, 3, 4, 4, 5};
+    insert_edges(s1, edges, 4);
+    insert_edges(s2, edges, 4);
+
+    int rc1 = wl_session_step(&s1->base);
+    int rc2 = wl_session_step(&s2->base);
+
+    uint32_t cnt1 = count_rows(s1, "r");
+    uint32_t cnt2 = count_rows(s2, "r");
+
+    cleanup_session(s1, p1, pr1);
+    cleanup_session(s2, p2, pr2);
+
+    if (rc1 != 0 || rc2 != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (cnt1 != cnt2) {
+        FAIL("BDX W=2 row count differs from W=1");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_bdx_selfjoin_w4(void)
+{
+    TEST("BDX self-join W=4 correctness");
+
+    wl_plan_t *p1, *p4;
+    wirelog_program_t *pr1, *pr4;
+    wl_col_session_t *s1 = make_selfjoin_tc_session(1, &p1, &pr1);
+    wl_col_session_t *s4 = make_selfjoin_tc_session(4, &p4, &pr4);
+    if (!s1 || !s4) {
+        FAIL("session creation failed");
+        return 1;
+    }
+
+    /* 5-node chain */
+    int64_t edges[] = {1, 2, 2, 3, 3, 4, 4, 5};
+    insert_edges(s1, edges, 4);
+    insert_edges(s4, edges, 4);
+
+    int rc1 = wl_session_step(&s1->base);
+    int rc4 = wl_session_step(&s4->base);
+
+    uint32_t cnt1 = count_rows(s1, "r");
+    uint32_t cnt4 = count_rows(s4, "r");
+
+    cleanup_session(s1, p1, pr1);
+    cleanup_session(s4, p4, pr4);
+
+    if (rc1 != 0 || rc4 != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (cnt1 != cnt4) {
+        FAIL("BDX W=4 row count differs from W=1");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -588,6 +722,8 @@ main(void)
     test_tc_deep_chain();
     test_tc_category_a_diamond();
     test_triple_idb_guard();
+    test_bdx_selfjoin_w2();
+    test_bdx_selfjoin_w4();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
     if (tests_failed > 0)
