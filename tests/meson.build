@@ -2104,3 +2104,24 @@ test_td_multiworker_exe = executable(
 )
 
 test('td_multiworker', test_td_multiworker_exe)
+
+# ============================================================================
+# TDD Multi-Worker Regression Tests (Issue #404)
+# ============================================================================
+
+test_tdd_multiworker_exe = executable(
+  'test_tdd_multiworker',
+  files('test_tdd_multiworker.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep],
+)
+
+test('tdd_multiworker', test_tdd_multiworker_exe)
