@@ -1227,6 +1227,8 @@ col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, uint32_t stratum_idx);
 bool
 tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp);
+uint32_t
+stratum_max_idb_body_atoms(const wl_plan_stratum_t *sp);
 bool
 tdd_stratum_idb_self_join_exchange_aligned(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord);

@@ -464,6 +464,112 @@ test_tc_category_a_diamond(void)
     return 0;
 }
 
+/*
+ * make_triple_idb_session:
+ * Build a session with a 3-IDB-body-atom rule:
+ *   .decl e(x: int32, y: int32)
+ *   .decl r(x: int32, y: int32)
+ *   r(x, y) :- e(x, y).
+ *   r(x, y) :- r(x, a), r(a, b), r(b, y).
+ *
+ * The recursive rule has 3 IDB body atoms (all r).
+ * BDX mode must NOT be enabled for this stratum.
+ */
+static wl_col_session_t *
+make_triple_idb_session(uint32_t num_workers, wl_plan_t **plan_out,
+    wirelog_program_t **prog_out)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl e(x: int32, y: int32)\n"
+        ".decl r(x: int32, y: int32)\n"
+        "r(x, y) :- e(x, y).\n"
+        "r(x, y) :- r(x, a), r(a, b), r(b, y).\n",
+        &err);
+    if (!prog)
+        return NULL;
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    wl_session_t *session = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, num_workers, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    *plan_out = plan;
+    *prog_out = prog;
+    return COL_SESSION(session);
+}
+
+/*
+ * test_triple_idb_guard:
+ * 3-IDB-body-atom rule must fall back to single-threaded (BDX guard).
+ * W=2 must still produce correct results matching W=1.
+ */
+static int
+test_triple_idb_guard(void)
+{
+    TEST(
+        "3-IDB guard: W=2 triple-join r(x,y):-r(x,a),r(a,b),r(b,y) matches W=1");
+
+    wl_plan_t *plan1 = NULL, *plan2 = NULL;
+    wirelog_program_t *prog1 = NULL, *prog2 = NULL;
+    wl_col_session_t *sess1 = make_triple_idb_session(1, &plan1, &prog1);
+    if (!sess1) {
+        FAIL("baseline session create");
+        return 1;
+    }
+    wl_col_session_t *sess2 = make_triple_idb_session(2, &plan2, &prog2);
+    if (!sess2) {
+        cleanup_session(sess1, plan1, prog1);
+        FAIL("W=2 session create");
+        return 1;
+    }
+
+    /* Chain: 1->2->3->4->5 (4 edges) */
+    int64_t rows[] = { 1, 2, 2, 3, 3, 4, 4, 5 };
+    if (wl_session_insert(&sess1->base, "e", rows, 4, 2) != 0
+        || wl_session_insert(&sess2->base, "e", rows, 4, 2) != 0) {
+        cleanup_session(sess1, plan1, prog1);
+        cleanup_session(sess2, plan2, prog2);
+        FAIL("insert");
+        return 1;
+    }
+
+    int rc1 = wl_session_step(&sess1->base);
+    int rc2 = wl_session_step(&sess2->base);
+
+    uint32_t cnt1 = count_rows(sess1, "r");
+    uint32_t cnt2 = count_rows(sess2, "r");
+
+    cleanup_session(sess1, plan1, prog1);
+    cleanup_session(sess2, plan2, prog2);
+
+    if (rc1 != 0 || rc2 != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (cnt1 != cnt2) {
+        FAIL(
+            "W=2 row count differs from W=1 (guard should force single-threaded)");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -481,6 +587,7 @@ main(void)
     test_tc_w2_empty_edb();
     test_tc_deep_chain();
     test_tc_category_a_diamond();
+    test_triple_idb_guard();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
     if (tests_failed > 0)

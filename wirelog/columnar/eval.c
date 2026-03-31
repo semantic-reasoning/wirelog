@@ -2784,6 +2784,67 @@ ops_have_idb_idb_join(const wl_plan_op_t *ops, uint32_t op_count,
 }
 
 /*
+ * ops_count_idb_body_atoms:
+ * Walk an op sequence and count the number of distinct IDB relations
+ * referenced as body atoms (VARIABLE loads + JOIN right_relations).
+ * Extends the pattern from ops_have_idb_idb_join but returns a count.
+ */
+static uint32_t
+ops_count_idb_body_atoms(const wl_plan_op_t *ops, uint32_t op_count,
+    const wl_plan_stratum_t *sp)
+{
+    uint32_t count = 0;
+    for (uint32_t oi = 0; oi < op_count; oi++) {
+        const wl_plan_op_t *op = &ops[oi];
+        if (op->op == WL_PLAN_OP_VARIABLE) {
+            if (is_stratum_idb(sp, op->relation_name))
+                count++;
+        } else if (op->op == WL_PLAN_OP_JOIN && op->right_relation) {
+            if (is_stratum_idb(sp, op->right_relation))
+                count++;
+        }
+    }
+    return count;
+}
+
+/*
+ * stratum_max_idb_body_atoms:
+ * Walk all relations in a stratum (including K_FUSION children) and
+ * return the maximum number of IDB body atoms across all rules.
+ * Used as a static guard: BDX mode is only correct for rules with
+ * at most 2 IDB body atoms.
+ */
+uint32_t
+stratum_max_idb_body_atoms(const wl_plan_stratum_t *sp)
+{
+    uint32_t max_count = 0;
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const wl_plan_relation_t *rel = &sp->relations[ri];
+
+        /* Check top-level ops */
+        uint32_t c = ops_count_idb_body_atoms(rel->ops, rel->op_count, sp);
+        if (c > max_count)
+            max_count = c;
+
+        /* Check ops inside K_FUSION */
+        for (uint32_t oi = 0; oi < rel->op_count; oi++) {
+            if (rel->ops[oi].op == WL_PLAN_OP_K_FUSION
+                && rel->ops[oi].opaque_data) {
+                const wl_plan_op_k_fusion_t *kf =
+                    (const wl_plan_op_k_fusion_t *)rel->ops[oi].opaque_data;
+                for (uint32_t ki = 0; ki < kf->k; ki++) {
+                    c = ops_count_idb_body_atoms(kf->k_ops[ki],
+                            kf->k_op_counts[ki], sp);
+                    if (c > max_count)
+                        max_count = c;
+                }
+            }
+        }
+    }
+    return max_count;
+}
+
+/*
  * tdd_stratum_has_idb_self_join:
  * Returns true if any rule in the stratum has a JOIN where BOTH the left
  * input (from VARIABLE or previous JOIN) AND the right_relation are IDB.
