@@ -52,6 +52,48 @@
 #define WL_PREFETCH_W(addr) ((void)(addr))
 #endif
 
+/* ---- COW helpers --------------------------------------------------------- */
+
+/*
+ * col_rel_cow_unshare:
+ * Copy-on-write: for each column where col_shared[c] is true, allocate a
+ * private heap buffer (capacity new_cap rows), copy the existing nrows of
+ * data, and clear col_shared[c].  Must be called before any in-place
+ * mutation of the column buffers (append, sort, compact).
+ *
+ * If new_cap == 0 the existing capacity is reused.
+ * Returns 0 on success, ENOMEM on allocation failure (relation unchanged).
+ */
+static int
+col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
+{
+    if (!r->col_shared)
+        return 0;
+    if (new_cap == 0)
+        new_cap = r->capacity;
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        if (!r->col_shared[c])
+            continue;
+        int64_t *priv = (int64_t *)malloc((size_t)new_cap * sizeof(int64_t));
+        if (!priv)
+            return ENOMEM;
+        memcpy(priv, r->columns[c], (size_t)r->nrows * sizeof(int64_t));
+        r->columns[c] = priv;
+        r->col_shared[c] = false;
+    }
+    /* If all columns are now owned, free the shared-flags array */
+    bool any_shared = false;
+    for (uint32_t c = 0; c < r->ncols; c++)
+        if (r->col_shared[c]) {
+            any_shared = true; break;
+        }
+    if (!any_shared) {
+        free(r->col_shared);
+        r->col_shared = NULL;
+    }
+    return 0;
+}
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 void
@@ -211,6 +253,12 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
         uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
         if (new_cap <= r->capacity) /* overflow guard */
             return ENOMEM;
+        /* COW: unshare shared columns before in-place growth (Issue #396) */
+        if (r->col_shared) {
+            int cow_rc = col_rel_cow_unshare(r, new_cap);
+            if (cow_rc != 0)
+                return cow_rc;
+        }
         /* Grow timestamps first (if tracking) so we can roll back cleanly
          * on a subsequent data realloc failure. */
         if (r->timestamps) {
@@ -277,6 +325,13 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             if (next_cap <= new_cap) /* overflow guard */
                 return ENOMEM;
             new_cap = next_cap;
+        }
+
+        /* COW: unshare shared columns before in-place growth (Issue #396) */
+        if (dst->col_shared) {
+            int cow_rc = col_rel_cow_unshare(dst, new_cap);
+            if (cow_rc != 0)
+                return cow_rc;
         }
 
         /* Grow timestamps first (if tracking) */
@@ -381,10 +436,22 @@ col_rel_compact(col_rel_t *r)
         return;
 
     if (r->nrows == 0) {
-        if (!r->arena_owned)
-            col_columns_free(r->columns, r->ncols);
-        else
+        if (!r->arena_owned) {
+            if (r->col_shared && r->columns) {
+                /* COW: free only non-shared columns (Issue #396) */
+                for (uint32_t c = 0; c < r->ncols; c++) {
+                    if (!r->col_shared[c])
+                        free(r->columns[c]);
+                }
+                free(r->columns);
+                free(r->col_shared);
+                r->col_shared = NULL;
+            } else {
+                col_columns_free(r->columns, r->ncols);
+            }
+        } else {
             free(r->columns);
+        }
         r->columns = NULL;
         r->capacity = 0;
         r->arena_owned = false;
@@ -409,6 +476,12 @@ col_rel_compact(col_rel_t *r)
             tight = UINT32_MAX;
         if (tight < COL_REL_INIT_CAP)
             tight = COL_REL_INIT_CAP;
+
+        /* COW: unshare shared columns before in-place realloc (Issue #396) */
+        if (r->col_shared) {
+            if (col_rel_cow_unshare(r, tight) != 0)
+                goto free_merge_buf; /* non-fatal on failure */
+        }
 
         if (r->arena_owned) {
             /* Arena data: allocate new heap columns and copy */
@@ -1492,6 +1565,13 @@ col_rel_radix_sort_int64(col_rel_t *r)
     if (r->nrows <= 1) {
         r->sorted_nrows = r->nrows;
         return;
+    }
+
+    /* COW: unshare shared columns before in-place sort (Issue #396).
+     * If unshare fails, skip the sort to avoid mutating borrowed buffers. */
+    if (r->col_shared) {
+        if (col_rel_cow_unshare(r, 0) != 0)
+            return;
     }
 
     col_rel_radix_sort(r, 0, r->nrows);
