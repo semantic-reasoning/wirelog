@@ -409,6 +409,61 @@ test_tc_deep_chain(void)
     return 0;
 }
 
+/*
+ * test_tc_category_a_diamond:
+ * Category A stratum (recursive + EXCHANGE + no IDB-IDB joins).
+ * Diamond graph: 1->2, 1->3, 2->4, 3->4.
+ * TC: (1,2),(1,3),(2,4),(3,4),(1,4) = 5 tuples.
+ * W=2 must match W=1, exercising TDD for Category A after the #390 fix.
+ */
+static int
+test_tc_category_a_diamond(void)
+{
+    TEST("Category A: W=2 TC diamond graph matches W=1 (no IDB-IDB join)");
+
+    wl_plan_t *plan1 = NULL, *plan2 = NULL;
+    wirelog_program_t *prog1 = NULL, *prog2 = NULL;
+    wl_col_session_t *sess1 = make_tc_session(1, &plan1, &prog1);
+    if (!sess1) {
+        FAIL("baseline session create");
+        return 1;
+    }
+    wl_col_session_t *sess2 = make_tc_session(2, &plan2, &prog2);
+    if (!sess2) {
+        cleanup_session(sess1, plan1, prog1);
+        FAIL("W=2 session create");
+        return 1;
+    }
+
+    int64_t rows[] = { 1, 2, 1, 3, 2, 4, 3, 4 };
+    insert_edges(sess1, rows, 4);
+    insert_edges(sess2, rows, 4);
+
+    int rc1 = wl_session_step(&sess1->base);
+    int rc2 = wl_session_step(&sess2->base);
+
+    uint32_t cnt1 = count_rows(sess1, "tc");
+    uint32_t cnt2 = count_rows(sess2, "tc");
+
+    cleanup_session(sess1, plan1, prog1);
+    cleanup_session(sess2, plan2, prog2);
+
+    if (rc1 != 0 || rc2 != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (cnt1 != 5) {
+        FAIL("W=1 expected 5 tc tuples");
+        return 1;
+    }
+    if (cnt1 != cnt2) {
+        FAIL("W=2 tc row count differs from W=1 baseline");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -425,6 +480,7 @@ main(void)
     test_tc_cyclic();
     test_tc_w2_empty_edb();
     test_tc_deep_chain();
+    test_tc_category_a_diamond();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
     if (tests_failed > 0)
