@@ -2372,29 +2372,40 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
         }
     }
 
-    for (uint32_t dst = 0; dst < W; dst++) {
-        col_rel_t *copy;
-        if (dst < W - 1) {
-            copy = col_rel_new_auto(dname, ncols);
-            if (!copy) {
-                col_rel_destroy(union_d);
-                return ENOMEM;
-            }
-            rc = col_rel_append_all(copy, union_d, NULL);
+    /* Issue #390: Dedup broadcast union to prevent duplicate delta
+     * amplification.  In self_join_mode, workers hold disjoint 1/W IDB
+     * partitions but can independently derive the same tuple via
+     * different join paths.  Matches tdd_broadcast_deltas (line 3299). */
+    if (union_d->nrows > 1)
+        tdd_dedup_rel(union_d);
+
+    /* Issue #390: zero-copy broadcast via col_shared.
+     * Anchor union_d in worker 0's session; workers 1..W-1 borrow
+     * column pointers via col_rel_install_shared_view (O(ncols) pointer
+     * setup) instead of O(|delta|) deep copies.  Mirrors the pattern
+     * in tdd_broadcast_deltas (lines 3307-3354). */
+    rc = session_add_rel(&coord->tdd_workers[0], union_d);
+    if (rc != 0) {
+        col_rel_destroy(union_d);
+        return rc;
+    }
+    /* union_d is now owned by worker 0's session */
+    for (uint32_t dst = 1; dst < W; dst++) {
+        col_rel_t *view = col_rel_new_auto(dname, ncols);
+        if (!view)
+            return ENOMEM;
+        rc = col_rel_install_shared_view(view, union_d);
+        if (rc != 0) {
+            /* Fallback: deep copy on shared-view alloc failure */
+            rc = col_rel_append_all(view, union_d, NULL);
             if (rc != 0) {
-                col_rel_destroy(copy);
-                col_rel_destroy(union_d);
+                col_rel_destroy(view);
                 return rc;
             }
-        } else {
-            copy = union_d;
-            union_d = NULL;
         }
-        rc = session_add_rel(&coord->tdd_workers[dst], copy);
+        rc = session_add_rel(&coord->tdd_workers[dst], view);
         if (rc != 0) {
-            col_rel_destroy(copy);
-            if (union_d)
-                col_rel_destroy(union_d);
+            col_rel_destroy(view);
             return rc;
         }
     }
