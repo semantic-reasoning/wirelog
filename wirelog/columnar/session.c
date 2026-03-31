@@ -1491,9 +1491,128 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
             && (plan->strata[si].is_recursive
                 ? (recursive_has_exchange && recursive_tdd_safe)
                 : true);
+        /* Issue #390: Correctness oracle — compare TDD vs single-threaded
+         * tuple counts for recursive strata.  Enabled via env var.
+         * Debug-only; never runs in production.
+         *
+         * Save pre-stratum IDB state before TDD so the single-threaded
+         * re-evaluation starts from the same base facts. */
+        static int tdd_cc = -1;
+        if (tdd_cc < 0) {
+            const char *env = getenv("WIRELOG_TDD_CORRECTNESS_CHECK");
+            tdd_cc = (env && env[0] == '1') ? 1 : 0;
+        }
+        bool tdd_cc_active = tdd_cc
+            && use_tdd && plan->strata[si].is_recursive;
+        const wl_plan_stratum_t *csp = &plan->strata[si];
+        uint32_t cnrels = csp->relation_count;
+        col_rel_t **pre_saved = NULL;
+        if (tdd_cc_active) {
+            pre_saved
+                = (col_rel_t **)calloc(cnrels, sizeof(col_rel_t *));
+            if (pre_saved) {
+                for (uint32_t ri = 0; ri < cnrels; ri++) {
+                    col_rel_t *r = session_find_rel(
+                        sess, csp->relations[ri].name);
+                    if (r && r->nrows > 0 && r->ncols > 0) {
+                        pre_saved[ri]
+                            = col_rel_new_auto(r->name, r->ncols);
+                        if (pre_saved[ri])
+                            col_rel_append_all(
+                                pre_saved[ri], r, NULL);
+                    }
+                }
+            }
+        }
+
         int rc = use_tdd
             ? col_eval_stratum_tdd(&plan->strata[si], sess, si)
             : col_eval_stratum(&plan->strata[si], sess, si);
+
+        if (tdd_cc_active && rc == 0 && pre_saved) {
+            uint32_t *tdd_counts
+                = (uint32_t *)calloc(cnrels, sizeof(uint32_t));
+            col_rel_t **tdd_saved
+                = (col_rel_t **)calloc(cnrels, sizeof(col_rel_t *));
+            if (tdd_counts && tdd_saved) {
+                /* Save TDD results */
+                for (uint32_t ri = 0; ri < cnrels; ri++) {
+                    col_rel_t *r = session_find_rel(
+                        sess, csp->relations[ri].name);
+                    tdd_counts[ri] = r ? r->nrows : 0;
+                    if (r && r->nrows > 0 && r->ncols > 0) {
+                        tdd_saved[ri]
+                            = col_rel_new_auto(r->name, r->ncols);
+                        if (tdd_saved[ri])
+                            col_rel_append_all(
+                                tdd_saved[ri], r, NULL);
+                    }
+                }
+
+                /* Restore pre-stratum IDB (base facts preserved) */
+                for (uint32_t ri = 0; ri < cnrels; ri++) {
+                    col_rel_t *r = session_find_rel(
+                        sess, csp->relations[ri].name);
+                    if (r)
+                        r->nrows = 0;
+                    if (pre_saved[ri] && r) {
+                        if (r->ncols == 0
+                            && pre_saved[ri]->ncols > 0)
+                            col_rel_set_schema(r,
+                                pre_saved[ri]->ncols,
+                                (const char *const *)
+                                pre_saved[ri]->col_names);
+                        col_rel_append_all(
+                            r, pre_saved[ri], NULL);
+                    }
+                }
+
+                /* Re-evaluate single-threaded */
+                int st_rc = col_eval_stratum(csp, sess, si);
+
+                if (st_rc == 0) {
+                    for (uint32_t ri = 0; ri < cnrels; ri++) {
+                        col_rel_t *r = session_find_rel(
+                            sess, csp->relations[ri].name);
+                        uint32_t st = r ? r->nrows : 0;
+                        if (st != tdd_counts[ri])
+                            fprintf(stderr,
+                                "[TDD-CHECK] stratum %u "
+                                "relation '%s': TDD=%u "
+                                "single=%u\n",
+                                si, csp->relations[ri].name,
+                                tdd_counts[ri], st);
+                    }
+                }
+
+                /* Restore TDD results */
+                for (uint32_t ri = 0; ri < cnrels; ri++) {
+                    col_rel_t *r = session_find_rel(
+                        sess, csp->relations[ri].name);
+                    if (r)
+                        r->nrows = 0;
+                    if (tdd_saved[ri] && r) {
+                        if (r->ncols == 0
+                            && tdd_saved[ri]->ncols > 0)
+                            col_rel_set_schema(r,
+                                tdd_saved[ri]->ncols,
+                                (const char *const *)
+                                tdd_saved[ri]->col_names);
+                        col_rel_append_all(
+                            r, tdd_saved[ri], NULL);
+                    }
+                    col_rel_destroy(tdd_saved[ri]);
+                }
+            }
+            free(tdd_counts);
+            free(tdd_saved);
+        }
+        if (pre_saved) {
+            for (uint32_t ri = 0; ri < cnrels; ri++)
+                col_rel_destroy(pre_saved[ri]);
+            free(pre_saved);
+        }
+
         if (rc != 0) {
             /* Issue #177: Cleanup pre-seeded $d$ deltas on error.
              * If evaluation fails, remove temporary delta relations created
