@@ -2131,9 +2131,16 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     /* Backpressure check (Issue #224): when RELATION subsystem reaches >= 80%
      * of its budget, skip row generation and push an empty result instead of
      * risking EOVERFLOW (rc=84).  Evaluation continues with gracefully
-     * degraded (incomplete) results rather than failing entirely. */
+     * degraded (incomplete) results rather than failing entirely.
+     *
+     * TDD workers (coordinator != NULL) skip this pre-join check (Issue #404):
+     * returning empty results before row generation causes silent correctness
+     * bugs — zero join output leads to premature fixed-point convergence.
+     * Workers still have in-loop backpressure + join_output_limit as safety
+     * nets.  Coordinator sessions retain full pre-join protection. */
     if (wl_mem_ledger_should_backpressure(&sess->mem_ledger,
-        WL_MEM_SUBSYS_RELATION, 80)) {
+        WL_MEM_SUBSYS_RELATION, 80)
+        && !sess->coordinator) {
         free(lk);
         free(rk);
         if (left_e.owned)
