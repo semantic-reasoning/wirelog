@@ -277,6 +277,25 @@ test_workqueue_exe = executable(
 test('workqueue', test_workqueue_exe)
 
 # ============================================================================
+# Lock-Free MPMC Queue Tests (Issue #401)
+# ============================================================================
+
+lockfree_queue_src = files(
+  '../wirelog/util/lockfree_queue.c',
+)
+
+test_lockfree_queue_exe = executable(
+  'test_lockfree_queue',
+  files('test_lockfree_queue.c'),
+  lockfree_queue_src,
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+)
+
+test('lockfree_queue', test_lockfree_queue_exe)
+
+# ============================================================================
 # Option 2 CSE Plan Rewriting Tests
 # ============================================================================
 
