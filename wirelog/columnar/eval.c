@@ -3299,56 +3299,59 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
         if (union_d->nrows > 1)
             tdd_dedup_rel(union_d);
 
-        /* Broadcast: refill existing $d$ on workers (reuses capacity) */
-        for (uint32_t w = 0; w < W; w++) {
-            if (union_from_session && w == 0)
-                continue; /* worker 0 already holds the union */
-
+        /* Issue #396: zero-copy broadcast via col_shared.
+         * Anchor union_d in worker 0's session so its lifetime covers all
+         * workers' reads during the next sub-pass.  Workers 1..W-1 borrow
+         * union_d's column pointers via col_rel_install_shared_view (O(ncols)
+         * pointer setup) instead of O(|delta|) deep copies. */
+        if (!union_from_session) {
+            /* Install union_d into worker 0's session as the authoritative $d$.
+            * session_add_rel replaces any existing entry with the same name. */
+            int rc = session_add_rel(&coord->tdd_workers[0], union_d);
+            if (rc != 0) {
+                col_rel_destroy(union_d);
+                return rc;
+            }
+            union_from_session = true;
+            /* slot0 now points to union_d (owned by worker 0's session) */
+        }
+        /* worker 0 already holds union_d; install shared views on workers 1..W-1 */
+        for (uint32_t w = 1; w < W; w++) {
             col_rel_t *worker_d = session_find_rel(
                 &coord->tdd_workers[w], dname);
             if (worker_d && worker_d->ncols == ncols) {
-                /* Reuse: clear and refill (capacity preserved) */
-                worker_d->nrows = 0;
-                int rc = col_rel_append_all(worker_d, union_d, NULL);
+                /* Reuse: install shared view (O(ncols) pointer setup) */
+                int rc = col_rel_install_shared_view(worker_d, union_d);
                 if (rc != 0) {
-                    if (!union_from_session)
-                        col_rel_destroy(union_d);
-                    return rc;
+                    /* Fallback: deep copy on shared-view alloc failure */
+                    worker_d->nrows = 0;
+                    rc = col_rel_append_all(worker_d, union_d, NULL);
+                    if (rc != 0)
+                        return rc;
                 }
             } else {
-                /* Fallback: create new (first iteration or schema mismatch) */
-                col_rel_t *new_d;
-                if (!union_from_session && w == W - 1) {
-                    new_d = union_d;
-                    union_d = NULL;
-                } else {
-                    new_d = col_rel_new_auto(dname, union_d->ncols);
-                    if (!new_d) {
-                        if (!union_from_session)
-                            col_rel_destroy(union_d);
-                        return ENOMEM;
-                    }
-                    int rc = col_rel_append_all(new_d, union_d, NULL);
+                /* First iteration or schema mismatch: create new relation */
+                col_rel_t *new_d = col_rel_new_auto(dname, ncols);
+                if (!new_d)
+                    return ENOMEM;
+                int rc = col_rel_install_shared_view(new_d, union_d);
+                if (rc != 0) {
+                    /* Fallback: deep copy on shared-view alloc failure */
+                    rc = col_rel_append_all(new_d, union_d, NULL);
                     if (rc != 0) {
                         col_rel_destroy(new_d);
-                        if (!union_from_session)
-                            col_rel_destroy(union_d);
                         return rc;
                     }
                 }
-                int rc = session_add_rel(&coord->tdd_workers[w], new_d);
+                rc = session_add_rel(&coord->tdd_workers[w], new_d);
                 if (rc != 0) {
                     col_rel_destroy(new_d);
-                    if (!union_from_session && union_d)
-                        col_rel_destroy(union_d);
                     return rc;
                 }
             }
         }
-
-        /* Free union if it was heap-allocated and not transferred */
-        if (!union_from_session && union_d)
-            col_rel_destroy(union_d);
+        /* union_d is owned by worker 0's session; no explicit free needed */
+        (void)union_from_session;
     }
 
     return 0;
