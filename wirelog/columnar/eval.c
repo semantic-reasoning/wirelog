@@ -2288,6 +2288,93 @@ tdd_dedup_rel(col_rel_t *r)
 }
 
 /*
+ * tdd_sorted_merge_append:
+ * Merge src (sorted, no overlap with dst) into dst (sorted), maintaining
+ * lexicographic sorted order.  O(N + D) where N = dst->nrows, D = src->nrows.
+ *
+ * Preconditions (caller guarantees):
+ *   - dst->columns[] rows are in sorted (lexicographic) order
+ *   - src->columns[] rows are in sorted order
+ *   - No row appears in both dst and src (guaranteed by bdx_merge_diff)
+ *
+ * Replaces col_rel_append_all + tdd_dedup_rel(dst) in tdd_bdx_exchange_deltas
+ * to keep the coordinator IDB sorted for bdx_merge_diff on the next iteration.
+ * Issue #390.
+ */
+int
+tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src)
+{
+    if (!src || src->nrows == 0)
+        return 0;
+    if (!dst || dst->ncols == 0)
+        return 0;
+
+    uint32_t N = dst->nrows;
+    uint32_t D = src->nrows;
+    uint32_t ncols = dst->ncols;
+    uint32_t total = N + D;
+
+    if (N == 0)
+        return col_rel_append_all(dst, src, NULL);
+
+    /* Copy current dst rows into the persistent merge buffer */
+    if (dst->merge_buf_cap < N) {
+        int64_t **mc = col_columns_alloc(ncols, N);
+        if (!mc)
+            return ENOMEM;
+        col_columns_free(dst->merge_columns, ncols);
+        dst->merge_columns = mc;
+        dst->merge_buf_cap = N;
+    }
+    for (uint32_t c = 0; c < ncols; c++)
+        memcpy(dst->merge_columns[c], dst->columns[c], N * sizeof(int64_t));
+
+    /* Grow dst columns to hold the merged result */
+    if (dst->capacity < total) {
+        if (col_columns_realloc(dst->columns, ncols, total) != 0)
+            return ENOMEM;
+        dst->capacity = total;
+    }
+
+    /* Two-pointer merge: both sequences are sorted, no overlap */
+    uint32_t i = 0, j = 0, wr = 0;
+    while (i < N && j < D) {
+        int cmp = 0;
+        for (uint32_t c = 0; c < ncols; c++) {
+            int64_t a = dst->merge_columns[c][i];
+            int64_t b = src->columns[c][j];
+            if (a < b) {
+                cmp = -1; break;
+            }
+            if (a > b) {
+                cmp = 1; break;
+            }
+        }
+        if (cmp <= 0) {
+            col_columns_copy_row(dst->columns, wr,
+                (int64_t *const *)dst->merge_columns, i, ncols);
+            i++; wr++;
+        } else {
+            col_columns_copy_row(dst->columns, wr,
+                (int64_t *const *)src->columns, j, ncols);
+            j++; wr++;
+        }
+    }
+    while (i < N) {
+        col_columns_copy_row(dst->columns, wr,
+            (int64_t *const *)dst->merge_columns, i, ncols);
+        i++; wr++;
+    }
+    while (j < D) {
+        col_columns_copy_row(dst->columns, wr,
+            (int64_t *const *)src->columns, j, ncols);
+        j++; wr++;
+    }
+    dst->nrows = total;
+    return 0;
+}
+
+/*
  * tdd_preregister_idb_on_workers:
  * Pre-register empty IDB relations on each worker session so that
  * VARIABLE ops can find them on the first sub-pass (eff_iter == 0).
@@ -3653,17 +3740,17 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
                     return rc;
                 }
             }
-            rc = col_rel_append_all(coord_idb, combined, NULL);
+            /* Phase 0 optimization (#406): Use sorted merge-append instead of
+             * append-then-sort. Since combined_delta is already deduped
+             * against coord_idb, merge-append maintains sort order in O(N+D)
+             * time instead of O(N log N) full re-sort. */
+            rc = tdd_sorted_merge_append(coord_idb, combined);
             if (rc != 0) {
                 col_rel_destroy(combined);
                 return rc;
             }
-            /* Re-sort coordinator IDB to maintain sorted invariant
-             * for next iteration's merge-diff.
-             * TODO(#406): This is O(N log N) per iteration.  Since
-             * combined_delta is already deduped against coord_idb,
-             * a merge-append that maintains sorted order would be
-             * O(N + D) where D = |combined_delta|. */
+            /* Dedup any duplicate rows from merge (safety check).
+             * With presort check, this becomes O(N) if already sorted. */
             if (coord_idb->nrows > 1)
                 tdd_dedup_rel(coord_idb);
         }
