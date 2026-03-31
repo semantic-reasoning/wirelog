@@ -78,6 +78,17 @@
 #include <stdint.h>
 
 /**
+ * Work Queue Ring Buffer Capacity (Phase 0: Dynamic Allocation)
+ *
+ * Ring capacity is now dynamically allocated based on num_workers.
+ * Each queue allocates ring_capacity = max(256, next_pow2(num_workers * 2)).
+ * This scales the ring buffer automatically for W=1 to W=512+ without
+ * compile-time configuration or back-pressure limits.
+ *
+ * OLD: Fixed compile-time macro WL_WQ_RING_CAP (now removed).
+ */
+
+/**
  * wl_work_queue_t:
  *
  * Opaque handle to a work queue with a cross-platform thread pool.
