@@ -2268,6 +2268,16 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     col_rel_destroy(left);
                 return join_rc;
             }
+            /* Warn when a TDD worker truncates: silent truncation causes
+             * premature convergence and incorrect results (Issue #404). */
+            if (sess->coordinator) {
+                fprintf(stderr,
+                    "[wirelog] WARNING: join truncated on worker %u "
+                    "(limit=%llu, nrows=%u) — results may be incomplete\n",
+                    sess->worker_id,
+                    (unsigned long long)sess->join_output_limit,
+                    out->nrows);
+            }
             join_rc = 0; /* soft truncation: push partial result below */
         }
         if (sess->debug_join)
@@ -2475,6 +2485,16 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 if (left_e.owned)
                     col_rel_destroy(left);
                 return join_rc;
+            }
+            /* Warn when a TDD worker truncates: silent truncation causes
+             * premature convergence and incorrect results (Issue #404). */
+            if (sess->coordinator) {
+                fprintf(stderr,
+                    "[wirelog] WARNING: join truncated on worker %u "
+                    "(limit=%llu, nrows=%u) — results may be incomplete\n",
+                    sess->worker_id,
+                    (unsigned long long)sess->join_output_limit,
+                    out->nrows);
             }
             join_rc = 0; /* soft truncation: push partial result below */
         }
