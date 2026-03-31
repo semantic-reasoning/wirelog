@@ -521,6 +521,67 @@ free_merge_buf:
         r->base_nrows = r->nrows;
 }
 
+/*
+ * col_rel_install_shared_view:
+ * Install src's column buffers into dst as a zero-copy shared view.
+ * dst's existing columns are freed (respecting any existing col_shared flags).
+ * After this call, dst->columns[c] points to src->columns[c] and
+ * dst->col_shared[c] is true for all c, so col_rel_free_contents/COW
+ * will not free the borrowed buffers.
+ *
+ * dst and src must have the same ncols.
+ * Returns 0 on success, ENOMEM if the col_shared flags array cannot be
+ * allocated (dst remains valid with its original columns in that case).
+ *
+ * Issue #396: used by tdd_broadcast_deltas to eliminate O(|delta|) deep
+ * copies when broadcasting the union delta to worker sessions.
+ */
+int
+col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
+{
+    if (dst->ncols != src->ncols)
+        return EINVAL;
+
+    /* Allocate (or reuse) the col_shared flags array before touching columns */
+    if (!dst->col_shared) {
+        dst->col_shared = (bool *)calloc(dst->ncols, sizeof(bool));
+        if (!dst->col_shared)
+            return ENOMEM;
+    }
+
+    /* Free dst's existing owned columns */
+    if (!dst->arena_owned) {
+        for (uint32_t c = 0; c < dst->ncols; c++) {
+            if (!dst->col_shared[c] && dst->columns && dst->columns[c])
+                free(dst->columns[c]);
+        }
+    }
+    /* Reuse or re-allocate the columns pointer array */
+    if (!dst->columns) {
+        dst->columns = (int64_t **)calloc(dst->ncols, sizeof(int64_t *));
+        if (!dst->columns) {
+            free(dst->col_shared);
+            dst->col_shared = NULL;
+            return ENOMEM;
+        }
+    }
+    dst->arena_owned = false;
+
+    /* Install src's column pointers as borrowed references */
+    for (uint32_t c = 0; c < dst->ncols; c++) {
+        dst->columns[c] = src->columns[c];
+        dst->col_shared[c] = true;
+    }
+
+    /* Copy row-count metadata */
+    dst->nrows = src->nrows;
+    dst->capacity = src->capacity;
+    dst->sorted_nrows = src->sorted_nrows;
+    dst->base_nrows = src->base_nrows;
+
+    return 0;
+}
+
 /* ---- column name lookup ------------------------------------------------- */
 
 int
