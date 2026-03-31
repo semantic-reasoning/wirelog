@@ -24,22 +24,22 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Helper: find relation IR by name                                         */
@@ -84,11 +84,14 @@ find_deepest_join(wirelog_ir_node_t *node)
 {
     if (!node || node->type != WIRELOG_IR_JOIN)
         return NULL;
-    /* If left child is also a JOIN, recurse */
-    if (node->child_count > 0 && node->children[0]
-        && node->children[0]->type == WIRELOG_IR_JOIN) {
-        return find_deepest_join(node->children[0]);
-    }
+    /* Descend into left child, skipping any intermediate PROJECT nodes
+     * that insert_projections may have added between JOIN levels. */
+    wirelog_ir_node_t *left
+        = node->child_count > 0 ? node->children[0] : NULL;
+    while (left && left->type == WIRELOG_IR_PROJECT && left->child_count > 0)
+        left = left->children[0];
+    if (left && left->type == WIRELOG_IR_JOIN)
+        return find_deepest_join(left);
     return node;
 }
 
@@ -135,8 +138,8 @@ test_jpp_null_stats(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl edge(x: int32, y: int32)\n"
-                               "edge(1, 2).\n",
-                               &err);
+            "edge(1, 2).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -163,8 +166,8 @@ test_jpp_no_ir_trees(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl edge(x: int32, y: int32)\n"
-                               "edge(1, 2).\n",
-                               &err);
+            "edge(1, 2).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -203,9 +206,9 @@ test_jpp_single_atom_noop(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl edge(x: int32, y: int32)\n"
-                               ".decl node(x: int32)\n"
-                               "node(x) :- edge(x, _).\n",
-                               &err);
+            ".decl node(x: int32)\n"
+            "node(x) :- edge(x, _).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -254,9 +257,9 @@ test_jpp_two_atom_noop(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl edge(x: int32, y: int32)\n"
-                               ".decl tc(x: int32, y: int32)\n"
-                               "tc(x, z) :- tc(x, y), edge(y, z).\n",
-                               &err);
+            ".decl tc(x: int32, y: int32)\n"
+            "tc(x, z) :- tc(x, y), edge(y, z).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -322,11 +325,11 @@ test_jpp_three_atom_reorder(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
-                               ".decl b(y: int32, w: int32)\n"
-                               ".decl c(w: int32, z: int32)\n"
-                               ".decl path(x: int32, z: int32)\n"
-                               "path(x, z) :- a(x, y), c(w, z), b(y, w).\n",
-                               &err);
+            ".decl b(y: int32, w: int32)\n"
+            ".decl c(w: int32, z: int32)\n"
+            ".decl path(x: int32, z: int32)\n"
+            "path(x, z) :- a(x, y), c(w, z), b(y, w).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -345,14 +348,14 @@ test_jpp_three_atom_reorder(void)
     if (stats.joins_reordered != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected joins_reordered=1, got %u",
-                 stats.joins_reordered);
+            stats.joins_reordered);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
     }
 
     /* Verify: no cross-products in the reordered tree.
-     * The deepest JOIN must have join_key_count > 0. */
+    * The deepest JOIN must have join_key_count > 0. */
     wirelog_ir_node_t *ir = find_relation_ir(prog, "path");
     if (!ir) {
         FAIL("no IR for 'path'");
@@ -432,7 +435,7 @@ test_jpp_already_optimal_three_atom(void)
     if (stats.chains_examined != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected chains_examined=1, got %u",
-                 stats.chains_examined);
+            stats.chains_examined);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -441,8 +444,8 @@ test_jpp_already_optimal_three_atom(void)
     if (stats.joins_reordered != 0) {
         char buf[64];
         snprintf(buf, sizeof(buf),
-                 "expected joins_reordered=0 (already optimal), got %u",
-                 stats.joins_reordered);
+            "expected joins_reordered=0 (already optimal), got %u",
+            stats.joins_reordered);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -493,7 +496,7 @@ test_jpp_chains_examined_count(void)
     if (stats.chains_examined != 2) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected chains_examined=2, got %u",
-                 stats.chains_examined);
+            stats.chains_examined);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -502,7 +505,7 @@ test_jpp_chains_examined_count(void)
     if (stats.joins_reordered != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected joins_reordered=1, got %u",
-                 stats.joins_reordered);
+            stats.joins_reordered);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -532,14 +535,14 @@ test_jpp_union_recurse(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
-                               ".decl b(y: int32, w: int32)\n"
-                               ".decl c(w: int32, z: int32)\n"
-                               ".decl d(v: int32, z: int32)\n"
-                               ".decl e(y: int32, v: int32)\n"
-                               ".decl path(x: int32, z: int32)\n"
-                               "path(x, z) :- a(x, y), c(w, z), b(y, w).\n"
-                               "path(x, z) :- a(x, y), d(v, z), e(y, v).\n",
-                               &err);
+            ".decl b(y: int32, w: int32)\n"
+            ".decl c(w: int32, z: int32)\n"
+            ".decl d(v: int32, z: int32)\n"
+            ".decl e(y: int32, v: int32)\n"
+            ".decl path(x: int32, z: int32)\n"
+            "path(x, z) :- a(x, y), c(w, z), b(y, w).\n"
+            "path(x, z) :- a(x, y), d(v, z), e(y, v).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -566,7 +569,7 @@ test_jpp_union_recurse(void)
     if (stats.chains_examined != 2) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected chains_examined=2, got %u",
-                 stats.chains_examined);
+            stats.chains_examined);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -575,7 +578,7 @@ test_jpp_union_recurse(void)
     if (stats.joins_reordered != 2) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected joins_reordered=2, got %u",
-                 stats.joins_reordered);
+            stats.joins_reordered);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -628,7 +631,7 @@ test_jpp_antijoin_preserved(void)
     if (stats.joins_reordered != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected joins_reordered=1, got %u",
-                 stats.joins_reordered);
+            stats.joins_reordered);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -683,11 +686,11 @@ test_jpp_intermediate_projection(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
-                               ".decl b(y: int32, w: int32)\n"
-                               ".decl c(w: int32, z: int32)\n"
-                               ".decl path(x: int32, z: int32)\n"
-                               "path(x, z) :- a(x, y), b(y, w), c(w, z).\n",
-                               &err);
+            ".decl b(y: int32, w: int32)\n"
+            ".decl c(w: int32, z: int32)\n"
+            ".decl path(x: int32, z: int32)\n"
+            "path(x, z) :- a(x, y), b(y, w), c(w, z).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -725,11 +728,11 @@ test_jpp_idempotent(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
-                               ".decl b(y: int32, w: int32)\n"
-                               ".decl c(w: int32, z: int32)\n"
-                               ".decl path(x: int32, z: int32)\n"
-                               "path(x, z) :- a(x, y), c(w, z), b(y, w).\n",
-                               &err);
+            ".decl b(y: int32, w: int32)\n"
+            ".decl c(w: int32, z: int32)\n"
+            ".decl path(x: int32, z: int32)\n"
+            "path(x, z) :- a(x, y), c(w, z), b(y, w).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse failed");
@@ -761,7 +764,7 @@ test_jpp_idempotent(void)
     if (stats2.joins_reordered != 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "second pass should not reorder, got %u",
-                 stats2.joins_reordered);
+            stats2.joins_reordered);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -816,7 +819,7 @@ test_jpp_four_atom_reorder(void)
     if (stats.joins_reordered != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected joins_reordered=1, got %u",
-                 stats.joins_reordered);
+            stats.joins_reordered);
         FAIL(buf);
         wirelog_program_free(prog);
         return;
@@ -846,6 +849,200 @@ test_jpp_four_atom_reorder(void)
             return;
         }
         n = n->child_count > 0 ? n->children[0] : NULL;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
+/* EDB Tie-Breaker Tests                                                   */
+/* ======================================================================== */
+
+/*
+ * Return the relation_name of a scan node, descending through any intra-atom
+ * FILTER wrapper that may have been inserted for duplicate-variable detection.
+ */
+static const char *
+get_scan_relation(const wirelog_ir_node_t *node)
+{
+    while (node) {
+        if (node->type == WIRELOG_IR_SCAN)
+            return node->relation_name;
+        if (node->type == WIRELOG_IR_FILTER && node->child_count > 0)
+            node = node->children[0];
+        else
+            break;
+    }
+    return NULL;
+}
+
+static void
+test_jpp_edb_tiebreak(void)
+{
+    TEST("jpp: EDB atom preferred over IDB on shared-var tie (issue #394)");
+
+    /*
+     * out(x, z) :- idb(x, y), IdbB(x, z), EdbA(y, z).
+     *
+     * idb  = IDB (derived by: idb(x,y)   :- seed_edb(x,y).)
+     * IdbB = IDB (derived by: IdbB(x,z)  :- EdbA(x,z).)
+     * EdbA = EDB (no rules)
+     *
+     * Greedy seed = idb (scan[0]), accumulated = {x, y}
+     * Step 2 tie:
+     *   IdbB(x,z) shares {x}  -> shared=1  (IDB)
+     *   EdbA(y,z) shares {y}  -> shared=1  (EDB)
+     * Without tie-break: IdbB wins (lower index 1).
+     * With EDB tie-break: EdbA wins (EDB beats IDB on equal shared count).
+     *
+     * Verify: deepest JOIN's right child is EdbA, not IdbB.
+     */
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl seed_edb(x: int32, y: int32)\n"
+        ".decl EdbA(y: int32, z: int32)\n"
+        ".decl IdbB(x: int32, z: int32)\n"
+        ".decl idb(x: int32, y: int32)\n"
+        ".decl out(x: int32, z: int32)\n"
+        "IdbB(x, z) :- EdbA(x, z).\n"
+        "idb(x, y) :- seed_edb(x, y).\n"
+        "out(x, z) :- idb(x, y), IdbB(x, z), EdbA(y, z).\n",
+        &err);
+
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_jpp_stats_t stats = { 0, 0, 0 };
+    int rc = wl_jpp_apply(prog, &stats);
+    if (rc != 0) {
+        FAIL("expected 0");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_ir_node_t *ir = find_relation_ir(prog, "out");
+    if (!ir) {
+        FAIL("no IR for 'out'");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_ir_node_t *join_root = find_join_root(ir);
+    if (!join_root || join_root->type != WIRELOG_IR_JOIN) {
+        FAIL("expected JOIN at root");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    /* Deepest join: children[1] is the 2nd atom in greedy order */
+    wirelog_ir_node_t *deep = find_deepest_join(join_root);
+    if (!deep || deep->child_count < 2) {
+        FAIL("no deepest join or missing children");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    const char *second = get_scan_relation(deep->children[1]);
+    if (!second) {
+        FAIL("could not get relation name of second scan");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    if (strcmp(second, "EdbA") != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "expected EdbA (EDB) as 2nd atom, got '%s' (EDB tie-break not applied)",
+            second);
+        FAIL(buf);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_jpp_idb_idb_tie_unchanged(void)
+{
+    TEST("jpp: two-IDB tie leaves original index order (no regression)");
+
+    /*
+     * out(x, z) :- idb(x, y), idb2(x, z), idb3(y, z).
+     *
+     * All three are IDB. At step 2 idb2 and idb3 both share 1 var.
+     * The tie-breaker does NOT apply (neither side is EDB), so the
+     * lower-index atom (idb2, index 1) is still chosen — unchanged
+     * from pre-fix behavior.
+     */
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl edb(x: int32, y: int32)\n"
+        ".decl idb(x: int32, y: int32)\n"
+        ".decl idb2(x: int32, z: int32)\n"
+        ".decl idb3(y: int32, z: int32)\n"
+        ".decl out(x: int32, z: int32)\n"
+        "idb(x, y) :- edb(x, y).\n"
+        "idb2(x, z) :- edb(x, z).\n"
+        "idb3(y, z) :- edb(y, z).\n"
+        "out(x, z) :- idb(x, y), idb2(x, z), idb3(y, z).\n",
+        &err);
+
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_jpp_stats_t stats = { 0, 0, 0 };
+    int rc = wl_jpp_apply(prog, &stats);
+    if (rc != 0) {
+        FAIL("expected 0");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    /* Both idb2 and idb3 are IDB, so tie-break should not apply.
+     * The deepest join's right child should be idb2 (lower index 1). */
+    wirelog_ir_node_t *ir = find_relation_ir(prog, "out");
+    if (!ir) {
+        FAIL("no IR for 'out'");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_ir_node_t *join_root = find_join_root(ir);
+    if (!join_root || join_root->type != WIRELOG_IR_JOIN) {
+        FAIL("expected JOIN at root");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_ir_node_t *deep = find_deepest_join(join_root);
+    if (!deep || deep->child_count < 2) {
+        FAIL("no deepest join or missing children");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    const char *second = get_scan_relation(deep->children[1]);
+    if (!second) {
+        FAIL("could not get relation name of second scan");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    if (strcmp(second, "idb2") != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "expected idb2 as 2nd atom (IDB-IDB tie unchanged), got '%s'",
+            second);
+        FAIL(buf);
+        wirelog_program_free(prog);
+        return;
     }
 
     wirelog_program_free(prog);
@@ -888,7 +1085,11 @@ main(void)
     test_jpp_idempotent();
     test_jpp_four_atom_reorder();
 
+    /* EDB tie-breaker (issue #394) */
+    test_jpp_edb_tiebreak();
+    test_jpp_idb_idb_tie_unchanged();
+
     printf("\n  Total: %d  Passed: %d  Failed: %d\n\n", tests_run, tests_passed,
-           tests_failed);
+        tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }
