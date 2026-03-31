@@ -183,9 +183,11 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                     if (used_in_join)
                         goto normal_eval;
                     /* Static EDB with no delta, not used in any JOIN →
-                     * pure base case. Push empty and skip the MAP that
-                     * follows, so the CONCAT still gets two stack entries
-                     * (empty base + recursive result). */
+                     * pure base case. Push empty and let MAP run on it.
+                     * MAP on 0 rows produces the correct output schema
+                     * (project_count columns) at O(1) cost, which CONCAT
+                     * requires. Skipping MAP would leave the wrong ncols
+                     * on the stack. */
                     col_rel_t *full = session_find_rel(sess, op->relation_name);
                     col_rel_t *empty = col_rel_pool_new_like(
                         sess->delta_pool, "$base_skip", full ? full : NULL);
@@ -196,10 +198,6 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                     if (rc != 0) {
                         col_rel_destroy(empty); break;
                     }
-                    /* Skip the subsequent MAP (MAP on empty = empty). */
-                    if (i + 1 < rplan->op_count
-                        && rplan->ops[i + 1].op == WL_PLAN_OP_MAP)
-                        i++;
                     continue;
                 }
             }
