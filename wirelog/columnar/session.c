@@ -408,13 +408,19 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         if (!env_valid) {
             uint64_t phys = col_detect_physical_memory();
             if (phys > 0) {
-                /* 25% of RAM / (8 bytes * 5 avg cols).  The per-worker
-                 * divisor was removed (Issue #386): in timely-differential
-                 * evaluation workers do not simultaneously produce peak
-                 * join output, and dividing by num_workers made the limit
-                 * unusably small on high-core machines (e.g. 196 cores
-                 * → <1M rows).  Runtime backpressure via mem_ledger
-                 * handles actual memory pressure instead. */
+                /* 25% of RAM / (8 bytes * 5 avg cols).
+                 *
+                 * This is a global per-join safety cap shared by all workers.
+                 * We do NOT divide by num_workers here: each K-fusion worker
+                 * operates on a 1/K partition of the data, so the individual
+                 * join output grows proportionally to the partition, not to
+                 * the total. Dividing by num_workers was too aggressive —
+                 * it shrunk each worker's cap to 1/K of what a single-worker
+                 * run would allow, causing EOVERFLOW on valid large joins and
+                 * OOM from the resulting fallback materialisation paths.
+                 *
+                 * Multi-worker memory coordination is handled dynamically by
+                 * wl_mem_ledger_should_backpressure() in the join hot path. */
                 sess->join_output_limit = (phys / 4) / 40ULL;
             } else {
                 sess->join_output_limit = COL_JOIN_OUTPUT_LIMIT_DEFAULT;
