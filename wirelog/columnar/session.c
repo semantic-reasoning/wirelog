@@ -1469,9 +1469,21 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                     /* Category A: no IDB-IDB joins — safe for hybrid
                      * init + hash-partitioned delta exchange. */
                     recursive_tdd_safe = true;
+                } else if (tdd_stratum_idb_self_join_exchange_aligned(
+                        rsp, sess)) {
+                    /* Category B: IDB-IDB joins are exchange-aligned. */
+                    recursive_tdd_safe = true;
                 } else {
-                    recursive_tdd_safe =
-                        tdd_stratum_idb_self_join_exchange_aligned(rsp, sess);
+                    /* Category C: non-aligned IDB-IDB joins.
+                     * BDX mode is only correct for rules with at most
+                     * 2 IDB body atoms (see design doc for proof). */
+                    uint32_t max_atoms =
+                        stratum_max_idb_body_atoms(rsp);
+                    if (max_atoms <= 2) {
+                        recursive_tdd_safe = true;
+                    }
+                    /* else: >2 IDB body atoms, fall back to
+                     * single-threaded (recursive_tdd_safe stays false) */
                 }
             }
         }
