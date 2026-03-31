@@ -3660,7 +3660,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             }
             /* Re-sort coordinator IDB to maintain sorted invariant
              * for next iteration's merge-diff.
-             * TODO(#390): This is O(N log N) per iteration.  Since
+             * TODO(#406): This is O(N log N) per iteration.  Since
              * combined_delta is already deduped against coord_idb,
              * a merge-append that maintains sorted order would be
              * O(N + D) where D = |combined_delta|. */
