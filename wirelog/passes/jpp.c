@@ -201,6 +201,30 @@ free_join_keys(wirelog_ir_node_t *node)
 }
 
 /* ======================================================================== */
+/* Internal: IDB scan detection                                             */
+/* ======================================================================== */
+
+/*
+ * Return true if the given scan node references an IDB relation.
+ * A relation is IDB if it appears as the head of at least one rule.
+ * idb_names/idb_count is the de-duplicated list of IDB relation names
+ * extracted from the program's rule set.
+ */
+static bool
+scan_is_idb(const wirelog_ir_node_t *scan, const char *const *idb_names,
+    uint32_t idb_count)
+{
+    if (!scan || !scan->relation_name || !idb_names)
+        return false;
+    for (uint32_t i = 0; i < idb_count; i++) {
+        if (idb_names[i]
+            && strcmp(scan->relation_name, idb_names[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* ======================================================================== */
 /* Internal: greedy reorder a join chain                                    */
 /* ======================================================================== */
 
@@ -208,10 +232,18 @@ free_join_keys(wirelog_ir_node_t *node)
  * Given an array of SCAN leaves, compute the greedy ordering that
  * maximizes shared variables at each step.
  *
+ * On a tie (equal shared-variable count), EDB atoms are preferred over
+ * IDB atoms.  This avoids placing large recursive relations early in the
+ * join chain (e.g. VarPointsTo in DOOP).
+ *
+ * idb_names/idb_count: de-duplicated IDB relation name list for tie-breaking.
+ * May be NULL/0 to disable tie-breaking (falls back to index order).
+ *
  * Returns true if the ordering changed from the original.
  */
 static bool
-greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order)
+greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order,
+    const char *const *idb_names, uint32_t idb_count)
 {
     if (nscan < 2) {
         for (uint32_t i = 0; i < nscan; i++)
@@ -226,6 +258,17 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order)
         return false;
     }
 
+    /* Pre-compute IDB flags for all scans */
+    bool *is_idb = (bool *)calloc(nscan, sizeof(bool));
+    if (!is_idb) {
+        free(used);
+        for (uint32_t i = 0; i < nscan; i++)
+            order[i] = i;
+        return false;
+    }
+    for (uint32_t i = 0; i < nscan; i++)
+        is_idb[i] = scan_is_idb(scans[i], idb_names, idb_count);
+
     /* Start with scan[0] */
     order[0] = 0;
     used[0] = true;
@@ -236,6 +279,7 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order)
     /* We need a mutable copy for merging */
     char **acc = (char **)calloc(acc_count + nscan * 16, sizeof(char *));
     if (!acc) {
+        free(is_idb);
         free(used);
         for (uint32_t i = 0; i < nscan; i++)
             order[i] = i;
@@ -255,7 +299,15 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order)
             uint32_t scount;
             char **svars = scan_vars(scans[j], &scount);
             uint32_t shared = count_shared_vars(acc, acc_count, svars, scount);
-            if (!found_any || shared > best_shared) {
+            /*
+             * Pick j if:
+             *   (a) strictly more shared variables, OR
+             *   (b) equal shared variables AND j is EDB while current best
+             *       is IDB (EDB tie-breaker).
+             */
+            if (!found_any || shared > best_shared
+                || (shared == best_shared && !is_idb[j]
+                && is_idb[best_idx])) {
                 best_shared = shared;
                 best_idx = j;
                 found_any = true;
@@ -284,6 +336,7 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order)
     }
 
     free(acc);
+    free(is_idb);
     free(used);
 
     /* Check if ordering changed */
@@ -699,7 +752,7 @@ typedef struct {
 
 static jpp_chain_result_t
 optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
-    uint32_t head_var_count)
+    uint32_t head_var_count, const char *const *idb_names, uint32_t idb_count)
 {
     jpp_chain_result_t result = { false, 0 };
 
@@ -746,7 +799,7 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
     }
 
     /* Compute greedy ordering */
-    bool changed = greedy_order(scans, nscan, order);
+    bool changed = greedy_order(scans, nscan, order, idb_names, idb_count);
 
     if (changed) {
         /* Build ordered scan array */
@@ -812,7 +865,8 @@ find_join_chain(wirelog_ir_node_t *node)
 
 static void
 optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
-    uint32_t *joins_reordered, uint32_t *projections_inserted)
+    uint32_t *joins_reordered, uint32_t *projections_inserted,
+    const char *const *idb_names, uint32_t idb_count)
 {
     if (!ir)
         return;
@@ -821,7 +875,7 @@ optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
     if (ir->type == WIRELOG_IR_UNION) {
         for (uint32_t i = 0; i < ir->child_count; i++) {
             optimize_tree(ir->children[i], chains_examined, joins_reordered,
-                projections_inserted);
+                projections_inserted, idb_names, idb_count);
         }
         return;
     }
@@ -837,7 +891,8 @@ optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
     char *head_vars[64];
     uint32_t head_var_count = collect_head_vars(ir, head_vars, 64);
 
-    jpp_chain_result_t result = optimize_chain(root, head_vars, head_var_count);
+    jpp_chain_result_t result
+        = optimize_chain(root, head_vars, head_var_count, idb_names, idb_count);
 
     if (result.reordered)
         (*joins_reordered)++;
@@ -867,10 +922,37 @@ wl_jpp_apply(struct wirelog_program *prog, wl_jpp_stats_t *stats)
     uint32_t joins_reordered = 0;
     uint32_t projections_inserted = 0;
 
+    /* Build de-duplicated IDB relation name list for EDB tie-breaking.
+     * A relation is IDB iff it appears as the head of at least one rule. */
+    const char **idb_names = NULL;
+    uint32_t idb_count = 0;
+    if (prog->rule_count > 0) {
+        idb_names
+            = (const char **)calloc(prog->rule_count, sizeof(const char *));
+        if (idb_names) {
+            for (uint32_t i = 0; i < prog->rule_count; i++) {
+                const char *h = prog->rules[i].head_relation;
+                if (!h)
+                    continue;
+                bool dup = false;
+                for (uint32_t j = 0; j < idb_count; j++) {
+                    if (idb_names[j] && strcmp(idb_names[j], h) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup)
+                    idb_names[idb_count++] = h;
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         optimize_tree(prog->relation_irs[i], &chains_examined, &joins_reordered,
-            &projections_inserted);
+            &projections_inserted, idb_names, idb_count);
     }
+
+    free(idb_names);
 
     if (stats) {
         stats->joins_reordered = joins_reordered;
