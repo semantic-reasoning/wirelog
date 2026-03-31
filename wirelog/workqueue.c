@@ -23,6 +23,7 @@
 
 #include "thread.h"
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -115,6 +116,9 @@ wl_workqueue_create(uint32_t num_workers)
 {
     if (num_workers == 0)
         return NULL;
+    /* Guard: ring capacity = num_workers * 2 must not overflow uint32_t */
+    if (num_workers > UINT32_MAX / 2u)
+        return NULL;
 
     wl_work_queue_t *wq = (wl_work_queue_t *)calloc(1, sizeof(wl_work_queue_t));
     if (!wq)
@@ -147,6 +151,13 @@ wl_workqueue_create(uint32_t num_workers)
 
     wq->num_workers = num_workers;
 
+    /* Memory note: W workers incur additional infrastructure costs beyond
+     * this workqueue. Session creation allocates a W×W exchange buffer matrix
+     * (W² × 8B) for TDD distributed evaluation partition routing (Issue #318).
+     * Combined with per-worker fixed allocations (20MB arena + pool + stack),
+     * total memory scales as: W × 20MB + W² × 8B. This workqueue ring buffer
+     * adds O(W) capacity, which is negligible. See session.c WL_MAX_WORKERS. */
+
     /* Allocate ring buffer dynamically (Phase 0: support W=512+).
      * Capacity = num_workers * 2, rounded up to power of 2, minimum 256.
      * This ensures a full batch of W items always fits without back-pressure. */
@@ -172,18 +183,27 @@ wl_workqueue_create(uint32_t num_workers)
 
     for (uint32_t i = 0; i < num_workers; i++) {
         if (thread_create(&wq->threads[i], worker_thread, wq) != 0) {
-            /* Partial creation: shut down already-created threads */
-            wq->shutdown = true;
-            cond_broadcast(&wq->work_avail);
-            for (uint32_t j = 0; j < i; j++)
-                thread_join(&wq->threads[j]);
-            free(wq->ring);
-            free(wq->threads);
-            cond_destroy(&wq->all_done);
-            cond_destroy(&wq->work_avail);
-            mutex_destroy(&wq->mutex);
-            free(wq);
-            return NULL;
+            if (i == 0) {
+                /* No threads created at all: full cleanup */
+                free(wq->ring);
+                free(wq->threads);
+                cond_destroy(&wq->all_done);
+                cond_destroy(&wq->work_avail);
+                mutex_destroy(&wq->mutex);
+                free(wq);
+                return NULL;
+            }
+            /* Partial creation (OS thread limit reached): reduce num_workers
+             * to the count that succeeded.  wl_workqueue_destroy joins only
+             * wq->num_workers threads, so this is safe.  Submitted work items
+             * will be serialized across fewer physical threads, but correctness
+             * is preserved.  Issue #409. */
+            fprintf(stderr,
+                "[wirelog] workqueue: only %u of %u threads created "
+                "(OS limit); work will serialize on available threads\n",
+                i, num_workers);
+            wq->num_workers = i;
+            break;
         }
     }
 
