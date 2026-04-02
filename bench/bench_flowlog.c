@@ -59,6 +59,8 @@ static uint64_t g_last_kfusion_cleanup_ns = 0;
 /* Fast-path profiling counters (Issue #278) */
 static uint64_t g_last_consolidate_fast_hits = 0;
 static uint64_t g_last_consolidate_slow_hits = 0;
+/* Exchange barrier timing (Issue #413): serial fraction measurement */
+static uint64_t g_last_exchange_ns = 0;
 
 #ifndef WITH_K_FUSION
 #define WITH_K_FUSION 1
@@ -71,7 +73,8 @@ output_json_row(const char *wl_name, int32_t edges, uint32_t workers,
     int64_t peak_rss_kb, int64_t tuples, uint32_t iters,
     uint64_t consolidation_ns, uint64_t kfusion_ns,
     uint64_t kfusion_alloc_ns, uint64_t kfusion_dispatch_ns,
-    uint64_t kfusion_merge_ns, uint64_t kfusion_cleanup_ns);
+    uint64_t kfusion_merge_ns, uint64_t kfusion_cleanup_ns,
+    uint64_t exchange_ns);
 
 #ifndef _MSC_VER
 /* getopt.h and getopt_long are POSIX-only; not available on Windows MSVC */
@@ -345,6 +348,7 @@ run_pipeline_count(const char *source, uint32_t num_workers, int64_t *out_count,
         &g_last_kfusion_merge_ns, &g_last_kfusion_cleanup_ns);
     col_session_get_consolidation_stats(sess, &g_last_consolidate_fast_hits,
         &g_last_consolidate_slow_hits);
+    col_session_get_exchange_time_ns(sess, &g_last_exchange_ns);
 
     wl_session_destroy(sess);
     wl_plan_free(plan);
@@ -439,7 +443,7 @@ run_workload(int wl_id, const char *data_path, uint32_t workers, int repeat)
                 total_iters, g_last_consolidation_ns,
                 g_last_kfusion_ns, g_last_kfusion_alloc_ns,
                 g_last_kfusion_dispatch_ns, g_last_kfusion_merge_ns,
-                g_last_kfusion_cleanup_ns);
+                g_last_kfusion_cleanup_ns, g_last_exchange_ns);
         else
             printf("%s\t%d\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64 "\t%" PRId64
                 "\t%u\t%s\n",
@@ -570,7 +574,8 @@ run_andersen_workload(const char *data_dir, uint32_t workers, int repeat)
                 median_ms, max_ms, peak_rss, tuples, total_iters,
                 g_last_consolidation_ns, g_last_kfusion_ns,
                 g_last_kfusion_alloc_ns, g_last_kfusion_dispatch_ns,
-                g_last_kfusion_merge_ns, g_last_kfusion_cleanup_ns);
+                g_last_kfusion_merge_ns, g_last_kfusion_cleanup_ns,
+                g_last_exchange_ns);
         else
             printf("andersen\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64
                 "\t%" PRId64 "\t%u\t%s\n",
@@ -827,7 +832,8 @@ run_cspa_workload(const char *data_dir, uint32_t workers, int repeat)
                 median_ms, max_ms, peak_rss, tuples, total_iters,
                 g_last_consolidation_ns, g_last_kfusion_ns,
                 g_last_kfusion_alloc_ns, g_last_kfusion_dispatch_ns,
-                g_last_kfusion_merge_ns, g_last_kfusion_cleanup_ns);
+                g_last_kfusion_merge_ns, g_last_kfusion_cleanup_ns,
+                g_last_exchange_ns);
         else
             printf("cspa\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64
                 "\t%" PRId64 "\t%u\t%s\n",
@@ -2663,7 +2669,8 @@ run_doop_workload(const char *data_dir, uint32_t workers, int repeat)
                 median_ms, max_ms, peak_rss, tuples, total_iters,
                 g_last_consolidation_ns, g_last_kfusion_ns,
                 g_last_kfusion_alloc_ns, g_last_kfusion_dispatch_ns,
-                g_last_kfusion_merge_ns, g_last_kfusion_cleanup_ns);
+                g_last_kfusion_merge_ns, g_last_kfusion_cleanup_ns,
+                g_last_exchange_ns);
         else
             printf("doop\t-\t%d\t%u\t%d\t%.1f\t%.1f\t%.1f\t%" PRId64
                 "\t%" PRId64 "\t%u\t%s\n",
@@ -2695,7 +2702,8 @@ output_json_row(const char *wl_name, int32_t edges, uint32_t workers,
     int64_t peak_rss_kb, int64_t tuples, uint32_t iters,
     uint64_t consolidation_ns, uint64_t kfusion_ns,
     uint64_t kfusion_alloc_ns, uint64_t kfusion_dispatch_ns,
-    uint64_t kfusion_merge_ns, uint64_t kfusion_cleanup_ns)
+    uint64_t kfusion_merge_ns, uint64_t kfusion_cleanup_ns,
+    uint64_t exchange_ns)
 {
     double wall_ns = median_ms * 1e6;
     double cons_pct
@@ -2755,6 +2763,11 @@ output_json_row(const char *wl_name, int32_t edges, uint32_t workers,
     printf("  \"consolidation_slow_hits\": %" PRIu64 ",\n",
         g_last_consolidate_slow_hits);
     printf("  \"consolidation_fast_pct\": %.1f,\n", fast_pct);
+    /* Exchange barrier timing (Issue #413): serial fraction for Amdahl's Law */
+    double exch_ms = (double)exchange_ns / 1e6;
+    double serial_frac = wall_ns > 0 ? (double)exchange_ns / wall_ns : 0.0;
+    printf("  \"exchange_ms\": %.3f,\n", exch_ms);
+    printf("  \"serial_fraction\": %.4f,\n", serial_frac);
     printf("  \"profiling_from_last_run\": true\n");
     printf("}\n");
 }

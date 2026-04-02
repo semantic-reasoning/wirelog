@@ -702,6 +702,12 @@ typedef struct wl_col_session_t {
     uint64_t kfusion_dispatch_ns;
     uint64_t kfusion_merge_ns;
     uint64_t kfusion_cleanup_ns;
+    /* Exchange path timing (Issue #413): accumulated wall time spent in
+     * tdd_exchange_deltas / tdd_bdx_exchange_deltas across all sub-pass
+     * barriers.  Used to compute serial_fraction = exchange_time_ns / total_ns
+     * for Amdahl's Law validation at varying worker counts W.
+     * Coordinator-only; reset at the start of each wl_session_snapshot(). */
+    uint64_t exchange_time_ns;
     /* Phase 4: tracks which relation was just inserted via
      * col_session_insert_incremental, enables affected-stratum skip
      * optimization. Borrowed pointer; lifetime: until next session_step.

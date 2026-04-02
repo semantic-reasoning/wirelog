@@ -4321,12 +4321,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * Issue #372: pass self_join_mode so asymmetric strata broadcast
              * deltas to all workers (each holds 1/W IDB, needs full delta). */
             int brc;
-            if (bdx_mode)
-                brc = tdd_bdx_exchange_deltas(sp, coord, ctxs, W,
-                        bdx_snap);
-            else
-                brc = tdd_exchange_deltas(sp, coord, ctxs, W,
-                        !replicate_mode, self_join_mode);
+            {
+                uint64_t t0 = now_ns();
+                if (bdx_mode)
+                    brc = tdd_bdx_exchange_deltas(sp, coord, ctxs, W,
+                            bdx_snap);
+                else
+                    brc = tdd_exchange_deltas(sp, coord, ctxs, W,
+                            !replicate_mode, self_join_mode);
+                coord->exchange_time_ns += now_ns() - t0;
+            }
 
             if (brc != 0) {
                 rc = brc;
