@@ -23,6 +23,7 @@
 #include "columnar/mem_ledger.h"
 #include "columnar/progress.h"
 #include "session.h"
+#include "util/lockfree_queue.h"
 #include "workqueue.h"
 #include "arena/arena.h"
 
@@ -819,6 +820,11 @@ typedef struct wl_col_session_t {
      * Owned by coordinator; worker sessions set tdd_workers = NULL. */
     struct wl_col_session_t *tdd_workers; /* owned array [num_workers] */
     uint32_t tdd_workers_count;         /* number of initialized workers */
+    /* MPSC delta queue for async delta transport (Issue #410).
+     * Created/destroyed per recursive stratum evaluation in
+     * col_eval_stratum_tdd_recursive(). NULL outside that scope.
+     * Coordinator only; worker sessions always have delta_queue=NULL. */
+    wl_mpmc_queue_t *delta_queue;
     /* Set true inside tdd_worker_subpass_fn so col_op_variable AUTO heuristic
      * always uses the broadcast delta (which may be >= local partition size).
      * False everywhere else, including retraction paths. */
@@ -1335,5 +1341,53 @@ col_detect_physical_memory(void);
  */
 uint32_t
 col_compute_worker_cap(uint64_t ram_bytes);
+
+/* ======================================================================== */
+/* TDD Distributed Evaluator (Issue #410)                                   */
+/* ======================================================================== */
+
+/*
+ * col_eval_tdd_worker_ctx_t:
+ * Per-worker context for one sub-pass of distributed stratum evaluation.
+ *
+ * For non-recursive workers (tdd_worker_nonrecursive_fn): only sp,
+ * worker_sess, stratum_idx, and rc are used.
+ *
+ * For recursive sub-pass workers (tdd_worker_subpass_fn): all fields.
+ * The coordinator allocates delta_rels[nrels] before dispatch; the worker
+ * fills in entries for each relation that produced new tuples.  Ownership
+ * of each delta_rels[ri] (heap-allocated via col_rel_new_like) transfers
+ * to the coordinator after the workqueue barrier.
+ */
+typedef struct {
+    const wl_plan_stratum_t *sp;   /* borrowed: stratum plan          */
+    wl_col_session_t *worker_sess; /* borrowed: isolated worker       */
+    uint32_t stratum_idx;
+    uint32_t eff_iter;             /* effective sub-pass index (set by coord) */
+    bool any_new;                  /* OUT: produced >=1 new tuple     */
+    bool all_empty_delta;          /* OUT: all FORCE_DELTA empty, skipped */
+    bool force_diff;               /* IN: enable diff from eff_iter 0 (BDX) */
+    col_rel_t **delta_rels;        /* OUT: produced deltas [nrels], coord frees */
+    int rc;                        /* OUT: return code                */
+} col_eval_tdd_worker_ctx_t;
+
+/*
+ * tdd_reconstruct_delta_matrix:
+ * Convert flat delta message buffer from MPSC queue drain into the
+ * ctxs[w].delta_rels[ri] matrix used by existing exchange functions.
+ *
+ * For each message in msgs[0..count), places msg.delta into
+ * ctxs[msg.worker_id].delta_rels[msg.rel_idx].
+ *
+ * Precondition: ctxs[w].delta_rels[ri] == NULL for all w,ri (freshly reset).
+ * Postcondition: ctxs[msg.worker_id].delta_rels[msg.rel_idx] holds the
+ *                delta pointer from each message (last write wins on dup).
+ *
+ * Pure: no allocations, no side effects, no atomics.  O(count) time, O(1) space.
+ */
+void
+tdd_reconstruct_delta_matrix(col_eval_tdd_worker_ctx_t *ctxs,
+    const wl_delta_msg_t *msgs, uint32_t count,
+    uint32_t num_workers, uint32_t nrels);
 
 #endif /* WL_COLUMNAR_INTERNAL_H */

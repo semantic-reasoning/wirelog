@@ -57,9 +57,13 @@
  * The @delta pointer is caller-owned; the queue does not manage its lifetime.
  */
 typedef struct {
-    void    *delta;     /* delta relation pointer     */
-    uint32_t stratum;   /* stratum ID                 */
-    uint32_t worker_id; /* originating worker thread  */
+    void    *delta;     /* delta relation pointer                  */
+    uint32_t stratum;   /* stratum ID                              */
+    uint32_t worker_id; /* originating worker thread               */
+    uint32_t rel_idx;   /* relation index within stratum plan      */
+    uint32_t epoch;     /* barrier epoch counter                   */
+    uint16_t flags;     /* message status flags                    */
+    int16_t rc;         /* return/result code                      */
 } wl_delta_msg_t;
 
 /**
@@ -103,6 +107,7 @@ wl_mpmc_queue_destroy(wl_mpmc_queue_t *q);
  *             calling thread; only one thread may use each worker_id.
  * @delta:     Delta relation pointer.  May be NULL.
  * @stratum:   Stratum ID.
+ * @rel_idx:   Relation index within the stratum plan.
  *
  * Enqueue one delta message into worker_id's dedicated SPSC ring buffer.
  * Non-blocking: returns -1 immediately if the ring is full.
@@ -115,7 +120,7 @@ wl_mpmc_queue_destroy(wl_mpmc_queue_t *q);
  */
 int
 wl_mpmc_enqueue(wl_mpmc_queue_t *q, uint32_t worker_id,
-    void *delta, uint32_t stratum);
+    void *delta, uint32_t stratum, uint32_t rel_idx);
 
 /**
  * wl_mpmc_dequeue:
