@@ -2763,8 +2763,17 @@ output_json_row(const char *wl_name, int32_t edges, uint32_t workers,
     printf("  \"consolidation_slow_hits\": %" PRIu64 ",\n",
         g_last_consolidate_slow_hits);
     printf("  \"consolidation_fast_pct\": %.1f,\n", fast_pct);
+    /* K-fusion serial fraction: alloc + merge + cleanup (non-dispatch overhead).
+     * Applies to non-recursive strata (CSPA, DOOP, etc.) evaluated via K-fusion.
+     * Dispatch time (alloc → worker parallelism → merge) is already factored in. */
+    double kf_serial_ns = (double)kfusion_alloc_ns + (double)kfusion_merge_ns
+        + (double)kfusion_cleanup_ns;
+    double kf_serial_frac = wall_ns > 0 ? kf_serial_ns / wall_ns : 0.0;
+    printf("  \"kfusion_serial_ms\": %.3f,\n", kf_serial_ns / 1e6);
+    printf("  \"kfusion_serial_fraction\": %.4f,\n", kf_serial_frac);
     /* Exchange barrier timing (Issue #413): fraction of wall time in serial
      * coordinator phases (exchange scatter/gather + non-recursive merge).
+     * Applies to recursive strata (TC, reach, etc.) evaluated via TDD.
      * This is a lower bound on the true Amdahl serial fraction f — queue
      * drain and convergence check are not included. */
     double exch_ms = (double)exchange_ns / 1e6;
