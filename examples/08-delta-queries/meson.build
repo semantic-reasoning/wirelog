@@ -46,6 +46,7 @@ demo_backend_src = files(
   subdir_wirelog / 'columnar/diff_bridge.c',
   subdir_wirelog / 'columnar/partition.c',
   subdir_wirelog / 'columnar/progress.c',
+  subdir_wirelog / 'util/lockfree_queue.c',
 )
 
 demo_arena_src = files(
