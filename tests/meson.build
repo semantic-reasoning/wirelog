@@ -196,6 +196,7 @@ backend_src = files(
   '../wirelog/columnar/diff_bridge.c',
   '../wirelog/columnar/partition.c',
   '../wirelog/columnar/progress.c',
+  '../wirelog/util/lockfree_queue.c',
 )
 
 io_src = files(

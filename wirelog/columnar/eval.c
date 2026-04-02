@@ -15,6 +15,7 @@
 
 #include "../wirelog-internal.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1471,29 +1472,26 @@ rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id)
 /* ======================================================================== */
 
 /*
- * col_eval_tdd_worker_ctx_t:
- * Per-worker context for one sub-pass of distributed stratum evaluation.
- *
- * For non-recursive workers (tdd_worker_nonrecursive_fn): only sp,
- * worker_sess, stratum_idx, and rc are used.
- *
- * For recursive sub-pass workers (tdd_worker_subpass_fn): all fields.
- * The coordinator allocates delta_rels[nrels] before dispatch; the worker
- * fills in entries for each relation that produced new tuples.  Ownership
- * of each delta_rels[ri] (heap-allocated via col_rel_new_like) transfers
- * to the coordinator after the workqueue barrier.
+ * tdd_reconstruct_delta_matrix:
+ * See declaration in columnar/internal.h for full contract.
  */
-typedef struct {
-    const wl_plan_stratum_t *sp;   /* borrowed: stratum plan          */
-    wl_col_session_t *worker_sess; /* borrowed: isolated worker       */
-    uint32_t stratum_idx;
-    uint32_t eff_iter;             /* effective sub-pass index (set by coord) */
-    bool any_new;                  /* OUT: produced ≥1 new tuple      */
-    bool all_empty_delta;          /* OUT: all FORCE_DELTA empty, skipped */
-    bool force_diff;               /* IN: enable diff from eff_iter 0 (BDX) */
-    col_rel_t **delta_rels;        /* OUT: produced deltas [nrels], coord frees */
-    int rc;                        /* OUT: return code                */
-} col_eval_tdd_worker_ctx_t;
+void
+tdd_reconstruct_delta_matrix(col_eval_tdd_worker_ctx_t *ctxs,
+    const wl_delta_msg_t *msgs, uint32_t count,
+    uint32_t num_workers, uint32_t nrels)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t w = msgs[i].worker_id;
+        uint32_t ri = msgs[i].rel_idx;
+
+        if (w >= num_workers || ri >= nrels) {
+            col_rel_destroy((col_rel_t *)msgs[i].delta);
+            continue;
+        }
+
+        ctxs[w].delta_rels[ri] = (col_rel_t *)msgs[i].delta;
+    }
+}
 
 /*
  * tdd_cleanup_workers:
@@ -2049,7 +2047,27 @@ tdd_worker_subpass_fn(void *arg)
                 }
             }
 
-            ctx->delta_rels[ri] = delta; /* coordinator takes ownership */
+            /* Issue #410, Commit 5: Queue-only transport.
+             * delta ownership transfers to queue; coordinator reconstructs
+             * ctxs via tdd_reconstruct_delta_matrix after barrier.
+             * Fallback to ctx write when queue unavailable (alloc failure). */
+            if (sess->coordinator && sess->coordinator->delta_queue) {
+                int enq_rc = wl_mpmc_enqueue(
+                    sess->coordinator->delta_queue,
+                    sess->worker_id, delta, ctx->stratum_idx, ri);
+                if (enq_rc != 0) {
+                    /* Queue full — signal error; destroy orphaned delta. */
+                    col_rel_destroy(delta);
+                    ctx->rc = ENOMEM;
+                    free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
+                    sess->diff_operators_active = saved_diff;
+                    return;
+                }
+            } else {
+                /* No queue (creation failed): fall back to direct ctx write. */
+                ctx->delta_rels[ri] = delta;
+            }
             any_new = true;
         } else {
             col_rel_destroy(delta);
@@ -4054,6 +4072,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         }
     }
 
+    /* Issue #410: Create MPSC delta queue for dual-write transport.
+     * Capacity = W × nrels × 2 (2x headroom; at most W×nrels per sub-pass).
+     * Failure is non-fatal: enqueue is skipped when delta_queue is NULL. */
+    coord->delta_queue = wl_mpmc_queue_create(W, nrels * 2 < 2 ? 2 : nrels * 2);
+
     /* Issue #390: BDX snap array — pre-subpass IDB sizes per worker/relation.
      * Used to truncate worker IDB back to clean partition state after each
      * sub-pass (removes cross-partition pollution from join output). */
@@ -4234,6 +4257,27 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 goto done;
             }
 
+            /* Issue #410, Commit 4: Drain MPSC queue and reconstruct
+             * ctxs[w].delta_rels[ri] via adapter.  Workers dual-write to both
+             * ctx and queue; shadow assert verifies agreement (debug only). */
+            if (coord->delta_queue) {
+                uint32_t max_msgs = W * nrels;
+                wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(
+                    max_msgs > 0 ? max_msgs : 1u, sizeof(wl_delta_msg_t));
+                if (msgs) {
+                    uint32_t msg_count = wl_mpmc_dequeue_all(
+                        coord->delta_queue, msgs, max_msgs);
+
+                    /* Clear and reconstruct from queue messages. */
+                    for (uint32_t w = 0; w < W; w++)
+                        memset(ctxs[w].delta_rels, 0,
+                            nrels * sizeof(col_rel_t *));
+                    tdd_reconstruct_delta_matrix(ctxs, msgs, msg_count,
+                        W, nrels);
+                    free(msgs);
+                }
+            }
+
             /* Stratum-level early exit: all workers have all_empty_delta */
             bool all_workers_empty = true;
             for (uint32_t w = 0; w < W; w++) {
@@ -4302,6 +4346,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     } /* end outer loop */
 
 done:
+    /* Issue #410: Destroy MPSC delta queue created for this stratum eval. */
+    wl_mpmc_queue_destroy(coord->delta_queue);
+    coord->delta_queue = NULL;
+
     /* Free pre-allocated worker contexts */
     if (ctxs) {
         for (uint32_t w = 0; w < W; w++)

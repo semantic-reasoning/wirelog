@@ -241,15 +241,16 @@ wl_mpmc_queue_destroy(wl_mpmc_queue_t *q)
 
 int
 wl_mpmc_enqueue(wl_mpmc_queue_t *q, uint32_t worker_id,
-    void *delta, uint32_t stratum)
+    void *delta, uint32_t stratum, uint32_t rel_idx)
 {
     if (!q || worker_id >= q->num_workers)
         return -1;
 
-    wl_delta_msg_t msg;
+    wl_delta_msg_t msg = {0};
     msg.delta = delta;
     msg.stratum = stratum;
     msg.worker_id = worker_id;
+    msg.rel_idx = rel_idx;
 
     return spsc_enqueue(&q->workers[worker_id], msg);
 }
