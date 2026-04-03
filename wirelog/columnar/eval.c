@@ -4321,12 +4321,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * Issue #372: pass self_join_mode so asymmetric strata broadcast
              * deltas to all workers (each holds 1/W IDB, needs full delta). */
             int brc;
-            if (bdx_mode)
-                brc = tdd_bdx_exchange_deltas(sp, coord, ctxs, W,
-                        bdx_snap);
-            else
-                brc = tdd_exchange_deltas(sp, coord, ctxs, W,
-                        !replicate_mode, self_join_mode);
+            {
+                uint64_t t0 = now_ns();
+                if (bdx_mode)
+                    brc = tdd_bdx_exchange_deltas(sp, coord, ctxs, W,
+                            bdx_snap);
+                else
+                    brc = tdd_exchange_deltas(sp, coord, ctxs, W,
+                            !replicate_mode, self_join_mode);
+                coord->exchange_time_ns += now_ns() - t0;
+            }
 
             if (brc != 0) {
                 rc = brc;
@@ -4447,9 +4451,15 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
     }
     free(ctxs);
 
-    /* Phase 6: CONSOLIDATE — merge worker IDB results to coordinator */
-    if (rc == 0)
+    /* Phase 6: CONSOLIDATE — merge worker IDB results to coordinator.
+     * This is a serial coordinator phase: accumulate into exchange_time_ns
+     * so serial_fraction / exchange_fraction accounts for non-recursive strata
+     * as well as recursive exchange barriers. */
+    if (rc == 0) {
+        uint64_t t0 = now_ns();
         rc = tdd_merge_worker_results(sp, coord);
+        coord->exchange_time_ns += now_ns() - t0;
+    }
 
     /* Dedup coordinator IDB (multiple workers evaluating the same rules on
      * different partitions may produce overlapping tuples). */
