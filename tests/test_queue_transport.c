@@ -308,17 +308,17 @@ test_queue_overflow_graceful(void)
      * Create a minimal 1-worker queue with capacity 2 (smallest allowed).
      * Fill both slots; the third enqueue must return -1 immediately.
      */
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(1, 2);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(1, 2);
     if (!q) {
-        FAIL("wl_mpmc_queue_create returned NULL");
+        FAIL("wl_mpsc_queue_create returned NULL");
         return 1;
     }
 
-    int r0 = wl_mpmc_enqueue(q, 0, (void *)0x1, 0, 0);
-    int r1 = wl_mpmc_enqueue(q, 0, (void *)0x2, 0, 1);
-    int r2 = wl_mpmc_enqueue(q, 0, (void *)0x3, 0, 2); /* must fail */
+    int r0 = wl_mpsc_enqueue(q, 0, (void *)0x1, 0, 0);
+    int r1 = wl_mpsc_enqueue(q, 0, (void *)0x2, 0, 1);
+    int r2 = wl_mpsc_enqueue(q, 0, (void *)0x3, 0, 2); /* must fail */
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
 
     if (r0 != 0) {
         FAIL("first enqueue unexpectedly failed");
@@ -385,26 +385,26 @@ test_error_propagation(void)
      * In the production path (eval.c), worker sets ctx->rc = ENOMEM on -1
      * return; coordinator detects rc != 0 after barrier and exits.
      */
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(2, 4);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(2, 4);
     if (!q) {
-        FAIL("wl_mpmc_queue_create returned NULL");
+        FAIL("wl_mpsc_queue_create returned NULL");
         return 1;
     }
 
     /* Worker 0: fill 4 slots */
     int all_ok = 1;
     for (uint32_t i = 0; i < 4; i++)
-        if (wl_mpmc_enqueue(q, 0, (void *)(uintptr_t)(i + 1), 0, i) != 0)
+        if (wl_mpsc_enqueue(q, 0, (void *)(uintptr_t)(i + 1), 0, i) != 0)
             all_ok = 0;
 
     /* Worker 0: 5th enqueue must fail */
-    int overflow = wl_mpmc_enqueue(q, 0, (void *)0xFF, 0, 4);
+    int overflow = wl_mpsc_enqueue(q, 0, (void *)0xFF, 0, 4);
 
     /* Coordinator drains: must get the 4 successful messages */
     wl_delta_msg_t buf[8];
-    uint32_t drained = wl_mpmc_dequeue_all(q, buf, 8);
+    uint32_t drained = wl_mpsc_dequeue_all(q, buf, 8);
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
 
     if (!all_ok) {
         FAIL("one of the first 4 enqueues unexpectedly failed");

@@ -74,25 +74,25 @@ test_create_destroy(void)
     TEST("create/destroy lifecycle");
 
     /* Normal creation */
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(4, 16);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(4, 16);
     ASSERT(q != NULL, "create(4, 16) returned NULL");
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
 
     /* NULL-safe destroy */
-    wl_mpmc_queue_destroy(NULL);
+    wl_mpsc_queue_destroy(NULL);
 
     /* Invalid: 0 workers */
-    q = wl_mpmc_queue_create(0, 16);
+    q = wl_mpsc_queue_create(0, 16);
     ASSERT(q == NULL, "create(0, 16) should return NULL");
 
     /* Invalid: capacity < 2 */
-    q = wl_mpmc_queue_create(2, 1);
+    q = wl_mpsc_queue_create(2, 1);
     ASSERT(q == NULL, "create(2, 1) should return NULL");
 
     /* Single worker */
-    q = wl_mpmc_queue_create(1, 8);
+    q = wl_mpsc_queue_create(1, 8);
     ASSERT(q != NULL, "create(1, 8) returned NULL");
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
 
     PASS();
 }
@@ -106,47 +106,47 @@ test_single_producer(void)
 {
     TEST("single producer enqueue/dequeue");
 
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(1, 8);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(1, 8);
     ASSERT(q != NULL, "create failed");
 
     /* Empty queue dequeue returns 0 */
     wl_delta_msg_t out;
-    int rc = wl_mpmc_dequeue(q, &out);
+    int rc = wl_mpsc_dequeue(q, &out);
     ASSERT(rc == 0, "dequeue from empty should return 0");
 
     /* Enqueue 3 items */
     int a = 10, b = 20, c = 30;
-    ASSERT(wl_mpmc_enqueue(q, 0, &a, 1, 0) == 0, "enqueue a failed");
-    ASSERT(wl_mpmc_enqueue(q, 0, &b, 2, 1) == 0, "enqueue b failed");
-    ASSERT(wl_mpmc_enqueue(q, 0, &c, 3, 2) == 0, "enqueue c failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, &a, 1, 0) == 0, "enqueue a failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, &b, 2, 1) == 0, "enqueue b failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, &c, 3, 2) == 0, "enqueue c failed");
 
-    ASSERT(wl_mpmc_size(q) == 3, "size should be 3");
+    ASSERT(wl_mpsc_size(q) == 3, "size should be 3");
 
     /* Dequeue in FIFO order */
-    rc = wl_mpmc_dequeue(q, &out);
+    rc = wl_mpsc_dequeue(q, &out);
     ASSERT(rc == 1, "dequeue 1 failed");
     ASSERT(out.delta == &a, "wrong delta ptr for item 1");
     ASSERT(out.stratum == 1, "wrong stratum for item 1");
     ASSERT(out.worker_id == 0, "wrong worker_id for item 1");
     ASSERT(out.rel_idx == 0, "wrong rel_idx for item 1");
 
-    rc = wl_mpmc_dequeue(q, &out);
+    rc = wl_mpsc_dequeue(q, &out);
     ASSERT(rc == 1, "dequeue 2 failed");
     ASSERT(out.delta == &b, "wrong delta ptr for item 2");
     ASSERT(out.stratum == 2, "wrong stratum for item 2");
     ASSERT(out.rel_idx == 1, "wrong rel_idx for item 2");
 
-    rc = wl_mpmc_dequeue(q, &out);
+    rc = wl_mpsc_dequeue(q, &out);
     ASSERT(rc == 1, "dequeue 3 failed");
     ASSERT(out.delta == &c, "wrong delta ptr for item 3");
     ASSERT(out.stratum == 3, "wrong stratum for item 3");
     ASSERT(out.rel_idx == 2, "wrong rel_idx for item 3");
 
     /* Now empty */
-    rc = wl_mpmc_dequeue(q, &out);
+    rc = wl_mpsc_dequeue(q, &out);
     ASSERT(rc == 0, "should be empty after 3 dequeues");
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
     PASS();
 }
 
@@ -159,18 +159,18 @@ test_rel_idx_field(void)
 {
     TEST("rel_idx field round-trip");
 
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(2, 16);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(2, 16);
     ASSERT(q != NULL, "create failed");
 
     /* Worker 0 enqueues rel_idx 0 and 5; worker 1 enqueues rel_idx 99 */
     int d0 = 100, d1 = 200, d2 = 300;
-    ASSERT(wl_mpmc_enqueue(q, 0, &d0, 0, 0) == 0, "enqueue rel 0 failed");
-    ASSERT(wl_mpmc_enqueue(q, 0, &d1, 0, 5) == 0, "enqueue rel 5 failed");
-    ASSERT(wl_mpmc_enqueue(q, 1, &d2, 1, 99) == 0, "enqueue rel 99 failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, &d0, 0, 0) == 0, "enqueue rel 0 failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, &d1, 0, 5) == 0, "enqueue rel 5 failed");
+    ASSERT(wl_mpsc_enqueue(q, 1, &d2, 1, 99) == 0, "enqueue rel 99 failed");
 
     /* Drain all 3 items (round-robin ordering not guaranteed across workers) */
     wl_delta_msg_t buf[4];
-    uint32_t n = wl_mpmc_dequeue_all(q, buf, 4);
+    uint32_t n = wl_mpsc_dequeue_all(q, buf, 4);
     ASSERT(n == 3, "should dequeue 3 items");
 
     /* Verify rel_idx values as a set: {0, 5, 99} */
@@ -199,7 +199,7 @@ test_rel_idx_field(void)
         }
     }
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
     PASS();
 }
 
@@ -212,20 +212,20 @@ test_new_fields(void)
 {
     TEST("epoch/flags/rc fields zero-initialized on enqueue");
 
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(1, 8);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(1, 8);
     ASSERT(q != NULL, "create failed");
 
     int val = 42;
-    ASSERT(wl_mpmc_enqueue(q, 0, &val, 1, 7) == 0, "enqueue failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, &val, 1, 7) == 0, "enqueue failed");
 
     wl_delta_msg_t out;
-    int rc = wl_mpmc_dequeue(q, &out);
+    int rc = wl_mpsc_dequeue(q, &out);
     ASSERT(rc == 1, "dequeue failed");
     ASSERT(out.epoch == 0,  "epoch should be zero-initialized");
     ASSERT(out.flags == 0,  "flags should be zero-initialized");
     ASSERT(out.rc == 0,  "rc should be zero-initialized");
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
     PASS();
 }
 
@@ -242,7 +242,7 @@ test_multiple_producers(void)
     const uint32_t nworkers = 4;
     const uint32_t per_worker = 4;
 
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(nworkers, 8);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(nworkers, 8);
     ASSERT(q != NULL, "create failed");
 
     /* Each worker enqueues per_worker items */
@@ -251,7 +251,7 @@ test_multiple_producers(void)
         for (uint32_t i = 0; i < per_worker; i++) {
             int idx = (int)(w * per_worker + i);
             values[idx] = idx;
-            int rc = wl_mpmc_enqueue(q, w, &values[idx], w * 10 + i, i);
+            int rc = wl_mpsc_enqueue(q, w, &values[idx], w * 10 + i, i);
             char msg[64];
             snprintf(msg, sizeof(msg), "enqueue w=%u i=%u failed", w, i);
             ASSERT(rc == 0, msg);
@@ -260,7 +260,7 @@ test_multiple_producers(void)
 
     /* dequeue_all should collect all 16 items */
     wl_delta_msg_t buf[32];
-    uint32_t n = wl_mpmc_dequeue_all(q, buf, 32);
+    uint32_t n = wl_mpsc_dequeue_all(q, buf, 32);
     ASSERT(n == nworkers * per_worker, "dequeue_all count mismatch");
 
     /* Verify no item is duplicated (check all values present) */
@@ -278,9 +278,9 @@ test_multiple_producers(void)
         ASSERT(seen[i] == 1, "missing value in dequeue_all output");
     }
 
-    ASSERT(wl_mpmc_size(q) == 0, "queue should be empty after dequeue_all");
+    ASSERT(wl_mpsc_size(q) == 0, "queue should be empty after dequeue_all");
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
     PASS();
 }
 
@@ -294,7 +294,7 @@ test_saturation(void)
     TEST("saturation: fill/overflow/drain/refill");
 
     /* capacity=4 (next_pow2 rounds 4 up to 4) */
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(1, 4);
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(1, 4);
     ASSERT(q != NULL, "create failed");
 
     int vals[8];
@@ -303,34 +303,34 @@ test_saturation(void)
 
     /* Fill to capacity */
     for (int i = 0; i < 4; i++) {
-        int rc = wl_mpmc_enqueue(q, 0, &vals[i], (uint32_t)i, (uint32_t)i);
+        int rc = wl_mpsc_enqueue(q, 0, &vals[i], (uint32_t)i, (uint32_t)i);
         char msg[64];
         snprintf(msg, sizeof(msg), "enqueue %d should succeed", i);
         ASSERT(rc == 0, msg);
     }
-    ASSERT(wl_mpmc_size(q) == 4, "size should be 4 when full");
+    ASSERT(wl_mpsc_size(q) == 4, "size should be 4 when full");
 
     /* 5th enqueue must fail */
-    int rc = wl_mpmc_enqueue(q, 0, &vals[4], 4, 4);
+    int rc = wl_mpsc_enqueue(q, 0, &vals[4], 4, 4);
     ASSERT(rc == -1, "enqueue into full ring should return -1");
 
     /* Drain via dequeue_all */
     wl_delta_msg_t buf[8];
-    uint32_t n = wl_mpmc_dequeue_all(q, buf, 8);
+    uint32_t n = wl_mpsc_dequeue_all(q, buf, 8);
     ASSERT(n == 4, "dequeue_all should return 4 items");
-    ASSERT(wl_mpmc_size(q) == 0, "size should be 0 after drain");
+    ASSERT(wl_mpsc_size(q) == 0, "size should be 0 after drain");
 
     /* Can enqueue again after drain */
     for (int i = 4; i < 8; i++) {
-        rc = wl_mpmc_enqueue(q, 0, &vals[i], (uint32_t)i, (uint32_t)i);
+        rc = wl_mpsc_enqueue(q, 0, &vals[i], (uint32_t)i, (uint32_t)i);
         char msg[64];
         snprintf(msg, sizeof(msg), "re-enqueue %d should succeed", i);
         ASSERT(rc == 0, msg);
     }
-    n = wl_mpmc_dequeue_all(q, buf, 8);
+    n = wl_mpsc_dequeue_all(q, buf, 8);
     ASSERT(n == 4, "second dequeue_all should return 4 items");
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
     PASS();
 }
 
@@ -343,7 +343,7 @@ test_saturation(void)
 #define QUEUE_CAPACITY      128
 
 struct producer_ctx {
-    wl_mpmc_queue_t *q;
+    wl_mpsc_queue_t *q;
     uint32_t worker_id;
     int values[ITEMS_PER_WORKER];
     int enqueued;              /* items successfully enqueued */
@@ -356,7 +356,7 @@ producer_fn(void *arg)
     for (int i = 0; i < ITEMS_PER_WORKER; i++) {
         ctx->values[i] = (int)(ctx->worker_id * 1000 + (uint32_t)i);
         /* Spin until enqueue succeeds (queue may be temporarily full). */
-        while (wl_mpmc_enqueue(ctx->q, ctx->worker_id,
+        while (wl_mpsc_enqueue(ctx->q, ctx->worker_id,
             &ctx->values[i],
             ctx->worker_id, (uint32_t)i) != 0)
             ;
@@ -370,7 +370,7 @@ test_concurrent(void)
 {
     TEST("concurrent producers + coordinator (thread safety)");
 
-    wl_mpmc_queue_t *q = wl_mpmc_queue_create(CONCURRENT_WORKERS,
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(CONCURRENT_WORKERS,
             QUEUE_CAPACITY);
     ASSERT(q != NULL, "create failed");
 
@@ -397,13 +397,13 @@ test_concurrent(void)
         thread_join(&threads[w]);
 
     /* Drain what's left after all producers finished. */
-    uint32_t n = wl_mpmc_dequeue_all(q, buf, QUEUE_CAPACITY);
+    uint32_t n = wl_mpsc_dequeue_all(q, buf, QUEUE_CAPACITY);
     total_received += (int)n;
 
     /* There may be more items than QUEUE_CAPACITY in the rings total.
      * Keep draining until empty. */
     while (1) {
-        n = wl_mpmc_dequeue_all(q, buf, QUEUE_CAPACITY);
+        n = wl_mpsc_dequeue_all(q, buf, QUEUE_CAPACITY);
         if (n == 0)
             break;
         total_received += (int)n;
@@ -422,7 +422,7 @@ test_concurrent(void)
         ASSERT(ctxs[w].enqueued == ITEMS_PER_WORKER, msg);
     }
 
-    wl_mpmc_queue_destroy(q);
+    wl_mpsc_queue_destroy(q);
     PASS();
 }
 
