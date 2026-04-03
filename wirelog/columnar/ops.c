@@ -4774,6 +4774,21 @@ cleanup_wq:
         col_session_free_delta_arrangements(&worker_sess[d]);
         /* Free worker's private diff-arrangement cache (diff_arr_*). */
         col_session_free_diff_arrangements(&worker_sess[d]);
+        /* Free contents of pool-allocated relations before bulk destroy.
+         * delta_pool_destroy frees the slab/arena but skips individually
+         * malloc'd members (name, columns, col_names) -- leaks under ASAN.
+         * col_rel_free_contents zeroes each slot, so already-destroyed
+         * relations (via mat_cache or results cleanup) are safe no-ops. */
+        {
+            delta_pool_t *dp = worker_sess[d].delta_pool;
+            if (dp) {
+                for (uint32_t s = 0; s < dp->slot_used; s++) {
+                    col_rel_t *pr = (col_rel_t *)(dp->slab
+                        + (size_t)s * dp->slot_size);
+                    col_rel_free_contents(pr);
+                }
+            }
+        }
         delta_pool_destroy(worker_sess[d].delta_pool);
         wl_arena_free(worker_sess[d].eval_arena);
     }

@@ -603,15 +603,18 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
                 uint64_t total = (phys / 4ULL) * 3ULL; /* 75% of RAM */
                 uint32_t nw = sess->num_workers;
                 if (nw > 1) {
-                    /* Mode 2 (TDD replicate): coordinator + W workers each
-                     * hold a full IDB copy in memory simultaneously.
-                     * Divide the total budget across W+1 parties so that
-                     * aggregate usage stays within 75% RAM.
-                     * Workers inherit this per-party budget via
-                     * col_worker_session_init (session.c:715).
-                     * TODO: For W > 64 on large-RAM systems a 1 GB minimum
-                     * floor may be needed to avoid over-restriction. */
-                    budget = total / (uint64_t)(nw + 1);
+                    /* Issue #416 (lazy budget partitioning): coordinator
+                     * starts with the full budget so that single-threaded
+                     * strata (use_tdd=false) are not penalised by an
+                     * artificially low backpressure threshold.  The per-
+                     * party share is stored in tdd_budget_per_party and
+                     * applied to the coordinator lazily (on first worker
+                     * session init) only when workers are actually used.
+                     * This ensures W=N and W=1 produce identical results
+                     * for workloads where no stratum uses TDD. */
+                    sess->tdd_budget_per_party
+                        = total / (uint64_t)(nw + 1);
+                    budget = total;
                 } else {
                     budget = total;
                 }
@@ -728,6 +731,19 @@ col_session_destroy(wl_session_t *session)
     col_session_free_delta_arrangements(sess);
     col_session_free_sorted_arrangements(sess);
     col_session_free_diff_arrangements(sess);
+    /* Free contents of pool-allocated relations before bulk destroy.
+     * delta_pool_destroy frees the slab/arena but skips individually
+     * malloc'd members (name, columns, col_names, row_scratch). */
+    {
+        delta_pool_t *dp = sess->delta_pool;
+        if (dp) {
+            for (uint32_t s = 0; s < dp->slot_used; s++) {
+                col_rel_t *pr = (col_rel_t *)(dp->slab
+                    + (size_t)s * dp->slot_size);
+                col_rel_free_contents(pr);
+            }
+        }
+    }
     delta_pool_destroy(sess->delta_pool);
     wl_arena_free(sess->eval_arena);
     /* Free exchange buffer matrix (Issue #316): coordinator-owned W x W grid */
@@ -840,10 +856,26 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->last_removed_relation = NULL;
 
     /* Step 5: Initialize independent mem_ledger (avoid copying atomics).
-     * Each worker handles 1/W of the data, so divide total_budget by W so
-     * the per-worker budget reflects the actual fraction of data it owns. */
-    wl_mem_ledger_init(&out_worker->mem_ledger,
-        coordinator->mem_ledger.total_budget / coordinator->num_workers);
+     * Issue #416 (lazy budget partitioning): if tdd_budget_per_party was
+     * set at session init, the coordinator started with the full budget so
+     * single-threaded strata are not penalised.  On the first worker init
+     * we lazily shrink the coordinator to its per-party share so that, once
+     * workers are live, aggregate memory usage stays within the 75%-RAM
+     * envelope (coordinator + W workers each hold tdd_budget_per_party). */
+    uint64_t worker_budget;
+    if (coordinator->tdd_budget_per_party > 0) {
+        if (coordinator->tdd_workers_count == 0) {
+            /* First worker: shrink coordinator to its per-party share. */
+            atomic_store_explicit(&coordinator->mem_ledger.total_budget,
+                coordinator->tdd_budget_per_party, memory_order_relaxed);
+        }
+        worker_budget = coordinator->tdd_budget_per_party;
+    } else {
+        worker_budget = atomic_load_explicit(
+            &coordinator->mem_ledger.total_budget, memory_order_relaxed)
+            / coordinator->num_workers;
+    }
+    wl_mem_ledger_init(&out_worker->mem_ledger, worker_budget);
 
     /* Step 6: Populate rels[] with partition relations (ownership transfer) */
     if (num_partitions > 0) {
@@ -953,6 +985,17 @@ col_worker_session_destroy(wl_col_session_t *worker)
 
     /* Free allocators (all NULL-safe) */
     wl_workqueue_destroy(worker->wq);
+    /* Free contents of pool-allocated relations before bulk destroy. */
+    {
+        delta_pool_t *dp = worker->delta_pool;
+        if (dp) {
+            for (uint32_t s = 0; s < dp->slot_used; s++) {
+                col_rel_t *pr = (col_rel_t *)(dp->slab
+                    + (size_t)s * dp->slot_size);
+                col_rel_free_contents(pr);
+            }
+        }
+    }
     delta_pool_destroy(worker->delta_pool);
     wl_arena_free(worker->eval_arena);
 
@@ -1595,9 +1638,14 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
              * the full join), which is worse than single-threaded. */
             if (recursive_has_exchange) {
                 if (!tdd_stratum_has_idb_self_join(rsp)) {
-                    /* Category A: no IDB-IDB joins — safe for hybrid
-                     * init + hash-partitioned delta exchange. */
-                    recursive_tdd_safe = true;
+                    /* Category A: no IDB-IDB joins.  TDD would fall into
+                     * replicate_mode (all workers receive the full dataset;
+                     * no work is partitioned → zero speedup).  With W>1,
+                     * memory backpressure inside each worker truncates joins
+                     * earlier than a single-threaded coordinator would,
+                     * causing fewer derived facts and a tuple count
+                     * discrepancy vs W=1 (Issue #416 residual).
+                     * recursive_tdd_safe stays false → single-threaded. */
                 } else if (tdd_stratum_idb_self_join_exchange_aligned(
                         rsp, sess)) {
                     /* Category B: IDB-IDB joins are exchange-aligned. */
@@ -1616,10 +1664,18 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
                 }
             }
         }
+        /* Issue #416: Non-recursive strata are always evaluated
+         * single-threaded.  col_eval_stratum_tdd_nonrecursive uses
+         * tdd_init_workers which partitions ALL relations (EDB and IDB)
+         * by col0.  Any rule whose join key is not col0 — the common
+         * case for DOOP preprocessing strata — loses cross-partition
+         * tuples, producing fewer derived facts that feed into recursive
+         * strata and causing W>1 to produce fewer final tuples than W=1
+         * (empirically: ~8.5% fewer for the DOOP benchmark). */
         bool use_tdd = snapshot_tdd_eligible
             && (plan->strata[si].is_recursive
                 ? (recursive_has_exchange && recursive_tdd_safe)
-                : true);
+                : false); /* Issue #416: non-recursive always single-threaded */
         /* Issue #390: Correctness oracle — compare TDD vs single-threaded
          * tuple counts for recursive strata.  Enabled via env var.
          * Debug-only; never runs in production.

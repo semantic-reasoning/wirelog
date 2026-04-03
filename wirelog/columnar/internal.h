@@ -826,6 +826,15 @@ typedef struct wl_col_session_t {
      * Owned by coordinator; worker sessions set tdd_workers = NULL. */
     struct wl_col_session_t *tdd_workers; /* owned array [num_workers] */
     uint32_t tdd_workers_count;         /* number of initialized workers */
+    /* Per-party memory budget for TDD replicate-mode (Issue #416).
+     * = total_ram*75% / (num_workers+1): the share that keeps aggregate
+     * usage within 75% RAM when coordinator + W workers each hold a full
+     * IDB copy simultaneously.  Coordinator starts with the full budget
+     * and is reduced to this value lazily on the first worker-session init,
+     * so that single-threaded strata (use_tdd=false for all) are not
+     * penalised by an artificially low join-backpressure threshold.
+     * 0 = not applicable (W=1 or env-override path). */
+    uint64_t tdd_budget_per_party;
     /* MPSC delta queue for async delta transport (Issue #410).
      * Created/destroyed per recursive stratum evaluation in
      * col_eval_stratum_tdd_recursive(). NULL outside that scope.
