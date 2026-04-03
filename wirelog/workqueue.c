@@ -293,6 +293,14 @@ wl_workqueue_drain(wl_work_queue_t *wq)
     }
 }
 
+uint32_t
+wl_workqueue_capacity(const wl_work_queue_t *wq)
+{
+    if (!wq)
+        return 0;
+    return wq->capacity;
+}
+
 void
 wl_workqueue_destroy(wl_work_queue_t *wq)
 {

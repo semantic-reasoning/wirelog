@@ -186,4 +186,21 @@ wl_workqueue_drain(wl_work_queue_t *wq);
 void
 wl_workqueue_destroy(wl_work_queue_t *wq);
 
+/**
+ * wl_workqueue_capacity:
+ * @wq: Work queue handle.  Must not be NULL.
+ *
+ * Return the ring buffer capacity of the work queue.
+ * Useful for testing and diagnostics.
+ *
+ * This is an internal API (not part of the public contract).
+ * The capacity is computed at create time via the formula:
+ *   capacity = max(256, next_pow2(num_workers * 2))
+ *
+ * Returns:
+ *   The ring buffer capacity (always a power of 2, >= 256).
+ */
+uint32_t
+wl_workqueue_capacity(const wl_work_queue_t *wq);
+
 #endif /* WL_WORKQUEUE_H */
