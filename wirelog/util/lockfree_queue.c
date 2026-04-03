@@ -1,5 +1,5 @@
 /*
- * lockfree_queue.c - wirelog Lock-Free MPMC Delta Queue
+ * lockfree_queue.c - wirelog Lock-Free MPSC Delta Queue
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
@@ -186,22 +186,22 @@ spsc_size(wl_spsc_queue_t *q)
 }
 
 /* ======================================================================== */
-/* MPMC Queue (W SPSC queues + single coordinator consumer)                   */
+/* MPSC Queue (W SPSC queues + single coordinator consumer)                   */
 /* ======================================================================== */
 
-struct wl_mpmc_queue {
+struct wl_mpsc_queue {
     wl_spsc_queue_t *workers;     /* per-worker SPSC rings   */
     uint32_t num_workers;
     uint32_t dequeue_idx;         /* round-robin scan cursor */
 };
 
-wl_mpmc_queue_t *
-wl_mpmc_queue_create(uint32_t num_workers, uint32_t capacity)
+wl_mpsc_queue_t *
+wl_mpsc_queue_create(uint32_t num_workers, uint32_t capacity)
 {
     if (num_workers == 0 || capacity < 2)
         return NULL;
 
-    wl_mpmc_queue_t *q = (wl_mpmc_queue_t *)calloc(1, sizeof(wl_mpmc_queue_t));
+    wl_mpsc_queue_t *q = (wl_mpsc_queue_t *)calloc(1, sizeof(wl_mpsc_queue_t));
     if (!q)
         return NULL;
 
@@ -229,7 +229,7 @@ wl_mpmc_queue_create(uint32_t num_workers, uint32_t capacity)
 }
 
 void
-wl_mpmc_queue_destroy(wl_mpmc_queue_t *q)
+wl_mpsc_queue_destroy(wl_mpsc_queue_t *q)
 {
     if (!q)
         return;
@@ -240,7 +240,7 @@ wl_mpmc_queue_destroy(wl_mpmc_queue_t *q)
 }
 
 int
-wl_mpmc_enqueue(wl_mpmc_queue_t *q, uint32_t worker_id,
+wl_mpsc_enqueue(wl_mpsc_queue_t *q, uint32_t worker_id,
     void *delta, uint32_t stratum, uint32_t rel_idx)
 {
     if (!q || worker_id >= q->num_workers)
@@ -256,7 +256,7 @@ wl_mpmc_enqueue(wl_mpmc_queue_t *q, uint32_t worker_id,
 }
 
 int
-wl_mpmc_dequeue(wl_mpmc_queue_t *q, wl_delta_msg_t *out)
+wl_mpsc_dequeue(wl_mpsc_queue_t *q, wl_delta_msg_t *out)
 {
     if (!q || !out)
         return 0;
@@ -272,7 +272,7 @@ wl_mpmc_dequeue(wl_mpmc_queue_t *q, wl_delta_msg_t *out)
 }
 
 uint32_t
-wl_mpmc_dequeue_all(wl_mpmc_queue_t *q, wl_delta_msg_t *buf, uint32_t buf_len)
+wl_mpsc_dequeue_all(wl_mpsc_queue_t *q, wl_delta_msg_t *buf, uint32_t buf_len)
 {
     if (!q || !buf || buf_len == 0)
         return 0;
@@ -287,7 +287,7 @@ wl_mpmc_dequeue_all(wl_mpmc_queue_t *q, wl_delta_msg_t *buf, uint32_t buf_len)
 }
 
 uint32_t
-wl_mpmc_size(wl_mpmc_queue_t *q)
+wl_mpsc_size(wl_mpsc_queue_t *q)
 {
     if (!q)
         return 0;
