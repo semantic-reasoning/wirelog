@@ -839,9 +839,11 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->last_inserted_relation = NULL;
     out_worker->last_removed_relation = NULL;
 
-    /* Step 5: Initialize independent mem_ledger (avoid copying atomics) */
+    /* Step 5: Initialize independent mem_ledger (avoid copying atomics).
+     * Each worker handles 1/W of the data, so divide total_budget by W so
+     * the per-worker budget reflects the actual fraction of data it owns. */
     wl_mem_ledger_init(&out_worker->mem_ledger,
-        coordinator->mem_ledger.total_budget);
+        coordinator->mem_ledger.total_budget / coordinator->num_workers);
 
     /* Step 6: Populate rels[] with partition relations (ownership transfer) */
     if (num_partitions > 0) {
