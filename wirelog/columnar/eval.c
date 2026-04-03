@@ -2052,7 +2052,7 @@ tdd_worker_subpass_fn(void *arg)
              * ctxs via tdd_reconstruct_delta_matrix after barrier.
              * Fallback to ctx write when queue unavailable (alloc failure). */
             if (sess->coordinator && sess->coordinator->delta_queue) {
-                int enq_rc = wl_mpmc_enqueue(
+                int enq_rc = wl_mpsc_enqueue(
                     sess->coordinator->delta_queue,
                     sess->worker_id, delta, ctx->stratum_idx, ri);
                 if (enq_rc != 0) {
@@ -4075,7 +4075,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     /* Issue #410: Create MPSC delta queue for dual-write transport.
      * Capacity = W × nrels × 2 (2x headroom; at most W×nrels per sub-pass).
      * Failure is non-fatal: enqueue is skipped when delta_queue is NULL. */
-    coord->delta_queue = wl_mpmc_queue_create(W, nrels * 2 < 2 ? 2 : nrels * 2);
+    coord->delta_queue = wl_mpsc_queue_create(W, nrels * 2 < 2 ? 2 : nrels * 2);
 
     /* Issue #390: BDX snap array — pre-subpass IDB sizes per worker/relation.
      * Used to truncate worker IDB back to clean partition state after each
@@ -4265,7 +4265,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(
                     max_msgs > 0 ? max_msgs : 1u, sizeof(wl_delta_msg_t));
                 if (msgs) {
-                    uint32_t msg_count = wl_mpmc_dequeue_all(
+                    uint32_t msg_count = wl_mpsc_dequeue_all(
                         coord->delta_queue, msgs, max_msgs);
 
                     /* Clear and reconstruct from queue messages. */
@@ -4351,7 +4351,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
 done:
     /* Issue #410: Destroy MPSC delta queue created for this stratum eval. */
-    wl_mpmc_queue_destroy(coord->delta_queue);
+    wl_mpsc_queue_destroy(coord->delta_queue);
     coord->delta_queue = NULL;
 
     /* Free pre-allocated worker contexts */

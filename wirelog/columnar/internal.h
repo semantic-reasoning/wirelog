@@ -830,7 +830,7 @@ typedef struct wl_col_session_t {
      * Created/destroyed per recursive stratum evaluation in
      * col_eval_stratum_tdd_recursive(). NULL outside that scope.
      * Coordinator only; worker sessions always have delta_queue=NULL. */
-    wl_mpmc_queue_t *delta_queue;
+    wl_mpsc_queue_t *delta_queue;
     /* Set true inside tdd_worker_subpass_fn so col_op_variable AUTO heuristic
      * always uses the broadcast delta (which may be >= local partition size).
      * False everywhere else, including retraction paths. */
