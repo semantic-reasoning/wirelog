@@ -1984,7 +1984,9 @@ tdd_worker_subpass_fn(void *arg)
                         col_rel_row_move(r, keep, i);
                     for (uint32_t c = 0; c < r->ncols; c++)
                         rbuf[c] = r->columns[c][keep];
-                    col_rel_append_row(delta, rbuf);
+                    rc2 = col_rel_append_row(delta, rbuf);
+                    if (rc2 != 0)
+                        break;
                     keep++;
                 }
             }
