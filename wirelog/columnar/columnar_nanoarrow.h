@@ -348,6 +348,20 @@ col_session_get_consolidation_stats(wl_session_t *sess,
     uint64_t *out_slow_hits);
 
 /**
+ * col_session_get_exchange_time_ns:
+ *
+ * Return total nanoseconds spent in exchange barriers (tdd_exchange_deltas /
+ * tdd_bdx_exchange_deltas) across the last wl_session_snapshot() call.
+ * out_exchange_ns is NULL-safe.
+ *
+ * @param sess            A wl_session_t* backed by the columnar backend.
+ * @param out_exchange_ns Accumulated exchange wall time in nanoseconds.
+ */
+void
+col_session_get_exchange_time_ns(wl_session_t *sess,
+    uint64_t *out_exchange_ns);
+
+/**
  * col_session_get_darr_count:
  *
  * Return the number of delta arrangement cache entries currently held by
