@@ -51,7 +51,7 @@ endif
 wirelog_workqueue_src = files('workqueue.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
-#Lock-Free MPMC Queue Module(Issue #401)
+#Lock-Free MPSC Queue Module(Issue #401)
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_lockfree_queue_src = files('util/lockfree_queue.c', )

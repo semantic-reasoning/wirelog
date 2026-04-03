@@ -122,8 +122,6 @@ int
 wl_mpsc_enqueue(wl_mpsc_queue_t *q, uint32_t worker_id,
     void *delta, uint32_t stratum, uint32_t rel_idx);
 
-/* WARNING: only coordinator thread can dequeue safely */
-
 /**
  * wl_mpsc_dequeue:
  * @q:   Queue handle.  Must not be NULL.
@@ -140,8 +138,6 @@ wl_mpsc_enqueue(wl_mpsc_queue_t *q, uint32_t worker_id,
  */
 int
 wl_mpsc_dequeue(wl_mpsc_queue_t *q, wl_delta_msg_t *out);
-
-/* WARNING: only coordinator thread can dequeue safely */
 
 /**
  * wl_mpsc_dequeue_all:

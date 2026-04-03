@@ -1,5 +1,5 @@
 /*
- * test_lockfree_queue.c - Unit tests for lock-free MPMC delta queue
+ * test_lockfree_queue.c - Unit tests for lock-free MPSC delta queue
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0

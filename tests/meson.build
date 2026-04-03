@@ -293,7 +293,7 @@ test_workqueue_capacity_exe = executable(
 test('workqueue_capacity', test_workqueue_capacity_exe)
 
 # ============================================================================
-# Lock-Free MPMC Queue Tests (Issue #401)
+# Lock-Free MPSC Queue Tests (Issue #401)
 # ============================================================================
 
 lockfree_queue_src = files(
