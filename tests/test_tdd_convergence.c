@@ -267,13 +267,13 @@ test_nonrecursive_frontier_sentinel(void)
 /*
  * test_second_step_frontier_skip:
  * W=2 TC: first step converges and records frontier.  A second step with no
- * new inserts should be a no-op (total_iterations == 0, frontier-skipped).
+ * new inserts should be a no-op (total_iterations unchanged, frontier-skipped).
  */
 static int
 test_second_step_frontier_skip(void)
 {
     TEST(
-        "Second step with no inserts is frontier-skipped (total_iterations==0)");
+        "Second step with no inserts is frontier-skipped (total_iterations unchanged)");
 
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
@@ -297,6 +297,8 @@ test_second_step_frontier_skip(void)
         return 1;
     }
 
+    uint32_t iters_after_first = sess->total_iterations;
+
     /* Second step with no new inserts */
     if (wl_session_step(&sess->base) != 0) {
         cleanup_session(sess, plan, prog);
@@ -307,11 +309,16 @@ test_second_step_frontier_skip(void)
     uint32_t iters = sess->total_iterations;
     cleanup_session(sess, plan, prog);
 
-    /* Frontier skip fires: no new tuples derived, total_iterations stays 0 */
-    if (iters != 0) {
-        char msg[64];
+    /* Frontier skip fires: no new tuples derived, total_iterations must not
+     * increase beyond first-step value.  Issue #416: total_iterations now
+     * accumulates (+=) rather than assigns (=), so it stays > 0 across steps
+     * and preserves the incremental-snapshot guard. */
+    if (iters != iters_after_first) {
+        char msg[96];
         snprintf(msg, sizeof(msg),
-            "expected total_iterations==0, got %u", iters);
+            "total_iterations changed: after first=%u, after second=%u"
+            " (frontier-skip should produce no new iterations)",
+            iters_after_first, iters);
         FAIL(msg);
         return 1;
     }

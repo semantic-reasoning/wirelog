@@ -4362,7 +4362,12 @@ done:
     }
     free(bdx_snap);
     coord->diff_operators_active = saved_diff;
-    coord->total_iterations = final_eff_iter;
+    /* Issue #416: Accumulate instead of assign so total_iterations stays > 0
+     * after any completed evaluation.  Assigning final_eff_iter (which is 0
+     * when a replicate-mode stratum converges with no new tuples) would
+     * incorrectly reset the first-snapshot guard used by col_snapshot and
+     * col_eval_stratum_tdd_recursive (total_iterations > 0). */
+    coord->total_iterations += final_eff_iter;
 
     if (rc == 0) {
         /* Record stratum and per-rule frontiers (mirrors eval.c:768-791) */
