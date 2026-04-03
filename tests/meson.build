@@ -2202,3 +2202,26 @@ test_queue_transport_exe = executable(
 )
 
 test('queue_transport', test_queue_transport_exe)
+
+# ============================================================================
+# DOOP Multi-Worker Stability Tests (Issue #416)
+# ============================================================================
+
+test_doop_multiworker_exe = executable(
+  'test_doop_multiworker',
+  files('test_doop_multiworker.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('doop_multiworker', test_doop_multiworker_exe,
+  env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
+)
