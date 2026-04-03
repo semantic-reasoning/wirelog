@@ -1,5 +1,5 @@
 /*
- * lockfree_queue.h - wirelog Lock-Free MPMC Delta Queue
+ * lockfree_queue.h - wirelog Lock-Free MPSC Delta Queue
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
@@ -21,10 +21,10 @@
  * Thread Safety Contract
  * ========================================================================
  *
- *   wl_mpmc_enqueue(worker_id=i): call ONLY from the thread that owns i.
- *   wl_mpmc_dequeue / wl_mpmc_dequeue_all: call ONLY from the coordinator.
- *   wl_mpmc_size: approximate; safe from any thread for diagnostics only.
- *   wl_mpmc_queue_create / _destroy: call before spawning or after joining
+ *   wl_mpsc_enqueue(worker_id=i): call ONLY from the thread that owns i.
+ *   wl_mpsc_dequeue / wl_mpsc_dequeue_all: call ONLY from the coordinator.
+ *   wl_mpsc_size: approximate; safe from any thread for diagnostics only.
+ *   wl_mpsc_queue_create / _destroy: call before spawning or after joining
  *     all threads (not concurrent with other queue operations).
  *
  * Violating these constraints produces data races (undefined behaviour).
@@ -67,15 +67,15 @@ typedef struct {
 } wl_delta_msg_t;
 
 /**
- * wl_mpmc_queue_t:
+ * wl_mpsc_queue_t:
  *
- * Opaque MPMC queue backed by num_workers independent SPSC ring buffers.
- * Created with wl_mpmc_queue_create(), destroyed with wl_mpmc_queue_destroy().
+ * Opaque MPSC queue backed by num_workers independent SPSC ring buffers.
+ * Created with wl_mpsc_queue_create(), destroyed with wl_mpsc_queue_destroy().
  */
-typedef struct wl_mpmc_queue wl_mpmc_queue_t;
+typedef struct wl_mpsc_queue wl_mpsc_queue_t;
 
 /**
- * wl_mpmc_queue_create:
+ * wl_mpsc_queue_create:
  * @num_workers: Number of producer threads.  Must be >= 1.
  * @capacity:    Per-worker ring buffer capacity (rounded up to next power of
  *               2 internally).  Must be >= 2.
@@ -84,24 +84,24 @@ typedef struct wl_mpmc_queue wl_mpmc_queue_t;
  *
  * Returns:
  *   non-NULL: Opaque queue handle.  Caller must destroy with
- *             wl_mpmc_queue_destroy().
+ *             wl_mpsc_queue_destroy().
  *   NULL:     Allocation failure or invalid arguments.
  */
-wl_mpmc_queue_t *
-wl_mpmc_queue_create(uint32_t num_workers, uint32_t capacity);
+wl_mpsc_queue_t *
+wl_mpsc_queue_create(uint32_t num_workers, uint32_t capacity);
 
 /**
- * wl_mpmc_queue_destroy:
+ * wl_mpsc_queue_destroy:
  * @q: (transfer full) Queue to destroy.  NULL-safe.
  *
  * Free all resources.  All threads must have stopped using the queue
  * before this is called.
  */
 void
-wl_mpmc_queue_destroy(wl_mpmc_queue_t *q);
+wl_mpsc_queue_destroy(wl_mpsc_queue_t *q);
 
 /**
- * wl_mpmc_enqueue:
+ * wl_mpsc_enqueue:
  * @q:         Queue handle.  Must not be NULL.
  * @worker_id: Caller's worker index (0 .. num_workers-1).  Must match the
  *             calling thread; only one thread may use each worker_id.
@@ -119,11 +119,13 @@ wl_mpmc_queue_destroy(wl_mpmc_queue_t *q);
  *   -1: Ring full or invalid arguments.
  */
 int
-wl_mpmc_enqueue(wl_mpmc_queue_t *q, uint32_t worker_id,
+wl_mpsc_enqueue(wl_mpsc_queue_t *q, uint32_t worker_id,
     void *delta, uint32_t stratum, uint32_t rel_idx);
 
+/* WARNING: only coordinator thread can dequeue safely */
+
 /**
- * wl_mpmc_dequeue:
+ * wl_mpsc_dequeue:
  * @q:   Queue handle.  Must not be NULL.
  * @out: (out) Filled with one dequeued message when an item is available.
  *
@@ -137,10 +139,12 @@ wl_mpmc_enqueue(wl_mpmc_queue_t *q, uint32_t worker_id,
  *   0: All rings empty; *out is unmodified.
  */
 int
-wl_mpmc_dequeue(wl_mpmc_queue_t *q, wl_delta_msg_t *out);
+wl_mpsc_dequeue(wl_mpsc_queue_t *q, wl_delta_msg_t *out);
+
+/* WARNING: only coordinator thread can dequeue safely */
 
 /**
- * wl_mpmc_dequeue_all:
+ * wl_mpsc_dequeue_all:
  * @q:       Queue handle.  Must not be NULL.
  * @buf:     Caller-supplied output buffer.
  * @buf_len: Capacity of @buf in elements.
@@ -154,10 +158,10 @@ wl_mpmc_dequeue(wl_mpmc_queue_t *q, wl_delta_msg_t *out);
  *   Number of items written to @buf (0 if all rings were empty).
  */
 uint32_t
-wl_mpmc_dequeue_all(wl_mpmc_queue_t *q, wl_delta_msg_t *buf, uint32_t buf_len);
+wl_mpsc_dequeue_all(wl_mpsc_queue_t *q, wl_delta_msg_t *buf, uint32_t buf_len);
 
 /**
- * wl_mpmc_size:
+ * wl_mpsc_size:
  * @q: Queue handle.  NULL-safe (returns 0).
  *
  * Approximate total number of live items across all worker rings.
@@ -167,6 +171,6 @@ wl_mpmc_dequeue_all(wl_mpmc_queue_t *q, wl_delta_msg_t *buf, uint32_t buf_len);
  *   Approximate item count (may be transiently inaccurate).
  */
 uint32_t
-wl_mpmc_size(wl_mpmc_queue_t *q);
+wl_mpsc_size(wl_mpsc_queue_t *q);
 
 #endif /* WL_LOCKFREE_QUEUE_H */
