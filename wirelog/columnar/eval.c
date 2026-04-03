@@ -3947,13 +3947,13 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      *
      *   replicate_mode (full replication): used when:
      *     - No new EDB inserted (frontier-skip path), OR
-     *     - Stratum has IDB self-join with >2 IDB body atoms (BDX unsafe).
+     *     - Stratum is not exchange-aligned AND has >2 IDB body atoms (BDX unsafe).
      *
      * Issue #388: Optional W=1 fallback for replicate mode only. */
     bool self_join_mode = tdd_stratum_idb_self_join_exchange_aligned(sp, coord);
     bool bdx_mode = tdd_stratum_has_idb_self_join(sp) && !self_join_mode;
     bool replicate_mode = (coord->last_inserted_relation == NULL)
-        || (bdx_mode && stratum_max_idb_body_atoms(sp) > 2);
+        || (!self_join_mode && stratum_max_idb_body_atoms(sp) > 2);
     bdx_mode = bdx_mode && !replicate_mode;
     if (replicate_mode) {
         const char *env = getenv("WIRELOG_TDD_REPLICATE_W1");
