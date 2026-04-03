@@ -278,6 +278,21 @@ test_workqueue_exe = executable(
 test('workqueue', test_workqueue_exe)
 
 # ============================================================================
+# Workqueue Capacity Tests (Issue #414)
+# ============================================================================
+
+test_workqueue_capacity_exe = executable(
+  'test_workqueue_capacity',
+  files('test_workqueue_capacity.c'),
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+)
+
+test('workqueue_capacity', test_workqueue_capacity_exe)
+
+# ============================================================================
 # Lock-Free MPMC Queue Tests (Issue #401)
 # ============================================================================
 
