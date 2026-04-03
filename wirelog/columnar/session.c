@@ -233,6 +233,22 @@ col_session_get_consolidation_stats(wl_session_t *sess,
 }
 
 /*
+ * col_session_get_exchange_time_ns:
+ *
+ * Return total nanoseconds spent in tdd_exchange_deltas /
+ * tdd_bdx_exchange_deltas (scatter/gather barriers) across the last
+ * wl_session_snapshot() call.  out_exchange_ns is NULL-safe.
+ */
+void
+col_session_get_exchange_time_ns(wl_session_t *sess,
+    uint64_t *out_exchange_ns)
+{
+    wl_col_session_t *cs = COL_SESSION(sess);
+    if (out_exchange_ns)
+        *out_exchange_ns = cs->exchange_time_ns;
+}
+
+/*
  * col_session_cleanup_old_data:
  *
  * Remove data that is entirely before the frontier (iteration, stratum).
@@ -1411,6 +1427,7 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
     sess->kfusion_cleanup_ns = 0;
     sess->consolidate_fast_hits = 0;
     sess->consolidate_slow_hits = 0;
+    sess->exchange_time_ns = 0;
 
     /* Phase 4 incremental skip: when last_inserted_relation is set, only
      * re-evaluate strata that transitively depend on the inserted relation.
@@ -1537,10 +1554,13 @@ col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
 
     /* Issue #361: Use TDD parallel evaluation in snapshot when workers are
      * available and facts have been loaded (initial non-incremental eval).
-     * col_eval_stratum_tdd falls back to single-threaded when W<=1. */
+     * col_eval_stratum_tdd falls back to single-threaded when W<=1.
+     * Issue #413: Enable TDD for initial snapshot (total_iterations == 0)
+     * OR incremental evaluation (last_inserted_relation != NULL). */
     bool snapshot_tdd_eligible = (affected_mask == UINT64_MAX
         && sess->num_workers > 1 && sess->tdd_workers
-        && sess->last_inserted_relation != NULL);
+        && (sess->last_inserted_relation != NULL ||
+        sess->total_iterations == 0));
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
             continue;
