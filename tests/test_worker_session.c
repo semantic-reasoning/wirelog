@@ -633,6 +633,122 @@ test_invalid_args(void)
 }
 
 static int
+test_join_output_limit_scaling(void)
+{
+    TEST("join_output_limit scaled 1/W per worker (Issue #426)");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+
+    /* --- W=1: worker gets full limit --- */
+    wl_col_session_t *coord1 = make_coordinator(&plan, &prog);
+    if (!coord1) {
+        FAIL("coordinator creation W=1");
+        return 1;
+    }
+    coord1->num_workers = 1;
+    coord1->join_output_limit = 4000;
+
+    int64_t rows1[] = { 1, 2 };
+    insert_edges(coord1, rows1, 1);
+
+    col_rel_t **parts1 = NULL;
+    partition_rel(coord1, "edge", 1, &parts1);
+
+    wl_col_session_t w1;
+    memset(&w1, 0, sizeof(w1));
+    col_worker_session_create(coord1, 0, parts1, 1, &w1);
+    free(parts1);
+
+    int ok = (w1.join_output_limit == 4000);
+    col_worker_session_destroy(&w1);
+    cleanup_coordinator(coord1, plan, prog);
+
+    if (!ok) {
+        FAIL("W=1: worker should get full limit");
+        return 1;
+    }
+
+    /* --- W=4: worker gets 1/4 of limit --- */
+    plan = NULL;
+    prog = NULL;
+    wl_col_session_t *coord4 = make_coordinator(&plan, &prog);
+    if (!coord4) {
+        FAIL("coordinator creation W=4");
+        return 1;
+    }
+    coord4->num_workers = 4;
+    coord4->join_output_limit = 8000;
+
+    int64_t rows4[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    insert_edges(coord4, rows4, 4);
+
+    col_rel_t **parts4 = NULL;
+    partition_rel(coord4, "edge", 4, &parts4);
+
+    /* Create 4 workers; each should get join_output_limit = 8000/4 = 2000 */
+    wl_col_session_t workers4[4];
+    memset(workers4, 0, sizeof(workers4));
+    for (uint32_t w = 0; w < 4; w++) {
+        col_rel_t *wp[1] = { parts4[w] };
+        parts4[w] = NULL;
+        col_worker_session_create(coord4, w, wp, 1, &workers4[w]);
+        if (workers4[w].join_output_limit != 2000)
+            ok = 0;
+    }
+    free(parts4);
+
+    for (uint32_t w = 0; w < 4; w++)
+        col_worker_session_destroy(&workers4[w]);
+    cleanup_coordinator(coord4, plan, prog);
+
+    if (!ok) {
+        FAIL("W=4: worker should get 1/4 of limit");
+        return 1;
+    }
+
+    /* --- W=2: zero limit stays zero (disabled) --- */
+    plan = NULL;
+    prog = NULL;
+    wl_col_session_t *coord2 = make_coordinator(&plan, &prog);
+    if (!coord2) {
+        FAIL("coordinator creation W=2 zero limit");
+        return 1;
+    }
+    coord2->num_workers = 2;
+    coord2->join_output_limit = 0; /* disabled */
+
+    int64_t rows2[] = { 1, 2, 3, 4 };
+    insert_edges(coord2, rows2, 2);
+
+    col_rel_t **parts2 = NULL;
+    partition_rel(coord2, "edge", 2, &parts2);
+
+    wl_col_session_t w2a, w2b;
+    memset(&w2a, 0, sizeof(w2a));
+    memset(&w2b, 0, sizeof(w2b));
+    col_rel_t *p2a[1] = { parts2[0] }; parts2[0] = NULL;
+    col_rel_t *p2b[1] = { parts2[1] }; parts2[1] = NULL;
+    col_worker_session_create(coord2, 0, p2a, 1, &w2a);
+    col_worker_session_create(coord2, 1, p2b, 1, &w2b);
+    free(parts2);
+
+    if (w2a.join_output_limit != 0 || w2b.join_output_limit != 0)
+        ok = 0;
+
+    col_worker_session_destroy(&w2a);
+    col_worker_session_destroy(&w2b);
+    cleanup_coordinator(coord2, plan, prog);
+
+    if (!ok) {
+        FAIL("zero limit should stay zero (disabled)");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
 test_hash_table_independent(void)
 {
     TEST("worker hash table is independent (lazy rebuild)");
@@ -699,6 +815,7 @@ main(void)
     test_find_rel_returns_partition();
     test_invalid_args();
     test_hash_table_independent();
+    test_join_output_limit_scaling();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

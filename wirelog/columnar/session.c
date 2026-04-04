@@ -877,6 +877,17 @@ col_worker_session_create(wl_col_session_t *coordinator,
     }
     wl_mem_ledger_init(&out_worker->mem_ledger, worker_budget);
 
+    /* Issue #426: Scale join_output_limit per worker.
+     * The bitwise copy above gave the worker the coordinator's full limit;
+     * shrink to a fair per-worker share (0 = disabled, preserved as-is).
+     * Clamp to minimum 1 so that limit < W does not accidentally disable
+     * the cap (0 means unlimited). */
+    if (coordinator->num_workers > 0 && coordinator->join_output_limit > 0) {
+        uint64_t per_worker =
+            coordinator->join_output_limit / coordinator->num_workers;
+        out_worker->join_output_limit = per_worker > 0 ? per_worker : 1;
+    }
+
     /* Step 6: Populate rels[] with partition relations (ownership transfer) */
     if (num_partitions > 0) {
         out_worker->rels
