@@ -314,12 +314,16 @@ typedef struct {
  *
  * Operator sequence for a single IDB relation within a stratum.
  *
- * @name:      Null-terminated relation name (caller-owned).
- * @ops:       Array of operator descriptors (caller-owned).
- * @op_count:  Number of operators in the sequence.
+ * @name:       Null-terminated relation name (caller-owned).
+ * @delta_name: Pre-computed "$d$<name>" string (caller-owned).
+ *              Caches the delta relation name to avoid repeated snprintf
+ *              in eval hot paths (Issue #285).
+ * @ops:        Array of operator descriptors (caller-owned).
+ * @op_count:   Number of operators in the sequence.
  */
 typedef struct {
     const char *name;
+    char *delta_name;
     const wl_plan_op_t *ops;
     uint32_t op_count;
 } wl_plan_relation_t;

@@ -592,8 +592,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 if (!delta_rels[ri])
                     continue;
-                char dname[256];
-                snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+                const char *dname = sp->relations[ri].delta_name;
                 session_remove_rel(sess, dname);
                 int rc = session_add_rel(sess, delta_rels[ri]);
                 if (rc != 0)
@@ -616,9 +615,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 > 0) { /* only skip from effective iteration 1 onward */
                 bool all_deltas_net_zero = true;
                 for (uint32_t ri = 0; ri < nrels; ri++) {
-                    char dname[256];
-                    snprintf(dname, sizeof(dname), "$d$%s",
-                        sp->relations[ri].name);
+                    const char *dname = sp->relations[ri].delta_name;
                     col_rel_t *delta = session_find_rel(sess, dname);
                     if (!delta || delta->nrows == 0) {
                         /* Empty delta: net multiplicity is zero */
@@ -766,8 +763,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
             /* Remove delta relations from session (evaluation is complete) */
             for (uint32_t ri = 0; ri < nrels; ri++) {
-                char dname[256];
-                snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+                const char *dname = sp->relations[ri].delta_name;
                 session_remove_rel(sess, dname);
             }
 
@@ -785,8 +781,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     continue; /* no new rows for this relation */
                 }
 
-                char dname[256];
-                snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+                const char *dname = sp->relations[ri].delta_name;
                 col_rel_t *delta = col_rel_pool_new_like(
                     sess->delta_pool, dname, r);
                 if (!delta) {
@@ -954,8 +949,7 @@ stride_error:
     for (uint32_t ri = 0; ri < nrels; ri++) {
         if (delta_rels[ri])
             col_rel_destroy(delta_rels[ri]);
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
         session_remove_rel(sess, dname);
     }
     free(delta_rels);
@@ -1428,8 +1422,7 @@ bool
 stratum_has_preseeded_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess)
 {
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
         col_rel_t *delta = session_find_rel(sess, dname);
         if (delta && delta->nrows > 0)
             return true;
@@ -1928,8 +1921,7 @@ tdd_worker_subpass_fn(void *arg)
      * Pre-installed $d$ persists across iterations; nrows=0 triggers
      * has_empty_forced_delta skip, same as absent $d$. */
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
         col_rel_t *d = session_find_rel(sess, dname);
         if (d) {
             d->nrows = 0;
@@ -1946,8 +1938,7 @@ tdd_worker_subpass_fn(void *arg)
         if (!r || snap[ri] >= r->nrows)
             continue;
 
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
 
         /* Heap-allocate delta so it survives delta_pool_reset below. */
         col_rel_t *delta = col_rel_new_like(dname, r);
@@ -2442,8 +2433,7 @@ static int
 tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W)
 {
-    char dname[256];
-    snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+    const char *dname = sp->relations[ri].delta_name;
 
     for (uint32_t w = 0; w < W; w++)
         session_remove_rel(&coord->tdd_workers[w], dname);
@@ -2698,8 +2688,7 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
     }
 
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
 
         /* Locate EXCHANGE key columns for this relation (if any). */
         const uint32_t *key_cols = NULL;
@@ -3412,8 +3401,7 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
     uint32_t nrels = sp->relation_count;
 
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
 
         /* Count total rows and find ncols */
         uint32_t total_rows = 0;
@@ -3693,8 +3681,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
     int rc = 0;
 
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
         const char *rel_name = sp->relations[ri].name;
 
         /* Remove stale $d$ from workers */
@@ -3991,8 +3978,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      * session_remove_rel, and broadcast refills instead of create+add.
      * Eliminates per-iteration alloc/free/session-ops (14k iters for CRDT). */
     for (uint32_t ri = 0; ri < nrels; ri++) {
-        char dname[256];
-        snprintf(dname, sizeof(dname), "$d$%s", sp->relations[ri].name);
+        const char *dname = sp->relations[ri].delta_name;
         col_rel_t *coord_rel = session_find_rel(coord,
                 sp->relations[ri].name);
         uint32_t ncols_ri = coord_rel ? coord_rel->ncols : 0;
@@ -4138,9 +4124,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     sp->relations[ri].name);
             if (!cidb || cidb->nrows == 0)
                 continue;
-            char dname[256];
-            snprintf(dname, sizeof(dname), "$d$%s",
-                sp->relations[ri].name);
+            const char *dname = sp->relations[ri].delta_name;
             uint32_t ncols = cidb->ncols;
             /* Install full IDB as $d$ on worker 0 */
             col_rel_t *d0 = session_find_rel(&coord->tdd_workers[0], dname);

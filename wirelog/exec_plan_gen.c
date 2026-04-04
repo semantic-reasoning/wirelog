@@ -58,6 +58,19 @@ dup_str(const char *s)
     return d;
 }
 
+/* Allocate "$d$<name>" for delta relation name caching (Issue #285). */
+static char *
+make_delta_name(const char *name)
+{
+    size_t len = strlen(name);
+    char *d = (char *)malloc(len + 4); /* "$d$" (3) + name + NUL */
+    if (!d)
+        return NULL;
+    memcpy(d, "$d$", 3);
+    memcpy(d + 3, name, len + 1);
+    return d;
+}
+
 /* ======================================================================== */
 /* Expression serialization (IR expr tree -> postfix byte buffer)           */
 /* ======================================================================== */
@@ -2263,6 +2276,7 @@ wl_plan_free(wl_plan_t *plan)
                     wl_plan_relation_t *rel
                         = (wl_plan_relation_t *)&st->relations[r];
                     free((void *)rel->name);
+                    free(rel->delta_name);
                     if (rel->ops) {
                         for (uint32_t o = 0; o < rel->op_count; o++)
                             free_op((wl_plan_op_t *)&rel->ops[o]);
@@ -2439,6 +2453,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
             }
 
             rels[u].name = dup_str(rel_name);
+            rels[u].delta_name = make_delta_name(rel_name);
 
             if (ir_root) {
                 op_list_t ol;
@@ -2447,6 +2462,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     /* Clean up already-built relations */
                     for (uint32_t v = 0; v < u; v++) {
                         free((void *)rels[v].name);
+                        free(rels[v].delta_name);
                         if (rels[v].ops) {
                             for (uint32_t o = 0; o < rels[v].op_count; o++)
                                 free_op((wl_plan_op_t *)&rels[v].ops[o]);
@@ -2454,6 +2470,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                         }
                     }
                     free((void *)rels[u].name);
+                    free(rels[u].delta_name);
                     free(rels);
                     free(strata);
                     wl_plan_free(plan);
@@ -2469,6 +2486,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     free((void *)unique_names);
                     for (uint32_t v = 0; v < u; v++) {
                         free((void *)rels[v].name);
+                        free(rels[v].delta_name);
                         if (rels[v].ops) {
                             for (uint32_t o = 0; o < rels[v].op_count; o++)
                                 free_op((wl_plan_op_t *)&rels[v].ops[o]);
@@ -2476,6 +2494,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                         }
                     }
                     free((void *)rels[u].name);
+                    free(rels[u].delta_name);
                     free(rels);
                     free(strata);
                     wl_plan_free(plan);
