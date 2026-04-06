@@ -103,6 +103,8 @@ now_ns(void)
 #define MAX_RULES 64
 #define COL_MAT_CACHE_MAX 64u
 #define COL_MAT_CACHE_LIMIT_BYTES (100ULL * 1024ULL * 1024ULL)
+#define COL_ARR_CACHE_MAX 128u
+#define COL_ARR_CACHE_LIMIT_BYTES (256ULL * 1024ULL * 1024ULL) /* 256 MB default */
 
 /* Default maximum output rows per single join operation (issue #218, #221).
  * Prevents unbounded memory growth from cardinality explosion in
@@ -493,6 +495,8 @@ typedef struct {
     uint32_t *key_cols; /* owned copy of key column array */
     uint32_t key_count;
     col_arrangement_t arr; /* embedded arrangement           */
+    uint64_t lru_clock;    /* logical time of last access (Issue #216) */
+    size_t mem_bytes;      /* bytes used by ht_head + ht_next arrays   */
 } col_arr_entry_t;
 
 /*
@@ -674,6 +678,10 @@ typedef struct wl_col_session_t {
     col_arr_entry_t *arr_entries; /* owned flat array of arrangements     */
     uint32_t arr_count;           /* number of active arrangements        */
     uint32_t arr_cap;             /* allocated capacity                   */
+    /* LRU eviction tracking for arrangement cache (Issue #216) */
+    uint64_t arr_clock;           /* monotonically increasing access counter */
+    size_t arr_total_bytes;       /* total bytes in ht_head + ht_next arrays */
+    size_t arr_cache_limit_bytes; /* eviction threshold (default 256 MB)     */
     /* Delta arrangement cache (Phase 3C-001-Ext): per-iteration hash
      * indices for delta-substituted right relations.  Unlike arr_entries
      * (cross-iteration, session-global), these are:

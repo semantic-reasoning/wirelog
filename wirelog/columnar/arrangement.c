@@ -158,6 +158,61 @@ arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
 }
 
 /* ======================================================================== */
+/* Arrangement Cache LRU Eviction (Issue #216)                              */
+/* ======================================================================== */
+
+/*
+ * col_arr_cache_evict_lru: evict arrangement cache entries until arr_total_bytes
+ * drops below target_bytes, or until no more evictable entries remain.
+ *
+ * Priority:
+ *   1. indexed_rows == 0 (already tombstoned — zero memory cost, but frees slot)
+ *   2. smallest lru_clock (least recently used)
+ *
+ * Eviction is a tombstone: arr_free_contents clears ht_head/ht_next and resets
+ * indexed_rows to 0.  The slot (rel_name, key_cols) is retained so the next
+ * access can rebuild without re-allocating the entry.
+ */
+static void
+col_arr_cache_evict_lru(wl_col_session_t *cs, size_t target_bytes)
+{
+    /* Keep evicting until we meet the target or have nothing left to evict. */
+    for (;;) {
+        if (cs->arr_total_bytes <= target_bytes)
+            break;
+
+        /* Find the best eviction candidate. */
+        int victim = -1;
+        uint64_t min_clock = UINT64_MAX;
+
+        for (uint32_t i = 0; i < cs->arr_count; i++) {
+            col_arr_entry_t *e = &cs->arr_entries[i];
+            if (e->mem_bytes == 0)
+                continue; /* already tombstoned, nothing to free */
+
+            /* Prefer indexed_rows == 0 (invalidated) entries first. */
+            if (e->arr.indexed_rows == 0) {
+                victim = (int)i;
+                break;
+            }
+
+            if (e->lru_clock < min_clock) {
+                min_clock = e->lru_clock;
+                victim = (int)i;
+            }
+        }
+
+        if (victim < 0)
+            break; /* nothing evictable */
+
+        col_arr_entry_t *e = &cs->arr_entries[victim];
+        cs->arr_total_bytes -= e->mem_bytes;
+        arr_free_contents(&e->arr);
+        e->mem_bytes = 0;
+    }
+}
+
+/* ======================================================================== */
 /* Arrangement Accessors (Phase 3C)                                         */
 /* ======================================================================== */
 
@@ -201,55 +256,106 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
 
         /* Found: update if stale. */
         if (e->arr.indexed_rows == 0 && rel->nrows > 0) {
-            if (arr_build_full(&e->arr, rel) != 0)
+            /* Deduct stale bytes before rebuild; restore on failure. */
+            cs->arr_total_bytes -= e->mem_bytes;
+            if (arr_build_full(&e->arr, rel) != 0) {
+                cs->arr_total_bytes += e->mem_bytes;
                 return NULL;
+            }
+            e->mem_bytes = (size_t)e->arr.nbuckets * sizeof(uint32_t)
+                + (size_t)e->arr.ht_cap * sizeof(uint32_t);
+            cs->arr_total_bytes += e->mem_bytes;
         } else if (e->arr.indexed_rows < rel->nrows) {
             uint32_t old = e->arr.indexed_rows;
-            if (arr_update_incremental(&e->arr, rel, old) != 0)
+            cs->arr_total_bytes -= e->mem_bytes;
+            if (arr_update_incremental(&e->arr, rel, old) != 0) {
+                cs->arr_total_bytes += e->mem_bytes; /* restore on failure */
                 return NULL;
+            }
+            e->mem_bytes = (size_t)e->arr.nbuckets * sizeof(uint32_t)
+                + (size_t)e->arr.ht_cap * sizeof(uint32_t);
+            cs->arr_total_bytes += e->mem_bytes;
         }
+        /* Bump LRU clock on every access. */
+        e->lru_clock = ++cs->arr_clock;
         return &e->arr;
     }
 
-    /* Not found: grow registry and create new entry. */
-    if (cs->arr_count >= cs->arr_cap) {
-        uint32_t new_cap = cs->arr_cap ? cs->arr_cap * 2u : 8u;
-        col_arr_entry_t *ne = (col_arr_entry_t *)realloc(
-            cs->arr_entries, new_cap * sizeof(col_arr_entry_t));
-        if (!ne)
-            return NULL;
-        cs->arr_entries = ne;
-        cs->arr_cap = new_cap;
+    /* Not found: evict if count or byte limits exceeded. */
+    if (cs->arr_count >= COL_ARR_CACHE_MAX
+        || cs->arr_total_bytes >= cs->arr_cache_limit_bytes) {
+        /* Target: drop to 75% of limit to amortize eviction overhead. */
+        size_t target = (cs->arr_cache_limit_bytes / 4u) * 3u;
+        col_arr_cache_evict_lru(cs, target);
     }
 
-    col_arr_entry_t *e = &cs->arr_entries[cs->arr_count];
+    /* Prefer reusing a tombstone slot to keep arr_count bounded at
+     * COL_ARR_CACHE_MAX.  A tombstone has indexed_rows == 0 and mem_bytes == 0
+     * (hash tables freed); rel_name/key_cols are still valid and must be
+     * replaced below. */
+    uint32_t slot = cs->arr_count; /* default: append */
+    for (uint32_t i = 0; i < cs->arr_count; i++) {
+        if (cs->arr_entries[i].arr.indexed_rows == 0
+            && cs->arr_entries[i].mem_bytes == 0) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == cs->arr_count) {
+        /* No tombstone available: grow the registry. */
+        if (cs->arr_count >= cs->arr_cap) {
+            uint32_t new_cap = cs->arr_cap ? cs->arr_cap * 2u : 8u;
+            col_arr_entry_t *ne = (col_arr_entry_t *)realloc(
+                cs->arr_entries, new_cap * sizeof(col_arr_entry_t));
+            if (!ne)
+                return NULL;
+            cs->arr_entries = ne;
+            cs->arr_cap = new_cap;
+        }
+        cs->arr_count++;
+    } else {
+        /* Reuse tombstone: free its old ownership before overwriting. */
+        free(cs->arr_entries[slot].rel_name);
+        free(cs->arr_entries[slot].key_cols);
+    }
+
+    col_arr_entry_t *e = &cs->arr_entries[slot];
     memset(e, 0, sizeof(*e));
 
     e->rel_name = wl_strdup(rel_name);
-    if (!e->rel_name)
+    if (!e->rel_name) {
+        if (slot == cs->arr_count - 1)
+            cs->arr_count--; /* roll back append */
         return NULL;
+    }
 
     e->key_cols = (uint32_t *)malloc(key_count * sizeof(uint32_t));
     if (!e->key_cols) {
         free(e->rel_name);
-        e->rel_name = NULL;
+        memset(e, 0, sizeof(*e));
+        if (slot == cs->arr_count - 1)
+            cs->arr_count--;
         return NULL;
     }
     memcpy(e->key_cols, key_cols, key_count * sizeof(uint32_t));
     e->key_count = key_count;
     e->arr.key_cols = e->key_cols; /* shared view; key_cols owned by entry */
     e->arr.key_count = key_count;
-    cs->arr_count++;
 
     /* Initial build. */
     if (rel->nrows > 0 && arr_build_full(&e->arr, rel) != 0) {
-        /* Roll back the entry we just added. */
-        cs->arr_count--;
         free(e->rel_name);
         free(e->key_cols);
         memset(e, 0, sizeof(*e));
+        if (slot == cs->arr_count - 1)
+            cs->arr_count--;
         return NULL;
     }
+    e->mem_bytes = (size_t)e->arr.nbuckets * sizeof(uint32_t)
+        + (size_t)e->arr.ht_cap * sizeof(uint32_t);
+    cs->arr_total_bytes += e->mem_bytes;
+    e->lru_clock = ++cs->arr_clock;
     return &e->arr;
 }
 

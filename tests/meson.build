@@ -666,6 +666,27 @@ test_arrangement_cache_reuse_exe = executable(
 test('arrangement_cache_reuse', test_arrangement_cache_reuse_exe)
 
 # ============================================================================
+# Arrangement LRU Eviction Tests (Issue #216)
+# ============================================================================
+
+test_arrangement_lru_eviction_exe = executable(
+  'test_arrangement_lru_eviction',
+  files('test_arrangement_lru_eviction.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('arrangement_lru_eviction', test_arrangement_lru_eviction_exe)
+
+# ============================================================================
 # Filtered Relation Cache Tests (Issue #386)
 # ============================================================================
 

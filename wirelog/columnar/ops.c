@@ -4355,6 +4355,9 @@ col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst)
     dst->arr.content_hash = src->arr.content_hash;
     dst->arr.nbuckets = src->arr.nbuckets;
     dst->arr.ht_cap = src->arr.ht_cap;
+    /* Issue #216: copy LRU metadata so worker clones inherit access state. */
+    dst->lru_clock = src->lru_clock;
+    dst->mem_bytes = src->mem_bytes;
 
     if (src->arr.nbuckets > 0 && src->arr.ht_head) {
         dst->arr.ht_head
@@ -4540,6 +4543,11 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
             }
             worker_sess[d].arr_count = sess->arr_count;
             worker_sess[d].arr_cap = clone_cap;
+            /* Issue #216: inherit LRU tracking state so worker clock is
+             * consistent with coordinator; worker computes its own totals. */
+            worker_sess[d].arr_clock = sess->arr_clock;
+            worker_sess[d].arr_total_bytes = sess->arr_total_bytes;
+            worker_sess[d].arr_cache_limit_bytes = sess->arr_cache_limit_bytes;
         }
         /* Issue #274: Deep-copy differential arrangement cache so each worker
          * has an independent copy. This prevents concurrent realloc() races
@@ -4777,6 +4785,25 @@ cleanup_wq:
          * entries were created by this worker — free from index 0. */
         for (uint32_t i = 0; i < wc->count; i++)
             col_rel_destroy(wc->entries[i].result);
+        /* Issue #216: merge worker lru_clocks back into coordinator so
+         * arrangements accessed by any worker are counted as recently used.
+         * Worker entries were cloned in the same order as coordinator entries,
+         * so index-matched comparison is valid. */
+        {
+            wl_col_session_t *cs = COL_SESSION(sess);
+            uint32_t shared = worker_sess[d].arr_count < cs->arr_count
+                ? worker_sess[d].arr_count
+                : cs->arr_count;
+            for (uint32_t i = 0; i < shared; i++) {
+                col_arr_entry_t *wk = &worker_sess[d].arr_entries[i];
+                col_arr_entry_t *co = &cs->arr_entries[i];
+                if (wk->lru_clock > co->lru_clock)
+                    co->lru_clock = wk->lru_clock;
+            }
+            /* Advance coordinator clock once outside the loop. */
+            if (worker_sess[d].arr_clock > cs->arr_clock)
+                cs->arr_clock = worker_sess[d].arr_clock;
+        }
         /* Free worker's private full-arrangement cache (arr_*). */
         for (uint32_t i = 0; i < worker_sess[d].arr_count; i++) {
             col_arr_entry_t *e = &worker_sess[d].arr_entries[i];
