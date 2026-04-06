@@ -640,11 +640,11 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     sess->consolidation_log = (getenv("WL_CONSOLIDATION_LOG") != NULL);
 
     /* Issue #176: Configure per-iteration cache eviction threshold.
-     * Default: 80% of COL_MAT_CACHE_LIMIT_BYTES (cache evicts when exceeding
+     * Default: 90% of COL_MAT_CACHE_LIMIT_BYTES (cache evicts when exceeding
      * this threshold). Users can override via environment variable or API.
      * 0 = disabled (cache cleared each iteration, backward compatible). */
     sess->cache_evict_threshold
-        = (COL_MAT_CACHE_LIMIT_BYTES * 80) / 100; /* default: 80% of limit */
+        = (COL_MAT_CACHE_LIMIT_BYTES * 90) / 100; /* default: 90% of limit */
 
     /* Pre-register EDB relations (ncols determined at first insert) */
     for (uint32_t i = 0; i < plan->edb_count; i++) {
