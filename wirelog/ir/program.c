@@ -393,7 +393,7 @@ collect_query(struct wirelog_program *prog,
     wl_magic_demand_t *d = &prog->demands[prog->demand_count++];
     d->relation_name = strdup_safe(query_node->name);
     d->bound_mask = (uint64_t)query_node->int_value;
-    d->arity = 0; /* auto-detect from program schema */
+    d->arity = query_node->query_arity; /* adornment count from parser */
     return 0;
 }
 
