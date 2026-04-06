@@ -657,7 +657,8 @@ typedef struct wl_col_session_t {
      * cache_evict_threshold: target cache size (bytes) for LRU eviction
      * in recursive stratum iteration loop. When cache exceeds this threshold,
      * LRU entries are evicted until size drops below it.
-     * 0 = disabled (cache cleared each iteration), default = 90% of limit */
+     * Configurable via WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT env var [1,100],
+     * default = 90% of limit */
     size_t cache_evict_threshold;
     wl_work_queue_t *wq; /* reusable thread pool for K-fusion     */
     /* Profiling counters (3B-003): accumulated across all strata/iters  */
