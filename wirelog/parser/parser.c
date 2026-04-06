@@ -1376,6 +1376,7 @@ parse_query_directive(wl_parser_t *parser)
     }
 
     query->int_value = (int64_t)bound_mask;
+    query->query_arity = position;
     return query;
 }
 

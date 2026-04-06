@@ -103,6 +103,9 @@ struct wl_parser_ast_node {
     wl_parser_ast_node_t **children;
     uint32_t child_count;
     uint32_t child_capacity;
+
+    /* Adornment count for WL_PARSER_AST_NODE_QUERY nodes */
+    uint32_t query_arity;
 };
 
 /* ======================================================================== */
