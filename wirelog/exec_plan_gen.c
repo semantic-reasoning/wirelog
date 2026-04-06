@@ -2454,6 +2454,24 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
 
             rels[u].name = dup_str(rel_name);
             rels[u].delta_name = make_delta_name(rel_name);
+            if (!rels[u].name || !rels[u].delta_name) {
+                free((void *)unique_names);
+                for (uint32_t v = 0; v < u; v++) {
+                    free((void *)rels[v].name);
+                    free(rels[v].delta_name);
+                    if (rels[v].ops) {
+                        for (uint32_t o = 0; o < rels[v].op_count; o++)
+                            free_op((wl_plan_op_t *)&rels[v].ops[o]);
+                        free((void *)rels[v].ops);
+                    }
+                }
+                free((void *)rels[u].name);
+                free(rels[u].delta_name);
+                free(rels);
+                free(strata);
+                wl_plan_free(plan);
+                return -1;
+            }
 
             if (ir_root) {
                 op_list_t ol;
