@@ -655,6 +655,26 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     sess->cache_evict_threshold
         = (COL_MAT_CACHE_LIMIT_BYTES * (uint64_t)threshold_percent) / 100;
 
+    /* Issue #216: Initialize arrangement cache LRU tracking.
+     * arr_clock starts at 1 so unaccessed entries (lru_clock=0) sort last.
+     * arr_cache_limit_bytes defaults to COL_ARR_CACHE_LIMIT_BYTES (256 MB)
+     * and can be overridden via WL_ARR_CACHE_LIMIT_BYTES env var. */
+    sess->arr_clock = 1;
+    sess->arr_total_bytes = 0;
+    {
+        size_t arr_limit = COL_ARR_CACHE_LIMIT_BYTES;
+        const char *arr_limit_env = getenv("WL_ARR_CACHE_LIMIT_BYTES");
+        if (arr_limit_env && arr_limit_env[0] != '\0') {
+            char *endp = NULL;
+            errno = 0;
+            unsigned long long val = strtoull(arr_limit_env, &endp, 10);
+            if (endp != arr_limit_env && *endp == '\0' && errno != ERANGE
+                && val > 0)
+                arr_limit = (size_t)val;
+        }
+        sess->arr_cache_limit_bytes = arr_limit;
+    }
+
     /* Pre-register EDB relations (ncols determined at first insert) */
     for (uint32_t i = 0; i < plan->edb_count; i++) {
         col_rel_t *r = NULL;
