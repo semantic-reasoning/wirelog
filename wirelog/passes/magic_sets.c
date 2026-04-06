@@ -116,14 +116,14 @@ adorned_contains(const ms_adorned_set_t *s, const char *name, uint64_t mask)
 /* Returns true if newly added, false if already present or table full. */
 static bool
 adorned_add(ms_adorned_set_t *s, const char *name, uint64_t mask,
-            uint32_t arity)
+    uint32_t arity)
 {
     if (adorned_contains(s, name, mask))
         return false;
     if (s->count >= MS_MAX_ADORNED)
         return false;
     snprintf(s->items[s->count].rel_name, sizeof(s->items[s->count].rel_name),
-             "%s", name);
+        "%s", name);
     s->items[s->count].bound_mask = mask;
     s->items[s->count].arity = arity;
     s->count++;
@@ -191,7 +191,7 @@ get_arity(const struct wirelog_program *prog, const char *rel_name)
 
 static void
 collect_scans_r(const wirelog_ir_node_t *node, ms_atom_t *atoms,
-                uint32_t *count)
+    uint32_t *count)
 {
     if (!node || *count >= MS_MAX_ATOMS)
         return;
@@ -250,7 +250,7 @@ collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms)
  */
 static uint32_t
 get_head_vars(const wirelog_ir_node_t *ir_root, const char **vars,
-              uint32_t max_vars)
+    uint32_t max_vars)
 {
     if (!ir_root)
         return 0;
@@ -308,9 +308,9 @@ popcount64(uint64_t x)
  */
 static wirelog_ir_node_t *
 build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
-                     const char **guard_bound_vars, uint32_t guard_bound_count,
-                     const ms_atom_t *prefix_atoms, uint32_t prefix_count,
-                     const ms_atom_t *target_atom, uint64_t target_bound_mask)
+    const char **guard_bound_vars, uint32_t guard_bound_count,
+    const ms_atom_t *prefix_atoms, uint32_t prefix_count,
+    const ms_atom_t *target_atom, uint64_t target_bound_mask)
 {
     /* === Step 1: Start with the guard magic SCAN === */
 
@@ -437,7 +437,7 @@ build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
         }
         uint32_t ei = 0;
         for (uint32_t i = 0;
-             i < target_atom->col_count && i < 64 && ei < bound_count; i++) {
+            i < target_atom->col_count && i < 64 && ei < bound_count; i++) {
             if (target_bound_mask & (1ULL << i)) {
                 wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_VAR);
                 if (e && target_atom->col_names && target_atom->col_names[i])
@@ -468,7 +468,7 @@ build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
  */
 static int
 insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
-                   const char **bound_vars, uint32_t bound_count)
+    const char **bound_vars, uint32_t bound_count)
 {
     if (!ir_root || !magic_name || bound_count == 0)
         return 0;
@@ -530,9 +530,9 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
 
 int
 wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
-                                 const wl_magic_demand_t *demands,
-                                 uint32_t demand_count,
-                                 wl_magic_sets_stats_t *stats)
+    const wl_magic_demand_t *demands,
+    uint32_t demand_count,
+    wl_magic_sets_stats_t *stats)
 {
     if (!prog)
         return -2;
@@ -572,8 +572,20 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
         }
 
         uint32_t arity = d->arity;
-        if (arity == 0)
+        if (arity == 0) {
             arity = get_arity(prog, d->relation_name);
+        } else {
+            uint32_t actual = get_arity(prog, d->relation_name);
+            if (actual != 0 && actual != arity) {
+                fprintf(stderr,
+                    "warning: .query %s has %u adornment(s) but relation "
+                    "has %u column(s); demand skipped\n",
+                    d->relation_name, arity, actual);
+                if (stats)
+                    stats->skipped_all_free++;
+                continue;
+            }
+        }
 
         adorned_add(&processed, d->relation_name, d->bound_mask, arity);
     }
@@ -620,7 +632,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                     /* Compute adornment of this IDB body atom */
                     uint64_t atom_mask = 0;
                     for (uint32_t ci = 0; ci < atom->col_count && ci < 64;
-                         ci++) {
+                        ci++) {
                         if (atom->col_names && atom->col_names[ci]
                             && varset_contains(&bound, atom->col_names[ci]))
                             atom_mask |= (1ULL << ci);
@@ -628,14 +640,14 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
 
                     if (atom_mask != 0) {
                         adorned_add(&processed, atom->rel_name, atom_mask,
-                                    atom->col_count);
+                            atom->col_count);
                     } else {
                         if (stats)
                             stats->skipped_all_free++;
                     }
                 }
 
-            next_atom:
+next_atom:
                 /* Add all vars of this atom to bound set */
                 for (uint32_t ci = 0; ci < atom->col_count; ci++) {
                     if (atom->col_names && atom->col_names[ci])
@@ -728,7 +740,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                 if (is_idb(prog, atom->rel_name)) {
                     uint64_t atom_mask = 0;
                     for (uint32_t ci = 0; ci < atom->col_count && ci < 64;
-                         ci++) {
+                        ci++) {
                         if (atom->col_names && atom->col_names[ci]
                             && varset_contains(&bound, atom->col_names[ci]))
                             atom_mask |= (1ULL << ci);
@@ -762,7 +774,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                     }
                 }
 
-            next_4a_atom:
+next_4a_atom:
                 for (uint32_t ci = 0; ci < atom->col_count; ci++) {
                     if (atom->col_names && atom->col_names[ci])
                         varset_add(&bound, atom->col_names[ci]);
@@ -811,7 +823,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
             }
 
             int rc = insert_magic_guard(ir_root, guard_magic, guard_bvars,
-                                        guard_bcount);
+                    guard_bcount);
             if (rc != 0) {
                 free(guard_magic);
                 return -1;

@@ -1338,10 +1338,15 @@ parse_query_directive(wl_parser_t *parser)
                 return NULL;
             }
 
+            if (position >= 64) {
+                parser_error(parser, "maximum 64 adornments supported");
+                wl_parser_ast_node_free(query);
+                return NULL;
+            }
+
             const wl_parser_lexer_token_t *tok = &parser->previous;
             if (tok->length == 1 && tok->start[0] == 'b') {
-                if (position < 64)
-                    bound_mask |= ((uint64_t)1 << position);
+                bound_mask |= ((uint64_t)1 << position);
             } else if (tok->length == 1 && tok->start[0] == 'f') {
                 /* free position: bit stays 0 */
             } else {
@@ -1371,6 +1376,7 @@ parse_query_directive(wl_parser_t *parser)
     }
 
     query->int_value = (int64_t)bound_mask;
+    query->child_capacity = position; /* adornment count (children unused on QUERY nodes) */
     return query;
 }
 
