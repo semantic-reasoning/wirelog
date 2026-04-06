@@ -731,6 +731,7 @@ col_session_destroy(wl_session_t *session)
     col_session_free_delta_arrangements(sess);
     col_session_free_sorted_arrangements(sess);
     col_session_free_diff_arrangements(sess);
+    col_session_free_filt_arrangements(sess);
     /* Free contents of pool-allocated relations before bulk destroy.
      * delta_pool_destroy frees the slab/arena but skips individually
      * malloc'd members (name, columns, col_names, row_scratch). */
@@ -981,6 +982,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
     col_session_free_delta_arrangements(worker);
     col_session_free_sorted_arrangements(worker);
     col_session_free_diff_arrangements(worker);
+    col_session_free_filt_arrangements(worker);
 
     /* Free owned relations (partition data) */
     for (uint32_t i = 0; i < worker->nrels; i++) {
