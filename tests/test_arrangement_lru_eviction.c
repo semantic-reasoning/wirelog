@@ -13,6 +13,8 @@
  *   6. WL_ARR_CACHE_LIMIT_BYTES env var sets the limit at session creation
  */
 
+#define _GNU_SOURCE
+
 #include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
@@ -28,7 +30,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+
+/* MSVC portability: setenv/unsetenv are POSIX-only. */
+#ifdef _MSC_VER
+static int
+setenv(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+static int
+unsetenv(const char *name)
+{
+    return _putenv_s(name, "");
+}
+#endif
 
 /* ----------------------------------------------------------------
  * Test framework
@@ -195,11 +211,7 @@ test_env_var_limit(void)
     TEST("WL_ARR_CACHE_LIMIT_BYTES env var sets limit");
 
     /* Set a very small limit (1 MB) so we can verify it was applied. */
-#ifdef _MSC_VER
-    _putenv("WL_ARR_CACHE_LIMIT_BYTES=1048576"); /* 1 MB (Windows) */
-#else
-    setenv("WL_ARR_CACHE_LIMIT_BYTES", "1048576", 1); /* 1 MB (POSIX) */
-#endif
+    setenv("WL_ARR_CACHE_LIMIT_BYTES", "1048576", 1);
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
         "edge(1, 2).\n"
@@ -217,11 +229,7 @@ test_env_var_limit(void)
         "arr_cache_limit_bytes must equal WL_ARR_CACHE_LIMIT_BYTES");
 
     free_session(sess, plan, prog);
-#ifdef _MSC_VER
-    _putenv("WL_ARR_CACHE_LIMIT_BYTES="); /* Clear on Windows */
-#else
     unsetenv("WL_ARR_CACHE_LIMIT_BYTES");
-#endif
     PASS();
 }
 
