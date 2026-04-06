@@ -603,6 +603,21 @@ typedef struct col_filt_cache_entry {
 } col_filt_cache_entry_t;
 
 /*
+ * col_filt_arr_entry_t: one entry in the filtered arrangement cache (Issue #433).
+ *
+ * Keyed by (rel_name, filter_hash, key_cols[]).  Unlike darr_entries (cleared
+ * per sub-pass), these persist across sub-passes and are invalidated only when
+ * col_session_invalidate_arrangements is called for the named relation.
+ */
+typedef struct col_filt_arr_entry {
+    char *rel_name;        /* owned: base relation name */
+    uint64_t filter_hash;  /* FNV-1a hash of right_filter_expr */
+    uint32_t *key_cols;    /* owned: right-side key column indices */
+    uint32_t key_count;
+    col_arrangement_t arr; /* owned: hash index over filtered relation */
+} col_filt_arr_entry_t;
+
+/*
  * wl_col_session_t: Columnar backend session state
  *
  * Memory layout (C11 6.7.2.1 P15 - pointer compatibility):
@@ -667,6 +682,14 @@ typedef struct wl_col_session_t {
     col_arr_entry_t *darr_entries; /* owned flat array of delta arrs      */
     uint32_t darr_count;           /* number of active delta arrangements */
     uint32_t darr_cap;             /* allocated capacity                  */
+    /* Filtered arrangement cache (Issue #433): persistent hash indices for
+     * filtered right-side relations from filt_cache.  Unlike darr_entries
+     * (cleared per sub-pass), these persist across sub-passes and are only
+     * reset when col_session_invalidate_arrangements is called.
+     * Workers start with empty filt_arr (like darr) for isolation safety. */
+    col_filt_arr_entry_t *filt_arr_entries;
+    uint32_t filt_arr_count;
+    uint32_t filt_arr_cap;
     /* 2D Frontier Epoch Tracking (Issue #103): Incremental insertion epoch counter.
      * Incremented before each EDB insertion and stratum evaluation to distinguish
      * between different insertion epochs. Used with frontiers[] to track
@@ -1115,6 +1138,14 @@ col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count);
 void
 col_session_free_delta_arrangements(wl_col_session_t *cs);
+
+/* Filtered arrangement cache (Issue #433) */
+col_arrangement_t *
+col_session_get_filt_arrangement(wl_col_session_t *cs, const char *rel_name,
+    uint64_t filter_hash, const col_rel_t *filtered_rel,
+    const uint32_t *key_cols, uint32_t key_count);
+void
+col_session_free_filt_arrangements(wl_col_session_t *cs);
 
 /* Differential arrangement registry (Issue #263) */
 col_diff_arrangement_t *

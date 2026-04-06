@@ -301,6 +301,13 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
             cs->arr_entries[i].arr.indexed_rows = 0; /* force full rebuild */
     }
 
+    /* Issue #433: Also invalidate filtered arrangement cache entries.
+     * When a relation changes, its cached filtered arrangement is stale. */
+    for (uint32_t i = 0; i < cs->filt_arr_count; i++) {
+        if (strcmp(cs->filt_arr_entries[i].rel_name, rel_name) == 0)
+            cs->filt_arr_entries[i].arr.indexed_rows = 0;
+    }
+
     /* Issue #275: Also invalidate differential arrangement cache.
      * After consolidation permutes physical row order, row-index-based
      * hash tables in diff_arr become stale. Reset indexed_rows and
@@ -451,6 +458,122 @@ col_session_get_darr_count(wl_session_t *sess)
     if (!sess)
         return 0;
     return COL_SESSION(sess)->darr_count;
+}
+
+/* ======================================================================== */
+/* Filtered Arrangement Cache (Issue #433)                                  */
+/* ======================================================================== */
+
+/*
+ * col_session_get_filt_arrangement:
+ *
+ * Return (or lazily create) a persistent arrangement for `filtered_rel`
+ * keyed on `key_cols[0..key_count)`.  The entry is keyed by
+ * (rel_name, filter_hash, key_cols[]) and persists across semi-naive
+ * sub-passes (unlike darr_entries which are cleared per sub-pass).
+ *
+ * Stale detection: if `e->arr.indexed_rows != filtered_rel->nrows`, the
+ * arrangement is rebuilt.  This handles the case where filt_cache rebuilt
+ * the filtered relation because the source EDB grew.
+ *
+ * Returns NULL on allocation failure or if key_count == 0.
+ */
+col_arrangement_t *
+col_session_get_filt_arrangement(wl_col_session_t *cs, const char *rel_name,
+    uint64_t filter_hash, const col_rel_t *filtered_rel,
+    const uint32_t *key_cols, uint32_t key_count)
+{
+    if (!cs || !rel_name || !filtered_rel || !key_cols || key_count == 0)
+        return NULL;
+
+    /* Search existing entries. */
+    for (uint32_t i = 0; i < cs->filt_arr_count; i++) {
+        col_filt_arr_entry_t *e = &cs->filt_arr_entries[i];
+        if (e->filter_hash != filter_hash || e->key_count != key_count)
+            continue;
+        if (strcmp(e->rel_name, rel_name) != 0)
+            continue;
+        bool match = true;
+        for (uint32_t k = 0; k < key_count; k++) {
+            if (e->key_cols[k] != key_cols[k]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match)
+            continue;
+        /* Found: rebuild if stale (filtered_rel grew since last build). */
+        if (e->arr.indexed_rows != filtered_rel->nrows) {
+            arr_free_contents(&e->arr);
+            if (filtered_rel->nrows > 0
+                && arr_build_full(&e->arr, filtered_rel) != 0)
+                return NULL;
+        }
+        return &e->arr;
+    }
+
+    /* Not found: grow cache and create new entry. */
+    if (cs->filt_arr_count >= cs->filt_arr_cap) {
+        uint32_t new_cap = cs->filt_arr_cap ? cs->filt_arr_cap * 2u : 4u;
+        col_filt_arr_entry_t *ne = (col_filt_arr_entry_t *)realloc(
+            cs->filt_arr_entries, new_cap * sizeof(col_filt_arr_entry_t));
+        if (!ne)
+            return NULL;
+        cs->filt_arr_entries = ne;
+        cs->filt_arr_cap = new_cap;
+    }
+
+    col_filt_arr_entry_t *e = &cs->filt_arr_entries[cs->filt_arr_count];
+    memset(e, 0, sizeof(*e));
+
+    e->rel_name = wl_strdup(rel_name);
+    if (!e->rel_name)
+        return NULL;
+
+    e->key_cols = (uint32_t *)malloc(key_count * sizeof(uint32_t));
+    if (!e->key_cols) {
+        free(e->rel_name);
+        e->rel_name = NULL;
+        return NULL;
+    }
+    memcpy(e->key_cols, key_cols, key_count * sizeof(uint32_t));
+    e->key_count = key_count;
+    e->filter_hash = filter_hash;
+    e->arr.key_cols = e->key_cols; /* shared view; owned by entry */
+    e->arr.key_count = key_count;
+    cs->filt_arr_count++;
+
+    if (filtered_rel->nrows > 0
+        && arr_build_full(&e->arr, filtered_rel) != 0) {
+        cs->filt_arr_count--;
+        free(e->rel_name);
+        free(e->key_cols);
+        memset(e, 0, sizeof(*e));
+        return NULL;
+    }
+    return &e->arr;
+}
+
+/*
+ * col_session_free_filt_arrangements:
+ *
+ * Free all entries in the filtered arrangement cache and reset the cache.
+ * Called from col_session_destroy.
+ */
+void
+col_session_free_filt_arrangements(wl_col_session_t *cs)
+{
+    if (!cs)
+        return;
+    for (uint32_t i = 0; i < cs->filt_arr_count; i++) {
+        free(cs->filt_arr_entries[i].rel_name);
+        free(cs->filt_arr_entries[i].key_cols);
+        arr_free_contents(&cs->filt_arr_entries[i].arr);
+    }
+    free(cs->filt_arr_entries);
+    cs->filt_arr_entries = NULL;
+    cs->filt_arr_count = 0;
+    cs->filt_arr_cap = 0;
 }
 
 /*

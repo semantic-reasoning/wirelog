@@ -705,6 +705,165 @@ test_bdx_selfjoin_w4(void)
 }
 
 /* ======================================================================== */
+/* Microbenchmark: Filtered-join arrangement cache (Issue #433)             */
+/* ======================================================================== */
+
+/*
+ * make_filtered_tc_session:
+ * Build a TC session with a constant filter on the right-side EDB:
+ *   tc(x, y) :- edge(x, y), y > 0.
+ *   tc(x, z) :- tc(x, y), edge(y, z), z > 0.
+ *
+ * The filter "y > 0" / "z > 0" is pushed to right_filter_expr by JPP,
+ * triggering the filt_cache path in col_op_join.  With the filt_arr
+ * optimization (Issue #433), the arrangement for the filtered edge
+ * relation is cached across sub-passes rather than rebuilt each time.
+ */
+static wl_col_session_t *
+make_filtered_tc_session(uint32_t num_workers, wl_plan_t **plan_out,
+    wirelog_program_t **prog_out)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl tc(x: int32, y: int32)\n"
+        "tc(x, y) :- edge(x, y), y > 0.\n"
+        "tc(x, z) :- tc(x, y), edge(y, z), z > 0.\n",
+        &err);
+    if (!prog)
+        return NULL;
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    wl_session_t *session = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, num_workers, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    *plan_out = plan;
+    *prog_out = prog;
+    return COL_SESSION(session);
+}
+
+/*
+ * test_filt_arr_bench_w1:
+ * W=1 filtered TC on a 10-node chain (9 edges, all y > 0).
+ * Expected: 45 tuples (all pairs i<j in 1..10).
+ *
+ * Correctness regression for filt_arr arrangement cache (Issue #433):
+ * verifies the cached arrangement for the filtered right-side EDB
+ * produces the same results as the ephemeral-hash-table path.
+ */
+static int
+test_filt_arr_bench_w1(void)
+{
+    TEST("Filt-arr bench W=1: 10-node chain filtered TC, 45 tuples");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_filtered_tc_session(1, &plan, &prog);
+    if (!sess) {
+        FAIL("session create failed");
+        return 1;
+    }
+
+    /* 10-node chain: edge(1,2)..edge(9,10) */
+    int64_t edges[] = {
+        1, 2,  2, 3,  3, 4,  4, 5,  5, 6,
+        6, 7,  7, 8,  8, 9,  9, 10
+    };
+    if (insert_edges(sess, edges, 9) != 0) {
+        cleanup_session(sess, plan, prog);
+        FAIL("insert_edges failed");
+        return 1;
+    }
+
+    uint64_t t0 = now_ns();
+    int rc = wl_session_step(&sess->base);
+    uint64_t elapsed_ms = (now_ns() - t0) / 1000000ULL;
+
+    uint32_t nrows = count_rows(sess, "tc");
+    cleanup_session(sess, plan, prog);
+
+    if (rc != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (nrows != 45) {
+        FAIL("expected 45 tc tuples");
+        return 1;
+    }
+    printf(" [%llu ms]", (unsigned long long)elapsed_ms);
+    PASS();
+    return 0;
+}
+
+/*
+ * test_filt_arr_bench_w4:
+ * W=4 filtered TC must match W=1 result (45 tuples).
+ * Validates that filt_arr caching is safe under K-fusion worker isolation.
+ */
+static int
+test_filt_arr_bench_w4(void)
+{
+    TEST("Filt-arr bench W=4: matches W=1 filtered TC (45 tuples)");
+
+    wl_plan_t *p1 = NULL, *p4 = NULL;
+    wirelog_program_t *pr1 = NULL, *pr4 = NULL;
+    wl_col_session_t *s1 = make_filtered_tc_session(1, &p1, &pr1);
+    wl_col_session_t *s4 = make_filtered_tc_session(4, &p4, &pr4);
+    if (!s1 || !s4) {
+        if (s1) cleanup_session(s1, p1, pr1);
+        if (s4) cleanup_session(s4, p4, pr4);
+        FAIL("session create failed");
+        return 1;
+    }
+
+    int64_t edges[] = {
+        1, 2,  2, 3,  3, 4,  4, 5,  5, 6,
+        6, 7,  7, 8,  8, 9,  9, 10
+    };
+    insert_edges(s1, edges, 9);
+    insert_edges(s4, edges, 9);
+
+    int rc1 = wl_session_step(&s1->base);
+    int rc4 = wl_session_step(&s4->base);
+
+    uint32_t cnt1 = count_rows(s1, "tc");
+    uint32_t cnt4 = count_rows(s4, "tc");
+
+    cleanup_session(s1, p1, pr1);
+    cleanup_session(s4, p4, pr4);
+
+    if (rc1 != 0 || rc4 != 0) {
+        FAIL("session step failed");
+        return 1;
+    }
+    if (cnt1 != 45) {
+        FAIL("W=1 expected 45 tc tuples");
+        return 1;
+    }
+    if (cnt1 != cnt4) {
+        FAIL("W=4 must match W=1");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -724,6 +883,8 @@ main(void)
     test_triple_idb_guard();
     test_bdx_selfjoin_w2();
     test_bdx_selfjoin_w4();
+    test_filt_arr_bench_w1();
+    test_filt_arr_bench_w4();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
     if (tests_failed > 0)
