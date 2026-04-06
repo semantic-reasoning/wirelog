@@ -643,12 +643,15 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
      * Default: 90% of COL_MAT_CACHE_LIMIT_BYTES (cache evicts when exceeding
      * this threshold). Users can override via WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT
      * environment variable. */
-    char *threshold_env = getenv("WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT");
-    int threshold_percent = threshold_env ? (int)strtol(threshold_env, NULL,
-            10) : 90;
-    /* Clamp to valid range [1, 100] */
-    if (threshold_percent < 1) threshold_percent = 1;
-    if (threshold_percent > 100) threshold_percent = 100;
+    const char *threshold_env = getenv("WL_MAT_CACHE_EVICT_THRESHOLD_PERCENT");
+    int threshold_percent = 90; /* default */
+    if (threshold_env) {
+        char *endptr;
+        long val = strtol(threshold_env, &endptr, 10);
+        if (*endptr == '\0' && val >= 1 && val <= 100)
+            threshold_percent = (int)val;
+        /* Non-numeric or out-of-range: keep default 90% */
+    }
     sess->cache_evict_threshold
         = (COL_MAT_CACHE_LIMIT_BYTES * (uint64_t)threshold_percent) / 100;
 
