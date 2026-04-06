@@ -25,7 +25,7 @@
 
 wl_parser_ast_node_t *
 wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line,
-                          uint32_t col)
+    uint32_t col)
 {
     wl_parser_ast_node_t *node
         = (wl_parser_ast_node_t *)calloc(1, sizeof(wl_parser_ast_node_t));
@@ -41,7 +41,7 @@ wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line,
 
 void
 wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent,
-                             wl_parser_ast_node_t *child)
+    wl_parser_ast_node_t *child)
 {
     if (!parent || !child)
         return;
@@ -94,7 +94,7 @@ wl_parser_ast_node_set_str_value(wl_parser_ast_node_t *node, const char *value)
 
 void
 wl_parser_ast_node_set_type_name(wl_parser_ast_node_t *node,
-                                 const char *type_name)
+    const char *type_name)
 {
     if (!node)
         return;
@@ -168,6 +168,8 @@ wl_parser_ast_node_type_str(wl_parser_ast_node_type_t type)
         return "INPUT_PARAM";
     case WL_PARSER_AST_NODE_OUTPUT_PARAM:
         return "OUTPUT_PARAM";
+    case WL_PARSER_AST_NODE_QUERY:
+        return "QUERY";
     }
     return "UNKNOWN";
 }
