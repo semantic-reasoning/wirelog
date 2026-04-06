@@ -79,9 +79,9 @@ parser_error(wl_parser_t *parser, const char *msg)
         return;
     parser->had_error = true;
     snprintf(parser->error_msg, sizeof(parser->error_msg),
-             "line %u, col %u: %s (got %s)", parser->current.line,
-             parser->current.col, msg,
-             wl_parser_lexer_token_type_str(parser->current.type));
+        "line %u, col %u: %s (got %s)", parser->current.line,
+        parser->current.col, msg,
+        wl_parser_lexer_token_type_str(parser->current.type));
 }
 
 /* ======================================================================== */
@@ -116,7 +116,7 @@ parser_match(wl_parser_t *parser, wl_parser_lexer_token_type_t type)
 
 static bool
 parser_consume(wl_parser_t *parser, wl_parser_lexer_token_type_t type,
-               const char *msg)
+    const char *msg)
 {
     if (parser_check(parser, type)) {
         parser_advance(parser);
@@ -221,14 +221,14 @@ parse_factor(wl_parser_t *parser)
         parser_advance(parser); /* consume keyword */
 
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after bitwise operator")) {
+            "expected '(' after bitwise operator")) {
             return NULL;
         }
         wl_parser_ast_node_t *left_arg = parse_arithmetic_expr(parser);
         if (!left_arg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_COMMA,
-                            "expected ',' in bitwise binary operator")) {
+            "expected ',' in bitwise binary operator")) {
             wl_parser_ast_node_free(left_arg);
             return NULL;
         }
@@ -238,7 +238,7 @@ parse_factor(wl_parser_t *parser)
             return NULL;
         }
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after bitwise operator arguments")) {
+            "expected ')' after bitwise operator arguments")) {
             wl_parser_ast_node_free(left_arg);
             wl_parser_ast_node_free(right_arg);
             return NULL;
@@ -255,14 +255,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_BNOT) {
         parser_advance(parser); /* consume bnot */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after bnot")) {
+            "expected '(' after bnot")) {
             return NULL;
         }
         wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
         if (!arg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after bnot argument")) {
+            "expected ')' after bnot argument")) {
             wl_parser_ast_node_free(arg);
             return NULL;
         }
@@ -277,14 +277,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_HASH) {
         parser_advance(parser); /* consume hash */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after hash")) {
+            "expected '(' after hash")) {
             return NULL;
         }
         wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
         if (!arg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after hash argument")) {
+            "expected ')' after hash argument")) {
             wl_parser_ast_node_free(arg);
             return NULL;
         }
@@ -299,14 +299,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_MD5) {
         parser_advance(parser); /* consume md5 */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after md5")) {
+            "expected '(' after md5")) {
             return NULL;
         }
         wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
         if (!arg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after md5 argument")) {
+            "expected ')' after md5 argument")) {
             wl_parser_ast_node_free(arg);
             return NULL;
         }
@@ -321,14 +321,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_SHA1) {
         parser_advance(parser); /* consume sha1 */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after sha1")) {
+            "expected '(' after sha1")) {
             return NULL;
         }
         wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
         if (!arg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after sha1 argument")) {
+            "expected ')' after sha1 argument")) {
             wl_parser_ast_node_free(arg);
             return NULL;
         }
@@ -343,14 +343,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_SHA256) {
         parser_advance(parser); /* consume sha256 */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after sha256")) {
+            "expected '(' after sha256")) {
             return NULL;
         }
         wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
         if (!arg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after sha256 argument")) {
+            "expected ')' after sha256 argument")) {
             wl_parser_ast_node_free(arg);
             return NULL;
         }
@@ -365,14 +365,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_SHA512) {
         parser_advance(parser); /* consume sha512 */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after sha512")) {
+            "expected '(' after sha512")) {
             return NULL;
         }
         wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
         if (!arg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after sha512 argument")) {
+            "expected ')' after sha512 argument")) {
             wl_parser_ast_node_free(arg);
             return NULL;
         }
@@ -387,14 +387,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_HMAC_SHA256) {
         parser_advance(parser); /* consume hmac_sha256 */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after hmac_sha256")) {
+            "expected '(' after hmac_sha256")) {
             return NULL;
         }
         wl_parser_ast_node_t *msg = parse_arithmetic_expr(parser);
         if (!msg)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_COMMA,
-                            "expected ',' between hmac_sha256 arguments")) {
+            "expected ',' between hmac_sha256 arguments")) {
             wl_parser_ast_node_free(msg);
             return NULL;
         }
@@ -404,7 +404,7 @@ parse_factor(wl_parser_t *parser)
             return NULL;
         }
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after hmac_sha256 arguments")) {
+            "expected ')' after hmac_sha256 arguments")) {
             wl_parser_ast_node_free(msg);
             wl_parser_ast_node_free(key);
             return NULL;
@@ -421,11 +421,11 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_UUID4) {
         parser_advance(parser); /* consume uuid4 */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after uuid4")) {
+            "expected '(' after uuid4")) {
             return NULL;
         }
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after uuid4")) {
+            "expected ')' after uuid4")) {
             return NULL;
         }
         wl_parser_ast_node_t *node = wl_parser_ast_node_create(
@@ -439,14 +439,14 @@ parse_factor(wl_parser_t *parser)
     if (parser->current.type == WL_PARSER_LEXER_TOK_UUID5) {
         parser_advance(parser); /* consume uuid5 */
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                            "expected '(' after uuid5")) {
+            "expected '(' after uuid5")) {
             return NULL;
         }
         wl_parser_ast_node_t *ns = parse_arithmetic_expr(parser);
         if (!ns)
             return NULL;
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_COMMA,
-                            "expected ',' between uuid5 arguments")) {
+            "expected ',' between uuid5 arguments")) {
             wl_parser_ast_node_free(ns);
             return NULL;
         }
@@ -456,7 +456,7 @@ parse_factor(wl_parser_t *parser)
             return NULL;
         }
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after uuid5 arguments")) {
+            "expected ')' after uuid5 arguments")) {
             wl_parser_ast_node_free(ns);
             wl_parser_ast_node_free(name);
             return NULL;
@@ -585,7 +585,7 @@ parse_aggregate_expr(wl_parser_t *parser)
     parser_advance(parser); /* consume aggregate keyword */
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                        "expected '(' after aggregate")) {
+        "expected '(' after aggregate")) {
         return NULL;
     }
 
@@ -594,7 +594,7 @@ parse_aggregate_expr(wl_parser_t *parser)
         return NULL;
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                        "expected ')' after aggregate expr")) {
+        "expected ')' after aggregate expr")) {
         wl_parser_ast_node_free(expr);
         return NULL;
     }
@@ -631,7 +631,7 @@ parse_atom_arg(wl_parser_t *parser)
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_UNDERSCORE)) {
         return wl_parser_ast_node_create(WL_PARSER_AST_NODE_WILDCARD, line,
-                                         col);
+                   col);
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_IDENT)) {
@@ -675,7 +675,7 @@ parse_atom(wl_parser_t *parser)
     atom->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                        "expected '(' after relation name")) {
+        "expected '(' after relation name")) {
         wl_parser_ast_node_free(atom);
         return NULL;
     }
@@ -700,7 +700,7 @@ parse_atom(wl_parser_t *parser)
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                        "expected ')' after arguments")) {
+        "expected ')' after arguments")) {
         wl_parser_ast_node_free(atom);
         return NULL;
     }
@@ -768,7 +768,7 @@ parse_predicate(wl_parser_t *parser)
     /* Negative atom */
     if (parser_match(parser, WL_PARSER_LEXER_TOK_BANG)) {
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                            "expected relation name after '!'")) {
+            "expected relation name after '!'")) {
             return NULL;
         }
         wl_parser_ast_node_t *atom = parse_atom(parser);
@@ -789,7 +789,7 @@ parse_predicate(wl_parser_t *parser)
         }
 
         /* Otherwise it's a comparison: arith_expr compare_op arith_expr
-         * We already consumed the identifier, so build the left side. */
+        * We already consumed the identifier, so build the left side. */
         wl_parser_ast_node_t *left_var = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_VARIABLE, parser->previous.line,
             parser->previous.col);
@@ -919,7 +919,7 @@ parse_head(wl_parser_t *parser)
     uint32_t col = parser->current.col;
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                        "expected relation name in head")) {
+        "expected relation name in head")) {
         return NULL;
     }
 
@@ -928,7 +928,7 @@ parse_head(wl_parser_t *parser)
     head->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                        "expected '(' after head name")) {
+        "expected '(' after head name")) {
         wl_parser_ast_node_free(head);
         return NULL;
     }
@@ -953,7 +953,7 @@ parse_head(wl_parser_t *parser)
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                        "expected ')' in head")) {
+        "expected ')' in head")) {
         wl_parser_ast_node_free(head);
         return NULL;
     }
@@ -997,7 +997,7 @@ parse_fact(wl_parser_t *parser, wl_parser_ast_node_t *head)
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT,
-                        "expected '.' at end of fact")) {
+        "expected '.' at end of fact")) {
         wl_parser_ast_node_free(fact);
         return NULL;
     }
@@ -1022,7 +1022,7 @@ parse_rule_or_fact(wl_parser_t *parser)
 
     /* Rule: head followed by ':-' */
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_HORN,
-                        "expected ':-' or '.' after head")) {
+        "expected ':-' or '.' after head")) {
         wl_parser_ast_node_free(head);
         return NULL;
     }
@@ -1049,7 +1049,7 @@ parse_rule_or_fact(wl_parser_t *parser)
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT,
-                        "expected '.' at end of rule")) {
+        "expected '.' at end of rule")) {
         wl_parser_ast_node_free(rule);
         return NULL;
     }
@@ -1074,7 +1074,7 @@ parse_declaration(wl_parser_t *parser)
     uint32_t col = parser->previous.col;
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                        "expected relation name after .decl")) {
+        "expected relation name after .decl")) {
         return NULL;
     }
 
@@ -1083,7 +1083,7 @@ parse_declaration(wl_parser_t *parser)
     decl->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                        "expected '(' after .decl name")) {
+        "expected '(' after .decl name")) {
         wl_parser_ast_node_free(decl);
         return NULL;
     }
@@ -1095,14 +1095,14 @@ parse_declaration(wl_parser_t *parser)
             uint32_t attr_col = parser->current.col;
 
             if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                                "expected attribute name")) {
+                "expected attribute name")) {
                 wl_parser_ast_node_free(decl);
                 return NULL;
             }
             char *attr_name = token_to_name(&parser->previous);
 
             if (!parser_consume(parser, WL_PARSER_LEXER_TOK_COLON,
-                                "expected ':' after attribute name")) {
+                "expected ':' after attribute name")) {
                 free(attr_name);
                 wl_parser_ast_node_free(decl);
                 return NULL;
@@ -1120,7 +1120,7 @@ parse_declaration(wl_parser_t *parser)
                 type_str = "symbol";
             } else {
                 parser_error(parser,
-                             "expected type (int32, int64, string, or symbol)");
+                    "expected type (int32, int64, string, or symbol)");
                 free(attr_name);
                 wl_parser_ast_node_free(decl);
                 return NULL;
@@ -1138,7 +1138,7 @@ parse_declaration(wl_parser_t *parser)
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                        "expected ')' after .decl")) {
+        "expected ')' after .decl")) {
         wl_parser_ast_node_free(decl);
         return NULL;
     }
@@ -1154,7 +1154,7 @@ parse_input_directive(wl_parser_t *parser)
     uint32_t col = parser->previous.col;
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                        "expected relation name after .input")) {
+        "expected relation name after .input")) {
         return NULL;
     }
 
@@ -1163,7 +1163,7 @@ parse_input_directive(wl_parser_t *parser)
     input->name = token_to_name(&parser->previous);
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
-                        "expected '(' after .input name")) {
+        "expected '(' after .input name")) {
         wl_parser_ast_node_free(input);
         return NULL;
     }
@@ -1175,21 +1175,21 @@ parse_input_directive(wl_parser_t *parser)
             uint32_t p_col = parser->current.col;
 
             if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                                "expected parameter name")) {
+                "expected parameter name")) {
                 wl_parser_ast_node_free(input);
                 return NULL;
             }
             char *param_name = token_to_name(&parser->previous);
 
             if (!parser_consume(parser, WL_PARSER_LEXER_TOK_EQ,
-                                "expected '=' after parameter name")) {
+                "expected '=' after parameter name")) {
                 free(param_name);
                 wl_parser_ast_node_free(input);
                 return NULL;
             }
 
             if (!parser_consume(parser, WL_PARSER_LEXER_TOK_STRING,
-                                "expected string value")) {
+                "expected string value")) {
                 free(param_name);
                 wl_parser_ast_node_free(input);
                 return NULL;
@@ -1208,7 +1208,7 @@ parse_input_directive(wl_parser_t *parser)
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                        "expected ')' after .input params")) {
+        "expected ')' after .input params")) {
         wl_parser_ast_node_free(input);
         return NULL;
     }
@@ -1223,7 +1223,7 @@ parse_output_directive(wl_parser_t *parser)
     uint32_t col = parser->previous.col;
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                        "expected relation name after .output")) {
+        "expected relation name after .output")) {
         return NULL;
     }
 
@@ -1239,21 +1239,21 @@ parse_output_directive(wl_parser_t *parser)
                 uint32_t p_col = parser->current.col;
 
                 if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                                    "expected parameter name")) {
+                    "expected parameter name")) {
                     wl_parser_ast_node_free(output);
                     return NULL;
                 }
                 char *param_name = token_to_name(&parser->previous);
 
                 if (!parser_consume(parser, WL_PARSER_LEXER_TOK_EQ,
-                                    "expected '=' after parameter name")) {
+                    "expected '=' after parameter name")) {
                     free(param_name);
                     wl_parser_ast_node_free(output);
                     return NULL;
                 }
 
                 if (!parser_consume(parser, WL_PARSER_LEXER_TOK_STRING,
-                                    "expected string value")) {
+                    "expected string value")) {
                     free(param_name);
                     wl_parser_ast_node_free(output);
                     return NULL;
@@ -1272,7 +1272,7 @@ parse_output_directive(wl_parser_t *parser)
         }
 
         if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
-                            "expected ')' after .output params")) {
+            "expected ')' after .output params")) {
             wl_parser_ast_node_free(output);
             return NULL;
         }
@@ -1288,7 +1288,7 @@ parse_printsize_directive(wl_parser_t *parser)
     uint32_t col = parser->previous.col;
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                        "expected relation name after .printsize")) {
+        "expected relation name after .printsize")) {
         return NULL;
     }
 
@@ -1296,6 +1296,82 @@ parse_printsize_directive(wl_parser_t *parser)
         = wl_parser_ast_node_create(WL_PARSER_AST_NODE_PRINTSIZE, line, col);
     ps->name = token_to_name(&parser->previous);
     return ps;
+}
+
+/* ======================================================================== */
+/* Query Directive Parsing                                                  */
+/* ======================================================================== */
+
+static wl_parser_ast_node_t *
+parse_query_directive(wl_parser_t *parser)
+{
+    /* .query already consumed */
+    uint32_t line = parser->previous.line;
+    uint32_t col = parser->previous.col;
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+        "expected relation name after .query")) {
+        return NULL;
+    }
+
+    wl_parser_ast_node_t *query
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_QUERY, line, col);
+    if (!query)
+        return NULL;
+    query->name = token_to_name(&parser->previous);
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+        "expected '(' after .query relation name")) {
+        wl_parser_ast_node_free(query);
+        return NULL;
+    }
+
+    /* Parse comma-separated adornments: b (bound) or f (free) */
+    uint64_t bound_mask = 0;
+    uint32_t position = 0;
+
+    if (!parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
+        for (;;) {
+            if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+                "expected 'b' or 'f' adornment")) {
+                wl_parser_ast_node_free(query);
+                return NULL;
+            }
+
+            const wl_parser_lexer_token_t *tok = &parser->previous;
+            if (tok->length == 1 && tok->start[0] == 'b') {
+                if (position < 64)
+                    bound_mask |= ((uint64_t)1 << position);
+            } else if (tok->length == 1 && tok->start[0] == 'f') {
+                /* free position: bit stays 0 */
+            } else {
+                parser_error(parser,
+                    "adornment must be 'b' (bound) or 'f' (free)");
+                wl_parser_ast_node_free(query);
+                return NULL;
+            }
+
+            position++;
+
+            if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
+                break;
+        }
+    }
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+        "expected ')' after .query adornments")) {
+        wl_parser_ast_node_free(query);
+        return NULL;
+    }
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT,
+        "expected '.' after .query directive")) {
+        wl_parser_ast_node_free(query);
+        return NULL;
+    }
+
+    query->int_value = (int64_t)bound_mask;
+    return query;
 }
 
 /* ======================================================================== */
@@ -1311,7 +1387,7 @@ parse_program(wl_parser_t *parser)
         return NULL;
 
     while (!parser_check(parser, WL_PARSER_LEXER_TOK_EOF)
-           && !parser->had_error) {
+        && !parser->had_error) {
         wl_parser_ast_node_t *node = NULL;
 
         if (parser_match(parser, WL_PARSER_LEXER_TOK_DECL)) {
@@ -1322,6 +1398,8 @@ parse_program(wl_parser_t *parser)
             node = parse_output_directive(parser);
         } else if (parser_match(parser, WL_PARSER_LEXER_TOK_PRINTSIZE)) {
             node = parse_printsize_directive(parser);
+        } else if (parser_match(parser, WL_PARSER_LEXER_TOK_QUERY)) {
+            node = parse_query_directive(parser);
         } else if (parser_check(parser, WL_PARSER_LEXER_TOK_IDENT)) {
             /* Fact or rule: both start with identifier */
             node = parse_rule_or_fact(parser);
@@ -1352,7 +1430,7 @@ parse_program(wl_parser_t *parser)
 
 wl_parser_ast_node_t *
 wl_parser_parse_string(const char *source, char *error_buf,
-                       size_t error_buf_size)
+    size_t error_buf_size)
 {
     wl_parser_t parser;
     memset(&parser, 0, sizeof(parser));

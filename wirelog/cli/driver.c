@@ -73,7 +73,7 @@ wl_read_file(const char *path)
 
 void
 wl_print_tuple(const char *relation, const int64_t *row, uint32_t ncols,
-               FILE *out)
+    FILE *out)
 {
     fprintf(out, "%s(", relation);
     for (uint32_t i = 0; i < ncols; i++) {
@@ -123,7 +123,7 @@ find_relation(const wirelog_program_t *prog, const char *name)
 /* Write a single tuple as a CSV row to the given file */
 static void
 write_tuple_csv(FILE *f, const wl_ir_relation_info_t *rel,
-                const wl_intern_t *intern, const int64_t *row, uint32_t ncols)
+    const wl_intern_t *intern, const int64_t *row, uint32_t ncols)
 {
     for (uint32_t i = 0; i < ncols; i++) {
         if (i > 0)
@@ -146,7 +146,7 @@ write_tuple_csv(FILE *f, const wl_ir_relation_info_t *rel,
 /* Callback adapter: type-aware output with string reverse-mapping */
 static void
 print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
-               void *user_data)
+    void *user_data)
 {
     wl_output_ctx_t *ctx = (wl_output_ctx_t *)user_data;
     const wl_ir_relation_info_t *rel = NULL;
@@ -165,7 +165,7 @@ print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
                 && strcmp(ctx->output_files[i].relation, relation) == 0
                 && ctx->output_files[i].file) {
                 write_tuple_csv(ctx->output_files[i].file, rel, ctx->intern,
-                                row, ncols);
+                    row, ncols);
                 break;
             }
         }
@@ -214,14 +214,14 @@ print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
  */
 static int
 parse_watch_line(char *line, char *relation_out, size_t rel_buf_size,
-                 int64_t *values, uint32_t *ncols_out,
-                 const wl_ir_relation_info_t *rel_info, wl_intern_t *intern)
+    int64_t *values, uint32_t *ncols_out,
+    const wl_ir_relation_info_t *rel_info, wl_intern_t *intern)
 {
     /* Strip trailing newline/carriage-return */
     size_t len = strlen(line);
     while (len > 0
-           && (line[len - 1] == '\n' || line[len - 1] == '\r'
-               || line[len - 1] == ' ' || line[len - 1] == '\t'))
+        && (line[len - 1] == '\n' || line[len - 1] == '\r'
+        || line[len - 1] == ' ' || line[len - 1] == '\t'))
         line[--len] = '\0';
 
     if (len == 0 || line[0] == '#')
@@ -312,7 +312,7 @@ parse_watch_line(char *line, char *relation_out, size_t rel_buf_size,
 
 static void
 delta_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
-               int32_t diff, void *user_data)
+    int32_t diff, void *user_data)
 {
     wl_output_ctx_t *ctx = (wl_output_ctx_t *)user_data;
     const wl_ir_relation_info_t *rel = NULL;
@@ -342,7 +342,7 @@ delta_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
 
 int
 wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
-                bool watch_mode, uint32_t watch_interval_ms, FILE *out)
+    bool watch_mode, uint32_t watch_interval_ms, FILE *out)
 {
     if (!source || !out)
         return -1;
@@ -360,7 +360,8 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
     wl_fusion_apply(prog, NULL);
     wl_jpp_apply(prog, NULL);
     wl_sip_apply(prog, NULL);
-    wl_magic_sets_apply(prog, NULL);
+    wl_magic_sets_apply_with_demands(prog, prog->demands, prog->demand_count,
+        NULL);
 
     /* 2a. Rebuild relation IR and re-stratify after magic sets */
     if (prog->magic_sets_applied) {
@@ -441,8 +442,8 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
             output_files[fi].file = fopen(rel->output_file, "w");
             if (!output_files[fi].file) {
                 fprintf(stderr,
-                        "error: cannot open output file '%s' for '%s'\n",
-                        rel->output_file, rel->name);
+                    "error: cannot open output file '%s' for '%s'\n",
+                    rel->output_file, rel->name);
                 /* Close already-opened files and fail */
                 for (uint32_t j = 0; j < fi; j++) {
                     if (output_files[j].file)
@@ -493,7 +494,7 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
                 = find_relation(prog, relation);
 
             if (parse_watch_line(line, relation, sizeof(relation), values,
-                                 &ncols, rel_info, prog->intern)
+                &ncols, rel_info, prog->intern)
                 != 0)
                 continue;
 
@@ -503,7 +504,7 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
             rc = wl_session_insert(sess, relation, values, 1, ncols);
             if (rc != 0) {
                 fprintf(stderr, "error: insert failed for relation '%s'\n",
-                        relation);
+                    relation);
                 continue;
             }
 

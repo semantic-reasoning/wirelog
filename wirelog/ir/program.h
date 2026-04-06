@@ -15,6 +15,7 @@
 #include "ir.h"
 #include "../intern.h"
 #include "../wirelog-types.h"
+#include "../passes/magic_sets.h"
 
 /* Forward declaration for AST (used only in program struct) */
 struct wl_parser_ast_node;
@@ -90,6 +91,11 @@ struct wirelog_program {
     /* Magic Sets pass metadata */
     bool magic_sets_applied;       /* True after magic sets pass */
     uint32_t magic_relation_count; /* Number of magic relations added */
+
+    /* .query demands collected from parser */
+    wl_magic_demand_t *demands;
+    uint32_t demand_count;
+    uint32_t demand_capacity;
 };
 
 /* ======================================================================== */
@@ -103,11 +109,11 @@ wl_ir_program_free(struct wirelog_program *program);
 
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
-                               const wl_parser_ast_node_t *ast);
+    const wl_parser_ast_node_t *ast);
 
 int
 wl_ir_program_convert_rules(struct wirelog_program *program,
-                            const wl_parser_ast_node_t *ast);
+    const wl_parser_ast_node_t *ast);
 
 int
 wl_ir_program_merge_unions(struct wirelog_program *program);
@@ -125,7 +131,7 @@ wl_ir_program_build_default_stratum(struct wirelog_program *program);
  */
 int
 wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
-                                 uint32_t column_count);
+    uint32_t column_count);
 
 /**
  * wl_ir_program_add_magic_rule:
@@ -135,8 +141,8 @@ wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
  */
 int
 wl_ir_program_add_magic_rule(struct wirelog_program *prog,
-                             const char *head_relation,
-                             wirelog_ir_node_t *ir_root);
+    const char *head_relation,
+    wirelog_ir_node_t *ir_root);
 
 /**
  * wl_ir_program_rebuild_relation_irs:
