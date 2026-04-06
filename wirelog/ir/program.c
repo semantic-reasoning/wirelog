@@ -11,6 +11,7 @@
 
 #include "program.h"
 #include "../parser/ast.h"
+#include "../passes/magic_sets.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,6 +163,14 @@ wl_ir_program_free(struct wirelog_program *program)
     /* Free intern table */
     wl_intern_free(program->intern);
 
+    /* Free .query demands */
+    if (program->demands) {
+        for (uint32_t i = 0; i < program->demand_count; i++) {
+            free((char *)program->demands[i].relation_name);
+        }
+        free(program->demands);
+    }
+
     free(program);
 }
 
@@ -227,7 +236,7 @@ add_rule_placeholder(struct wirelog_program *prog, const char *head_name)
 
 static int
 collect_decl(struct wirelog_program *prog,
-             const wl_parser_ast_node_t *decl_node)
+    const wl_parser_ast_node_t *decl_node)
 {
     if (!decl_node->name)
         return -1;
@@ -271,7 +280,7 @@ collect_decl(struct wirelog_program *prog,
 
 static int
 collect_input(struct wirelog_program *prog,
-              const wl_parser_ast_node_t *input_node)
+    const wl_parser_ast_node_t *input_node)
 {
     if (!input_node->name)
         return -1;
@@ -316,7 +325,7 @@ collect_input(struct wirelog_program *prog,
 
 static int
 collect_output(struct wirelog_program *prog,
-               const wl_parser_ast_node_t *output_node)
+    const wl_parser_ast_node_t *output_node)
 {
     if (!output_node->name)
         return -1;
@@ -346,7 +355,7 @@ collect_output(struct wirelog_program *prog,
 
 static int
 collect_printsize(struct wirelog_program *prog,
-                  const wl_parser_ast_node_t *ps_node)
+    const wl_parser_ast_node_t *ps_node)
 {
     if (!ps_node->name)
         return -1;
@@ -363,8 +372,34 @@ collect_printsize(struct wirelog_program *prog,
 }
 
 static int
+collect_query(struct wirelog_program *prog,
+    const wl_parser_ast_node_t *query_node)
+{
+    if (!query_node->name)
+        return -1;
+
+    if (prog->demand_count >= prog->demand_capacity) {
+        uint32_t new_cap = prog->demand_capacity == 0
+                               ? INITIAL_CAPACITY
+                               : prog->demand_capacity * 2;
+        wl_magic_demand_t *new_demands = (wl_magic_demand_t *)realloc(
+            prog->demands, new_cap * sizeof(wl_magic_demand_t));
+        if (!new_demands)
+            return -1;
+        prog->demands = new_demands;
+        prog->demand_capacity = new_cap;
+    }
+
+    wl_magic_demand_t *d = &prog->demands[prog->demand_count++];
+    d->relation_name = strdup_safe(query_node->name);
+    d->bound_mask = (uint64_t)query_node->int_value;
+    d->arity = 0; /* auto-detect from program */
+    return 0;
+}
+
+static int
 collect_rule(struct wirelog_program *prog,
-             const wl_parser_ast_node_t *rule_node)
+    const wl_parser_ast_node_t *rule_node)
 {
     /* rule_node: children[0] = HEAD, children[1..] = body */
     if (rule_node->child_count < 1)
@@ -390,7 +425,7 @@ collect_rule(struct wirelog_program *prog,
 
 static int
 collect_fact(struct wirelog_program *prog,
-             const wl_parser_ast_node_t *fact_node)
+    const wl_parser_ast_node_t *fact_node)
 {
     if (!fact_node->name)
         return -1;
@@ -437,7 +472,7 @@ collect_fact(struct wirelog_program *prog,
 
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
-                               const wl_parser_ast_node_t *ast)
+    const wl_parser_ast_node_t *ast)
 {
     if (!program || !ast || ast->type != WL_PARSER_AST_NODE_PROGRAM)
         return -1;
@@ -458,6 +493,9 @@ wl_ir_program_collect_metadata(struct wirelog_program *program,
             break;
         case WL_PARSER_AST_NODE_PRINTSIZE:
             rc = collect_printsize(program, child);
+            break;
+        case WL_PARSER_AST_NODE_QUERY:
+            rc = collect_query(program, child);
             break;
         case WL_PARSER_AST_NODE_RULE:
             rc = collect_rule(program, child);
@@ -491,7 +529,7 @@ wl_ir_program_build_schemas(struct wirelog_program *program)
     free(program->schemas);
 
     program->schemas = (wirelog_schema_t *)calloc(program->relation_count,
-                                                  sizeof(wirelog_schema_t));
+            sizeof(wirelog_schema_t));
     if (!program->schemas)
         return;
 
@@ -626,7 +664,7 @@ free_var_names(char **names, uint32_t count)
 
 static char **
 merge_var_names(char **left, uint32_t left_count, char **right,
-                uint32_t right_count, uint32_t *out_count)
+    uint32_t right_count, uint32_t *out_count)
 {
     uint32_t max_count = left_count + right_count;
     char **merged
@@ -674,7 +712,7 @@ merge_var_names(char **left, uint32_t left_count, char **right,
 
 static void
 setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
-                uint32_t right_count, wirelog_ir_node_t *join)
+    uint32_t right_count, wirelog_ir_node_t *join)
 {
     /* Count shared variables (exclude NULL = wildcard/constant) */
     uint32_t key_count = 0;
@@ -721,7 +759,7 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
 
 static wirelog_ir_node_t *
 build_atom_scan(const wl_parser_ast_node_t *atom, char ***out_var_names,
-                uint32_t *out_var_count)
+    uint32_t *out_var_count)
 {
     wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
     if (!scan)
@@ -878,7 +916,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
         const wl_parser_ast_node_t *b = rule_node->children[i];
         if (b->type == WL_PARSER_AST_NODE_ATOM) {
             scans[scan_count] = build_atom_scan(b, &scan_vars[scan_count],
-                                                &scan_vcounts[scan_count]);
+                    &scan_vcounts[scan_count]);
             scan_count++;
         }
     }
@@ -905,14 +943,14 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
                 break;
 
             setup_join_keys(cur_vars, cur_vcount, scan_vars[i], scan_vcounts[i],
-                            join);
+                join);
 
             wl_ir_node_add_child(join, current);
             wl_ir_node_add_child(join, scans[i]);
 
             uint32_t merged_count;
             char **merged = merge_var_names(cur_vars, cur_vcount, scan_vars[i],
-                                            scan_vcounts[i], &merged_count);
+                    scan_vcounts[i], &merged_count);
             if (cur_vars_is_merged) {
                 free_var_names(cur_vars, cur_vcount);
             }
@@ -970,7 +1008,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
                 wirelog_ir_node_t *aj = wl_ir_node_create(WIRELOG_IR_ANTIJOIN);
                 if (aj) {
                     setup_join_keys(cur_vars, cur_vcount, neg_vars, neg_vcount,
-                                    aj);
+                        aj);
                     wl_ir_node_add_child(aj, current);
                     wl_ir_node_add_child(aj, neg_scan);
                     current = aj;
@@ -1081,7 +1119,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
 
 int
 wl_ir_program_convert_rules(struct wirelog_program *program,
-                            const wl_parser_ast_node_t *ast)
+    const wl_parser_ast_node_t *ast)
 {
     if (!program || !ast || ast->type != WL_PARSER_AST_NODE_PROGRAM)
         return -1;
@@ -1174,7 +1212,7 @@ wl_ir_program_merge_unions(struct wirelog_program *program)
 
 int
 wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
-                                 uint32_t column_count)
+    uint32_t column_count)
 {
     if (!prog || !name)
         return -1;
@@ -1188,13 +1226,13 @@ wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
         return -1;
 
     /* Keep relation_irs in sync with relation_count so wl_ir_program_free
-     * doesn't walk past the end of the array.  The new entry is NULL; it
-     * will be filled in by the subsequent wl_ir_program_rebuild_relation_irs
-     * call.  If realloc fails, NULL out relation_irs so free() is safe. */
+    * doesn't walk past the end of the array.  The new entry is NULL; it
+    * will be filled in by the subsequent wl_ir_program_rebuild_relation_irs
+    * call.  If realloc fails, NULL out relation_irs so free() is safe. */
     if (prog->relation_irs) {
         void *new_irs_v
             = realloc((void *)prog->relation_irs,
-                      prog->relation_count * sizeof(wirelog_ir_node_t *));
+                prog->relation_count * sizeof(wirelog_ir_node_t *));
         if (new_irs_v) {
             prog->relation_irs = (wirelog_ir_node_t **)new_irs_v;
             prog->relation_irs[prog->relation_count - 1] = NULL;
@@ -1206,7 +1244,7 @@ wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
 
     if (column_count > 0) {
         rel->columns = (wirelog_column_t *)calloc(column_count,
-                                                  sizeof(wirelog_column_t));
+                sizeof(wirelog_column_t));
         if (!rel->columns)
             return -1;
         rel->column_count = column_count;
@@ -1223,8 +1261,8 @@ wl_ir_program_add_magic_relation(struct wirelog_program *prog, const char *name,
 
 int
 wl_ir_program_add_magic_rule(struct wirelog_program *prog,
-                             const char *head_relation,
-                             wirelog_ir_node_t *ir_root)
+    const char *head_relation,
+    wirelog_ir_node_t *ir_root)
 {
     if (!prog || !head_relation || !ir_root)
         return -1;

@@ -171,7 +171,7 @@ scan_integer(wl_parser_lexer_t *lexer)
 
 static bool
 check_keyword(const char *start, uint32_t length, const char *keyword,
-              size_t kw_len)
+    size_t kw_len)
 {
     return length == (uint32_t)kw_len && memcmp(start, keyword, kw_len) == 0;
 }
@@ -267,7 +267,7 @@ scan_identifier(wl_parser_lexer_t *lexer)
 {
     /* First char already consumed (alpha or _alpha) */
     while (!is_at_end(lexer)
-           && (isalnum((unsigned char)peek(lexer)) || peek(lexer) == '_')) {
+        && (isalnum((unsigned char)peek(lexer)) || peek(lexer) == '_')) {
         advance(lexer);
     }
 
@@ -301,6 +301,8 @@ scan_directive(wl_parser_lexer_t *lexer)
         return make_token(lexer, WL_PARSER_LEXER_TOK_PRINTSIZE);
     if (length == 5 && memcmp(start, ".plan", 5) == 0)
         return make_token(lexer, WL_PARSER_LEXER_TOK_PLAN);
+    if (length == 6 && memcmp(start, ".query", 6) == 0)
+        return make_token(lexer, WL_PARSER_LEXER_TOK_QUERY);
 
     /* Not a known directive: back up to just after the dot,
      * return DOT token */
@@ -563,6 +565,8 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "PRINTSIZE";
     case WL_PARSER_LEXER_TOK_PLAN:
         return "PLAN";
+    case WL_PARSER_LEXER_TOK_QUERY:
+        return "QUERY";
     case WL_PARSER_LEXER_TOK_EOF:
         return "EOF";
     case WL_PARSER_LEXER_TOK_ERROR:

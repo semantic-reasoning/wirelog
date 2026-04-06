@@ -105,6 +105,7 @@ typedef enum {
     WL_PARSER_LEXER_TOK_OUTPUT,    /* .output */
     WL_PARSER_LEXER_TOK_PRINTSIZE, /* .printsize */
     WL_PARSER_LEXER_TOK_PLAN,      /* .plan */
+    WL_PARSER_LEXER_TOK_QUERY,     /* .query */
 
     /* Special */
     WL_PARSER_LEXER_TOK_EOF,   /* end of input */
