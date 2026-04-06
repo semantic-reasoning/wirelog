@@ -99,6 +99,21 @@ typedef enum {
     WL_PARSER_LEXER_TOK_UUID4, /* uuid4 */
     WL_PARSER_LEXER_TOK_UUID5, /* uuid5 */
 
+    /* String function keywords */
+    WL_PARSER_LEXER_TOK_STRLEN,      /* strlen */
+    WL_PARSER_LEXER_TOK_CAT,         /* cat */
+    WL_PARSER_LEXER_TOK_SUBSTR,      /* substr */
+    WL_PARSER_LEXER_TOK_CONTAINS,    /* contains */
+    WL_PARSER_LEXER_TOK_STR_PREFIX,  /* str_prefix */
+    WL_PARSER_LEXER_TOK_STR_SUFFIX,  /* str_suffix */
+    WL_PARSER_LEXER_TOK_STR_ORD,     /* str_ord */
+    WL_PARSER_LEXER_TOK_TO_UPPER,    /* to_upper */
+    WL_PARSER_LEXER_TOK_TO_LOWER,    /* to_lower */
+    WL_PARSER_LEXER_TOK_STR_REPLACE, /* str_replace */
+    WL_PARSER_LEXER_TOK_TRIM,        /* trim */
+    WL_PARSER_LEXER_TOK_TO_STRING,   /* to_string */
+    WL_PARSER_LEXER_TOK_TO_NUMBER,   /* to_number */
+
     /* Directives (dot-prefixed keywords) */
     WL_PARSER_LEXER_TOK_DECL,      /* .decl */
     WL_PARSER_LEXER_TOK_INPUT,     /* .input */

@@ -85,6 +85,26 @@ typedef enum {
 } wirelog_agg_fn_t;
 
 /* ======================================================================== */
+/* String Functions                                                         */
+/* ======================================================================== */
+
+typedef enum {
+    WL_STR_FN_STRLEN,      /* strlen(s) - byte length */
+    WL_STR_FN_CAT,         /* cat(s1, s2) - concatenation */
+    WL_STR_FN_SUBSTR,      /* substr(s, start, len) - substring */
+    WL_STR_FN_CONTAINS,    /* contains(s, needle) - substring test */
+    WL_STR_FN_STR_PREFIX,  /* str_prefix(s, prefix) - prefix test */
+    WL_STR_FN_STR_SUFFIX,  /* str_suffix(s, suffix) - suffix test */
+    WL_STR_FN_STR_ORD,     /* str_ord(s) - first code point ordinal */
+    WL_STR_FN_TO_UPPER,    /* to_upper(s) - ASCII upper-case */
+    WL_STR_FN_TO_LOWER,    /* to_lower(s) - ASCII lower-case */
+    WL_STR_FN_STR_REPLACE, /* str_replace(s, from, to) - replace all */
+    WL_STR_FN_TRIM,        /* trim(s) - strip leading/trailing whitespace */
+    WL_STR_FN_TO_STRING,   /* to_string(x) - numeric to string */
+    WL_STR_FN_TO_NUMBER,   /* to_number(s) - string to numeric */
+} wirelog_str_fn_t;
+
+/* ======================================================================== */
 /* Operator String Conversion                                               */
 /* ======================================================================== */
 

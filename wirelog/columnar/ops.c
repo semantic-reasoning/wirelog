@@ -22,6 +22,8 @@
 #include "columnar/lftj.h"
 
 #include "../wirelog-internal.h"
+#include "../intern.h"
+#include "../string_ops.h"
 
 #include <xxhash.h>
 
@@ -86,7 +88,7 @@ filt_pop(filt_stack_t *s)
  */
 static int
 col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
-    uint32_t ncols, int64_t *out_val)
+    uint32_t ncols, int64_t *out_val, wl_intern_t *intern)
 {
     filt_stack_t s;
     s.top = 0;
@@ -141,8 +143,21 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             uint16_t slen;
             memcpy(&slen, buf + i, 2);
             i += 2;
-            i += slen; /* skip string data, push 0 placeholder */
-            filt_push(&s, 0);
+            if (i + slen > size)
+                goto bad;
+            if (intern) {
+                char *tmp = (char *)malloc((size_t)slen + 1);
+                if (!tmp)
+                    goto bad;
+                memcpy(tmp, buf + i, slen);
+                tmp[slen] = '\0';
+                int64_t id = wl_intern_put(intern, tmp);
+                free(tmp);
+                filt_push(&s, id);
+            } else {
+                filt_push(&s, 0);
+            }
+            i += slen;
             break;
         }
 
@@ -451,6 +466,122 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         case WL_PLAN_EXPR_AGG_MAX:
             break;
 
+        /* String functions: operands are intern IDs (int64_t on stack) */
+        case WL_PLAN_EXPR_STR_FN_STRLEN: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_strlen(a, intern) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_CAT: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_cat(a, b, intern) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_SUBSTR: {
+            int64_t c = filt_pop(&s), b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_substr(a, b, c, intern) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_CONTAINS: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s,
+                intern ? (string_ops_contains(a, b, intern) ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_STR_PREFIX: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s,
+                intern ? (string_ops_str_prefix(a, b, intern) ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_STR_SUFFIX: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s,
+                intern ? (string_ops_str_suffix(a, b, intern) ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_STR_ORD: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_str_ord(a, intern) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_TO_UPPER: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_to_upper(a, intern) : a);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_TO_LOWER: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_to_lower(a, intern) : a);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_STR_REPLACE: {
+            int64_t c = filt_pop(&s), b = filt_pop(&s), a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_str_replace(a, b, c, intern) : a);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_TRIM: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_trim(a, intern) : a);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_TO_STRING: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_to_string(a, intern) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_TO_NUMBER: {
+            int64_t a = filt_pop(&s);
+            filt_push(&s, intern ? string_ops_to_number(a, intern) : 0);
+            break;
+        }
+
+        /* String comparisons: intern IDs → strcmp-based bool */
+        case WL_PLAN_EXPR_CMP_STR_EQ: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s,
+                (sa && sb) ? (strcmp(sa, sb) == 0 ? 1 : 0) : (a == b ? 1 : 0));
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_NEQ: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s,
+                (sa && sb) ? (strcmp(sa, sb) != 0 ? 1 : 0) : (a != b ? 1 : 0));
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_LT: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) < 0 ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_GT: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) > 0 ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_LTE: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) <= 0 ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_GTE: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) >= 0 ? 1 : 0) : 0);
+            break;
+        }
+
         default:
             goto bad;
         }
@@ -471,10 +602,10 @@ bad:
  */
 static int
 col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
-    uint32_t ncols)
+    uint32_t ncols, wl_intern_t *intern)
 {
     int64_t val;
-    int err = col_eval_expr_run(buf, size, row, ncols, &val);
+    int err = col_eval_expr_run(buf, size, row, ncols, &val, intern);
     return err ? 1 : (val != 0 ? 1 : 0); /* on error: pass row through */
 }
 
@@ -486,10 +617,10 @@ col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
  */
 static int64_t
 col_eval_expr_i64(const uint8_t *buf, uint32_t size, const int64_t *row,
-    uint32_t ncols)
+    uint32_t ncols, wl_intern_t *intern)
 {
     int64_t val;
-    col_eval_expr_run(buf, size, row, ncols, &val);
+    col_eval_expr_run(buf, size, row, ncols, &val, intern);
     return val;
 }
 
@@ -985,7 +1116,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 } else {
                     tmp[c] = col_eval_expr_i64(op->map_exprs[c].data,
                             op->map_exprs[c].size, row,
-                            e.rel->ncols);
+                            e.rel->ncols, sess->intern);
                 }
             } else {
                 uint32_t src = op->project_indices ? op->project_indices[c] : c;
@@ -1488,7 +1619,8 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
                        ? (val != 0 ? 1 : 0)
                        : 1; /* on error: pass row through */
         } else {
-            pass = col_eval_filter_row(buf, bsz, row, e.rel->ncols);
+            pass = col_eval_filter_row(buf, bsz, row, e.rel->ncols,
+                    sess->intern);
         }
         if (pass) {
             int rc = col_rel_append_row(out, row);
@@ -1788,7 +1920,7 @@ keys_match_neon(const int64_t *lrow, const uint32_t *lk, const int64_t *rrow,
  */
 static int
 fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
-    col_rel_t *out)
+    col_rel_t *out, wl_intern_t *intern)
 {
     /* Fast path: simple colA CMP CONST or colA CMP colB predicate */
     simple_filter_cmp_t cmp;
@@ -1817,7 +1949,8 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
                        : 0; /* fail-closed: reject row on eval error */
         } else {
             int64_t val = 0;
-            int err = col_eval_expr_run(buf, bsz, row_buf, rel->ncols, &val);
+            int err = col_eval_expr_run(buf, bsz, row_buf, rel->ncols, &val,
+                    intern);
             pass = (err == 0) ? (val != 0 ? 1 : 0) : 0; /* fail-closed */
         }
         if (pass && col_rel_append_row(out, row_buf) != 0) {
@@ -1837,13 +1970,13 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
  */
 static col_rel_t *
 apply_right_filter(const wl_plan_expr_buffer_t *fexpr, col_rel_t *rel,
-    delta_pool_t *pool)
+    delta_pool_t *pool, wl_intern_t *intern)
 {
     col_rel_t *out = col_rel_pool_new_like(pool, "$rfilter", rel);
     if (!out)
         return NULL;
 
-    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out) != 0) {
+    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out, intern) != 0) {
         col_rel_destroy(out);
         return NULL;
     }
@@ -1911,7 +2044,7 @@ apply_right_filter_cached(wl_col_session_t *sess,
         if (!sess->filt_cache[i].filtered)
             return NULL;
         if (fill_filtered_rel(fexpr->data, fexpr->size, rel,
-            sess->filt_cache[i].filtered) != 0) {
+            sess->filt_cache[i].filtered, sess->intern) != 0) {
             col_rel_destroy(sess->filt_cache[i].filtered);
             sess->filt_cache[i].filtered = NULL;
             return NULL;
@@ -1957,7 +2090,8 @@ apply_right_filter_cached(wl_col_session_t *sess,
 
     /* Fill the new entry */
     col_rel_t *out = sess->filt_cache[idx].filtered;
-    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out) != 0) {
+    if (fill_filtered_rel(fexpr->data, fexpr->size, rel, out,
+        sess->intern) != 0) {
         col_rel_destroy(out);
         sess->filt_cache[idx].filtered = NULL;
         /* Leave the entry in cache with NULL filtered; harmless on next lookup */
@@ -2066,7 +2200,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     } else if (op->right_filter_expr.size > 0) {
         /* Delta path or no relation name: fall back to pool-allocated filter */
         col_rel_t *filtered = apply_right_filter(&op->right_filter_expr, right,
-                sess->delta_pool);
+                sess->delta_pool, sess->intern);
         if (!filtered) {
             if (left_e.owned)
                 col_rel_destroy(left_e.rel);
@@ -2579,7 +2713,7 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,
-                sess->delta_pool);
+                sess->delta_pool, sess->intern);
         if (!filtered) {
             if (left_e.owned)
                 col_rel_destroy(left_e.rel);
@@ -4865,7 +4999,7 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
     if (op->right_filter_expr.size > 0) {
         col_rel_t *filtered
             = apply_right_filter(&op->right_filter_expr, right,
-                sess->delta_pool);
+                sess->delta_pool, sess->intern);
         if (!filtered) {
             if (left_e.owned)
                 col_rel_destroy(left_e.rel);
@@ -5460,7 +5594,7 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     } else if (op->right_filter_expr.size > 0) {
         /* Delta path or no relation name: fall back to pool-allocated filter */
         col_rel_t *filtered = apply_right_filter(&op->right_filter_expr, right,
-                sess->delta_pool);
+                sess->delta_pool, sess->intern);
         if (!filtered) {
             if (left_e.owned)
                 col_rel_destroy(left_e.rel);

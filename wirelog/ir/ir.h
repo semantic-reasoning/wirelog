@@ -31,6 +31,7 @@ typedef enum {
     WL_IR_EXPR_CMP,       /* comparison (=,!=,<,>,<=,>=) */
     WL_IR_EXPR_AGG,       /* aggregate function */
     WL_IR_EXPR_BOOL,      /* boolean literal */
+    WL_IR_EXPR_STR_FN,    /* string function (strlen, cat, substr, ...) */
 } wl_ir_expr_type_t;
 
 typedef struct wl_ir_expr wl_ir_expr_t;
@@ -47,6 +48,7 @@ struct wl_ir_expr {
     wirelog_arith_op_t arith_op; /* WL_IR_EXPR_ARITH */
     wirelog_cmp_op_t cmp_op;     /* WL_IR_EXPR_CMP */
     wirelog_agg_fn_t agg_fn;     /* WL_IR_EXPR_AGG */
+    wirelog_str_fn_t str_fn;     /* WL_IR_EXPR_STR_FN */
 
     /* Children (binary ops have 2, aggregate has 1) */
     wl_ir_expr_t **children;
@@ -69,7 +71,7 @@ struct wirelog_ir_node {
     uint32_t *project_indices; /* PROJECT: column index mapping */
     uint32_t project_count;    /* PROJECT: number of projected columns */
     wl_ir_expr_t *
-        *project_exprs; /* PROJECT: expressions (for computed columns) */
+    *project_exprs;     /* PROJECT: expressions (for computed columns) */
 
     wl_ir_expr_t *filter_expr; /* FILTER: predicate expression */
 

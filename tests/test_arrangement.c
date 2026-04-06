@@ -102,13 +102,14 @@ typedef struct {
 } test_col_rel_mirror_t;
 
 /*
- * Mirror of wl_col_session_t (first 7 fields only).
- * Full definition is in columnar_nanoarrow.c:670-690.
+ * Mirror of wl_col_session_t (first 8 fields only).
+ * Full definition is in columnar/internal.h.
  *
  * Memory layout (x86-64):
  *   wl_session_t   base          (sizeof(wl_session_t) bytes, offset 0)
  *   const void    *frontier_ops  (8 bytes, Issue #261)
  *   const void    *plan          (8 bytes)
+ *   void          *intern        (8 bytes, Issue #143)
  *   col_rel_t    **rels          (8 bytes)
  *   uint32_t       nrels         (4 bytes)
  *   uint32_t       rel_cap       (4 bytes)
@@ -117,6 +118,7 @@ typedef struct {
     wl_session_t base;
     const void *frontier_ops;
     const void *plan;
+    const void *intern;            /* wl_intern_t *, added Issue #143 */
     test_col_rel_mirror_t **rels;
     uint32_t nrels;
     uint32_t rel_cap;

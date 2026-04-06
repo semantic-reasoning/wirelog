@@ -203,6 +203,28 @@ arith_to_tag(wirelog_arith_op_t op)
     return WL_PLAN_EXPR_ARITH_ADD; /* fallback */
 }
 
+/* Map IR string function -> plan expr tag */
+static uint8_t
+str_fn_to_tag(wirelog_str_fn_t fn)
+{
+    switch (fn) {
+    case WL_STR_FN_STRLEN:      return WL_PLAN_EXPR_STR_FN_STRLEN;
+    case WL_STR_FN_CAT:         return WL_PLAN_EXPR_STR_FN_CAT;
+    case WL_STR_FN_SUBSTR:      return WL_PLAN_EXPR_STR_FN_SUBSTR;
+    case WL_STR_FN_CONTAINS:    return WL_PLAN_EXPR_STR_FN_CONTAINS;
+    case WL_STR_FN_STR_PREFIX:  return WL_PLAN_EXPR_STR_FN_STR_PREFIX;
+    case WL_STR_FN_STR_SUFFIX:  return WL_PLAN_EXPR_STR_FN_STR_SUFFIX;
+    case WL_STR_FN_STR_ORD:     return WL_PLAN_EXPR_STR_FN_STR_ORD;
+    case WL_STR_FN_TO_UPPER:    return WL_PLAN_EXPR_STR_FN_TO_UPPER;
+    case WL_STR_FN_TO_LOWER:    return WL_PLAN_EXPR_STR_FN_TO_LOWER;
+    case WL_STR_FN_STR_REPLACE: return WL_PLAN_EXPR_STR_FN_STR_REPLACE;
+    case WL_STR_FN_TRIM:        return WL_PLAN_EXPR_STR_FN_TRIM;
+    case WL_STR_FN_TO_STRING:   return WL_PLAN_EXPR_STR_FN_TO_STRING;
+    case WL_STR_FN_TO_NUMBER:   return WL_PLAN_EXPR_STR_FN_TO_NUMBER;
+    }
+    return WL_PLAN_EXPR_STR_FN_STRLEN; /* fallback */
+}
+
 /* Map IR cmp op -> plan expr tag */
 static uint8_t
 cmp_to_tag(wirelog_cmp_op_t op)
@@ -326,6 +348,15 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
                 return -1;
         }
         return expr_buf_push_u8(buf, agg_to_tag(expr->agg_fn));
+
+    case WL_IR_EXPR_STR_FN:
+        /* Serialize arguments first (postfix), then emit the function opcode */
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+            if (serialize_expr(buf, expr->children[i], col_names, col_count)
+                != 0)
+                return -1;
+        }
+        return expr_buf_push_u8(buf, str_fn_to_tag(expr->str_fn));
     }
 
     return -1; /* unknown type */
@@ -2309,6 +2340,8 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
     wl_plan_t *plan = (wl_plan_t *)calloc(1, sizeof(wl_plan_t));
     if (!plan)
         return -1;
+
+    plan->intern = prog->intern;
 
     /* ----------------------------------------------------------------
      * Build EDB relation list (relations with no rules / only facts)

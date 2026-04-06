@@ -644,6 +644,20 @@ convert_expr(const wl_parser_ast_node_t *node)
             e->bool_value = node->bool_value;
         return e;
     }
+    case WL_PARSER_AST_NODE_STR_FUNCTION: {
+        wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_STR_FN);
+        if (!e)
+            return NULL;
+        e->str_fn = node->str_fn;
+        for (uint32_t ci = 0; ci < node->child_count; ci++) {
+            wl_ir_expr_t *child = convert_expr(node->children[ci]);
+            if (!child) {
+                wl_ir_expr_free(e); return NULL;
+            }
+            wl_ir_expr_add_child(e, child);
+        }
+        return e;
+    }
     default:
         return NULL;
     }
@@ -986,6 +1000,14 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
                 current = f;
             }
             /* Boolean True -> no-op */
+        } else if (b->type == WL_PARSER_AST_NODE_STR_FUNCTION && current) {
+            /* Standalone string predicate: contains(x, y), str_prefix(x, y), etc. */
+            wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
+            if (!f)
+                continue;
+            f->filter_expr = convert_expr(b);
+            wl_ir_node_add_child(f, current);
+            current = f;
         }
     }
 

@@ -142,6 +142,29 @@ typedef enum {
     WL_PLAN_EXPR_AGG_SUM = 0x31,
     WL_PLAN_EXPR_AGG_MIN = 0x32,
     WL_PLAN_EXPR_AGG_MAX = 0x33,
+
+    /* String function operators (operands are intern IDs as int64_t) */
+    WL_PLAN_EXPR_STR_FN_STRLEN     = 0x40, /* unary:   pop 1 push 1 */
+    WL_PLAN_EXPR_STR_FN_CAT        = 0x41, /* binary:  pop 2 push 1 */
+    WL_PLAN_EXPR_STR_FN_SUBSTR     = 0x42, /* ternary: pop 3 push 1 */
+    WL_PLAN_EXPR_STR_FN_CONTAINS   = 0x43, /* binary:  pop 2 push bool */
+    WL_PLAN_EXPR_STR_FN_STR_PREFIX = 0x44, /* binary:  pop 2 push bool */
+    WL_PLAN_EXPR_STR_FN_STR_SUFFIX = 0x45, /* binary:  pop 2 push bool */
+    WL_PLAN_EXPR_STR_FN_STR_ORD    = 0x46, /* unary:   pop 1 push 1 */
+    WL_PLAN_EXPR_STR_FN_TO_UPPER   = 0x47, /* unary:   pop 1 push 1 */
+    WL_PLAN_EXPR_STR_FN_TO_LOWER   = 0x48, /* unary:   pop 1 push 1 */
+    WL_PLAN_EXPR_STR_FN_STR_REPLACE= 0x49, /* ternary: pop 3 push 1 */
+    WL_PLAN_EXPR_STR_FN_TRIM       = 0x4A, /* unary:   pop 1 push 1 */
+    WL_PLAN_EXPR_STR_FN_TO_STRING  = 0x4B, /* unary:   pop 1 push 1 */
+    WL_PLAN_EXPR_STR_FN_TO_NUMBER  = 0x4C, /* unary:   pop 1 push 1 */
+
+    /* String comparison operators (intern IDs → bool, via strcmp) */
+    WL_PLAN_EXPR_CMP_STR_EQ  = 0x50, /* binary: pop 2 push bool */
+    WL_PLAN_EXPR_CMP_STR_NEQ = 0x51,
+    WL_PLAN_EXPR_CMP_STR_LT  = 0x52,
+    WL_PLAN_EXPR_CMP_STR_GT  = 0x53,
+    WL_PLAN_EXPR_CMP_STR_LTE = 0x54,
+    WL_PLAN_EXPR_CMP_STR_GTE = 0x55,
 } wl_plan_expr_tag_t;
 
 /**
@@ -375,6 +398,7 @@ typedef struct {
     uint32_t stratum_count;
     const char *const *edb_relations;
     uint32_t edb_count;
+    struct wl_intern *intern; /* borrowed from program; lifetime >= plan */
 } wl_plan_t;
 
 #endif /* WL_EXEC_PLAN_H */

@@ -23,6 +23,7 @@
 #include "columnar/mem_ledger.h"
 #include "columnar/progress.h"
 #include "session.h"
+#include "intern.h"
 #include "util/lockfree_queue.h"
 #include "workqueue.h"
 #include "arena/arena.h"
@@ -642,6 +643,7 @@ typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     const col_frontier_ops_t *frontier_ops; /* frontier vtable (#261)   */
     const wl_plan_t *plan;     /* borrowed, lifetime: caller             */
+    wl_intern_t *intern;       /* borrowed, lifetime: caller (prog)      */
     col_rel_t **rels;          /* owned array of owned col_rel_t*        */
     uint32_t nrels;            /* current number of registered relations */
     uint32_t rel_cap;          /* allocated capacity of rels[]           */

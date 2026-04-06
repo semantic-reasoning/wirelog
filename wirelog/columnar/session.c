@@ -426,6 +426,7 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
 
     sess->frontier_ops = &col_frontier_epoch_ops;
     sess->plan = plan;
+    sess->intern = plan->intern;
     sess->num_workers = num_workers > 0 ? num_workers : 1;
 
     /*

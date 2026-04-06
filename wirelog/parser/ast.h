@@ -58,6 +58,7 @@ typedef enum {
 
     /* Expressions */
     WL_PARSER_AST_NODE_BINARY_EXPR, /* arith_op, children[0]=left, children[1]=right */
+    WL_PARSER_AST_NODE_STR_FUNCTION, /* str_fn, children = arguments */
 
     /* Inline facts */
     WL_PARSER_AST_NODE_FACT, /* name=relation, children=constant args */
@@ -91,10 +92,11 @@ struct wl_parser_ast_node {
     bool bool_value;   /* Boolean predicate value */
     bool is_planning;  /* .plan optimization marker (rules only) */
 
-    /* Operator (for comparisons, arithmetic, aggregates) */
+    /* Operator (for comparisons, arithmetic, aggregates, string functions) */
     wirelog_cmp_op_t cmp_op;
     wirelog_arith_op_t arith_op;
     wirelog_agg_fn_t agg_fn;
+    wirelog_str_fn_t str_fn;
 
     /* Type name for typed parameters (int32, int64, string) */
     char *type_name;

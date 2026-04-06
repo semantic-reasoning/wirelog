@@ -257,6 +257,34 @@ identifier_type(const char *start, uint32_t length)
     if (IS_KW("uuid5"))
         return WL_PARSER_LEXER_TOK_UUID5;
 
+    /* String function keywords */
+    if (IS_KW("strlen"))
+        return WL_PARSER_LEXER_TOK_STRLEN;
+    if (IS_KW("cat"))
+        return WL_PARSER_LEXER_TOK_CAT;
+    if (IS_KW("substr"))
+        return WL_PARSER_LEXER_TOK_SUBSTR;
+    if (IS_KW("contains"))
+        return WL_PARSER_LEXER_TOK_CONTAINS;
+    if (IS_KW("str_prefix"))
+        return WL_PARSER_LEXER_TOK_STR_PREFIX;
+    if (IS_KW("str_suffix"))
+        return WL_PARSER_LEXER_TOK_STR_SUFFIX;
+    if (IS_KW("str_ord"))
+        return WL_PARSER_LEXER_TOK_STR_ORD;
+    if (IS_KW("to_upper"))
+        return WL_PARSER_LEXER_TOK_TO_UPPER;
+    if (IS_KW("to_lower"))
+        return WL_PARSER_LEXER_TOK_TO_LOWER;
+    if (IS_KW("str_replace"))
+        return WL_PARSER_LEXER_TOK_STR_REPLACE;
+    if (IS_KW("trim"))
+        return WL_PARSER_LEXER_TOK_TRIM;
+    if (IS_KW("to_string"))
+        return WL_PARSER_LEXER_TOK_TO_STRING;
+    if (IS_KW("to_number"))
+        return WL_PARSER_LEXER_TOK_TO_NUMBER;
+
     return WL_PARSER_LEXER_TOK_IDENT;
 }
 
@@ -555,6 +583,32 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "UUID4";
     case WL_PARSER_LEXER_TOK_UUID5:
         return "UUID5";
+    case WL_PARSER_LEXER_TOK_STRLEN:
+        return "STRLEN";
+    case WL_PARSER_LEXER_TOK_CAT:
+        return "CAT";
+    case WL_PARSER_LEXER_TOK_SUBSTR:
+        return "SUBSTR";
+    case WL_PARSER_LEXER_TOK_CONTAINS:
+        return "CONTAINS";
+    case WL_PARSER_LEXER_TOK_STR_PREFIX:
+        return "STR_PREFIX";
+    case WL_PARSER_LEXER_TOK_STR_SUFFIX:
+        return "STR_SUFFIX";
+    case WL_PARSER_LEXER_TOK_STR_ORD:
+        return "STR_ORD";
+    case WL_PARSER_LEXER_TOK_TO_UPPER:
+        return "TO_UPPER";
+    case WL_PARSER_LEXER_TOK_TO_LOWER:
+        return "TO_LOWER";
+    case WL_PARSER_LEXER_TOK_STR_REPLACE:
+        return "STR_REPLACE";
+    case WL_PARSER_LEXER_TOK_TRIM:
+        return "TRIM";
+    case WL_PARSER_LEXER_TOK_TO_STRING:
+        return "TO_STRING";
+    case WL_PARSER_LEXER_TOK_TO_NUMBER:
+        return "TO_NUMBER";
     case WL_PARSER_LEXER_TOK_DECL:
         return "DECL";
     case WL_PARSER_LEXER_TOK_INPUT:

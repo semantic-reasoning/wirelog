@@ -161,6 +161,96 @@ static wl_parser_ast_node_t *
 parse_arithmetic_expr(wl_parser_t *parser);
 
 /* ======================================================================== */
+/* String Function Helpers                                                  */
+/* ======================================================================== */
+
+static wirelog_str_fn_t
+token_to_str_fn(wl_parser_lexer_token_type_t type)
+{
+    switch (type) {
+    case WL_PARSER_LEXER_TOK_STRLEN:      return WL_STR_FN_STRLEN;
+    case WL_PARSER_LEXER_TOK_CAT:         return WL_STR_FN_CAT;
+    case WL_PARSER_LEXER_TOK_SUBSTR:      return WL_STR_FN_SUBSTR;
+    case WL_PARSER_LEXER_TOK_CONTAINS:    return WL_STR_FN_CONTAINS;
+    case WL_PARSER_LEXER_TOK_STR_PREFIX:  return WL_STR_FN_STR_PREFIX;
+    case WL_PARSER_LEXER_TOK_STR_SUFFIX:  return WL_STR_FN_STR_SUFFIX;
+    case WL_PARSER_LEXER_TOK_STR_ORD:     return WL_STR_FN_STR_ORD;
+    case WL_PARSER_LEXER_TOK_TO_UPPER:    return WL_STR_FN_TO_UPPER;
+    case WL_PARSER_LEXER_TOK_TO_LOWER:    return WL_STR_FN_TO_LOWER;
+    case WL_PARSER_LEXER_TOK_STR_REPLACE: return WL_STR_FN_STR_REPLACE;
+    case WL_PARSER_LEXER_TOK_TRIM:        return WL_STR_FN_TRIM;
+    case WL_PARSER_LEXER_TOK_TO_STRING:   return WL_STR_FN_TO_STRING;
+    case WL_PARSER_LEXER_TOK_TO_NUMBER:   return WL_STR_FN_TO_NUMBER;
+    default:                               return WL_STR_FN_STRLEN;
+    }
+}
+
+static bool
+is_string_fn_token(wl_parser_lexer_token_type_t type)
+{
+    return type == WL_PARSER_LEXER_TOK_STRLEN
+           || type == WL_PARSER_LEXER_TOK_CAT
+           || type == WL_PARSER_LEXER_TOK_SUBSTR
+           || type == WL_PARSER_LEXER_TOK_CONTAINS
+           || type == WL_PARSER_LEXER_TOK_STR_PREFIX
+           || type == WL_PARSER_LEXER_TOK_STR_SUFFIX
+           || type == WL_PARSER_LEXER_TOK_STR_ORD
+           || type == WL_PARSER_LEXER_TOK_TO_UPPER
+           || type == WL_PARSER_LEXER_TOK_TO_LOWER
+           || type == WL_PARSER_LEXER_TOK_STR_REPLACE
+           || type == WL_PARSER_LEXER_TOK_TRIM
+           || type == WL_PARSER_LEXER_TOK_TO_STRING
+           || type == WL_PARSER_LEXER_TOK_TO_NUMBER;
+}
+
+/* Parse a string function call: fn(arg [, arg]*) */
+static wl_parser_ast_node_t *
+parse_string_fn_expr(wl_parser_t *parser)
+{
+    uint32_t line = parser->current.line;
+    uint32_t col = parser->current.col;
+    wirelog_str_fn_t fn = token_to_str_fn(parser->current.type);
+    parser_advance(parser); /* consume keyword */
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+        "expected '(' after string function")) {
+        return NULL;
+    }
+
+    wl_parser_ast_node_t *node
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_STR_FUNCTION, line, col);
+    if (!node)
+        return NULL;
+    node->str_fn = fn;
+
+    if (!parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
+        wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
+        if (!arg) {
+            wl_parser_ast_node_free(node);
+            return NULL;
+        }
+        wl_parser_ast_node_add_child(node, arg);
+
+        while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
+            arg = parse_arithmetic_expr(parser);
+            if (!arg) {
+                wl_parser_ast_node_free(node);
+                return NULL;
+            }
+            wl_parser_ast_node_add_child(node, arg);
+        }
+    }
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+        "expected ')' after string function arguments")) {
+        wl_parser_ast_node_free(node);
+        return NULL;
+    }
+
+    return node;
+}
+
+/* ======================================================================== */
 /* Expression Parsing                                                       */
 /* ======================================================================== */
 
@@ -467,6 +557,11 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_add_child(node, ns);
         wl_parser_ast_node_add_child(node, name);
         return node;
+    }
+
+    /* String function calls: strlen(expr), cat(expr, expr), etc. */
+    if (is_string_fn_token(parser->current.type)) {
+        return parse_string_fn_expr(parser);
     }
 
     parser_error(parser, "expected variable, integer, or string");
@@ -902,6 +997,37 @@ parse_predicate(wl_parser_t *parser)
         wl_parser_ast_node_add_child(cmp, left);
         wl_parser_ast_node_add_child(cmp, right);
         return cmp;
+    }
+
+    /* String function as body predicate (contains, str_prefix, str_suffix)
+     * or as left-hand side of a comparison: strlen(x) > 5 */
+    if (is_string_fn_token(parser->current.type)) {
+        wl_parser_ast_node_t *left = parse_arithmetic_expr(parser);
+        if (!left)
+            return NULL;
+
+        if (is_compare_op(parser->current.type)) {
+            wirelog_cmp_op_t cmp_op = token_to_cmp_op(parser->current.type);
+            uint32_t cmp_line = parser->current.line;
+            uint32_t cmp_col = parser->current.col;
+            parser_advance(parser);
+
+            wl_parser_ast_node_t *right = parse_arithmetic_expr(parser);
+            if (!right) {
+                wl_parser_ast_node_free(left);
+                return NULL;
+            }
+
+            wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
+                WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
+            cmp->cmp_op = cmp_op;
+            wl_parser_ast_node_add_child(cmp, left);
+            wl_parser_ast_node_add_child(cmp, right);
+            return cmp;
+        }
+
+        /* Standalone boolean string predicate: contains(x, y), str_prefix(x, y), etc. */
+        return left;
     }
 
     parser_error(parser, "expected predicate");

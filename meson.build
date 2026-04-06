@@ -211,6 +211,7 @@ wirelog_sources += wirelog_thread_src
 wirelog_sources += wirelog_backend_src
 wirelog_sources += wirelog_workqueue_src
 wirelog_sources += wirelog_io_src
+wirelog_sources += wirelog_string_ops_src
 
 #Public headers
 wirelog_public_headers = [

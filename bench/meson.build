@@ -46,6 +46,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/partition.c',
   subdir_wirelog / 'columnar/progress.c',
   subdir_wirelog / 'util/lockfree_queue.c',
+  subdir_wirelog / 'string_ops.c',
 )
 
 bench_io_src = files(

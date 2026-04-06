@@ -34,6 +34,10 @@ intern_src = files(
   '../wirelog/intern.c',
 )
 
+string_ops_src = files(
+  '../wirelog/string_ops.c',
+)
+
 csv_src = files(
   '../wirelog/io/csv_reader.c',
 )
@@ -197,6 +201,7 @@ backend_src = files(
   '../wirelog/columnar/partition.c',
   '../wirelog/columnar/progress.c',
   '../wirelog/util/lockfree_queue.c',
+  '../wirelog/string_ops.c',
 )
 
 io_src = files(
@@ -2246,3 +2251,46 @@ test_doop_multiworker_exe = executable(
 test('doop_multiworker', test_doop_multiworker_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
 )
+
+# ============================================================================
+# String Operations Tests (Issue #143)
+# ============================================================================
+
+test_string_ops_exe = executable(
+  'test_string_ops',
+  files('test_string_ops.c'),
+  intern_src,
+  string_ops_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('string_ops', test_string_ops_exe)
+
+test_string_parser_exe = executable(
+  'test_string_parser',
+  files('test_string_parser.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  csv_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('string_parser', test_string_parser_exe)
+
+test_string_eval_exe = executable(
+  'test_string_eval',
+  files('test_string_eval.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('string_eval', test_string_eval_exe)
