@@ -111,9 +111,10 @@ arr_build_full(col_arrangement_t *arr, const col_rel_t *rel)
     }
 
     for (uint32_t row = 0; row < nrows; row++) {
-        const int64_t *rp = col_rel_row(rel, row);
+        int64_t row_buf[16]; /* stack buffer; avoids col_rel_row heap alloc */
+        col_rel_row_copy_out(rel, row, row_buf);
         uint32_t bucket
-            = arr_hash_key(rp, arr->key_cols, arr->key_count, nbuckets);
+            = arr_hash_key(row_buf, arr->key_cols, arr->key_count, nbuckets);
         arr->ht_next[row] = arr->ht_head[bucket];
         arr->ht_head[bucket] = row;
     }
@@ -148,8 +149,10 @@ arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
 
     uint32_t nb = arr->nbuckets;
     for (uint32_t row = old_nrows; row < nrows; row++) {
-        const int64_t *rp = col_rel_row(rel, row);
-        uint32_t bucket = arr_hash_key(rp, arr->key_cols, arr->key_count, nb);
+        int64_t row_buf[16]; /* stack buffer; avoids col_rel_row heap alloc */
+        col_rel_row_copy_out(rel, row, row_buf);
+        uint32_t bucket = arr_hash_key(row_buf, arr->key_cols, arr->key_count,
+                nb);
         arr->ht_next[row] = arr->ht_head[bucket];
         arr->ht_head[bucket] = row;
     }
