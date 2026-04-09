@@ -1,0 +1,4 @@
+.decl friend(a: symbol, b: symbol)
+.decl mutual(a: symbol, b: symbol)
+
+mutual(A, B) :- friend(A, B), friend(B, A).
