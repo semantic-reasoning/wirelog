@@ -302,6 +302,7 @@ endif
 subdir('examples/08-delta-queries')
 subdir('examples/09-retraction-basics')
 subdir('examples/10-recursive-under-update')
+subdir('examples/11-time-evolution')
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Documentation

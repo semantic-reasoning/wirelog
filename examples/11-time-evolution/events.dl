@@ -1,0 +1,4 @@
+.decl event(id: symbol, kind: symbol)
+.decl alert(id: symbol)
+
+alert(ID) :- event(ID, "error").

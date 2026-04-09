@@ -1,0 +1,13 @@
+Example 11: Time Evolution (Per-Epoch Delta Isolation)
+=====================================================
+
+=== epoch 1: insert e1(error), e2(info), e3(error) ===
++ alert("e1")
++ alert("e3")
+
+=== epoch 2: insert e4(info) ===
+
+=== epoch 3: insert e5(error) ===
++ alert("e5")
+
+Done.
