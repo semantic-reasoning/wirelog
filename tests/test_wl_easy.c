@@ -418,6 +418,52 @@ test_print_delta_integer_column(void)
 }
 
 static void
+test_print_delta_unknown_relation_integer_fallback(void)
+{
+    TEST("print_delta on unknown relation falls back to integer rendering");
+
+#ifdef _WIN32
+    SKIP("fork not available on Windows");
+    return;
+#else
+    pid_t pid = fork();
+    if (pid < 0) {
+        FAIL("fork failed");
+        return;
+    }
+    if (pid == 0) {
+        /* Child: exits 0 only if print_delta completes without aborting.
+         * We pass a relation name that the program does NOT declare, so
+         * wirelog_program_get_schema() returns NULL.  Pre-fix, the
+         * fallback set as_string=true for every column and the ids below
+         * would trigger abort() on reverse-intern.  Post-fix, the
+         * schema-less branch renders raw int64 values and returns
+         * cleanly. */
+        fclose(stdout);
+        fclose(stderr);
+
+        wl_easy_session_t *s = NULL;
+        if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s)
+            _exit(2);
+        int64_t row[2] = { 123456789, 987654321 };
+        wl_easy_print_delta("no_such_relation", row, 2, 1, s);
+        wl_easy_close(s);
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        FAIL("waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        FAIL("print_delta aborted on schema-unavailable path");
+        return;
+    }
+    PASS();
+#endif
+}
+
+static void
 test_print_delta_abort_on_missed_symbol(void)
 {
     TEST("print_delta aborts on missed reverse-intern");
@@ -556,6 +602,7 @@ main(void)
     test_remove_sym();
     test_snapshot_filter();
     test_print_delta_integer_column();
+    test_print_delta_unknown_relation_integer_fallback();
     test_print_delta_abort_on_missed_symbol();
     test_cleanup_order_no_use_after_free();
     test_intern_after_step_succeeds();

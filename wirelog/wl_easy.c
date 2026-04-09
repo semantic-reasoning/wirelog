@@ -100,9 +100,32 @@ wl_easy_open(const char *dl_src, wl_easy_session_t **out)
     if (!prog)
         return (err != WIRELOG_OK) ? err : WIRELOG_ERR_PARSE;
 
-    wl_fusion_apply(prog, NULL);
-    wl_jpp_apply(prog, NULL);
-    wl_sip_apply(prog, NULL);
+    /* Optimizer passes return 0 on success and negative rc on failure
+     * (see passes/fusion.h, passes/jpp.h, passes/sip.h).  A silent
+     * discard would leave the caller to discover the failure at plan
+     * build time with a misleading WIRELOG_ERR_EXEC; surface the real
+     * cause up front instead. */
+    int pass_rc = wl_fusion_apply(prog, NULL);
+    if (pass_rc != 0) {
+        fprintf(stderr,
+            "wl_easy_open: wl_fusion_apply failed (rc=%d)\n", pass_rc);
+        wirelog_program_free(prog);
+        return WIRELOG_ERR_EXEC;
+    }
+    pass_rc = wl_jpp_apply(prog, NULL);
+    if (pass_rc != 0) {
+        fprintf(stderr,
+            "wl_easy_open: wl_jpp_apply failed (rc=%d)\n", pass_rc);
+        wirelog_program_free(prog);
+        return WIRELOG_ERR_EXEC;
+    }
+    pass_rc = wl_sip_apply(prog, NULL);
+    if (pass_rc != 0) {
+        fprintf(stderr,
+            "wl_easy_open: wl_sip_apply failed (rc=%d)\n", pass_rc);
+        wirelog_program_free(prog);
+        return WIRELOG_ERR_EXEC;
+    }
 
     wl_easy_session_t *s
         = (wl_easy_session_t *)calloc(1, sizeof(wl_easy_session_t));
@@ -287,9 +310,13 @@ wl_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
 
     char sign = (diff > 0) ? '+' : '-';
 
-    /* Try schema-aware path first.  If the schema is unavailable for any
-     * reason (NULL program, unknown relation), fall back to all-symbol mode
-     * which still aborts on missed reverse-intern. */
+    /* Schema lookup may fail (unknown relation or arity mismatch).  The
+     * abort-on-missed-reverse-intern policy applies ONLY when the schema
+     * explicitly declares a column as STRING — otherwise we have no
+     * warrant to treat an integer id as a pointer into the intern table.
+     * In the schema-unavailable branch, default to integer rendering so a
+     * synthetic delta call (or a schema-less relation) does not trip the
+     * abort. */
     const wirelog_schema_t *schema
         = wirelog_program_get_schema(s->prog, relation);
     bool have_schema = (schema != NULL && schema->columns != NULL
@@ -300,13 +327,7 @@ wl_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
         if (i > 0)
             printf(", ");
 
-        bool as_string;
-        if (have_schema)
-            as_string = column_is_string(schema->columns[i].type);
-        else
-            as_string = true; /* fall back to symbol mode */
-
-        if (as_string) {
+        if (have_schema && column_is_string(schema->columns[i].type)) {
             const char *str = wl_intern_reverse(s->intern_mut, row[i]);
             if (!str) {
                 fprintf(stderr,
@@ -317,6 +338,9 @@ wl_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
             }
             printf("\"%s\"", str);
         } else {
+            /* Either the schema declares this column as a non-string
+             * (int/bool) type, or no schema was available at all.  In
+             * both cases, render the raw int64 value. */
             printf("%" PRId64, row[i]);
         }
     }
