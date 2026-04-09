@@ -35,20 +35,20 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Plan Helper                                                             */
@@ -91,7 +91,7 @@ typedef struct {
 
 static void
 collect_delta(const char *relation, const int64_t *row, uint32_t ncols,
-              int32_t diff, void *user_data)
+    int32_t diff, void *user_data)
 {
     delta_collector_t *c = (delta_collector_t *)user_data;
     if (c->count >= MAX_DELTAS)
@@ -122,8 +122,8 @@ test_simple_nonrecursive(void)
     TEST("Simple non-recursive retraction (semi-naive)");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -187,8 +187,8 @@ test_simple_nonrecursive(void)
     if (r1_minus1_count != 1) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "expected exactly 1 r(1) diff=-1 in step 2, got %d",
-                 r1_minus1_count);
+            "expected exactly 1 r(1) diff=-1 in step 2, got %d",
+            r1_minus1_count);
         FAIL(msg);
         return 1;
     }
@@ -214,8 +214,8 @@ test_no_phantom_delta(void)
     TEST("No phantom deltas on retraction");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -305,9 +305,9 @@ test_join_retraction(void)
     TEST("Join retraction (correct row selection)");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl b(y: int32)\n"
-                                ".decl r(x: int32, y: int32)\n"
-                                "r(x, y) :- a(x), b(y).\n");
+            ".decl b(y: int32)\n"
+            ".decl r(x: int32, y: int32)\n"
+            "r(x, y) :- a(x), b(y).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -405,9 +405,9 @@ test_recursive_fallback(void)
     TEST("Recursive fallback (full re-eval)");
 
     wl_plan_t *ffi = build_plan(".decl edge(x: int32, y: int32)\n"
-                                ".decl tc(x: int32, y: int32)\n"
-                                "tc(x, y) :- edge(x, y).\n"
-                                "tc(x, y) :- tc(x, z), edge(z, y).\n");
+            ".decl tc(x: int32, y: int32)\n"
+            "tc(x, y) :- edge(x, y).\n"
+            "tc(x, y) :- tc(x, z), edge(z, y).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -493,9 +493,9 @@ test_alternate_path(void)
     TEST("Alternate path (no spurious retraction)");
 
     wl_plan_t *ffi = build_plan(".decl edge(x: int32, y: int32)\n"
-                                ".decl tc(x: int32, y: int32)\n"
-                                "tc(x, y) :- edge(x, y).\n"
-                                "tc(x, y) :- tc(x, z), edge(z, y).\n");
+            ".decl tc(x: int32, y: int32)\n"
+            "tc(x, y) :- edge(x, y).\n"
+            "tc(x, y) :- tc(x, z), edge(z, y).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -587,8 +587,8 @@ test_remove_nonexistent(void)
     TEST("Remove non-existent row (no error/crash)");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -668,8 +668,8 @@ test_remove_reinject(void)
     TEST("Remove and reinsert (delta sequence)");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -779,6 +779,120 @@ test_remove_reinject(void)
 }
 
 /* ======================================================================== */
+/* Test 8: Self-join retraction (Issue #472)                                */
+/* ======================================================================== */
+
+/*
+ * Rule: mutual(A, B) :- friend(A, B), friend(B, A).
+ * Insert friend(1,2), friend(2,1)
+ * Step 1: expect mutual(1,2) diff=+1, mutual(2,1) diff=+1
+ * Remove friend(2,1)
+ * Step 2: expect exactly 2 diff=-1 deltas on mutual
+ *
+ * This is a regression test for Issue #472: the full re-eval + set-diff
+ * retraction path left retraction_seeded=true during col_eval_stratum,
+ * causing the VARIABLE op to load $r$<name> instead of the full relation.
+ * This produced a partial result that masked one retraction delta.
+ */
+static int
+test_self_join_retraction(void)
+{
+    TEST("Self-join retraction (two deltas, issue #472)");
+
+    wl_plan_t *ffi = build_plan(".decl friend(a: int32, b: int32)\n"
+            ".decl mutual(a: int32, b: int32)\n"
+            "mutual(A, B) :- friend(A, B), friend(B, A).\n");
+    if (!ffi) {
+        FAIL("could not generate FFI plan");
+        return 1;
+    }
+
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(ffi);
+        FAIL("session_create failed");
+        return 1;
+    }
+
+    delta_collector_t deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+
+    /* Insert friend(1,2) and friend(2,1) */
+    int64_t f1[] = { 1, 2 };
+    int64_t f2[] = { 2, 1 };
+    wl_session_insert(session, "friend", f1, 1, 2);
+    wl_session_insert(session, "friend", f2, 1, 2);
+
+    rc = wl_session_step(session);
+    if (rc != 0) {
+        FAIL("step 1 failed");
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        return 1;
+    }
+
+    /* Verify step 1: two +1 deltas on mutual */
+    int plus_count = 0;
+    for (int i = 0; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "mutual") == 0
+            && deltas.diffs[i] == +1)
+            plus_count++;
+    }
+    if (plus_count != 2) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "step 1: expected 2 '+1' mutual deltas, got %d", plus_count);
+        FAIL(msg);
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        return 1;
+    }
+
+    int count_after_step1 = deltas.count;
+
+    /* Remove friend(2,1) */
+    int64_t remove_data[] = { 2, 1 };
+    rc = wl_session_remove(session, "friend", remove_data, 1, 2);
+    if (rc != 0) {
+        FAIL("remove failed");
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        return 1;
+    }
+
+    rc = wl_session_step(session);
+    if (rc != 0) {
+        FAIL("step 2 failed");
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        return 1;
+    }
+
+    wl_session_destroy(session);
+    wl_plan_free(ffi);
+
+    /* Verify step 2: exactly 2 diff=-1 deltas on mutual */
+    int minus_count = 0;
+    for (int i = count_after_step1; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "mutual") == 0
+            && deltas.diffs[i] == -1)
+            minus_count++;
+    }
+    if (minus_count != 2) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "step 2: expected 2 '-1' mutual deltas, got %d", minus_count);
+        FAIL(msg);
+        return 1;
+    }
+
+    PASS();
+    return 0;
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -795,6 +909,7 @@ main(void)
     test_alternate_path();
     test_remove_nonexistent();
     test_remove_reinject();
+    test_self_join_retraction();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);
