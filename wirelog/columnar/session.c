@@ -1322,6 +1322,12 @@ next_del_incr:;
     if (r->base_nrows > r->nrows)
         r->base_nrows = r->nrows;
 
+    /* Issue #472: Invalidate arrangement caches for the modified relation
+     * so subsequent re-evaluation rebuilds hash indices without the removed
+     * rows.  Without this, cached arrangements contain stale entries that
+     * produce phantom join matches during full re-eval retraction. */
+    col_session_invalidate_arrangements(session, relation);
+
     /* Mark removal for affected-stratum calculation */
     sess->last_removed_relation = relation;
     sess->outer_epoch++;

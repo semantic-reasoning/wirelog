@@ -1381,10 +1381,16 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     * (with the removed row already gone), not from $r$ retraction deltas.
     * The $r$ deltas are only for the semi-naive retraction path. */
     bool saved_retraction_seeded = sess->retraction_seeded;
+    bool saved_diff_operators_active = sess->diff_operators_active;
     sess->retraction_seeded = false;
     sess->retraction_right_pass = false;
+    /* Issue #472: Disable differential operators during full re-eval.
+     * The set-diff path requires a complete evaluation (all matching tuples),
+     * not a differential one that tracks only epoch-based changes. */
+    sess->diff_operators_active = false;
     int rc = col_eval_stratum(sp, sess, stratum_idx);
     sess->retraction_seeded = saved_retraction_seeded;
+    sess->diff_operators_active = saved_diff_operators_active;
     if (rc != 0)
         goto cleanup;
 
