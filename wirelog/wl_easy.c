@@ -278,14 +278,16 @@ wl_easy_step(wl_easy_session_t *s)
     return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
 }
 
-void
+wirelog_error_t
 wl_easy_set_delta_cb(wl_easy_session_t *s, wl_on_delta_fn cb, void *user_data)
 {
     if (!s)
-        return;
-    if (ensure_plan_built(s) != WIRELOG_OK)
-        return;
+        return WIRELOG_ERR_EXEC;
+    wirelog_error_t err = ensure_plan_built(s);
+    if (err != WIRELOG_OK)
+        return err;
     wl_session_set_delta_cb(s->session, cb, user_data);
+    return WIRELOG_OK;
 }
 
 /* ======================================================================== */

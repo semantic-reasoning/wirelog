@@ -177,10 +177,15 @@ wl_easy_step(wl_easy_session_t *s);
  * @cb:        Delta callback (may be NULL to clear).
  * @user_data: Opaque user data passed back to @cb.
  *
- * Register a delta callback.  This eagerly builds the plan/session like the
- * other step-class calls, so all wl_easy_intern() calls must precede this.
+ * Register a delta callback.  This eagerly builds the plan and underlying
+ * session (lazy-init path), which may fail; the return value propagates
+ * that error to the caller.  Symbol interning via wl_easy_intern() may
+ * happen before OR after this call.
+ *
+ * Returns: WIRELOG_OK on success, or a wirelog_error_t describing the
+ * plan/session build failure.  A NULL @s returns WIRELOG_ERR_EXEC.
  */
-void
+wirelog_error_t
 wl_easy_set_delta_cb(wl_easy_session_t *s, wl_on_delta_fn cb, void *user_data);
 
 /**

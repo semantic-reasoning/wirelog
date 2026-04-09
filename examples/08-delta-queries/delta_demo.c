@@ -44,7 +44,11 @@ main(void)
     (void)id_alice; (void)id_bob; (void)id_carol;
     (void)id_read;  (void)id_write; (void)id_admin;
 
-    wl_easy_set_delta_cb(s, wl_easy_print_delta, s);
+    if (wl_easy_set_delta_cb(s, wl_easy_print_delta, s) != WIRELOG_OK) {
+        fprintf(stderr, "wl_easy_set_delta_cb failed\n");
+        wl_easy_close(s);
+        return 1;
+    }
 
     printf("Inserting access control facts...\n\n");
 
