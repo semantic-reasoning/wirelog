@@ -1120,9 +1120,47 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
         r->run_count = 0;
     }
 
-    /* Step 1: Enable retraction-seeded mode and evaluate stratum */
+    /* Step 1: Enable retraction-seeded mode and evaluate stratum.
+     * First pass (left): VARIABLE loads $r$, JOIN uses full right.
+     * Issue #472: Second pass (right): VARIABLE loads full, JOIN uses $r$
+     * on the right side.  This is needed for self-join rules where the
+     * retracted EDB appears on both sides of a JOIN. */
     sess->retraction_seeded = true;
+    sess->retraction_right_pass = false;
     int rc = col_eval_stratum(sp, sess, stratum_idx);
+
+    /* Issue #472: Check if a second (right) pass is needed.
+     * Scan relation plans for JOIN/SEMIJOIN ops whose right_relation has
+     * a $r$ retraction delta.  If found, run a second pass so that
+     * full(left) x $r$(right) produces additional retraction candidates. */
+    if (rc == 0) {
+        bool need_right_pass = false;
+        for (uint32_t ri = 0; ri < sp->relation_count && !need_right_pass;
+            ri++) {
+            const wl_plan_relation_t *rp = &sp->relations[ri];
+            for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+                const wl_plan_op_t *pop = &rp->ops[oi];
+                if ((pop->op == WL_PLAN_OP_JOIN
+                    || pop->op == WL_PLAN_OP_SEMIJOIN)
+                    && pop->right_relation) {
+                    char rname[256];
+                    if (retraction_rel_name(pop->right_relation, rname,
+                        sizeof(rname)) == 0) {
+                        col_rel_t *rd = session_find_rel(sess, rname);
+                        if (rd && rd->nrows > 0) {
+                            need_right_pass = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (need_right_pass) {
+            sess->retraction_right_pass = true;
+            rc = col_eval_stratum(sp, sess, stratum_idx);
+            sess->retraction_right_pass = false;
+        }
+    }
     sess->retraction_seeded = false;
     if (rc != 0) {
         /* Restore all backup pointers; free any eval-allocated buffers */
@@ -1337,8 +1375,16 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
     }
 
-    /* Step 2: evaluate stratum (appends new rows to IDB relations) */
+    /* Step 2: evaluate stratum (appends new rows to IDB relations).
+    * Issue #472: Temporarily clear retraction_seeded during full re-eval.
+    * The full re-eval + set-diff path must evaluate from clean EDB state
+    * (with the removed row already gone), not from $r$ retraction deltas.
+    * The $r$ deltas are only for the semi-naive retraction path. */
+    bool saved_retraction_seeded = sess->retraction_seeded;
+    sess->retraction_seeded = false;
+    sess->retraction_right_pass = false;
     int rc = col_eval_stratum(sp, sess, stratum_idx);
+    sess->retraction_seeded = saved_retraction_seeded;
     if (rc != 0)
         goto cleanup;
 

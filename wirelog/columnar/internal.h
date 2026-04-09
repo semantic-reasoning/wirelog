@@ -786,6 +786,10 @@ typedef struct wl_col_session_t {
      * the session before re-evaluation. Similar to delta_seeded but for
      * $r$<name> relations. Cleared after eval completes. */
     bool retraction_seeded;
+    /* Issue #472: Second-pass flag for self-join retraction.
+     * When true, VARIABLE ops load the full relation (not $r$) and
+     * JOIN/SEMIJOIN ops substitute $r$ on the right side instead. */
+    bool retraction_right_pass;
     delta_pool_t *delta_pool; /* Pool allocator for operator temporaries */
     /* Sorted arrangement cache (Issue #195): per-key-column sorted copies of
      * EDB relations for leapfrog triejoin (WL_PLAN_OP_LFTJ).  Unlike hash

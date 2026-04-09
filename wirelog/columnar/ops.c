@@ -990,8 +990,11 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     char dname[256];
     col_rel_t *delta = NULL;
 
-    if (sess->retraction_seeded && sess->current_iteration == 0) {
-        /* Retraction mode: look for $r$<name> retraction delta */
+    if (sess->retraction_seeded && sess->current_iteration == 0
+        && !sess->retraction_right_pass) {
+        /* Retraction mode (left pass): look for $r$<name> retraction delta.
+         * Issue #472: Skip during right pass — VARIABLE loads full relation
+         * so JOIN/SEMIJOIN can use $r$ on the right side instead. */
         if (retraction_rel_name(op->relation_name, dname, sizeof(dname)) == 0)
             delta = session_find_rel(sess, dname);
     } else {
@@ -2150,11 +2153,21 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         char rdname[256];
         snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
         col_rel_t *rdelta = session_find_rel(sess, rdname);
+        /* Issue #472: mirror VARIABLE op retraction-aware pattern —
+         * fall back to $r$<name> when retraction_seeded at iteration 0. */
+        if (!rdelta && sess->retraction_seeded
+            && sess->current_iteration == 0) {
+            if (retraction_rel_name(op->right_relation, rdname,
+                sizeof(rdname)) == 0)
+                rdelta = session_find_rel(sess, rdname);
+        }
         if (rdelta && rdelta->nrows > 0) {
             right = rdelta;
             used_right_delta = true;
-        } else if (sess->current_iteration > 0 || sess->delta_seeded) {
-            /* Iteration > 0 or delta-seeded iter 0 (issue #83):
+        } else if (sess->current_iteration > 0 || sess->delta_seeded
+            || sess->retraction_seeded) {
+            /* Iteration > 0, delta-seeded iter 0 (issue #83), or
+             * retraction-seeded iter 0 (issue #472):
              * FORCE_DELTA required but delta absent/empty. Short-circuit to
              * empty result — this rule copy produces no tuples from this
              * permutation (correct semi-naive, issue #85). */
@@ -2179,6 +2192,21 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (rdelta && rdelta->nrows > 0 && rdelta->nrows < right->nrows) {
             right = rdelta;
             used_right_delta = true;
+        }
+    }
+    /* Issue #472: Retraction right-pass — when retraction_right_pass is set,
+     * use the $r$ retraction delta on the right side so that self-join rules
+     * derive retractions from full(left) x $r$(right). */
+    if (!used_right_delta && sess->retraction_right_pass
+        && sess->current_iteration == 0 && op->right_relation) {
+        char rdname[256];
+        if (retraction_rel_name(op->right_relation, rdname,
+            sizeof(rdname)) == 0) {
+            col_rel_t *rdelta = session_find_rel(sess, rdname);
+            if (rdelta && rdelta->nrows > 0) {
+                right = rdelta;
+                used_right_delta = true;
+            }
         }
     }
 
@@ -5550,10 +5578,19 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
         char rdname[256];
         snprintf(rdname, sizeof(rdname), "$d$%s", op->right_relation);
         col_rel_t *rdelta = session_find_rel(sess, rdname);
+        /* Issue #472: mirror VARIABLE op retraction-aware pattern —
+         * fall back to $r$<name> when retraction_seeded at iteration 0. */
+        if (!rdelta && sess->retraction_seeded
+            && sess->current_iteration == 0) {
+            if (retraction_rel_name(op->right_relation, rdname,
+                sizeof(rdname)) == 0)
+                rdelta = session_find_rel(sess, rdname);
+        }
         if (rdelta && rdelta->nrows > 0) {
             right = rdelta;
             used_right_delta = true;
-        } else if (sess->current_iteration > 0 || sess->delta_seeded) {
+        } else if (sess->current_iteration > 0 || sess->delta_seeded
+            || sess->retraction_seeded) {
             uint32_t ocols = left_e.rel->ncols + right->ncols;
             if (left_e.owned)
                 col_rel_destroy(left_e.rel);
@@ -5573,6 +5610,19 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
         if (rdelta && rdelta->nrows > 0 && rdelta->nrows < right->nrows) {
             right = rdelta;
             used_right_delta = true;
+        }
+    }
+    /* Issue #472: Retraction right-pass (same as col_op_join). */
+    if (!used_right_delta && sess->retraction_right_pass
+        && sess->current_iteration == 0 && op->right_relation) {
+        char rdname[256];
+        if (retraction_rel_name(op->right_relation, rdname,
+            sizeof(rdname)) == 0) {
+            col_rel_t *rdelta = session_find_rel(sess, rdname);
+            if (rdelta && rdelta->nrows > 0) {
+                right = rdelta;
+                used_right_delta = true;
+            }
         }
     }
 
