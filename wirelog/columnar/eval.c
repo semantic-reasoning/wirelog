@@ -1376,18 +1376,20 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     }
 
     /* Step 2: evaluate stratum (appends new rows to IDB relations).
-    * Issue #472: Temporarily clear retraction_seeded during full re-eval.
-    * The full re-eval + set-diff path must evaluate from clean EDB state
-    * (with the removed row already gone), not from $r$ retraction deltas.
-    * The $r$ deltas are only for the semi-naive retraction path. */
+     * Issue #472: When retraction is in progress, temporarily clear
+     * retraction_seeded and diff_operators_active during full re-eval.
+     * The full re-eval + set-diff path must evaluate from clean EDB state
+     * (with the removed row already gone), not from $r$ retraction deltas.
+     * Only modify these flags when retraction_seeded was actually set;
+     * otherwise, leave the normal evaluation path untouched to avoid
+     * interfering with non-retraction steps (e.g., DOOP multi-worker). */
     bool saved_retraction_seeded = sess->retraction_seeded;
     bool saved_diff_operators_active = sess->diff_operators_active;
-    sess->retraction_seeded = false;
-    sess->retraction_right_pass = false;
-    /* Issue #472: Disable differential operators during full re-eval.
-     * The set-diff path requires a complete evaluation (all matching tuples),
-     * not a differential one that tracks only epoch-based changes. */
-    sess->diff_operators_active = false;
+    if (saved_retraction_seeded) {
+        sess->retraction_seeded = false;
+        sess->retraction_right_pass = false;
+        sess->diff_operators_active = false;
+    }
     int rc = col_eval_stratum(sp, sess, stratum_idx);
     sess->retraction_seeded = saved_retraction_seeded;
     sess->diff_operators_active = saved_diff_operators_active;
