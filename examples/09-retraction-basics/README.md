@@ -7,7 +7,8 @@ This example demonstrates incremental retraction in wirelog using
 is retracted, the engine propagates `-1` deltas to any derived relations
 that depended on it.  The scope here is non-recursive: a single join rule
 derives `mutual(A, B)` from `friend(A, B), friend(B, A)`, and removing one
-side of the friendship pair produces exactly two `-1` deltas on `mutual`.
+side of the friendship pair produces exactly two `-1` deltas on `mutual`,
+one for each derived tuple that is no longer supported.
 
 ## Datalog Program
 
@@ -40,6 +41,7 @@ Example 09: Retraction Basics (-1 deltas)
 
 === step 3: bob unfriends alice ===
 - mutual("alice", "bob")
+- mutual("bob", "alice")
 
 Done.
 ```
@@ -53,10 +55,11 @@ Done.
   `friend(carol,alice)` does not exist, the join produces no new `mutual`
   tuples and no deltas fire.
 - **Step 3**: `wl_easy_remove_sym` retracts `friend(bob,alice)`.  After
-  `wl_easy_step`, the engine emits a `-1` delta for `mutual(alice,bob)`,
-  reflecting that the derived tuple is no longer supported.
+  `wl_easy_step`, the engine emits exactly two `-1` deltas:
+  `mutual(alice,bob)` and `mutual(bob,alice)`, reflecting that both
+  derived tuples are no longer supported.
 - **In-driver assertion**: The driver counts the `-1` deltas on `mutual` in
-  step 3 and exits non-zero if the count is less than 1.
+  step 3 and exits non-zero if the count is not exactly 2.
 
 ## What You Will NOT See Here
 

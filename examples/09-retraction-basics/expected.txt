@@ -9,5 +9,6 @@ Example 09: Retraction Basics (-1 deltas)
 
 === step 3: bob unfriends alice ===
 - mutual("alice", "bob")
+- mutual("bob", "alice")
 
 Done.

@@ -164,9 +164,9 @@ main(void)
 
     printf("\nDone.\n");
 
-    if (step3_minus < 1) {
+    if (step3_minus != 2) {
         fprintf(stderr,
-            "ASSERTION FAILED: expected at least 1 '-1' delta on mutual in step 3, got %d\n",
+            "ASSERTION FAILED: expected 2 '-1' deltas on mutual in step 3, got %d\n",
             step3_minus);
         wl_easy_close(s);
         return 2;
