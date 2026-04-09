@@ -2315,3 +2315,21 @@ test_string_eval_exe = executable(
 )
 
 test('string_eval', test_string_eval_exe)
+
+test_wl_easy_exe = executable(
+  'test_wl_easy',
+  files('test_wl_easy.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  '../wirelog/wl_easy.c',
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('wl_easy', test_wl_easy_exe)
