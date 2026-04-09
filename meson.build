@@ -212,6 +212,7 @@ wirelog_sources += wirelog_backend_src
 wirelog_sources += wirelog_workqueue_src
 wirelog_sources += wirelog_io_src
 wirelog_sources += wirelog_string_ops_src
+wirelog_sources += wirelog_wl_easy_src
 
 #Public headers
 wirelog_public_headers = [
@@ -220,6 +221,7 @@ wirelog_public_headers = [
   'wirelog/wirelog-parser.h',
   'wirelog/wirelog-ir.h',
   'wirelog/wirelog-optimizer.h',
+  'wirelog/wl_easy.h',
 ]
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
