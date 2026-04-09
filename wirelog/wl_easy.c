@@ -141,8 +141,14 @@ wl_easy_close(wl_easy_session_t *s)
 int64_t
 wl_easy_intern(wl_easy_session_t *s, const char *sym)
 {
-    if (!s || !sym || s->plan_built || !s->intern_mut)
+    if (!s || !sym || !s->intern_mut)
         return -1;
+    /* The program's intern table is aliased all the way through plan and
+     * session (see exec_plan_gen.c: plan->intern = prog->intern and
+     * columnar/session.c: sess->intern = plan->intern), so a newly interned
+     * symbol is immediately visible to any already-built session.  Interning
+     * at any time is therefore safe; wl_intern_put() returns the existing id
+     * for a repeat symbol, so ids remain stable across the run. */
     return wl_intern_put(s->intern_mut, sym);
 }
 

@@ -46,6 +46,17 @@ typedef void (*wl_on_delta_fn)(const char *relation, const int64_t *row,
  * Opaque convenience handle that bundles parse, optimize, plan and session
  * lifecycle in a single object.  Use wl_easy_open() / wl_easy_close() to
  * manage instances.
+ *
+ * Thread safety:
+ *   A wl_easy_session_t is NOT thread-safe.  Any two concurrent calls on the
+ *   same session pointer — including read-only helpers like wl_easy_intern()
+ *   or wl_easy_snapshot() — race on the underlying program, plan and
+ *   session state.  Callers MUST serialize access (e.g. with an external
+ *   mutex) if they share a session across threads.
+ *
+ *   Independent sessions created by separate wl_easy_open() calls may be
+ *   used on different threads provided the caller does not share any
+ *   derived state (rows, callback user_data, intern ids) between them.
  */
 typedef struct wl_easy_session wl_easy_session_t;
 
@@ -56,9 +67,10 @@ typedef struct wl_easy_session wl_easy_session_t;
  *
  * Parse @dl_src, run the standard optimizer passes (fusion, jpp, sip), and
  * return a session handle.  The execution plan and underlying session are
- * built lazily on the first call to wl_easy_insert/remove/step/set_delta_cb,
- * which means callers MUST intern any required symbols via wl_easy_intern()
- * before that first step-class call.
+ * built lazily on the first call to wl_easy_insert/remove/step/set_delta_cb.
+ * Symbol interning via wl_easy_intern() may happen before or after that
+ * first step-class call; the intern table is shared through the whole
+ * session lifetime.
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_PARSE on parse failure,
  * WIRELOG_ERR_MEMORY on allocation failure, or another wirelog_error_t on
@@ -81,13 +93,15 @@ wl_easy_close(wl_easy_session_t *s);
  * @s:   Open session (must not be NULL).
  * @sym: Symbol to intern (must not be NULL).
  *
- * Intern @sym into the program's intern table.  MUST be called before the
- * first wl_easy_insert/remove/step/set_delta_cb call.  After the plan has
- * been built, this function refuses further interns and returns -1 to keep
- * symbol IDs stable across the run.
+ * Intern @sym into the program's intern table and return its id.  May be
+ * called at any point in a session's lifetime — before or after the plan
+ * has been built — because the program's intern table is aliased through
+ * the plan and session, so a new id is immediately visible to any running
+ * backend.  Calling this function repeatedly for the same string returns
+ * the same id, so symbol ids remain stable across the run regardless of
+ * call ordering.
  *
- * Returns: non-negative ID on success, -1 on NULL args or once the plan is
- * already built.
+ * Returns: non-negative ID on success, -1 on NULL args or internal error.
  */
 int64_t
 wl_easy_intern(wl_easy_session_t *s, const char *sym);

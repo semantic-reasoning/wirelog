@@ -489,9 +489,9 @@ test_cleanup_order_no_use_after_free(void)
 }
 
 static void
-test_intern_after_step_rejected(void)
+test_intern_after_step_succeeds(void)
 {
-    TEST("intern after first step returns -1");
+    TEST("intern after first step still succeeds (Option B contract)");
 
     wl_easy_session_t *s = NULL;
     if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
@@ -516,10 +516,23 @@ test_intern_after_step_rejected(void)
         wl_easy_close(s);
         return;
     }
+    /* After the plan has been built and stepped, interning a brand new
+     * symbol must still succeed and return a fresh id, because the intern
+     * table is aliased through the whole session lifetime. */
     int64_t late = wl_easy_intern(s, "late_symbol");
+    /* And a new insert using that id must also succeed, proving the id is
+     * actually visible to the running backend. */
+    int64_t late_row[2] = { late, read };
+    wirelog_error_t ins_rc
+        = wl_easy_insert(s, "can", late_row, 2);
+    wirelog_error_t step_rc = wl_easy_step(s);
     wl_easy_close(s);
-    if (late != -1) {
-        FAIL("intern after step should have returned -1");
+    if (late < 0) {
+        FAIL("late intern should have returned a non-negative id");
+        return;
+    }
+    if (ins_rc != WIRELOG_OK || step_rc != WIRELOG_OK) {
+        FAIL("insert/step using late-interned id failed");
         return;
     }
     PASS();
@@ -545,7 +558,7 @@ main(void)
     test_print_delta_integer_column();
     test_print_delta_abort_on_missed_symbol();
     test_cleanup_order_no_use_after_free();
-    test_intern_after_step_rejected();
+    test_intern_after_step_succeeds();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
