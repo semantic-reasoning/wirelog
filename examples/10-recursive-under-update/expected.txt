@@ -1,0 +1,24 @@
+Example 10: Recursive Under Update (Transitive Closure)
+=======================================================
+
+=== step 1: insert edges a->b->c->d ===
++ reach("a", "b")
++ reach("a", "c")
++ reach("a", "d")
++ reach("b", "c")
++ reach("b", "d")
++ reach("c", "d")
+
+=== step 2: remove edge(b,c) ===
+- reach("a", "c")
+- reach("a", "d")
+- reach("b", "c")
+- reach("b", "d")
+
+=== step 3: re-insert edge(b,c) ===
++ reach("a", "c")
++ reach("a", "d")
++ reach("b", "c")
++ reach("b", "d")
+
+Done.

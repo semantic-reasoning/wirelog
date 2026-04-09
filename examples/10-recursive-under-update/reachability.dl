@@ -1,0 +1,5 @@
+.decl edge(x: symbol, y: symbol)
+.decl reach(x: symbol, y: symbol)
+
+reach(X, Y) :- edge(X, Y).
+reach(X, Z) :- reach(X, Y), edge(Y, Z).
