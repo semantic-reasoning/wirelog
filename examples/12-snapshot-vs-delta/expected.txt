@@ -1,0 +1,13 @@
+Example 12: Snapshot vs Delta
+=============================
+
+=== delta mode: wl_easy_step ===
+=== snapshot mode: wl_easy_snapshot ===
+
+delta: granted("alice", "read")        snapshot: granted("alice", "read")        MATCH
+delta: granted("alice", "write")       snapshot: granted("alice", "write")       MATCH
+delta: granted("bob", "admin")         snapshot: granted("bob", "admin")         MATCH
+delta: granted("bob", "read")          snapshot: granted("bob", "read")          MATCH
+delta: granted("carol", "read")        snapshot: granted("carol", "read")        MATCH
+
+PASS
