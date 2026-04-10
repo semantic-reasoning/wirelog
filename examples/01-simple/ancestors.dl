@@ -1,5 +1,8 @@
+.decl parent(x: symbol, y: symbol)
+.decl ancestor(x: symbol, y: symbol)
+
 // Load facts from CSV
-.input parent("ancestors_facts.csv")
+.input parent("ancestors_facts.csv", delimiter=",")
 
 // Output results to CSV
 .output ancestor("ancestors_output.csv")

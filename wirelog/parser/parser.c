@@ -1294,42 +1294,64 @@ parse_input_directive(wl_parser_t *parser)
         return NULL;
     }
 
-    /* Parse key=value parameters */
+    /* Parse parameters: positional string or key=value pairs.
+     * Positional: .input relation("file.csv") => filename="file.csv"
+     * Key=value:  .input relation(filename="file.csv", delimiter=",") */
     if (!parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
-        for (;;) {
+        /* Check for positional string as first argument */
+        if (parser_check(parser, WL_PARSER_LEXER_TOK_STRING)) {
             uint32_t p_line = parser->current.line;
             uint32_t p_col = parser->current.col;
-
-            if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                "expected parameter name")) {
-                wl_parser_ast_node_free(input);
-                return NULL;
-            }
-            char *param_name = token_to_name(&parser->previous);
-
-            if (!parser_consume(parser, WL_PARSER_LEXER_TOK_EQ,
-                "expected '=' after parameter name")) {
-                free(param_name);
-                wl_parser_ast_node_free(input);
-                return NULL;
-            }
-
-            if (!parser_consume(parser, WL_PARSER_LEXER_TOK_STRING,
-                "expected string value")) {
-                free(param_name);
-                wl_parser_ast_node_free(input);
-                return NULL;
-            }
-            char *param_value = token_to_str_value(&parser->previous);
-
+            parser_advance(parser);
             wl_parser_ast_node_t *param = wl_parser_ast_node_create(
                 WL_PARSER_AST_NODE_INPUT_PARAM, p_line, p_col);
-            param->name = param_name;
-            param->str_value = param_value;
+            param->name = strdup_safe("filename");
+            param->str_value = token_to_str_value(&parser->previous);
             wl_parser_ast_node_add_child(input, param);
+            /* Allow trailing key=value params after positional */
+            if (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)
+                && parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
+                /* trailing comma before ) -- skip */
+            } else if (parser->previous.type == WL_PARSER_LEXER_TOK_COMMA) {
+                goto input_kv_params;
+            }
+        } else {
+input_kv_params:
+            for (;;) {
+                uint32_t p_line = parser->current.line;
+                uint32_t p_col = parser->current.col;
 
-            if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
-                break;
+                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+                    "expected parameter name")) {
+                    wl_parser_ast_node_free(input);
+                    return NULL;
+                }
+                char *param_name = token_to_name(&parser->previous);
+
+                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_EQ,
+                    "expected '=' after parameter name")) {
+                    free(param_name);
+                    wl_parser_ast_node_free(input);
+                    return NULL;
+                }
+
+                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_STRING,
+                    "expected string value")) {
+                    free(param_name);
+                    wl_parser_ast_node_free(input);
+                    return NULL;
+                }
+                char *param_value = token_to_str_value(&parser->previous);
+
+                wl_parser_ast_node_t *param = wl_parser_ast_node_create(
+                    WL_PARSER_AST_NODE_INPUT_PARAM, p_line, p_col);
+                param->name = param_name;
+                param->str_value = param_value;
+                wl_parser_ast_node_add_child(input, param);
+
+                if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
+                    break;
+            }
         }
     }
 
@@ -1357,43 +1379,65 @@ parse_output_directive(wl_parser_t *parser)
         = wl_parser_ast_node_create(WL_PARSER_AST_NODE_OUTPUT, line, col);
     output->name = token_to_name(&parser->previous);
 
-    /* Optional: (.output relation(key="value", ...)) */
+    /* Optional: .output relation("file") or .output relation(key="value", ...)
+     * Bare .output relation (no parens) is also valid. */
     if (parser_match(parser, WL_PARSER_LEXER_TOK_LPAREN)) {
         if (!parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
-            for (;;) {
+            /* Check for positional string as first argument */
+            if (parser_check(parser, WL_PARSER_LEXER_TOK_STRING)) {
                 uint32_t p_line = parser->current.line;
                 uint32_t p_col = parser->current.col;
-
-                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-                    "expected parameter name")) {
-                    wl_parser_ast_node_free(output);
-                    return NULL;
-                }
-                char *param_name = token_to_name(&parser->previous);
-
-                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_EQ,
-                    "expected '=' after parameter name")) {
-                    free(param_name);
-                    wl_parser_ast_node_free(output);
-                    return NULL;
-                }
-
-                if (!parser_consume(parser, WL_PARSER_LEXER_TOK_STRING,
-                    "expected string value")) {
-                    free(param_name);
-                    wl_parser_ast_node_free(output);
-                    return NULL;
-                }
-                char *param_value = token_to_str_value(&parser->previous);
-
+                parser_advance(parser);
                 wl_parser_ast_node_t *param = wl_parser_ast_node_create(
                     WL_PARSER_AST_NODE_OUTPUT_PARAM, p_line, p_col);
-                param->name = param_name;
-                param->str_value = param_value;
+                param->name = strdup_safe("filename");
+                param->str_value = token_to_str_value(&parser->previous);
                 wl_parser_ast_node_add_child(output, param);
+                /* Allow trailing key=value params after positional */
+                if (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)
+                    && parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
+                    /* trailing comma before ) -- skip */
+                } else if (parser->previous.type
+                    == WL_PARSER_LEXER_TOK_COMMA) {
+                    goto output_kv_params;
+                }
+            } else {
+output_kv_params:
+                for (;;) {
+                    uint32_t p_line = parser->current.line;
+                    uint32_t p_col = parser->current.col;
 
-                if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
-                    break;
+                    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+                        "expected parameter name")) {
+                        wl_parser_ast_node_free(output);
+                        return NULL;
+                    }
+                    char *param_name = token_to_name(&parser->previous);
+
+                    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_EQ,
+                        "expected '=' after parameter name")) {
+                        free(param_name);
+                        wl_parser_ast_node_free(output);
+                        return NULL;
+                    }
+
+                    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_STRING,
+                        "expected string value")) {
+                        free(param_name);
+                        wl_parser_ast_node_free(output);
+                        return NULL;
+                    }
+                    char *param_value = token_to_str_value(&parser->previous);
+
+                    wl_parser_ast_node_t *param = wl_parser_ast_node_create(
+                        WL_PARSER_AST_NODE_OUTPUT_PARAM, p_line, p_col);
+                    param->name = param_name;
+                    param->str_value = param_value;
+                    wl_parser_ast_node_add_child(output, param);
+
+                    if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
+                        break;
+                }
             }
         }
 
