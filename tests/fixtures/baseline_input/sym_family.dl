@@ -1,0 +1,5 @@
+.decl parent(x: symbol, y: symbol)
+.input parent(filename="sym_family.csv", delimiter=",")
+.decl ancestor(x: symbol, y: symbol)
+ancestor(X, Y) :- parent(X, Y).
+ancestor(X, Z) :- parent(X, Y), ancestor(Y, Z).

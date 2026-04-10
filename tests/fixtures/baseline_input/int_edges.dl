@@ -1,0 +1,5 @@
+.decl edge(x: int32, y: int32)
+.input edge(filename="int_edges.csv", delimiter=",")
+.decl tc(x: int32, y: int32)
+tc(X, Y) :- edge(X, Y).
+tc(X, Z) :- tc(X, Y), edge(Y, Z).

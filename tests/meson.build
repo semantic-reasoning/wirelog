@@ -2333,3 +2333,51 @@ test_wl_easy_exe = executable(
 )
 
 test('wl_easy', test_wl_easy_exe)
+
+# ============================================================================
+# Baseline .input Fixture Snapshot Tests (Issue #448)
+# ============================================================================
+
+baseline_py3 = find_program('python3', 'python', required: true)
+baseline_diff_script = files('golden_diff_baseline.py')
+baseline_fixture_dir = meson.project_source_root() / 'tests/fixtures/baseline_input'
+baseline_snapshot_dir = meson.project_source_root() / 'tests/baseline_snapshots'
+
+test('baseline_int_edges',
+  baseline_py3,
+  args: [
+    baseline_diff_script[0],
+    wirelog_cli.full_path(),
+    baseline_fixture_dir / 'int_edges.dl',
+    baseline_snapshot_dir / 'int_edges_stdout.txt',
+  ],
+  depends: wirelog_cli,
+  workdir: baseline_fixture_dir,
+  suite: 'baseline',
+)
+
+test('baseline_sym_family',
+  baseline_py3,
+  args: [
+    baseline_diff_script[0],
+    wirelog_cli.full_path(),
+    baseline_fixture_dir / 'sym_family.dl',
+    baseline_snapshot_dir / 'sym_family_stdout.txt',
+  ],
+  depends: wirelog_cli,
+  workdir: baseline_fixture_dir,
+  suite: 'baseline',
+)
+
+test('baseline_tab_nodes',
+  baseline_py3,
+  args: [
+    baseline_diff_script[0],
+    wirelog_cli.full_path(),
+    baseline_fixture_dir / 'tab_nodes.dl',
+    baseline_snapshot_dir / 'tab_nodes_stdout.txt',
+  ],
+  depends: wirelog_cli,
+  workdir: baseline_fixture_dir,
+  suite: 'baseline',
+)

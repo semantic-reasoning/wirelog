@@ -1,0 +1,3 @@
+doubled(1, 10)
+doubled(2, 20)
+doubled(3, 30)

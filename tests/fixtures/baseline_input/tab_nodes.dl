@@ -1,0 +1,4 @@
+.decl node(id: int32, val: int32)
+.input node(filename="tab_nodes.csv")
+.decl doubled(id: int32, res: int32)
+doubled(X, Y) :- node(X, Y).
