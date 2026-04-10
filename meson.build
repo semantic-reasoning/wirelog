@@ -221,6 +221,7 @@ wirelog_public_headers = [
   'wirelog/wirelog-parser.h',
   'wirelog/wirelog-ir.h',
   'wirelog/wirelog-optimizer.h',
+  'wirelog/wirelog-export.h',
   'wirelog/wl_easy.h',
 ]
 
@@ -234,6 +235,7 @@ wirelog_lib = library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
   dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: true,
   version: project_version,
@@ -245,6 +247,7 @@ wirelog_static_lib = static_library(
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
   dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: false,  # Not installed by default
 )
@@ -253,6 +256,11 @@ wirelog_static_lib = static_library(
 install_headers(
   wirelog_public_headers,
   subdir: 'wirelog'
+)
+
+install_headers(
+  'wirelog/io/io_adapter.h',
+  subdir: 'wirelog/io'
 )
 
 #pkg - config file
