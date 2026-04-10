@@ -1,0 +1,3 @@
+.decl can(user: symbol, perm: symbol)
+.decl granted(user: symbol, perm: symbol)
+granted(U, P) :- can(U, P).
