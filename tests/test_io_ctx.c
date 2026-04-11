@@ -12,14 +12,37 @@
  * Part of #446 (I/O adapter umbrella).
  */
 
+#define TEST_CTX_PRESENT
+
 #include <stdio.h>
 #include <string.h>
 
-/* The io_adapter.h header declares context accessor prototypes (#451)
- * but the actual functions are not yet implemented (#453). Guard all
- * test bodies behind TEST_CTX_PRESENT so they compile as SKIP until
- * the implementation lands. */
-#include "wirelog/io/io_adapter.h"
+#include "wirelog/io/io_ctx_internal.h"
+
+/* ======================================================================== */
+/* Mock Helpers                                                             */
+/* ======================================================================== */
+
+static wl_intern_t *g_intern = NULL;
+
+static wl_io_ctx_t *
+create_mock_ctx(const char *relation_name,
+    const wirelog_column_type_t *col_types, uint32_t num_cols,
+    const char **param_keys, const char **param_values,
+    uint32_t num_params)
+{
+    if (!g_intern)
+        g_intern = wl_intern_create();
+    return wl_io_ctx_create_test(relation_name, col_types, num_cols,
+               param_keys, param_values, num_params,
+               g_intern);
+}
+
+static void
+destroy_mock_ctx(wl_io_ctx_t *ctx)
+{
+    wl_io_ctx_destroy(ctx);
+}
 
 /* ======================================================================== */
 /* Test Harness                                                             */
@@ -199,5 +222,9 @@ int main(void) {
     test_platform_ctx();
     printf("=== Results: %d passed, %d failed, %d skipped ===\n",
         passed, failed, skipped);
+    if (g_intern) {
+        wl_intern_free(g_intern);
+        g_intern = NULL;
+    }
     return failed > 0 ? 1 : 0;
 }

@@ -2404,8 +2404,10 @@ test('io_adapter', test_io_adapter_exe)
 
 test_io_ctx_exe = executable(
   'test_io_ctx',
-  files('test_io_ctx.c'),
+  files('test_io_ctx.c', '../wirelog/io/io_ctx.c'),
+  intern_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
   install: false,
 )
 test('io_ctx', test_io_ctx_exe)
