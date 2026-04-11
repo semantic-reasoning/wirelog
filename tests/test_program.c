@@ -26,23 +26,23 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                      \
-    do {                                \
-        tests_run++;                    \
-        printf("  [TEST] %-55s", name); \
-        fflush(stdout);                 \
-    } while (0)
+        do {                                \
+            tests_run++;                    \
+            printf("  [TEST] %-55s", name); \
+            fflush(stdout);                 \
+        } while (0)
 
 #define PASS()             \
-    do {                   \
-        tests_passed++;    \
-        printf(" PASS\n"); \
-    } while (0)
+        do {                   \
+            tests_passed++;    \
+            printf(" PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                   \
-    do {                            \
-        tests_failed++;             \
-        printf(" FAIL: %s\n", msg); \
-    } while (0)
+        do {                            \
+            tests_failed++;             \
+            printf(" FAIL: %s\n", msg); \
+        } while (0)
 
 /* Helper: parse string and build program */
 static struct wirelog_program *
@@ -89,7 +89,7 @@ test_decl_single_relation(void)
     if (prog->relation_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 relation, got %u",
-                 prog->relation_count);
+            prog->relation_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -171,7 +171,7 @@ test_input_directive_param_names_values(void)
     if (prog->relations[0].input_param_count != 3) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 3 params, got %u",
-                 prog->relations[0].input_param_count);
+            prog->relations[0].input_param_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -183,12 +183,12 @@ test_input_directive_param_names_values(void)
     for (uint32_t i = 0; i < 3; i++) {
         if (!prog->relations[0].input_param_names[i]
             || strcmp(prog->relations[0].input_param_names[i],
-                      expected_names[i])
-                   != 0) {
+            expected_names[i])
+            != 0) {
             char buf[128];
             snprintf(buf, sizeof(buf), "param %u name: expected '%s', got '%s'",
-                     i, expected_names[i],
-                     prog->relations[0].input_param_names[i]
+                i, expected_names[i],
+                prog->relations[0].input_param_names[i]
                          ? prog->relations[0].input_param_names[i]
                          : "(null)");
             wl_ir_program_free(prog);
@@ -197,13 +197,13 @@ test_input_directive_param_names_values(void)
         }
         if (!prog->relations[0].input_param_values[i]
             || strcmp(prog->relations[0].input_param_values[i],
-                      expected_values[i])
-                   != 0) {
+            expected_values[i])
+            != 0) {
             char buf[128];
             snprintf(buf, sizeof(buf),
-                     "param %u value: expected '%s', got '%s'", i,
-                     expected_values[i],
-                     prog->relations[0].input_param_values[i]
+                "param %u value: expected '%s', got '%s'", i,
+                expected_values[i],
+                prog->relations[0].input_param_values[i]
                          ? prog->relations[0].input_param_values[i]
                          : "(null)");
             wl_ir_program_free(prog);
@@ -217,13 +217,79 @@ test_input_directive_param_names_values(void)
 }
 
 static void
+test_input_io_scheme_present(void)
+{
+    TEST("input_io_scheme populated from io param");
+
+    struct wirelog_program *prog = make_program(
+        ".decl R(x: int32, y: int32)\n"
+        ".input R(io=\"pcap\", filename=\"x.pcap\")\n");
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    if (!prog->relations[0].input_io_scheme
+        || strcmp(prog->relations[0].input_io_scheme, "pcap") != 0) {
+        wl_ir_program_free(prog);
+        FAIL("input_io_scheme should be \"pcap\"");
+        return;
+    }
+
+    /* "io" must NOT appear in input_param_names */
+    if (prog->relations[0].input_param_count != 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 1 passthrough param, got %u",
+            prog->relations[0].input_param_count);
+        wl_ir_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (!prog->relations[0].input_param_names[0]
+        || strcmp(prog->relations[0].input_param_names[0], "filename") != 0) {
+        wl_ir_program_free(prog);
+        FAIL("passthrough param should be \"filename\"");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
+test_input_io_scheme_absent(void)
+{
+    TEST("input_io_scheme NULL when io param absent");
+
+    struct wirelog_program *prog = make_program(
+        ".decl R(x: int32, y: int32)\n"
+        ".input R(filename=\"x.csv\")\n");
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    if (prog->relations[0].input_io_scheme != NULL) {
+        wl_ir_program_free(prog);
+        FAIL("input_io_scheme should be NULL");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
 test_output_directive(void)
 {
     TEST("Parse .output marks relation has_output");
 
     struct wirelog_program *prog
         = make_program(".decl Reach(x: int32, y: int32)\n"
-                       ".output Reach\n");
+            ".output Reach\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -247,7 +313,7 @@ test_output_directive_with_filename(void)
 
     struct wirelog_program *prog
         = make_program(".decl Reach(x: int32, y: int32)\n"
-                       ".output Reach(filename=\"reach.csv\")\n");
+            ".output Reach(filename=\"reach.csv\")\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -277,7 +343,7 @@ test_printsize_directive(void)
     TEST("Parse .printsize marks relation has_printsize");
 
     struct wirelog_program *prog = make_program(".decl Tc(x: int32, y: int32)\n"
-                                                ".printsize Tc\n");
+            ".printsize Tc\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -301,11 +367,11 @@ test_full_tc_metadata(void)
 
     struct wirelog_program *prog
         = make_program(".decl Arc(x: int32, y: int32)\n"
-                       ".decl Tc(x: int32, y: int32)\n"
-                       ".input Arc(filename=\"arc.csv\")\n"
-                       ".output Tc\n"
-                       "Tc(x, y) :- Arc(x, y).\n"
-                       "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
+            ".decl Tc(x: int32, y: int32)\n"
+            ".input Arc(filename=\"arc.csv\")\n"
+            ".output Tc\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -315,7 +381,7 @@ test_full_tc_metadata(void)
     if (prog->relation_count != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 relations, got %u",
-                 prog->relation_count);
+            prog->relation_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -351,7 +417,7 @@ test_full_tc_metadata(void)
     if (prog->rule_count != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 rules, got %u",
-                 prog->rule_count);
+            prog->rule_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -368,7 +434,7 @@ test_no_rules_program(void)
 
     struct wirelog_program *prog
         = make_program(".decl Arc(x: int32, y: int32)\n"
-                       ".input Arc(filename=\"data.csv\")\n");
+            ".input Arc(filename=\"data.csv\")\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -435,9 +501,9 @@ test_default_stratum(void)
 
     struct wirelog_program *prog
         = make_program(".decl Arc(x: int32, y: int32)\n"
-                       ".decl Tc(x: int32, y: int32)\n"
-                       "Tc(x, y) :- Arc(x, y).\n"
-                       "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -461,7 +527,7 @@ test_default_stratum(void)
     if (prog->strata[0].rule_count != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 rule names, got %u",
-                 prog->strata[0].rule_count);
+            prog->strata[0].rule_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -507,8 +573,8 @@ test_simple_rule(void)
     TEST("Simple rule r(x) :- a(x). -> PROJECT over SCAN");
 
     struct wirelog_program *prog = make_program_with_rules(".decl a(x: int32)\n"
-                                                           ".decl r(x: int32)\n"
-                                                           "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -550,8 +616,8 @@ test_two_body_join(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl Tc(x: int32, y: int32)\n"
-                                  ".decl Arc(x: int32, y: int32)\n"
-                                  "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
+            ".decl Arc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -589,7 +655,7 @@ test_two_body_join(void)
     if (join->join_key_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 join key, got %u",
-                 join->join_key_count);
+            join->join_key_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -664,9 +730,9 @@ test_negation_antijoin(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl node(x: int32)\n"
-                                  ".decl edge(x: int32, y: int32)\n"
-                                  ".decl isolated(x: int32)\n"
-                                  "isolated(x) :- node(x), !edge(x, _).\n");
+            ".decl edge(x: int32, y: int32)\n"
+            ".decl isolated(x: int32)\n"
+            "isolated(x) :- node(x), !edge(x, _).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -684,7 +750,7 @@ test_negation_antijoin(void)
     if (antijoin->type != WIRELOG_IR_ANTIJOIN) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected ANTIJOIN, got type %d",
-                 antijoin->type);
+            antijoin->type);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -707,8 +773,8 @@ test_aggregation_simple(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl sssp2(x: int32, d: int32)\n"
-                                  ".decl sssp(x: int32, d: int32)\n"
-                                  "sssp(x, min(d)) :- sssp2(x, d).\n");
+            ".decl sssp(x: int32, d: int32)\n"
+            "sssp(x, min(d)) :- sssp2(x, d).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -791,8 +857,8 @@ test_aggregation_constant(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl id(x: int32)\n"
-                                  ".decl r(x: int32, d: int32)\n"
-                                  "r(x, min(0)) :- id(x).\n");
+            ".decl r(x: int32, d: int32)\n"
+            "r(x, min(0)) :- id(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -829,10 +895,10 @@ test_three_body_join(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl a(x: int32, y: int32)\n"
-                                  ".decl b(y: int32, z: int32)\n"
-                                  ".decl c(z: int32)\n"
-                                  ".decl r(x: int32)\n"
-                                  "r(x) :- a(x, y), b(y, z), c(z).\n");
+            ".decl b(y: int32, z: int32)\n"
+            ".decl c(z: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x, y), b(y, z), c(z).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -884,8 +950,8 @@ test_duplicate_variable(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl a(x: int32, y: int32)\n"
-                                  ".decl r(x: int32)\n"
-                                  "r(x) :- a(x, x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x, x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -904,7 +970,7 @@ test_duplicate_variable(void)
     if (filter->type != WIRELOG_IR_FILTER) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected FILTER, got type %d",
-                 filter->type);
+            filter->type);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -939,8 +1005,8 @@ test_constant_in_atom(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl a(x: int32, y: int32)\n"
-                                  ".decl r(x: int32)\n"
-                                  "r(x) :- a(x, 42).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x, 42).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -958,7 +1024,7 @@ test_constant_in_atom(void)
     if (filter->type != WIRELOG_IR_FILTER) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected FILTER, got type %d",
-                 filter->type);
+            filter->type);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -998,9 +1064,9 @@ test_wildcard_not_join_key(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl a(x: int32, y: int32)\n"
-                                  ".decl b(z: int32, w: int32)\n"
-                                  ".decl r(x: int32)\n"
-                                  "r(x) :- a(x, _), b(_, x).\n");
+            ".decl b(z: int32, w: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x, _), b(_, x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1013,7 +1079,7 @@ test_wildcard_not_join_key(void)
 
     /* May have filters wrapping, find the JOIN */
     while (join_node && join_node->type != WIRELOG_IR_JOIN
-           && join_node->child_count > 0) {
+        && join_node->child_count > 0) {
         join_node = join_node->children[0];
     }
 
@@ -1027,7 +1093,7 @@ test_wildcard_not_join_key(void)
     if (join_node->join_key_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 join key, got %u",
-                 join_node->join_key_count);
+            join_node->join_key_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -1036,7 +1102,7 @@ test_wildcard_not_join_key(void)
     if (strcmp(join_node->join_left_keys[0], "x") != 0) {
         char buf[100];
         snprintf(buf, sizeof(buf), "join key should be x, got %s",
-                 join_node->join_left_keys[0]);
+            join_node->join_left_keys[0]);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -1053,8 +1119,8 @@ test_wildcard_in_scan(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl a(x: int32, y: int32, z: int32)\n"
-                                  ".decl r(x: int32)\n"
-                                  "r(x) :- a(x, _, _).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x, _, _).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1110,8 +1176,8 @@ test_boolean_true_noop(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl a(x: int32)\n"
-                                  ".decl r(x: int32)\n"
-                                  "r(x) :- a(x), True.\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x), True.\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1129,8 +1195,8 @@ test_boolean_true_noop(void)
     if (root->children[0]->type != WIRELOG_IR_SCAN) {
         char buf[100];
         snprintf(buf, sizeof(buf),
-                 "expected SCAN, got type %d (True should be no-op)",
-                 root->children[0]->type);
+            "expected SCAN, got type %d (True should be no-op)",
+            root->children[0]->type);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -1147,8 +1213,8 @@ test_boolean_false_filter(void)
 
     struct wirelog_program *prog
         = make_program_with_rules(".decl a(x: int32)\n"
-                                  ".decl r(x: int32)\n"
-                                  "r(x) :- a(x), False.\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x), False.\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1215,9 +1281,9 @@ test_union_merge_tc(void)
 
     struct wirelog_program *prog
         = make_full_program(".decl Arc(x: int32, y: int32)\n"
-                            ".decl Tc(x: int32, y: int32)\n"
-                            "Tc(x, y) :- Arc(x, y).\n"
-                            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1249,7 +1315,7 @@ test_union_merge_tc(void)
     if (tc_ir->child_count != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "UNION should have 2 children, got %u",
-                 tc_ir->child_count);
+            tc_ir->child_count);
         wl_ir_program_free(prog);
         FAIL(buf);
         return;
@@ -1265,8 +1331,8 @@ test_union_single_rule(void)
     TEST("Single-rule relation -> no UNION wrapping");
 
     struct wirelog_program *prog = make_full_program(".decl a(x: int32)\n"
-                                                     ".decl r(x: int32)\n"
-                                                     "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1324,10 +1390,10 @@ test_api_parse_string(void)
     wirelog_error_t err = WIRELOG_ERR_UNKNOWN;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
-                               ".decl Tc(x: int32, y: int32)\n"
-                               "Tc(x, y) :- Arc(x, y).\n"
-                               "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
-                               &err);
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+            &err);
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1373,10 +1439,10 @@ test_api_get_rule_count(void)
 
     wirelog_program_t *prog
         = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
-                               ".decl Tc(x: int32, y: int32)\n"
-                               "Tc(x, y) :- Arc(x, y).\n"
-                               "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
-                               NULL);
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+            NULL);
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1470,9 +1536,9 @@ test_api_get_stratum_count(void)
 
     wirelog_program_t *prog
         = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
-                               ".decl Tc(x: int32, y: int32)\n"
-                               "Tc(x, y) :- Arc(x, y).\n",
-                               NULL);
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n",
+            NULL);
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1499,10 +1565,10 @@ test_api_get_stratum(void)
 
     wirelog_program_t *prog
         = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
-                               ".decl Tc(x: int32, y: int32)\n"
-                               "Tc(x, y) :- Arc(x, y).\n"
-                               "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
-                               NULL);
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+            NULL);
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1519,7 +1585,7 @@ test_api_get_stratum(void)
     if (stratum->rule_count != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 rules, got %u",
-                 stratum->rule_count);
+            stratum->rule_count);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -1631,12 +1697,12 @@ test_api_end_to_end(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
-                               ".decl Tc(x: int32, y: int32)\n"
-                               ".input Arc(filename=\"arc.csv\")\n"
-                               ".output Tc\n"
-                               "Tc(x, y) :- Arc(x, y).\n"
-                               "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
-                               &err);
+            ".decl Tc(x: int32, y: int32)\n"
+            ".input Arc(filename=\"arc.csv\")\n"
+            ".output Tc\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+            &err);
 
     if (!prog || err != WIRELOG_OK) {
         FAIL("parse failed");
@@ -1695,8 +1761,8 @@ test_fact_collection_single_relation(void)
 
     struct wirelog_program *prog
         = make_program(".decl edge(src: int32, dst: int32)\n"
-                       "edge(1, 2).\n"
-                       "edge(2, 3).\n");
+            "edge(1, 2).\n"
+            "edge(2, 3).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1752,10 +1818,10 @@ test_api_get_facts(void)
 
     wirelog_program_t *prog
         = wirelog_parse_string(".decl edge(src: int32, dst: int32)\n"
-                               "edge(1, 2).\n"
-                               "edge(2, 3).\n"
-                               "edge(3, 4).\n",
-                               NULL);
+            "edge(1, 2).\n"
+            "edge(2, 3).\n"
+            "edge(3, 4).\n",
+            NULL);
     if (!prog) {
         FAIL("program is NULL");
         return;
@@ -1774,7 +1840,7 @@ test_api_get_facts(void)
     if (num_rows != 3 || num_cols != 2) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 3x2, got %ux%u", num_rows,
-                 num_cols);
+            num_cols);
         free(data);
         wirelog_program_free(prog);
         FAIL(buf);
@@ -1839,7 +1905,7 @@ test_api_get_facts_unknown_relation(void)
     int64_t *data = NULL;
     uint32_t num_rows = 0, num_cols = 0;
     int rc = wirelog_program_get_facts(prog, "nonexistent", &data, &num_rows,
-                                       &num_cols);
+            &num_cols);
     if (rc != -1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected rc=-1, got %d", rc);
@@ -1863,9 +1929,9 @@ test_string_fact_interning(void)
     TEST("string fact interning via parser");
 
     const char *source = ".decl name(x: string)\n"
-                         "name(\"Alice\").\n"
-                         "name(\"Bob\").\n"
-                         "name(\"Alice\").\n";
+        "name(\"Alice\").\n"
+        "name(\"Bob\").\n"
+        "name(\"Alice\").\n";
 
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(source, &err);
@@ -1952,6 +2018,8 @@ main(void)
     test_decl_single_relation();
     test_input_directive();
     test_input_directive_param_names_values();
+    test_input_io_scheme_present();
+    test_input_io_scheme_absent();
     test_output_directive();
     test_output_directive_with_filename();
     test_printsize_directive();
@@ -2011,7 +2079,7 @@ main(void)
     test_api_end_to_end();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
-           tests_passed, tests_failed, tests_run);
+        tests_passed, tests_failed, tests_run);
 
     return tests_failed > 0 ? 1 : 0;
 }

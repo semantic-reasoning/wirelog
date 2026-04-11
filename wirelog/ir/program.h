@@ -36,6 +36,7 @@ typedef struct {
     char **input_param_names;
     char **input_param_values;
     uint32_t input_param_count;
+    char *input_io_scheme;   /* strdup'd from io="..." param; NULL => default "csv" */
     /* .output parameters */
     char *
         output_file; /* filename from .output relation(filename="..."), or NULL */

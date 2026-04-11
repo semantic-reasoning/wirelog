@@ -91,6 +91,7 @@ relation_info_free(wl_ir_relation_info_t *info)
         free(info->input_param_names);
         free(info->input_param_values);
     }
+    free(info->input_io_scheme);
     free(info->output_file);
     free(info->fact_data);
 }
@@ -197,6 +198,11 @@ add_relation(struct wirelog_program *prog, const char *name)
         uint32_t new_cap = prog->relation_capacity == 0
                                ? INITIAL_CAPACITY
                                : prog->relation_capacity * 2;
+        /* Shallow copy of wl_ir_relation_info_t is safe here: input_io_scheme
+         * is a strdup'd string owned by the entry, mirroring the existing
+         * input_param_names/values pattern. No double-free risk because the
+         * old array is freed (not its elements) and the new array takes
+         * ownership of all pointers. */
         wl_ir_relation_info_t *new_rels = (wl_ir_relation_info_t *)realloc(
             prog->relations, new_cap * sizeof(wl_ir_relation_info_t));
         if (!new_rels)
@@ -294,11 +300,19 @@ collect_input(struct wirelog_program *prog,
 
     rel->has_input = true;
 
-    /* Extract input parameters */
+    /* Extract input parameters.  The "io" key is consumed as a reserved
+     * parameter to populate input_io_scheme and is NOT passed through
+     * to input_param_names/values. */
     uint32_t param_count = 0;
     for (uint32_t i = 0; i < input_node->child_count; i++) {
         if (input_node->children[i]->type == WL_PARSER_AST_NODE_INPUT_PARAM) {
-            param_count++;
+            if (input_node->children[i]->name
+                && strncmp("io", input_node->children[i]->name, 3) == 0) {
+                rel->input_io_scheme
+                    = strdup_safe(input_node->children[i]->str_value);
+            } else {
+                param_count++;
+            }
         }
     }
 
@@ -313,6 +327,8 @@ collect_input(struct wirelog_program *prog,
         for (uint32_t i = 0; i < input_node->child_count; i++) {
             const wl_parser_ast_node_t *param = input_node->children[i];
             if (param->type == WL_PARSER_AST_NODE_INPUT_PARAM) {
+                if (param->name && strncmp(param->name, "io", 3) == 0)
+                    continue;
                 rel->input_param_names[idx] = strdup_safe(param->name);
                 rel->input_param_values[idx] = strdup_safe(param->str_value);
                 idx++;
