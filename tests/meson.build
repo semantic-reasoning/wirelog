@@ -2381,3 +2381,15 @@ test('baseline_tab_nodes',
   workdir: baseline_fixture_dir,
   suite: 'baseline',
 )
+
+# ============================================================================
+# I/O Adapter Registry Tests (#450)
+# ============================================================================
+
+test_io_adapter_exe = executable(
+  'test_io_adapter',
+  files('test_io_adapter.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  install: false,
+)
+test('io_adapter', test_io_adapter_exe)
