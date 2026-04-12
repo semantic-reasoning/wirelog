@@ -51,6 +51,9 @@ bench_backend_src = files(
 
 bench_io_src = files(
   subdir_wirelog / 'io/csv_reader.c',
+  subdir_wirelog / 'io/io_adapter.c',
+  subdir_wirelog / 'io/io_ctx.c',
+  subdir_wirelog / 'io/csv_adapter.c',
 )
 
 bench_arena_src = files(

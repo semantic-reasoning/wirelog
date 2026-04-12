@@ -42,10 +42,18 @@
 /* Intern Trampoline                                                        */
 /* ======================================================================== */
 
+/*
+ * The built-in CSV adapter calls wl_intern_put directly (0-based IDs)
+ * to stay consistent with the legacy wl_csv_read_file_ex path.
+ * External adapters should use wl_io_ctx_intern_string (1-based) instead.
+ */
 static int64_t
 csv_intern_trampoline(void *opaque, const char *str)
 {
-    return wl_io_ctx_intern_string((wl_io_ctx_t *)opaque, str);
+    wl_io_ctx_t *ctx = (wl_io_ctx_t *)opaque;
+    if (!ctx || !ctx->intern)
+        return -1;
+    return wl_intern_put(ctx->intern, str);
 }
 
 /* ======================================================================== */

@@ -17,6 +17,43 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
+/* Production Constructor (from relation metadata)                          */
+/* ------------------------------------------------------------------------ */
+
+wl_io_ctx_t *
+wl_io_ctx_create_for_relation(const wl_ir_relation_info_t *rel,
+    wl_intern_t *intern)
+{
+    if (!rel)
+        return NULL;
+
+    wl_io_ctx_t *ctx = (wl_io_ctx_t *)calloc(1, sizeof(*ctx));
+    if (!ctx)
+        return NULL;
+
+    ctx->relation_name = rel->name;                          /* borrowed */
+    ctx->num_cols = rel->column_count;
+    ctx->param_keys = (const char **)rel->input_param_names;      /* borrowed */
+    ctx->param_values = (const char **)rel->input_param_values;   /* borrowed */
+    ctx->num_params = rel->input_param_count;
+    ctx->intern = intern;                                    /* borrowed */
+    ctx->platform_ctx = NULL;
+
+    if (rel->column_count > 0 && rel->columns) {
+        ctx->col_types = (wirelog_column_type_t *)malloc(
+            rel->column_count * sizeof(wirelog_column_type_t));
+        if (!ctx->col_types) {
+            free(ctx);
+            return NULL;
+        }
+        for (uint32_t i = 0; i < rel->column_count; i++)
+            ctx->col_types[i] = rel->columns[i].type;
+    }
+
+    return ctx;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Test Constructor / Destructor                                            */
 /* ------------------------------------------------------------------------ */
 
