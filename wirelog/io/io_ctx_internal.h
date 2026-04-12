@@ -16,6 +16,7 @@
 
 #include "wirelog/io/io_adapter.h"
 #include "wirelog/intern.h"
+#include "wirelog/ir/program.h"  /* for wl_ir_relation_info_t */
 
 struct wl_io_ctx {
     const char             *relation_name;
@@ -24,7 +25,7 @@ struct wl_io_ctx {
     const char            **param_keys;      /* borrowed */
     const char            **param_values;    /* borrowed */
     uint32_t num_params;
-    wl_intern_t            *intern;          /* owned by context */
+    wl_intern_t            *intern;          /* borrowed, not owned */
     void                   *platform_ctx;
 };
 
@@ -35,5 +36,9 @@ wl_io_ctx_t *wl_io_ctx_create_test(
     wl_intern_t *intern);
 
 void wl_io_ctx_destroy(wl_io_ctx_t *ctx);
+
+wl_io_ctx_t *wl_io_ctx_create_for_relation(
+    const wl_ir_relation_info_t *rel,
+    wl_intern_t *intern);
 
 #endif /* WIRELOG_IO_IO_CTX_INTERNAL_H */

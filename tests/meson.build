@@ -42,6 +42,20 @@ csv_src = files(
   '../wirelog/io/csv_reader.c',
 )
 
+io_src = files(
+  '../wirelog/io/csv_reader.c',
+  '../wirelog/io/io_adapter.c',
+  '../wirelog/io/csv_adapter.c',
+  '../wirelog/io/io_ctx.c',
+)
+
+# Select threading backend based on platform
+if host_machine.system() == 'windows'
+  thread_src = files('../wirelog/thread_msvc.c',)
+else
+  thread_src = files('../wirelog/thread_posix.c',)
+endif
+
 # ============================================================================
 # Test Executables
 # ============================================================================
@@ -65,8 +79,10 @@ test_ir_exe = executable(
   files('test_ir.c'),
   parser_src,
   ir_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test_program_exe = executable(
@@ -74,8 +90,10 @@ test_program_exe = executable(
   files('test_program.c'),
   parser_src,
   ir_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test_stratify_exe = executable(
@@ -83,8 +101,10 @@ test_stratify_exe = executable(
   files('test_stratify.c'),
   parser_src,
   ir_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 # ============================================================================
@@ -103,8 +123,10 @@ test_fusion_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('fusion', test_fusion_exe)
@@ -115,8 +137,10 @@ test_jpp_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('jpp', test_jpp_exe)
@@ -127,8 +151,10 @@ test_sip_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('sip', test_sip_exe)
@@ -204,13 +230,6 @@ backend_src = files(
   '../wirelog/string_ops.c',
 )
 
-io_src = files(
-  '../wirelog/io/csv_reader.c',
-  '../wirelog/io/io_adapter.c',
-  '../wirelog/io/csv_adapter.c',
-  '../wirelog/io/io_ctx.c',
-)
-
 arena_src = files(
   '../wirelog/arena/arena.c',
 )
@@ -218,13 +237,6 @@ arena_src = files(
 workqueue_src = files(
   '../wirelog/workqueue.c',
 )
-
-# Select threading backend based on platform
-if host_machine.system() == 'windows'
-  thread_src = files('../wirelog/thread_msvc.c',)
-else
-  thread_src = files('../wirelog/thread_posix.c',)
-endif
 
 test_plan_gen_exe = executable(
   'test_plan_gen',
@@ -1338,9 +1350,10 @@ test_bitwise_types_exe = executable(
   files('test_bitwise_types.c'),
   parser_src,
   ir_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep],
+  dependencies: [nanoarrow_dep, threads_dep],
 )
 
 test('bitwise_types', test_bitwise_types_exe)
@@ -1350,9 +1363,10 @@ test_bitwise_parser_exe = executable(
   files('test_bitwise_parser.c'),
   parser_src,
   ir_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep],
+  dependencies: [nanoarrow_dep, threads_dep],
 )
 
 test('bitwise_parser', test_bitwise_parser_exe)
@@ -1400,9 +1414,10 @@ test_hash_types_exe = executable(
   files('test_hash_types.c'),
   parser_src,
   ir_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep],
+  dependencies: [nanoarrow_dep, threads_dep],
 )
 
 test('hash_types', test_hash_types_exe)
@@ -1412,9 +1427,10 @@ test_hash_parser_exe = executable(
   files('test_hash_parser.c'),
   parser_src,
   ir_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep],
+  dependencies: [nanoarrow_dep, threads_dep],
 )
 
 test('hash_parser', test_hash_parser_exe)
@@ -1619,8 +1635,10 @@ test_magic_sets_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('magic_sets', test_magic_sets_exe)
@@ -2296,8 +2314,10 @@ test_string_parser_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
-  csv_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('string_parser', test_string_parser_exe)
@@ -2421,7 +2441,13 @@ test('io_ctx', test_io_ctx_exe)
 test_io_dispatch_exe = executable(
   'test_io_dispatch',
   files('test_io_dispatch.c'),
+  parser_src,
+  ir_src,
+  io_src,
+  thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING', '-DTEST_DISPATCH_PRESENT'],
+  dependencies: [threads_dep],
   install: false,
 )
 test('io_dispatch', test_io_dispatch_exe)
