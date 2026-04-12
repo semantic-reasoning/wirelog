@@ -26,22 +26,22 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Test: wl_csv_parse_line                                                  */
@@ -422,7 +422,7 @@ test_parse_line_ex_mixed(void)
     int64_t values[3];
     uint32_t count = 0;
     int rc = wl_csv_parse_line_ex("\"Alice\",42,\"Bob\"", ',', types, 3, values,
-                                  &count, intern);
+            &count, intern);
 
     if (rc != 0) {
         FAIL("returned non-zero");
@@ -476,7 +476,7 @@ test_parse_line_ex_unquoted_strings(void)
     int64_t values[2];
     uint32_t count = 0;
     int rc = wl_csv_parse_line_ex("hello,world", ',', types, 2, values, &count,
-                                  intern);
+            intern);
 
     if (rc != 0) {
         FAIL("returned non-zero");
@@ -539,6 +539,82 @@ test_parse_line_ex_all_int(void)
 }
 
 /* ======================================================================== */
+/* Test: wl_csv_read_file_via_ctx (callback-based, #455)                    */
+/* ======================================================================== */
+
+static int64_t fake_intern_counter;
+
+static int64_t
+fake_intern_cb(void *opaque, const char *str)
+{
+    (void)opaque;
+    (void)str;
+    return fake_intern_counter++;
+}
+
+static void
+test_csv_via_ctx_callback(void)
+{
+    TEST("read_file_via_ctx: callback invoked for STRING columns");
+
+    char path[512];
+    test_tmppath(path, sizeof(path), "wirelog_test_csv_via_ctx.csv");
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        FAIL("cannot create temp file");
+        return;
+    }
+    fprintf(f, "\"Alice\",10\n\"Bob\",20\n\"Carol\",30\n");
+    fclose(f);
+
+    wirelog_column_type_t types[]
+        = { WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT32 };
+
+    fake_intern_counter = 0;
+
+    int64_t *data = NULL;
+    uint32_t nrows = 0, ncols = 0;
+    int rc = wl_csv_read_file_via_ctx(path, ',', types, 2,
+            &data, &nrows, &ncols,
+            fake_intern_cb, NULL);
+    remove(path);
+
+    if (rc != 0) {
+        FAIL("returned non-zero");
+        return;
+    }
+    if (nrows != 3 || ncols != 2) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected 3x2, got %ux%u", nrows, ncols);
+        free(data);
+        FAIL(msg);
+        return;
+    }
+
+    /* Callback should have been called 3 times (once per STRING cell) */
+    if (fake_intern_counter != 3) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected 3 intern calls, got %d",
+            (int)fake_intern_counter);
+        free(data);
+        FAIL(msg);
+        return;
+    }
+
+    /* String column IDs: 0, 1, 2 (from counter); int column values: 10, 20, 30 */
+    if (data[0] != 0 || data[1] != 10
+        || data[2] != 1 || data[3] != 20
+        || data[4] != 2 || data[5] != 30) {
+        free(data);
+        FAIL("wrong data values");
+        return;
+    }
+
+    free(data);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -570,8 +646,11 @@ main(void)
     test_read_file_null_args();
     test_read_file_inconsistent_cols();
 
+    printf("\n--- Callback-based Reading (#455) ---\n");
+    test_csv_via_ctx_callback();
+
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
-           tests_passed, tests_failed, tests_run);
+        tests_passed, tests_failed, tests_run);
 
     return tests_failed > 0 ? 1 : 0;
 }

@@ -35,7 +35,7 @@
  */
 int
 wl_csv_parse_line(const char *line, char delimiter, int64_t *values,
-                  uint32_t max_cols, uint32_t *count);
+    uint32_t max_cols, uint32_t *count);
 
 /**
  * wl_csv_read_file:
@@ -56,7 +56,7 @@ wl_csv_parse_line(const char *line, char delimiter, int64_t *values,
  */
 int
 wl_csv_read_file(const char *path, char delimiter, int64_t **data,
-                 uint32_t *nrows, uint32_t *ncols);
+    uint32_t *nrows, uint32_t *ncols);
 
 /**
  * wl_csv_parse_line_ex:
@@ -81,8 +81,8 @@ wl_csv_read_file(const char *path, char delimiter, int64_t **data,
  */
 int
 wl_csv_parse_line_ex(const char *line, char delimiter,
-                     const wirelog_column_type_t *col_types, uint32_t num_cols,
-                     int64_t *values, uint32_t *count, wl_intern_t *intern);
+    const wirelog_column_type_t *col_types, uint32_t num_cols,
+    int64_t *values, uint32_t *count, wl_intern_t *intern);
 
 /**
  * wl_csv_read_file_ex:
@@ -107,8 +107,29 @@ wl_csv_parse_line_ex(const char *line, char delimiter,
  */
 int
 wl_csv_read_file_ex(const char *path, char delimiter,
-                    const wirelog_column_type_t *col_types, uint32_t num_cols,
-                    int64_t **data, uint32_t *nrows, uint32_t *ncols,
-                    wl_intern_t *intern);
+    const wirelog_column_type_t *col_types, uint32_t num_cols,
+    int64_t **data, uint32_t *nrows, uint32_t *ncols,
+    wl_intern_t *intern);
+
+/**
+ * wl_csv_read_file_via_ctx:
+ * Callback-based variant for I/O adapter integration (#455).
+ * @intern_cb: called for each STRING cell, must return an int64_t id.
+ * @opaque:    passed verbatim to intern_cb.
+ *
+ * Otherwise identical to wl_csv_read_file_ex.
+ * DO NOT DELETE -- Path A rollback target
+ */
+int
+wl_csv_read_file_via_ctx(
+    const char *filepath,
+    char delimiter,
+    const wirelog_column_type_t *col_types,
+    uint32_t num_cols,
+    int64_t **out_data,
+    uint32_t *out_nrows,
+    uint32_t *out_ncols,
+    int64_t (*intern_cb)(void *opaque, const char *str),
+    void *opaque);
 
 #endif /* WIRELOG_IO_CSV_READER_H */
