@@ -230,30 +230,6 @@ Timely-Differential은 다음을 제공합니다:
 
 ---
 
-## 알려진 이슈 & 향후 작업
-
-### 이슈 1: C11 순수성 위반 (계획된 제거)
-
-**현재**: POSIX pthreads, `_GNU_SOURCE`, `__builtin_*` (qsort_r은 fallback만)  
-**향후**: C11 `<threads.h>`, 포터블 인트린직으로 마이그레이션  
-**타임라인**: T+2-3개월 (컴파일러 지원 안정화 시)
-
-### 이슈 2: Shared Plan에서 Backend 특정 연산자 노출
-
-**현재**: `WL_PLAN_OP_K_FUSION`, `WL_PLAN_OP_LFTJ`, `WL_PLAN_OP_EXCHANGE`이 `exec_plan.h` enum에 있음  
-**향후**: 보편적 (0-8)과 backend 특정 (9+) 연산자 분리  
-**이유**: FPGA backend 추가 시 혼동을 방지합니다.  
-**타임라인**: FPGA backend 구현 전
-
-### 이슈 3: 단일 Backend 구현
-
-**현재**: Columnar backend만 존재; 추상화가 여러 backend에서 미검증  
-**향후**: Arrow IPC를 사용하는 FPGA backend 추가  
-**위험**: Backend 인터페이스의 아키텍처 결함이 2번째 backend 추가까지 숨겨질 수 있습니다.  
-**완화**: FPGA 구현 전 vtable 설계의 코드 리뷰
-
----
-
 ## 참고자료
 
 - **검증 보고서**: 아키텍트 & 비평가 분석 (2026-04-13)

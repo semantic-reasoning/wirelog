@@ -231,30 +231,6 @@ Timely-Differential provides:
 
 ---
 
-## Known Issues & Future Work
-
-### Issue 1: C11 Purity Violations (Planned Removal)
-
-**Current**: POSIX pthreads, `_GNU_SOURCE`, `__builtin_*` (qsort_r only as fallback)  
-**Future**: Migrate to C11 `<threads.h>`, portable intrinsics  
-**Timeline**: T+2-3 months (when compiler support stabilizes)
-
-### Issue 2: Backend-Specific Operators in Shared Plan
-
-**Current**: `WL_PLAN_OP_K_FUSION`, `WL_PLAN_OP_LFTJ`, `WL_PLAN_OP_EXCHANGE` in `exec_plan.h` enum  
-**Future**: Separate universal (0-8) from backend-specific (9+) operators  
-**Why**: Prevents confusion when adding FPGA backend  
-**Timeline**: Before FPGA backend implementation
-
-### Issue 3: Single Backend Implementation
-
-**Current**: Only columnar backend exists; abstraction untested with multiple backends  
-**Future**: Add FPGA backend via Arrow IPC  
-**Risk**: Architectural flaws in backend interface may be hidden until 2nd backend is added  
-**Mitigation**: Code review of vtable design before FPGA implementation
-
----
-
 ## References
 
 - **Verification Report**: Architect & Critic analysis (2026-04-13)
