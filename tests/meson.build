@@ -2473,3 +2473,25 @@ test_io_adapter_concurrent_exe = executable(
   install: false,
 )
 test('io_adapter_concurrent', test_io_adapter_concurrent_exe)
+
+# ============================================================================
+# Mock Adapter Error-Path Tests for ASan (#459)
+# Exercises NULL inputs, boundary scheme lengths, registry-full, and
+# error-string clearing.  ASan catches out-of-bounds writes on scheme copy.
+# ============================================================================
+
+test_io_adapter_asan_exe = executable(
+  'test_io_adapter_asan',
+  files('test_io_adapter_asan.c',
+        '../wirelog/io/io_adapter.c',
+        '../wirelog/io/csv_adapter.c',
+        '../wirelog/io/csv_reader.c',
+        '../wirelog/io/io_ctx.c',
+        '../wirelog/intern.c'),
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
+  dependencies: [threads_dep],
+  install: false,
+)
+test('io_adapter_asan', test_io_adapter_asan_exe)
