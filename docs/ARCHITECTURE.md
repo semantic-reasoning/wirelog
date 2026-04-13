@@ -1,276 +1,263 @@
-# Wirelog Architecture
+# Wirelog Architecture - Persistent Design
 
-**Last Updated:** 2026-03-08
-**Version:** 0.11.0
-
----
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Core Components](#core-components)
-3. [Evaluator Architecture](#evaluator-architecture)
-4. [K-Fusion Optimization](#k-fusion-optimization)
-5. [Performance Characteristics](#performance-characteristics)
-6. [Extensibility](#extensibility)
+**Last Updated:** 2026-04-13  
+**Verification:** Architect & Critic review complete
 
 ---
 
 ## Overview
 
-Wirelog is a datalog engine with a pure C11 columnar backend. It evaluates Datalog programs via semi-naive fixed-point iteration, tracking deltas between iterations to enable incremental updates.
+Wirelog is a Datalog engine built on **Timely-Differential concepts** implemented in **Pure C11**, using **Columnar storage** with **K-Fusion parallelism** and a **pluggable Backend abstraction**.
 
-**Key Characteristics:**
-- **Execution Model**: Semi-naive evaluation with delta tracking
-- **Backend**: Pure C11 columnar storage (nanoarrow format)
-- **Parallelism**: Workqueue-based task parallelism (Phase 2B+)
-- **Memory**: Arena-based allocation for efficient multi-threaded execution
-- **Optimization**: K-fusion parallelism for multi-copy relations
+This document describes the **invariant architectural principles** that must be preserved across all phases and implementations. It is intentionally separated from phase-specific implementation details (which may be in separate roadmap documents).
 
 ---
 
-## Core Components
+## Core Design Philosophy
 
-### Parser & IR (`wirelog/parser/`, `wirelog/ir/`)
-- **Lexer/Parser**: Parse Datalog source into Abstract Syntax Tree
-- **IR (Intermediate Representation)**: Normalized AST with validation
-- **Stratification**: Dependency analysis and stratum ordering
-- **Interning**: Symbol table for efficient string/identifier management
-
-### Optimizer (`wirelog/passes/`)
-- **Fusion**: Combine adjacent operators into compound operations
-- **JPP (Predicate Push-down)**: Push filters early in evaluation
-- **SIP (Semi-Join Push-down)**: Optimize joins via semi-joins
-
-### Plan Generation (`wirelog/exec_plan_gen.c`)
-- **Plan Structure**: Compile Datalog programs to operator sequences
-- **Multi-way Delta Expansion**: Create K-copy evaluation for relations with K ≥ 2 IDB body atoms
-- **Materialization Hints**: Mark shared join prefixes for CSE reuse
-
-### Backend Execution (`wirelog/backend/columnar_nanoarrow.c`)
-- **Operator Dispatch**: Execute operators on columnar data
-- **Columnar Storage**: Row-major int64_t arrays for efficient SIMD
-- **Session Management**: Maintain relations across iterations
-- **Operator Implementations**: VARIABLE, MAP, FILTER, JOIN, ANTIJOIN, REDUCE, CONCAT, CONSOLIDATE, SEMIJOIN, K_FUSION
+1. **Embedded-to-Enterprise Duality**: Single codebase targets both resource-constrained embedded systems and high-performance enterprise servers
+2. **FPGA-Ready Lightweight Design**: No heavy dependencies (LLVM, CUDA, MPI); Arrow IPC enables future hardware acceleration
+3. **Backend Pluggability**: Compute backends are swappable via abstraction; new backends (FPGA, GPU) can be added without modifying core logic
+4. **Pure C11 Foundation**: No runtime, no GC, minimal external dependencies
 
 ---
 
-## Evaluator Architecture
+## Five Invariant Principles
 
-### Semi-Naive Evaluation
+### 1. Timely-Differential Foundation
 
-The semi-naive evaluator executes relations via fixed-point iteration:
+**Principle**: Wirelog implements core concepts from Timely-Differential dataflow natively in C11.
 
-```
-Iteration 0: Evaluate base case (E₀) using full relations
-Iteration 1-∞: Evaluate delta case (Δ) using deltas from prior iteration
-Loop while: Iteration produces new facts (Δ is non-empty)
-```
+**What this means**:
+- **Lattice timestamps**: Each iteration/epoch is represented as a partially-ordered lattice `(outer_epoch, iteration, worker)` with semilattice join operation
+- **Z-set semantics**: Facts carry signed multiplicities (+1 insert, -1 retract) enabling correct incremental computation
+- **Differential arrangements**: Relations are indexed with delta tracking for incremental skip optimization
+- **Frontier tracking**: Per-stratum and per-rule progress frontiers enable incremental evaluation (skip unnecessary iterations)
+- **Mobius delta formula**: Weighted joins use multiplicity multiplication and Mobius inversion for correct semantics
 
-**Fixed-Point Property**: For acyclic Datalog, convergence is guaranteed in polynomial iterations (typically 6-10 for most workloads).
+**Why**: Timely-Differential provides proven correctness guarantees for incremental datalog evaluation. Reimplementing these concepts in C ensures embedded compatibility while retaining the computational model.
 
-### Delta Tracking
-
-Relations are stored in two forms:
-- **Full relation** (`rel_name`): Complete set of facts
-- **Delta relation** (`$d$rel_name`): New facts from last iteration
-
-On each iteration:
-1. **Iteration 0**: Uses full relations as base case
-2. **Iteration 1+**: Uses deltas for incremental computation
-3. **Consolidation**: Merge iteration results back into full relation
-
-### K-Copy Relations
-
-When a recursive relation has K ≥ 2 occurrences in rule bodies (IDB atoms), the evaluator creates K separate evaluation paths:
-
-```
-Original Rule: `Path(x,y) :- Edge(x,z), Path(z,y)`
-               (Path is self-referential, K=1)
-
-Multi-way Rule: `TCReach(x,y) :- Path1(x,z), Path2(z,y)`
-                (TCReach depends on 2 Path instances, K=2)
-                Expansion: Path1_copy1, Path2_copy1, Path1_copy2, Path2_copy2
-```
-
-**Current Implementation**: K-copy relations use sequential evaluation with CONSOLIDATE merging.
-**Future K-Fusion Parallelism**: Would use parallel workqueue dispatch for faster evaluation.
+**Code locations**:
+- Lattice timestamps: `wirelog/columnar/diff_trace.h` (col_diff_trace_t)
+- Z-set multiplicity: `wirelog/columnar/columnar_nanoarrow.h:162-174` (col_delta_timestamp_t)
+- Differential arrangements: `wirelog/columnar/diff_arrangement.h`
+- Frontier tracking: `wirelog/columnar/frontier.h`, `wirelog/columnar/progress.h`
+- Mobius formula: `wirelog/columnar/mobius.c`
 
 ---
 
-## K-Fusion Optimization
+### 2. Pure C11 Language
 
-### Motivation
+**Principle**: All implementation must be in standard C11 (ISO/IEC 9899:2011).
 
-Multi-way recursive relations generate K separate evaluation paths (K-copies). Current implementation evaluates them sequentially:
+**What this means**:
+- No Rust, C++, Python, or other languages in the core codebase
+- No FFI boundaries (foreign function interfaces)
+- C11 standard features allowed: `_Static_assert`, `stdatomic.h`, designated initializers, etc.
 
-```
-Sequential: Evaluate_K1 -> Evaluate_K2 -> ... -> Consolidate
-Wall-time: O(K × iteration_time)
-```
+**Current State (2026-04-13)**:
+- ✅ Core engine: Pure C11
+- ✅ Sorting: LSD radix sort (`col_rel_radix_sort_int64()`), fallback to `qsort_r` on allocation failure
+- ⚠️ POSIX dependencies: `pthread` (not C11 `<threads.h>`)
+- ⚠️ Platform intrinsics: `__builtin_ctzll`, `__builtin_prefetch` (GCC/Clang specific)
 
-K-Fusion optimization enables parallel evaluation:
+**Planned Removal**:
+- POSIX pthread → migrate to C11 `<threads.h>` when compiler support matures
+- `__builtin_*` → fallback to portable C11 equivalents
 
-```
-Parallel:  Evaluate_K1 --------\
-           Evaluate_K2 -------- Consolidate
-           ...                 /
-           Evaluate_KN ------/
-Wall-time: O(max(iteration_time) + merge_time)
-```
-
-### Implementation Layers
-
-#### Layer 1: Merge Algorithm (Complete ✅)
-
-**Function**: `col_rel_merge_k()` in `columnar_nanoarrow.c:2138`
-
-- **Purpose**: Merge K sorted relations with on-the-fly deduplication
-- **Algorithms**:
-  - K=1: Passthrough with in-place dedup
-  - K=2: Optimized 2-pointer merge
-  - K≥3: Pairwise recursive merge
-- **Correctness**: Uses lexicographic int64_t comparison (kway_row_cmp)
-- **Thread-Safety**: Callable from main thread after workqueue barrier
-
-#### Layer 2: Operator Infrastructure (Complete ✅)
-
-**Enum**: `WL_PLAN_OP_K_FUSION = 9` in `exec_plan.h`
-
-**Operator Handler**: `col_op_k_fusion()` in `columnar_nanoarrow.c:2301`
-
-- **Status**: Infrastructure complete, awaits plan generation for actual dispatch
-- **Integration**: Case statement in `col_eval_relation_plan()` (line 2571-2573)
-- **Backward Compatibility**: Non-K-fusion operators unchanged
-
-#### Layer 3: Worker Task (Complete ✅)
-
-**Function**: `col_op_k_fusion_worker()` in `columnar_nanoarrow.c:2285`
-
-- **Purpose**: Worker thread entry point for parallel evaluation
-- **Thread-Safety Pattern**:
-  - Per-worker eval_stack: No sharing between workers
-  - Per-worker arena: Independent memory allocation
-  - Read-only session reference: Safe concurrent access
-
-#### Layer 4: Workqueue Integration (Ready for Implementation)
-
-**Requires**:
-1. Per-worker arena allocation
-2. Workqueue create/submit/wait_all/destroy lifecycle
-3. Result collection and in-memory merge
-4. Session registration of merged result
-
-**Interfaces Available**:
-- `wl_workqueue_create(num_workers)`
-- `wl_workqueue_submit(wq, worker_fn, ctx)`
-- `wl_workqueue_wait_all(wq)`
-- `wl_workqueue_destroy(wq)`
-
-### Plan Generation Integration (Future Phase)
-
-**Current Status**: Sequential evaluation via CONSOLIDATE
-**Required for Parallelism**: Plan generation to create K_FUSION nodes with metadata
-
-See `docs/performance/PLAN-GENERATION-STRATEGY.md` for detailed roadmap.
-
-### Performance Characteristics
-
-**Target Improvements** (with full K-Fusion implementation):
-- CSPA (K=2): 30-40% improvement (28.7s → 17-20s)
-- DOOP (K=8): 50-60% improvement (enables 8-way joins)
-
-**Current Sequential Implementation**:
-- Baseline: CSPA 28.7s (Phase 2B)
-- Uses proven CONSOLIDATE merging
-- Correct and efficient without parallelization overhead
+**Code locations**:
+- Build enforcement: `meson.build:49` (`-std=c11`)
+- POSIX abstraction: `wirelog/thread.h`, `wirelog/thread_posix.c`, `wirelog/thread_msvc.c`
+- Radix sort: `wirelog/columnar/relation.c:1449-1638` (col_rel_radix_sort, col_rel_radix_sort_int64)
+- qsort compatibility (fallback): `wirelog/columnar/internal.h:999-1115`
 
 ---
 
-## Performance Characteristics
+### 3. Columnar Storage Foundation
 
-### Bottleneck Analysis
+**Principle**: All relation data is stored in column-major (columnar) format.
 
-Profiling reveals the primary bottleneck (Phase 2B):
+**What this means**:
+- Relations are represented as `col_rel_t`: array of columns, each column is an `int64_t[]` array
+- Layout: `columns[col_index][row_index]` — column-major access pattern
+- Arrow schema metadata: Each relation carries an `ArrowSchema` for type information (via nanoarrow)
+- No row-major storage in hot paths (row-major structures exist only for auxiliary indices like sorted copies or join caches)
 
-1. **K-Copy Evaluation**: ~60-70% of wall-time
-   - Sequential evaluation of K copies
-   - Dominated by merge-sort in CONSOLIDATE
+**Why**:
+- **SIMD-friendly**: Column-major enables vectorized operations on homogeneous data types
+- **Cache-efficient**: Sequential column access improves CPU cache locality
+- **Arrow interop**: Direct mapping to Apache Arrow columnar format enables future IPC integration (FPGA, external systems)
 
-2. **Other Operations**: ~30-40% of wall-time
-   - JOIN execution
-   - Delta tracking
-   - Operator dispatch overhead
-
-**See**: `docs/performance/BOTTLENECK-PROFILING-ANALYSIS.md`
-
-### Memory Usage
-
-- **Baseline**: CSPA ~1.5GB, DOOP not feasible (relation explosion with K=8)
-- **With K-Fusion**: Expected <4GB for K=8 parallelism
-
-### Iteration Counts
-
-- **CSPA**: 6 iterations (fixed-point achieved)
-- **DOOP**: Currently times out at K=8; K-Fusion should enable completion
+**Code locations**:
+- Relation struct: `wirelog/columnar/internal.h:183-266` (col_rel_t with columns[col][row])
+- ArrowSchema integration: `wirelog/columnar/relation.c:213-227`
+- Operator implementations: `wirelog/columnar/ops.c` (VARIABLE/MAP/FILTER/JOIN work on columnar buffers)
 
 ---
 
-## Extensibility
+### 4. K-Fusion Parallelism
 
-### Adding New Operators
+**Principle**: Multi-way semi-naive evaluation is parallelized via K-Fusion: when a recursive relation appears K ≥ 2 times in rule bodies, the backend creates K independent parallel evaluation paths.
 
-1. **Define operator type** in `exec_plan.h` (`wl_plan_op_type_t`)
-2. **Implement handler** in `columnar_nanoarrow.c` (e.g., `col_op_newop()`)
-3. **Add case statement** in `col_eval_relation_plan()` switch
-4. **Write unit tests** in `tests/` with meson registration
-5. **Document** in ARCHITECTURE.md and relevant design docs
+**What this means**:
+- For rule `Path(x,y) :- Edge(x,z), Path(z,y)` (K=1 self-loop): standard semi-naive
+- For rule `Result(x,y) :- Path1(x,z), Path2(z,y)` (K=2 multi-way): creates 2 independent operator sequences, dispatches to workqueue
+- Each worker has isolated copies of differential arrangements (no cross-worker synchronization)
+- Results are merged back after all K workers complete
 
-### Parallelization Patterns
+**Why**:
+- Exposes parallelism at the stratum level without global synchronization
+- Deep-copy isolation simplifies correctness (no locks needed for K-fusion workers)
+- Natural fit for workqueue-based parallel execution
 
-The workqueue + per-worker arena pattern is reusable for future optimizations:
-
-- **Pattern**: Create workers → submit tasks → collect results → barrier → merge
-- **Thread-Safety**: Per-worker exclusive resources avoid contention
-- **Example**: K-Fusion dispatch (future implementation)
-
-### Configuration
-
-Arena allocation strategy can be tuned via:
-- `ARENA_SIZE` macro in `arena/arena.c`
-- Worker count in workqueue creation
-- Delta relation materialization hints
+**Code locations**:
+- Plan-level: `wirelog/exec_plan.h:259` (WL_PLAN_OP_K_FUSION operator type)
+- Plan generation: `wirelog/exec_plan_gen.c:1574-1746` (expand_multiway_k_fusion)
+- Execution: `wirelog/columnar/internal.h:1257` (col_op_k_fusion)
+- Worker isolation: `wirelog/columnar/diff_arrangement.h:88-98` (col_diff_arrangement_deep_copy)
 
 ---
 
-## Testing & Validation
+### 5. Backend Abstraction (Pluggable)
 
-### Unit Tests
-- `tests/test_k_fusion_merge.c`: Merge algorithm correctness (5 tests)
-- `tests/test_k_fusion_dispatch.c`: Dispatch functionality (7 tests)
-- `tests/test_consolidate_kway_merge.c`: CONSOLIDATE operator (multiple cases)
+**Principle**: Compute backends are swappable via a clean vtable abstraction. The core engine (parser, optimizer, plan generation) is backend-agnostic.
 
-### Regression Tests
-- 15 workloads in `bench/` directory
-- Full suite: `meson test -C build`
-- Result validation: fact counts match baseline
+**What this means**:
+- `wl_compute_backend_t` vtable in `wirelog/backend.h:85-107` defines 7 operations: `session_create`, `session_destroy`, `session_insert`, `session_remove`, `session_step`, `session_set_delta_cb`, `session_snapshot`
+- Each backend provides an implementation of this interface
+- `wl_session_t` contains only a pointer to the backend vtable; all dispatch is polymorphic
+- Future backends (FPGA, GPU, distributed) can be added without modifying core engine
 
-### Performance Validation
-- Baseline profiling: `perf record -e cycles,instructions`
-- CSPA wall-time measurement: 3-run median
-- DOOP breakthrough validation: < 5 minute target
+**Current State**:
+- ✅ Columnar backend implemented (`wl_backend_columnar()`)
+- ⚠️ Only one backend exists; abstraction untested with multiple backends
+- ⚠️ Backend-specific operators (K_FUSION, LFTJ, EXCHANGE) leak into shared `exec_plan.h` enum
+
+**Planned Improvements**:
+- Separate universal operators (0-8) from backend-specific operators (9+)
+- Add FPGA backend using Arrow IPC for data transfer
+
+**Code locations**:
+- Vtable: `wirelog/backend.h:85-107` (wl_compute_backend_t)
+- Dispatch layer: `wirelog/session.c` (pure vtable delegation)
+- Embedding contract: `wirelog/columnar/columnar_nanoarrow.h:140-149` (C11 section 6.7.2.1 casting)
+- Singleton: `wirelog/session.c:1921-1936` (wl_backend_columnar)
+
+---
+
+## Architecture Layers
+
+```
+┌─────────────────────────────────────────┐
+│ Application API (wirelog.h)             │
+│ - wirelog_program_load()                │
+│ - wirelog_program_eval()                │
+│ - wirelog_get_facts()                   │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ Logic Layer (C11)                       │
+│ - Parser (hand-written RDP)             │
+│ - IR (Intermediate Representation)      │
+│ - Stratification (SCC detection)        │
+│ - Symbol interning (string dedup)       │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ Optimizer (C11)                         │
+│ - Fusion (FILTER+PROJECT → FLATMAP)    │
+│ - JPP (join reordering)                │
+│ - SIP (semijoin pre-filtering)         │
+│ - Magic Sets, Subsumption              │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ Plan Generation (C11)                   │
+│ - IR → Execution plan translation      │
+│ - K-Fusion expansion                   │
+│ - Multi-way delta expansion            │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ Backend Abstraction Vtable              │
+│ - wl_compute_backend_t interface       │
+└──────────────┬──────────────────────────┘
+               │
+      ┌────────┴────────────┐
+      │                     │
+┌─────▼──────────┐  ┌──────▼──────────┐
+│ Columnar       │  │ FPGA Backend    │
+│ Backend (C11)  │  │ (Planned)       │
+│ + nanoarrow    │  │ Arrow IPC       │
+└────────────────┘  └─────────────────┘
+```
+
+---
+
+## Design Decisions
+
+### Why Timely-Differential (not just semi-naive)?
+
+Timely-Differential provides:
+- Correct incremental evaluation with arbitrary precedence of derivations
+- Frontier-based skip optimization (avoid redundant iterations)
+- Multiplicity tracking for negation and aggregation correctness
+- Natural extension to distributed evaluation
+
+### Why Pure C11 (not Rust)?
+
+- **Embedded compatibility**: C11 runs on bare metal, RTOS, microcontrollers
+- **No runtime**: No garbage collector, predictable memory behavior
+- **Single toolchain**: GCC, Clang, MSVC all supported without FFI
+- **Minimal dependencies**: nanoarrow and xxHash are both C
+
+### Why Columnar (not row-major)?
+
+- **SIMD acceleration**: Vectorized comparison, hash, join operations
+- **Cache efficiency**: Sequential column access improves L1/L2 hit rate
+- **Arrow ecosystem**: Direct mapping to Apache Arrow format
+
+### Why K-Fusion?
+
+- **Exposes parallelism**: Multi-way joins create multiple independent execution paths
+- **Avoids synchronization**: Deep-copy isolation eliminates cross-worker locking
+- **Scalable**: Works for any K (fan-in) without algorithmic changes
+
+### Why Backend Abstraction?
+
+- **Extensibility**: FPGA, GPU, distributed backends can be added later
+- **Separation of concerns**: Engine doesn't know about compute target
+- **Testing**: Mock backends can be added for unit tests
+
+---
+
+## Known Issues & Future Work
+
+### Issue 1: C11 Purity Violations (Planned Removal)
+
+**Current**: POSIX pthreads, `_GNU_SOURCE`, `__builtin_*` (qsort_r only as fallback)  
+**Future**: Migrate to C11 `<threads.h>`, portable intrinsics  
+**Timeline**: T+2-3 months (when compiler support stabilizes)
+
+### Issue 2: Backend-Specific Operators in Shared Plan
+
+**Current**: `WL_PLAN_OP_K_FUSION`, `WL_PLAN_OP_LFTJ`, `WL_PLAN_OP_EXCHANGE` in `exec_plan.h` enum  
+**Future**: Separate universal (0-8) from backend-specific (9+) operators  
+**Why**: Prevents confusion when adding FPGA backend  
+**Timeline**: Before FPGA backend implementation
+
+### Issue 3: Single Backend Implementation
+
+**Current**: Only columnar backend exists; abstraction untested with multiple backends  
+**Future**: Add FPGA backend via Arrow IPC  
+**Risk**: Architectural flaws in backend interface may be hidden until 2nd backend is added  
+**Mitigation**: Code review of vtable design before FPGA implementation
 
 ---
 
 ## References
 
-- **K-Fusion Design**: `docs/performance/K-FUSION-DESIGN.md`
-- **K-Fusion Architecture**: `docs/performance/K-FUSION-ARCHITECTURE.md`
-- **Plan Generation Strategy**: `docs/performance/PLAN-GENERATION-STRATEGY.md`
-- **Bottleneck Analysis**: `docs/performance/BOTTLENECK-PROFILING-ANALYSIS.md`
-- **Specialist Review**: `docs/performance/SPECIALIST-REVIEW-SYNTHESIS.md`
-
----
-
-**Maintained by**: Wirelog development team
-**Last Review**: 2026-03-08 (Architect-verified K-fusion infrastructure)
+- **Verification Report**: Architect & Critic analysis (2026-04-13)
+- **Timely-Differential Paper**: McCLeland et al., SIGMOD 2013
+- **Apache Arrow Format**: https://arrow.apache.org/docs/format/
+- **nanoarrow**: https://github.com/apache/arrow-nanoarrow

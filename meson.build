@@ -16,7 +16,7 @@ project(
 project_name = meson.project_name()
 project_version = meson.project_version()
 project_license = 'LGPL-3.0'
-project_url = 'https://github.com/justinjoy/wirelog'
+project_url = 'https://github.com/semantic-reasoning/wirelog'
 
 #Directories
 wirelog_libdir = get_option('libdir')

@@ -40,7 +40,7 @@ int main(void) {
 Build and run:
 
 ```bash
-git clone https://github.com/justinjoy/wirelog.git
+git clone https://github.com/semantic-reasoning/wirelog.git
 cd wirelog
 meson setup build && meson compile -C build
 meson test -C build

@@ -53,4 +53,4 @@ Top-level internal headers use the file name: `wl_backend_*`, `wl_session_*`, `w
 #define WL_PARSER_AST_H
 ```
 
-See [issue #75](https://github.com/justinjoy/wirelog/issues/75) for the full rename plan.
+See [issue #75](https://github.com/semantic-reasoning/wirelog/issues/75) for the full rename plan.

@@ -1,6 +1,0 @@
-# CSPA Validation Run
-# Date: 2026-03-07T07:35:58Z
-# Branch: next/pure-c11 @ 0288254
-# Host: iMac (arm64) Darwin 25.3.0
-# Baseline tuples: 20381
-# Columns: workload | input_facts | workers | repeat | min_ms | median_ms | max_ms | peak_rss_kb | output_tuples | status

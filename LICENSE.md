@@ -61,7 +61,7 @@ When using wirelog under LGPL-3.0, please include this notice:
 wirelog - Embedded-to-Enterprise Datalog Engine
 Copyright (C) CleverPlant
 Licensed under LGPL-3.0
-https://github.com/justinjoy/wirelog
+https://github.com/semantic-reasoning/wirelog
 ```
 
 ---
