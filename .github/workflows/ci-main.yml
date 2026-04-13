@@ -212,3 +212,64 @@ jobs:
           echo "## Sanitizer Results: ${{ matrix.os }} / ${{ matrix.compiler }} (main monitor)" >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           echo "Status: **${STATUS}** (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # Phase 4: TSan — Thread Sanitizer (parallel, non-blocking)
+  # Linux GCC + Clang only (TSan/ASan mutually exclusive)
+  # Monitors mutex safety in I/O adapter registry and workqueue.
+  # fail-fast: false — all configurations run to completion
+  # ==========================================================================
+  tsan:
+    name: TSan / ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux - GCC with TSan
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+
+          # Linux - Clang with TSan
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Configure with TSan
+        run: >
+          meson setup builddir-tsan
+          -Db_sanitize=thread
+          -Db_lundef=false
+          -Dtests=true
+          --buildtype=debug
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build
+        run: meson compile -C builddir-tsan
+
+      - name: Test
+        run: meson test -C builddir-tsan --print-errorlogs
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+
+      - name: Publish results
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## TSan Results: ${{ matrix.os }} / ${{ matrix.compiler }} (main monitor)" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}** (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
