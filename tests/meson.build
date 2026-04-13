@@ -2451,3 +2451,25 @@ test_io_dispatch_exe = executable(
   install: false,
 )
 test('io_dispatch', test_io_dispatch_exe)
+
+# ============================================================================
+# Concurrent I/O Adapter Registry Stress Test (#459)
+# Exercises mutex safety under TSan: concurrent find, register/unregister,
+# and mixed readers+writers.  Linux/macOS only (pthreads; skipped on Windows).
+# ============================================================================
+
+test_io_adapter_concurrent_exe = executable(
+  'test_io_adapter_concurrent',
+  files('test_io_adapter_concurrent.c',
+        '../wirelog/io/io_adapter.c',
+        '../wirelog/io/csv_adapter.c',
+        '../wirelog/io/csv_reader.c',
+        '../wirelog/io/io_ctx.c',
+        '../wirelog/intern.c'),
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
+  dependencies: [threads_dep],
+  install: false,
+)
+test('io_adapter_concurrent', test_io_adapter_concurrent_exe)
