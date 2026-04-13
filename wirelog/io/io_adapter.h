@@ -84,6 +84,38 @@ typedef struct wl_io_adapter {
 #define WL_IO_USED
 #endif
 
+/*
+ * Adapter Lifetime Contract
+ * -------------------------
+ * The wl_io_adapter_t pointer passed to wl_io_register_adapter() MUST remain
+ * valid (i.e. the pointed-to struct must not be freed or modified) until the
+ * corresponding wl_io_unregister_adapter() call or process exit.  The registry
+ * stores the raw pointer and returns it verbatim from wl_io_find_adapter().
+ *
+ * The scheme string within the adapter struct is copied into an internal
+ * fixed-size buffer (SCHEME_MAX_LEN-1 characters) at registration time, so
+ * the caller's scheme pointer may be freed or reused after register returns.
+ *
+ * Thread Safety
+ * -------------
+ * All three public API functions (register, unregister, find) are thread-safe.
+ * They acquire a process-global mutex for the duration of each operation.
+ * TSan CI gate (Issue #459) validates this invariant on every PR.
+ *
+ * Error Reporting
+ * ---------------
+ * On failure, functions return -1 and record a human-readable reason in a
+ * thread-local buffer retrievable via wl_io_last_error().  On success the
+ * error buffer is cleared.  The returned pointer is valid until the next call
+ * on the same thread.
+ *
+ * Return values:
+ *   wl_io_register_adapter   0 on success, -1 on error (NULL input, ABI
+ *                             mismatch, duplicate scheme, or registry full)
+ *   wl_io_unregister_adapter 0 on success, -1 if scheme is not registered
+ *   wl_io_find_adapter        pointer to adapter, or NULL if not found
+ */
+
 WL_PUBLIC int wl_io_register_adapter(const wl_io_adapter_t *adapter) WL_IO_USED;
 
 WL_PUBLIC int wl_io_unregister_adapter(const char *scheme) WL_IO_USED;
