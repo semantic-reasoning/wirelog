@@ -143,3 +143,17 @@ jobs:
         env:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
+
+      - name: Sanitizers / TSan
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          meson setup builddir-tsan \
+            -Db_sanitize=thread \
+            -Db_lundef=false \
+            -Dtests=true \
+            --buildtype=debug
+          meson compile -C builddir-tsan
+          meson test -C builddir-tsan --print-errorlogs
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+          CC: ${{ matrix.cc }}
