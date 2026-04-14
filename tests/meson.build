@@ -2495,3 +2495,48 @@ test_io_adapter_asan_exe = executable(
   install: false,
 )
 test('io_adapter_asan', test_io_adapter_asan_exe)
+
+# ======================================================================
+# Plugin loader tests (Issue #461)
+# Only built when io_plugin_dlopen is enabled and not on Windows
+# ======================================================================
+if io_plugin_dlopen_option == 'enabled' and not is_windows
+
+  # Mock plugin shared library (valid adapter)
+  mock_plugin_lib = shared_library(
+    'mock_plugin_adapter',
+    files('mock_plugin_adapter.c'),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    install: false,
+  )
+
+  # Mock plugin shared library (ABI mismatch — always returns NULL)
+  mock_plugin_bad_abi_lib = shared_library(
+    'mock_plugin_adapter_bad_abi',
+    files('mock_plugin_adapter_bad_abi.c'),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    install: false,
+  )
+
+  _dl_test_dep = cc.find_library('dl', required: false)
+  test_plugin_loader_exe = executable(
+    'test_plugin_loader',
+    files('test_plugin_loader.c',
+          '../wirelog/cli/plugin_loader.c',
+          '../wirelog/io/io_adapter.c',
+          '../wirelog/io/csv_adapter.c',
+          '../wirelog/io/csv_reader.c',
+          '../wirelog/io/io_ctx.c',
+          '../wirelog/intern.c'),
+    thread_src,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    c_args: ['-DWIRELOG_BUILDING', '-DWL_HAVE_PLUGIN_LOADER'],
+    dependencies: [threads_dep] + (_dl_test_dep.found() ? [_dl_test_dep] : []),
+    install: false,
+  )
+  test('plugin_loader', test_plugin_loader_exe,
+    args: [mock_plugin_lib.full_path(), mock_plugin_bad_abi_lib.full_path()],
+    depends: [mock_plugin_lib, mock_plugin_bad_abi_lib],
+  )
+
+endif
