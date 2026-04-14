@@ -137,6 +137,18 @@ jobs:
         continue-on-error: true
         run: scripts/ci/check-text-size.sh builddir/libwirelog.so
 
+      - name: Path A example compile-check
+        if: runner.os == 'Linux' && matrix.compiler == 'gcc'
+        continue-on-error: true
+        run: |
+          meson install -C builddir --destdir="$PWD/staging"
+          staging_prefix="$PWD/staging/usr/local"
+          PKG_CONFIG_SYSROOT_DIR="$PWD/staging" \
+          PKG_CONFIG_PATH="$staging_prefix/lib/pkgconfig" \
+            meson setup builddir-path-a examples/path_a_pcap_skeleton
+          meson compile -C builddir-path-a
+          LD_LIBRARY_PATH="$staging_prefix/lib" ./builddir-path-a/pcap_skeleton
+
       - name: Publish results
         if: always()
         shell: bash

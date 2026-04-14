@@ -126,6 +126,22 @@ jobs:
         run: scripts/ci/check-text-size.sh builddir/libwirelog.so
 
       # =======================================================================
+      # Path A example compile-check (Issue #462)
+      # Install wirelog to a staging dir, then build the example as a
+      # separate project to catch header-install regressions (#449).
+      # =======================================================================
+      - name: Path A example compile-check
+        if: runner.os == 'Linux' && matrix.compiler == 'gcc'
+        run: |
+          meson install -C builddir --destdir="$PWD/staging"
+          staging_prefix="$PWD/staging/usr/local"
+          PKG_CONFIG_SYSROOT_DIR="$PWD/staging" \
+          PKG_CONFIG_PATH="$staging_prefix/lib/pkgconfig" \
+            meson setup builddir-path-a examples/path_a_pcap_skeleton
+          meson compile -C builddir-path-a
+          LD_LIBRARY_PATH="$staging_prefix/lib" ./builddir-path-a/pcap_skeleton
+
+      # =======================================================================
       # Phase 3: Sanitizers (ASan + UBSan) — runs on same platform after build
       # Linux: GCC + Clang; macOS: Clang (Windows: skipped)
       # =======================================================================
