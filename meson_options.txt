@@ -44,6 +44,14 @@ option(
 )
 
 option(
+  'io_plugin_dlopen',
+  type: 'combo',
+  choices: ['disabled', 'enabled'],
+  value: 'disabled',
+  description: 'Enable optional CLI plugin loader via dlopen (Issue #461). Excluded from Android/iOS.'
+)
+
+option(
   'mbedTLS',
   type: 'combo',
   choices: ['disabled', 'enabled', 'auto'],

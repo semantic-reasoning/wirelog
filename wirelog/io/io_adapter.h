@@ -125,6 +125,46 @@ WL_PUBLIC const wl_io_adapter_t *wl_io_find_adapter(
 
 WL_PUBLIC const char *wl_io_last_error(void);
 
+/* ======================================================================== */
+/* Plugin Entry Point (Path B, Issue #461)                                  */
+/* ======================================================================== */
+
+/*
+ * Macro for plugin shared libraries to export their entry symbol.
+ * Users define their entry function with this attribute so the linker
+ * does not strip it even under -fvisibility=hidden or LTO.
+ */
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define WL_IO_PLUGIN_EXPORT __declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
+#define WL_IO_PLUGIN_EXPORT __attribute__((visibility("default")))
+#else
+#define WL_IO_PLUGIN_EXPORT
+#endif
+
+/*
+ * Plugin entry point signature.
+ *
+ * A plugin shared library must export exactly one symbol named
+ * "wl_io_plugin_entry" with this signature.  The CLI plugin loader
+ * calls dlopen() on the library, resolves this symbol via dlsym(),
+ * validates the ABI version, and bulk-registers all returned adapters.
+ *
+ * Parameters:
+ *   n_out    [out] Number of adapters in the returned array.
+ *   abi_ver  [in]  Host's WL_IO_ABI_VERSION.  The plugin should check
+ *                  this against its own compiled version and return NULL
+ *                  on mismatch.
+ *
+ * Returns:
+ *   Array of adapter pointers (must remain valid for process lifetime),
+ *   or NULL on ABI mismatch / error.
+ */
+typedef const wl_io_adapter_t *const *(*wl_io_plugin_entry_fn)(
+    uint32_t *n_out, uint32_t abi_ver);
+
+#define WL_IO_PLUGIN_ENTRY_SYMBOL "wl_io_plugin_entry"
+
 #ifdef __cplusplus
 }
 #endif
