@@ -118,6 +118,14 @@ jobs:
           meson test -C builddir --print-errorlogs
 
       # =======================================================================
+      # Binary size regression gate (Issue #460)
+      # Only runs on Linux GCC (reference platform for .text baseline)
+      # =======================================================================
+      - name: Check binary size
+        if: runner.os == 'Linux' && matrix.compiler == 'gcc'
+        run: scripts/ci/check-text-size.sh builddir/libwirelog.so
+
+      # =======================================================================
       # Phase 3: Sanitizers (ASan + UBSan) — runs on same platform after build
       # Linux: GCC + Clang; macOS: Clang (Windows: skipped)
       # =======================================================================
