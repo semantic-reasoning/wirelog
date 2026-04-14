@@ -69,15 +69,24 @@ typedef struct {
 
 static registry_entry_t s_registry[WL_IO_MAX_ADAPTERS];
 static uint32_t s_count;
-/* POSIX: statically initialized via PTHREAD_MUTEX_INITIALIZER.
- * Windows: CRITICAL_SECTION cannot be statically initialized, so we
- * use a two-phase flag + InterlockedCompareExchange for one-shot init.
+/* Mutex initialization strategy (3-tier, Issue #494):
  *
- * Two-phase flag is required to avoid a race where one thread sets the
- * flag to "done" via ICS and then starts mutex_init(), while a second
- * thread sees "done" and calls mutex_lock() before mutex_init() returns.
- * See Issue #459 for background. */
-#if defined(_WIN32) || defined(_WIN64)
+ * C11 threads:  No static initializer for mtx_t.  Use call_once() to
+ *               lazily call mtx_init() on first access.
+ * POSIX:        Statically initialized via PTHREAD_MUTEX_INITIALIZER.
+ * Windows:      CRITICAL_SECTION cannot be statically initialized, so we
+ *               use a two-phase flag + InterlockedCompareExchange.
+ *               See Issue #459 for background. */
+#if defined(WL_HAVE_C11_THREADS)
+static mutex_t s_mutex;
+static once_flag s_mutex_once = ONCE_FLAG_INIT;
+static int s_mutex_init_ok;
+static void
+init_mutex(void)
+{
+    s_mutex_init_ok = (mutex_init(&s_mutex) == 0);
+}
+#elif defined(_WIN32) || defined(_WIN64)
 static mutex_t s_mutex;
 /* 0 = uninitialised, 1 = initialisation in progress, 2 = ready */
 static volatile long s_mutex_init;
@@ -96,13 +105,19 @@ extern const wl_io_adapter_t wl_csv_adapter;
 static void
 ensure_builtins(void)
 {
-    /* On Windows, CRITICAL_SECTION requires explicit init.
-     * Two-phase flag protocol (Issue #459):
+    /* Lazy mutex initialization for backends without static initializers. */
+#if defined(WL_HAVE_C11_THREADS)
+    call_once(&s_mutex_once, init_mutex);
+    if (!s_mutex_init_ok) {
+        set_error("mutex initialization failed");
+        return;
+    }
+#elif defined(_WIN32) || defined(_WIN64)
+    /* Two-phase flag protocol (Issue #459):
      *   0 -> 1: winning thread claims init (ICS); all others spin.
      *   1 -> 2: winning thread sets "done" only after mutex_init returns.
      * This prevents a competing thread from calling mutex_lock on a
      * CRITICAL_SECTION that has not yet been initialised. */
-#if defined(_WIN32) || defined(_WIN64)
     if (InterlockedCompareExchange(&s_mutex_init, 2, 2) != 2) {
         if (InterlockedCompareExchange(&s_mutex_init, 1, 0) == 0) {
             mutex_init(&s_mutex);

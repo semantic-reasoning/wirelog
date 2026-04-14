@@ -11,13 +11,14 @@
  * Overview
  * ========================================================================
  *
- * Platform-agnostic threading interface supporting both POSIX (pthread)
- * and Windows (MSVC) threading models.
+ * Platform-agnostic threading interface with three backends, selected
+ * at build time by meson:
  *
- * This abstraction layer allows the work queue and other threading code
- * to remain platform-independent while supporting:
- *   - Unix/Linux/macOS via POSIX pthreads
- *   - Windows via MSVC threading APIs (CreateThread, CRITICAL_SECTION, etc.)
+ *   1. C11 <threads.h>  (preferred, Linux GCC 10+/glibc 2.28+, musl)
+ *   2. POSIX pthreads    (fallback, macOS Apple Clang, older Linux)
+ *   3. Windows MSVC      (CreateThread, CRITICAL_SECTION, etc.)
+ *
+ * Detection order: WL_HAVE_C11_THREADS > _WIN32 > POSIX (default).
  *
  * ========================================================================
  * Thread Safety Guarantees
@@ -58,7 +59,9 @@
 /* Platform-Specific Includes                                               */
 /* ======================================================================== */
 
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(WL_HAVE_C11_THREADS)
+#include <threads.h>
+#elif defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #else
 #include <pthread.h>
@@ -71,10 +74,16 @@
 /**
  * thread_t:
  *
- * Thread handle. Platform-specific (pthread_t on POSIX, HANDLE on Windows).
- * Embed by value or allocate as needed.
+ * Thread handle. Backend-specific:
+ *   C11:   thrd_t
+ *   POSIX: pthread_t
+ *   Win32: HANDLE
  */
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(WL_HAVE_C11_THREADS)
+typedef struct thread_t {
+    thrd_t tid;
+} thread_t;
+#elif defined(_WIN32) || defined(_WIN64)
 typedef struct thread_t {
     HANDLE handle;
 } thread_t;
@@ -87,18 +96,22 @@ typedef struct thread_t {
 /**
  * mutex_t:
  *
- * Mutex (mutual exclusion lock). Platform-specific
- * (pthread_mutex_t on POSIX, CRITICAL_SECTION on Windows).
+ * Mutex (mutual exclusion lock). Backend-specific:
+ *   C11:   mtx_t
+ *   POSIX: pthread_mutex_t
+ *   Win32: CRITICAL_SECTION
  *
- * Non-recursive on POSIX: attempting to lock a pthread_mutex_t held by
- * the same thread will deadlock (standard mutex semantics).
+ * Non-recursive semantics on all backends.
  *
  * NOTE: Windows CRITICAL_SECTION is reentrant/recursive by default, but
  * the public interface guarantees non-recursive semantics. Code must not
- * rely on self-reentrance. If future code requires self-deadlock detection
- * for safety, the MSVC backend can be enhanced with thread-ID tracking.
+ * rely on self-reentrance.
  */
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(WL_HAVE_C11_THREADS)
+typedef struct mutex_t {
+    mtx_t m;
+} mutex_t;
+#elif defined(_WIN32) || defined(_WIN64)
 typedef struct mutex_t {
     CRITICAL_SECTION cs;
 } mutex_t;
@@ -111,10 +124,16 @@ typedef struct mutex_t {
 /**
  * cond_t:
  *
- * Condition variable. Platform-specific
- * (pthread_cond_t on POSIX, CONDITION_VARIABLE on Windows).
+ * Condition variable. Backend-specific:
+ *   C11:   cnd_t
+ *   POSIX: pthread_cond_t
+ *   Win32: CONDITION_VARIABLE
  */
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(WL_HAVE_C11_THREADS)
+typedef struct cond_t {
+    cnd_t c;
+} cond_t;
+#elif defined(_WIN32) || defined(_WIN64)
 typedef struct cond_t {
     CONDITION_VARIABLE cv;
 } cond_t;

@@ -37,11 +37,31 @@ wirelog_arena_src = files('arena/arena.c', )
 #Thread Backend Module(Issue #88 - Cross-Platform Threading)
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-# Select threading backend based on platform
-if host_machine.system() == 'windows'
+# Select threading backend: C11 threads.h > POSIX pthreads > Windows MSVC
+# C11 threads.h detection uses cc.links() to verify actual support,
+# not just header presence (Apple Clang ships no threads.h).
+c11_threads_test = '''
+#include <threads.h>
+static int dummy(void *arg) { (void)arg; return 0; }
+int main(void) {
+    thrd_t t;
+    if (thrd_create(&t, dummy, 0) == thrd_success)
+        thrd_join(t, 0);
+    return 0;
+}
+'''
+have_c11_threads = cc.links(c11_threads_test, name: 'C11 <threads.h> support')
+
+if have_c11_threads
+    wirelog_thread_src = files('thread_c11.c', )
+    add_project_arguments('-DWL_HAVE_C11_THREADS', language: 'c')
+    message('  Threading backend: C11 <threads.h>')
+elif host_machine.system() == 'windows'
     wirelog_thread_src = files('thread_msvc.c', )
+    message('  Threading backend: Windows MSVC')
 else
     wirelog_thread_src = files('thread_posix.c', )
+    message('  Threading backend: POSIX pthreads')
 endif
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
