@@ -135,11 +135,13 @@ jobs:
         run: |
           meson install -C builddir --destdir="$PWD/staging"
           staging_prefix="$PWD/staging/usr/local"
+          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
           PKG_CONFIG_SYSROOT_DIR="$PWD/staging" \
-          PKG_CONFIG_PATH="$staging_prefix/lib/pkgconfig" \
+          PKG_CONFIG_PATH="$staging_prefix/lib/${multiarch:+$multiarch/}pkgconfig:$staging_prefix/lib/pkgconfig" \
             meson setup builddir-path-a examples/path_a_pcap_skeleton
           meson compile -C builddir-path-a
-          LD_LIBRARY_PATH="$staging_prefix/lib" ./builddir-path-a/pcap_skeleton
+          LD_LIBRARY_PATH="$staging_prefix/lib/${multiarch:+$multiarch:}$staging_prefix/lib" \
+            ./builddir-path-a/pcap_skeleton
 
       # =======================================================================
       # Phase 3: Sanitizers (ASan + UBSan) — runs on same platform after build
