@@ -31,12 +31,12 @@
 static int passed = 0, failed = 0;
 
 /* ======================================================================== */
-/* Concurrent Tests (POSIX only; skipped on Windows)                        */
+/* Concurrent Tests (POSIX/C11; skipped on Windows)                         */
 /* ======================================================================== */
 
 #ifndef _WIN32
 
-#include <pthread.h>
+#include "wirelog/thread.h"
 
 #define NTHREADS     8
 #define FIND_ITERS   2000
@@ -60,11 +60,11 @@ test_concurrent_find(void)
 {
     TEST("concurrent find (csv built-in, 8 threads x 2000 iters)");
 
-    pthread_t threads[NTHREADS];
+    thread_t threads[NTHREADS];
     for (int i = 0; i < NTHREADS; i++)
-        pthread_create(&threads[i], NULL, find_worker, NULL);
+        thread_create(&threads[i], find_worker, NULL);
     for (int i = 0; i < NTHREADS; i++)
-        pthread_join(threads[i], NULL);
+        thread_join(&threads[i]);
 
     /* After concurrent reads, csv must still be findable */
     const wl_io_adapter_t *a = wl_io_find_adapter("csv");
@@ -109,7 +109,7 @@ test_concurrent_register_unregister(void)
 {
     TEST("concurrent register/unregister (8 threads x 2000 iters each)");
 
-    pthread_t threads[NTHREADS];
+    thread_t threads[NTHREADS];
     reg_arg_t args[NTHREADS];
 
     for (int i = 0; i < NTHREADS; i++) {
@@ -118,10 +118,10 @@ test_concurrent_register_unregister(void)
         args[i].adapter.scheme = args[i].scheme;
         args[i].adapter.abi_version = WL_IO_ABI_VERSION;
         args[i].result = 0;
-        pthread_create(&threads[i], NULL, reg_unreg_worker, &args[i]);
+        thread_create(&threads[i], reg_unreg_worker, &args[i]);
     }
     for (int i = 0; i < NTHREADS; i++)
-        pthread_join(threads[i], NULL);
+        thread_join(&threads[i]);
 
     int any_failed = 0;
     for (int i = 0; i < NTHREADS; i++) {
@@ -165,8 +165,8 @@ test_mixed_readers_writers(void)
 {
     TEST("mixed readers + writers (4 find + 4 reg/unreg threads)");
 
-    pthread_t readers[4];
-    pthread_t writers[4];
+    thread_t readers[4];
+    thread_t writers[4];
     reg_arg_t wargs[4];
 
     for (int i = 0; i < 4; i++) {
@@ -174,12 +174,12 @@ test_mixed_readers_writers(void)
         memset(&wargs[i].adapter, 0, sizeof(wargs[i].adapter));
         wargs[i].adapter.scheme = wargs[i].scheme;
         wargs[i].adapter.abi_version = WL_IO_ABI_VERSION;
-        pthread_create(&readers[i], NULL, mixed_find_worker, NULL);
-        pthread_create(&writers[i], NULL, mixed_reg_worker, &wargs[i]);
+        thread_create(&readers[i], mixed_find_worker, NULL);
+        thread_create(&writers[i], mixed_reg_worker, &wargs[i]);
     }
     for (int i = 0; i < 4; i++) {
-        pthread_join(readers[i], NULL);
-        pthread_join(writers[i], NULL);
+        thread_join(&readers[i]);
+        thread_join(&writers[i]);
     }
 
     /* Registry must still be consistent: csv findable, no dangling entries */

@@ -9,7 +9,7 @@
  *   1. alloc/free tracking accuracy
  *   2. budget enforcement (over_budget)
  *   3. peak_bytes high-water mark
- *   4. concurrent multi-pthread consistency
+ *   4. concurrent thread consistency
  *   5. human-readable report output (smoke test)
  *   6. subsystem over-budget detection
  *   7. backpressure threshold
@@ -25,7 +25,7 @@
 #include <string.h>
 
 #ifndef _WIN32
-#include <pthread.h>
+#include "wirelog/thread.h"
 #endif
 
 /* ======================================================================== */
@@ -37,20 +37,20 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Test 1: alloc/free tracking accuracy                                     */
@@ -69,7 +69,7 @@ test_alloc_free_accuracy(void)
     wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_CACHE, 256);
 
     uint64_t cur = (uint64_t)atomic_load_explicit(&ledger.current_bytes,
-                                                  memory_order_relaxed);
+            memory_order_relaxed);
     uint64_t rel = (uint64_t)atomic_load_explicit(
         &ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION], memory_order_relaxed);
     uint64_t arena = (uint64_t)atomic_load_explicit(
@@ -78,7 +78,7 @@ test_alloc_free_accuracy(void)
     if (cur != 1792) {
         char msg[64];
         snprintf(msg, sizeof(msg), "current_bytes=%llu, want 1792",
-                 (unsigned long long)cur);
+            (unsigned long long)cur);
         FAIL(msg);
         return 1;
     }
@@ -93,14 +93,14 @@ test_alloc_free_accuracy(void)
 
     wl_mem_ledger_free(&ledger, WL_MEM_SUBSYS_RELATION, 512);
     cur = (uint64_t)atomic_load_explicit(&ledger.current_bytes,
-                                         memory_order_relaxed);
+            memory_order_relaxed);
     rel = (uint64_t)atomic_load_explicit(
         &ledger.subsys_bytes[WL_MEM_SUBSYS_RELATION], memory_order_relaxed);
 
     if (cur != 1280) {
         char msg[64];
         snprintf(msg, sizeof(msg), "current_bytes=%llu after free, want 1280",
-                 (unsigned long long)cur);
+            (unsigned long long)cur);
         FAIL(msg);
         return 1;
     }
@@ -153,7 +153,7 @@ test_budget_enforcement(void)
     wl_mem_ledger_t unlimited;
     wl_mem_ledger_init(&unlimited, 0);
     wl_mem_ledger_alloc(&unlimited, WL_MEM_SUBSYS_RELATION,
-                        UINT64_MAX / 2); /* enormous */
+        UINT64_MAX / 2);                 /* enormous */
     if (wl_mem_ledger_over_budget(&unlimited)) {
         FAIL("unlimited budget (0) should never be over_budget");
         return 1;
@@ -177,11 +177,11 @@ test_peak_high_water(void)
 
     wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION, 2000);
     uint64_t peak1 = (uint64_t)atomic_load_explicit(&ledger.peak_bytes,
-                                                    memory_order_relaxed);
+            memory_order_relaxed);
     if (peak1 != 2000) {
         char msg[64];
         snprintf(msg, sizeof(msg), "peak=%llu after 2000 alloc, want 2000",
-                 (unsigned long long)peak1);
+            (unsigned long long)peak1);
         FAIL(msg);
         return 1;
     }
@@ -189,7 +189,7 @@ test_peak_high_water(void)
     /* Free does not lower peak */
     wl_mem_ledger_free(&ledger, WL_MEM_SUBSYS_RELATION, 2000);
     uint64_t peak2 = (uint64_t)atomic_load_explicit(&ledger.peak_bytes,
-                                                    memory_order_relaxed);
+            memory_order_relaxed);
     if (peak2 != 2000) {
         FAIL("peak_bytes decreased after free (should be HWM)");
         return 1;
@@ -198,7 +198,7 @@ test_peak_high_water(void)
     /* New alloc below old HWM does not change peak */
     wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_ARENA, 500);
     uint64_t peak3 = (uint64_t)atomic_load_explicit(&ledger.peak_bytes,
-                                                    memory_order_relaxed);
+            memory_order_relaxed);
     if (peak3 != 2000) {
         FAIL("peak_bytes changed for alloc below HWM");
         return 1;
@@ -207,11 +207,11 @@ test_peak_high_water(void)
     /* Alloc above old HWM updates peak */
     wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_ARENA, 2000);
     uint64_t peak4 = (uint64_t)atomic_load_explicit(&ledger.peak_bytes,
-                                                    memory_order_relaxed);
+            memory_order_relaxed);
     if (peak4 != 2500) {
         char msg[64];
         snprintf(msg, sizeof(msg), "peak=%llu, want 2500",
-                 (unsigned long long)peak4);
+            (unsigned long long)peak4);
         FAIL(msg);
         return 1;
     }
@@ -222,7 +222,7 @@ test_peak_high_water(void)
     if (arena_peak != 2500) {
         char msg[64];
         snprintf(msg, sizeof(msg), "ARENA subsys_peak=%llu, want 2500",
-                 (unsigned long long)arena_peak);
+            (unsigned long long)arena_peak);
         FAIL(msg);
         return 1;
     }
@@ -232,7 +232,7 @@ test_peak_high_water(void)
 }
 
 /* ======================================================================== */
-/* Test 4: concurrent multi-pthread consistency (Unix-like systems only)    */
+/* Test 4: concurrent thread consistency (Unix-like systems only)           */
 /* ======================================================================== */
 
 #ifndef _WIN32
@@ -260,38 +260,38 @@ conc_worker(void *arg)
 static int
 test_concurrent_consistency(void)
 {
-    TEST("concurrent multi-pthread consistency");
+    TEST("concurrent thread consistency");
 
     wl_mem_ledger_t ledger;
     wl_mem_ledger_init(&ledger, 0);
 
-    pthread_t threads[CONC_THREADS];
+    thread_t threads[CONC_THREADS];
     conc_arg_t args[CONC_THREADS];
 
     for (int i = 0; i < CONC_THREADS; i++) {
         args[i].ledger = &ledger;
         args[i].subsys = i % WL_MEM_SUBSYS_COUNT;
-        pthread_create(&threads[i], NULL, conc_worker, &args[i]);
+        thread_create(&threads[i], conc_worker, &args[i]);
     }
     for (int i = 0; i < CONC_THREADS; i++) {
-        pthread_join(threads[i], NULL);
+        thread_join(&threads[i]);
     }
 
     /* After equal alloc/free cycles, current_bytes must be 0 */
     uint64_t cur = (uint64_t)atomic_load_explicit(&ledger.current_bytes,
-                                                  memory_order_relaxed);
+            memory_order_relaxed);
     if (cur != 0) {
         char msg[80];
         snprintf(msg, sizeof(msg),
-                 "current_bytes=%llu after balanced alloc/free, want 0",
-                 (unsigned long long)cur);
+            "current_bytes=%llu after balanced alloc/free, want 0",
+            (unsigned long long)cur);
         FAIL(msg);
         return 1;
     }
 
     /* Peak must be > 0 (some concurrent allocation occurred) */
     uint64_t peak = (uint64_t)atomic_load_explicit(&ledger.peak_bytes,
-                                                   memory_order_relaxed);
+            memory_order_relaxed);
     if (peak == 0) {
         FAIL("peak_bytes==0 after concurrent allocs (unexpected)");
         return 1;
@@ -316,11 +316,11 @@ test_report_output(void)
     wl_mem_ledger_init(&ledger, (uint64_t)48 * 1024 * 1024 * 1024); /* 48GB */
 
     wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION,
-                        (uint64_t)12 * 1024 * 1024 * 1024); /* 12GB */
+        (uint64_t)12 * 1024 * 1024 * 1024);                 /* 12GB */
     wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_ARENA,
-                        (uint64_t)2 * 1024 * 1024 * 1024);
+        (uint64_t)2 * 1024 * 1024 * 1024);
     wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_CACHE,
-                        (uint64_t)500 * 1024 * 1024);
+        (uint64_t)500 * 1024 * 1024);
 
     /* Just verify it doesn't crash; output goes to stderr */
     wl_mem_ledger_report(&ledger);
@@ -420,7 +420,7 @@ test_bytes_remaining(void)
     if (rem != 1000) {
         char msg[64];
         snprintf(msg, sizeof(msg), "remaining=%llu, want 1000",
-                 (unsigned long long)rem);
+            (unsigned long long)rem);
         FAIL(msg);
         return 1;
     }
@@ -430,7 +430,7 @@ test_bytes_remaining(void)
     if (rem != 700) {
         char msg[64];
         snprintf(msg, sizeof(msg), "remaining=%llu after 300 alloc, want 700",
-                 (unsigned long long)rem);
+            (unsigned long long)rem);
         FAIL(msg);
         return 1;
     }
@@ -441,7 +441,7 @@ test_bytes_remaining(void)
     if (rem != 0) {
         char msg[64];
         snprintf(msg, sizeof(msg), "remaining=%llu when over budget, want 0",
-                 (unsigned long long)rem);
+            (unsigned long long)rem);
         FAIL(msg);
         return 1;
     }
