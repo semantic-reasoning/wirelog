@@ -11,6 +11,7 @@ All notable changes to wirelog are documented in this file.
 - **wl_easy Facade** (#445): Simplified high-level API (`wl_easy.h`) for common session workflows
 - **String Operations** (#444): String-typed column functions (`strlen`, `cat`, `substr`, `contains`, `to_upper`, `to_lower`, `trim`, `str_replace`, `to_string`, `to_number`)
 - **Path A Example** (#462): Standalone pcap adapter skeleton with CI compile-check against installed headers
+- **C11 Threading Backend** (#494): Add C11 `<threads.h>` backend with auto-detection; POSIX/MSVC fallback preserved. `call_once` pattern for adapter registry initialization
 - **Binary Size Gate** (#460): CI regression gate for `.text` section growth (5KB budget)
 - **I/O Adapters User Guide** (#463): `docs/io-adapters.md` with Path A/B workflows, ABI policy, ownership rules, and thread-safety notes
 - **Retraction Support** (#443): Fact retraction with recursive re-evaluation
