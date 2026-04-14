@@ -83,12 +83,15 @@ tests_option = get_option('tests')
 docs_option = get_option('documentation')
 # crc32_variant_option already defined earlier before compiler settings
 
+io_plugin_dlopen_option = get_option('io_plugin_dlopen')
+
 message('wirelog ' + project_version)
 message('  Platform: ' + platform)
 message('  Embedded: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
 message('  CRC-32 variant: ' + crc32_variant_option)
+message('  Plugin loader (dlopen): ' + io_plugin_dlopen_option)
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Dependencies
@@ -277,15 +280,31 @@ pkg.generate(
 #CLI Driver
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
+# Optional plugin loader via dlopen (Issue #461)
+# Excluded from Windows builds (no dlopen); Android/iOS excluded via option default.
+cli_plugin_src = []
+cli_plugin_deps = []
+cli_plugin_args = []
+if io_plugin_dlopen_option == 'enabled' and not is_windows
+  _dl_dep = cc.find_library('dl', required: false)
+  if _dl_dep.found()
+    cli_plugin_deps += [_dl_dep]
+  endif
+  cli_plugin_src = files('wirelog/cli/plugin_loader.c')
+  cli_plugin_args = ['-DWL_HAVE_PLUGIN_LOADER']
+endif
+
 #Build wirelog-cli executable (wirelog_cli_src defined in wirelog/meson.build)
 #Include all wirelog sources to ensure proper linking with LTO
 wirelog_cli = executable(
   'wirelog_cli',
   wirelog_cli_src,
+  cli_plugin_src,
   wirelog_sources,
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: cli_plugin_args,
+  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep] + cli_plugin_deps,
   install: true,
 )
 
