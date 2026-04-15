@@ -230,6 +230,15 @@ typedef enum {
  * Operator types in a backend execution plan.
  * Explicit integer values for stable ABI across backends.
  *
+ * Range partitioning (Issue #495):
+ *   Universal operators  (0-8):  Backend-agnostic relational algebra ops.
+ *                                Use flat fields in wl_plan_op_t only.
+ *   Backend-specific ops (9+):   Columnar backend optimizations.
+ *                                Use opaque_data for backend-defined metadata.
+ *                                See WL_PLAN_OP__BACKEND_START below.
+ *
+ * --- Universal operators (0-8) ---
+ *
  * WL_PLAN_OP_VARIABLE:    Reference to an input collection (EDB or IDB).
  * WL_PLAN_OP_MAP:         Column projection / rename.
  * WL_PLAN_OP_FILTER:      Predicate filter (expr in serialized buffer).
@@ -239,14 +248,20 @@ typedef enum {
  * WL_PLAN_OP_CONCAT:      Union of multiple collections.
  * WL_PLAN_OP_CONSOLIDATE: Deduplication / consolidation.
  * WL_PLAN_OP_SEMIJOIN:    Semijoin (SIP pre-filter).
+ *
+ * --- Columnar backend operators (9-11) ---
+ *
+ * WL_PLAN_OP_K_FUSION:    Parallel semi-naive delta expansion (Issue #370).
+ *                          opaque_data -> wl_plan_op_k_fusion_t.
  * WL_PLAN_OP_LFTJ:        Multi-way leapfrog triejoin on a single shared key
  *                          column across k >= 3 EDB relations (Issue #195).
+ *                          opaque_data -> wl_plan_op_lftj_t.
  * WL_PLAN_OP_EXCHANGE:    Redistribute tuples by hash(key_columns) % W across
  *                          workers for partition-correct parallel evaluation
- *                          (Issue #316).  opaque_data points to
- *                          wl_plan_op_exchange_t.
+ *                          (Issue #316).  opaque_data -> wl_plan_op_exchange_t.
  */
 typedef enum {
+    /* Universal operators (0-8): backend-agnostic */
     WL_PLAN_OP_VARIABLE = 0,
     WL_PLAN_OP_MAP = 1,
     WL_PLAN_OP_FILTER = 2,
@@ -256,10 +271,18 @@ typedef enum {
     WL_PLAN_OP_CONCAT = 6,
     WL_PLAN_OP_CONSOLIDATE = 7,
     WL_PLAN_OP_SEMIJOIN = 8,
+
+    /* Columnar backend operators (9+): use opaque_data */
     WL_PLAN_OP_K_FUSION = 9,
     WL_PLAN_OP_LFTJ = 10,
-    WL_PLAN_OP_EXCHANGE = 11, /* Redistribute tuples by hash(key) % W */
+    WL_PLAN_OP_EXCHANGE = 11,
 } wl_plan_op_type_t;
+
+/* First backend-specific operator value.  All ops with numeric value
+ * >= WL_PLAN_OP__BACKEND_START carry their metadata in opaque_data
+ * (defined by the active backend, e.g. columnar/columnar_nanoarrow.h).
+ * Universal ops (< WL_PLAN_OP__BACKEND_START) use flat wl_plan_op_t fields. */
+#define WL_PLAN_OP__BACKEND_START 9
 
 /* ======================================================================== */
 /* Operator Node                                                            */
