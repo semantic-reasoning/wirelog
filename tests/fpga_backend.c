@@ -349,7 +349,9 @@ fpga_eval_expr(const wl_plan_expr_buffer_t *expr, const int64_t *row,
             break;
         case WL_PLAN_EXPR_ARITH_SHL: /* 0x18 */
             if (sp >= 2) {
-                sp--; stack[sp - 1] <<= stack[sp];
+                sp--;
+                stack[sp - 1] = (int64_t)((uint64_t)stack[sp - 1]
+                    << ((uint64_t)stack[sp] & 63));
             }
             break;
         case WL_PLAN_EXPR_ARITH_SHR: /* 0x19 */
