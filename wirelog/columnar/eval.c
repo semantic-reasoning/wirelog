@@ -127,6 +127,11 @@ dedup_set_init_from_rel(col_rel_t *r)
 /* Stratum Evaluator                                                         */
 /* ======================================================================== */
 
+/* Compile-time check: WL_PLAN_OP__BACKEND_START must match the first
+ * backend-specific operator (Issue #495). */
+_Static_assert(WL_PLAN_OP_K_FUSION == WL_PLAN_OP__BACKEND_START,
+    "WL_PLAN_OP__BACKEND_START must equal WL_PLAN_OP_K_FUSION");
+
 /*
  * col_eval_relation_plan:
  * Evaluate all operators for one relation plan using the eval stack.
@@ -253,6 +258,7 @@ normal_eval:
             rc = col_op_exchange(op, stack, sess);
             break;
         default:
+            assert(0 && "unknown plan op type in columnar eval dispatch");
             break;
         }
         if (rc != 0)
