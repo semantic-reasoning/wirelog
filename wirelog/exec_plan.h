@@ -311,6 +311,7 @@ wl_plan_op_is_universal(wl_plan_op_type_t op)
  *
  * Field usage by operator type:
  *
+ * Universal operators (use flat fields only, opaque_data is NULL):
  *   VARIABLE:    relation_name
  *   MAP:         project_indices, project_count  (and/or map_exprs)
  *   FILTER:      filter_expr
@@ -323,9 +324,11 @@ wl_plan_op_is_universal(wl_plan_op_type_t op)
  *   CONSOLIDATE: (no fields used)
  *   SEMIJOIN:    right_relation, right_filter_expr, left_keys, right_keys,
  *                key_count, project_indices, project_count
- *   K_FUSION:    opaque_data (points to wl_plan_op_k_fusion_t in columnar backend)
- *   LFTJ:        opaque_data (points to wl_plan_op_lftj_t in columnar backend)
- *   EXCHANGE:    opaque_data (points to wl_plan_op_exchange_t in columnar backend)
+ *
+ * Backend-specific operators (>= WL_PLAN_OP__BACKEND_START, use opaque_data):
+ *   K_FUSION:    opaque_data -> wl_plan_op_k_fusion_t (columnar)
+ *   LFTJ:        opaque_data -> wl_plan_op_lftj_t (columnar)
+ *   EXCHANGE:    opaque_data -> wl_plan_op_exchange_t (columnar)
  */
 typedef struct {
     wl_plan_op_type_t op;
@@ -352,11 +355,10 @@ typedef struct {
     wl_delta_mode_t delta_mode; /* semi-naive delta/full selection control */
     bool materialized; /* hint: cache this intermediate result for CSE reuse */
 
-    /* Backend-specific metadata.  NULL for all ops except K_FUSION.
-     * For K_FUSION: points to a wl_plan_op_k_fusion_t (defined in
-     * backend/columnar_nanoarrow.h) containing K operator sequences
-     * for parallel semi-naive evaluation.  Owned by the plan; freed
-     * via wl_plan_free() -> free_op() path. */
+    /* Backend-specific metadata.  NULL for all universal ops (< BACKEND_START).
+     * For backend-specific ops (K_FUSION, LFTJ, EXCHANGE): points to a
+     * backend-defined struct in columnar/columnar_nanoarrow.h.
+     * Owned by the plan; freed via wl_plan_free() -> free_op() path. */
     void *opaque_data;
 
     /* Filter predicate applied to right-child tuples before join probe.
