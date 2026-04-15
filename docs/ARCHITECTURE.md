@@ -111,7 +111,7 @@ This document describes the **invariant architectural principles** that must be 
 - Natural fit for workqueue-based parallel execution
 
 **Code locations**:
-- Plan-level: `wirelog/exec_plan.h:259` (WL_PLAN_OP_K_FUSION operator type)
+- Plan-level: `wirelog/exec_plan.h` (WL_PLAN_OP_K_FUSION operator type)
 - Plan generation: `wirelog/exec_plan_gen.c:1574-1746` (expand_multiway_k_fusion)
 - Execution: `wirelog/columnar/internal.h:1257` (col_op_k_fusion)
 - Worker isolation: `wirelog/columnar/diff_arrangement.h:88-98` (col_diff_arrangement_deep_copy)

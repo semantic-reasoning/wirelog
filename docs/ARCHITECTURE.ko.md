@@ -110,7 +110,7 @@ Wirelog는 **순수 C11**로 구현된 **Timely-Differential 개념** 기반의 
 - 워크큐 기반 병렬 실행에 자연스러운 적합성
 
 **코드 위치**:
-- 계획 수준: `wirelog/exec_plan.h:259` (WL_PLAN_OP_K_FUSION 연산자 타입)
+- 계획 수준: `wirelog/exec_plan.h` (WL_PLAN_OP_K_FUSION 연산자 타입)
 - 계획 생성: `wirelog/exec_plan_gen.c:1574-1746` (expand_multiway_k_fusion)
 - 실행: `wirelog/columnar/internal.h:1257` (col_op_k_fusion)
 - 워커 격리: `wirelog/columnar/diff_arrangement.h:88-98` (col_diff_arrangement_deep_copy)
