@@ -284,6 +284,20 @@ typedef enum {
  * Universal ops (< WL_PLAN_OP__BACKEND_START) use flat wl_plan_op_t fields. */
 #define WL_PLAN_OP__BACKEND_START 9
 
+/** Returns true if @op is a backend-specific operator (>= BACKEND_START). */
+static inline bool
+wl_plan_op_is_backend_specific(wl_plan_op_type_t op)
+{
+    return (int)op >= WL_PLAN_OP__BACKEND_START;
+}
+
+/** Returns true if @op is a universal (backend-agnostic) operator. */
+static inline bool
+wl_plan_op_is_universal(wl_plan_op_type_t op)
+{
+    return (int)op < WL_PLAN_OP__BACKEND_START;
+}
+
 /* ======================================================================== */
 /* Operator Node                                                            */
 /* ======================================================================== */
