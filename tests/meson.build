@@ -313,6 +313,27 @@ test_workqueue_capacity_exe = executable(
 test('workqueue_capacity', test_workqueue_capacity_exe)
 
 # ============================================================================
+# FPGA Stub Backend Tests (Issue #496)
+# ============================================================================
+
+test_fpga_backend_exe = executable(
+  'test_fpga_backend',
+  files('test_fpga_backend.c', 'fpga_backend.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('fpga_backend', test_fpga_backend_exe)
+
+# ============================================================================
 # Lock-Free MPSC Queue Tests (Issue #401)
 # ============================================================================
 
