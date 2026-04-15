@@ -40,6 +40,9 @@ wirelog_arena_src = files('arena/arena.c', )
 # Select threading backend: C11 threads.h > POSIX pthreads > Windows MSVC
 # C11 threads.h detection uses cc.links() to verify actual support,
 # not just header presence (Apple Clang ships no threads.h).
+#
+# -Dthreads=posix forces POSIX pthreads (required for TSan, which only
+# intercepts pthread calls, not C11 thread functions).
 c11_threads_test = '''
 #include <threads.h>
 static int dummy(void *arg) { (void)arg; return 0; }
@@ -50,7 +53,13 @@ int main(void) {
     return 0;
 }
 '''
-have_c11_threads = cc.links(c11_threads_test, name: 'C11 <threads.h> support')
+
+if threads_option == 'posix'
+    have_c11_threads = false
+    message('  Threading backend: POSIX pthreads (forced via -Dthreads=posix)')
+else
+    have_c11_threads = cc.links(c11_threads_test, name: 'C11 <threads.h> support')
+endif
 
 if have_c11_threads
     wirelog_thread_src = files('thread_c11.c', )

@@ -267,11 +267,13 @@ jobs:
             sudo apt-get install -y clang
           fi
 
+      # Force POSIX pthreads for TSan (C11 threads.h is uninstrumented)
       - name: Configure with TSan
         run: >
           meson setup builddir-tsan
           -Db_sanitize=thread
           -Db_lundef=false
+          -Dthreads=posix
           -Dtests=true
           --buildtype=debug
         env:

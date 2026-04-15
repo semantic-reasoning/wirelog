@@ -170,12 +170,16 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
 
+      # TSan: force POSIX pthreads via -Dthreads=posix.
+      # TSan only intercepts pthread calls; C11 <threads.h> functions
+      # (thrd_create, mtx_lock) are uninstrumented and cause false SEGV.
       - name: Sanitizers / TSan
         if: matrix.os == 'ubuntu-latest'
         run: |
           meson setup builddir-tsan \
             -Db_sanitize=thread \
             -Db_lundef=false \
+            -Dthreads=posix \
             -Dtests=true \
             --buildtype=debug
           meson compile -C builddir-tsan

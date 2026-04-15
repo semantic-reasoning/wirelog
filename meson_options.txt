@@ -16,9 +16,9 @@ option(
 option(
   'threads',
   type: 'combo',
-  choices: ['disabled', 'enabled'],
-  value: 'enabled',
-  description: 'Enable pthreads support for multi-threaded execution'
+  choices: ['native', 'posix'],
+  value: 'native',
+  description: 'Threading backend: native (auto-detect C11/POSIX) or posix (force pthreads, required for TSan)'
 )
 
 option(

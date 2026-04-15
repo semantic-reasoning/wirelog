@@ -97,16 +97,14 @@ message('  Plugin loader (dlopen): ' + io_plugin_dlopen_option)
 #Dependencies
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-#Optional : pthreads for threading
+#pthreads for threading
 threads_dep = []
-if threads_option == 'enabled'
-  _td = dependency('threads', required: false)
-  if not _td.found()
-    _td = cc.find_library('pthread', required: false)
-  endif
-  if _td.found()
-    threads_dep = [_td]
-  endif
+_td = dependency('threads', required: false)
+if not _td.found()
+  _td = cc.find_library('pthread', required: false)
+endif
+if _td.found()
+  threads_dep = [_td]
 endif
 
 #Optional : zlib for IPC compression(future)
@@ -180,7 +178,7 @@ config_h.set_quoted('WIRELOG_VERSION', project_version)
 config_h.set_quoted('WIRELOG_PLATFORM', platform)
 config_h.set('WIRELOG_EMBEDDED', is_embedded)
 config_h.set('WIRELOG_IPC', ipc_option == 'enabled')
-config_h.set('WIRELOG_THREADS', threads_option == 'enabled')
+config_h.set('WIRELOG_THREADS', true)
 
 #Generate config header
 config_h_file = configure_file(
