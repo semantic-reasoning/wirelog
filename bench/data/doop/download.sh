@@ -1,15 +1,26 @@
 #!/bin/bash
 # Download DOOP (zxing) benchmark dataset
-# Source: FlowLog artifact (VLDB 2026)
+# Source: FlowLog VLDB 2026 artifact (mirrored on HuggingFace).
+# The original host (pages.cs.wisc.edu/~m0riarty) is no longer available.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-URL="https://pages.cs.wisc.edu/~m0riarty/dataset/csv/zxing.zip"
+URL="${DOOP_ZXING_URL:-https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/resolve/main/dataset/csv/zxing.zip}"
 TMPZIP="/tmp/zxing_doop_$$.zip"
 TMPDIR="/tmp/zxing_doop_$$"
 
-echo "Downloading zxing dataset (~112 MB)..."
-curl -L "$URL" -o "$TMPZIP"
+cleanup() { rm -rf "$TMPZIP" "$TMPDIR"; }
+trap cleanup EXIT
+
+echo "Downloading zxing dataset (~112 MB) from $URL ..."
+curl --fail -L "$URL" -o "$TMPZIP"
+
+# Fail fast if the server returned HTML (e.g. 404 page) instead of a zip.
+if ! unzip -tq "$TMPZIP" > /dev/null 2>&1; then
+    echo "ERROR: downloaded file is not a valid zip archive." >&2
+    echo "       Check connectivity and DOOP_ZXING_URL." >&2
+    exit 1
+fi
 
 echo "Extracting required CSV files..."
 mkdir -p "$TMPDIR"
@@ -28,5 +39,4 @@ for f in $REQUIRED; do
     cp "$TMPDIR/zxing/${f}.csv" "$SCRIPT_DIR/"
 done
 
-rm -rf "$TMPDIR" "$TMPZIP"
 echo "Done. 34 CSV files copied to $SCRIPT_DIR/"
