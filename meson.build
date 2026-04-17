@@ -69,6 +69,19 @@ else
   )
 endif
 
+# Issue #287: structured logger compile-time ceiling.
+_log_level_map = {'error': 1, 'warn': 2, 'info': 3, 'debug': 4, 'trace': 5}
+_log_opt = get_option('wirelog_log_max_level')
+add_project_arguments(
+  '-DWL_LOG_COMPILE_MAX_LEVEL=' + _log_level_map[_log_opt].to_string(),
+  language: 'c',
+)
+if _log_opt == 'trace' and get_option('buildtype') == 'release'
+  warning(
+    'wirelog_log_max_level=trace in release build; pass -Dwirelog_log_max_level=error for zero-cost disabled log sites.'
+  )
+endif
+
 #Platform detection
 platform = host_machine.system()
 is_embedded = get_option('embedded')
@@ -214,6 +227,7 @@ wirelog_sources += wirelog_workqueue_src
 wirelog_sources += wirelog_io_src
 wirelog_sources += wirelog_string_ops_src
 wirelog_sources += wirelog_wl_easy_src
+wirelog_sources += wirelog_util_log_src
 
 #Public headers
 wirelog_public_headers = [

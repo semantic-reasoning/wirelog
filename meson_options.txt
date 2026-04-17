@@ -58,3 +58,11 @@ option(
   value: 'disabled',
   description: 'Use system-installed mbedTLS for cryptographic functions. auto=enabled if found, else disabled'
 )
+
+option(
+  'wirelog_log_max_level',
+  type: 'combo',
+  choices: ['error', 'warn', 'info', 'debug', 'trace'],
+  value: 'trace',
+  description: 'Compile-time ceiling for WL_LOG() (Issue #287). Set to "error" in release for zero-cost disabled TRACE/DEBUG/INFO/WARN sites.'
+)

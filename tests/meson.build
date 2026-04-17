@@ -193,6 +193,29 @@ test_csv_exe = executable(
 
 test('csv', test_csv_exe)
 
+# Issue #287: logger env parser tests (pure function; no env mutation).
+test_log_parse_exe = executable(
+  'test_log_parse',
+  files('test_log_parse.c'),
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+test('log_parse', test_log_parse_exe,
+     suite: 'log')
+
+# Issue #287: ABI lints for the logger - header must not leak into public
+# surface; testhook symbols must not appear in libwirelog.
+test('log_abi_header_not_public',
+     find_program(meson.project_source_root() / 'scripts/check_log_header_not_public.sh'),
+     suite: 'abi')
+test('log_abi_no_testhook_in_libwirelog',
+     find_program(meson.project_source_root() / 'scripts/ci/check-no-testhook-in-libwirelog.sh'),
+     args: [meson.project_build_root()],
+     suite: 'abi')
+
 test_intern_exe = executable(
   'test_intern',
   files('test_intern.c'),
