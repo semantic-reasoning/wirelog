@@ -21,6 +21,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* MSVC lacks POSIX setenv/unsetenv. _putenv_s(name, "") removes the
+ * variable in the MSVC CRT, so substitute a minimal non-empty value on
+ * set to preserve POSIX presence-check semantics (getenv() non-NULL for
+ * both "" and "anything"). This test file relies on that presence
+ * contract for the #277 legacy shim. */
+#if defined(_MSC_VER) && !defined(__clang__)
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+#  define setenv   wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
+#endif
+
 static void
 test_presence_any_value_enables(void)
 {

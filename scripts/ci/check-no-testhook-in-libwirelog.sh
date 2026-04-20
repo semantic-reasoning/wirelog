@@ -7,7 +7,9 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 BUILD_DIR="${1:-$ROOT/build}"
 LIB=""
-for candidate in "$BUILD_DIR/libwirelog.so" "$BUILD_DIR"/libwirelog.so.* "$BUILD_DIR/libwirelog.a"; do
+for candidate in "$BUILD_DIR/libwirelog.so" "$BUILD_DIR"/libwirelog.so.* \
+                 "$BUILD_DIR/libwirelog.dylib" "$BUILD_DIR"/libwirelog.*.dylib \
+                 "$BUILD_DIR/libwirelog.a"; do
     if [[ -f "$candidate" ]]; then LIB="$candidate"; break; fi
 done
 if [[ -z "$LIB" ]]; then
@@ -15,14 +17,25 @@ if [[ -z "$LIB" ]]; then
     exit 2
 fi
 
+# Portable "defined symbols" wrapper. GNU binutils nm supports --defined-only;
+# BSD nm (macOS) does not. On BSD, undefined symbols have 'U' in the type
+# column and can be filtered via awk. Works on both toolchains.
+nm_defined() {
+    if nm --defined-only "$1" 2>/dev/null; then
+        return 0
+    fi
+    nm "$1" 2>/dev/null | awk '$2 != "U" && $2 != "u"'
+}
+
 # (a) No testhook-branded symbols may be defined in production.
-if nm --defined-only "$LIB" 2>/dev/null | grep -qE 'wl_log_test_last|wl_log_test_count|wl_log_testhook|__log_testhook'; then
+if nm_defined "$LIB" | grep -qE 'wl_log_test_last|wl_log_test_count|wl_log_testhook|__log_testhook'; then
     echo "LEAK: testhook symbols present in $LIB" >&2
-    nm --defined-only "$LIB" | grep -E 'wl_log_test_last|wl_log_test_count|wl_log_testhook|__log_testhook' >&2 || true
+    nm_defined "$LIB" | grep -E 'wl_log_test_last|wl_log_test_count|wl_log_testhook|__log_testhook' >&2 || true
     exit 1
 fi
 
-# (b) wl_log_emit provenance = log_emit.c. Requires -g; soft NOTICE on stripped.
+# (b) wl_log_emit provenance = log_emit.c. GNU binutils --line-numbers only;
+# BSD nm has no equivalent, so this degrades to a soft NOTICE on macOS.
 PROV="$(nm --line-numbers --defined-only "$LIB" 2>/dev/null \
         | awk '$NF ~ /:[0-9]+$/ && $0 ~ / wl_log_emit$/ {print $NF; exit}')"
 if [[ -z "$PROV" ]]; then

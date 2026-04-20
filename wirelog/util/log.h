@@ -35,6 +35,23 @@
 # endif
 #endif
 
+/* Portable compiler-attribute shims. MSVC does not accept __attribute__()
+ * or the C11 alignas() macro in its C mode; supply no-ops / equivalents
+ * so the same header compiles under GCC, Clang, and MSVC. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define WL_LOG_ALIGN64               __declspec(align(64))
+#  define WL_LOG_ATTR_FORMAT(fi, ai)   /* MSVC: no printf-format check */
+#  define WL_LOG_ATTR_COLD             /* MSVC: no cold attribute */
+#  define WL_LOG_ATTR_USED             /* MSVC: link-retention via /INCLUDE, n/a here */
+#  define WL_LOG_BUILTIN_EXPECT(x, y)  (x)
+#else
+#  define WL_LOG_ALIGN64               alignas(64)
+#  define WL_LOG_ATTR_FORMAT(fi, ai)   __attribute__((format(printf, fi, ai)))
+#  define WL_LOG_ATTR_COLD             __attribute__((cold))
+#  define WL_LOG_ATTR_USED             __attribute__((used))
+#  define WL_LOG_BUILTIN_EXPECT(x, y)  __builtin_expect((x), (y))
+#endif
+
 typedef enum {
     WL_LOG_NONE  = 0,
     WL_LOG_ERROR = 1,
@@ -61,7 +78,7 @@ typedef enum {
 
 /* Cacheline-aligned; bilateral 128B pads in log.c prevent false sharing
  * with neighbor globals on both 64B (x86) and 128B (Apple/ARM) cachelines. */
-extern alignas(64) uint8_t wl_log_thresholds[WL_LOG_SEC__COUNT];
+extern WL_LOG_ALIGN64 uint8_t wl_log_thresholds[WL_LOG_SEC__COUNT];
 
 int  wl_log_init(void);
 void wl_log_shutdown(void);
@@ -77,7 +94,7 @@ wl_log_section_t   wl_log_section_from_name(const char *name);
 
 void wl_log_emit(wl_log_section_t sec, wl_log_level_t lvl,
     const char *file, int line, const char *fmt, ...)
-__attribute__((format(printf, 5, 6)));
+WL_LOG_ATTR_FORMAT(5, 6);
 
 /* Compile-erasure sentinel. Stripped from libwirelog when
  * -Dwirelog_log_max_level=error. Verified by scripts/ci/check-log-erasure.sh.
@@ -98,7 +115,7 @@ void wl_log_demo_join(void);
 #define WL_LOG(SEC, LVL, ...)                                                 \
         do {                                                                      \
             if ((LVL) <= WL_LOG_COMPILE_MAX_LEVEL                                 \
-                && __builtin_expect((LVL) <= wl_log_thresholds[SEC], 0)) {        \
+                && WL_LOG_BUILTIN_EXPECT((LVL) <= wl_log_thresholds[SEC], 0)) {   \
                 wl_log_emit((SEC), (LVL), __FILE__, __LINE__, __VA_ARGS__);       \
             }                                                                     \
         } while (0)

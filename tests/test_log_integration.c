@@ -18,17 +18,65 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
+
+/* Portability shims for MSVC: no <unistd.h>, no setenv/unsetenv/getpid.
+ * _putenv_s(name, "") removes the variable per MSVC docs; _getpid lives
+ * in <process.h>. The integration test writes its tmpfile to $TMP/$TEMP
+ * on Windows and /tmp elsewhere. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <process.h>
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;  /* _putenv_s unconditionally overwrites */
+    /* MSVC CRT: _putenv_s(name, "") removes the variable. Substitute a
+     * minimal non-empty value so getenv() returns non-NULL, matching
+     * POSIX presence semantics used by this test file. */
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+#  define setenv   wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
+#  define getpid   _getpid
+#else
+#  include <unistd.h>
+#endif
 
 static char tmp_path_[256];
+
+static const char *
+tmpdir_(void)
+{
+    const char *d = getenv("TMPDIR");
+    if (d && *d) return d;
+#if defined(_WIN32)
+    d = getenv("TEMP");
+    if (d && *d) return d;
+    d = getenv("TMP");
+    if (d && *d) return d;
+    return ".";
+#else
+    return "/tmp";
+#endif
+}
 
 static void
 make_tmpfile_(void)
 {
     /* pid+time gives a unique-enough path per invocation for tests. */
+    const char *d = tmpdir_();
+#if defined(_WIN32)
+    const char sep = '\\';
+#else
+    const char sep = '/';
+#endif
     snprintf(tmp_path_, sizeof(tmp_path_),
-        "/tmp/wl_log_integration_%ld_%ld.log",
-        (long)getpid(), (long)time(NULL));
+        "%s%cwl_log_integration_%ld_%ld.log",
+        d, sep, (long)getpid(), (long)time(NULL));
     (void)remove(tmp_path_);
 }
 

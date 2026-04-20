@@ -52,6 +52,8 @@ fi
 LIB=""
 for candidate in "${BUILD_DIR}/libwirelog.so" \
                  "${BUILD_DIR}"/libwirelog.so.* \
+                 "${BUILD_DIR}/libwirelog.dylib" \
+                 "${BUILD_DIR}"/libwirelog.*.dylib \
                  "${BUILD_DIR}/libwirelog.a"; do
     if [[ -f "${candidate}" ]]; then LIB="${candidate}"; break; fi
 done

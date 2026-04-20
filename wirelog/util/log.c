@@ -18,9 +18,9 @@
  * 128B (Apple/ARM) cachelines regardless of which edge a neighbor global lands
  * on. Total BSS overhead: 256 bytes.
  */
-__attribute__((used)) alignas(64) static char wl_log_pad_lead_[128];
-alignas(64) uint8_t wl_log_thresholds[WL_LOG_SEC__COUNT];
-__attribute__((used)) alignas(64) static char wl_log_pad_trail_[128];
+WL_LOG_ATTR_USED WL_LOG_ALIGN64 static char wl_log_pad_lead_[128];
+WL_LOG_ALIGN64 uint8_t wl_log_thresholds[WL_LOG_SEC__COUNT];
+WL_LOG_ATTR_USED WL_LOG_ALIGN64 static char wl_log_pad_trail_[128];
 
 /* Cached sink set once by wl_log_init(). Reader access is not synchronized;
  * init must run before any WL_LOG call. */

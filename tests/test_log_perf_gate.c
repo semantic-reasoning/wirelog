@@ -106,6 +106,18 @@ cpufreq_is_performance_(void)
 int
 main(void)
 {
+    /* Opt-in only: shared CI runners exhibit several-percent wall-clock
+     * noise which is above the 1% budget. Explicit opt-in lets operators
+     * run the gate on dedicated perf hardware (merge-to-main / nightly)
+     * while keeping per-PR CI silent. */
+    const char *opt_in = getenv("WIRELOG_PERF_GATE");
+    if (!opt_in || !*opt_in || opt_in[0] == '0') {
+        fprintf(stderr,
+            "test_log_perf_gate: SKIP: set WIRELOG_PERF_GATE=1 to run "
+            "(designed for dedicated perf hardware, not shared CI runners)\n");
+        return SKIP_EXIT;
+    }
+
     /* Skip if the compile-time ceiling compiled the WL_LOG call out - the
      * test would be vacuous. This build-configuration is detected via the
      * preprocessor. */

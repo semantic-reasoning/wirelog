@@ -234,19 +234,24 @@ test('log_gating', test_log_gating_exe,
 
 # Issue #287: TSan sanity test - readers spin on wl_log_thresholds while one
 # writer flips it. No torn reads, TSan clean under the sanitizer build.
-test_log_threshold_race_exe = executable(
-  'test_log_threshold_race',
-  files('test_log_threshold_race.c'),
-  files(
-    '../wirelog/util/log.c',
-    '../wirelog/util/log_emit.c',
-  ),
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep],
-)
-test('log_threshold_race', test_log_threshold_race_exe,
-     suite: 'log',
-     timeout: 30)
+# Skipped on Windows/MSVC: uses <pthread.h> and __atomic_* GCC/Clang
+# builtins; TSan is a Linux-only sanitizer, so the test has no reason to
+# build on MSVC.
+if not is_windows
+  test_log_threshold_race_exe = executable(
+    'test_log_threshold_race',
+    files('test_log_threshold_race.c'),
+    files(
+      '../wirelog/util/log.c',
+      '../wirelog/util/log_emit.c',
+    ),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [threads_dep],
+  )
+  test('log_threshold_race', test_log_threshold_race_exe,
+       suite: 'log',
+       timeout: 30)
+endif
 
 # Issue #287: release-mode perf gate (suite 'perf', excluded from default run).
 # Requires -Dwirelog_log_max_level=trace and a 'performance' cpufreq governor;
@@ -255,18 +260,23 @@ test('log_threshold_race', test_log_threshold_race_exe,
 #   meson setup build-release --buildtype=release -Dwirelog_log_max_level=trace
 #   meson compile -C build-release
 #   taskset -c 0 meson test -C build-release --suite perf
-test_log_perf_gate_exe = executable(
-  'test_log_perf_gate',
-  files('test_log_perf_gate.c'),
-  files(
-    '../wirelog/util/log.c',
-    '../wirelog/util/log_emit.c',
-  ),
-  include_directories: [wirelog_inc, wirelog_src_inc],
-)
-test('log_perf_gate', test_log_perf_gate_exe,
-     suite: 'perf',
-     timeout: 120)
+# Skipped on Windows/MSVC: source uses __attribute__((noinline)) and the
+# runtime gate checks cpufreq governor (Linux-only). Dedicated perf
+# hardware targets are Linux anyway.
+if not is_windows
+  test_log_perf_gate_exe = executable(
+    'test_log_perf_gate',
+    files('test_log_perf_gate.c'),
+    files(
+      '../wirelog/util/log.c',
+      '../wirelog/util/log_emit.c',
+    ),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+  )
+  test('log_perf_gate', test_log_perf_gate_exe,
+       suite: 'perf',
+       timeout: 120)
+endif
 
 # Issue #287: end-to-end integration - WL_LOG=JOIN:5 + WL_LOG_FILE captures
 # one "[TRACE][JOIN] ... hello 42" line; unset produces zero output.
@@ -296,23 +306,29 @@ test_log_legacy_shim_exe = executable(
 test('log_legacy_shim', test_log_legacy_shim_exe,
      suite: 'log')
 
-# Issue #287: compile-erasure CI. Rebuilds libwirelog with
-# -Dwirelog_log_max_level=error in an isolated build dir and asserts TRACE-
-# level WL_LOG() sentinels are absent from .rodata.
-test('log_abi_compile_erasure',
-     find_program(meson.project_source_root() / 'scripts/ci/check-log-erasure.sh'),
-     suite: 'abi',
-     timeout: 180)
+# Issue #287: ABI lints for the logger. These are POSIX shell scripts that
+# shell out to nm/objdump/awk; no Windows equivalent exists, and MSVC CI
+# does not ship bash. Linux/macOS coverage is sufficient for the invariants
+# they check (compile-erasure, header non-leakage, testhook symbol absence).
+if not is_windows
+  # Compile-erasure: rebuild libwirelog with -Dwirelog_log_max_level=error
+  # in an isolated build dir; assert TRACE-level WL_LOG() sentinels are
+  # absent from .rodata.
+  test('log_abi_compile_erasure',
+       find_program(meson.project_source_root() / 'scripts/ci/check-log-erasure.sh'),
+       suite: 'abi',
+       timeout: 180)
 
-# Issue #287: ABI lints for the logger - header must not leak into public
-# surface; testhook symbols must not appear in libwirelog.
-test('log_abi_header_not_public',
-     find_program(meson.project_source_root() / 'scripts/check_log_header_not_public.sh'),
-     suite: 'abi')
-test('log_abi_no_testhook_in_libwirelog',
-     find_program(meson.project_source_root() / 'scripts/ci/check-no-testhook-in-libwirelog.sh'),
-     args: [meson.project_build_root()],
-     suite: 'abi')
+  # Header must not leak into public surface; testhook symbols must not
+  # appear in libwirelog.
+  test('log_abi_header_not_public',
+       find_program(meson.project_source_root() / 'scripts/check_log_header_not_public.sh'),
+       suite: 'abi')
+  test('log_abi_no_testhook_in_libwirelog',
+       find_program(meson.project_source_root() / 'scripts/ci/check-no-testhook-in-libwirelog.sh'),
+       args: [meson.project_build_root()],
+       suite: 'abi')
+endif
 
 test_intern_exe = executable(
   'test_intern',

@@ -45,7 +45,7 @@ level_name_(wl_log_level_t lvl)
     return wl_log_level_names_[lvl];
 }
 
-__attribute__((cold))
+WL_LOG_ATTR_COLD
 void
 wl_log_emit(wl_log_section_t sec, wl_log_level_t lvl,
     const char *file, int line, const char *fmt, ...)
