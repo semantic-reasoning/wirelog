@@ -41,7 +41,7 @@ enum {
     SKIP_EXIT = 77,   /* Meson "skip" exit code. */
 };
 
-__attribute__((noinline))
+BENCH_NOINLINE
 static uint64_t
 run_nolog(uint64_t iters, int a, int b, int c)
 {
@@ -52,7 +52,7 @@ run_nolog(uint64_t iters, int a, int b, int c)
     return acc;
 }
 
-__attribute__((noinline))
+BENCH_NOINLINE
 static uint64_t
 run_wllog(uint64_t iters, int a, int b, int c)
 {
