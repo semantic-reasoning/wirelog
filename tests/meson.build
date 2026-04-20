@@ -268,6 +268,34 @@ test('log_perf_gate', test_log_perf_gate_exe,
      suite: 'perf',
      timeout: 120)
 
+# Issue #287: end-to-end integration - WL_LOG=JOIN:5 + WL_LOG_FILE captures
+# one "[TRACE][JOIN] ... hello 42" line; unset produces zero output.
+test_log_integration_exe = executable(
+  'test_log_integration',
+  files('test_log_integration.c'),
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+test('log_integration', test_log_integration_exe,
+     suite: 'log')
+
+# Issue #287: legacy WL_DEBUG_JOIN/WL_CONSOLIDATION_LOG presence-check shim.
+# Asserts WL_DEBUG_JOIN=0 still enables JOIN at TRACE; WL_LOG overrides shim.
+test_log_legacy_shim_exe = executable(
+  'test_log_legacy_shim',
+  files('test_log_legacy_shim.c'),
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+test('log_legacy_shim', test_log_legacy_shim_exe,
+     suite: 'log')
+
 # Issue #287: compile-erasure CI. Rebuilds libwirelog with
 # -Dwirelog_log_max_level=error in an isolated build dir and asserts TRACE-
 # level WL_LOG() sentinels are absent from .rodata.
@@ -320,6 +348,8 @@ backend_src = files(
   '../wirelog/columnar/partition.c',
   '../wirelog/columnar/progress.c',
   '../wirelog/util/lockfree_queue.c',
+  '../wirelog/util/log.c',
+  '../wirelog/util/log_emit.c',
   '../wirelog/string_ops.c',
 )
 

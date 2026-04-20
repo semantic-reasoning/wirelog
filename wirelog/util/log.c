@@ -263,3 +263,14 @@ wl_log_erasure_sentinel(void)
     WL_LOG(WL_LOG_SEC_GENERAL, WL_LOG_TRACE,
         "wl_log_erasure_sentinel_trace %d", 0);
 }
+
+/*
+ * End-to-end demo helper. Drives the full env-parse -> threshold -> WL_LOG
+ * -> wl_log_emit -> fwrite path. tests/test_log_integration.c asserts the
+ * output matches "[TRACE][JOIN] <file>:<line>: hello 42".
+ */
+void
+wl_log_demo_join(void)
+{
+    WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_TRACE, "hello %d", 42);
+}
