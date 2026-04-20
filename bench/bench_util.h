@@ -170,6 +170,64 @@ bench_peak_rss_kb(void)
 #endif
 
 /* ================================================================
+ * Perf-harness stability controls
+ * ================================================================
+ *
+ * bench_stability_prep() pins the current thread to a single CPU and
+ * elevates the process priority class. Callers that are about to do
+ * microbenchmark measurements should call this once at startup; the
+ * combined effect is roughly equivalent to the Linux workflow of
+ * `taskset -c 0 chrt -f 99` without requiring privileged users.
+ *
+ * Returns 1 on full success, 0 if any step failed. A return of 0 is a
+ * signal to widen the measurement-variance tolerance, not to abort.
+ *
+ * On Linux this is intentionally a no-op: the test harness there
+ * relies on a pre-configured cpufreq governor (`performance`) plus
+ * optional `taskset`/`chrt` wrapping by the operator, which is what
+ * the existing perf gate already checks.
+ */
+
+#if defined(_WIN32)
+
+static inline int
+bench_stability_prep(void)
+{
+    int ok = 1;
+    /* Pin to CPU 0. Affinity mask is a DWORD_PTR; bit i = permission to
+     * run on CPU i. */
+    DWORD_PTR old = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1);
+    if (old == 0)
+        ok = 0;
+    if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
+        ok = 0;
+    if (!SetThreadPriority(GetCurrentThread(),
+            THREAD_PRIORITY_HIGHEST))
+        ok = 0;
+    return ok;
+}
+
+#elif defined(__linux__) || defined(__APPLE__)
+
+/* POSIX-side stability is the operator's responsibility (cpufreq
+ * governor, taskset, chrt). No per-process escalation here. */
+static inline int
+bench_stability_prep(void)
+{
+    return 1;
+}
+
+#else
+
+static inline int
+bench_stability_prep(void)
+{
+    return 0; /* unsupported host: caller should SKIP */
+}
+
+#endif
+
+/* ================================================================
  * Comparison helper for qsort (double)
  * ================================================================ */
 

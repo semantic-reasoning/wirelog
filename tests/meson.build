@@ -264,15 +264,14 @@ if not is_windows
 endif
 
 # Issue #287: release-mode perf gate (suite 'perf', excluded from default run).
-# Requires -Dwirelog_log_max_level=trace and a 'performance' cpufreq governor;
-# otherwise skips with Meson exit code 77. See the test source for full
-# methodology. Intended invocation:
-#   meson setup build-release --buildtype=release -Dwirelog_log_max_level=trace
-#   meson compile -C build-release
-#   taskset -c 0 meson test -C build-release --suite perf
-# Now parses under MSVC via BENCH_NOINLINE (bench/bench_util.h). The
-# runtime still SKIPs on non-Linux because cpufreq_is_performance_() is
-# Linux-only; Windows-native measurement design is tracked by #508 Phase 2.
+# Requires WIRELOG_PERF_GATE=1 and -Dwirelog_log_max_level=trace. Linux also
+# requires a 'performance' cpufreq governor; Windows uses thread affinity +
+# HIGH_PRIORITY_CLASS via bench_stability_prep() (issue #508 Phase 2).
+# A baseline coefficient-of-variation self-check converts noisy runs to SKIP
+# instead of FAIL so shared CI runners never flag a false regression.
+#   Linux:   taskset -c 0 WIRELOG_PERF_GATE=1 meson test -C build --suite perf
+#   Windows: set WIRELOG_PERF_GATE=1 & meson test -C build --suite perf
+# math_dep supplies sqrt() for the variance self-check.
 test_log_perf_gate_exe = executable(
   'test_log_perf_gate',
   files('test_log_perf_gate.c'),
@@ -281,6 +280,7 @@ test_log_perf_gate_exe = executable(
     '../wirelog/util/log_emit.c',
   ),
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [math_dep],
 )
 test('log_perf_gate', test_log_perf_gate_exe,
      suite: 'perf',
