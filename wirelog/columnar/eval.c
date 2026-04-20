@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 
 #include "columnar/internal.h"
+#include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
 
@@ -823,16 +824,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 /* Invalidate arrangements for this relation (data changed). */
                 col_session_invalidate_arrangements(&sess->base,
                     sp->relations[ri].name);
-                /* Per-call trace: WL_CONSOLIDATION_LOG=1 prints per-call info */
-                if (sess->consolidation_log) {
-                    fprintf(stderr,
-                        "CONS eff_iter=%u stratum=%u rel=%s N=%u D=%u "
-                        "time_us=%.1f ratio=%.4f\n",
-                        eff_iter, stratum_idx, sp->relations[ri].name,
-                        cons_old, cons_new, (double)cons_elapsed / 1000.0,
-                        cons_old > 0 ? (double)cons_new / (double)cons_old
-                                         : 0.0);
-                }
+                /* Per-call trace: WL_LOG=CONSOLIDATION:5 (or legacy
+                 * WL_CONSOLIDATION_LOG presence shim). */
+                WL_LOG(WL_LOG_SEC_CONSOLIDATION, WL_LOG_DEBUG,
+                    "eff_iter=%u stratum=%u rel=%s N=%u D=%u "
+                    "time_us=%.1f ratio=%.4f",
+                    eff_iter, stratum_idx, sp->relations[ri].name,
+                    cons_old, cons_new, (double)cons_elapsed / 1000.0,
+                    cons_old > 0 ? (double)cons_new / (double)cons_old
+                                     : 0.0);
                 if (rc2 != 0) {
                     col_rel_destroy(delta);
                     outer_rc = rc2;

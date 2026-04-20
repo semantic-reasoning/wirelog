@@ -20,6 +20,7 @@
 
 #include "columnar/internal.h"
 #include "columnar/lftj.h"
+#include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
 #include "../intern.h"
@@ -2449,10 +2450,9 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             }
             join_rc = 0; /* soft truncation: push partial result below */
         }
-        if (sess->debug_join)
-            fprintf(stderr,
-                "DEBUG[JOIN]: Unary join completed, out->nrows=%u\n",
-                out->nrows);
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+            "Unary join completed, out->nrows=%u",
+            out->nrows);
     } else {
         /* Standard merge-join for non-unary relations. */
         /* Hash join: use persistent arrangement for the full right relation;
@@ -2463,11 +2463,9 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t *ht_head_ep = NULL;
         uint32_t *ht_next_ep = NULL;
 
-        if (sess->debug_join)
-            fprintf(stderr,
-                "DEBUG[JOIN]: Standard merge-join starting - left=%u rows, "
-                "right=%u rows, kc=%u\n",
-                left->nrows, right->nrows, kc);
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+            "Standard merge-join starting - left=%u rows, right=%u rows, kc=%u",
+            left->nrows, right->nrows, kc);
 
         if (!used_right_delta && op->right_relation && kc > 0) {
             if (op->right_filter_expr.size == 0) {
@@ -2487,14 +2485,12 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             arr = col_session_get_delta_arrangement(sess, op->right_relation,
                     right, rk, kc);
 
-        if (sess->debug_join) {
-            if (arr)
-                fprintf(stderr, "DEBUG[JOIN]: Using persistent arrangement\n");
-            else
-                fprintf(stderr,
-                    "DEBUG[JOIN]: No arrangement available, will use "
-                    "ephemeral hash table\n");
-        }
+        if (arr)
+            WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                "Using persistent arrangement");
+        else
+            WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                "No arrangement available, will use ephemeral hash table");
 
         if (!arr) {
             /* Ephemeral hash table (delta path or arrangement unavailable). */
@@ -2517,10 +2513,9 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     col_rel_destroy(left);
                 return ENOMEM;
             }
-            if (sess->debug_join)
-                fprintf(stderr,
-                    "DEBUG[JOIN]: Ephemeral hash table created - nbuckets=%u\n",
-                    nbuckets_ep);
+            WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                "Ephemeral hash table created - nbuckets=%u",
+                nbuckets_ep);
             for (uint32_t rr = 0; rr < right->nrows; rr++) {
                 int64_t rrow_buf[COL_STACK_MAX];
                 col_rel_row_copy_out(right, rr, rrow_buf);
@@ -2530,9 +2525,8 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 ht_next_ep[rr] = ht_head_ep[h];
                 ht_head_ep[h] = rr + 1; /* 1-based; 0 = end of chain */
             }
-            if (sess->debug_join)
-                fprintf(stderr,
-                    "DEBUG[JOIN]: Ephemeral hash table built successfully\n");
+            WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                "Ephemeral hash table built successfully");
         }
 
         /* key_row scratch buffer for arrangement probe: values placed at rk[]
@@ -2641,22 +2635,18 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             }
         }
 
-        if (sess->debug_join)
-            fprintf(
-                stderr,
-                "DEBUG[JOIN]: Merge-join loop completed, out->nrows=%u, rc=%d\n",
-                out->nrows, join_rc);
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+            "Merge-join loop completed, out->nrows=%u, rc=%d",
+            out->nrows, join_rc);
 
         free(key_row);
         free(ht_head_ep);
         free(ht_next_ep);
         if (join_rc != 0) {
             if (join_rc != EOVERFLOW) {
-                if (sess->debug_join)
-                    fprintf(stderr,
-                        "DEBUG[JOIN]: Merge-join failed with rc=%d, "
-                        "out->nrows=%u\n",
-                        join_rc, out->nrows);
+                WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                    "Merge-join failed with rc=%d, out->nrows=%u",
+                    join_rc, out->nrows);
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -2677,8 +2667,7 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             }
             join_rc = 0; /* soft truncation: push partial result below */
         }
-        if (sess->debug_join)
-            fprintf(stderr, "DEBUG[JOIN]: Merge-join succeeded\n");
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG, "Merge-join succeeded");
     }
 
     free(tmp);

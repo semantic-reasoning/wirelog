@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 
 #include "columnar/internal.h"
+#include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
 
@@ -636,9 +637,17 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     }
 
     /* Issue #277: Cache debug/log env vars at session init to avoid repeated
-     * getenv() calls in hot paths. */
+     * getenv() calls in hot paths. Retained as dead-until-retired session
+     * fields until the legacy flags are formally removed in a follow-up
+     * issue; the active flag surface is now wl_log_thresholds[], seeded by
+     * wl_log_init() (see Issue #287 presence-check shim). */
     sess->debug_join = (getenv("WL_DEBUG_JOIN") != NULL);
     sess->consolidation_log = (getenv("WL_CONSOLIDATION_LOG") != NULL);
+
+    /* Issue #287: initialize the structured logger so WL_LOG() in migrated
+     * call sites honors WL_LOG / WL_LOG_FILE / legacy presence flags.
+     * Idempotent; cheap on re-entry. */
+    wl_log_init();
 
     /* Issue #286: Configurable cache eviction threshold via environment variable.
      * Default: 90% of COL_MAT_CACHE_LIMIT_BYTES (cache evicts when exceeding

@@ -84,6 +84,10 @@ __attribute__((format(printf, 5, 6)));
  * DO NOT MODIFY: the script depends on this sentinel's TRACE-level shape. */
 void wl_log_erasure_sentinel(void);
 
+/* End-to-end demo helper used by tests/test_log_integration.c. Emits a single
+ * TRACE-level line on SEC_JOIN. Not called from any production code path. */
+void wl_log_demo_join(void);
+
 /*
  * EXACT macro expansion. The compile-time guard `(LVL) <= WL_LOG_COMPILE_MAX_LEVEL`
  * is a comparison of two integer constant expressions; when it folds to false,
