@@ -15,6 +15,19 @@
 #include <stdint.h>
 
 /* ================================================================
+ * Compiler attribute shims
+ * ================================================================ */
+
+/* Portable noinline for bench/perf-gate call sites.
+ * MSVC C mode does not parse __attribute__((...)), so keep the two
+ * spellings behind a single macro used at call sites. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define BENCH_NOINLINE __declspec(noinline)
+#else
+#  define BENCH_NOINLINE __attribute__((noinline))
+#endif
+
+/* ================================================================
  * Wall-clock timing
  * ================================================================ */
 
