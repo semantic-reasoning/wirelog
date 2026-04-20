@@ -270,23 +270,21 @@ endif
 #   meson setup build-release --buildtype=release -Dwirelog_log_max_level=trace
 #   meson compile -C build-release
 #   taskset -c 0 meson test -C build-release --suite perf
-# Skipped on Windows/MSVC: source uses __attribute__((noinline)) and the
-# runtime gate checks cpufreq governor (Linux-only). Dedicated perf
-# hardware targets are Linux anyway.
-if not is_windows
-  test_log_perf_gate_exe = executable(
-    'test_log_perf_gate',
-    files('test_log_perf_gate.c'),
-    files(
-      '../wirelog/util/log.c',
-      '../wirelog/util/log_emit.c',
-    ),
-    include_directories: [wirelog_inc, wirelog_src_inc],
-  )
-  test('log_perf_gate', test_log_perf_gate_exe,
-       suite: 'perf',
-       timeout: 120)
-endif
+# Now parses under MSVC via BENCH_NOINLINE (bench/bench_util.h). The
+# runtime still SKIPs on non-Linux because cpufreq_is_performance_() is
+# Linux-only; Windows-native measurement design is tracked by #508 Phase 2.
+test_log_perf_gate_exe = executable(
+  'test_log_perf_gate',
+  files('test_log_perf_gate.c'),
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+test('log_perf_gate', test_log_perf_gate_exe,
+     suite: 'perf',
+     timeout: 120)
 
 # Issue #287: end-to-end integration - WL_LOG=JOIN:5 + WL_LOG_FILE captures
 # one "[TRACE][JOIN] ... hello 42" line; unset produces zero output.
