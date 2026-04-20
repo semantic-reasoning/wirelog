@@ -232,6 +232,22 @@ test_log_gating_exe = executable(
 test('log_gating', test_log_gating_exe,
      suite: 'log')
 
+# Issue #287: TSan sanity test - readers spin on wl_log_thresholds while one
+# writer flips it. No torn reads, TSan clean under the sanitizer build.
+test_log_threshold_race_exe = executable(
+  'test_log_threshold_race',
+  files('test_log_threshold_race.c'),
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+)
+test('log_threshold_race', test_log_threshold_race_exe,
+     suite: 'log',
+     timeout: 30)
+
 # Issue #287: ABI lints for the logger - header must not leak into public
 # surface; testhook symbols must not appear in libwirelog.
 test('log_abi_header_not_public',

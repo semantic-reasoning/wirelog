@@ -241,6 +241,15 @@ wl_log_shutdown(void)
     memset(wl_log_thresholds, 0, WL_LOG_SEC__COUNT);
 }
 
+/* Private accessor exposed to log_emit.c (prototype declared extern in that
+ * TU). Keeps the sink FILE* out of the public header; callers outside the
+ * logger module must not use it. */
+FILE *
+wl_log_sink_get_(void)
+{
+    return wl_log_sink_ ? wl_log_sink_ : stderr;
+}
+
 /*
  * Compile-erasure sentinel. MUST call WL_LOG at TRACE level so that
  * scripts/ci/check-log-erasure.sh can assert its format string is absent
