@@ -206,6 +206,32 @@ test_log_parse_exe = executable(
 test('log_parse', test_log_parse_exe,
      suite: 'log')
 
+# Issue #287: logger gating tests (compile-time ceiling + runtime threshold).
+# Links log.c + log_testhook.c (test emit capture); log_emit.c is deliberately
+# omitted to avoid duplicate wl_log_emit definitions. The ceiling-override TU
+# is built with its own -DWL_LOG_COMPILE_MAX_LEVEL=1 to exercise the
+# compile-time short-circuit (Case A). Per-target c_args are appended after
+# add_project_arguments, so the narrower ceiling wins in that TU.
+test_log_gating_ceiling_lib = static_library(
+  'test_log_gating_ceiling',
+  files('test_log_gating_ceiling.c'),
+  c_args: ['-UWL_LOG_COMPILE_MAX_LEVEL', '-DWL_LOG_COMPILE_MAX_LEVEL=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test_log_gating_exe = executable(
+  'test_log_gating',
+  files('test_log_gating.c'),
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_testhook.c',
+  ),
+  link_with: test_log_gating_ceiling_lib,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+test('log_gating', test_log_gating_exe,
+     suite: 'log')
+
 # Issue #287: ABI lints for the logger - header must not leak into public
 # surface; testhook symbols must not appear in libwirelog.
 test('log_abi_header_not_public',
