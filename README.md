@@ -114,6 +114,102 @@ meson test -C build-san --print-errorlogs
 
 Platforms: Linux (GCC/Clang), macOS (Clang), Windows (MSVC).
 
+## Logging (`WL_LOG`)
+
+Runtime, section-filtered, level-gated diagnostics — GStreamer `GST_DEBUG`
+style. Zero overhead when disabled: release builds strip disabled levels
+at compile time (`&&` short-circuit over a compile-time constant guard);
+runtime-disabled sites are a single cacheline byte load plus a
+predicted-not-taken branch.
+
+### Syntax
+
+```
+WL_LOG = entry ( ',' entry )*
+entry  = name ':' level
+name   = ident | '*'
+level  = 0..5        # NONE=0  ERROR=1  WARN=2  INFO=3  DEBUG=4  TRACE=5
+```
+
+Whitespace is tolerated. The wildcard `*` sets all sections; subsequent
+entries override per-section (last-wins). Unknown section names are
+silently skipped. Malformed tokens zero the output and emit a one-time
+`wirelog: malformed WL_LOG spec: <value>` on stderr.
+
+Sections (closed enum in v1; extensions are a recompile):
+`GENERAL`, `JOIN`, `CONSOLIDATION`, `ARRANGEMENT`, `EVAL`, `SESSION`,
+`IO`, `PARSER`, `PLUGIN`.
+
+### Examples
+
+```bash
+WL_LOG=JOIN:4 ./build/wirelog_cli run file.wl        # DEBUG on JOIN only
+WL_LOG=CONSOLIDATION:3 ./build/bench/bench_flowlog   # INFO+ on CONSOLIDATION
+WL_LOG=*:2,JOIN:5 ./build/wirelog_cli                # WARN+ everywhere, TRACE on JOIN
+WL_LOG_FILE=/tmp/wl.log WL_LOG=JOIN:5 ./build/wirelog_cli
+```
+
+Output shape: `[LEVEL][SECTION] file:line: <message>`. Timestamps and
+thread IDs are deferred to a follow-up. If `WL_LOG_FILE` fopen fails,
+the logger falls back to `stderr` with a one-time notice.
+
+### Release builds
+
+Pass `-Dwirelog_log_max_level=error` to strip all levels above `ERROR`
+at compile time — disabled sites contribute zero `.text` bytes and do
+not evaluate their arguments. Meson emits a warning if you request
+`--buildtype=release` without lowering the ceiling.
+
+```bash
+meson setup build-release --buildtype=release -Dwirelog_log_max_level=error
+meson compile -C build-release
+```
+
+`meson test -C build --suite abi` includes a compile-erasure check that
+rebuilds libwirelog with the ceiling at `error` and asserts TRACE-level
+sentinel strings are absent from `.rodata`.
+
+### Performance gate
+
+A release-mode microbenchmark lives under `meson test --suite perf`.
+Requires a `performance` CPU governor and the `trace` ceiling so the
+runtime guard is exercised; skips with Meson code 77 otherwise rather
+than silently passing on noisy hardware.
+
+```bash
+meson setup build-release --buildtype=release -Dwirelog_log_max_level=trace
+meson compile -C build-release
+taskset -c 0 meson test -C build-release --suite perf
+```
+
+Fail criteria: wall-clock delta > 1% OR per-iteration delta > 1 ns
+against a no-log baseline (100M iters, 1M warmup, 5 trials, median).
+
+### Safety caveats
+
+- `WL_LOG` is **not** async-signal-safe. Do not call from signal
+  handlers.
+- After `fork()` in a child that changes the sink, call `wl_log_init()`
+  again. No `pthread_atfork` handler is installed.
+- Threshold writes happen only at init; reads are lock-free byte loads
+  on a cacheline-aligned, padded table. Single-writer / many-reader at
+  runtime is safe without TSan noise.
+
+### Migrating from `WL_DEBUG_JOIN` / `WL_CONSOLIDATION_LOG` (#277)
+
+The legacy presence-check flags continue to work: any value (including
+`0`, matching their original semantics) seeds the matching section to
+`TRACE` at init. `WL_LOG` overrides the shim, including explicit
+silence via `WL_LOG=JOIN:0`.
+
+| Legacy invocation | Canonical replacement |
+|---|---|
+| `WL_DEBUG_JOIN=1 ./app` | `WL_LOG=JOIN:5 ./app` |
+| `WL_CONSOLIDATION_LOG=1 ./app` | `WL_LOG=CONSOLIDATION:5 ./app` |
+
+A separate issue will retire the legacy env vars after an
+external-consumer audit.
+
 ## Documentation
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) -- system design, optimizer pipeline, execution model
