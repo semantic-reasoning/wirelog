@@ -1,0 +1,149 @@
+name: Perf Nightly
+
+# Nightly WL_LOG disabled-path perf gate (issue #508 Phase 3).
+#
+# Why separate from ci-main.yml / ci-pr.yml:
+#   The perf gate is intentionally opt-in (WIRELOG_PERF_GATE=1) because
+#   shared CI runners exhibit several-percent wall-clock noise above the
+#   1% wall budget. Running it per-PR would be flaky; running it never
+#   means regressions can slip to main. Nightly is the compromise.
+#
+# Runners:
+#   ubuntu-latest   - GCC; sets cpufreq governor to performance via
+#                     cpupower if available, pins to CPU 0 via taskset.
+#   windows-latest  - MSVC; bench_stability_prep() in the test handles
+#                     thread affinity + HIGH_PRIORITY_CLASS internally.
+#
+# Both runners are shared GitHub-hosted boxes. The coefficient-of-
+# variation self-check inside test_log_perf_gate converts noisy runs
+# to SKIP (exit 77) instead of FAIL, so background load never produces
+# a false regression signal. When the gate actually FAILs, it means
+# both wall-delta > 1% AND per-iter > 1 ns tripped on a measurement
+# stable enough to pass the CoV ceiling - a real regression.
+#
+# fail-fast: false  - both matrix entries run to completion even if
+# one fails, so we get a complete picture per night.
+
+on:
+  schedule:
+    # Daily at 04:00 UTC (overnight US Pacific / EU early morning).
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  perf:
+    name: Perf / ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build linux-tools-common linux-tools-generic
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pip install meson ninja
+          choco install pkgconfiglite -y
+
+      # Best-effort: request the 'performance' cpufreq governor. On
+      # GitHub's ubuntu-latest the governor is usually already
+      # 'performance' or 'schedutil'; if it is not and cpupower cannot
+      # set it (no permission / no governor driver), the test will SKIP
+      # with a diagnostic rather than FAIL.
+      - name: Set cpufreq governor (Linux, best-effort)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo cpupower frequency-set -g performance || true
+          for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+            echo "governor($cpu) = $(cat "$cpu" 2>/dev/null || echo 'unreadable')"
+          done
+
+      - name: Configure release + trace ceiling (Linux)
+        if: runner.os == 'Linux'
+        run: >
+          meson setup build-perf
+          --buildtype=release
+          -Dwirelog_log_max_level=trace
+          -Dtests=true
+          -DmbedTLS=disabled
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Configure release + trace ceiling (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson setup build-perf --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: meson compile -C build-perf
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson compile -C build-perf
+
+      # Linux: taskset pins the meson test harness to CPU 0. The test
+      # still benefits from the operator-imposed cpufreq=performance
+      # check pre-gate; if that check fails, the test SKIPs cleanly.
+      - name: Run perf suite (Linux)
+        if: runner.os == 'Linux'
+        env:
+          WIRELOG_PERF_GATE: '1'
+        run: |
+          taskset -c 0 meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
+
+      # Windows: bench_stability_prep() sets thread affinity and raises
+      # priority class from inside the test process. No external wrapper
+      # needed; meson test invokes the binary directly.
+      - name: Run perf suite (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        env:
+          WIRELOG_PERF_GATE: '1'
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
+
+      - name: Publish results
+        if: always()
+        shell: bash
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## Perf Nightly: ${{ matrix.os }} / ${{ matrix.compiler }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f build-perf/meson-logs/testlog.txt ]; then
+            echo '<details><summary>Perf suite testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -A 30 'test_log_perf_gate' build-perf/meson-logs/testlog.txt 2>/dev/null \
+              | head -200 >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+          fi
