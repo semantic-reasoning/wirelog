@@ -248,6 +248,34 @@ test('log_threshold_race', test_log_threshold_race_exe,
      suite: 'log',
      timeout: 30)
 
+# Issue #287: release-mode perf gate (suite 'perf', excluded from default run).
+# Requires -Dwirelog_log_max_level=trace and a 'performance' cpufreq governor;
+# otherwise skips with Meson exit code 77. See the test source for full
+# methodology. Intended invocation:
+#   meson setup build-release --buildtype=release -Dwirelog_log_max_level=trace
+#   meson compile -C build-release
+#   taskset -c 0 meson test -C build-release --suite perf
+test_log_perf_gate_exe = executable(
+  'test_log_perf_gate',
+  files('test_log_perf_gate.c'),
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+test('log_perf_gate', test_log_perf_gate_exe,
+     suite: 'perf',
+     timeout: 120)
+
+# Issue #287: compile-erasure CI. Rebuilds libwirelog with
+# -Dwirelog_log_max_level=error in an isolated build dir and asserts TRACE-
+# level WL_LOG() sentinels are absent from .rodata.
+test('log_abi_compile_erasure',
+     find_program(meson.project_source_root() / 'scripts/ci/check-log-erasure.sh'),
+     suite: 'abi',
+     timeout: 180)
+
 # Issue #287: ABI lints for the logger - header must not leak into public
 # surface; testhook symbols must not appear in libwirelog.
 test('log_abi_header_not_public',
