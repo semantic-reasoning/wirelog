@@ -24,43 +24,43 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                      \
-    do {                                \
-        tests_run++;                    \
-        printf("  [TEST] %-55s", name); \
-        fflush(stdout);                 \
-    } while (0)
+        do {                                \
+            tests_run++;                    \
+            printf("  [TEST] %-55s", name); \
+            fflush(stdout);                 \
+        } while (0)
 
 #define PASS()             \
-    do {                   \
-        tests_passed++;    \
-        printf(" PASS\n"); \
-    } while (0)
+        do {                   \
+            tests_passed++;    \
+            printf(" PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                   \
-    do {                            \
-        tests_failed++;             \
-        printf(" FAIL: %s\n", msg); \
-    } while (0)
+        do {                            \
+            tests_failed++;             \
+            printf(" FAIL: %s\n", msg); \
+        } while (0)
 
 #define PARSE(src)                \
-    char errbuf[512] = { 0 };     \
-    wl_parser_ast_node_t *program \
-        = wl_parser_parse_string(src, errbuf, sizeof(errbuf))
+        char errbuf[512] = { 0 };     \
+        wl_parser_ast_node_t *program \
+            = wl_parser_parse_string(src, errbuf, sizeof(errbuf))
 
 #define ASSERT_PARSED()                                             \
-    do {                                                            \
-        if (!program) {                                             \
-            char buf[600];                                          \
-            snprintf(buf, sizeof(buf), "parse failed: %s", errbuf); \
-            FAIL(buf);                                              \
-            return;                                                 \
-        }                                                           \
-        if (program->type != WL_PARSER_AST_NODE_PROGRAM) {          \
-            wl_parser_ast_node_free(program);                       \
-            FAIL("root is not PROGRAM");                            \
-            return;                                                 \
-        }                                                           \
-    } while (0)
+        do {                                                            \
+            if (!program) {                                             \
+                char buf[600];                                          \
+                snprintf(buf, sizeof(buf), "parse failed: %s", errbuf); \
+                FAIL(buf);                                              \
+                return;                                                 \
+            }                                                           \
+            if (program->type != WL_PARSER_AST_NODE_PROGRAM) {          \
+                wl_parser_ast_node_free(program);                       \
+                FAIL("root is not PROGRAM");                            \
+                return;                                                 \
+            }                                                           \
+        } while (0)
 
 #define CLEANUP() wl_parser_ast_node_free(program)
 
@@ -247,7 +247,7 @@ test_parse_input_directive(void)
     if (inp->child_count != 3) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 3 params, got %u",
-                 inp->child_count);
+            inp->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -283,7 +283,7 @@ test_parse_input_directive_filename_only(void)
     if (inp->child_count != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 1 param child, got %u",
-                 inp->child_count);
+            inp->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -312,7 +312,7 @@ static void
 test_parse_input_directive_all_params_stored(void)
 {
     TEST(".input relation(IO=\"file\", filename=\"test.csv\", delimiter=\",\") "
-         "all params stored");
+        "all params stored");
     PARSE(".input Node(IO=\"file\", filename=\"test.csv\", delimiter=\",\")");
     ASSERT_PARSED();
     const wl_parser_ast_node_t *inp = child(program, 0);
@@ -324,7 +324,7 @@ test_parse_input_directive_all_params_stored(void)
     if (inp->child_count != 3) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 3 param children, got %u",
-                 inp->child_count);
+            inp->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -344,7 +344,7 @@ test_parse_input_directive_all_params_stored(void)
         if (strcmp(p->name, expected_names[i]) != 0) {
             char buf[128];
             snprintf(buf, sizeof(buf), "param %u name: expected '%s', got '%s'",
-                     i, expected_names[i], p->name ? p->name : "(null)");
+                i, expected_names[i], p->name ? p->name : "(null)");
             CLEANUP();
             FAIL(buf);
             return;
@@ -496,7 +496,7 @@ test_parse_recursive_rule(void)
     if (rule->child_count != 3) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 3 children, got %u",
-                 rule->child_count);
+            rule->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -953,20 +953,20 @@ test_parse_transitive_closure(void)
 {
     TEST("transitive closure program");
     PARSE(".decl Arc(x: int32, y: int32)\n"
-          ".input Arc(IO=\"file\", filename=\"Arc.csv\", delimiter=\",\")\n"
-          "\n"
-          ".decl Tc(x: int32, y: int32)\n"
-          "\n"
-          "Tc(x, y) :- Arc(x, y).\n"
-          "Tc(x, y) :- Tc(x, z), Arc(z, y).\n"
-          "\n"
-          ".printsize Tc\n");
+        ".input Arc(IO=\"file\", filename=\"Arc.csv\", delimiter=\",\")\n"
+        "\n"
+        ".decl Tc(x: int32, y: int32)\n"
+        "\n"
+        "Tc(x, y) :- Arc(x, y).\n"
+        "Tc(x, y) :- Tc(x, z), Arc(z, y).\n"
+        "\n"
+        ".printsize Tc\n");
     ASSERT_PARSED();
     /* Expected: .decl Arc, .input Arc, .decl Tc, rule1, rule2, .printsize */
     if (program->child_count != 6) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 6 children, got %u",
-                 program->child_count);
+            program->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1028,7 +1028,7 @@ test_parse_reachability(void)
     if (program->child_count != 8) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 8 children, got %u",
-                 program->child_count);
+            program->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1042,24 +1042,24 @@ test_parse_sssp(void)
 {
     TEST("SSSP program with aggregation");
     PARSE(".decl arc(src: int32, dest: int32, weight: int32)\n"
-          ".decl id(src: int32)\n"
-          ".decl sssp2(x: int32, y: int32)\n"
-          ".decl sssp(x: int32, y: int32)\n"
-          "\n"
-          ".input arc(IO=\"file\", filename=\"Arc.csv\", delimiter=\",\")\n"
-          ".input id(IO=\"file\", filename=\"Id.csv\", delimiter=\",\")\n"
-          "\n"
-          "sssp2(x, min(0)) :- id(x).\n"
-          "sssp2(y, min(d1 + d2)) :- sssp2(x, d1), arc(x, y, d2).\n"
-          "sssp(x, min(d)) :- sssp2(x, d).\n"
-          "\n"
-          ".printsize sssp\n");
+        ".decl id(src: int32)\n"
+        ".decl sssp2(x: int32, y: int32)\n"
+        ".decl sssp(x: int32, y: int32)\n"
+        "\n"
+        ".input arc(IO=\"file\", filename=\"Arc.csv\", delimiter=\",\")\n"
+        ".input id(IO=\"file\", filename=\"Id.csv\", delimiter=\",\")\n"
+        "\n"
+        "sssp2(x, min(0)) :- id(x).\n"
+        "sssp2(y, min(d1 + d2)) :- sssp2(x, d1), arc(x, y, d2).\n"
+        "sssp(x, min(d)) :- sssp2(x, d).\n"
+        "\n"
+        ".printsize sssp\n");
     ASSERT_PARSED();
     /* 4 decls + 2 inputs + 3 rules + 1 printsize = 10 */
     if (program->child_count != 10) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 10 children, got %u",
-                 program->child_count);
+            program->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1095,18 +1095,18 @@ test_parse_negation_program(void)
 {
     TEST("program with negation");
     PARSE(".decl edge(x: int32, y: int32)\n"
-          ".decl node(x: int32)\n"
-          ".decl isolated(x: int32)\n"
-          "\n"
-          "isolated(x) :- node(x), !edge(x, _).\n"
-          "\n"
-          ".output isolated\n");
+        ".decl node(x: int32)\n"
+        ".decl isolated(x: int32)\n"
+        "\n"
+        "isolated(x) :- node(x), !edge(x, _).\n"
+        "\n"
+        ".output isolated\n");
     ASSERT_PARSED();
     /* 3 decls + 1 rule + 1 output = 5 */
     if (program->child_count != 5) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 5 children, got %u",
-                 program->child_count);
+            program->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1133,11 +1133,11 @@ test_parse_comparison_program(void)
 {
     TEST("program with comparisons");
     PARSE(".decl edge(x: int32, y: int32)\n"
-          ".decl sg(x: int32, y: int32)\n"
-          "\n"
-          "sg(x, y) :- edge(z, x), edge(z, y), x != y.\n"
-          "\n"
-          ".printsize sg\n");
+        ".decl sg(x: int32, y: int32)\n"
+        "\n"
+        "sg(x, y) :- edge(z, x), edge(z, y), x != y.\n"
+        "\n"
+        ".printsize sg\n");
     ASSERT_PARSED();
     const wl_parser_ast_node_t *rule = child(program, 2);
     if (rule->type != WL_PARSER_AST_NODE_RULE) {
@@ -1175,7 +1175,7 @@ test_parse_single_fact(void)
     if (program->child_count != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 1 child, got %u",
-                 program->child_count);
+            program->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1194,7 +1194,7 @@ test_parse_single_fact(void)
     if (fact->child_count != 2) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 2 args, got %u",
-                 fact->child_count);
+            fact->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1224,7 +1224,7 @@ test_parse_multiple_facts(void)
     if (program->child_count != 3) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 3 children, got %u",
-                 program->child_count);
+            program->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1266,15 +1266,15 @@ test_parse_facts_mixed_with_rules(void)
 {
     TEST("facts mixed with decls and rules");
     PARSE(".decl edge(src: int32, dst: int32)\n"
-          "edge(1, 2).\n"
-          "edge(2, 3).\n"
-          "Tc(x, y) :- edge(x, y).\n"
-          ".output Tc\n");
+        "edge(1, 2).\n"
+        "edge(2, 3).\n"
+        "Tc(x, y) :- edge(x, y).\n"
+        ".output Tc\n");
     ASSERT_PARSED();
     if (program->child_count != 5) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 5 children, got %u",
-                 program->child_count);
+            program->child_count);
         CLEANUP();
         FAIL(buf);
         return;
@@ -1357,6 +1357,300 @@ test_parse_fact_string_constant(void)
         return;
     }
     CLEANUP();
+    PASS();
+}
+
+/* ======================================================================== */
+/* Parser: Compound Terms (Issue #530)                                      */
+/* ======================================================================== */
+
+static void
+test_parser_compound_basic(void)
+{
+    TEST("compound term basic: f(a), f(a, b)");
+    /*
+     * Compound terms appear as atom arguments on the body side, so parse
+     * two rules that exercise arity-1 and arity-2 compounds.
+     */
+    PARSE("r(x) :- p(f(a)).\n"
+        "r(x) :- q(f(a, b)).\n");
+    ASSERT_PARSED();
+    if (program->child_count != 2) {
+        CLEANUP();
+        FAIL("expected 2 rules");
+        return;
+    }
+
+    /* Rule 0: r(x) :- p(f(a)).
+     *   body atom p -> child 0 = COMPOUND_TERM "f" -> child 0 = VARIABLE "a"
+     */
+    const wl_parser_ast_node_t *rule0 = child(program, 0);
+    const wl_parser_ast_node_t *body0 = child(rule0, 1);
+    if (!body0 || body0->type != WL_PARSER_AST_NODE_ATOM
+        || strcmp(body0->name, "p") != 0) {
+        CLEANUP();
+        FAIL("rule 0 body should be atom 'p'");
+        return;
+    }
+    const wl_parser_ast_node_t *c0 = child(body0, 0);
+    if (!c0 || c0->type != WL_PARSER_AST_NODE_COMPOUND_TERM) {
+        CLEANUP();
+        FAIL("rule 0 body arg 0 should be COMPOUND_TERM");
+        return;
+    }
+    if (!c0->name || strcmp(c0->name, "f") != 0) {
+        CLEANUP();
+        FAIL("compound functor should be 'f'");
+        return;
+    }
+    if (c0->child_count != 1) {
+        CLEANUP();
+        FAIL("f(a) should have 1 arg");
+        return;
+    }
+    const wl_parser_ast_node_t *c0a0 = child(c0, 0);
+    if (c0a0->type != WL_PARSER_AST_NODE_VARIABLE
+        || strcmp(c0a0->name, "a") != 0) {
+        CLEANUP();
+        FAIL("f(a) arg 0 should be VARIABLE 'a'");
+        return;
+    }
+
+    /* Rule 1: r(x) :- q(f(a, b)).
+     *   body atom q -> child 0 = COMPOUND_TERM "f"/2
+     */
+    const wl_parser_ast_node_t *rule1 = child(program, 1);
+    const wl_parser_ast_node_t *body1 = child(rule1, 1);
+    const wl_parser_ast_node_t *c1 = child(body1, 0);
+    if (!c1 || c1->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+        || c1->child_count != 2) {
+        CLEANUP();
+        FAIL("f(a, b) should be COMPOUND_TERM with 2 args");
+        return;
+    }
+    const wl_parser_ast_node_t *c1a0 = child(c1, 0);
+    const wl_parser_ast_node_t *c1a1 = child(c1, 1);
+    if (c1a0->type != WL_PARSER_AST_NODE_VARIABLE
+        || strcmp(c1a0->name, "a") != 0
+        || c1a1->type != WL_PARSER_AST_NODE_VARIABLE
+        || strcmp(c1a1->name, "b") != 0) {
+        CLEANUP();
+        FAIL("f(a, b) args should be VARIABLE 'a', 'b'");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parser_compound_nested(void)
+{
+    TEST("compound term nested: f(g(a)), scope(metadata(x,y,z))");
+    PARSE("r(x) :- p(f(g(a))).\n"
+        "r(x) :- q(scope(metadata(x, y, z))).\n");
+    ASSERT_PARSED();
+    if (program->child_count != 2) {
+        CLEANUP();
+        FAIL("expected 2 rules");
+        return;
+    }
+
+    /* Rule 0: f(g(a))
+     *   outer f -> child 0 = COMPOUND_TERM g -> child 0 = VARIABLE a
+     */
+    const wl_parser_ast_node_t *rule0 = child(program, 0);
+    const wl_parser_ast_node_t *body0 = child(rule0, 1);
+    const wl_parser_ast_node_t *f = child(body0, 0);
+    if (!f || f->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+        || strcmp(f->name, "f") != 0 || f->child_count != 1) {
+        CLEANUP();
+        FAIL("outer f/1 malformed");
+        return;
+    }
+    const wl_parser_ast_node_t *g = child(f, 0);
+    if (!g || g->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+        || strcmp(g->name, "g") != 0 || g->child_count != 1) {
+        CLEANUP();
+        FAIL("inner g/1 malformed");
+        return;
+    }
+    const wl_parser_ast_node_t *a = child(g, 0);
+    if (a->type != WL_PARSER_AST_NODE_VARIABLE || strcmp(a->name, "a") != 0) {
+        CLEANUP();
+        FAIL("g's argument should be VARIABLE 'a'");
+        return;
+    }
+
+    /* Rule 1: scope(metadata(x, y, z)) — the target authorization shape. */
+    const wl_parser_ast_node_t *rule1 = child(program, 1);
+    const wl_parser_ast_node_t *body1 = child(rule1, 1);
+    const wl_parser_ast_node_t *scope = child(body1, 0);
+    if (!scope || scope->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+        || strcmp(scope->name, "scope") != 0 || scope->child_count != 1) {
+        CLEANUP();
+        FAIL("scope/1 malformed");
+        return;
+    }
+    const wl_parser_ast_node_t *meta = child(scope, 0);
+    if (!meta || meta->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+        || strcmp(meta->name, "metadata") != 0 || meta->child_count != 3) {
+        CLEANUP();
+        FAIL("metadata/3 malformed");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parser_compound_arity_large(void)
+{
+    TEST("compound term arity-5 (f/5): parse without arity validation");
+    /*
+     * arity validation is the IR's job (issue #531). The parser must
+     * accept any arity so long as the grammar is well-formed.
+     */
+    PARSE("r(x) :- p(f(a, b, c, d, e)).\n");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *rule = child(program, 0);
+    const wl_parser_ast_node_t *body = child(rule, 1);
+    const wl_parser_ast_node_t *f = child(body, 0);
+    if (!f || f->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+        || strcmp(f->name, "f") != 0 || f->child_count != 5) {
+        CLEANUP();
+        FAIL("expected COMPOUND_TERM 'f'/5");
+        return;
+    }
+    const char *names[] = { "a", "b", "c", "d", "e" };
+    for (uint32_t i = 0; i < 5; i++) {
+        const wl_parser_ast_node_t *arg = child(f, i);
+        if (arg->type != WL_PARSER_AST_NODE_VARIABLE
+            || strcmp(arg->name, names[i]) != 0) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "arg %u should be VARIABLE '%s'", i,
+                names[i]);
+            CLEANUP();
+            FAIL(buf);
+            return;
+        }
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parser_compound_mixed_args(void)
+{
+    TEST("compound term mixed args: f(1, \"s\", x, _)");
+    PARSE("r(y) :- p(f(1, \"s\", x, _)).\n");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *rule = child(program, 0);
+    const wl_parser_ast_node_t *body = child(rule, 1);
+    const wl_parser_ast_node_t *f = child(body, 0);
+    if (!f || f->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+        || f->child_count != 4) {
+        CLEANUP();
+        FAIL("f/4 malformed");
+        return;
+    }
+    if (child(f, 0)->type != WL_PARSER_AST_NODE_INTEGER
+        || child(f, 0)->int_value != 1) {
+        CLEANUP();
+        FAIL("arg 0 should be INTEGER 1");
+        return;
+    }
+    if (child(f, 1)->type != WL_PARSER_AST_NODE_STRING
+        || strcmp(child(f, 1)->str_value, "s") != 0) {
+        CLEANUP();
+        FAIL("arg 1 should be STRING \"s\"");
+        return;
+    }
+    if (child(f, 2)->type != WL_PARSER_AST_NODE_VARIABLE
+        || strcmp(child(f, 2)->name, "x") != 0) {
+        CLEANUP();
+        FAIL("arg 2 should be VARIABLE x");
+        return;
+    }
+    if (child(f, 3)->type != WL_PARSER_AST_NODE_WILDCARD) {
+        CLEANUP();
+        FAIL("arg 3 should be WILDCARD");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parser_compound_deep_nesting(void)
+{
+    TEST("compound term deep nesting (depth 5): no stack overflow");
+    /* Nesting well beyond inline-tier M=1 still parses — tier enforcement
+     * happens in IR lowering, not parsing. */
+    PARSE("r(x) :- p(f(g(h(i(j(a)))))).\n");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *rule = child(program, 0);
+    const wl_parser_ast_node_t *body = child(rule, 1);
+    const wl_parser_ast_node_t *cur = child(body, 0);
+    const char *expected[] = { "f", "g", "h", "i", "j" };
+    for (uint32_t i = 0; i < 5; i++) {
+        if (!cur || cur->type != WL_PARSER_AST_NODE_COMPOUND_TERM
+            || strcmp(cur->name, expected[i]) != 0 || cur->child_count != 1) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "nesting level %u should be '%s'/1", i,
+                expected[i]);
+            CLEANUP();
+            FAIL(buf);
+            return;
+        }
+        cur = child(cur, 0);
+    }
+    /* innermost argument is VARIABLE 'a' */
+    if (!cur || cur->type != WL_PARSER_AST_NODE_VARIABLE
+        || strcmp(cur->name, "a") != 0) {
+        CLEANUP();
+        FAIL("innermost arg should be VARIABLE 'a'");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parser_compound_error_empty_args(void)
+{
+    TEST("error: compound term f() rejected");
+    PARSE("r(x) :- p(f()).\n");
+    if (program != NULL) {
+        CLEANUP();
+        FAIL("expected parse failure for f()");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_parser_compound_error_unbalanced_paren(void)
+{
+    TEST("error: compound term with unbalanced parens");
+    PARSE("r(x) :- p(f(a, b).\n");
+    if (program != NULL) {
+        CLEANUP();
+        FAIL("expected parse failure for f(a, b without ')'");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_parser_compound_error_trailing_comma(void)
+{
+    TEST("error: compound term with leading/empty comma f(,)");
+    PARSE("r(x) :- p(f(,)).\n");
+    if (program != NULL) {
+        CLEANUP();
+        FAIL("expected parse failure for f(,)");
+        return;
+    }
     PASS();
 }
 
@@ -1445,10 +1739,10 @@ test_parse_all_arithmetic_ops(void)
 {
     TEST("all arithmetic operators in comparisons");
     PARSE("r(x) :- a(x, y), x + y > 0.\n"
-          "r(x) :- a(x, y), x - y < 0.\n"
-          "r(x) :- a(x, y), x * y = 0.\n"
-          "r(x) :- a(x, y), x / y >= 1.\n"
-          "r(x) :- a(x, y), x % y <= 2.\n");
+        "r(x) :- a(x, y), x - y < 0.\n"
+        "r(x) :- a(x, y), x * y = 0.\n"
+        "r(x) :- a(x, y), x / y >= 1.\n"
+        "r(x) :- a(x, y), x % y <= 2.\n");
     ASSERT_PARSED();
     if (program->child_count != 5) {
         CLEANUP();
@@ -1540,6 +1834,16 @@ main(void)
     test_parse_facts_mixed_with_rules();
     test_parse_fact_rejects_variables();
     test_parse_fact_string_constant();
+
+    printf("\n--- Compound Terms (Issue #530) ---\n");
+    test_parser_compound_basic();
+    test_parser_compound_nested();
+    test_parser_compound_arity_large();
+    test_parser_compound_mixed_args();
+    test_parser_compound_deep_nesting();
+    test_parser_compound_error_empty_args();
+    test_parser_compound_error_unbalanced_paren();
+    test_parser_compound_error_trailing_comma();
 
     printf("\n--- Error Cases ---\n");
     test_parse_error_missing_horn();
