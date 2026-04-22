@@ -55,6 +55,10 @@ typedef enum {
     WL_PARSER_AST_NODE_STRING,    /* str_value = string constant */
     WL_PARSER_AST_NODE_WILDCARD,  /* _ placeholder */
     WL_PARSER_AST_NODE_AGGREGATE, /* agg_fn, children[0] = arithmetic expr */
+    WL_PARSER_AST_NODE_COMPOUND_TERM, /* name=functor, children=args
+                                         (issue #530, hybrid compound terms;
+                                         inline vs side-relation branching
+                                         happens at IR lowering, not here) */
 
     /* Expressions */
     WL_PARSER_AST_NODE_BINARY_EXPR, /* arith_op, children[0]=left, children[1]=right */
