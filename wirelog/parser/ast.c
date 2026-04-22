@@ -158,6 +158,8 @@ wl_parser_ast_node_type_str(wl_parser_ast_node_type_t type)
         return "WILDCARD";
     case WL_PARSER_AST_NODE_AGGREGATE:
         return "AGGREGATE";
+    case WL_PARSER_AST_NODE_COMPOUND_TERM:
+        return "COMPOUND_TERM";
     case WL_PARSER_AST_NODE_BINARY_EXPR:
         return "BINARY_EXPR";
     case WL_PARSER_AST_NODE_STR_FUNCTION:

@@ -718,11 +718,100 @@ parse_head_arg(wl_parser_t *parser)
 /* Atom Argument Parsing                                                    */
 /* ======================================================================== */
 
+/*
+ * Maximum compound-term nesting depth accepted by the parser. This is an
+ * explicit recursion bound that keeps `parse_atom_arg` from blowing the C
+ * stack on pathological input like `f(f(f(...)))`. Deeper nesting is
+ * rejected with a parser error rather than a crash.
+ *
+ * The declared inline-tier M (nesting depth) in HYBRID_COMPOUND_DESIGN.md
+ * §2.2 is 1; we accept far more here because the parser is a pure syntax
+ * layer. Inline vs side-relation tiering, and the M=1 cutoff for the
+ * inline tier, are enforced in IR lowering (issue #531), not here.
+ */
+#define WL_PARSER_COMPOUND_MAX_DEPTH 64
+
+static wl_parser_ast_node_t *
+parse_atom_arg_at_depth(wl_parser_t *parser, uint32_t depth);
+
 static wl_parser_ast_node_t *
 parse_atom_arg(wl_parser_t *parser)
 {
+    return parse_atom_arg_at_depth(parser, 0);
+}
+
+/*
+ * Parse a compound term: IDENT '(' arg_list ')'.
+ *
+ * The leading IDENT has already been consumed into parser->previous by the
+ * caller. The LPAREN is the current token when we enter this function.
+ *
+ * Empty argument lists ("f()") are rejected: a compound term with zero
+ * arguments is indistinguishable from a 0-arity predicate, and the
+ * grammar reserves IDENT-without-parens for a plain variable.
+ */
+static wl_parser_ast_node_t *
+parse_compound_term(wl_parser_t *parser, uint32_t depth)
+{
+    uint32_t line = parser->previous.line;
+    uint32_t col = parser->previous.col;
+
+    wl_parser_ast_node_t *compound = wl_parser_ast_node_create(
+        WL_PARSER_AST_NODE_COMPOUND_TERM, line, col);
+    if (!compound)
+        return NULL;
+    compound->name = token_to_name(&parser->previous);
+
+    /* Consume the '(' that the caller saw via lookahead. */
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+        "expected '(' after compound functor")) {
+        wl_parser_ast_node_free(compound);
+        return NULL;
+    }
+
+    /* Empty compound "f()" is not a valid term. */
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
+        parser_error(parser,
+            "compound term requires at least one argument");
+        wl_parser_ast_node_free(compound);
+        return NULL;
+    }
+
+    wl_parser_ast_node_t *arg = parse_atom_arg_at_depth(parser, depth + 1);
+    if (!arg) {
+        wl_parser_ast_node_free(compound);
+        return NULL;
+    }
+    wl_parser_ast_node_add_child(compound, arg);
+
+    while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
+        arg = parse_atom_arg_at_depth(parser, depth + 1);
+        if (!arg) {
+            wl_parser_ast_node_free(compound);
+            return NULL;
+        }
+        wl_parser_ast_node_add_child(compound, arg);
+    }
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+        "expected ')' after compound arguments")) {
+        wl_parser_ast_node_free(compound);
+        return NULL;
+    }
+
+    return compound;
+}
+
+static wl_parser_ast_node_t *
+parse_atom_arg_at_depth(wl_parser_t *parser, uint32_t depth)
+{
     uint32_t line = parser->current.line;
     uint32_t col = parser->current.col;
+
+    if (depth > WL_PARSER_COMPOUND_MAX_DEPTH) {
+        parser_error(parser, "compound term nesting too deep");
+        return NULL;
+    }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_UNDERSCORE)) {
         return wl_parser_ast_node_create(WL_PARSER_AST_NODE_WILDCARD, line,
@@ -730,6 +819,10 @@ parse_atom_arg(wl_parser_t *parser)
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_IDENT)) {
+        /* Lookahead for LPAREN decides variable vs compound term. */
+        if (parser_check(parser, WL_PARSER_LEXER_TOK_LPAREN)) {
+            return parse_compound_term(parser, depth);
+        }
         wl_parser_ast_node_t *node
             = wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, line, col);
         node->name = token_to_name(&parser->previous);
