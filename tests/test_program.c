@@ -8,6 +8,8 @@
  * Tests written first (TDD) before program implementation.
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +18,29 @@
 #include "../wirelog/ir/program.h"
 #include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
+#include "../wirelog/util/log.h"
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <process.h>
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+#  define setenv   wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
+#  define getpid   _getpid
+#else
+#  include <unistd.h>
+#endif
+
+#include <time.h>
 
 /* ======================================================================== */
 /* Test Helpers                                                             */
@@ -1608,6 +1633,115 @@ test_compound_participates_in_join(void)
     PASS();
 }
 
+/*
+ * Issue #539 Phase 3: observability coverage. Drives compound IR lowering
+ * with WL_LOG=COMPOUND:5 pointed at a tempfile and asserts that the
+ * build_atom_scan entry, metadata, and SCAN-annotation lines are all
+ * captured through the logger.
+ */
+static const char *
+obs_tmpdir_(void)
+{
+    const char *d = getenv("TMPDIR");
+    if (d && *d) return d;
+#if defined(_WIN32)
+    d = getenv("TEMP");
+    if (d && *d) return d;
+    d = getenv("TMP");
+    if (d && *d) return d;
+    return ".";
+#else
+    return "/tmp";
+#endif
+}
+
+static void
+test_compound_observability_logging(void)
+{
+    TEST("WL_LOG captures COMPOUND section during IR lowering");
+
+    char tmp_path[256];
+    const char *d = obs_tmpdir_();
+#if defined(_WIN32)
+    const char sep = '\\';
+#else
+    const char sep = '/';
+#endif
+    snprintf(tmp_path, sizeof(tmp_path),
+        "%s%cwl_compound_obs_%ld_%ld.log",
+        d, sep, (long)getpid(), (long)time(NULL));
+    (void)remove(tmp_path);
+
+    setenv("WL_LOG_FILE", tmp_path, 1);
+    setenv("WL_LOG", "COMPOUND:5", 1);
+    wl_log_init();
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- pred(f(x)).\n");
+    if (!prog) {
+        wl_log_shutdown();
+        unsetenv("WL_LOG");
+        unsetenv("WL_LOG_FILE");
+        FAIL("program is NULL");
+        return;
+    }
+
+    patch_compound_column(prog, "pred", 0, WIRELOG_COMPOUND_KIND_INLINE, "f", 1,
+        0);
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        wl_log_shutdown();
+        unsetenv("WL_LOG");
+        unsetenv("WL_LOG_FILE");
+        FAIL("convert_rules failed");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    wl_log_shutdown();
+
+    /* Read the log file and verify key markers are present. */
+    char buf[4096] = { 0 };
+    FILE *f = fopen(tmp_path, "r");
+    if (!f) {
+        unsetenv("WL_LOG");
+        unsetenv("WL_LOG_FILE");
+        FAIL("could not open log file");
+        return;
+    }
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    (void)remove(tmp_path);
+    unsetenv("WL_LOG");
+    unsetenv("WL_LOG_FILE");
+
+    if (n == 0) {
+        FAIL("log file is empty");
+        return;
+    }
+    if (!strstr(buf, "[COMPOUND]")) {
+        FAIL("log missing [COMPOUND] section tag");
+        return;
+    }
+    if (!strstr(buf, "build_atom_scan: enter")) {
+        FAIL("log missing build_atom_scan entry message");
+        return;
+    }
+    if (!strstr(buf, "compound metadata:")) {
+        FAIL("log missing compound metadata message");
+        return;
+    }
+    if (!strstr(buf, "SCAN annotated as COMPOUND_INLINE")) {
+        FAIL("log missing SCAN annotation INFO message");
+        return;
+    }
+
+    PASS();
+}
+
 /* ======================================================================== */
 /* UNION Merge Tests                                                        */
 /* ======================================================================== */
@@ -2394,6 +2528,9 @@ main(void)
     test_compound_mixed_columns();
     test_compound_regular_atom_unchanged();
     test_compound_participates_in_join();
+
+    /* Phase 3 (Issue #539): observability via WL_LOG */
+    test_compound_observability_logging();
 
     /* UNION merge */
     test_union_merge_tc();

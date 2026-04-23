@@ -73,6 +73,7 @@ typedef enum {
     WL_LOG_SEC_IO,
     WL_LOG_SEC_PARSER,
     WL_LOG_SEC_PLUGIN,
+    WL_LOG_SEC_COMPOUND,
     WL_LOG_SEC__COUNT
 } wl_log_section_t;
 

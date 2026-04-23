@@ -37,6 +37,7 @@ static const char *const wl_log_section_names_[WL_LOG_SEC__COUNT] = {
     [WL_LOG_SEC_IO] = "IO",
     [WL_LOG_SEC_PARSER] = "PARSER",
     [WL_LOG_SEC_PLUGIN] = "PLUGIN",
+    [WL_LOG_SEC_COMPOUND] = "COMPOUND",
 };
 
 const char *

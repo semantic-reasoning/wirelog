@@ -20,6 +20,10 @@ ir_src = files(
   '../wirelog/session.c',
   '../wirelog/exec_plan_gen.c',
   '../wirelog/session_facts.c',
+  # program.c uses WL_LOG (Issue #539 observability); bundle the logger so
+  # every test executable that links ir_src resolves the symbols.
+  '../wirelog/util/log.c',
+  '../wirelog/util/log_emit.c',
 )
 
 optimizer_src = files(

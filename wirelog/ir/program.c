@@ -13,6 +13,7 @@
 #include "../parser/ast.h"
 #include "../passes/magic_sets.h"
 #include "../intern.h"
+#include "../util/log.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -882,6 +883,11 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     const struct wirelog_program *prog, char ***out_var_names,
     uint32_t *out_var_count)
 {
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
+        "build_atom_scan: enter relation=%s arity=%u",
+        atom && atom->name ? atom->name : "?",
+        atom ? atom->child_count : 0u);
+
     wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
     if (!scan)
         return NULL;
@@ -954,6 +960,13 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
 
                 /* First compound column annotates the SCAN. */
                 if (scan->type == WIRELOG_IR_SCAN) {
+                    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
+                        "compound metadata: relation=%s col=%u kind=%d "
+                        "functor_id=%u arity=%u inline_offset=%u",
+                        atom->name, i, (int)col->compound_kind,
+                        col->compound_functor_id, col->compound_arity,
+                        col->compound_inline_col_offset);
+
                     scan->type = (col->compound_kind
                         == WIRELOG_COMPOUND_KIND_INLINE)
                         ? WIRELOG_IR_COMPOUND_INLINE
@@ -963,6 +976,12 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
                     scan->compound_inline.arity = col->compound_arity;
                     scan->compound_inline.inline_col_offset
                         = col->compound_inline_col_offset;
+
+                    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_INFO,
+                        "SCAN annotated as %s for relation=%s col=%u",
+                        scan->type == WIRELOG_IR_COMPOUND_INLINE
+                            ? "COMPOUND_INLINE" : "COMPOUND_SIDE",
+                        atom->name, i);
                 }
             }
         }
@@ -1089,6 +1108,9 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
         if (b->type == WL_PARSER_AST_NODE_ATOM) {
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
+                "convert_rule: build scan for body atom relation=%s",
+                b->name ? b->name : "?");
             scans[scan_count] = build_atom_scan(b, prog,
                     &scan_vars[scan_count], &scan_vcounts[scan_count]);
             scan_count++;
