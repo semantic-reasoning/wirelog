@@ -223,18 +223,260 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Physical column layout (Issue #532 Task 2)                               */
+/* ======================================================================== */
+
+static void
+test_physical_column_expansion(void)
+{
+    TEST("physical-column expansion with mixed INLINE/SIDE/scalar");
+
+    /* Logical schema: [scalar, INLINE/2, scalar, INLINE/3, SIDE/5].
+     * Expected physical layout:
+     *   col 0  scalar     -> 1 slot  at offset 0
+     *   col 1  INLINE/2   -> 2 slots at offset 1..2
+     *   col 2  scalar     -> 1 slot  at offset 3
+     *   col 3  INLINE/3   -> 3 slots at offset 4..6
+     *   col 4  SIDE/5     -> 1 slot  at offset 7  (handle only)
+     * physical_ncols         = 8
+     * inline_physical_offset = 1  (first INLINE column)
+     * compound_count         = 2  (INLINE columns only). */
+    const col_rel_logical_col_t cols[5] = {
+        { WIRELOG_COMPOUND_KIND_NONE,   0u, 0u },
+        { WIRELOG_COMPOUND_KIND_INLINE, 2u, 1u },
+        { WIRELOG_COMPOUND_KIND_NONE,   0u, 0u },
+        { WIRELOG_COMPOUND_KIND_INLINE, 3u, 1u },
+        { WIRELOG_COMPOUND_KIND_SIDE,   5u, 1u },
+    };
+    uint32_t offsets[5] = { 0 };
+    uint32_t physical = 0u;
+    uint32_t first_inline = 0u;
+    uint32_t compound_count = 0u;
+    col_rel_t *r = NULL;
+
+    int rc = col_rel_compute_physical_layout(cols, 5u, &physical, offsets,
+            &first_inline, &compound_count);
+    if (rc != 0) {
+        tests_failed++;
+        printf(" ... FAIL: compute_physical_layout rc=%d\n", rc);
+        return;
+    }
+
+    ASSERT(physical == 8u, "physical_ncols != 8");
+    ASSERT(offsets[0] == 0u, "offsets[0] != 0");
+    ASSERT(offsets[1] == 1u, "offsets[1] != 1");
+    ASSERT(offsets[2] == 3u, "offsets[2] != 3");
+    ASSERT(offsets[3] == 4u, "offsets[3] != 4");
+    ASSERT(offsets[4] == 7u, "offsets[4] != 7");
+    ASSERT(first_inline == 1u, "inline_physical_offset != 1");
+    ASSERT(compound_count == 2u, "compound_count != 2");
+
+    /* All-scalar schema degenerates: physical == logical, no inline offset. */
+    const col_rel_logical_col_t scalar_cols[3] = {
+        { WIRELOG_COMPOUND_KIND_NONE, 0u, 0u },
+        { WIRELOG_COMPOUND_KIND_NONE, 0u, 0u },
+        { WIRELOG_COMPOUND_KIND_NONE, 0u, 0u },
+    };
+    physical = 99u;
+    first_inline = 99u;
+    compound_count = 99u;
+    ASSERT(col_rel_compute_physical_layout(scalar_cols, 3u, &physical, NULL,
+        &first_inline, &compound_count)
+        == 0,
+        "scalar layout rejected");
+    ASSERT(physical == 3u, "scalar physical_ncols != 3");
+    ASSERT(first_inline == 0u, "scalar first_inline != 0");
+    ASSERT(compound_count == 0u, "scalar compound_count != 0");
+
+    /* apply_compound_schema: populates the owned map; destroy releases it. */
+    ASSERT(col_rel_alloc(&r, "phys_expand") == 0, "col_rel_alloc failed");
+    ASSERT(col_rel_apply_compound_schema(r, cols, 5u) == 0,
+        "apply_compound_schema failed");
+    ASSERT(r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE,
+        "compound_kind not INLINE after apply");
+    ASSERT(r->compound_count == 2u, "compound_count on rel != 2");
+    ASSERT(r->inline_physical_offset == 1u,
+        "inline_physical_offset on rel != 1");
+    ASSERT(r->compound_arity_map != NULL,
+        "compound_arity_map not allocated");
+    ASSERT(r->compound_arity_map[0] == 1u, "rel arity_map[0] != 1");
+    ASSERT(r->compound_arity_map[1] == 2u, "rel arity_map[1] != 2");
+    ASSERT(r->compound_arity_map[2] == 1u, "rel arity_map[2] != 1");
+    ASSERT(r->compound_arity_map[3] == 3u, "rel arity_map[3] != 3");
+    ASSERT(r->compound_arity_map[4] == 1u,
+        "rel arity_map[4] != 1 (SIDE is 1 slot)");
+
+    /* Re-apply with a different schema: the previous arity_map is freed and
+     * replaced, not leaked. Switch to a SIDE-only schema to also verify the
+     * relation-level kind flips accordingly. */
+    const col_rel_logical_col_t side_only[2] = {
+        { WIRELOG_COMPOUND_KIND_SIDE, 3u, 1u },
+        { WIRELOG_COMPOUND_KIND_NONE, 0u, 0u },
+    };
+    ASSERT(col_rel_apply_compound_schema(r, side_only, 2u) == 0,
+        "reapply with SIDE schema failed");
+    ASSERT(r->compound_kind == WIRELOG_COMPOUND_KIND_SIDE,
+        "compound_kind not SIDE after reapply");
+    ASSERT(r->compound_count == 0u,
+        "compound_count should be 0 (no INLINE cols) after reapply");
+    ASSERT(r->inline_physical_offset == 0u,
+        "inline_physical_offset should be 0 on SIDE-only schema");
+    ASSERT(r->compound_arity_map[0] == 1u, "SIDE col width != 1");
+    ASSERT(r->compound_arity_map[1] == 1u, "scalar col width != 1");
+
+    PASS();
+cleanup:
+    col_rel_destroy(r);
+}
+
+static void
+test_arity_overflow(void)
+{
+    TEST("arity overflow rejected (INLINE arity > MAX_ARITY)");
+
+    /* Spot-check the boundary: arity == MAX_ARITY must succeed, arity ==
+     * MAX_ARITY + 1 must fail. Also verify arity == 0 is rejected because
+     * an inline compound with no arguments is degenerate. */
+    col_rel_logical_col_t col = {
+        WIRELOG_COMPOUND_KIND_INLINE,
+        WL_COMPOUND_INLINE_MAX_ARITY, /* == 4, acceptable boundary */
+        1u,
+    };
+    uint32_t physical = 0u;
+    ASSERT(col_rel_compute_physical_layout(&col, 1u, &physical, NULL, NULL,
+        NULL)
+        == 0,
+        "boundary arity rejected");
+    ASSERT(physical == WL_COMPOUND_INLINE_MAX_ARITY,
+        "boundary physical_ncols mismatch");
+
+    col.arity = WL_COMPOUND_INLINE_MAX_ARITY + 1u; /* == 5, overflow */
+    ASSERT(col_rel_compute_physical_layout(&col, 1u, NULL, NULL, NULL, NULL)
+        == EINVAL,
+        "overflow arity not rejected");
+
+    col.arity = 0u;
+    ASSERT(col_rel_compute_physical_layout(&col, 1u, NULL, NULL, NULL, NULL)
+        == EINVAL,
+        "zero-arity INLINE not rejected");
+
+    /* Overflow leaves relation state untouched (no partial write). */
+    col_rel_t *r = NULL;
+    ASSERT(col_rel_alloc(&r, "overflow") == 0, "col_rel_alloc failed");
+    col.arity = WL_COMPOUND_INLINE_MAX_ARITY + 2u;
+    ASSERT(col_rel_apply_compound_schema(r, &col, 1u) == EINVAL,
+        "overflow not rejected via apply");
+    ASSERT(r->compound_kind == WIRELOG_COMPOUND_KIND_NONE,
+        "compound_kind mutated on failure");
+    ASSERT(r->compound_arity_map == NULL,
+        "compound_arity_map allocated on failure");
+    col_rel_destroy(r);
+
+    /* SIDE-kind arity is NOT capped by the inline limit -- SIDE columns
+     * hold only a handle in the row, regardless of functor arity. */
+    col_rel_logical_col_t side = {
+        WIRELOG_COMPOUND_KIND_SIDE,
+        16u, /* intentionally above WL_COMPOUND_INLINE_MAX_ARITY */
+        1u,
+    };
+    ASSERT(col_rel_compute_physical_layout(&side, 1u, &physical, NULL, NULL,
+        NULL)
+        == 0,
+        "SIDE arity incorrectly capped");
+    ASSERT(physical == 1u, "SIDE col should occupy exactly 1 physical slot");
+
+    PASS();
+cleanup:
+    return;
+}
+
+static void
+test_depth_validation(void)
+{
+    TEST("nesting depth validation (INLINE depth > MAX_DEPTH rejected)");
+    col_rel_t *r = NULL;
+
+    /* depth == MAX_DEPTH (= 1) is the acceptable boundary. */
+    col_rel_logical_col_t col = {
+        WIRELOG_COMPOUND_KIND_INLINE,
+        2u,
+        WL_COMPOUND_INLINE_MAX_DEPTH,
+    };
+    ASSERT(col_rel_compute_physical_layout(&col, 1u, NULL, NULL, NULL, NULL)
+        == 0,
+        "boundary depth rejected");
+
+    col.depth = WL_COMPOUND_INLINE_MAX_DEPTH + 1u; /* nested; must fail */
+    ASSERT(col_rel_compute_physical_layout(&col, 1u, NULL, NULL, NULL, NULL)
+        == EINVAL,
+        "depth overflow not rejected");
+
+    /* Mixing a depth-valid and depth-invalid column: function must still
+     * fail and must not partially commit to a physical count. */
+    const col_rel_logical_col_t mixed[2] = {
+        { WIRELOG_COMPOUND_KIND_INLINE, 2u, 1u },
+        { WIRELOG_COMPOUND_KIND_INLINE, 3u, 2u }, /* too deep */
+    };
+    uint32_t offsets[2] = { 99u, 99u };
+    uint32_t physical = 99u;
+    ASSERT(col_rel_compute_physical_layout(mixed, 2u, &physical, offsets,
+        NULL, NULL)
+        == EINVAL,
+        "mixed depth overflow not rejected");
+    ASSERT(physical == 99u, "physical_ncols modified on EINVAL");
+    ASSERT(offsets[0] == 99u && offsets[1] == 99u,
+        "offsets modified on EINVAL");
+
+    /* apply_compound_schema must refuse and preserve rel state on EINVAL. */
+    ASSERT(col_rel_alloc(&r, "depth_validation") == 0,
+        "col_rel_alloc failed");
+    ASSERT(col_rel_apply_compound_schema(r, mixed, 2u) == EINVAL,
+        "apply did not reject depth overflow");
+    ASSERT(r->compound_kind == WIRELOG_COMPOUND_KIND_NONE,
+        "compound_kind mutated by failed apply");
+    ASSERT(r->compound_arity_map == NULL,
+        "compound_arity_map allocated on failed apply");
+
+    /* SIDE columns are not subject to the inline depth limit (the side-
+     * relation path represents nesting via handle chains, not expansion). */
+    col_rel_logical_col_t side = {
+        WIRELOG_COMPOUND_KIND_SIDE,
+        3u,
+        5u, /* arbitrary: ignored for SIDE */
+    };
+    ASSERT(col_rel_compute_physical_layout(&side, 1u, NULL, NULL, NULL, NULL)
+        == 0,
+        "SIDE depth incorrectly validated");
+
+    /* NULL / zero-length inputs */
+    ASSERT(col_rel_compute_physical_layout(NULL, 0u, NULL, NULL, NULL, NULL)
+        == EINVAL,
+        "NULL input not rejected");
+    ASSERT(col_rel_compute_physical_layout(&col, 0u, NULL, NULL, NULL, NULL)
+        == EINVAL,
+        "zero logical_ncols not rejected");
+
+    PASS();
+cleanup:
+    col_rel_destroy(r);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
 int
 main(void)
 {
-    printf("test_col_rel_compound_schema (Issue #532 Task 1)\n");
-    printf("================================================\n");
+    printf("test_col_rel_compound_schema (Issue #532 Tasks 1 + 2)\n");
+    printf("=====================================================\n");
 
     test_col_rel_side_default();
     test_col_rel_inline_schema();
     test_col_rel_backward_compat();
+    test_physical_column_expansion();
+    test_arity_overflow();
+    test_depth_validation();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);

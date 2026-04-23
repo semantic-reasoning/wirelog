@@ -247,6 +247,130 @@ col_rel_alloc(col_rel_t **out, const char *name)
     return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Compound-column layout (Issue #532 Task 2).                              */
+/* ------------------------------------------------------------------------ */
+
+/* Reject an INLINE column that violates the inline-tier invariants. Returns
+ * EINVAL on violation, 0 when the column is acceptable. Non-INLINE columns
+ * are always acceptable at this layer (SIDE widths are handled below and
+ * NONE columns are scalars). */
+static int
+col_rel_validate_inline_col(const col_rel_logical_col_t *col)
+{
+    if (col->kind != WIRELOG_COMPOUND_KIND_INLINE)
+        return 0;
+    if (col->arity == 0u || col->arity > WL_COMPOUND_INLINE_MAX_ARITY)
+        return EINVAL;
+    if (col->depth > WL_COMPOUND_INLINE_MAX_DEPTH)
+        return EINVAL;
+    return 0;
+}
+
+/* Width contribution of one logical column in the physical schema.
+ * NONE/SIDE contribute a single slot (SIDE stores only the opaque handle
+ * into the side-relation). INLINE contributes `arity` slots; callers must
+ * have already accepted the column via col_rel_validate_inline_col. */
+static uint32_t
+col_rel_slot_width(const col_rel_logical_col_t *col)
+{
+    if (col->kind == WIRELOG_COMPOUND_KIND_INLINE)
+        return col->arity;
+    return 1u;
+}
+
+int
+col_rel_compute_physical_layout(const col_rel_logical_col_t *logical_cols,
+    uint32_t logical_ncols,
+    uint32_t *out_physical_ncols,
+    uint32_t *out_offset_map,
+    uint32_t *out_inline_physical_offset,
+    uint32_t *out_compound_count)
+{
+    if (!logical_cols || logical_ncols == 0u)
+        return EINVAL;
+
+    /* Validate before touching outputs so EINVAL leaves everything intact. */
+    for (uint32_t i = 0; i < logical_ncols; i++) {
+        int rc = col_rel_validate_inline_col(&logical_cols[i]);
+        if (rc != 0)
+            return rc;
+    }
+
+    uint32_t physical = 0u;
+    uint32_t compound_count = 0u;
+    uint32_t first_inline_offset = 0u;
+    bool saw_inline = false;
+
+    for (uint32_t i = 0; i < logical_ncols; i++) {
+        if (out_offset_map)
+            out_offset_map[i] = physical;
+        if (logical_cols[i].kind == WIRELOG_COMPOUND_KIND_INLINE) {
+            if (!saw_inline) {
+                first_inline_offset = physical;
+                saw_inline = true;
+            }
+            compound_count++;
+        }
+        physical += col_rel_slot_width(&logical_cols[i]);
+    }
+
+    if (out_physical_ncols)
+        *out_physical_ncols = physical;
+    if (out_inline_physical_offset)
+        *out_inline_physical_offset = first_inline_offset;
+    if (out_compound_count)
+        *out_compound_count = compound_count;
+    return 0;
+}
+
+int
+col_rel_apply_compound_schema(col_rel_t *r,
+    const col_rel_logical_col_t *logical_cols,
+    uint32_t logical_ncols)
+{
+    if (!r)
+        return EINVAL;
+
+    /* Reuse the pure layout routine for validation + offset math so the
+     * two entry points cannot drift. We don't need the per-column offsets
+     * here, but the prefix sum walks every column exactly once. */
+    uint32_t compound_count = 0u;
+    uint32_t inline_offset = 0u;
+    int rc = col_rel_compute_physical_layout(logical_cols, logical_ncols,
+            NULL, NULL, &inline_offset, &compound_count);
+    if (rc != 0)
+        return rc;
+
+    uint32_t *arity_map
+        = (uint32_t *)malloc((size_t)logical_ncols * sizeof(uint32_t));
+    if (!arity_map)
+        return ENOMEM;
+
+    bool has_inline = false;
+    bool has_side = false;
+    for (uint32_t i = 0; i < logical_ncols; i++) {
+        arity_map[i] = col_rel_slot_width(&logical_cols[i]);
+        if (logical_cols[i].kind == WIRELOG_COMPOUND_KIND_INLINE)
+            has_inline = true;
+        else if (logical_cols[i].kind == WIRELOG_COMPOUND_KIND_SIDE)
+            has_side = true;
+    }
+
+    /* Commit: free any prior map before taking ownership of the new one. */
+    free(r->compound_arity_map);
+    r->compound_arity_map = arity_map;
+    r->compound_count = compound_count;
+    r->inline_physical_offset = inline_offset;
+    if (has_inline)
+        r->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    else if (has_side)
+        r->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+    else
+        r->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+    return 0;
+}
+
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
