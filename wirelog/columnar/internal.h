@@ -1348,6 +1348,32 @@ int
 col_rel_merge_partitions(col_rel_t **parts, uint32_t num_workers,
     col_rel_t **out);
 
+/*
+ * col_rel_exchange_partition:
+ * Graph-aware EXCHANGE partitioning wrapper for col_rel_partition_by_key.
+ *
+ * When src->has_graph_column == true AND num_workers > 1, this function
+ * partitions by src->graph_col_idx (a single-column key), ignoring
+ * fallback_key_cols entirely.  This ensures that all rows belonging to
+ * the same named graph land on the same worker, which is required for
+ * correct graph-scoped join and aggregation semantics.
+ *
+ * When src->has_graph_column == false OR num_workers == 1, the call
+ * forwards unchanged to col_rel_partition_by_key with fallback_key_cols.
+ *
+ * Co-partitioning correctness: each relation is routed based on its OWN
+ * has_graph_column flag.  If both sides of a join carry the flag, both
+ * route by graph_id and co-partitioning is preserved.  If only one side
+ * carries the flag the fallback key is used for that side, matching the
+ * existing join-key co-partitioning contract.
+ *
+ * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
+ */
+int
+col_rel_exchange_partition(const col_rel_t *src,
+    const uint32_t *fallback_key_cols, uint32_t fallback_key_count,
+    uint32_t num_workers, col_rel_t **out_parts);
+
 /* ======================================================================== */
 /* Per-Worker Session State (columnar/session.c, Issue #315)                */
 /* ======================================================================== */

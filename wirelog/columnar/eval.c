@@ -1647,7 +1647,7 @@ tdd_init_workers(wl_col_session_t *coord)
             if (!parts) {
                 rc = ENOMEM;
             } else {
-                rc = col_rel_partition_by_key(rel, key_cols, 1, W, parts);
+                rc = col_rel_exchange_partition(rel, key_cols, 1, W, parts);
                 if (rc == 0) {
                     for (uint32_t w = 0; w < W && rc == 0; w++) {
                         free(parts[w]->name);
@@ -2861,7 +2861,7 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
                     continue;
                 }
 
-                rc = col_rel_partition_by_key(d, key_cols, key_count,
+                rc = col_rel_exchange_partition(d, key_cols, key_count,
                         W, coord->exchange_bufs[w]);
                 col_rel_destroy(d);
 
@@ -3347,7 +3347,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
             if (!parts) {
                 rc = ENOMEM;
             } else {
-                rc = col_rel_partition_by_key(rel, key, key_count, W, parts);
+                rc = col_rel_exchange_partition(rel, key, key_count, W, parts);
                 if (rc == 0) {
                     for (uint32_t w = 0; w < W && rc == 0; w++) {
                         free(parts[w]->name);
@@ -3378,7 +3378,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
             if (!parts) {
                 rc = ENOMEM;
             } else {
-                rc = col_rel_partition_by_key(rel, edb_part_keys,
+                rc = col_rel_exchange_partition(rel, edb_part_keys,
                         edb_part_key_count, W, parts);
                 if (rc == 0) {
                     for (uint32_t w = 0; w < W && rc == 0; w++) {
@@ -3871,7 +3871,8 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             col_rel_destroy(combined);
             return ENOMEM;
         }
-        rc = col_rel_partition_by_key(combined, key_cols, key_count, W, parts);
+        rc = col_rel_exchange_partition(combined, key_cols, key_count, W,
+                parts);
         if (rc != 0) {
             for (uint32_t w = 0; w < W; w++)
                 col_rel_destroy(parts[w]);
