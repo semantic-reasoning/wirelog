@@ -428,6 +428,27 @@ test_plan_exchange_exe = executable(
 test('plan_exchange', test_plan_exchange_exe)
 
 # ============================================================================
+# RDF Named-Graph Integration Tests (Issue #535)
+# ============================================================================
+
+test_rdf_named_graph_exe = executable(
+  'test_rdf_named_graph',
+  files('test_rdf_named_graph.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('rdf_named_graph', test_rdf_named_graph_exe)
+
+# ============================================================================
 # Workqueue Tests (Phase B-lite)
 # ============================================================================
 
