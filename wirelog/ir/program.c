@@ -916,9 +916,22 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
 
     wirelog_ir_node_t *result = scan;
 
-    /* Phase 2B: Compound column IR lowering (Issue #531) */
+    /*
+     * Phase 2B: Compound column IR lowering (Issue #531).
+     *
+     * Annotate the SCAN node directly rather than wrapping it. Wrapping
+     * placed a COMPOUND node above the SCAN, which broke downstream passes
+     * (sip.c, magic_sets.c, exec_plan_gen.c) that descend to a SCAN leaf
+     * by checking node->type == WIRELOG_IR_SCAN. The annotation approach
+     * preserves the leaf's relation_name / column_names while flagging
+     * the compound kind via the node type and metadata fields.
+     *
+     * Multi-compound-column atoms: the first compound column drives the
+     * annotation (the compound_inline struct holds metadata for one
+     * column). Additional compound columns retain the same scan-leaf
+     * shape; richer multi-column lowering is deferred to Phase 2C.
+     */
     if (prog && atom->name) {
-        /* Find the relation in the program schema */
         wl_ir_relation_info_t *rel_info = NULL;
         for (uint32_t i = 0; i < prog->relation_count; i++) {
             if (prog->relations[i].name
@@ -929,35 +942,27 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         }
 
         if (rel_info && rel_info->columns) {
-            /* Check each atom argument for compound terms */
             for (uint32_t i = 0; i < arg_count && i < rel_info->column_count;
                 i++) {
                 const wl_parser_ast_node_t *arg = atom->children[i];
                 const wirelog_column_t *col = &rel_info->columns[i];
 
-                /* Detect compound term arguments */
-                if (arg->type == WL_PARSER_AST_NODE_COMPOUND_TERM
-                    && col->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
-                    /* Create COMPOUND IR node based on kind */
-                    wirelog_ir_node_type_t compound_type
-                        = col->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                if (arg->type != WL_PARSER_AST_NODE_COMPOUND_TERM)
+                    continue;
+                if (col->compound_kind == WIRELOG_COMPOUND_KIND_NONE)
+                    continue;
+
+                /* First compound column annotates the SCAN. */
+                if (scan->type == WIRELOG_IR_SCAN) {
+                    scan->type = (col->compound_kind
+                        == WIRELOG_COMPOUND_KIND_INLINE)
                         ? WIRELOG_IR_COMPOUND_INLINE
                         : WIRELOG_IR_COMPOUND_SIDE;
-                    wirelog_ir_node_t *comp
-                        = wl_ir_node_create(compound_type);
-                    if (comp) {
-                        /* Populate compound metadata from column and argument */
-                        comp->compound_inline.functor_id
-                            = col->compound_functor_id;
-                        comp->compound_inline.arity = col->compound_arity;
-                        comp->compound_inline.inline_col_offset
-                            = col->compound_inline_col_offset;
-
-                        /* Attach SCAN as child so compound can access relation
-                         */
-                        wl_ir_node_add_child(comp, result);
-                        result = comp;
-                    }
+                    scan->compound_inline.functor_id
+                        = col->compound_functor_id;
+                    scan->compound_inline.arity = col->compound_arity;
+                    scan->compound_inline.inline_col_offset
+                        = col->compound_inline_col_offset;
                 }
             }
         }
@@ -1084,8 +1089,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
         if (b->type == WL_PARSER_AST_NODE_ATOM) {
-            scans[scan_count] = build_atom_scan(b, NULL, &scan_vars[scan_count],
-                    &scan_vcounts[scan_count]);
+            scans[scan_count] = build_atom_scan(b, prog,
+                    &scan_vars[scan_count], &scan_vcounts[scan_count]);
             scan_count++;
         }
     }
@@ -1179,7 +1184,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             char **neg_vars = NULL;
             uint32_t neg_vcount = 0;
             wirelog_ir_node_t *neg_scan
-                = build_atom_scan(neg_atom, NULL, &neg_vars, &neg_vcount);
+                = build_atom_scan(neg_atom, prog, &neg_vars, &neg_vcount);
 
             if (neg_scan) {
                 wirelog_ir_node_t *aj = wl_ir_node_create(WIRELOG_IR_ANTIJOIN);
