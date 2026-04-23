@@ -883,14 +883,35 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     const struct wirelog_program *prog, char ***out_var_names,
     uint32_t *out_var_count)
 {
+    /* Validate required arguments. atom, out_var_names, and out_var_count
+     * are dereferenced unconditionally below; prog is tolerated as NULL
+     * (skips compound annotation). */
+    if (!atom || !out_var_names || !out_var_count) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
+            "build_atom_scan: invalid arguments atom=%p "
+            "out_var_names=%p out_var_count=%p",
+            (const void *)atom, (void *)out_var_names,
+            (void *)out_var_count);
+        if (out_var_names)
+            *out_var_names = NULL;
+        if (out_var_count)
+            *out_var_count = 0;
+        return NULL;
+    }
+
     WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
         "build_atom_scan: enter relation=%s arity=%u",
-        atom && atom->name ? atom->name : "?",
-        atom ? atom->child_count : 0u);
+        atom->name ? atom->name : "?", atom->child_count);
 
     wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
-    if (!scan)
+    if (!scan) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
+            "build_atom_scan: wl_ir_node_create(SCAN) failed for relation=%s",
+            atom->name ? atom->name : "?");
+        *out_var_names = NULL;
+        *out_var_count = 0;
         return NULL;
+    }
 
     wl_ir_node_set_relation(scan, atom->name);
 
@@ -957,6 +978,31 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
                     continue;
                 if (col->compound_kind == WIRELOG_COMPOUND_KIND_NONE)
                     continue;
+
+                /* Validate compound_kind is a known annotatable value.
+                 * Defensive: unknown kinds (from corrupt metadata) are
+                 * skipped rather than producing a malformed SCAN type. */
+                if (col->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+                    && col->compound_kind != WIRELOG_COMPOUND_KIND_SIDE) {
+                    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                        "invalid compound_kind=%d for relation=%s col=%u, "
+                        "skipping annotation",
+                        (int)col->compound_kind, atom->name, i);
+                    continue;
+                }
+
+                /* INLINE compounds require a non-zero arity. A zero arity
+                 * indicates missing/corrupt metadata — skip rather than
+                 * annotate, so downstream passes don't see a compound
+                 * with no payload. */
+                if (col->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                    && col->compound_arity == 0) {
+                    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                        "inline compound with arity=0 for relation=%s "
+                        "col=%u, skipping annotation",
+                        atom->name, i);
+                    continue;
+                }
 
                 /* First compound column annotates the SCAN. */
                 if (scan->type == WIRELOG_IR_SCAN) {
@@ -1107,12 +1153,20 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     uint32_t scan_count = 0;
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
+        if (!b)
+            continue;
         if (b->type == WL_PARSER_AST_NODE_ATOM) {
             WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
                 "convert_rule: build scan for body atom relation=%s",
                 b->name ? b->name : "?");
             scans[scan_count] = build_atom_scan(b, prog,
                     &scan_vars[scan_count], &scan_vcounts[scan_count]);
+            if (!scans[scan_count]) {
+                WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
+                    "convert_rule: build_atom_scan returned NULL for "
+                    "body atom index=%u relation=%s",
+                    i, b->name ? b->name : "?");
+            }
             scan_count++;
         }
     }

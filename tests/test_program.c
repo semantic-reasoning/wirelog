@@ -1743,6 +1743,174 @@ test_compound_observability_logging(void)
 }
 
 /* ======================================================================== */
+/* Phase 3: Error handling / validation tests (Issue #539)                   */
+/* ======================================================================== */
+
+/*
+ * Passing NULL program or NULL ast to convert_rules must return an error
+ * code, not segfault.
+ */
+static void
+test_convert_rules_null_inputs(void)
+{
+    TEST("wl_ir_program_convert_rules rejects NULL inputs");
+
+    if (wl_ir_program_convert_rules(NULL, NULL) == 0) {
+        FAIL("expected non-zero return for NULL program and ast");
+        return;
+    }
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- pred(x).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    if (wl_ir_program_convert_rules(prog, NULL) == 0) {
+        wl_ir_program_free(prog);
+        FAIL("expected non-zero return for NULL ast");
+        return;
+    }
+
+    if (wl_ir_program_convert_rules(NULL, prog->ast) == 0) {
+        wl_ir_program_free(prog);
+        FAIL("expected non-zero return for NULL program");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+/*
+ * Corrupt column metadata with an out-of-range compound_kind value.
+ * build_atom_scan must skip the annotation and leave the leaf as SCAN
+ * instead of producing a malformed node type.
+ */
+static void
+test_compound_invalid_kind_skipped(void)
+{
+    TEST("Invalid compound_kind value leaves leaf as SCAN");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- pred(f(x)).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    /* Inject an out-of-range kind (cast from int). */
+    patch_compound_column(prog, "pred", 0,
+        (wirelog_compound_kind_t)99, "f", 1, 0);
+
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules must tolerate corrupt compound_kind");
+        return;
+    }
+
+    const wirelog_ir_node_t *leaf
+        = find_relation_leaf(prog->rules[0].ir_root, "pred");
+    if (!leaf) {
+        wl_ir_program_free(prog);
+        FAIL("could not locate pred leaf");
+        return;
+    }
+
+    if (leaf->type != WIRELOG_IR_SCAN) {
+        wl_ir_program_free(prog);
+        FAIL("leaf must remain SCAN when compound_kind is invalid");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+/*
+ * INLINE compounds must carry a non-zero arity; arity=0 is treated as
+ * corrupt metadata and the annotation is skipped so downstream passes
+ * don't see a compound with no payload.
+ */
+static void
+test_compound_inline_zero_arity_skipped(void)
+{
+    TEST("INLINE compound with arity=0 leaves leaf as SCAN");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- pred(f(x)).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    /* arity=0 is invalid for an INLINE compound. */
+    patch_compound_column(prog, "pred", 0, WIRELOG_COMPOUND_KIND_INLINE, "f", 0,
+        0);
+
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules must tolerate arity=0");
+        return;
+    }
+
+    const wirelog_ir_node_t *leaf
+        = find_relation_leaf(prog->rules[0].ir_root, "pred");
+    if (!leaf || leaf->type != WIRELOG_IR_SCAN) {
+        wl_ir_program_free(prog);
+        FAIL("leaf must remain SCAN when INLINE arity is 0");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+/*
+ * A program with zero relations still exercises convert_rules without
+ * hitting the compound annotation path. Sanity check that the empty/edge
+ * case doesn't regress.
+ */
+static void
+test_compound_no_relations_safe(void)
+{
+    TEST("convert_rules safe when program has no rules or relations");
+
+    struct wirelog_program *prog = wl_ir_program_create();
+    if (!prog) {
+        FAIL("program_create returned NULL");
+        return;
+    }
+
+    /* Build a minimal empty AST-like stub by parsing an empty program. */
+    char errbuf[128] = { 0 };
+    wl_parser_ast_node_t *ast
+        = wl_parser_parse_string("", errbuf, sizeof(errbuf));
+    if (!ast) {
+        wl_ir_program_free(prog);
+        FAIL("failed to parse empty program");
+        return;
+    }
+    prog->ast = ast;
+
+    if (wl_ir_program_convert_rules(prog, ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules failed on empty program");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* UNION Merge Tests                                                        */
 /* ======================================================================== */
 
@@ -2531,6 +2699,12 @@ main(void)
 
     /* Phase 3 (Issue #539): observability via WL_LOG */
     test_compound_observability_logging();
+
+    /* Phase 3: error handling / validation (Issue #539) */
+    test_convert_rules_null_inputs();
+    test_compound_invalid_kind_skipped();
+    test_compound_inline_zero_arity_skipped();
+    test_compound_no_relations_safe();
 
     /* UNION merge */
     test_union_merge_tc();
