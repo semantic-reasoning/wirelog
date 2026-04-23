@@ -2777,6 +2777,42 @@ test_rdf_graph_column_at_index_zero(void)
     PASS();
 }
 
+static void
+test_rdf_graph_metadata_reserved_arity_enforced(void)
+{
+    TEST("user .decl __graph_metadata with wrong arity is rejected");
+
+    /* make_program returns NULL when the parser or metadata pass fails.
+     * Two columns is not the reserved 6-column schema. */
+    struct wirelog_program *prog = make_program(
+        ".decl __graph_metadata(graph_id: int64, tenant: int64)\n");
+
+    if (prog != NULL) {
+        wl_ir_program_free(prog);
+        FAIL("__graph_metadata with 2 columns should be rejected");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_rdf_graph_metadata_reserved_arity_accepted(void)
+{
+    TEST("user .decl __graph_metadata with 6 columns is accepted");
+
+    struct wirelog_program *prog = make_program(
+        ".decl __graph_metadata(graph_id: int64, tenant: int64,"
+        " timestamp: int64, location: int64, risk: int64,"
+        " description: int64)\n");
+
+    if (prog == NULL) {
+        FAIL("__graph_metadata with 6 columns should be accepted");
+        return;
+    }
+    wl_ir_program_free(prog);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -2838,6 +2874,8 @@ main(void)
     test_rdf_graph_column_flag_set();
     test_rdf_graph_column_flag_absent();
     test_rdf_graph_column_at_index_zero();
+    test_rdf_graph_metadata_reserved_arity_enforced();
+    test_rdf_graph_metadata_reserved_arity_accepted();
 
     /* UNION merge */
     test_union_merge_tc();

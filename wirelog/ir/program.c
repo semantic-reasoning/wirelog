@@ -329,6 +329,32 @@ collect_decl(struct wirelog_program *prog,
     if (!decl_node->name)
         return -1;
 
+    /* Issue #535: Validate user declarations of the reserved __graph_metadata
+     * relation. The session layer auto-creates __graph_metadata with a fixed
+     * 6-column schema (graph_id, tenant, timestamp, location, risk,
+     * description); the duplicate guard in col_session_create silently skips
+     * auto-creation if the user declared it. A user declaration with a
+     * different arity would therefore leave downstream code (which assumes
+     * 6 columns) reading out-of-bounds. Reject arity mismatches at parse
+     * time. Declarations with exactly 6 typed params are accepted as a
+     * compatible alias. */
+    if (strcmp(decl_node->name, "__graph_metadata") == 0) {
+        uint32_t typed_count = 0;
+        for (uint32_t i = 0; i < decl_node->child_count; i++) {
+            if (decl_node->children[i]->type
+                == WL_PARSER_AST_NODE_TYPED_PARAM)
+                typed_count++;
+        }
+        if (typed_count != 6) {
+            WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                "'__graph_metadata' is reserved and must have exactly 6"
+                " columns (graph_id, tenant, timestamp, location, risk,"
+                " description); got %u",
+                typed_count);
+            return -1;
+        }
+    }
+
     wl_ir_relation_info_t *rel = find_relation(prog, decl_node->name);
     if (!rel) {
         rel = add_relation(prog, decl_node->name);
