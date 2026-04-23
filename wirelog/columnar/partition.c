@@ -230,6 +230,18 @@ cleanup:
 }
 
 int
+col_rel_exchange_partition(const col_rel_t *src,
+    const uint32_t *fallback_key_cols, uint32_t fallback_key_count,
+    uint32_t num_workers, col_rel_t **out_parts)
+{
+    if (src && src->has_graph_column && num_workers > 1)
+        return col_rel_partition_by_key(src, &src->graph_col_idx, 1,
+                   num_workers, out_parts);
+    return col_rel_partition_by_key(src, fallback_key_cols,
+               fallback_key_count, num_workers, out_parts);
+}
+
+int
 col_rel_merge_partitions(col_rel_t **parts, uint32_t num_workers,
     col_rel_t **out)
 {

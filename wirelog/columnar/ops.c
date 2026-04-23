@@ -6145,7 +6145,7 @@ col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     /* Scatter: partition input into exchange_bufs[my_id][0..W-1] */
-    int rc = col_rel_partition_by_key(input, meta->key_col_idxs,
+    int rc = col_rel_exchange_partition(input, meta->key_col_idxs,
             meta->key_col_count, meta->num_workers,
             coord->exchange_bufs[my_id]);
 

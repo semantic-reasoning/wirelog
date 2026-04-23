@@ -856,6 +856,238 @@ test_invalid_zero_workers(void)
 }
 
 /* ======================================================================== */
+/* Issue #535: col_rel_exchange_partition tests                             */
+/* ======================================================================== */
+
+/*
+ * test_exchange_graph_override_w2:
+ * When has_graph_column == true and num_workers > 1, the wrapper must
+ * partition by graph_col_idx regardless of the fallback key supplied by
+ * the caller.  Two rows sharing the same graph_id must end up in the
+ * same partition; total row count must equal source row count.
+ */
+static int
+test_exchange_graph_override_w2(void)
+{
+    TEST("exchange_partition: graph flag overrides fallback key (W=2)");
+
+    /*
+     * 3-column relation, 4 rows.
+     * col 0: general data  col 1: more data  col 2: graph_id
+     * Rows 0 and 2 share graph_id=10; rows 1 and 3 share graph_id=20.
+     * fallback key = col 0 (unique per row -> would scatter differently).
+     */
+    int64_t rows[] = {
+        1, 100, 10,
+        2, 200, 20,
+        3, 300, 10,
+        4, 400, 20,
+    };
+    col_rel_t *src = make_rel(3, rows, 4);
+    if (!src) {
+        FAIL("alloc");
+        return 1;
+    }
+    src->has_graph_column = true;
+    src->graph_col_idx = 2;
+
+    col_rel_t *parts[2] = { NULL };
+    uint32_t key_zero = 0;
+    int rc = col_rel_exchange_partition(src, &key_zero, 1, 2, parts);
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "returned error %d", rc);
+        FAIL(msg);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    /* Total rows must equal source rows */
+    uint32_t total = partition_total_rows(parts, 2);
+    if (total != 4) {
+        FAIL("total row count mismatch");
+        destroy_parts(parts, 2);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    /*
+     * Rows with graph_id=10 must land in the same partition; same for 20.
+     * Find which partition holds graph_id=10 and verify the other row
+     * with graph_id=10 is in the same partition.
+     */
+    int partition_of_gid10 = -1;
+    int ok = 1;
+    for (uint32_t w = 0; w < 2 && ok; w++) {
+        for (uint32_t r = 0; r < parts[w]->nrows && ok; r++) {
+            int64_t gid = col_rel_get(parts[w], r, 2);
+            if (gid == 10) {
+                if (partition_of_gid10 == -1) {
+                    partition_of_gid10 = (int)w;
+                } else if (partition_of_gid10 != (int)w) {
+                    ok = 0;
+                }
+            }
+        }
+    }
+    if (!ok || partition_of_gid10 == -1) {
+        FAIL("rows with same graph_id not in same partition");
+        destroy_parts(parts, 2);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    destroy_parts(parts, 2);
+    col_rel_destroy(src);
+    PASS();
+    return 0;
+}
+
+/*
+ * test_exchange_no_graph_override_unchanged:
+ * When has_graph_column == false the wrapper must forward to the
+ * fallback key unchanged.  With key_zero (col 0) the two rows that
+ * share graph_id=10 but differ in col 0 (1 vs 3) may end up in
+ * different partitions -- we simply verify the total row count is
+ * preserved and coverage is complete (no data lost).
+ */
+static int
+test_exchange_no_graph_override_unchanged(void)
+{
+    TEST("exchange_partition: no graph flag falls back to supplied key");
+
+    int64_t rows[] = {
+        1, 100, 10,
+        2, 200, 20,
+        3, 300, 10,
+        4, 400, 20,
+    };
+    col_rel_t *src = make_rel(3, rows, 4);
+    if (!src) {
+        FAIL("alloc");
+        return 1;
+    }
+    /* has_graph_column stays false (default from make_rel/col_rel_new_auto) */
+
+    col_rel_t *parts[2] = { NULL };
+    uint32_t key_zero = 0;
+    int rc = col_rel_exchange_partition(src, &key_zero, 1, 2, parts);
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "returned error %d", rc);
+        FAIL(msg);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    uint32_t total = partition_total_rows(parts, 2);
+    if (total != 4) {
+        FAIL("total row count mismatch");
+        destroy_parts(parts, 2);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    if (!verify_partition_coverage(src, parts, 2)) {
+        FAIL("coverage check failed");
+        destroy_parts(parts, 2);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    destroy_parts(parts, 2);
+    col_rel_destroy(src);
+    PASS();
+    return 0;
+}
+
+/*
+ * test_exchange_w1_noop:
+ * Single-worker case: all rows land in partition 0 regardless of
+ * has_graph_column.
+ */
+static int
+test_exchange_w1_noop(void)
+{
+    TEST("exchange_partition: W=1 puts all rows in partition 0");
+
+    int64_t rows[] = {
+        1, 100, 10,
+        2, 200, 20,
+        3, 300, 30,
+    };
+    col_rel_t *src = make_rel(3, rows, 3);
+    if (!src) {
+        FAIL("alloc");
+        return 1;
+    }
+    src->has_graph_column = true;
+    src->graph_col_idx = 2;
+
+    col_rel_t *parts[1] = { NULL };
+    uint32_t key_zero = 0;
+    int rc = col_rel_exchange_partition(src, &key_zero, 1, 1, parts);
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "returned error %d", rc);
+        FAIL(msg);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    if (parts[0]->nrows != 3) {
+        FAIL("not all rows in partition 0");
+        destroy_parts(parts, 1);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    destroy_parts(parts, 1);
+    col_rel_destroy(src);
+    PASS();
+    return 0;
+}
+
+/*
+ * test_col_rel_new_like_inherits_graph_flag:
+ * Commit 2 sanity: col_rel_new_like must copy has_graph_column and
+ * graph_col_idx from the source relation.
+ */
+static int
+test_col_rel_new_like_inherits_graph_flag(void)
+{
+    TEST("col_rel_new_like inherits has_graph_column and graph_col_idx");
+
+    col_rel_t *src = col_rel_new_auto("src", 3);
+    if (!src) {
+        FAIL("alloc");
+        return 1;
+    }
+    src->has_graph_column = true;
+    src->graph_col_idx = 2;
+
+    col_rel_t *clone = col_rel_new_like("clone", src);
+    if (!clone) {
+        FAIL("col_rel_new_like returned NULL");
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    int ok = (clone->has_graph_column == true)
+        && (clone->graph_col_idx == 2);
+
+    col_rel_destroy(clone);
+    col_rel_destroy(src);
+
+    if (!ok) {
+        FAIL("graph flag or index not propagated");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -880,6 +1112,12 @@ main(void)
     test_invalid_zero_key_count();
     test_invalid_key_out_of_bounds();
     test_invalid_zero_workers();
+
+    /* Issue #535: exchange_partition wrapper */
+    test_exchange_graph_override_w2();
+    test_exchange_no_graph_override_unchanged();
+    test_exchange_w1_noop();
+    test_col_rel_new_like_inherits_graph_flag();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
