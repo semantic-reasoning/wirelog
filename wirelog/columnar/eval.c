@@ -4695,3 +4695,114 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
 
     return 0;
 }
+
+/* ======================================================================== */
+/* Inline Compound Storage (Issue #532 Task 3)                              */
+/*                                                                          */
+/* Per-row accessors for the inline compound tier. The Task #2 physical     */
+/* layout gives each INLINE logical column `compound_arity_map[i]`          */
+/* contiguous physical slots; these ops resolve that offset by prefix       */
+/* sum and touch only the addressed range. Functor identity is schema-     */
+/* level, so no handle is stored per row.                                   */
+/* ======================================================================== */
+
+/* Resolve the physical offset and slot width of a logical column in an
+ * INLINE-kind relation. Returns 0 and writes *out_offset / *out_width on
+ * success; EINVAL if the relation is not INLINE, compound_arity_map is
+ * absent, a zero-width entry is seen (corruption), or the prefix sum
+ * walks past the physical schema (logical_col out of range). */
+static int
+wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
+    uint32_t *out_offset, uint32_t *out_width)
+{
+    if (rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE)
+        return EINVAL;
+    if (!rel->compound_arity_map)
+        return EINVAL;
+
+    uint32_t offset = 0u;
+    for (uint32_t i = 0; ; i++) {
+        uint32_t width = rel->compound_arity_map[i];
+        if (width == 0u)
+            return EINVAL; /* Task #2 never emits zero-width entries */
+        if (offset + width > rel->ncols)
+            return EINVAL; /* logical_col beyond end of schema */
+        if (i == logical_col) {
+            *out_offset = offset;
+            *out_width = width;
+            return 0;
+        }
+        offset += width;
+    }
+}
+
+int
+wl_col_rel_store_inline_compound(col_rel_t *rel, uint32_t row_idx,
+    uint32_t logical_col, const int64_t *args, uint32_t arity)
+{
+    if (!rel || !args || arity == 0u)
+        return EINVAL;
+    if (row_idx >= rel->nrows)
+        return EINVAL;
+
+    uint32_t offset = 0u;
+    uint32_t width = 0u;
+    int rc = wl_col_rel_inline_locate(rel, logical_col, &offset, &width);
+    if (rc != 0)
+        return rc;
+    if (width != arity)
+        return EINVAL;
+
+    for (uint32_t k = 0; k < arity; k++)
+        col_rel_set(rel, row_idx, offset + k, args[k]);
+    return 0;
+}
+
+int
+wl_col_rel_retrieve_inline_compound(const col_rel_t *rel, uint32_t row_idx,
+    uint32_t logical_col, int64_t *out_args, uint32_t arity)
+{
+    if (!rel || !out_args || arity == 0u)
+        return EINVAL;
+    if (row_idx >= rel->nrows)
+        return EINVAL;
+
+    uint32_t offset = 0u;
+    uint32_t width = 0u;
+    int rc = wl_col_rel_inline_locate(rel, logical_col, &offset, &width);
+    if (rc != 0)
+        return rc;
+    if (width != arity)
+        return EINVAL;
+
+    for (uint32_t k = 0; k < arity; k++)
+        out_args[k] = col_rel_get(rel, row_idx, offset + k);
+    return 0;
+}
+
+int
+wl_col_rel_retract_inline_compound(col_rel_t *rel, uint32_t row_idx,
+    uint32_t logical_col, int64_t multiplicity)
+{
+    if (!rel || row_idx >= rel->nrows)
+        return EINVAL;
+    if (multiplicity == 0)
+        return EINVAL; /* retraction with zero multiplicity is nonsense */
+
+    uint32_t offset = 0u;
+    uint32_t width = 0u;
+    int rc = wl_col_rel_inline_locate(rel, logical_col, &offset, &width);
+    if (rc != 0)
+        return rc;
+
+    /* Physical slots are deliberately NOT mutated: Z-set multiplicity is
+     * tracked at the delta/timestamps layer (col_rel_t::timestamps), and
+     * retraction-seeded semi-naive evaluation still needs the original
+     * tuple visible for join matching during the retraction pass. The
+     * caller is responsible for negating multiplicity in the session
+     * delta path; this op validates addressability of the compound. */
+    (void)offset;
+    (void)width;
+    (void)multiplicity;
+    return 0;
+}
