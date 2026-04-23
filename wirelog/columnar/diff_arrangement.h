@@ -90,20 +90,6 @@ void col_diff_arrangement_get_delta_range(
  * Allocates new memory for the arrangement and all hash table buckets.
  * Each K-fusion worker gets an independent copy to avoid synchronization.
  *
- * Contract (docs/ARCHITECTURE.md §4 "K-Fusion Parallelism"):
- *   - "Each worker has isolated copies of differential arrangements
- *      (no cross-worker synchronization)"
- *   - "Deep-copy isolation simplifies correctness (no locks needed
- *      for K-fusion workers)"
- *
- * Interaction with inline compound storage (Issue #532 Task 4):
- *   Workers index the same underlying col_rel_t column buffers but
- *   through private ht_head / ht_next arrays produced by this function.
- *   The Option (iii) immutable-during-epoch strategy guarantees those
- *   column buffers are not written during the worker read phase, so
- *   concurrent retrieves of inline compounds are race-free without any
- *   locking. See tests/test_k_fusion_inline_shadow.c.
- *
  * @param arr: Source arrangement
  *
  * Returns: Pointer to new independent copy (caller must free with col_diff_arrangement_destroy)
