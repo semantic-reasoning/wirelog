@@ -79,6 +79,14 @@ col_diff_arrangement_get_delta_range(const col_diff_arrangement_t *arr,
     *out_current_nrows = arr->current_nrows;
 }
 
+/* Deep-copy the arrangement so a K-fusion worker can evaluate without
+ * touching sibling worker state. See docs/ARCHITECTURE.md §4 "K-Fusion
+ * Parallelism": "Each worker has isolated copies of differential
+ * arrangements" + "Deep-copy isolation simplifies correctness". The
+ * worker still reads the shared col_rel_t column buffers but, under the
+ * Option (iii) immutable-during-epoch invariant (Issue #532 Task 4),
+ * those buffers are not mutated during the read phase, so no locking
+ * is required. Isolation is validated by tests/test_k_fusion_inline_shadow.c. */
 col_diff_arrangement_t *
 col_diff_arrangement_deep_copy(const col_diff_arrangement_t *arr)
 {
