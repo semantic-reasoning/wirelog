@@ -707,6 +707,42 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         }
     }
 
+    /* Issue #535: Auto-create __graph_metadata when any EDB has __graph_id.
+     * The relation is empty at creation; user code populates it.
+     * Duplicate guard: skip if already declared explicitly. */
+    {
+        bool any_graph_enabled = false;
+        if (plan->edb_has_graph_column != NULL) {
+            for (uint32_t i = 0; i < plan->edb_count; i++) {
+                if (plan->edb_has_graph_column[i]) {
+                    any_graph_enabled = true;
+                    break;
+                }
+            }
+        }
+        if (any_graph_enabled
+            && session_find_rel(sess, "__graph_metadata") == NULL) {
+            col_rel_t *meta = NULL;
+            int rc = col_rel_alloc(&meta, "__graph_metadata");
+            if (rc != 0)
+                goto oom;
+            static const char *const meta_cols[6] = {
+                "graph_id", "tenant", "timestamp", "location", "risk",
+                "description"
+            };
+            rc = col_rel_set_schema(meta, 6, meta_cols);
+            if (rc != 0) {
+                col_rel_destroy(meta);
+                goto oom;
+            }
+            rc = session_add_rel(sess, meta);
+            if (rc != 0) {
+                col_rel_destroy(meta);
+                goto oom;
+            }
+        }
+    }
+
     /* Issue #105: Populate stratum_is_monotone from plan.
      * Copy monotone property from each stratum in the plan.
      * Conservative default (all false from calloc) is already set,
