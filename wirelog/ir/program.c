@@ -12,7 +12,9 @@
 #include "program.h"
 #include "../parser/ast.h"
 #include "../passes/magic_sets.h"
+#include "../intern.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +50,83 @@ type_name_to_column_type(const char *type_name)
 
     /* Default to int32 for unknown types */
     return WIRELOG_TYPE_INT32;
+}
+
+/* ======================================================================== */
+/* Compound Column Metadata Parsing (Issue #531)                            */
+/* ======================================================================== */
+
+typedef struct {
+    wirelog_compound_kind_t kind;
+    uint32_t functor_id;
+    uint32_t arity;
+} compound_metadata_t;
+
+/**
+ * Parse compound metadata from type_name.
+ * Syntax: "functor/arity" or "functor/arity side" or "functor/arity inline"
+ * Examples: "f/2", "g/3 side", "h/2 inline"
+ *
+ * Returns: compound_metadata_t with kind=NONE if not a compound type.
+ */
+static compound_metadata_t
+parse_compound_metadata(const char *type_name, wl_intern_t *intern)
+{
+    compound_metadata_t result = {0};
+    result.kind = WIRELOG_COMPOUND_KIND_NONE;
+    result.functor_id = 0;
+    result.arity = 0;
+
+    if (!type_name || !intern)
+        return result;
+
+    /* Look for '/' separator indicating compound syntax */
+    const char *slash = strchr(type_name, '/');
+    if (!slash)
+        return result; /* Not a compound type */
+
+    /* Extract functor name (everything before '/') */
+    size_t functor_len = slash - type_name;
+    char *functor_name = (char *)malloc(functor_len + 1);
+    if (!functor_name)
+        return result;
+
+    memcpy(functor_name, type_name, functor_len);
+    functor_name[functor_len] = '\0';
+
+    /* Parse arity after '/' */
+    char *arity_str = (char *)(slash + 1);
+    char *arity_end = NULL;
+    long arity_val = strtol(arity_str, &arity_end, 10);
+
+    if (arity_end == arity_str || arity_val < 0 || arity_val > UINT32_MAX) {
+        free(functor_name);
+        return result; /* Invalid arity */
+    }
+
+    result.arity = (uint32_t)arity_val;
+
+    /* Intern the functor name to get ID (default: side-relation for now) */
+    int64_t functor_id = wl_intern_put(intern, functor_name);
+    if (functor_id < 0) {
+        free(functor_name);
+        return result; /* Intern failed */
+    }
+    result.functor_id = (uint32_t)functor_id;
+    result.kind = WIRELOG_COMPOUND_KIND_SIDE; /* Default to side-relation */
+
+    /* Check for kind modifier (inline/side) after arity */
+    char *kind_str = arity_end;
+    while (*kind_str && isspace(*kind_str))
+        kind_str++;
+
+    if (strncmp(kind_str, "inline", 6) == 0)
+        result.kind = WIRELOG_COMPOUND_KIND_INLINE;
+    else if (strncmp(kind_str, "side", 4) == 0)
+        result.kind = WIRELOG_COMPOUND_KIND_SIDE;
+
+    free(functor_name);
+    return result;
 }
 
 /* ======================================================================== */
@@ -276,6 +355,15 @@ collect_decl(struct wirelog_program *prog,
                 rel->columns[idx].name = strdup_safe(param->name);
                 rel->columns[idx].type
                     = type_name_to_column_type(param->type_name);
+
+                /* Phase 1B: Extract compound metadata if present */
+                compound_metadata_t meta = parse_compound_metadata(
+                    param->type_name, prog->intern);
+                rel->columns[idx].compound_kind = meta.kind;
+                rel->columns[idx].compound_functor_id = meta.functor_id;
+                rel->columns[idx].compound_arity = meta.arity;
+                rel->columns[idx].compound_inline_col_offset = 0;
+
                 idx++;
             }
         }
