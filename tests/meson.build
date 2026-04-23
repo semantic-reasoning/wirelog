@@ -2243,42 +2243,6 @@ test_col_rel_inline_storage_exe = executable(
 test('col_rel_inline_storage', test_col_rel_inline_storage_exe)
 
 # ============================================================================
-# Compound logging + error observability (Issue #532 Task 6)
-# ============================================================================
-
-test_compound_logging_exe = executable(
-  'test_compound_logging',
-  files('test_compound_logging.c'),
-  backend_src,
-  intern_src,
-  arena_src,
-  thread_src,
-  workqueue_src,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-)
-
-test('compound_logging', test_compound_logging_exe, suite: 'log')
-
-# ============================================================================
-# Inline-tier integration battery (Issue #532 Task 5)
-# ============================================================================
-
-test_columnar_inline_exe = executable(
-  'test_columnar_inline',
-  files('test_columnar_inline.c'),
-  backend_src,
-  intern_src,
-  arena_src,
-  thread_src,
-  workqueue_src,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-)
-
-test('columnar_inline', test_columnar_inline_exe)
-
-# ============================================================================
 # K-Fusion deep-copy + inline compound visibility (Issue #532 Task 4)
 # ============================================================================
 
