@@ -117,12 +117,14 @@ parse_compound_metadata(const char *type_name, wl_intern_t *intern)
 
     /* Check for kind modifier (inline/side) after arity */
     char *kind_str = arity_end;
-    while (*kind_str && isspace(*kind_str))
+    while (*kind_str && isspace((unsigned char)*kind_str))
         kind_str++;
 
-    if (strncmp(kind_str, "inline", 6) == 0)
+    if (strncmp(kind_str, "inline", 6) == 0
+        && (kind_str[6] == '\0' || isspace((unsigned char)kind_str[6])))
         result.kind = WIRELOG_COMPOUND_KIND_INLINE;
-    else if (strncmp(kind_str, "side", 4) == 0)
+    else if (strncmp(kind_str, "side", 4) == 0
+        && (kind_str[4] == '\0' || isspace((unsigned char)kind_str[4])))
         result.kind = WIRELOG_COMPOUND_KIND_SIDE;
 
     free(functor_name);
