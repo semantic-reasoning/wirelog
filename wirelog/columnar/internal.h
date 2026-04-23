@@ -27,7 +27,6 @@
 #include "util/lockfree_queue.h"
 #include "workqueue.h"
 #include "arena/arena.h"
-#include "wirelog-types.h"
 
 #include "nanoarrow/nanoarrow.h"
 
@@ -264,50 +263,6 @@ typedef struct {
     uint64_t *dedup_slots;     /* open-addressing hash table (0 = empty) */
     uint32_t dedup_cap;        /* power of 2 */
     uint32_t dedup_count;
-    /* Compound-column metadata (Issue #532: inline tier).
-     *
-     * Relation-level summary of how compound columns are stored.  For
-     * relations with no compound columns, all four fields are zero/NULL
-     * and ncols == logical column count (no expansion).
-     *
-     * compound_kind
-     *   WIRELOG_COMPOUND_KIND_NONE   -- no compound columns (default)
-     *   WIRELOG_COMPOUND_KIND_INLINE -- >=1 inline compound column; the
-     *                                   physical schema (ncols/columns)
-     *                                   has been expanded, each inline
-     *                                   compound occupying `arity`
-     *                                   contiguous physical slots.
-     *   WIRELOG_COMPOUND_KIND_SIDE   -- compound values live in a
-     *                                   side-relation; physical schema
-     *                                   matches the logical schema one-
-     *                                   to-one (no expansion).
-     *
-     * compound_count
-     *   Number of inline-kind logical columns in this relation.  Zero
-     *   when compound_kind != INLINE.
-     *
-     * compound_arity_map
-     *   Owned array of length equal to the LOGICAL column count.  Entry
-     *   i is the expansion arity of logical column i: 1 for a scalar
-     *   column, N (>=1) for an inline compound of arity N.  NULL when
-     *   compound_kind != INLINE; Phase 2B populates this during schema
-     *   inference.  Freed on relation destruction.
-     *
-     * inline_physical_offset
-     *   Physical column index at which the first inline compound slot
-     *   begins.  Zero when compound_kind != INLINE.  When non-zero it
-     *   matches the prefix-sum of compound_arity_map entries that
-     *   precede the first inline compound.
-     *
-     * Phase 1 (this commit) introduces the fields only.  Logic that
-     * populates and consumes them lands in Phase 2 (Issue #532, Tasks
-     * #2-#4).  All allocation paths zero-initialise these slots via
-     * calloc(), and col_rel_free_contents() frees compound_arity_map.
-     */
-    wirelog_compound_kind_t compound_kind;
-    uint32_t compound_count;
-    uint32_t *compound_arity_map;
-    uint32_t inline_physical_offset;
 } col_rel_t;
 
 /* ======================================================================== */
