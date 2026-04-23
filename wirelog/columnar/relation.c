@@ -132,6 +132,7 @@ col_rel_free_contents(col_rel_t *r)
         free(r->col_names);
     }
     free(r->dedup_slots);
+    free(r->compound_arity_map);
     if (r->schema_ok)
         ArrowSchemaRelease(&r->schema);
     memset(r, 0, sizeof(*r));
