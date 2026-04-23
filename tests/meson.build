@@ -2264,6 +2264,24 @@ test_col_rel_inline_storage_exe = executable(
 test('col_rel_inline_storage', test_col_rel_inline_storage_exe)
 
 # ============================================================================
+# K-Fusion deep-copy + inline compound visibility (Issue #532 Task 4)
+# ============================================================================
+
+test_k_fusion_inline_shadow_exe = executable(
+  'test_k_fusion_inline_shadow',
+  files('test_k_fusion_inline_shadow.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('k_fusion_inline_shadow', test_k_fusion_inline_shadow_exe, timeout: 60)
+
+# ============================================================================
 # Per-Worker Session State (Issue #315)
 # ============================================================================
 
