@@ -229,8 +229,10 @@ test_k_fusion_inline_shadow(void)
     }
 
     for (int w = 0; w < K_WORKERS; w++) {
-        if (thread_created[w])
+        if (thread_created[w]) {
             pthread_join(threads[w], NULL);
+            thread_created[w] = false; /* avoid double-join in cleanup */
+        }
     }
 
     uint32_t total_errors = 0;
@@ -245,8 +247,8 @@ test_k_fusion_inline_shadow(void)
 
     PASS();
 cleanup:
-    /* Best-effort thread drain on the FAIL path so TSan does not flag a
-     * leaked thread over a detached arrangement. */
+    /* Drain any threads still in flight (only reachable via a FAIL that
+     * jumps here before the happy-path join loop runs). */
     for (int w = 0; w < K_WORKERS; w++) {
         if (thread_created[w])
             pthread_join(threads[w], NULL);
