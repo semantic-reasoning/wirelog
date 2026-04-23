@@ -1271,6 +1271,344 @@ make_full_program(const char *source)
 }
 
 /* ======================================================================== */
+/* Phase 2B: Compound Column IR Lowering Tests (Issue #531/#539)            */
+/*                                                                          */
+/* The parser does not yet accept "f/N inline" / "f/N side" syntax in       */
+/* .decl bodies, so these tests build a program with regular column types   */
+/* and then patch the relation's column metadata before convert_rules() to  */
+/* simulate compound declarations. This isolates the IR lowering path that  */
+/* runs inside build_atom_scan().                                           */
+/* ======================================================================== */
+
+static void
+patch_compound_column(struct wirelog_program *prog, const char *relation,
+    uint32_t col_idx, wirelog_compound_kind_t kind, const char *functor,
+    uint32_t arity, uint32_t inline_offset)
+{
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (prog->relations[i].name
+            && strcmp(prog->relations[i].name, relation) == 0
+            && col_idx < prog->relations[i].column_count) {
+            wirelog_column_t *col = &prog->relations[i].columns[col_idx];
+            col->compound_kind = kind;
+            col->compound_arity = arity;
+            col->compound_inline_col_offset = inline_offset;
+            int64_t fid = wl_intern_put(prog->intern, functor);
+            col->compound_functor_id = (fid >= 0) ? (uint32_t)fid : 0;
+            return;
+        }
+    }
+}
+
+/*
+ * Walk an IR subtree and count nodes whose type matches `target`.
+ * Used to verify Phase 2B annotates the leaf SCAN in place rather than
+ * wrapping it in an additional COMPOUND_INLINE/SIDE parent.
+ */
+static uint32_t
+count_ir_nodes_of_type(const wirelog_ir_node_t *node,
+    wirelog_ir_node_type_t target)
+{
+    if (!node)
+        return 0;
+    uint32_t total = (node->type == target) ? 1 : 0;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        total += count_ir_nodes_of_type(node->children[i], target);
+    }
+    return total;
+}
+
+/* Descend through wrappers (PROJECT, FILTER, etc.) to the relation leaf. */
+static const wirelog_ir_node_t *
+find_relation_leaf(const wirelog_ir_node_t *node, const char *relation)
+{
+    if (!node)
+        return NULL;
+    if (node->relation_name && strcmp(node->relation_name, relation) == 0
+        && node->child_count == 0) {
+        return node;
+    }
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        const wirelog_ir_node_t *r
+            = find_relation_leaf(node->children[i], relation);
+        if (r)
+            return r;
+    }
+    return NULL;
+}
+
+static void
+test_compound_inline_annotation(void)
+{
+    TEST("INLINE compound: scan->type becomes COMPOUND_INLINE with metadata");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32, b: int32)\n"
+            ".decl r(b: int32)\n"
+            "r(b) :- pred(f(x), b).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    patch_compound_column(prog, "pred", 0, WIRELOG_COMPOUND_KIND_INLINE, "f", 1,
+        7);
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *leaf
+        = find_relation_leaf(prog->rules[0].ir_root, "pred");
+    if (!leaf) {
+        wl_ir_program_free(prog);
+        FAIL("could not locate pred leaf in IR");
+        return;
+    }
+
+    if (leaf->type != WIRELOG_IR_COMPOUND_INLINE) {
+        wl_ir_program_free(prog);
+        FAIL("leaf type should be COMPOUND_INLINE");
+        return;
+    }
+
+    int64_t expected_fid = wl_intern_get(prog->intern, "f");
+    if (leaf->compound_inline.functor_id != (uint32_t)expected_fid
+        || leaf->compound_inline.arity != 1
+        || leaf->compound_inline.inline_col_offset != 7) {
+        wl_ir_program_free(prog);
+        FAIL("compound metadata incorrect on annotated leaf");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
+test_compound_side_annotation(void)
+{
+    TEST("SIDE compound: scan->type becomes COMPOUND_SIDE with metadata");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- pred(g(x)).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    patch_compound_column(prog, "pred", 0, WIRELOG_COMPOUND_KIND_SIDE, "g", 1,
+        0);
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *leaf
+        = find_relation_leaf(prog->rules[0].ir_root, "pred");
+    if (!leaf || leaf->type != WIRELOG_IR_COMPOUND_SIDE) {
+        wl_ir_program_free(prog);
+        FAIL("leaf type should be COMPOUND_SIDE");
+        return;
+    }
+
+    int64_t expected_fid = wl_intern_get(prog->intern, "g");
+    if (leaf->compound_inline.functor_id != (uint32_t)expected_fid
+        || leaf->compound_inline.arity != 1) {
+        wl_ir_program_free(prog);
+        FAIL("compound metadata incorrect on annotated leaf");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
+test_compound_annotation_not_wrapped(void)
+{
+    TEST("Compound annotation: no extra COMPOUND wrapper above the SCAN");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- pred(f(x)).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    patch_compound_column(prog, "pred", 0, WIRELOG_COMPOUND_KIND_INLINE, "f", 1,
+        0);
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *root = prog->rules[0].ir_root;
+    uint32_t inline_count
+        = count_ir_nodes_of_type(root, WIRELOG_IR_COMPOUND_INLINE);
+    uint32_t scan_count = count_ir_nodes_of_type(root, WIRELOG_IR_SCAN);
+
+    /* Annotation must produce exactly one COMPOUND_INLINE leaf and zero
+       residual SCAN nodes for the compound atom. */
+    if (inline_count != 1 || scan_count != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "expected 1 COMPOUND_INLINE + 0 SCAN, got %u + %u",
+            inline_count, scan_count);
+        wl_ir_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    const wirelog_ir_node_t *leaf = find_relation_leaf(root, "pred");
+    if (!leaf || leaf->child_count != 0) {
+        wl_ir_program_free(prog);
+        FAIL("annotated leaf must have no children");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
+test_compound_mixed_columns(void)
+{
+    TEST("Mixed columns: first compound column drives annotation");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32, b: int32, c: int32)\n"
+            ".decl r(y: int32)\n"
+            "r(y) :- pred(f(x), y, g(z)).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    /* col 0: INLINE f/1, col 1: regular, col 2: SIDE g/1 */
+    patch_compound_column(prog, "pred", 0, WIRELOG_COMPOUND_KIND_INLINE, "f", 1,
+        3);
+    patch_compound_column(prog, "pred", 2, WIRELOG_COMPOUND_KIND_SIDE, "g", 1,
+        0);
+
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *leaf
+        = find_relation_leaf(prog->rules[0].ir_root, "pred");
+    if (!leaf || leaf->type != WIRELOG_IR_COMPOUND_INLINE) {
+        wl_ir_program_free(prog);
+        FAIL("leaf should be annotated by FIRST compound column (INLINE)");
+        return;
+    }
+
+    int64_t fid = wl_intern_get(prog->intern, "f");
+    if (leaf->compound_inline.functor_id != (uint32_t)fid
+        || leaf->compound_inline.arity != 1
+        || leaf->compound_inline.inline_col_offset != 3) {
+        wl_ir_program_free(prog);
+        FAIL("metadata should reflect FIRST compound column (f/1, offset 3)");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
+test_compound_regular_atom_unchanged(void)
+{
+    TEST("Regular atom (no compound column declared) stays as SCAN");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32, b: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- pred(x, y).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *leaf
+        = find_relation_leaf(prog->rules[0].ir_root, "pred");
+    if (!leaf || leaf->type != WIRELOG_IR_SCAN) {
+        wl_ir_program_free(prog);
+        FAIL("leaf should remain SCAN when no compound metadata");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+static void
+test_compound_participates_in_join(void)
+{
+    TEST("Compound annotation participates in JOIN chain (well-formed IR)");
+
+    struct wirelog_program *prog
+        = make_program(".decl pred(a: int32, b: int32)\n"
+            ".decl other(b: int32, c: int32)\n"
+            ".decl r(x: int32, c: int32)\n"
+            "r(x, c) :- pred(f(x), y), other(y, c).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    patch_compound_column(prog, "pred", 0, WIRELOG_COMPOUND_KIND_INLINE, "f", 1,
+        0);
+    if (wl_ir_program_convert_rules(prog, prog->ast) != 0) {
+        wl_ir_program_free(prog);
+        FAIL("convert_rules failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *root = prog->rules[0].ir_root;
+    if (!root || root->type != WIRELOG_IR_PROJECT) {
+        wl_ir_program_free(prog);
+        FAIL("root should be PROJECT");
+        return;
+    }
+    const wirelog_ir_node_t *join = root->children[0];
+    if (!join || join->type != WIRELOG_IR_JOIN || join->child_count != 2) {
+        wl_ir_program_free(prog);
+        FAIL("PROJECT child should be a 2-child JOIN");
+        return;
+    }
+    if (join->children[0]->type != WIRELOG_IR_COMPOUND_INLINE
+        || join->children[1]->type != WIRELOG_IR_SCAN) {
+        wl_ir_program_free(prog);
+        FAIL("JOIN children should be [COMPOUND_INLINE pred, SCAN other]");
+        return;
+    }
+    if (join->join_key_count != 1) {
+        wl_ir_program_free(prog);
+        FAIL("expected join key on shared variable y");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* UNION Merge Tests                                                        */
 /* ======================================================================== */
 
@@ -2048,6 +2386,14 @@ main(void)
     test_wildcard_in_scan();
     test_boolean_true_noop();
     test_boolean_false_filter();
+
+    /* Phase 2B: compound column IR lowering (Issue #531/#539) */
+    test_compound_inline_annotation();
+    test_compound_side_annotation();
+    test_compound_annotation_not_wrapped();
+    test_compound_mixed_columns();
+    test_compound_regular_atom_unchanged();
+    test_compound_participates_in_join();
 
     /* UNION merge */
     test_union_merge_tc();
