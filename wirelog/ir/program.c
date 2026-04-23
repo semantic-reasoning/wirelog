@@ -878,7 +878,8 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
 /* ---- Scan Building with Intra-atom Filters ---- */
 
 static wirelog_ir_node_t *
-build_atom_scan(const wl_parser_ast_node_t *atom, char ***out_var_names,
+build_atom_scan(const wl_parser_ast_node_t *atom,
+    const struct wirelog_program *prog, char ***out_var_names,
     uint32_t *out_var_count)
 {
     wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
@@ -1006,7 +1007,8 @@ build_atom_scan(const wl_parser_ast_node_t *atom, char ***out_var_names,
 /* ---- Single Rule Conversion ---- */
 
 static wirelog_ir_node_t *
-convert_rule(const wl_parser_ast_node_t *rule_node)
+convert_rule(const wl_parser_ast_node_t *rule_node,
+    const struct wirelog_program *prog)
 {
     if (!rule_node || rule_node->child_count < 1)
         return NULL;
@@ -1035,7 +1037,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
         if (b->type == WL_PARSER_AST_NODE_ATOM) {
-            scans[scan_count] = build_atom_scan(b, &scan_vars[scan_count],
+            scans[scan_count] = build_atom_scan(b, NULL, &scan_vars[scan_count],
                     &scan_vcounts[scan_count]);
             scan_count++;
         }
@@ -1130,7 +1132,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node)
             char **neg_vars = NULL;
             uint32_t neg_vcount = 0;
             wirelog_ir_node_t *neg_scan
-                = build_atom_scan(neg_atom, &neg_vars, &neg_vcount);
+                = build_atom_scan(neg_atom, NULL, &neg_vars, &neg_vcount);
 
             if (neg_scan) {
                 wirelog_ir_node_t *aj = wl_ir_node_create(WIRELOG_IR_ANTIJOIN);
@@ -1262,7 +1264,7 @@ wl_ir_program_convert_rules(struct wirelog_program *program,
         if (rule_idx >= program->rule_count)
             return -1;
 
-        wirelog_ir_node_t *ir = convert_rule(child);
+        wirelog_ir_node_t *ir = convert_rule(child, program);
         if (!ir)
             return -1;
 
