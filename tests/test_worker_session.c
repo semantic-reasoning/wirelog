@@ -795,6 +795,144 @@ test_hash_table_independent(void)
 }
 
 /* ======================================================================== */
+/* Issue #535: RDF Named-Graph column propagation tests                     */
+/* ======================================================================== */
+
+/*
+ * Helper: parse src, generate plan, create columnar session.
+ * Caller must call wl_session_destroy + wl_plan_free + wirelog_program_free.
+ * Returns the wl_col_session_t* (cast of wl_session_t*) or NULL on error.
+ */
+static wl_col_session_t *
+make_session_from_src(const char *src, wl_plan_t **plan_out,
+    wirelog_program_t **prog_out)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return NULL;
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc != 0) {
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    wl_session_t *session = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        return NULL;
+    }
+
+    *plan_out = plan;
+    *prog_out = prog;
+    return COL_SESSION(session);
+}
+
+/*
+ * test_rdf_graph_column_propagates_to_col_rel:
+ * A relation declared with __graph_id as third column must have
+ * has_graph_column == true and graph_col_idx == 2 on its col_rel_t
+ * after col_session_create.
+ */
+static int
+test_rdf_graph_column_propagates_to_col_rel(void)
+{
+    TEST("rdf: __graph_id propagates has_graph_column=true, graph_col_idx=2");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_session_from_src(
+        ".decl edge(a: int64, b: int64, __graph_id: int64)\n",
+        &plan, &prog);
+    if (!sess) {
+        FAIL("session creation failed");
+        return 1;
+    }
+
+    col_rel_t *r = session_find_rel(sess, "edge");
+    if (!r) {
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("edge relation not found in session");
+        return 1;
+    }
+
+    if (!r->has_graph_column) {
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("has_graph_column should be true");
+        return 1;
+    }
+
+    if (r->graph_col_idx != 2) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected graph_col_idx=2, got %u",
+            r->graph_col_idx);
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return 1;
+    }
+
+    wl_session_destroy(&sess->base);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+    return 0;
+}
+
+/*
+ * test_rdf_no_graph_column_defaults_to_false:
+ * A relation without __graph_id must have has_graph_column == false
+ * on its col_rel_t after col_session_create.
+ */
+static int
+test_rdf_no_graph_column_defaults_to_false(void)
+{
+    TEST("rdf: relation without __graph_id has has_graph_column=false");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_session_from_src(
+        ".decl edge(a: int64, b: int64)\n",
+        &plan, &prog);
+    if (!sess) {
+        FAIL("session creation failed");
+        return 1;
+    }
+
+    col_rel_t *r = session_find_rel(sess, "edge");
+    if (!r) {
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("edge relation not found in session");
+        return 1;
+    }
+
+    if (r->has_graph_column) {
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("has_graph_column should be false when __graph_id absent");
+        return 1;
+    }
+
+    wl_session_destroy(&sess->base);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+    return 0;
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -816,6 +954,8 @@ main(void)
     test_invalid_args();
     test_hash_table_independent();
     test_join_output_limit_scaling();
+    test_rdf_graph_column_propagates_to_col_rel();
+    test_rdf_no_graph_column_defaults_to_false();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

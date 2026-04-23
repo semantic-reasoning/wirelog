@@ -2330,6 +2330,10 @@ wl_plan_free(wl_plan_t *plan)
         free((void *)plan->edb_relations);
     }
 
+    /* Issue #535: free per-EDB graph-column metadata arrays. */
+    free((void *)plan->edb_has_graph_column);
+    free((void *)plan->edb_graph_col_index);
+
     free(plan);
 }
 
@@ -2353,6 +2357,16 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
     uint32_t edb_cap = 8;
     char **edb_rels = (char **)malloc(edb_cap * sizeof(char *));
     if (!edb_rels) {
+        free(plan);
+        return -1;
+    }
+    /* Issue #535: parallel arrays for per-EDB graph-column metadata. */
+    bool *edb_has_graph = (bool *)calloc(edb_cap, sizeof(bool));
+    uint32_t *edb_graph_idx = (uint32_t *)calloc(edb_cap, sizeof(uint32_t));
+    if (!edb_has_graph || !edb_graph_idx) {
+        free(edb_graph_idx);
+        free(edb_has_graph);
+        free(edb_rels);
         free(plan);
         return -1;
     }
@@ -2385,25 +2399,58 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     for (uint32_t j = 0; j < edb_count; j++)
                         free(edb_rels[j]);
                     free((void *)edb_rels);
+                    free(edb_has_graph);
+                    free(edb_graph_idx);
                     free(plan);
                     return -1;
                 }
                 edb_rels = tmp;
+                bool *htmp = (bool *)realloc(edb_has_graph,
+                        edb_cap * sizeof(bool));
+                if (!htmp) {
+                    for (uint32_t j = 0; j < edb_count; j++)
+                        free(edb_rels[j]);
+                    free((void *)edb_rels);
+                    free(edb_has_graph);
+                    free(edb_graph_idx);
+                    free(plan);
+                    return -1;
+                }
+                edb_has_graph = htmp;
+                uint32_t *itmp = (uint32_t *)realloc(edb_graph_idx,
+                        edb_cap * sizeof(uint32_t));
+                if (!itmp) {
+                    for (uint32_t j = 0; j < edb_count; j++)
+                        free(edb_rels[j]);
+                    free((void *)edb_rels);
+                    free(edb_has_graph);
+                    free(edb_graph_idx);
+                    free(plan);
+                    return -1;
+                }
+                edb_graph_idx = itmp;
             }
             edb_rels[edb_count] = dup_str(rel->name);
             if (!edb_rels[edb_count]) {
                 for (uint32_t j = 0; j < edb_count; j++)
                     free(edb_rels[j]);
                 free((void *)edb_rels);
+                free(edb_has_graph);
+                free(edb_graph_idx);
                 free(plan);
                 return -1;
             }
+            /* Issue #535: propagate graph-column metadata from IR. */
+            edb_has_graph[edb_count] = rel->has_graph_column;
+            edb_graph_idx[edb_count] = rel->graph_column_index;
             edb_count++;
         }
     }
 
     plan->edb_relations = (const char *const *)edb_rels;
     plan->edb_count = edb_count;
+    plan->edb_has_graph_column = (const bool *)edb_has_graph;
+    plan->edb_graph_col_index = (const uint32_t *)edb_graph_idx;
 
     /* ----------------------------------------------------------------
      * Build strata

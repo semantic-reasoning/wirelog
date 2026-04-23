@@ -631,6 +631,10 @@ col_rel_new_like(const char *name, const col_rel_t *src)
         col_rel_destroy(r);
         return NULL;
     }
+    /* Issue #535: inherit graph-column metadata so deltas/clones route by
+     * __graph_id consistently with their source relation. */
+    r->has_graph_column = src->has_graph_column;
+    r->graph_col_idx = src->graph_col_idx;
     return r;
 }
 
@@ -677,6 +681,9 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
             }
         }
     }
+    /* Issue #535: inherit graph-column metadata (see col_rel_new_like). */
+    r->has_graph_column = like->has_graph_column;
+    r->graph_col_idx = like->graph_col_idx;
     r->nrows = 0;
     return r;
 }

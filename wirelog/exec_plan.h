@@ -425,18 +425,30 @@ typedef struct {
  * Complete execution plan for a stratified Datalog program.
  * Passed to any backend (DD via FFI, or columnar directly).
  *
- * @strata:        Array of stratum plans ordered by execution sequence.
- *                 Stratum 0 executes first (caller-owned).
- * @stratum_count: Number of strata.
- * @edb_relations: Array of null-terminated EDB (input) relation names
- *                 (caller-owned array and strings).
- * @edb_count:     Number of EDB relations.
+ * @strata:                Array of stratum plans ordered by execution sequence.
+ *                         Stratum 0 executes first (caller-owned).
+ * @stratum_count:         Number of strata.
+ * @edb_relations:         Array of null-terminated EDB (input) relation names
+ *                         (caller-owned array and strings).
+ * @edb_count:             Number of EDB relations.
+ * @edb_has_graph_column:  Parallel array (length edb_count); true when the
+ *                         corresponding EDB relation has an __graph_id column.
+ *                         Issue #535: RDF named-graph support.
+ * @edb_graph_col_index:   Parallel array (length edb_count); column index of
+ *                         __graph_id (valid only when edb_has_graph_column[i]).
+ *                         Issue #535: RDF named-graph support.
  */
 typedef struct {
     const wl_plan_stratum_t *strata;
     uint32_t stratum_count;
     const char *const *edb_relations;
     uint32_t edb_count;
+    /* Issue #535: per-EDB graph-column metadata (parallel arrays; length = edb_count).
+     * edb_has_graph_column[i] == true  => edb_relations[i] has an __graph_id column.
+     * edb_graph_col_index[i] == column index of __graph_id (valid only when flag true).
+     * Allocated with edb_relations; freed in wl_plan_free. */
+    const bool *edb_has_graph_column;
+    const uint32_t *edb_graph_col_index;
     struct wl_intern *intern; /* borrowed from program; lifetime >= plan */
 } wl_plan_t;
 

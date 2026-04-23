@@ -691,6 +691,15 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         int rc = col_rel_alloc(&r, plan->edb_relations[i]);
         if (rc != 0)
             goto oom;
+        /* Issue #535: propagate graph-column metadata from plan to col_rel_t.
+         * Guard on non-NULL array to stay compatible with callers that have
+         * not populated edb_has_graph_column (defensive; wl_plan_from_program
+         * always populates it). */
+        if (plan->edb_has_graph_column != NULL
+            && plan->edb_has_graph_column[i]) {
+            r->has_graph_column = true;
+            r->graph_col_idx = plan->edb_graph_col_index[i];
+        }
         rc = session_add_rel(sess, r);
         if (rc != 0) {
             col_rel_destroy(r);

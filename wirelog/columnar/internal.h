@@ -263,6 +263,13 @@ typedef struct {
     uint64_t *dedup_slots;     /* open-addressing hash table (0 = empty) */
     uint32_t dedup_cap;        /* power of 2 */
     uint32_t dedup_count;
+    /* Issue #535: RDF named-graph support.
+     * When has_graph_column == true, column at index graph_col_idx holds
+     * the graph_id for each row, used for EXCHANGE partitioning and
+     * metadata joining via __graph_metadata.  Set at relation creation
+     * from plan's edb_has_graph_column[]; default false via calloc. */
+    bool has_graph_column;
+    uint32_t graph_col_idx;
 } col_rel_t;
 
 /* ======================================================================== */
