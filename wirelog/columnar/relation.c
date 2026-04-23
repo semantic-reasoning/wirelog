@@ -10,6 +10,7 @@
  */
 
 #include "columnar/internal.h"
+#include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
 
@@ -254,16 +255,31 @@ col_rel_alloc(col_rel_t **out, const char *name)
 /* Reject an INLINE column that violates the inline-tier invariants. Returns
  * EINVAL on violation, 0 when the column is acceptable. Non-INLINE columns
  * are always acceptable at this layer (SIDE widths are handled below and
- * NONE columns are scalars). */
+ * NONE columns are scalars).
+ *
+ * K-Fusion C1 (§5): INLINE columns must fit within arity<=MAX_ARITY and
+ * depth<=MAX_DEPTH; wider/deeper functors must lower to the SIDE tier.
+ * Violations are structured logs (error=arity_overflow|depth_overflow) so
+ * operators can diagnose schema-mismatch without abort. */
 static int
 col_rel_validate_inline_col(const col_rel_logical_col_t *col)
 {
     if (col->kind != WIRELOG_COMPOUND_KIND_INLINE)
         return 0;
-    if (col->arity == 0u || col->arity > WL_COMPOUND_INLINE_MAX_ARITY)
+    if (col->arity == 0u || col->arity > WL_COMPOUND_INLINE_MAX_ARITY) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=validate path=inline error=arity_overflow "
+            "expected=1..%u got=%u",
+            (unsigned)WL_COMPOUND_INLINE_MAX_ARITY, col->arity);
         return EINVAL;
-    if (col->depth > WL_COMPOUND_INLINE_MAX_DEPTH)
+    }
+    if (col->depth > WL_COMPOUND_INLINE_MAX_DEPTH) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=validate path=inline error=depth_overflow "
+            "expected=0..%u got=%u",
+            (unsigned)WL_COMPOUND_INLINE_MAX_DEPTH, col->depth);
         return EINVAL;
+    }
     return 0;
 }
 
@@ -287,14 +303,22 @@ col_rel_compute_physical_layout(const col_rel_logical_col_t *logical_cols,
     uint32_t *out_inline_physical_offset,
     uint32_t *out_compound_count)
 {
-    if (!logical_cols || logical_ncols == 0u)
+    if (!logical_cols || logical_ncols == 0u) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=layout error=bad_input logical_cols=%p logical_ncols=%u",
+            (const void *)logical_cols, logical_ncols);
         return EINVAL;
+    }
 
-    /* Validate before touching outputs so EINVAL leaves everything intact. */
+    /* Validate before touching outputs so EINVAL leaves everything intact.
+    * Per-column failures are already logged inside validate_inline_col. */
     for (uint32_t i = 0; i < logical_ncols; i++) {
         int rc = col_rel_validate_inline_col(&logical_cols[i]);
-        if (rc != 0)
+        if (rc != 0) {
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                "event=layout error=validation logical_col=%u", i);
             return rc;
+        }
     }
 
     uint32_t physical = 0u;
@@ -321,6 +345,11 @@ col_rel_compute_physical_layout(const col_rel_logical_col_t *logical_cols,
         *out_inline_physical_offset = first_inline_offset;
     if (out_compound_count)
         *out_compound_count = compound_count;
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
+        "event=layout path=%s logical=%u physical=%u compound=%u "
+        "first_inline_offset=%u",
+        compound_count > 0u ? "inline" : "scalar",
+        logical_ncols, physical, compound_count, first_inline_offset);
     return 0;
 }
 
@@ -329,8 +358,11 @@ col_rel_apply_compound_schema(col_rel_t *r,
     const col_rel_logical_col_t *logical_cols,
     uint32_t logical_ncols)
 {
-    if (!r)
+    if (!r) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=apply_schema error=null_relation");
         return EINVAL;
+    }
 
     /* Reuse the pure layout routine for validation + offset math so the
      * two entry points cannot drift. We don't need the per-column offsets
@@ -344,8 +376,12 @@ col_rel_apply_compound_schema(col_rel_t *r,
 
     uint32_t *arity_map
         = (uint32_t *)malloc((size_t)logical_ncols * sizeof(uint32_t));
-    if (!arity_map)
+    if (!arity_map) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
+            "event=apply_schema error=oom bytes=%zu",
+            (size_t)logical_ncols * sizeof(uint32_t));
         return ENOMEM;
+    }
 
     bool has_inline = false;
     bool has_side = false;
@@ -362,12 +398,22 @@ col_rel_apply_compound_schema(col_rel_t *r,
     r->compound_arity_map = arity_map;
     r->compound_count = compound_count;
     r->inline_physical_offset = inline_offset;
-    if (has_inline)
+    const char *path_tag;
+    if (has_inline) {
         r->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
-    else if (has_side)
+        path_tag = "inline";
+    } else if (has_side) {
         r->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
-    else
+        path_tag = "side";
+    } else {
         r->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+        path_tag = "none";
+    }
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
+        "event=apply_schema path=%s rel=%s logical=%u compound_count=%u "
+        "inline_offset=%u",
+        path_tag, r->name ? r->name : "(anon)", logical_ncols,
+        compound_count, inline_offset);
     return 0;
 }
 

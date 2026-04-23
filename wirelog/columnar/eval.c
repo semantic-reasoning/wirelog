@@ -4765,23 +4765,46 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
  * INLINE-kind relation. Returns 0 and writes *out_offset / *out_width on
  * success; EINVAL if the relation is not INLINE, compound_arity_map is
  * absent, a zero-width entry is seen (corruption), or the prefix sum
- * walks past the physical schema (logical_col out of range). */
+ * walks past the physical schema (logical_col out of range).
+ *
+ * K-Fusion C2 (§5): locate is pure/read-only; failures surface as
+ * structured error tags so the fused driver can route the row to the
+ * SIDE tier without aborting the worker. */
 static int
 wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
     uint32_t *out_offset, uint32_t *out_width)
 {
-    if (rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE)
+    if (rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=locate error=not_inline rel=%s kind=%d logical_col=%u",
+            rel->name ? rel->name : "(anon)", (int)rel->compound_kind,
+            logical_col);
         return EINVAL;
-    if (!rel->compound_arity_map)
+    }
+    if (!rel->compound_arity_map) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
+            "event=locate error=missing_arity_map rel=%s",
+            rel->name ? rel->name : "(anon)");
         return EINVAL;
+    }
 
     uint32_t offset = 0u;
     for (uint32_t i = 0; ; i++) {
         uint32_t width = rel->compound_arity_map[i];
-        if (width == 0u)
+        if (width == 0u) {
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
+                "event=locate error=corrupt_width rel=%s logical_col=%u "
+                "scan_idx=%u",
+                rel->name ? rel->name : "(anon)", logical_col, i);
             return EINVAL; /* Task #2 never emits zero-width entries */
-        if (offset + width > rel->ncols)
+        }
+        if (offset + width > rel->ncols) {
+            WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+                "event=locate error=logical_col_oor rel=%s "
+                "logical_col=%u physical_ncols=%u",
+                rel->name ? rel->name : "(anon)", logical_col, rel->ncols);
             return EINVAL; /* logical_col beyond end of schema */
+        }
         if (i == logical_col) {
             *out_offset = offset;
             *out_width = width;
@@ -4795,21 +4818,38 @@ int
 wl_col_rel_store_inline_compound(col_rel_t *rel, uint32_t row_idx,
     uint32_t logical_col, const int64_t *args, uint32_t arity)
 {
-    if (!rel || !args || arity == 0u)
+    if (!rel || !args || arity == 0u) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=store path=inline error=bad_input rel=%p args=%p arity=%u",
+            (const void *)rel, (const void *)args, arity);
         return EINVAL;
-    if (row_idx >= rel->nrows)
+    }
+    if (row_idx >= rel->nrows) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=store path=inline error=row_oor rel=%s row=%u nrows=%u",
+            rel->name ? rel->name : "(anon)", row_idx, rel->nrows);
         return EINVAL;
+    }
 
     uint32_t offset = 0u;
     uint32_t width = 0u;
     int rc = wl_col_rel_inline_locate(rel, logical_col, &offset, &width);
     if (rc != 0)
         return rc;
-    if (width != arity)
+    if (width != arity) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=store path=inline error=arity_mismatch rel=%s "
+            "logical_col=%u expected=%u got=%u",
+            rel->name ? rel->name : "(anon)", logical_col, width, arity);
         return EINVAL;
+    }
 
     for (uint32_t k = 0; k < arity; k++)
         col_rel_set(rel, row_idx, offset + k, args[k]);
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "event=store path=inline rel=%s row=%u logical_col=%u offset=%u "
+        "arity=%u",
+        rel->name ? rel->name : "(anon)", row_idx, logical_col, offset, arity);
     return 0;
 }
 
@@ -4817,21 +4857,39 @@ int
 wl_col_rel_retrieve_inline_compound(const col_rel_t *rel, uint32_t row_idx,
     uint32_t logical_col, int64_t *out_args, uint32_t arity)
 {
-    if (!rel || !out_args || arity == 0u)
+    if (!rel || !out_args || arity == 0u) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=retrieve path=inline error=bad_input rel=%p out=%p "
+            "arity=%u",
+            (const void *)rel, (const void *)out_args, arity);
         return EINVAL;
-    if (row_idx >= rel->nrows)
+    }
+    if (row_idx >= rel->nrows) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=retrieve path=inline error=row_oor rel=%s row=%u nrows=%u",
+            rel->name ? rel->name : "(anon)", row_idx, rel->nrows);
         return EINVAL;
+    }
 
     uint32_t offset = 0u;
     uint32_t width = 0u;
     int rc = wl_col_rel_inline_locate(rel, logical_col, &offset, &width);
     if (rc != 0)
         return rc;
-    if (width != arity)
+    if (width != arity) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=retrieve path=inline error=arity_mismatch rel=%s "
+            "logical_col=%u expected=%u got=%u",
+            rel->name ? rel->name : "(anon)", logical_col, width, arity);
         return EINVAL;
+    }
 
     for (uint32_t k = 0; k < arity; k++)
         out_args[k] = col_rel_get(rel, row_idx, offset + k);
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "event=retrieve path=inline rel=%s row=%u logical_col=%u offset=%u "
+        "arity=%u",
+        rel->name ? rel->name : "(anon)", row_idx, logical_col, offset, arity);
     return 0;
 }
 
@@ -4839,16 +4897,27 @@ int
 wl_col_rel_retract_inline_compound(col_rel_t *rel, uint32_t row_idx,
     uint32_t logical_col, int64_t multiplicity)
 {
-    if (!rel || row_idx >= rel->nrows)
+    if (!rel || row_idx >= rel->nrows) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=retract path=inline error=bad_input rel=%p row=%u",
+            (const void *)rel, row_idx);
         return EINVAL;
-    if (multiplicity == 0)
+    }
+    if (multiplicity == 0) {
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "event=retract path=inline error=zero_multiplicity rel=%s "
+            "row=%u logical_col=%u",
+            rel->name ? rel->name : "(anon)", row_idx, logical_col);
         return EINVAL; /* retraction with zero multiplicity is nonsense */
+    }
 
     uint32_t offset = 0u;
     uint32_t width = 0u;
     int rc = wl_col_rel_inline_locate(rel, logical_col, &offset, &width);
     if (rc != 0)
         return rc;
+    /* K-Fusion C3 (§5): physical slots preserved across retraction so the
+     * delta/timestamp layer can re-match the tuple during semi-naive. */
 
     /* Physical slots are deliberately NOT mutated: Z-set multiplicity is
      * tracked at the delta/timestamps layer (col_rel_t::timestamps), and
@@ -4858,6 +4927,10 @@ wl_col_rel_retract_inline_compound(col_rel_t *rel, uint32_t row_idx,
      * delta path; this op validates addressability of the compound. */
     (void)offset;
     (void)width;
-    (void)multiplicity;
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
+        "event=retract path=inline rel=%s row=%u logical_col=%u offset=%u "
+        "width=%u multiplicity=%lld",
+        rel->name ? rel->name : "(anon)", row_idx, logical_col, offset, width,
+        (long long)multiplicity);
     return 0;
 }
