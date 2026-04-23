@@ -932,6 +932,106 @@ test_rdf_no_graph_column_defaults_to_false(void)
     return 0;
 }
 
+/*
+ * test_rdf_graph_metadata_auto_created_when_any_graph_column:
+ * Issue #535: when any EDB has __graph_id, col_session_create must
+ * auto-register __graph_metadata(graph_id, tenant, timestamp, location,
+ * risk, description) — 6 columns — in the session registry.
+ */
+static int
+test_rdf_graph_metadata_auto_created_when_any_graph_column(void)
+{
+    TEST("rdf: __graph_metadata auto-created when any EDB has __graph_id");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_session_from_src(
+        ".decl triple(s: int64, p: int64, __graph_id: int64)\n",
+        &plan, &prog);
+    if (!sess) {
+        FAIL("session creation failed");
+        return 1;
+    }
+
+    col_rel_t *meta = session_find_rel(sess, "__graph_metadata");
+    if (!meta) {
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("__graph_metadata relation not found in session");
+        return 1;
+    }
+
+    if (meta->ncols != 6) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected ncols=6, got %u", meta->ncols);
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL(msg);
+        return 1;
+    }
+
+    static const char *const expected[6] = {
+        "graph_id", "tenant", "timestamp", "location", "risk", "description"
+    };
+    for (int ci = 0; ci < 6; ci++) {
+        if (strcmp(meta->col_names[ci], expected[ci]) != 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                "col[%d]: expected '%s', got '%s'",
+                ci, expected[ci], meta->col_names[ci]);
+            wl_session_destroy(&sess->base);
+            wl_plan_free(plan);
+            wirelog_program_free(prog);
+            FAIL(msg);
+            return 1;
+        }
+    }
+
+    wl_session_destroy(&sess->base);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+    return 0;
+}
+
+/*
+ * test_rdf_graph_metadata_absent_when_no_graph_column:
+ * Issue #535: when no EDB has __graph_id, __graph_metadata must NOT
+ * be auto-created.
+ */
+static int
+test_rdf_graph_metadata_absent_when_no_graph_column(void)
+{
+    TEST("rdf: __graph_metadata absent when no EDB has __graph_id");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *sess = make_session_from_src(
+        ".decl edge(a: int64, b: int64)\n",
+        &plan, &prog);
+    if (!sess) {
+        FAIL("session creation failed");
+        return 1;
+    }
+
+    col_rel_t *meta = session_find_rel(sess, "__graph_metadata");
+    if (meta != NULL) {
+        wl_session_destroy(&sess->base);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("__graph_metadata should not exist when no __graph_id present");
+        return 1;
+    }
+
+    wl_session_destroy(&sess->base);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -956,6 +1056,8 @@ main(void)
     test_join_output_limit_scaling();
     test_rdf_graph_column_propagates_to_col_rel();
     test_rdf_no_graph_column_defaults_to_false();
+    test_rdf_graph_metadata_auto_created_when_any_graph_column();
+    test_rdf_graph_metadata_absent_when_no_graph_column();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
