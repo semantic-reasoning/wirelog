@@ -1058,43 +1058,6 @@ int
 col_rel_apply_compound_schema(col_rel_t *r,
     const col_rel_logical_col_t *logical_cols,
     uint32_t logical_ncols);
-
-/* ------------------------------------------------------------------------ */
-/* Inline-tier storage ops (Issue #532 Task 3).                             */
-/*                                                                          */
-/* Inline compounds occupy `compound_arity_map[logical_col]` contiguous     */
-/* physical slots starting at the prefix-sum of preceding widths. The       */
-/* functor identity is schema-level (see col_rel_apply_compound_schema),    */
-/* so only the arguments are materialised per row -- no handle slot.        */
-/* All three ops are O(logical_col) for offset resolution and preserve      */
-/* physical slot contents outside the addressed range.                      */
-/* ------------------------------------------------------------------------ */
-
-/* Write `arity` argument values into the inline compound at
- * (row_idx, logical_col). Returns 0 on success; EINVAL when the relation
- * is not INLINE, row_idx is out of range, logical_col is beyond the
- * schema, or `arity` does not match compound_arity_map[logical_col]. */
-int
-wl_col_rel_store_inline_compound(col_rel_t *rel, uint32_t row_idx,
-    uint32_t logical_col, const int64_t *args, uint32_t arity);
-
-/* Copy the inline compound at (row_idx, logical_col) into out_args
- * (must hold at least `arity` int64s). Returns 0 on success; EINVAL on
- * the same precondition violations as store_inline_compound. */
-int
-wl_col_rel_retrieve_inline_compound(const col_rel_t *rel, uint32_t row_idx,
-    uint32_t logical_col, int64_t *out_args, uint32_t arity);
-
-/* Signal retraction of the inline compound at (row_idx, logical_col) with
- * the given non-zero Z-set multiplicity. Physical slots are intentionally
- * left intact: Z-set multiplicity lives in the delta/timestamps layer,
- * and join matching during retraction-seeded semi-naive evaluation still
- * needs to see the original tuple. Returns 0 on success; EINVAL for the
- * usual precondition violations or when multiplicity is zero. */
-int
-wl_col_rel_retract_inline_compound(col_rel_t *rel, uint32_t row_idx,
-    uint32_t logical_col, int64_t multiplicity);
-
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
 int
