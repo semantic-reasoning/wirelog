@@ -24,23 +24,23 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                      \
-    do {                                \
-        tests_run++;                    \
-        printf("  [TEST] %-55s", name); \
-        fflush(stdout);                 \
-    } while (0)
+        do {                                \
+            tests_run++;                    \
+            printf("  [TEST] %-55s", name); \
+            fflush(stdout);                 \
+        } while (0)
 
 #define PASS()             \
-    do {                   \
-        tests_passed++;    \
-        printf(" PASS\n"); \
-    } while (0)
+        do {                   \
+            tests_passed++;    \
+            printf(" PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                   \
-    do {                            \
-        tests_failed++;             \
-        printf(" FAIL: %s\n", msg); \
-    } while (0)
+        do {                            \
+            tests_failed++;             \
+            printf(" FAIL: %s\n", msg); \
+        } while (0)
 
 /* ======================================================================== */
 /* IR Node Creation Tests                                                   */
@@ -733,6 +733,161 @@ test_join_keys(void)
 }
 
 /* ======================================================================== */
+/* Phase 2B: Compound Column IR Lowering Tests (Issue #531)                 */
+/* ======================================================================== */
+
+static void
+test_compound_inline_annotation(void)
+{
+    TEST("Compound column IR: INLINE annotation on SCAN");
+
+    wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
+    if (!scan) {
+        FAIL("Failed to create SCAN node");
+        return;
+    }
+
+    wl_ir_node_set_relation(scan, "TestRel");
+
+    /* Simulate Phase 2B: Annotate SCAN with compound metadata */
+    scan->type = WIRELOG_IR_COMPOUND_INLINE;
+    scan->compound_inline.functor_id = 42;
+    scan->compound_inline.arity = 2;
+    scan->compound_inline.inline_col_offset = 1;
+
+    /* Verify type */
+    if (wirelog_ir_node_get_type(scan) != WIRELOG_IR_COMPOUND_INLINE) {
+        wl_ir_node_free(scan);
+        FAIL("Type should be COMPOUND_INLINE");
+        return;
+    }
+
+    /* Verify metadata */
+    if (scan->compound_inline.functor_id != 42) {
+        wl_ir_node_free(scan);
+        FAIL("functor_id should be 42");
+        return;
+    }
+
+    if (scan->compound_inline.arity != 2) {
+        wl_ir_node_free(scan);
+        FAIL("arity should be 2");
+        return;
+    }
+
+    if (scan->compound_inline.inline_col_offset != 1) {
+        wl_ir_node_free(scan);
+        FAIL("inline_col_offset should be 1");
+        return;
+    }
+
+    /* Verify SCAN is NOT wrapped (no children) */
+    if (wirelog_ir_node_get_child_count(scan) != 0) {
+        wl_ir_node_free(scan);
+        FAIL("SCAN should have 0 children (not wrapped)");
+        return;
+    }
+
+    wl_ir_node_free(scan);
+    PASS();
+}
+
+static void
+test_compound_side_annotation(void)
+{
+    TEST("Compound column IR: SIDE annotation on SCAN");
+
+    wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
+    if (!scan) {
+        FAIL("Failed to create SCAN node");
+        return;
+    }
+
+    wl_ir_node_set_relation(scan, "TestRel");
+
+    /* Simulate Phase 2B: Annotate SCAN as SIDE compound */
+    scan->type = WIRELOG_IR_COMPOUND_SIDE;
+    scan->compound_side.handle_expr = NULL;
+
+    /* Verify type */
+    if (wirelog_ir_node_get_type(scan) != WIRELOG_IR_COMPOUND_SIDE) {
+        wl_ir_node_free(scan);
+        FAIL("Type should be COMPOUND_SIDE");
+        return;
+    }
+
+    /* Verify SCAN is NOT wrapped */
+    if (wirelog_ir_node_get_child_count(scan) != 0) {
+        wl_ir_node_free(scan);
+        FAIL("SCAN should have 0 children (not wrapped)");
+        return;
+    }
+
+    wl_ir_node_free(scan);
+    PASS();
+}
+
+static void
+test_compound_scan_not_wrapped(void)
+{
+    TEST("Compound column IR: SCAN not wrapped in parent node");
+
+    wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
+    if (!scan) {
+        FAIL("Failed to create SCAN node");
+        return;
+    }
+
+    wl_ir_node_set_relation(scan, "TestRel");
+
+    /* Annotate SCAN directly (not wrapping) */
+    scan->type = WIRELOG_IR_COMPOUND_INLINE;
+    scan->compound_inline.functor_id = 1;
+    scan->compound_inline.arity = 1;
+
+    /* Create a FILTER above SCAN (normal IR pattern) */
+    wirelog_ir_node_t *filter = wl_ir_node_create(WIRELOG_IR_FILTER);
+    if (!filter) {
+        wl_ir_node_free(scan);
+        FAIL("Failed to create FILTER node");
+        return;
+    }
+
+    wl_ir_node_add_child(filter, scan);
+
+    /* Verify: Filter has COMPOUND_INLINE SCAN as child */
+    if (wirelog_ir_node_get_child_count(filter) != 1) {
+        wl_ir_node_free(filter);
+        FAIL("Filter should have 1 child");
+        return;
+    }
+
+    const wirelog_ir_node_t *child = wirelog_ir_node_get_child(filter, 0);
+    if (!child) {
+        wl_ir_node_free(filter);
+        FAIL("Child is NULL");
+        return;
+    }
+
+    if (wirelog_ir_node_get_type(child) != WIRELOG_IR_COMPOUND_INLINE) {
+        wl_ir_node_free(filter);
+        FAIL("Child should be COMPOUND_INLINE");
+        return;
+    }
+
+    /* Verify the relation name is preserved */
+    const char *rel_name = wirelog_ir_node_get_relation_name(child);
+    if (!rel_name || strcmp(rel_name, "TestRel") != 0) {
+        wl_ir_node_free(filter);
+        FAIL("Relation name should be preserved");
+        return;
+    }
+
+    wl_ir_node_free(filter);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -768,8 +923,13 @@ main(void)
     test_scan_column_names();
     test_join_keys();
 
+    /* Phase 2B: Compound column IR lowering (Issue #531) */
+    test_compound_inline_annotation();
+    test_compound_side_annotation();
+    test_compound_scan_not_wrapped();
+
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
-           tests_passed, tests_failed, tests_run);
+        tests_passed, tests_failed, tests_run);
 
     return tests_failed > 0 ? 1 : 0;
 }
