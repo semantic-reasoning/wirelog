@@ -3304,6 +3304,46 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
             break;
     }
 
+    /* Issue #535 hardening: if only one of the two co-partitioned sides carries
+     * has_graph_column, col_rel_exchange_partition would pick different hash
+     * keys for IDB and EDB → matching tuples land on different workers → silent
+     * wrong results.  Detect the asymmetry here and force both sides onto the
+     * natural join key (Option A: warn + fallback). */
+    bool force_natural_key = false;
+    if (edb_part_name) {
+        bool idb_graph = false;
+        bool edb_graph = false;
+        const char *idb_name_found = NULL;
+        const char *edb_name_found = NULL;
+        for (uint32_t r = 0; r < nrels; r++) {
+            col_rel_t *rel = coord->rels[r];
+            if (!rel || !rel->name)
+                continue;
+            /* IDB: appears in sp->relations */
+            for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+                if (strcmp(rel->name, sp->relations[ri].name) == 0) {
+                    idb_graph = rel->has_graph_column;
+                    idb_name_found = rel->name;
+                    break;
+                }
+            }
+            /* EDB co-partition target */
+            if (strcmp(rel->name, edb_part_name) == 0) {
+                edb_graph = rel->has_graph_column;
+                edb_name_found = rel->name;
+            }
+        }
+        if (idb_name_found && edb_name_found
+            && idb_graph != edb_graph) {
+            WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_WARN,
+                "EDB/IDB graph-column flag mismatch for rel '%s' vs '%s';"
+                " falling back to natural key for both sides to preserve"
+                " co-partitioning correctness",
+                idb_name_found, edb_name_found);
+            force_natural_key = true;
+        }
+    }
+
     uint32_t rels_built = 0;
 
     for (uint32_t r = 0; r < nrels && rc == 0; r++) {
@@ -3347,7 +3387,15 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
             if (!parts) {
                 rc = ENOMEM;
             } else {
-                rc = col_rel_exchange_partition(rel, key, key_count, W, parts);
+                /* When graph-flag mismatch detected, bypass the graph-key
+                 * override in col_rel_exchange_partition and use the natural
+                 * join key directly so both sides hash identically. */
+                if (force_natural_key)
+                    rc = col_rel_partition_by_key(rel, key, key_count,
+                            W, parts);
+                else
+                    rc = col_rel_exchange_partition(rel, key, key_count,
+                            W, parts);
                 if (rc == 0) {
                     for (uint32_t w = 0; w < W && rc == 0; w++) {
                         free(parts[w]->name);
@@ -3378,8 +3426,14 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
             if (!parts) {
                 rc = ENOMEM;
             } else {
-                rc = col_rel_exchange_partition(rel, edb_part_keys,
-                        edb_part_key_count, W, parts);
+                /* When graph-flag mismatch detected, bypass the graph-key
+                 * override and use the supplied EDB key directly. */
+                if (force_natural_key)
+                    rc = col_rel_partition_by_key(rel, edb_part_keys,
+                            edb_part_key_count, W, parts);
+                else
+                    rc = col_rel_exchange_partition(rel, edb_part_keys,
+                            edb_part_key_count, W, parts);
                 if (rc == 0) {
                     for (uint32_t w = 0; w < W && rc == 0; w++) {
                         free(parts[w]->name);

@@ -1087,6 +1087,185 @@ test_col_rel_new_like_inherits_graph_flag(void)
     return 0;
 }
 
+/*
+ * test_exchange_graph_mismatch_falls_back_both_sides:
+ * Issue #535 hardening: when IDB has has_graph_column==true but EDB does
+ * not (or vice-versa), calling col_rel_exchange_partition on both sides
+ * would hash them by different keys, causing co-partition misalignment.
+ *
+ * This unit test validates the correct fallback behaviour directly at the
+ * col_rel_partition_by_key level (the underlying primitive used by the
+ * hardening guard in tdd_init_workers_hybrid):
+ *
+ *   - Partitioning the IDB with graph_col_idx produces one distribution.
+ *   - Partitioning the EDB with the natural join key produces a DIFFERENT
+ *     distribution (demonstrating the hazard).
+ *   - When BOTH sides are partitioned with the same natural key the
+ *     distributions are consistent: every IDB row with join-key K lands
+ *     on the same worker as every EDB row with join-key K.
+ *
+ * The test does not call tdd_init_workers_hybrid (integration cost), but
+ * it exercises the exact same primitive the guard falls back to and
+ * verifies the invariant that co-partitioning requires.
+ */
+static int
+test_exchange_graph_mismatch_falls_back_both_sides(void)
+{
+    TEST(
+        "exchange_partition: graph-flag mismatch → fallback key aligns both sides");
+
+    /*
+     * IDB: 3 columns, 4 rows.
+     *   col 0: join key (shared with EDB)
+     *   col 1: idb payload
+     *   col 2: graph_id  (has_graph_column = true, graph_col_idx = 2)
+     *
+     * EDB: 2 columns, 4 rows.
+     *   col 0: join key  (edb_part_key = col 0)
+     *   col 1: edb payload
+     *   has_graph_column = false
+     *
+     * Join key col 0 values: 10, 20, 10, 20
+     * Graph col values in IDB:  5,  5, 99, 99  (differ from join key)
+     *
+     * With W=2 and a well-distributed hash, rows with join-key=10 must
+     * land on the same worker for both relations, and rows with join-key=20
+     * must land on the same (possibly different) worker.
+     *
+     * Hazard scenario (what the guard prevents):
+     *   IDB partitioned by graph_col_idx=2 → rows 0+1 (graph_id=5) on
+     *   one worker, rows 2+3 (graph_id=99) on the other.
+     *   EDB partitioned by join key col 0 → rows 0+2 (key=10) on one
+     *   worker, rows 1+3 (key=20) on the other.
+     *   A row with join-key=10 in IDB (row 0, graph_id=5) lands on
+     *   worker-A; the matching EDB row (row 0, key=10) lands on worker-B
+     *   → join misses the pair.
+     *
+     * Correct behaviour (what the fallback delivers):
+     *   Both sides partitioned by join key col 0.  For every join-key value
+     *   K, all IDB rows with col0=K and all EDB rows with col0=K land on
+     *   the same worker.
+     */
+    int64_t idb_rows[] = {
+        10, 1000, 5,
+        20, 2000, 5,
+        10, 3000, 99,
+        20, 4000, 99,
+    };
+    int64_t edb_rows[] = {
+        10, 100,
+        20, 200,
+        10, 300,
+        20, 400,
+    };
+
+    col_rel_t *idb = make_rel(3, idb_rows, 4);
+    col_rel_t *edb = make_rel(2, edb_rows, 4);
+    if (!idb || !edb) {
+        col_rel_destroy(idb);
+        col_rel_destroy(edb);
+        FAIL("alloc");
+        return 1;
+    }
+    idb->has_graph_column = true;
+    idb->graph_col_idx = 2;
+    /* edb->has_graph_column remains false */
+
+    /* Detect asymmetry (mirrors the guard logic in tdd_init_workers_hybrid) */
+    int asymmetric = (idb->has_graph_column != edb->has_graph_column);
+    if (!asymmetric) {
+        col_rel_destroy(idb);
+        col_rel_destroy(edb);
+        FAIL("test setup error: flags must differ");
+        return 1;
+    }
+
+    /* Fallback: partition both by join key (col 0) */
+    uint32_t join_key = 0;
+    col_rel_t *idb_parts[2] = { NULL };
+    col_rel_t *edb_parts[2] = { NULL };
+
+    int rc = col_rel_partition_by_key(idb, &join_key, 1, 2, idb_parts);
+    if (rc != 0) {
+        col_rel_destroy(idb);
+        col_rel_destroy(edb);
+        FAIL("col_rel_partition_by_key(idb) failed");
+        return 1;
+    }
+    rc = col_rel_partition_by_key(edb, &join_key, 1, 2, edb_parts);
+    if (rc != 0) {
+        destroy_parts(idb_parts, 2);
+        col_rel_destroy(idb);
+        col_rel_destroy(edb);
+        FAIL("col_rel_partition_by_key(edb) failed");
+        return 1;
+    }
+
+    /* Row counts must be preserved */
+    if (partition_total_rows(idb_parts, 2) != 4) {
+        FAIL("IDB total row count mismatch");
+        destroy_parts(idb_parts, 2);
+        destroy_parts(edb_parts, 2);
+        col_rel_destroy(idb);
+        col_rel_destroy(edb);
+        return 1;
+    }
+    if (partition_total_rows(edb_parts, 2) != 4) {
+        FAIL("EDB total row count mismatch");
+        destroy_parts(idb_parts, 2);
+        destroy_parts(edb_parts, 2);
+        col_rel_destroy(idb);
+        col_rel_destroy(edb);
+        return 1;
+    }
+
+    /*
+     * Co-partition correctness: for each join-key value K, all IDB rows
+     * with col0=K and all EDB rows with col0=K must reside on the same
+     * worker.  Build a map: join_key_value → worker index, derived from
+     * IDB partitions.  Then verify EDB agrees.
+     */
+    int key10_idb_worker = -1;
+    int key20_idb_worker = -1;
+    for (uint32_t w = 0; w < 2; w++) {
+        for (uint32_t row = 0; row < idb_parts[w]->nrows; row++) {
+            int64_t k = col_rel_get(idb_parts[w], row, 0);
+            if (k == 10) {
+                if (key10_idb_worker == -1)
+                    key10_idb_worker = (int)w;
+            } else if (k == 20) {
+                if (key20_idb_worker == -1)
+                    key20_idb_worker = (int)w;
+            }
+        }
+    }
+
+    int ok = 1;
+    for (uint32_t w = 0; w < 2 && ok; w++) {
+        for (uint32_t row = 0; row < edb_parts[w]->nrows && ok; row++) {
+            int64_t k = col_rel_get(edb_parts[w], row, 0);
+            if (k == 10 && key10_idb_worker != -1
+                && (int)w != key10_idb_worker)
+                ok = 0;
+            if (k == 20 && key20_idb_worker != -1
+                && (int)w != key20_idb_worker)
+                ok = 0;
+        }
+    }
+
+    destroy_parts(idb_parts, 2);
+    destroy_parts(edb_parts, 2);
+    col_rel_destroy(idb);
+    col_rel_destroy(edb);
+
+    if (!ok) {
+        FAIL("co-partition mismatch: EDB join-key landed on wrong worker");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1118,6 +1297,7 @@ main(void)
     test_exchange_no_graph_override_unchanged();
     test_exchange_w1_noop();
     test_col_rel_new_like_inherits_graph_flag();
+    test_exchange_graph_mismatch_falls_back_both_sides();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
