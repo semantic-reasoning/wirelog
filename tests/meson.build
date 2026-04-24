@@ -2932,3 +2932,26 @@ if io_plugin_dlopen_option == 'enabled' and not is_windows
   )
 
 endif
+
+# ======================================================================
+# bench_compound smoke test (Issue #536 TDD red step)
+# Execs bench/bench_compound --mode parser --iters 10 and asserts
+# stdout contains p50=, p95=, p99=.  bench_compound_exe is defined in
+# bench/meson.build (processed before this subdir); depends: ensures
+# the binary is built before the test runs.
+# ======================================================================
+
+test_bench_compound_smoke_exe = executable(
+  'test_bench_compound_smoke',
+  files('test_bench_compound.c'),
+  include_directories: [],
+  install: false,
+)
+
+# bench_compound_exe is defined in bench/meson.build (processed before
+# this subdir).  depends: ensures the binary is built before the test runs;
+# args: passes the absolute path so the test does not rely on CWD.
+test('bench_compound_smoke', test_bench_compound_smoke_exe,
+  args: [bench_compound_exe.full_path()],
+  depends: [bench_compound_exe],
+)

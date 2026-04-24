@@ -120,6 +120,23 @@ bench_col_layout = executable(
   install: false,
 )
 
+# Compound term microbenchmarks (Issue #536)
+# Modes: parser | match | semijoin | multi-graph
+# bench_compound_exe is referenced by tests/meson.build (bench_compound_smoke).
+bench_compound_exe = executable(
+  'bench_compound',
+  files('bench_compound.c'),
+  bench_parser_src,
+  bench_backend_src,
+  files(subdir_wirelog / 'intern.c'),
+  bench_arena_src,
+  bench_thread_src,
+  bench_workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+
 datagen = executable(
   'datagen',
   files('datagen.c'),
