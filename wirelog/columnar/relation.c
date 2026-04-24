@@ -806,6 +806,43 @@ col_rel_new_like(const char *name, const col_rel_t *src)
      * __graph_id consistently with their source relation. */
     r->has_graph_column = src->has_graph_column;
     r->graph_col_idx = src->graph_col_idx;
+    /* Issue #534 Task #1: inherit compound metadata so FILTER/PROJECT/LFTJ
+     * outputs remain INLINE-kind and the logical<->physical translation
+     * stays valid for downstream ops. compound_arity_map is a separately
+     * owned heap array; we deep-copy it so dst and src destroy paths stay
+     * independent (K-Fusion isolation). */
+    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && src->compound_arity_map && src->ncols > 0u) {
+        /* compound_arity_map is keyed by LOGICAL column index, but we
+         * record at least as many entries as the physical ncols to match
+         * the source's allocation footprint. Walk the source map summing
+         * widths until we cover ncols physical slots, then copy that many
+         * entries. Bail gracefully on any inconsistency. */
+        uint32_t logical_count = 0u;
+        uint32_t acc = 0u;
+        while (acc < src->ncols) {
+            if (src->compound_arity_map[logical_count] == 0u) {
+                /* Corrupt width — leave compound metadata cleared rather
+                 * than propagating the inconsistency. */
+                logical_count = 0u;
+                break;
+            }
+            acc += src->compound_arity_map[logical_count];
+            logical_count++;
+        }
+        if (logical_count > 0u && acc == src->ncols) {
+            uint32_t *copy = (uint32_t *)malloc(
+                (size_t)logical_count * sizeof(uint32_t));
+            if (copy) {
+                memcpy(copy, src->compound_arity_map,
+                    (size_t)logical_count * sizeof(uint32_t));
+                r->compound_arity_map = copy;
+                r->compound_kind = src->compound_kind;
+                r->compound_count = src->compound_count;
+                r->inline_physical_offset = src->inline_physical_offset;
+            }
+        }
+    }
     return r;
 }
 
@@ -855,6 +892,34 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     /* Issue #535: inherit graph-column metadata (see col_rel_new_like). */
     r->has_graph_column = like->has_graph_column;
     r->graph_col_idx = like->graph_col_idx;
+    /* Issue #534 Task #1: inherit compound metadata so pool-allocated
+     * FILTER/PROJECT outputs retain INLINE schema. Mirrors col_rel_new_like
+     * with the same deep-copy discipline. */
+    if (like->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && like->compound_arity_map && like->ncols > 0u) {
+        uint32_t logical_count = 0u;
+        uint32_t acc = 0u;
+        while (acc < like->ncols) {
+            if (like->compound_arity_map[logical_count] == 0u) {
+                logical_count = 0u;
+                break;
+            }
+            acc += like->compound_arity_map[logical_count];
+            logical_count++;
+        }
+        if (logical_count > 0u && acc == like->ncols) {
+            uint32_t *copy = (uint32_t *)malloc(
+                (size_t)logical_count * sizeof(uint32_t));
+            if (copy) {
+                memcpy(copy, like->compound_arity_map,
+                    (size_t)logical_count * sizeof(uint32_t));
+                r->compound_arity_map = copy;
+                r->compound_kind = like->compound_kind;
+                r->compound_count = like->compound_count;
+                r->inline_physical_offset = like->inline_physical_offset;
+            }
+        }
+    }
     r->nrows = 0;
     return r;
 }

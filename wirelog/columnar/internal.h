@@ -1102,6 +1102,67 @@ int
 wl_col_rel_retract_inline_compound(col_rel_t *rel, uint32_t row_idx,
     uint32_t logical_col, int64_t multiplicity);
 
+/* ------------------------------------------------------------------------ */
+/* Inline-tier FILTER/PROJECT/LFTJ wiring helpers (Issue #534 Task #1).     */
+/*                                                                          */
+/* Pure, read-only resolvers that bridge the `logical` column identity used */
+/* by IR lowering (#531) to the `physical` column offsets used by the       */
+/* FILTER/PROJECT/LFTJ hot paths. K-Fusion isolation is preserved: each     */
+/* helper touches only the passed relation's own arity map / buffers, so a  */
+/* fused worker's per-worker snapshot stays isolated from sibling workers.  */
+/*                                                                          */
+/* Z-set semantics (Invariant #1): none of these helpers mutate multiplicity*/
+/* or timestamps; they are pure resolvers/comparators. Mutation is the      */
+/* responsibility of the store/retract ops + delta/timestamp layer.         */
+/* ------------------------------------------------------------------------ */
+
+/* Resolve the physical offset and slot width of a logical column in an
+ * INLINE-kind relation. On success writes *out_offset and *out_width and
+ * returns 0. Returns EINVAL when the relation is not INLINE, the arity
+ * map is absent, logical_col is out of range, or the prefix sum becomes
+ * inconsistent with the physical schema.
+ *
+ * K-Fusion C2 (§5): pure/read-only; safe to call from any worker thread on
+ * a per-worker-owned relation without synchronization. */
+int
+wl_col_rel_inline_locate(const col_rel_t *rel, uint32_t logical_col,
+    uint32_t *out_offset, uint32_t *out_width);
+
+/* Resolve the physical column index of the i-th argument of an inline
+ * compound at logical_col. Returns 0 and writes *out_physical_col on
+ * success; EINVAL if arg_idx >= compound width or locate fails. Intended
+ * for LFTJ callers that use a single inline argument as the join key. */
+int
+wl_col_rel_inline_arg_physical_col(const col_rel_t *rel, uint32_t logical_col,
+    uint32_t arg_idx, uint32_t *out_physical_col);
+
+/* FILTER helper: return non-zero if the inline compound at (row_idx,
+ * logical_col) equals the `expect` tuple element-for-element. Matches
+ * iff the locate succeeds, widths agree, and all arity args compare
+ * equal. Returns 0 on any mismatch or precondition failure. This is the
+ * hot-path equality predicate for authorization-style matches like
+ * `p(_, f(1,2), _)`.
+ *
+ * Multiplicity (Invariant #1): this helper only INSPECTS row content; the
+ * caller is responsible for preserving the source row's Z-set multiplicity
+ * when copying into the output relation. */
+int
+wl_col_rel_inline_compound_equals(const col_rel_t *rel, uint32_t row_idx,
+    uint32_t logical_col, const int64_t *expect, uint32_t expect_arity);
+
+/* PROJECT helper: copy the `width` physical slots of an inline compound
+ * from src[src_row] to dst[dst_row] starting at the logical_col offset.
+ * Both relations must be INLINE and the compound's arity must match; on
+ * any precondition failure returns EINVAL without mutating dst.
+ *
+ * Multiplicity (Invariant #1): this helper copies payload only. The
+ * caller is responsible for extending dst->nrows (via col_rel_append_row
+ * semantics) and preserving the source row's Z-set multiplicity so that
+ * consolidation can later collapse duplicates correctly. */
+int
+wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
+    const col_rel_t *src, uint32_t src_row, uint32_t logical_col);
+
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
 int

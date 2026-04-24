@@ -2300,6 +2300,24 @@ test_columnar_inline_exe = executable(
 test('columnar_inline', test_columnar_inline_exe)
 
 # ============================================================================
+# FILTER/PROJECT/LFTJ inline wiring unit tests (Issue #534 Task #1)
+# ============================================================================
+
+test_inline_compound_wiring_exe = executable(
+  'test_inline_compound_wiring',
+  files('test_inline_compound_wiring.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('inline_compound_wiring', test_inline_compound_wiring_exe)
+
+# ============================================================================
 # K-Fusion deep-copy + inline compound visibility (Issue #532 Task 4)
 # ============================================================================
 
@@ -2316,6 +2334,97 @@ test_k_fusion_inline_shadow_exe = executable(
 )
 
 test('k_fusion_inline_shadow', test_k_fusion_inline_shadow_exe, timeout: 60)
+
+# ============================================================================
+# K-Fusion Correctness Tests (Issue #534 Task 5)
+# Verifies K=1/K=2/K=4/K=8 byte-for-byte output equivalence via fingerprint
+# ============================================================================
+
+test_k_fusion_correctness_exe = executable(
+  'test_k_fusion_correctness',
+  files('test_k_fusion_correctness.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  io_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('k_fusion_correctness', test_k_fusion_correctness_exe, timeout: 60)
+
+# ============================================================================
+# K=4 Inline Compound Authorization E2E (Issue #534 Task 5 - Auth Use Case)
+# ============================================================================
+
+test_e2e_kfusion_k4_inline_exe = executable(
+  'test_e2e_kfusion_k4_inline',
+  files('test_e2e_kfusion_k4_inline.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('e2e_kfusion_k4_inline', test_e2e_kfusion_k4_inline_exe, timeout: 60)
+
+# ============================================================================
+# TSan stress: K=4 concurrent readers over nested inline compound (Issue #534 Task 3)
+# K=4 workers x 10k iterations over scope(metadata(t,ts,loc,risk)) inline/4.
+# + 100 insert/delete lifecycle cycles with K=4 concurrent readers per epoch.
+# TSan clean == 0 data races on inline column buffers.
+# ============================================================================
+
+test_e2e_tsan_inline_kfusion_exe = executable(
+  'test_e2e_tsan_inline_kfusion',
+  files('test_e2e_tsan_inline_kfusion.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('e2e_tsan_inline_kfusion', test_e2e_tsan_inline_kfusion_exe,
+     suite: 'tsan',
+     timeout: 180)
+
+# ============================================================================
+# ASan stress: K=4 workers, nested inline + side-relation arena GC (Issue #534 Task 4)
+# K=4 independent workers x 2500 cycles: arena alloc/retain/gc + inline store/retrieve.
+# + arena freeze/unfreeze correctness under K-Fusion epoch model.
+# ASan clean == 0 leaks, 0 use-after-free.
+# ============================================================================
+
+test_e2e_asan_side_relation_nested_exe = executable(
+  'test_e2e_asan_side_relation_nested',
+  files('test_e2e_asan_side_relation_nested.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  files('../wirelog/arena/compound_arena.c'),
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('e2e_asan_side_relation_nested', test_e2e_asan_side_relation_nested_exe,
+     suite: 'asan',
+     timeout: 120)
 
 # ============================================================================
 # Per-Worker Session State (Issue #315)
