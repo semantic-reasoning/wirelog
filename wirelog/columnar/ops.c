@@ -4608,6 +4608,180 @@ col_op_k_fusion_worker(void *ctx)
 }
 
 /**
+ * K-Fusion W=1 serial fast-path (Issue #549).
+ *
+ * Why this is safe:
+ *   At num_workers <= 1 there is only one thread, so the per-worker session
+ *   clone / arena / delta_pool machinery exists purely to isolate concurrent
+ *   workers that no longer exist. Arrangements and mat_cache are stateful
+ *   caches that the engine rebuilds on demand, so executing K branches
+ *   sequentially against the parent sess cannot race and cannot change the
+ *   computed result. Skipping the 375-per-iter arrangement clones is pure
+ *   profit for workloads like DOOP at W=1.
+ *
+ * The parallel path deliberately drops any mat_cache entries its workers
+ * produced during a dispatch (workers start with count=0, cleanup frees
+ * from index 0). Mirror that invariant here by snapshotting sess->mat_cache
+ * count on entry and trimming any branch-added entries on return, so outside
+ * code sees identical K-Fusion side-effects regardless of worker count.
+ */
+static int
+col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess)
+{
+    wl_plan_op_k_fusion_t *meta = (wl_plan_op_k_fusion_t *)op->opaque_data;
+    uint32_t k = meta->k;
+
+    uint64_t _phase_t0 = now_ns();
+    col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
+    COL_SESSION(sess)->kfusion_alloc_ns += now_ns() - _phase_t0;
+    if (!results)
+        return ENOMEM;
+
+    /* Snapshot mat_cache so branch-added entries don't leak past K-Fusion
+     * (parity with parallel path which discards all worker additions). */
+    uint32_t mat_base = sess->mat_cache.count;
+
+    /* Snapshot delta_pool->slot_used so any intermediate pool-allocated
+     * relations produced by branch evaluation (VARIABLE FORCE_EMPTY,
+     * JOIN/SEMIJOIN outputs, etc.) can have their heap-allocated fields
+     * (name, columns, col_names) freed in cleanup.  The parallel path gets
+     * this for free by owning a per-worker delta_pool that is fully
+     * destroyed at teardown; the serial path shares the parent pool and
+     * must sweep the range itself (#549 ASAN fix). */
+    uint32_t pool_slot_base
+        = sess->delta_pool ? sess->delta_pool->slot_used : 0;
+
+    int rc = 0;
+    uint32_t n_results = 0;
+
+    /* Evaluate each K branch sequentially against the parent session. */
+    _phase_t0 = now_ns();
+    for (uint32_t d = 0; d < k; d++) {
+        wl_plan_relation_t plan_data;
+        plan_data.name = "<k_fusion_copy>";
+        plan_data.delta_name = NULL;
+        plan_data.ops = meta->k_ops[d];
+        plan_data.op_count = meta->k_op_counts[d];
+
+        /* Per-copy empty-delta skip (issue #85): if this copy references an
+         * empty/absent delta on iteration > 0, skip — produces 0 rows. */
+        if (has_empty_forced_delta(&plan_data, sess, sess->current_iteration))
+            continue;
+
+        eval_stack_t s;
+        eval_stack_init(&s);
+        int branch_rc = col_eval_relation_plan(&plan_data, &s, sess);
+        if (branch_rc != 0) {
+            rc = branch_rc;
+            eval_stack_drain(&s);
+            goto cleanup;
+        }
+
+        eval_entry_t e = eval_stack_pop(&s);
+        if (!e.rel) {
+            rc = EINVAL;
+            eval_stack_drain(&s);
+            goto cleanup;
+        }
+
+        /* If not owned, share columns zero-copy (parity with parallel path). */
+        if (!e.owned) {
+            col_rel_t *copy = col_rel_pool_new_like(sess->delta_pool,
+                    "<k_fusion_copy>", e.rel);
+            if (!copy) {
+                rc = ENOMEM;
+                eval_stack_drain(&s);
+                goto cleanup;
+            }
+            copy->col_shared = (bool *)calloc(e.rel->ncols, sizeof(bool));
+            if (copy->col_shared) {
+                for (uint32_t c = 0; c < e.rel->ncols; c++) {
+                    free(copy->columns[c]); /* free pool-allocated column */
+                    copy->columns[c] = e.rel->columns[c];
+                    copy->col_shared[c] = true;
+                }
+            } else {
+                /* Fallback: deep copy on alloc failure */
+                for (uint32_t c = 0; c < e.rel->ncols; c++)
+                    memcpy(copy->columns[c], e.rel->columns[c],
+                        (size_t)e.rel->nrows * sizeof(int64_t));
+            }
+            copy->nrows = e.rel->nrows;
+            results[n_results++] = copy;
+        } else {
+            results[n_results++] = e.rel;
+        }
+        eval_stack_drain(&s);
+    }
+    COL_SESSION(sess)->kfusion_dispatch_ns += now_ns() - _phase_t0;
+
+    /* Merge: inputs are sorted+deduped (CONSOLIDATE is each branch's last op). */
+    _phase_t0 = now_ns();
+    {
+        col_rel_t *merged;
+        if (n_results == 0) {
+            /* All copies skipped: empty output with target relation schema. */
+            uint32_t ncols = 0;
+            if (op->relation_name) {
+                col_rel_t *target = session_find_rel(sess, op->relation_name);
+                if (target)
+                    ncols = target->ncols;
+            }
+            merged = col_rel_new_auto("$kfusion_empty", ncols);
+        } else {
+            merged = col_rel_merge_k(results, n_results);
+        }
+        if (!merged) {
+            rc = ENOMEM;
+            goto cleanup;
+        }
+        rc = eval_stack_push(stack, merged, true);
+        if (rc != 0)
+            col_rel_destroy(merged);
+    }
+    COL_SESSION(sess)->kfusion_merge_ns += now_ns() - _phase_t0;
+
+cleanup:
+    _phase_t0 = now_ns();
+    for (uint32_t d = 0; d < n_results; d++) {
+        if (results[d])
+            col_rel_destroy(results[d]);
+    }
+    /* Trim mat_cache back to pre-dispatch baseline. Entries added by branches
+     * are owned by the cache and must be freed the same way the parallel path
+     * frees its worker caches. */
+    {
+        col_mat_cache_t *mc = &sess->mat_cache;
+        for (uint32_t i = mat_base; i < mc->count; i++) {
+            col_rel_destroy(mc->entries[i].result);
+            mc->total_bytes -= mc->entries[i].mem_bytes;
+        }
+        mc->count = mat_base;
+    }
+    /* Sweep any pool slots allocated during branch eval (#549 ASAN fix).
+     * Slots whose relations were already col_rel_destroy'd upstream are
+     * zeroed and this walk is a safe no-op for them (free(NULL) chains).
+     * Slots still holding heap pointers (e.g. intermediate $empty_skip
+     * names, JOIN $join_out names that the engine left dangling in the
+     * parent pool) get their name/columns/col_names/etc. freed here.
+     * After the sweep we reclaim slot_used so the pool can reuse the
+     * range for the next K-Fusion dispatch. */
+    if (sess->delta_pool) {
+        delta_pool_t *dp = sess->delta_pool;
+        for (uint32_t s = pool_slot_base; s < dp->slot_used; s++) {
+            col_rel_t *pr = (col_rel_t *)(dp->slab
+                + (size_t)s * dp->slot_size);
+            col_rel_free_contents(pr);
+        }
+        dp->slot_used = pool_slot_base;
+    }
+    free(results);
+    COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
+    return rc;
+}
+
+/**
  * K-Fusion operator: evaluate K copies of a relation plan via workqueue,
  * merge results with deduplication, and push result onto stack.
  *
@@ -4627,6 +4801,11 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t k = meta->k;
     if (k == 0)
         return EINVAL;
+
+    /* Issue #549: W=1 fast-path. Skip per-worker clone/arena/delta_pool
+     * machinery when there's only one thread — pure overhead otherwise. */
+    if (sess->wq == NULL && sess->num_workers <= 1)
+        return col_op_k_fusion_serial(op, stack, sess);
 
     uint64_t _phase_t0 = now_ns();
     col_rel_t **results = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
