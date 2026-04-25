@@ -418,7 +418,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         }
         col_mat_cache_clear(&sess->mat_cache);
         delta_pool_reset(sess->delta_pool);
-        wl_arena_reset(sess->eval_arena);
+        sess->rotation_ops->rotate_eval_arena(sess);
 
         /* Non-recursive stratum frontier: record convergence epoch and iteration.
         * Non-recursive strata always converge at iteration UINT32_MAX (no loop),
@@ -889,7 +889,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             }
 
             delta_pool_reset(sess->delta_pool);
-            wl_arena_reset(sess->eval_arena);
+            sess->rotation_ops->rotate_eval_arena(sess);
             /* Issue #176: Per-sub-pass cache eviction for recursive strata.
              * Use configurable eviction threshold (cache_evict_threshold):
              * - If 0: clear entire cache each sub-pass (backward compatible)
@@ -974,7 +974,7 @@ stride_error:
     free(snap);
     free(delta_rels);
     delta_pool_reset(sess->delta_pool);
-    wl_arena_reset(sess->eval_arena);
+    sess->rotation_ops->rotate_eval_arena(sess);
     col_mat_cache_clear(&sess->mat_cache);
 
     return 0;
@@ -2145,7 +2145,7 @@ tdd_worker_subpass_fn(void *arg)
 
     /* Reset per-sub-pass allocators and cache (eval.c:716-727) */
     delta_pool_reset(sess->delta_pool);
-    wl_arena_reset(sess->eval_arena);
+    sess->rotation_ops->rotate_eval_arena(sess);
     if (sess->cache_evict_threshold == 0) {
         col_mat_cache_clear(&sess->mat_cache);
     } else {
