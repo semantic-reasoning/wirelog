@@ -1058,6 +1058,84 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
      * calloc above already zeroed every byte, so no explicit assignment
      * is required here -- the comment is the contract.
      */
+
+    /*
+     * Group A: column buffers.  Allocate a private ncols x capacity grid
+     * via col_columns_alloc, then memcpy the live nrows of each column.
+     * Reading through src->columns[c] is correct even when col_shared[c]
+     * is true (the buffer is borrowed-readable); the copy unconditionally
+     * owns its storage so col_shared stays NULL on dst (Group J).
+     */
+    if (src->ncols > 0u && src->capacity > 0u) {
+        dst->columns = col_columns_alloc(src->ncols, src->capacity);
+        if (!dst->columns) {
+            col_rel_free_contents(dst);
+            free(dst);
+            return ENOMEM;
+        }
+        if (src->columns) {
+            for (uint32_t c = 0; c < src->ncols; c++) {
+                if (src->columns[c] && src->nrows > 0u) {
+                    memcpy(dst->columns[c], src->columns[c],
+                        (size_t)src->nrows * sizeof(int64_t));
+                }
+            }
+        }
+    }
+
+    /*
+     * Group B: col_names array + ArrowSchema (manual reinit).
+     *
+     * Schema is rebuilt the same way col_rel_set_schema does it
+     * (ArrowSchemaInit + ArrowSchemaSetTypeStruct + per-child
+     * ArrowSchemaInitFromType + ArrowSchemaSetName) rather than
+     * memcpy'd; the ArrowSchema release callback would otherwise
+     * alias between src and dst, leading to a double-release.
+     */
+    if (src->ncols > 0u && src->col_names) {
+        dst->col_names = (char **)calloc(src->ncols, sizeof(char *));
+        if (!dst->col_names) {
+            col_rel_free_contents(dst);
+            free(dst);
+            return ENOMEM;
+        }
+        for (uint32_t i = 0; i < src->ncols; i++) {
+            if (src->col_names[i]) {
+                dst->col_names[i] = wl_strdup(src->col_names[i]);
+                if (!dst->col_names[i]) {
+                    col_rel_free_contents(dst);
+                    free(dst);
+                    return ENOMEM;
+                }
+            }
+        }
+    }
+
+    if (src->schema_ok) {
+        ArrowSchemaInit(&dst->schema);
+        if (ArrowSchemaSetTypeStruct(&dst->schema, (int64_t)src->ncols)
+            != NANOARROW_OK) {
+            ArrowSchemaRelease(&dst->schema);
+            col_rel_free_contents(dst);
+            free(dst);
+            return ENOMEM;
+        }
+        for (uint32_t i = 0; i < src->ncols; i++) {
+            if (ArrowSchemaInitFromType(dst->schema.children[i],
+                NANOARROW_TYPE_INT64)
+                != NANOARROW_OK) {
+                ArrowSchemaRelease(&dst->schema);
+                col_rel_free_contents(dst);
+                free(dst);
+                return ENOMEM;
+            }
+            const char *cname = (dst->col_names && dst->col_names[i])
+                ? dst->col_names[i] : "";
+            ArrowSchemaSetName(dst->schema.children[i], cname);
+        }
+        dst->schema_ok = true;
+    }
+
     *out = dst;
     return 0;
 }
