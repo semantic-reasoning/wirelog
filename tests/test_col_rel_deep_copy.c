@@ -186,6 +186,174 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Group A + Group B: columns, schema, col_names (Issue #553 Commit 2)      */
+/* ======================================================================== */
+
+/* Helper: build a 3-col, N-row relation with deterministic content. */
+static col_rel_t *
+build_populated(const char *name, uint32_t nrows)
+{
+    col_rel_t *r = NULL;
+    if (col_rel_alloc(&r, name) != 0)
+        return NULL;
+    const char *names[3] = { "alpha", "beta", "gamma" };
+    if (col_rel_set_schema(r, 3u, names) != 0) {
+        col_rel_destroy(r);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < nrows; i++) {
+        int64_t row[3] = {
+            (int64_t)i,
+            (int64_t)(i * 10),
+            (int64_t)(i * 100),
+        };
+        if (col_rel_append_row(r, row) != 0) {
+            col_rel_destroy(r);
+            return NULL;
+        }
+    }
+    return r;
+}
+
+static void
+test_columns_independent_after_modify(void)
+{
+    TEST("Group A: column buffers are independent after mutation");
+    col_rel_t *src = build_populated("src", 5u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->columns != src->columns,
+        "columns array pointer aliased between src and dst");
+    for (uint32_t c = 0; c < src->ncols; c++) {
+        ASSERT(dst->columns[c] != src->columns[c],
+            "per-column buffer aliased");
+    }
+
+    /* Mutate every cell on dst and verify src is unchanged. */
+    for (uint32_t r0 = 0; r0 < dst->nrows; r0++) {
+        for (uint32_t c = 0; c < dst->ncols; c++) {
+            col_rel_set(dst, r0, c, (int64_t)-1);
+        }
+    }
+    for (uint32_t r0 = 0; r0 < src->nrows; r0++) {
+        ASSERT(col_rel_get(src, r0, 0) == (int64_t)r0,
+            "src col 0 perturbed by dst mutation");
+        ASSERT(col_rel_get(src, r0, 1) == (int64_t)(r0 * 10),
+            "src col 1 perturbed by dst mutation");
+        ASSERT(col_rel_get(src, r0, 2) == (int64_t)(r0 * 100),
+            "src col 2 perturbed by dst mutation");
+    }
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+static void
+test_col_names_independent(void)
+{
+    TEST("Group B: col_names strings are independent");
+    col_rel_t *src = build_populated("src", 1u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->col_names != NULL, "dst col_names not allocated");
+    ASSERT(dst->col_names != src->col_names,
+        "col_names array pointer aliased");
+    for (uint32_t i = 0; i < src->ncols; i++) {
+        ASSERT(dst->col_names[i] != src->col_names[i],
+            "per-name buffer aliased");
+        ASSERT(strcmp(dst->col_names[i], src->col_names[i]) == 0,
+            "col_names content mismatch");
+    }
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+static void
+test_schema_round_trip(void)
+{
+    TEST("Group B: ArrowSchema is independently reinit'd");
+    col_rel_t *src = build_populated("src", 1u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+    ASSERT(src->schema_ok == true, "src schema_ok unexpectedly false");
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->schema_ok == true, "dst schema_ok not set");
+    ASSERT(dst->schema.release != NULL, "dst schema release callback NULL");
+    /* The format string ("+s" for struct) is independently allocated by
+     * ArrowSchemaSetTypeStruct -- if it were aliased, release of either
+     * schema would corrupt the other.  This is the cheapest single-check
+     * proof that the schemas are not bit-copies. */
+    ASSERT(dst->schema.format != src->schema.format,
+        "ArrowSchema format buffer aliased between src and dst");
+    ASSERT(dst->schema.children != src->schema.children,
+        "ArrowSchema children array aliased between src and dst");
+    ASSERT(dst->schema.n_children == src->schema.n_children,
+        "n_children mismatch");
+    for (int64_t i = 0; i < src->schema.n_children; i++) {
+        ASSERT(dst->schema.children[i] != src->schema.children[i],
+            "per-child schema aliased");
+        ASSERT(dst->schema.children[i]->name != NULL,
+            "per-child name not set");
+        ASSERT(strcmp(dst->schema.children[i]->name,
+            src->schema.children[i]->name) == 0,
+            "per-child schema name mismatch");
+    }
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+static void
+test_destroy_source_copy_still_valid(void)
+{
+    TEST("destroying src after deep-copy leaves dst fully usable");
+    col_rel_t *src = build_populated("src", 4u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+
+    /* Destroy src first so any aliased pointer would dangle. */
+    col_rel_destroy(src);
+    src = NULL;
+
+    /* Confirm dst still reports correct content. */
+    ASSERT(dst->ncols == 3u, "dst ncols corrupted post-src-destroy");
+    ASSERT(dst->nrows == 4u, "dst nrows corrupted post-src-destroy");
+    for (uint32_t r0 = 0; r0 < dst->nrows; r0++) {
+        ASSERT(col_rel_get(dst, r0, 0) == (int64_t)r0,
+            "dst col 0 corrupted post-src-destroy");
+        ASSERT(col_rel_get(dst, r0, 1) == (int64_t)(r0 * 10),
+            "dst col 1 corrupted post-src-destroy");
+        ASSERT(col_rel_get(dst, r0, 2) == (int64_t)(r0 * 100),
+            "dst col 2 corrupted post-src-destroy");
+    }
+    ASSERT(strcmp(dst->name, "src") == 0,
+        "dst name corrupted post-src-destroy");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -199,6 +367,10 @@ main(void)
     test_empty_0x0_relation();
     test_design_invariants_zero_state();
     test_graph_metadata_round_trip();
+    test_columns_independent_after_modify();
+    test_col_names_independent();
+    test_schema_round_trip();
+    test_destroy_source_copy_still_valid();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);
