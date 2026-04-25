@@ -14,6 +14,7 @@
 
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/wirelog-types.h"
+#include "col_rel_deep_copy_fixture.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -132,17 +133,12 @@ test_design_invariants_zero_state(void)
     rc = col_rel_deep_copy(src, &dst, NULL);
     ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
 
-    /* Group I: ownership flags reset, ledger NULL. */
-    ASSERT(dst->pool_owned == false, "pool_owned leaked from src");
-    ASSERT(dst->arena_owned == false, "arena_owned leaked from src");
-    ASSERT(dst->mem_ledger == NULL, "mem_ledger not reset");
-
-    /* Group J: caches cleared. */
-    ASSERT(dst->dedup_slots == NULL, "dedup_slots not reset");
-    ASSERT(dst->dedup_cap == 0u, "dedup_cap not reset");
-    ASSERT(dst->dedup_count == 0u, "dedup_count not reset");
-    ASSERT(dst->col_shared == NULL, "col_shared not reset");
-    ASSERT(dst->row_scratch == NULL, "row_scratch not reset");
+    /* Issue #556 framework: collapse the per-field R-1/R-2/R-3 checks
+     * into one fixture call.  The helper enforces the same surface
+     * (pool_owned, arena_owned, mem_ledger, col_shared, dedup_slots/cap/
+     * count, row_scratch) that this test asserted explicitly before. */
+    ASSERT(deep_copy_fixture_assert_design_invariants(dst) == 1,
+        "design invariants violated on dst");
 
     /* Restore src ownership flags so destroy paths behave correctly. */
     src->pool_owned = false;
@@ -219,12 +215,20 @@ static void
 test_columns_independent_after_modify(void)
 {
     TEST("Group A: column buffers are independent after mutation");
-    col_rel_t *src = build_populated("src", 5u);
+    /* Issue #556 framework: build src via the deterministic fixture
+     * helper.  The fixture content pattern is columns[c][r] = r*ncols+c
+     * so we can recompute expected values without storing them. */
+    const uint32_t fx_nrows = 5u;
+    const uint32_t fx_ncols = 3u;
+    col_rel_t *src = deep_copy_fixture_make_relation("src", fx_nrows,
+            fx_ncols);
     col_rel_t *dst = NULL;
-    ASSERT(src != NULL, "build_populated failed");
+    ASSERT(src != NULL, "fixture make_relation failed");
 
     int rc = col_rel_deep_copy(src, &dst, NULL);
     ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(deep_copy_fixture_assert_design_invariants(dst) == 1,
+        "dst design invariants violated");
     ASSERT(dst->columns != src->columns,
         "columns array pointer aliased between src and dst");
     for (uint32_t c = 0; c < src->ncols; c++) {
@@ -239,12 +243,12 @@ test_columns_independent_after_modify(void)
         }
     }
     for (uint32_t r0 = 0; r0 < src->nrows; r0++) {
-        ASSERT(col_rel_get(src, r0, 0) == (int64_t)r0,
-            "src col 0 perturbed by dst mutation");
-        ASSERT(col_rel_get(src, r0, 1) == (int64_t)(r0 * 10),
-            "src col 1 perturbed by dst mutation");
-        ASSERT(col_rel_get(src, r0, 2) == (int64_t)(r0 * 100),
-            "src col 2 perturbed by dst mutation");
+        for (uint32_t c = 0; c < src->ncols; c++) {
+            int64_t expected = (int64_t)((uint64_t)r0
+                * (uint64_t)fx_ncols + (uint64_t)c);
+            ASSERT(col_rel_get(src, r0, c) == expected,
+                "src perturbed by dst mutation");
+        }
     }
 
     PASS();
@@ -257,21 +261,21 @@ static void
 test_col_names_independent(void)
 {
     TEST("Group B: col_names strings are independent");
-    col_rel_t *src = build_populated("src", 1u);
+    /* Issue #556 framework: src built via fixture helper.  The
+     * pointer-aliasing/content-equality checks below are exactly what
+     * deep_copy_fixture_assert_relations_equal already enforces, so we
+     * piggy-back on it as the primary assertion. */
+    col_rel_t *src = deep_copy_fixture_make_relation("src", 1u, 3u);
     col_rel_t *dst = NULL;
-    ASSERT(src != NULL, "build_populated failed");
+    ASSERT(src != NULL, "fixture make_relation failed");
 
     int rc = col_rel_deep_copy(src, &dst, NULL);
     ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(deep_copy_fixture_assert_design_invariants(dst) == 1,
+        "dst design invariants violated");
+    ASSERT(deep_copy_fixture_assert_relations_equal(src, dst) == 1,
+        "src and dst observable content not equal");
     ASSERT(dst->col_names != NULL, "dst col_names not allocated");
-    ASSERT(dst->col_names != src->col_names,
-        "col_names array pointer aliased");
-    for (uint32_t i = 0; i < src->ncols; i++) {
-        ASSERT(dst->col_names[i] != src->col_names[i],
-            "per-name buffer aliased");
-        ASSERT(strcmp(dst->col_names[i], src->col_names[i]) == 0,
-            "col_names content mismatch");
-    }
 
     PASS();
 cleanup:
