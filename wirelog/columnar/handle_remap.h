@@ -39,11 +39,13 @@
  * Error Codes
  * ========================================================================
  *
- * Operations return 0 on success and a negative errno on failure:
+ * Operations return 0 on success and a positive errno on failure, to
+ * match the existing convention in wirelog/columnar/ (e.g. session.c,
+ * eval.c return ENOMEM / EINVAL / ENOENT directly):
  *
- *   WL_ERROR_INVALID_ARGS   (-EINVAL)  bad argument (NULL out, key == 0)
- *   WL_ERROR_OOM            (-ENOMEM)  allocation failed
- *   WL_ERROR_NOT_FOUND      (-ENOENT)  reserved for future find_or_fail
+ *   WL_ERROR_INVALID_ARGS   (EINVAL)   bad argument (NULL out, key == 0)
+ *   WL_ERROR_OOM            (ENOMEM)   allocation failed
+ *   WL_ERROR_NOT_FOUND      (ENOENT)   reserved for future find_or_fail
  *
  * `wl_handle_remap_lookup` does not return an error on miss; it
  * returns 0 (WL_COMPOUND_HANDLE_NULL). Since NULL is never a valid
@@ -58,15 +60,15 @@
 #include <stdint.h>
 
 #ifndef WL_ERROR_INVALID_ARGS
-#define WL_ERROR_INVALID_ARGS (-EINVAL)
+#define WL_ERROR_INVALID_ARGS EINVAL
 #endif
 
 #ifndef WL_ERROR_OOM
-#define WL_ERROR_OOM (-ENOMEM)
+#define WL_ERROR_OOM ENOMEM
 #endif
 
 #ifndef WL_ERROR_NOT_FOUND
-#define WL_ERROR_NOT_FOUND (-ENOENT)
+#define WL_ERROR_NOT_FOUND ENOENT
 #endif
 
 /**
