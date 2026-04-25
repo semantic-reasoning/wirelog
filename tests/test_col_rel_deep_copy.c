@@ -354,6 +354,78 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Group C: timestamps (Issue #553 Commit 3)                                */
+/* ======================================================================== */
+
+static void
+test_timestamps_round_trip(void)
+{
+    TEST("Group C: timestamps array is deep-copied (capacity-sized)");
+    col_rel_t *src = build_populated("ts_src", 3u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+
+    /* Manually attach a timestamps buffer matching src->capacity.  In
+     * production col_eval_stratum / append-with-ts paths populate this;
+     * here we wire it up directly to keep the test self-contained. */
+    src->timestamps = (col_delta_timestamp_t *)calloc(src->capacity,
+            sizeof(col_delta_timestamp_t));
+    ASSERT(src->timestamps != NULL, "calloc src timestamps failed");
+    for (uint32_t i = 0; i < src->nrows; i++) {
+        src->timestamps[i].iteration = i + 1u;
+        src->timestamps[i].stratum = 2u;
+        src->timestamps[i].worker = 0u;
+        src->timestamps[i].multiplicity = 1;
+    }
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->timestamps != NULL, "dst timestamps not allocated");
+    ASSERT(dst->timestamps != src->timestamps,
+        "timestamps buffer aliased between src and dst");
+    for (uint32_t i = 0; i < src->nrows; i++) {
+        ASSERT(dst->timestamps[i].iteration == src->timestamps[i].iteration,
+            "iteration mismatch");
+        ASSERT(dst->timestamps[i].stratum == src->timestamps[i].stratum,
+            "stratum mismatch");
+        ASSERT(dst->timestamps[i].multiplicity
+            == src->timestamps[i].multiplicity,
+            "multiplicity mismatch");
+    }
+
+    /* Mutate src timestamps and confirm dst stays unchanged. */
+    src->timestamps[0].iteration = 9999u;
+    ASSERT(dst->timestamps[0].iteration == 1u,
+        "dst timestamps perturbed by src mutation");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+static void
+test_timestamps_null_when_src_null(void)
+{
+    TEST("Group C: NULL src timestamps -> NULL dst timestamps");
+    col_rel_t *src = build_populated("no_ts_src", 2u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+    ASSERT(src->timestamps == NULL,
+        "src timestamps unexpectedly non-NULL by default");
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->timestamps == NULL,
+        "dst timestamps allocated despite src being NULL");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -371,6 +443,8 @@ main(void)
     test_col_names_independent();
     test_schema_round_trip();
     test_destroy_source_copy_still_valid();
+    test_timestamps_round_trip();
+    test_timestamps_null_when_src_null();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);

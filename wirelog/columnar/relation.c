@@ -1111,6 +1111,24 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
         }
     }
 
+    /*
+     * Group C: timestamps array.  Sized to capacity (not nrows) so that
+     * append_row paths after the copy do not need to grow the timestamps
+     * buffer in lockstep with the columns buffer.  Skipped when src has
+     * timestamp tracking disabled (timestamps == NULL).
+     */
+    if (src->timestamps && src->capacity > 0u) {
+        dst->timestamps = (col_delta_timestamp_t *)malloc(
+            (size_t)src->capacity * sizeof(col_delta_timestamp_t));
+        if (!dst->timestamps) {
+            col_rel_free_contents(dst);
+            free(dst);
+            return ENOMEM;
+        }
+        memcpy(dst->timestamps, src->timestamps,
+            (size_t)src->capacity * sizeof(col_delta_timestamp_t));
+    }
+
     if (src->schema_ok) {
         ArrowSchemaInit(&dst->schema);
         if (ArrowSchemaSetTypeStruct(&dst->schema, (int64_t)src->ncols)
