@@ -16,6 +16,7 @@
 
 #include "wirelog/util/log.h"
 
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -182,8 +183,8 @@ wl_compound_arena_alloc(wl_compound_arena_t *arena, uint32_t size)
     uint64_t handle = wl_compound_handle_pack(arena->session_seed,
             arena->current_epoch, offset);
     WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_TRACE,
-        "handle_alloc(epoch=%u, offset=%u, packed=0x%lx)",
-        arena->current_epoch, offset, (unsigned long)handle);
+        "handle_alloc(epoch=%u, offset=%u, packed=0x%" PRIx64 ")",
+        arena->current_epoch, offset, handle);
     return handle;
 }
 
@@ -319,8 +320,8 @@ wl_compound_arena_gc_epoch_boundary(wl_compound_arena_t *arena)
     else
         arena->current_epoch = arena->max_epochs; /* sentinel: saturated */
     WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_INFO,
-        "gc_epoch_boundary(epoch=%u, freed_handles=%u, remaining=%lu)",
-        closed_epoch, reclaimed, (unsigned long)arena->live_handles);
+        "gc_epoch_boundary(epoch=%u, freed_handles=%u, remaining=%" PRIu64 ")",
+        closed_epoch, reclaimed, arena->live_handles);
     if (arena->current_epoch + 5u >= arena->max_epochs) {
         WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_WARN,
             "epoch nearing saturation (current=%u, max=%u)",
