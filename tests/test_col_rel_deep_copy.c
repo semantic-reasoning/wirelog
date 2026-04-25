@@ -714,6 +714,60 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Large-buffer integration (Issue #553 Commit 7)                           */
+/* ======================================================================== */
+
+static void
+test_large_relation_buffers(void)
+{
+    /* 5M rows x 1 col x sizeof(int64_t) ~= 40 MB.  Smaller than the
+     * issue body's 100 MB target so CI stays fast, but big enough to
+     * exercise the bulk allocation + memcpy paths and prove the deep
+     * copy survives realistic workloads. */
+    TEST("large 5M-row x 1-col relation deep-copies cleanly");
+    const uint32_t target_rows = 5u * 1000u * 1000u;
+    col_rel_t *src = NULL;
+    col_rel_t *dst = NULL;
+    int rc = col_rel_alloc(&src, "large_src");
+    ASSERT(rc == 0 && src != NULL, "col_rel_alloc src failed");
+    const char *names[1] = { "id" };
+    ASSERT(col_rel_set_schema(src, 1u, names) == 0, "set_schema failed");
+    for (uint32_t i = 0; i < target_rows; i++) {
+        int64_t row[1] = { (int64_t)i };
+        ASSERT(col_rel_append_row(src, row) == 0, "append_row failed");
+    }
+    ASSERT(src->nrows == target_rows, "src nrows mismatch after build");
+
+    rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "large deep-copy failed");
+    ASSERT(dst->nrows == src->nrows, "dst nrows mismatch");
+    ASSERT(dst->columns != src->columns, "columns array aliased");
+    ASSERT(dst->columns[0] != src->columns[0], "column buffer aliased");
+
+    /* Spot-check head, midpoint and tail; full equality would dominate
+     * test wall-clock without adding coverage. */
+    ASSERT(col_rel_get(dst, 0u, 0) == 0,
+        "dst[0] mismatch");
+    ASSERT(col_rel_get(dst, target_rows / 2u, 0)
+        == (int64_t)(target_rows / 2u),
+        "dst midpoint mismatch");
+    ASSERT(col_rel_get(dst, target_rows - 1u, 0)
+        == (int64_t)(target_rows - 1u),
+        "dst tail mismatch");
+
+    /* Mutate src tail; dst stays independent. */
+    col_rel_set(src, target_rows - 1u, 0, (int64_t)-1);
+    ASSERT(col_rel_get(dst, target_rows - 1u, 0)
+        == (int64_t)(target_rows - 1u),
+        "dst tail aliased through src");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -739,6 +793,7 @@ main(void)
     test_retract_backup_copy_when_present();
     test_compound_arity_map_round_trip_inline();
     test_compound_arity_map_corrupt_input_degrades();
+    test_large_relation_buffers();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);

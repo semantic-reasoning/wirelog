@@ -996,21 +996,58 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
 
 /* ---- deep copy ----------------------------------------------------------- */
 
-/*
- * col_rel_deep_copy (Issue #553):
- * Produce a fully-owned deep copy of `src`.  See the contract in
- * wirelog/columnar/internal.h next to the declaration.
+/**
+ * @brief Produce a fully-owned deep copy of a col_rel_t (Issue #553).
  *
- * Implementation strategy: zero-allocate `dst` with calloc so that
- * col_rel_free_contents is safe to call at any unwind point.  All Group
- * I/J fields (pool/arena ownership, ledgers, caches, sharing) start at
- * their zero defaults and are NEVER inherited from src.
+ * Allocates a new heap-resident relation and clones every owned buffer
+ * and metadata field so the result is byte-equivalent to @p src yet
+ * shares no storage with it.  Mutating either side after the call (data
+ * appends, schema upgrades, retraction, consolidation) leaves the other
+ * untouched.  This is the K-Fusion isolation primitive: callers that
+ * need to fork a relation across worker boundaries should use this in
+ * preference to col_rel_new_like + replay.
  *
- * NOTE: This commit ships the scaffold (Issue #553 Commit 1) covering
- * Groups H, I, J and the scalar bookkeeping fields.  Subsequent commits
- * land Groups A/B (columns + schema + names), C (timestamps), D+F
- * (merge buffer + run tracking), E (retract backup), and G (compound
- * metadata).  At this stage callers may only deep-copy 0x0 relations.
+ * Field-group taxonomy (per #553 body):
+ *   - Groups A/B: columns, col_names, ArrowSchema -- deep copied.  The
+ *     ArrowSchema is rebuilt via the same manual reinit used by
+ *     col_rel_set_schema (ArrowSchemaInit + ArrowSchemaSetTypeStruct +
+ *     per-child ArrowSchemaInitFromType + ArrowSchemaSetName).  The
+ *     schema struct is NEVER bit-copied because the release callback /
+ *     private_data would alias and trigger a double-release on destroy.
+ *   - Group C: timestamps array sized to capacity (not nrows).
+ *   - Group D: persistent merge buffer sized to merge_buf_cap.
+ *   - Group E: retraction backup defensively deep-copied if populated.
+ *   - Group F: run_count + run_ends fixed array memcpy'd.
+ *   - Group G: compound_arity_map cloned via col_rel_clone_compound_meta;
+ *     corrupt arity maps degrade dst to NONE-kind (matches new_like).
+ *   - Group H: has_graph_column, graph_col_idx direct copy.
+ *   - Group I: pool_owned, arena_owned, mem_ledger always reset.
+ *   - Group J: dedup_*, col_shared, row_scratch always reset; any cache
+ *     state will be rebuilt lazily on demand.
+ *
+ * @param src    Relation to clone.  Must be non-NULL.  May carry inline
+ *               compound metadata, sharing flags, retraction backup,
+ *               etc.; the function reads through src->columns even when
+ *               col_shared[c] is true (borrowed-readable contract).
+ * @param out    Out-parameter for the heap-allocated copy.  Must be
+ *               non-NULL.  On any failure *out is left as NULL.
+ * @param arena  Reserved.  Currently ignored -- the deep copy always
+ *               heap-owns its buffers so subsequent col_rel_destroy on
+ *               the result is correct without an arena reference.
+ *               Accepted to match the FROZEN signature in the issue
+ *               body and reserve room for an arena-aware variant.
+ *
+ * @retval 0       Success; @p *out points at the newly allocated copy.
+ * @retval EINVAL  src or out was NULL.
+ * @retval ENOMEM  Allocation of dst, name, columns, col_names, schema,
+ *                 timestamps, merge buffer, or retraction backup
+ *                 failed.  Partial state is unwound via
+ *                 col_rel_free_contents + free(dst); calloc-zero-init
+ *                 makes that safe at any unwind point.
+ *
+ * @note The result inherits no pool/arena/ledger affiliation from
+ *       @p src.  Callers that need ledger accounting on the copy must
+ *       wire up dst->mem_ledger themselves.
  */
 int
 col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
