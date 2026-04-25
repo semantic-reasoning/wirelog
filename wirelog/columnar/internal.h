@@ -1176,6 +1176,28 @@ col_rel_new_like(const char *name, const col_rel_t *src);
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like);
+/*
+ * col_rel_deep_copy (Issue #553):
+ * Produce a fully independent deep copy of `src`.  Unlike col_rel_new_like
+ * (which clones schema only), col_rel_deep_copy clones every owned buffer
+ * and metadata field of the source relation so that subsequent mutations
+ * on either relation are completely isolated.
+ *
+ * On success, *out is set to a heap-allocated col_rel_t whose fields are
+ * deep copies or fresh zero state per the field-group taxonomy in #553.
+ * Pool/arena ownership is reset (always heap-owned), col_shared/dedup_*
+ * caches are cleared, and the schema is rebuilt via manual reinit (the
+ * Arrow release callback cannot be aliased across copies).
+ *
+ * Returns 0 on success, EINVAL when src or out is NULL, ENOMEM on
+ * allocation failure.  On failure *out is set to NULL.
+ *
+ * The `arena` parameter is currently reserved (always heap-allocated);
+ * it is accepted to mirror the FROZEN signature in the issue body so that
+ * future arena-aware optimizations are ABI-compatible.
+ */
+int
+col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena);
 col_rel_t *
 col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     const char *name, uint32_t ncols);
