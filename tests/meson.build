@@ -1815,6 +1815,27 @@ test_session_exe = executable(
 test('session', test_session_exe)
 
 # ============================================================================
+# Rotation Strategy Vtable (Issue #600)
+# ============================================================================
+
+test_rotation_strategy_exe = executable(
+  'test_rotation_strategy',
+  files('test_rotation_strategy.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('rotation_strategy', test_rotation_strategy_exe)
+
+# ============================================================================
 # Session Compound Arena Lifecycle (Issue #559) - Phase 0 gateway
 # ============================================================================
 
