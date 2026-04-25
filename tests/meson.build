@@ -2246,6 +2246,24 @@ test_col_rel_compound_schema_exe = executable(
 test('col_rel_compound_schema', test_col_rel_compound_schema_exe)
 
 # ============================================================================
+# col_rel_deep_copy (Issue #553)
+# ============================================================================
+
+test_col_rel_deep_copy_exe = executable(
+  'test_col_rel_deep_copy',
+  files('test_col_rel_deep_copy.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('col_rel_deep_copy', test_col_rel_deep_copy_exe)
+
+# ============================================================================
 # Inline compound store/retrieve/retract ops (Issue #532 Task 3)
 # ============================================================================
 

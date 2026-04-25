@@ -994,6 +994,74 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     return r;
 }
 
+/* ---- deep copy ----------------------------------------------------------- */
+
+/*
+ * col_rel_deep_copy (Issue #553):
+ * Produce a fully-owned deep copy of `src`.  See the contract in
+ * wirelog/columnar/internal.h next to the declaration.
+ *
+ * Implementation strategy: zero-allocate `dst` with calloc so that
+ * col_rel_free_contents is safe to call at any unwind point.  All Group
+ * I/J fields (pool/arena ownership, ledgers, caches, sharing) start at
+ * their zero defaults and are NEVER inherited from src.
+ *
+ * NOTE: This commit ships the scaffold (Issue #553 Commit 1) covering
+ * Groups H, I, J and the scalar bookkeeping fields.  Subsequent commits
+ * land Groups A/B (columns + schema + names), C (timestamps), D+F
+ * (merge buffer + run tracking), E (retract backup), and G (compound
+ * metadata).  At this stage callers may only deep-copy 0x0 relations.
+ */
+int
+col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
+{
+    (void)arena; /* reserved; see contract block in internal.h */
+    if (!src || !out)
+        return EINVAL;
+    *out = NULL;
+
+    col_rel_t *dst = (col_rel_t *)calloc(1, sizeof(*dst));
+    if (!dst)
+        return ENOMEM;
+
+    /* Name: deep-copy the optional null-terminated owned string. */
+    if (src->name) {
+        dst->name = wl_strdup(src->name);
+        if (!dst->name) {
+            col_rel_free_contents(dst);
+            free(dst);
+            return ENOMEM;
+        }
+    }
+
+    /* Scalar bookkeeping (Groups A scalars + D scalars). */
+    dst->ncols = src->ncols;
+    dst->nrows = src->nrows;
+    dst->capacity = src->capacity;
+    dst->sorted_nrows = src->sorted_nrows;
+    dst->base_nrows = src->base_nrows;
+
+    /* Group H: graph-column metadata (Issue #535). */
+    dst->has_graph_column = src->has_graph_column;
+    dst->graph_col_idx = src->graph_col_idx;
+
+    /*
+     * Group I (pool_owned, arena_owned, mem_ledger): always reset.  The
+     * copy is heap-allocated and never participates in pool/arena/ledger
+     * accounting -- callers that need those must wire them up explicitly.
+     *
+     * Group J (dedup_slots/cap/count, col_shared, row_scratch): always
+     * reset.  The dedup hash table and row scratch are caches that will
+     * be rebuilt lazily; col_shared is unconditionally cleared because
+     * deep copies own all of their columns.
+     *
+     * calloc above already zeroed every byte, so no explicit assignment
+     * is required here -- the comment is the contract.
+     */
+    *out = dst;
+    return 0;
+}
+
 /* ---- radix sort ---------------------------------------------------------- */
 
 /*
