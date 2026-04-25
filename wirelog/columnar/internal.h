@@ -655,6 +655,38 @@ extern const col_frontier_ops_t col_frontier_epoch_ops;
 extern const col_frontier_ops_t col_frontier_diff_ops;
 
 /* ======================================================================== */
+/* Rotation Strategy Vtable (Issue #600)                                    */
+/* ======================================================================== */
+
+/*
+ * col_rotation_ops_t: vtable interface for arena/handle rotation strategy.
+ *
+ * Abstracts the per-iteration `wl_arena_reset` and per-epoch
+ * `wl_compound_arena_gc_epoch_boundary` callsites behind function pointers
+ * so alternative rotation models (e.g. MVCC) can be swapped in without
+ * touching eval.c or session.c. The default STANDARD strategy passes
+ * through to the existing arena APIs.
+ *
+ * The init/destroy hooks are optional (NULL-safe at the callsite).
+ * init returns 0 on success, non-zero on failure (treated as ENOMEM by
+ * col_session_create's `oom:` cleanup path).
+ */
+struct wl_col_session_t; /* forward decl: full type defined below */
+
+typedef struct col_rotation_ops {
+    void (*rotate_eval_arena)(struct wl_col_session_t *sess);
+    void (*gc_epoch_boundary)(struct wl_col_session_t *sess);
+    int (*init)(struct wl_col_session_t *sess);      /* optional, return 0 on success */
+    void (*destroy)(struct wl_col_session_t *sess);  /* optional */
+} col_rotation_ops_t;
+
+/* Default STANDARD rotation strategy (defined in rotation_standard.c). */
+extern const col_rotation_ops_t col_rotation_standard_ops;
+
+/* MVCC placeholder rotation strategy (defined in rotation_mvcc.c). */
+extern const col_rotation_ops_t col_rotation_mvcc_ops;
+
+/* ======================================================================== */
 /* Session                                                                  */
 /* ======================================================================== */
 
@@ -709,6 +741,7 @@ typedef struct col_filt_arr_entry {
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     const col_frontier_ops_t *frontier_ops; /* frontier vtable (#261)   */
+    const col_rotation_ops_t *rotation_ops; /* rotation vtable (#600)   */
     const wl_plan_t *plan;     /* borrowed, lifetime: caller             */
     wl_intern_t *intern;       /* borrowed, lifetime: caller (prog)      */
     col_rel_t **rels;          /* owned array of owned col_rel_t*        */
