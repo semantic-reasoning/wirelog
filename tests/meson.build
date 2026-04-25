@@ -375,6 +375,8 @@ backend_src = files(
   '../wirelog/columnar/diff_bridge.c',
   '../wirelog/columnar/partition.c',
   '../wirelog/columnar/progress.c',
+  '../wirelog/columnar/rotation_standard.c',
+  '../wirelog/columnar/rotation_mvcc.c',
   '../wirelog/util/lockfree_queue.c',
   '../wirelog/util/log.c',
   '../wirelog/util/log_emit.c',
