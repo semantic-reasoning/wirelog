@@ -426,6 +426,32 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         return ENOMEM;
 
     sess->frontier_ops = &col_frontier_epoch_ops;
+
+    /* Issue #600: select rotation strategy via WIRELOG_ROTATION env var.
+     * Default is STANDARD; "mvcc" selects the MVCC placeholder. Run init()
+     * if the chosen vtable provides one; on failure, treat as ENOMEM and
+     * fall through the oom path (init must not have allocated anything
+     * else, otherwise it must clean up before returning). */
+    {
+        const col_rotation_ops_t *chosen = &col_rotation_standard_ops;
+        const char *rot_env = getenv("WIRELOG_ROTATION");
+        const char *strategy_name = "standard";
+        if (rot_env && strcmp(rot_env, "mvcc") == 0) {
+            chosen = &col_rotation_mvcc_ops;
+            strategy_name = "mvcc";
+        }
+        sess->rotation_ops = chosen;
+        WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,
+            "event=rotation_ops_select strategy=%s", strategy_name);
+        if (chosen->init) {
+            int rc = chosen->init(sess);
+            if (rc != 0) {
+                free(sess);
+                return ENOMEM;
+            }
+        }
+    }
+
     sess->plan = plan;
     sess->intern = plan->intern;
     sess->num_workers = num_workers > 0 ? num_workers : 1;
@@ -812,6 +838,11 @@ col_session_destroy(wl_session_t *session)
     if (!session)
         return;
     wl_col_session_t *sess = COL_SESSION(session);
+    /* Issue #600: tear down rotation strategy first so the destroy hook
+     * still sees a fully-populated session (eval_arena, compound_arena,
+     * etc.) before any of the other teardown frees them. NULL-safe. */
+    if (sess->rotation_ops && sess->rotation_ops->destroy)
+        sess->rotation_ops->destroy(sess);
     for (uint32_t i = 0; i < sess->nrels; i++) {
         col_rel_free_contents(sess->rels[i]);
         free(sess->rels[i]);
