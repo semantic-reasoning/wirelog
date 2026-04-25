@@ -231,20 +231,20 @@ and Go's hash/maphash. It is freely usable.
 - Rounds `capacity / 0.75` up to the next power of two (minimum 16).
 - Allocates `keys` (zeroed) and `values` arrays.
 - Stores `rehash_at = capacity * 3 / 4`.
-- Returns `0` on success, `-ENOMEM` on allocation failure, `-EINVAL`
+- Returns `0` on success, `ENOMEM` on allocation failure, `EINVAL`
   if `out == NULL`.
 
 ### 4.2 `wl_handle_remap_insert(remap, old, new)`
 
 - Asserts `old != 0` (NULL handle is the empty sentinel; cannot be a
-  key). Returns `-EINVAL` for `old == 0`.
+  key). Returns `EINVAL` for `old == 0`.
 - Hashes `old` and probes linearly until finding either a matching key
   (overwrite value) or an empty slot (insert).
 - If `count + 1 > rehash_at`, allocates a new keys/values array of
   double capacity, reinserts every live entry, and frees the old
   arrays. Reinsertion uses the same `insert` path so probe ordering
   is consistent.
-- Returns `0` on success, `-ENOMEM` if rehash allocation fails (the
+- Returns `0` on success, `ENOMEM` if rehash allocation fails (the
   table remains usable at its previous size).
 
 ### 4.3 `wl_handle_remap_lookup(remap, old)`
@@ -264,14 +264,18 @@ and Go's hash/maphash. It is freely usable.
 
 ### 4.5 Error codes
 
-The header maps the OMC names to errno values to match how the rest
-of `wirelog/columnar/` reports errors (negative errno from `errno.h`):
+The header maps the OMC names to **positive errno** values to match
+the existing `wirelog/columnar/` convention. Other files in this
+directory (`session.c`, `eval.c`, `internal.h`) return `ENOMEM` /
+`EINVAL` / `ENOENT` directly with no sign flip; this header follows
+the same pattern so callers can compare against `errno.h` constants
+without translation:
 
-| OMC name                  | Constant             |
-|---------------------------|----------------------|
-| `WL_ERROR_INVALID_ARGS`   | `-EINVAL`            |
-| `WL_ERROR_OOM`            | `-ENOMEM`            |
-| `WL_ERROR_NOT_FOUND`      | `-ENOENT` (reserved) |
+| OMC name                  | Constant            |
+|---------------------------|---------------------|
+| `WL_ERROR_INVALID_ARGS`   | `EINVAL`            |
+| `WL_ERROR_OOM`            | `ENOMEM`            |
+| `WL_ERROR_NOT_FOUND`      | `ENOENT` (reserved) |
 
 `WL_ERROR_NOT_FOUND` is not currently returned by any operation — the
 lookup contract is "return 0 on miss" — but the constant is reserved
@@ -327,7 +331,7 @@ concurrency is safe.
 5. **Lookup miss**: lookup a never-inserted handle; expect 0.
 6. **Insert overwrite**: insert (k, v1) then (k, v2); lookup(k) ==
    v2; count unchanged.
-7. **Reject NULL key**: insert with `old == 0` returns `-EINVAL`.
+7. **Reject NULL key**: insert with `old == 0` returns `EINVAL`.
 8. **NULL-safe free**: `wl_handle_remap_free(NULL)` is a no-op.
 
 Stress and ASan/TSan coverage piggyback on #563's full EDB-remap
