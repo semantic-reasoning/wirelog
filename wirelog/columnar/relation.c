@@ -776,6 +776,56 @@ col_rel_col_idx(const col_rel_t *r, const char *name)
 
 /* ---- convenience constructors ------------------------------------------- */
 
+/*
+ * col_rel_clone_compound_meta:
+ * Replicate src's compound metadata onto dst. Mirrors the logical-column
+ * walk used by col_rel_new_like / col_rel_pool_new_like (Issue #534): walk
+ * src->compound_arity_map summing widths until physical ncols are covered,
+ * then deep-copy that many entries so dst and src destroy paths stay
+ * independent (K-Fusion isolation, Issue #553).
+ *
+ * Src must satisfy: src->compound_kind != WIRELOG_COMPOUND_KIND_NONE,
+ * src->compound_arity_map != NULL, src->ncols > 0. Callers gate on these.
+ *
+ * Returns 0 on success (compound metadata installed on dst), -1 on
+ * width-inconsistency or allocation failure (dst's compound metadata is
+ * left untouched, matching the existing graceful-degrade behaviour).
+ */
+static int
+col_rel_clone_compound_meta(col_rel_t *dst, const col_rel_t *src)
+{
+    /* compound_arity_map is keyed by LOGICAL column index, but we record
+     * at least as many entries as the physical ncols to match the
+     * source's allocation footprint. Walk the source map summing widths
+     * until we cover ncols physical slots, then copy that many entries.
+     * Bail gracefully on any inconsistency. */
+    uint32_t logical_count = 0u;
+    uint32_t acc = 0u;
+    while (acc < src->ncols) {
+        if (src->compound_arity_map[logical_count] == 0u) {
+            /* Corrupt width -- leave compound metadata cleared rather
+             * than propagating the inconsistency. */
+            return -1;
+        }
+        acc += src->compound_arity_map[logical_count];
+        logical_count++;
+    }
+    if (logical_count == 0u || acc != src->ncols)
+        return -1;
+
+    uint32_t *copy = (uint32_t *)malloc(
+        (size_t)logical_count * sizeof(uint32_t));
+    if (!copy)
+        return -1;
+    memcpy(copy, src->compound_arity_map,
+        (size_t)logical_count * sizeof(uint32_t));
+    dst->compound_arity_map = copy;
+    dst->compound_kind = src->compound_kind;
+    dst->compound_count = src->compound_count;
+    dst->inline_physical_offset = src->inline_physical_offset;
+    return 0;
+}
+
 /* Helper: create a new owned relation with given ncols and auto-named cols. */
 col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols)
@@ -810,38 +860,12 @@ col_rel_new_like(const char *name, const col_rel_t *src)
      * outputs remain INLINE-kind and the logical<->physical translation
      * stays valid for downstream ops. compound_arity_map is a separately
      * owned heap array; we deep-copy it so dst and src destroy paths stay
-     * independent (K-Fusion isolation). */
+     * independent (K-Fusion isolation). Failure is non-fatal: the helper
+     * leaves dst's compound metadata cleared (NONE-kind), matching the
+     * pre-#553 graceful-degrade contract. */
     if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         && src->compound_arity_map && src->ncols > 0u) {
-        /* compound_arity_map is keyed by LOGICAL column index, but we
-         * record at least as many entries as the physical ncols to match
-         * the source's allocation footprint. Walk the source map summing
-         * widths until we cover ncols physical slots, then copy that many
-         * entries. Bail gracefully on any inconsistency. */
-        uint32_t logical_count = 0u;
-        uint32_t acc = 0u;
-        while (acc < src->ncols) {
-            if (src->compound_arity_map[logical_count] == 0u) {
-                /* Corrupt width — leave compound metadata cleared rather
-                 * than propagating the inconsistency. */
-                logical_count = 0u;
-                break;
-            }
-            acc += src->compound_arity_map[logical_count];
-            logical_count++;
-        }
-        if (logical_count > 0u && acc == src->ncols) {
-            uint32_t *copy = (uint32_t *)malloc(
-                (size_t)logical_count * sizeof(uint32_t));
-            if (copy) {
-                memcpy(copy, src->compound_arity_map,
-                    (size_t)logical_count * sizeof(uint32_t));
-                r->compound_arity_map = copy;
-                r->compound_kind = src->compound_kind;
-                r->compound_count = src->compound_count;
-                r->inline_physical_offset = src->inline_physical_offset;
-            }
-        }
+        (void)col_rel_clone_compound_meta(r, src);
     }
     return r;
 }
@@ -897,28 +921,7 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
      * with the same deep-copy discipline. */
     if (like->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         && like->compound_arity_map && like->ncols > 0u) {
-        uint32_t logical_count = 0u;
-        uint32_t acc = 0u;
-        while (acc < like->ncols) {
-            if (like->compound_arity_map[logical_count] == 0u) {
-                logical_count = 0u;
-                break;
-            }
-            acc += like->compound_arity_map[logical_count];
-            logical_count++;
-        }
-        if (logical_count > 0u && acc == like->ncols) {
-            uint32_t *copy = (uint32_t *)malloc(
-                (size_t)logical_count * sizeof(uint32_t));
-            if (copy) {
-                memcpy(copy, like->compound_arity_map,
-                    (size_t)logical_count * sizeof(uint32_t));
-                r->compound_arity_map = copy;
-                r->compound_kind = like->compound_kind;
-                r->compound_count = like->compound_count;
-                r->inline_physical_offset = like->inline_physical_offset;
-            }
-        }
+        (void)col_rel_clone_compound_meta(r, like);
     }
     r->nrows = 0;
     return r;
