@@ -523,6 +523,107 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Group E: retract backup defensive copy (Issue #553 Commit 5)             */
+/* ======================================================================== */
+
+static void
+test_retract_backup_null_when_src_null(void)
+{
+    TEST("Group E: NULL src retract_backup -> NULL dst retract_backup");
+    col_rel_t *src = build_populated("rb_src", 2u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+    ASSERT(src->retract_backup_columns == NULL,
+        "src retract_backup_columns unexpectedly non-NULL by default");
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->retract_backup_columns == NULL,
+        "dst retract_backup_columns allocated despite src being NULL");
+    ASSERT(dst->retract_backup_nrows == 0u, "retract_backup_nrows leaked");
+    ASSERT(dst->retract_backup_capacity == 0u,
+        "retract_backup_capacity leaked");
+    ASSERT(dst->retract_backup_sorted_nrows == 0u,
+        "retract_backup_sorted_nrows leaked");
+    ASSERT(dst->retract_backup_run_count == 0u,
+        "retract_backup_run_count leaked");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+static void
+test_retract_backup_copy_when_present(void)
+{
+    TEST("Group E: defensive copy of retract_backup_* when populated");
+    col_rel_t *src = build_populated("rb_src", 0u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+
+    /* Synthesize a mid-retraction snapshot.  In production, the live
+     * column buffer is parked into retract_backup_columns and a fresh
+     * empty grid is installed; we set up the same shape directly so the
+     * test does not depend on the retraction-eval pipeline. */
+    const uint32_t bcap = 4u;
+    const uint32_t bnrows = 3u;
+    src->retract_backup_columns = col_columns_alloc(src->ncols, bcap);
+    ASSERT(src->retract_backup_columns != NULL,
+        "col_columns_alloc retract_backup failed");
+    src->retract_backup_capacity = bcap;
+    src->retract_backup_nrows = bnrows;
+    src->retract_backup_sorted_nrows = bnrows;
+    src->retract_backup_run_count = 2u;
+    src->retract_backup_run_ends[0] = 1u;
+    src->retract_backup_run_ends[1] = 3u;
+    for (uint32_t c = 0; c < src->ncols; c++) {
+        for (uint32_t i = 0; i < bnrows; i++) {
+            src->retract_backup_columns[c][i] =
+                (int64_t)((c + 1u) * 100 + i + 1);
+        }
+    }
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->retract_backup_columns != NULL,
+        "dst retract_backup_columns not allocated");
+    ASSERT(dst->retract_backup_columns != src->retract_backup_columns,
+        "retract_backup_columns array aliased");
+    ASSERT(dst->retract_backup_capacity == bcap,
+        "retract_backup_capacity mismatch");
+    ASSERT(dst->retract_backup_nrows == bnrows,
+        "retract_backup_nrows mismatch");
+    ASSERT(dst->retract_backup_sorted_nrows == bnrows,
+        "retract_backup_sorted_nrows mismatch");
+    ASSERT(dst->retract_backup_run_count == 2u,
+        "retract_backup_run_count mismatch");
+    ASSERT(dst->retract_backup_run_ends[0] == 1u
+        && dst->retract_backup_run_ends[1] == 3u,
+        "retract_backup_run_ends mismatch");
+    for (uint32_t c = 0; c < src->ncols; c++) {
+        ASSERT(dst->retract_backup_columns[c]
+            != src->retract_backup_columns[c],
+            "per-column retract_backup buffer aliased");
+        for (uint32_t i = 0; i < bnrows; i++) {
+            ASSERT(dst->retract_backup_columns[c][i]
+                == src->retract_backup_columns[c][i],
+                "retract_backup content mismatch");
+        }
+    }
+
+    /* Mutate src; dst stays independent. */
+    src->retract_backup_columns[0][0] = (int64_t)-1;
+    ASSERT(dst->retract_backup_columns[0][0] == (int64_t)101,
+        "dst retract_backup aliased through src");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -544,6 +645,8 @@ main(void)
     test_timestamps_null_when_src_null();
     test_merge_buffer_round_trip();
     test_run_tracking_round_trip();
+    test_retract_backup_null_when_src_null();
+    test_retract_backup_copy_when_present();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);

@@ -1136,6 +1136,41 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
     }
 
     /*
+     * Group E: zero-copy retraction backup (Issue #300, #369).  Outside
+     * a retraction step every retract_backup_* field is NULL/0, so this
+     * branch is normally inert -- but if a deep copy ever lands inside
+     * a retraction window, the copy must own its own backup or any
+     * subsequent restore would corrupt src's columns.  We therefore
+     * defensively allocate retract_backup_capacity rows and memcpy
+     * retract_backup_nrows live entries per column, plus mirror the run
+     * tracking scalars + fixed array.
+     */
+    dst->retract_backup_nrows = src->retract_backup_nrows;
+    dst->retract_backup_capacity = src->retract_backup_capacity;
+    dst->retract_backup_sorted_nrows = src->retract_backup_sorted_nrows;
+    dst->retract_backup_run_count = src->retract_backup_run_count;
+    memcpy(dst->retract_backup_run_ends, src->retract_backup_run_ends,
+        sizeof(src->retract_backup_run_ends));
+    if (src->retract_backup_columns && src->ncols > 0u
+        && src->retract_backup_capacity > 0u) {
+        dst->retract_backup_columns = col_columns_alloc(src->ncols,
+                src->retract_backup_capacity);
+        if (!dst->retract_backup_columns) {
+            col_rel_free_contents(dst);
+            free(dst);
+            return ENOMEM;
+        }
+        for (uint32_t c = 0; c < src->ncols; c++) {
+            if (src->retract_backup_columns[c]
+                && src->retract_backup_nrows > 0u) {
+                memcpy(dst->retract_backup_columns[c],
+                    src->retract_backup_columns[c],
+                    (size_t)src->retract_backup_nrows * sizeof(int64_t));
+            }
+        }
+    }
+
+    /*
      * Group F: tiered run-tracking metadata (Issue #369).  Both fields
      * are fixed-size POD: a scalar count plus a COL_MAX_RUNS-element
      * array of run end offsets.  Direct copy (the retract-backup mirror
