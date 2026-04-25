@@ -186,6 +186,16 @@ col_columns_copy_row(int64_t **dst_cols, uint32_t dst_row,
  * Tuples are stored column-major: columns[col][row] (Phase C, Issue #332).
  * Column names enable JOIN key resolution (variable name -> position).
  * The ArrowSchema provides Arrow-compatible type metadata.
+ *
+ * Deep Copy Semantics (Issue #555, rule R-3):
+ *   When col_rel_deep_copy() creates a transient copy:
+ *   - pool_owned and arena_owned are set to false on the destination
+ *   - Caller owns the copy and must free it explicitly via
+ *     col_rel_destroy() (or col_rel_free_contents() + free(struct))
+ *   - delta_pool_reset() and arena reclaim will NOT touch the copy,
+ *     since both flags are false
+ *   - mem_ledger is also NULL on the copy (Issue #554, R-1)
+ *   See wirelog/columnar/ownership_flags_design.md for the full rationale.
  */
 typedef struct {
     char *name;                /* owned, null-terminated                */
@@ -217,13 +227,17 @@ typedef struct {
      * Capacity tracks with the data array (capacity entries allocated). */
     col_delta_timestamp_t *timestamps;
     /* Pool ownership flag (issue #123).
-     * true  = struct was allocated from delta_pool; do not free() the struct.
-     * false = struct was heap-allocated via calloc(); free() on destroy. */
+     * true  = struct was allocated from delta_pool; do not free() the struct
+     *         (lifecycle managed by allocator pool).
+     * false = struct was heap-allocated via calloc(); free() on destroy.
+     * Deep copies (#553) always set this to false (R-3, #555). */
     bool pool_owned;
     /* Arena ownership flag for data buffer.
-     * true  = column buffers were allocated from wl_arena_t; do not free().
+     * true  = column buffers were allocated from wl_arena_t; do not free()
+     *         (lifecycle managed by arena allocator).
      *         On growth (append_row), data is migrated to heap (malloc+memcpy).
-     * false = column buffers were heap-allocated via malloc(); normal free(). */
+     * false = column buffers were heap-allocated via malloc(); normal free().
+     * Deep copies (#553) always set this to false (R-3, #555). */
     bool arena_owned;
     /* Memory ledger reference (Issue #224): when non-NULL, data buffer
      * growth/free events are reported to this ledger under
