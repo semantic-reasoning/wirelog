@@ -1197,6 +1197,21 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
             (size_t)src->capacity * sizeof(col_delta_timestamp_t));
     }
 
+    /*
+     * Group G: compound-column metadata (Issue #534, #553).  Mirror the
+     * col_rel_new_like / col_rel_pool_new_like clone path: when the
+     * source carries an INLINE-tier arity map, deep-copy it through the
+     * shared col_rel_clone_compound_meta helper.  Helper failure is
+     * handled with the existing graceful-degrade contract (compound
+     * metadata cleared to NONE-kind on dst), keeping behavior aligned
+     * with col_rel_new_like.  Sources with WIRELOG_COMPOUND_KIND_NONE
+     * leave dst at the zero default already established by calloc.
+     */
+    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && src->compound_arity_map && src->ncols > 0u) {
+        (void)col_rel_clone_compound_meta(dst, src);
+    }
+
     if (src->schema_ok) {
         ArrowSchemaInit(&dst->schema);
         if (ArrowSchemaSetTypeStruct(&dst->schema, (int64_t)src->ncols)

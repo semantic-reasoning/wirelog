@@ -624,6 +624,96 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Group G: compound metadata via helper (Issue #553 Commit 6)              */
+/* ======================================================================== */
+
+static void
+test_compound_arity_map_round_trip_inline(void)
+{
+    TEST("Group G: INLINE compound_arity_map round-trips");
+    col_rel_t *src = build_populated("inline_src", 0u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+
+    /* Logical schema (alpha, beta, gamma) -> physical (alpha, beta1,
+     * beta2, gamma) where beta is an inline compound of arity 2.  We
+     * already have ncols == 3 from build_populated; for this clone-the-
+     * map test that is enough -- the layout doesn't need to be valid
+     * end-to-end. */
+    src->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    src->compound_count = 1u;
+    src->inline_physical_offset = 1u;
+    /* logical layout: scalar, INLINE/2 (covers physical 1..2), <fill>.
+     * Walk-by-physical sums: 1 + 2 = 3, matching ncols. */
+    src->compound_arity_map = (uint32_t *)calloc(2u, sizeof(uint32_t));
+    ASSERT(src->compound_arity_map != NULL, "calloc arity_map failed");
+    src->compound_arity_map[0] = 1u;
+    src->compound_arity_map[1] = 2u;
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(dst->compound_kind == WIRELOG_COMPOUND_KIND_INLINE,
+        "compound_kind not copied");
+    ASSERT(dst->compound_count == 1u, "compound_count not copied");
+    ASSERT(dst->inline_physical_offset == 1u,
+        "inline_physical_offset not copied");
+    ASSERT(dst->compound_arity_map != NULL,
+        "dst compound_arity_map not allocated");
+    ASSERT(dst->compound_arity_map != src->compound_arity_map,
+        "compound_arity_map aliased between src and dst");
+    ASSERT(dst->compound_arity_map[0] == 1u, "arity_map[0] mismatch");
+    ASSERT(dst->compound_arity_map[1] == 2u, "arity_map[1] mismatch");
+
+    /* Mutate src; dst stays independent. */
+    src->compound_arity_map[1] = 99u;
+    ASSERT(dst->compound_arity_map[1] == 2u,
+        "dst arity_map aliased through src");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+static void
+test_compound_arity_map_corrupt_input_degrades(void)
+{
+    TEST("Group G: corrupt arity_map degrades to NONE-kind on dst");
+    col_rel_t *src = build_populated("corrupt_src", 0u);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "build_populated failed");
+
+    /* INLINE-kind but with a zero-width entry that prevents the helper
+     * from covering ncols == 3 -- col_rel_new_like degrades silently in
+     * this case, and col_rel_deep_copy must too. */
+    src->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    src->compound_count = 1u;
+    src->inline_physical_offset = 0u;
+    src->compound_arity_map = (uint32_t *)calloc(3u, sizeof(uint32_t));
+    ASSERT(src->compound_arity_map != NULL, "calloc arity_map failed");
+    src->compound_arity_map[0] = 1u;
+    src->compound_arity_map[1] = 0u; /* corrupt: width-zero entry */
+    src->compound_arity_map[2] = 2u;
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    /* Helper bailed -> dst's compound metadata cleared to NONE. */
+    ASSERT(dst->compound_kind == WIRELOG_COMPOUND_KIND_NONE,
+        "corrupt input did not degrade to NONE-kind");
+    ASSERT(dst->compound_count == 0u,
+        "compound_count should be zero after degrade");
+    ASSERT(dst->compound_arity_map == NULL,
+        "compound_arity_map should be NULL after degrade");
+    ASSERT(dst->inline_physical_offset == 0u,
+        "inline_physical_offset should be zero after degrade");
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -647,6 +737,8 @@ main(void)
     test_run_tracking_round_trip();
     test_retract_backup_null_when_src_null();
     test_retract_backup_copy_when_present();
+    test_compound_arity_map_round_trip_inline();
+    test_compound_arity_map_corrupt_input_degrades();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);
