@@ -13,6 +13,7 @@
  */
 
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/thread.h"
 #include "../wirelog/wirelog-types.h"
 #include "col_rel_deep_copy_fixture.h"
 
@@ -907,6 +908,170 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Concurrent reads safety (Issue #556)                                     */
+/* ======================================================================== */
+
+/* Portable barrier built on the wirelog thread layer (mutex_t + cond_t).
+ * pthread_barrier_t is a POSIX optional XSI feature and is unavailable
+ * on Apple platforms; raw pthread_t is unavailable on Windows MSVC.
+ * Going through wirelog/thread.h keeps the test buildable on the C11,
+ * POSIX, and Win32 backends meson selects from at configure time. */
+typedef struct {
+    mutex_t mtx;
+    cond_t cond;
+    unsigned count;         /* threads still waiting to arrive */
+    unsigned total;         /* initial count (reset each generation) */
+    unsigned phase;         /* generation counter, prevents lost wakeups */
+} simple_barrier_t;
+
+static int
+simple_barrier_init(simple_barrier_t *b, unsigned n)
+{
+    if (mutex_init(&b->mtx) != 0)
+        return -1;
+    if (cond_init(&b->cond) != 0) {
+        mutex_destroy(&b->mtx);
+        return -1;
+    }
+    b->count = n;
+    b->total = n;
+    b->phase = 0;
+    return 0;
+}
+
+static void
+simple_barrier_wait(simple_barrier_t *b)
+{
+    mutex_lock(&b->mtx);
+    unsigned my_phase = b->phase;
+    if (--b->count == 0) {
+        b->count = b->total;
+        b->phase++;
+        cond_broadcast(&b->cond);
+    } else {
+        while (b->phase == my_phase)
+            cond_wait(&b->cond, &b->mtx);
+    }
+    mutex_unlock(&b->mtx);
+}
+
+static void
+simple_barrier_destroy(simple_barrier_t *b)
+{
+    mutex_destroy(&b->mtx);
+    cond_destroy(&b->cond);
+}
+
+#define DEEP_COPY_CONCURRENT_NREADERS 4u
+#define DEEP_COPY_CONCURRENT_ITERS    10000u
+
+typedef struct {
+    const col_rel_t *dst;
+    simple_barrier_t *barrier;
+    uint32_t fx_ncols;
+    uint32_t fx_nrows;
+    uint32_t reader_id;
+    int mismatch;      /* 0 = OK, 1 = saw a wrong value */
+} concurrent_reader_args_t;
+
+static void *
+concurrent_reader_fn(void *arg)
+{
+    concurrent_reader_args_t *a = (concurrent_reader_args_t *)arg;
+    simple_barrier_wait(a->barrier);
+
+    /* Read-only access via direct columns[c][r] indexing.  We do NOT
+     * call col_rel_row -- it lazily allocates and writes into
+     * row_scratch, which is not concurrent-safe. */
+    for (uint32_t i = 0; i < DEEP_COPY_CONCURRENT_ITERS; i++) {
+        /* Walk a per-thread offset across the (col, row) grid so each
+         * thread covers a different stride pattern.  All threads read
+         * the same dst, so any aliasing/race surfaces as a wrong
+         * deterministic value. */
+        uint32_t c = (i + a->reader_id) % a->fx_ncols;
+        uint32_t r = (i * (a->reader_id + 1u)) % a->fx_nrows;
+        int64_t got = a->dst->columns[c][r];
+        int64_t expected = (int64_t)((uint64_t)r
+            * (uint64_t)a->fx_ncols + (uint64_t)c);
+        if (got != expected) {
+            a->mismatch = 1;
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void
+test_concurrent_reads_race_free(void)
+{
+    /* Spawn N reader threads on a single deep-copied dst, all using a
+     * portable mutex+condvar barrier (built on wirelog/thread.h) to
+     * start simultaneously.  Each thread reads dst->columns[c][r] for
+     * many iterations and asserts the value matches the deterministic
+     * fixture pattern.
+     *
+     * On a TSan build this exercises whether deep_copy left a hidden
+     * shared mutable state behind (it must not -- dst is an owned,
+     * read-only relation post-copy).  Without TSan, the
+     * single-threaded baseline below still confirms correctness. */
+    TEST("concurrent col_rel_get reads on dst are race-free");
+    const uint32_t fx_nrows = 100u;
+    const uint32_t fx_ncols = 4u;
+    col_rel_t *src = deep_copy_fixture_make_relation("conc_src", fx_nrows,
+            fx_ncols);
+    col_rel_t *dst = NULL;
+    ASSERT(src != NULL, "fixture make_relation failed");
+
+    int rc = col_rel_deep_copy(src, &dst, NULL);
+    ASSERT(rc == 0 && dst != NULL, "deep-copy failed");
+    ASSERT(deep_copy_fixture_assert_design_invariants(dst) == 1,
+        "dst design invariants violated");
+
+    /* Single-threaded baseline: confirm correctness even when TSan is
+     * not active.  If this fails, the concurrent runs below are moot. */
+    for (uint32_t r = 0; r < fx_nrows; r++) {
+        for (uint32_t c = 0; c < fx_ncols; c++) {
+            int64_t expected = (int64_t)((uint64_t)r
+                * (uint64_t)fx_ncols + (uint64_t)c);
+            ASSERT(dst->columns[c][r] == expected,
+                "single-threaded baseline mismatch");
+        }
+    }
+
+    /* Concurrent reader fan-out. */
+    simple_barrier_t barrier;
+    ASSERT(simple_barrier_init(&barrier, DEEP_COPY_CONCURRENT_NREADERS) == 0,
+        "simple_barrier_init failed");
+
+    thread_t readers[DEEP_COPY_CONCURRENT_NREADERS];
+    concurrent_reader_args_t args[DEEP_COPY_CONCURRENT_NREADERS];
+    for (uint32_t i = 0; i < DEEP_COPY_CONCURRENT_NREADERS; i++) {
+        args[i].dst = dst;
+        args[i].barrier = &barrier;
+        args[i].fx_ncols = fx_ncols;
+        args[i].fx_nrows = fx_nrows;
+        args[i].reader_id = i;
+        args[i].mismatch = 0;
+        int crc = thread_create(&readers[i], concurrent_reader_fn, &args[i]);
+        ASSERT(crc == 0, "thread_create failed");
+    }
+    for (uint32_t i = 0; i < DEEP_COPY_CONCURRENT_NREADERS; i++) {
+        thread_join(&readers[i]);
+    }
+    simple_barrier_destroy(&barrier);
+
+    for (uint32_t i = 0; i < DEEP_COPY_CONCURRENT_NREADERS; i++) {
+        ASSERT(args[i].mismatch == 0,
+            "concurrent reader observed wrong cell value");
+    }
+
+    PASS();
+cleanup:
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -935,6 +1100,7 @@ main(void)
     test_deep_copy_mem_ledger_null();
     test_large_relation_buffers();
     test_wide_column_relation_deep_copies();
+    test_concurrent_reads_race_free();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);
