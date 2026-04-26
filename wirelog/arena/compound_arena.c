@@ -290,6 +290,12 @@ wl_compound_arena_gc_epoch_boundary(wl_compound_arena_t *arena)
 {
     if (!arena)
         return (uint32_t)-1;
+    if (arena->frozen) {
+        WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_WARN,
+            "gc_epoch_boundary skipped (arena frozen, current_epoch=%u)",
+            arena->current_epoch);
+        return arena->current_epoch;
+    }
     /* Skeleton policy: sweep the current generation, count reclaimable
      * handles (multiplicity <= 0), and reset the generation's bump buffer
      * so it can be reused.  Subsequent allocations go into the same
