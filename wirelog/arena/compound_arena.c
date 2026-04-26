@@ -306,8 +306,17 @@ wl_compound_arena_gc_epoch_boundary(wl_compound_arena_t *arena)
     if (!arena)
         return (uint32_t)-1;
     if (arena->frozen) {
-        WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_WARN,
-            "gc_epoch_boundary skipped (arena frozen, current_epoch=%u)",
+        /* Issue #561 / #584: freeze guard is a no-op skip, not a reset.
+         * Returning the unchanged current_epoch (rather than 0) lets
+         * callers compare against a pre-call snapshot to detect "no
+         * advance" without conflating it with "epoch zero advanced".
+         *
+         * Log under COMPOUND alongside the lifecycle traces in
+         * arena_alloc / freeze / unfreeze (Issue #583) so a single
+         * `WL_LOG=COMPOUND:5` captures the skip event in the same
+         * audit stream. */
+        WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_WARN,
+            "lifecycle event=gc_skip_frozen current_epoch=%u",
             arena->current_epoch);
         return arena->current_epoch;
     }
