@@ -379,6 +379,7 @@ backend_src = files(
   '../wirelog/columnar/rotation_mvcc.c',
   '../wirelog/columnar/compound_side.c',
   '../wirelog/columnar/handle_remap.c',
+  '../wirelog/columnar/handle_remap_apply.c',
   '../wirelog/util/lockfree_queue.c',
   '../wirelog/util/log.c',
   '../wirelog/util/log_emit.c',
