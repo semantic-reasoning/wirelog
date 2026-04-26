@@ -401,6 +401,113 @@ test_worker_skips_gc_epoch_boundary_dispatch(void)
     return 0;
 }
 
+static int
+test_worker_observes_frozen_arena(void)
+{
+    TEST(
+        "worker borrows coordinator's frozen arena (alloc blocked, lookup OK)");
+
+    /* Issue #581: when K-Fusion freezes the coordinator's compound_arena
+     * before fanning workers out, each worker must observe the frozen
+     * state through its borrowed pointer.  The contract:
+     *   - allocations from the worker's arena handle return
+     *     WL_COMPOUND_HANDLE_NULL while frozen,
+     *   - lookups of coordinator-allocated handles still resolve through
+     *     the worker's borrowed pointer (frozen is read-only, not
+     *     unreadable).
+     * This pins both halves so a future change to alloc/lookup that
+     * crosses the freeze barrier is caught immediately. */
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    if (!coord) {
+        FAIL("coordinator creation");
+        return 1;
+    }
+    if (!coord->compound_arena) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("coordinator compound_arena unexpectedly NULL");
+        return 1;
+    }
+
+    /* Allocate a sentinel handle BEFORE freezing so we can probe lookup
+     * through the worker's borrowed arena once the freeze is live. */
+    uint64_t sentinel = wl_compound_arena_alloc(coord->compound_arena, 48u);
+    if (sentinel == WL_COMPOUND_HANDLE_NULL) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("sentinel arena_alloc on coordinator returned NULL");
+        return 1;
+    }
+
+    /* Build a partition + worker the way K-Fusion does, then freeze the
+     * coordinator's arena.  Order matters: we want the worker to observe
+     * the freeze through the borrowed pointer, so the freeze is the last
+     * coordinator-side mutation before the assertions. */
+    int64_t rows[] = { 1, 2 };
+    if (insert_edges(coord, rows, 1) != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("insert_edges");
+        return 1;
+    }
+
+    col_rel_t **parts = NULL;
+    int rc = partition_rel(coord, "edge", 1, &parts);
+    if (rc != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("partition_rel");
+        return 1;
+    }
+
+    wl_col_session_t worker;
+    memset(&worker, 0, sizeof(worker));
+    rc = col_worker_session_create(coord, 0, parts, 1, &worker);
+    free(parts);
+    if (rc != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("col_worker_session_create");
+        return 1;
+    }
+
+    wl_compound_arena_freeze(coord->compound_arena);
+
+    int ok = (worker.compound_arena == coord->compound_arena
+        && worker.compound_arena != NULL
+        && worker.compound_arena->frozen);
+
+    /* Frozen alloc through the worker's borrowed pointer must refuse. */
+    if (ok) {
+        uint64_t denied = wl_compound_arena_alloc(worker.compound_arena, 16u);
+        if (denied != WL_COMPOUND_HANDLE_NULL)
+            ok = 0;
+    }
+
+    /* Lookup of the pre-freeze sentinel must still succeed via worker. */
+    if (ok) {
+        uint32_t out_size = 0;
+        const void *payload = wl_compound_arena_lookup(
+            worker.compound_arena, sentinel, &out_size);
+        if (!payload || out_size != 48u)
+            ok = 0;
+    }
+
+    /* Restore the unfrozen state so coordinator destroy doesn't run any
+     * cleanup against a frozen arena (defensive: the destroy path
+     * shouldn't care, but keeping the test isolated avoids cross-
+     * coupling future changes). */
+    wl_compound_arena_unfreeze(coord->compound_arena);
+
+    col_worker_session_destroy(&worker);
+    cleanup_coordinator(coord, plan, prog);
+
+    if (!ok) {
+        FAIL("worker did not observe frozen arena correctly");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
@@ -412,6 +519,7 @@ main(void)
     test_worker_borrows_coordinator_arena();
     test_worker_destroy_does_not_free_coordinator_arena();
     test_worker_skips_gc_epoch_boundary_dispatch();
+    test_worker_observes_frozen_arena();
     printf("\n%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed == 0 ? 0 : 1;
