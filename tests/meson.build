@@ -1858,6 +1858,27 @@ test('session_compound_arena_lifecycle',
      test_session_compound_arena_lifecycle_exe)
 
 # ============================================================================
+# GC Epoch Boundary Integration (Issue #560)
+# ============================================================================
+
+test_gc_epoch_boundary_exe = executable(
+  'test_gc_epoch_boundary',
+  files('test_gc_epoch_boundary.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('gc_epoch_boundary', test_gc_epoch_boundary_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
