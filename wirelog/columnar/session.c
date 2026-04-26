@@ -974,9 +974,12 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->filt_cache = NULL;
     out_worker->filt_cache_count = 0;
     out_worker->filt_cache_cap = 0;
-    /* Issue #559: compound arena is coordinator-owned; workers must not
-     * inherit the bitwise-copied pointer or they would double-free. */
-    out_worker->compound_arena = NULL;
+    /* Issue #579 / R-5: workers BORROW the coordinator's frozen arena.
+     * Worker destroy must NOT free this pointer (see
+     * col_worker_session_destroy).  The K-Fusion freeze contract
+     * (Issue #561) guarantees the arena is frozen for the duration
+     * of worker access. */
+    out_worker->compound_arena = coordinator->compound_arena;
     memset(&out_worker->mat_cache, 0, sizeof(col_mat_cache_t));
     /* Exchange buffers are owned by coordinator; worker inherits borrowed ptr */
     out_worker->exchange_bufs = NULL;
@@ -1152,6 +1155,10 @@ col_worker_session_destroy(wl_col_session_t *worker)
     }
     delta_pool_destroy(worker->delta_pool);
     wl_arena_free(worker->eval_arena);
+
+    /* compound_arena is BORROWED from coordinator (Issue #579 / R-5).
+     * DO NOT call wl_compound_arena_free here — the coordinator owns it
+     * and frees it in its own col_session_destroy path. */
 
     /* Issue #386: Free filtered relation cache (workers own their own copy) */
     for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
