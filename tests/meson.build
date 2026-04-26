@@ -2462,6 +2462,32 @@ test_compound_side_relation_exe = executable(
 test('compound_side_relation', test_compound_side_relation_exe)
 
 # ============================================================================
+# Compound arena freeze-cycle stress (Issue #582)
+# Concurrent workers + many freeze/unfreeze cycles on a borrowed arena.
+# Heavy under TSan; timeout extended.  Note: this is the in-arena freeze
+# cycle, NOT the cross-arena rotation that #550 Option C will introduce;
+# a sibling test will own that path.
+# ============================================================================
+
+test_compound_arena_freeze_cycle_stress_exe = executable(
+  'test_compound_arena_freeze_cycle_stress',
+  files('test_compound_arena_freeze_cycle_stress.c'),
+  arena_src,
+  thread_src,
+  workqueue_src,
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep, math_dep],
+)
+
+test('compound_arena_freeze_cycle_stress',
+     test_compound_arena_freeze_cycle_stress_exe,
+     timeout: 120)
+
+# ============================================================================
 # K-Fusion deep-copy + inline compound visibility (Issue #532 Task 4)
 # ============================================================================
 
