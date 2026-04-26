@@ -298,4 +298,28 @@ wl_compound_arena_unfreeze(wl_compound_arena_t *arena);
 uint32_t
 wl_compound_arena_gc_epoch_boundary(wl_compound_arena_t *arena);
 
+/**
+ * wl_compound_arena_live_handles:
+ * @arena: arena to query (NULL-safe).
+ *
+ * Return the current live-handle population of @arena (the value of
+ * @arena->live_handles), or 0 if @arena is NULL.  Introspection-only
+ * accessor used by the rotation-helper path (Issue #586): the remap
+ * table sizes itself against this number when migrating compound
+ * handles into a fresh session (#562 / #550 Option C).
+ *
+ * Stability: NOT stable across rotations or during live K-Fusion
+ * worker access.  Callers must invoke this either while the arena
+ * is frozen (so coordinator-side mutation is paused) or before any
+ * worker has spawned — see the file-level "Thread safety" note at
+ * the top of this header.  `live_handles` is a plain (non-atomic)
+ * `uint64_t`; this accessor is TSan-clean iff the caller honors
+ * that contract.
+ */
+static inline uint64_t
+wl_compound_arena_live_handles(const wl_compound_arena_t *arena)
+{
+    return arena ? arena->live_handles : (uint64_t)0;
+}
+
 #endif /* WL_COMPOUND_ARENA_H */

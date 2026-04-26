@@ -1,5 +1,5 @@
 # Handle Remapping Data Structure Design
-## Issue #557 — Open-Addressing Hash Table for Compound-Handle Remap
+## Issues #557 (initial freeze) / #586 (rotation-evacuation tightening) — Open-Addressing Hash Table for Compound-Handle Remap
 
 **Status**: Design (Phase 3C)
 **Audience**: Implementers (#562, #563), reviewers, architects
@@ -167,6 +167,76 @@ of two so the modulo operation reduces to `index & (capacity - 1)`.
 The minimum capacity is 16 (small enough not to matter; large enough
 that the rounding doesn't dominate). This is an implementation detail
 and not exposed through the API.
+
+### 2.8 Initial capacity for rotation evacuation (Issue #586)
+
+When the table is created on the rotation-helper path
+(`wl_session_rotate`, #550 Option C / blocked by #562), the caller
+already knows the live-handle population it is about to migrate:
+`wl_compound_arena_t.live_handles`.  The contract is one-sided to
+avoid double-counting the load-factor headroom against §4.1:
+
+  - Caller passes the raw `live_handles` value to
+    `wl_handle_remap_create(capacity, &out)`.  Do NOT pre-divide by
+    0.75 — the constructor (§4.1) already applies the load-factor
+    headroom by rounding `capacity / 0.75` up to the next power of
+    two.  Passing `live_handles / 0.75` would double-count and
+    over-allocate by ~2×.
+  - The resulting table starts at the smallest power of two ≥
+    `ceil(live_handles / 0.75)`, which is the smallest size that
+    holds the population without crossing the 0.75 load threshold.
+  - For the issue's quoted "256K initial" point: a population of
+    ~190K handles passes `live_handles = 190000`; the constructor
+    computes `ceil(190000 / 0.75) = 253334` and rounds up to
+    `2^18 = 262144` slots.  That ~256K figure is therefore not a
+    hard-coded constant but the natural consequence of (a) the
+    live-count input and (b) §2.7 rounding.
+
+Default-on-zero stays at 16 (§2.7), which keeps unit tests and tiny
+fixtures cheap.  The 256K figure is the bound for the *production
+rotation* call site, not a global default.
+
+### 2.9 Capacity upper bound (Issue #586)
+
+The remap table sizes itself against `arena->live_handles` (the
+caller-visible "generation size"), not against per-epoch
+`entry_count` or total payload bytes.  The upper bound is the
+arena's saturation point:
+
+  - Pre-rotation: `live_handles ≤ Σ_e entry_count[e]` over all live
+    epochs `e`.  This is bounded by the 12-bit epoch field × the
+    32-bit per-generation offset, i.e. `2^44` in theory; in practice
+    bounded by RAM × the per-handle payload size.
+  - Caller responsibility (#562 implementer): the SOA layout (§3.2)
+    holds `keys` and `values` as two separate `int64_t` arrays of
+    `capacity` entries each.  `ceil_pow2(live_handles * 4/3)` can
+    almost double again (the next power of two is at most 2× the
+    input), so the worst-case post-rounded `capacity` is
+    `live_handles * 8/3 ≈ 2.67×`.  Total bytes allocated for the
+    table is therefore up to:
+
+        capacity * sizeof(int64_t) * 2  ≈  live_handles * 128/3
+                                        ≈  live_handles * 42.67
+
+    Before calling `wl_handle_remap_create(live_handles, &out)`,
+    the caller must validate that this post-rounded allocation
+    does not overflow `size_t` on 32-bit targets (MSVC i386 still
+    in CI):
+
+        live_handles ≤ SIZE_MAX / 64           (safe, with headroom)
+        live_handles ≤ SIZE_MAX / 42.67        (tight)
+
+    On 32-bit `size_t` the tight bound is ~100M handles before the
+    table allocation overflows; the safe bound is ~67M.  On 64-bit
+    `size_t` either bound vastly exceeds the arena's `2^44`
+    saturation cap, so the check is a no-op there but stays free.
+    The constructor itself is also free to re-validate after
+    rounding and return ENOMEM if the bound is exceeded; doing
+    both belt-and-suspenders is encouraged.
+
+These two bullets close the "max bounded by generation size"
+clause in #586 with a single unambiguous formula and one explicit
+overflow check the implementer must enforce.
 
 ---
 
