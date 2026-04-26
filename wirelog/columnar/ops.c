@@ -4841,8 +4841,11 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
      * epoch-frontier GC reclaim handles whose multiplicity already
      * dropped to zero in the parent.  Each link is NULL-guarded so
      * sessions without a compound arena or rotation strategy still
-     * spawn workers unchanged. */
-    if (sess->compound_arena && sess->rotation_ops
+     * spawn workers unchanged.  The compound_arena is borrowed from
+     * the coordinator (Issue #579 / R-5); only the coordinator may
+     * mutate it, so worker-context invocations skip the dispatch. */
+    if (sess->coordinator == NULL
+        && sess->compound_arena && sess->rotation_ops
         && sess->rotation_ops->gc_epoch_boundary) {
         sess->rotation_ops->gc_epoch_boundary(sess);
     }

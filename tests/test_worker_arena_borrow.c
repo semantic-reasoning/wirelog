@@ -311,6 +311,96 @@ test_worker_destroy_does_not_free_coordinator_arena(void)
     return 0;
 }
 
+static int
+test_worker_skips_gc_epoch_boundary_dispatch(void)
+{
+    TEST("worker context closes gc_epoch_boundary call-site gate");
+
+    /* Regression for the TSan data race that surfaced once workers
+     * started borrowing the coordinator's compound_arena (Issue #579 /
+     * R-5).  The dispatch sites at ops.c (col_op_k_fusion entry) and
+     * eval.c (recursive sub-pass tail) advance arena->current_epoch,
+     * which is a write on a pointer that workers share with the
+     * coordinator.  The gate predicate must therefore reject worker
+     * sessions: only the coordinator may mutate the borrowed arena. */
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    if (!coord) {
+        FAIL("coordinator creation");
+        return 1;
+    }
+    if (!coord->compound_arena || !coord->rotation_ops
+        || !coord->rotation_ops->gc_epoch_boundary) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("coordinator missing arena/rotation_ops prerequisites");
+        return 1;
+    }
+
+    int64_t rows[] = { 1, 2 };
+    if (insert_edges(coord, rows, 1) != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("insert_edges");
+        return 1;
+    }
+
+    col_rel_t **parts = NULL;
+    int rc = partition_rel(coord, "edge", 1, &parts);
+    if (rc != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("partition_rel");
+        return 1;
+    }
+
+    wl_col_session_t worker;
+    memset(&worker, 0, sizeof(worker));
+    rc = col_worker_session_create(coord, 0, parts, 1, &worker);
+    free(parts);
+    if (rc != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("col_worker_session_create");
+        return 1;
+    }
+
+    /* The gate predicate that ops.c:col_op_k_fusion and
+     * eval.c:col_eval_stratum apply before dispatching
+     * gc_epoch_boundary.  Mirroring it here pins the invariant: any
+     * future relaxation of the worker check at either call site will
+     * trip this assertion. */
+    int coord_open = (coord->coordinator == NULL
+        && coord->compound_arena && coord->rotation_ops
+        && coord->rotation_ops->gc_epoch_boundary);
+    int worker_open = (worker.coordinator == NULL
+        && worker.compound_arena && worker.rotation_ops
+        && worker.rotation_ops->gc_epoch_boundary);
+
+    /* Worker must observably borrow the coordinator's arena, otherwise
+     * the test reduces to a tautology over a NULL pointer. */
+    int worker_borrows = (worker.compound_arena == coord->compound_arena
+        && worker.compound_arena != NULL
+        && worker.rotation_ops == coord->rotation_ops
+        && worker.coordinator == coord);
+
+    col_worker_session_destroy(&worker);
+    cleanup_coordinator(coord, plan, prog);
+
+    if (!coord_open) {
+        FAIL("coordinator gate unexpectedly closed");
+        return 1;
+    }
+    if (!worker_borrows) {
+        FAIL("worker did not borrow coordinator arena/rotation_ops");
+        return 1;
+    }
+    if (worker_open) {
+        FAIL("worker gate must be closed (coordinator-only mutation)");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
@@ -321,6 +411,7 @@ main(void)
     printf("test_worker_arena_borrow (Issue #579 / R-5)\n");
     test_worker_borrows_coordinator_arena();
     test_worker_destroy_does_not_free_coordinator_arena();
+    test_worker_skips_gc_epoch_boundary_dispatch();
     printf("\n%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed == 0 ? 0 : 1;
