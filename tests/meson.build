@@ -2488,6 +2488,26 @@ test('compound_arena_freeze_cycle_stress',
      timeout: 120)
 
 # ============================================================================
+# Compound arena lifecycle observability (Issue #583)
+# WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
+# ============================================================================
+
+test_compound_arena_trace_exe = executable(
+  'test_compound_arena_trace',
+  files('test_compound_arena_trace.c'),
+  arena_src,
+  thread_src,
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep, math_dep],
+)
+
+test('compound_arena_trace', test_compound_arena_trace_exe, suite: 'log')
+
+# ============================================================================
 # K-Fusion deep-copy + inline compound visibility (Issue #532 Task 4)
 # ============================================================================
 

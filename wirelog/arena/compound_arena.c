@@ -185,6 +185,13 @@ wl_compound_arena_alloc(wl_compound_arena_t *arena, uint32_t size)
     WL_LOG(WL_LOG_SEC_ARENA, WL_LOG_TRACE,
         "handle_alloc(epoch=%u, offset=%u, packed=0x%" PRIx64 ")",
         arena->current_epoch, offset, handle);
+    /* Issue #583: lifecycle audit trail under the COMPOUND section so a
+     * single `WL_LOG=COMPOUND:5` captures end-to-end side-relation
+     * activity without enabling the noisier generic-allocator ARENA
+     * traces above. */
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "lifecycle event=alloc handle=0x%" PRIx64 " size=%u epoch=%u",
+        handle, size, arena->current_epoch);
     return handle;
 }
 
@@ -274,15 +281,23 @@ wl_compound_arena_retain(wl_compound_arena_t *arena, uint64_t handle,
 void
 wl_compound_arena_freeze(wl_compound_arena_t *arena)
 {
-    if (arena)
-        arena->frozen = true;
+    if (!arena)
+        return;
+    arena->frozen = true;
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "lifecycle event=freeze epoch=%u live_handles=%" PRIu64,
+        arena->current_epoch, arena->live_handles);
 }
 
 void
 wl_compound_arena_unfreeze(wl_compound_arena_t *arena)
 {
-    if (arena)
-        arena->frozen = false;
+    if (!arena)
+        return;
+    arena->frozen = false;
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "lifecycle event=unfreeze epoch=%u live_handles=%" PRIu64,
+        arena->current_epoch, arena->live_handles);
 }
 
 uint32_t

@@ -725,6 +725,13 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,
         "event=compound_arena_init seed=0x%08x default_gen_cap=%u",
         0x53455353u, 4096u);
+    /* Issue #583: lifecycle audit trail for the compound side-relation
+     * subsystem.  WL_LOG=COMPOUND:5 captures create/destroy/alloc/
+     * freeze/unfreeze in one section without enabling the noisier
+     * SESSION INFO surface. */
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "lifecycle event=session_create seed=0x%08x default_gen_cap=%u",
+        0x53455353u, 4096u);
 
     /* Pre-register EDB relations (ncols determined at first insert) */
     for (uint32_t i = 0; i < plan->edb_count; i++) {
@@ -913,6 +920,12 @@ col_session_destroy(wl_session_t *session)
     /* Issue #559: free side-relation compound arena (NULL-safe). */
     WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,
         "event=compound_arena_destroy live_handles=%llu",
+        sess->compound_arena
+            ? (unsigned long long)sess->compound_arena->live_handles
+            : 0ULL);
+    /* Issue #583: lifecycle audit trail (mirrors session_create). */
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "lifecycle event=session_destroy live_handles=%llu",
         sess->compound_arena
             ? (unsigned long long)sess->compound_arena->live_handles
             : 0ULL);
