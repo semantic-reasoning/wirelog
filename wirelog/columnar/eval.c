@@ -890,6 +890,16 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
             delta_pool_reset(sess->delta_pool);
             sess->rotation_ops->rotate_eval_arena(sess);
+            /* Issue #560: Advance the compound-arena epoch frontier at the
+            * end of each recursive sub-pass iteration so the
+            * epoch-frontier GC can reclaim handles whose multiplicity
+            * dropped to zero in this iteration.  NULL-guard each link in
+            * the dispatch chain because tests and early lifecycle paths
+            * may operate without a compound arena or rotation strategy. */
+            if (sess->compound_arena && sess->rotation_ops
+                && sess->rotation_ops->gc_epoch_boundary) {
+                sess->rotation_ops->gc_epoch_boundary(sess);
+            }
             /* Issue #176: Per-sub-pass cache eviction for recursive strata.
              * Use configurable eviction threshold (cache_evict_threshold):
              * - If 0: clear entire cache each sub-pass (backward compatible)
