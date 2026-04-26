@@ -282,8 +282,18 @@ wl_compound_arena_unfreeze(wl_compound_arena_t *arena);
  *   3. Advance current_epoch by 1.  If the cap is exceeded, further alloc
  *      calls return 0 and the caller is expected to rotate arenas.
  *
- * Returns the number of handles reclaimed (>= 0), or (uint32_t)-1 if the
- * arena is NULL.
+ * Freeze-guard contract (Issue #561 / verified in #584):
+ *   When arena->frozen is true, this function is a no-op: it neither
+ *   sweeps multiplicity nor advances current_epoch.  The return value
+ *   on the frozen path is the unchanged @current_epoch, which lets
+ *   callers detect "no advance happened" by comparing against a
+ *   pre-call snapshot.  It is NOT zero — that would conflict with
+ *   epoch zero being a valid generational scope.
+ *
+ * Returns:
+ *   - (uint32_t)-1 if @arena is NULL.
+ *   - arena->current_epoch (unchanged) if @arena is frozen.
+ *   - the number of handles reclaimed (>= 0) otherwise.
  */
 uint32_t
 wl_compound_arena_gc_epoch_boundary(wl_compound_arena_t *arena);
