@@ -1879,6 +1879,25 @@ test_gc_epoch_boundary_exe = executable(
 test('gc_epoch_boundary', test_gc_epoch_boundary_exe)
 
 # ============================================================================
+# GC Freeze Guard Unit Tests (Issue #561)
+# ============================================================================
+
+test_gc_freeze_guard_exe = executable(
+  'test_gc_freeze_guard',
+  files(
+    'test_gc_freeze_guard.c',
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  arena_src,
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('gc_freeze_guard', test_gc_freeze_guard_exe)
+
+# ============================================================================
 # Recursive Aggregation Plan Tests - DISABLED in Phase 2C
 # ============================================================================
 #
