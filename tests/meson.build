@@ -377,6 +377,7 @@ backend_src = files(
   '../wirelog/columnar/progress.c',
   '../wirelog/columnar/rotation_standard.c',
   '../wirelog/columnar/rotation_mvcc.c',
+  '../wirelog/columnar/compound_side.c',
   '../wirelog/util/lockfree_queue.c',
   '../wirelog/util/log.c',
   '../wirelog/util/log_emit.c',
@@ -2438,6 +2439,27 @@ test_inline_compound_wiring_exe = executable(
 )
 
 test('inline_compound_wiring', test_inline_compound_wiring_exe)
+
+# ============================================================================
+# Side-relation auto-creation (Issue #533, with #580 arena precondition)
+# ============================================================================
+
+test_compound_side_relation_exe = executable(
+  'test_compound_side_relation',
+  files('test_compound_side_relation.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('compound_side_relation', test_compound_side_relation_exe)
 
 # ============================================================================
 # K-Fusion deep-copy + inline compound visibility (Issue #532 Task 4)
