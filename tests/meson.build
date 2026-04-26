@@ -2488,6 +2488,27 @@ test('compound_arena_freeze_cycle_stress',
      timeout: 120)
 
 # ============================================================================
+# Compound arena GC freeze-guard alloc race (Issue #584)
+# W=2 TSan: alloc and gc_epoch_boundary concurrently observe arena->frozen.
+# ============================================================================
+
+test_gc_freeze_alloc_race_exe = executable(
+  'test_gc_freeze_alloc_race',
+  files('test_gc_freeze_alloc_race.c'),
+  arena_src,
+  thread_src,
+  workqueue_src,
+  files(
+    '../wirelog/util/log.c',
+    '../wirelog/util/log_emit.c',
+  ),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep, math_dep],
+)
+
+test('gc_freeze_alloc_race', test_gc_freeze_alloc_race_exe, timeout: 60)
+
+# ============================================================================
 # Compound arena lifecycle observability (Issue #583)
 # WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
 # ============================================================================
