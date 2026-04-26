@@ -387,6 +387,56 @@ cleanup:
 }
 
 /* ======================================================================== */
+/* Issue #580: arena precondition for side-relation creation                 */
+/* ======================================================================== */
+
+/*
+ * wl_compound_side_ensure stores compound payloads through the session's
+ * compound arena, so the arena must exist before the relation can be
+ * registered.  Constructing a side-relation without an arena would yield
+ * a relation that no subsequent allocation could populate, masking the
+ * misconfiguration until much later (during eval).  The contract:
+ *
+ *   if !sess || !sess->compound_arena: return EINVAL, *out_rel = NULL.
+ *
+ * The session created via make_session() always has compound_arena set
+ * (col_session_create allocates it), so we explicitly tear it down here
+ * to exercise the EINVAL path without polluting other tests' state.
+ */
+static void
+test_side_relation_requires_arena(void)
+{
+    TEST("side-relation creation rejects NULL compound_arena");
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    if (make_session(&sess, &plan, &prog) != 0) {
+        tests_failed++;
+        printf(" ... FAIL: make_session failed\n");
+        return;
+    }
+    wl_col_session_t *cs = (wl_col_session_t *)sess;
+
+    /* Sanity: the freshly-created session should have an arena. */
+    ASSERT(cs->compound_arena != NULL,
+        "fresh session lacks compound_arena (test setup);"
+        " #580 contract relies on detaching from a known-good baseline");
+
+    /* Detach the arena so the validation path is reachable. */
+    wl_compound_arena_free(cs->compound_arena);
+    cs->compound_arena = NULL;
+
+    col_rel_t *rel = (col_rel_t *)0xdeadbeef; /* sentinel */
+    int rc = wl_compound_side_ensure(cs, "metadata", 4, &rel);
+    ASSERT(rc == EINVAL, "missing arena should return EINVAL");
+    ASSERT(rel == NULL, "out_rel must be cleared on validation failure");
+
+    PASS();
+cleanup:
+    free_session(sess, plan, prog);
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -401,6 +451,7 @@ main(void)
     test_side_relation_store_retrieve();
     test_side_relation_nested();
     test_side_relation_arena_gc_integration();
+    test_side_relation_requires_arena();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);

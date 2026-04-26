@@ -41,7 +41,12 @@ wl_compound_side_ensure(wl_col_session_t *sess, const char *functor,
 {
     if (out_rel)
         *out_rel = NULL;
-    if (!sess || !functor || arity == 0)
+    /* Issue #580: side-relation rows carry a compound handle in column 0,
+     * so the session must own a compound arena before a side-relation can
+     * be registered.  Refusing here surfaces the misconfiguration at the
+     * registration site instead of letting downstream allocations silently
+     * skip into the arena's frozen / NULL fallback. */
+    if (!sess || !sess->compound_arena || !functor || arity == 0)
         return EINVAL;
 
     char name[WL_COMPOUND_SIDE_NAME_MAX];
