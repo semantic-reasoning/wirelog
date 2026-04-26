@@ -2511,6 +2511,25 @@ test_gc_freeze_alloc_race_exe = executable(
 test('gc_freeze_alloc_race', test_gc_freeze_alloc_race_exe, timeout: 60)
 
 # ============================================================================
+# Handle remap EDB apply pass (Issue #589)
+# 10K rows x 3 compound columns acceptance harness, plus negative paths.
+# ============================================================================
+
+test_handle_remap_apply_exe = executable(
+  'test_handle_remap_apply',
+  files('test_handle_remap_apply.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('handle_remap_apply', test_handle_remap_apply_exe, timeout: 60)
+
+# ============================================================================
 # Compound arena lifecycle observability (Issue #583)
 # WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
 # ============================================================================
