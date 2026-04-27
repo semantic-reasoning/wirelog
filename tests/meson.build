@@ -2550,6 +2550,28 @@ test_handle_remap_side_apply_exe = executable(
 test('handle_remap_side_apply', test_handle_remap_side_apply_exe, timeout: 60)
 
 # ============================================================================
+# Post-remap cache invalidation (Issue #591)
+# Arrangements + dedup_slots reset for __compound_* relations.
+# ============================================================================
+
+test_post_remap_invalidate_exe = executable(
+  'test_post_remap_invalidate',
+  files('test_post_remap_invalidate.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('post_remap_invalidate', test_post_remap_invalidate_exe, timeout: 60)
+
+# ============================================================================
 # Compound arena lifecycle observability (Issue #583)
 # WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
 # ============================================================================
