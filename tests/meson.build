@@ -2713,6 +2713,63 @@ test('stress_harness_rotation_release_mvcc', test_stress_harness_exe,
            'WL_STRESS_WORKLOAD': 'rotation-vtable',
            'WIRELOG_ROTATION': 'mvcc'})
 
+# Daemon-soak workload (#597): long-running soak proving bounded-RSS
+# behavior under saturation-driven rotation cadence + cumulative
+# handle survival across many gc_epoch_boundary calls within a
+# rotation window.  Both strategy variants (WIRELOG_ROTATION=standard
+# and =mvcc) are registered at PR/nightly/release tiers because #596's
+# contract is the dispatch path; the ASan tier is single-strategy to
+# keep cost down (both ASan slowdown and a long soak per run).
+# WL_STRESS_R for this workload is the step count (not cycle count),
+# K=1000 handles per step is fixed, hard-cap is 10000 steps.  Single-
+# mutator -- W is accepted but ignored.
+test('stress_harness_daemon_pr', test_stress_harness_exe,
+     timeout: 60,
+     env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '100',
+           'WL_STRESS_WORKLOAD': 'daemon-soak',
+           'WIRELOG_ROTATION': 'standard'})
+
+test('stress_harness_daemon_pr_mvcc', test_stress_harness_exe,
+     timeout: 60,
+     env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '100',
+           'WL_STRESS_WORKLOAD': 'daemon-soak',
+           'WIRELOG_ROTATION': 'mvcc'})
+
+test('stress_harness_daemon_asan', test_stress_harness_exe,
+     suite: 'asan',
+     timeout: 240,
+     env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '200',
+           'WL_STRESS_WORKLOAD': 'daemon-soak',
+           'WIRELOG_ROTATION': 'standard'})
+
+test('stress_harness_daemon_nightly', test_stress_harness_exe,
+     suite: 'stress-nightly',
+     timeout: 600,
+     env: {'WL_STRESS_W': '4', 'WL_STRESS_R': '2000',
+           'WL_STRESS_WORKLOAD': 'daemon-soak',
+           'WIRELOG_ROTATION': 'standard'})
+
+test('stress_harness_daemon_nightly_mvcc', test_stress_harness_exe,
+     suite: 'stress-nightly',
+     timeout: 600,
+     env: {'WL_STRESS_W': '4', 'WL_STRESS_R': '2000',
+           'WL_STRESS_WORKLOAD': 'daemon-soak',
+           'WIRELOG_ROTATION': 'mvcc'})
+
+test('stress_harness_daemon_release', test_stress_harness_exe,
+     suite: 'stress-release',
+     timeout: 1800,
+     env: {'WL_STRESS_W': '8', 'WL_STRESS_R': '10000',
+           'WL_STRESS_WORKLOAD': 'daemon-soak',
+           'WIRELOG_ROTATION': 'standard'})
+
+test('stress_harness_daemon_release_mvcc', test_stress_harness_exe,
+     suite: 'stress-release',
+     timeout: 1800,
+     env: {'WL_STRESS_W': '8', 'WL_STRESS_R': '10000',
+           'WL_STRESS_WORKLOAD': 'daemon-soak',
+           'WIRELOG_ROTATION': 'mvcc'})
+
 # ============================================================================
 # Compound arena lifecycle observability (Issue #583)
 # WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
