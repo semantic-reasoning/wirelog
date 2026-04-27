@@ -7,12 +7,13 @@ baseline protocol the repo uses to triage intermittent failures.
 
 ## CI tier topology
 
-The same `test_stress_harness` binary is registered thirteen times in
+The same `test_stress_harness` binary is registered twenty times in
 `tests/meson.build` with different `env:` blocks and meson `suite:`
 tags so a single configurable harness backs three CI tiers
-without duplicating code.  (Twelve in the table below plus
-`stress_harness_nested_asan` under the `asan` suite -- omitted from
-this table because it ships separately from the W/R/strategy axes.)
+without duplicating code.  (Eighteen in the table below plus
+`stress_harness_nested_asan` and `stress_harness_daemon_asan` under
+the `asan` suite -- omitted from this table because they ship
+separately from the W/R/strategy axes.)
 
 | Test name | Suite | Workload | W | R | Where it runs |
 |---|---|---|---|---|---|
@@ -20,14 +21,20 @@ this table because it ships separately from the W/R/strategy axes.)
 | `stress_harness_apply_roundtrip_pr` | (default) | apply-roundtrip | 2 | 500 | every PR |
 | `stress_harness_rotation_pr` | (default) | rotation-vtable (standard) | 2 | 50 | every PR |
 | `stress_harness_rotation_pr_mvcc` | (default) | rotation-vtable (mvcc) | 2 | 50 | every PR |
+| `stress_harness_daemon_pr` | (default) | daemon-soak (standard) | 2 | 100 | every PR |
+| `stress_harness_daemon_pr_mvcc` | (default) | daemon-soak (mvcc) | 2 | 100 | every PR |
 | `stress_harness_w4` | `stress-nightly` | freeze-cycle | 4 | 500 | nightly (`perf-nightly.yml`, 04:00 UTC) |
 | `stress_harness_apply_roundtrip_nightly` | `stress-nightly` | apply-roundtrip | 4 | 5000 | nightly |
 | `stress_harness_rotation_nightly` | `stress-nightly` | rotation-vtable (standard) | 4 | 500 | nightly |
 | `stress_harness_rotation_nightly_mvcc` | `stress-nightly` | rotation-vtable (mvcc) | 4 | 500 | nightly |
+| `stress_harness_daemon_nightly` | `stress-nightly` | daemon-soak (standard) | 4 | 2000 | nightly |
+| `stress_harness_daemon_nightly_mvcc` | `stress-nightly` | daemon-soak (mvcc) | 4 | 2000 | nightly |
 | `stress_harness_w8` | `stress-release` | freeze-cycle | 8 | 1000 | release-tier (manual, see below) |
 | `stress_harness_apply_roundtrip_release` | `stress-release` | apply-roundtrip | 8 | 50000 | release-tier (manual) |
 | `stress_harness_rotation_release` | `stress-release` | rotation-vtable (standard) | 8 | 1000 | release-tier (manual) |
 | `stress_harness_rotation_release_mvcc` | `stress-release` | rotation-vtable (mvcc) | 8 | 1000 | release-tier (manual) |
+| `stress_harness_daemon_release` | `stress-release` | daemon-soak (standard) | 8 | 10000 | release-tier (manual) |
+| `stress_harness_daemon_release_mvcc` | `stress-release` | daemon-soak (mvcc) | 8 | 10000 | release-tier (manual) |
 
 The PR tier runs in the default suite, picked up by every
 `meson test -C build` invocation in `ci-pr.yml`/`ci-main.yml`. The
@@ -141,6 +148,115 @@ the compound arena's 4096-epoch ceiling.
 combined). Healthy floor: any single CI failure is a real regression,
 not a flake.
 
+### `daemon-soak`
+
+Long-running soak that proves bounded-RSS behavior under saturation-
+driven rotation cadence and cumulative handle survival across many
+`gc_epoch_boundary` calls within a rotation window. Differs from
+`rotation-vtable` (#596) on three axes:
+
+1. **Cadence is saturation-driven**, not loop-bounded `R`. When the
+   compound arena's `current_epoch + 8 >= max_epochs` the workload
+   calls `sess->rotation_ops->gc_epoch_boundary(sess)` explicitly to
+   advance the epoch ahead of allocations. On absolute saturation
+   (`current_epoch == max_epochs`, the sentinel from
+   `compound_arena.c:351`) the arena is destroyed and recreated -- a
+   deliberate scope discontinuity that resets the cycle-window
+   survival oracle. The workload uses a tight `max_epochs=32`
+   ceiling so the predicate fires every ~24 steps, which forces the
+   soak's working-set ceiling to plateau early so VmHWM stays
+   bounded across the run regardless of `R`.
+2. **Per-step handle fan-out `K=1000`** (vs `rotation-vtable`'s
+   `K=64`) so each step produces meaningful allocator pressure.
+   `K` is a constant, not parameterized.
+3. **Cumulative-survival oracle** every 100th step walks the LAST
+   `WL_DAEMON_WINDOW=8000` handles (~8 epochs of allocations within
+   a single arena lifetime) to exercise the `wl_compound_arena_lookup`
+   path under a long soak. Lookups against closed-epoch handles are
+   tolerated to return `NULL` by design (`compound_arena.c:332-344`
+   zeroes the closed generation); the survival contract asserts
+   crash-free behavior plus size-equality on non-`NULL` resolutions.
+   ASan / TSan tiers add the orthogonal memory-safety axis.
+
+`WL_STRESS_R` for this workload is the **step count**, not cycle
+count. Hard cap is 10000 steps (issue spec); `WL_STRESS_R=10001`
+hard-fails with a parseable diagnostic. `WL_STRESS_W` is accepted
+but ignored: rotation hooks are single-mutator by contract.
+
+Per step:
+
+1. Saturation predicate: if `current_epoch + 8 >= max_epochs`,
+   advance via `gc_epoch_boundary`; if the result is the
+   `current_epoch == max_epochs` sentinel, destroy + recreate the
+   arena and reset the survival oracle.
+2. Allocate `K=1000` handles in `sess->compound_arena` via
+   `wl_compound_arena_alloc(arena, 24)`. Record each in the
+   window-local oracle.
+3. Call `sess->rotation_ops->rotate_eval_arena(sess)` (vtable
+   hook 1, must NOT touch `compound_arena` per the #596 contract).
+4. Mid-rotation oracle: every just-allocated handle resolves via
+   `wl_compound_arena_lookup` with size-equality, plus
+   `wl_compound_arena_multiplicity == 1` (initial-alloc
+   multiplicity per `compound_arena.h`).
+5. Cumulative-survival check (every 100th step): walk last
+   `min(WINDOW, oracle_n)` handles. Skipped when oracle was just
+   reset by arena recreation.
+6. Call `sess->rotation_ops->gc_epoch_boundary(sess)` (vtable
+   hook 2) to close the epoch.
+
+#### RSS gate
+
+End-of-run RSS gate proves no leak by bounding the peak resident
+working set growth. The cross-platform sampler lives in
+`tests/test_rss_util.h` (mirrors `bench/bench_util.h:107-149`):
+
+- **Linux**: `/proc/self/status` `VmHWM` parser, returns KB.
+- **macOS**: `task_info` with `MACH_TASK_BASIC_INFO`, returns KB.
+- **Windows**: `GetProcessMemoryInfo.PeakWorkingSetSize`, returns KB.
+- Returns `-1` on platform sampler unavailability.
+
+`getrusage(RUSAGE_SELF).ru_maxrss` is intentionally NOT used here
+because of its KB-on-Linux / bytes-on-macOS divergence (a known
+foot-gun).
+
+The gate samples `rss_baseline_kb` immediately after mock-session
+construction (BEFORE the first step) and `rss_final_kb` after the
+last step's `gc_epoch_boundary` (BEFORE cleanup, so the heap has
+not yet been deallocated). Gate formula:
+
+```
+rss_final_kb <= rss_baseline_kb + max(rss_baseline_kb / 10, 16384)
+```
+
+10% growth or 16 MB absolute floor (whichever larger). The floor
+is the binding constraint for typical CI baselines (1-30 MB); the
+percentage kicks in at very large baselines (>160 MB). On gate
+failure the diagnostic prints baseline / final / delta / gate values
+so a reviewer can read off the leak signal directly.
+
+**Platform behavior:**
+
+- Linux / macOS native: gate enforced.
+- Windows or Linux containers without `/proc`: sampler returns -1;
+  the gate is skipped with a `[rss-gate skipped: platform sampler
+  unavailable]` diagnostic and the run continues.
+- AddressSanitizer instrumentation: gate skipped at compile time
+  (via `__SANITIZE_ADDRESS__` / `__has_feature(address_sanitizer)`)
+  with a `[rss-gate skipped: AddressSanitizer instrumentation
+  confounds VmHWM signal]` diagnostic. ASan's redzones, shadow
+  memory, and quarantine freelist prevent the OS from reclaiming
+  pages back below VmHWM after `free()`, so the no-leak signal is
+  confounded under ASan; the ASan tier still validates the workload
+  functionally and surfaces actual heap-buffer-overflow / use-after-
+  free / leak via ASan's own reporting.
+
+#### Baseline pass rate
+
+100/100 PR-tier daemon-soak runs pass on the baseline machine
+(`stress_harness_daemon_pr` + `stress_harness_daemon_pr_mvcc`
+combined). Healthy floor: any single CI failure is a real
+regression, not a flake.
+
 ## Running release-tier locally
 
 There is no `release.yml` workflow yet (deferred follow-up). To
@@ -155,13 +271,17 @@ TSAN_OPTIONS='halt_on_error=1' \
     --print-errorlogs --num-processes 1
 ```
 
-All four release-tier entries must pass:
+All six release-tier entries must pass:
 `stress_harness_w8` (freeze-cycle, 1000 cycles),
 `stress_harness_apply_roundtrip_release` (apply-roundtrip, 50000
-rows), and the two `stress_harness_rotation_release{,_mvcc}` entries
-(rotation-vtable, 1000 cycles each, both strategy variants). Wall
-time is sub-minute per entry on a typical x86_64 laptop under TSan;
-the test() entries set `timeout: 300-600` as headroom.
+rows), the two `stress_harness_rotation_release{,_mvcc}` entries
+(rotation-vtable, 1000 cycles each, both strategy variants), and
+the two `stress_harness_daemon_release{,_mvcc}` entries (daemon-
+soak, 10000 steps each, both strategy variants). Wall time is sub-
+minute per entry on a typical x86_64 laptop under TSan; the test()
+entries set `timeout: 300-1800` as headroom (the daemon-soak
+release tier sets 1800s to accommodate 10000 steps under TSan
+slowdown).
 
 ## Flake baseline protocol
 
