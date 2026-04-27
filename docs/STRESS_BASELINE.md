@@ -349,6 +349,98 @@ Record the new baseline pass-rate in the file header docstring of
 `test_stress_harness.c` so future on-callers do not have to
 re-derive it.
 
+## Per-rotation RSS-bounded gate (Issue #598)
+
+`tests/test_rss_bounded.c` is the residual-scope companion to #597's
+end-of-run daemon-soak gate. It exercises three signals NOT covered
+by the daemon-soak workload:
+
+1. **Per-rotation sampling granularity**, not just end-of-run. The
+   sampler is `test_current_rss_kb()` (Linux `/proc/self/status:VmRSS`,
+   macOS `task_info` `resident_size`, Windows
+   `PROCESS_MEMORY_COUNTERS.WorkingSetSize`), which returns the
+   CURRENT working-set size. The companion `test_peak_rss_kb()` (used
+   by daemon-soak) returns the monotonic VmHWM peak and is unfit for
+   per-rotation deltas because `VmHWM(N+1) - VmHWM(N) >= 0` always,
+   independent of memory pressure. Per-rotation gates require VmRSS;
+   end-of-run gates use VmHWM.
+2. **Cumulative cap with no 4 MB floor.** The PR-tier gate is
+   `rss_after <= rss_warmup + max(rss_warmup / 10, 1024 KB)` -- 10
+   percent growth or a 1 MB absolute floor (whichever larger),
+   strictly tighter than daemon-soak's `max(10 percent, 4 MB)`. The
+   wider 4 MB floor is appropriate for an end-of-run signal at small
+   baselines (~2 MB) where 10 percent would be too tight; the
+   per-rotation gate is the canary for incremental drift and benefits
+   from the tighter floor.
+3. **Per-rotation `mem_ledger.current_bytes` snapshot.** Production
+   rotation hooks (`rotation_standard.c`) only call
+   `wl_arena_reset`; they do NOT mutate `wl_mem_ledger`. The gate
+   asserts `ledger.current_bytes` is EXACTLY equal before and after
+   each rotation -- production rotation does not allocate via the
+   ledger; any change is a regression. Today the assertion is
+   tautological (catches future regressions that introduce ledger
+   churn into the rotation hot path).
+
+The strict per-rotation delta gate
+`rss_after - rss_prev <= rss_prev / 10` (skip when delta < 256 KB
+page-size noise floor) is opt-in via `WL_RSS_BOUNDED_STRICT=1` and
+runs only in the nightly/release tiers. Localhost machines that fail
+the warmup CoV self-check (>0.05) exit 77 (meson SKIP); the pattern
+mirrors `test_log_perf_gate.c`.
+
+The workload uses a saturation-driven arena recycle pattern
+(max_epochs=32, epoch_buffer=8) so the working set plateaus at the
+arena ceiling, mirroring daemon-soak. Without recycle, R=1000 with
+K=64 handles per epoch would accumulate legitimate per-epoch
+generation overhead and trip the cumulative gate.
+
+### CI tier topology
+
+| Test name | Suite | R | Strict | Where it runs |
+|---|---|---|---|---|
+| `rss_bounded_pr` | (default) | 100 | off | every PR |
+| `rss_bounded_nightly` | `stress-nightly` | 500 | on | nightly |
+| `rss_bounded_release` | `stress-release` | 1000 | on | release-tier (manual) |
+| `rss_bounded_asan` | `asan` | 100 | off | every PR (build-san) |
+
+ASan tier compile-time skips the RSS portion (ASan instrumentation
+confounds VmRSS the same way it confounds VmHWM -- redzones, shadow
+memory, and quarantine prevent reclaim). Ledger and rotation
+assertions still run to surface UAF/heap-overflow on the rotation
+hot path via ASan's own reporting.
+
+### Baseline pass rate
+
+100/100 PR-tier `rss_bounded_pr` runs pass on the baseline machine.
+Healthy floor: any single CI failure is a real regression, not a
+flake.
+
+## deep_copy ledger-charge canary (Issue #598)
+
+`tests/test_deep_copy_ledger_canary.c` is the destroy-side companion
+to `test_col_rel_deep_copy.c::test_deep_copy_mem_ledger_null`
+(Issue #554). The existing test already pins:
+
+1. `dst->mem_ledger == NULL` after `col_rel_deep_copy`.
+2. Source ledger counters are unchanged by the deep copy itself.
+
+The canary adds the residual #598 acceptance bullet:
+
+- `col_rel_destroy(dst)` does NOT double-charge the source session's
+  ledger. Because `dst->mem_ledger` is NULL,
+  `col_rel_free_contents` must not accidentally consult
+  `src->mem_ledger` when it walks dst's columns.
+
+**Vacuous in production today**: `col_rel_deep_copy` has NO
+production callers in rotation paths today (verified by grep across
+`wirelog/`). Only `tests/test_col_rel_deep_copy.c` and
+`tests/col_rel_deep_copy_fixture.c` invoke it. The canary becomes
+load-bearing when #550-C `wl_session_rotate` ships: the cross-arena
+rotation helper will deep-copy live relations into the new arena,
+and any ledger churn would corrupt per-session memory accounting.
+
+Registered in the default suite as `deep_copy_ledger_canary`.
+
 ## Out of scope (#594 follow-up tracking)
 
 - **Release-tier CI workflow**: no `release.yml` exists yet. The
