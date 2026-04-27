@@ -2793,6 +2793,26 @@ test_rss_bounded_exe = executable(
 
 test('rss_bounded_pr', test_rss_bounded_exe, timeout: 60)
 
+# ----------------------------------------------------------------------------
+# deep_copy ledger-charge canary (Issue #598)
+# Vacuous today (col_rel_deep_copy has no production rotation callers);
+# regression canary for #550-C wl_session_rotate.
+# ----------------------------------------------------------------------------
+
+test_deep_copy_ledger_canary_exe = executable(
+  'test_deep_copy_ledger_canary',
+  files('test_deep_copy_ledger_canary.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('deep_copy_ledger_canary', test_deep_copy_ledger_canary_exe)
+
 # ============================================================================
 # Compound arena lifecycle observability (Issue #583)
 # WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
