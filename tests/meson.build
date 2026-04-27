@@ -2655,6 +2655,17 @@ test('stress_harness_apply_roundtrip_release', test_stress_harness_exe,
      env: {'WL_STRESS_W': '8', 'WL_STRESS_R': '50000',
            'WL_STRESS_WORKLOAD': 'apply-roundtrip'})
 
+# Nested-asan workload (#595): session-level register/apply/invalidate/GC
+# churn over 100 __compound_ side-relations.  Suite 'asan' so it runs
+# every PR via builddir-san (ci-pr.yml:158).  Single-mutator -- W is
+# accepted but ignored by the workload; R=50 default keeps wall time
+# under 1s without ASan and well under the 120s timeout under ASan.
+test('stress_harness_nested_asan', test_stress_harness_exe,
+     suite: 'asan',
+     timeout: 120,
+     env: {'WL_STRESS_R': '50',
+           'WL_STRESS_WORKLOAD': 'nested-asan'})
+
 # ============================================================================
 # Compound arena lifecycle observability (Issue #583)
 # WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
