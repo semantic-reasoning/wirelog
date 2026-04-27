@@ -124,4 +124,54 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
     uint64_t *out_rels_rewritten,
     uint64_t *out_total_cells);
 
+/**
+ * wl_handle_remap_invalidate_side_relation_caches:
+ * @sess:                 session whose side-relation caches should be
+ *                        invalidated.  Must not be NULL.
+ * @out_rels_invalidated: (out, optional): number of side-relations
+ *                        touched by the invalidation pass.
+ *
+ * Post-remap cache cleanup (#591).  Walks @sess->rels[] looking for
+ * the __compound_ name prefix and, for each matched relation:
+ *
+ *   1. Calls col_session_invalidate_arrangements(@sess, rel->name).
+ *      That helper (already shipped, arrangement.c) clears the full,
+ *      filtered, and differential arrangement caches whose hash keys
+ *      include the (now stale) handle column values.
+ *
+ *   2. Frees and zeroes the per-relation row-dedup hash:
+ *           free(rel->dedup_slots);
+ *           rel->dedup_slots = NULL;
+ *           rel->dedup_cap = 0; rel->dedup_count = 0;
+ *      The next consolidation rebuilds the dedup table from the
+ *      rewritten row data (eval.c).  Setting only the pointer to
+ *      NULL would leak the prior allocation.
+ *
+ * Out of scope for #591 (call out for #598 / follow-up):
+ *   - mat_cache is content-keyed and may carry stale join results
+ *     over remapped sources.  Whether to clear or accept the
+ *     content-hash miss is left to the rotation helper (#550-C);
+ *     this pass does NOT touch mat_cache.
+ *   - sarr_entries (sorted-by-key permutations) are not currently
+ *     touched by col_session_invalidate_arrangements.  Side-
+ *     relations are not expected to have sarr entries today, so
+ *     the gap is harmless until a side-relation gets sorted; that
+ *     extension belongs to a follow-up that grows
+ *     col_session_invalidate_arrangements rather than this pass.
+ *
+ * Multiplicity (Z-set): the invalidation pass touches per-relation
+ * cache fields only.  col_rel_t::timestamps[] (which carries per-
+ * row multiplicity) is never read or written.
+ *
+ * Returns:
+ *   0 on success.
+ *   EINVAL if @sess is NULL.
+ *
+ * NULL-safe on a session with zero side-relations.  No EIO path:
+ * the underlying invalidation helpers are infallible.
+ */
+int
+wl_handle_remap_invalidate_side_relation_caches(struct wl_col_session_t *sess,
+    uint64_t *out_rels_invalidated);
+
 #endif /* WL_COLUMNAR_HANDLE_REMAP_APPLY_SIDE_H */

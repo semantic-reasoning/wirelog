@@ -9,6 +9,7 @@
 
 #include "handle_remap_apply_side.h"
 
+#include "columnar_nanoarrow.h"
 #include "compound_side.h"
 #include "handle_remap_apply.h"
 #include "wirelog/util/log.h"
@@ -158,5 +159,50 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
         "lifecycle event=remap_apply_side_session "
         "rels=%" PRIu64 " cells=%" PRIu64,
         rels, cells);
+    return 0;
+}
+
+int
+wl_handle_remap_invalidate_side_relation_caches(struct wl_col_session_t *sess,
+    uint64_t *out_rels_invalidated)
+{
+    if (out_rels_invalidated)
+        *out_rels_invalidated = 0;
+    if (!sess)
+        return EINVAL;
+
+    uint64_t touched = 0;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        col_rel_t *rel = sess->rels[i];
+        if (!rel)
+            continue;
+        if (!is_side_relation_name_(rel->name))
+            continue;
+
+        /* (1) Per-relation arrangement caches (full, filtered,
+         * differential).  Existing helper already covers all three
+         * keyed-by-row-value caches and is no-op safe when the
+         * relation has no entries. */
+        col_session_invalidate_arrangements(&sess->base, rel->name);
+
+        /* (2) Per-relation row-dedup hash.  IMPORTANT: dedup_slots is
+         * heap-allocated (eval.c lazy-builds it via calloc); free()
+         * before clearing the pointer or we leak dedup_cap *
+         * sizeof(*dedup_slots) bytes per remapped relation per
+         * rotation.  The next consolidation rebuilds the table from
+         * the (rewritten) row data. */
+        free(rel->dedup_slots);
+        rel->dedup_slots = NULL;
+        rel->dedup_cap = 0;
+        rel->dedup_count = 0;
+
+        touched++;
+    }
+
+    if (out_rels_invalidated)
+        *out_rels_invalidated = touched;
+    WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
+        "lifecycle event=remap_invalidate_side_caches rels=%" PRIu64,
+        touched);
     return 0;
 }
