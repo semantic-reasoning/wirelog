@@ -2793,6 +2793,26 @@ test_rss_bounded_exe = executable(
 
 test('rss_bounded_pr', test_rss_bounded_exe, timeout: 60)
 
+# Nightly tier: strict per-rotation delta gate at R=500.  Skipped via
+# meson exit-77 if warmup CoV exceeds 0.05 on a noisy localhost.
+test('rss_bounded_nightly', test_rss_bounded_exe,
+     suite: 'stress-nightly',
+     timeout: 600,
+     env: {'WL_RSS_BOUNDED_STRICT': '1', 'WL_RSS_BOUNDED_R': '500'})
+
+# Release tier: strict per-rotation delta gate at R=1000.
+test('rss_bounded_release', test_rss_bounded_exe,
+     suite: 'stress-release',
+     timeout: 1200,
+     env: {'WL_RSS_BOUNDED_STRICT': '1', 'WL_RSS_BOUNDED_R': '1000'})
+
+# ASan tier: RSS portion is compile-time skipped (ASan instrumentation
+# confounds VmRSS/VmHWM signal).  Ledger and rotation assertions still
+# run under ASan to surface UAF/heap-overflow on the rotation hot path.
+test('rss_bounded_asan', test_rss_bounded_exe,
+     suite: 'asan',
+     timeout: 240)
+
 # ----------------------------------------------------------------------------
 # deep_copy ledger-charge canary (Issue #598)
 # Vacuous today (col_rel_deep_copy has no production rotation callers);

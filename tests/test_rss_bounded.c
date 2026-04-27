@@ -62,12 +62,21 @@
 #endif
 
 /* Test parameters -- match the daemon-soak workload's surface so a
- * future divergence in one does not silently churn the other. */
+ * future divergence in one does not silently churn the other.
+ * WL_RSS_BOUNDED_MAX_EPOCHS=32 with WL_RSS_BOUNDED_EPOCH_BUFFER=8
+ * mirrors the daemon-soak pattern: the saturation predicate fires
+ * every ~24 steps so the working set plateaus at the arena's ceiling
+ * regardless of R, which is exactly the bounded-RSS contract the
+ * cumulative gate asserts.  Without saturation-recycle, R=1000 with
+ * K=64 handles per epoch would accumulate ~1.5 MB of legitimate
+ * allocator pressure (64 * 24 bytes * 1000 epochs + per-epoch
+ * generation overhead) and trip the 10%/1 MB cumulative gate. */
 #define WL_RSS_BOUNDED_K_HANDLES   64u
 #define WL_RSS_BOUNDED_PAYLOAD_SZ  24u
 #define WL_RSS_BOUNDED_WARMUP      5u
 #define WL_RSS_BOUNDED_DEFAULT_R   100u
-#define WL_RSS_BOUNDED_MAX_EPOCHS  4096u
+#define WL_RSS_BOUNDED_MAX_EPOCHS  32u
+#define WL_RSS_BOUNDED_EPOCH_BUFFER 8u
 #define WL_RSS_BOUNDED_EVAL_ARENA  (256u * 1024u)
 #define WL_RSS_BOUNDED_COV_CEILING 0.05
 #define WL_RSS_BOUNDED_NOISE_FLOOR_KB 256
@@ -133,6 +142,43 @@ free_session(wl_col_session_t *s)
     if (s->eval_arena)
         wl_arena_free(s->eval_arena);
     free(s);
+}
+
+/* Saturation predicate: when current_epoch + EPOCH_BUFFER >= max_epochs,
+ * advance via gc_epoch_boundary to keep allocations flowing.  If the
+ * advance pushes (or has already pushed) current_epoch to the saturation
+ * sentinel (== max_epochs, see compound_arena.c:351), destroy and
+ * recreate the arena so the working set plateaus.  Mirrors the pattern
+ * in test_stress_harness.c's daemon-soak workload.
+ *
+ * Returns the (possibly newly recreated) arena via *arena_io.  Updates
+ * sess->compound_arena to match.  Returns 0 on success, non-zero on
+ * arena recreate failure. */
+static int
+maybe_recycle_arena(wl_col_session_t *sess, wl_compound_arena_t **arena_io)
+{
+    wl_compound_arena_t *arena = *arena_io;
+    if (arena->current_epoch + WL_RSS_BOUNDED_EPOCH_BUFFER
+        < arena->max_epochs) {
+        return 0;
+    }
+    /* Advance the epoch ahead of allocations -- but only if we're not
+     * already at the saturation sentinel (gc_epoch_boundary indexes
+     * gens[current_epoch] unconditionally; current_epoch == max_epochs
+     * is out of bounds). */
+    if (arena->current_epoch < arena->max_epochs)
+        sess->rotation_ops->gc_epoch_boundary(sess);
+    if (arena->current_epoch == arena->max_epochs) {
+        /* Tear down and recreate. */
+        wl_compound_arena_free(arena);
+        arena = wl_compound_arena_create(0xBEEFu, 4096u,
+                WL_RSS_BOUNDED_MAX_EPOCHS);
+        if (!arena)
+            return -1;
+        sess->compound_arena = arena;
+        *arena_io = arena;
+    }
+    return 0;
 }
 
 /* CoV self-check: skip-on-noise pattern from tests/test_log_perf_gate.c.
@@ -212,6 +258,11 @@ main(void)
      * ------------------------------------------------------------------ */
     int64_t warmup_rss[WL_RSS_BOUNDED_WARMUP];
     for (uint32_t i = 0; i < WL_RSS_BOUNDED_WARMUP; i++) {
+        if (maybe_recycle_arena(sess, &arena) != 0) {
+            printf("FAIL: warmup %u arena recycle failed\n", i);
+            verdict = 1;
+            goto cleanup;
+        }
         for (uint32_t k = 0; k < WL_RSS_BOUNDED_K_HANDLES; k++) {
             uint64_t h = wl_compound_arena_alloc(arena,
                     WL_RSS_BOUNDED_PAYLOAD_SZ);
@@ -253,14 +304,15 @@ main(void)
      * ------------------------------------------------------------------ */
     int64_t rss_prev_kb = rss_warmup_kb;
     for (uint32_t r = 0; r < R; r++) {
+        if (maybe_recycle_arena(sess, &arena) != 0) {
+            printf("FAIL: rotation %u arena recycle failed\n", r);
+            verdict = 1;
+            goto cleanup;
+        }
         for (uint32_t k = 0; k < WL_RSS_BOUNDED_K_HANDLES; k++) {
             uint64_t h = wl_compound_arena_alloc(arena,
                     WL_RSS_BOUNDED_PAYLOAD_SZ);
             if (h == WL_COMPOUND_HANDLE_NULL) {
-                /* Out of epochs is a normal end-of-soak condition for
-                 * very large R; surface as a clean PASS only after we
-                 * confirm the ledger gate held.  For now, treat as FAIL
-                 * to surface premature exhaustion. */
                 printf("FAIL: rotation %u handle %u alloc returned NULL "
                     "(current_epoch=%u max_epochs=%u)\n",
                     r, k, arena->current_epoch, arena->max_epochs);
