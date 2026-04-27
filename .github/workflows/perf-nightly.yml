@@ -147,3 +147,62 @@ jobs:
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             echo '</details>' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # ==========================================================================
+  # Stress nightly (Issue #594): runs the W=4 / R=500 freeze-cycle and
+  # W=4 / R=5000 apply-roundtrip workloads under TSan instrumentation on
+  # Linux GCC.  Independent of the perf gate above (different build flags
+  # and different test suite) so a stress regression doesn't mask a perf
+  # regression and vice-versa.  See docs/STRESS_BASELINE.md for the
+  # release-tier (W=8) invocation and the flake-baseline protocol.
+  # ==========================================================================
+  stress:
+    name: Stress / ubuntu-latest / gcc / TSan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+
+      - name: Configure debug + TSan
+        run: >
+          meson setup build-stress-tsan
+          -Db_sanitize=thread
+          -Db_lundef=false
+          -Dthreads=posix
+          -Dtests=true
+          --buildtype=debug
+        env:
+          CC: gcc
+
+      - name: Build
+        run: meson compile -C build-stress-tsan
+
+      - name: Run stress-nightly suite under TSan
+        env:
+          TSAN_OPTIONS: 'halt_on_error=1:second_deadlock_stack=1'
+        run: |
+          meson test -C build-stress-tsan --suite stress-nightly \
+            --print-errorlogs --num-processes 1
+
+      - name: Publish results
+        if: always()
+        shell: bash
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## Stress Nightly: ubuntu-latest / gcc / TSan" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f build-stress-tsan/meson-logs/testlog.txt ]; then
+            echo '<details><summary>Stress-nightly testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -A 30 'stress_harness' build-stress-tsan/meson-logs/testlog.txt 2>/dev/null \
+              | head -200 >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+          fi
