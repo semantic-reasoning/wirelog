@@ -2596,6 +2596,66 @@ test_worker_borrow_w2_tsan_exe = executable(
 test('worker_borrow_w2_tsan', test_worker_borrow_w2_tsan_exe, timeout: 60)
 
 # ============================================================================
+# Parameterizable freeze-cycle stress harness (Issue #594)
+# Same binary registered three times with WL_STRESS_W / WL_STRESS_R env
+# overrides; suite tags route W=4 to nightly and W=8 to release.
+# ============================================================================
+
+test_stress_harness_exe = executable(
+  'test_stress_harness',
+  files('test_stress_harness.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+# Freeze-cycle workload (default).
+# PR tier (default suite -> picked up by ci-pr.yml's meson test).
+test('stress_harness_w2', test_stress_harness_exe,
+     timeout: 60,
+     env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '200',
+           'WL_STRESS_WORKLOAD': 'freeze-cycle'})
+
+# Nightly tier (suite: stress-nightly).  Wired into perf-nightly.yml.
+test('stress_harness_w4', test_stress_harness_exe,
+     suite: 'stress-nightly',
+     timeout: 120,
+     env: {'WL_STRESS_W': '4', 'WL_STRESS_R': '500',
+           'WL_STRESS_WORKLOAD': 'freeze-cycle'})
+
+# Release tier (suite: stress-release).  Run manually per
+# docs/STRESS_BASELINE.md; no release.yml workflow exists yet.
+test('stress_harness_w8', test_stress_harness_exe,
+     suite: 'stress-release',
+     timeout: 300,
+     env: {'WL_STRESS_W': '8', 'WL_STRESS_R': '1000',
+           'WL_STRESS_WORKLOAD': 'freeze-cycle'})
+
+# Apply-roundtrip workload (#594 acceptance: pre-rotation handles
+# valid post-apply).  Single-mutator by contract -- W is accepted
+# but ignored by the workload; PR/nightly/release tiers vary R.
+test('stress_harness_apply_roundtrip_pr', test_stress_harness_exe,
+     timeout: 60,
+     env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '500',
+           'WL_STRESS_WORKLOAD': 'apply-roundtrip'})
+
+test('stress_harness_apply_roundtrip_nightly', test_stress_harness_exe,
+     suite: 'stress-nightly',
+     timeout: 120,
+     env: {'WL_STRESS_W': '4', 'WL_STRESS_R': '5000',
+           'WL_STRESS_WORKLOAD': 'apply-roundtrip'})
+
+test('stress_harness_apply_roundtrip_release', test_stress_harness_exe,
+     suite: 'stress-release',
+     timeout: 300,
+     env: {'WL_STRESS_W': '8', 'WL_STRESS_R': '50000',
+           'WL_STRESS_WORKLOAD': 'apply-roundtrip'})
+
+# ============================================================================
 # Compound arena lifecycle observability (Issue #583)
 # WL_LOG=COMPOUND:5 must emit alloc/freeze/unfreeze tags.
 # ============================================================================
