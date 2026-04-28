@@ -428,17 +428,35 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     sess->frontier_ops = &col_frontier_epoch_ops;
 
     /* Issue #600: select rotation strategy via WIRELOG_ROTATION env var.
-     * Default is STANDARD; "mvcc" selects the MVCC placeholder. Run init()
-     * if the chosen vtable provides one; on failure, treat as ENOMEM and
-     * fall through the oom path (init must not have allocated anything
-     * else, otherwise it must clean up before returning). */
+     * Default is STANDARD; "pinned" selects the pin-aware placeholder.
+     * Run init() if the chosen vtable provides one; on failure, treat as
+     * ENOMEM and fall through the oom path (init must not have allocated
+     * anything else, otherwise it must clean up before returning).
+     *
+     * #630: the legacy "mvcc" value is no longer accepted -- the
+     * strategy was renamed to "pinned" because wirelog is single-mutator
+     * and the pin-aware reclamation mechanism (RCU/EBR territory) is
+     * the correct mental model.  An "mvcc" env value emits a one-shot
+     * stderr migration message and falls through to STANDARD so a
+     * stale operator config surfaces loudly rather than silently
+     * selecting the placeholder. */
     {
         const col_rotation_ops_t *chosen = &col_rotation_standard_ops;
         const char *rot_env = getenv("WIRELOG_ROTATION");
         const char *strategy_name = "standard";
-        if (rot_env && strcmp(rot_env, "mvcc") == 0) {
-            chosen = &col_rotation_mvcc_ops;
-            strategy_name = "mvcc";
+        if (rot_env && strcmp(rot_env, "pinned") == 0) {
+            chosen = &col_rotation_pinned_ops;
+            strategy_name = "pinned";
+        } else if (rot_env && strcmp(rot_env, "mvcc") == 0) {
+            static bool mvcc_migrated = false;
+            if (!mvcc_migrated) {
+                mvcc_migrated = true;
+                fprintf(stderr,
+                    "[wirelog] WIRELOG_ROTATION=mvcc was renamed to "
+                    "pinned in #630; treating as standard. Set "
+                    "WIRELOG_ROTATION=pinned to select the pin-aware "
+                    "placeholder.\n");
+            }
         }
         sess->rotation_ops = chosen;
         WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,

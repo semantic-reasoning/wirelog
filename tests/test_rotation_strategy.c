@@ -7,7 +7,7 @@
  *
  * Drives col_session_create's rotation_ops selection path:
  *   test_rotation_default_is_standard   -- WIRELOG_ROTATION unset -> STANDARD
- *   test_rotation_env_override_mvcc     -- WIRELOG_ROTATION=mvcc -> MVCC
+ *   test_rotation_env_override_pinned   -- WIRELOG_ROTATION=pinned -> pinned
  *   test_rotation_dispatch_no_crash     -- vtable dispatch is callable on
  *                                          a live session and does not crash
  */
@@ -144,12 +144,12 @@ test_rotation_default_is_standard(void)
 }
 
 static void
-test_rotation_env_override_mvcc(void)
+test_rotation_env_override_pinned(void)
 {
-    TEST("rotation: WIRELOG_ROTATION=mvcc selects MVCC vtable");
+    TEST("rotation: WIRELOG_ROTATION=pinned selects pinned vtable");
 
-    if (setenv("WIRELOG_ROTATION", "mvcc", 1) != 0) {
-        FAIL("setenv WIRELOG_ROTATION=mvcc failed");
+    if (setenv("WIRELOG_ROTATION", "pinned", 1) != 0) {
+        FAIL("setenv WIRELOG_ROTATION=pinned failed");
         return;
     }
 
@@ -170,7 +170,7 @@ test_rotation_env_override_mvcc(void)
     }
 
     wl_col_session_t *cs = COL_SESSION(session);
-    bool ok = (cs->rotation_ops == &col_rotation_mvcc_ops);
+    bool ok = (cs->rotation_ops == &col_rotation_pinned_ops);
 
     wl_session_destroy(session);
     wl_plan_free(plan);
@@ -178,7 +178,7 @@ test_rotation_env_override_mvcc(void)
 
     if (!ok) {
         FAIL(
-            "rotation_ops != &col_rotation_mvcc_ops under WIRELOG_ROTATION=mvcc");
+            "rotation_ops != &col_rotation_pinned_ops under WIRELOG_ROTATION=pinned");
         return;
     }
     PASS();
@@ -233,7 +233,7 @@ main(void)
     printf("Rotation strategy vtable tests (#600):\n");
 
     test_rotation_default_is_standard();
-    test_rotation_env_override_mvcc();
+    test_rotation_env_override_pinned();
     test_rotation_dispatch_no_crash();
 
     printf("\nResults: %d run, %d passed, %d failed\n",

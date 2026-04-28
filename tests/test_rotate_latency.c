@@ -9,7 +9,7 @@
  * set is bounded across rotations; #599 asserts that each rotation is
  * fast.  Both gate the same rotation_ops vtable (selected by
  * WIRELOG_ROTATION env var; default `col_rotation_standard_ops`,
- * `mvcc` selects `col_rotation_mvcc_ops`); the workload shape (K=64
+ * `pinned` selects `col_rotation_pinned_ops`); the workload shape (K=64
  * handles, 24-byte payload, compound_arena) is identical so a
  * divergence in either gate lights up a real regression rather than a
  * workload-shape change.
@@ -197,13 +197,13 @@ parse_rotation_strategy(const col_rotation_ops_t **out_ops,
         *out_name = "standard";
         return 0;
     }
-    if (strcmp(rot_env, "mvcc") == 0) {
-        *out_ops = &col_rotation_mvcc_ops;
-        *out_name = "mvcc";
+    if (strcmp(rot_env, "pinned") == 0) {
+        *out_ops = &col_rotation_pinned_ops;
+        *out_name = "pinned";
         return 0;
     }
     fprintf(stderr,
-        "FAIL: WIRELOG_ROTATION='%s' is not 'standard' or 'mvcc'\n",
+        "FAIL: WIRELOG_ROTATION='%s' is not 'standard' or 'pinned'\n",
         rot_env);
     return -1;
 }

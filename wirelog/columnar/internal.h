@@ -663,9 +663,9 @@ extern const col_frontier_ops_t col_frontier_diff_ops;
  *
  * Abstracts the per-iteration `wl_arena_reset` and per-epoch
  * `wl_compound_arena_gc_epoch_boundary` callsites behind function pointers
- * so alternative rotation models (e.g. MVCC) can be swapped in without
- * touching eval.c or session.c. The default STANDARD strategy passes
- * through to the existing arena APIs.
+ * so alternative rotation models (e.g. pin-aware reclamation) can be
+ * swapped in without touching eval.c or session.c. The default STANDARD
+ * strategy passes through to the existing arena APIs.
  *
  * The init/destroy hooks are optional (NULL-safe at the callsite).
  * init returns 0 on success, non-zero on failure (treated as ENOMEM by
@@ -683,8 +683,8 @@ typedef struct col_rotation_ops {
 /* Default STANDARD rotation strategy (defined in rotation_standard.c). */
 extern const col_rotation_ops_t col_rotation_standard_ops;
 
-/* MVCC placeholder rotation strategy (defined in rotation_mvcc.c). */
-extern const col_rotation_ops_t col_rotation_mvcc_ops;
+/* Pin-aware placeholder rotation strategy (defined in rotation_pinned.c). */
+extern const col_rotation_ops_t col_rotation_pinned_ops;
 
 /* ======================================================================== */
 /* Session                                                                  */

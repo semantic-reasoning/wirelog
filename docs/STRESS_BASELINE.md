@@ -20,21 +20,21 @@ separately from the W/R/strategy axes.)
 | `stress_harness_w2` | (default) | freeze-cycle | 2 | 200 | every PR (`ci-pr.yml` -> `meson test`) |
 | `stress_harness_apply_roundtrip_pr` | (default) | apply-roundtrip | 2 | 500 | every PR |
 | `stress_harness_rotation_pr` | (default) | rotation-vtable (standard) | 2 | 50 | every PR |
-| `stress_harness_rotation_pr_mvcc` | (default) | rotation-vtable (mvcc) | 2 | 50 | every PR |
+| `stress_harness_rotation_pr_pinned` | (default) | rotation-vtable (pinned) | 2 | 50 | every PR |
 | `stress_harness_daemon_pr` | (default) | daemon-soak (standard) | 2 | 100 | every PR |
-| `stress_harness_daemon_pr_mvcc` | (default) | daemon-soak (mvcc) | 2 | 100 | every PR |
+| `stress_harness_daemon_pr_pinned` | (default) | daemon-soak (pinned) | 2 | 100 | every PR |
 | `stress_harness_w4` | `stress-nightly` | freeze-cycle | 4 | 500 | nightly (`perf-nightly.yml`, 04:00 UTC) |
 | `stress_harness_apply_roundtrip_nightly` | `stress-nightly` | apply-roundtrip | 4 | 5000 | nightly |
 | `stress_harness_rotation_nightly` | `stress-nightly` | rotation-vtable (standard) | 4 | 500 | nightly |
-| `stress_harness_rotation_nightly_mvcc` | `stress-nightly` | rotation-vtable (mvcc) | 4 | 500 | nightly |
+| `stress_harness_rotation_nightly_pinned` | `stress-nightly` | rotation-vtable (pinned) | 4 | 500 | nightly |
 | `stress_harness_daemon_nightly` | `stress-nightly` | daemon-soak (standard) | 4 | 2000 | nightly |
-| `stress_harness_daemon_nightly_mvcc` | `stress-nightly` | daemon-soak (mvcc) | 4 | 2000 | nightly |
+| `stress_harness_daemon_nightly_pinned` | `stress-nightly` | daemon-soak (pinned) | 4 | 2000 | nightly |
 | `stress_harness_w8` | `stress-release` | freeze-cycle | 8 | 1000 | release-tier (manual, see below) |
 | `stress_harness_apply_roundtrip_release` | `stress-release` | apply-roundtrip | 8 | 50000 | release-tier (manual) |
 | `stress_harness_rotation_release` | `stress-release` | rotation-vtable (standard) | 8 | 1000 | release-tier (manual) |
-| `stress_harness_rotation_release_mvcc` | `stress-release` | rotation-vtable (mvcc) | 8 | 1000 | release-tier (manual) |
+| `stress_harness_rotation_release_pinned` | `stress-release` | rotation-vtable (pinned) | 8 | 1000 | release-tier (manual) |
 | `stress_harness_daemon_release` | `stress-release` | daemon-soak (standard) | 8 | 10000 | release-tier (manual) |
-| `stress_harness_daemon_release_mvcc` | `stress-release` | daemon-soak (mvcc) | 8 | 10000 | release-tier (manual) |
+| `stress_harness_daemon_release_pinned` | `stress-release` | daemon-soak (pinned) | 8 | 10000 | release-tier (manual) |
 
 The PR tier runs in the default suite, picked up by every
 `meson test -C build` invocation in `ci-pr.yml`/`ci-main.yml`. The
@@ -123,16 +123,22 @@ The rotation-vtable workload is the only one that honors the
 - `WIRELOG_ROTATION=standard` (default): selects
   `col_rotation_standard_ops`. Behavior matches the pre-#600 direct
   calls.
-- `WIRELOG_ROTATION=mvcc`: selects `col_rotation_mvcc_ops`. The MVCC
-  vtable is a placeholder today (per `rotation_mvcc.c`); behavior is
-  identical to `standard` until the real MVCC implementation lands.
+- `WIRELOG_ROTATION=pinned`: selects `col_rotation_pinned_ops`. The
+  pinned vtable is a placeholder today (per `rotation_pinned.c`);
+  behavior is identical to `standard` until the real pin-aware
+  reclamation implementation lands. Selecting `pinned` emits a one-shot
+  stderr placeholder warning (footgun guard, #630); set
+  `WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1` to silence it. The
+  legacy value `WIRELOG_ROTATION=mvcc` was renamed to `pinned` in #630
+  and is no longer accepted; passing it prints a one-shot stderr
+  migration message and falls through to `standard`.
 
 Both variants are registered at every CI tier because #596's contract
-is the dispatch path itself, not the strategy semantics: the MVCC
+is the dispatch path itself, not the strategy semantics: the pinned
 placeholder must remain reachable through the function pointer under
 stress. Coverage delta vs `tests/test_rotation_strategy.c` (#600's
 correctness test): that file functional-tests selection
-(default-is-standard, env-override-mvcc) and runs ONE rotate+gc
+(default-is-standard, env-override-pinned) and runs ONE rotate+gc
 dispatch on a live session with no churn. The rotation-vtable
 workload exercises the dispatch under R cycles of pre-rotation alloc
 fan-out and per-handle post-rotate validity oracle.
@@ -144,7 +150,7 @@ the compound arena's 4096-epoch ceiling.
 #### Baseline pass rate
 
 100/100 PR-tier rotation-vtable runs pass on the baseline machine
-(`stress_harness_rotation_pr` + `stress_harness_rotation_pr_mvcc`
+(`stress_harness_rotation_pr` + `stress_harness_rotation_pr_pinned`
 combined). Healthy floor: any single CI failure is a real regression,
 not a flake.
 
@@ -253,7 +259,7 @@ so a reviewer can read off the leak signal directly.
 #### Baseline pass rate
 
 100/100 PR-tier daemon-soak runs pass on the baseline machine
-(`stress_harness_daemon_pr` + `stress_harness_daemon_pr_mvcc`
+(`stress_harness_daemon_pr` + `stress_harness_daemon_pr_pinned`
 combined). Healthy floor: any single CI failure is a real
 regression, not a flake.
 
@@ -274,9 +280,9 @@ TSAN_OPTIONS='halt_on_error=1' \
 All six release-tier entries must pass:
 `stress_harness_w8` (freeze-cycle, 1000 cycles),
 `stress_harness_apply_roundtrip_release` (apply-roundtrip, 50000
-rows), the two `stress_harness_rotation_release{,_mvcc}` entries
+rows), the two `stress_harness_rotation_release{,_pinned}` entries
 (rotation-vtable, 1000 cycles each, both strategy variants), and
-the two `stress_harness_daemon_release{,_mvcc}` entries (daemon-
+the two `stress_harness_daemon_release{,_pinned}` entries (daemon-
 soak, 10000 steps each, both strategy variants). Wall time is sub-
 minute per entry on a typical x86_64 laptop under TSan; the test()
 entries set `timeout: 300-1800` as headroom (the daemon-soak
@@ -482,11 +488,11 @@ perf hardware and a realistic budget is established.
 | Test name | Suite | N | Strict (p999) | Strategy | Where it runs |
 |---|---|---|---|---|---|
 | `rotate_latency_pr` | `perf` | 1000 | off | standard | nightly only (perf-nightly.yml) |
-| `rotate_latency_pr_mvcc` | `perf` | 1000 | off | mvcc | nightly only |
+| `rotate_latency_pr_pinned` | `perf` | 1000 | off | pinned | nightly only |
 | `rotate_latency_nightly` | `perf` | 10000 | on | standard | nightly only |
-| `rotate_latency_nightly_mvcc` | `perf` | 10000 | on | mvcc | nightly only |
+| `rotate_latency_nightly_pinned` | `perf` | 10000 | on | pinned | nightly only |
 | `rotate_latency_release` | `stress-release` | 100000 | on | standard | release-tier (manual) |
-| `rotate_latency_release_mvcc` | `stress-release` | 100000 | on | mvcc | release-tier (manual) |
+| `rotate_latency_release_pinned` | `stress-release` | 100000 | on | pinned | release-tier (manual) |
 
 The `perf` suite is invoked only by `.github/workflows/perf-nightly.yml`
 (via `meson test --suite perf`); `ci-pr.yml` does NOT pass `--suite perf`
@@ -501,13 +507,16 @@ All entries set `WIRELOG_PERF_GATE=1` in the meson env so the binary
 opts in. Bare invocation (`./test_rotate_latency`) without the env
 var exits 77 (SKIP).
 
-Strategy axis: every tier registers both `standard` and `mvcc`
+Strategy axis: every tier registers both `standard` and `pinned`
 strategy variants (mirrors the `stress_harness_rotation_*` tier
-layout). The MVCC vtable is a placeholder today (per
-`rotation_mvcc.c`) and behaves identically to standard until the
-real implementation lands; the variants exist now so the dispatch
-path is gated under the latency budget at every tier the moment a
-non-trivial MVCC implementation lands.
+layout). The pinned vtable is a placeholder today (per
+`rotation_pinned.c`) and behaves identically to standard until the
+real pin-aware reclamation implementation lands; the variants exist
+now so the dispatch path is gated under the latency budget at every
+tier the moment a non-trivial implementation lands. The pinned
+variants set `WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1` so the
+one-shot stderr placeholder warning (#630) does not pollute test
+output.
 
 ### Gate sensitivity
 

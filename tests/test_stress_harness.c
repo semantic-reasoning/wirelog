@@ -73,14 +73,14 @@
  *       dispatch indirection #600 introduced.  Coverage delta vs.
  *       tests/test_rotation_strategy.c (#600's correctness test): that
  *       file functional-tests selection (default-is-standard,
- *       env-override-mvcc) and runs ONE rotate+gc dispatch on a live
+ *       env-override-pinned) and runs ONE rotate+gc dispatch on a live
  *       session with no churn.  This workload exercises the dispatch
  *       under R cycles of pre-rotation alloc fan-out + per-cycle
  *       vtable invocation + per-cycle handle-validity oracle, on both
- *       strategy variants (WIRELOG_ROTATION=standard and =mvcc, parsed
+ *       strategy variants (WIRELOG_ROTATION=standard and =pinned, parsed
  *       at workload start).  Both variants must be tested because
  *       #596's contract is the dispatch path, not the strategy
- *       semantics (MVCC is functionally STANDARD today; the placeholder
+ *       semantics (pinned is functionally STANDARD today; the placeholder
  *       still has to be reachable through the function pointer).
  *
  *       Per-cycle: (1) allocate K=64 handles in sess->compound_arena
@@ -153,7 +153,7 @@
  *                       "rotation-vtable"
  *                       "daemon-soak"
  *
- *   WIRELOG_ROTATION    "standard" | "mvcc"           (default "standard")
+ *   WIRELOG_ROTATION    "standard" | "pinned"         (default "standard")
  *                       Honored by the rotation-vtable and daemon-soak
  *                       workloads; parsed at workload start.  Both
  *                       variants must be tested to prove the #600
@@ -240,12 +240,12 @@ parse_rotation_strategy(const col_rotation_ops_t **out_ops,
         *out_name = "standard";
         return 0;
     }
-    if (strcmp(rot_env, "mvcc") == 0) {
-        *out_ops = &col_rotation_mvcc_ops;
-        *out_name = "mvcc";
+    if (strcmp(rot_env, "pinned") == 0) {
+        *out_ops = &col_rotation_pinned_ops;
+        *out_name = "pinned";
         return 0;
     }
-    printf("FAIL: WIRELOG_ROTATION='%s' is not 'standard' or 'mvcc'\n",
+    printf("FAIL: WIRELOG_ROTATION='%s' is not 'standard' or 'pinned'\n",
         rot_env);
     return -1;
 }
@@ -1060,7 +1060,7 @@ cleanup:
 
 /* Per-cycle hard cap for R: each cycle's gc_epoch_boundary advances
  * current_epoch by one (see standard_gc_epoch_boundary in
- * rotation_standard.c, mvcc_gc_epoch_boundary in rotation_mvcc.c).
+ * rotation_standard.c, pinned_gc_epoch_boundary in rotation_pinned.c).
  * Mirror nested-asan's cap of 1500 -- WL_COMPOUND_EPOCH_MAX is 4095, so
  * 1500 leaves >2x headroom and keeps the bound assertion symmetric
  * across workloads.  The bounds-check error message uses this constant
@@ -1085,9 +1085,9 @@ typedef struct {
  * rotation hooks touch (compound_arena, eval_arena) plus rotation_ops.
  * No delta_pool / mem_ledger / rels are required: the rotation vtable
  * surface is intentionally narrow, which is what makes the mock
- * justified -- read rotation_standard.c and rotation_mvcc.c to confirm.
+ * justified -- read rotation_standard.c and rotation_pinned.c to confirm.
  *
- * @ops: STANDARD or MVCC vtable, selected by the caller from the
+ * @ops: STANDARD or pinned vtable, selected by the caller from the
  *       WIRELOG_ROTATION env var.
  */
 static wl_col_session_t *
@@ -1104,9 +1104,10 @@ rotation_make_mock_session(wl_compound_arena_t *arena,
         return NULL;
     }
     s->rotation_ops = ops;
-    /* Note: we deliberately do NOT call ops->init(s) -- the mvcc init
-     * hook is a no-op apart from a one-time WL_LOG line, and standard
-     * init is empty.  Skipping init keeps the mock self-contained. */
+    /* Note: we deliberately do NOT call ops->init(s) -- the pinned init
+     * hook is a no-op apart from a one-time WL_LOG line and stderr
+     * placeholder warning (#630), and standard init is empty.  Skipping
+     * init keeps the mock self-contained. */
     return s;
 }
 
@@ -1133,7 +1134,7 @@ run_rotation_vtable_workload(uint32_t num_workers, uint32_t cycles)
     (void)num_workers;
 
     /* Strategy selection: WIRELOG_ROTATION mirrors session.c:437-442.
-     * Default is STANDARD; "mvcc" selects the placeholder.  Anything
+     * Default is STANDARD; "pinned" selects the placeholder.  Anything
      * else is a hard FAIL so a misconfigured CI tier surfaces loudly
      * (mirrors the unknown-workload diagnostic in main()). */
     const col_rotation_ops_t *ops = NULL;

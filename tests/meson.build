@@ -376,7 +376,7 @@ backend_src = files(
   '../wirelog/columnar/partition.c',
   '../wirelog/columnar/progress.c',
   '../wirelog/columnar/rotation_standard.c',
-  '../wirelog/columnar/rotation_mvcc.c',
+  '../wirelog/columnar/rotation_pinned.c',
   '../wirelog/columnar/compound_side.c',
   '../wirelog/columnar/handle_remap.c',
   '../wirelog/columnar/handle_remap_apply.c',
@@ -2669,21 +2669,22 @@ test('stress_harness_nested_asan', test_stress_harness_exe,
 # Rotation-vtable workload (#596): drives the #600 rotation strategy
 # vtable (sess->rotation_ops->rotate_eval_arena and ->gc_epoch_boundary)
 # under W/R stress.  Both strategy variants (WIRELOG_ROTATION=standard
-# and =mvcc) must be exercised because #596's contract is the dispatch
-# path, not the strategy semantics; PR-tier registers both at small R
-# to keep cost down, nightly/release tiers scale R for soak coverage.
-# Single-mutator -- W is accepted but ignored by the workload.
+# and =pinned) must be exercised because #596's contract is the
+# dispatch path, not the strategy semantics; PR-tier registers both at
+# small R to keep cost down, nightly/release tiers scale R for soak
+# coverage.  Single-mutator -- W is accepted but ignored by the workload.
 test('stress_harness_rotation_pr', test_stress_harness_exe,
      timeout: 60,
      env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '50',
            'WL_STRESS_WORKLOAD': 'rotation-vtable',
            'WIRELOG_ROTATION': 'standard'})
 
-test('stress_harness_rotation_pr_mvcc', test_stress_harness_exe,
+test('stress_harness_rotation_pr_pinned', test_stress_harness_exe,
      timeout: 60,
      env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '50',
            'WL_STRESS_WORKLOAD': 'rotation-vtable',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 test('stress_harness_rotation_nightly', test_stress_harness_exe,
      suite: 'stress-nightly',
@@ -2692,12 +2693,13 @@ test('stress_harness_rotation_nightly', test_stress_harness_exe,
            'WL_STRESS_WORKLOAD': 'rotation-vtable',
            'WIRELOG_ROTATION': 'standard'})
 
-test('stress_harness_rotation_nightly_mvcc', test_stress_harness_exe,
+test('stress_harness_rotation_nightly_pinned', test_stress_harness_exe,
      suite: 'stress-nightly',
      timeout: 240,
      env: {'WL_STRESS_W': '4', 'WL_STRESS_R': '500',
            'WL_STRESS_WORKLOAD': 'rotation-vtable',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 test('stress_harness_rotation_release', test_stress_harness_exe,
      suite: 'stress-release',
@@ -2706,18 +2708,19 @@ test('stress_harness_rotation_release', test_stress_harness_exe,
            'WL_STRESS_WORKLOAD': 'rotation-vtable',
            'WIRELOG_ROTATION': 'standard'})
 
-test('stress_harness_rotation_release_mvcc', test_stress_harness_exe,
+test('stress_harness_rotation_release_pinned', test_stress_harness_exe,
      suite: 'stress-release',
      timeout: 600,
      env: {'WL_STRESS_W': '8', 'WL_STRESS_R': '1000',
            'WL_STRESS_WORKLOAD': 'rotation-vtable',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 # Daemon-soak workload (#597): long-running soak proving bounded-RSS
 # behavior under saturation-driven rotation cadence + cumulative
 # handle survival across many gc_epoch_boundary calls within a
 # rotation window.  Both strategy variants (WIRELOG_ROTATION=standard
-# and =mvcc) are registered at PR/nightly/release tiers because #596's
+# and =pinned) are registered at PR/nightly/release tiers because #596's
 # contract is the dispatch path; the ASan tier is single-strategy to
 # keep cost down (both ASan slowdown and a long soak per run).
 # WL_STRESS_R for this workload is the step count (not cycle count),
@@ -2729,11 +2732,12 @@ test('stress_harness_daemon_pr', test_stress_harness_exe,
            'WL_STRESS_WORKLOAD': 'daemon-soak',
            'WIRELOG_ROTATION': 'standard'})
 
-test('stress_harness_daemon_pr_mvcc', test_stress_harness_exe,
+test('stress_harness_daemon_pr_pinned', test_stress_harness_exe,
      timeout: 60,
      env: {'WL_STRESS_W': '2', 'WL_STRESS_R': '100',
            'WL_STRESS_WORKLOAD': 'daemon-soak',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 test('stress_harness_daemon_asan', test_stress_harness_exe,
      suite: 'asan',
@@ -2749,12 +2753,13 @@ test('stress_harness_daemon_nightly', test_stress_harness_exe,
            'WL_STRESS_WORKLOAD': 'daemon-soak',
            'WIRELOG_ROTATION': 'standard'})
 
-test('stress_harness_daemon_nightly_mvcc', test_stress_harness_exe,
+test('stress_harness_daemon_nightly_pinned', test_stress_harness_exe,
      suite: 'stress-nightly',
      timeout: 600,
      env: {'WL_STRESS_W': '4', 'WL_STRESS_R': '2000',
            'WL_STRESS_WORKLOAD': 'daemon-soak',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 test('stress_harness_daemon_release', test_stress_harness_exe,
      suite: 'stress-release',
@@ -2763,12 +2768,13 @@ test('stress_harness_daemon_release', test_stress_harness_exe,
            'WL_STRESS_WORKLOAD': 'daemon-soak',
            'WIRELOG_ROTATION': 'standard'})
 
-test('stress_harness_daemon_release_mvcc', test_stress_harness_exe,
+test('stress_harness_daemon_release_pinned', test_stress_harness_exe,
      suite: 'stress-release',
      timeout: 1800,
      env: {'WL_STRESS_W': '8', 'WL_STRESS_R': '10000',
            'WL_STRESS_WORKLOAD': 'daemon-soak',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 # ============================================================================
 # Per-rotation RSS-bounded + ledger-stability gates (Issue #598)
@@ -2847,11 +2853,12 @@ test('rotate_latency_pr', test_rotate_latency_exe,
      env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_N': '1000',
            'WIRELOG_ROTATION': 'standard'})
 
-test('rotate_latency_pr_mvcc', test_rotate_latency_exe,
+test('rotate_latency_pr_pinned', test_rotate_latency_exe,
      suite: 'perf',
      timeout: 60,
      env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_N': '1000',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 # Nightly tier: strict (p999 gated) at N=10000.
 test('rotate_latency_nightly', test_rotate_latency_exe,
@@ -2861,12 +2868,13 @@ test('rotate_latency_nightly', test_rotate_latency_exe,
            'WL_ROTATE_LATENCY_N': '10000',
            'WIRELOG_ROTATION': 'standard'})
 
-test('rotate_latency_nightly_mvcc', test_rotate_latency_exe,
+test('rotate_latency_nightly_pinned', test_rotate_latency_exe,
      suite: 'perf',
      timeout: 600,
      env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_STRICT': '1',
            'WL_ROTATE_LATENCY_N': '10000',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 # Release tier: strict at N=100000.
 test('rotate_latency_release', test_rotate_latency_exe,
@@ -2876,12 +2884,13 @@ test('rotate_latency_release', test_rotate_latency_exe,
            'WL_ROTATE_LATENCY_N': '100000',
            'WIRELOG_ROTATION': 'standard'})
 
-test('rotate_latency_release_mvcc', test_rotate_latency_exe,
+test('rotate_latency_release_pinned', test_rotate_latency_exe,
      suite: 'stress-release',
      timeout: 1800,
      env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_STRICT': '1',
            'WL_ROTATE_LATENCY_N': '100000',
-           'WIRELOG_ROTATION': 'mvcc'})
+           'WIRELOG_ROTATION': 'pinned',
+           'WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER': '1'})
 
 # ----------------------------------------------------------------------------
 # deep_copy ledger-charge canary (Issue #598)
