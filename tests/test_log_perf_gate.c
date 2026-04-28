@@ -55,7 +55,6 @@
 
 #include "../bench/bench_util.h"
 
-#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
