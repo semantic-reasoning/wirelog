@@ -2813,6 +2813,76 @@ test('rss_bounded_asan', test_rss_bounded_exe,
      suite: 'asan',
      timeout: 240)
 
+# ============================================================================
+# Issue #599: rotate-latency p50/p99/p999 gate.  Companion to #598's
+# RSS-bounded gate -- same workload (K=64 handles, 24-byte payload,
+# compound_arena), same rotation_ops vtable, but gates wall-clock latency
+# of the rotate_eval_arena + gc_epoch_boundary pair.
+#
+# Suite: 'perf' (mirrors test_log_perf_gate.c).  Default-suite invocation
+# SKIPs unless WIRELOG_PERF_GATE=1.  No 'asan' variant: the test is
+# compile-time-skipped under sanitizers (wall-clock timing is invalidated
+# by ASan/TSan instrumentation).
+#
+#   Linux:   WIRELOG_PERF_GATE=1 taskset -c 0 meson test -C build --suite perf
+#   Other:   no shipped stability design today -- test SKIPs at runtime.
+# ============================================================================
+
+test_rotate_latency_exe = executable(
+  'test_rotate_latency',
+  files('test_rotate_latency.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+# PR tier: N=1000.  Opt-in via WIRELOG_PERF_GATE=1; default invocation SKIPs.
+test('rotate_latency_pr', test_rotate_latency_exe,
+     suite: 'perf',
+     timeout: 60,
+     env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_N': '1000',
+           'WIRELOG_ROTATION': 'standard'})
+
+test('rotate_latency_pr_mvcc', test_rotate_latency_exe,
+     suite: 'perf',
+     timeout: 60,
+     env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_N': '1000',
+           'WIRELOG_ROTATION': 'mvcc'})
+
+# Nightly tier: strict (p999 gated) at N=10000.
+test('rotate_latency_nightly', test_rotate_latency_exe,
+     suite: 'perf',
+     timeout: 600,
+     env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_STRICT': '1',
+           'WL_ROTATE_LATENCY_N': '10000',
+           'WIRELOG_ROTATION': 'standard'})
+
+test('rotate_latency_nightly_mvcc', test_rotate_latency_exe,
+     suite: 'perf',
+     timeout: 600,
+     env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_STRICT': '1',
+           'WL_ROTATE_LATENCY_N': '10000',
+           'WIRELOG_ROTATION': 'mvcc'})
+
+# Release tier: strict at N=100000.
+test('rotate_latency_release', test_rotate_latency_exe,
+     suite: 'stress-release',
+     timeout: 1800,
+     env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_STRICT': '1',
+           'WL_ROTATE_LATENCY_N': '100000',
+           'WIRELOG_ROTATION': 'standard'})
+
+test('rotate_latency_release_mvcc', test_rotate_latency_exe,
+     suite: 'stress-release',
+     timeout: 1800,
+     env: {'WIRELOG_PERF_GATE': '1', 'WL_ROTATE_LATENCY_STRICT': '1',
+           'WL_ROTATE_LATENCY_N': '100000',
+           'WIRELOG_ROTATION': 'mvcc'})
+
 # ----------------------------------------------------------------------------
 # deep_copy ledger-charge canary (Issue #598)
 # Vacuous today (col_rel_deep_copy has no production rotation callers);
