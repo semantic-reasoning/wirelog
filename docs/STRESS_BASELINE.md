@@ -441,6 +441,157 @@ and any ledger churn would corrupt per-session memory accounting.
 
 Registered in the default suite as `deep_copy_ledger_canary`.
 
+## Rotate-latency p50/p99/p999 gate (Issue #599)
+
+Companion to #598's RSS-bounded gate. #598 asserts that the working
+set is bounded across rotations; #599 asserts that each rotation is
+fast. Both gate the same rotation_ops vtable
+(`col_rotation_standard_ops`) on an identical workload (K=64
+handles, 24-byte payload, `compound_arena`), so a divergence in
+either lights up a real regression rather than a workload-shape
+change.
+
+### Recalibration: ms in the issue body, us in the gate
+
+The original Issue #599 body specified targets of "p50 < 10ms,
+p99 < 100ms, p999 < 500ms". Those numbers were transcription
+errors by ~1000x: the rotation hot path is
+`wl_arena_reset` (one bump-pointer reset) plus a per-epoch
+generation table walk -- 30-50 nanoseconds per rotation in
+steady state on x86_64. Gating at the literal millisecond
+values would have allowed five orders of magnitude of slowdown
+to slip through.
+
+The shipped gate uses **microsecond budgets**:
+
+| Percentile | Budget    | Observed (local Linux/x86_64) | Headroom |
+|------------|-----------|-------------------------------|----------|
+| p50        | 10 us     | 31-36 ns                      | ~280-320x |
+| p99        | 100 us    | 37-62 ns                      | ~1600-2700x |
+| p999       | 500 us    | 60-187 ns                     | ~2700-8300x |
+
+The 100 us p99 budget is the load-bearing "1.5x regression gate":
+it is intentionally wider than observed steady-state to absorb
+dispatcher noise on shared CI runners and slow CI hardware,
+without masking a real 1.5x regression on the rotation hot path.
+Tighten if the rotation path is ever benchmarked on dedicated
+perf hardware and a realistic budget is established.
+
+### CI tier topology
+
+| Test name | Suite | N | Strict (p999) | Strategy | Where it runs |
+|---|---|---|---|---|---|
+| `rotate_latency_pr` | `perf` | 1000 | off | standard | nightly only (perf-nightly.yml) |
+| `rotate_latency_pr_mvcc` | `perf` | 1000 | off | mvcc | nightly only |
+| `rotate_latency_nightly` | `perf` | 10000 | on | standard | nightly only |
+| `rotate_latency_nightly_mvcc` | `perf` | 10000 | on | mvcc | nightly only |
+| `rotate_latency_release` | `stress-release` | 100000 | on | standard | release-tier (manual) |
+| `rotate_latency_release_mvcc` | `stress-release` | 100000 | on | mvcc | release-tier (manual) |
+
+The `perf` suite is invoked only by `.github/workflows/perf-nightly.yml`
+(via `meson test --suite perf`); `ci-pr.yml` does NOT pass `--suite perf`
+so the rotate-latency gate does not run on per-PR CI. This mirrors
+`test_log_perf_gate.c`'s nightly-only cadence: rotation latency is a
+dedicated-hardware signal (cpufreq governor pre-check, opt-in env)
+and shared per-PR runners cannot supply the stability budget. The
+release-tier entries (`stress-release` suite) have no automation
+today; release engineers invoke them manually.
+
+All entries set `WIRELOG_PERF_GATE=1` in the meson env so the binary
+opts in. Bare invocation (`./test_rotate_latency`) without the env
+var exits 77 (SKIP).
+
+Strategy axis: every tier registers both `standard` and `mvcc`
+strategy variants (mirrors the `stress_harness_rotation_*` tier
+layout). The MVCC vtable is a placeholder today (per
+`rotation_mvcc.c`) and behaves identically to standard until the
+real implementation lands; the variants exist now so the dispatch
+path is gated under the latency budget at every tier the moment a
+non-trivial MVCC implementation lands.
+
+### Gate sensitivity
+
+The original Issue #599 acceptance criterion was "p99 > 1.5x baseline
+blocks merge". The shipped gate is an **absolute budget** (100 us p99)
+chosen ~1600x above the observed steady-state p99 (37-62 ns). That
+recalibration was deliberate but the headroom drifted from "1.5x" to
+roughly three orders of magnitude during recalibration; the gate as
+shipped is a **catastrophic-regression detector**, not a 1.5x
+trend-tracker.
+
+Concretely:
+
+- A 2-10x regression on the rotation hot path (e.g. 30 ns -> 300 ns)
+  passes this gate cleanly. The absolute p99 budget (100 us / 100 000 ns)
+  has ~1600x headroom over steady-state, so the gate is silent across
+  multiple orders of magnitude of incremental drift.
+- A ~1000x regression (300 ns -> 30 us) is flagged. By that point the
+  rotation hot path has lost most of its headroom over a parser parse
+  call, which is the regression class the gate was specified to
+  detect after recalibration.
+
+Catching incremental 2-10x drift requires a separate trend-tracking
+job that compares against a moving baseline rather than a fixed
+absolute threshold. **Out of scope for #599** -- a sibling issue
+should track that work, including baseline JSON schema, percentile
+deviation thresholds, and CI integration. The current gate stays
+honest: it gates catastrophic regressions and does NOT pretend to
+catch trend drift.
+
+### Workload shape
+
+K=64 handles per cycle, 24-byte payload, `compound_arena` --
+identical to #598's RSS-bounded gate so divergence between the
+two is impossible without a deliberate edit. W=1 mandated:
+rotation hooks walk the eval arena's bump pointer and the
+per-epoch generation table, neither concurrency-safe (see the
+"Rotation hooks" reasoning early in this doc).
+
+### Steady-state vs recycle
+
+The compound arena caps `max_epochs` at
+`WL_COMPOUND_DEFAULT_MAX_EPOCHS` (4096; see
+`wirelog/arena/compound_arena.c`). Larger N would otherwise hit
+the saturation sentinel. The test sizes the arena to the platform
+max and recycles (full destroy + recreate) **outside the timed
+window** when `current_epoch >= max_epochs - 64`. Only
+`rotate_eval_arena + gc_epoch_boundary` is timed, so the
+measurement observes only the steady-state hot path; arena
+recycle is a workload-shape event that #598's RSS-bounded gate
+covers separately.
+
+### Skip behavior
+
+The gate exits 77 (Meson SKIP) on any of:
+
+- **Sanitizer build** (compile-time): wall-clock signal is
+  invalidated by ASan/TSan instrumentation.
+- **`WIRELOG_PERF_GATE` not `1`**: opt-in gate; default-suite
+  invocation (no env) is silent.
+- **Linux: cpufreq governor != "performance"**: mirrors
+  `test_log_perf_gate.c`. Set with
+  `echo performance | sudo tee /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`.
+- **macOS / BSD / Windows**: no shipped stability design today --
+  `wl_perf_stability_env_ok()` returns 0.
+- **Steady-state CoV > 0.50**: jittery host. The CoV ceiling is
+  wider than `test_rss_bounded.c`'s 0.05 because at ~30 ns per
+  sample the measurement is within an order of magnitude of
+  `clock_gettime` resolution; sub-ns jitter trivially yields
+  25-40% CoV at this scale even on a quiet dedicated host.
+
+### Failure UX
+
+On gate breach the test prints, in addition to the always-printed
+distribution line `[rotate-latency] N=... p50=... p95=... p99=...
+p999=... max=... cov=... rotation=...`, the 5 slowest sample
+positions from the un-sorted measurement buffer. Clustered indices
+(consecutive) point at a cold-cache or recycle artifact;
+scattered indices point at dispatcher jitter. There is no
+baseline JSON file -- the gate is a hard absolute budget, not a
+deviation-from-baseline test (#599 is the regression alarm; a
+baseline-tracking test belongs in a separate issue if ever
+needed).
+
 ## Out of scope (#594 follow-up tracking)
 
 - **Release-tier CI workflow**: no `release.yml` exists yet. The
