@@ -29,6 +29,13 @@
 #include "bench_argv.h"
 #include "bench_util.h"
 
+/* Shared sort + percentile helpers; consolidated in #599 to keep the
+ * private percentile math in tests/test_log_perf_gate.c, this bench,
+ * and tests/test_rotate_latency.c from drifting.  test_perf_util.h
+ * unconditionally pulls in <math.h>, <string.h>, <stdio.h>, <stdlib.h>;
+ * including it before the project headers below is intentional. */
+#include "../tests/test_perf_util.h"
+
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/parser/ast.h"
 #include "../wirelog/parser/parser.h"
@@ -60,14 +67,18 @@
 /* Timing helpers                                                           */
 /* ======================================================================== */
 
-/* Sort samples and print p50/p95/p99 percentiles. */
+/* Sort samples and print p50/p95/p99 percentiles.  Shares the sort
+ * comparator + percentile pick with #599's rotate-latency gate via
+ * tests/test_perf_util.h to keep the percentile math from forking
+ * across consumers. */
 static void
 report_pct(const char *mode, int iters, double *samples)
 {
-    qsort(samples, (size_t)iters, sizeof(double), bench_cmp_double);
-    double p50 = samples[iters / 2];
-    double p95 = samples[(iters - 1) * 95 / 100];
-    double p99 = samples[(iters - 1) * 99 / 100];
+    size_t n = (size_t)iters;
+    qsort(samples, n, sizeof(double), wl_perf_cmp_double);
+    double p50 = wl_perf_percentile_ms(samples, n, 0.50);
+    double p95 = wl_perf_percentile_ms(samples, n, 0.95);
+    double p99 = wl_perf_percentile_ms(samples, n, 0.99);
     printf("mode=%s iters=%d p50=%.2fus p95=%.2fus p99=%.2fus\n",
         mode, iters, p50, p95, p99);
     fflush(stdout);
