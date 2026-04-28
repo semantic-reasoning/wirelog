@@ -18,8 +18,15 @@
  * path real and testable.
  *
  * The init hook emits one WL_LOG INFO line on the SESSION section when a
- * session first selects the pinned strategy, so callers see that the
- * placeholder is in effect rather than the future implementation.
+ * session first selects the pinned strategy, plus a one-shot stderr
+ * fprintf footgun guard (#630) so the placeholder status is visible
+ * regardless of compile-time WL_LOG ceiling. Operators who select
+ * WIRELOG_ROTATION=pinned in production env would otherwise get no
+ * visible signal: WL_LOG INFO on the SESSION channel is stripped at
+ * release log levels (-Dwirelog_log_max_level=error). The stderr line
+ * bypasses the structured logger so it prints regardless. Set
+ * WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1 to silence it after an
+ * informed opt-in.
  */
 
 #include "columnar/internal.h"
@@ -27,6 +34,10 @@
 #include "arena/arena.h"
 #include "arena/compound_arena.h"
 #include "wirelog/util/log.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static void
 pinned_rotate_eval_arena(struct wl_col_session_t *sess)
@@ -57,6 +68,27 @@ pinned_init(struct wl_col_session_t *sess)
         WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,
             "event=rotation_pinned_placeholder note=\"pinned strategy is a "
             "placeholder; behavior matches STANDARD\"");
+
+        /* Footgun guard (#630): the WL_LOG INFO line above is stripped
+         * at release log levels (-Dwirelog_log_max_level=error), so
+         * operators who select WIRELOG_ROTATION=pinned in production
+         * env get no visible signal that they have opted into a
+         * placeholder strategy. Emit a one-shot stderr line that
+         * bypasses the structured logger so it prints regardless of
+         * compile-time level. The acknowledge env var silences the
+         * warning for operators who have explicitly opted in to
+         * running the placeholder. */
+        const char *ack
+            = getenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+        if (!(ack && strcmp(ack, "1") == 0)) {
+            fprintf(stderr,
+                "[wirelog] WARNING: WIRELOG_ROTATION=pinned selected, but "
+                "the pinned strategy is currently a PLACEHOLDER -- its "
+                "behavior is identical to WIRELOG_ROTATION=standard. Real "
+                "pin-aware reclamation will land via issue #630. Set "
+                "WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1 to silence "
+                "this warning.\n");
+        }
     }
     return 0;
 }

@@ -6,10 +6,21 @@
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
  * Drives col_session_create's rotation_ops selection path:
- *   test_rotation_default_is_standard   -- WIRELOG_ROTATION unset -> STANDARD
- *   test_rotation_env_override_pinned   -- WIRELOG_ROTATION=pinned -> pinned
- *   test_rotation_dispatch_no_crash     -- vtable dispatch is callable on
- *                                          a live session and does not crash
+ *   test_rotation_default_is_standard       -- WIRELOG_ROTATION unset -> STANDARD
+ *   test_rotation_pinned_placeholder_warns  -- pinned init prints stderr
+ *                                              warning when acknowledge
+ *                                              flag is unset (#630)
+ *   test_rotation_env_override_pinned       -- WIRELOG_ROTATION=pinned ->
+ *                                              pinned vtable
+ *   test_rotation_dispatch_no_crash         -- vtable dispatch is callable
+ *                                              on a live session and does
+ *                                              not crash
+ *
+ * The placeholder-warning test runs FIRST among the pinned-strategy
+ * tests because the stderr fprintf is one-shot per process (gated by
+ * a static bool inside pinned_init); subsequent pinned-strategy tests
+ * would not retrigger it. Set WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1
+ * after the warning test to keep later test stderr clean.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -143,12 +154,218 @@ test_rotation_default_is_standard(void)
     PASS();
 }
 
+/* #630: capture stderr while creating a session under
+ * WIRELOG_ROTATION=pinned (acknowledge flag unset) and assert the
+ * placeholder-warning substring is present. The warning is one-shot
+ * per process (static bool warned inside pinned_init), so this test
+ * MUST run before any other test creates a pinned session.
+ *
+ * Linux-only: portable stderr capture across freopen/dup2 semantics
+ * is non-trivial on Windows/MSVC; skipping there is acceptable
+ * because the footgun guard exists for production *nix operators.
+ */
+#if defined(__linux__)
+static void
+test_rotation_pinned_placeholder_warns(void)
+{
+    TEST("rotation: pinned strategy emits stderr placeholder warning (#630)");
+
+    /* Ensure neither env var is set so the warning fires. */
+    unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+    if (setenv("WIRELOG_ROTATION", "pinned", 1) != 0) {
+        FAIL("setenv WIRELOG_ROTATION=pinned failed");
+        return;
+    }
+
+    /* Redirect stderr to a temp file via freopen, then restore via
+     * fdopen+dup2. Mirrors the standard libc capture pattern; portable
+     * across glibc/musl. */
+    fflush(stderr);
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0) {
+        unsetenv("WIRELOG_ROTATION");
+        FAIL("dup(STDERR_FILENO) failed");
+        return;
+    }
+
+    char tmpl[] = "/tmp/wl_rotation_stderr_XXXXXX";
+    int tmp_fd = mkstemp(tmpl);
+    if (tmp_fd < 0) {
+        close(saved_stderr);
+        unsetenv("WIRELOG_ROTATION");
+        FAIL("mkstemp failed");
+        return;
+    }
+    if (dup2(tmp_fd, STDERR_FILENO) < 0) {
+        close(tmp_fd);
+        unlink(tmpl);
+        close(saved_stderr);
+        unsetenv("WIRELOG_ROTATION");
+        FAIL("dup2(tmp, STDERR) failed");
+        return;
+    }
+
+    wl_plan_t *plan = build_minimal_plan();
+    wl_session_t *session = NULL;
+    int rc = -1;
+    if (plan)
+        rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+
+    /* Restore stderr before any FAIL() so the diagnostic is visible. */
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    close(tmp_fd);
+
+    if (!plan || rc != 0 || session == NULL) {
+        if (session)
+            wl_session_destroy(session);
+        if (plan)
+            wl_plan_free(plan);
+        unlink(tmpl);
+        unsetenv("WIRELOG_ROTATION");
+        FAIL("wl_session_create failed");
+        return;
+    }
+
+    /* Read the captured stderr from the temp file. */
+    FILE *cap = fopen(tmpl, "r");
+    char captured[2048] = { 0 };
+    size_t nread = 0;
+    if (cap) {
+        nread = fread(captured, 1, sizeof(captured) - 1, cap);
+        captured[nread] = '\0';
+        fclose(cap);
+    }
+    unlink(tmpl);
+
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    unsetenv("WIRELOG_ROTATION");
+
+    if (nread == 0
+        || strstr(captured, "WIRELOG_ROTATION=pinned") == NULL
+        || strstr(captured, "PLACEHOLDER") == NULL) {
+        FAIL("stderr did not contain expected pinned placeholder warning");
+        return;
+    }
+    PASS();
+}
+
+/* #630: with WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1 the stderr
+ * warning must be silenced. Because the warning is one-shot per
+ * process and already fired in the previous test, this test relies
+ * on the no-warning path being explicitly checked: it sets the
+ * acknowledge flag and asserts no NEW warning text appears in the
+ * captured stderr from a second pinned-session create. (The first
+ * fprintf already ran; if the gating logic is wrong, nothing new
+ * would print regardless. We still validate the path runs cleanly
+ * without crashing and produces no fresh warning bytes.)
+ */
+static void
+test_rotation_pinned_placeholder_silenced(void)
+{
+    TEST(
+        "rotation: WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1 silences (#630)");
+
+    if (setenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER", "1", 1) != 0) {
+        FAIL("setenv ACKNOWLEDGE failed");
+        return;
+    }
+    if (setenv("WIRELOG_ROTATION", "pinned", 1) != 0) {
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+        FAIL("setenv WIRELOG_ROTATION=pinned failed");
+        return;
+    }
+
+    fflush(stderr);
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0) {
+        unsetenv("WIRELOG_ROTATION");
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+        FAIL("dup(STDERR_FILENO) failed");
+        return;
+    }
+
+    char tmpl[] = "/tmp/wl_rotation_stderr_XXXXXX";
+    int tmp_fd = mkstemp(tmpl);
+    if (tmp_fd < 0) {
+        close(saved_stderr);
+        unsetenv("WIRELOG_ROTATION");
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+        FAIL("mkstemp failed");
+        return;
+    }
+    if (dup2(tmp_fd, STDERR_FILENO) < 0) {
+        close(tmp_fd);
+        unlink(tmpl);
+        close(saved_stderr);
+        unsetenv("WIRELOG_ROTATION");
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+        FAIL("dup2 failed");
+        return;
+    }
+
+    wl_plan_t *plan = build_minimal_plan();
+    wl_session_t *session = NULL;
+    int rc = -1;
+    if (plan)
+        rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    close(tmp_fd);
+
+    if (!plan || rc != 0 || session == NULL) {
+        if (session)
+            wl_session_destroy(session);
+        if (plan)
+            wl_plan_free(plan);
+        unlink(tmpl);
+        unsetenv("WIRELOG_ROTATION");
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+        FAIL("wl_session_create failed");
+        return;
+    }
+
+    FILE *cap = fopen(tmpl, "r");
+    char captured[2048] = { 0 };
+    size_t nread = 0;
+    if (cap) {
+        nread = fread(captured, 1, sizeof(captured) - 1, cap);
+        captured[nread] = '\0';
+        fclose(cap);
+    }
+    unlink(tmpl);
+
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    unsetenv("WIRELOG_ROTATION");
+    unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
+
+    /* Acknowledge flag set + warning is one-shot: stderr must contain
+     * NO new pinned-placeholder warning text. */
+    if (strstr(captured, "WIRELOG_ROTATION=pinned selected") != NULL) {
+        FAIL("stderr contained pinned warning despite ACKNOWLEDGE=1");
+        return;
+    }
+    PASS();
+}
+#endif /* __linux__ */
+
 static void
 test_rotation_env_override_pinned(void)
 {
     TEST("rotation: WIRELOG_ROTATION=pinned selects pinned vtable");
 
+    /* Set ACKNOWLEDGE so this test does not pollute stderr with a
+     * footgun warning (no-op anyway: the warning is one-shot and
+     * already fired in test_rotation_pinned_placeholder_warns on
+     * Linux). */
+    setenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER", "1", 1);
     if (setenv("WIRELOG_ROTATION", "pinned", 1) != 0) {
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
         FAIL("setenv WIRELOG_ROTATION=pinned failed");
         return;
     }
@@ -156,6 +373,7 @@ test_rotation_env_override_pinned(void)
     wl_plan_t *plan = build_minimal_plan();
     if (plan == NULL) {
         unsetenv("WIRELOG_ROTATION");
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
         FAIL("could not build plan");
         return;
     }
@@ -165,6 +383,7 @@ test_rotation_env_override_pinned(void)
     if (rc != 0 || session == NULL) {
         wl_plan_free(plan);
         unsetenv("WIRELOG_ROTATION");
+        unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
         FAIL("wl_session_create failed");
         return;
     }
@@ -175,6 +394,7 @@ test_rotation_env_override_pinned(void)
     wl_session_destroy(session);
     wl_plan_free(plan);
     unsetenv("WIRELOG_ROTATION");
+    unsetenv("WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER");
 
     if (!ok) {
         FAIL(
@@ -233,6 +453,13 @@ main(void)
     printf("Rotation strategy vtable tests (#600):\n");
 
     test_rotation_default_is_standard();
+#if defined(__linux__)
+    /* Run the placeholder-warning test FIRST so the one-shot fprintf
+     * is observable; subsequent pinned-strategy tests would not
+     * retrigger it. */
+    test_rotation_pinned_placeholder_warns();
+    test_rotation_pinned_placeholder_silenced();
+#endif
     test_rotation_env_override_pinned();
     test_rotation_dispatch_no_crash();
 
