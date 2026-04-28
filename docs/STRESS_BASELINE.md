@@ -126,12 +126,14 @@ The rotation-vtable workload is the only one that honors the
 - `WIRELOG_ROTATION=pinned`: selects `col_rotation_pinned_ops`. The
   pinned vtable is a placeholder today (per `rotation_pinned.c`);
   behavior is identical to `standard` until the real pin-aware
-  reclamation implementation lands. Selecting `pinned` emits a one-shot
-  stderr placeholder warning (footgun guard, #630); set
-  `WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1` to silence it. The
-  legacy value `WIRELOG_ROTATION=mvcc` was renamed to `pinned` in #630
-  and is no longer accepted; passing it prints a one-shot stderr
-  migration message and falls through to `standard`.
+  reclamation implementation lands. See "Pinned placeholder warning
+  (#630)" below for operator-facing details.
+
+The legacy value `WIRELOG_ROTATION=mvcc` was renamed to `pinned` in
+#630 and is no longer accepted; passing it prints a one-shot stderr
+migration message and falls through to `standard`. There is no
+backward-compat alias: the rename is hard so a stale operator config
+surfaces loudly rather than silently selecting the placeholder.
 
 Both variants are registered at every CI tier because #596's contract
 is the dispatch path itself, not the strategy semantics: the pinned
@@ -146,6 +148,52 @@ fan-out and per-handle post-rotate validity oracle.
 `R` cap is 1500 (mirrors `WL_NESTED_ASAN_R_CAP`); higher values
 hard-FAIL with a parseable diagnostic to keep epoch headroom under
 the compound arena's 4096-epoch ceiling.
+
+#### Pinned placeholder warning (#630)
+
+The pinned strategy is a placeholder: its body is currently identical
+to `standard` and the name reflects the *destined* mechanism --
+pin-aware reclamation driven by per-generation pin counters from
+K-Fusion freeze/unfreeze fences (RCU/EBR territory) -- not any
+MVCC/transactional concept. Wirelog is single-mutator and does not
+implement multi-version concurrency control.
+
+To prevent operators from silently opting into the placeholder
+strategy in production, `pinned_init` emits a **one-shot stderr
+fprintf** at first session selection that bypasses the structured
+logger (`WL_LOG`):
+
+```
+[wirelog] WARNING: WIRELOG_ROTATION=pinned selected, but the pinned
+strategy is currently a PLACEHOLDER -- its behavior is identical to
+WIRELOG_ROTATION=standard. Real pin-aware reclamation will land via
+issue #630. Set WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1 to
+silence this warning.
+```
+
+The fprintf bypass is load-bearing: `WL_LOG INFO` on the SESSION
+channel is stripped at release log levels
+(`-Dwirelog_log_max_level=error`), so a structured-only signal is
+invisible to the operators who most need to see it. The stderr line
+prints regardless of compile-time `WL_LOG` ceiling. The existing
+`WL_LOG INFO` line is retained so structured-logging consumers can
+still capture the event.
+
+Operator opt-in:
+
+- `WIRELOG_ROTATION_ACKNOWLEDGE_PLACEHOLDER=1`: silences the stderr
+  warning. Use after an informed opt-in (e.g. CI tiers exercising the
+  dispatch path under the rotation-vtable / daemon-soak / rotate-
+  latency workloads). All meson test entries that set
+  `WIRELOG_ROTATION=pinned` also set this acknowledge flag so test
+  stderr stays clean.
+
+The warning is one-shot per process (`static bool warned` inside
+`pinned_init`); subsequent `wl_col_session_t` creates with the
+pinned strategy in the same process do not retrigger it. Tests that
+assert the warning fires must run the assertion before any other
+test creates a pinned session in the same binary -- see
+`tests/test_rotation_strategy.c::test_rotation_pinned_placeholder_warns`.
 
 #### Baseline pass rate
 
