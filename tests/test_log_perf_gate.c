@@ -49,6 +49,8 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include "test_perf_util.h"
+
 #include "wirelog/util/log.h"
 
 #include "../bench/bench_util.h"
@@ -98,41 +100,11 @@ run_wllog(uint64_t iters, int a, int b, int c)
     return acc;
 }
 
-static int
-cmp_double_(const void *a, const void *b)
-{
-    double x = *(const double *)a;
-    double y = *(const double *)b;
-    return (x < y) ? -1 : (x > y) ? 1 : 0;
-}
-
-static double
-median_ms_(double *vals, int n)
-{
-    qsort(vals, (size_t)n, sizeof(vals[0]), cmp_double_);
-    return (n & 1) ? vals[n / 2] : 0.5 * (vals[n / 2 - 1] + vals[n / 2]);
-}
-
-static double
-mean_ms_(const double *vals, int n)
-{
-    double s = 0.0;
-    for (int i = 0; i < n; ++i) s += vals[i];
-    return s / (double)n;
-}
-
-/* Population stdev (n, not n-1) — we have the full sample, not an
- * estimator. */
-static double
-stdev_ms_(const double *vals, int n, double mean)
-{
-    double ss = 0.0;
-    for (int i = 0; i < n; ++i) {
-        double d = vals[i] - mean;
-        ss += d * d;
-    }
-    return sqrt(ss / (double)n);
-}
+/* Median, mean, and population stdev are shared with #599's
+ * rotate-latency gate via tests/test_perf_util.h
+ * (wl_perf_median_ms_inplace, wl_perf_mean_ms, wl_perf_stdev_ms).
+ * Population stdev (n, not n-1) -- the trial buffer is the full
+ * sample, not an estimator. */
 
 /*
  * Reads /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor (Linux only).
@@ -256,12 +228,12 @@ main(void)
 
     /* Baseline self-check: if the nolog trials themselves are too
      * noisy, no signal at the 1% budget can be trusted. */
-    double nolog_mean = mean_ms_(t_nolog, TRIALS);
-    double nolog_stdev = stdev_ms_(t_nolog, TRIALS, nolog_mean);
+    double nolog_mean = wl_perf_mean_ms(t_nolog, (size_t)TRIALS);
+    double nolog_stdev = wl_perf_stdev_ms(t_nolog, (size_t)TRIALS, nolog_mean);
     double nolog_cov = (nolog_mean > 0.0) ? nolog_stdev / nolog_mean : 0.0;
 
-    double med_nolog = median_ms_(t_nolog, TRIALS);
-    double med_wllog = median_ms_(t_wllog, TRIALS);
+    double med_nolog = wl_perf_median_ms_inplace(t_nolog, (size_t)TRIALS);
+    double med_wllog = wl_perf_median_ms_inplace(t_wllog, (size_t)TRIALS);
 
     double wall_delta_frac = (med_wllog - med_nolog) / med_nolog;
     double per_iter_ns =
