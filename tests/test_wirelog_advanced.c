@@ -130,10 +130,10 @@ test_create_invalid_backend(void)
     wirelog_error_t err
         = wirelog_session_create(prog, (wirelog_backend_kind_t)999, 1, &s);
     int rc = 0;
-    if (err == WIRELOG_OK || s != NULL) {
+    if (err != WIRELOG_ERR_EXEC || s != NULL) {
         fprintf(stderr,
-            "T3: bad backend should reject, got err=%d s=%p\n", err,
-            (void *)s);
+            "T3: bad backend should reject with ERR_EXEC, got err=%d s=%p\n",
+            err, (void *)s);
         rc = 1;
     }
     wirelog_program_free(prog);
@@ -270,6 +270,17 @@ test_null_safety(void)
         rc = 1;
     if (wirelog_session_set_delta_cb(NULL, NULL, NULL) != WIRELOG_ERR_EXEC)
         rc = 1;
+    if (wirelog_session_snapshot(NULL, count_rows, NULL) != WIRELOG_ERR_EXEC)
+        rc = 1;
+    uint64_t handle = WIRELOG_COMPOUND_HANDLE_NULL + 1;
+    if (wirelog_session_make_compound(NULL, "f", 1, NULL, &handle)
+        != WIRELOG_ERR_EXEC)
+        rc = 1;
+    if (handle != WIRELOG_COMPOUND_HANDLE_NULL) {
+        fprintf(stderr,
+            "T7: make_compound(NULL) must pre-clear handle_out\n");
+        rc = 1;
+    }
 
     wirelog_program_t *prog = parse_or_die(PROG_SRC, "T7");
     if (!prog)
