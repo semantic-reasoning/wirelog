@@ -263,11 +263,11 @@ external-consumer audit.
 
 Wirelog is **dual-licensed** to serve both open-source and enterprise needs.
 
-**LGPL-3.0** (default): Use wirelog as a library in your application -- open-source or proprietary -- without disclosing your own source code. Modifications to wirelog itself must be shared under LGPL-3.0. See [LICENSE.md](LICENSE.md) for full terms.
+**LGPL-3.0-or-later** (default): Use wirelog as a library in your application -- open-source or proprietary -- without disclosing your own source code. Modifications to wirelog itself must be shared under LGPL-3.0-or-later. See [LICENSE.md](LICENSE.md) for full terms.
 
 **Commercial license**: For use cases that require no LGPL obligations -- closed-source OEM embedding, proprietary extensions, or custom feature development -- a commercial license is available.
 
-| | LGPL-3.0 | Commercial |
+| | LGPL-3.0-or-later | Commercial |
 |---|---|---|
 | Use in proprietary apps | Yes (as a library) | Yes |
 | Modify wirelog | Must share modifications | No obligation |

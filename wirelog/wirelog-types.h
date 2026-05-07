@@ -2,7 +2,8 @@
  * wirelog-types.h - wirelog Type Definitions
  *
  * Copyright (C) CleverPlant
- * Licensed under LGPL-3.0
+ * SPDX-License-Identifier: LGPL-3.0-or-later
+ * Licensed under LGPL-3.0-or-later
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
  * This library is free software; you can redistribute it and/or
