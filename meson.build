@@ -2,7 +2,7 @@ project(
   'wirelog',
   'c',
   version: '0.39.0',
-  license: 'LGPL-3.0',
+  license: 'LGPL-3.0-or-later',
   meson_version: '>=0.62.0',
   default_options: [
     'buildtype=release',
@@ -15,7 +15,7 @@ project(
 #Project metadata
 project_name = meson.project_name()
 project_version = meson.project_version()
-project_license = 'LGPL-3.0'
+project_license = 'LGPL-3.0-or-later'
 project_url = 'https://github.com/semantic-reasoning/wirelog'
 
 #Directories

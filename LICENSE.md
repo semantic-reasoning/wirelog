@@ -2,20 +2,20 @@
 
 wirelog is available under dual licensing:
 
-## 1. Open Source License: LGPL-3.0
+## 1. Open Source License: LGPL-3.0-or-later
 
-wirelog is distributed under the **GNU Lesser General Public License v3.0 (LGPL-3.0)**.
+wirelog is distributed under the **GNU Lesser General Public License v3.0 (LGPL-3.0-or-later), or, at your option, any later version (LGPL-3.0-or-later)**. This matches the per-file license headers included in every public source file (SPDX-License-Identifier: `LGPL-3.0-or-later`).
 
 This license allows you to:
 - Use wirelog as a library in your applications
 - Modify and distribute modified versions
 - Link wirelog with proprietary software (with conditions)
 
-For the full text of LGPL-3.0, see the file `COPYING.LGPL` or visit:
+For the full text of LGPL-3.0-or-later, see the file `COPYING.LGPL` or visit:
 https://www.gnu.org/licenses/lgpl-3.0.html
 
-### LGPL-3.0 Conditions Summary:
-- Include a copy of the LGPL-3.0 license with your distribution
+### LGPL-3.0-or-later Conditions Summary:
+- Include a copy of the LGPL-3.0-or-later license with your distribution
 - Document any modifications to wirelog
 - If you distribute applications using wirelog, you must provide:
   - Source code of wirelog modifications (if any)
@@ -45,8 +45,8 @@ If you wish to use wirelog under a **proprietary/commercial license** (e.g., to 
 
 | Scenario | License |
 |----------|---------|
-| Open-source project | LGPL-3.0 |
-| Proprietary application using wirelog as library | LGPL-3.0 ✓ (allowed) |
+| Open-source project | LGPL-3.0-or-later |
+| Proprietary application using wirelog as library | LGPL-3.0-or-later ✓ (allowed) |
 | Closed-source application | Commercial License required |
 | Distribution requiring proprietary terms | Commercial License required |
 | Custom/enterprise agreement | Commercial License (contact us) |
@@ -55,12 +55,12 @@ If you wish to use wirelog under a **proprietary/commercial license** (e.g., to 
 
 ## 4. Attribution
 
-When using wirelog under LGPL-3.0, please include this notice:
+When using wirelog under LGPL-3.0-or-later, please include this notice:
 
 ```
 wirelog - Embedded-to-Enterprise Datalog Engine
 Copyright (C) CleverPlant
-Licensed under LGPL-3.0
+Licensed under LGPL-3.0-or-later
 https://github.com/semantic-reasoning/wirelog
 ```
 
@@ -75,7 +75,7 @@ Each source file should include:
  * wirelog - Embedded-to-Enterprise Datalog Engine
  *
  * Copyright (C) CleverPlant
- * Licensed under LGPL-3.0
+ * Licensed under LGPL-3.0-or-later
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
  * This library is free software; you can redistribute it and/or
@@ -106,16 +106,16 @@ wirelog uses the following third-party components:
 | Differential Dataflow | MIT/Apache 2.0 | Phase 0-3 |
 | Meson Build System | Apache 2.0 | Build-time only |
 
-All third-party licenses are compatible with LGPL-3.0.
+All third-party licenses are compatible with LGPL-3.0-or-later.
 
 ---
 
 ## 7. Legal Disclaimer
 
-wirelog is provided "AS IS" without any warranty. See LGPL-3.0 for full disclaimer.
+wirelog is provided "AS IS" without any warranty. See LGPL-3.0-or-later for full disclaimer.
 
 For questions about licensing:
-- **Open Source (LGPL-3.0)**: Refer to https://www.gnu.org/licenses/lgpl-3.0.html
+- **Open Source (LGPL-3.0-or-later)**: Refer to https://www.gnu.org/licenses/lgpl-3.0.html
 - **Commercial Licensing**: inquiry@cleverplant.com
 
 ---
