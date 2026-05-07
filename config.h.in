@@ -8,7 +8,7 @@
 #ifndef WIRELOG_CONFIG_H
 #define WIRELOG_CONFIG_H
 
-#define WIRELOG_VERSION "@WIRELOG_VERSION@"
+/* WIRELOG_VERSION moved to wirelog/wirelog-version.h.  See #688. */
 #define WIRELOG_PLATFORM "@WIRELOG_PLATFORM@"
 
 #mesondefine WIRELOG_EMBEDDED

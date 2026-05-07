@@ -2,7 +2,8 @@
  * wirelog.h - Embedded-to-Enterprise Datalog Engine
  *
  * Copyright (C) CleverPlant
- * Licensed under LGPL-3.0
+ * SPDX-License-Identifier: LGPL-3.0-or-later
+ * Licensed under LGPL-3.0-or-later
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
  * This library is free software; you can redistribute it and/or
@@ -47,13 +48,10 @@ extern "C" {
 /* Version Information                                                      */
 /* ======================================================================== */
 
-#define WIRELOG_VERSION_MAJOR 0
-#define WIRELOG_VERSION_MINOR 11
-#define WIRELOG_VERSION_PATCH 0
-
-#define WIRELOG_VERSION                                          \
-        (WIRELOG_VERSION_MAJOR * 10000 + WIRELOG_VERSION_MINOR * 100 \
-        + WIRELOG_VERSION_PATCH)
+/* WIRELOG_VERSION_MAJOR / _MINOR / _PATCH and WIRELOG_VERSION are
+ * generated from meson.build's project_version; see
+ * wirelog/wirelog-version.h. */
+#include "wirelog/wirelog-version.h"
 
 /* ======================================================================== */
 /* Type Definitions                                                         */
