@@ -46,7 +46,7 @@ meson setup build && meson compile -C build
 meson test -C build
 ```
 
-For fine-grained control over plans, backends, or worker counts, use the `wl_session_*` primitives in `wirelog/session.h`.
+For fine-grained control over plans, backends, or worker counts, use the `wirelog_session_*` API in [`wirelog/wirelog-advanced.h`](wirelog/wirelog-advanced.h). The internal `wl_session_*` primitives in `wirelog/session.h` are not part of the installed surface and may change without notice.
 
 ## Features
 
@@ -257,7 +257,7 @@ external-consumer audit.
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- development workflow, CI/CD, PR requirements
 - [SECURITY.md](SECURITY.md) -- vulnerability disclosure
 - [CLA.md](CLA.md) -- Contributor License Agreement (required for dual licensing)
-- API: [`wirelog/wl_easy.h`](wirelog/wl_easy.h) (simple) | [`wirelog/session.h`](wirelog/session.h) (advanced)
+- API: [`wirelog/wl_easy.h`](wirelog/wl_easy.h) (simple) | [`wirelog/wirelog-advanced.h`](wirelog/wirelog-advanced.h) (advanced)
 
 ## License
 

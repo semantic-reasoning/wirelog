@@ -76,16 +76,18 @@ Two patterns are supported:
   weighted aggregates) are subject to the engine's
   multiplicity-tracking rules, not promised by this document.
 
-### Forward compatibility (Future work — not yet shipped)
+### Cross-facade parity (Status: Current)
 
-`wirelog/wirelog-advanced.h` and the public `wirelog_session_*` surface
-do not exist in the tree yet. They are planned per
-`stable-release-plan.md` §3 and, when they land, are intended to share
-this exact semantic model: open-time inline-fact seeding, z-set host
-insert/remove, optional pre-check via `wirelog_program_get_facts`. The
-intent here is to avoid drift between the easy facade and the future
-advanced surface; this paragraph is non-binding until those headers
-actually ship.
+`wirelog/wirelog-advanced.h` ships the public `wirelog_session_*` surface
+as the advanced peer of `wl_easy`. Both facades share this exact
+semantic model: open-time inline-fact seeding, z-set host insert/remove,
+optional pre-check via `wirelog_program_get_facts`. This is the contract
+that prevents behavioral drift between the easy and advanced surfaces.
+
+Internal `wl_session_*` and `wl_compute_backend_t` remain private. The
+advanced API exposes backend selection through the
+`wirelog_backend_kind_t` enum (`DEFAULT`, `COLUMNAR`); new backends
+will appear as additive enum values in future minor releases.
 
 ### References
 
