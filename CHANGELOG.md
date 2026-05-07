@@ -13,6 +13,10 @@ All notable changes to wirelog are documented in this file.
 
 - **wl_easy inline-fact materialization** (#718): `wl_easy_open` now seeds inline `.dl` facts into the columnar session at first lazy build, matching the CLI driver's order-of-operations. Previously the wl_easy facade dropped every static fact silently, so snapshots and IDB derivations re-evaluated against an empty EDB and returned no rows.
 
+### Added
+
+- **CLA-bot automation** (#702): `.github/workflows/cla.yml` runs the `contributor-assistant/github-action` on every PR. The bot blocks merging until every contributor has signed the wirelog CLA (recorded in `signatures/version1/cla.json`), protecting the LGPL-3.0-or-later + commercial dual-license model. Operational prerequisite documented inside the workflow file: a `CLA_SIGN_TOKEN` PAT secret with `contents:write` + `pull_requests:write` must be registered after merge.
+
 ### Documentation
 
 - **`docs/SECURITY_MODEL.md`** (#701): new document recording the threat model, the mbedTLS-enabled build's license stack (Apache-2.0 + Apache-2.0 sub-dependencies on top of LGPL-3.0-or-later wirelog), and a good-faith export-control self-classification (ECCN 5D002.c.1 + License Exception ENC for `mbedTLS=enabled`; EAR99 for the default `disabled` build). Linked from README.md and from the `mbedTLS` option description in `meson_options.txt`.
