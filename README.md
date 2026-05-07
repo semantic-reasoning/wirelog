@@ -256,6 +256,7 @@ external-consumer audit.
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) -- system design, optimizer pipeline, execution model
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- development workflow, CI/CD, PR requirements
 - [SECURITY.md](SECURITY.md) -- vulnerability disclosure
+- [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) -- threat model, mbedTLS license stack, and export-control self-classification
 - [CLA.md](CLA.md) -- Contributor License Agreement (required for dual licensing)
 - API: [`wirelog/wl_easy.h`](wirelog/wl_easy.h) (simple) | [`wirelog/wirelog-advanced.h`](wirelog/wirelog-advanced.h) (advanced)
 
