@@ -4,13 +4,19 @@ All notable changes to wirelog are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`wirelog/wirelog-advanced.h`** (#717, #703): New public header exposing the fine-grained `wirelog_session_*` API as the stable peer of `wl_easy`. Eight thin wrappers (`create` / `destroy` / `insert` / `remove` / `step` / `set_delta_cb` / `snapshot` / `make_compound`) over the internal session primitives. Backend selection through the `wirelog_backend_kind_t` enum (`DEFAULT` / `COLUMNAR`) — no vtable exposure. Inline `.dl` facts are seeded eagerly at `wirelog_session_create()` time, matching the wl_easy contract from #718. Internal `wl_session_*` and `wl_compute_backend_t` remain private.
+- **CI guard** (#717): `scripts/ci/check-advanced-header.sh` (suite `abi`) fails when `wirelog/wirelog-advanced.h` includes any internal header.
+
 ### Fixed
 
 - **wl_easy inline-fact materialization** (#718): `wl_easy_open` now seeds inline `.dl` facts into the columnar session at first lazy build, matching the CLI driver's order-of-operations. Previously the wl_easy facade dropped every static fact silently, so snapshots and IDB derivations re-evaluated against an empty EDB and returned no rows.
 
 ### Documentation
 
-- **`docs/SEMANTICS.md`** (#718): New document recording the engine's observable semantic-model decisions and the path toward 1.0 stabilization. First entry: inline `.dl` fact loading rules and the z-set host insert/remove model (status: Current).
+- **README.md** (#717): replace the now-misleading `wl_session_*` / `wirelog/session.h` advisory with `wirelog_session_*` / `wirelog/wirelog-advanced.h`. The internal session header is explicitly called out as private.
+- **`docs/SEMANTICS.md`** (#717, #718): record observable semantic-model decisions and the path toward 1.0 stabilization. Inline `.dl` fact loading rules + z-set host insert/remove model (status: Current). Promote the cross-facade parity section to Current now that the advanced surface ships.
 
 ## [0.30.0] - 2026-05-07
 
