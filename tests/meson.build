@@ -375,6 +375,16 @@ if not is_windows
        suite: 'abi')
 endif
 
+# Issue #688 / #704: meson.build version, the generated wirelog-version.h,
+# and the template's @-placeholders must agree.  Python so it runs on
+# Windows runners too.  Pass the build directory that actually contains
+# the generated header (see wirelog/meson.build's configure_file()).
+py3 = find_program('python3', 'python', required: true)
+test('version_sync', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-version-sync.py',
+            meson.project_build_root() / 'wirelog'],
+     suite: 'abi')
+
 test_intern_exe = executable(
   'test_intern',
   files('test_intern.c'),
