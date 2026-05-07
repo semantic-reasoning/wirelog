@@ -126,6 +126,12 @@ wirelog_string_ops_src = files('string_ops.c', )
 
 wirelog_wl_easy_src = files('wl_easy.c', )
 
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Advanced session API (Issue #717 / #703)
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+
+wirelog_advanced_src = files('wirelog_advanced.c', )
+
 #==================================================================================
 # Util / Logger Module (Issue #287 - GST_DEBUG-style structured logging)
 #==================================================================================
