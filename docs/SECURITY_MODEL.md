@@ -94,14 +94,31 @@ notices.
 
 **Self-classification (mbedTLS-enabled build)**: **ECCN 5D002.c.1**
 ("information security" software providing encryption functions),
-qualifying for **License Exception ENC** under U.S. 15 CFR 740.17,
-sub-paragraph (b)(1) (publicly available encryption source code,
-mass-market notification path).
+matching the international **Wassenaar Arrangement 5.A.2 / 5.D.2**
+control list. wirelog has **not** requested a CCATS (Commodity
+Classification Automated Tracking System) determination from BIS;
+the classification above is the project's own good-faith assessment.
+
+Two U.S. EAR pathways apply to publicly-available source code:
+
+- **§740.13(e) TSU** (Technology and Software — Unrestricted) covers
+  publicly-available encryption source code with **no notification
+  requirement**. This is the safest baseline for a downstream
+  redistributor that has not separately filed the §740.17 notice.
+- **§740.17(b)(1) ENC** (Encryption commodities, software, and
+  technology) covers publicly-available encryption source code under
+  the ENC license exception, but is conditioned on a **one-time
+  email notification** to BIS and the ENC Encryption Request
+  Coordinator. A redistributor that has filed that notification may
+  cite §740.17(b)(1); otherwise §740.13(e) TSU is the cleaner cite.
+
+Either pathway permits export to most destinations; both exclude
+EAR-embargoed countries.
 
 This mirrors the upstream mbedTLS project's published stance: mbedTLS
-is freely available source code, subject to ENC mass-market notice
-filing rather than a license requirement, and is generally exportable
-to all destinations except those embargoed under the EAR.
+is freely available source code, generally exportable subject to the
+above EAR pathways and not requiring an export license for the
+default redistribution channel.
 
 **What this means for downstream redistributors:**
 
@@ -111,10 +128,18 @@ to all destinations except those embargoed under the EAR.
    ECCN 5D002.c.1. Most commercial mass-market redistribution paths
    are covered by License Exception ENC notification (a one-time
    email to BIS and NSA per 15 CFR 740.17(b)(1)).
-2. From other jurisdictions (EU, UK, Japan, etc.), determine the
-   equivalent classification under the local export regime. The EU
-   counterpart is the EU Dual-Use Regulation Annex I Category 5
-   Part 2, with similar mass-market exemptions.
+2. From other jurisdictions, determine the equivalent classification
+   under the local export regime:
+   - **EU**: Regulation 2021/821 Annex I Category 5 Part 2, with
+     similar publicly-available-source and mass-market exemptions.
+   - **UK** (post-Brexit): Strategic Export Control regime under the
+     Export Control Order 2008 (as amended); UK Strategic Export
+     Control Lists Annex 1 Category 5 Part 2 mirrors the Wassenaar
+     5.A.2 / 5.D.2 controls.
+   - **Japan**: METI Foreign Exchange and Foreign Trade Act, with
+     publicly-available-software exemptions paralleling the EAR's.
+   - All Wassenaar Arrangement participating states have closely
+     analogous controls in their own dual-use frameworks.
 3. **Do not redistribute to embargoed destinations** without checking
    the current sanctions lists (OFAC SDN, EU consolidated list, etc.).
 4. The project does not file Annual Self-Classification Reports
@@ -148,11 +173,20 @@ counsel for your specific distribution model.
 
 - **mbedTLS upstream** — <https://github.com/Mbed-TLS/mbedtls>
   (license, ECCN, Annual Self-Classification posture).
-- **U.S. EAR §740.17(b)(1)** — License Exception ENC for
-  publicly-available encryption source code.
+- **U.S. EAR §740.13(e) TSU** — unrestricted publicly-available
+  encryption source code, no notification required.
+- **U.S. EAR §740.17(b)(1) ENC** — License Exception ENC pathway for
+  publicly-available encryption source code, conditioned on the
+  one-time BIS / ENC-Coordinator notification.
 - **U.S. CCL 5D002** — Encryption software classification.
+- **Wassenaar Arrangement 5.A.2 / 5.D.2** — international control
+  list parent of the EAR / EU / UK / JP cryptography controls.
 - **EU Regulation 2021/821** — Dual-use export-control regime,
   Annex I Category 5 Part 2.
+- **UK Export Control Order 2008** — UK Strategic Export Control
+  Lists Annex 1 Category 5 Part 2 (post-Brexit).
+- **Japan FEFTA** — METI Foreign Exchange and Foreign Trade Act,
+  publicly-available-software exemptions.
 - **Apache License 2.0 NOTICE** — required attribution for mbedTLS
   redistributions.
 - **`meson_options.txt`** — the `mbedTLS` build option entry repeats
