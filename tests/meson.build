@@ -367,6 +367,12 @@ if not is_windows
        find_program(meson.project_source_root() / 'scripts/ci/check-wl-easy-opts-symbol.sh'),
        args: [meson.project_build_root()],
        suite: 'abi')
+  # Issue #717 / #703: wirelog/wirelog-advanced.h must not leak any
+  # internal header (session.h, backend.h, exec_plan*.h, intern.h,
+  # session_facts.h, wirelog-internal.h) into the installed surface.
+  test('advanced_abi_header',
+       find_program(meson.project_source_root() / 'scripts/ci/check-advanced-header.sh'),
+       suite: 'abi')
 endif
 
 test_intern_exe = executable(

@@ -293,6 +293,7 @@ wirelog_config_threads(void);
 #include "wirelog/wirelog-ir.h"
 #include "wirelog/wirelog-optimizer.h"
 #include "wirelog/wl_easy.h"
+#include "wirelog/wirelog-advanced.h"
 #include "wirelog/io/io_adapter.h"
 
 #endif /* WIRELOG_H */
