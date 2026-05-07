@@ -56,7 +56,7 @@ option(
   type: 'combo',
   choices: ['disabled', 'enabled', 'auto'],
   value: 'disabled',
-  description: 'Use system-installed mbedTLS for cryptographic functions. auto=enabled if found, else disabled'
+  description: 'Use system-installed mbedTLS for cryptographic functions. auto=enabled if found, else disabled. Enabling links Apache-2.0 mbedTLS and brings cryptography into the build (see docs/SECURITY_MODEL.md): the artifact then carries ECCN 5D002.c.1 under U.S. EAR; downstream redistributors are responsible for any export filings under their own jurisdiction. Default-disabled builds carry no cryptographic code (EAR99).'
 )
 
 option(
