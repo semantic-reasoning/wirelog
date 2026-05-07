@@ -132,6 +132,20 @@ wirelog_wl_easy_src = files('wl_easy.c', )
 
 wirelog_advanced_src = files('wirelog_advanced.c', )
 
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Version header generation (Issue #688 / #704)
+#configure_file() runs in this subdir so the generated header lands at
+#build/wirelog/wirelog-version.h, matching the canonical include path
+#used by wirelog/wirelog.h.
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+
+version_h_file = configure_file(
+  input: 'wirelog-version.h.in',
+  output: 'wirelog-version.h',
+  configuration: version_h,
+  install_dir: get_option('includedir') / 'wirelog'
+)
+
 #==================================================================================
 # Util / Logger Module (Issue #287 - GST_DEBUG-style structured logging)
 #==================================================================================

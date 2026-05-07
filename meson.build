@@ -187,7 +187,6 @@ endif
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 config_h = configuration_data()
-config_h.set_quoted('WIRELOG_VERSION', project_version)
 config_h.set_quoted('WIRELOG_PLATFORM', platform)
 config_h.set('WIRELOG_EMBEDDED', is_embedded)
 config_h.set('WIRELOG_IPC', ipc_option == 'enabled')
@@ -200,6 +199,24 @@ config_h_file = configure_file(
   configuration: config_h,
   install_dir: wirelog_includedir / 'wirelog'
 )
+
+#Version header (Issue #688 / #704)
+#The integer triple (WIRELOG_VERSION_MAJOR/MINOR/PATCH) is parsed from
+#project_version with any '-rcN' / '-dev' suffix stripped; the suffix is
+#preserved verbatim in WIRELOG_VERSION_STRING.  The configure_file()
+#call lives in wirelog/meson.build so the generated header lands in
+#build/wirelog/wirelog-version.h, where include_directories('.') below
+#picks it up under the canonical "wirelog/wirelog-version.h" path.
+version_release = project_version.split('-')[0]
+version_parts = version_release.split('.')
+assert(version_parts.length() == 3,
+  'project_version must be MAJOR.MINOR.PATCH (got: @0@)'.format(project_version))
+
+version_h = configuration_data()
+version_h.set('WIRELOG_VERSION_MAJOR', version_parts[0].to_int())
+version_h.set('WIRELOG_VERSION_MINOR', version_parts[1].to_int())
+version_h.set('WIRELOG_VERSION_PATCH', version_parts[2].to_int())
+version_h.set('WIRELOG_VERSION_STRING', project_version)
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Include directories
