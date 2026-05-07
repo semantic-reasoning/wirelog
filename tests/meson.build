@@ -3566,6 +3566,26 @@ test_wl_easy_inline_facts_exe = executable(
 
 test('wl_easy_inline_facts', test_wl_easy_inline_facts_exe)
 
+# Issue #717 / #703: behavioral-parity test for the advanced session API.
+test_wirelog_advanced_exe = executable(
+  'test_wirelog_advanced',
+  files('test_wirelog_advanced.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  '../wirelog/wl_easy.c',
+  '../wirelog/wirelog_advanced.c',
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('wirelog_advanced', test_wirelog_advanced_exe)
+
 # ============================================================================
 # Baseline .input Fixture Snapshot Tests (Issue #448)
 # ============================================================================
