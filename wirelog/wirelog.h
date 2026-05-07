@@ -76,7 +76,12 @@ typedef struct wirelog_result wirelog_result_t;
 /**
  * wirelog_executor_t:
  *
- * Opaque handle to the execution engine.
+ * Opaque handle to the batch execution engine: parse + optimize + run +
+ * collect IDB results in one shot via wirelog_evaluate().  For
+ * incremental sessions with delta callbacks and z-set semantics, use
+ * wirelog_session_t (in wirelog/wirelog-advanced.h) or
+ * wl_easy_session_t (in wirelog/wl_easy.h) instead.  These three
+ * facades are independent surfaces; do not mix handles across them.
  */
 typedef struct wirelog_executor wirelog_executor_t;
 

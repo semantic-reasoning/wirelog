@@ -54,9 +54,11 @@ wirelog_session_create(wirelog_program_t *program,
     wirelog_backend_kind_t backend, uint32_t num_workers,
     wirelog_session_t **out)
 {
-    if (!program || !out)
+    if (!out)
         return WIRELOG_ERR_EXEC;
     *out = NULL;
+    if (!program)
+        return WIRELOG_ERR_EXEC;
 
     const wl_compute_backend_t *be = resolve_backend(backend);
     if (!be)

@@ -16,7 +16,9 @@ All notable changes to wirelog are documented in this file.
 ### Documentation
 
 - **README.md** (#717): replace the now-misleading `wl_session_*` / `wirelog/session.h` advisory with `wirelog_session_*` / `wirelog/wirelog-advanced.h`. The internal session header is explicitly called out as private.
-- **`docs/SEMANTICS.md`** (#717, #718): record observable semantic-model decisions and the path toward 1.0 stabilization. Inline `.dl` fact loading rules + z-set host insert/remove model (status: Current). Promote the cross-facade parity section to Current now that the advanced surface ships.
+- **`docs/SEMANTICS.md`** (#718): new document recording the engine's observable semantic-model decisions and the path toward 1.0 stabilization. First entry: inline `.dl` fact loading rules and the z-set host insert/remove model (status: Current).
+- **`docs/SEMANTICS.md`** (#717): promote the cross-facade parity section from Future to Current now that the advanced surface ships.
+- **`wirelog/wirelog.h`** (#717): expand the `wirelog_executor_t` docstring to clarify that it is the batch facade and to point at `wirelog_session_t` / `wl_easy_session_t` for incremental delta-callback workflows.
 
 ## [0.30.0] - 2026-05-07
 
