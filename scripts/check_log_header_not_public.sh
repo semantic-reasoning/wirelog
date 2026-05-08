@@ -17,6 +17,7 @@ PUBLIC_HEADERS=(
     wirelog/wirelog-optimizer.h
     wirelog/wirelog-export.h
     wirelog/wl_easy.h
+    wirelog/wirelog-advanced.h
     wirelog/io/io_adapter.h
 )
 
