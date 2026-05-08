@@ -18,7 +18,7 @@ By submitting a contribution (via pull request, patch, or any other means) to th
 
 You hereby grant to CleverPlant a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable copyright license to reproduce, prepare derivative works of, publicly display, publicly perform, sublicense, and distribute your Contributions and such derivative works under any license terms, including without limitation:
 
-- The GNU Lesser General Public License v3.0 (LGPL-3.0)
+- The GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later)
 - Any commercial or proprietary license
 
 ## 3. Grant of Patent License
@@ -39,7 +39,7 @@ You represent that:
 
 You acknowledge that wirelog is distributed under a dual licensing model:
 
-1. **Open Source**: GNU Lesser General Public License v3.0 (LGPL-3.0)
+1. **Open Source**: GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later)
 2. **Commercial**: Proprietary license offered by CleverPlant
 
 Your Contributions may be distributed under either or both of these licenses. CleverPlant retains the right to offer commercial licenses that include your Contributions.
