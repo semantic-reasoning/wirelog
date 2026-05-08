@@ -393,6 +393,18 @@ collect_decl(struct wirelog_program *prog,
     }
 
     if (col_count > 0) {
+        /* Issue #724: a second .decl for the same relation overwrites the
+         * columns array.  Free any prior allocation so the per-column
+         * name strings and the array itself do not leak when programs
+         * are assembled by concatenating templates that share a
+         * declaration. */
+        if (rel->columns) {
+            for (uint32_t i = 0; i < rel->column_count; i++)
+                free((char *)rel->columns[i].name);
+            free(rel->columns);
+            rel->columns = NULL;
+            rel->column_count = 0;
+        }
         rel->columns
             = (wirelog_column_t *)calloc(col_count, sizeof(wirelog_column_t));
         if (!rel->columns)
@@ -463,6 +475,24 @@ collect_input(struct wirelog_program *prog,
     }
 
     rel->has_input = true;
+
+    /* Issue #724: a second .input for the same relation overwrites the
+     * input_io_scheme and input_param_names/values arrays.  Reclaim the
+     * prior allocations so concatenated template bundles that share an
+     * .input directive do not leak. */
+    free(rel->input_io_scheme);
+    rel->input_io_scheme = NULL;
+    if (rel->input_param_names) {
+        for (uint32_t i = 0; i < rel->input_param_count; i++) {
+            free(rel->input_param_names[i]);
+            free(rel->input_param_values[i]);
+        }
+        free(rel->input_param_names);
+        free(rel->input_param_values);
+        rel->input_param_names = NULL;
+        rel->input_param_values = NULL;
+        rel->input_param_count = 0;
+    }
 
     /* Extract input parameters.  The "io" key is consumed as a reserved
      * parameter to populate input_io_scheme and is NOT passed through
