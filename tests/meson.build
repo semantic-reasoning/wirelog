@@ -397,6 +397,15 @@ test('version_sync', py3,
             meson.project_build_root() / 'wirelog'],
      suite: 'abi')
 
+# Issue #705 / Blocker B2: every in-tree mirror of the public header
+# surface must agree with `wirelog_public_headers` (plus the standalone
+# `install_headers('wirelog/io/io_adapter.h', ...)` call) in
+# meson.build. Static parse only — no build-tree input required.
+test('public_header_surface', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-public-header-surface.py',
+            meson.project_source_root()],
+     suite: 'abi')
+
 test_intern_exe = executable(
   'test_intern',
   files('test_intern.c'),

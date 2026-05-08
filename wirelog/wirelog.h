@@ -32,8 +32,9 @@
  *
  * Individual sub-headers (wirelog-types.h, wirelog-parser.h,
  * wirelog-ir.h, wirelog-optimizer.h, wirelog-export.h, wl_easy.h,
- * io/io_adapter.h) are still installed for backwards compatibility
- * but should not be included directly in new code.
+ * wirelog-advanced.h, io/io_adapter.h) are still installed for
+ * backwards compatibility but should not be included directly in
+ * new code.
  */
 
 #ifdef __cplusplus
