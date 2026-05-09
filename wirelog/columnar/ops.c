@@ -4522,40 +4522,64 @@ col_rel_compact_runs(col_rel_t *rel)
     if (!merged)
         return ENOMEM;
 
-    /* Min-heap entries (stack-allocated, K <= COL_MAX_RUNS = 8) */
+    /* Min-heap entries (stack-allocated, K <= COL_MAX_RUNS = 8).
+     *
+     * lead_key[i] shadows columns[0][heap[i].cursor] so the inner
+     * comparator can short-circuit on the leading column without
+     * indirecting through col_rel_row_cmp() and its column-array
+     * dereference.  When the leading keys differ (the common case for
+     * sorted runs whose interleaving is determined by the leading
+     * sort key), the heap relation falls out of a register-resident
+     * scalar compare; only equal-leading rows pay the full row_cmp
+     * cost.  lead_key is kept consistent with heap[].cursor at every
+     * mutation: cursor advance, end-of-run replacement, and sift-down
+     * swap. */
     typedef struct {
         uint32_t cursor;
         uint32_t end;
     } compact_he_t;
 
     compact_he_t heap[COL_MAX_RUNS];
+    int64_t lead_key[COL_MAX_RUNS];
     uint32_t heap_size = 0;
+    const int64_t *lead_col = rel->columns[0];
 
     for (uint32_t s = 0; s < K; s++) {
         if (seg_bounds[s] < seg_bounds[s + 1]) {
             heap[heap_size].cursor = seg_bounds[s];
             heap[heap_size].end = seg_bounds[s + 1];
+            lead_key[heap_size] = lead_col[seg_bounds[s]];
             heap_size++;
         }
     }
+
+#define COMPACT_LT_(_a, _b) \
+        (lead_key[_a] < lead_key[_b]                                             \
+        || (lead_key[_a] == lead_key[_b]                                        \
+        && col_rel_row_cmp(rel, heap[_a].cursor, heap[_b].cursor) < 0))
+
+#define COMPACT_LE_(_a, _b) \
+        (lead_key[_a] < lead_key[_b]                                             \
+        || (lead_key[_a] == lead_key[_b]                                        \
+        && col_rel_row_cmp(rel, heap[_a].cursor, heap[_b].cursor) <= 0))
 
 #define COMPACT_SIFT_DOWN(start, size)                                       \
         do {                                                                     \
             uint32_t _p = (start);                                               \
             while (2 * _p + 1 < (size)) {                                        \
                 uint32_t _c = 2 * _p + 1;                                        \
-                if (_c + 1 < (size)                                               \
-                    && col_rel_row_cmp(rel, heap[_c + 1].cursor,                 \
-                    heap[_c].cursor) < 0)                                     \
-                _c++;                                                         \
-                if (col_rel_row_cmp(rel, heap[_p].cursor,                         \
-                    heap[_c].cursor) <= 0)                                    \
-                break;                                                        \
-                compact_he_t _tmp = heap[_p];                                     \
-                heap[_p] = heap[_c];                                              \
-                heap[_c] = _tmp;                                                  \
-                _p = _c;                                                          \
-            }                                                                     \
+                if (_c + 1 < (size) && COMPACT_LT_(_c + 1, _c))                  \
+                _c++;                                                            \
+                if (COMPACT_LE_(_p, _c))                                         \
+                break;                                                           \
+                compact_he_t _tmp = heap[_p];                                    \
+                heap[_p] = heap[_c];                                             \
+                heap[_c] = _tmp;                                                 \
+                int64_t _kt = lead_key[_p];                                      \
+                lead_key[_p] = lead_key[_c];                                     \
+                lead_key[_c] = _kt;                                              \
+                _p = _c;                                                         \
+            }                                                                    \
         } while (0)
 
     /* Build min-heap */
@@ -4580,13 +4604,18 @@ col_rel_compact_runs(col_rel_t *rel)
         heap[0].cursor++;
         if (heap[0].cursor >= heap[0].end) {
             heap[0] = heap[heap_size - 1];
+            lead_key[0] = lead_key[heap_size - 1];
             heap_size--;
+        } else {
+            lead_key[0] = lead_col[heap[0].cursor];
         }
         if (heap_size > 0)
             COMPACT_SIFT_DOWN(0, heap_size);
     }
 
 #undef COMPACT_SIFT_DOWN
+#undef COMPACT_LT_
+#undef COMPACT_LE_
 
     /* Scatter flat merged buffer back into column-major */
     for (uint32_t r = 0; r < out; r++)
