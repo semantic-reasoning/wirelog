@@ -645,6 +645,46 @@ test('option2_doop', test_option2_doop_exe,
 )
 
 # ============================================================================
+# CRDT W=1 perf-suite gate.
+#
+# Drives the same Datalog source as bench_flowlog --workload crdt and
+# asserts median wall <= TARGET_MS (currently 19,840 ms = baseline
+# 18,890 ms x 1.05).  Default-suite invocation skips this entry
+# (suite is 'perf').  Registered here, after backend_src/arena_src/
+# workqueue_src are defined, so it can link the full evaluator.
+#
+#   Linux:   echo performance | sudo tee /sys/.../scaling_governor
+#            WIRELOG_PERF_GATE=1 WIRELOG_PERF_REQUIRE=1 \
+#                meson test -C build --suite perf
+#
+# WIRELOG_PERF_GATE=1 must be set or the test SKIPs.  Without
+# WIRELOG_PERF_REQUIRE=1 the test SKIPs on a non-performance cpufreq
+# governor; with WIRELOG_PERF_REQUIRE=1 it FAILs loud (the merge
+# runner asserts the host is configured for stable timing).
+# ============================================================================
+
+test_crdt_perf_gate_exe = executable(
+  'test_crdt_perf_gate',
+  files('test_crdt_perf_gate.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('crdt_perf_gate', test_crdt_perf_gate_exe,
+     suite: 'perf',
+     timeout: 600,
+     env: [
+       'WIRELOG_CRDT_DATA_DIR=' + meson.project_source_root() / 'bench/data/crdt',
+     ])
+
+# ============================================================================
 # Consolidation Function Tests (US-003 TDD RED Phase)
 # ============================================================================
 
