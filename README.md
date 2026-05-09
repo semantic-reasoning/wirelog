@@ -69,25 +69,25 @@ governor, thermal state, and memory pressure.
 
 | Category | Workload | W=1 median | W=8 median | Tuples | Iterations | Peak RSS (W=1 / W=8) |
 |----------|----------|------------|------------|--------|------------|----------------------|
-| Graph | TC (Transitive Closure) | 7.3ms | 7.1ms | 4,950 | 98 | 2.8MB / 3.0MB |
-| Graph | Reach | 0.8ms | 0.7ms | 100 | 98 | 2.6MB / 2.6MB |
-| Graph | CC (Connected Components) | 0.7ms | 0.7ms | 100 | 0 | 2.7MB / 2.6MB |
+| Graph | TC (Transitive Closure) | 7.2ms | 7.2ms | 4,950 | 98 | 3.0MB / 3.0MB |
+| Graph | Reach | 0.7ms | 0.7ms | 100 | 98 | 2.6MB / 2.6MB |
+| Graph | CC (Connected Components) | 0.7ms | 0.7ms | 100 | 0 | 2.7MB / 2.7MB |
 | Graph | SSSP (Shortest Path) | 0.6ms | 0.5ms | 1 | 0 | 2.6MB / 2.6MB |
 | Graph | SG (Subgraph) | 0.6ms | 0.6ms | 0 | 0 | 2.6MB / 2.6MB |
 | Graph | Bipartite | 1.0ms | 1.0ms | 100 | 73 | 2.6MB / 2.6MB |
-| Pointer Analysis | Andersen | 2.1ms | 2.7ms | 155 | 8 | 4.5MB / 3.0MB |
-| Pointer Analysis | Dyck-2 | 15.1ms | 9.4ms | 2,120 | 8 | 5.5MB / 6.3MB |
-| Pointer Analysis | CSPA | 1.55s | 0.58s | 20,381 | 6 | 314MB / 409MB |
-| Data Flow | CSDA | 2.9ms | 2.9ms | 2,986 | 29 | 3.1MB / 3.0MB |
-| Ontology | Galen | 32.8ms | 27.9ms | 5,568 | 23 | 6.1MB / 15.5MB |
-| Borrow Check | Polonius | 4.6ms | 4.6ms | 1,807 | 23 | 5.0MB / 5.0MB |
-| Disassembly | DDISASM | 3.8ms | 4.3ms | 531 | 0 | 4.9MB / 4.9MB |
-| CRDT | CRDT | 19.25s | 19.23s | 1,301,914 | 0 / 7,603 | 73MB / 175MB |
-| Program Analysis | DOOP (zxing) | 73.42s | 59.05s | 6,276,657 | 28 | 11.8GB / 12.0GB |
+| Pointer Analysis | Andersen | 2.6ms | 3.2ms | 155 | 8 | 2.7MB / 3.0MB |
+| Pointer Analysis | Dyck-2 | 14.8ms | 9.7ms | 2,120 | 8 | 3.6MB / 6.1MB |
+| Pointer Analysis | CSPA | 1.85s | 0.79s | 20,381 | 6 | 308MB / 419MB |
+| Data Flow | CSDA | 2.9ms | 2.9ms | 2,986 | 29 | 3.0MB / 3.0MB |
+| Ontology | Galen | 31.3ms | 25.4ms | 5,568 | 23 | 4.0MB / 6.9MB |
+| Borrow Check | Polonius | 4.3ms | 4.4ms | 1,807 | 23 | 3.2MB / 3.2MB |
+| Disassembly | DDISASM | 3.4ms | 4.0ms | 531 | 0 | 3.1MB / 3.3MB |
+| CRDT | CRDT | 18.50s | 19.33s | 1,301,914 | 0 / 7,603 | 73MB / 133MB |
+| Program Analysis | DOOP (zxing) | 57.36s | 28.78s | 6,276,657 | 28 | 11.8GB / 12.4GB |
 
-**Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.55s
--> incremental re-eval 30.7ms (**50.4x faster**); W=8 baseline 648.2ms
--> incremental re-eval 26.3ms (**24.6x faster**). Each run inserted one
+**Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.85s
+-> incremental re-eval 21.7ms (**87.2x faster**); W=8 baseline 775.5ms
+-> incremental re-eval 22.9ms (**33.9x faster**). Each run inserted one
 fact and changed the result from 20,381 to 21,063 tuples.
 
 `--workers N` means "use up to N workers", not "force exactly N workers for
