@@ -10,10 +10,19 @@
  * explicit FAIL-LOUD mode for misconfigured CI runners):
  *
  *   - WIRELOG_PERF_GATE != "1"           -> SKIP (exit 77)
- *   - WL_LOG_COMPILE_MAX_LEVEL > ERROR   -> SKIP (un-stripped log
- *                                           sites pessimize the inner
- *                                           loop; gate measures the
- *                                           wrong thing)
+ *   - WL_LOG_COMPILE_MAX_LEVEL > ERROR:
+ *       WIRELOG_PERF_REQUIRE != "1"      -> SKIP (default; un-stripped
+ *                                           log sites pessimize the
+ *                                           inner loop, so the gate
+ *                                           would measure the wrong
+ *                                           thing)
+ *       WIRELOG_PERF_REQUIRE == "1"      -> FAIL (loud; mirrors the
+ *                                           governor escalator -- the
+ *                                           merge runner that asserts
+ *                                           REQUIRE must be on the
+ *                                           perf-gate measurement
+ *                                           build, not a default
+ *                                           trace-level build)
  *   - cpufreq governor != performance:
  *       WIRELOG_PERF_REQUIRE != "1"      -> SKIP (default; lets dev
  *                                           hosts and unconfigured
@@ -219,6 +228,16 @@ main(void)
     }
 
     if (WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
+        if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
+            fprintf(stderr,
+                "test_crdt_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but "
+                "WL_LOG_COMPILE_MAX_LEVEL=%d > ERROR.  The build is not the "
+                "perf-gate measurement build (reconfigure with "
+                "-Dwirelog_log_max_level=error so the inner-loop log sites "
+                "are stripped at compile time).  Refusing to skip.\n",
+                (int)WL_LOG_COMPILE_MAX_LEVEL);
+            return 1;
+        }
         fprintf(stderr,
             "test_crdt_perf_gate: SKIP: WL_LOG_COMPILE_MAX_LEVEL=%d > ERROR; "
             "build with -Dwirelog_log_max_level=error so the inner-loop "
