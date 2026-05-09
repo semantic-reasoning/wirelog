@@ -69,25 +69,31 @@ governor, thermal state, and memory pressure.
 
 | Category | Workload | W=1 median | W=8 median | Tuples | Iterations | Peak RSS (W=1 / W=8) |
 |----------|----------|------------|------------|--------|------------|----------------------|
-| Graph | TC (Transitive Closure) | 7.2ms | 7.2ms | 4,950 | 98 | 3.0MB / 3.0MB |
-| Graph | Reach | 0.7ms | 0.7ms | 100 | 98 | 2.6MB / 2.6MB |
-| Graph | CC (Connected Components) | 0.7ms | 0.7ms | 100 | 0 | 2.7MB / 2.7MB |
-| Graph | SSSP (Shortest Path) | 0.6ms | 0.5ms | 1 | 0 | 2.6MB / 2.6MB |
-| Graph | SG (Subgraph) | 0.6ms | 0.6ms | 0 | 0 | 2.6MB / 2.6MB |
-| Graph | Bipartite | 1.0ms | 1.0ms | 100 | 73 | 2.6MB / 2.6MB |
-| Pointer Analysis | Andersen | 2.6ms | 3.2ms | 155 | 8 | 2.7MB / 3.0MB |
-| Pointer Analysis | Dyck-2 | 14.8ms | 9.7ms | 2,120 | 8 | 3.6MB / 6.1MB |
-| Pointer Analysis | CSPA | 1.85s | 0.79s | 20,381 | 6 | 308MB / 419MB |
-| Data Flow | CSDA | 2.9ms | 2.9ms | 2,986 | 29 | 3.0MB / 3.0MB |
-| Ontology | Galen | 31.3ms | 25.4ms | 5,568 | 23 | 4.0MB / 6.9MB |
-| Borrow Check | Polonius | 4.3ms | 4.4ms | 1,807 | 23 | 3.2MB / 3.2MB |
-| Disassembly | DDISASM | 3.4ms | 4.0ms | 531 | 0 | 3.1MB / 3.3MB |
-| CRDT | CRDT | 18.50s | 19.33s | 1,301,914 | 0 / 7,603 | 73MB / 133MB |
-| Program Analysis | DOOP (zxing) | 57.36s | 28.78s | 6,276,657 | 28 | 11.8GB / 12.4GB |
+| Graph | TC (Transitive Closure) | 11.6ms | 6.7ms | 4,950 | 98 | 3.0MB / 3.2MB |
+| Graph | Reach | 1.0ms | 0.6ms | 100 | 98 | 2.8MB / 2.8MB |
+| Graph | CC (Connected Components) | 0.9ms | 0.6ms | 100 | 0 | 2.9MB / 2.9MB |
+| Graph | SSSP (Shortest Path) | 0.7ms | 0.5ms | 1 | 0 | 2.8MB / 2.8MB |
+| Graph | SG (Subgraph) | 0.7ms | 0.5ms | 0 | 0 | 2.8MB / 2.8MB |
+| Graph | Bipartite | 1.5ms | 0.9ms | 100 | 73 | 3.0MB / 3.0MB |
+| Pointer Analysis | Andersen | 3.9ms | 2.7ms | 155 | 8 | 3.0MB / 3.5MB |
+| Pointer Analysis | Dyck-2 | 21.4ms | 8.5ms | 2,120 | 8 | 3.8MB / 6.9MB |
+| Pointer Analysis | CSPA | 1.95s | 0.79s | 20,381 | 6 | 333MB / 514MB |
+| Data Flow | CSDA | 2.5ms | 2.5ms | 2,986 | 29 | 3.1MB / 3.3MB |
+| Ontology | Galen | 30.2ms | 22.6ms | 5,568 | 23 | 4.3MB / 8.0MB |
+| Borrow Check | Polonius | 3.9ms | 4.0ms | 1,807 | 23 | 3.4MB / 3.5MB |
+| Disassembly | DDISASM | 2.9ms | 3.3ms | 531 | 0 | 3.4MB / 3.6MB |
+| CRDT | CRDT | 19.10s | 18.20s | 1,301,914 | 0 / 7,603 | 73MB / 271MB |
+| Program Analysis | DOOP (zxing) | 55.00s | 26.22s | 6,276,657 | 28 | 12.5GB / 13.4GB |
+
+Numbers are 5-trial medians (`--repeat 5`) on a single dev host with
+cpufreq governor `schedutil`; treat them as descriptive, not gated.
+The `meson test --suite perf` regression gate is separate and runs
+under `-Dwirelog_log_max_level=error` plus a `performance` governor
+(see `tests/test_crdt_perf_gate.c`).
 
 **Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.85s
--> incremental re-eval 21.7ms (**87.2x faster**); W=8 baseline 775.5ms
--> incremental re-eval 22.9ms (**33.9x faster**). Each run inserted one
+-> incremental re-eval 21.7ms (**85.3x faster**); W=8 baseline 822.1ms
+-> incremental re-eval 21.1ms (**38.9x faster**). Each run inserted one
 fact and changed the result from 20,381 to 21,063 tuples.
 
 `--workers N` means "use up to N workers", not "force exactly N workers for
@@ -104,22 +110,22 @@ Re-run the large-workload snapshot with:
 meson setup build --buildtype=release
 meson compile -C build bench/bench_flowlog
 for w in 1 8; do
-  ./build/bench/bench_flowlog --workload tc --data bench/data/graph_100.csv --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload reach --data bench/data/graph_100.csv --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload cc --data bench/data/graph_100.csv --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload sssp --data bench/data/graph_100.csv --data-weighted bench/data/graph_100_weighted.csv --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload sg --data bench/data/graph_100.csv --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload bipartite --data bench/data/graph_100.csv --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload andersen --data-andersen bench/data/andersen --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload dyck --data-dyck bench/data/dyck --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload cspa-fast --data-cspa bench/data/cspa --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload cspa --data-cspa bench/data/cspa --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload csda --data-csda bench/data/csda --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload galen --data-galen bench/data/galen --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload polonius --data-polonius bench/data/polonius --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload ddisasm --data-ddisasm bench/data/ddisasm --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload crdt --data-crdt bench/data/crdt --workers "$w" --repeat 1
-  ./build/bench/bench_flowlog --workload doop --data-doop bench/data/doop --workers "$w" --repeat 1
+  ./build/bench/bench_flowlog --workload tc --data bench/data/graph_100.csv --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload reach --data bench/data/graph_100.csv --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload cc --data bench/data/graph_100.csv --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload sssp --data bench/data/graph_100.csv --data-weighted bench/data/graph_100_weighted.csv --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload sg --data bench/data/graph_100.csv --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload bipartite --data bench/data/graph_100.csv --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload andersen --data-andersen bench/data/andersen --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload dyck --data-dyck bench/data/dyck --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload cspa-fast --data-cspa bench/data/cspa --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload cspa --data-cspa bench/data/cspa --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload csda --data-csda bench/data/csda --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload galen --data-galen bench/data/galen --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload polonius --data-polonius bench/data/polonius --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload ddisasm --data-ddisasm bench/data/ddisasm --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload crdt --data-crdt bench/data/crdt --workers "$w" --repeat 5
+  ./build/bench/bench_flowlog --workload doop --data-doop bench/data/doop --workers "$w" --repeat 5
 done
 ```
 
