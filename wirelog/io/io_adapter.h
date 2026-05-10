@@ -117,14 +117,15 @@ typedef struct wl_io_adapter {
  *   wl_io_find_adapter        pointer to adapter, or NULL if not found
  */
 
-WL_PUBLIC int wl_io_register_adapter(const wl_io_adapter_t *adapter) WL_IO_USED;
+WIRELOG_PUBLIC int wl_io_register_adapter(
+    const wl_io_adapter_t *adapter) WL_IO_USED;
 
-WL_PUBLIC int wl_io_unregister_adapter(const char *scheme) WL_IO_USED;
+WIRELOG_PUBLIC int wl_io_unregister_adapter(const char *scheme) WL_IO_USED;
 
-WL_PUBLIC const wl_io_adapter_t *wl_io_find_adapter(
+WIRELOG_PUBLIC const wl_io_adapter_t *wl_io_find_adapter(
     const char *scheme) WL_IO_USED;
 
-WL_PUBLIC const char *wl_io_last_error(void);
+WIRELOG_PUBLIC const char *wl_io_last_error(void);
 
 /* ======================================================================== */
 /* Plugin Entry Point (Path B, Issue #461)                                  */
