@@ -6,6 +6,16 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Standalone-include compile matrix for public headers** (#689):
+  9 small `tests/standalone/test_standalone_<HEADER>.c` stubs, each
+  including exactly one public installed header and a trivial
+  `main()`, registered as `meson test --suite abi:standalone_include_*`.
+  Failure = a public header has a hidden dependency on another
+  header being included first (broken self-containment).  The
+  GCC/Clang/MSVC compiler matrix is realised at the GitHub Actions
+  level: each platform compiles every stub via its native CC.  Closes
+  Blocker B2 of the v0.40 API audit and supplements the existing
+  3-way SSoT verification at `scripts/ci/check-public-header-surface.py`.
 - **CI lint backstop for public-API prefix conformance** (#761):
   `scripts/ci/check-public-prefix.py` (registered as
   `meson test --suite abi:public_prefix`) scans the 9 public
