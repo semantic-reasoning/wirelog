@@ -6,6 +6,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Export-attribute macro renamed for v1.0 prefix conformance**
+  (#759): `wirelog/wirelog-export.h` no longer defines
+  `WL_PUBLIC`; the new public name is `WIRELOG_PUBLIC`.
+  `WIRELOG_API` continues as the alias and remains the recommended
+  attribute name for new public-API declarations.  Source-
+  incompatible for downstream code that referenced `WL_PUBLIC`
+  directly; migrate via a textual rename to `WIRELOG_PUBLIC` (or
+  switch to `WIRELOG_API`).  Part of public-API prefix audit
+  epic #755.
 - **String-fn enum constants renamed for v1.0 prefix conformance**
   (#757): the 12 `WL_STR_FN_*` enum constants in
   `wirelog/wirelog-types.h` (declaring the string-op kinds shipped

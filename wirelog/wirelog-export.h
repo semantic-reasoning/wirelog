@@ -11,20 +11,20 @@
 
 #if defined(_WIN32) || defined(__CYGWIN__)
   #ifdef WIRELOG_BUILDING
-    #define WL_PUBLIC __declspec(dllexport)
+    #define WIRELOG_PUBLIC __declspec(dllexport)
   #else
-    #define WL_PUBLIC __declspec(dllimport)
+    #define WIRELOG_PUBLIC __declspec(dllimport)
   #endif
 #elif defined(__GNUC__) && __GNUC__ >= 4
-  #define WL_PUBLIC __attribute__((visibility("default")))
+  #define WIRELOG_PUBLIC __attribute__((visibility("default")))
 #else
-  #define WL_PUBLIC
+  #define WIRELOG_PUBLIC
 #endif
 
-/* Public-API attribute macro.  Alias of WL_PUBLIC defined unconditionally
+/* Public-API attribute macro.  Alias of WIRELOG_PUBLIC defined unconditionally
  * above; new code should prefer WIRELOG_API for clarity.  The full
  * adoption sweep across existing prototypes is tracked separately. */
-#define WIRELOG_API WL_PUBLIC
+#define WIRELOG_API WIRELOG_PUBLIC
 
 /* WIRELOG_DEPRECATED_SINCE(major, minor): annotate APIs scheduled for
  * removal.  Expands to a compile-time deprecation warning on

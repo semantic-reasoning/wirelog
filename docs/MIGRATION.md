@@ -14,6 +14,27 @@ during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
 for the full scope.  Entries are filed atomically as the renames land;
 #745 then consolidates the narrative for the GA migration guide.
 
+### Export-attribute macro rename: WL_PUBLIC -> WIRELOG_PUBLIC (#759)
+
+`wirelog/wirelog-export.h` previously defined `WL_PUBLIC` as
+the symbol-visibility / dllexport attribute macro that gates
+every exported function on the public surface
+(`WL_PUBLIC int wirelog_session_create(...)`, etc.).  The
+`WL_*` prefix on a public macro contradicts `AGENTS.md:17-20`.
+
+The macro is renamed in a clean break:
+
+| Old | New |
+|---|---|
+| `WL_PUBLIC` (in `wirelog/wirelog-export.h`) | `WIRELOG_PUBLIC` |
+
+`WIRELOG_API` continues as the existing alias (now defined as
+`#define WIRELOG_API WIRELOG_PUBLIC`), and remains the
+recommended attribute name for new public-API declarations.
+Source-incompatible for downstream code that referenced
+`WL_PUBLIC` directly; migrate via a textual rename to
+`WIRELOG_PUBLIC` (or, preferred, switch to `WIRELOG_API`).
+
 ### String-fn enum constants rename (#757)
 
 The 12 `WL_STR_FN_*` enum constants in `wirelog/wirelog-types.h`
