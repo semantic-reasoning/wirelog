@@ -67,7 +67,7 @@ Done.
 - **Re-derivation on re-insert**: Re-inserting the same edge re-derives
   exactly the same four `reach` tuples, demonstrating that the engine's
   internal state is fully consistent after retraction.
-- **Per-step delta isolation**: Each `wl_easy_step` call produces only the
+- **Per-step delta isolation**: Each `wirelog_easy_step` call produces only the
   deltas for that step's input changes; no cross-step leakage occurs.
 
 ## What You Will NOT See Here
@@ -82,8 +82,8 @@ Done.
 ## See Also
 
 - `examples/08-delta-queries/` -- introduces delta callbacks with
-  `wl_easy_print_delta`.
+  `wirelog_easy_print_delta`.
 - `examples/09-retraction-basics/` -- non-recursive retraction basics with
   `-1` deltas on a single-join rule.
 - `tests/test_delta_retraction.c` -- engine-level retraction tests (issue
-  #158) that exercise the same `wl_easy_remove_sym` contract used here.
+  #158) that exercise the same `wirelog_easy_remove_sym` contract used here.

@@ -5,14 +5,14 @@
  * Licensed under LGPL-3.0
  *
  * Static facts declared in a `.dl` program must materialize into snapshots
- * and IDB derivations when the host opens the program through wl_easy.
- * Pre-fix, wl_easy never invoked wl_session_load_facts, so static rows
+ * and IDB derivations when the host opens the program through wirelog_easy.
+ * Pre-fix, wirelog_easy never invoked wl_session_load_facts, so static rows
  * never reached col_rel_t and every downstream observation (snapshot,
  * derived IDB, host-mirrored insert) silently disagreed with the .dl
  * program.
  */
 
-#include "wirelog/wl_easy.h"
+#include "wirelog/wirelog-easy.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -48,13 +48,13 @@ count_rows(const char *relation, const int64_t *row, uint32_t ncols,
 static int
 test_static_fact_drives_idb_snapshot(void)
 {
-    wl_easy_session_t *s = NULL;
-    wirelog_error_t err = wl_easy_open(PROG_SRC, &s);
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(PROG_SRC, &s);
     if (err != WIRELOG_OK || !s)
         return 1;
 
     struct count_state st = { 0 };
-    err = wl_easy_snapshot(s, "effective_permission", count_rows, &st);
+    err = wirelog_easy_snapshot(s, "effective_permission", count_rows, &st);
     int rc = 0;
     if (err != WIRELOG_OK) {
         fprintf(stderr, "T1 snapshot err=%d\n", err);
@@ -64,7 +64,7 @@ test_static_fact_drives_idb_snapshot(void)
             "T1: expected 1 effective_permission row, got %u\n", st.rows);
         rc = 1;
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     return rc;
 }
 
@@ -73,28 +73,28 @@ test_static_fact_drives_idb_snapshot(void)
 static int
 test_static_fact_joins_with_host_insert(void)
 {
-    wl_easy_session_t *s = NULL;
-    wirelog_error_t err = wl_easy_open(PROG_SRC, &s);
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(PROG_SRC, &s);
     if (err != WIRELOG_OK || !s)
         return 1;
 
-    int64_t alice = wl_easy_intern(s, "alice");
-    int64_t admin = wl_easy_intern(s, "wr.system_admin");
-    int64_t global = wl_easy_intern(s, "global");
+    int64_t alice = wirelog_easy_intern(s, "alice");
+    int64_t admin = wirelog_easy_intern(s, "wr.system_admin");
+    int64_t global = wirelog_easy_intern(s, "global");
     if (alice < 0 || admin < 0 || global < 0) {
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return 1;
     }
     int64_t row[3] = { alice, admin, global };
-    err = wl_easy_insert(s, "member_of", row, 3);
+    err = wirelog_easy_insert(s, "member_of", row, 3);
     if (err != WIRELOG_OK) {
         fprintf(stderr, "T2 insert err=%d\n", err);
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return 1;
     }
 
     struct count_state st = { 0 };
-    err = wl_easy_snapshot(s, "has_permission", count_rows, &st);
+    err = wirelog_easy_snapshot(s, "has_permission", count_rows, &st);
     int rc = 0;
     if (err != WIRELOG_OK) {
         fprintf(stderr, "T2 snapshot err=%d\n", err);
@@ -104,7 +104,7 @@ test_static_fact_joins_with_host_insert(void)
             "T2: expected 1 has_permission row, got %u\n", st.rows);
         rc = 1;
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     return rc;
 }
 

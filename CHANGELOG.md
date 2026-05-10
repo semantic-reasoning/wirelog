@@ -6,6 +6,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **wl_easy facade renamed and moved for v1.0 prefix conformance**
+  (#756): the `wl_easy` convenience facade is renamed across its
+  entire surface from `wl_easy_*` / `WL_EASY_*` to
+  `wirelog_easy_*` / `WIRELOG_EASY_*`.  The header and source
+  files move from `wirelog/wl_easy.h` / `wirelog/wl_easy.c` to
+  `wirelog/wirelog-easy.h` / `wirelog/wirelog-easy.c`; test files
+  move accordingly.  `AGENTS.md` public-headers list and
+  `meson.build` SSoT entries update with the move.  Source-
+  incompatible across the entire facade; downstream consumers
+  update `#include` paths plus a textual symbol rename.  Part of
+  public-API prefix audit epic #755.
 - **Export-attribute macro renamed for v1.0 prefix conformance**
   (#759): `wirelog/wirelog-export.h` no longer defines
   `WL_PUBLIC`; the new public name is `WIRELOG_PUBLIC`.
@@ -42,7 +53,7 @@ All notable changes to wirelog are documented in this file.
   rule that public typedefs use the `wirelog_` prefix.  Source-
   incompatible for downstream consumers of the
   `wirelog_session_set_delta_cb` / `wirelog_session_snapshot` /
-  `wl_easy_set_delta_cb` / `wl_easy_snapshot` parameter types.  Migrate
+  `wirelog_easy_set_delta_cb` / `wirelog_easy_snapshot` parameter types.  Migrate
   via a textual rename; no signature change.  Tracked under
   `docs/MIGRATION.md` 0.30 -> 1.0 section.  Part of public-API prefix
   audit epic #755.
@@ -55,12 +66,12 @@ All notable changes to wirelog are documented in this file.
 
 - **CRDT median-time perf gate** (PR #731): `tests/test_crdt_perf_gate.c` registered under `meson test --suite perf`. Drives the same Datalog source as `bench_flowlog --workload crdt` through the public `wirelog_*` API, asserts tuple count == 1,301,914 before any timing assertion, asserts coefficient of variation <= 3% (else SKIP), asserts median wall <= `WL_CRDT_PERF_GATE_TARGET_MS` (19,840 ms = baseline 18,890 ms x 1.05). Three-mode SKIP/SKIP/FAIL behaviour: SKIP by default; FAIL-loud under `WIRELOG_PERF_REQUIRE=1` when the cpufreq governor is not `performance` OR when the build is not `-Dwirelog_log_max_level=error` (per #731 follow-up commit). The escalator pattern lets dev hosts run `meson test --suite perf` cleanly while merge runners that opt into REQUIRE mode catch misconfiguration loud.
 - **`bench/bench_crdt_workload.h`** (PR #731): the CRDT verification template is moved out of `bench_flowlog.c` into a shared header so the bench driver and the perf gate cannot drift on rule structure.
-- **`wirelog/wirelog-advanced.h`** (#717, #703): New public header exposing the fine-grained `wirelog_session_*` API as the stable peer of `wl_easy`. Eight thin wrappers (`create` / `destroy` / `insert` / `remove` / `step` / `set_delta_cb` / `snapshot` / `make_compound`) over the internal session primitives. Backend selection through the `wirelog_backend_kind_t` enum (`DEFAULT` / `COLUMNAR`) — no vtable exposure. Inline `.dl` facts are seeded eagerly at `wirelog_session_create()` time, matching the wl_easy contract from #718. Internal `wl_session_*` and `wl_compute_backend_t` remain private.
+- **`wirelog/wirelog-advanced.h`** (#717, #703): New public header exposing the fine-grained `wirelog_session_*` API as the stable peer of `wirelog_easy`. Eight thin wrappers (`create` / `destroy` / `insert` / `remove` / `step` / `set_delta_cb` / `snapshot` / `make_compound`) over the internal session primitives. Backend selection through the `wirelog_backend_kind_t` enum (`DEFAULT` / `COLUMNAR`) — no vtable exposure. Inline `.dl` facts are seeded eagerly at `wirelog_session_create()` time, matching the wirelog_easy contract from #718. Internal `wl_session_*` and `wl_compute_backend_t` remain private.
 - **CI guard** (#717): `scripts/ci/check-advanced-header.sh` (suite `abi`) fails when `wirelog/wirelog-advanced.h` includes any internal header.
 
 ### Fixed
 
-- **wl_easy inline-fact materialization** (#718): `wl_easy_open` now seeds inline `.dl` facts into the columnar session at first lazy build, matching the CLI driver's order-of-operations. Previously the wl_easy facade dropped every static fact silently, so snapshots and IDB derivations re-evaluated against an empty EDB and returned no rows.
+- **wirelog_easy inline-fact materialization** (#718): `wirelog_easy_open` now seeds inline `.dl` facts into the columnar session at first lazy build, matching the CLI driver's order-of-operations. Previously the wirelog_easy facade dropped every static fact silently, so snapshots and IDB derivations re-evaluated against an empty EDB and returned no rows.
 
 ### Added
 
@@ -73,7 +84,7 @@ All notable changes to wirelog are documented in this file.
 - **README.md** (#717): replace the now-misleading `wl_session_*` / `wirelog/session.h` advisory with `wirelog_session_*` / `wirelog/wirelog-advanced.h`. The internal session header is explicitly called out as private.
 - **`docs/SEMANTICS.md`** (#718): new document recording the engine's observable semantic-model decisions and the path toward 1.0 stabilization. First entry: inline `.dl` fact loading rules and the z-set host insert/remove model (status: Current).
 - **`docs/SEMANTICS.md`** (#717): promote the cross-facade parity section from Future to Current now that the advanced surface ships.
-- **`wirelog/wirelog.h`** (#717): expand the `wirelog_executor_t` docstring to clarify that it is the batch facade and to point at `wirelog_session_t` / `wl_easy_session_t` for incremental delta-callback workflows.
+- **`wirelog/wirelog.h`** (#717): expand the `wirelog_executor_t` docstring to clarify that it is the batch facade and to point at `wirelog_session_t` / `wirelog_easy_session_t` for incremental delta-callback workflows.
 
 ## [0.30.0] - 2026-05-07
 
@@ -81,7 +92,7 @@ All notable changes to wirelog are documented in this file.
 
 - **I/O Adapter Framework** (#446): User-defined I/O adapters via runtime registry (`wl_io_register_adapter`). Public header `wirelog/io/io_adapter.h` with opaque context, ABI versioning (`WL_IO_ABI_VERSION=1`), and thread-safe registration API
 - **Built-in CSV Adapter** (#455): CSV loading refactored into the adapter framework; backward-compatible `.input(filename=...)` dispatch
-- **wl_easy Facade** (#445): Simplified high-level API (`wl_easy.h`) for common session workflows
+- **wirelog_easy Facade** (#445): Simplified high-level API (`wirelog-easy.h`) for common session workflows
 - **String Operations** (#444): String-typed column functions (`strlen`, `cat`, `substr`, `contains`, `to_upper`, `to_lower`, `trim`, `str_replace`, `to_string`, `to_number`)
 - **Path A Example** (#462): Standalone pcap adapter skeleton with CI compile-check against installed headers
 - **C11 Threading Backend** (#494): Add C11 `<threads.h>` backend with auto-detection; POSIX/MSVC fallback preserved. `call_once` pattern for adapter registry initialization

@@ -375,7 +375,7 @@ if not is_windows
        find_program(meson.project_source_root() / 'scripts/ci/check-no-testhook-in-libwirelog.sh'),
        args: [meson.project_build_root()],
        suite: 'abi')
-  test('wl_easy_abi_opts_symbol',
+  test('wirelog_easy_abi_opts_symbol',
        find_program(meson.project_source_root() / 'scripts/ci/check-wl-easy-opts-symbol.sh'),
        args: [meson.project_build_root()],
        suite: 'abi')
@@ -3600,9 +3600,9 @@ test_string_eval_exe = executable(
 
 test('string_eval', test_string_eval_exe)
 
-test_wl_easy_exe = executable(
-  'test_wl_easy',
-  files('test_wl_easy.c'),
+test_wirelog_easy_exe = executable(
+  'test_wirelog_easy',
+  files('test_wirelog_easy.c'),
   parser_src,
   ir_src,
   optimizer_src,
@@ -3611,17 +3611,17 @@ test_wl_easy_exe = executable(
   arena_src,
   thread_src,
   workqueue_src,
-  '../wirelog/wl_easy.c',
+  '../wirelog/wirelog-easy.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
-test('wl_easy', test_wl_easy_exe)
+test('wirelog_easy', test_wirelog_easy_exe)
 
 # Issue #718: inline .dl static-fact materialization regression.
-test_wl_easy_inline_facts_exe = executable(
-  'test_wl_easy_inline_facts',
-  files('test_wl_easy_inline_facts.c'),
+test_wirelog_easy_inline_facts_exe = executable(
+  'test_wirelog_easy_inline_facts',
+  files('test_wirelog_easy_inline_facts.c'),
   parser_src,
   ir_src,
   optimizer_src,
@@ -3630,12 +3630,12 @@ test_wl_easy_inline_facts_exe = executable(
   arena_src,
   thread_src,
   workqueue_src,
-  '../wirelog/wl_easy.c',
+  '../wirelog/wirelog-easy.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
-test('wl_easy_inline_facts', test_wl_easy_inline_facts_exe)
+test('wirelog_easy_inline_facts', test_wirelog_easy_inline_facts_exe)
 
 # Issue #717 / #703: behavioral-parity test for the advanced session API.
 test_wirelog_advanced_exe = executable(
@@ -3649,7 +3649,7 @@ test_wirelog_advanced_exe = executable(
   arena_src,
   thread_src,
   workqueue_src,
-  '../wirelog/wl_easy.c',
+  '../wirelog/wirelog-easy.c',
   '../wirelog/wirelog_advanced.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],

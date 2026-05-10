@@ -1,7 +1,7 @@
 /*
  * daemon.c - Example 13: Daemon-style session rotation
  *
- * Demonstrates a long-running wl_easy caller that preserves persistent EDB
+ * Demonstrates a long-running wirelog_easy caller that preserves persistent EDB
  * facts across session rotations.  The example uses a public side compound
  * declaration for event metadata and rotates when the compound arena reports
  * saturation through the installed public API.
@@ -248,14 +248,14 @@ edb_free(edb_store_t *edb)
 }
 
 static int
-intern_symbols(wl_easy_session_t *s, symbol_ids_t *ids)
+intern_symbols(wirelog_easy_session_t *s, symbol_ids_t *ids)
 {
-    ids->tenant_a = wl_easy_intern(s, "tenant-a");
-    ids->tenant_b = wl_easy_intern(s, "tenant-b");
-    ids->info = wl_easy_intern(s, "info");
-    ids->warn = wl_easy_intern(s, "warn");
-    ids->host_a = wl_easy_intern(s, "edge-01");
-    ids->host_b = wl_easy_intern(s, "edge-02");
+    ids->tenant_a = wirelog_easy_intern(s, "tenant-a");
+    ids->tenant_b = wirelog_easy_intern(s, "tenant-b");
+    ids->info = wirelog_easy_intern(s, "info");
+    ids->warn = wirelog_easy_intern(s, "warn");
+    ids->host_a = wirelog_easy_intern(s, "edge-01");
+    ids->host_b = wirelog_easy_intern(s, "edge-02");
     return (ids->tenant_a < 0 || ids->tenant_b < 0 || ids->info < 0
            || ids->warn < 0 || ids->host_a < 0 || ids->host_b < 0)
         ? -1
@@ -263,24 +263,25 @@ intern_symbols(wl_easy_session_t *s, symbol_ids_t *ids)
 }
 
 static int
-enable_delta_cb(wl_easy_session_t *s, delta_stats_t *stats)
+enable_delta_cb(wirelog_easy_session_t *s, delta_stats_t *stats)
 {
-    return wl_easy_set_delta_cb(s, on_delta, stats) == WIRELOG_OK ? 0 : -1;
+    return wirelog_easy_set_delta_cb(s, on_delta, stats) == WIRELOG_OK ? 0 : -1;
 }
 
 static int
-open_session(wl_easy_session_t **out, symbol_ids_t *ids, delta_stats_t *stats,
+open_session(wirelog_easy_session_t **out, symbol_ids_t *ids,
+    delta_stats_t *stats,
     bool emit_live_deltas)
 {
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(DAEMON_SRC, &s) != WIRELOG_OK)
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(DAEMON_SRC, &s) != WIRELOG_OK)
         return -1;
     if (intern_symbols(s, ids) != 0) {
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return -1;
     }
     if (emit_live_deltas && enable_delta_cb(s, stats) != 0) {
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return -1;
     }
     *out = s;
@@ -288,7 +289,7 @@ open_session(wl_easy_session_t **out, symbol_ids_t *ids, delta_stats_t *stats,
 }
 
 static insert_status_t
-insert_event(wl_easy_session_t *s, const symbol_ids_t *ids,
+insert_event(wirelog_easy_session_t *s, const symbol_ids_t *ids,
     const event_record_t *record)
 {
     const int64_t level = record->hot ? ids->warn : ids->info;
@@ -314,12 +315,12 @@ insert_event(wl_easy_session_t *s, const symbol_ids_t *ids,
     row[1] = record->tenant_a ? ids->tenant_a : ids->tenant_b;
     row[2] = risk;
     row[3] = (int64_t)payload;
-    return wl_easy_insert(s, "event", row, 4) == WIRELOG_OK ? INSERT_OK
+    return wirelog_easy_insert(s, "event", row, 4) == WIRELOG_OK ? INSERT_OK
                                                             : INSERT_FAILED;
 }
 
 static int
-replay_edb(wl_easy_session_t *s, const symbol_ids_t *ids,
+replay_edb(wirelog_easy_session_t *s, const symbol_ids_t *ids,
     const edb_store_t *edb)
 {
     for (size_t i = 0; i < edb->count; i++) {
@@ -330,21 +331,21 @@ replay_edb(wl_easy_session_t *s, const symbol_ids_t *ids,
 }
 
 static int
-rotate_session(wl_easy_session_t **session_io, symbol_ids_t *ids,
+rotate_session(wirelog_easy_session_t **session_io, symbol_ids_t *ids,
     const edb_store_t *edb, delta_stats_t *stats, uint64_t *rotations)
 {
-    wl_easy_session_t *fresh = NULL;
+    wirelog_easy_session_t *fresh = NULL;
     if (open_session(&fresh, ids, stats, false) != 0)
         return -1;
     if (replay_edb(fresh, ids, edb) != 0) {
-        wl_easy_close(fresh);
+        wirelog_easy_close(fresh);
         return -1;
     }
     if (enable_delta_cb(fresh, stats) != 0) {
-        wl_easy_close(fresh);
+        wirelog_easy_close(fresh);
         return -1;
     }
-    wl_easy_close(*session_io);
+    wirelog_easy_close(*session_io);
     *session_io = fresh;
     (*rotations)++;
     return 0;
@@ -365,7 +366,7 @@ int
 main(int argc, char **argv)
 {
     daemon_opts_t opts;
-    wl_easy_session_t *session = NULL;
+    wirelog_easy_session_t *session = NULL;
     symbol_ids_t ids;
     delta_stats_t stats = { 0 };
     edb_store_t edb = { 0 };
@@ -404,7 +405,7 @@ main(int argc, char **argv)
             if (rotate_session(&session, &ids, &edb, &stats, &rotations)
                 != 0) {
                 fprintf(stderr, "[daemon] rotation failed\n");
-                wl_easy_close(session);
+                wirelog_easy_close(session);
                 edb_free(&edb);
                 return 1;
             }
@@ -413,20 +414,20 @@ main(int argc, char **argv)
         if (insert_rc != INSERT_OK) {
             fprintf(stderr, "[daemon] insert failed at event=%" PRIu64 "\n",
                 event_id);
-            wl_easy_close(session);
+            wirelog_easy_close(session);
             edb_free(&edb);
             return 1;
         }
-        if (wl_easy_step(session) != WIRELOG_OK) {
+        if (wirelog_easy_step(session) != WIRELOG_OK) {
             fprintf(stderr, "[daemon] step failed at event=%" PRIu64 "\n",
                 event_id);
-            wl_easy_close(session);
+            wirelog_easy_close(session);
             edb_free(&edb);
             return 1;
         }
         if (edb_push(&edb, &record) != 0) {
             fprintf(stderr, "[daemon] out of memory while recording EDB\n");
-            wl_easy_close(session);
+            wirelog_easy_close(session);
             edb_free(&edb);
             return 1;
         }
@@ -451,7 +452,7 @@ main(int argc, char **argv)
         event_id, edb.count, stats.hot_deltas, rotations, saturations,
         rss_kb());
 
-    wl_easy_close(session);
+    wirelog_easy_close(session);
     edb_free(&edb);
     return rotations > 0 ? 0 : 1;
 }

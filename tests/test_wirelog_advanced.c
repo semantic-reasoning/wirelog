@@ -5,7 +5,7 @@
  * Licensed under LGPL-3.0
  *
  * Behavioral parity tests for the advanced session API.  Each test
- * exercises one observable wl_easy-equivalent invariant so the two
+ * exercises one observable wirelog_easy-equivalent invariant so the two
  * facades cannot drift apart silently.
  */
 
@@ -141,7 +141,7 @@ test_create_invalid_backend(void)
 }
 
 /* T4: inline `.dl` facts must materialize into snapshot derivations on
- *     the advanced facade just like wl_easy (#718 contract carries over). */
+ *     the advanced facade just like wirelog_easy (#718 contract carries over). */
 static int
 test_inline_facts_seeded(void)
 {

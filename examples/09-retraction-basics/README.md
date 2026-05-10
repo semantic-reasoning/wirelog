@@ -3,7 +3,7 @@
 ## Overview
 
 This example demonstrates incremental retraction in wirelog using
-`wl_easy_remove_sym`.  When a base fact is retracted, the engine
+`wirelog_easy_remove_sym`.  When a base fact is retracted, the engine
 propagates `-1` deltas to any derived relations that depended on it.  The scope here is non-recursive: a single join rule
 derives `mutual(A, B)` from `friend(A, B), friend(B, A)`, and removing one
 side of the friendship pair produces exactly two `-1` deltas on `mutual`,
@@ -47,14 +47,14 @@ Done.
 
 ## What This Demonstrates
 
-- **Step 1**: `wl_easy_insert_sym` inserts `friend(alice,bob)` and
-  `friend(bob,alice)`.  After `wl_easy_step`, two `+1` deltas fire for
+- **Step 1**: `wirelog_easy_insert_sym` inserts `friend(alice,bob)` and
+  `friend(bob,alice)`.  After `wirelog_easy_step`, two `+1` deltas fire for
   `mutual(alice,bob)` and `mutual(bob,alice)`.
-- **Step 2**: `wl_easy_insert_sym` inserts `friend(alice,carol)`.  Since
+- **Step 2**: `wirelog_easy_insert_sym` inserts `friend(alice,carol)`.  Since
   `friend(carol,alice)` does not exist, the join produces no new `mutual`
   tuples and no deltas fire.
-- **Step 3**: `wl_easy_remove_sym` retracts `friend(bob,alice)`.  After
-  `wl_easy_step`, the engine emits exactly two `-1` deltas:
+- **Step 3**: `wirelog_easy_remove_sym` retracts `friend(bob,alice)`.  After
+  `wirelog_easy_step`, the engine emits exactly two `-1` deltas:
   `mutual(alice,bob)` and `mutual(bob,alice)`, reflecting that both
   derived tuples are no longer supported.
 - **In-driver assertion**: The driver counts the `-1` deltas on `mutual` in
@@ -72,6 +72,6 @@ Done.
 ## See Also
 
 - `examples/08-delta-queries/` -- the preceding example that introduces
-  delta callbacks with `wl_easy_print_delta`.
+  delta callbacks with `wirelog_easy_print_delta`.
 - `tests/test_delta_retraction.c` -- engine-level retraction tests (issue
-  #158) that exercise the same `wl_easy_remove_sym` contract used here.
+  #158) that exercise the same `wirelog_easy_remove_sym` contract used here.

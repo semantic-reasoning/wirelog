@@ -14,6 +14,52 @@ during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
 for the full scope.  Entries are filed atomically as the renames land;
 #745 then consolidates the narrative for the GA migration guide.
 
+### wl_easy facade rename + file move (#756)
+
+The `wl_easy` convenience facade carried internal `wl_*`
+prefixes on a public installed header (`wirelog/wl_easy.h`).
+Per `AGENTS.md:17-20`, public symbols and headers must use
+the `wirelog_*` / `WIRELOG_*` prefix and (by convention) the
+`wirelog-` filename prefix.
+
+File moves:
+
+| Old path | New path |
+|---|---|
+| `wirelog/wl_easy.h` | `wirelog/wirelog-easy.h` |
+| `wirelog/wl_easy.c` | `wirelog/wirelog-easy.c` |
+| `tests/test_wl_easy.c` | `tests/test_wirelog_easy.c` |
+| `tests/test_wl_easy_inline_facts.c` | `tests/test_wirelog_easy_inline_facts.c` |
+
+Symbol renames (full surface):
+
+| Old | New |
+|---|---|
+| `wl_easy_session_t` | `wirelog_easy_session_t` |
+| `wl_easy_open_opts_t` | `wirelog_easy_open_opts_t` |
+| `WL_EASY_OPEN_OPTS_INIT` | `WIRELOG_EASY_OPEN_OPTS_INIT` |
+| `WL_EASY_MAX_COLS` | `WIRELOG_EASY_MAX_COLS` |
+| `wl_easy_open` / `wl_easy_close` | `wirelog_easy_open` / `wirelog_easy_close` |
+| `wl_easy_insert` / `wl_easy_remove` | `wirelog_easy_insert` / `wirelog_easy_remove` |
+| `wl_easy_insert_sym` / `wl_easy_remove_sym` | `wirelog_easy_insert_sym` / `wirelog_easy_remove_sym` |
+| `wl_easy_step` / `wl_easy_snapshot` | `wirelog_easy_step` / `wirelog_easy_snapshot` |
+| `wl_easy_set_delta_cb` | `wirelog_easy_set_delta_cb` |
+| `wl_easy_intern` | `wirelog_easy_intern` |
+| `wl_easy_print_delta` / `wl_easy_banner` | `wirelog_easy_print_delta` / `wirelog_easy_banner` |
+| `wl_easy_snapshot_filter_t` | `wirelog_easy_snapshot_filter_t` |
+
+`AGENTS.md:23` public-headers list updates the path.
+`meson.build` install_headers SSoT and source list reflect
+both the file move and the new symbol names.  Source-
+incompatible across the entire facade; migrate via:
+
+1. Update `#include` paths from `wirelog/wl_easy.h` to
+   `wirelog/wirelog-easy.h`.
+2. Textual-rename all `wl_easy_*` symbol references to
+   `wirelog_easy_*`.
+3. Textual-rename all `WL_EASY_*` macro references to
+   `WIRELOG_EASY_*`.
+
 ### Export-attribute macro rename: WL_PUBLIC -> WIRELOG_PUBLIC (#759)
 
 `wirelog/wirelog-export.h` previously defined `WL_PUBLIC` as
@@ -98,8 +144,8 @@ match `AGENTS.md:17-20`:
 
 Both typedefs live in `wirelog/wirelog-types.h` and are consumed by
 `wirelog/wirelog-advanced.h` (`wirelog_session_set_delta_cb`,
-`wirelog_session_snapshot`) and `wirelog/wl_easy.h`
-(`wl_easy_set_delta_cb`, `wl_easy_snapshot`).  Function-pointer
+`wirelog_session_snapshot`) and `wirelog/wirelog-easy.h`
+(`wirelog_easy_set_delta_cb`, `wirelog_easy_snapshot`).  Function-pointer
 parameter declarations rename to the new typedef names; the function
 signatures are otherwise unchanged.  Source-incompatible; existing
 callers update via a textual rename.

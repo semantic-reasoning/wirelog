@@ -21,7 +21,7 @@ diff marker.
 ## Files
 
 - **access_control.dl**: Datalog program for the access control example (reference)
-- **delta_demo.c**: C program demonstrating `wl_easy_set_delta_cb()`
+- **delta_demo.c**: C program demonstrating `wirelog_easy_set_delta_cb()`
 - **example.csv**: Sample access control facts used as input
 - **meson.build**: Build configuration for `delta_demo`
 
@@ -42,7 +42,7 @@ Example 08: Delta Queries with Callback API
 
 Inserting access control facts...
 
-Delta output from wl_easy_step():
+Delta output from wirelog_easy_step():
 + granted("alice", "read")
 + granted("alice", "write")
 + granted("bob", "read")
@@ -57,11 +57,11 @@ Done.
 ### 1. Register the Callback
 
 ```c
-wl_easy_set_delta_cb(session, on_delta, user_data);
+wirelog_easy_set_delta_cb(session, on_delta, user_data);
 ```
 
 The callback fires for every output tuple that is newly derived (diff = +1)
-or retracted (diff = -1) when `wl_easy_step()` is called.
+or retracted (diff = -1) when `wirelog_easy_step()` is called.
 
 ### 2. Callback Signature
 
@@ -94,14 +94,14 @@ on_delta(const char *relation, const int64_t *row, uint32_t ncols,
 ```
 
 To insert facts with symbol columns from C code, intern your strings
-with `wl_easy_intern()` first:
+with `wirelog_easy_intern()` first:
 
 ```c
-int64_t id_alice = wl_easy_intern(s, "alice");
-int64_t id_read  = wl_easy_intern(s, "read");
+int64_t id_alice = wirelog_easy_intern(s, "alice");
+int64_t id_read  = wirelog_easy_intern(s, "read");
 
 int64_t row[] = { id_alice, id_read };
-wl_easy_insert(s, "can", row, 2);
+wirelog_easy_insert(s, "can", row, 2);
 ```
 
 ### 4. Datalog Program
@@ -136,8 +136,8 @@ not on every step if the fact was already known.
 
 | API | When to use |
 |-----|-------------|
-| `wl_easy_set_delta_cb` + `wl_easy_step` | Streaming, event-driven, incremental pipelines |
-| `wl_easy_snapshot` | One-shot batch queries |
+| `wirelog_easy_set_delta_cb` + `wirelog_easy_step` | Streaming, event-driven, incremental pipelines |
+| `wirelog_easy_snapshot` | One-shot batch queries |
 
 Delta mode is efficient for cases where facts trickle in over time and
 you want to react to each change without re-scanning the full result set.
@@ -152,7 +152,7 @@ snapshot. This is efficient even for large relation sizes.
 ## Next Steps
 
 - Add role-based rules: `granted(U, P) :- role(U, R), role_perm(R, P)`
-- Extend to retraction: use `wl_easy_remove_sym()` to revoke permissions
+- Extend to retraction: use `wirelog_easy_remove_sym()` to revoke permissions
   and observe diff=-1 callbacks
 - Combine with `07-multi-source-analysis` to integrate permissions from
   multiple identity providers

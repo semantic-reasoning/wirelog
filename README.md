@@ -14,25 +14,25 @@ path(X, Y) :- edge(X, Y).
 path(X, Z) :- path(X, Y), edge(Y, Z).
 ```
 
-Run it from C using the `wl_easy` facade:
+Run it from C using the `wirelog_easy` facade:
 
 ```c
-#include <wirelog/wirelog.h>  /* umbrella: pulls in wl_easy and the rest */
+#include <wirelog/wirelog.h>  /* umbrella: pulls in wirelog_easy and the rest */
 
 int main(void) {
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(
             ".decl edge(a:symbol,b:symbol)\n"
             ".decl path(a:symbol,b:symbol)\n"
             "path(X,Y) :- edge(X,Y).\n"
             "path(X,Z) :- path(X,Y), edge(Y,Z).\n", &s) != WIRELOG_OK)
         return 1;
 
-    wl_easy_set_delta_cb(s, wl_easy_print_delta, s);
-    wl_easy_insert_sym(s, "edge", "a", "b", NULL);
-    wl_easy_insert_sym(s, "edge", "b", "c", NULL);
-    wl_easy_step(s);   /* prints: + path("a","b"), + path("b","c"), + path("a","c") */
-    wl_easy_close(s);
+    wirelog_easy_set_delta_cb(s, wirelog_easy_print_delta, s);
+    wirelog_easy_insert_sym(s, "edge", "a", "b", NULL);
+    wirelog_easy_insert_sym(s, "edge", "b", "c", NULL);
+    wirelog_easy_step(s);   /* prints: + path("a","b"), + path("b","c"), + path("a","c") */
+    wirelog_easy_close(s);
     return 0;
 }
 ```
@@ -140,7 +140,7 @@ done
 | `05-crc32-checksum` | CRC32 checksum validation |
 | `06-timestamp-lww` | Last-write-wins timestamp resolution |
 | `07-multi-source-analysis` | Set operations across data sources |
-| `08-delta-queries` | Delta callbacks with `wl_easy` |
+| `08-delta-queries` | Delta callbacks with `wirelog_easy` |
 | `09-retraction-basics` | Fact retraction with `-1` deltas |
 | `10-recursive-under-update` | Transitive closure under insert/remove |
 | `11-time-evolution` | Per-epoch delta isolation |
@@ -264,7 +264,7 @@ external-consumer audit.
 - [SECURITY.md](SECURITY.md) -- vulnerability disclosure
 - [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) -- threat model, mbedTLS license stack, and export-control self-classification
 - [CLA.md](CLA.md) -- Contributor License Agreement (required for dual licensing)
-- API: [`wirelog/wl_easy.h`](wirelog/wl_easy.h) (simple) | [`wirelog/wirelog-advanced.h`](wirelog/wirelog-advanced.h) (advanced)
+- API: [`wirelog/wirelog-easy.h`](wirelog/wirelog-easy.h) (simple) | [`wirelog/wirelog-advanced.h`](wirelog/wirelog-advanced.h) (advanced)
 
 ## License
 

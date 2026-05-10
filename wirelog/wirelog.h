@@ -31,7 +31,7 @@
  *     #include <wirelog/wirelog.h>
  *
  * Individual sub-headers (wirelog-types.h, wirelog-parser.h,
- * wirelog-ir.h, wirelog-optimizer.h, wirelog-export.h, wl_easy.h,
+ * wirelog-ir.h, wirelog-optimizer.h, wirelog-export.h, wirelog-easy.h,
  * wirelog-advanced.h, io/io_adapter.h) are still installed for
  * backwards compatibility but should not be included directly in
  * new code.
@@ -79,7 +79,7 @@ typedef struct wirelog_result wirelog_result_t;
  * collect IDB results in one shot via wirelog_evaluate().  For
  * incremental sessions with delta callbacks and z-set semantics, use
  * wirelog_session_t (in wirelog/wirelog-advanced.h) or
- * wl_easy_session_t (in wirelog/wl_easy.h) instead.  These three
+ * wirelog_easy_session_t (in wirelog/wirelog-easy.h) instead.  These three
  * facades are independent surfaces; do not mix handles across them.
  */
 typedef struct wirelog_executor wirelog_executor_t;
@@ -302,7 +302,7 @@ wirelog_config_threads(void);
 #include "wirelog/wirelog-parser.h"
 #include "wirelog/wirelog-ir.h"
 #include "wirelog/wirelog-optimizer.h"
-#include "wirelog/wl_easy.h"
+#include "wirelog/wirelog-easy.h"
 #include "wirelog/wirelog-advanced.h"
 #include "wirelog/io/io_adapter.h"
 

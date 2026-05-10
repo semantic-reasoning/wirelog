@@ -3,8 +3,8 @@
 ## Overview
 
 Wirelog exposes two ways to read derived facts: **delta mode**
-(`wl_easy_set_delta_cb` + `wl_easy_step`) streams sign-tagged changes
-as they happen, while **snapshot mode** (`wl_easy_snapshot`) returns the
+(`wirelog_easy_set_delta_cb` + `wirelog_easy_step`) streams sign-tagged changes
+as they happen, while **snapshot mode** (`wirelog_easy_snapshot`) returns the
 full IDB in one shot.  Two APIs, same answer, different costs.
 
 This example runs the same access-control Datalog program through both
@@ -35,8 +35,8 @@ meson compile -C build snapshot_demo
 Example 12: Snapshot vs Delta
 =============================
 
-=== delta mode: wl_easy_step ===
-=== snapshot mode: wl_easy_snapshot ===
+=== delta mode: wirelog_easy_step ===
+=== snapshot mode: wirelog_easy_snapshot ===
 
 delta: granted("alice", "read")        snapshot: granted("alice", "read")        MATCH
 delta: granted("alice", "write")       snapshot: granted("alice", "write")       MATCH
@@ -51,8 +51,8 @@ PASS
 
 | API | Use when | Cost shape |
 |---|---|---|
-| `wl_easy_set_delta_cb` + `wl_easy_step` | Facts trickle in over time and you want to react to *changes* | Proportional to delta size |
-| `wl_easy_snapshot` | One-shot batch query where you want the full IDB | Proportional to total IDB size |
+| `wirelog_easy_set_delta_cb` + `wirelog_easy_step` | Facts trickle in over time and you want to react to *changes* | Proportional to delta size |
+| `wirelog_easy_snapshot` | One-shot batch query where you want the full IDB | Proportional to total IDB size |
 
 Delta mode is ideal for long-running sessions where only incremental
 updates matter (monitoring, streaming pipelines).  Snapshot mode is
@@ -62,9 +62,9 @@ simpler when you just need the current answer without tracking history.
 
 - **Semantic equivalence** -- the incremental delta path produces the
   same derived facts as full re-evaluation via snapshot.
-- **Two independent sessions** -- because `wl_easy_snapshot` is an
+- **Two independent sessions** -- because `wirelog_easy_snapshot` is an
   evaluating call, the driver uses separate sessions to avoid
-  double-counting.  See `wl_easy.h` for the full contract.
+  double-counting.  See `wirelog-easy.h` for the full contract.
 - **Deterministic comparison** -- both result sets are sorted before
   comparison so the test is stable regardless of backend evaluation
   order.
@@ -81,4 +81,4 @@ simpler when you just need the current answer without tracking history.
 - `examples/09-retraction-basics/` -- retraction deltas
 - `examples/10-recursive-under-update/` -- recursive transitive closure
 - `examples/11-time-evolution/` -- per-epoch delta isolation
-- `wirelog/wl_easy.h` -- convenience facade API
+- `wirelog/wirelog-easy.h` -- convenience facade API

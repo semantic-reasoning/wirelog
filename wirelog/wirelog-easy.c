@@ -1,5 +1,5 @@
 /*
- * wl_easy.c - wirelog convenience facade (Issue #441)
+ * wirelog-easy.c - wirelog convenience facade (Issue #441)
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
@@ -20,7 +20,7 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
-#include "wirelog/wl_easy.h"
+#include "wirelog/wirelog-easy.h"
 
 #include "wirelog/backend.h"
 #include "wirelog/exec_plan.h"
@@ -42,9 +42,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define WL_EASY_MAX_COLS 16
+#define WIRELOG_EASY_MAX_COLS 16
 
-struct wl_easy_session {
+struct wirelog_easy_session {
     wirelog_program_t *prog; /* owns */
     wl_plan_t *plan;         /* owns, lazy-built */
     wl_session_t *session;   /* owns, lazy-built */
@@ -54,7 +54,7 @@ struct wl_easy_session {
      * intern's lifetime so the cast is safe. */
     wl_intern_t *intern_mut;
     uint32_t num_workers;
-    bool plan_built; /* true once first wl_easy_step-class call ran */
+    bool plan_built; /* true once first wirelog_easy_step-class call ran */
 };
 
 /* ======================================================================== */
@@ -62,7 +62,7 @@ struct wl_easy_session {
 /* ======================================================================== */
 
 static wirelog_error_t
-ensure_plan_built(wl_easy_session_t *s, uint32_t num_workers)
+ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
 {
     if (!s)
         return WIRELOG_ERR_EXEC;
@@ -89,7 +89,7 @@ ensure_plan_built(wl_easy_session_t *s, uint32_t num_workers)
      * so snapshots and IDB derivations observe them.  This mirrors the
      * fact-load step of the CLI driver's session-build sequence
      * (cli/driver.c:397); the wider optimizer pipeline alignment
-     * between wl_easy (fusion + jpp + sip) and the CLI (which also
+     * between wirelog_easy (fusion + jpp + sip) and the CLI (which also
      * runs subsumption + magic_sets) is tracked separately and is not
      * in scope here.  The load runs exactly once on the lazy
      * plan/session boundary, before any host delta callback can be
@@ -114,14 +114,14 @@ ensure_plan_built(wl_easy_session_t *s, uint32_t num_workers)
 /* ======================================================================== */
 
 wirelog_error_t
-wl_easy_open_opts(const char *dl_src, const wl_easy_open_opts_t *opts,
-    wl_easy_session_t **out)
+wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
+    wirelog_easy_session_t **out)
 {
     if (!dl_src || !out)
         return WIRELOG_ERR_EXEC;
     *out = NULL;
 
-    if (opts && opts->size < sizeof(wl_easy_open_opts_t))
+    if (opts && opts->size < sizeof(wirelog_easy_open_opts_t))
         return WIRELOG_ERR_EXEC;
     if (opts && opts->_reserved)
         return WIRELOG_ERR_EXEC;
@@ -139,27 +139,27 @@ wl_easy_open_opts(const char *dl_src, const wl_easy_open_opts_t *opts,
     int pass_rc = wl_fusion_apply(prog, NULL);
     if (pass_rc != 0) {
         fprintf(stderr,
-            "wl_easy_open: wl_fusion_apply failed (rc=%d)\n", pass_rc);
+            "wirelog_easy_open: wl_fusion_apply failed (rc=%d)\n", pass_rc);
         wirelog_program_free(prog);
         return WIRELOG_ERR_EXEC;
     }
     pass_rc = wl_jpp_apply(prog, NULL);
     if (pass_rc != 0) {
         fprintf(stderr,
-            "wl_easy_open: wl_jpp_apply failed (rc=%d)\n", pass_rc);
+            "wirelog_easy_open: wl_jpp_apply failed (rc=%d)\n", pass_rc);
         wirelog_program_free(prog);
         return WIRELOG_ERR_EXEC;
     }
     pass_rc = wl_sip_apply(prog, NULL);
     if (pass_rc != 0) {
         fprintf(stderr,
-            "wl_easy_open: wl_sip_apply failed (rc=%d)\n", pass_rc);
+            "wirelog_easy_open: wl_sip_apply failed (rc=%d)\n", pass_rc);
         wirelog_program_free(prog);
         return WIRELOG_ERR_EXEC;
     }
 
-    wl_easy_session_t *s
-        = (wl_easy_session_t *)calloc(1, sizeof(wl_easy_session_t));
+    wirelog_easy_session_t *s
+        = (wirelog_easy_session_t *)calloc(1, sizeof(wirelog_easy_session_t));
     if (!s) {
         wirelog_program_free(prog);
         return WIRELOG_ERR_MEMORY;
@@ -189,13 +189,13 @@ wl_easy_open_opts(const char *dl_src, const wl_easy_open_opts_t *opts,
 }
 
 wirelog_error_t
-wl_easy_open(const char *dl_src, wl_easy_session_t **out)
+wirelog_easy_open(const char *dl_src, wirelog_easy_session_t **out)
 {
-    return wl_easy_open_opts(dl_src, NULL, out);
+    return wirelog_easy_open_opts(dl_src, NULL, out);
 }
 
 void
-wl_easy_close(wl_easy_session_t *s)
+wirelog_easy_close(wirelog_easy_session_t *s)
 {
     if (!s)
         return;
@@ -213,7 +213,7 @@ wl_easy_close(wl_easy_session_t *s)
 /* ======================================================================== */
 
 int64_t
-wl_easy_intern(wl_easy_session_t *s, const char *sym)
+wirelog_easy_intern(wirelog_easy_session_t *s, const char *sym)
 {
     if (!s || !sym || !s->intern_mut)
         return -1;
@@ -227,7 +227,7 @@ wl_easy_intern(wl_easy_session_t *s, const char *sym)
 }
 
 wirelog_error_t
-wirelog_easy_make_compound(wl_easy_session_t *s, const char *functor,
+wirelog_easy_make_compound(wirelog_easy_session_t *s, const char *functor,
     uint32_t arity, const wirelog_compound_arg_t *args, uint64_t *handle_out)
 {
     if (handle_out)
@@ -259,7 +259,7 @@ wirelog_easy_make_compound(wl_easy_session_t *s, const char *functor,
 /* ======================================================================== */
 
 wirelog_error_t
-wl_easy_insert(wl_easy_session_t *s, const char *relation, const int64_t *row,
+wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation, const int64_t *row,
     uint32_t ncols)
 {
     if (!s || !relation || !row)
@@ -272,7 +272,7 @@ wl_easy_insert(wl_easy_session_t *s, const char *relation, const int64_t *row,
 }
 
 wirelog_error_t
-wl_easy_remove(wl_easy_session_t *s, const char *relation, const int64_t *row,
+wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation, const int64_t *row,
     uint32_t ncols)
 {
     if (!s || !relation || !row)
@@ -289,16 +289,16 @@ wl_easy_remove(wl_easy_session_t *s, const char *relation, const int64_t *row,
 /* ======================================================================== */
 
 static wirelog_error_t
-collect_sym_row(wl_easy_session_t *s, va_list ap, int64_t *row, uint32_t *ncols)
+collect_sym_row(wirelog_easy_session_t *s, va_list ap, int64_t *row, uint32_t *ncols)
 {
     uint32_t n = 0;
-    while (n < WL_EASY_MAX_COLS) {
+    while (n < WIRELOG_EASY_MAX_COLS) {
         const char *sym = va_arg(ap, const char *);
         if (sym == NULL)
             break;
         /* Interning a never-seen symbol after plan build is rejected by
-         * wl_easy_intern, but if the caller pre-interned the symbol via
-         * wl_easy_intern() before the first step, wl_intern_put() simply
+         * wirelog_easy_intern, but if the caller pre-interned the symbol via
+         * wirelog_easy_intern() before the first step, wl_intern_put() simply
          * returns the existing id. */
         int64_t id = wl_intern_put(s->intern_mut, sym);
         if (id < 0)
@@ -310,11 +310,11 @@ collect_sym_row(wl_easy_session_t *s, va_list ap, int64_t *row, uint32_t *ncols)
 }
 
 wirelog_error_t
-wl_easy_insert_sym(wl_easy_session_t *s, const char *relation, ...)
+wirelog_easy_insert_sym(wirelog_easy_session_t *s, const char *relation, ...)
 {
     if (!s || !relation)
         return WIRELOG_ERR_EXEC;
-    int64_t row[WL_EASY_MAX_COLS];
+    int64_t row[WIRELOG_EASY_MAX_COLS];
     uint32_t ncols = 0;
     va_list ap;
     va_start(ap, relation);
@@ -322,15 +322,15 @@ wl_easy_insert_sym(wl_easy_session_t *s, const char *relation, ...)
     va_end(ap);
     if (err != WIRELOG_OK)
         return err;
-    return wl_easy_insert(s, relation, row, ncols);
+    return wirelog_easy_insert(s, relation, row, ncols);
 }
 
 wirelog_error_t
-wl_easy_remove_sym(wl_easy_session_t *s, const char *relation, ...)
+wirelog_easy_remove_sym(wirelog_easy_session_t *s, const char *relation, ...)
 {
     if (!s || !relation)
         return WIRELOG_ERR_EXEC;
-    int64_t row[WL_EASY_MAX_COLS];
+    int64_t row[WIRELOG_EASY_MAX_COLS];
     uint32_t ncols = 0;
     va_list ap;
     va_start(ap, relation);
@@ -338,7 +338,7 @@ wl_easy_remove_sym(wl_easy_session_t *s, const char *relation, ...)
     va_end(ap);
     if (err != WIRELOG_OK)
         return err;
-    return wl_easy_remove(s, relation, row, ncols);
+    return wirelog_easy_remove(s, relation, row, ncols);
 }
 
 /* ======================================================================== */
@@ -346,7 +346,7 @@ wl_easy_remove_sym(wl_easy_session_t *s, const char *relation, ...)
 /* ======================================================================== */
 
 wirelog_error_t
-wl_easy_step(wl_easy_session_t *s)
+wirelog_easy_step(wirelog_easy_session_t *s)
 {
     if (!s)
         return WIRELOG_ERR_EXEC;
@@ -358,7 +358,7 @@ wl_easy_step(wl_easy_session_t *s)
 }
 
 wirelog_error_t
-wl_easy_set_delta_cb(wl_easy_session_t *s, wirelog_on_delta_fn cb,
+wirelog_easy_set_delta_cb(wirelog_easy_session_t *s, wirelog_on_delta_fn cb,
     void *user_data)
 {
     if (!s)
@@ -381,12 +381,12 @@ column_is_string(wirelog_column_type_t t)
 }
 
 void
-wl_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
+wirelog_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
     int32_t diff, void *user_data)
 {
-    wl_easy_session_t *s = (wl_easy_session_t *)user_data;
+    wirelog_easy_session_t *s = (wirelog_easy_session_t *)user_data;
     if (!s || !relation || !row) {
-        fprintf(stderr, "wl_easy_print_delta: NULL argument\n");
+        fprintf(stderr, "wirelog_easy_print_delta: NULL argument\n");
         abort();
     }
 
@@ -413,7 +413,7 @@ wl_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
             const char *str = wl_intern_reverse(s->intern_mut, row[i]);
             if (!str) {
                 fprintf(stderr,
-                    "wl_easy_print_delta: missed reverse-intern for "
+                    "wirelog_easy_print_delta: missed reverse-intern for "
                     "relation '%s' column %u id %" PRId64 "\n",
                     relation, i, row[i]);
                 abort();
@@ -434,7 +434,7 @@ wl_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
 /* ======================================================================== */
 
 void
-wl_easy_banner(const char *label)
+wirelog_easy_banner(const char *label)
 {
     printf("\n=== %s ===\n", label ? label : "");
 }
@@ -447,13 +447,13 @@ typedef struct {
     const char *wanted;
     wirelog_on_tuple_fn user_cb;
     void *user_data;
-} wl_easy_snapshot_filter_t;
+} wirelog_easy_snapshot_filter_t;
 
 static void
 snapshot_trampoline(const char *relation, const int64_t *row, uint32_t ncols,
     void *user_data)
 {
-    wl_easy_snapshot_filter_t *f = (wl_easy_snapshot_filter_t *)user_data;
+    wirelog_easy_snapshot_filter_t *f = (wirelog_easy_snapshot_filter_t *)user_data;
     if (!relation || !f || !f->wanted)
         return;
     if (strcmp(relation, f->wanted) != 0)
@@ -463,7 +463,7 @@ snapshot_trampoline(const char *relation, const int64_t *row, uint32_t ncols,
 }
 
 wirelog_error_t
-wl_easy_snapshot(wl_easy_session_t *s, const char *relation,
+wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
     wirelog_on_tuple_fn cb,
     void *user_data)
 {
@@ -472,7 +472,7 @@ wl_easy_snapshot(wl_easy_session_t *s, const char *relation,
     wirelog_error_t err = ensure_plan_built(s, s->num_workers);
     if (err != WIRELOG_OK)
         return err;
-    wl_easy_snapshot_filter_t filter
+    wirelog_easy_snapshot_filter_t filter
         = { .wanted = relation, .user_cb = cb, .user_data = user_data };
     int rc = wl_session_snapshot(s->session, snapshot_trampoline, &filter);
     return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;

@@ -1,5 +1,5 @@
 # examples/09-retraction-basics/meson.build
-# Retraction Basics demo using the wl_easy facade (#442)
+# Retraction Basics demo using the wirelog_easy facade (#442)
 #
 # Include all wirelog sources directly (same pattern as example 08 and
 # wirelog_cli) to ensure proper linking under LTO.

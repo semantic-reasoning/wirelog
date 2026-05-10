@@ -44,9 +44,9 @@ struct wl_session {
 /*
  * NOTE: This header is INTERNAL — it is not part of the installed
  * public surface (see install_headers in the top-level meson.build).
- * Public users must use <wirelog/wl_easy.h> (or, equivalently, the
+ * Public users must use <wirelog/wirelog-easy.h> (or, equivalently, the
  * umbrella <wirelog/wirelog.h>).  The wl_session_* primitives below
- * back the wl_easy_* facade and are exercised by in-tree tests; they
+ * back the wirelog_easy_* facade and are exercised by in-tree tests; they
  * are not promised to external consumers and may change without notice.
  */
 
