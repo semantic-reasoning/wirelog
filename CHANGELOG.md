@@ -90,7 +90,7 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
-- **I/O Adapter Framework** (#446): User-defined I/O adapters via runtime registry (`wl_io_register_adapter`). Public header `wirelog/io/io_adapter.h` with opaque context, ABI versioning (`WL_IO_ABI_VERSION=1`), and thread-safe registration API
+- **I/O Adapter Framework** (#446): User-defined I/O adapters via runtime registry (`wirelog_io_register_adapter`). Public header `wirelog/io/io_adapter.h` with opaque context, ABI versioning (`WIRELOG_IO_ABI_VERSION=1`), and thread-safe registration API
 - **Built-in CSV Adapter** (#455): CSV loading refactored into the adapter framework; backward-compatible `.input(filename=...)` dispatch
 - **wirelog_easy Facade** (#445): Simplified high-level API (`wirelog-easy.h`) for common session workflows
 - **String Operations** (#444): String-typed column functions (`strlen`, `cat`, `substr`, `contains`, `to_upper`, `to_lower`, `trim`, `str_replace`, `to_string`, `to_number`)

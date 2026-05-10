@@ -4,7 +4,7 @@
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
  *
- * Seven test scenarios for wl_io_ctx_t accessors: relation_name,
+ * Seven test scenarios for wirelog_io_ctx_t accessors: relation_name,
  * num_cols, col_type, param_lookup, param_null_key, intern_string,
  * platform_ctx. All guarded behind TEST_CTX_PRESENT and currently SKIP
  * until #453 implements the context.
@@ -25,7 +25,7 @@
 
 static wl_intern_t *g_intern = NULL;
 
-static wl_io_ctx_t *
+static wirelog_io_ctx_t *
 create_mock_ctx(const char *relation_name,
     const wirelog_column_type_t *col_types, uint32_t num_cols,
     const char **param_keys, const char **param_values,
@@ -33,15 +33,15 @@ create_mock_ctx(const char *relation_name,
 {
     if (!g_intern)
         g_intern = wl_intern_create();
-    return wl_io_ctx_create_test(relation_name, col_types, num_cols,
+    return wirelog_io_ctx_create_test(relation_name, col_types, num_cols,
                param_keys, param_values, num_params,
                g_intern);
 }
 
 static void
-destroy_mock_ctx(wl_io_ctx_t *ctx)
+destroy_mock_ctx(wirelog_io_ctx_t *ctx)
 {
-    wl_io_ctx_destroy(ctx);
+    wirelog_io_ctx_destroy(ctx);
 }
 
 /* ======================================================================== */
@@ -62,11 +62,11 @@ static int passed = 0, failed = 0, skipped = 0;
 static void
 test_relation_name(void)
 {
-    TEST("wl_io_ctx_relation_name returns correct name");
+    TEST("wirelog_io_ctx_relation_name returns correct name");
 #ifdef TEST_CTX_PRESENT
     wirelog_column_type_t cols[] = { WIRELOG_TYPE_INT32 };
-    wl_io_ctx_t *ctx = create_mock_ctx("events", cols, 1, NULL, NULL, 0);
-    if (strcmp(wl_io_ctx_relation_name(ctx), "events") != 0) {
+    wirelog_io_ctx_t *ctx = create_mock_ctx("events", cols, 1, NULL, NULL, 0);
+    if (strcmp(wirelog_io_ctx_relation_name(ctx), "events") != 0) {
         FAIL("relation name mismatch"); destroy_mock_ctx(ctx); return;
     }
     PASS();
@@ -79,13 +79,13 @@ test_relation_name(void)
 static void
 test_num_cols(void)
 {
-    TEST("wl_io_ctx_num_cols returns correct count");
+    TEST("wirelog_io_ctx_num_cols returns correct count");
 #ifdef TEST_CTX_PRESENT
     wirelog_column_type_t cols[] = {
         WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT32, WIRELOG_TYPE_STRING
     };
-    wl_io_ctx_t *ctx = create_mock_ctx("rel3", cols, 3, NULL, NULL, 0);
-    if (wl_io_ctx_num_cols(ctx) != 3) {
+    wirelog_io_ctx_t *ctx = create_mock_ctx("rel3", cols, 3, NULL, NULL, 0);
+    if (wirelog_io_ctx_num_cols(ctx) != 3) {
         FAIL("expected 3 columns"); destroy_mock_ctx(ctx); return;
     }
     PASS();
@@ -98,19 +98,19 @@ test_num_cols(void)
 static void
 test_col_type(void)
 {
-    TEST("wl_io_ctx_col_type returns correct types");
+    TEST("wirelog_io_ctx_col_type returns correct types");
 #ifdef TEST_CTX_PRESENT
     wirelog_column_type_t cols[] = {
         WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT32, WIRELOG_TYPE_STRING
     };
-    wl_io_ctx_t *ctx = create_mock_ctx("typed", cols, 3, NULL, NULL, 0);
-    if (wl_io_ctx_col_type(ctx, 0) != WIRELOG_TYPE_STRING) {
+    wirelog_io_ctx_t *ctx = create_mock_ctx("typed", cols, 3, NULL, NULL, 0);
+    if (wirelog_io_ctx_col_type(ctx, 0) != WIRELOG_TYPE_STRING) {
         FAIL("col 0 type mismatch"); destroy_mock_ctx(ctx); return;
     }
-    if (wl_io_ctx_col_type(ctx, 1) != WIRELOG_TYPE_INT32) {
+    if (wirelog_io_ctx_col_type(ctx, 1) != WIRELOG_TYPE_INT32) {
         FAIL("col 1 type mismatch"); destroy_mock_ctx(ctx); return;
     }
-    if (wl_io_ctx_col_type(ctx, 2) != WIRELOG_TYPE_STRING) {
+    if (wirelog_io_ctx_col_type(ctx, 2) != WIRELOG_TYPE_STRING) {
         FAIL("col 2 type mismatch"); destroy_mock_ctx(ctx); return;
     }
     PASS();
@@ -123,19 +123,19 @@ test_col_type(void)
 static void
 test_param_lookup(void)
 {
-    TEST("wl_io_ctx_param returns correct values");
+    TEST("wirelog_io_ctx_param returns correct values");
 #ifdef TEST_CTX_PRESENT
     wirelog_column_type_t cols[] = { WIRELOG_TYPE_INT32 };
     const char *keys[] = { "filename", "delimiter" };
     const char *values[] = { "data.csv", "," };
-    wl_io_ctx_t *ctx = create_mock_ctx("params", cols, 1, keys, values, 2);
-    if (strcmp(wl_io_ctx_param(ctx, "filename"), "data.csv") != 0) {
+    wirelog_io_ctx_t *ctx = create_mock_ctx("params", cols, 1, keys, values, 2);
+    if (strcmp(wirelog_io_ctx_param(ctx, "filename"), "data.csv") != 0) {
         FAIL("filename param mismatch"); destroy_mock_ctx(ctx); return;
     }
-    if (strcmp(wl_io_ctx_param(ctx, "delimiter"), ",") != 0) {
+    if (strcmp(wirelog_io_ctx_param(ctx, "delimiter"), ",") != 0) {
         FAIL("delimiter param mismatch"); destroy_mock_ctx(ctx); return;
     }
-    if (wl_io_ctx_param(ctx, "nonexistent") != NULL) {
+    if (wirelog_io_ctx_param(ctx, "nonexistent") != NULL) {
         FAIL("expected NULL for unknown param"); destroy_mock_ctx(ctx); return;
     }
     PASS();
@@ -148,11 +148,11 @@ test_param_lookup(void)
 static void
 test_param_null_key(void)
 {
-    TEST("wl_io_ctx_param with NULL key returns NULL");
+    TEST("wirelog_io_ctx_param with NULL key returns NULL");
 #ifdef TEST_CTX_PRESENT
     wirelog_column_type_t cols[] = { WIRELOG_TYPE_INT32 };
-    wl_io_ctx_t *ctx = create_mock_ctx("nullkey", cols, 1, NULL, NULL, 0);
-    if (wl_io_ctx_param(ctx, NULL) != NULL) {
+    wirelog_io_ctx_t *ctx = create_mock_ctx("nullkey", cols, 1, NULL, NULL, 0);
+    if (wirelog_io_ctx_param(ctx, NULL) != NULL) {
         FAIL("expected NULL for NULL key"); destroy_mock_ctx(ctx); return;
     }
     PASS();
@@ -165,16 +165,16 @@ test_param_null_key(void)
 static void
 test_intern_string(void)
 {
-    TEST("wl_io_ctx_intern_string returns consistent IDs");
+    TEST("wirelog_io_ctx_intern_string returns consistent IDs");
 #ifdef TEST_CTX_PRESENT
     wirelog_column_type_t cols[] = { WIRELOG_TYPE_STRING };
-    wl_io_ctx_t *ctx = create_mock_ctx("intern", cols, 1, NULL, NULL, 0);
-    int64_t id1 = wl_io_ctx_intern_string(ctx, "hello");
+    wirelog_io_ctx_t *ctx = create_mock_ctx("intern", cols, 1, NULL, NULL, 0);
+    int64_t id1 = wirelog_io_ctx_intern_string(ctx, "hello");
     if (id1 <= 0) {
         FAIL("first intern returned non-positive ID"); destroy_mock_ctx(ctx);
         return;
     }
-    int64_t id2 = wl_io_ctx_intern_string(ctx, "hello");
+    int64_t id2 = wirelog_io_ctx_intern_string(ctx, "hello");
     if (id2 != id1) {
         FAIL("second intern returned different ID"); destroy_mock_ctx(ctx);
         return;
@@ -189,15 +189,15 @@ test_intern_string(void)
 static void
 test_platform_ctx(void)
 {
-    TEST("wl_io_ctx_platform get/set round-trip");
+    TEST("wirelog_io_ctx_platform get/set round-trip");
 #ifdef TEST_CTX_PRESENT
     wirelog_column_type_t cols[] = { WIRELOG_TYPE_INT32 };
-    wl_io_ctx_t *ctx = create_mock_ctx("plat", cols, 1, NULL, NULL, 0);
-    if (wl_io_ctx_platform(ctx) != NULL) {
+    wirelog_io_ctx_t *ctx = create_mock_ctx("plat", cols, 1, NULL, NULL, 0);
+    if (wirelog_io_ctx_platform(ctx) != NULL) {
         FAIL("expected NULL initial platform"); destroy_mock_ctx(ctx); return;
     }
-    wl_io_ctx_set_platform(ctx, (void *)0xCAFE);
-    if (wl_io_ctx_platform(ctx) != (void *)0xCAFE) {
+    wirelog_io_ctx_set_platform(ctx, (void *)0xCAFE);
+    if (wirelog_io_ctx_platform(ctx) != (void *)0xCAFE) {
         FAIL("platform pointer mismatch"); destroy_mock_ctx(ctx); return;
     }
     PASS();

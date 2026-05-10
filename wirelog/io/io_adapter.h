@@ -37,41 +37,55 @@ extern "C" {
 /* Constants                                                                */
 /* ======================================================================== */
 
-#define WL_IO_ABI_VERSION   1u
-#define WL_IO_MAX_ADAPTERS  32
+/* WIRELOG_IO_ABI_VERSION:
+ *   1u (v0.30.0): symbols carried internal `wl_io_*` / `WL_IO_*`
+ *      prefixes on this public installed header, contradicting the
+ *      AGENTS.md naming-convention rule that public symbols must use
+ *      `wirelog_*` / `WIRELOG_*`.
+ *   2u (v0.40+): symbols renamed; the registration-time
+ *      `adapter->abi_version != WIRELOG_IO_ABI_VERSION` check rejects
+ *      v0.30.0 plugins (abi_version == 1u) loud, with a diagnostic
+ *      retrievable via `wirelog_io_last_error()`.  Plugin authors
+ *      built against v0.30.0 must rebuild against v0.40+ to
+ *      ABI-version 2u.
+ */
+#define WIRELOG_IO_ABI_VERSION   2u
+#define WIRELOG_IO_MAX_ADAPTERS  32
 
 /* ======================================================================== */
 /* Opaque Context                                                           */
 /* ======================================================================== */
 
-typedef struct wl_io_ctx wl_io_ctx_t;
+typedef struct wirelog_io_ctx wirelog_io_ctx_t;
 
 /* ======================================================================== */
 /* Context Accessors (implemented in #453)                                  */
 /* ======================================================================== */
 
-const char *wl_io_ctx_relation_name(const wl_io_ctx_t *ctx);
-uint32_t    wl_io_ctx_num_cols(const wl_io_ctx_t *ctx);
-wirelog_column_type_t wl_io_ctx_col_type(const wl_io_ctx_t *ctx, uint32_t col);
-const char *wl_io_ctx_param(const wl_io_ctx_t *ctx, const char *key);
-int64_t     wl_io_ctx_intern_string(wl_io_ctx_t *ctx, const char *utf8);
-void       *wl_io_ctx_platform(const wl_io_ctx_t *ctx);
-int         wl_io_ctx_set_platform(wl_io_ctx_t *ctx, void *ptr);
+const char *wirelog_io_ctx_relation_name(const wirelog_io_ctx_t *ctx);
+uint32_t    wirelog_io_ctx_num_cols(const wirelog_io_ctx_t *ctx);
+wirelog_column_type_t wirelog_io_ctx_col_type(const wirelog_io_ctx_t *ctx,
+    uint32_t col);
+const char *wirelog_io_ctx_param(const wirelog_io_ctx_t *ctx, const char *key);
+int64_t     wirelog_io_ctx_intern_string(wirelog_io_ctx_t *ctx,
+    const char *utf8);
+void       *wirelog_io_ctx_platform(const wirelog_io_ctx_t *ctx);
+int         wirelog_io_ctx_set_platform(wirelog_io_ctx_t *ctx, void *ptr);
 
 /* ======================================================================== */
 /* Adapter VTable                                                           */
 /* ======================================================================== */
 
-typedef struct wl_io_adapter {
+typedef struct wirelog_io_adapter {
     uint32_t abi_version;
     const char *scheme;
     const char *description;
-    int (*read)(wl_io_ctx_t *ctx, int64_t **out_data, uint32_t *out_nrows,
+    int (*read)(wirelog_io_ctx_t *ctx, int64_t **out_data, uint32_t *out_nrows,
         void *user_data);
-    int (*validate)(wl_io_ctx_t *ctx, char *errbuf, size_t errbuf_len,
+    int (*validate)(wirelog_io_ctx_t *ctx, char *errbuf, size_t errbuf_len,
         void *user_data);
     void *user_data;
-} wl_io_adapter_t;
+} wirelog_io_adapter_t;
 
 /* ======================================================================== */
 /* Registration API                                                         */
@@ -80,18 +94,18 @@ typedef struct wl_io_adapter {
 /* __attribute__((used)) prevents iOS static-library dead-stripping.
  * MSVC does not support it; use #pragma comment(linker, /include:) if needed. */
 #if defined(__GNUC__) || defined(__clang__)
-#define WL_IO_USED __attribute__((used))
+#define WIRELOG_IO_USED __attribute__((used))
 #else
-#define WL_IO_USED
+#define WIRELOG_IO_USED
 #endif
 
 /*
  * Adapter Lifetime Contract
  * -------------------------
- * The wl_io_adapter_t pointer passed to wl_io_register_adapter() MUST remain
+ * The wirelog_io_adapter_t pointer passed to wirelog_io_register_adapter() MUST remain
  * valid (i.e. the pointed-to struct must not be freed or modified) until the
- * corresponding wl_io_unregister_adapter() call or process exit.  The registry
- * stores the raw pointer and returns it verbatim from wl_io_find_adapter().
+ * corresponding wirelog_io_unregister_adapter() call or process exit.  The registry
+ * stores the raw pointer and returns it verbatim from wirelog_io_find_adapter().
  *
  * The scheme string within the adapter struct is copied into an internal
  * fixed-size buffer (SCHEME_MAX_LEN-1 characters) at registration time, so
@@ -106,26 +120,27 @@ typedef struct wl_io_adapter {
  * Error Reporting
  * ---------------
  * On failure, functions return -1 and record a human-readable reason in a
- * thread-local buffer retrievable via wl_io_last_error().  On success the
+ * thread-local buffer retrievable via wirelog_io_last_error().  On success the
  * error buffer is cleared.  The returned pointer is valid until the next call
  * on the same thread.
  *
  * Return values:
- *   wl_io_register_adapter   0 on success, -1 on error (NULL input, ABI
+ *   wirelog_io_register_adapter   0 on success, -1 on error (NULL input, ABI
  *                             mismatch, duplicate scheme, or registry full)
- *   wl_io_unregister_adapter 0 on success, -1 if scheme is not registered
- *   wl_io_find_adapter        pointer to adapter, or NULL if not found
+ *   wirelog_io_unregister_adapter 0 on success, -1 if scheme is not registered
+ *   wirelog_io_find_adapter        pointer to adapter, or NULL if not found
  */
 
-WIRELOG_PUBLIC int wl_io_register_adapter(
-    const wl_io_adapter_t *adapter) WL_IO_USED;
+WIRELOG_PUBLIC int wirelog_io_register_adapter(
+    const wirelog_io_adapter_t *adapter) WIRELOG_IO_USED;
 
-WIRELOG_PUBLIC int wl_io_unregister_adapter(const char *scheme) WL_IO_USED;
+WIRELOG_PUBLIC int wirelog_io_unregister_adapter(
+    const char *scheme) WIRELOG_IO_USED;
 
-WIRELOG_PUBLIC const wl_io_adapter_t *wl_io_find_adapter(
-    const char *scheme) WL_IO_USED;
+WIRELOG_PUBLIC const wirelog_io_adapter_t *wirelog_io_find_adapter(
+    const char *scheme) WIRELOG_IO_USED;
 
-WIRELOG_PUBLIC const char *wl_io_last_error(void);
+WIRELOG_PUBLIC const char *wirelog_io_last_error(void);
 
 /* ======================================================================== */
 /* Plugin Entry Point (Path B, Issue #461)                                  */
@@ -137,24 +152,24 @@ WIRELOG_PUBLIC const char *wl_io_last_error(void);
  * does not strip it even under -fvisibility=hidden or LTO.
  */
 #if defined(_WIN32) || defined(__CYGWIN__)
-#define WL_IO_PLUGIN_EXPORT __declspec(dllexport)
+#define WIRELOG_IO_PLUGIN_EXPORT __declspec(dllexport)
 #elif defined(__GNUC__) || defined(__clang__)
-#define WL_IO_PLUGIN_EXPORT __attribute__((visibility("default")))
+#define WIRELOG_IO_PLUGIN_EXPORT __attribute__((visibility("default")))
 #else
-#define WL_IO_PLUGIN_EXPORT
+#define WIRELOG_IO_PLUGIN_EXPORT
 #endif
 
 /*
  * Plugin entry point signature.
  *
  * A plugin shared library must export exactly one symbol named
- * "wl_io_plugin_entry" with this signature.  The CLI plugin loader
+ * "wirelog_io_plugin_entry" with this signature.  The CLI plugin loader
  * calls dlopen() on the library, resolves this symbol via dlsym(),
  * validates the ABI version, and bulk-registers all returned adapters.
  *
  * Parameters:
  *   n_out    [out] Number of adapters in the returned array.
- *   abi_ver  [in]  Host's WL_IO_ABI_VERSION.  The plugin should check
+ *   abi_ver  [in]  Host's WIRELOG_IO_ABI_VERSION.  The plugin should check
  *                  this against its own compiled version and return NULL
  *                  on mismatch.
  *
@@ -162,10 +177,10 @@ WIRELOG_PUBLIC const char *wl_io_last_error(void);
  *   Array of adapter pointers (must remain valid for process lifetime),
  *   or NULL on ABI mismatch / error.
  */
-typedef const wl_io_adapter_t *const *(*wl_io_plugin_entry_fn)(
+typedef const wirelog_io_adapter_t *const *(*wirelog_io_plugin_entry_fn)(
     uint32_t *n_out, uint32_t abi_ver);
 
-#define WL_IO_PLUGIN_ENTRY_SYMBOL "wl_io_plugin_entry"
+#define WIRELOG_IO_PLUGIN_ENTRY_SYMBOL "wirelog_io_plugin_entry"
 
 #ifdef __cplusplus
 }

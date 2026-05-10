@@ -10,7 +10,7 @@
  *   - Scheme at SCHEME_MAX_LEN-1 boundary (max safe length)
  *   - Scheme one byte over SCHEME_MAX_LEN (must be truncated safely)
  *   - Fill registry to capacity then verify "registry full" error
- *   - wl_io_last_error() valid after each error path
+ *   - wirelog_io_last_error() valid after each error path
  *
  * Part of #459 (ASan + TSan CI gates).
  */
@@ -60,11 +60,11 @@ static void
 test_null_adapter(void)
 {
     TEST("register NULL adapter returns -1");
-    int rc = wl_io_register_adapter(NULL);
+    int rc = wirelog_io_register_adapter(NULL);
     if (rc != -1) {
         FAIL("expected -1"); return;
     }
-    const char *err = wl_io_last_error();
+    const char *err = wirelog_io_last_error();
     if (err && err[0] != '\0') PASS();
     else FAIL("expected non-empty error string after NULL adapter");
 }
@@ -73,15 +73,15 @@ static void
 test_null_scheme_register(void)
 {
     TEST("register adapter with NULL scheme returns -1");
-    wl_io_adapter_t a;
+    wirelog_io_adapter_t a;
     memset(&a, 0, sizeof(a));
     a.scheme = NULL;
-    a.abi_version = WL_IO_ABI_VERSION;
-    int rc = wl_io_register_adapter(&a);
+    a.abi_version = WIRELOG_IO_ABI_VERSION;
+    int rc = wirelog_io_register_adapter(&a);
     if (rc != -1) {
         FAIL("expected -1"); return;
     }
-    const char *err = wl_io_last_error();
+    const char *err = wirelog_io_last_error();
     if (err && err[0] != '\0') PASS();
     else FAIL("expected non-empty error string");
 }
@@ -90,7 +90,7 @@ static void
 test_null_find(void)
 {
     TEST("find NULL scheme returns NULL");
-    const wl_io_adapter_t *found = wl_io_find_adapter(NULL);
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter(NULL);
     if (found == NULL) PASS();
     else FAIL("expected NULL for NULL scheme");
 }
@@ -99,11 +99,11 @@ static void
 test_null_unregister(void)
 {
     TEST("unregister NULL scheme returns -1");
-    int rc = wl_io_unregister_adapter(NULL);
+    int rc = wirelog_io_unregister_adapter(NULL);
     if (rc != -1) {
         FAIL("expected -1"); return;
     }
-    const char *err = wl_io_last_error();
+    const char *err = wirelog_io_last_error();
     if (err && err[0] != '\0') PASS();
     else FAIL("expected non-empty error string");
 }
@@ -112,11 +112,11 @@ static void
 test_abi_mismatch(void)
 {
     TEST("register adapter with wrong ABI version returns -1");
-    wl_io_adapter_t a;
+    wirelog_io_adapter_t a;
     memset(&a, 0, sizeof(a));
     a.scheme = "mock_bad_abi2";
-    a.abi_version = WL_IO_ABI_VERSION + 99u;
-    int rc = wl_io_register_adapter(&a);
+    a.abi_version = WIRELOG_IO_ABI_VERSION + 99u;
+    int rc = wirelog_io_register_adapter(&a);
     if (rc == -1) PASS();
     else FAIL("expected -1 for ABI mismatch");
 }
@@ -125,22 +125,22 @@ static void
 test_boundary_scheme_length(void)
 {
     TEST("register/find/unregister scheme at max length boundary");
-    wl_io_adapter_t a;
+    wirelog_io_adapter_t a;
     memset(&a, 0, sizeof(a));
     a.scheme = s_long_scheme;        /* 63 chars */
-    a.abi_version = WL_IO_ABI_VERSION;
+    a.abi_version = WIRELOG_IO_ABI_VERSION;
 
-    int rc = wl_io_register_adapter(&a);
+    int rc = wirelog_io_register_adapter(&a);
     if (rc != 0) {
         FAIL("register failed for max-length scheme"); return;
     }
 
-    const wl_io_adapter_t *found = wl_io_find_adapter(s_long_scheme);
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter(s_long_scheme);
     if (found == NULL) {
         FAIL("find failed for max-length scheme"); return;
     }
 
-    rc = wl_io_unregister_adapter(s_long_scheme);
+    rc = wirelog_io_unregister_adapter(s_long_scheme);
     if (rc == 0) PASS();
     else FAIL("unregister failed for max-length scheme");
 }
@@ -153,20 +153,20 @@ test_overlong_scheme_safe(void)
      * strncpy(dst, src, SCHEME_MAX_LEN-1) so it will be truncated to 63 'b'
      * chars.  We just verify the call does not crash (ASan would detect any
      * out-of-bounds write). */
-    wl_io_adapter_t a;
+    wirelog_io_adapter_t a;
     memset(&a, 0, sizeof(a));
     a.scheme = s_overlong_scheme;
-    a.abi_version = WL_IO_ABI_VERSION;
+    a.abi_version = WIRELOG_IO_ABI_VERSION;
 
     /* May succeed or fail (truncated scheme might collide or not), but must
      * not crash or write out of bounds. */
-    int rc = wl_io_register_adapter(&a);
+    int rc = wirelog_io_register_adapter(&a);
     if (rc == 0) {
         /* Clean up: look up by first SCHEME_MAX_LEN-1 chars */
         char truncated[SCHEME_MAX_LEN];
         memset(truncated, 'b', SCHEME_MAX_LEN - 1);
         truncated[SCHEME_MAX_LEN - 1] = '\0';
-        wl_io_unregister_adapter(truncated);
+        wirelog_io_unregister_adapter(truncated);
     }
     /* If rc == -1, that's also fine (duplicate or other error). */
     PASS();
@@ -175,37 +175,37 @@ test_overlong_scheme_safe(void)
 static void
 test_registry_full(void)
 {
-    TEST("register past WL_IO_MAX_ADAPTERS returns -1 with error");
+    TEST("register past WIRELOG_IO_MAX_ADAPTERS returns -1 with error");
 
     /* csv is already registered (slot 0).  Register adapters to fill the
      * remaining 31 slots, then attempt one more. */
-    wl_io_adapter_t adapters[WL_IO_MAX_ADAPTERS];
-    char schemes[WL_IO_MAX_ADAPTERS][16];
+    wirelog_io_adapter_t adapters[WIRELOG_IO_MAX_ADAPTERS];
+    char schemes[WIRELOG_IO_MAX_ADAPTERS][16];
     int registered = 0;
 
-    for (int i = 0; i < WL_IO_MAX_ADAPTERS - 1; i++) {
+    for (int i = 0; i < WIRELOG_IO_MAX_ADAPTERS - 1; i++) {
         snprintf(schemes[i], sizeof(schemes[i]), "fill_%d", i);
         memset(&adapters[i], 0, sizeof(adapters[i]));
         adapters[i].scheme = schemes[i];
-        adapters[i].abi_version = WL_IO_ABI_VERSION;
-        if (wl_io_register_adapter(&adapters[i]) == 0)
+        adapters[i].abi_version = WIRELOG_IO_ABI_VERSION;
+        if (wirelog_io_register_adapter(&adapters[i]) == 0)
             registered++;
     }
 
     /* Try to register one more beyond capacity */
-    wl_io_adapter_t overflow;
+    wirelog_io_adapter_t overflow;
     memset(&overflow, 0, sizeof(overflow));
     overflow.scheme = "overflow_scheme";
-    overflow.abi_version = WL_IO_ABI_VERSION;
-    int rc = wl_io_register_adapter(&overflow);
+    overflow.abi_version = WIRELOG_IO_ABI_VERSION;
+    int rc = wirelog_io_register_adapter(&overflow);
 
     /* Cleanup: unregister all fill_ adapters we registered */
-    for (int i = 0; i < WL_IO_MAX_ADAPTERS - 1; i++) {
+    for (int i = 0; i < WIRELOG_IO_MAX_ADAPTERS - 1; i++) {
         if (adapters[i].scheme)
-            wl_io_unregister_adapter(schemes[i]);
+            wirelog_io_unregister_adapter(schemes[i]);
     }
 
-    if (rc == -1 && registered == WL_IO_MAX_ADAPTERS - 1) PASS();
+    if (rc == -1 && registered == WIRELOG_IO_MAX_ADAPTERS - 1) PASS();
     else if (rc == -1) {
         /* Registry may have been partially filled by prior test state */
         PASS();
@@ -218,7 +218,7 @@ static void
 test_unregister_nonexistent(void)
 {
     TEST("unregister non-existent scheme returns -1");
-    int rc = wl_io_unregister_adapter("scheme_that_was_never_registered");
+    int rc = wirelog_io_unregister_adapter("scheme_that_was_never_registered");
     if (rc == -1) PASS();
     else FAIL("expected -1 for unknown scheme");
 }
@@ -226,21 +226,21 @@ test_unregister_nonexistent(void)
 static void
 test_error_string_after_success(void)
 {
-    TEST("wl_io_last_error() is empty after successful operation");
-    wl_io_adapter_t a;
+    TEST("wirelog_io_last_error() is empty after successful operation");
+    wirelog_io_adapter_t a;
     memset(&a, 0, sizeof(a));
     a.scheme = "mock_err_clear";
-    a.abi_version = WL_IO_ABI_VERSION;
+    a.abi_version = WIRELOG_IO_ABI_VERSION;
 
-    int rc = wl_io_register_adapter(&a);
+    int rc = wirelog_io_register_adapter(&a);
     if (rc != 0) {
         FAIL("register failed unexpectedly"); return;
     }
 
-    const char *err = wl_io_last_error();
+    const char *err = wirelog_io_last_error();
     int ok = (err == NULL || err[0] == '\0');
 
-    wl_io_unregister_adapter("mock_err_clear");
+    wirelog_io_unregister_adapter("mock_err_clear");
 
     if (ok) PASS();
     else FAIL("expected empty error string after success");

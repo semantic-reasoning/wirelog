@@ -14,6 +14,58 @@ during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
 for the full scope.  Entries are filed atomically as the renames land;
 #745 then consolidates the narrative for the GA migration guide.
 
+### I/O adapter framework rename + ABI v2 bump (#762)
+
+The `wirelog/io/io_adapter.h` public-installed header carried
+internal-style `wl_io_*` / `WL_IO_*` prefixes across its entire
+20-symbol surface, contradicting `AGENTS.md:17-20`.  All
+identifiers are renamed and the I/O-adapter ABI version is
+bumped from `1u` to `2u` so plugins compiled against v0.30.0
+fail loud at registration time.
+
+Symbol renames (full surface):
+
+| Old | New |
+|---|---|
+| `wl_io_ctx_t` | `wirelog_io_ctx_t` |
+| `wl_io_adapter_t` | `wirelog_io_adapter_t` |
+| `wl_io_register_adapter` | `wirelog_io_register_adapter` |
+| `wl_io_unregister_adapter` | `wirelog_io_unregister_adapter` |
+| `wl_io_find_adapter` | `wirelog_io_find_adapter` |
+| `wl_io_last_error` | `wirelog_io_last_error` |
+| `wl_io_ctx_relation_name` | `wirelog_io_ctx_relation_name` |
+| `wl_io_ctx_num_cols` | `wirelog_io_ctx_num_cols` |
+| `wl_io_ctx_col_type` | `wirelog_io_ctx_col_type` |
+| `wl_io_ctx_param` | `wirelog_io_ctx_param` |
+| `wl_io_ctx_intern_string` | `wirelog_io_ctx_intern_string` |
+| `wl_io_ctx_platform` | `wirelog_io_ctx_platform` |
+| `wl_io_ctx_set_platform` | `wirelog_io_ctx_set_platform` |
+| `wl_io_plugin_entry_fn` | `wirelog_io_plugin_entry_fn` |
+| `wl_io_plugin_entry` (dlsym key) | `wirelog_io_plugin_entry` |
+| `WL_IO_ABI_VERSION` (1u) | `WIRELOG_IO_ABI_VERSION` (2u) |
+| `WL_IO_MAX_ADAPTERS` | `WIRELOG_IO_MAX_ADAPTERS` |
+| `WL_IO_PLUGIN_ENTRY_SYMBOL` | `WIRELOG_IO_PLUGIN_ENTRY_SYMBOL` |
+| `WL_IO_PLUGIN_EXPORT` | `WIRELOG_IO_PLUGIN_EXPORT` |
+| `WL_IO_USED` | `WIRELOG_IO_USED` |
+
+ABI bump 1u -> 2u: the registration-time check
+(`adapter->abi_version != WIRELOG_IO_ABI_VERSION`) rejects
+v0.30.0 plugins (abi_version == 1u) with a clear diagnostic
+retrievable via `wirelog_io_last_error()`.  Combined with the
+dlsym-symbol rename, v0.30.0 Path-B plugins fail loudly on
+load: `dlsym(handle, "wirelog_io_plugin_entry")` returns NULL
+because the plugin still exports `wl_io_plugin_entry`.
+
+Migration for downstream consumers:
+
+1. Rebuild Path-A consumers (link-time adapter registration)
+   against `WIRELOG_IO_ABI_VERSION = 2u` headers.
+2. Rebuild Path-B plugins (dynamic `dlopen` load) and rename
+   the exported entry symbol from `wl_io_plugin_entry` to
+   `wirelog_io_plugin_entry`.
+3. Textual-rename all source-level `wl_io_*` / `WL_IO_*`
+   references to `wirelog_io_*` / `WIRELOG_IO_*`.
+
 ### wl_easy facade rename + file move (#756)
 
 The `wl_easy` convenience facade carried internal `wl_*`

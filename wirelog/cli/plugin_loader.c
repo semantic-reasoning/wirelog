@@ -24,7 +24,7 @@
 
 typedef struct {
     void *handle;
-    const wl_io_adapter_t *const *adapters;
+    const wirelog_io_adapter_t *const *adapters;
     uint32_t n_adapters;
 } loaded_plugin_t;
 
@@ -59,28 +59,29 @@ wl_plugin_load(const char *path)
     /* Clear any stale dlerror */
     dlerror();
 
-    wl_io_plugin_entry_fn entry =
-        (wl_io_plugin_entry_fn)dlsym(handle, WL_IO_PLUGIN_ENTRY_SYMBOL);
+    wirelog_io_plugin_entry_fn entry =
+        (wirelog_io_plugin_entry_fn)dlsym(handle,
+            WIRELOG_IO_PLUGIN_ENTRY_SYMBOL);
 
     const char *err = dlerror();
     if (err || !entry) {
         fprintf(stderr,
             "error: plugin '%s' missing symbol '%s': %s\n",
-            path, WL_IO_PLUGIN_ENTRY_SYMBOL,
+            path, WIRELOG_IO_PLUGIN_ENTRY_SYMBOL,
             err ? err : "symbol resolved to NULL");
         dlclose(handle);
         return -1;
     }
 
     uint32_t n_out = 0;
-    const wl_io_adapter_t *const *adapters =
-        entry(&n_out, WL_IO_ABI_VERSION);
+    const wirelog_io_adapter_t *const *adapters =
+        entry(&n_out, WIRELOG_IO_ABI_VERSION);
 
     if (!adapters) {
         fprintf(stderr,
             "error: plugin '%s' returned NULL "
             "(ABI version mismatch? host=%u)\n",
-            path, (unsigned)WL_IO_ABI_VERSION);
+            path, (unsigned)WIRELOG_IO_ABI_VERSION);
         dlclose(handle);
         return -1;
     }
@@ -100,17 +101,17 @@ wl_plugin_load(const char *path)
                 path, (unsigned)i);
             continue;
         }
-        if (wl_io_register_adapter(adapters[i]) != 0) {
+        if (wirelog_io_register_adapter(adapters[i]) != 0) {
             fprintf(stderr,
                 "error: plugin '%s' adapter[%u] (%s) "
                 "registration failed: %s\n",
                 path, (unsigned)i,
                 adapters[i]->scheme ? adapters[i]->scheme : "(null)",
-                wl_io_last_error());
+                wirelog_io_last_error());
             /* Fail fast: unregister what we registered and close */
             for (uint32_t j = 0; j < i; j++) {
                 if (adapters[j] && adapters[j]->scheme) {
-                    wl_io_unregister_adapter(adapters[j]->scheme);
+                    wirelog_io_unregister_adapter(adapters[j]->scheme);
                 }
             }
             dlclose(handle);
@@ -137,7 +138,7 @@ wl_plugin_unload_all(void)
         /* Unregister all adapters from this plugin */
         for (uint32_t j = 0; j < p->n_adapters; j++) {
             if (p->adapters[j] && p->adapters[j]->scheme) {
-                wl_io_unregister_adapter(p->adapters[j]->scheme);
+                wirelog_io_unregister_adapter(p->adapters[j]->scheme);
             }
         }
 

@@ -8,7 +8,7 @@
  * Designed to expose data races under TSan (Issue #459).
  *
  * Tests:
- *   1. Concurrent find: N threads repeatedly call wl_io_find_adapter
+ *   1. Concurrent find: N threads repeatedly call wirelog_io_find_adapter
  *   2. Concurrent register/unregister: N threads each own a unique scheme
  *   3. Mixed readers + writers: find and register running simultaneously
  *
@@ -49,7 +49,7 @@ find_worker(void *arg)
     (void)arg;
     for (int i = 0; i < FIND_ITERS; i++) {
         /* csv is the built-in; must always be findable */
-        const wl_io_adapter_t *a = wl_io_find_adapter("csv");
+        const wirelog_io_adapter_t *a = wirelog_io_find_adapter("csv");
         (void)a;
     }
     return NULL;
@@ -67,7 +67,7 @@ test_concurrent_find(void)
         thread_join(&threads[i]);
 
     /* After concurrent reads, csv must still be findable */
-    const wl_io_adapter_t *a = wl_io_find_adapter("csv");
+    const wirelog_io_adapter_t *a = wirelog_io_find_adapter("csv");
     if (a != NULL) PASS();
     else FAIL("csv not found after concurrent reads");
 }
@@ -76,7 +76,7 @@ test_concurrent_find(void)
 
 typedef struct {
     char scheme[32];
-    wl_io_adapter_t adapter;
+    wirelog_io_adapter_t adapter;
     int result;   /* 0 = ok, 1 = error */
 } reg_arg_t;
 
@@ -89,12 +89,12 @@ reg_unreg_worker(void *arg)
      * times.  The registry has 32 slots total; with 8 threads, each holding
      * at most 1 slot at a time, we stay well within capacity. */
     for (int i = 0; i < FIND_ITERS; i++) {
-        int rc = wl_io_register_adapter(&a->adapter);
+        int rc = wirelog_io_register_adapter(&a->adapter);
         if (rc != 0) {
             a->result = 1;
             return NULL;
         }
-        rc = wl_io_unregister_adapter(a->scheme);
+        rc = wirelog_io_unregister_adapter(a->scheme);
         if (rc != 0) {
             a->result = 1;
             return NULL;
@@ -116,7 +116,7 @@ test_concurrent_register_unregister(void)
         snprintf(args[i].scheme, sizeof(args[i].scheme), "conc_%d", i);
         memset(&args[i].adapter, 0, sizeof(args[i].adapter));
         args[i].adapter.scheme = args[i].scheme;
-        args[i].adapter.abi_version = WL_IO_ABI_VERSION;
+        args[i].adapter.abi_version = WIRELOG_IO_ABI_VERSION;
         args[i].result = 0;
         thread_create(&threads[i], reg_unreg_worker, &args[i]);
     }
@@ -141,9 +141,9 @@ mixed_find_worker(void *arg)
 {
     (void)arg;
     for (int i = 0; i < FIND_ITERS; i++) {
-        const wl_io_adapter_t *a = wl_io_find_adapter("csv");
+        const wirelog_io_adapter_t *a = wirelog_io_find_adapter("csv");
         (void)a;
-        a = wl_io_find_adapter("nonexistent_scheme_xyz");
+        a = wirelog_io_find_adapter("nonexistent_scheme_xyz");
         (void)a;
     }
     return NULL;
@@ -154,8 +154,8 @@ mixed_reg_worker(void *arg)
 {
     reg_arg_t *a = (reg_arg_t *)arg;
     for (int i = 0; i < FIND_ITERS; i++) {
-        wl_io_register_adapter(&a->adapter);
-        wl_io_unregister_adapter(a->scheme);
+        wirelog_io_register_adapter(&a->adapter);
+        wirelog_io_unregister_adapter(a->scheme);
     }
     return NULL;
 }
@@ -173,7 +173,7 @@ test_mixed_readers_writers(void)
         snprintf(wargs[i].scheme, sizeof(wargs[i].scheme), "mixed_%d", i);
         memset(&wargs[i].adapter, 0, sizeof(wargs[i].adapter));
         wargs[i].adapter.scheme = wargs[i].scheme;
-        wargs[i].adapter.abi_version = WL_IO_ABI_VERSION;
+        wargs[i].adapter.abi_version = WIRELOG_IO_ABI_VERSION;
         thread_create(&readers[i], mixed_find_worker, NULL);
         thread_create(&writers[i], mixed_reg_worker, &wargs[i]);
     }
@@ -183,7 +183,7 @@ test_mixed_readers_writers(void)
     }
 
     /* Registry must still be consistent: csv findable, no dangling entries */
-    const wl_io_adapter_t *a = wl_io_find_adapter("csv");
+    const wirelog_io_adapter_t *a = wirelog_io_find_adapter("csv");
     if (a != NULL) PASS();
     else FAIL("csv not found after mixed concurrent access");
 }

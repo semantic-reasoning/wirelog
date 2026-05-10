@@ -20,7 +20,7 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  *
  * Wraps wl_csv_read_file / wl_csv_read_file_via_ctx behind the
- * wl_io_adapter_t vtable for auto-registration in the I/O registry.
+ * wirelog_io_adapter_t vtable for auto-registration in the I/O registry.
  *
  * Part of #446 (I/O adapter umbrella).
  */
@@ -45,12 +45,12 @@
 /*
  * The built-in CSV adapter calls wl_intern_put directly (0-based IDs)
  * to stay consistent with the legacy wl_csv_read_file_ex path.
- * External adapters should use wl_io_ctx_intern_string (1-based) instead.
+ * External adapters should use wirelog_io_ctx_intern_string (1-based) instead.
  */
 static int64_t
 csv_intern_trampoline(void *opaque, const char *str)
 {
-    wl_io_ctx_t *ctx = (wl_io_ctx_t *)opaque;
+    wirelog_io_ctx_t *ctx = (wirelog_io_ctx_t *)opaque;
     if (!ctx || !ctx->intern)
         return -1;
     return wl_intern_put(ctx->intern, str);
@@ -61,19 +61,19 @@ csv_intern_trampoline(void *opaque, const char *str)
 /* ======================================================================== */
 
 static int
-csv_read(wl_io_ctx_t *ctx, int64_t **out_data,
+csv_read(wirelog_io_ctx_t *ctx, int64_t **out_data,
     uint32_t *out_nrows, void *user_data)
 {
     (void)user_data;
 
     /* ---- filename (required) ---- */
-    const char *filename = wl_io_ctx_param(ctx, "filename");
+    const char *filename = wirelog_io_ctx_param(ctx, "filename");
     if (!filename)
         return -1;
 
     /* ---- delimiter (default: tab) ---- */
     char delimiter = '\t';
-    const char *delim_str = wl_io_ctx_param(ctx, "delimiter");
+    const char *delim_str = wirelog_io_ctx_param(ctx, "delimiter");
     if (delim_str) {
         if (strcmp(delim_str, "\\t") == 0)
             delimiter = '\t';
@@ -102,10 +102,10 @@ csv_read(wl_io_ctx_t *ctx, int64_t **out_data,
     }
 
     /* ---- check for STRING columns ---- */
-    uint32_t num_cols = wl_io_ctx_num_cols(ctx);
+    uint32_t num_cols = wirelog_io_ctx_num_cols(ctx);
     int has_string = 0;
     for (uint32_t i = 0; i < num_cols; i++) {
-        if (wl_io_ctx_col_type(ctx, i) == WIRELOG_TYPE_STRING) {
+        if (wirelog_io_ctx_col_type(ctx, i) == WIRELOG_TYPE_STRING) {
             has_string = 1;
             break;
         }
@@ -117,7 +117,7 @@ csv_read(wl_io_ctx_t *ctx, int64_t **out_data,
         if (!types)
             return -1;
         for (uint32_t i = 0; i < num_cols; i++)
-            types[i] = wl_io_ctx_col_type(ctx, i);
+            types[i] = wirelog_io_ctx_col_type(ctx, i);
 
         uint32_t out_ncols = 0;
         int rc = wl_csv_read_file_via_ctx(resolved_path, delimiter,
@@ -138,8 +138,8 @@ csv_read(wl_io_ctx_t *ctx, int64_t **out_data,
 /* Adapter Definition                                                       */
 /* ======================================================================== */
 
-const wl_io_adapter_t wl_csv_adapter = {
-    .abi_version = WL_IO_ABI_VERSION,
+const wirelog_io_adapter_t wl_csv_adapter = {
+    .abi_version = WIRELOG_IO_ABI_VERSION,
     .scheme = "csv",
     .description = "Built-in CSV/TSV file reader",
     .read = csv_read,

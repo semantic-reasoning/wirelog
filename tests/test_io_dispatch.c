@@ -74,12 +74,12 @@ static int s_mock_read_called;
 static const char *s_mock_received_key;
 
 static int
-mock_read_cb(wl_io_ctx_t *ctx, int64_t **out_data,
+mock_read_cb(wirelog_io_ctx_t *ctx, int64_t **out_data,
     uint32_t *out_nrows, void *user_data)
 {
     (void)user_data;
     s_mock_read_called = 1;
-    s_mock_received_key = wl_io_ctx_param(ctx, "key");
+    s_mock_received_key = wirelog_io_ctx_param(ctx, "key");
 
     /* Return a single row with one column */
     *out_data = (int64_t *)malloc(sizeof(int64_t));
@@ -168,15 +168,15 @@ test_dispatch_mock_adapter(void)
     s_insert_called = 0;
 
     /* Register mock adapter */
-    wl_io_adapter_t mock = {0};
-    mock.abi_version = WL_IO_ABI_VERSION;
+    wirelog_io_adapter_t mock = {0};
+    mock.abi_version = WIRELOG_IO_ABI_VERSION;
     mock.scheme = "mock";
     mock.description = "test mock adapter";
     mock.read = mock_read_cb;
     mock.validate = NULL;
     mock.user_data = NULL;
 
-    int reg_rc = wl_io_register_adapter(&mock);
+    int reg_rc = wirelog_io_register_adapter(&mock);
     if (reg_rc != 0) {
         FAIL("failed to register mock adapter");
         return;
@@ -188,7 +188,7 @@ test_dispatch_mock_adapter(void)
     struct wirelog_program *prog = make_program("mock", pnames, pvalues, 1);
     if (!prog) {
         FAIL("failed to create program");
-        wl_io_unregister_adapter("mock");
+        wirelog_io_unregister_adapter("mock");
         return;
     }
 
@@ -206,7 +206,7 @@ test_dispatch_mock_adapter(void)
     }
 
     free_program(prog);
-    wl_io_unregister_adapter("mock");
+    wirelog_io_unregister_adapter("mock");
 #else
     SKIP("dispatch rewrite not yet implemented (#458)");
 #endif

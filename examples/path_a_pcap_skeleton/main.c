@@ -22,12 +22,12 @@
 /* ---------- adapter callbacks ---------- */
 
 static int
-pcap_validate(wl_io_ctx_t *ctx, char *errbuf, size_t errbuf_len,
+pcap_validate(wirelog_io_ctx_t *ctx, char *errbuf, size_t errbuf_len,
     void *user_data)
 {
     (void)user_data;
 
-    const char *filename = wl_io_ctx_param(ctx, "filename");
+    const char *filename = wirelog_io_ctx_param(ctx, "filename");
     if (!filename) {
         snprintf(errbuf, errbuf_len, "missing required param 'filename'");
         return -1;
@@ -36,7 +36,7 @@ pcap_validate(wl_io_ctx_t *ctx, char *errbuf, size_t errbuf_len,
 }
 
 static int
-pcap_read(wl_io_ctx_t *ctx, int64_t **out_data, uint32_t *out_nrows,
+pcap_read(wirelog_io_ctx_t *ctx, int64_t **out_data, uint32_t *out_nrows,
     void *user_data)
 {
     (void)ctx;
@@ -54,8 +54,8 @@ pcap_read(wl_io_ctx_t *ctx, int64_t **out_data, uint32_t *out_nrows,
 
 /* ---------- adapter definition ---------- */
 
-static const wl_io_adapter_t pcap_adapter = {
-    .abi_version = WL_IO_ABI_VERSION,
+static const wirelog_io_adapter_t pcap_adapter = {
+    .abi_version = WIRELOG_IO_ABI_VERSION,
     .scheme = "pcap",
     .description = "libpcap file reader (skeleton)",
     .read = pcap_read,
@@ -68,12 +68,12 @@ static const wl_io_adapter_t pcap_adapter = {
 int
 main(void)
 {
-    if (wl_io_register_adapter(&pcap_adapter) != 0) {
-        fprintf(stderr, "register failed: %s\n", wl_io_last_error());
+    if (wirelog_io_register_adapter(&pcap_adapter) != 0) {
+        fprintf(stderr, "register failed: %s\n", wirelog_io_last_error());
         return 1;
     }
 
-    const wl_io_adapter_t *found = wl_io_find_adapter("pcap");
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter("pcap");
     if (!found) {
         fprintf(stderr, "adapter lookup failed\n");
         return 1;
@@ -82,6 +82,6 @@ main(void)
     printf("registered adapter: scheme=%s desc=\"%s\"\n",
         found->scheme, found->description);
 
-    wl_io_unregister_adapter("pcap");
+    wirelog_io_unregister_adapter("pcap");
     return 0;
 }

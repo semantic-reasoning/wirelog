@@ -12,7 +12,7 @@
  * Load adapter plugin(s) from a shared library.
  *
  * Opens the library at `path` via dlopen, resolves the
- * "wl_io_plugin_entry" symbol, validates the ABI version,
+ * "wirelog_io_plugin_entry" symbol, validates the ABI version,
  * and bulk-registers all returned adapters.
  *
  * Returns 0 on success, -1 on error (message printed to stderr).
