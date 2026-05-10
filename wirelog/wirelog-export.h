@@ -10,7 +10,9 @@
 #define WIRELOG_EXPORT_H
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-  #ifdef WIRELOG_BUILDING
+  #if defined(WIRELOG_STATIC)
+    #define WIRELOG_PUBLIC
+  #elif defined(WIRELOG_BUILDING)
     #define WIRELOG_PUBLIC __declspec(dllexport)
   #else
     #define WIRELOG_PUBLIC __declspec(dllimport)
