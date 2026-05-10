@@ -14,6 +14,30 @@ during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
 for the full scope.  Entries are filed atomically as the renames land;
 #745 then consolidates the narrative for the GA migration guide.
 
+### Public-API typedef rename: wl_intern_t -> wirelog_intern_t (#760)
+
+The `wirelog/wirelog.h` umbrella header previously exposed
+`typedef struct wl_intern wl_intern_t;` -- an internal-style
+`wl_*` typedef name on a public installed header.  The struct
+tag (`struct wl_intern`) is internal and stays internal; only
+the typedef name on the public surface changes:
+
+| Old (internal-style on public surface) | New (public conforming) |
+|---|---|
+| `wl_intern_t` (in `wirelog/wirelog.h`) | `wirelog_intern_t` |
+
+`wirelog_program_get_intern()` now returns
+`const wirelog_intern_t *` instead of `const wl_intern_t *`.
+The internal header `wirelog/intern.h` continues to declare
+`typedef struct wl_intern wl_intern_t;` for in-tree callers
+(both names alias the same struct), so internal code is
+unchanged.
+
+Two docstrings in `wirelog/wirelog.h` previously referenced the
+internal helper `wl_dd_load_edb()` by name; they are rephrased
+to refer to "the project's internal EDB-load helper" without
+naming the internal symbol on the public surface.
+
 ### Callback typedef rename (#758)
 
 Public-API callback typedefs lose their internal `wl_*` prefix to
