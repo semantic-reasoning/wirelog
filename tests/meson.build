@@ -423,12 +423,28 @@ test('changelog_format', py3,
             meson.project_source_root() / 'CHANGELOG.md'],
      suite: 'abi')
 
+# Shell interpreter for the abi-suite shell scripts below.  Resolved
+# once and reused; tests that depend on `sh.found()` are gated on
+# the same handle so platforms without bash (e.g. some Windows
+# runners) silently skip both gates instead of failing
+# inconsistently.
+sh = find_program('bash', required: false)
+
+# Issue #772: release-template gate.  Asserts that the GitHub Releases
+# body for the current tag matches the corresponding CHANGELOG section.
+# SKIPs cleanly outside tag-triggered CI context (PR builds, main
+# branch); enforces inside the release-tag.yml workflow (#749 B19).
+if sh.found()
+  test('release_template', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-release-template.sh'],
+       suite: 'abi')
+endif
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss
 # of an exported symbol fails the gate.  Linux/ELF-focused; SKIPs
 # cleanly on platforms without `libwirelog.so` (Windows, static-only).
-sh = find_program('bash', required: false)
 if sh.found()
   test('abi_symbols', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols.sh',
