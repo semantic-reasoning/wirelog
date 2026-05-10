@@ -195,7 +195,7 @@ wirelog_session_step(wirelog_session_t *session);
  */
 wirelog_error_t
 wirelog_session_set_delta_cb(wirelog_session_t *session,
-    wl_on_delta_fn callback, void *user_data);
+    wirelog_on_delta_fn callback, void *user_data);
 
 /**
  * wirelog_session_snapshot:
@@ -212,7 +212,8 @@ wirelog_session_set_delta_cb(wirelog_session_t *session,
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
 wirelog_error_t
-wirelog_session_snapshot(wirelog_session_t *session, wl_on_tuple_fn callback,
+wirelog_session_snapshot(wirelog_session_t *session,
+    wirelog_on_tuple_fn callback,
     void *user_data);
 
 /**

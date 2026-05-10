@@ -764,7 +764,7 @@ typedef struct wl_col_session_t {
     uint32_t *rel_hash_next;      /* owned collision chain pointers           */
     uint32_t rel_hash_nbuckets;   /* current bucket count (power of 2)       */
     uint32_t rel_hash_chain_cap;  /* allocated capacity of rel_hash_next[]  */
-    wl_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
+    wirelog_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
     void *delta_data;          /* opaque user context for delta_cb       */
     wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
     col_mat_cache_t mat_cache; /* materialization cache (US-006)        */

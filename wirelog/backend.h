@@ -33,7 +33,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 
-/* wl_on_tuple_fn / wl_on_delta_fn now live in wirelog-types.h (single source of truth). */
+/* wirelog_on_tuple_fn / wirelog_on_delta_fn now live in wirelog-types.h (single source of truth). */
 
 /**
  * wl_session_t:
@@ -80,10 +80,11 @@ typedef struct {
 
     int (*session_step)(wl_session_t *session);
 
-    void (*session_set_delta_cb)(wl_session_t *session, wl_on_delta_fn callback,
+    void (*session_set_delta_cb)(wl_session_t *session,
+        wirelog_on_delta_fn callback,
         void *user_data);
 
-    int (*session_snapshot)(wl_session_t *session, wl_on_tuple_fn callback,
+    int (*session_snapshot)(wl_session_t *session, wirelog_on_tuple_fn callback,
         void *user_data);
 } wl_compute_backend_t;
 

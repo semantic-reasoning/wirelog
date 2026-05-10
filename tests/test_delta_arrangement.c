@@ -40,29 +40,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Private session mirror (partial)
@@ -79,7 +79,7 @@ static int fail_count = 0;
  *   col_rel_t    **rels          (8)
  *   uint32_t       nrels         (4)
  *   uint32_t       rel_cap       (4)
- *   wl_on_delta_fn delta_cb      (8)  -- function pointer
+ *   wirelog_on_delta_fn delta_cb      (8)  -- function pointer
  *   void          *delta_data    (8)
  *   wl_arena_t    *eval_arena    (8)
  *   col_mat_cache_t mat_cache    (sizeof(col_mat_cache_t))
@@ -132,7 +132,7 @@ count_cb(const char *rel, const int64_t *row, uint32_t nc, void *u)
 
 static int
 run_program(const char *src, const char *rel, int64_t *out_count,
-            uint32_t *out_iters, wl_session_t **out_sess_keep)
+    uint32_t *out_iters, wl_session_t **out_sess_keep)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -201,12 +201,12 @@ test_delta_arr_tc_3edge(void)
     TEST("TC 3-edge: delta arrangement probe produces 6 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 3). r(3, 4).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 3). r(3, 4).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     ASSERT(run_program(src, "r", &count, NULL, NULL) == 0,
-           "TC 3-edge program failed");
+        "TC 3-edge program failed");
     ASSERT(count == 6, "expected 6 tuples from 3-edge TC");
 
     PASS();
@@ -224,12 +224,12 @@ test_delta_arr_tc_2cycle(void)
     TEST("TC 2-cycle: delta arrangement self-join = 4 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 1).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 1).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     ASSERT(run_program(src, "r", &count, NULL, NULL) == 0,
-           "2-cycle program failed");
+        "2-cycle program failed");
     ASSERT(count == 4, "expected 4 tuples from 2-cycle TC");
 
     PASS();
@@ -249,15 +249,15 @@ test_delta_arr_5node_chain(void)
     TEST("5-node chain: stale delta detected and rebuilt, 10 tuples");
 
     const char *src = ".decl e(x: int32, y: int32)\n"
-                      "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- e(x, y).\n"
-                      "reach(x, z) :- reach(x, y), reach(y, z).\n";
+        "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- e(x, y).\n"
+        "reach(x, z) :- reach(x, y), reach(y, z).\n";
 
     int64_t count = 0;
     uint32_t iters = 0;
     ASSERT(run_program(src, "reach", &count, &iters, NULL) == 0,
-           "5-node chain program failed");
+        "5-node chain program failed");
     ASSERT(count == 10, "expected 10 tuples from 5-node chain");
     ASSERT(iters >= 2, "5-node chain needs at least 2 iterations");
 
@@ -276,14 +276,14 @@ test_delta_arr_complete_graph_dedup(void)
     TEST("Complete 3-node graph: delta arrangement dedup = 9 tuples (KI-1)");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 1). r(1, 3). r(3, 1). r(2, 3). r(3, 2).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 1). r(1, 3). r(3, 1). r(2, 3). r(3, 2).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     ASSERT(run_program(src, "r", &count, NULL, NULL) == 0,
-           "complete-graph program failed");
+        "complete-graph program failed");
     ASSERT(count == 9,
-           "expected 9 tuples (KI-1 regression check with delta arrangement)");
+        "expected 9 tuples (KI-1 regression check with delta arrangement)");
 
     PASS();
 }
@@ -304,18 +304,18 @@ test_delta_arr_worker_isolation(void)
     TEST("Worker isolation: main session darr_count == 0 after evaluation");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 3). r(3, 4).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 3). r(3, 4).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     wl_session_t *sess = NULL;
     int64_t count = 0;
     ASSERT(run_program(src, "r", &count, NULL, &sess) == 0,
-           "TC 3-edge program failed");
+        "TC 3-edge program failed");
     ASSERT(count == 6, "expected 6 tuples");
 
     uint32_t darr_count = col_session_get_darr_count(sess);
     ASSERT(darr_count == 0,
-           "darr_count must be 0 on main session: delta caches are per-worker");
+        "darr_count must be 0 on main session: delta caches are per-worker");
 
     wl_session_destroy(sess);
     PASS();

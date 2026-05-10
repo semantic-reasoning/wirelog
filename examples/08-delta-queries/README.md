@@ -66,7 +66,7 @@ or retracted (diff = -1) when `wl_easy_step()` is called.
 ### 2. Callback Signature
 
 ```c
-typedef void (*wl_on_delta_fn)(
+typedef void (*wirelog_on_delta_fn)(
     const char *relation,  /* output relation name     */
     const int64_t *row,    /* column values (IDs)      */
     uint32_t ncols,        /* number of columns        */

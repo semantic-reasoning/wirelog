@@ -4,6 +4,20 @@ All notable changes to wirelog are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Callback typedefs renamed for v1.0 prefix conformance** (#758): the
+  public-API callback typedefs `wl_on_delta_fn` and `wl_on_tuple_fn`
+  in `wirelog/wirelog-types.h` are renamed to `wirelog_on_delta_fn` and
+  `wirelog_on_tuple_fn` respectively, matching the `AGENTS.md:17-20`
+  rule that public typedefs use the `wirelog_` prefix.  Source-
+  incompatible for downstream consumers of the
+  `wirelog_session_set_delta_cb` / `wirelog_session_snapshot` /
+  `wl_easy_set_delta_cb` / `wl_easy_snapshot` parameter types.  Migrate
+  via a textual rename; no signature change.  Tracked under
+  `docs/MIGRATION.md` 0.30 -> 1.0 section.  Part of public-API prefix
+  audit epic #755.
+
 ### Performance
 
 - **CRDT W=8 -6.3% via leading-key cache in compact_runs heap** (PR #731): the K-way merge in `col_rel_compact_runs` now shadows the leading column with a stack-resident `int64_t lead_key[]` array parallel to the heap entries; the inner sift-down comparator short-circuits on column 0 instead of indirecting through `col_rel_row_cmp` for every comparison. CRDT W=8 5-rep median moves from 19.43s to 18.20s (-6.3%); first time `W=8 < W=1` on the dev box. No row-layout change, no sort-algorithm change, no public-header surface impact. Cross-workload (DOOP / CSPA / Polonius / Galen / DDISASM) tuple counts and gold relations preserved.

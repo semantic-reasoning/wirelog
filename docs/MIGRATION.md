@@ -7,6 +7,33 @@ steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
 
+## 0.30 -> 1.0
+
+This section accumulates the API renames and behaviour pins landing
+during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
+for the full scope.  Entries are filed atomically as the renames land;
+#745 then consolidates the narrative for the GA migration guide.
+
+### Callback typedef rename (#758)
+
+Public-API callback typedefs lose their internal `wl_*` prefix to
+match `AGENTS.md:17-20`:
+
+| Old (internal-style) | New (public conforming) |
+|---|---|
+| `wl_on_delta_fn` | `wirelog_on_delta_fn` |
+| `wl_on_tuple_fn` | `wirelog_on_tuple_fn` |
+
+Both typedefs live in `wirelog/wirelog-types.h` and are consumed by
+`wirelog/wirelog-advanced.h` (`wirelog_session_set_delta_cb`,
+`wirelog_session_snapshot`) and `wirelog/wl_easy.h`
+(`wl_easy_set_delta_cb`, `wl_easy_snapshot`).  Function-pointer
+parameter declarations rename to the new typedef names; the function
+signatures are otherwise unchanged.  Source-incompatible; existing
+callers update via a textual rename.
+
+---
+
 ## Compound Terms and RDF Named Graphs (Issue #530 / #535)
 
 Wirelog gains two additive features in this release. Both are strictly

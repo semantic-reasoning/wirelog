@@ -89,7 +89,7 @@ wl_session_step(wl_session_t *session)
 }
 
 void
-wl_session_set_delta_cb(wl_session_t *session, wl_on_delta_fn callback,
+wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     void *user_data)
 {
     if (!session || !session->backend
@@ -99,7 +99,7 @@ wl_session_set_delta_cb(wl_session_t *session, wl_on_delta_fn callback,
 }
 
 int
-wl_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
+wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data)
 {
     if (!session || !session->backend || !session->backend->session_snapshot)

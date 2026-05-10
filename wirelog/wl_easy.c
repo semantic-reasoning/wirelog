@@ -358,7 +358,8 @@ wl_easy_step(wl_easy_session_t *s)
 }
 
 wirelog_error_t
-wl_easy_set_delta_cb(wl_easy_session_t *s, wl_on_delta_fn cb, void *user_data)
+wl_easy_set_delta_cb(wl_easy_session_t *s, wirelog_on_delta_fn cb,
+    void *user_data)
 {
     if (!s)
         return WIRELOG_ERR_EXEC;
@@ -444,7 +445,7 @@ wl_easy_banner(const char *label)
 
 typedef struct {
     const char *wanted;
-    wl_on_tuple_fn user_cb;
+    wirelog_on_tuple_fn user_cb;
     void *user_data;
 } wl_easy_snapshot_filter_t;
 
@@ -462,7 +463,8 @@ snapshot_trampoline(const char *relation, const int64_t *row, uint32_t ncols,
 }
 
 wirelog_error_t
-wl_easy_snapshot(wl_easy_session_t *s, const char *relation, wl_on_tuple_fn cb,
+wl_easy_snapshot(wl_easy_session_t *s, const char *relation,
+    wirelog_on_tuple_fn cb,
     void *user_data)
 {
     if (!s || !relation || !cb)

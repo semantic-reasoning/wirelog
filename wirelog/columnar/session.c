@@ -2144,7 +2144,7 @@ col_session_step(wl_session_t *session)
  * @param user_data: Opaque pointer passed through to callback
  */
 static void
-col_session_set_delta_cb(wl_session_t *session, wl_on_delta_fn callback,
+col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     void *user_data)
 {
     if (!session)
@@ -2174,7 +2174,7 @@ col_session_set_delta_cb(wl_session_t *session, wl_on_delta_fn callback,
  * @return 0 on success, EINVAL if session/callback NULL, non-zero on eval error
  */
 static int
-col_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
+col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data)
 {
     if (!session || !callback)
