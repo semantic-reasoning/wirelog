@@ -75,7 +75,7 @@ typedef struct {
     fpga_rel_t *relations;
     uint32_t rel_count;
     uint32_t rel_cap;
-    wl_on_delta_fn delta_cb;
+    wirelog_on_delta_fn delta_cb;
     void *delta_user_data;
 } wl_fpga_session_t;
 
@@ -947,7 +947,7 @@ fpga_session_remove(wl_session_t *session, const char *relation,
 }
 
 static void
-fpga_session_set_delta_cb(wl_session_t *session, wl_on_delta_fn callback,
+fpga_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     void *user_data)
 {
     wl_fpga_session_t *s = (wl_fpga_session_t *)session;
@@ -1112,7 +1112,7 @@ fpga_session_step(wl_session_t *session)
 }
 
 static int
-fpga_session_snapshot(wl_session_t *session, wl_on_tuple_fn callback,
+fpga_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data)
 {
     wl_fpga_session_t *s = (wl_fpga_session_t *)session;

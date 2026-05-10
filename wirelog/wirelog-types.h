@@ -130,7 +130,7 @@ typedef bool wirelog_bool_t;
 /* ======================================================================== */
 
 /**
- * wl_on_tuple_fn:
+ * wirelog_on_tuple_fn:
  *
  * Callback invoked once per computed output tuple.
  *
@@ -139,11 +139,11 @@ typedef bool wirelog_bool_t;
  * @ncols:     Number of columns in the row.
  * @user_data: Opaque pointer passed through from the caller.
  */
-typedef void (*wl_on_tuple_fn)(const char *relation, const int64_t *row,
+typedef void (*wirelog_on_tuple_fn)(const char *relation, const int64_t *row,
     uint32_t ncols, void *user_data);
 
 /**
- * wl_on_delta_fn:
+ * wirelog_on_delta_fn:
  *
  * Callback invoked when a tuple is inserted/removed in an incremental session.
  *
@@ -153,7 +153,7 @@ typedef void (*wl_on_tuple_fn)(const char *relation, const int64_t *row,
  * @diff:      +1 for insertion, -1 for removal.
  * @user_data: Opaque pointer passed through from the caller.
  */
-typedef void (*wl_on_delta_fn)(const char *relation, const int64_t *row,
+typedef void (*wirelog_on_delta_fn)(const char *relation, const int64_t *row,
     uint32_t ncols, int32_t diff, void *user_data);
 
 /* ======================================================================== */

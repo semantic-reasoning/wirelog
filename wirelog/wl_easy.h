@@ -280,7 +280,8 @@ wl_easy_step(wl_easy_session_t *s);
  * plan/session build failure.  A NULL @s returns WIRELOG_ERR_EXEC.
  */
 wirelog_error_t
-wl_easy_set_delta_cb(wl_easy_session_t *s, wl_on_delta_fn cb, void *user_data);
+wl_easy_set_delta_cb(wl_easy_session_t *s, wirelog_on_delta_fn cb,
+    void *user_data);
 
 /**
  * wl_easy_print_delta:
@@ -331,7 +332,8 @@ wl_easy_banner(const char *label);
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
 wirelog_error_t
-wl_easy_snapshot(wl_easy_session_t *s, const char *relation, wl_on_tuple_fn cb,
+wl_easy_snapshot(wl_easy_session_t *s, const char *relation,
+    wirelog_on_tuple_fn cb,
     void *user_data);
 
 #ifdef __cplusplus
