@@ -1,5 +1,5 @@
 # examples/10-recursive-under-update/meson.build
-# Transitive Closure demo using the wl_easy facade (#443)
+# Transitive Closure demo using the wirelog_easy facade (#443)
 #
 # Include all wirelog sources directly (same pattern as example 08/09 and
 # wirelog_cli) to ensure proper linking under LTO.

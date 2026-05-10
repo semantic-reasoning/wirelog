@@ -1,5 +1,5 @@
 # examples/08-delta-queries/meson.build
-# Delta Queries demo using the wl_easy facade (#441)
+# Delta Queries demo using the wirelog_easy facade (#441)
 #
 # Include all wirelog sources directly (same pattern as wirelog_cli) to
 # ensure proper linking under LTO. Linking against wirelog_static_lib fails

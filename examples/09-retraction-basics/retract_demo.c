@@ -52,7 +52,7 @@ typedef struct {
 #define MAX_BUFFER 16
 
 typedef struct {
-    wl_easy_session_t *sess;
+    wirelog_easy_session_t *sess;
     buffered_delta_t buf[MAX_BUFFER];
     int n;
     int minus_mutual_count;
@@ -104,7 +104,7 @@ flush_sorted(demo_ctx_t *ctx)
     qsort(ctx->buf, (size_t)ctx->n, sizeof(ctx->buf[0]), delta_compare);
     for (int i = 0; i < ctx->n; i++) {
         buffered_delta_t *b = &ctx->buf[i];
-        wl_easy_print_delta(b->relation, b->row, 2, b->diff, ctx->sess);
+        wirelog_easy_print_delta(b->relation, b->row, 2, b->diff, ctx->sess);
     }
     ctx->n = 0;
 }
@@ -112,7 +112,7 @@ flush_sorted(demo_ctx_t *ctx)
 #define CHECK(expr, msg) do { \
             if ((expr) != WIRELOG_OK) { \
                 fprintf(stderr, "%s\n", msg); \
-                wl_easy_close(s); \
+                wirelog_easy_close(s); \
                 return 1; \
             } \
 } while (0)
@@ -123,42 +123,42 @@ main(void)
     printf("Example 09: Retraction Basics (-1 deltas)\n");
     printf("=========================================\n");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(FRIENDSHIP_SRC, &s) != WIRELOG_OK) {
-        fprintf(stderr, "wl_easy_open failed\n");
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(FRIENDSHIP_SRC, &s) != WIRELOG_OK) {
+        fprintf(stderr, "wirelog_easy_open failed\n");
         return 1;
     }
 
     demo_ctx_t ctx = { .sess = s, .n = 0, .minus_mutual_count = 0 };
-    CHECK(wl_easy_set_delta_cb(s, on_delta_wrapper, &ctx),
-        "wl_easy_set_delta_cb failed");
+    CHECK(wirelog_easy_set_delta_cb(s, on_delta_wrapper, &ctx),
+        "wirelog_easy_set_delta_cb failed");
 
-    (void)wl_easy_intern(s, "alice");
-    (void)wl_easy_intern(s, "bob");
-    (void)wl_easy_intern(s, "carol");
+    (void)wirelog_easy_intern(s, "alice");
+    (void)wirelog_easy_intern(s, "bob");
+    (void)wirelog_easy_intern(s, "carol");
 
     /* ---- Step 1 ---- */
-    wl_easy_banner("step 1: alice <-> bob");
-    CHECK(wl_easy_insert_sym(s, "friend", "alice", "bob", NULL),
+    wirelog_easy_banner("step 1: alice <-> bob");
+    CHECK(wirelog_easy_insert_sym(s, "friend", "alice", "bob", NULL),
         "insert friend(alice,bob) failed");
-    CHECK(wl_easy_insert_sym(s, "friend", "bob", "alice", NULL),
+    CHECK(wirelog_easy_insert_sym(s, "friend", "bob", "alice", NULL),
         "insert friend(bob,alice) failed");
-    CHECK(wl_easy_step(s), "step 1 failed");
+    CHECK(wirelog_easy_step(s), "step 1 failed");
     flush_sorted(&ctx);
 
     /* ---- Step 2 ---- */
-    wl_easy_banner("step 2: one-way alice -> carol");
-    CHECK(wl_easy_insert_sym(s, "friend", "alice", "carol", NULL),
+    wirelog_easy_banner("step 2: one-way alice -> carol");
+    CHECK(wirelog_easy_insert_sym(s, "friend", "alice", "carol", NULL),
         "insert friend(alice,carol) failed");
-    CHECK(wl_easy_step(s), "step 2 failed");
+    CHECK(wirelog_easy_step(s), "step 2 failed");
     flush_sorted(&ctx);
 
     /* ---- Step 3 ---- */
-    wl_easy_banner("step 3: bob unfriends alice");
+    wirelog_easy_banner("step 3: bob unfriends alice");
     int before = ctx.minus_mutual_count;
-    CHECK(wl_easy_remove_sym(s, "friend", "bob", "alice", NULL),
+    CHECK(wirelog_easy_remove_sym(s, "friend", "bob", "alice", NULL),
         "remove friend(bob,alice) failed");
-    CHECK(wl_easy_step(s), "step 3 failed");
+    CHECK(wirelog_easy_step(s), "step 3 failed");
     flush_sorted(&ctx);
     int step3_minus = ctx.minus_mutual_count - before;
 
@@ -168,10 +168,10 @@ main(void)
         fprintf(stderr,
             "ASSERTION FAILED: expected 2 '-1' deltas on mutual in step 3, got %d\n",
             step3_minus);
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return 2;
     }
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     return 0;
 }

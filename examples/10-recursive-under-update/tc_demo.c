@@ -53,7 +53,7 @@ typedef struct {
 #define MAX_BUFFER 32
 
 typedef struct {
-    wl_easy_session_t *sess;
+    wirelog_easy_session_t *sess;
     buffered_delta_t buf[MAX_BUFFER];
     int n;
     int plus_reach;
@@ -110,7 +110,7 @@ flush_sorted(demo_ctx_t *ctx)
     qsort(ctx->buf, (size_t)ctx->n, sizeof(ctx->buf[0]), delta_compare);
     for (int i = 0; i < ctx->n; i++) {
         buffered_delta_t *b = &ctx->buf[i];
-        wl_easy_print_delta(b->relation, b->row, 2, b->diff, ctx->sess);
+        wirelog_easy_print_delta(b->relation, b->row, 2, b->diff, ctx->sess);
     }
     ctx->n = 0;
 }
@@ -118,7 +118,7 @@ flush_sorted(demo_ctx_t *ctx)
 #define CHECK(expr, msg) do { \
             if ((expr) != WIRELOG_OK) { \
                 fprintf(stderr, "%s\n", msg); \
-                wl_easy_close(s); \
+                wirelog_easy_close(s); \
                 return 1; \
             } \
 } while (0)
@@ -128,7 +128,7 @@ flush_sorted(demo_ctx_t *ctx)
                 fprintf(stderr, \
                     "ASSERTION FAILED: %s: expected %d, got %d\n", \
                     label, expected, actual); \
-                wl_easy_close(s); \
+                wirelog_easy_close(s); \
                 return 2; \
             } \
 } while (0)
@@ -139,56 +139,56 @@ main(void)
     printf("Example 10: Recursive Under Update (Transitive Closure)\n");
     printf("=======================================================\n");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(TC_SRC, &s) != WIRELOG_OK) {
-        fprintf(stderr, "wl_easy_open failed\n");
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(TC_SRC, &s) != WIRELOG_OK) {
+        fprintf(stderr, "wirelog_easy_open failed\n");
         return 1;
     }
 
     demo_ctx_t ctx = { .sess = s, .n = 0, .plus_reach = 0, .minus_reach = 0 };
-    CHECK(wl_easy_set_delta_cb(s, on_delta_wrapper, &ctx),
-        "wl_easy_set_delta_cb failed");
+    CHECK(wirelog_easy_set_delta_cb(s, on_delta_wrapper, &ctx),
+        "wirelog_easy_set_delta_cb failed");
 
     /* Pre-intern symbols for deterministic intern IDs. */
-    (void)wl_easy_intern(s, "a");
-    (void)wl_easy_intern(s, "b");
-    (void)wl_easy_intern(s, "c");
-    (void)wl_easy_intern(s, "d");
+    (void)wirelog_easy_intern(s, "a");
+    (void)wirelog_easy_intern(s, "b");
+    (void)wirelog_easy_intern(s, "c");
+    (void)wirelog_easy_intern(s, "d");
 
     /* ---- Step 1: Insert edges a->b->c->d ---- */
-    wl_easy_banner("step 1: insert edges a->b->c->d");
-    CHECK(wl_easy_insert_sym(s, "edge", "a", "b", NULL),
+    wirelog_easy_banner("step 1: insert edges a->b->c->d");
+    CHECK(wirelog_easy_insert_sym(s, "edge", "a", "b", NULL),
         "insert edge(a,b) failed");
-    CHECK(wl_easy_insert_sym(s, "edge", "b", "c", NULL),
+    CHECK(wirelog_easy_insert_sym(s, "edge", "b", "c", NULL),
         "insert edge(b,c) failed");
-    CHECK(wl_easy_insert_sym(s, "edge", "c", "d", NULL),
+    CHECK(wirelog_easy_insert_sym(s, "edge", "c", "d", NULL),
         "insert edge(c,d) failed");
-    CHECK(wl_easy_step(s), "step 1 failed");
+    CHECK(wirelog_easy_step(s), "step 1 failed");
     flush_sorted(&ctx);
     ASSERT_DELTAS("step 1 +reach", ctx.plus_reach, 6);
 
     /* ---- Step 2: Remove edge(b,c) ---- */
     ctx.plus_reach = 0;
     ctx.minus_reach = 0;
-    wl_easy_banner("step 2: remove edge(b,c)");
-    CHECK(wl_easy_remove_sym(s, "edge", "b", "c", NULL),
+    wirelog_easy_banner("step 2: remove edge(b,c)");
+    CHECK(wirelog_easy_remove_sym(s, "edge", "b", "c", NULL),
         "remove edge(b,c) failed");
-    CHECK(wl_easy_step(s), "step 2 failed");
+    CHECK(wirelog_easy_step(s), "step 2 failed");
     flush_sorted(&ctx);
     ASSERT_DELTAS("step 2 -reach", ctx.minus_reach, 4);
 
     /* ---- Step 3: Re-insert edge(b,c) ---- */
     ctx.plus_reach = 0;
     ctx.minus_reach = 0;
-    wl_easy_banner("step 3: re-insert edge(b,c)");
-    CHECK(wl_easy_insert_sym(s, "edge", "b", "c", NULL),
+    wirelog_easy_banner("step 3: re-insert edge(b,c)");
+    CHECK(wirelog_easy_insert_sym(s, "edge", "b", "c", NULL),
         "re-insert edge(b,c) failed");
-    CHECK(wl_easy_step(s), "step 3 failed");
+    CHECK(wirelog_easy_step(s), "step 3 failed");
     flush_sorted(&ctx);
     ASSERT_DELTAS("step 3 +reach", ctx.plus_reach, 4);
 
     printf("\nDone.\n");
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     return 0;
 }

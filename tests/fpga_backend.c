@@ -16,7 +16,7 @@
  *    LFTJ, and EXCHANGE operators.  Non-columnar backends must skip these
  *    (ops >= WL_PLAN_OP__BACKEND_START).
  *
- * 2. wl_easy.h hardcodes the columnar backend via wl_backend_columnar().
+ * 2. wirelog-easy.h hardcodes the columnar backend via wl_backend_columnar().
  *    Alternative backends require manual wl_session_create() calls.
  *
  * 3. Expression opcode coverage: only arithmetic and comparison opcodes

@@ -19,14 +19,14 @@ die() {
 
 [ -f "$HEADER" ] || die "header not found: $HEADER"
 
-ALLOWED='#include[[:space:]]*"wirelog/(wirelog\.h|wirelog-types\.h|wirelog-parser\.h|wirelog-ir\.h|wirelog-optimizer\.h|wirelog-export\.h|wl_easy\.h|wirelog-advanced\.h|io/io_adapter\.h)"[[:space:]]*$'
+ALLOWED='#include[[:space:]]*"wirelog/(wirelog\.h|wirelog-types\.h|wirelog-parser\.h|wirelog-ir\.h|wirelog-optimizer\.h|wirelog-export\.h|wirelog_easy\.h|wirelog-advanced\.h|io/io_adapter\.h)"[[:space:]]*$'
 
 quoted_includes=$(grep -nE '^[[:space:]]*#include[[:space:]]*"' "$HEADER" || true)
 suspicious=$(printf '%s\n' "$quoted_includes" | grep -vE "$ALLOWED" || true)
 
 if [ -n "$suspicious" ]; then
     printf 'check-advanced-header: internal or unlisted header in public surface:\n%s\n' "$suspicious" >&2
-    printf '\nallowed quoted includes (allowlist):\n  wirelog/wirelog.h\n  wirelog/wirelog-types.h\n  wirelog/wirelog-parser.h\n  wirelog/wirelog-ir.h\n  wirelog/wirelog-optimizer.h\n  wirelog/wirelog-export.h\n  wirelog/wl_easy.h\n  wirelog/wirelog-advanced.h\n  wirelog/io/io_adapter.h\n' >&2
+    printf '\nallowed quoted includes (allowlist):\n  wirelog/wirelog.h\n  wirelog/wirelog-types.h\n  wirelog/wirelog-parser.h\n  wirelog/wirelog-ir.h\n  wirelog/wirelog-optimizer.h\n  wirelog/wirelog-export.h\n  wirelog/wirelog-easy.h\n  wirelog/wirelog-advanced.h\n  wirelog/io/io_adapter.h\n' >&2
     exit 1
 fi
 

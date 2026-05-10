@@ -25,10 +25,10 @@
  * @file wirelog-advanced.h
  *
  * Fine-grained session API.  This header is the public counterpart to the
- * convenience facade in <wirelog/wl_easy.h>: it lets a host pick the
+ * convenience facade in <wirelog/wirelog-easy.h>: it lets a host pick the
  * compute backend, the worker count, and drive the session through the
  * same insert / remove / step / snapshot / set_delta_cb / make_compound
- * surface that wl_easy wraps.
+ * surface that wirelog_easy wraps.
  *
  * Status: Current.  The signatures and semantics here are stable for the
  * 0.x series and are intended to freeze at 1.0; see docs/SEMANTICS.md and
@@ -36,7 +36,7 @@
  *
  * The internal wl_session_* primitives in wirelog/session.h are not part
  * of the installed public surface and may change without notice between
- * minor releases.  External users must use this header (or wl_easy.h).
+ * minor releases.  External users must use this header (or wirelog-easy.h).
  */
 
 #ifndef WIRELOG_ADVANCED_H
@@ -102,7 +102,7 @@ typedef enum {
  *
  * Build the execution plan, instantiate the chosen backend, and seed
  * any inline `.dl` facts declared in @program into the session as base
- * rows (the same contract documented for wl_easy_open in #718 — see
+ * rows (the same contract documented for wirelog_easy_open in #718 — see
  * docs/SEMANTICS.md "Inline `.dl` facts").  All work happens before
  * this call returns; there is no lazy-build path on the advanced API.
  *
@@ -204,7 +204,7 @@ wirelog_session_set_delta_cb(wirelog_session_t *session,
  * @user_data: Opaque user data passed to @callback.
  *
  * Evaluate the current state and forward every IDB tuple to @callback.
- * Like wl_easy_snapshot(), this is an *evaluating* call; do NOT mix
+ * Like wirelog_easy_snapshot(), this is an *evaluating* call; do NOT mix
  * with wirelog_session_step() on the same insert batch (step() and
  * snapshot() each derive IDB rows independently and combining them
  * produces duplicates).

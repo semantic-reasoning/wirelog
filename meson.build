@@ -255,7 +255,7 @@ wirelog_public_headers = [
   'wirelog/wirelog-ir.h',
   'wirelog/wirelog-optimizer.h',
   'wirelog/wirelog-export.h',
-  'wirelog/wl_easy.h',
+  'wirelog/wirelog-easy.h',
   'wirelog/wirelog-advanced.h',
 ]
 

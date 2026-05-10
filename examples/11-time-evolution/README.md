@@ -2,7 +2,7 @@
 
 ## Overview
 
-Each `wl_easy_step()` call is one tick of logical time.  Only deltas
+Each `wirelog_easy_step()` call is one tick of logical time.  Only deltas
 produced *during that step* are reported to the delta callback -- tuples
 derived in earlier steps are never re-emitted.
 
@@ -50,7 +50,7 @@ Done.
   not the epoch-1 alerts `alert("e1")` and `alert("e3")`.
 - **Insert-only monotone growth** -- no retraction is used; the fact set
   grows monotonically across steps.
-- **Discrete time model** -- each `wl_easy_step()` advances logical time
+- **Discrete time model** -- each `wirelog_easy_step()` advances logical time
   by one tick.  Facts inserted between steps are batched into the next
   step.
 
@@ -65,4 +65,4 @@ Done.
 - `examples/08-delta-queries/` -- single-step delta introduction
 - `examples/09-retraction-basics/` -- retraction deltas
 - `examples/10-recursive-under-update/` -- recursive transitive closure
-- `wirelog/wl_easy.h` -- convenience facade API
+- `wirelog/wirelog-easy.h` -- convenience facade API

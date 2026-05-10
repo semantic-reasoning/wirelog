@@ -11,8 +11,8 @@ rotation lifecycle with a side compound declaration and the public
 This example shows the daemon pattern using only the installed public API:
 
 - keep a caller-owned copy of long-lived EDB facts
-- stream new facts through `wl_easy_insert`
-- consume changes through `wl_easy_set_delta_cb` and `wl_easy_step`
+- stream new facts through `wirelog_easy_insert`
+- consume changes through `wirelog_easy_set_delta_cb` and `wirelog_easy_step`
 - rotate by closing the old session, opening a new one, and replaying the EDB
 - log operator-visible lifecycle data to `stderr`
 
@@ -126,4 +126,4 @@ The exact RSS value depends on platform and allocator state.
 - `docs/COMPOUND_TERMS.md` -- compound term storage and arena lifecycle
 - `examples/08-delta-queries/` -- first delta-callback example
 - `examples/11-time-evolution/` -- per-epoch delta isolation
-- `wirelog/wl_easy.h` -- public convenience facade
+- `wirelog/wirelog-easy.h` -- public convenience facade

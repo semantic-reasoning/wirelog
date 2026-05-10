@@ -20,11 +20,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  *
  * Runs the same access-control Datalog program through both
- * wl_easy_step (delta callback, streaming) and wl_easy_snapshot
+ * wirelog_easy_step (delta callback, streaming) and wirelog_easy_snapshot
  * (one-shot batch) and verifies that they produce identical results.
  *
- * IMPORTANT: wl_easy_snapshot() is an evaluating call -- calling
- * wl_easy_step() followed by wl_easy_snapshot() on the same insert
+ * IMPORTANT: wirelog_easy_snapshot() is an evaluating call -- calling
+ * wirelog_easy_step() followed by wirelog_easy_snapshot() on the same insert
  * batch would double-count derived tuples.  This driver therefore
  * uses two independent sessions: one for the delta path and one for
  * the snapshot path.
@@ -153,20 +153,20 @@ row_compare(const void *a, const void *b)
 #define CHECK(expr, msg, sess) do { \
             if ((expr) != WIRELOG_OK) { \
                 fprintf(stderr, "%s\n", msg); \
-                wl_easy_close(sess); \
+                wirelog_easy_close(sess); \
                 return 1; \
             } \
 } while (0)
 
 static void
-insert_facts(wl_easy_session_t *s, sym_table_t *syms)
+insert_facts(wirelog_easy_session_t *s, sym_table_t *syms)
 {
-    int64_t alice = wl_easy_intern(s, "alice");
-    int64_t bob = wl_easy_intern(s, "bob");
-    int64_t carol = wl_easy_intern(s, "carol");
-    int64_t rd = wl_easy_intern(s, "read");
-    int64_t wr = wl_easy_intern(s, "write");
-    int64_t adm = wl_easy_intern(s, "admin");
+    int64_t alice = wirelog_easy_intern(s, "alice");
+    int64_t bob = wirelog_easy_intern(s, "bob");
+    int64_t carol = wirelog_easy_intern(s, "carol");
+    int64_t rd = wirelog_easy_intern(s, "read");
+    int64_t wr = wirelog_easy_intern(s, "write");
+    int64_t adm = wirelog_easy_intern(s, "admin");
 
     sym_table_add(syms, alice, "alice");
     sym_table_add(syms, bob,   "bob");
@@ -180,11 +180,11 @@ insert_facts(wl_easy_session_t *s, sym_table_t *syms)
     int64_t r3[] = { bob,   rd  };
     int64_t r4[] = { bob,   adm };
     int64_t r5[] = { carol, rd  };
-    wl_easy_insert(s, "can", r1, 2);
-    wl_easy_insert(s, "can", r2, 2);
-    wl_easy_insert(s, "can", r3, 2);
-    wl_easy_insert(s, "can", r4, 2);
-    wl_easy_insert(s, "can", r5, 2);
+    wirelog_easy_insert(s, "can", r1, 2);
+    wirelog_easy_insert(s, "can", r2, 2);
+    wirelog_easy_insert(s, "can", r3, 2);
+    wirelog_easy_insert(s, "can", r4, 2);
+    wirelog_easy_insert(s, "can", r5, 2);
 }
 
 int
@@ -194,28 +194,28 @@ main(void)
     printf("=============================\n\n");
 
     /* ---- Path A: delta mode ---- */
-    wl_easy_session_t *sd = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &sd) != WIRELOG_OK) {
-        fprintf(stderr, "wl_easy_open (delta) failed\n");
+    wirelog_easy_session_t *sd = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &sd) != WIRELOG_OK) {
+        fprintf(stderr, "wirelog_easy_open (delta) failed\n");
         return 1;
     }
 
     sym_table_t delta_syms = { .n = 0 };
     result_set_t delta_rs = { .n = 0, .syms = &delta_syms };
 
-    CHECK(wl_easy_set_delta_cb(sd, on_delta, &delta_rs),
-        "wl_easy_set_delta_cb failed", sd);
+    CHECK(wirelog_easy_set_delta_cb(sd, on_delta, &delta_rs),
+        "wirelog_easy_set_delta_cb failed", sd);
 
     insert_facts(sd, &delta_syms);
 
-    printf("=== delta mode: wl_easy_step ===\n");
-    CHECK(wl_easy_step(sd), "wl_easy_step failed", sd);
-    wl_easy_close(sd);
+    printf("=== delta mode: wirelog_easy_step ===\n");
+    CHECK(wirelog_easy_step(sd), "wirelog_easy_step failed", sd);
+    wirelog_easy_close(sd);
 
     /* ---- Path B: snapshot mode ---- */
-    wl_easy_session_t *ss = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &ss) != WIRELOG_OK) {
-        fprintf(stderr, "wl_easy_open (snapshot) failed\n");
+    wirelog_easy_session_t *ss = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &ss) != WIRELOG_OK) {
+        fprintf(stderr, "wirelog_easy_open (snapshot) failed\n");
         return 1;
     }
 
@@ -224,10 +224,10 @@ main(void)
 
     insert_facts(ss, &snap_syms);
 
-    printf("=== snapshot mode: wl_easy_snapshot ===\n");
-    CHECK(wl_easy_snapshot(ss, "granted", on_snapshot, &snap_rs),
-        "wl_easy_snapshot failed", ss);
-    wl_easy_close(ss);
+    printf("=== snapshot mode: wirelog_easy_snapshot ===\n");
+    CHECK(wirelog_easy_snapshot(ss, "granted", on_snapshot, &snap_rs),
+        "wirelog_easy_snapshot failed", ss);
+    wirelog_easy_close(ss);
 
     /* ---- Sort both result sets ---- */
     qsort(delta_rs.rows, (size_t)delta_rs.n, RESULT_LEN, row_compare);

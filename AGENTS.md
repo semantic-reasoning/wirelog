@@ -20,7 +20,7 @@ python script.py
 | **Internal** (not installed) | `wl_` | `WL_` |
 
 **Public API headers** (installed, user-facing):
-`wirelog/wirelog.h`, `wirelog/wirelog-types.h`, `wirelog/wirelog-ir.h`, `wirelog/wirelog-parser.h`, `wirelog/wirelog-optimizer.h`, `wirelog/wirelog-export.h`, `wirelog/wl_easy.h`, `wirelog/wirelog-advanced.h`, `wirelog/io/io_adapter.h`
+`wirelog/wirelog.h`, `wirelog/wirelog-types.h`, `wirelog/wirelog-ir.h`, `wirelog/wirelog-parser.h`, `wirelog/wirelog-optimizer.h`, `wirelog/wirelog-export.h`, `wirelog/wirelog-easy.h`, `wirelog/wirelog-advanced.h`, `wirelog/io/io_adapter.h`
 
 > Single source of truth: `wirelog_public_headers` in `meson.build`
 > (plus the standalone `install_headers('wirelog/io/io_adapter.h', ...)`

@@ -26,28 +26,28 @@ the EDB. After parsing the program, the engine seeds these facts into
 the columnar session as base rows exactly once, on the first
 plan/session build:
 
-- via `wl_easy_open` / any `wl_easy_*` lazy entry point: at first
+- via `wirelog_easy_open` / any `wirelog_easy_*` lazy entry point: at first
   build, before any host delta callback can be installed.
 - via the CLI driver: at the same point in the
   `wl_session_create` → `wl_session_load_facts` →
   `wl_session_load_input_files` sequence.
 
-Snapshots returned by `wl_easy_snapshot()` and IDB rows derived by the
+Snapshots returned by `wirelog_easy_snapshot()` and IDB rows derived by the
 optimizer pipeline therefore observe inline facts on the first call,
 without any host action.
 
 ### Z-set semantics for host insert / remove
 
-`wl_easy_insert()` and `wl_easy_remove()` are differential operations
+`wirelog_easy_insert()` and `wirelog_easy_remove()` are differential operations
 on the session's z-set state:
 
-- `wl_easy_insert(R, row)` raises the multiplicity of `row` in `R`
+- `wirelog_easy_insert(R, row)` raises the multiplicity of `row` in `R`
   by `+1`.
-- `wl_easy_remove(R, row)` lowers it by `-1`.
+- `wirelog_easy_remove(R, row)` lowers it by `-1`.
 
 If a host inserts a row that is already present from the inline-fact
 seed, the row's multiplicity becomes `+2`. A subsequent
-`wl_easy_remove()` of the same row leaves multiplicity `+1`; the row
+`wirelog_easy_remove()` of the same row leaves multiplicity `+1`; the row
 remains observable in snapshots until both copies are retracted.
 
 This matches differential dataflow conventions and is consistent with
@@ -79,7 +79,7 @@ Two patterns are supported:
 ### Cross-facade parity (Status: Current)
 
 `wirelog/wirelog-advanced.h` ships the public `wirelog_session_*` surface
-as the advanced peer of `wl_easy`. Both facades share this exact
+as the advanced peer of `wirelog_easy`. Both facades share this exact
 semantic model: open-time inline-fact seeding, z-set host insert/remove,
 optional pre-check via `wirelog_program_get_facts`. This is the contract
 that prevents behavioral drift between the easy and advanced surfaces.
@@ -91,7 +91,7 @@ will appear as additive enum values in future minor releases.
 
 ### References
 
-- `wirelog/wl_easy.c` — `ensure_plan_built` performs the seed.
+- `wirelog/wirelog-easy.c` — `ensure_plan_built` performs the seed.
 - `wirelog/session_facts.c` — backend-agnostic loader.
 - `wirelog/cli/driver.c` — the canonical sequence the easy facade mirrors.
 - `wirelog/wirelog.h` — `wirelog_program_get_facts` for host pre-check.

@@ -1,5 +1,5 @@
 # examples/11-time-evolution/meson.build
-# Time Evolution demo using the wl_easy facade (#444)
+# Time Evolution demo using the wirelog_easy facade (#444)
 #
 # Include all wirelog sources directly (same pattern as example 08 and
 # wirelog_cli) to ensure proper linking under LTO.

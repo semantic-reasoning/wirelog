@@ -1,5 +1,5 @@
 /*
- * test_wl_easy.c - Unit tests for the wl_easy convenience facade (Issue #441)
+ * test_wirelog-easy.c - Unit tests for the wirelog_easy convenience facade (Issue #441)
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
@@ -8,7 +8,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-#include "../wirelog/wl_easy.h"
+#include "../wirelog/wirelog-easy.h"
 #include "../wirelog/util/log.h"
 
 #include <fcntl.h>
@@ -136,22 +136,22 @@ collect_tuple(const char *relation, const int64_t *row, uint32_t ncols,
 }
 
 static bool
-drive_access_control_trace(wl_easy_session_t *s)
+drive_access_control_trace(wirelog_easy_session_t *s)
 {
-    int64_t alice = wl_easy_intern(s, "alice");
-    int64_t read = wl_easy_intern(s, "read");
+    int64_t alice = wirelog_easy_intern(s, "alice");
+    int64_t read = wirelog_easy_intern(s, "read");
     if (alice < 0 || read < 0)
         return false;
 
     delta_collector_t deltas;
     memset(&deltas, 0, sizeof(deltas));
-    if (wl_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK)
+    if (wirelog_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK)
         return false;
 
     int64_t row[2] = { alice, read };
-    if (wl_easy_insert(s, "can", row, 2) != WIRELOG_OK)
+    if (wirelog_easy_insert(s, "can", row, 2) != WIRELOG_OK)
         return false;
-    if (wl_easy_step(s) != WIRELOG_OK)
+    if (wirelog_easy_step(s) != WIRELOG_OK)
         return false;
 
     bool found_delta = false;
@@ -168,7 +168,7 @@ drive_access_control_trace(wl_easy_session_t *s)
 
     tuple_collector_t granted_t;
     memset(&granted_t, 0, sizeof(granted_t));
-    if (wl_easy_snapshot(s, "granted", collect_tuple, &granted_t)
+    if (wirelog_easy_snapshot(s, "granted", collect_tuple, &granted_t)
         != WIRELOG_OK)
         return false;
 
@@ -197,7 +197,7 @@ file_contains_substring(const char *path, const char *needle)
 
 #ifndef _WIN32
 static bool
-capture_num_workers_log(const wl_easy_open_opts_t *opts, uint32_t expected)
+capture_num_workers_log(const wirelog_easy_open_opts_t *opts, uint32_t expected)
 {
     char path[128];
     snprintf(path, sizeof(path), "/tmp/wl-easy-num-test-%ld-%u.log",
@@ -230,11 +230,11 @@ capture_num_workers_log(const wl_easy_open_opts_t *opts, uint32_t expected)
     }
     close(log_fd);
 
-    wl_easy_session_t *s = NULL;
-    wirelog_error_t open_rc = wl_easy_open_opts(ACCESS_CONTROL_SRC, opts, &s);
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t open_rc = wirelog_easy_open_opts(ACCESS_CONTROL_SRC, opts, &s);
     wirelog_error_t build_rc = WIRELOG_ERR_EXEC;
     if (open_rc == WIRELOG_OK && s)
-        build_rc = wl_easy_set_delta_cb(s, NULL, NULL);
+        build_rc = wirelog_easy_set_delta_cb(s, NULL, NULL);
 
     fflush(stderr);
     bool restored = dup2(saved_stderr, STDERR_FILENO) >= 0;
@@ -244,7 +244,7 @@ capture_num_workers_log(const wl_easy_open_opts_t *opts, uint32_t expected)
     unsetenv("WL_LOG");
     wl_log_init();
     if (s)
-        wl_easy_close(s);
+        wirelog_easy_close(s);
     unlink(path);
 
     return restored && open_rc == WIRELOG_OK && build_rc == WIRELOG_OK
@@ -261,17 +261,17 @@ test_open_close_null_safe(void)
 {
     TEST("open NULL src + NULL out + close(NULL) safe");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(NULL, &s) == WIRELOG_OK) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(NULL, &s) == WIRELOG_OK) {
         FAIL("expected non-OK on NULL src");
         return;
     }
-    if (wl_easy_open(ACCESS_CONTROL_SRC, NULL) == WIRELOG_OK) {
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, NULL) == WIRELOG_OK) {
         FAIL("expected non-OK on NULL out");
         return;
     }
     /* Must not crash */
-    wl_easy_close(NULL);
+    wirelog_easy_close(NULL);
     PASS();
 }
 
@@ -280,8 +280,8 @@ test_open_parse_error(void)
 {
     TEST("open invalid Datalog returns error");
 
-    wl_easy_session_t *s = (wl_easy_session_t *)0xdeadbeef;
-    wirelog_error_t rc = wl_easy_open("this is not datalog ::: !!!", &s);
+    wirelog_easy_session_t *s = (wirelog_easy_session_t *)0xdeadbeef;
+    wirelog_error_t rc = wirelog_easy_open("this is not datalog ::: !!!", &s);
     if (rc == WIRELOG_OK) {
         FAIL("parse should have failed");
         return;
@@ -298,17 +298,17 @@ test_open_opts_null_equiv_to_open(void)
 {
     TEST("open_opts NULL opts equivalent to open");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open_opts(ACCESS_CONTROL_SRC, NULL, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open_opts(ACCESS_CONTROL_SRC, NULL, &s) != WIRELOG_OK || !s) {
         FAIL("open_opts failed");
         return;
     }
     if (!drive_access_control_trace(s)) {
         FAIL("access-control trace failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     PASS();
 }
 
@@ -317,9 +317,9 @@ test_open_opts_zero_size_rejected(void)
 {
     TEST("open_opts rejects zero size");
 
-    wl_easy_open_opts_t opts = { 0 };
-    wl_easy_session_t *s = (wl_easy_session_t *)0xdeadbeef;
-    wirelog_error_t rc = wl_easy_open_opts(ACCESS_CONTROL_SRC, &opts, &s);
+    wirelog_easy_open_opts_t opts = { 0 };
+    wirelog_easy_session_t *s = (wirelog_easy_session_t *)0xdeadbeef;
+    wirelog_error_t rc = wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts, &s);
     if (rc != WIRELOG_ERR_EXEC) {
         FAIL("expected WIRELOG_ERR_EXEC");
         return;
@@ -336,11 +336,11 @@ test_open_opts_reserved_rejected(void)
 {
     TEST("open_opts rejects reserved field before parsing");
 
-    wl_easy_open_opts_t opts = WL_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
     opts._reserved = (const void *)0x1;
-    wl_easy_session_t *s = (wl_easy_session_t *)0xdeadbeef;
+    wirelog_easy_session_t *s = (wirelog_easy_session_t *)0xdeadbeef;
     wirelog_error_t rc
-        = wl_easy_open_opts("this is not datalog", &opts, &s);
+        = wirelog_easy_open_opts("this is not datalog", &opts, &s);
     if (rc != WIRELOG_ERR_EXEC) {
         FAIL("expected WIRELOG_ERR_EXEC");
         return;
@@ -357,8 +357,8 @@ test_open_opts_init_macro(void)
 {
     TEST("open_opts init macro sets defaults");
 
-    wl_easy_open_opts_t opts = WL_EASY_OPEN_OPTS_INIT;
-    if (opts.size != sizeof(wl_easy_open_opts_t)) {
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    if (opts.size != sizeof(wirelog_easy_open_opts_t)) {
         FAIL("unexpected size");
         return;
     }
@@ -382,19 +382,19 @@ test_open_opts_eager_build_ok(void)
 {
     TEST("open_opts eager_build opens usable session");
 
-    wl_easy_open_opts_t opts = WL_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
     opts.eager_build = true;
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open_opts(ACCESS_CONTROL_SRC, &opts, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts, &s) != WIRELOG_OK || !s) {
         FAIL("open_opts eager_build failed");
         return;
     }
     if (!drive_access_control_trace(s)) {
         FAIL("access-control trace failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     PASS();
 }
 
@@ -409,11 +409,11 @@ test_open_opts_eager_build_propagates_parse_error(void)
 {
     TEST("open_opts eager_build propagates parse error");
 
-    wl_easy_open_opts_t opts = WL_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
     opts.eager_build = true;
-    wl_easy_session_t *s = (wl_easy_session_t *)0xdeadbeef;
+    wirelog_easy_session_t *s = (wirelog_easy_session_t *)0xdeadbeef;
     wirelog_error_t rc
-        = wl_easy_open_opts("definitely not datalog", &opts, &s);
+        = wirelog_easy_open_opts("definitely not datalog", &opts, &s);
     if (rc != WIRELOG_ERR_PARSE) {
         FAIL("expected WIRELOG_ERR_PARSE");
         return;
@@ -451,7 +451,7 @@ test_num_workers_explicit_four(void)
     SKIP("POSIX fd redirection not available on Windows");
     return;
 #else
-    wl_easy_open_opts_t opts = WL_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
     opts.num_workers = 4;
     if (!capture_num_workers_log(&opts, 4)) {
         FAIL("expected num_workers=4 log");
@@ -466,19 +466,19 @@ test_intern_returns_same_id(void)
 {
     TEST("intern same string returns same id");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
-    int64_t a = wl_easy_intern(s, "alice");
-    int64_t b = wl_easy_intern(s, "alice");
+    int64_t a = wirelog_easy_intern(s, "alice");
+    int64_t b = wirelog_easy_intern(s, "alice");
     if (a < 0 || b < 0 || a != b) {
         FAIL("intern returned inconsistent ids");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     PASS();
 }
 
@@ -487,32 +487,32 @@ test_insert_step_delta(void)
 {
     TEST("insert + step fires delta callback");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
-    int64_t alice = wl_easy_intern(s, "alice");
-    int64_t read = wl_easy_intern(s, "read");
+    int64_t alice = wirelog_easy_intern(s, "alice");
+    int64_t read = wirelog_easy_intern(s, "read");
     if (alice < 0 || read < 0) {
         FAIL("intern failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     delta_collector_t deltas;
     memset(&deltas, 0, sizeof(deltas));
-    wl_easy_set_delta_cb(s, collect_delta, &deltas);
+    wirelog_easy_set_delta_cb(s, collect_delta, &deltas);
 
     int64_t row[2] = { alice, read };
-    if (wl_easy_insert(s, "can", row, 2) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "can", row, 2) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("step failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
@@ -525,7 +525,7 @@ test_insert_step_delta(void)
             break;
         }
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     if (!found) {
         FAIL("expected +granted(alice,read) delta not seen");
         return;
@@ -543,30 +543,30 @@ test_inline_compound_body_binding(void)
         ".decl hot(id: int64)\n"
         "hot(ID) :- event(ID, metadata(Level, Ts, Host, Risk)), Risk > 80.\n";
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(src, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
     int64_t hot_row[5] = { 7, 1, 2, 3, 90 };
     int64_t cold_row[5] = { 8, 1, 2, 3, 40 };
-    if (wl_easy_insert(s, "event", hot_row, 5) != WIRELOG_OK
-        || wl_easy_insert(s, "event", cold_row, 5) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "event", hot_row, 5) != WIRELOG_OK
+        || wirelog_easy_insert(s, "event", cold_row, 5) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     tuple_collector_t hot;
     memset(&hot, 0, sizeof(hot));
-    if (wl_easy_snapshot(s, "hot", collect_tuple, &hot) != WIRELOG_OK) {
+    if (wirelog_easy_snapshot(s, "hot", collect_tuple, &hot) != WIRELOG_OK) {
         FAIL("snapshot failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
 
     if (hot.count != 1 || strcmp(hot.relations[0], "hot") != 0
         || hot.ncols[0] != 1 || hot.rows[0][0] != 7) {
@@ -588,8 +588,8 @@ test_inline_compound_body_join_binding(void)
         "hot(ID) :- event(ID, metadata(Level, Ts, Host, Risk)), "
         "threshold(Risk).\n";
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(src, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
@@ -597,23 +597,23 @@ test_inline_compound_body_join_binding(void)
     int64_t matched_row[5] = { 7, 1, 2, 3, 90 };
     int64_t unmatched_row[5] = { 8, 1, 2, 3, 40 };
     int64_t threshold_row[1] = { 90 };
-    if (wl_easy_insert(s, "event", matched_row, 5) != WIRELOG_OK
-        || wl_easy_insert(s, "event", unmatched_row, 5) != WIRELOG_OK
-        || wl_easy_insert(s, "threshold", threshold_row, 1) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "event", matched_row, 5) != WIRELOG_OK
+        || wirelog_easy_insert(s, "event", unmatched_row, 5) != WIRELOG_OK
+        || wirelog_easy_insert(s, "threshold", threshold_row, 1) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     tuple_collector_t hot;
     memset(&hot, 0, sizeof(hot));
-    if (wl_easy_snapshot(s, "hot", collect_tuple, &hot) != WIRELOG_OK) {
+    if (wirelog_easy_snapshot(s, "hot", collect_tuple, &hot) != WIRELOG_OK) {
         FAIL("snapshot failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
 
     if (hot.count != 1 || strcmp(hot.relations[0], "hot") != 0
         || hot.ncols[0] != 1 || hot.rows[0][0] != 7) {
@@ -633,28 +633,28 @@ test_inline_compound_functor_mismatch_is_empty(void)
         ".decl bad(id: int64)\n"
         "bad(ID) :- event(ID, other(Level, Ts, Host, Risk)).\n";
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(src, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
     int64_t row[5] = { 7, 1, 2, 3, 90 };
-    if (wl_easy_insert(s, "event", row, 5) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "event", row, 5) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     tuple_collector_t bad;
     memset(&bad, 0, sizeof(bad));
-    if (wl_easy_snapshot(s, "bad", collect_tuple, &bad) != WIRELOG_OK) {
+    if (wirelog_easy_snapshot(s, "bad", collect_tuple, &bad) != WIRELOG_OK) {
         FAIL("snapshot failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
 
     if (bad.count != 0) {
         FAIL("mismatched functor should derive no rows");
@@ -673,30 +673,30 @@ test_inline_compound_constant_child_filters(void)
         ".decl hot(id: int64)\n"
         "hot(ID) :- event(ID, metadata(_, _, _, 90)).\n";
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(src, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
     int64_t hot_row[5] = { 7, 1, 2, 3, 90 };
     int64_t cold_row[5] = { 8, 1, 2, 3, 40 };
-    if (wl_easy_insert(s, "event", hot_row, 5) != WIRELOG_OK
-        || wl_easy_insert(s, "event", cold_row, 5) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "event", hot_row, 5) != WIRELOG_OK
+        || wirelog_easy_insert(s, "event", cold_row, 5) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     tuple_collector_t hot;
     memset(&hot, 0, sizeof(hot));
-    if (wl_easy_snapshot(s, "hot", collect_tuple, &hot) != WIRELOG_OK) {
+    if (wirelog_easy_snapshot(s, "hot", collect_tuple, &hot) != WIRELOG_OK) {
         FAIL("snapshot failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
 
     if (hot.count != 1 || hot.ncols[0] != 1 || hot.rows[0][0] != 7) {
         FAIL("expected only row with constant child value 90");
@@ -715,30 +715,30 @@ test_inline_compound_duplicate_child_variables_filter(void)
         ".decl same(id: int64)\n"
         "same(ID) :- event(ID, metadata(X, X, _, _)).\n";
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(src, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
     int64_t matched_row[5] = { 7, 4, 4, 3, 90 };
     int64_t unmatched_row[5] = { 8, 1, 2, 3, 90 };
-    if (wl_easy_insert(s, "event", matched_row, 5) != WIRELOG_OK
-        || wl_easy_insert(s, "event", unmatched_row, 5) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "event", matched_row, 5) != WIRELOG_OK
+        || wirelog_easy_insert(s, "event", unmatched_row, 5) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     tuple_collector_t same;
     memset(&same, 0, sizeof(same));
-    if (wl_easy_snapshot(s, "same", collect_tuple, &same) != WIRELOG_OK) {
+    if (wirelog_easy_snapshot(s, "same", collect_tuple, &same) != WIRELOG_OK) {
         FAIL("snapshot failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
 
     if (same.count != 1 || same.ncols[0] != 1 || same.rows[0][0] != 7) {
         FAIL("expected only row with equal duplicate child variables");
@@ -766,8 +766,8 @@ test_side_compound_public_allocation_saturates(void)
         "tc(X, Y) :- edge(X, Y).\n"
         "tc(X, Z) :- edge(X, Y), tc(Y, Z).\n";
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(src, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
         unsetenv("WIRELOG_COMPOUND_MAX_EPOCHS");
         FAIL("open failed");
         return;
@@ -783,7 +783,7 @@ test_side_compound_public_allocation_saturates(void)
     wirelog_error_t rc = wirelog_easy_make_compound(s, "metadata", 4, args,
             &handle);
     if (rc != WIRELOG_OK || handle == 0) {
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         unsetenv("WIRELOG_COMPOUND_MAX_EPOCHS");
         FAIL("first compound allocation failed");
         return;
@@ -792,12 +792,12 @@ test_side_compound_public_allocation_saturates(void)
     int64_t edge_12[2] = { 1, 2 };
     int64_t edge_23[2] = { 2, 3 };
     int64_t edge_34[2] = { 3, 4 };
-    if (wl_easy_insert(s, "event", row, 2) != WIRELOG_OK
-        || wl_easy_insert(s, "edge", edge_12, 2) != WIRELOG_OK
-        || wl_easy_insert(s, "edge", edge_23, 2) != WIRELOG_OK
-        || wl_easy_insert(s, "edge", edge_34, 2) != WIRELOG_OK
-        || wl_easy_step(s) != WIRELOG_OK) {
-        wl_easy_close(s);
+    if (wirelog_easy_insert(s, "event", row, 2) != WIRELOG_OK
+        || wirelog_easy_insert(s, "edge", edge_12, 2) != WIRELOG_OK
+        || wirelog_easy_insert(s, "edge", edge_23, 2) != WIRELOG_OK
+        || wirelog_easy_insert(s, "edge", edge_34, 2) != WIRELOG_OK
+        || wirelog_easy_step(s) != WIRELOG_OK) {
+        wirelog_easy_close(s);
         unsetenv("WIRELOG_COMPOUND_MAX_EPOCHS");
         FAIL("first insert/step failed");
         return;
@@ -805,7 +805,7 @@ test_side_compound_public_allocation_saturates(void)
 
     handle = 123;
     rc = wirelog_easy_make_compound(s, "metadata", 4, args, &handle);
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     unsetenv("WIRELOG_COMPOUND_MAX_EPOCHS");
     if (rc != WIRELOG_ERR_COMPOUND_SATURATED || handle != 0) {
         FAIL("expected WIRELOG_ERR_COMPOUND_SATURATED with cleared handle");
@@ -819,25 +819,25 @@ test_insert_sym_variadic(void)
 {
     TEST("insert_sym variadic helper");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
     delta_collector_t deltas;
     memset(&deltas, 0, sizeof(deltas));
-    wl_easy_set_delta_cb(s, collect_delta, &deltas);
+    wirelog_easy_set_delta_cb(s, collect_delta, &deltas);
 
-    if (wl_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
+    if (wirelog_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
         != WIRELOG_OK) {
         FAIL("insert_sym failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("step failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
     bool found = false;
@@ -848,7 +848,7 @@ test_insert_sym_variadic(void)
             break;
         }
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     if (!found) {
         FAIL("no granted delta after insert_sym");
         return;
@@ -861,38 +861,38 @@ test_remove_sym(void)
 {
     TEST("remove_sym fires negative delta");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
     delta_collector_t deltas;
     memset(&deltas, 0, sizeof(deltas));
-    wl_easy_set_delta_cb(s, collect_delta, &deltas);
+    wirelog_easy_set_delta_cb(s, collect_delta, &deltas);
 
-    if (wl_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
+    if (wirelog_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
         != WIRELOG_OK) {
         FAIL("insert_sym failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("step 1 failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
     int after_step1 = deltas.count;
 
-    if (wl_easy_remove_sym(s, "can", "alice", "read", (const char *)NULL)
+    if (wirelog_easy_remove_sym(s, "can", "alice", "read", (const char *)NULL)
         != WIRELOG_OK) {
         FAIL("remove_sym failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("step 2 failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
@@ -904,7 +904,7 @@ test_remove_sym(void)
             break;
         }
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     if (!found_neg) {
         FAIL("no -granted delta after remove_sym + step");
         return;
@@ -917,44 +917,44 @@ test_snapshot_filter(void)
 {
     TEST("snapshot filters by relation name");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
-    if (wl_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
+    if (wirelog_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
         != WIRELOG_OK
-        || wl_easy_insert_sym(s, "can", "bob", "write", (const char *)NULL)
+        || wirelog_easy_insert_sym(s, "can", "bob", "write", (const char *)NULL)
         != WIRELOG_OK) {
         FAIL("insert_sym failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    /* NOTE: Do NOT call wl_easy_step() before wl_easy_snapshot().  The
+    /* NOTE: Do NOT call wirelog_easy_step() before wirelog_easy_snapshot().  The
      * columnar backend's snapshot path re-evaluates all strata and appends
      * to the IDB relation rows; a prior step() already derived the IDB
      * tuples, so combining the two would double-count.  See the doc
-     * comment on wl_easy_snapshot() in wl_easy.h. */
+     * comment on wirelog_easy_snapshot() in wirelog-easy.h. */
 
     tuple_collector_t granted_t;
     memset(&granted_t, 0, sizeof(granted_t));
-    if (wl_easy_snapshot(s, "granted", collect_tuple, &granted_t)
+    if (wirelog_easy_snapshot(s, "granted", collect_tuple, &granted_t)
         != WIRELOG_OK) {
         FAIL("snapshot granted failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     tuple_collector_t can_t;
     memset(&can_t, 0, sizeof(can_t));
-    if (wl_easy_snapshot(s, "can", collect_tuple, &can_t) != WIRELOG_OK) {
+    if (wirelog_easy_snapshot(s, "can", collect_tuple, &can_t) != WIRELOG_OK) {
         FAIL("snapshot can failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
-    wl_easy_close(s);
+    wirelog_easy_close(s);
 
     if (granted_t.count != 2) {
         FAIL("expected 2 granted tuples in snapshot");
@@ -984,24 +984,24 @@ test_print_delta_integer_column(void)
     static const char *SRC = ".decl a(x: int32)\n"
         ".decl r(x: int32)\n"
         "r(x) :- a(x).\n";
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
-    wl_easy_set_delta_cb(s, wl_easy_print_delta, s);
+    wirelog_easy_set_delta_cb(s, wirelog_easy_print_delta, s);
     int64_t row[1] = { 42 };
-    if (wl_easy_insert(s, "a", row, 1) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "a", row, 1) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("step failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     PASS();
 }
 
@@ -1030,12 +1030,12 @@ test_print_delta_unknown_relation_integer_fallback(void)
         fclose(stdout);
         fclose(stderr);
 
-        wl_easy_session_t *s = NULL;
-        if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s)
+        wirelog_easy_session_t *s = NULL;
+        if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s)
             _exit(2);
         int64_t row[2] = { 123456789, 987654321 };
-        wl_easy_print_delta("no_such_relation", row, 2, 1, s);
-        wl_easy_close(s);
+        wirelog_easy_print_delta("no_such_relation", row, 2, 1, s);
+        wirelog_easy_close(s);
         _exit(0);
     }
     int status = 0;
@@ -1071,15 +1071,15 @@ test_print_delta_abort_on_missed_symbol(void)
         fclose(stdout);
         fclose(stderr);
 
-        wl_easy_session_t *s = NULL;
-        if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s)
+        wirelog_easy_session_t *s = NULL;
+        if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s)
             _exit(2);
-        wl_easy_set_delta_cb(s, wl_easy_print_delta, s);
+        wirelog_easy_set_delta_cb(s, wirelog_easy_print_delta, s);
         /* Bogus, never-interned ids — printer must abort. */
         int64_t row[2] = { 999999, 888888 };
-        wl_easy_insert(s, "can", row, 2);
-        wl_easy_step(s);
-        wl_easy_close(s);
+        wirelog_easy_insert(s, "can", row, 2);
+        wirelog_easy_step(s);
+        wirelog_easy_close(s);
         _exit(0);
     }
     int status = 0;
@@ -1101,23 +1101,23 @@ test_cleanup_order_no_use_after_free(void)
     TEST("open/use/close repeated has no leaks");
 
     for (int iter = 0; iter < 2; iter++) {
-        wl_easy_session_t *s = NULL;
-        if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
+        wirelog_easy_session_t *s = NULL;
+        if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
             FAIL("open failed");
             return;
         }
-        if (wl_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
+        if (wirelog_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
             != WIRELOG_OK) {
             FAIL("insert_sym failed");
-            wl_easy_close(s);
+            wirelog_easy_close(s);
             return;
         }
-        if (wl_easy_step(s) != WIRELOG_OK) {
+        if (wirelog_easy_step(s) != WIRELOG_OK) {
             FAIL("step failed");
-            wl_easy_close(s);
+            wirelog_easy_close(s);
             return;
         }
-        wl_easy_close(s);
+        wirelog_easy_close(s);
     }
     PASS();
 }
@@ -1127,40 +1127,40 @@ test_intern_after_step_succeeds(void)
 {
     TEST("intern after first step still succeeds (Option B contract)");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(ACCESS_CONTROL_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
-    int64_t alice = wl_easy_intern(s, "alice");
-    int64_t read = wl_easy_intern(s, "read");
+    int64_t alice = wirelog_easy_intern(s, "alice");
+    int64_t read = wirelog_easy_intern(s, "read");
     if (alice < 0 || read < 0) {
         FAIL("intern failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
     int64_t row[2] = { alice, read };
-    if (wl_easy_insert(s, "can", row, 2) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "can", row, 2) != WIRELOG_OK) {
         FAIL("insert failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("step failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
     /* After the plan has been built and stepped, interning a brand new
      * symbol must still succeed and return a fresh id, because the intern
      * table is aliased through the whole session lifetime. */
-    int64_t late = wl_easy_intern(s, "late_symbol");
+    int64_t late = wirelog_easy_intern(s, "late_symbol");
     /* And a new insert using that id must also succeed, proving the id is
      * actually visible to the running backend. */
     int64_t late_row[2] = { late, read };
     wirelog_error_t ins_rc
-        = wl_easy_insert(s, "can", late_row, 2);
-    wirelog_error_t step_rc = wl_easy_step(s);
-    wl_easy_close(s);
+        = wirelog_easy_insert(s, "can", late_row, 2);
+    wirelog_error_t step_rc = wirelog_easy_step(s);
+    wirelog_easy_close(s);
     if (late < 0) {
         FAIL("late intern should have returned a non-negative id");
         return;
@@ -1177,9 +1177,9 @@ test_delta_cb_multi_round_recursive_insert(void)
 {
     TEST("delta_cb + recursive insert/step rounds produce expected deltas");
 
-    /* Issue #662: when wl_easy_set_delta_cb has installed a callback, a
-     * subsequent wl_easy_insert must take the same incremental path that
-     * wl_easy_remove already takes, so that arrangement caches are
+    /* Issue #662: when wirelog_easy_set_delta_cb has installed a callback, a
+     * subsequent wirelog_easy_insert must take the same incremental path that
+     * wirelog_easy_remove already takes, so that arrangement caches are
      * invalidated and the outer-epoch counter advances.  Without that
      * symmetry, a second insert+step round on a recursive stratum either
      * skips the new iteration (no delta surfaces) or trips the join over
@@ -1190,47 +1190,47 @@ test_delta_cb_multi_round_recursive_insert(void)
         "reach(A, B) :- edge(A, B).\n"
         "reach(A, C) :- reach(A, B), edge(B, C).\n";
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(RECURSIVE_REACH_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(RECURSIVE_REACH_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
 
     delta_collector_t deltas;
     memset(&deltas, 0, sizeof(deltas));
-    if (wl_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK) {
+    if (wirelog_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK) {
         FAIL("set_delta_cb failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     int64_t e12[2] = { 1, 2 };
-    if (wl_easy_insert(s, "edge", e12, 2) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "edge", e12, 2) != WIRELOG_OK) {
         FAIL("insert edge(1,2) failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("first step returned non-OK");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
     int round1_count = deltas.count;
     if (round1_count == 0) {
         FAIL("first step produced no deltas");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
     int64_t e23[2] = { 2, 3 };
-    if (wl_easy_insert(s, "edge", e23, 2) != WIRELOG_OK) {
+    if (wirelog_easy_insert(s, "edge", e23, 2) != WIRELOG_OK) {
         FAIL("insert edge(2,3) failed");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
-    if (wl_easy_step(s) != WIRELOG_OK) {
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
         FAIL("second step returned non-OK (issue #662 reproduction)");
-        wl_easy_close(s);
+        wirelog_easy_close(s);
         return;
     }
 
@@ -1247,7 +1247,7 @@ test_delta_cb_multi_round_recursive_insert(void)
             break;
         }
     }
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     if (!saw_reach_1_3) {
         FAIL("expected +reach(1,3) delta in round 2 not seen");
         return;
@@ -1256,7 +1256,7 @@ test_delta_cb_multi_round_recursive_insert(void)
 }
 
 /* Issue #665: a 5-relation conjunctive rule was reported to surface
-* WIRELOG_ERR_EXEC from wl_easy_step when the EDB prerequisites were
+* WIRELOG_ERR_EXEC from wirelog_easy_step when the EDB prerequisites were
 * inserted across separate epochs and only some were present at step time.
 * PR #663 (Closes #662) made col_session_insert reroute to the incremental
 * path under an installed delta callback; that reroute also covers the
@@ -1290,30 +1290,30 @@ count_allow_bool_added(const delta_collector_t *deltas, int from)
 }
 
 static bool
-drive_issue_665_partial_conjunction(wl_easy_session_t *s)
+drive_issue_665_partial_conjunction(wirelog_easy_session_t *s)
 {
     delta_collector_t deltas;
     memset(&deltas, 0, sizeof(deltas));
-    if (wl_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK)
+    if (wirelog_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK)
         return false;
 
     /* Step 1: only grant present. allow_bool requires four more EDB legs;
      * the partial-prereq step must succeed and emit no allow_bool delta. */
-    if (wl_easy_insert_sym(s, "grant", "u", "p", (const char *)NULL)
+    if (wirelog_easy_insert_sym(s, "grant", "u", "p", (const char *)NULL)
         != WIRELOG_OK)
         return false;
-    if (wl_easy_step(s) != WIRELOG_OK)
+    if (wirelog_easy_step(s) != WIRELOG_OK)
         return false;
     if (count_allow_bool_added(&deltas, 0) != 0)
         return false;
     int after_grant = deltas.count;
 
     /* Step 2: add principal_state with the literal "authenticated". */
-    if (wl_easy_insert_sym(s, "principal_state", "u", "authenticated",
+    if (wirelog_easy_insert_sym(s, "principal_state", "u", "authenticated",
         (const char *)NULL)
         != WIRELOG_OK)
         return false;
-    if (wl_easy_step(s) != WIRELOG_OK)
+    if (wirelog_easy_step(s) != WIRELOG_OK)
         return false;
     if (count_allow_bool_added(&deltas, after_grant) != 0)
         return false;
@@ -1321,20 +1321,20 @@ drive_issue_665_partial_conjunction(wl_easy_session_t *s)
 
     /* Step 3: session_state(S, ST) — still missing session_active and
      * perm_state, so the join body is unsatisfied. */
-    if (wl_easy_insert_sym(s, "session_state", "s", "st", (const char *)NULL)
+    if (wirelog_easy_insert_sym(s, "session_state", "s", "st", (const char *)NULL)
         != WIRELOG_OK)
         return false;
-    if (wl_easy_step(s) != WIRELOG_OK)
+    if (wirelog_easy_step(s) != WIRELOG_OK)
         return false;
     if (count_allow_bool_added(&deltas, after_principal) != 0)
         return false;
     int after_session = deltas.count;
 
     /* Step 4: session_active(ST) — perm_state still missing. */
-    if (wl_easy_insert_sym(s, "session_active", "st", (const char *)NULL)
+    if (wirelog_easy_insert_sym(s, "session_active", "st", (const char *)NULL)
         != WIRELOG_OK)
         return false;
-    if (wl_easy_step(s) != WIRELOG_OK)
+    if (wirelog_easy_step(s) != WIRELOG_OK)
         return false;
     if (count_allow_bool_added(&deltas, after_session) != 0)
         return false;
@@ -1342,20 +1342,20 @@ drive_issue_665_partial_conjunction(wl_easy_session_t *s)
 
     /* Step 5: perm_state(U, P, S, "armed") completes the conjunction.
      * Exactly one +allow_bool("u","p","s") must surface. */
-    if (wl_easy_insert_sym(s, "perm_state", "u", "p", "s", "armed",
+    if (wirelog_easy_insert_sym(s, "perm_state", "u", "p", "s", "armed",
         (const char *)NULL)
         != WIRELOG_OK)
         return false;
-    if (wl_easy_step(s) != WIRELOG_OK)
+    if (wirelog_easy_step(s) != WIRELOG_OK)
         return false;
     if (count_allow_bool_added(&deltas, after_active) != 1)
         return false;
 
     /* Verify the bound row matches the inputs we interned through the
      * insert_sym helper: allow_bool(u, p, s). */
-    int64_t u = wl_easy_intern(s, "u");
-    int64_t p = wl_easy_intern(s, "p");
-    int64_t scope = wl_easy_intern(s, "s");
+    int64_t u = wirelog_easy_intern(s, "u");
+    int64_t p = wirelog_easy_intern(s, "p");
+    int64_t scope = wirelog_easy_intern(s, "s");
     if (u < 0 || p < 0 || scope < 0)
         return false;
     bool matched = false;
@@ -1377,13 +1377,13 @@ test_issue_665_partial_conjunction_default_workers(void)
 {
     TEST("issue 665: partial conjunctive EDB updates step OK across epochs");
 
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open(ISSUE_665_PROGRAM_SRC, &s) != WIRELOG_OK || !s) {
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(ISSUE_665_PROGRAM_SRC, &s) != WIRELOG_OK || !s) {
         FAIL("open failed");
         return;
     }
     bool ok = drive_issue_665_partial_conjunction(s);
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     if (!ok) {
         FAIL("partial-prereq step regressed");
         return;
@@ -1403,16 +1403,16 @@ test_issue_665_partial_conjunction_multi_worker(void)
      * delta contract that the default-workers test pins. */
     TEST("issue 665: partial conjunctive shape stable on num_workers=4");
 
-    wl_easy_open_opts_t opts = WL_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
     opts.num_workers = 4;
-    wl_easy_session_t *s = NULL;
-    if (wl_easy_open_opts(ISSUE_665_PROGRAM_SRC, &opts, &s) != WIRELOG_OK
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open_opts(ISSUE_665_PROGRAM_SRC, &opts, &s) != WIRELOG_OK
         || !s) {
         FAIL("open_opts failed");
         return;
     }
     bool ok = drive_issue_665_partial_conjunction(s);
-    wl_easy_close(s);
+    wirelog_easy_close(s);
     if (!ok) {
         FAIL("partial-prereq step regressed under multi-worker");
         return;
@@ -1427,7 +1427,7 @@ test_issue_665_partial_conjunction_multi_worker(void)
 int
 main(void)
 {
-    printf("wl_easy Tests (Issue #441)\n");
+    printf("wirelog_easy Tests (Issue #441)\n");
     printf("==========================\n\n");
 
     test_open_close_null_safe();

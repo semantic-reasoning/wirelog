@@ -1,8 +1,8 @@
 Example 12: Snapshot vs Delta
 =============================
 
-=== delta mode: wl_easy_step ===
-=== snapshot mode: wl_easy_snapshot ===
+=== delta mode: wirelog_easy_step ===
+=== snapshot mode: wirelog_easy_snapshot ===
 
 delta: granted("alice", "read")        snapshot: granted("alice", "read")        MATCH
 delta: granted("alice", "write")       snapshot: granted("alice", "write")       MATCH

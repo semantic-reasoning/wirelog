@@ -121,10 +121,10 @@ wirelog_io_src = files('io/csv_reader.c', 'io/io_adapter.c', 'io/io_ctx.c', 'io/
 wirelog_string_ops_src = files('string_ops.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
-#wl_easy Module(Issue #441)
+#wirelog_easy Module(Issue #441)
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-wirelog_wl_easy_src = files('wl_easy.c', )
+wirelog_wl_easy_src = files('wirelog-easy.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Advanced session API (Issue #717 / #703)

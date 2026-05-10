@@ -1075,7 +1075,7 @@ test_bulk_insert_no_epoch_increment(void)
  * outer_epoch counter advances exactly as it would for
  * col_session_insert_incremental.  Without the symmetric routing in
  * col_session_insert, this assertion fails (epoch stays at epoch_before),
- * which is the engine-level signature of the wl_easy_step EXEC report in
+ * which is the engine-level signature of the wirelog_easy_step EXEC report in
  * issue #662. */
 static void
 test_bulk_insert_with_delta_cb_takes_incremental_path(void)
