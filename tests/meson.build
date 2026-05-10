@@ -414,6 +414,34 @@ test('public_prefix', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-public-prefix.py'],
      suite: 'abi')
 
+# Issue #689 / Blocker B2: standalone-include compile matrix for the
+# public-headers SSoT.  One executable per public header, each
+# compiled in isolation against tests/standalone/test_standalone_<H>.c
+# whose body is `#include "wirelog/<H>.h"; int main(void) { return 0; }`.
+# Failure = the header has a hidden dependency on another header being
+# included first.  The cross-compiler matrix (GCC / Clang / MSVC) is
+# realised at the GitHub Actions level: each platform compiles every
+# stub via its native CC.
+public_standalone_headers = [
+  ['wirelog',           'test_standalone_wirelog.c'],
+  ['wirelog_types',     'test_standalone_wirelog_types.c'],
+  ['wirelog_ir',        'test_standalone_wirelog_ir.c'],
+  ['wirelog_parser',    'test_standalone_wirelog_parser.c'],
+  ['wirelog_optimizer', 'test_standalone_wirelog_optimizer.c'],
+  ['wirelog_export',    'test_standalone_wirelog_export.c'],
+  ['wirelog_easy',      'test_standalone_wirelog_easy.c'],
+  ['wirelog_advanced',  'test_standalone_wirelog_advanced.c'],
+  ['io_adapter',        'test_standalone_io_adapter.c'],
+]
+foreach hdr : public_standalone_headers
+  exe = executable(
+    'test_standalone_' + hdr[0],
+    files('standalone/' + hdr[1]),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+  )
+  test('standalone_include_' + hdr[0], exe, suite: 'abi')
+endforeach
+
 test_intern_exe = executable(
   'test_intern',
   files('test_intern.c'),
