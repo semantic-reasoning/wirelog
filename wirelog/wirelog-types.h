@@ -24,6 +24,8 @@
 #ifndef WIRELOG_TYPES_H
 #define WIRELOG_TYPES_H
 
+#include "wirelog/wirelog-export.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -109,11 +111,11 @@ typedef enum {
 /* Operator String Conversion                                               */
 /* ======================================================================== */
 
-const char *
+WIRELOG_PUBLIC const char *
 wirelog_cmp_op_str(wirelog_cmp_op_t op);
-const char *
+WIRELOG_PUBLIC const char *
 wirelog_arith_op_str(wirelog_arith_op_t op);
-const char *
+WIRELOG_PUBLIC const char *
 wirelog_agg_fn_str(wirelog_agg_fn_t fn);
 
 /* ======================================================================== */
