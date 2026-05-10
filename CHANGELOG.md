@@ -6,6 +6,22 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **I/O adapter framework renamed and ABI bumped to 2u for v1.0
+  prefix conformance** (#762): the entire `wirelog/io/io_adapter.h`
+  surface (20 identifiers including `wl_io_*` symbols, `WL_IO_*`
+  macros, the `"wl_io_plugin_entry"` dlsym key, and the
+  `WL_IO_ABI_VERSION` macro) is renamed to `wirelog_io_*` /
+  `WIRELOG_IO_*`, and `WIRELOG_IO_ABI_VERSION` is bumped from
+  `1u` to `2u`.  The registration-time
+  `adapter->abi_version != WIRELOG_IO_ABI_VERSION` check rejects
+  v0.30.0 plugins loud (abi_version == 1u) with a clear
+  `wirelog_io_last_error()` diagnostic.  Path-B plugins must
+  rebuild and rename the exported entry symbol from
+  `wl_io_plugin_entry` to `wirelog_io_plugin_entry`; otherwise
+  the loader's `dlsym` lookup returns NULL.  Source- and binary-
+  incompatible across the entire I/O adapter surface; pre-1.0
+  ABI break per the v0.40 API audit decision.  Part of public-
+  API prefix audit epic #755.
 - **wl_easy facade renamed and moved for v1.0 prefix conformance**
   (#756): the `wl_easy` convenience facade is renamed across its
   entire surface from `wl_easy_*` / `WL_EASY_*` to
