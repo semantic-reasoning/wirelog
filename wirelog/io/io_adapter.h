@@ -62,15 +62,20 @@ typedef struct wirelog_io_ctx wirelog_io_ctx_t;
 /* Context Accessors (implemented in #453)                                  */
 /* ======================================================================== */
 
-const char *wirelog_io_ctx_relation_name(const wirelog_io_ctx_t *ctx);
-uint32_t    wirelog_io_ctx_num_cols(const wirelog_io_ctx_t *ctx);
-wirelog_column_type_t wirelog_io_ctx_col_type(const wirelog_io_ctx_t *ctx,
-    uint32_t col);
-const char *wirelog_io_ctx_param(const wirelog_io_ctx_t *ctx, const char *key);
-int64_t     wirelog_io_ctx_intern_string(wirelog_io_ctx_t *ctx,
-    const char *utf8);
-void       *wirelog_io_ctx_platform(const wirelog_io_ctx_t *ctx);
-int         wirelog_io_ctx_set_platform(wirelog_io_ctx_t *ctx, void *ptr);
+WIRELOG_PUBLIC const char *
+wirelog_io_ctx_relation_name(const wirelog_io_ctx_t *ctx);
+WIRELOG_PUBLIC uint32_t
+wirelog_io_ctx_num_cols(const wirelog_io_ctx_t *ctx);
+WIRELOG_PUBLIC wirelog_column_type_t
+wirelog_io_ctx_col_type(const wirelog_io_ctx_t *ctx, uint32_t col);
+WIRELOG_PUBLIC const char *
+wirelog_io_ctx_param(const wirelog_io_ctx_t *ctx, const char *key);
+WIRELOG_PUBLIC int64_t
+wirelog_io_ctx_intern_string(wirelog_io_ctx_t *ctx, const char *utf8);
+WIRELOG_PUBLIC void *
+wirelog_io_ctx_platform(const wirelog_io_ctx_t *ctx);
+WIRELOG_PUBLIC int
+wirelog_io_ctx_set_platform(wirelog_io_ctx_t *ctx, void *ptr);
 
 /* ======================================================================== */
 /* Adapter VTable                                                           */
