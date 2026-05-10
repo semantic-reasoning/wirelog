@@ -6,6 +6,13 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **String-fn enum constants renamed for v1.0 prefix conformance**
+  (#757): the 12 `WL_STR_FN_*` enum constants in
+  `wirelog/wirelog-types.h` (declaring the string-op kinds shipped
+  in #444) are renamed to `WIRELOG_STR_FN_*`.  Source-incompatible
+  for downstream consumers passing the constants to public string-
+  op APIs; migrate via a textual rename.  Enum values and behaviour
+  are unchanged.  Part of public-API prefix audit epic #755.
 - **Public-API typedef renamed for v1.0 prefix conformance** (#760):
   the `wirelog/wirelog.h` umbrella header no longer exposes the
   internal-style `wl_intern_t` typedef name.  The new public name is
