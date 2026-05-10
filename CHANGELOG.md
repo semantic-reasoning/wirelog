@@ -6,6 +6,45 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **ABI symbol allowlist gate (#733 K2)**: `meson test --suite abi:abi_symbols`
+  diffs `nm -D --defined-only build/libwirelog.so | awk '$2=="T"'`
+  against `abi/libwirelog-1.0.symbols`.  53 entries seeded from the
+  current export set after `gnu_symbol_visibility: 'hidden'` lands.
+  Any new public symbol must update the allowlist in the same PR;
+  any accidental loss of an exported symbol fails the gate.  SKIPs
+  cleanly on platforms without `libwirelog.so` (Windows / static-
+  only).  Cross-link with #690 B3 (libabigail-based richer ABI
+  manifest will sit alongside).
+
+### Changed
+
+- **libwirelog symbol-visibility default = hidden, SOVERSION=1**
+  (#733 K1): the shared library now exports only `WIRELOG_PUBLIC`-
+  annotated symbols (53 in v0.40 baseline).  Internal `wl_*` /
+  `col_*` / `arr_*` / `eval_stack_*` symbols are no longer
+  reachable through `libwirelog.so`'s dynamic-symbol table; the
+  total exported `T`-class count drops from 348 to 53.  SONAME
+  bumps from `libwirelog.so.0` to `libwirelog.so.1` via explicit
+  `soversion: '1'`, decoupled from the pre-1.0 `project_version`
+  so the 1.0 ABI commitment is fixed ahead of `1.0.0` release.
+  macOS gains explicit `darwin_versions: ['1', '1.0.0']`.
+  Source-incompatible for downstream code that relied on
+  resolving internal symbols through `libwirelog.so` -- those
+  consumers must rebuild against the public surface (or against
+  the non-installed `libwirelog_static.a` which retains all
+  symbols).
+- **Public-API prototype annotation sweep** (#733 K0): the 7
+  installed public headers (`wirelog.h`, `wirelog-types.h`,
+  `wirelog-parser.h`, `wirelog-ir.h`, `wirelog-optimizer.h`,
+  `wirelog-easy.h`, `wirelog-advanced.h`) plus
+  `wirelog/io/io_adapter.h` ctx accessors gain `WIRELOG_PUBLIC`
+  on every function prototype (72 prototypes total).  No
+  source-level behaviour change before K1; load-bearing for the
+  visibility flip in K1 (without it, every public function
+  becomes hidden).
+
+### Added
+
 - **Standalone-include compile matrix for public headers** (#689):
   9 small `tests/standalone/test_standalone_<HEADER>.c` stubs, each
   including exactly one public installed header and a trivial
