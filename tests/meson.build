@@ -414,6 +414,15 @@ test('public_prefix', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-public-prefix.py'],
      suite: 'abi')
 
+# Issue #471: CHANGELOG format gate.  Asserts the [Unreleased] section
+# follows Keep-a-Changelog conventions documented in CONTRIBUTING.md
+# (categories, PR/issue refs, dated versioned sections).  Static text
+# scan; no build-tree input required.
+test('changelog_format', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-changelog-format.py',
+            meson.project_source_root() / 'CHANGELOG.md'],
+     suite: 'abi')
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss

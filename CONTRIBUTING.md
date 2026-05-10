@@ -106,3 +106,80 @@ See [docs/LINTING.md](docs/LINTING.md) for complete linting documentation, check
 * Write clear, self-documenting code.
 * Add comments for complex logic or design decisions.
 * When adding documentation or updating existing texts, adhere to Markdown formatting.
+
+## Changelog Conventions
+
+`CHANGELOG.md` follows a Keep-a-Changelog-style format with a project-
+specific format gate enforced by
+`scripts/ci/check-changelog-format.py` (registered as
+`meson test --suite abi:changelog_format`).  Every PR that introduces
+user-visible behaviour MUST add a bullet to the `[Unreleased]` section
+under the appropriate category, with a reference to the PR or
+originating issue.
+
+### Allowed categories
+
+Each `[Unreleased]` bullet sits under exactly one of:
+
+* `### Added` — new public-facing functionality
+* `### Changed` — changes to existing behaviour (incl. ABI breaks)
+* `### Deprecated` — soon-to-be-removed features (warning fired)
+* `### Removed` — features removed in this release
+* `### Fixed` — bug fixes
+* `### Performance` — measurable performance changes (gated by
+  `meson test --suite perf`)
+* `### Security` — vulnerability fixes (CVE refs encouraged)
+* `### Documentation` — doc-only changes that nonetheless affect a
+  user-visible contract
+
+### Required content per bullet
+
+Every bullet MUST include at least one PR or issue reference (`#N`).
+The format gate trips when an `[Unreleased]` bullet lacks any `#N`
+match.
+
+Example (good):
+
+```md
+### Added
+
+- **Foo widget** (#123): introduces the `wirelog_foo_*` API for
+  bar-style integration.  See `docs/FOO.md` for usage.
+```
+
+Example (will fail the gate):
+
+```md
+### Added
+
+- Foo widget: introduces the wirelog_foo_* API
+```
+
+### Cutover procedure
+
+When cutting a release tag (`vX.Y.Z`):
+
+1. Move the entire `[Unreleased]` block under a new heading
+   `## [X.Y.Z] - YYYY-MM-DD`.  The format gate enforces the date
+   format on versioned sections.
+2. Reset `[Unreleased]` to the placeholder shape:
+   ```md
+   ## [Unreleased]
+
+   ### Added
+
+   ### Changed
+
+   ...
+   ```
+   Empty category bullets are fine; the gate only fails on bullets
+   that lack a #N reference, not on empty categories.
+3. Open the release PR; CI will refuse to merge if the gate fails.
+
+### Freeze rule (post-release-1.x cut)
+
+After `release-1.x` is cut for v1.0 RC1 (#685), the `[Unreleased]`
+section on `release-1.x` is **frozen** — every hotfix landing on
+`release-1.x` between rc1 cut and GA tag updates the versioned
+section, not `[Unreleased]`.  This is mechanically enforced by
+the per-branch CI rule landed under #747 (B18).

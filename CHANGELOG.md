@@ -6,6 +6,18 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **CHANGELOG format CI gate** (#471):
+  `scripts/ci/check-changelog-format.py` (registered as
+  `meson test --suite abi:changelog_format`) asserts the
+  `[Unreleased]` section follows the Keep-a-Changelog conventions
+  documented in `CONTRIBUTING.md`: every bullet sits under one of
+  the allowed categories (`Added`, `Changed`, `Deprecated`,
+  `Removed`, `Fixed`, `Performance`, `Security`, `Documentation`)
+  and carries at least one `#N` PR or issue reference.  Versioned
+  section headers must use `## [X.Y.Z] - YYYY-MM-DD`.  CONTRIBUTING.md
+  gains a "Changelog Conventions" section documenting the format,
+  cutover procedure, and the freeze rule for `release-1.x`
+  (cross-link with #747 B18).
 - **ABI symbol allowlist gate (#733 K2)**: `meson test --suite abi:abi_symbols`
   diffs `nm -D --defined-only build/libwirelog.so | awk '$2=="T"'`
   against `abi/libwirelog-1.0.symbols`.  53 entries seeded from the
