@@ -14,6 +14,33 @@ during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
 for the full scope.  Entries are filed atomically as the renames land;
 #745 then consolidates the narrative for the GA migration guide.
 
+### String-fn enum constants rename (#757)
+
+The 12 `WL_STR_FN_*` enum constants in `wirelog/wirelog-types.h`
+declare the supported string-operation kinds (#444).  Per
+`AGENTS.md:17-20`, public macros / enums use the `WIRELOG_*`
+prefix.  All 12 constants are renamed:
+
+| Old | New |
+|---|---|
+| `WL_STR_FN_STRLEN` | `WIRELOG_STR_FN_STRLEN` |
+| `WL_STR_FN_CAT` | `WIRELOG_STR_FN_CAT` |
+| `WL_STR_FN_CONTAINS` | `WIRELOG_STR_FN_CONTAINS` |
+| `WL_STR_FN_STR_ORD` | `WIRELOG_STR_FN_STR_ORD` |
+| `WL_STR_FN_STR_PREFIX` | `WIRELOG_STR_FN_STR_PREFIX` |
+| `WL_STR_FN_STR_REPLACE` | `WIRELOG_STR_FN_STR_REPLACE` |
+| `WL_STR_FN_STR_SUFFIX` | `WIRELOG_STR_FN_STR_SUFFIX` |
+| `WL_STR_FN_SUBSTR` | `WIRELOG_STR_FN_SUBSTR` |
+| `WL_STR_FN_TO_LOWER` | `WIRELOG_STR_FN_TO_LOWER` |
+| `WL_STR_FN_TO_NUMBER` | `WIRELOG_STR_FN_TO_NUMBER` |
+| `WL_STR_FN_TO_STRING` | `WIRELOG_STR_FN_TO_STRING` |
+| `WL_STR_FN_TO_UPPER` | `WIRELOG_STR_FN_TO_UPPER` |
+| `WL_STR_FN_TRIM` | `WIRELOG_STR_FN_TRIM` |
+
+Source-incompatible for downstream consumers passing the
+constants to `wirelog_*` string-op APIs; migrate via a textual
+rename.  Underlying enum values and behaviour are unchanged.
+
 ### Public-API typedef rename: wl_intern_t -> wirelog_intern_t (#760)
 
 The `wirelog/wirelog.h` umbrella header previously exposed

@@ -262,20 +262,20 @@ static wirelog_str_fn_t
 token_to_str_fn(wl_parser_lexer_token_type_t type)
 {
     switch (type) {
-    case WL_PARSER_LEXER_TOK_STRLEN:      return WL_STR_FN_STRLEN;
-    case WL_PARSER_LEXER_TOK_CAT:         return WL_STR_FN_CAT;
-    case WL_PARSER_LEXER_TOK_SUBSTR:      return WL_STR_FN_SUBSTR;
-    case WL_PARSER_LEXER_TOK_CONTAINS:    return WL_STR_FN_CONTAINS;
-    case WL_PARSER_LEXER_TOK_STR_PREFIX:  return WL_STR_FN_STR_PREFIX;
-    case WL_PARSER_LEXER_TOK_STR_SUFFIX:  return WL_STR_FN_STR_SUFFIX;
-    case WL_PARSER_LEXER_TOK_STR_ORD:     return WL_STR_FN_STR_ORD;
-    case WL_PARSER_LEXER_TOK_TO_UPPER:    return WL_STR_FN_TO_UPPER;
-    case WL_PARSER_LEXER_TOK_TO_LOWER:    return WL_STR_FN_TO_LOWER;
-    case WL_PARSER_LEXER_TOK_STR_REPLACE: return WL_STR_FN_STR_REPLACE;
-    case WL_PARSER_LEXER_TOK_TRIM:        return WL_STR_FN_TRIM;
-    case WL_PARSER_LEXER_TOK_TO_STRING:   return WL_STR_FN_TO_STRING;
-    case WL_PARSER_LEXER_TOK_TO_NUMBER:   return WL_STR_FN_TO_NUMBER;
-    default:                               return WL_STR_FN_STRLEN;
+    case WL_PARSER_LEXER_TOK_STRLEN:      return WIRELOG_STR_FN_STRLEN;
+    case WL_PARSER_LEXER_TOK_CAT:         return WIRELOG_STR_FN_CAT;
+    case WL_PARSER_LEXER_TOK_SUBSTR:      return WIRELOG_STR_FN_SUBSTR;
+    case WL_PARSER_LEXER_TOK_CONTAINS:    return WIRELOG_STR_FN_CONTAINS;
+    case WL_PARSER_LEXER_TOK_STR_PREFIX:  return WIRELOG_STR_FN_STR_PREFIX;
+    case WL_PARSER_LEXER_TOK_STR_SUFFIX:  return WIRELOG_STR_FN_STR_SUFFIX;
+    case WL_PARSER_LEXER_TOK_STR_ORD:     return WIRELOG_STR_FN_STR_ORD;
+    case WL_PARSER_LEXER_TOK_TO_UPPER:    return WIRELOG_STR_FN_TO_UPPER;
+    case WL_PARSER_LEXER_TOK_TO_LOWER:    return WIRELOG_STR_FN_TO_LOWER;
+    case WL_PARSER_LEXER_TOK_STR_REPLACE: return WIRELOG_STR_FN_STR_REPLACE;
+    case WL_PARSER_LEXER_TOK_TRIM:        return WIRELOG_STR_FN_TRIM;
+    case WL_PARSER_LEXER_TOK_TO_STRING:   return WIRELOG_STR_FN_TO_STRING;
+    case WL_PARSER_LEXER_TOK_TO_NUMBER:   return WIRELOG_STR_FN_TO_NUMBER;
+    default:                               return WIRELOG_STR_FN_STRLEN;
     }
 }
 
