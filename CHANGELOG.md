@@ -6,6 +6,19 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Release-process documentation + release-template CI gate** (#772):
+  `docs/RELEASE_PROCESS.md` defines the canonical procedure for cutting
+  a release tag, including the 9-section release-note template and the
+  publication procedure (release PR, tag, GitHub Releases body, signed
+  artefacts).  Two helper scripts land alongside:
+  `scripts/release/extract-changelog-section.sh` (emits one CHANGELOG
+  versioned section to stdout, used by `gh release create
+  --notes-file`), and `scripts/ci/check-release-template.sh`
+  (registered as `meson test --suite abi:release_template`) which
+  diffs the published GitHub Releases body for the current tag against
+  the corresponding CHANGELOG section.  The gate SKIPs outside
+  tag-triggered CI context (PR builds, main branch) and enforces
+  inside the release-tag.yml workflow (#749 B19).
 - **CHANGELOG format CI gate** (#471):
   `scripts/ci/check-changelog-format.py` (registered as
   `meson test --suite abi:changelog_format`) asserts the
