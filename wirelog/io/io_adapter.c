@@ -63,11 +63,11 @@ set_error(const char *msg)
 #define SCHEME_MAX_LEN 64
 
 typedef struct {
-    const wl_io_adapter_t *adapter;
+    const wirelog_io_adapter_t *adapter;
     char scheme[SCHEME_MAX_LEN];
 } registry_entry_t;
 
-static registry_entry_t s_registry[WL_IO_MAX_ADAPTERS];
+static registry_entry_t s_registry[WIRELOG_IO_MAX_ADAPTERS];
 static uint32_t s_count;
 /* Mutex initialization strategy (3-tier, Issue #494):
  *
@@ -97,7 +97,7 @@ static mutex_t s_mutex = { PTHREAD_MUTEX_INITIALIZER };
 static bool s_initialized;
 
 /* Built-in CSV adapter (implemented in csv_adapter.c) */
-extern const wl_io_adapter_t wl_csv_adapter;
+extern const wirelog_io_adapter_t wl_csv_adapter;
 
 /* ======================================================================== */
 /* One-Shot Initialization                                                  */
@@ -147,7 +147,7 @@ ensure_builtins(void)
 /* ======================================================================== */
 
 int
-wl_io_register_adapter(const wl_io_adapter_t *adapter)
+wirelog_io_register_adapter(const wirelog_io_adapter_t *adapter)
 {
     ensure_builtins();
 
@@ -159,7 +159,7 @@ wl_io_register_adapter(const wl_io_adapter_t *adapter)
         set_error("adapter scheme is NULL");
         return -1;
     }
-    if (adapter->abi_version != WL_IO_ABI_VERSION) {
+    if (adapter->abi_version != WIRELOG_IO_ABI_VERSION) {
         set_error("ABI version mismatch");
         return -1;
     }
@@ -176,7 +176,7 @@ wl_io_register_adapter(const wl_io_adapter_t *adapter)
     }
 
     /* Check capacity */
-    if (s_count >= WL_IO_MAX_ADAPTERS) {
+    if (s_count >= WIRELOG_IO_MAX_ADAPTERS) {
         mutex_unlock(&s_mutex);
         set_error("registry full");
         return -1;
@@ -194,7 +194,7 @@ wl_io_register_adapter(const wl_io_adapter_t *adapter)
 }
 
 int
-wl_io_unregister_adapter(const char *scheme)
+wirelog_io_unregister_adapter(const char *scheme)
 {
     ensure_builtins();
 
@@ -224,8 +224,8 @@ wl_io_unregister_adapter(const char *scheme)
     return -1;
 }
 
-const wl_io_adapter_t *
-wl_io_find_adapter(const char *scheme)
+const wirelog_io_adapter_t *
+wirelog_io_find_adapter(const char *scheme)
 {
     ensure_builtins();
 
@@ -238,7 +238,7 @@ wl_io_find_adapter(const char *scheme)
 
     for (uint32_t i = 0; i < s_count; i++) {
         if (strcmp(s_registry[i].scheme, scheme) == 0) {
-            const wl_io_adapter_t *found = s_registry[i].adapter;
+            const wirelog_io_adapter_t *found = s_registry[i].adapter;
             mutex_unlock(&s_mutex);
             set_error(NULL);
             return found;
@@ -251,7 +251,7 @@ wl_io_find_adapter(const char *scheme)
 }
 
 const char *
-wl_io_last_error(void)
+wirelog_io_last_error(void)
 {
     return s_errbuf;
 }

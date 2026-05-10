@@ -8,9 +8,9 @@
 
 #include <stddef.h>
 
-WL_IO_PLUGIN_EXPORT
-const wl_io_adapter_t *const *
-wl_io_plugin_entry(uint32_t *n_out, uint32_t abi_ver)
+WIRELOG_IO_PLUGIN_EXPORT
+const wirelog_io_adapter_t *const *
+wirelog_io_plugin_entry(uint32_t *n_out, uint32_t abi_ver)
 {
     (void)abi_ver;
     *n_out = 0;

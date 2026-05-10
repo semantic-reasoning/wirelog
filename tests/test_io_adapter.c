@@ -42,17 +42,17 @@ test_register_and_find(void)
 {
     TEST("register_and_find");
 #ifdef TEST_REGISTRY_PRESENT
-    wl_io_adapter_t adapter;
+    wirelog_io_adapter_t adapter;
     memset(&adapter, 0, sizeof(adapter));
     adapter.scheme = "mock";
-    adapter.abi_version = WL_IO_ABI_VERSION;
+    adapter.abi_version = WIRELOG_IO_ABI_VERSION;
 
-    int rc = wl_io_register_adapter(&adapter);
+    int rc = wirelog_io_register_adapter(&adapter);
     if (rc != 0) {
         FAIL("register returned non-zero"); return;
     }
 
-    const wl_io_adapter_t *found = wl_io_find_adapter("mock");
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter("mock");
     if (found == &adapter) PASS();
     else FAIL("found pointer does not match registered adapter");
 #else
@@ -65,7 +65,7 @@ test_find_unknown_scheme(void)
 {
     TEST("find_unknown_scheme");
 #ifdef TEST_REGISTRY_PRESENT
-    const wl_io_adapter_t *found = wl_io_find_adapter("nonexistent");
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter("nonexistent");
     if (found == NULL) PASS();
     else FAIL("expected NULL for unknown scheme");
 #else
@@ -78,17 +78,17 @@ test_duplicate_register_error(void)
 {
     TEST("duplicate_register_error");
 #ifdef TEST_REGISTRY_PRESENT
-    wl_io_adapter_t adapter;
+    wirelog_io_adapter_t adapter;
     memset(&adapter, 0, sizeof(adapter));
     adapter.scheme = "mock_dup";
-    adapter.abi_version = WL_IO_ABI_VERSION;
+    adapter.abi_version = WIRELOG_IO_ABI_VERSION;
 
-    int rc1 = wl_io_register_adapter(&adapter);
+    int rc1 = wirelog_io_register_adapter(&adapter);
     if (rc1 != 0) {
         FAIL("first register failed"); return;
     }
 
-    int rc2 = wl_io_register_adapter(&adapter);
+    int rc2 = wirelog_io_register_adapter(&adapter);
     if (rc2 == -1) PASS();
     else FAIL("expected -1 for duplicate registration");
 #else
@@ -101,7 +101,7 @@ test_builtin_csv_autoload(void)
 {
     TEST("builtin_csv_autoload");
 #ifdef TEST_REGISTRY_PRESENT
-    const wl_io_adapter_t *found = wl_io_find_adapter("csv");
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter("csv");
     if (found != NULL) PASS();
     else FAIL("expected non-NULL for built-in csv adapter");
 #else
@@ -114,27 +114,27 @@ test_unregister_then_find(void)
 {
     TEST("unregister_then_find");
 #ifdef TEST_REGISTRY_PRESENT
-    wl_io_adapter_t adapter;
+    wirelog_io_adapter_t adapter;
     memset(&adapter, 0, sizeof(adapter));
     adapter.scheme = "mock_unreg";
-    adapter.abi_version = WL_IO_ABI_VERSION;
+    adapter.abi_version = WIRELOG_IO_ABI_VERSION;
 
-    int rc = wl_io_register_adapter(&adapter);
+    int rc = wirelog_io_register_adapter(&adapter);
     if (rc != 0) {
         FAIL("register failed"); return;
     }
 
-    rc = wl_io_unregister_adapter("mock_unreg");
+    rc = wirelog_io_unregister_adapter("mock_unreg");
     if (rc != 0) {
         FAIL("unregister failed"); return;
     }
 
-    const wl_io_adapter_t *found = wl_io_find_adapter("mock_unreg");
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter("mock_unreg");
     if (found != NULL) {
         FAIL("expected NULL after unregister"); return;
     }
 
-    rc = wl_io_register_adapter(&adapter);
+    rc = wirelog_io_register_adapter(&adapter);
     if (rc == 0) PASS();
     else FAIL("re-register after unregister failed");
 #else
@@ -147,12 +147,12 @@ test_abi_version_mismatch(void)
 {
     TEST("abi_version_mismatch");
 #ifdef TEST_REGISTRY_PRESENT
-    wl_io_adapter_t adapter;
+    wirelog_io_adapter_t adapter;
     memset(&adapter, 0, sizeof(adapter));
     adapter.scheme = "mock_bad_abi";
     adapter.abi_version = 999;
 
-    int rc = wl_io_register_adapter(&adapter);
+    int rc = wirelog_io_register_adapter(&adapter);
     if (rc == -1) PASS();
     else FAIL("expected -1 for ABI version mismatch");
 #else

@@ -4,7 +4,7 @@
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
  *
- * Implements the wl_io_ctx_t accessor functions declared in
+ * Implements the wirelog_io_ctx_t accessor functions declared in
  * io_adapter.h (#451) and the test constructor/destructor from
  * io_ctx_internal.h.
  *
@@ -20,14 +20,14 @@
 /* Production Constructor (from relation metadata)                          */
 /* ------------------------------------------------------------------------ */
 
-wl_io_ctx_t *
-wl_io_ctx_create_for_relation(const wl_ir_relation_info_t *rel,
+wirelog_io_ctx_t *
+wirelog_io_ctx_create_for_relation(const wl_ir_relation_info_t *rel,
     wl_intern_t *intern)
 {
     if (!rel)
         return NULL;
 
-    wl_io_ctx_t *ctx = (wl_io_ctx_t *)calloc(1, sizeof(*ctx));
+    wirelog_io_ctx_t *ctx = (wirelog_io_ctx_t *)calloc(1, sizeof(*ctx));
     if (!ctx)
         return NULL;
 
@@ -57,13 +57,13 @@ wl_io_ctx_create_for_relation(const wl_ir_relation_info_t *rel,
 /* Test Constructor / Destructor                                            */
 /* ------------------------------------------------------------------------ */
 
-wl_io_ctx_t *
-wl_io_ctx_create_test(const char *relation_name,
+wirelog_io_ctx_t *
+wirelog_io_ctx_create_test(const char *relation_name,
     const wirelog_column_type_t *col_types, uint32_t num_cols,
     const char **param_keys, const char **param_values,
     uint32_t num_params, wl_intern_t *intern)
 {
-    wl_io_ctx_t *ctx = (wl_io_ctx_t *)calloc(1, sizeof(*ctx));
+    wirelog_io_ctx_t *ctx = (wirelog_io_ctx_t *)calloc(1, sizeof(*ctx));
     if (!ctx)
         return NULL;
 
@@ -90,7 +90,7 @@ wl_io_ctx_create_test(const char *relation_name,
 }
 
 void
-wl_io_ctx_destroy(wl_io_ctx_t *ctx)
+wirelog_io_ctx_destroy(wirelog_io_ctx_t *ctx)
 {
     if (!ctx)
         return;
@@ -103,7 +103,7 @@ wl_io_ctx_destroy(wl_io_ctx_t *ctx)
 /* ------------------------------------------------------------------------ */
 
 const char *
-wl_io_ctx_relation_name(const wl_io_ctx_t *ctx)
+wirelog_io_ctx_relation_name(const wirelog_io_ctx_t *ctx)
 {
     if (!ctx)
         return NULL;
@@ -111,7 +111,7 @@ wl_io_ctx_relation_name(const wl_io_ctx_t *ctx)
 }
 
 uint32_t
-wl_io_ctx_num_cols(const wl_io_ctx_t *ctx)
+wirelog_io_ctx_num_cols(const wirelog_io_ctx_t *ctx)
 {
     if (!ctx)
         return 0;
@@ -119,7 +119,7 @@ wl_io_ctx_num_cols(const wl_io_ctx_t *ctx)
 }
 
 wirelog_column_type_t
-wl_io_ctx_col_type(const wl_io_ctx_t *ctx, uint32_t col)
+wirelog_io_ctx_col_type(const wirelog_io_ctx_t *ctx, uint32_t col)
 {
     if (!ctx || col >= ctx->num_cols)
         return (wirelog_column_type_t)-1;
@@ -127,7 +127,7 @@ wl_io_ctx_col_type(const wl_io_ctx_t *ctx, uint32_t col)
 }
 
 const char *
-wl_io_ctx_param(const wl_io_ctx_t *ctx, const char *key)
+wirelog_io_ctx_param(const wirelog_io_ctx_t *ctx, const char *key)
 {
     if (!ctx || !key)
         return NULL;
@@ -139,7 +139,7 @@ wl_io_ctx_param(const wl_io_ctx_t *ctx, const char *key)
 }
 
 int64_t
-wl_io_ctx_intern_string(wl_io_ctx_t *ctx, const char *utf8)
+wirelog_io_ctx_intern_string(wirelog_io_ctx_t *ctx, const char *utf8)
 {
     if (!ctx || !ctx->intern)
         return -1;
@@ -151,7 +151,7 @@ wl_io_ctx_intern_string(wl_io_ctx_t *ctx, const char *utf8)
 }
 
 void *
-wl_io_ctx_platform(const wl_io_ctx_t *ctx)
+wirelog_io_ctx_platform(const wirelog_io_ctx_t *ctx)
 {
     if (!ctx)
         return NULL;
@@ -159,7 +159,7 @@ wl_io_ctx_platform(const wl_io_ctx_t *ctx)
 }
 
 int
-wl_io_ctx_set_platform(wl_io_ctx_t *ctx, void *ptr)
+wirelog_io_ctx_set_platform(wirelog_io_ctx_t *ctx, void *ptr)
 {
     if (!ctx)
         return -1;

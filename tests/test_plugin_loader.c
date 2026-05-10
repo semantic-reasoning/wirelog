@@ -34,7 +34,7 @@ test_load_valid_plugin(const char *mock_path)
         return;
     }
 
-    const wl_io_adapter_t *found = wl_io_find_adapter("mock_plugin");
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter("mock_plugin");
     if (!found) {
         FAIL("adapter 'mock_plugin' not found after load");
         return;
@@ -55,7 +55,7 @@ test_unload_cleans_registry(void)
 
     wl_plugin_unload_all();
 
-    const wl_io_adapter_t *found = wl_io_find_adapter("mock_plugin");
+    const wirelog_io_adapter_t *found = wirelog_io_find_adapter("mock_plugin");
     if (found) {
         FAIL("adapter 'mock_plugin' still found after unload");
         return;

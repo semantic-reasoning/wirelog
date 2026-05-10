@@ -62,7 +62,7 @@ wl_session_load_input_files(wl_session_t *sess,
         const char *scheme = rel->input_io_scheme ? rel->input_io_scheme
                                                   : "csv";
 
-        const wl_io_adapter_t *adapter = wl_io_find_adapter(scheme);
+        const wirelog_io_adapter_t *adapter = wirelog_io_find_adapter(scheme);
         if (!adapter) {
             fprintf(stderr,
                 "error: no I/O adapter registered for scheme '%s' "
@@ -71,8 +71,8 @@ wl_session_load_input_files(wl_session_t *sess,
             return -1;
         }
 
-        wl_io_ctx_t *ctx =
-            wl_io_ctx_create_for_relation(rel, prog->intern);
+        wirelog_io_ctx_t *ctx =
+            wirelog_io_ctx_create_for_relation(rel, prog->intern);
         if (!ctx) {
             fprintf(stderr,
                 "error: failed to create I/O context for '%s'\n",
@@ -90,7 +90,7 @@ wl_session_load_input_files(wl_session_t *sess,
                 fprintf(stderr,
                     "error: validation failed for '%s': %s\n",
                     rel->name, errbuf);
-                wl_io_ctx_destroy(ctx);
+                wirelog_io_ctx_destroy(ctx);
                 return -1;
             }
         }
@@ -100,7 +100,7 @@ wl_session_load_input_files(wl_session_t *sess,
         uint32_t nrows = 0;
 
         int rc = adapter->read(ctx, &data, &nrows, adapter->user_data);
-        wl_io_ctx_destroy(ctx);
+        wirelog_io_ctx_destroy(ctx);
 
         if (rc != 0) {
             fprintf(stderr,

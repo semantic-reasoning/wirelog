@@ -28,7 +28,7 @@ host, with the host owning the I/O boundary. Specifically:
 - **Trusted**: the program text fed to `wirelog_parse` /
   `wirelog_parse_string`, the row data passed to
   `wirelog_session_insert` and `wirelog_easy_insert`, the I/O adapter
-  callbacks the host registers via `wl_io_register_adapter`.
+  callbacks the host registers via `wirelog_io_register_adapter`.
 - **Untrusted**: nothing in the default surface. wirelog does not
   open sockets, accept network connections, or fork helper processes.
 - **Optional crypto**: when built with `-DmbedTLS=enabled` (default
