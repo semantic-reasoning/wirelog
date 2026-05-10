@@ -414,6 +414,19 @@ test('public_prefix', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-public-prefix.py'],
      suite: 'abi')
 
+# Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
+# libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
+# symbol must update the allowlist in the same PR; any accidental loss
+# of an exported symbol fails the gate.  Linux/ELF-focused; SKIPs
+# cleanly on platforms without `libwirelog.so` (Windows, static-only).
+sh = find_program('bash', required: false)
+if sh.found()
+  test('abi_symbols', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols.sh',
+              meson.project_build_root()],
+       suite: 'abi')
+endif
+
 # Issue #689 / Blocker B2: standalone-include compile matrix for the
 # public-headers SSoT.  One executable per public header, each
 # compiled in isolation against tests/standalone/test_standalone_<H>.c
