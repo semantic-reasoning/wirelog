@@ -6,6 +6,19 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Public-API typedef renamed for v1.0 prefix conformance** (#760):
+  the `wirelog/wirelog.h` umbrella header no longer exposes the
+  internal-style `wl_intern_t` typedef name.  The new public name is
+  `wirelog_intern_t`; `wirelog_program_get_intern()` returns
+  `const wirelog_intern_t *`.  The internal header
+  `wirelog/intern.h` keeps `typedef struct wl_intern wl_intern_t;`
+  for in-tree callers (both names alias the same struct).  Two
+  docstrings that previously named the internal `wl_dd_load_edb()`
+  helper are rephrased to refer to it as the project's internal
+  EDB-load helper.  Source-incompatible for downstream consumers
+  using `wl_intern_t` after including only `wirelog/wirelog.h`;
+  migrate via a textual rename to `wirelog_intern_t`.  Part of
+  public-API prefix audit epic #755.
 - **Callback typedefs renamed for v1.0 prefix conformance** (#758): the
   public-API callback typedefs `wl_on_delta_fn` and `wl_on_tuple_fn`
   in `wirelog/wirelog-types.h` are renamed to `wirelog_on_delta_fn` and
