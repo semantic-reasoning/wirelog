@@ -4,6 +4,21 @@ All notable changes to wirelog are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **CI lint backstop for public-API prefix conformance** (#761):
+  `scripts/ci/check-public-prefix.py` (registered as
+  `meson test --suite abi:public_prefix`) scans the 9 public
+  installed headers for any `wl_*` / `WL_*` token that might
+  leak through after the v0.40 API audit closes its sibling
+  renames (#762 / #756 / #757 / #758 / #759 / #760).  An
+  inline `ALLOW_LIST` documents the single intentional
+  exception today (`struct wl_intern` tag forward-declared in
+  `wirelog/wirelog.h` for the public `wirelog_intern_t`
+  typedef per #760's design).  Closes the public-API prefix
+  audit epic #755 by making the rule mechanically enforced
+  rather than human-only.
+
 ### Changed
 
 - **I/O adapter framework renamed and ABI bumped to 2u for v1.0

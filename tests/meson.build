@@ -406,6 +406,14 @@ test('public_header_surface', py3,
             meson.project_source_root()],
      suite: 'abi')
 
+# Issue #761: backstop CI lint preventing wl_*/WL_* prefixes from leaking
+# back onto public installed headers after the v0.40 API audit closes its
+# sibling rename issues (#762 / #756 / #757 / #758 / #759 / #760).
+# Static text scan; no build-tree input required.
+test('public_prefix', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-public-prefix.py'],
+     suite: 'abi')
+
 test_intern_exe = executable(
   'test_intern',
   files('test_intern.c'),
