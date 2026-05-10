@@ -4,8 +4,14 @@ All notable changes to wirelog are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- **CRDT W=8 -6.3% via leading-key cache in compact_runs heap** (PR #731): the K-way merge in `col_rel_compact_runs` now shadows the leading column with a stack-resident `int64_t lead_key[]` array parallel to the heap entries; the inner sift-down comparator short-circuits on column 0 instead of indirecting through `col_rel_row_cmp` for every comparison. CRDT W=8 5-rep median moves from 19.43s to 18.20s (-6.3%); first time `W=8 < W=1` on the dev box. No row-layout change, no sort-algorithm change, no public-header surface impact. Cross-workload (DOOP / CSPA / Polonius / Galen / DDISASM) tuple counts and gold relations preserved.
+
 ### Added
 
+- **CRDT median-time perf gate** (PR #731): `tests/test_crdt_perf_gate.c` registered under `meson test --suite perf`. Drives the same Datalog source as `bench_flowlog --workload crdt` through the public `wirelog_*` API, asserts tuple count == 1,301,914 before any timing assertion, asserts coefficient of variation <= 3% (else SKIP), asserts median wall <= `WL_CRDT_PERF_GATE_TARGET_MS` (19,840 ms = baseline 18,890 ms x 1.05). Three-mode SKIP/SKIP/FAIL behaviour: SKIP by default; FAIL-loud under `WIRELOG_PERF_REQUIRE=1` when the cpufreq governor is not `performance` OR when the build is not `-Dwirelog_log_max_level=error` (per #731 follow-up commit). The escalator pattern lets dev hosts run `meson test --suite perf` cleanly while merge runners that opt into REQUIRE mode catch misconfiguration loud.
+- **`bench/bench_crdt_workload.h`** (PR #731): the CRDT verification template is moved out of `bench_flowlog.c` into a shared header so the bench driver and the perf gate cannot drift on rule structure.
 - **`wirelog/wirelog-advanced.h`** (#717, #703): New public header exposing the fine-grained `wirelog_session_*` API as the stable peer of `wl_easy`. Eight thin wrappers (`create` / `destroy` / `insert` / `remove` / `step` / `set_delta_cb` / `snapshot` / `make_compound`) over the internal session primitives. Backend selection through the `wirelog_backend_kind_t` enum (`DEFAULT` / `COLUMNAR`) — no vtable exposure. Inline `.dl` facts are seeded eagerly at `wirelog_session_create()` time, matching the wl_easy contract from #718. Internal `wl_session_*` and `wl_compute_backend_t` remain private.
 - **CI guard** (#717): `scripts/ci/check-advanced-header.sh` (suite `abi`) fails when `wirelog/wirelog-advanced.h` includes any internal header.
 
@@ -19,6 +25,7 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **README.md benchmark table refresh** (PR #731): full 16-workload portfolio re-measured at `--repeat 5` (5-trial medians) on the same dev host (cpufreq governor `schedutil`), replacing the previous `--repeat 1` snapshot. CRDT row reflects the new W=8 win (18.20s median, down from 19.43s). DOOP W=8 reflects unrelated post-baseline main-branch work (-51% vs prior table). Recipe block updated to `--repeat 5`. Numbers are descriptive; the regression gate in `meson test --suite perf` is the gated path.
 - **`docs/SECURITY_MODEL.md`** (#701): new document recording the threat model, the mbedTLS-enabled build's license stack (Apache-2.0 + Apache-2.0 sub-dependencies on top of LGPL-3.0-or-later wirelog), and a good-faith export-control self-classification (ECCN 5D002.c.1 + License Exception ENC for `mbedTLS=enabled`; EAR99 for the default `disabled` build). Linked from README.md and from the `mbedTLS` option description in `meson_options.txt`.
 - **README.md** (#717): replace the now-misleading `wl_session_*` / `wirelog/session.h` advisory with `wirelog_session_*` / `wirelog/wirelog-advanced.h`. The internal session header is explicitly called out as private.
 - **`docs/SEMANTICS.md`** (#718): new document recording the engine's observable semantic-model decisions and the path toward 1.0 stabilization. First entry: inline `.dl` fact loading rules and the z-set host insert/remove model (status: Current).
