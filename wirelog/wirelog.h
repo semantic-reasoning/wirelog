@@ -150,7 +150,12 @@ wirelog_program_free(wirelog_program_t *program);
 /* Symbol Interning                                                         */
 /* ======================================================================== */
 
-typedef struct wl_intern wl_intern_t;
+/* Public-API typedef for the program's symbol intern table.  The
+ * underlying struct (`struct wl_intern`) is internal and remains
+ * accessible inside the project tree as `wl_intern_t` via
+ * `wirelog/intern.h`; downstream consumers see only the
+ * conformant public name. */
+typedef struct wl_intern wirelog_intern_t;
 
 /**
  * Get the program's symbol intern table for reverse-mapping
@@ -159,7 +164,7 @@ typedef struct wl_intern wl_intern_t;
  * @param prog  Compiled program
  * @return Intern table (owned by program, do not free), or NULL
  */
-const wl_intern_t *
+const wirelog_intern_t *
 wirelog_program_get_intern(const wirelog_program_t *prog);
 
 /* ======================================================================== */
@@ -188,8 +193,9 @@ wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
  * Load all inline facts from the program into a DD worker.
  *
  * Iterates over all relations with inline facts (fact_count > 0) and
- * calls wl_dd_load_edb() for each.  This bridges the parser's fact
- * storage with the DD execution engine.
+ * loads each batch into the DD execution engine via the project's
+ * internal EDB-load helper.  This bridges the parser's fact storage
+ * with the DD execution engine.
  *
  * @param prog    Compiled program with inline facts
  * @param worker  DD worker handle to load facts into
@@ -203,7 +209,7 @@ wirelog_load_all_facts(const wirelog_program_t *prog, void *worker);
  *
  * Iterates over all relations with has_input=true, reads the "filename"
  * and "delimiter" parameters, parses the CSV file, and loads the data
- * into the DD worker via wl_dd_load_edb().
+ * into the DD worker via the project's internal EDB-load helper.
  *
  * @param prog    Compiled program with .input directives
  * @param worker  DD worker handle to load facts into
