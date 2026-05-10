@@ -272,7 +272,22 @@ wirelog_lib = library(
   c_args: ['-DWIRELOG_BUILDING'],
   dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: true,
+  # SOVERSION ('soversion') is decoupled from project_version so the
+  # 1.0 ABI commitment is fixed at SOVERSION=1 ahead of project_version
+  # actually reaching 1.0.0.  Linux: libwirelog.so.1 -> libwirelog.so.1.0.0.
+  # macOS: compatibility_version=1, current_version=1.0.0.
+  # Windows: meson auto-derives wirelog-1.dll from version major.
+  # See #733.
   version: project_version,
+  soversion: '1',
+  darwin_versions: ['1', '1.0.0'],
+  # Symbol-visibility default: hidden.  Every public-API function on the
+  # 9 installed headers carries WIRELOG_PUBLIC (= visibility("default")
+  # / dllexport) per #733 K0.  Internal symbols (wl_*, col_*, arr_*)
+  # are now hidden from the dynamic-symbol table; consumers who relied
+  # on resolving them through libwirelog.so must rebuild against the
+  # public surface.  See #733.
+  gnu_symbol_visibility: 'hidden',
 )
 
 #Static library(optional)
