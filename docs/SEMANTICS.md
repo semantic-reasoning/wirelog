@@ -97,3 +97,42 @@ will appear as additive enum values in future minor releases.
 - `wirelog/wirelog.h` — `wirelog_program_get_facts` for host pre-check.
 - `CHANGELOG.md` — entry for #718.
 - `stable-release-plan.md` §3, §7 — public-surface and conformance plans.
+
+## v0.40 API audit closure (Status: Current)
+
+The v0.40 API audit (epic #680, Risk-C and Blocker-B series catalogued
+in `stable-release-plan.md` §1.3) drove a sweep of the public-API
+surface against `AGENTS.md:17-20` (public uses `wirelog_*` /
+`WIRELOG_*`, internal uses `wl_*` / `WL_*`).  Every concrete open
+question raised during the audit pass has been resolved through a
+landed PR; this section records the closures so v1.0 readers can
+reconstruct the reasoning.
+
+### Decisions taken
+
+| Question | Decision | Anchor |
+|---|---|---|
+| `wirelog/io/io_adapter.h` classification | Public, with full `wirelog_io_*` rename + ABI version 1u→2u | #762 (replaces audit-era #706) |
+| `wl_easy` facade prefix | Renamed to `wirelog_easy_*`; file moved to `wirelog/wirelog-easy.h` | #756 |
+| `WL_STR_FN_*` enum constants | Renamed to `WIRELOG_STR_FN_*` | #757 |
+| `wl_on_delta_fn` / `wl_on_tuple_fn` callback typedefs | Renamed to `wirelog_on_*_fn` | #758 |
+| `WL_PUBLIC` export-attribute macro | Renamed to `WIRELOG_PUBLIC` | #759 |
+| `wl_intern_t` typedef on `wirelog/wirelog.h` | Renamed to `wirelog_intern_t` (internal `struct wl_intern` tag retained) | #760 |
+| Future-drift prevention | `scripts/ci/check-public-prefix.py` (suite `abi`) refuses any `wl_*` / `WL_*` symbol on a public installed header | #761 |
+| Public-header SSoT 3-way verification | `scripts/ci/check-public-header-surface.py` already shipped at #705; PR #770 added the standalone-include compile matrix that closes Blocker B2 | #689 (B2) |
+| Symbol-visibility default | `gnu_symbol_visibility: 'hidden'`; `WIRELOG_PUBLIC` annotation gates the dynamic-symbol table; SOVERSION=1 decoupled from `project_version` | #733 (K0/K1/K2) |
+
+### What remains open
+
+No audit-era "binding decision required" notes remain unresolved at
+the time of writing.  The audit residue in `.omc/plans/issue-706-brief.md`
+references its own forward-link to #762; subsequent ABI work (libabigail
+manifest, branch-protection, signing) is tracked under v0.41+ blockers
+(#690 B3) and the v1.0.0-rc and GA epics, not under the v0.40 audit.
+
+### References
+
+- Epic #680 — v0.40 API Audit.
+- Epic #755 — public-API prefix rename rollup (closed all sub-issues
+  above).
+- `stable-release-plan.md` §1.3, §12.1.
