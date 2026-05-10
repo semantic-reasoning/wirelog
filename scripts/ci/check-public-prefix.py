@@ -90,7 +90,9 @@ def scan_header(path: pathlib.Path) -> list[tuple[int, str, str]]:
     raw = path.read_text(encoding="utf-8")
     stripped = strip_block_comments(raw)
     lines = stripped.splitlines()
-    rel = str(path.relative_to(REPO_ROOT))
+    # Normalize path separator so Windows backslashes match the
+    # ALLOW_LIST tuples (which always use forward slashes).
+    rel = path.relative_to(REPO_ROOT).as_posix()
     allow_set = {tok for (tok, hdr) in ALLOW_LIST if hdr == rel}
     hits: list[tuple[int, str, str]] = []
     for lineno, line in enumerate(lines, start=1):
