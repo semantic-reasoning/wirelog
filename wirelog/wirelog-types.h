@@ -21,6 +21,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
+/**
+ * @file wirelog-types.h
+ * @brief Common type definitions and enums for the wirelog public API.
+ */
+
 #ifndef WIRELOG_TYPES_H
 #define WIRELOG_TYPES_H
 

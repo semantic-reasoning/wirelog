@@ -21,6 +21,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
+/**
+ * @file wirelog-ir.h
+ * @brief Intermediate-representation (IR) inspection API for compiled wirelog programs.
+ */
+
 #ifndef WIRELOG_IR_H
 #define WIRELOG_IR_H
 

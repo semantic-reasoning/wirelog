@@ -21,6 +21,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
+/**
+ * @file wirelog-optimizer.h
+ * @brief Query and program optimizer API for compiled wirelog programs.
+ */
+
 #ifndef WIRELOG_OPTIMIZER_H
 #define WIRELOG_OPTIMIZER_H
 

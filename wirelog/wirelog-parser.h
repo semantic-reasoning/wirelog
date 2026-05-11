@@ -21,6 +21,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
+/**
+ * @file wirelog-parser.h
+ * @brief Datalog source parser API: parse .dl text or files into wirelog_program_t.
+ */
+
 #ifndef WIRELOG_PARSER_H
 #define WIRELOG_PARSER_H
 

@@ -6,6 +6,22 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **File-level Doxygen markers on every public header + CI gate**
+  (#780, closes #680 exit condition): every entry in
+  `wirelog_public_headers` (plus the standalone
+  `install_headers('wirelog/io/io_adapter.h', ...)` call) now
+  carries `@file` + `@brief` inside a `/** ... */` JavaDoc block
+  placed between the SPDX C-comment and the include guard.  Eight
+  headers gained both markers; `wirelog/wirelog-advanced.h` gained
+  `@brief` (it already had `@file`).  A new gate
+  `scripts/ci/check-public-doxygen-headers.py` (registered as
+  `meson test --suite abi:public_doxygen_headers`) sources its
+  header list from `parse_meson_sot` in
+  `scripts/ci/check-public-header-surface.py` (the single SoT) and
+  fails when any installed public header is missing either marker.
+  Detection is regex-strict (`^\s*\*\s*@file\b`, `^\s*\*\s*@brief\b`)
+  so per-parameter `@filename:` annotations in GTK-Doc-style function
+  blocks do not satisfy the file-level check.
 - **Release-process documentation + release-template CI gate** (#772):
   `docs/RELEASE_PROCESS.md` defines the canonical procedure for cutting
   a release tag, including the 9-section release-note template and the

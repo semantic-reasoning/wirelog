@@ -6,6 +6,11 @@
  * Licensed under LGPL-3.0-or-later
  */
 
+/**
+ * @file wirelog-export.h
+ * @brief Public-symbol visibility and deprecation attribute macros.
+ */
+
 #ifndef WIRELOG_EXPORT_H
 #define WIRELOG_EXPORT_H
 
