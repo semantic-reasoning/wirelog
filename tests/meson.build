@@ -414,6 +414,16 @@ test('public_prefix', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-public-prefix.py'],
      suite: 'abi')
 
+# Issue #780 / Epic #680 exit gate: every public header must carry
+# `@file` and `@brief` inside a `/** ... */` Doxygen block.  Header
+# list is sourced from `parse_meson_sot` in check-public-header-surface.py
+# (which authoritatively parses meson.build), so the lint adapts
+# automatically to surface additions/removals.  Static text scan; no
+# build-tree input required.
+test('public_doxygen_headers', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-public-doxygen-headers.py'],
+     suite: 'abi')
+
 # Issue #471: CHANGELOG format gate.  Asserts the [Unreleased] section
 # follows Keep-a-Changelog conventions documented in CONTRIBUTING.md
 # (categories, PR/issue refs, dated versioned sections).  Static text

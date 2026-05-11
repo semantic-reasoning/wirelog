@@ -23,6 +23,7 @@
 
 /**
  * @file wirelog-advanced.h
+ * @brief Fine-grained session API; backend selection, worker count, manual stepping.
  *
  * Fine-grained session API.  This header is the public counterpart to the
  * convenience facade in <wirelog/wirelog-easy.h>: it lets a host pick the

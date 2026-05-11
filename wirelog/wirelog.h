@@ -21,6 +21,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
+/**
+ * @file wirelog.h
+ * @brief Umbrella header for the wirelog public C API.
+ */
+
 #ifndef WIRELOG_H
 #define WIRELOG_H
 

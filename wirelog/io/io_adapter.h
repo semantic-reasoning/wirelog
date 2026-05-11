@@ -21,6 +21,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
+/**
+ * @file io_adapter.h
+ * @brief Pluggable I/O adapter ABI for custom source and sink backends.
+ */
+
 #ifndef WIRELOG_IO_IO_ADAPTER_H
 #define WIRELOG_IO_IO_ADAPTER_H
 

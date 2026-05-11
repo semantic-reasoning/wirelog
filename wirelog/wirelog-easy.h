@@ -21,6 +21,11 @@
  * <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
+/**
+ * @file wirelog-easy.h
+ * @brief Convenience facade API; one-call session lifecycle for embedders.
+ */
+
 #ifndef WIRELOG_WL_EASY_H
 #define WIRELOG_WL_EASY_H
 
