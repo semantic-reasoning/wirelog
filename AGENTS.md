@@ -29,6 +29,18 @@ python script.py
 > The generated `wirelog/wirelog-version.h` is also installed but is
 > tracked separately by `check-version-sync.py`.
 
+### Visibility Attribute
+
+New public-API prototypes on installed headers MUST use `WIRELOG_API`
+as the export attribute (defined in `wirelog/wirelog-export.h`).  The
+underlying macro `WIRELOG_PUBLIC` is retained inside
+`wirelog/wirelog-export.h` only as a backward-compatibility alias for
+downstream code that referenced it directly during the v0.40 cycle;
+new declarations on the installed prototype surface must use
+`WIRELOG_API`.  Deprecations use `WIRELOG_DEPRECATED_SINCE(major, minor)`.
+Enforced by `scripts/ci/check-public-api-macro.py`
+(`meson test --suite abi:public_api_macro`).
+
 **Internal headers** (not installed):
 Everything under `wirelog/parser/`, `wirelog/ir/`, `wirelog/backend/`, and `wirelog/backend.h`, `wirelog/session.h`, `wirelog/intern.h`
 
