@@ -6,6 +6,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **`scripts/ci/check-threading-doc.sh`** (#734): static gate
+  registered as `meson test --suite abi:threading_doc` that counts
+  `atomic_*` call sites in `wirelog/` production sources and asserts
+  the count matches the number of audit-table rows in
+  `docs/THREADING.md` §5.  Drift in either direction (atomic_* added
+  in code without a doc row, or doc row removed without code change)
+  fails the gate with a clear diagnostic pointing at the section to
+  update.
 - **Compile-only smoke test for `WIRELOG_DEPRECATED_SINCE`** (#782):
   `tests/standalone/test_standalone_wirelog_deprecated_macro.c`
   annotates a static probe function with
@@ -68,6 +76,23 @@ All notable changes to wirelog are documented in this file.
 ### Security
 
 ### Documentation
+
+- **`docs/THREADING.md`** (#734, under epic #681): new canonical
+  document covering wirelog's threading model -- backend selection
+  (C11 `<threads.h>` > Win32 > POSIX, with `-Dthreads=posix` forcing
+  pthreads as required for TSan), the three-layer atomics surface
+  (direct `<stdatomic.h>` on GCC/Clang, MSVC shim in
+  `mem_ledger.h:24-86`, MSVC shim in `lockfree_queue.c:22-37`), a
+  40-row atomics audit table (every `atomic_*` call site in
+  `wirelog/` with file:line + memory order + per-row justification),
+  the lock-free SPSC delta queue ordering contract, K-fusion's two
+  thresholds (K≥2 plan emission via `WL_PLAN_OP_K_FUSION`, K≥4
+  parallel runtime via `WL_KFUSION_MIN_PARALLEL_K`), the
+  compound-arena epoch boundary contract anchored by the
+  `sess->coordinator == NULL` gate (#579), and the signal-safety
+  stance (WL_LOG NOT async-signal-safe; do not call wirelog from
+  signal handlers).  `README.md` and `docs/SEMANTICS.md` gain
+  cross-links.
 
 ## [0.40.0] - 2026-05-12
 

@@ -136,3 +136,5 @@ manifest, branch-protection, signing) is tracked under v0.41+ blockers
 - Epic #755 — public-API prefix rename rollup (closed all sub-issues
   above).
 - `stable-release-plan.md` §1.3, §12.1.
+- `docs/THREADING.md` — threading model + atomics audit (closes #734
+  under v0.41 epic #681).
