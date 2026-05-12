@@ -116,11 +116,11 @@ typedef enum {
 /* Operator String Conversion                                               */
 /* ======================================================================== */
 
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_cmp_op_str(wirelog_cmp_op_t op);
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_arith_op_str(wirelog_arith_op_t op);
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_agg_fn_str(wirelog_agg_fn_t fn);
 
 /* ======================================================================== */

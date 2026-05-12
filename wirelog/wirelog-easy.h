@@ -123,7 +123,7 @@ typedef struct {
  *
  * Returns: WIRELOG_OK on success; *out set to NULL on any error.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_open_opts(const char *dl_src,
     const wirelog_easy_open_opts_t *opts,
     wirelog_easy_session_t **out);
@@ -153,7 +153,7 @@ wirelog_easy_open_opts(const char *dl_src,
  * WIRELOG_ERR_MEMORY on allocation failure, or another wirelog_error_t on
  * other failure modes.  *out is set to NULL on error.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_open(const char *dl_src, wirelog_easy_session_t **out);
 
 /**
@@ -162,7 +162,7 @@ wirelog_easy_open(const char *dl_src, wirelog_easy_session_t **out);
  *
  * Release the session, plan, program, and intern table in the correct order.
  */
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_easy_close(wirelog_easy_session_t *s);
 
 /**
@@ -180,7 +180,7 @@ wirelog_easy_close(wirelog_easy_session_t *s);
  *
  * Returns: non-negative ID on success, -1 on NULL args or internal error.
  */
-WIRELOG_PUBLIC int64_t
+WIRELOG_API int64_t
 wirelog_easy_intern(wirelog_easy_session_t *s, const char *sym);
 
 /**
@@ -203,7 +203,7 @@ wirelog_easy_intern(wirelog_easy_session_t *s, const char *sym);
  * WIRELOG_ERR_EXEC for invalid arguments, plan/session build failure,
  * side-relation registration failure, or insertion failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_make_compound(wirelog_easy_session_t *s, const char *functor,
     uint32_t arity, const wirelog_compound_arg_t *args, uint64_t *handle_out);
 
@@ -219,7 +219,7 @@ wirelog_easy_make_compound(wirelog_easy_session_t *s, const char *functor,
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation,
     const int64_t *row,
     uint32_t ncols);
@@ -235,7 +235,7 @@ wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation,
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation,
     const int64_t *row,
     uint32_t ncols);
@@ -250,7 +250,7 @@ wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation,
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_insert_sym(wirelog_easy_session_t *s, const char *relation, ...);
 
 /**
@@ -260,7 +260,7 @@ wirelog_easy_insert_sym(wirelog_easy_session_t *s, const char *relation, ...);
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_remove_sym(wirelog_easy_session_t *s, const char *relation, ...);
 
 /**
@@ -271,7 +271,7 @@ wirelog_easy_remove_sym(wirelog_easy_session_t *s, const char *relation, ...);
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_step(wirelog_easy_session_t *s);
 
 /**
@@ -288,7 +288,7 @@ wirelog_easy_step(wirelog_easy_session_t *s);
  * Returns: WIRELOG_OK on success, or a wirelog_error_t describing the
  * plan/session build failure.  A NULL @s returns WIRELOG_ERR_EXEC.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_set_delta_cb(wirelog_easy_session_t *s, wirelog_on_delta_fn cb,
     void *user_data);
 
@@ -306,7 +306,7 @@ wirelog_easy_set_delta_cb(wirelog_easy_session_t *s, wirelog_on_delta_fn cb,
  * STRING column cannot be reverse-interned, the function calls abort() to
  * prevent silent corruption (NDEBUG-safe — assert() would compile out).
  */
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_easy_print_delta(const char *relation, const int64_t *row,
     uint32_t ncols,
     int32_t diff, void *user_data);
@@ -317,7 +317,7 @@ wirelog_easy_print_delta(const char *relation, const int64_t *row,
  *
  * Print a small "=== @label ===" banner used by examples.
  */
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_easy_banner(const char *label);
 
 /**
@@ -341,7 +341,7 @@ wirelog_easy_banner(const char *label);
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
     wirelog_on_tuple_fn cb,
     void *user_data);

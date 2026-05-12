@@ -28,9 +28,12 @@
   #define WIRELOG_PUBLIC
 #endif
 
-/* Public-API attribute macro.  Alias of WIRELOG_PUBLIC defined unconditionally
- * above; new code should prefer WIRELOG_API for clarity.  The full
- * adoption sweep across existing prototypes is tracked separately. */
+/* Public-API attribute macro.  WIRELOG_API is the canonical name for
+ * the public-symbol visibility attribute and is the form used on
+ * every prototype in the installed public headers.  The underlying
+ * WIRELOG_PUBLIC macro is retained as a backward-compat alias for
+ * downstream code that referenced it directly during the v0.40 cycle
+ * (see docs/MIGRATION.md 0.30 -> 1.0). */
 #define WIRELOG_API WIRELOG_PUBLIC
 
 /* WIRELOG_DEPRECATED_SINCE(major, minor): annotate APIs scheduled for

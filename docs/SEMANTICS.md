@@ -120,7 +120,7 @@ reconstruct the reasoning.
 | `wl_intern_t` typedef on `wirelog/wirelog.h` | Renamed to `wirelog_intern_t` (internal `struct wl_intern` tag retained) | #760 |
 | Future-drift prevention | `scripts/ci/check-public-prefix.py` (suite `abi`) refuses any `wl_*` / `WL_*` symbol on a public installed header | #761 |
 | Public-header SSoT 3-way verification | `scripts/ci/check-public-header-surface.py` already shipped at #705; PR #770 added the standalone-include compile matrix that closes Blocker B2 | #689 (B2) |
-| Symbol-visibility default | `gnu_symbol_visibility: 'hidden'`; `WIRELOG_PUBLIC` annotation gates the dynamic-symbol table; SOVERSION=1 decoupled from `project_version` | #733 (K0/K1/K2) |
+| Symbol-visibility default | `gnu_symbol_visibility: 'hidden'`; `WIRELOG_API` annotation gates the dynamic-symbol table (alias of `WIRELOG_PUBLIC`; see `wirelog/wirelog-export.h`); SOVERSION=1 decoupled from `project_version` | #733 (K0/K1/K2), #782 |
 
 ### What remains open
 

@@ -6,8 +6,9 @@
 # `abi/libwirelog-1.0.symbols`.
 #
 # - The allowlist is the public-API surface frozen for the v1.0
-#   ABI: every name on the list is a `WIRELOG_PUBLIC`-annotated
-#   symbol exported through one of the 9 installed public headers.
+#   ABI: every name on the list is a `WIRELOG_API`-annotated
+#   symbol (alias of `WIRELOG_PUBLIC`; see `wirelog/wirelog-export.h`)
+#   exported through one of the 9 installed public headers.
 # - Any addition of a new public symbol must update the allowlist
 #   in the same PR (the gate fails otherwise).
 # - Any accidental loss of an exported symbol (e.g. an annotation

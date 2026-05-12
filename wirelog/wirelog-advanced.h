@@ -118,7 +118,7 @@ typedef enum {
  * backend selection, WIRELOG_ERR_INVALID_IR on plan generation failure,
  * WIRELOG_ERR_MEMORY on allocation failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_session_create(wirelog_program_t *program,
     wirelog_backend_kind_t backend, uint32_t num_workers,
     wirelog_session_t **out);
@@ -130,7 +130,7 @@ wirelog_session_create(wirelog_program_t *program,
  * Release the session and its plan.  Does NOT free the program passed
  * to wirelog_session_create(); the caller still owns it.
  */
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_session_destroy(wirelog_session_t *session);
 
 /**
@@ -148,7 +148,7 @@ wirelog_session_destroy(wirelog_session_t *session);
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_session_insert(wirelog_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols);
 
@@ -166,7 +166,7 @@ wirelog_session_insert(wirelog_session_t *session, const char *relation,
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure or if
  * the backend does not support retraction.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_session_remove(wirelog_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols);
 
@@ -180,7 +180,7 @@ wirelog_session_remove(wirelog_session_t *session, const char *relation,
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_session_step(wirelog_session_t *session);
 
 /**
@@ -196,7 +196,7 @@ wirelog_session_step(wirelog_session_t *session);
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on NULL @session.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_session_set_delta_cb(wirelog_session_t *session,
     wirelog_on_delta_fn callback, void *user_data);
 
@@ -214,7 +214,7 @@ wirelog_session_set_delta_cb(wirelog_session_t *session,
  *
  * Returns: WIRELOG_OK on success, WIRELOG_ERR_EXEC on failure.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_session_snapshot(wirelog_session_t *session,
     wirelog_on_tuple_fn callback,
     void *user_data);
@@ -238,7 +238,7 @@ wirelog_session_snapshot(wirelog_session_t *session,
  * temporarily frozen; WIRELOG_ERR_MEMORY on allocation failure;
  * WIRELOG_ERR_EXEC on invalid arguments or session-side errors.
  */
-WIRELOG_PUBLIC wirelog_error_t
+WIRELOG_API wirelog_error_t
 wirelog_session_make_compound(wirelog_session_t *session, const char *functor,
     uint32_t arity, const wirelog_compound_arg_t *args, uint64_t *handle_out);
 

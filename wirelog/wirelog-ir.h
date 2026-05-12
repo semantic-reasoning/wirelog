@@ -75,7 +75,7 @@ typedef enum {
  *
  * Returns: Node type
  */
-WIRELOG_PUBLIC wirelog_ir_node_type_t
+WIRELOG_API wirelog_ir_node_type_t
 wirelog_ir_node_get_type(const wirelog_ir_node_t *node);
 
 /**
@@ -86,7 +86,7 @@ wirelog_ir_node_get_type(const wirelog_ir_node_t *node);
  *
  * Returns: (transfer none): Relation name string
  */
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_ir_node_get_relation_name(const wirelog_ir_node_t *node);
 
 /**
@@ -97,7 +97,7 @@ wirelog_ir_node_get_relation_name(const wirelog_ir_node_t *node);
  *
  * Returns: Child count (0 for leaf nodes like SCAN)
  */
-WIRELOG_PUBLIC uint32_t
+WIRELOG_API uint32_t
 wirelog_ir_node_get_child_count(const wirelog_ir_node_t *node);
 
 /**
@@ -109,7 +109,7 @@ wirelog_ir_node_get_child_count(const wirelog_ir_node_t *node);
  *
  * Returns: (transfer none): Child node, or NULL if invalid index
  */
-WIRELOG_PUBLIC const wirelog_ir_node_t *
+WIRELOG_API const wirelog_ir_node_t *
 wirelog_ir_node_get_child(const wirelog_ir_node_t *node, uint32_t index);
 
 /* ======================================================================== */
@@ -123,7 +123,7 @@ wirelog_ir_node_get_child(const wirelog_ir_node_t *node, uint32_t index);
  *
  * Print an IR node (for debugging).
  */
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_ir_node_print(const wirelog_ir_node_t *node, uint32_t indent);
 
 /**
@@ -134,7 +134,7 @@ wirelog_ir_node_print(const wirelog_ir_node_t *node, uint32_t indent);
  *
  * Returns: (transfer full): String representation (must be freed)
  */
-WIRELOG_PUBLIC char *
+WIRELOG_API char *
 wirelog_ir_node_to_string(const wirelog_ir_node_t *node);
 
 #ifdef __cplusplus
