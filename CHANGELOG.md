@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.40.0] - 2026-05-12
+
+### Added
+
 - **File-level Doxygen markers on every public header + CI gate**
   (#780, closes #680 exit condition): every entry in
   `wirelog_public_headers` (plus the standalone
