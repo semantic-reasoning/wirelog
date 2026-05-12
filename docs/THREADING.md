@@ -434,14 +434,18 @@ Workers are forbidden to advance the arena's epoch counter or to
 free its memory; only the coordinator may do so. The live invariant
 that enforces this is the `sess->coordinator == NULL` predicate:
 
-- `wirelog/columnar/ops.c:5456-5459` (K-fusion path):
+- `wirelog/columnar/ops.c:5456-5460` (K-fusion path):
   ```c
   if (sess->coordinator == NULL
-      && sess->rotation_ops
+      && sess->compound_arena && sess->rotation_ops
       && sess->rotation_ops->gc_epoch_boundary) {
       sess->rotation_ops->gc_epoch_boundary(sess);
   }
   ```
+  The `sess->compound_arena` conjunct is the defensive NULL-pointer
+  guard noted in the surrounding `ops.c:5451-5455` comment block;
+  the `coordinator == NULL` conjunct is the load-bearing
+  coordinator-only invariant.
 - `wirelog/columnar/eval.c:933-935` (eval-stratum sub-pass tail): the
   same gate.
 
