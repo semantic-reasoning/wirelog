@@ -1011,13 +1011,22 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         if (!env_valid) {
             uint64_t phys = col_detect_physical_memory();
             if (phys > 0) {
-                /* Global per-join cap: 25% of RAM / (8 bytes * 5 avg cols).
+                /* Global per-join cap: 25% of RAM / (8 bytes * 3 avg cols).
                  * Each K-fusion worker processes a 1/K data partition, so
                  * per-partition join output does NOT scale with K.  Dividing
                  * by num_workers here was a regression (commit 6929689) that
                  * caused silent data loss in multi-worker mode (Issue #404).
-                 * Dynamic mem_ledger backpressure handles runtime coordination. */
-                sess->join_output_limit = (phys / 4) / 40ULL;
+                 * Dynamic mem_ledger backpressure handles runtime coordination.
+                 *
+                 * Avg-col assumption was 5 (Issue #221, /40), but DOOP-class
+                 * points-to analyses dominate the recursive recursive-join
+                 * cost on 2-3 column intermediates (SubtypeOf, MethodLookup,
+                 * VarPointsTo, CallGraphEdge); /40 was conservatively low and
+                 * caused DOOP to hit the cap at ~105M intermediate rows on
+                 * 16 GB hosts (Issue #791).  /24 is a 67 % headroom bump that
+                 * preserves the 25 % RAM safety margin and matches the
+                 * narrow-join workloads that dominate the v0.43 portfolio. */
+                sess->join_output_limit = (phys / 4) / 24ULL;
             } else {
                 sess->join_output_limit = COL_JOIN_OUTPUT_LIMIT_DEFAULT;
             }
