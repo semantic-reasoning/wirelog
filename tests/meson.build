@@ -490,6 +490,28 @@ foreach hdr : public_standalone_headers
   test('standalone_include_' + hdr[0], exe, suite: 'abi')
 endforeach
 
+# Issue #782: compile-only smoke test for WIRELOG_DEPRECATED_SINCE.
+# The macro is defined in wirelog/wirelog-export.h but has zero
+# in-tree adopters at the time of v0.40.0 release; this stub
+# annotates a static probe function with WIRELOG_DEPRECATED_SINCE(99,99)
+# so the compiler exercises the attribute's expansion path
+# (GCC/Clang __attribute__((deprecated)); MSVC __declspec(deprecated);
+# no-op fallback elsewhere).  The deprecation diagnostic at the call
+# site is suppressed per-target so it does not break -Werror CI.
+deprecated_macro_smoke_warning_flags = cc.get_supported_arguments([
+  '-Wno-deprecated-declarations',
+  '/wd4996',
+])
+test_standalone_wirelog_deprecated_macro_exe = executable(
+  'test_standalone_wirelog_deprecated_macro',
+  files('standalone/test_standalone_wirelog_deprecated_macro.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: deprecated_macro_smoke_warning_flags,
+)
+test('standalone_include_wirelog_deprecated_macro',
+     test_standalone_wirelog_deprecated_macro_exe,
+     suite: 'abi')
+
 test_intern_exe = executable(
   'test_intern',
   files('test_intern.c'),
