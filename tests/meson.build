@@ -414,6 +414,13 @@ test('public_prefix', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-public-prefix.py'],
      suite: 'abi')
 
+# Issue #782 backstop: WIRELOG_PUBLIC must not re-appear on the 8
+# prototype headers after the v0.40-cycle adoption sweep to WIRELOG_API.
+# The macro itself lives in wirelog/wirelog-export.h (exempt).
+test('public_api_macro', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-public-api-macro.py'],
+     suite: 'abi')
+
 # Issue #780 / Epic #680 exit gate: every public header must carry
 # `@file` and `@brief` inside a `/** ... */` Doxygen block.  Header
 # list is sourced from `parse_meson_sot` in check-public-header-surface.py

@@ -6,7 +6,56 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Compile-only smoke test for `WIRELOG_DEPRECATED_SINCE`** (#782):
+  `tests/standalone/test_standalone_wirelog_deprecated_macro.c`
+  annotates a static probe function with
+  `WIRELOG_DEPRECATED_SINCE(99, 99)` and references it from `main`,
+  so the macro's cross-compiler expansion path
+  (GCC/Clang `__attribute__((deprecated))`, MSVC
+  `__declspec(deprecated)`, no-op for unknown compilers) is
+  exercised by the build before any real public-API deprecation
+  ships.  Registered as `meson test --suite abi:standalone_include_wirelog_deprecated_macro`;
+  the call-site deprecation diagnostic is suppressed per-target via
+  `cc.get_supported_arguments(['-Wno-deprecated-declarations',
+  '/wd4996'])` so the test does not break `-Werror` CI.
+- **Public-API attribute lint backstop** (#782):
+  `scripts/ci/check-public-api-macro.py` (registered as
+  `meson test --suite abi:public_api_macro`) bans
+  `WIRELOG_PUBLIC` on the 8 prototype headers after the v0.40-cycle
+  adoption sweep to `WIRELOG_API`.  `WIRELOG_PUBLIC` remains valid
+  only inside `wirelog/wirelog-export.h` where the platform `#if`
+  ladder defines it.  Sources its header list by importing
+  `PUBLIC_HEADERS` from the sibling `scripts/ci/check-public-prefix.py`
+  so the surface stays in sync without a second hand-maintained list.
+
 ### Changed
+
+- **Adopt `WIRELOG_API` on every installed public prototype** (#782):
+  76 occurrences of `WIRELOG_PUBLIC` across the 8 prototype headers
+  (`wirelog.h`, `wirelog-types.h`, `wirelog-ir.h`, `wirelog-parser.h`,
+  `wirelog-optimizer.h`, `wirelog-easy.h`, `wirelog-advanced.h`,
+  `wirelog/io/io_adapter.h`) are renamed to `WIRELOG_API`.  The rename
+  is binary-identical: `#define WIRELOG_API WIRELOG_PUBLIC` at
+  `wirelog/wirelog-export.h:34` expands to the same platform-specific
+  attribute (`__attribute__((visibility("default")))` on GCC/Clang,
+  `__declspec(dllexport)` / `__declspec(dllimport)` on Windows,
+  no-op on `WIRELOG_STATIC` or unknown compilers).  The 53-entry
+  allowlist at `abi/libwirelog-1.0.symbols` continues to pass the
+  `abi_symbols` gate unchanged.  `WIRELOG_PUBLIC` is retained as a
+  backward-compat alias for downstream code that referenced it
+  directly during the v0.40 cycle.  Closes the adoption tail of
+  v0.40 epic #680 exit condition 6 (macros were "introduced" at the
+  definition level in v0.40; this commit puts them in use).
+- **Forward-looking documentation of the visibility attribute renamed
+  to `WIRELOG_API`** (#782): `docs/SEMANTICS.md` visibility table,
+  `meson.build` library() comment, `scripts/ci/check-abi-symbols.sh`
+  docstring, and the previously-stale "adoption sweep tracked
+  separately" note in `wirelog/wirelog-export.h:31-33` all updated to
+  reflect the new canonical attribute name.  `AGENTS.md` gains a
+  "Visibility Attribute" subsection mandating `WIRELOG_API` for new
+  public-API declarations.  History in `CHANGELOG.md` and
+  `docs/MIGRATION.md` is left untouched -- those sections describe
+  v0.40 state and should not retroactively change.
 
 ### Deprecated
 
