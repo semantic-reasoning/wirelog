@@ -70,7 +70,7 @@ typedef struct {
  *
  * Returns: (transfer full): Parsed program, or NULL on error
  */
-WIRELOG_PUBLIC wirelog_program_t *
+WIRELOG_API wirelog_program_t *
 wirelog_parse_with_error_info(const char *filename,
     wirelog_parse_error_t *error_info);
 
@@ -86,7 +86,7 @@ wirelog_parse_with_error_info(const char *filename,
  *
  * Returns: Number of strata (always >= 1)
  */
-WIRELOG_PUBLIC uint32_t
+WIRELOG_API uint32_t
 wirelog_program_get_stratum_count(const wirelog_program_t *program);
 
 /**
@@ -98,7 +98,7 @@ wirelog_program_get_stratum_count(const wirelog_program_t *program);
  *
  * Returns: (transfer none): Stratum info, or NULL if invalid ID
  */
-WIRELOG_PUBLIC const wirelog_stratum_t *
+WIRELOG_API const wirelog_stratum_t *
 wirelog_program_get_stratum(const wirelog_program_t *program,
     uint32_t stratum_id);
 
@@ -110,7 +110,7 @@ wirelog_program_get_stratum(const wirelog_program_t *program,
  *
  * Returns: Total rule count
  */
-WIRELOG_PUBLIC uint32_t
+WIRELOG_API uint32_t
 wirelog_program_get_rule_count(const wirelog_program_t *program);
 
 /**
@@ -122,7 +122,7 @@ wirelog_program_get_rule_count(const wirelog_program_t *program);
  *
  * Returns: (transfer none): Schema info, or NULL if not found
  */
-WIRELOG_PUBLIC const wirelog_schema_t *
+WIRELOG_API const wirelog_schema_t *
 wirelog_program_get_schema(const wirelog_program_t *program,
     const char *relation_name);
 
@@ -134,7 +134,7 @@ wirelog_program_get_schema(const wirelog_program_t *program,
  *
  * Returns: true if stratified, false otherwise
  */
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_program_is_stratified(const wirelog_program_t *program);
 
 /* Note: wirelog_program_free() lives in wirelog.h. */

@@ -128,7 +128,7 @@ typedef enum {
  *
  * Returns: (transfer full): Parsed program, or NULL on error
  */
-WIRELOG_PUBLIC wirelog_program_t *
+WIRELOG_API wirelog_program_t *
 wirelog_parse(const char *filename, wirelog_error_t *error);
 
 /**
@@ -140,7 +140,7 @@ wirelog_parse(const char *filename, wirelog_error_t *error);
  *
  * Returns: (transfer full): Parsed program, or NULL on error
  */
-WIRELOG_PUBLIC wirelog_program_t *
+WIRELOG_API wirelog_program_t *
 wirelog_parse_string(const char *program_text, wirelog_error_t *error);
 
 /**
@@ -149,7 +149,7 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error);
  *
  * Free a parsed program and all associated resources.
  */
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_program_free(wirelog_program_t *program);
 
 /* ======================================================================== */
@@ -170,7 +170,7 @@ typedef struct wl_intern wirelog_intern_t;
  * @param prog  Compiled program
  * @return Intern table (owned by program, do not free), or NULL
  */
-WIRELOG_PUBLIC const wirelog_intern_t *
+WIRELOG_API const wirelog_intern_t *
 wirelog_program_get_intern(const wirelog_program_t *prog);
 
 /* ======================================================================== */
@@ -190,7 +190,7 @@ wirelog_program_get_intern(const wirelog_program_t *prog);
  * @param num_cols   Output: number of columns per tuple
  * @return 0 on success, -1 on error (unknown relation), 1 if no facts
  */
-WIRELOG_PUBLIC int
+WIRELOG_API int
 wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
     int64_t **data, uint32_t *num_rows,
     uint32_t *num_cols);
@@ -207,7 +207,7 @@ wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
  * @param worker  DD worker handle to load facts into
  * @return 0 on success, -1 on error (NULL args or EDB load failure)
  */
-WIRELOG_PUBLIC int
+WIRELOG_API int
 wirelog_load_all_facts(const wirelog_program_t *prog, void *worker);
 
 /**
@@ -221,74 +221,74 @@ wirelog_load_all_facts(const wirelog_program_t *prog, void *worker);
  * @param worker  DD worker handle to load facts into
  * @return 0 on success, -1 on error (NULL args, missing file, parse error)
  */
-WIRELOG_PUBLIC int
+WIRELOG_API int
 wirelog_load_input_files(const wirelog_program_t *prog, void *worker);
 
 /* ======================================================================== */
 /* Optimizer API                                                            */
 /* ======================================================================== */
 
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_optimize(wirelog_program_t *program, wirelog_error_t *error);
 
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_optimizer_debug(const wirelog_program_t *program);
 
 /* ======================================================================== */
 /* Executor API                                                             */
 /* ======================================================================== */
 
-WIRELOG_PUBLIC wirelog_executor_t *
+WIRELOG_API wirelog_executor_t *
 wirelog_executor_create(wirelog_program_t *program, wirelog_error_t *error);
 
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_executor_free(wirelog_executor_t *executor);
 
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_load_facts_from_csv(wirelog_executor_t *executor,
     const char *relation_name, const char *csv_file,
     wirelog_error_t *error);
 
-WIRELOG_PUBLIC wirelog_result_t *
+WIRELOG_API wirelog_result_t *
 wirelog_evaluate(wirelog_executor_t *executor, wirelog_error_t *error);
 
 /* ======================================================================== */
 /* Result API                                                               */
 /* ======================================================================== */
 
-WIRELOG_PUBLIC const void *
+WIRELOG_API const void *
 wirelog_result_get_relation(const wirelog_result_t *result,
     const char *relation_name);
 
-WIRELOG_PUBLIC uint64_t
+WIRELOG_API uint64_t
 wirelog_result_relation_cardinality(const wirelog_result_t *result,
     const char *relation_name);
 
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_result_write_csv(const wirelog_result_t *result,
     const char *relation_name, const char *output_file,
     wirelog_error_t *error);
 
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_result_free(wirelog_result_t *result);
 
 /* ======================================================================== */
 /* Utility API                                                              */
 /* ======================================================================== */
 
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_version_string(void);
 
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_error_string(wirelog_error_t error);
 
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_config_embedded(void);
 
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_config_ipc(void);
 
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_config_threads(void);
 
 #ifdef __cplusplus

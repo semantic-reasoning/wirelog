@@ -282,11 +282,11 @@ wirelog_lib = library(
   soversion: '1',
   darwin_versions: ['1', '1.0.0'],
   # Symbol-visibility default: hidden.  Every public-API function on the
-  # 9 installed headers carries WIRELOG_PUBLIC (= visibility("default")
-  # / dllexport) per #733 K0.  Internal symbols (wl_*, col_*, arr_*)
-  # are now hidden from the dynamic-symbol table; consumers who relied
-  # on resolving them through libwirelog.so must rebuild against the
-  # public surface.  See #733.
+  # 9 installed headers carries WIRELOG_API (alias of WIRELOG_PUBLIC =
+  # visibility("default") / dllexport) per #733 K0 + #782.  Internal
+  # symbols (wl_*, col_*, arr_*) are now hidden from the dynamic-symbol
+  # table; consumers who relied on resolving them through libwirelog.so
+  # must rebuild against the public surface.  See #733.
   gnu_symbol_visibility: 'hidden',
 )
 

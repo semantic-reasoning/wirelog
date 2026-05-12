@@ -107,7 +107,7 @@ typedef struct {
  *
  * Returns: Default configuration (all optimizations enabled)
  */
-WIRELOG_PUBLIC wirelog_opt_config_t
+WIRELOG_API wirelog_opt_config_t
 wirelog_optimizer_get_default_config(void);
 
 /* Note: wirelog_optimize() lives in wirelog.h — this header adds the
@@ -131,7 +131,7 @@ wirelog_optimizer_get_default_config(void);
  *
  * Returns: true on success, false on error
  */
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_optimize_with_config(wirelog_program_t *program,
     const wirelog_opt_config_t *config,
     wirelog_error_t *error);
@@ -148,7 +148,7 @@ wirelog_optimize_with_config(wirelog_program_t *program,
  *
  * Returns: true on success, false on error
  */
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_optimize_apply_pass(wirelog_program_t *program, wirelog_opt_pass_t pass,
     wirelog_error_t *error);
 
@@ -165,7 +165,7 @@ wirelog_optimize_apply_pass(wirelog_program_t *program, wirelog_opt_pass_t pass,
  *
  * Returns: true if stats were collected, false otherwise
  */
-WIRELOG_PUBLIC bool
+WIRELOG_API bool
 wirelog_optimizer_get_stats(const wirelog_program_t *program,
     wirelog_opt_stats_t *stats);
 
@@ -181,7 +181,7 @@ wirelog_optimizer_get_stats(const wirelog_program_t *program,
  * - Cost model decisions
  * - Join ordering rationale
  */
-WIRELOG_PUBLIC void
+WIRELOG_API void
 wirelog_optimizer_debug_print(const wirelog_program_t *program);
 
 /**
@@ -192,7 +192,7 @@ wirelog_optimizer_debug_print(const wirelog_program_t *program);
  *
  * Returns: Estimated cost (arbitrary units), or 0 if not available
  */
-WIRELOG_PUBLIC uint64_t
+WIRELOG_API uint64_t
 wirelog_optimizer_cost_estimate(const wirelog_program_t *program);
 
 #ifdef __cplusplus

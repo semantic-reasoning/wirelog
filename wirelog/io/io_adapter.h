@@ -67,19 +67,19 @@ typedef struct wirelog_io_ctx wirelog_io_ctx_t;
 /* Context Accessors (implemented in #453)                                  */
 /* ======================================================================== */
 
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_io_ctx_relation_name(const wirelog_io_ctx_t *ctx);
-WIRELOG_PUBLIC uint32_t
+WIRELOG_API uint32_t
 wirelog_io_ctx_num_cols(const wirelog_io_ctx_t *ctx);
-WIRELOG_PUBLIC wirelog_column_type_t
+WIRELOG_API wirelog_column_type_t
 wirelog_io_ctx_col_type(const wirelog_io_ctx_t *ctx, uint32_t col);
-WIRELOG_PUBLIC const char *
+WIRELOG_API const char *
 wirelog_io_ctx_param(const wirelog_io_ctx_t *ctx, const char *key);
-WIRELOG_PUBLIC int64_t
+WIRELOG_API int64_t
 wirelog_io_ctx_intern_string(wirelog_io_ctx_t *ctx, const char *utf8);
-WIRELOG_PUBLIC void *
+WIRELOG_API void *
 wirelog_io_ctx_platform(const wirelog_io_ctx_t *ctx);
-WIRELOG_PUBLIC int
+WIRELOG_API int
 wirelog_io_ctx_set_platform(wirelog_io_ctx_t *ctx, void *ptr);
 
 /* ======================================================================== */
@@ -141,16 +141,16 @@ typedef struct wirelog_io_adapter {
  *   wirelog_io_find_adapter        pointer to adapter, or NULL if not found
  */
 
-WIRELOG_PUBLIC int wirelog_io_register_adapter(
+WIRELOG_API int wirelog_io_register_adapter(
     const wirelog_io_adapter_t *adapter) WIRELOG_IO_USED;
 
-WIRELOG_PUBLIC int wirelog_io_unregister_adapter(
+WIRELOG_API int wirelog_io_unregister_adapter(
     const char *scheme) WIRELOG_IO_USED;
 
-WIRELOG_PUBLIC const wirelog_io_adapter_t *wirelog_io_find_adapter(
+WIRELOG_API const wirelog_io_adapter_t *wirelog_io_find_adapter(
     const char *scheme) WIRELOG_IO_USED;
 
-WIRELOG_PUBLIC const char *wirelog_io_last_error(void);
+WIRELOG_API const char *wirelog_io_last_error(void);
 
 /* ======================================================================== */
 /* Plugin Entry Point (Path B, Issue #461)                                  */
