@@ -32,6 +32,18 @@ when a published release exists for the tag at HEAD; it SKIPs
 cleanly on PR builds and on tags whose release does not yet
 exist.
 
+### ABI manifest update
+
+The libabigail-backed `abi/libwirelog-1.0.abi.json` baseline pins struct
+layouts, function signatures, and visibility attributes that the
+`abi/libwirelog-1.0.symbols` allowlist cannot see (Issue #786 /
+`meson test --suite abi:abi_manifest`).  On a release PR that
+deliberately reshapes the ABI, regenerate the baseline with
+`scripts/release/regenerate-abi-manifest.sh build` and commit the diff
+alongside the API change.  The gate SKIPs cleanly when libabigail is
+not installed or when the baseline is absent — first-time seeding only
+requires running the regeneration script once on a Linux/x86_64 host.
+
 ### Template (Markdown)
 
 ```md

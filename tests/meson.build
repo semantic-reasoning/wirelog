@@ -478,6 +478,20 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #786 (cross-link #690 libabigail half): libabigail manifest gate.
+# Where abi_symbols only checks the dynamic-symbol set, abi_manifest uses
+# `abidiff` to catch struct member offsets, function signature changes,
+# and visibility/linkage drift that nm -D cannot see.  Linux/ELF-focused;
+# SKIPs cleanly when libwirelog.so is missing (Windows, static-only),
+# when abidiff is not on PATH, or when the baseline has not been seeded
+# yet (run scripts/release/regenerate-abi-manifest.sh to seed).
+if sh.found()
+  test('abi_manifest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-abi-manifest.sh',
+              meson.project_build_root()],
+       suite: 'abi')
+endif
+
 # Issue #689 / Blocker B2: standalone-include compile matrix for the
 # public-headers SSoT.  One executable per public header, each
 # compiled in isolation against tests/standalone/test_standalone_<H>.c
