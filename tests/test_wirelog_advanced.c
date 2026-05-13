@@ -23,6 +23,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+/* MSVC's CRT lacks POSIX setenv / unsetenv; route through _putenv_s.
+ * Mirrors the same shim block in tests/test_wirelog_easy.c so the
+ * cross-facade saturation parity test (T16) compiles cleanly under
+ * the Windows MSVC CI leg. */
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#  define setenv   wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
+#endif
+
 static const char *PROG_SRC =
     ".decl edge(a:symbol,b:symbol)\n"
     ".decl path(a:symbol,b:symbol)\n"
