@@ -82,6 +82,21 @@ if [ ! -f "$baseline" ]; then
     exit 0
 fi
 
+# The committed baseline is generated on Linux x86_64.  abidiff treats
+# ELF architecture as an ABI-breaking change (rc=12 "ELF architecture
+# changed"), so on a non-x86_64 host the gate would always fail despite
+# the source-level public API being identical.  Per-arch baselines are
+# tracked as future work (see #799 / v0.41 soak).  For now SKIP cleanly
+# on non-x86_64 hosts -- arm64 still exercises the arch-agnostic
+# `abi_symbols` allowlist gate.
+host_arch=$(uname -m)
+if [ "$host_arch" != "x86_64" ]; then
+    echo "check-abi-manifest: SKIP: host arch '$host_arch' is not x86_64" >&2
+    echo "  baseline at $baseline is x86_64-only; per-arch baselines" >&2
+    echo "  pending (#799 soak / v0.41 follow-up)." >&2
+    exit 0
+fi
+
 # `--suppr` is optional; pass it only if the suppression file exists so
 # the gate stays usable for the v1.0 frozen-ABI case where no
 # suppressions are needed.

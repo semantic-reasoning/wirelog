@@ -23,7 +23,14 @@ All notable changes to wirelog are documented in this file.
   and `.github/workflows/ci-main.yml` now `apt-get install
   abigail-tools` (the Ubuntu 24.04 package name; `libabigail-tools`
   is not a valid candidate on that runner image) so `abidiff` is
-  on PATH in CI; the gate's SKIP
+  on PATH in CI.  On non-x86_64 hosts (e.g. the new
+  `ubuntu-24.04-arm` PR leg) the gate SKIPs cleanly with a clear
+  message -- abidiff treats ELF architecture as an ABI-breaking
+  change (`architecture changed from 'elf-amd-x86_64' to
+  'elf-arm-aarch64'`, rc=12), so the committed x86_64 baseline
+  cannot directly diff against an arm64 build.  Per-arch baselines
+  are a v0.41 follow-up; arm64 still exercises the arch-agnostic
+  `abi_symbols` allowlist on every PR.  The gate's other SKIP
   paths remain for platforms where libabigail is unavailable
   (Windows, macOS, cross-builds).  Demonstrated firing on a
   synthetic break: adding a new `WIRELOG_API` function trips the
