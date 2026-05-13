@@ -81,10 +81,18 @@ jobs:
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
-          # ARM64 specific: verify NEON support
-          if [ "${{ matrix.os }}" = "arm64" ]; then
-            echo "ARM64 runner detected. Verifying NEON support..."
-            [ -f /proc/cpuinfo ] && grep -q "neon" /proc/cpuinfo && echo "NEON support verified" || echo "Warning: NEON support not detected"
+          # ARM64 specific: verify NEON / aarch64 SIMD support.  The
+          # historical check matched against `matrix.os == 'arm64'`,
+          # which never matched the actual runner label
+          # `ubuntu-24.04-arm` and silently no-op'd.  The corrected
+          # comparison runs on every arm64 matrix entry (#787).
+          if [ "${{ matrix.os }}" = "ubuntu-24.04-arm" ]; then
+            echo "ARM64 runner detected. Verifying ASIMD / NEON support..."
+            if [ -f /proc/cpuinfo ] && grep -qE 'asimd|neon' /proc/cpuinfo; then
+              echo "ARM64 SIMD (asimd / NEON) support verified"
+            else
+              echo "Warning: ARM64 SIMD support not detected in /proc/cpuinfo"
+            fi
           fi
 
       - name: Install dependencies (macOS)
