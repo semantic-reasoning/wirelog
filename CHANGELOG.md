@@ -21,7 +21,9 @@ All notable changes to wirelog are documented in this file.
   the gate when libabigail reports incompatible-change bits (rc & 4).
   Both Linux GCC and Clang legs of `.github/workflows/ci-pr.yml`
   and `.github/workflows/ci-main.yml` now `apt-get install
-  libabigail-tools` so `abidiff` is on PATH in CI; the gate's SKIP
+  abigail-tools` (the Ubuntu 24.04 package name; `libabigail-tools`
+  is not a valid candidate on that runner image) so `abidiff` is
+  on PATH in CI; the gate's SKIP
   paths remain for platforms where libabigail is unavailable
   (Windows, macOS, cross-builds).  Demonstrated firing on a
   synthetic break: adding a new `WIRELOG_API` function trips the
