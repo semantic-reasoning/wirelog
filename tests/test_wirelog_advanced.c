@@ -9,12 +9,19 @@
  * facades cannot drift apart silently.
  */
 
+/* setenv / unsetenv are POSIX (used by the side-compound saturation
+ * parity test).  The Windows variants used by test_wirelog_easy.c live
+ * under _WIN32 and are out of scope for the v0.40 sweep. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "wirelog/wirelog-advanced.h"
 #include "wirelog/wirelog.h"
 #include "wirelog/intern.h"
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static const char *PROG_SRC =
     ".decl edge(a:symbol,b:symbol)\n"
@@ -64,6 +71,34 @@ count_deltas(const char *relation, const int64_t *row, uint32_t ncols,
         st->inserts++;
     else if (diff < 0)
         st->removes++;
+}
+
+/* Per-relation tuple collector used by inline-compound parity tests
+ * (#785).  wirelog_session_snapshot has no relation filter (the easy
+ * counterpart does), so we filter inside the callback. */
+#define WL_FILTER_MAX_ROWS 8
+#define WL_FILTER_MAX_COLS 8
+
+struct tuple_filter {
+    const char *target_relation;
+    int count;
+    uint32_t ncols[WL_FILTER_MAX_ROWS];
+    int64_t rows[WL_FILTER_MAX_ROWS][WL_FILTER_MAX_COLS];
+};
+
+static void
+filter_tuples(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    struct tuple_filter *f = (struct tuple_filter *)user_data;
+    if (strcmp(relation, f->target_relation) != 0)
+        return;
+    if (f->count >= WL_FILTER_MAX_ROWS)
+        return;
+    int idx = f->count++;
+    f->ncols[idx] = ncols;
+    for (uint32_t i = 0; i < ncols && i < WL_FILTER_MAX_COLS; i++)
+        f->rows[idx][i] = row[i];
 }
 
 static wirelog_program_t *
@@ -383,6 +418,325 @@ test_num_workers_explicit_four(void)
     return rc;
 }
 
+/* Parity (#785): mirrors test_wirelog_easy.c::test_inline_compound_body_binding.
+ * Asserts the inline-compound body pattern `metadata(L,T,H,R)` binds
+ * the four child variables so the head condition `R > 80` filters
+ * rows correctly. */
+static int
+test_inline_compound_body_binding(void)
+{
+    const char *src
+        = ".decl event(id: int64, payload: metadata/4 inline)\n"
+        ".decl hot(id: int64)\n"
+        "hot(ID) :- event(ID, metadata(Level, Ts, Host, Risk)),"
+        " Risk > 80.\n";
+    wirelog_program_t *prog = parse_or_die(src, "T11");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    int64_t hot_row[5] = { 7, 1, 2, 3, 90 };
+    int64_t cold_row[5] = { 8, 1, 2, 3, 40 };
+    int rc = 0;
+    if (wirelog_session_insert(s, "event", hot_row, 1, 5) != WIRELOG_OK
+        || wirelog_session_insert(s, "event", cold_row, 1, 5) != WIRELOG_OK) {
+        fprintf(stderr, "T11 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+    struct tuple_filter f = { .target_relation = "hot" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T11 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 1 || f.ncols[0] != 1 || f.rows[0][0] != 7) {
+        fprintf(stderr,
+            "T11: expected only hot(7), got count=%d row0[0]=%lld\n",
+            f.count, (long long)f.rows[0][0]);
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_inline_compound_body_join_binding.
+ * Verifies that body variables from the inline compound participate
+ * in joins (here: Risk joins threshold). */
+static int
+test_inline_compound_body_join_binding(void)
+{
+    const char *src
+        = ".decl event(id: int64, payload: metadata/4 inline)\n"
+        ".decl threshold(risk: int64)\n"
+        ".decl hot(id: int64)\n"
+        "hot(ID) :- event(ID, metadata(Level, Ts, Host, Risk)),"
+        " threshold(Risk).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T12");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    int64_t matched[5] = { 7, 1, 2, 3, 90 };
+    int64_t unmatched[5] = { 8, 1, 2, 3, 40 };
+    int64_t threshold_row[1] = { 90 };
+    int rc = 0;
+    if (wirelog_session_insert(s, "event", matched, 1, 5) != WIRELOG_OK
+        || wirelog_session_insert(s, "event", unmatched, 1, 5) != WIRELOG_OK
+        || wirelog_session_insert(s, "threshold", threshold_row, 1, 1)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T12 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+    struct tuple_filter f = { .target_relation = "hot" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T12 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 1 || f.rows[0][0] != 7) {
+        fprintf(stderr, "T12: expected join to derive only hot(7)\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_inline_compound_functor_mismatch_is_empty.
+ * A body using a different functor name does not match. */
+static int
+test_inline_compound_functor_mismatch_is_empty(void)
+{
+    const char *src
+        = ".decl event(id: int64, payload: metadata/4 inline)\n"
+        ".decl bad(id: int64)\n"
+        "bad(ID) :- event(ID, other(Level, Ts, Host, Risk)).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T13");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    int64_t row[5] = { 7, 1, 2, 3, 90 };
+    int rc = 0;
+    if (wirelog_session_insert(s, "event", row, 1, 5) != WIRELOG_OK) {
+        fprintf(stderr, "T13 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+    struct tuple_filter f = { .target_relation = "bad" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T13 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 0) {
+        fprintf(stderr,
+            "T13: mismatched functor should derive no rows, got %d\n",
+            f.count);
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_inline_compound_constant_child_filters.
+ * A constant in a child slot filters rows that do not match the
+ * literal value. */
+static int
+test_inline_compound_constant_child_filters(void)
+{
+    const char *src
+        = ".decl event(id: int64, payload: metadata/4 inline)\n"
+        ".decl hot(id: int64)\n"
+        "hot(ID) :- event(ID, metadata(_, _, _, 90)).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T14");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    int64_t hot_row[5] = { 7, 1, 2, 3, 90 };
+    int64_t cold_row[5] = { 8, 1, 2, 3, 40 };
+    int rc = 0;
+    if (wirelog_session_insert(s, "event", hot_row, 1, 5) != WIRELOG_OK
+        || wirelog_session_insert(s, "event", cold_row, 1, 5) != WIRELOG_OK) {
+        fprintf(stderr, "T14 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+    struct tuple_filter f = { .target_relation = "hot" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T14 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 1 || f.rows[0][0] != 7) {
+        fprintf(stderr,
+            "T14: expected only row with constant child 90\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_inline_compound_duplicate_child_variables_filter.
+ * Repeating a child variable in a compound pattern filters rows where
+ * the two slots are unequal. */
+static int
+test_inline_compound_duplicate_child_variables_filter(void)
+{
+    const char *src
+        = ".decl event(id: int64, payload: metadata/4 inline)\n"
+        ".decl same(id: int64)\n"
+        "same(ID) :- event(ID, metadata(X, X, _, _)).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T15");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    int64_t matched[5] = { 7, 4, 4, 3, 90 };
+    int64_t unmatched[5] = { 8, 1, 2, 3, 90 };
+    int rc = 0;
+    if (wirelog_session_insert(s, "event", matched, 1, 5) != WIRELOG_OK
+        || wirelog_session_insert(s, "event", unmatched, 1, 5) != WIRELOG_OK) {
+        fprintf(stderr, "T15 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+    struct tuple_filter f = { .target_relation = "same" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T15 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 1 || f.rows[0][0] != 7) {
+        fprintf(stderr,
+            "T15: expected only row with equal duplicate variables\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_side_compound_public_allocation_saturates.
+ * With WIRELOG_COMPOUND_MAX_EPOCHS=2, the second compound allocation
+ * across two epochs reports WIRELOG_ERR_COMPOUND_SATURATED and the
+ * out-handle is cleared to WIRELOG_COMPOUND_HANDLE_NULL. */
+static int
+test_side_compound_public_allocation_saturates(void)
+{
+    if (setenv("WIRELOG_COMPOUND_MAX_EPOCHS", "2", 1) != 0)
+        return 1;
+
+    const char *src
+        = ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl seen(id: int64)\n"
+        ".decl edge(x: int64, y: int64)\n"
+        ".decl tc(x: int64, y: int64)\n"
+        "seen(ID) :- event(ID, _).\n"
+        "tc(X, Y) :- edge(X, Y).\n"
+        "tc(X, Z) :- edge(X, Y), tc(Y, Z).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T16");
+    if (!prog) {
+        unsetenv("WIRELOG_COMPOUND_MAX_EPOCHS");
+        return 1;
+    }
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        unsetenv("WIRELOG_COMPOUND_MAX_EPOCHS");
+        return 1;
+    }
+
+    wirelog_compound_arg_t args[4] = {
+        { WIRELOG_TYPE_INT64, 1 },
+        { WIRELOG_TYPE_INT64, 2 },
+        { WIRELOG_TYPE_INT64, 3 },
+        { WIRELOG_TYPE_INT64, 4 },
+    };
+    uint64_t handle = 0;
+    int rc = 0;
+    wirelog_error_t mc_rc
+        = wirelog_session_make_compound(s, "metadata", 4, args, &handle);
+    if (mc_rc != WIRELOG_OK || handle == WIRELOG_COMPOUND_HANDLE_NULL) {
+        fprintf(stderr,
+            "T16: first make_compound failed rc=%d handle=%llu\n",
+            mc_rc, (unsigned long long)handle);
+        rc = 1;
+        goto out;
+    }
+    int64_t event_row[2] = { 1, (int64_t)handle };
+    int64_t edge_12[2] = { 1, 2 };
+    int64_t edge_23[2] = { 2, 3 };
+    int64_t edge_34[2] = { 3, 4 };
+    if (wirelog_session_insert(s, "event", event_row, 1, 2) != WIRELOG_OK
+        || wirelog_session_insert(s, "edge", edge_12, 1, 2) != WIRELOG_OK
+        || wirelog_session_insert(s, "edge", edge_23, 1, 2) != WIRELOG_OK
+        || wirelog_session_insert(s, "edge", edge_34, 1, 2) != WIRELOG_OK
+        || wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr, "T16 first insert/step failed\n");
+        rc = 1;
+        goto out;
+    }
+    handle = 123;
+    mc_rc = wirelog_session_make_compound(s, "metadata", 4, args, &handle);
+    if (mc_rc != WIRELOG_ERR_COMPOUND_SATURATED
+        || handle != WIRELOG_COMPOUND_HANDLE_NULL) {
+        fprintf(stderr,
+            "T16: expected SATURATED + cleared handle, got rc=%d "
+            "handle=%llu\n",
+            mc_rc, (unsigned long long)handle);
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    unsetenv("WIRELOG_COMPOUND_MAX_EPOCHS");
+    return rc;
+}
+
 int
 main(void)
 {
@@ -397,6 +751,12 @@ main(void)
     failures += test_open_parse_error();
     failures += test_num_workers_default_is_one();
     failures += test_num_workers_explicit_four();
+    failures += test_inline_compound_body_binding();
+    failures += test_inline_compound_body_join_binding();
+    failures += test_inline_compound_functor_mismatch_is_empty();
+    failures += test_inline_compound_constant_child_filters();
+    failures += test_inline_compound_duplicate_child_variables_filter();
+    failures += test_side_compound_public_allocation_saturates();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
     else
