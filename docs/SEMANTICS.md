@@ -89,6 +89,31 @@ advanced API exposes backend selection through the
 `wirelog_backend_kind_t` enum (`DEFAULT`, `COLUMNAR`); new backends
 will appear as additive enum values in future minor releases.
 
+#### Parity audit (v0.41 / #785)
+
+The cross-facade contract is mechanically pinned by a per-test
+parity rule: every `test_*` function in
+`tests/test_wirelog_easy.c` is either (a) **paired** with a
+same-named function in `tests/test_wirelog_advanced.c` or
+(b) **annotated** with a `/* PARITY: ... */` block-comment on the
+line(s) immediately preceding the declaration, naming the
+structural reason no advanced analogue exists (typically the
+easy facade carries a convenience surface -- `*_sym` variadics,
+`wirelog_easy_open_opts_t`, `wirelog_easy_print_delta` -- that
+has no `wirelog_session_*` counterpart).  Enforced by
+`scripts/ci/check-test-parity.py` (`meson test --suite abi:test_parity`).
+
+The rule is per-test, not a numeric ratio: future additions on
+either side cannot silently regress parity.  Either pair the new
+test or annotate the easy declaration with the structural reason.
+
+**Reverse parity is intentionally asymmetric.**  Advanced-only
+tests (`test_create_columnar`, `test_create_invalid_backend`,
+`test_null_safety` for backend selection) do not back-port to the
+easy facade -- the easy surface hides backend selection by
+design.  The asymmetry is recorded here so future maintainers do
+not assume symmetric coverage.
+
 ### References
 
 - `wirelog/wirelog-easy.c` — `ensure_plan_built` performs the seed.

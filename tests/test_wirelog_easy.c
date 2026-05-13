@@ -257,6 +257,7 @@ capture_num_workers_log(const wirelog_easy_open_opts_t *opts, uint32_t expected)
 /* Tests                                                                    */
 /* ======================================================================== */
 
+/* PARITY: paired -- mirrored by test_null_safety on the advanced side (#785). */
 static void
 test_open_close_null_safe(void)
 {
@@ -824,6 +825,7 @@ test_side_compound_public_allocation_saturates(void)
     PASS();
 }
 
+/* PARITY: facade-only -- no wirelog_session_insert_sym variadic on advanced (#785). */
 static void
 test_insert_sym_variadic(void)
 {
@@ -866,6 +868,7 @@ test_insert_sym_variadic(void)
     PASS();
 }
 
+/* PARITY: facade-only -- no wirelog_session_remove_sym; row-form remove paired by test_insert_remove_roundtrip (#785). */
 static void
 test_remove_sym(void)
 {
@@ -986,6 +989,7 @@ test_snapshot_filter(void)
     PASS();
 }
 
+/* PARITY: facade-only -- wirelog_easy_print_delta is a stdout helper; no advanced equivalent (#785). */
 static void
 test_print_delta_integer_column(void)
 {
@@ -1015,6 +1019,7 @@ test_print_delta_integer_column(void)
     PASS();
 }
 
+/* PARITY: facade-only -- wirelog_easy_print_delta is a stdout helper; no advanced equivalent (#785). */
 static void
 test_print_delta_unknown_relation_integer_fallback(void)
 {
@@ -1061,6 +1066,7 @@ test_print_delta_unknown_relation_integer_fallback(void)
 #endif
 }
 
+/* PARITY: facade-only -- wirelog_easy_print_delta is a stdout helper; no advanced equivalent (#785). */
 static void
 test_print_delta_abort_on_missed_symbol(void)
 {
@@ -1384,6 +1390,7 @@ drive_issue_665_partial_conjunction(wirelog_easy_session_t *s)
     return matched;
 }
 
+/* PARITY: deferred -- #665 partial-conjunction regression scenario relies on the easy-specific drive_issue_665_partial_conjunction helper; advanced-side port tracked separately (#785 follow-up). */
 static void
 test_issue_665_partial_conjunction_default_workers(void)
 {
@@ -1403,6 +1410,7 @@ test_issue_665_partial_conjunction_default_workers(void)
     PASS();
 }
 
+/* PARITY: deferred -- multi-worker opts-path variant of the #665 scenario; advanced exposes num_workers via constructor (test_num_workers_explicit_four), but the full #665 helper port is the v0.41+ follow-up above. */
 static void
 test_issue_665_partial_conjunction_multi_worker(void)
 {

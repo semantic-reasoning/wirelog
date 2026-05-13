@@ -737,6 +737,246 @@ out:
     return rc;
 }
 
+/* Parity (#785): mirrors test_wirelog_easy.c::test_intern_returns_same_id.
+ * Interning the same string twice through wl_intern_put must return
+ * the same int64 id; the advanced API exposes the intern table via
+ * wirelog_program_get_intern. */
+static int
+test_intern_returns_same_id(void)
+{
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T17");
+    if (!prog)
+        return 1;
+
+    wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+    int64_t a = wl_intern_put(intern, "alice");
+    int64_t b = wl_intern_put(intern, "alice");
+    int rc = 0;
+    if (a < 0 || b < 0 || a != b) {
+        fprintf(stderr,
+            "T17: intern inconsistent a=%lld b=%lld\n",
+            (long long)a, (long long)b);
+        rc = 1;
+    }
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_wirelog_easy.c::test_snapshot_filter.
+ * wirelog_session_snapshot itself does not filter by relation, but
+ * the per-tuple callback can.  Insert into two relations (edge and
+ * derived path), then verify the filter callback collects only the
+ * targeted relation's rows. */
+static int
+test_snapshot_filter(void)
+{
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T18");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+    int64_t a = wl_intern_put(intern, "a");
+    int64_t b = wl_intern_put(intern, "b");
+    int64_t c = wl_intern_put(intern, "c");
+    int rc = 0;
+    int64_t e_ab[2] = { a, b };
+    int64_t e_bc[2] = { b, c };
+    if (wirelog_session_insert(s, "edge", e_ab, 1, 2) != WIRELOG_OK
+        || wirelog_session_insert(s, "edge", e_bc, 1, 2) != WIRELOG_OK) {
+        fprintf(stderr, "T18 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    struct tuple_filter path_filter = { .target_relation = "path" };
+    if (wirelog_session_snapshot(s, filter_tuples, &path_filter)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T18 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    /* path is transitive closure over edge: expect path(a,b), path(b,c),
+     * path(a,c) -> 3 rows. */
+    if (path_filter.count != 3) {
+        fprintf(stderr,
+            "T18: expected 3 path tuples after filter, got %d\n",
+            path_filter.count);
+        rc = 1;
+    }
+    /* All filtered rows must be from the "path" relation. */
+    for (int i = 0; i < path_filter.count; i++) {
+        if (path_filter.ncols[i] != 2) {
+            fprintf(stderr, "T18: path row %d ncols=%u\n",
+                i, path_filter.ncols[i]);
+            rc = 1;
+        }
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_wirelog_easy.c::test_cleanup_order_no_use_after_free.
+ * Repeated open/use/close cycles must not leak or use-after-free under
+ * ASAN.  Mirrors easy by running two iterations through a tiny insert
+ * + step cycle. */
+static int
+test_cleanup_order_no_use_after_free(void)
+{
+    for (int iter = 0; iter < 2; iter++) {
+        wirelog_program_t *prog = parse_or_die(PROG_SRC, "T19");
+        if (!prog)
+            return 1;
+
+        wirelog_session_t *s = NULL;
+        if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+            != WIRELOG_OK || !s) {
+            wirelog_program_free(prog);
+            return 1;
+        }
+
+        wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+        int64_t a = wl_intern_put(intern, "a");
+        int64_t b = wl_intern_put(intern, "b");
+        int64_t row[2] = { a, b };
+        int rc = 0;
+        if (wirelog_session_insert(s, "edge", row, 1, 2) != WIRELOG_OK
+            || wirelog_session_step(s) != WIRELOG_OK) {
+            fprintf(stderr, "T19 iter=%d insert/step failed\n", iter);
+            rc = 1;
+        }
+        wirelog_session_destroy(s);
+        wirelog_program_free(prog);
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
+/* Parity (#785): mirrors test_wirelog_easy.c::test_intern_after_step_succeeds.
+ * Interning a brand new symbol after the plan has been built and
+ * stepped must still succeed; the new id must be usable for a
+ * subsequent insert+step. */
+static int
+test_intern_after_step_succeeds(void)
+{
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T20");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+    int64_t a = wl_intern_put(intern, "a");
+    int64_t b = wl_intern_put(intern, "b");
+    int rc = 0;
+    int64_t row[2] = { a, b };
+    if (wirelog_session_insert(s, "edge", row, 1, 2) != WIRELOG_OK
+        || wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr, "T20 first insert/step failed\n");
+        rc = 1;
+        goto out;
+    }
+    /* Intern a brand new symbol after the first step. */
+    int64_t late = wl_intern_put(intern, "late_symbol");
+    if (late < 0) {
+        fprintf(stderr, "T20 late intern failed\n");
+        rc = 1;
+        goto out;
+    }
+    int64_t late_row[2] = { late, b };
+    if (wirelog_session_insert(s, "edge", late_row, 1, 2) != WIRELOG_OK
+        || wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr, "T20 late insert/step failed\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_wirelog_easy.c::test_delta_cb_multi_round_recursive_insert.
+ * Issue #662 invariant: a delta callback installed before two
+ * insert+step rounds on a recursive stratum must observe deltas in
+ * BOTH rounds.  Without the symmetric arrangement-cache invalidation
+ * the second round either drops deltas or trips on stale joins. */
+static int
+test_delta_cb_multi_round_recursive_insert(void)
+{
+    static const char *RECURSIVE_REACH_SRC
+        = ".decl edge(a: int64, b: int64)\n"
+        ".decl reach(a: int64, b: int64)\n"
+        "reach(A, B) :- edge(A, B).\n"
+        "reach(A, C) :- reach(A, B), edge(B, C).\n";
+
+    wirelog_program_t *prog = parse_or_die(RECURSIVE_REACH_SRC, "T21");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    struct delta_state st = { 0, 0 };
+    if (wirelog_session_set_delta_cb(s, count_deltas, &st) != WIRELOG_OK) {
+        wirelog_session_destroy(s);
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    int rc = 0;
+    int64_t e12[2] = { 1, 2 };
+    if (wirelog_session_insert(s, "edge", e12, 1, 2) != WIRELOG_OK
+        || wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr, "T21 round 1 insert/step failed\n");
+        rc = 1;
+        goto out;
+    }
+    uint32_t first_round_inserts = st.inserts;
+    if (first_round_inserts == 0) {
+        fprintf(stderr, "T21 round 1: no inserts surfaced\n");
+        rc = 1;
+        goto out;
+    }
+
+    /* Second insert/step round must also surface deltas on the
+     * recursive stratum. */
+    int64_t e23[2] = { 2, 3 };
+    if (wirelog_session_insert(s, "edge", e23, 1, 2) != WIRELOG_OK
+        || wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr, "T21 round 2 insert/step failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (st.inserts <= first_round_inserts) {
+        fprintf(stderr,
+            "T21 round 2: expected more inserts than round 1=%u, got %u\n",
+            first_round_inserts, st.inserts);
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
 int
 main(void)
 {
@@ -757,6 +997,11 @@ main(void)
     failures += test_inline_compound_constant_child_filters();
     failures += test_inline_compound_duplicate_child_variables_filter();
     failures += test_side_compound_public_allocation_saturates();
+    failures += test_intern_returns_same_id();
+    failures += test_snapshot_filter();
+    failures += test_cleanup_order_no_use_after_free();
+    failures += test_intern_after_step_succeeds();
+    failures += test_delta_cb_multi_round_recursive_insert();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
     else

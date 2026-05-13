@@ -6,6 +6,28 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Cross-facade test-parity audit + CI gate** (#785):
+  `tests/test_wirelog_advanced.c` grows from 7 to 21 test
+  functions, mirroring `tests/test_wirelog_easy.c` invariants
+  through the public `wirelog_session_*` surface.  14 new
+  advanced tests cover parse errors, num_workers explicit
+  values, intern stability (twice -- before and after first
+  step), snapshot relation filtering, repeated open/use/close
+  ordering, recursive multi-round delta callbacks, and the full
+  inline-compound + side-compound parity sweep (5 inline-compound
+  binding patterns + 1 side-compound saturation).  Every
+  easy-side test is either paired with a same-named advanced
+  test or carries a `/* PARITY: ... */` block-comment on its
+  declaration line naming the structural reason no advanced
+  analogue exists (12 facade-only annotations covering opts
+  struct, `*_sym` variadics, `wirelog_easy_print_delta`, plus 2
+  deferred-annotations for the #665 partial-conjunction tests
+  whose easy-side test helper is not yet ported to advanced).
+  New gate `scripts/ci/check-test-parity.py` (registered as
+  `meson test --suite abi:test_parity`) enforces the rule
+  per-test, not as a numeric ratio, so future additions on
+  either side cannot silently regress parity.  Result at this
+  commit: 15 paired + 14 annotated = 29 easy tests covered.
 - **`scripts/ci/check-threading-doc.sh`** (#734): static gate
   registered as `meson test --suite abi:threading_doc` that counts
   `atomic_*` call sites in `wirelog/` production sources and asserts
@@ -77,6 +99,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **`docs/SEMANTICS.md` cross-facade parity audit subsection**
+  (#785, under epic #681): the existing "Cross-facade parity
+  (Status: Current)" block gains a new sub-block recording the
+  per-test paired-or-annotated rule, the lint backstop, and the
+  intentional reverse-parity asymmetry (backend selection is
+  advanced-only by design).  Future maintainers reading the
+  semantic model now see why some `test_create_*` tests are
+  one-sided.
 - **`docs/THREADING.md`** (#734, under epic #681): new canonical
   document covering wirelog's threading model -- backend selection
   (C11 `<threads.h>` > Win32 > POSIX, with `-Dthreads=posix` forcing
