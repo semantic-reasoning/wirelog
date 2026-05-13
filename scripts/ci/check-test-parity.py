@@ -54,12 +54,18 @@ def die(msg: str) -> None:
 
 def collect_test_names(path: pathlib.Path) -> dict[str, int]:
     """Return {test_name: 1-based_line_no} for every `test_*(void)`
-    in the file."""
+    in the file.  Duplicate names fail loudly (a C linker would
+    reject them anyway, but the lint catches them earlier with a
+    clearer diagnostic)."""
     out: dict[str, int] = {}
     for lineno, line in enumerate(path.read_text().splitlines(), start=1):
         m = NAME_RE.match(line)
         if m:
-            out[f"test_{m.group(1)}"] = lineno
+            name = f"test_{m.group(1)}"
+            if name in out:
+                die(f"duplicate test name {name} at {path.name}:{lineno} "
+                    f"(also at line {out[name]})")
+            out[name] = lineno
     return out
 
 
