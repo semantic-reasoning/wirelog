@@ -302,6 +302,87 @@ test_null_safety(void)
     return rc;
 }
 
+/* Parity (#785): mirrors test_wirelog_easy.c::test_open_parse_error.
+ * On the advanced side, parsing happens explicitly via
+ * wirelog_parse_string; the test asserts that malformed Datalog
+ * returns NULL and sets the error indicator. */
+static int
+test_open_parse_error(void)
+{
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog
+        = wirelog_parse_string("this is not datalog ::: !!!", &err);
+    int rc = 0;
+    if (prog) {
+        fprintf(stderr, "T8: parse should have failed, got prog=%p\n",
+            (void *)prog);
+        wirelog_program_free(prog);
+        rc = 1;
+    }
+    if (err == WIRELOG_OK) {
+        fprintf(stderr, "T8: parse failed but err == WIRELOG_OK\n");
+        rc = 1;
+    }
+    return rc;
+}
+
+/* Parity (#785): mirrors test_wirelog_easy.c::test_num_workers_default_is_one.
+ * Where the easy facade reads num_workers from an opts struct and
+ * defaults to 1 when unspecified, the advanced API takes num_workers
+ * as an explicit constructor argument; this test verifies that
+ * passing 1 is accepted and the resulting session is usable. */
+static int
+test_num_workers_default_is_one(void)
+{
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T9");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    wirelog_error_t err
+        = wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s);
+    int rc = 0;
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T9 create num_workers=1 err=%d\n", err);
+        rc = 1;
+    } else if (wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr, "T9 step failed with num_workers=1\n");
+        rc = 1;
+    }
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_wirelog_easy.c::test_num_workers_explicit_four.
+ * Pass num_workers=4 explicitly and verify session_create accepts the
+ * value and the resulting session can evaluate a step.  The easy-side
+ * test captures the log line to verify the value reached the runtime;
+ * on the advanced side num_workers IS the parameter, so behavioural
+ * verification (step succeeds) is sufficient. */
+static int
+test_num_workers_explicit_four(void)
+{
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T10");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    wirelog_error_t err
+        = wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 4, &s);
+    int rc = 0;
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T10 create num_workers=4 err=%d\n", err);
+        rc = 1;
+    } else if (wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr, "T10 step failed with num_workers=4\n");
+        rc = 1;
+    }
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
 int
 main(void)
 {
@@ -313,6 +394,9 @@ main(void)
     failures += test_insert_step_delta();
     failures += test_insert_remove_roundtrip();
     failures += test_null_safety();
+    failures += test_open_parse_error();
+    failures += test_num_workers_default_is_one();
+    failures += test_num_workers_explicit_four();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
     else

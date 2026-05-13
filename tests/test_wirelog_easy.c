@@ -231,7 +231,8 @@ capture_num_workers_log(const wirelog_easy_open_opts_t *opts, uint32_t expected)
     close(log_fd);
 
     wirelog_easy_session_t *s = NULL;
-    wirelog_error_t open_rc = wirelog_easy_open_opts(ACCESS_CONTROL_SRC, opts, &s);
+    wirelog_error_t open_rc = wirelog_easy_open_opts(ACCESS_CONTROL_SRC, opts,
+            &s);
     wirelog_error_t build_rc = WIRELOG_ERR_EXEC;
     if (open_rc == WIRELOG_OK && s)
         build_rc = wirelog_easy_set_delta_cb(s, NULL, NULL);
@@ -293,13 +294,15 @@ test_open_parse_error(void)
     PASS();
 }
 
+/* PARITY: facade-only -- wirelog_session_create has no opts struct (#785). */
 static void
 test_open_opts_null_equiv_to_open(void)
 {
     TEST("open_opts NULL opts equivalent to open");
 
     wirelog_easy_session_t *s = NULL;
-    if (wirelog_easy_open_opts(ACCESS_CONTROL_SRC, NULL, &s) != WIRELOG_OK || !s) {
+    if (wirelog_easy_open_opts(ACCESS_CONTROL_SRC, NULL,
+        &s) != WIRELOG_OK || !s) {
         FAIL("open_opts failed");
         return;
     }
@@ -312,6 +315,7 @@ test_open_opts_null_equiv_to_open(void)
     PASS();
 }
 
+/* PARITY: facade-only -- advanced API has no opts struct to size-validate (#785). */
 static void
 test_open_opts_zero_size_rejected(void)
 {
@@ -331,6 +335,7 @@ test_open_opts_zero_size_rejected(void)
     PASS();
 }
 
+/* PARITY: facade-only -- no _reserved field on the advanced API surface (#785). */
 static void
 test_open_opts_reserved_rejected(void)
 {
@@ -352,6 +357,7 @@ test_open_opts_reserved_rejected(void)
     PASS();
 }
 
+/* PARITY: facade-only -- WIRELOG_EASY_OPEN_OPTS_INIT is a facade convenience macro (#785). */
 static void
 test_open_opts_init_macro(void)
 {
@@ -377,6 +383,7 @@ test_open_opts_init_macro(void)
     PASS();
 }
 
+/* PARITY: facade-only -- advanced wirelog_session_create is always eager; no eager_build flag (#785). */
 static void
 test_open_opts_eager_build_ok(void)
 {
@@ -385,7 +392,8 @@ test_open_opts_eager_build_ok(void)
     wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
     opts.eager_build = true;
     wirelog_easy_session_t *s = NULL;
-    if (wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts, &s) != WIRELOG_OK || !s) {
+    if (wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts,
+        &s) != WIRELOG_OK || !s) {
         FAIL("open_opts eager_build failed");
         return;
     }
@@ -404,6 +412,7 @@ test_open_opts_eager_build_ok(void)
  * parse-error path (per the architect+critic synthesis plan, scope-narrow per
  * Critic MAJOR #6).
  */
+/* PARITY: facade-only -- advanced parse error is covered by test_open_parse_error (#785). */
 static void
 test_open_opts_eager_build_propagates_parse_error(void)
 {
@@ -599,7 +608,8 @@ test_inline_compound_body_join_binding(void)
     int64_t threshold_row[1] = { 90 };
     if (wirelog_easy_insert(s, "event", matched_row, 5) != WIRELOG_OK
         || wirelog_easy_insert(s, "event", unmatched_row, 5) != WIRELOG_OK
-        || wirelog_easy_insert(s, "threshold", threshold_row, 1) != WIRELOG_OK) {
+        || wirelog_easy_insert(s, "threshold", threshold_row,
+        1) != WIRELOG_OK) {
         FAIL("insert failed");
         wirelog_easy_close(s);
         return;
@@ -1106,7 +1116,8 @@ test_cleanup_order_no_use_after_free(void)
             FAIL("open failed");
             return;
         }
-        if (wirelog_easy_insert_sym(s, "can", "alice", "read", (const char *)NULL)
+        if (wirelog_easy_insert_sym(s, "can", "alice", "read",
+            (const char *)NULL)
             != WIRELOG_OK) {
             FAIL("insert_sym failed");
             wirelog_easy_close(s);
@@ -1321,7 +1332,8 @@ drive_issue_665_partial_conjunction(wirelog_easy_session_t *s)
 
     /* Step 3: session_state(S, ST) — still missing session_active and
      * perm_state, so the join body is unsatisfied. */
-    if (wirelog_easy_insert_sym(s, "session_state", "s", "st", (const char *)NULL)
+    if (wirelog_easy_insert_sym(s, "session_state", "s", "st",
+        (const char *)NULL)
         != WIRELOG_OK)
         return false;
     if (wirelog_easy_step(s) != WIRELOG_OK)
