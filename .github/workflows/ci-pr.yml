@@ -80,7 +80,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify libabigail-tools
+          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
@@ -195,7 +195,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev libabigail-tools
+          sudo apt-get install -y meson ninja-build libmbedtls-dev abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi

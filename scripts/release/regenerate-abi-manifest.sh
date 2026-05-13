@@ -37,7 +37,7 @@ baseline="$repo_root/abi/libwirelog-1.0.abi.json"
 
 if ! command -v abidw >/dev/null 2>&1; then
     echo "regenerate-abi-manifest: FAIL: abidw not on PATH" >&2
-    echo "  install libabigail (Ubuntu: apt-get install -y libabigail-tools)" >&2
+    echo "  install libabigail (Ubuntu: apt-get install -y abigail-tools)" >&2
     exit 1
 fi
 
