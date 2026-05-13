@@ -60,6 +60,26 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **CI: enroll Linux arm64 (`ubuntu-24.04-arm`) GCC build in the PR
+  gate matrix** (#787): mirrors the arm64 leg already present in
+  `.github/workflows/ci-main.yml` so the abi suite (`abi_symbols`,
+  `public_header_surface`, `public_prefix`,
+  `public_doxygen_headers`, `public_api_macro`, `test_parity`,
+  `threading_doc`, `version_sync`, `changelog_format`,
+  `release_template`, and the standalone-include compile tests)
+  exercises the second supported architecture on every PR before
+  merge.  Same-source-of-truth allowlist
+  (`abi/libwirelog-1.0.symbols`) is intentionally arch-agnostic --
+  `gnu_symbol_visibility: 'hidden'` plus `WIRELOG_API`-only export
+  keeps SIMD/NEON wrappers internal so the 53-symbol set is
+  identical across x86_64 and arm64.  Also fixes a stale matrix
+  comparison in `ci-main.yml:84-95` that compared against the
+  unused literal `'arm64'` instead of the actual runner label
+  `'ubuntu-24.04-arm'`, so the SIMD-capability verification block
+  now runs on the arm64 leg as intended.  Required-check
+  promotion is a follow-up repo-admin action (branch protection),
+  not part of this PR; the libabigail `.abi.json` half of the
+  cross-arch ABI gate lands under #786 once that issue ships.
 - **Adopt `WIRELOG_API` on every installed public prototype** (#782):
   76 occurrences of `WIRELOG_PUBLIC` across the 8 prototype headers
   (`wirelog.h`, `wirelog-types.h`, `wirelog-ir.h`, `wirelog-parser.h`,

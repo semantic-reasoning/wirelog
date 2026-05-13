@@ -60,6 +60,19 @@ jobs:
             compiler: msvc
             cc: cl
 
+          # ARM64 - GCC (GitHub-hosted runner, #787)
+          # Mirrors the leg in ci-main.yml; required by the v0.41 ABI
+          # Infrastructure milestone (#681) to ensure the abi suite
+          # (abi_symbols, public_header_surface, public_prefix,
+          # public_doxygen_headers, public_api_macro, test_parity,
+          # threading_doc, version_sync, changelog_format,
+          # release_template, and the standalone-include compile
+          # tests) passes on the second supported architecture before
+          # v1.0 ABI freeze.
+          - os: ubuntu-24.04-arm
+            compiler: gcc
+            cc: gcc
+
     steps:
       - uses: actions/checkout@v5
 
