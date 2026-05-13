@@ -421,6 +421,15 @@ test('public_api_macro', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-public-api-macro.py'],
      suite: 'abi')
 
+# Issue #785: cross-facade test parity.  Every test_* function in
+# tests/test_wirelog_easy.c must either pair with a same-named
+# function in tests/test_wirelog_advanced.c or carry a
+# `/* PARITY: ... */` annotation on the line(s) above its
+# declaration.  Static text scan.
+test('test_parity', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-test-parity.py'],
+     suite: 'abi')
+
 # Issue #780 / Epic #680 exit gate: every public header must carry
 # `@file` and `@brief` inside a `/** ... */` Doxygen block.  Header
 # list is sourced from `parse_meson_sot` in check-public-header-surface.py
