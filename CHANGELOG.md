@@ -6,6 +6,29 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **libabigail `.abi.json` ABI manifest + abidiff CI gate** (#786):
+  the v1.0 ABI golden file gains its libabigail half.  Where the
+  53-entry `abi/libwirelog-1.0.symbols` allowlist (#733 K2) only
+  checks the dynamic-symbol *set*, the new
+  `abi/libwirelog-1.0.abi.json` baseline (16 KB / 127 lines,
+  generated reproducibly via
+  `scripts/release/regenerate-abi-manifest.sh`) pins struct member
+  offsets and padding, function-signature shapes, visibility
+  attributes, and typedef targets.  `scripts/ci/check-abi-manifest.sh`
+  (registered as `meson test --suite abi:abi_manifest`) runs
+  `abidiff --suppr abi/libwirelog-1.0.suppr` (suppression file
+  optional) against the just-built `build/libwirelog.so` and fails
+  the gate when libabigail reports incompatible-change bits (rc & 4).
+  Both Linux GCC and Clang legs of `.github/workflows/ci-pr.yml`
+  and `.github/workflows/ci-main.yml` now `apt-get install
+  libabigail-tools` so `abidiff` is on PATH in CI; the gate's SKIP
+  paths remain for platforms where libabigail is unavailable
+  (Windows, macOS, cross-builds).  Demonstrated firing on a
+  synthetic break: adding a new `WIRELOG_API` function trips the
+  gate with `abidiff rc=4` and a clear remediation paragraph
+  pointing at the regeneration script.  Closes the libabigail half
+  of original ABI-Infrastructure scope from epic #690 (now
+  decomposed under #786).
 - **Cross-facade test-parity audit + CI gate** (#785):
   `tests/test_wirelog_advanced.c` grows from 7 to 21 test
   functions, mirroring `tests/test_wirelog_easy.c` invariants
