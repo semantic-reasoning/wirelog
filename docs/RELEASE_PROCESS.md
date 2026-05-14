@@ -10,6 +10,21 @@ It is the operational counterpart of:
 - `docs/SECURITY_MODEL.md` — vulnerability-disclosure policy.
 - `stable-release-plan.md` — long-form roadmap to v1.0 GA.
 
+> **Note on `stable-release-plan.md`.**  Unlike the other documents
+> listed above, the long-form release plan is intentionally **not**
+> tracked in the source tree — it is a working planning artifact that
+> maintainers keep locally during release preparation.  The public-
+> header SoT gate `scripts/ci/check-public-header-surface.py` knows
+> this: its `parse_plan_section()` helper returns `None` when the
+> file is absent, which is the case in every CI checkout and clean
+> clone today.  The §3.1 cross-check therefore activates only for
+> contributors who keep a working copy of the plan locally; drift
+> errors against that copy (e.g. a public-header rename that the
+> local plan has not yet picked up) are local-developer noise and do
+> not gate CI.  If the team later decides to track the plan in-tree,
+> the existing gate immediately becomes a hard mirror for §3.1 with
+> no script change required.
+
 It is the deliverable for issue **#772** (release-note template +
 publication procedure) and is referenced by **#687** (v1.0.0 GA
 epic) which lists "CHANGELOG `[1.0.0]` section merged" as an exit
