@@ -3851,6 +3851,22 @@ test('baseline_tab_nodes',
 )
 
 # ============================================================================
+# CLI Version / Help Surface Test (Issue #801)
+# Reuses baseline_py3 (already resolved above) to invoke the executable.
+# ============================================================================
+
+test('cli_version',
+  baseline_py3,
+  args: [
+    files('test_cli_version.py')[0],
+    wirelog_cli.full_path(),
+    meson.project_version(),
+  ],
+  depends: wirelog_cli,
+  suite: 'cli',
+)
+
+# ============================================================================
 # I/O Adapter Registry Tests (#450)
 # ============================================================================
 

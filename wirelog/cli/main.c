@@ -12,6 +12,7 @@
  *   --watch [interval]         Watch mode: re-evaluate on stdin input
  *   --load-adapter PATH        Load adapter plugin (repeatable, requires
  *                              -Dio_plugin_dlopen=enabled)
+ *   --version, -v              Print version and exit
  *   --help                     Show usage information
  */
 
@@ -20,6 +21,9 @@
 #ifdef WL_HAVE_PLUGIN_LOADER
 #include "plugin_loader.h"
 #endif
+
+/* WIRELOG_VERSION_STRING; generated header, see wirelog-version.h.in. */
+#include "wirelog/wirelog-version.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -31,6 +35,7 @@
 static void
 print_usage(const char *progname)
 {
+    fprintf(stderr, "wirelog_cli %s\n\n", WIRELOG_VERSION_STRING);
     fprintf(stderr, "Usage: %s [options] <file.dl>\n", progname);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --workers N          Number of worker threads "
@@ -46,7 +51,8 @@ print_usage(const char *progname)
         ", disabled in this build"
 #endif
         ")\n");
-    fprintf(stderr, "  --help               Show this help message\n");
+    fprintf(stderr, "  --version, -v        Print version and exit\n");
+    fprintf(stderr, "  --help, -h           Show this help message\n");
 }
 
 int
@@ -63,6 +69,11 @@ main(int argc, char *argv[])
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[i], "--version") == 0
+            || strcmp(argv[i], "-v") == 0) {
+            printf("wirelog_cli %s\n", WIRELOG_VERSION_STRING);
             return 0;
         }
         if (strcmp(argv[i], "--delta") == 0) {
