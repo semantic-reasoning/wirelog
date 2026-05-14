@@ -58,7 +58,7 @@ for candidate in "${BUILD_DIR}/libwirelog.so" \
     if [[ -f "${candidate}" ]]; then LIB="${candidate}"; break; fi
 done
 if [[ -z "${LIB}" ]]; then
-    echo "ERROR: libwirelog artifact not found under ${BUILD_DIR}" >&2
+    echo "ERROR: libwirelog not built under ${BUILD_DIR}; run 'meson compile -C ${BUILD_DIR}' first" >&2
     exit 2
 fi
 
