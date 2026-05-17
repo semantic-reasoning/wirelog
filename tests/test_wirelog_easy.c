@@ -758,6 +758,323 @@ test_inline_compound_duplicate_child_variables_filter(void)
     PASS();
 }
 
+static wirelog_error_t
+make_compound4(wirelog_easy_session_t *s, const char *functor, int64_t a0,
+    int64_t a1, int64_t a2, int64_t a3, uint64_t *handle)
+{
+    wirelog_compound_arg_t args[4] = {
+        { WIRELOG_TYPE_INT64, a0 },
+        { WIRELOG_TYPE_INT64, a1 },
+        { WIRELOG_TYPE_INT64, a2 },
+        { WIRELOG_TYPE_INT64, a3 },
+    };
+    return wirelog_easy_make_compound(s, functor, 4, args, handle);
+}
+
+static wirelog_error_t
+make_compound1(wirelog_easy_session_t *s, const char *functor, int64_t a0,
+    uint64_t *handle)
+{
+    wirelog_compound_arg_t args[1] = {
+        { WIRELOG_TYPE_INT64, a0 },
+    };
+    return wirelog_easy_make_compound(s, functor, 1, args, handle);
+}
+
+static void
+test_side_compound_body_field_binding(void)
+{
+    TEST("side compound body pattern binds fields through side join");
+
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl host_hit(id: int64, host: symbol)\n"
+        "host_hit(ID, Host) :- event(ID, Tenant, "
+        "metadata(Level, Ts, Host, Risk)), Risk > 80.\n";
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+
+    int64_t tenant = wirelog_easy_intern(s, "acme");
+    int64_t host_a = wirelog_easy_intern(s, "edge-a");
+    int64_t host_b = wirelog_easy_intern(s, "edge-b");
+    uint64_t hot_handle = 0;
+    uint64_t cold_handle = 0;
+    if (tenant < 0 || host_a < 0 || host_b < 0
+        || make_compound4(s, "metadata", 1, 100, host_a, 90,
+        &hot_handle) != WIRELOG_OK
+        || make_compound4(s, "metadata", 1, 101, host_b, 40,
+        &cold_handle) != WIRELOG_OK) {
+        FAIL("compound allocation failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t hot_row[3] = { 7, tenant, (int64_t)hot_handle };
+    int64_t cold_row[3] = { 8, tenant, (int64_t)cold_handle };
+    if (wirelog_easy_insert(s, "event", hot_row, 3) != WIRELOG_OK
+        || wirelog_easy_insert(s, "event", cold_row, 3) != WIRELOG_OK) {
+        FAIL("insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    tuple_collector_t host_hit;
+    memset(&host_hit, 0, sizeof(host_hit));
+    if (wirelog_easy_snapshot(s, "host_hit", collect_tuple, &host_hit)
+        != WIRELOG_OK) {
+        FAIL("snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    wirelog_easy_close(s);
+
+    if (host_hit.count != 1 || host_hit.ncols[0] != 2
+        || host_hit.rows[0][0] != 7 || host_hit.rows[0][1] != host_a) {
+        FAIL("expected only host_hit(7, edge-a)");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_side_compound_constant_child_filters(void)
+{
+    TEST("side compound constant child filters rows");
+
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl hot(id: int64)\n"
+        "hot(ID) :- event(ID, _, metadata(_, _, _, 90)).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+
+    int64_t tenant = wirelog_easy_intern(s, "acme");
+    uint64_t hot_handle = 0;
+    uint64_t cold_handle = 0;
+    if (tenant < 0
+        || make_compound4(s, "metadata", 1, 100, 3, 90,
+        &hot_handle) != WIRELOG_OK
+        || make_compound4(s, "metadata", 1, 101, 3, 40,
+        &cold_handle) != WIRELOG_OK) {
+        FAIL("compound allocation failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t hot_row[3] = { 7, tenant, (int64_t)hot_handle };
+    int64_t cold_row[3] = { 8, tenant, (int64_t)cold_handle };
+    if (wirelog_easy_insert(s, "event", hot_row, 3) != WIRELOG_OK
+        || wirelog_easy_insert(s, "event", cold_row, 3) != WIRELOG_OK) {
+        FAIL("insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    tuple_collector_t hot;
+    memset(&hot, 0, sizeof(hot));
+    if (wirelog_easy_snapshot(s, "hot", collect_tuple, &hot) != WIRELOG_OK) {
+        FAIL("snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    wirelog_easy_close(s);
+
+    if (hot.count != 1 || hot.ncols[0] != 1 || hot.rows[0][0] != 7) {
+        FAIL("expected only side row with constant child value 90");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_side_compound_duplicate_child_variables_filter(void)
+{
+    TEST("side compound duplicate child variables filter rows");
+
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl same(id: int64)\n"
+        "same(ID) :- event(ID, _, metadata(X, X, _, _)).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+
+    int64_t tenant = wirelog_easy_intern(s, "acme");
+    uint64_t matched_handle = 0;
+    uint64_t unmatched_handle = 0;
+    if (tenant < 0
+        || make_compound4(s, "metadata", 4, 4, 3, 90,
+        &matched_handle) != WIRELOG_OK
+        || make_compound4(s, "metadata", 1, 2, 3, 90,
+        &unmatched_handle) != WIRELOG_OK) {
+        FAIL("compound allocation failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t matched_row[3] = { 7, tenant, (int64_t)matched_handle };
+    int64_t unmatched_row[3] = { 8, tenant, (int64_t)unmatched_handle };
+    if (wirelog_easy_insert(s, "event", matched_row, 3) != WIRELOG_OK
+        || wirelog_easy_insert(s, "event", unmatched_row, 3) != WIRELOG_OK) {
+        FAIL("insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    tuple_collector_t same;
+    memset(&same, 0, sizeof(same));
+    if (wirelog_easy_snapshot(s, "same", collect_tuple, &same)
+        != WIRELOG_OK) {
+        FAIL("snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    wirelog_easy_close(s);
+
+    if (same.count != 1 || same.ncols[0] != 1 || same.rows[0][0] != 7) {
+        FAIL("expected only side row with equal duplicate child variables");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_side_compound_wrong_functor_handle_no_match(void)
+{
+    TEST("side compound wrong functor handle does not match metadata pattern");
+
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl seen(id: int64)\n"
+        "seen(ID) :- event(ID, _, metadata(_, _, _, _)).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+
+    int64_t tenant = wirelog_easy_intern(s, "acme");
+    uint64_t wrong_handle = 0;
+    if (tenant < 0
+        || make_compound4(s, "other", 1, 2, 3, 4,
+        &wrong_handle) != WIRELOG_OK) {
+        FAIL("compound allocation failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t row[3] = { 7, tenant, (int64_t)wrong_handle };
+    if (wirelog_easy_insert(s, "event", row, 3) != WIRELOG_OK) {
+        FAIL("insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    tuple_collector_t seen;
+    memset(&seen, 0, sizeof(seen));
+    if (wirelog_easy_snapshot(s, "seen", collect_tuple, &seen)
+        != WIRELOG_OK) {
+        FAIL("snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    wirelog_easy_close(s);
+
+    if (seen.count != 0) {
+        FAIL("wrong functor handle should not join metadata side relation");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_side_compound_nested_child_no_match(void)
+{
+    TEST("side compound nested child pattern is not recursive");
+
+    const char *src
+        = ".decl record(id: int64, scope_col: scope/1 side)\n"
+        ".decl seen(id: int64)\n"
+        "seen(ID) :- record(ID, scope(metadata(Level, Ts, Host, Risk))).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+
+    uint64_t metadata_handle = 0;
+    uint64_t scope_handle = 0;
+    if (make_compound4(s, "metadata", 1, 100, 3, 90, &metadata_handle)
+        != WIRELOG_OK
+        || make_compound1(s, "scope", (int64_t)metadata_handle,
+        &scope_handle) != WIRELOG_OK) {
+        FAIL("compound allocation failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t row[2] = { 7, (int64_t)scope_handle };
+    if (wirelog_easy_insert(s, "record", row, 2) != WIRELOG_OK) {
+        FAIL("insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    tuple_collector_t seen;
+    memset(&seen, 0, sizeof(seen));
+    if (wirelog_easy_snapshot(s, "seen", collect_tuple, &seen)
+        != WIRELOG_OK) {
+        FAIL("snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    wirelog_easy_close(s);
+
+    if (seen.count != 0) {
+        FAIL("nested side body destructuring should not match");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_negated_side_compound_body_pattern_rejected(void)
+{
+    TEST("negated side compound body pattern is rejected");
+
+    const char *src
+        = ".decl all_events(id: int64)\n"
+        ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl clean(id: int64)\n"
+        "clean(ID) :- all_events(ID), !event(ID, metadata(_, _, _, 90)).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) == WIRELOG_OK || s) {
+        wirelog_easy_close(s);
+        FAIL("negated side compound pattern should fail open");
+        return;
+    }
+    PASS();
+}
+
 static void
 test_side_compound_public_allocation_saturates(void)
 {
@@ -1467,6 +1784,12 @@ main(void)
     test_inline_compound_functor_mismatch_is_empty();
     test_inline_compound_constant_child_filters();
     test_inline_compound_duplicate_child_variables_filter();
+    test_side_compound_body_field_binding();
+    test_side_compound_constant_child_filters();
+    test_side_compound_duplicate_child_variables_filter();
+    test_side_compound_wrong_functor_handle_no_match();
+    test_side_compound_nested_child_no_match();
+    test_negated_side_compound_body_pattern_rejected();
     test_side_compound_public_allocation_saturates();
     test_insert_sym_variadic();
     test_remove_sym();
