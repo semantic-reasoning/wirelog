@@ -135,6 +135,29 @@ parse_or_die(const char *src, const char *what)
     return prog;
 }
 
+static wirelog_error_t
+make_compound4(wirelog_session_t *s, const char *functor, int64_t a0,
+    int64_t a1, int64_t a2, int64_t a3, uint64_t *handle)
+{
+    wirelog_compound_arg_t args[4] = {
+        { WIRELOG_TYPE_INT64, a0 },
+        { WIRELOG_TYPE_INT64, a1 },
+        { WIRELOG_TYPE_INT64, a2 },
+        { WIRELOG_TYPE_INT64, a3 },
+    };
+    return wirelog_session_make_compound(s, functor, 4, args, handle);
+}
+
+static wirelog_error_t
+make_compound1(wirelog_session_t *s, const char *functor, int64_t a0,
+    uint64_t *handle)
+{
+    wirelog_compound_arg_t args[1] = {
+        { WIRELOG_TYPE_INT64, a0 },
+    };
+    return wirelog_session_make_compound(s, functor, 1, args, handle);
+}
+
 /* T1: create / destroy with default backend; program ownership stays
  *     with the caller (destroy must not free it). */
 static int
@@ -759,6 +782,319 @@ out:
     return rc;
 }
 
+/* Parity (#785): mirrors test_side_compound_body_field_binding. */
+static int
+test_side_compound_body_field_binding(void)
+{
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl host_hit(id: int64, host: symbol)\n"
+        "host_hit(ID, Host) :- event(ID, Tenant, "
+        "metadata(Level, Ts, Host, Risk)), Risk > 80.\n";
+    wirelog_program_t *prog = parse_or_die(src, "T17");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+    int64_t tenant = wl_intern_put(intern, "acme");
+    int64_t host_a = wl_intern_put(intern, "edge-a");
+    int64_t host_b = wl_intern_put(intern, "edge-b");
+    uint64_t hot_handle = 0;
+    uint64_t cold_handle = 0;
+    int rc = 0;
+    if (tenant < 0 || host_a < 0 || host_b < 0
+        || make_compound4(s, "metadata", 1, 100, host_a, 90,
+        &hot_handle) != WIRELOG_OK
+        || make_compound4(s, "metadata", 1, 101, host_b, 40,
+        &cold_handle) != WIRELOG_OK) {
+        fprintf(stderr, "T17 compound allocation failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    int64_t hot_row[3] = { 7, tenant, (int64_t)hot_handle };
+    int64_t cold_row[3] = { 8, tenant, (int64_t)cold_handle };
+    if (wirelog_session_insert(s, "event", hot_row, 1, 3) != WIRELOG_OK
+        || wirelog_session_insert(s, "event", cold_row, 1, 3)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T17 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    struct tuple_filter f = { .target_relation = "host_hit" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T17 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 1 || f.ncols[0] != 2 || f.rows[0][0] != 7
+        || f.rows[0][1] != host_a) {
+        fprintf(stderr, "T17: expected only host_hit(7, edge-a)\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_side_compound_constant_child_filters. */
+static int
+test_side_compound_constant_child_filters(void)
+{
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl hot(id: int64)\n"
+        "hot(ID) :- event(ID, _, metadata(_, _, _, 90)).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T18");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    uint64_t hot_handle = 0;
+    uint64_t cold_handle = 0;
+    int rc = 0;
+    if (make_compound4(s, "metadata", 1, 100, 3, 90, &hot_handle)
+        != WIRELOG_OK
+        || make_compound4(s, "metadata", 1, 101, 3, 40, &cold_handle)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T18 compound allocation failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    int64_t hot_row[3] = { 7, 1, (int64_t)hot_handle };
+    int64_t cold_row[3] = { 8, 1, (int64_t)cold_handle };
+    if (wirelog_session_insert(s, "event", hot_row, 1, 3) != WIRELOG_OK
+        || wirelog_session_insert(s, "event", cold_row, 1, 3)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T18 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    struct tuple_filter f = { .target_relation = "hot" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T18 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 1 || f.ncols[0] != 1 || f.rows[0][0] != 7) {
+        fprintf(stderr, "T18: expected only hot(7)\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_side_compound_duplicate_child_variables_filter. */
+static int
+test_side_compound_duplicate_child_variables_filter(void)
+{
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl same(id: int64)\n"
+        "same(ID) :- event(ID, _, metadata(X, X, _, _)).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T19");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    uint64_t matched_handle = 0;
+    uint64_t unmatched_handle = 0;
+    int rc = 0;
+    if (make_compound4(s, "metadata", 4, 4, 3, 90, &matched_handle)
+        != WIRELOG_OK
+        || make_compound4(s, "metadata", 1, 2, 3, 90,
+        &unmatched_handle) != WIRELOG_OK) {
+        fprintf(stderr, "T19 compound allocation failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    int64_t matched_row[3] = { 7, 1, (int64_t)matched_handle };
+    int64_t unmatched_row[3] = { 8, 1, (int64_t)unmatched_handle };
+    if (wirelog_session_insert(s, "event", matched_row, 1, 3)
+        != WIRELOG_OK
+        || wirelog_session_insert(s, "event", unmatched_row, 1, 3)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T19 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    struct tuple_filter f = { .target_relation = "same" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T19 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 1 || f.ncols[0] != 1 || f.rows[0][0] != 7) {
+        fprintf(stderr, "T19: expected only same(7)\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_side_compound_wrong_functor_handle_no_match. */
+static int
+test_side_compound_wrong_functor_handle_no_match(void)
+{
+    const char *src
+        = ".decl event(id: int64, tenant: symbol, payload: metadata/4 side)\n"
+        ".decl seen(id: int64)\n"
+        "seen(ID) :- event(ID, _, metadata(_, _, _, _)).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T20");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    uint64_t wrong_handle = 0;
+    int rc = 0;
+    if (make_compound4(s, "other", 1, 2, 3, 4, &wrong_handle)
+        != WIRELOG_OK) {
+        fprintf(stderr, "T20 compound allocation failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    int64_t row[3] = { 7, 1, (int64_t)wrong_handle };
+    if (wirelog_session_insert(s, "event", row, 1, 3) != WIRELOG_OK) {
+        fprintf(stderr, "T20 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    struct tuple_filter f = { .target_relation = "seen" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T20 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 0) {
+        fprintf(stderr, "T20: wrong functor handle derived rows\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_side_compound_nested_child_no_match. */
+static int
+test_side_compound_nested_child_no_match(void)
+{
+    const char *src
+        = ".decl record(id: int64, scope_col: scope/1 side)\n"
+        ".decl seen(id: int64)\n"
+        "seen(ID) :- record(ID, scope(metadata(Level, Ts, Host, Risk))).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T21");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK || !s) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    uint64_t metadata_handle = 0;
+    uint64_t scope_handle = 0;
+    int rc = 0;
+    if (make_compound4(s, "metadata", 1, 100, 3, 90, &metadata_handle)
+        != WIRELOG_OK
+        || make_compound1(s, "scope", (int64_t)metadata_handle,
+        &scope_handle) != WIRELOG_OK) {
+        fprintf(stderr, "T21 compound allocation failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    int64_t row[2] = { 7, (int64_t)scope_handle };
+    if (wirelog_session_insert(s, "record", row, 1, 2) != WIRELOG_OK) {
+        fprintf(stderr, "T21 insert failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    struct tuple_filter f = { .target_relation = "seen" };
+    if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+        fprintf(stderr, "T21 snapshot failed\n");
+        rc = 1;
+        goto out;
+    }
+    if (f.count != 0) {
+        fprintf(stderr, "T21: nested side body destructuring matched\n");
+        rc = 1;
+    }
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_negated_side_compound_body_pattern_rejected. */
+static int
+test_negated_side_compound_body_pattern_rejected(void)
+{
+    const char *src
+        = ".decl all_events(id: int64)\n"
+        ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl clean(id: int64)\n"
+        "clean(ID) :- all_events(ID), !event(ID, metadata(_, _, _, 90)).\n";
+    wirelog_error_t parse_err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(src, &parse_err);
+    if (!prog)
+        return parse_err == WIRELOG_OK ? 1 : 0;
+
+    wirelog_session_t *s = NULL;
+    wirelog_error_t err
+        = wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s);
+    int rc = 0;
+    if (err != WIRELOG_ERR_INVALID_IR || s) {
+        fprintf(stderr,
+            "T22: expected invalid IR for negated side compound, got %d\n",
+            err);
+        wirelog_session_destroy(s);
+        rc = 1;
+    }
+    wirelog_program_free(prog);
+    return rc;
+}
+
 /* Parity (#785): mirrors test_wirelog_easy.c::test_intern_returns_same_id.
  * Interning the same string twice through wl_intern_put must return
  * the same int64 id; the advanced API exposes the intern table via
@@ -1019,6 +1355,12 @@ main(void)
     failures += test_inline_compound_constant_child_filters();
     failures += test_inline_compound_duplicate_child_variables_filter();
     failures += test_side_compound_public_allocation_saturates();
+    failures += test_side_compound_body_field_binding();
+    failures += test_side_compound_constant_child_filters();
+    failures += test_side_compound_duplicate_child_variables_filter();
+    failures += test_side_compound_wrong_functor_handle_no_match();
+    failures += test_side_compound_nested_child_no_match();
+    failures += test_negated_side_compound_body_pattern_rejected();
     failures += test_intern_returns_same_id();
     failures += test_snapshot_filter();
     failures += test_cleanup_order_no_use_after_free();
