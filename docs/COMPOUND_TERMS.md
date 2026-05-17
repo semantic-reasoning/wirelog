@@ -176,8 +176,19 @@ For `inline` compound columns, the pattern `f(a, b)` in a body literal:
 - Binds variables `a` and `b` to the inline physical argument columns.
 - Fails to match rows when the declared functor or arity differs.
 
-Side-relation compound declarations are parsed and exposed in schema metadata,
-but side body-argument binding is not yet lowered into a side-relation join.
+For `side` compound columns, the same body pattern lowers to a parent relation
+scan joined with the generated side relation:
+
+```
+rel(..., f(a, b), ...)  ->  rel(...) JOIN __compound_f_2(handle, arg0, arg1)
+```
+
+The join key is the parent handle column equals the side relation `handle`
+column. Variables, constants, and duplicate variables inside the pattern are
+then handled by the existing JOIN, FILTER, and PROJECT machinery. This is
+structural body-pattern binding for declared compound columns, not general
+Prolog unification: it does not construct new compounds in rule heads, search
+alternative functors, or recursively destructure arbitrary nested side handles.
 
 ### Example: projecting a compound argument
 
@@ -197,18 +208,20 @@ x_values(id, x) :- event(id, point(x, _)).
 hot_items(key) :- item(key, tag(category, priority)), priority > 10.
 ```
 
-### Current limitation: side-relation body binding
+### Side-relation body binding
 
-Side declarations are accepted:
+Side declarations can bind body fields:
 
 ```
-.decl event(id: int64, meta: metadata/4)
-.decl event_side(id: int64, meta: metadata/4 side)
+.decl event(id: int64, tenant: symbol, meta: metadata/4 side)
+.decl hot(id: int64, host: symbol)
+
+hot(ID, Host) :- event(ID, _, metadata(Level, Ts, Host, Risk)), Risk > 80.
 ```
 
-The public execution path currently binds compound body variables for inline
-columns only. Support for lowering side patterns through
-`__compound_<functor>_<arity>` side-relation joins is tracked separately.
+At execution time the `metadata(...)` pattern reads rows from
+`__compound_metadata_4(handle, arg0, arg1, arg2, arg3)` by joining
+`event.meta == __compound_metadata_4.handle`.
 
 ### Parser limitation: compound terms in rule heads
 
@@ -250,11 +263,15 @@ For a nested compound like `scope(metadata(t, ts, loc, risk))`:
 3. Main relation column: holds `handle_scope`.
 
 Nested side-tier storage metadata follows the same nesting. Rule-body binding
-for nested side terms is not lowered yet:
+for a flat declared side pattern is supported, but nested body destructuring is
+not recursive. A nested body pattern such as the following does not match by
+recursively opening `metadata(...)`:
 
 ```
 .decl record(id: int64, scope_col: scope/1)
-.decl record(id: int64, scope_col: scope/1)
+.decl seen(id: int64)
+
+seen(ID) :- record(ID, scope(metadata(Level, Ts, Host, Risk))).
 ```
 
 ---
@@ -282,6 +299,7 @@ When in doubt, omit the hint. The default (`side`) is always correct.
 | Nesting > 64 levels                      | Parse error: "compound term nesting too deep"         |
 | `inline` hint with arity > 4            | Parse error |
 | `inline` hint with depth > 1            | Schema-apply error; `WL_LOG=COMPOUND:2` emits `error=depth_overflow` |
+| Negated side compound body pattern       | IR conversion error; negated side-join lowering is not yet supported |
 | Handle from session A used in session B  | `arena_lookup` returns NULL (session seed mismatch)   |
 | Handle after arena saturation (epoch 4095)| `arena_alloc` returns `WL_COMPOUND_HANDLE_NULL`      |
 
@@ -305,8 +323,10 @@ sum_rel(id, x + y) :- pair_rel(id, pair(x, y)).
 .decl message(msg_id: int64, envelope: envelope/2)
 ```
 
-The declaration is accepted and exposed in schema metadata. Binding nested side
-arguments in rule bodies requires the future side-relation lowering path.
+The declaration is accepted and exposed in schema metadata. A rule can bind the
+outer `envelope/2` arguments through its generated side relation; recursively
+destructuring a nested child handle inside the same body term is not part of the
+current binding model.
 
 ---
 
