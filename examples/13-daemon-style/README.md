@@ -27,12 +27,14 @@ pulse(ID) :- pulse(ID).
 hot_event(ID, Tenant) :- event(ID, Tenant, Risk, _), Risk > 80.
 ```
 
-The `risk` scalar drives the rule because side-compound body destructuring is a
-larger compiler feature tracked separately. The payload still uses the real
-session-local compound arena, so rotations are triggered by arena saturation
-rather than by a caller-owned event watermark. The synthetic empty `pulse`
-recursion forces deterministic epoch advancement for the demo workload; it does
-not change the emitted `hot_event` results.
+The demo keeps `risk` as a scalar so the hot-event rule stays readable, but a
+declared side payload can also be bound in rule bodies, for example
+`event(ID, Tenant, _, metadata(Level, Ts, Host, Risk))`. That binding is a
+handle join against `__compound_metadata_4`, not general Prolog unification.
+The payload uses the real session-local compound arena, so rotations are
+triggered by arena saturation rather than by a caller-owned event watermark.
+The synthetic empty `pulse` recursion forces deterministic epoch advancement
+for the demo workload; it does not change the emitted `hot_event` results.
 The EDB log stores source-level event values rather than encoded Wirelog rows,
 so each fresh session re-interns symbols and rebuilds rows with its own public
 API state.
