@@ -101,6 +101,33 @@ chmod +x .git/hooks/pre-commit
 
 See [docs/LINTING.md](docs/LINTING.md) for complete linting documentation, check rationale, and rollout plan.
 
+### Perf-suite gate for heap-touching edits
+
+The CRDT median-time gate at `tests/test_crdt_perf_gate.c` derives its
+win from a leading-key shadow array in `col_rel_compact_runs`'s K-way
+merge heap (`wirelog/columnar/ops.c`). Because `compact_runs` is
+shared with every recursive workload (DOOP, CSPA, Galen, Polonius),
+a regression in the heap path silently regresses all of them.
+
+A required-check workflow
+(`.github/workflows/perf-suite-required.yml`) reruns
+`meson test --suite perf` on any PR that touches `wirelog/columnar/ops.c`
+or `wirelog/columnar/internal.h`. The workflow is best-effort on
+shared-runner cpufreq stability:
+
+* If `cpufreq=performance` cannot be set, the test self-SKIPs (exit 77).
+* If a real regression slips through, the gate FAILs and blocks the PR.
+
+Local reproduction:
+
+```sh
+meson setup build-perf --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true
+meson compile -C build-perf
+sudo cpupower frequency-set -g performance     # if available
+taskset -c 0 WIRELOG_PERF_GATE=1 meson test -C build-perf --suite perf --print-errorlogs
+```
+
+
 ## General Styleguides
 
 * Write clear, self-documenting code.

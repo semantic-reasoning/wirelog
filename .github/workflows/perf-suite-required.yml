@@ -1,0 +1,114 @@
+name: Perf Suite Required
+
+# Issue #738: rerun the --suite perf gate when `col_rel_compact_runs`
+# or any heap-related macro in wirelog/columnar/ops.c changes.
+#
+# Why this exists:
+#   PR #731 added a CRDT median-time gate to `meson test --suite perf`
+#   (`tests/test_crdt_perf_gate.c`).  The gate's win came from a
+#   leading-key shadow array in `col_rel_compact_runs`'s K-way merge
+#   heap (`wirelog/columnar/ops.c:4505+`).  `compact_runs` is shared
+#   with every recursive workload (DOOP, CSPA, Galen, Polonius), so
+#   a regression there silently regresses all of them.
+#
+# Without this gate a future contributor editing `compact_runs`, the
+# K-way merge heap, or `COMPACT_SIFT_DOWN` does not have to rerun the
+# perf-suite gate before merge, and the CRDT W=8 win silently
+# regresses.
+#
+# Trigger surface (coarse, file-level): any change to
+#   wirelog/columnar/ops.c
+# triggers this workflow.  Most edits to that file are unrelated to
+# the heap path, but the perf gate is cheap (~30s), self-skips on
+# noisy runners, and treats "no measurement" as SKIP rather than
+# FAIL, so the false-positive cost is bounded.
+#
+# Stability posture:
+#   - Linux runner: best-effort cpufreq governor = performance, pin
+#     to CPU 0 via taskset.  If the governor cannot be set, the test
+#     self-SKIPs (exit 77) so background load never produces a false
+#     regression.  When the gate actually FAILs, it means a real
+#     regression slipped through.
+#   - continue-on-error: false (required check) -- a real FAIL blocks
+#     the PR.
+#
+# This is the per-PR mirror of `perf-nightly.yml`; the two workflows
+# share the same suite, the same WIRELOG_PERF_GATE=1 entry, and the
+# same SKIP-on-noise self-protection.  The nightly continues to run
+# the full surface unconditionally.
+
+on:
+  pull_request:
+    paths:
+      - 'wirelog/columnar/ops.c'
+      - 'wirelog/columnar/internal.h'
+      - '.github/workflows/perf-suite-required.yml'
+      - 'tests/test_crdt_perf_gate.c'
+
+permissions:
+  contents: read
+
+jobs:
+  perf-gate:
+    name: Perf Suite (col_rel_compact_runs / heap surfaces)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build linux-tools-common linux-tools-generic
+
+      # Best-effort: request the 'performance' cpufreq governor. If
+      # the governor cannot be set (no permission / no governor
+      # driver), the test self-SKIPs with a diagnostic rather than
+      # FAILing.  This matches perf-nightly.yml.
+      - name: Set cpufreq governor (best-effort)
+        continue-on-error: true
+        run: |
+          sudo cpupower frequency-set -g performance || true
+          for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+            echo "governor($cpu) = $(cat "$cpu" 2>/dev/null || echo 'unreadable')"
+          done
+
+      - name: Configure release + trace ceiling
+        run: >
+          meson setup build-perf
+          --buildtype=release
+          -Dwirelog_log_max_level=trace
+          -Dtests=true
+          -DmbedTLS=disabled
+        env:
+          CC: gcc
+
+      - name: Build
+        run: meson compile -C build-perf
+
+      # taskset pins the meson test harness to CPU 0. The test still
+      # benefits from the operator-imposed cpufreq=performance check
+      # pre-gate; if that check fails, the test SKIPs cleanly.
+      - name: Run perf suite
+        env:
+          WIRELOG_PERF_GATE: '1'
+        run: |
+          taskset -c 0 meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
+
+      - name: Publish results
+        if: always()
+        shell: bash
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## Perf Suite (col_rel_compact_runs / heap)" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}**" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f build-perf/meson-logs/testlog.txt ]; then
+            echo '<details><summary>Perf suite testlog</summary>' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -A 30 'crdt_perf_gate\|test_log_perf_gate' build-perf/meson-logs/testlog.txt 2>/dev/null \
+              | head -200 >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+          fi
