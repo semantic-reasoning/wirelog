@@ -2017,7 +2017,7 @@ next_del_incr:;
  *   - Delta path: col_stratum_step_with_delta (snapshot + eval + set diff)
  * Arena is reset after each stratum to reclaim temporary evaluation data.
  *
- * TODO(Phase 2B): Replace set-diff delta with semi-naive ΔR propagation.
+ * TODO(#810): Replace set-diff delta with semi-naive ΔR propagation.
  *
  * @param session: wl_session_t* (cast to wl_col_session_t* internally)
  * @return 0 on success, non-zero on evaluation error
@@ -2145,7 +2145,7 @@ col_session_step(wl_session_t *session)
  * Implements wl_compute_backend_t.session_set_delta_cb vtable slot.
  * The callback is invoked with diff=+1 for new tuples during col_session_step.
  *
- * TODO(Phase 2B): Also fire diff=-1 for retracted tuples when semi-naive
+ * TODO(#810): Also fire diff=-1 for retracted tuples when semi-naive
  * delta propagation tracks removed tuples explicitly.
  *
  * @param session:   wl_session_t* (cast to wl_col_session_t* internally)
@@ -2174,7 +2174,7 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
  *
  * Complexity: O(S * R * N) where S=strata, R=relations per stratum, N=rows
  *
- * TODO(Phase 2B): Snapshot should read from stable R (not recompute);
+ * TODO(#811): Snapshot should read from stable R (not recompute);
  * currently re-evaluates on every call which is O(input) per snapshot.
  *
  * @param session:   wl_session_t* (cast to wl_col_session_t* internally)
