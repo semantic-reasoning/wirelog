@@ -151,6 +151,28 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **`docs/SEMANTICS.md` optimizer-equivalence conformance section** (#700):
+  records the scope decision to slip Blocker B13 closure to v0.43.  Defines
+  the optimizer-equivalence matrix (4 passes × on/off = 16 toggle
+  combinations; Magic Sets via `wl_magic_sets_apply_with_demands`, SIP via
+  `wl_sip_apply`, Logic Fusion via `wl_fusion_apply`, JPP via
+  `wl_jpp_apply`; result Z-sets must equal the all-enabled baseline).
+  Documents current state: harness absent; `wirelog_opt_config_t` at
+  `wirelog/wirelog-optimizer.h:71-79` and `wirelog_optimize_with_config`
+  at `:134-137` declared but never consumed; pipelines at
+  `cli/driver.c:365-368` and `wirelog-easy.c:139-159` unconditionally
+  invoke all four passes.  Defines "all-free adornment" (Magic Sets skip
+  path at `magic_sets.c:571-575` when `bound_mask == 0`) and
+  "aggregate-skip" (Magic Sets returns 0 for AGGREGATE rules at
+  `magic_sets.c:251-275`; SIP/Fusion/JPP have no equivalent).  Records
+  taxonomy mismatch: "Magic Sets" absent from public `wirelog_opt_pass_t`
+  enum.  v0.43 plan: wire toggle config into driver + easy pipelines,
+  add `WIRELOG_OPT_MAGIC_SETS` or adopt `wl_*_apply` axis,
+  add `tests/test_optimizer_equivalence.c` (16 combos × N programs),
+  introduce new `skipped_aggregate` counters in Magic Sets, SIP, Fusion,
+  and JPP (counter does not yet exist; model after `skipped_all_free` at
+  `magic_sets.c:551`).
+
 - **README Performance section: clarify `--repeat 5` methodology** (#736):
   fixes the stale `repeat=1` label on line 63 (now reads `--repeat 5`
   medians) to match the correct description already present on lines
