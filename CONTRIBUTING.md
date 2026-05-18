@@ -127,6 +127,30 @@ sudo cpupower frequency-set -g performance     # if available
 taskset -c 0 WIRELOG_PERF_GATE=1 meson test -C build-perf --suite perf --print-errorlogs
 ```
 
+### Internal commit-series labels in source comments
+
+Internal commit-series labels (such as `Phase 2A`, `Phase 3C-001`,
+`Phase 4B`) are an artifact of how individual contributors decompose
+work into commit batches. They are **not** meaningful to readers of
+the codebase and must not appear in source comments without a public
+issue cross-reference. The rule:
+
+* If a source comment in `wirelog/**/*.{c,h}` references a phase label
+  matching `Phase \d+[A-Z]`, the same line must include a public issue
+  reference (`#NNN`, `Issue NNN`, or `US-N-NNN`).
+* If the label refers to historical work whose context is no longer
+  necessary, **remove** the bare phase token rather than retroactively
+  inventing an issue link.
+* Allowlisted historical entries are listed in
+  `scripts/ci/phase-label-allowlist.txt`. The CI gate
+  (`meson test --suite abi:phase_labels` /
+  `scripts/ci/check-phase-labels.sh`) fails if a new unanchored label
+  appears outside that allowlist. The allowlist may shrink as cleanup
+  PRs land; it should not grow.
+
+This is the source-comment counterpart to the rule (recorded in
+project-wide assistant config) that forbids internal phase labels in
+commit messages and PR descriptions.
 
 ## General Styleguides
 

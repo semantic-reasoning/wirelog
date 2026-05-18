@@ -1,0 +1,23 @@
+wirelog/arena/arena.h| * Memory Profiling Targets (Phase 2A)
+wirelog/columnar/arrangement.c| * columnar/arrangement.c - wirelog Arrangement Layer (Phase 3C)
+wirelog/columnar/arrangement.c|/* Arrangement Accessors (Phase 3C)                                         */
+wirelog/columnar/arrangement.c|/* Arrangement Layer (Phase 3C)                                             */
+wirelog/columnar/arrangement.c|/* Delta Arrangement Cache (Phase 3C-001-Ext)                               */
+wirelog/columnar/columnar_nanoarrow.h| * fixed-point evaluation.  Used for debugging row lineage and by Phase 3C
+wirelog/columnar/columnar_nanoarrow.h|/* Arrangement Layer (Phase 3C)                                             */
+wirelog/columnar/columnar_nanoarrow.h|/* Frontier Tracking (Phase 3B)                                             */
+wirelog/columnar/eval.c|        /* Phase 3C NOTE: Weighted operation cases (WL_PLAN_OP_JOIN_WEIGHTED,
+wirelog/columnar/eval.c| * Phase 2A algorithm (full re-eval + set diff):
+wirelog/columnar/eval.c| * TODO(Phase 2B): Replace step 2 with semi-naive ΔR propagation.
+wirelog/columnar/internal.h|     *   compound_kind != INLINE; Phase 2B populates this during schema
+wirelog/columnar/internal.h|    /* Arrangement registry (Phase 3C): persistent hash indices           */
+wirelog/columnar/internal.h|    /* Delta arrangement cache (Phase 3C-001-Ext): per-iteration hash
+wirelog/columnar/internal.h|    /* Per-phase K-fusion profiling (Phase 3A): breakdown of kfusion_ns into
+wirelog/columnar/ops.c|    /* (Simple O(n^2) implementation; sufficient for Phase 2A) */
+wirelog/columnar/session.c|    /* Free arrangement registry (Phase 3C) */
+wirelog/columnar/session.c| * TODO(Phase 2B): Also fire diff=-1 for retracted tuples when semi-naive
+wirelog/columnar/session.c| * TODO(Phase 2B): Replace set-diff delta with semi-naive ΔR propagation.
+wirelog/columnar/session.c| * TODO(Phase 2B): Snapshot should read from stable R (not recompute);
+wirelog/exec_plan_gen.c| * Set to 1 for parallel K-fusion execution (Phase 2C performance testing).
+wirelog/ir/program.c|                /* Phase 1B: Extract compound metadata if present */
+wirelog/ir/program.c|     * shape; richer multi-column lowering is deferred to Phase 2C.

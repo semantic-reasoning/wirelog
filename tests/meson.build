@@ -475,6 +475,17 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #737: forbid new unanchored "Phase NX" labels in wirelog/ source.
+# Each Phase NX label must either carry an explicit issue cross-reference
+# on the same line ("#N", "Issue N", "US-N-NNN"), or be present in the
+# historical allowlist at scripts/ci/phase-label-allowlist.txt.  Static
+# text scan; no build-tree input required.
+if sh.found()
+  test('phase_labels', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-phase-labels.sh'],
+       suite: 'abi')
+endif
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss
