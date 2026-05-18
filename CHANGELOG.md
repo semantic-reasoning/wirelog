@@ -151,6 +151,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **README Performance section: clarify `--repeat 5` methodology** (#736):
+  fixes the stale `repeat=1` label on line 63 (now reads `--repeat 5`
+  medians) to match the correct description already present on lines
+  88-90.  Adds a short note explaining that historic single-trial numbers
+  from pre-`1e6af00` README revisions are not directly comparable to
+  current 5-trial medians; the +26% CSPA W=1 delta (1.55s -> 1.95s) is
+  a measurement-methodology change, not a runtime regression, and 1.95s
+  is the honest baseline.  Closes #736.
+
 - **`docs/SEMANTICS.md` cross-facade parity audit subsection**
   (#785, under epic #681): the existing "Cross-facade parity
   (Status: Current)" block gains a new sub-block recording the

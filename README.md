@@ -60,7 +60,7 @@ For fine-grained control over plans, backends, or worker counts, use the `wirelo
 ## Performance
 
 15-workload benchmark portfolio (2026-05-06, `main` at `8240f97`,
-release/LTO build, GCC 16.1.1, `repeat=1`):
+release/LTO build, GCC 16.1.1, `--repeat 5` medians):
 
 **Test environment**: Intel Xeon E5-2696 v4 (22C/44T), Linux 6.19.14
 (Arch), 44 logical CPUs, single NUMA node. Measurements were collected
@@ -90,6 +90,12 @@ cpufreq governor `schedutil`; treat them as descriptive, not gated.
 The `meson test --suite perf` regression gate is separate and runs
 under `-Dwirelog_log_max_level=error` plus a `performance` governor
 (see `tests/test_crdt_perf_gate.c`).
+
+Historic single-trial numbers from pre-2026-05-09 README revisions
+(before commit `1e6af00`) used `--repeat 1` and are not directly
+comparable to the current 5-trial medians. The +26% delta seen on
+CSPA W=1 (1.55s -> 1.95s) is a measurement-methodology change, not a
+runtime regression; 1.95s is the honest baseline.
 
 **Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.85s
 -> incremental re-eval 21.7ms (**85.3x faster**); W=8 baseline 822.1ms
