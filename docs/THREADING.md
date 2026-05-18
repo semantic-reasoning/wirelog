@@ -514,7 +514,141 @@ documented in `CLAUDE.md`).
 
 ---
 
-## 10. Appendix: ThreadSanitizer configuration
+## 10. Fork-safety
+
+wirelog is **not fork-safe**. Specifically, calling `fork()` from a
+process that has already initialized any `wirelog_*` state and then
+continuing in the child without `exec*()` is **undefined behavior**.
+
+This section documents the contract for embedders that run under
+fork-then-exec hosts (CGI, `subprocess.Popen`, classic `system(3)`)
+versus fork-without-exec hosts (uWSGI prefork worker model, Apache
+`mod_wsgi` prefork, gunicorn `sync` workers, classic `fork()`
+daemon-supervisor patterns).
+
+### 10.1 The fork hazard for the I/O adapter registry
+
+The I/O adapter registry at `wirelog/io/io_adapter.c` is a
+**process-global, mutex-protected** singleton. The mutex is published
+exactly once via `call_once(&s_mutex_once, init_mutex)` (POSIX) or
+the equivalent `InterlockedCompareExchange` ladder (Windows), gated
+by the `s_mutex_init_ok` atomic from §5.3.
+
+After a `fork()`:
+
+- The child inherits the *value* of `s_mutex_once`, `s_mutex_init_ok`,
+  and the mutex bytes themselves.
+- If a *different* thread in the parent held `s_mutex` at the moment
+  of `fork()`, the child inherits a mutex that is **locked by a
+  non-existent thread**. The very next call to
+  `wirelog_io_register_adapter()`, `wirelog_io_unregister_adapter()`,
+  or `wirelog_io_find_adapter()` in the child will deadlock (POSIX) or
+  return an undefined error (Windows).
+- Even if no thread held `s_mutex` at fork time, the registry's table
+  entries (`scheme` strings copied into the fixed-size buffer, the
+  adapter pointer slots) reference memory owned by the parent's
+  address-space snapshot. Pointers remain valid in the child until
+  the child mutates them, but any host-supplied
+  `wirelog_io_adapter_t *` is only guaranteed to remain valid for the
+  parent's lifetime.
+
+The CHANGELOG line "thread-safe (process-global mutex)" describes
+thread-safety **within a single process image**. It is not a
+fork-after-thread contract.
+
+### 10.2 Supported child-process patterns
+
+A child process MUST follow one of these patterns:
+
+1. **fork-then-exec** (recommended). The child calls `execve()` (or
+   `execvp`, `posix_spawn`, etc.) before invoking any `wirelog_*`
+   entrypoint. After `exec`, the child has a fresh address space and
+   all wirelog state is reinitialized from scratch. This is the
+   normal `subprocess`-style pattern and is fully supported.
+2. **fork-without-exec, no wirelog use in child**. The child uses
+   `fork()` to spawn a worker process but never calls any
+   `wirelog_*` API. Only the parent retains the wirelog state. This
+   is also fully supported.
+3. **fork-without-exec, wirelog re-initialized in child**. The child
+   treats wirelog as uninitialized after the `fork()` return point
+   and re-builds its own state from scratch:
+   - The child MUST NOT call any registry function before
+     re-initializing.
+   - The child MAY register fresh adapters via
+     `wirelog_io_register_adapter()` *only if* a process-wide
+     `pthread_atfork()` child handler has reset
+     `s_mutex_once`, `s_mutex_init_ok`, and re-initialized
+     `s_mutex` from the child side. wirelog does **not** install
+     such a handler internally: the host must install it, or the
+     host must accept that the registry is unusable in the child.
+   - Any session, program, easy, or backend objects created in the
+     parent (`wirelog_session_*`, `wirelog_easy_*`,
+     `wirelog_program_*`, etc.) MUST NOT be reused in the child.
+     They are not transferable across the fork boundary; the only
+     safe operation is to discard them and rebuild.
+
+The recommended posture for new embedders is pattern (1) or (2).
+Pattern (3) is feasible but requires host-side `pthread_atfork`
+plumbing and is not validated by the wirelog test suite.
+
+### 10.3 Implications for uWSGI / mod_wsgi / gunicorn
+
+These hosts are the canonical fork-without-exec deployment shape and
+deserve an explicit note:
+
+- **uWSGI** with `processes > 1`: each worker is a `fork()` child of
+  the master. If the wirelog import (Python binding load, `dlopen` of
+  `libwirelog.so.1`, or a Path-A C extension) happens before
+  `lazy-apps` (i.e. in the master), every worker inherits the
+  parent's registry mutex. The supported configuration is
+  `lazy-apps = true` (uWSGI option) so each worker imports
+  wirelog in its own post-fork address space.
+- **mod_wsgi** prefork MPM: same hazard, same mitigation. Use a
+  daemon-mode MPM (`worker` or `event`) or ensure the wirelog import
+  happens lazily in the request thread, not at module load.
+- **gunicorn sync workers**: same hazard. The supported
+  configurations are `--preload=False` (default) or workers that
+  invoke `exec`-style spawning (`--worker-class=gevent` with
+  `--preload=False`).
+
+The shared principle: **wirelog must be initialized in the same
+process that will use it.** Crossing a `fork()` boundary without
+`exec*()` is unsupported.
+
+### 10.4 `WL_LOG` and the structured logger
+
+The `wirelog/util/log.h` structured logger has its own fork-safety
+note: after `fork()`, if the child changes the log sink, the child
+must call `wl_log_init()` again. This is documented in §9 (signal-
+safety) and in `CLAUDE.md` Runtime Diagnostics. It is reproduced
+here for completeness: the logger fits the same fork-without-exec
+hazard pattern as the I/O adapter registry.
+
+### 10.5 What about `pthread_atfork`?
+
+Installing `pthread_atfork()` handlers from inside `libwirelog.so.1`
+was considered and rejected for v1.0:
+
+- It would only fix POSIX hosts. Windows has no `fork()`; uWSGI on
+  Windows uses different worker semantics.
+- It would interact unpredictably with host-installed `atfork`
+  handlers in larger Python/Java stacks.
+- The clean child-side reset of the registry mutex requires
+  invalidating any in-flight `wirelog_io_*` call that was holding
+  the mutex at fork time -- there is no async-safe way to abort a
+  mutex holder mid-operation. The host's `atfork` prepare handler
+  would still need to acquire the mutex before fork, which is the
+  shape every host is already expected to provide.
+
+The 1.0 contract is therefore the explicit set of supported patterns
+in §10.2 above, with the explicit non-goal that `libwirelog.so.1`
+itself does not register `pthread_atfork()` handlers.
+
+Cross-reference: Risk C13, issue #716 (this section).
+
+---
+
+## 11. Appendix: ThreadSanitizer configuration
 
 To run wirelog under TSan the host must build with
 `-Dthreads=posix`:
@@ -536,7 +670,7 @@ Cross-reference: Risk C5, issue #708 (-Dthreads=native + TSan).
 
 ---
 
-## 11. References
+## 12. References
 
 - `wirelog/thread.h:1-130` — backend precedence and type definitions.
 - `wirelog/meson.build:40-72` — `cc.links()` C11-threads detection.
@@ -565,6 +699,7 @@ Cross-reference: Risk C5, issue #708 (-Dthreads=native + TSan).
 - Issue #681 — v0.41 ABI Infrastructure epic.
 - Issue #734 — this document.
 - Issue #708 — TSan + `-Dthreads=posix` cross-link.
+- Issue #716 — io_adapter fork-safety (§10).
 - Issue #709 — WL_LOG signal-safety risk note.
 - Issue #731 — CRDT median-time perf gate (empirical anchor for
   K = 4 parallel threshold).

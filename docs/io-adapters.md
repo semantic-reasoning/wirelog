@@ -82,6 +82,11 @@ const char *wirelog_io_last_error(void);
 ```
 
 - All three mutation/query functions are **thread-safe** (process-global mutex).
+- The thread-safety guarantee applies **within a single process image**. After
+  `fork()` without `exec*()`, the registry is unsafe to call from the child
+  unless the host has installed a `pthread_atfork()` reset handler; see
+  [docs/THREADING.md §10](THREADING.md#10-fork-safety) for the supported
+  child-process patterns and the uWSGI/mod_wsgi/gunicorn guidance.
 - The adapter pointer must remain valid until `wirelog_io_unregister_adapter()` or
   process exit. Typical usage: pass `&static_const_struct`.
 - The `scheme` string is copied into a fixed-size internal buffer at
