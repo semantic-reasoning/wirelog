@@ -486,6 +486,16 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #742: every `Status: Future` entry in docs/SEMANTICS.md must
+# cite a milestone or issue link within an 8-line window of the
+# heading.  Prevents the doc from accruing unbounded "Future" entries
+# with no schedule.  Static text scan; no build-tree input required.
+if sh.found()
+  test('semantics_future', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-semantics-future.sh'],
+       suite: 'abi')
+endif
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss

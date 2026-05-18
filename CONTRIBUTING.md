@@ -152,6 +152,25 @@ This is the source-comment counterpart to the rule (recorded in
 project-wide assistant config) that forbids internal phase labels in
 commit messages and PR descriptions.
 
+### `Status: Future` entries in docs/SEMANTICS.md
+
+`docs/SEMANTICS.md` is the canonical reference for semantic-model
+decisions and labels each entry `Status: Current` or `Status: Future`.
+A 1.0 stable contract that says "this is Future" with no schedule is
+an unbounded liability; external embedders cannot estimate when a
+Future entry becomes Current.
+
+The rule:
+
+* Every `Status: Future` heading in `docs/SEMANTICS.md` MUST cite a
+  milestone or issue reference within the 8-line window starting at
+  the heading. Acceptable anchors are `#NNN`, `Milestone vX.Y`, or
+  `Target: milestone vX.Y`.
+* The gate `meson test --suite abi:semantics_future` /
+  `scripts/ci/check-semantics-future.sh` enforces this. It exits 0
+  cleanly when there are no Future entries (i.e. when the doc is
+  fully Current).
+
 ## General Styleguides
 
 * Write clear, self-documenting code.
