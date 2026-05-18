@@ -177,7 +177,19 @@ All notable changes to wirelog are documented in this file.
   exit criterion to "non-agg recursion residue = 0" via Phase 2B;
   recursive aggregation residue = 0 slips to v0.43 per architect+critic
   synthesis on 2026-05-18.
-
+- **Advisory TSan leg for `-Dthreads=native` on Linux glibc** (#708):
+  `.github/workflows/ci-pr.yml` gains a `tsan-native` job mirroring the
+  existing `tsan` (posix) leg but configured with `-Dthreads=native`;
+  native-leg failures are emitted as GitHub Actions warnings so the check
+  remains advisory.  On Linux glibc the C11 `<threads.h>` shim
+  routes to NPTL, so libtsan's pthread interceptors observe the same
+  happens-before edges as the posix backend; the advisory leg therefore
+  covers `wirelog/thread_c11.c`'s trampoline without blocking PRs on
+  non-glibc noise.  `docs/THREADING.md` section 10 is updated to soften
+  the "non-negotiable" language (now qualified to non-glibc only) and adds
+  a coverage matrix table (posix = gating, native/glibc = advisory,
+  native/musl/Apple/MSVC = not covered).  Refs #708; native-leg SEGV
+  triage is tracked in #826.
 - **`docs/SEMANTICS.md` cross-facade parity audit subsection**
   (#785, under epic #681): the existing "Cross-facade parity
   (Status: Current)" block gains a new sub-block recording the

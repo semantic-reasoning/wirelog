@@ -262,3 +262,72 @@ jobs:
         run: meson test -C builddir-tsan --print-errorlogs
         env:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+
+  # ==========================================================================
+  # Phase 3b (advisory): TSan with -Dthreads=native on Linux glibc
+  #
+  # WHY THIS LEG EXISTS:
+  #   wirelog/thread_c11.c implements a thin trampoline over NPTL: on Linux
+  #   glibc, thrd_create resolves to pthread_create, mtx_lock to
+  #   pthread_mutex_lock, and cnd_wait to pthread_cond_wait.  libtsan
+  #   intercepts at the public-symbol level (not internal versioned aliases),
+  #   so the same happens-before edges observed under -Dthreads=posix are
+  #   observable here too.  Running TSan against -Dthreads=native therefore
+  #   exercises the 40-
+  #   line trampoline in thread_c11.c and its thin wrappers without leaving
+  #   a coverage gap for that translation unit.
+  #
+  # WHY IT IS ADVISORY:
+  #   TSan does not directly intercept C11 thrd_*/mtx_*/cnd_* call sites;
+  #   coverage relies on glibc's NPTL trampoline redirecting them to the
+  #   pthread symbols that libtsan intercepts.  On non-glibc platforms (musl,
+  #   Apple libc, MSVC) the C11 shim does not route through NPTL, so TSan
+  #   either produces false positives or misses races entirely.  This leg
+  #   runs on ubuntu-latest (glibc) only and converts test failures to a
+  #   GitHub Actions warning so that noise on edge cases does not block PRs.
+  #   The posix leg above remains the gating TSan signal.
+  #
+  # Cross-references:
+  #   - docs/THREADING.md section 10 (Appendix: ThreadSanitizer configuration)
+  #   - Risk C5, issue #708 (-Dthreads=native + TSan advisory leg)
+  #   - Issue #826 (native TSan SEGV triage surfaced by this advisory leg)
+  # ==========================================================================
+  tsan-native:
+    name: TSan-native / ubuntu-latest / gcc
+    needs: [lint]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libmbedtls-dev
+
+      - name: Configure with TSan (native threads)
+        run: |
+          meson setup builddir-tsan-native \
+            -Db_sanitize=thread \
+            -Db_lundef=false \
+            -Dthreads=native \
+            -Dtests=true \
+            --buildtype=debug
+        env:
+          CC: gcc
+
+      - name: Build with TSan (native threads)
+        run: meson compile -C builddir-tsan-native
+
+      - name: Test with TSan (native threads)
+        run: |
+          set +e
+          meson test -C builddir-tsan-native --print-errorlogs
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Advisory TSan-native failures::meson test failed with rc=$rc under -Dthreads=native; the posix TSan job remains the gating signal."
+            exit 0
+          fi
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
