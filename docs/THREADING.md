@@ -662,11 +662,37 @@ meson setup build-tsan \
 meson test -C build-tsan --suite tsan
 ```
 
-The `-Dthreads=posix` requirement is non-negotiable: TSan only
-intercepts pthread synchronization primitives, and C11
-`<threads.h>` calls bypass its interceptor.
+The `-Dthreads=posix` requirement is non-negotiable on non-glibc
+platforms; on Linux glibc, the C11 `<threads.h>` backend is
+implemented as a thin shim over NPTL (e.g., `thrd_create` ->
+`pthread_create`, `mtx_lock` -> `pthread_mutex_lock`), so libtsan's
+pthread interceptors — which hook at the public-symbol level, not at
+internal glibc versioned aliases — still observe the same
+happens-before edges that the posix backend exposes.  The posix
+backend remains canonical for race gating; the native backend is
+exercised by an advisory TSan leg under `.github/workflows/ci-pr.yml`
+that reports native-leg failures as GitHub Actions warnings.
 
-Cross-reference: Risk C5, issue #708 (-Dthreads=native + TSan).
+### TSan coverage matrix
+
+| Backend | Platform | TSan status | Notes |
+|---------|----------|-------------|-------|
+| `posix` | all | **gating** | libtsan intercepts pthread_* directly; canonical race surface |
+| `native` | Linux glibc | advisory | C11 shim routes to NPTL; same happens-before edges as posix; failures are reported as CI warnings |
+| `native` | musl | not covered | musl C11 shim does not route through NPTL pthread symbols |
+| `native` | Apple libc | not covered | Apple libc lacks `<threads.h>`; C11 backend not buildable (see meson.build:42) |
+| `native` | Windows MSVC | not covered | no libtsan; Win32 threads only |
+
+On glibc, both the posix and native backends ultimately resolve to
+the same NPTL synchronization primitives, so the advisory TSan leg
+catches regressions in `wirelog/thread_c11.c`'s trampoline and thin
+wrappers without leaving a coverage gap for that translation unit.
+On non-glibc platforms the native backend is not TSan-testable; the
+posix backend remains the only reliable option.
+
+Cross-references: Risk C5, issue #708 (-Dthreads=native + TSan
+advisory leg); issue #826 (native TSan SEGV triage);
+`.github/workflows/ci-pr.yml` `tsan-native` job.
 
 ---
 
