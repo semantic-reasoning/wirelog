@@ -159,6 +159,24 @@ All notable changes to wirelog are documented in this file.
   current 5-trial medians; the +26% CSPA W=1 delta (1.55s -> 1.95s) is
   a measurement-methodology change, not a runtime regression, and 1.95s
   is the honest baseline.  Closes #736.
+- **`docs/SEMANTICS.md` recursive aggregation residue definition + v0.43
+  slip** (#692): adds a new "Recursive aggregation residue (Status:
+  Future)" section defining "residue" operationally as the count of
+  `'not yet implemented'` markers and disabled conformance tests in
+  `tests/test_recursive_agg*.c` that block CC-min, SSSP-max, and
+  count-stratified programs from producing correct output at workers in
+  {1, 4, 8, 16}.  Records the current state (harness disabled at
+  `tests/meson.build:184-198, 2190-2194`; `col_op_reduce` IS wired
+  (`WL_PLAN_OP_REDUCE` case at `eval.c:267-269`) but conformance cannot
+  run because the harness is disabled; `col_op_reduce_weighted` built
+  but NOT dispatched (no `WL_PLAN_OP_REDUCE_WEIGHTED:` case) in the
+  recursive dispatch switch at `wirelog/columnar/eval.c:241-288`;
+  count-stratified
+  scope asymmetry) and the path to residue = 0: Phase 2B prerequisite
+  (#735, #809/#810/#811) then v0.43 harness re-port.  Narrows the v0.42
+  exit criterion to "non-agg recursion residue = 0" via Phase 2B;
+  recursive aggregation residue = 0 slips to v0.43 per architect+critic
+  synthesis on 2026-05-18.
 
 - **`docs/SEMANTICS.md` cross-facade parity audit subsection**
   (#785, under epic #681): the existing "Cross-facade parity
