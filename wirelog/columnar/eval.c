@@ -1108,7 +1108,7 @@ col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
  *   4. Fire delta_cb(+1) for each row in new state not found in prev state
  *   5. Free snapshots
  *
- * TODO(Phase 2B): Replace step 2 with semi-naive ΔR propagation.
+ * TODO(#809): Replace step 2 with semi-naive ΔR propagation.
  */
 
 /* Forward declaration for col_stratum_step_with_delta (defined below) */
