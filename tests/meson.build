@@ -3832,60 +3832,65 @@ baseline_diff_script = files('golden_diff_baseline.py')
 baseline_fixture_dir = meson.project_source_root() / 'tests/fixtures/baseline_input'
 baseline_snapshot_dir = meson.project_source_root() / 'tests/baseline_snapshots'
 
-test('baseline_int_edges',
-  baseline_py3,
-  args: [
-    baseline_diff_script[0],
-    wirelog_cli.full_path(),
-    baseline_fixture_dir / 'int_edges.dl',
-    baseline_snapshot_dir / 'int_edges_stdout.txt',
-  ],
-  depends: wirelog_cli,
-  workdir: baseline_fixture_dir,
-  suite: 'baseline',
-)
+# Issue #464: CLI-dependent tests skip on Android (wirelog_cli is not
+# built when -Dandroid=true; see meson.build CLI Driver section).  The
+# guard mirrors the cli executable() guard in the project meson.build.
+if not is_android
+  test('baseline_int_edges',
+    baseline_py3,
+    args: [
+      baseline_diff_script[0],
+      wirelog_cli.full_path(),
+      baseline_fixture_dir / 'int_edges.dl',
+      baseline_snapshot_dir / 'int_edges_stdout.txt',
+    ],
+    depends: wirelog_cli,
+    workdir: baseline_fixture_dir,
+    suite: 'baseline',
+  )
 
-test('baseline_sym_family',
-  baseline_py3,
-  args: [
-    baseline_diff_script[0],
-    wirelog_cli.full_path(),
-    baseline_fixture_dir / 'sym_family.dl',
-    baseline_snapshot_dir / 'sym_family_stdout.txt',
-  ],
-  depends: wirelog_cli,
-  workdir: baseline_fixture_dir,
-  suite: 'baseline',
-)
+  test('baseline_sym_family',
+    baseline_py3,
+    args: [
+      baseline_diff_script[0],
+      wirelog_cli.full_path(),
+      baseline_fixture_dir / 'sym_family.dl',
+      baseline_snapshot_dir / 'sym_family_stdout.txt',
+    ],
+    depends: wirelog_cli,
+    workdir: baseline_fixture_dir,
+    suite: 'baseline',
+  )
 
-test('baseline_tab_nodes',
-  baseline_py3,
-  args: [
-    baseline_diff_script[0],
-    wirelog_cli.full_path(),
-    baseline_fixture_dir / 'tab_nodes.dl',
-    baseline_snapshot_dir / 'tab_nodes_stdout.txt',
-  ],
-  depends: wirelog_cli,
-  workdir: baseline_fixture_dir,
-  suite: 'baseline',
-)
+  test('baseline_tab_nodes',
+    baseline_py3,
+    args: [
+      baseline_diff_script[0],
+      wirelog_cli.full_path(),
+      baseline_fixture_dir / 'tab_nodes.dl',
+      baseline_snapshot_dir / 'tab_nodes_stdout.txt',
+    ],
+    depends: wirelog_cli,
+    workdir: baseline_fixture_dir,
+    suite: 'baseline',
+  )
 
-# ============================================================================
-# CLI Version / Help Surface Test (Issue #801)
-# Reuses baseline_py3 (already resolved above) to invoke the executable.
-# ============================================================================
+  # ============================================================================
+  # CLI Version / Help Surface Test (Issue #801)
+  # Reuses baseline_py3 (already resolved above) to invoke the executable.
+  # ============================================================================
 
-test('cli_version',
-  baseline_py3,
-  args: [
-    files('test_cli_version.py')[0],
-    wirelog_cli.full_path(),
-    meson.project_version(),
-  ],
-  depends: wirelog_cli,
-  suite: 'cli',
-)
+  test('cli_version',
+    baseline_py3,
+    args: [
+      files('test_cli_version.py')[0],
+      wirelog_cli.full_path(),
+      meson.project_version(),
+    ],
+    depends: wirelog_cli,
+    suite: 'cli',
+  )
+endif
 
 # ============================================================================
 # I/O Adapter Registry Tests (#450)
