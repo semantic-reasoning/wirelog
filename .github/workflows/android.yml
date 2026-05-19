@@ -1,0 +1,235 @@
+name: Android CI
+
+# Issue #465: Android CI smoke + 16 KB alignment hard gate.
+#
+# Hard-fails when a `-Dandroid=true` arm64 build produces a libwirelog.so
+# whose PT_LOAD segments are NOT aligned to >= 0x4000 (16 KB).  Android
+# 14+ on arm64 supports 16 KB-page kernels and Play Store rejects new
+# 4 KB-only binaries on API 35+ uploads (Nov 2025 enforcement).  A silent
+# regression of the `-Wl,-z,max-page-size=16384` flag from #464 (which
+# is added by meson.build:91-110's wirelog_android_link_args block) would
+# ship a .so that cannot run on those devices.
+#
+# The workflow has three deliverables, each load-bearing:
+#
+#   1. Positive case (alignment-arm64 job): cross-compile arm64 .so via
+#      cross/android-arm64.ini and assert
+#      scripts/ci/check-android-alignment.sh exits 0.
+#
+#   2. Negative self-test (negative-host job): build the host Linux .so
+#      (no -Dandroid=true, so the 16 KB flag is NOT appended) and assert
+#      the SAME script exits 1.  This proves the parser actually works
+#      in both directions and protects against fake-closure regex bugs.
+#
+#   3. x86_64 smoke (smoke-x86_64 job): cross-compile the emulator
+#      target via cross/android-x86_64.ini.  No alignment assertion (the
+#      flag is gated on cpu_family == 'aarch64'); this leg only proves
+#      the x86_64 cross-file still compiles, which is in-scope for #464's
+#      delivered surface.
+#
+# All three jobs run with `continue-on-error: false` (the default) -- a
+# real FAIL blocks the PR.  This is the opposite posture from #708's
+# tsan-native advisory leg, where instrumentation gaps justify
+# continue-on-error; here, Play Store rejection is binary and a failing
+# alignment check IS the bug.
+#
+# NDK pin: r27c (LTS), matching cross/android-arm64.ini and
+# docs/cross-compile-android.md.  Installed via nttld/setup-ndk and
+# symlinked to /opt/android-ndk-r27c so the committed cross-files work
+# unmodified (cross-files cannot interpolate env vars; the constant
+# `ndk = '/opt/android-ndk-r27c'` is the single point of override).
+
+on:
+  pull_request:
+    paths:
+      - 'meson.build'
+      - 'meson_options.txt'
+      - 'wirelog/**'
+      - 'cross/**'
+      - 'scripts/ci/check-android-alignment.sh'
+      - '.github/workflows/android.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'meson.build'
+      - 'meson_options.txt'
+      - 'wirelog/**'
+      - 'cross/**'
+      - 'scripts/ci/check-android-alignment.sh'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+
+  # =====================================================================
+  # Job 1: arm64-v8a positive case -- the load-bearing 16 KB hard gate.
+  # =====================================================================
+  alignment-arm64:
+    name: Android arm64 16K alignment (hard gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build binutils
+
+      - name: Install NDK r27c
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          # local-cache: true would reuse a partial extraction across
+          # runs on GitHub-hosted runners (the cached tarball only
+          # contains wrapper scripts; the underlying `clang` binary
+          # ends up missing).  Force a fresh download per run; ~3 GB
+          # but reliable.  See #465 PR #836 run 26107246171 for the
+          # partial-cache symptom ("clang: No such file or directory").
+          local-cache: false
+
+      - name: Patch cross-file NDK path + verify toolchain
+        run: |
+          # cross/android-arm64.ini pins `ndk = '/opt/android-ndk-r27c'`.
+          # Substitute the actual NDK location from setup-ndk's output
+          # rather than symlinking into /opt (which races with restored
+          # caches and confuses meson's compiler probe when the symlink
+          # resolves to a stripped cache hit).
+          NDK_PATH='${{ steps.setup-ndk.outputs.ndk-path }}'
+          echo "ndk-path resolved to: $NDK_PATH"
+          sed -i "s|/opt/android-ndk-r27c|${NDK_PATH}|" cross/android-arm64.ini
+          cat cross/android-arm64.ini | grep -E '^(ndk|toolchain|c\s*=)'
+
+          # Surface any compiler-probe failure BEFORE meson tries to use
+          # it, so the diagnostic is the toolchain error not "Unknown
+          # compiler(s)".  This catches missing system libs (libtinfo,
+          # libc++) and partial cache extractions.
+          CLANG="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          ls -l "$CLANG"
+          "$CLANG" --version
+
+      - name: Configure (arm64 cross)
+        run: |
+          meson setup build-android-arm64 \
+            --cross-file cross/android-arm64.ini \
+            -Dandroid=true \
+            -Dtests=false \
+            -DmbedTLS=disabled \
+            -Dwirelog_log_max_level=error
+
+      - name: Build
+        run: meson compile -C build-android-arm64
+
+      - name: Hard gate -- assert 16 KB PT_LOAD alignment
+        run: |
+          # Show what we are checking before the gate fires.
+          readelf -lW build-android-arm64/libwirelog.so | awk '/^Program Headers:/,/^$/'
+          bash scripts/ci/check-android-alignment.sh build-android-arm64/libwirelog.so
+
+      - name: Upload readelf output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readelf-arm64-on-fail
+          path: |
+            build-android-arm64/libwirelog.so
+            build-android-arm64/meson-logs/meson-log.txt
+          retention-days: 7
+
+  # =====================================================================
+  # Job 2: negative self-test -- prove the parser fails when expected.
+  #
+  # Runs the same scripts/ci/check-android-alignment.sh against a host
+  # Linux .so built without `-Dandroid=true`.  The host .so has 4 KB
+  # PT_LOAD alignment (0x1000), so the script MUST exit 1.  If it exits
+  # 0 here, the parser is broken in a way that would silently green-light
+  # a misaligned Android build in job 1, and that is the fake-closure
+  # mode #465 was filed to prevent.
+  # =====================================================================
+  negative-host:
+    name: Alignment script negative self-test (host Linux .so must fail)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build binutils
+
+      - name: Build host Linux .so (no -Dandroid; expect 4 KB alignment)
+        run: |
+          meson setup build-host \
+            -Dtests=false \
+            -DmbedTLS=disabled \
+            -Dwirelog_log_max_level=error
+          meson compile -C build-host
+
+      - name: Assert alignment script EXITS NON-ZERO on host .so
+        run: |
+          if bash scripts/ci/check-android-alignment.sh build-host/libwirelog.so; then
+            echo "::error::check-android-alignment.sh passed on a host Linux .so;" \
+                 "the script's parser is broken (it should have FAILED on 4 KB alignment)."
+            echo "readelf output for diagnosis:"
+            readelf -lW build-host/libwirelog.so | awk '/^Program Headers:/,/^$/'
+            exit 1
+          fi
+          echo "negative self-test PASSED: script correctly rejected host .so"
+
+  # =====================================================================
+  # Job 3: x86_64 cross-compile smoke -- proves the second cross-file
+  # from #464 still works.  No alignment assertion (the 16 KB flag is
+  # aarch64-only).
+  # =====================================================================
+  smoke-x86_64:
+    name: Android x86_64 cross-compile smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build binutils
+
+      - name: Install NDK r27c
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          # local-cache: true would reuse a partial extraction across
+          # runs on GitHub-hosted runners (the cached tarball only
+          # contains wrapper scripts; the underlying `clang` binary
+          # ends up missing).  Force a fresh download per run; ~3 GB
+          # but reliable.  See #465 PR #836 run 26107246171 for the
+          # partial-cache symptom ("clang: No such file or directory").
+          local-cache: false
+
+      - name: Patch cross-file NDK path + verify toolchain
+        run: |
+          NDK_PATH='${{ steps.setup-ndk.outputs.ndk-path }}'
+          echo "ndk-path resolved to: $NDK_PATH"
+          sed -i "s|/opt/android-ndk-r27c|${NDK_PATH}|" cross/android-x86_64.ini
+          CLANG="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang"
+          ls -l "$CLANG"
+          "$CLANG" --version
+
+      - name: Configure (x86_64 cross)
+        run: |
+          meson setup build-android-x86_64 \
+            --cross-file cross/android-x86_64.ini \
+            -Dandroid=true \
+            -Dtests=false \
+            -DmbedTLS=disabled \
+            -Dwirelog_log_max_level=error
+
+      - name: Build
+        run: meson compile -C build-android-x86_64
+
+      - name: Show resulting .so summary
+        run: |
+          file build-android-x86_64/libwirelog.so
+          readelf -h build-android-x86_64/libwirelog.so | grep -E 'Machine|Class'
