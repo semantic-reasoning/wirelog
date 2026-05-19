@@ -264,33 +264,29 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
 
   # ==========================================================================
-  # Phase 3b (advisory): TSan with -Dthreads=native on Linux glibc
+  # Phase 3b (advisory): TSan compile smoke with -Dthreads=native
   #
   # WHY THIS LEG EXISTS:
-  #   wirelog/thread_c11.c implements a thin trampoline over NPTL: on Linux
-  #   glibc, thrd_create resolves to pthread_create, mtx_lock to
-  #   pthread_mutex_lock, and cnd_wait to pthread_cond_wait.  libtsan
-  #   intercepts at the public-symbol level (not internal versioned aliases),
-  #   so the same happens-before edges observed under -Dthreads=posix are
-  #   observable here too.  Running TSan against -Dthreads=native therefore
-  #   exercises the 40-
-  #   line trampoline in thread_c11.c and its thin wrappers without leaving
-  #   a coverage gap for that translation unit.
+  #   The normal TSan job above forces -Dthreads=posix because libtsan's
+  #   reliable synchronization interceptors are pthread-based.  This job keeps
+  #   an advisory compile/link smoke for the native C11 backend under the same
+  #   sanitizer flags, so wirelog/thread_c11.c remains build-covered without
+  #   pretending that C11 thrd_*/mtx_*/cnd_* runtime execution is a valid race
+  #   signal under GCC/libtsan.
   #
-  # WHY IT IS ADVISORY:
-  #   TSan does not directly intercept C11 thrd_*/mtx_*/cnd_* call sites;
-  #   coverage relies on glibc's NPTL trampoline redirecting them to the
-  #   pthread symbols that libtsan intercepts.  On non-glibc platforms (musl,
-  #   Apple libc, MSVC) the C11 shim does not route through NPTL, so TSan
-  #   either produces false positives or misses races entirely.  This leg
-  #   runs on ubuntu-latest (glibc) only and converts test failures to a
-  #   GitHub Actions warning so that noise on edge cases does not block PRs.
-  #   The posix leg above remains the gating TSan signal.
+  # WHY THIS JOB DOES NOT RUN THE FULL TEST SUITE:
+  #   Issue #826 showed that executing instrumented C11-created worker threads
+  #   can crash the sanitizer runtime itself with ThreadSanitizer:DEADLYSIGNAL
+  #   SEGV 0x18 before wirelog synchronization can be diagnosed.  Suppressions
+  #   do not apply to that fatal runtime failure, and skipping only the first
+  #   failing tests would leave the job noisy and misleading.  Runtime C11
+  #   backend coverage comes from the ordinary non-TSan matrix; race detection
+  #   remains the responsibility of the gating posix TSan leg.
   #
   # Cross-references:
-  #   - docs/THREADING.md section 10 (Appendix: ThreadSanitizer configuration)
+  #   - docs/THREADING.md section 11 (Appendix: ThreadSanitizer configuration)
   #   - Risk C5, issue #708 (-Dthreads=native + TSan advisory leg)
-  #   - Issue #826 (native TSan SEGV triage surfaced by this advisory leg)
+  #   - Issue #826 (native C11 runtime under TSan is not a valid signal)
   # ==========================================================================
   tsan-native:
     name: TSan-native / ubuntu-latest / gcc
@@ -319,15 +315,7 @@ jobs:
       - name: Build with TSan (native threads)
         run: meson compile -C builddir-tsan-native
 
-      - name: Test with TSan (native threads)
+      - name: Policy smoke (native threads under TSan)
         run: |
-          set +e
-          meson test -C builddir-tsan-native --print-errorlogs
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "::warning title=Advisory TSan-native failures::meson test failed with rc=$rc under -Dthreads=native; the posix TSan job remains the gating signal."
-            exit 0
-          fi
-        env:
-          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+          echo "::notice title=TSan-native policy::Native C11 runtime tests are intentionally not executed under TSan; see docs/THREADING.md and issue #826."
+          meson test -C builddir-tsan-native threading_doc --print-errorlogs
