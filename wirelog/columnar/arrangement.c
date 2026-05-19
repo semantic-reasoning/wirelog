@@ -737,39 +737,6 @@ col_session_get_frontier(wl_session_t *session, uint32_t stratum_idx,
 /* ======================================================================== */
 
 /*
- * sarr_row_cmp: qsort_r comparator that orders rows by a single key column.
- * Context points to a uint32_t key_col value (matching QSORT_R_CALL signature
- * in internal.h).
- */
-#ifdef __GLIBC__
-static int
-sarr_row_cmp(const void *a, const void *b, void *ctx)
-{
-    const uint32_t kc = *(const uint32_t *)ctx;
-    const int64_t ka = ((const int64_t *)a)[kc];
-    const int64_t kb = ((const int64_t *)b)[kc];
-    return (ka > kb) - (ka < kb);
-}
-#elif defined(_MSC_VER)
-static int __cdecl sarr_row_cmp(void *ctx, const void *a, const void *b)
-{
-    const uint32_t kc = *(const uint32_t *)ctx;
-    const int64_t ka = ((const int64_t *)a)[kc];
-    const int64_t kb = ((const int64_t *)b)[kc];
-    return (ka > kb) - (ka < kb);
-}
-#else
-static int
-sarr_row_cmp(void *ctx, const void *a, const void *b)
-{
-    const uint32_t kc = *(const uint32_t *)ctx;
-    const int64_t ka = ((const int64_t *)a)[kc];
-    const int64_t kb = ((const int64_t *)b)[kc];
-    return (ka > kb) - (ka < kb);
-}
-#endif
-
-/*
  * sarr_build: (re)build sorted copy from rel into sarr.
  * Frees any previous sorted buffer and allocates a fresh one.
  * Returns 0 on success, ENOMEM on allocation failure.
@@ -794,9 +761,17 @@ sarr_build(col_sorted_arr_t *sarr, const col_rel_t *rel, uint32_t key_col)
 
     for (uint32_t r = 0; r < rel->nrows; r++)
         col_rel_row_copy_out(rel, r, sarr->sorted + (size_t)r * rel->ncols);
-    uint32_t kc = key_col;
-    QSORT_R_CALL(sarr->sorted, rel->nrows, rel->ncols * sizeof(int64_t), &kc,
-        sarr_row_cmp);
+    /* #465: stable LSD radix sort by the single key column replaces the
+     * platform-specific qsort_r path that did not exist on Android NDK
+     * bionic libc.  Failure here is malloc-fail in the radix scratch
+     * buffer; on that path sarr->sorted is unmodified and we propagate
+     * ENOMEM so the caller can react. */
+    if (col_radix_sort_rows_by_key(sarr->sorted, rel->nrows, rel->ncols,
+        key_col) != 0) {
+        free(sarr->sorted);
+        sarr->sorted = NULL;
+        return ENOMEM;
+    }
     sarr->nrows = rel->nrows;
     sarr->indexed_rows = rel->nrows;
     return 0;

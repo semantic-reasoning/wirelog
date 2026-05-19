@@ -13,8 +13,6 @@
  * Optimal Join Algorithm", ICDT 2014.
  */
 
-#define _GNU_SOURCE /* Required for qsort_r on glibc */
-
 #include "columnar/lftj.h"
 #include "columnar/internal.h"
 
@@ -22,43 +20,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* ======================================================================== */
-/* Platform-specific qsort_r comparator (sort by single key column)        */
-/* ======================================================================== */
-
-/*
- * lftj_row_cmp: compare two rows by a single key column.
- * Context is a uint32_t* pointing to the key column index.
- * Platform signatures match QSORT_R_CALL macro from internal.h.
- */
-#ifdef __GLIBC__
-static int
-lftj_row_cmp(const void *a, const void *b, void *ctx)
-{
-    const uint32_t key_col = *(const uint32_t *)ctx;
-    const int64_t ka = ((const int64_t *)a)[key_col];
-    const int64_t kb = ((const int64_t *)b)[key_col];
-    return (ka > kb) - (ka < kb);
-}
-#elif defined(_MSC_VER)
-static int __cdecl lftj_row_cmp(void *ctx, const void *a, const void *b)
-{
-    const uint32_t key_col = *(const uint32_t *)ctx;
-    const int64_t ka = ((const int64_t *)a)[key_col];
-    const int64_t kb = ((const int64_t *)b)[key_col];
-    return (ka > kb) - (ka < kb);
-}
-#else
-static int
-lftj_row_cmp(void *ctx, const void *a, const void *b)
-{
-    const uint32_t key_col = *(const uint32_t *)ctx;
-    const int64_t ka = ((const int64_t *)a)[key_col];
-    const int64_t kb = ((const int64_t *)b)[key_col];
-    return (ka > kb) - (ka < kb);
-}
-#endif
 
 /* ======================================================================== */
 /* LFTJ Iterator                                                            */
@@ -123,7 +84,7 @@ lftj_seek(lftj_iter_t *it, int64_t target)
  */
 static void
 lftj_key_range(const lftj_iter_t *it, int64_t key, uint32_t *out_lo,
-               uint32_t *out_hi)
+    uint32_t *out_hi)
 {
     *out_lo = it->pos;
     uint32_t left = it->pos;
@@ -162,9 +123,16 @@ lftj_iter_init(lftj_iter_t *it, const wl_lftj_input_t *inp)
 
     memcpy(it->sorted, inp->data, bytes);
 
-    uint32_t key_col = inp->key_col;
-    QSORT_R_CALL(it->sorted, inp->nrows, inp->ncols * sizeof(int64_t), &key_col,
-                 lftj_row_cmp);
+    /* #465: stable LSD radix sort by the single key column replaces the
+     * platform-specific qsort_r path that did not exist on Android NDK
+     * bionic libc.  Returning ENOMEM on radix scratch alloc failure
+     * lets the caller surface OOM cleanly. */
+    if (col_radix_sort_rows_by_key(it->sorted, inp->nrows, inp->ncols,
+        inp->key_col) != 0) {
+        free(it->sorted);
+        it->sorted = NULL;
+        return ENOMEM;
+    }
     return 0;
 }
 
@@ -202,9 +170,9 @@ lftj_iter_free(lftj_iter_t *it)
  */
 static int
 lftj_emit_product(const lftj_iter_t *iters, uint32_t k, int64_t key,
-                  const uint32_t *ranges, uint32_t depth, int64_t *row_buf,
-                  uint32_t col_offset, wl_lftj_result_fn cb, void *user,
-                  uint32_t total_cols)
+    const uint32_t *ranges, uint32_t depth, int64_t *row_buf,
+    uint32_t col_offset, wl_lftj_result_fn cb, void *user,
+    uint32_t total_cols)
 {
     if (depth == k) {
         cb(row_buf, total_cols, user);
@@ -229,7 +197,7 @@ lftj_emit_product(const lftj_iter_t *iters, uint32_t k, int64_t key,
             row_buf[w++] = rp[c];
         }
         int rc = lftj_emit_product(iters, k, key, ranges, depth + 1u, row_buf,
-                                   w, cb, user, total_cols);
+                w, cb, user, total_cols);
         if (rc != 0)
             return rc;
     }
@@ -242,7 +210,7 @@ lftj_emit_product(const lftj_iter_t *iters, uint32_t k, int64_t key,
 
 int
 wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
-             void *user)
+    void *user)
 {
     if (!inputs || k < 2u || k > WL_LFTJ_MAX_K || !cb)
         return EINVAL;
@@ -338,11 +306,11 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
             /* Compute per-iterator key ranges for the product enumeration. */
             for (uint32_t j = 0; j < k; j++)
                 lftj_key_range(&iters[j], max_key, &ranges[(size_t)j * 2u],
-                               &ranges[(size_t)j * 2u + 1u]);
+                    &ranges[(size_t)j * 2u + 1u]);
 
             /* Emit Cartesian product of matching rows. */
             rc = lftj_emit_product(iters, k, max_key, ranges, 0, row_buf, 1u,
-                                   cb, user, total_cols);
+                    cb, user, total_cols);
             if (rc != 0)
                 break;
 
@@ -368,7 +336,7 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
             max_key = next_max;
         }
 
-    done:
+done:
         free(row_buf);
         free(ranges);
     }
