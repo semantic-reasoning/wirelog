@@ -1321,8 +1321,17 @@ int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src);
 void
 col_rel_radix_sort_int64(col_rel_t *r);
+
+/** Stable LSD radix sort of a row-major int64_t buffer by a single key
+ *  column.  Used by arrangement.c (sarr_build) and lftj.c
+ *  (lftj_iter_init) to replace the platform-specific qsort_r path --
+ *  the call site only needs a sort by one column, which radix can do
+ *  in one pass over 8 key bytes without any comparator callback.
+ *  Returns 0 on success, -1 on allocation failure (data is unchanged).
+ *  No-op when key_col >= ncols or nrows < 2.  (#465). */
 int
-col_radix_sort_rows(int64_t *data, uint32_t nrows, uint32_t ncols);
+col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
+    uint32_t key_col);
 
 /** Index-permutation radix sort on sub-range [start_row, start_row+nrows).
  *  Uses col_rel_get() for key extraction -- layout independent.
@@ -1354,126 +1363,6 @@ col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
 void
 col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_rel_t *result);
-
-/* ======================================================================== */
-/* qsort_r Compatibility                                                    */
-/* ======================================================================== */
-
-/* Comparison for qsort_r: lexicographic int64 row order.
- * Note: BSD qsort_r has signature: qsort_r(base, nmemb, size, ctx, comparator)
- *       GNU qsort_r has signature: qsort_r(base, nmemb, size, comparator, arg)
- */
-#ifdef __GLIBC__
-/* GNU glibc qsort_r: comparator first, context last */
-static inline int
-row_cmp_fn(const void *a, const void *b, void *ctx)
-{
-    const uint32_t ncols = *(const uint32_t *)ctx;
-    const int64_t *ra = (const int64_t *)a;
-    const int64_t *rb = (const int64_t *)b;
-    /* Issue #279: fast path for the two most common relation widths. */
-    if (ncols == 2) {
-        if (ra[0] != rb[0])
-            return (ra[0] < rb[0]) ? -1 : 1;
-        if (ra[1] != rb[1])
-            return (ra[1] < rb[1]) ? -1 : 1;
-        return 0;
-    }
-    if (ncols == 4) {
-        if (ra[0] != rb[0])
-            return (ra[0] < rb[0]) ? -1 : 1;
-        if (ra[1] != rb[1])
-            return (ra[1] < rb[1]) ? -1 : 1;
-        if (ra[2] != rb[2])
-            return (ra[2] < rb[2]) ? -1 : 1;
-        if (ra[3] != rb[3])
-            return (ra[3] < rb[3]) ? -1 : 1;
-        return 0;
-    }
-    for (uint32_t c = 0; c < ncols; c++) {
-        if (ra[c] < rb[c])
-            return -1;
-        if (ra[c] > rb[c])
-            return 1;
-    }
-    return 0;
-}
-#define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
-        qsort_r(base, nmemb, size, fn, ctx)
-#elif defined(_MSC_VER)
-/* MSVC qsort_s: context first, comparator last */
-static inline int __cdecl row_cmp_fn(void *ctx, const void *a, const void *b)
-{
-    const uint32_t ncols = *(const uint32_t *)ctx;
-    const int64_t *ra = (const int64_t *)a;
-    const int64_t *rb = (const int64_t *)b;
-    /* Issue #279: fast path for the two most common relation widths. */
-    if (ncols == 2) {
-        if (ra[0] != rb[0])
-            return (ra[0] < rb[0]) ? -1 : 1;
-        if (ra[1] != rb[1])
-            return (ra[1] < rb[1]) ? -1 : 1;
-        return 0;
-    }
-    if (ncols == 4) {
-        if (ra[0] != rb[0])
-            return (ra[0] < rb[0]) ? -1 : 1;
-        if (ra[1] != rb[1])
-            return (ra[1] < rb[1]) ? -1 : 1;
-        if (ra[2] != rb[2])
-            return (ra[2] < rb[2]) ? -1 : 1;
-        if (ra[3] != rb[3])
-            return (ra[3] < rb[3]) ? -1 : 1;
-        return 0;
-    }
-    for (uint32_t c = 0; c < ncols; c++) {
-        if (ra[c] < rb[c])
-            return -1;
-        if (ra[c] > rb[c])
-            return 1;
-    }
-    return 0;
-}
-#define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
-        qsort_s(base, nmemb, size, fn, ctx)
-#else
-/* BSD qsort_r: context first, comparator last */
-static inline int
-row_cmp_fn(void *ctx, const void *a, const void *b)
-{
-    const uint32_t ncols = *(const uint32_t *)ctx;
-    const int64_t *ra = (const int64_t *)a;
-    const int64_t *rb = (const int64_t *)b;
-    /* Issue #279: fast path for the two most common relation widths. */
-    if (ncols == 2) {
-        if (ra[0] != rb[0])
-            return (ra[0] < rb[0]) ? -1 : 1;
-        if (ra[1] != rb[1])
-            return (ra[1] < rb[1]) ? -1 : 1;
-        return 0;
-    }
-    if (ncols == 4) {
-        if (ra[0] != rb[0])
-            return (ra[0] < rb[0]) ? -1 : 1;
-        if (ra[1] != rb[1])
-            return (ra[1] < rb[1]) ? -1 : 1;
-        if (ra[2] != rb[2])
-            return (ra[2] < rb[2]) ? -1 : 1;
-        if (ra[3] != rb[3])
-            return (ra[3] < rb[3]) ? -1 : 1;
-        return 0;
-    }
-    for (uint32_t c = 0; c < ncols; c++) {
-        if (ra[c] < rb[c])
-            return -1;
-        if (ra[c] > rb[c])
-            return 1;
-    }
-    return 0;
-}
-#define QSORT_R_CALL(base, nmemb, size, ctx, fn) \
-        qsort_r(base, nmemb, size, ctx, fn)
-#endif
 
 /* ======================================================================== */
 /* Session Helpers (backend/columnar_nanoarrow.c)                           */

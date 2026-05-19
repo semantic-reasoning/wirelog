@@ -1307,86 +1307,80 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
     return 0;
 }
 
-/* ---- radix sort ---------------------------------------------------------- */
+/* ---- radix sort by single key column ----------------------------------- */
 
 /*
- * col_radix_sort_rows: sort nrows rows of ncols int64_t columns in-place
- * using LSD radix sort.  Works on a raw pointer (no col_rel_t needed).
+ * col_radix_sort_rows_by_key: stable LSD radix sort of a row-major
+ * int64_t buffer by a single key column.  Used by arrangement.c
+ * (sarr_build) and lftj.c (lftj_iter_init) to replace the
+ * platform-specific qsort_r path -- those call sites only need a sort
+ * by one column, which radix can do in eight passes over the key's
+ * bytes without any comparator callback.  See #465 for the Android
+ * portability driver that motivated removing qsort_r.
  *
- * Falls back to qsort_r on allocation failure.
- * Returns 0 on success, -1 on fallback (still sorted, just via qsort).
+ * Allocates one tmp row-major scratch buffer.  Returns 0 on success,
+ * -1 if scratch allocation fails (the input is then unmodified).
  */
 int
-col_radix_sort_rows(int64_t *data, uint32_t nrows, uint32_t ncols)
+col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
+    uint32_t key_col)
 {
-    if (!data || ncols == 0 || nrows <= 1)
+    if (!data || ncols == 0 || nrows <= 1 || key_col >= ncols)
         return 0;
 
-    uint32_t nr = nrows;
-    uint32_t nc = ncols;
-    size_t row_bytes = (size_t)nc * sizeof(int64_t);
-
-    int64_t *tmp = (int64_t *)malloc((size_t)nr * row_bytes);
-    if (!tmp) {
-        /* Fallback to comparison sort on allocation failure */
-        QSORT_R_CALL(data, nr, row_bytes, &nc, row_cmp_fn);
+    size_t row_bytes = (size_t)ncols * sizeof(int64_t);
+    int64_t *tmp = (int64_t *)malloc((size_t)nrows * row_bytes);
+    if (!tmp)
         return -1;
-    }
 
     int64_t *src = data;
     int64_t *dst = tmp;
-
-    /* count[b] = frequency of byte value b in current pass.
-     * prefix[b] = output index for next element with byte value b. */
     uint32_t count[256];
     uint32_t prefix[256];
 
     /*
-     * LSD radix sort: process from least significant sort key to most
-     * significant.  Column nc-1 is least significant, column 0 is most
-     * significant.  Within each column, byte 0 (LSB) is processed first
-     * and byte 7 (MSB) last.  The sign bit (bit 7 of byte 7) is flipped
-     * so that unsigned bucket ordering matches signed int64 ordering.
+     * LSD radix over the 8 bytes of the int64_t key column.  Byte 0
+     * (LSB) processed first; byte 7 (MSB) last.  The sign bit on byte
+     * 7 is flipped so unsigned bucket order matches signed int64
+     * order.  Stable: rows with equal key keep their relative order.
      */
-    for (int c = (int)nc - 1; c >= 0; c--) {
-        for (int b = 0; b < 8; b++) {
-            int shift = b * 8;
-            int is_sign_byte = (b == 7);
+    for (int b = 0; b < 8; b++) {
+        int shift = b * 8;
+        int is_sign_byte = (b == 7);
 
-            memset(count, 0, sizeof(count));
-            for (uint32_t row = 0; row < nr; row++) {
-                uint8_t bv = (uint8_t)((uint64_t)src[(size_t)row * nc + c] >>
-                    shift);
-                if (is_sign_byte)
-                    bv ^= 0x80u;
-                count[bv]++;
-            }
-
-            prefix[0] = 0;
-            for (int i = 1; i < 256; i++)
-                prefix[i] = prefix[i - 1] + count[i - 1];
-
-            for (uint32_t row = 0; row < nr; row++) {
-                uint8_t bv = (uint8_t)((uint64_t)src[(size_t)row * nc + c] >>
-                    shift);
-                if (is_sign_byte)
-                    bv ^= 0x80u;
-                uint32_t out_pos = prefix[bv]++;
-                memcpy(dst + (size_t)out_pos * nc,
-                    src + (size_t)row * nc,
-                    row_bytes);
-            }
-
-            /* Swap buffers: output of this pass is input of next */
-            int64_t *t = src;
-            src = dst;
-            dst = t;
+        memset(count, 0, sizeof(count));
+        for (uint32_t row = 0; row < nrows; row++) {
+            uint8_t bv = (uint8_t)((uint64_t)
+                src[(size_t)row * ncols + key_col] >> shift);
+            if (is_sign_byte)
+                bv ^= 0x80u;
+            count[bv]++;
         }
+
+        prefix[0] = 0;
+        for (int i = 1; i < 256; i++)
+            prefix[i] = prefix[i - 1] + count[i - 1];
+
+        for (uint32_t row = 0; row < nrows; row++) {
+            uint8_t bv = (uint8_t)((uint64_t)
+                src[(size_t)row * ncols + key_col] >> shift);
+            if (is_sign_byte)
+                bv ^= 0x80u;
+            uint32_t out_pos = prefix[bv]++;
+            memcpy(dst + (size_t)out_pos * ncols,
+                src + (size_t)row * ncols,
+                row_bytes);
+        }
+
+        int64_t *t = src;
+        src = dst;
+        dst = t;
     }
 
-    /* After nc*8 passes the result is in src.  Copy back if needed. */
+    /* After 8 passes the sorted output is in `src`.  Copy back if the
+     * final pass ended in tmp. */
     if (src != data)
-        memcpy(data, src, (size_t)nr * row_bytes);
+        memcpy(data, src, (size_t)nrows * row_bytes);
 
     free(tmp);
     return 0;

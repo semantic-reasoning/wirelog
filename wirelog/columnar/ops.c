@@ -3580,8 +3580,6 @@ col_op_concat(eval_stack_t *stack, wl_col_session_t *sess)
 
 /* --- CONSOLIDATE --------------------------------------------------------- */
 
-/* row_cmp_fn and QSORT_R_CALL are defined in columnar/internal.h */
-
 /* Issue #197: SIMD row comparison functions moved here so kway_row_cmp and
  * all callers in the consolidate/merge paths use the optimized dispatcher. */
 
