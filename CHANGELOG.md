@@ -6,6 +6,28 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Android CI smoke + 16 KB alignment hard gate** (#465):
+  new `.github/workflows/android.yml` with three jobs.  `alignment-arm64`
+  cross-compiles `libwirelog.so` via `cross/android-arm64.ini` and runs
+  `scripts/ci/check-android-alignment.sh` against the result; the script
+  uses `readelf -lW` to enumerate PT_LOAD segments and asserts each
+  carries `Align >= 0x4000` (16 KB).  Hard-fails the PR on any
+  insufficiently-aligned segment -- Play Store rejects new 4 KB-only
+  arm64 binaries on API 35+ uploads (Nov 2025 enforcement).
+  `negative-host` is the load-bearing self-test: builds the host Linux
+  `.so` (which has 4 KB PT_LOAD alignment) and asserts the SAME script
+  exits non-zero, proving the parser works in both directions and
+  protecting against the fake-closure mode where a regex bug always
+  passes.  `smoke-x86_64` cross-compiles the second ABI from #464
+  without an alignment assertion (the 16 KB link flag is gated on
+  `cpu_family == 'aarch64'`).  NDK r27c is installed via
+  `nttld/setup-ndk@v1` and symlinked to `/opt/android-ndk-r27c` so the
+  committed cross-files resolve their `ndk` constant without local
+  edits.  All three jobs use the default `continue-on-error: false`
+  (the deliberate opposite of #708's tsan-native advisory leg).
+  Issue body's earlier `readelf -l | grep LOAD` recipe was superseded
+  by the wide-mode parser; issue body's `r26d` NDK pin was reconciled
+  up to `r27c` to match the cross-files shipped in #464.
 - **Android meson option + NDK cross-files** (#464):
   new `meson_options.txt` boolean `android` (default false).  When
   enabled, `meson.build` excludes `wirelog_cli` from the build (no
