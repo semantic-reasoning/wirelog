@@ -43,11 +43,12 @@ jobs:
         run: scripts/ci/check-ios-symbols.sh builddir-ios
 
       - name: Swift modulemap smoke typecheck
-        run: >
-          xcrun --sdk iphoneos swiftc
-          -target arm64-apple-ios13.0
-          -typecheck
-          -I "$PWD"
-          -I "$PWD/builddir-ios"
-          -Xcc -Wno-incomplete-umbrella
-          tests/ios/swift_smoke.swift
+        run: |
+          cp tests/ios/swift_smoke.swift.fixture "$RUNNER_TEMP/swift_smoke.swift"
+          xcrun --sdk iphoneos swiftc \
+            -target arm64-apple-ios13.0 \
+            -typecheck \
+            -I "$PWD" \
+            -I "$PWD/builddir-ios" \
+            -Xcc -Wno-incomplete-umbrella \
+            "$RUNNER_TEMP/swift_smoke.swift"
