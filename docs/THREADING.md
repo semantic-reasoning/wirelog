@@ -85,9 +85,10 @@ option('threads', type: 'combo', choices: ['native', 'posix'],
   falls back to pthreads (or Windows on `_WIN32`).
 - `-Dthreads=posix`: the probe is skipped and `pthreads` is forced
   unconditionally. **This is required for ThreadSanitizer** because
-  TSan only intercepts pthread synchronization primitives; C11
-  `<threads.h>` calls bypass the interceptor. The TSan CI legs at
-  `.github/workflows/ci-pr.yml` invoke meson with `-Dthreads=posix`.
+  TSan only provides reliable race diagnostics for wirelog when the
+  worker threads are created through the pthread backend. The gating
+  TSan CI leg at `.github/workflows/ci-pr.yml` invokes meson with
+  `-Dthreads=posix`.
 
 ### Public API
 
@@ -662,33 +663,37 @@ meson setup build-tsan \
 meson test -C build-tsan --suite tsan
 ```
 
-The `-Dthreads=posix` requirement is non-negotiable on non-glibc
-platforms; on Linux glibc, the C11 `<threads.h>` backend is
-implemented as a thin shim over NPTL (e.g., `thrd_create` ->
-`pthread_create`, `mtx_lock` -> `pthread_mutex_lock`), so libtsan's
-pthread interceptors — which hook at the public-symbol level, not at
-internal glibc versioned aliases — still observe the same
-happens-before edges that the posix backend exposes.  The posix
-backend remains canonical for race gating; the native backend is
-exercised by an advisory TSan leg under `.github/workflows/ci-pr.yml`
-that reports native-leg failures as GitHub Actions warnings.
+The `-Dthreads=posix` requirement is non-negotiable for race gating.
+Issue #826 showed that the Linux glibc C11 `<threads.h>` backend is
+not a reliable TSan runtime signal even though glibc implements the C11
+surface over NPTL.  Executing instrumented workers created through
+`thrd_create` can crash the sanitizer runtime itself with
+`ThreadSanitizer:DEADLYSIGNAL` / SEGV `0x18` before wirelog
+synchronization is meaningfully diagnosed.  Suppressions do not apply
+to that fatal sanitizer crash.
+
+The posix backend is therefore the only canonical TSan race surface.
+The `tsan-native` CI leg under `.github/workflows/ci-pr.yml`
+configures and compiles with `-Dthreads=native` plus
+`-Db_sanitize=thread`, then runs only a policy/documentation smoke. It
+does not execute the full runtime test suite under native C11 TSan.
+Runtime coverage for the native C11 backend comes from the ordinary
+non-TSan matrix.
 
 ### TSan coverage matrix
 
 | Backend | Platform | TSan status | Notes |
 |---------|----------|-------------|-------|
 | `posix` | all | **gating** | libtsan intercepts pthread_* directly; canonical race surface |
-| `native` | Linux glibc | advisory | C11 shim routes to NPTL; same happens-before edges as posix; failures are reported as CI warnings |
+| `native` | Linux glibc | compile-only advisory | CI configures and compiles with TSan, but does not run native C11 worker tests because issue #826 shows sanitizer-runtime SEGVs before race diagnostics |
 | `native` | musl | not covered | musl C11 shim does not route through NPTL pthread symbols |
 | `native` | Apple libc | not covered | Apple libc lacks `<threads.h>`; C11 backend not buildable (see meson.build:42) |
 | `native` | Windows MSVC | not covered | no libtsan; Win32 threads only |
 
-On glibc, both the posix and native backends ultimately resolve to
-the same NPTL synchronization primitives, so the advisory TSan leg
-catches regressions in `wirelog/thread_c11.c`'s trampoline and thin
-wrappers without leaving a coverage gap for that translation unit.
-On non-glibc platforms the native backend is not TSan-testable; the
-posix backend remains the only reliable option.
+The compile-only native leg exists to keep `wirelog/thread_c11.c`
+buildable under sanitizer flags. It is not evidence that libtsan has
+observed C11-thread happens-before edges. On all platforms the posix
+backend remains the only reliable TSan option.
 
 Cross-references: Risk C5, issue #708 (-Dthreads=native + TSan
 advisory leg); issue #826 (native TSan SEGV triage);
