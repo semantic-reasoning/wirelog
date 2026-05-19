@@ -59,6 +59,13 @@ option(
 )
 
 option(
+  'ios',
+  type: 'boolean',
+  value: false,
+  description: 'Build for iOS. Disables executable targets and plugin loading, and applies Apple iOS target flags.'
+)
+
+option(
   'mbedTLS',
   type: 'combo',
   choices: ['disabled', 'enabled', 'auto'],
