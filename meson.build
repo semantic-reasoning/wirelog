@@ -88,6 +88,26 @@ is_embedded = get_option('embedded')
 is_windows = platform == 'windows'
 is_macos = platform == 'darwin'
 is_linux = platform == 'linux'
+is_android = get_option('android')
+
+# Issue #464: Android packaging needs 16 KB ELF page alignment on aarch64
+# so the same .so loads on both 4 KB and 16 KB kernels (Android 14+ on
+# arm64).  Gated on cpu_family == 'aarch64' because 16 KB pages are an
+# arm64-only kernel feature; the flag is meaningless on armv7 (deprecated)
+# and harmless-but-irrelevant on x86_64 emulator builds.
+#
+# Note: on an aarch64 Linux host (e.g., Ampere / Apple Silicon Linux)
+# invoking `-Dandroid=true` without a cross-file would also add the flag
+# to a *Linux* .so.  Linux honors -Wl,-z,max-page-size as the maximum
+# alignment a load segment may take, so the resulting .so is forward-
+# compatible with hypothetical 16 KB Linux kernels and unchanged on
+# normal 4 KB hosts.  Cross-compilation via cross/android-*.ini is the
+# supported path; native-host -Dandroid=true is meant for option-flow
+# testing, not shipping.
+wirelog_android_link_args = []
+if is_android and host_machine.cpu_family() == 'aarch64'
+  wirelog_android_link_args += ['-Wl,-z,max-page-size=16384']
+endif
 
 #Build options
 ipc_option = get_option('ipc')
@@ -270,6 +290,7 @@ wirelog_lib = library(
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],
+  link_args: wirelog_android_link_args,
   dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: true,
   # SOVERSION ('soversion') is decoupled from project_version so the
@@ -291,6 +312,10 @@ wirelog_lib = library(
 )
 
 #Static library(optional)
+# Note: `wirelog_android_link_args` is intentionally NOT threaded here.
+# Static archives carry object code only, not link-time attributes; ELF
+# page alignment is decided when the .a is finally linked into a .so
+# or executable by the downstream consumer.
 wirelog_static_lib = static_library(
   'wirelog_static',
   wirelog_sources,
@@ -342,17 +367,24 @@ endif
 
 #Build wirelog-cli executable (wirelog_cli_src defined in wirelog/meson.build)
 #Include all wirelog sources to ensure proper linking with LTO
-wirelog_cli = executable(
-  'wirelog_cli',
-  wirelog_cli_src,
-  cli_plugin_src,
-  wirelog_sources,
-  config_h_file,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  c_args: cli_plugin_args,
-  dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep] + cli_plugin_deps,
-  install: true,
-)
+# Issue #464: Android builds do not ship the CLI -- on Android the
+# library is loaded into a host process (e.g., JNI / NDK app) and there
+# is no useful command-line entry point.  Skipping the executable here
+# also cascades to the CLI-dependent baseline tests in tests/meson.build,
+# which are guarded by `if not is_android` next to their wirelog_cli refs.
+if not is_android
+  wirelog_cli = executable(
+    'wirelog_cli',
+    wirelog_cli_src,
+    cli_plugin_src,
+    wirelog_sources,
+    config_h_file,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    c_args: cli_plugin_args,
+    dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep] + cli_plugin_deps,
+    install: true,
+  )
+endif
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Benchmarks

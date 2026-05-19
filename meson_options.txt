@@ -52,6 +52,13 @@ option(
 )
 
 option(
+  'android',
+  type: 'boolean',
+  value: false,
+  description: 'Build for Android (NDK cross-compile, Issue #464). When true: excludes wirelog_cli, adds -Wl,-z,max-page-size=16384 on aarch64 for 16 KB page compatibility (Android 14+). Symbol visibility remains hidden -- WIRELOG_API on public headers already covers Android exports. Use with meson --cross-file cross/android-arm64.ini (or android-x86_64.ini).'
+)
+
+option(
   'mbedTLS',
   type: 'combo',
   choices: ['disabled', 'enabled', 'auto'],
