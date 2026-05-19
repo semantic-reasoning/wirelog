@@ -6,6 +6,28 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Android meson option + NDK cross-files** (#464):
+  new `meson_options.txt` boolean `android` (default false).  When
+  enabled, `meson.build` excludes `wirelog_cli` from the build (no
+  useful CLI entry on JNI / NDK apps), appends
+  `-Wl,-z,max-page-size=16384` to `libwirelog.so`'s `link_args` on
+  `aarch64` for Android 14+ 16 KB page compatibility (the flag is
+  meaningless on x86_64 emulator builds and is omitted there), and
+  cascades the CLI guard to the four CLI-dependent baseline tests in
+  `tests/meson.build` (`baseline_int_edges`, `baseline_sym_family`,
+  `baseline_tab_nodes`, `cli_version`).  Symbol-visibility policy is
+  unchanged -- `gnu_symbol_visibility: 'hidden'` plus `WIRELOG_API`
+  annotations on the 9 installed headers already cover all 53 Android
+  exports, so the v1.0 ABI manifest gate at
+  `scripts/ci/check-abi-symbols.sh` remains intact across platforms.
+  Two NDK cross-files ship: `cross/android-arm64.ini` and
+  `cross/android-x86_64.ini`, both pinned to NDK r27c (LTS), with
+  `[constants]`-driven path composition and a documented override path
+  for non-standard NDK install prefixes.  `armeabi-v7a` is intentionally
+  not supported (Play Store has required 64-bit since 2019; armv7
+  would carry a third toolchain for zero modern delivery value).  The
+  recipe lives at `docs/cross-compile-android.md`; CI matrix coverage
+  is a separate follow-up (out of scope for #464).
 - **libabigail `.abi.json` ABI manifest + abidiff CI gate** (#786):
   the v1.0 ABI golden file gains its libabigail half.  Where the
   53-entry `abi/libwirelog-1.0.symbols` allowlist (#733 K2) only
