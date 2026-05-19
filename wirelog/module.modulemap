@@ -1,0 +1,6 @@
+module wirelog {
+  umbrella header "wirelog.h"
+  header "io/io_adapter.h"
+  export *
+  link "wirelog"
+}

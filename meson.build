@@ -117,6 +117,7 @@ docs_option = get_option('documentation')
 # crc32_variant_option already defined earlier before compiler settings
 
 io_plugin_dlopen_option = get_option('io_plugin_dlopen')
+ios_option = get_option('ios')
 
 message('wirelog ' + project_version)
 message('  Platform: ' + platform)
@@ -125,6 +126,27 @@ message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
 message('  CRC-32 variant: ' + crc32_variant_option)
 message('  Plugin loader (dlopen): ' + io_plugin_dlopen_option)
+message('  iOS: @0@'.format(ios_option))
+
+mobile_cross = is_android or ios_option
+wirelog_ios_link_args = []
+
+if ios_option
+  ios_min_version = meson.get_external_property('wirelog_ios_min_version', '13.0')
+  ios_platform = meson.get_external_property('wirelog_ios_platform', 'iphoneos')
+  ios_arch = meson.get_external_property('wirelog_ios_arch',
+    host_machine.cpu_family() == 'x86_64' ? 'x86_64' : 'arm64')
+
+  if ios_platform == 'iphonesimulator'
+    ios_target = ios_arch + '-apple-ios' + ios_min_version + '-simulator'
+  else
+    ios_target = ios_arch + '-apple-ios' + ios_min_version
+  endif
+
+  add_project_arguments(['-target', ios_target], language: 'c')
+  wirelog_ios_link_args += ['-target', ios_target]
+  message('  iOS target: ' + ios_target)
+endif
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Dependencies
@@ -290,7 +312,7 @@ wirelog_lib = library(
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],
-  link_args: wirelog_android_link_args,
+  link_args: wirelog_android_link_args + wirelog_ios_link_args,
   dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: true,
   # SOVERSION ('soversion') is decoupled from project_version so the
@@ -308,7 +330,7 @@ wirelog_lib = library(
   # symbols (wl_*, col_*, arr_*) are now hidden from the dynamic-symbol
   # table; consumers who relied on resolving them through libwirelog.so
   # must rebuild against the public surface.  See #733.
-  gnu_symbol_visibility: 'hidden',
+  gnu_symbol_visibility: ios_option ? 'default' : 'hidden',
 )
 
 #Static library(optional)
@@ -322,6 +344,7 @@ wirelog_static_lib = static_library(
   config_h_file,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],
+  link_args: wirelog_ios_link_args,
   dependencies: [threads_dep, zlib_dep, nanoarrow_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: false,  # Not installed by default
 )
@@ -335,6 +358,11 @@ install_headers(
 install_headers(
   'wirelog/io/io_adapter.h',
   subdir: 'wirelog/io'
+)
+
+install_data(
+  'wirelog/module.modulemap',
+  install_dir: wirelog_includedir / 'wirelog'
 )
 
 #pkg - config file
@@ -356,7 +384,7 @@ pkg.generate(
 cli_plugin_src = []
 cli_plugin_deps = []
 cli_plugin_args = []
-if io_plugin_dlopen_option == 'enabled' and not is_windows
+if io_plugin_dlopen_option == 'enabled' and not (is_windows or ios_option)
   _dl_dep = cc.find_library('dl', required: false)
   if _dl_dep.found()
     cli_plugin_deps += [_dl_dep]
@@ -367,12 +395,10 @@ endif
 
 #Build wirelog-cli executable (wirelog_cli_src defined in wirelog/meson.build)
 #Include all wirelog sources to ensure proper linking with LTO
-# Issue #464: Android builds do not ship the CLI -- on Android the
-# library is loaded into a host process (e.g., JNI / NDK app) and there
-# is no useful command-line entry point.  Skipping the executable here
-# also cascades to the CLI-dependent baseline tests in tests/meson.build,
-# which are guarded by `if not is_android` next to their wirelog_cli refs.
-if not is_android
+# Mobile builds do not ship the CLI: Android loads the library into a
+# host process, and iOS uses the library/module surface rather than a
+# command-line entry point.
+if not mobile_cross
   wirelog_cli = executable(
     'wirelog_cli',
     wirelog_cli_src,
@@ -390,13 +416,15 @@ endif
 #Benchmarks
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-subdir('bench')
+if not mobile_cross
+  subdir('bench')
+endif
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Tests
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-if tests_option
+if tests_option and not mobile_cross
   subdir('tests')
 endif
 
