@@ -1,0 +1,53 @@
+name: iOS CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ios-arm64:
+    name: iOS arm64 smoke / Xcode 16.4
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$DEVELOPER_DIR"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install dependencies
+        run: brew install meson ninja
+
+      - name: Configure iOS arm64
+        run: >
+          meson setup builddir-ios
+          --cross-file cross/ios-arm64.ini
+          -Dios=true
+          -Dtests=false
+          -DmbedTLS=disabled
+
+      - name: Build iOS arm64
+        run: meson compile -C builddir-ios
+
+      - name: Check static archive symbols
+        run: scripts/ci/check-ios-symbols.sh builddir-ios
+
+      - name: Swift modulemap smoke typecheck
+        run: >
+          xcrun --sdk iphoneos swiftc
+          -target arm64-apple-ios13.0
+          -typecheck
+          -I "$PWD"
+          -I "$PWD/builddir-ios"
+          -Xcc -Wno-incomplete-umbrella
+          tests/ios/swift_smoke.swift
