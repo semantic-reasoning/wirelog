@@ -50,10 +50,12 @@ All notable changes to wirelog are documented in this file.
   message -- abidiff treats ELF architecture as an ABI-breaking
   change (`architecture changed from 'elf-amd-x86_64' to
   'elf-arm-aarch64'`, rc=12), so the committed x86_64 baseline
-  cannot directly diff against an arm64 build.  Per-arch baselines
-  are a v0.41 follow-up; arm64 still exercises the arch-agnostic
-  `abi_symbols` allowlist on every PR.  The gate's other SKIP
-  paths remain for platforms where libabigail is unavailable
+  cannot directly diff against an arm64 build.  Issue #824 explicitly
+  scopes v1.0 Linux arm64 ABI coverage to the arch-agnostic
+  `abi_symbols` allowlist on every PR; per-arch libabigail baselines
+  are out of scope for #681 / v1.0 unless a later policy issue adds
+  an arm64 baseline file and regeneration workflow.  The gate's other
+  SKIP paths remain for platforms where libabigail is unavailable
   (Windows, macOS, cross-builds).  Demonstrated firing on a
   synthetic break: adding a new `WIRELOG_API` function trips the
   gate with `abidiff rc=4` and a clear remediation paragraph
@@ -132,8 +134,9 @@ All notable changes to wirelog are documented in this file.
   `'ubuntu-24.04-arm'`, so the SIMD-capability verification block
   now runs on the arm64 leg as intended.  Required-check
   promotion is a follow-up repo-admin action (branch protection),
-  not part of this PR; the libabigail `.abi.json` half of the
-  cross-arch ABI gate lands under #786 once that issue ships.
+  not part of this PR; per #824, Linux arm64 v1.0 ABI coverage is the
+  arch-agnostic `abi_symbols` gate while libabigail `.abi.json`
+  enforcement remains Linux x86_64-only.
 - **Adopt `WIRELOG_API` on every installed public prototype** (#782):
   76 occurrences of `WIRELOG_PUBLIC` across the 8 prototype headers
   (`wirelog.h`, `wirelog-types.h`, `wirelog-ir.h`, `wirelog-parser.h`,

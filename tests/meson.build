@@ -514,7 +514,9 @@ endif
 # and visibility/linkage drift that nm -D cannot see.  Linux/ELF-focused;
 # SKIPs cleanly when libwirelog.so is missing (Windows, static-only),
 # when abidiff is not on PATH, or when the baseline has not been seeded
-# yet (run scripts/release/regenerate-abi-manifest.sh to seed).
+# yet (run scripts/release/regenerate-abi-manifest.sh to seed).  Per
+# issue #824, the committed v1.0 libabigail baseline is x86_64-only;
+# Linux arm64 v1.0 ABI coverage is symbol-only via abi_symbols.
 if sh.found()
   test('abi_manifest', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-abi-manifest.sh',

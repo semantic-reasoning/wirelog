@@ -39,6 +39,10 @@
 #   - `abidiff` not on PATH (libabigail not installed).
 #   - Baseline `abi/libwirelog-1.0.abi.json` absent (first-time setup;
 #     run `scripts/release/regenerate-abi-manifest.sh` to seed).
+#   - Host architecture is not x86_64.  The v1.0 libabigail baseline is
+#     intentionally x86_64-only; Linux arm64 ABI coverage is symbol-only
+#     unless and until a per-architecture baseline policy is added after
+#     v1.0 (issue #824).
 
 set -euo pipefail
 
@@ -85,15 +89,17 @@ fi
 # The committed baseline is generated on Linux x86_64.  abidiff treats
 # ELF architecture as an ABI-breaking change (rc=12 "ELF architecture
 # changed"), so on a non-x86_64 host the gate would always fail despite
-# the source-level public API being identical.  Per-arch baselines are
-# tracked as future work (see #799 / v0.41 soak).  For now SKIP cleanly
-# on non-x86_64 hosts -- arm64 still exercises the arch-agnostic
-# `abi_symbols` allowlist gate.
+# the source-level public API being identical.  Issue #824 explicitly
+# scopes v1.0 Linux arm64 ABI coverage to the arch-agnostic
+# `abi_symbols` allowlist; richer per-arch libabigail baselines are a
+# post-v1.0 policy decision, not a v0.41 / #681 closure requirement.
 host_arch=$(uname -m)
 if [ "$host_arch" != "x86_64" ]; then
     echo "check-abi-manifest: SKIP: host arch '$host_arch' is not x86_64" >&2
-    echo "  baseline at $baseline is x86_64-only; per-arch baselines" >&2
-    echo "  pending (#799 soak / v0.41 follow-up)." >&2
+    echo "  baseline at $baseline is x86_64-only." >&2
+    echo "  issue #824 scopes v1.0 Linux arm64 ABI coverage to" >&2
+    echo "  abi/libwirelog-1.0.symbols; per-arch libabigail baselines" >&2
+    echo "  require a separate post-v1.0 policy and regeneration flow." >&2
     exit 0
 fi
 

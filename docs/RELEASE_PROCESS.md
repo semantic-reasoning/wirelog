@@ -59,6 +59,16 @@ alongside the API change.  The gate SKIPs cleanly when libabigail is
 not installed or when the baseline is absent — first-time seeding only
 requires running the regeneration script once on a Linux/x86_64 host.
 
+The v1.0 libabigail baseline is intentionally Linux/x86_64-only.  On
+Linux arm64, v1.0 ABI coverage is the arch-agnostic
+`abi/libwirelog-1.0.symbols` gate (`meson test --suite
+abi:abi_symbols`); `abi_manifest` skips because libabigail treats the
+ELF architecture difference between the x86_64 baseline and an arm64
+build as an ABI break.  Per issue #824, arm64 per-architecture
+libabigail baselines are out of scope for #681 / v1.0 unless a later
+policy issue adds an arm64 baseline file and matching regeneration
+workflow.
+
 ### Template (Markdown)
 
 ```md
@@ -122,8 +132,8 @@ release-pinned benchmark snapshot.
   checksums committed alongside).
 - **SBOM**: `wirelog-X.Y.Z.spdx.json` (SPDX 2.3) +
   `wirelog-X.Y.Z.cdx.json` (CycloneDX 1.5).
-- **ABI manifest**: `abi/libwirelog-1.0.symbols` +
-  `abi/libwirelog-1.0.abi.json` (libabigail).
+- **ABI manifest**: `abi/libwirelog-1.0.symbols` on Linux x86_64 and
+  arm64; `abi/libwirelog-1.0.abi.json` (libabigail) on Linux x86_64.
 
 ## Acknowledgments
 
