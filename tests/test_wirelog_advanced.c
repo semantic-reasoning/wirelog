@@ -17,7 +17,11 @@
 #include "wirelog/wirelog-advanced.h"
 #include "wirelog/wirelog.h"
 #include "wirelog/intern.h"
+#include "wirelog/passes/fusion.h"
+#include "wirelog/passes/jpp.h"
+#include "wirelog/passes/sip.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +65,21 @@ static const char *PROG_RBAC_SRC =
     "has_permission(U, P, S) :- "
     "  member_of(U, R, S), effective_permission(R, P).\n";
 
+static const char *ISSUE_665_PROGRAM_SRC
+    = ".decl grant(user: symbol, perm: symbol)\n"
+    ".decl principal_state(user: symbol, state: symbol)\n"
+    ".decl session_state(scope: symbol, state: symbol)\n"
+    ".decl session_active(state: symbol)\n"
+    ".decl perm_state(user: symbol, perm: symbol, scope: symbol, "
+    "state: symbol)\n"
+    ".decl allow_bool(user: symbol, perm: symbol, scope: symbol)\n"
+    "allow_bool(U, P, S) :-\n"
+    "    grant(U, P),\n"
+    "    principal_state(U, \"authenticated\"),\n"
+    "    session_state(S, ST),\n"
+    "    session_active(ST),\n"
+    "    perm_state(U, P, S, \"armed\").\n";
+
 struct count_state {
     uint32_t rows;
 };
@@ -68,6 +87,17 @@ struct count_state {
 struct delta_state {
     uint32_t inserts;
     uint32_t removes;
+};
+
+#define WL_DELTA_MAX_ROWS 64
+#define WL_DELTA_MAX_COLS 8
+
+struct delta_collector {
+    int count;
+    char relations[WL_DELTA_MAX_ROWS][32];
+    uint32_t ncols[WL_DELTA_MAX_ROWS];
+    int64_t rows[WL_DELTA_MAX_ROWS][WL_DELTA_MAX_COLS];
+    int32_t diffs[WL_DELTA_MAX_ROWS];
 };
 
 static void
@@ -93,6 +123,34 @@ count_deltas(const char *relation, const int64_t *row, uint32_t ncols,
         st->inserts++;
     else if (diff < 0)
         st->removes++;
+}
+
+static void
+collect_delta_rows(const char *relation, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *user_data)
+{
+    struct delta_collector *c = (struct delta_collector *)user_data;
+    if (c->count >= WL_DELTA_MAX_ROWS)
+        return;
+    int idx = c->count++;
+    strncpy(c->relations[idx], relation, sizeof(c->relations[idx]) - 1);
+    c->relations[idx][sizeof(c->relations[idx]) - 1] = '\0';
+    c->ncols[idx] = ncols;
+    c->diffs[idx] = diff;
+    for (uint32_t i = 0; i < ncols && i < WL_DELTA_MAX_COLS; i++)
+        c->rows[idx][i] = row[i];
+}
+
+static int
+count_allow_bool_added(const struct delta_collector *deltas, int from)
+{
+    int hits = 0;
+    for (int i = from; i < deltas->count; i++) {
+        if (strcmp(deltas->relations[i], "allow_bool") == 0
+            && deltas->diffs[i] == 1)
+            hits++;
+    }
+    return hits;
 }
 
 /* Per-relation tuple collector used by inline-compound parity tests
@@ -133,6 +191,27 @@ parse_or_die(const char *src, const char *what)
         return NULL;
     }
     return prog;
+}
+
+static int
+apply_standard_optimizer(wirelog_program_t *prog, const char *what)
+{
+    int rc = wl_fusion_apply(prog, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "%s: wl_fusion_apply failed rc=%d\n", what, rc);
+        return 0;
+    }
+    rc = wl_jpp_apply(prog, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "%s: wl_jpp_apply failed rc=%d\n", what, rc);
+        return 0;
+    }
+    rc = wl_sip_apply(prog, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "%s: wl_sip_apply failed rc=%d\n", what, rc);
+        return 0;
+    }
+    return 1;
 }
 
 static wirelog_error_t
@@ -1335,6 +1414,136 @@ out:
     return rc;
 }
 
+static int
+insert_sym_row(wirelog_session_t *s, wl_intern_t *intern,
+    const char *relation, const char *const *symbols, uint32_t ncols)
+{
+    if (ncols > WL_DELTA_MAX_COLS)
+        return 0;
+
+    int64_t row[WL_DELTA_MAX_COLS];
+    for (uint32_t i = 0; i < ncols; i++) {
+        row[i] = wl_intern_put(intern, symbols[i]);
+        if (row[i] < 0)
+            return 0;
+    }
+    return wirelog_session_insert(s, relation, row, 1, ncols) == WIRELOG_OK;
+}
+
+static bool
+drive_issue_665_partial_conjunction(wirelog_session_t *s, wl_intern_t *intern)
+{
+    struct delta_collector deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    if (wirelog_session_set_delta_cb(s, collect_delta_rows, &deltas)
+        != WIRELOG_OK)
+        return false;
+
+    const char *const grant[] = { "u", "p" };
+    if (!insert_sym_row(s, intern, "grant", grant, 2)
+        || wirelog_session_step(s) != WIRELOG_OK)
+        return false;
+    if (count_allow_bool_added(&deltas, 0) != 0)
+        return false;
+    int after_grant = deltas.count;
+
+    const char *const principal_state[] = { "u", "authenticated" };
+    if (!insert_sym_row(s, intern, "principal_state", principal_state, 2)
+        || wirelog_session_step(s) != WIRELOG_OK)
+        return false;
+    if (count_allow_bool_added(&deltas, after_grant) != 0)
+        return false;
+    int after_principal = deltas.count;
+
+    const char *const session_state[] = { "s", "st" };
+    if (!insert_sym_row(s, intern, "session_state", session_state, 2)
+        || wirelog_session_step(s) != WIRELOG_OK)
+        return false;
+    if (count_allow_bool_added(&deltas, after_principal) != 0)
+        return false;
+    int after_session = deltas.count;
+
+    const char *const session_active[] = { "st" };
+    if (!insert_sym_row(s, intern, "session_active", session_active, 1)
+        || wirelog_session_step(s) != WIRELOG_OK)
+        return false;
+    if (count_allow_bool_added(&deltas, after_session) != 0)
+        return false;
+    int after_active = deltas.count;
+
+    const char *const perm_state[] = { "u", "p", "s", "armed" };
+    if (!insert_sym_row(s, intern, "perm_state", perm_state, 4)
+        || wirelog_session_step(s) != WIRELOG_OK)
+        return false;
+    if (count_allow_bool_added(&deltas, after_active) != 1)
+        return false;
+
+    int64_t u = wl_intern_put(intern, "u");
+    int64_t p = wl_intern_put(intern, "p");
+    int64_t scope = wl_intern_put(intern, "s");
+    if (u < 0 || p < 0 || scope < 0)
+        return false;
+
+    bool matched = false;
+    for (int i = after_active; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "allow_bool") != 0
+            || deltas.diffs[i] != 1)
+            continue;
+        if (deltas.ncols[i] == 3 && deltas.rows[i][0] == u
+            && deltas.rows[i][1] == p && deltas.rows[i][2] == scope) {
+            matched = true;
+            break;
+        }
+    }
+    return matched;
+}
+
+static int
+run_issue_665_partial_conjunction(uint32_t num_workers, const char *what)
+{
+    wirelog_program_t *prog = parse_or_die(ISSUE_665_PROGRAM_SRC, what);
+    if (!prog)
+        return 1;
+
+    int rc = 0;
+    if (!apply_standard_optimizer(prog, what)) {
+        rc = 1;
+        goto out_prog;
+    }
+
+    wirelog_session_t *s = NULL;
+    wirelog_error_t err
+        = wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, num_workers,
+            &s);
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "%s create failed err=%d\n", what, err);
+        rc = 1;
+        goto out_prog;
+    }
+
+    wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+    if (!drive_issue_665_partial_conjunction(s, intern)) {
+        fprintf(stderr, "%s partial conjunction parity failed\n", what);
+        rc = 1;
+    }
+    wirelog_session_destroy(s);
+out_prog:
+    wirelog_program_free(prog);
+    return rc;
+}
+
+static int
+test_issue_665_partial_conjunction_default_workers(void)
+{
+    return run_issue_665_partial_conjunction(1, "issue 665 default workers");
+}
+
+static int
+test_issue_665_partial_conjunction_multi_worker(void)
+{
+    return run_issue_665_partial_conjunction(4, "issue 665 multi-worker");
+}
+
 int
 main(void)
 {
@@ -1366,6 +1575,8 @@ main(void)
     failures += test_cleanup_order_no_use_after_free();
     failures += test_intern_after_step_succeeds();
     failures += test_delta_cb_multi_round_recursive_insert();
+    failures += test_issue_665_partial_conjunction_default_workers();
+    failures += test_issue_665_partial_conjunction_multi_worker();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
     else

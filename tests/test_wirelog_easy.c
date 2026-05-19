@@ -1707,7 +1707,7 @@ drive_issue_665_partial_conjunction(wirelog_easy_session_t *s)
     return matched;
 }
 
-/* PARITY: deferred -- #665 partial-conjunction regression scenario relies on the easy-specific drive_issue_665_partial_conjunction helper; advanced-side port tracked separately (#785 follow-up). */
+/* PARITY: paired in test_wirelog_advanced.c by the same test name (#825). */
 static void
 test_issue_665_partial_conjunction_default_workers(void)
 {
@@ -1727,7 +1727,7 @@ test_issue_665_partial_conjunction_default_workers(void)
     PASS();
 }
 
-/* PARITY: deferred -- multi-worker opts-path variant of the #665 scenario; advanced exposes num_workers via constructor (test_num_workers_explicit_four), but the full #665 helper port is the v0.41+ follow-up above. */
+/* PARITY: paired in test_wirelog_advanced.c by the same test name (#825). */
 static void
 test_issue_665_partial_conjunction_multi_worker(void)
 {
