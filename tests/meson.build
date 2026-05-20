@@ -421,6 +421,12 @@ test('public_api_macro', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-public-api-macro.py'],
      suite: 'abi')
 
+# Issue #841: every installed public WIRELOG_API function declaration
+# must be present in the ABI dynamic-symbol allowlist.
+test('public_api_exports', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-public-api-exports.py'],
+     suite: 'abi')
+
 # Issue #785: cross-facade test parity.  Every test_* function in
 # tests/test_wirelog_easy.c must either pair with a same-named
 # function in tests/test_wirelog_advanced.c or carry a
@@ -3845,6 +3851,17 @@ test_wirelog_advanced_exe = executable(
 )
 
 test('wirelog_advanced', test_wirelog_advanced_exe)
+
+# Issue #841: umbrella public API symbols are real linkable/runtime
+# entry points, not only header declarations.
+test_wirelog_public_api_exe = executable(
+  'test_wirelog_public_api',
+  files('test_wirelog_public_api.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  link_with: wirelog_lib,
+)
+
+test('wirelog_public_api', test_wirelog_public_api_exe)
 
 # ============================================================================
 # Baseline .input Fixture Snapshot Tests (Issue #448)
