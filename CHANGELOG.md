@@ -20,6 +20,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Recursive aggregation conformance for columnar MIN/MAX** (#692):
+  REDUCE plan ops now carry aggregate expressions, so recursive
+  aggregates evaluate `min(l)` / `max(d + w)` instead of falling back to
+  a positional input column.  Recursive MIN/MAX IDBs are canonicalized
+  after sequential fixed-point convergence and TDD final merge so
+  dominated aggregate rows are removed from snapshots.  Adds
+  `recursive_agg_conformance` coverage for CC-min, SSSP-max, and
+  stratified COUNT at workers 1, 4, 8, and 16.
+
 ### Performance
 
 ### Security

@@ -6102,11 +6102,27 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
+    col_expr_compiled_t *agg_ce = NULL;
+    if (op->agg_expr.data && op->agg_expr.size > 0)
+        agg_ce = col_expr_compile(op->agg_expr.data, op->agg_expr.size);
+
     /* Sort by group key for group-by */
     /* (Simple O(n^2) implementation; sufficient for Phase 2A) */
     for (uint32_t r = 0; r < in->nrows; r++) {
         int64_t row_buf[COL_STACK_MAX]; col_rel_row_copy_out(in, r, row_buf);
         const int64_t *row = row_buf;
+        int64_t agg_val = (in->ncols > gc) ? row[gc] : 1;
+        if (op->agg_fn != WIRELOG_AGG_COUNT
+            && op->agg_expr.data && op->agg_expr.size > 0) {
+            if (agg_ce) {
+                int64_t val = 0;
+                if (col_eval_expr_compiled(agg_ce, row, in->ncols, &val) == 0)
+                    agg_val = val;
+            } else {
+                agg_val = col_eval_expr_i64(op->agg_expr.data,
+                        op->agg_expr.size, row, in->ncols, sess->intern);
+            }
+        }
 
         /* Check if this group key already exists in output */
         bool found = false;
@@ -6120,22 +6136,21 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             }
             if (match) {
                 /* Update aggregate */
-                int64_t val = (in->ncols > gc) ? row[gc] : 1;
                 int64_t cur = col_rel_get(out, o, gc);
                 switch (op->agg_fn) {
                 case WIRELOG_AGG_COUNT:
                     col_rel_set(out, o, gc, cur + 1);
                     break;
                 case WIRELOG_AGG_SUM:
-                    col_rel_set(out, o, gc, cur + val);
+                    col_rel_set(out, o, gc, cur + agg_val);
                     break;
                 case WIRELOG_AGG_MIN:
-                    if (val < cur)
-                        col_rel_set(out, o, gc, val);
+                    if (agg_val < cur)
+                        col_rel_set(out, o, gc, agg_val);
                     break;
                 case WIRELOG_AGG_MAX:
-                    if (val > cur)
-                        col_rel_set(out, o, gc, val);
+                    if (agg_val > cur)
+                        col_rel_set(out, o, gc, agg_val);
                     break;
                 default:
                     break;
@@ -6150,10 +6165,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     = op->group_by_indices ? op->group_by_indices[k] : k;
                 tmp[k] = row[gi < in->ncols ? gi : 0];
             }
-            int64_t init_val = (in->ncols > gc) ? row[gc] : 1;
-            tmp[gc] = (op->agg_fn == WIRELOG_AGG_COUNT) ? 1 : init_val;
+            tmp[gc] = (op->agg_fn == WIRELOG_AGG_COUNT) ? 1 : agg_val;
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
+                col_expr_compiled_free(agg_ce);
                 free(tmp);
                 col_rel_destroy(out);
                 if (e.owned)
@@ -6163,6 +6178,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
+    col_expr_compiled_free(agg_ce);
     free(tmp);
     if (e.owned)
         col_rel_destroy(in);
