@@ -1,7 +1,7 @@
 project(
   'wirelog',
   'c',
-  version: '0.40.99',
+  version: '0.41.0',
   license: 'LGPL-3.0-or-later',
   meson_version: '>=0.62.0',
   default_options: [
