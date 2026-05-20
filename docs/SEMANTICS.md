@@ -123,9 +123,9 @@ not assume symmetric coverage.
 - `CHANGELOG.md` — entry for #718.
 - `stable-release-plan.md` §3, §7 — public-surface and conformance plans.
 
-## Recursive aggregation residue (Status: Future)
+## Recursive aggregation residue (Status: Implemented for MIN/MAX)
 
-Tracked under #692.  Target: residue = 0 in Milestone v0.43.
+Tracked under #692.
 
 ### Definition
 
@@ -134,48 +134,28 @@ conformance tests in `tests/test_recursive_agg*.c` that prevent
 recursive aggregation programs (CC-min, SSSP-max, count-stratified)
 from producing semantically correct output at workers in {1, 4, 8, 16}.
 
-### Current state (as of v0.42)
+### Current state
 
-- **Conformance harness disabled**: `tests/test_recursive_agg.c`,
-  `tests/test_recursive_agg_cc_min.c`, and
-  `tests/test_recursive_agg_sssp_max.c` are disabled in
-  `tests/meson.build:184-198, 2190-2194`.  The harness depended on the
-  DD/Rust FFI backend, which has been removed.  No replacement fixtures
-  have been ported to the columnar backend.
-- **Columnar dispatch state** at `wirelog/columnar/eval.c:241-288`:
-  - `col_op_reduce` (`wirelog/columnar/ops.c:6090`) IS wired into the
-    recursive dispatch switch (`WL_PLAN_OP_REDUCE` case at
-    `eval.c:267-269`).  Conformance for recursive monotone aggregation
-    (MIN/MAX) cannot run today only because the harness in
-    `tests/test_recursive_agg*.c` is disabled.
-  - `col_op_reduce_weighted` (`wirelog/columnar/ops.c:6200`) is built
-    but NOT dispatched (no `WL_PLAN_OP_REDUCE_WEIGHTED:` case in the
-    switch).  Weighted reductions inside `iterate()` cannot execute.
-- **count-stratified scope asymmetry**: count-stratified aggregation
-  appears in the #692 issue body but is absent from the acceptance
-  criteria, and no test fixtures exist.
-
-### Path to residue = 0
-
-1. **Phase 2B prerequisite**: semi-naive Delta-R for non-aggregation
-   recursion (#735, #809, #810, #811) must land first.  Phase 2B covers
-   non-agg recursion; REDUCE-inside-iterate is a separate concern.
-2. **v0.43 work**: re-enable the conformance harness against the
-   columnar backend; add a `WL_PLAN_OP_REDUCE_WEIGHTED:` case to wire
-   `col_op_reduce_weighted` into the recursive dispatch switch; add
-   count-stratified fixtures.
-
-v0.42 narrowed exit criterion: "non-agg recursion residue = 0" via
-Phase 2B sub-issues (#809/#810/#811).  Recursive aggregation residue = 0
-carries to v0.43 under #692.
+- `WL_PLAN_OP_REDUCE` carries the aggregate expression into the exec
+  plan, so recursive aggregate rules such as `min(l)` and `max(d + w)`
+  aggregate the requested expression rather than the fallback column.
+- Recursive MIN/MAX IDB materialization is canonicalized after fixed-point
+  convergence in both sequential and TDD final-merge paths, removing
+  dominated rows from snapshots.
+- `tests/test_recursive_agg_conformance.c` covers CC-min, SSSP-max, and
+  stratified COUNT for workers in {1, 4, 8, 16}.
+- The old `tests/test_recursive_agg*.c` DD/Rust FFI harness remains
+  disabled because that backend was removed; the columnar conformance
+  harness is the active replacement.
+- `col_op_reduce_weighted` remains a weighted Z-set helper and is not part
+  of the #692 MIN/MAX recursive aggregate closure.
 
 ### References
 
 - Issue #692 — Blocker B5: Recursive aggregation residue = 0.
-- Phase 2B: #735, #809, #810, #811.
-- `wirelog/columnar/ops.c` — `col_op_reduce`, `col_op_reduce_weighted`.
-- `wirelog/columnar/eval.c:241-288` — recursive dispatch switch.
-- `tests/meson.build:184-198, 2190-2194` — disabled harness entries.
+- `wirelog/columnar/ops.c` — `col_op_reduce`.
+- `wirelog/columnar/eval.c` — recursive aggregate canonicalization.
+- `tests/test_recursive_agg_conformance.c` — active columnar harness.
 
 ---
 

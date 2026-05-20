@@ -353,6 +353,7 @@ typedef struct {
     wl_plan_expr_buffer_t filter_expr;
 
     wirelog_agg_fn_t agg_fn;
+    wl_plan_expr_buffer_t agg_expr;
     const uint32_t *group_by_indices;
     uint32_t group_by_count;
 

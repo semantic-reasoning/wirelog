@@ -971,6 +971,31 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
         op->group_by_indices
             = dup_indices(node->group_by_indices, node->group_by_count);
         op->group_by_count = node->group_by_count;
+        if (node->agg_expr) {
+            char **child_col_names = NULL;
+            uint32_t child_col_count = 0;
+            if (node->column_names && node->column_count > 0) {
+                child_col_count = node->column_count;
+                child_col_names = (char **)calloc(child_col_count,
+                        sizeof(char *));
+                if (!child_col_names)
+                    return -1;
+                for (uint32_t i = 0; i < child_col_count; i++)
+                    child_col_names[i] = dup_str(node->column_names[i]);
+            } else {
+                const wirelog_ir_node_t *child0
+                    = (node->child_count > 0) ? node->children[0] : NULL;
+                collect_output_columns(child0, &child_col_names,
+                    &child_col_count);
+            }
+            int agg_rc = serialize_expr_to_buffer_ctx(node->agg_expr,
+                    child_col_names, child_col_count, &op->agg_expr);
+            for (uint32_t c = 0; c < child_col_count; c++)
+                free(child_col_names[c]);
+            free((void *)child_col_names);
+            if (agg_rc != 0)
+                return -1;
+        }
         return 0;
     }
 
@@ -1121,6 +1146,7 @@ free_op(wl_plan_op_t *op)
     free((void *)op->project_indices);
     free(op->filter_expr.data);
     free(op->right_filter_expr.data);
+    free(op->agg_expr.data);
     free((void *)op->group_by_indices);
 
     if (op->map_exprs) {
@@ -1479,6 +1505,14 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
         memcpy(dst->right_filter_expr.data, src->right_filter_expr.data,
             src->right_filter_expr.size);
         dst->right_filter_expr.size = src->right_filter_expr.size;
+    }
+
+    if (src->agg_expr.data && src->agg_expr.size > 0) {
+        dst->agg_expr.data = (uint8_t *)malloc(src->agg_expr.size);
+        if (!dst->agg_expr.data)
+            return -1;
+        memcpy(dst->agg_expr.data, src->agg_expr.data, src->agg_expr.size);
+        dst->agg_expr.size = src->agg_expr.size;
     }
 
     if (src->map_exprs && src->map_expr_count > 0) {

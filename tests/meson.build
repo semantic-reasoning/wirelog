@@ -672,6 +672,24 @@ test_plan_gen_exe = executable(
 
 test('plan_gen', test_plan_gen_exe)
 
+test_recursive_agg_conformance_exe = executable(
+  'test_recursive_agg_conformance',
+  files('test_recursive_agg_conformance.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('recursive_agg_conformance', test_recursive_agg_conformance_exe,
+     suite: 'semantics')
+
 # ============================================================================
 # Plan Exchange Insertion Tests (Issue #319)
 # ============================================================================

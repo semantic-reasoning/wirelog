@@ -874,6 +874,32 @@ convert_expr(const wl_parser_ast_node_t *node)
     }
 }
 
+static void
+rewrite_expr_vars_to_columns(wl_ir_expr_t *expr, char **vars,
+    uint32_t var_count)
+{
+    if (!expr)
+        return;
+
+    if (expr->type == WL_IR_EXPR_VAR && expr->var_name) {
+        for (uint32_t i = 0; i < var_count; i++) {
+            if (vars[i] && strcmp(vars[i], expr->var_name) == 0) {
+                char col[32];
+                snprintf(col, sizeof(col), "col%u", i);
+                char *next = strdup_safe(col);
+                if (next) {
+                    free(expr->var_name);
+                    expr->var_name = next;
+                }
+                return;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < expr->child_count; i++)
+        rewrite_expr_vars_to_columns(expr->children[i], vars, var_count);
+}
+
 /* ---- Variable Name Tracking Helpers ---- */
 
 static void
@@ -899,37 +925,15 @@ merge_var_names(char **left, uint32_t left_count, char **right,
         return NULL;
     }
 
-    uint32_t count = 0;
-
     for (uint32_t i = 0; i < left_count; i++) {
-        if (!left[i])
-            continue;
-        bool dup = false;
-        for (uint32_t j = 0; j < count; j++) {
-            if (merged[j] && strcmp(merged[j], left[i]) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup)
-            merged[count++] = strdup_safe(left[i]);
+        merged[i] = left[i] ? strdup_safe(left[i]) : NULL;
     }
 
     for (uint32_t i = 0; i < right_count; i++) {
-        if (!right[i])
-            continue;
-        bool dup = false;
-        for (uint32_t j = 0; j < count; j++) {
-            if (merged[j] && strcmp(merged[j], right[i]) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup)
-            merged[count++] = strdup_safe(right[i]);
+        merged[left_count + i] = right[i] ? strdup_safe(right[i]) : NULL;
     }
 
-    *out_count = count;
+    *out_count = max_count;
     return merged;
 }
 
@@ -943,6 +947,15 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
     uint32_t key_count = 0;
     for (uint32_t i = 0; i < left_count; i++) {
         if (!left_vars[i])
+            continue;
+        bool seen_left = false;
+        for (uint32_t prev = 0; prev < i; prev++) {
+            if (left_vars[prev] && strcmp(left_vars[prev], left_vars[i]) == 0) {
+                seen_left = true;
+                break;
+            }
+        }
+        if (seen_left)
             continue;
         for (uint32_t j = 0; j < right_count; j++) {
             if (!right_vars[j])
@@ -966,6 +979,15 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
     uint32_t k = 0;
     for (uint32_t i = 0; i < left_count; i++) {
         if (!left_vars[i])
+            continue;
+        bool seen_left = false;
+        for (uint32_t prev = 0; prev < i; prev++) {
+            if (left_vars[prev] && strcmp(left_vars[prev], left_vars[i]) == 0) {
+                seen_left = true;
+                break;
+            }
+        }
+        if (seen_left)
             continue;
         for (uint32_t j = 0; j < right_count; j++) {
             if (!right_vars[j])
@@ -1881,6 +1903,20 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
 
             if (agg_node->child_count >= 1) {
                 root->agg_expr = convert_expr(agg_node->children[0]);
+                rewrite_expr_vars_to_columns(root->agg_expr, cur_vars,
+                    cur_vcount);
+            }
+
+            root->column_count = cur_vcount;
+            if (cur_vcount > 0) {
+                root->column_names
+                    = (char **)calloc(cur_vcount, sizeof(char *));
+                if (root->column_names) {
+                    for (uint32_t j = 0; j < cur_vcount; j++)
+                        root->column_names[j] = strdup_safe(cur_vars[j]);
+                } else {
+                    root->column_count = 0;
+                }
             }
 
             root->group_by_count = non_agg_count;

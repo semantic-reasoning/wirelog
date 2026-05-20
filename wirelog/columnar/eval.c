@@ -362,6 +362,115 @@ col_frontier_compute(const col_rel_t *rel);
 static int
 col_eval_nonrecursive_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
+static int
+col_canonicalize_recursive_aggregates(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess);
+
+static bool
+col_reduce_output_group_equal(const col_rel_t *rel, uint32_t a, uint32_t b,
+    uint32_t group_by_count)
+{
+    for (uint32_t c = 0; c < group_by_count; c++) {
+        if (col_rel_get(rel, a, c) != col_rel_get(rel, b, c))
+            return false;
+    }
+    return true;
+}
+
+static const wl_plan_op_t *
+col_relation_recursive_reduce_op(const wl_plan_relation_t *rp)
+{
+    const wl_plan_op_t *reduce_op = NULL;
+
+    for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+        const wl_plan_op_t *op = &rp->ops[oi];
+        if (op->op != WL_PLAN_OP_REDUCE)
+            continue;
+        if (op->agg_fn != WIRELOG_AGG_MIN && op->agg_fn != WIRELOG_AGG_MAX)
+            return NULL;
+        if (reduce_op
+            && (reduce_op->agg_fn != op->agg_fn
+            || reduce_op->group_by_count != op->group_by_count)) {
+            return NULL;
+        }
+        reduce_op = op;
+    }
+
+    return reduce_op;
+}
+
+static int
+col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
+    const wl_plan_op_t *reduce_op)
+{
+    if (!rel || !reduce_op || rel->nrows < 2)
+        return 0;
+
+    uint32_t gc = reduce_op->group_by_count;
+    if (rel->ncols <= gc)
+        return EINVAL;
+
+    uint32_t out = 0;
+    for (uint32_t row = 0; row < rel->nrows; row++) {
+        uint32_t found = UINT32_MAX;
+        for (uint32_t keep = 0; keep < out; keep++) {
+            if (col_reduce_output_group_equal(rel, keep, row, gc)) {
+                found = keep;
+                break;
+            }
+        }
+
+        if (found != UINT32_MAX) {
+            int64_t cur = col_rel_get(rel, found, gc);
+            int64_t val = col_rel_get(rel, row, gc);
+            bool better = (reduce_op->agg_fn == WIRELOG_AGG_MIN)
+                ? val < cur : val > cur;
+            if (better) {
+                col_rel_set(rel, found, gc, val);
+                if (rel->timestamps)
+                    rel->timestamps[found] = rel->timestamps[row];
+            }
+            continue;
+        }
+
+        if (out != row) {
+            for (uint32_t c = 0; c < rel->ncols; c++)
+                col_rel_set(rel, out, c, col_rel_get(rel, row, c));
+            if (rel->timestamps)
+                rel->timestamps[out] = rel->timestamps[row];
+        }
+        out++;
+    }
+
+    if (out != rel->nrows) {
+        rel->nrows = out;
+        rel->sorted_nrows = out;
+        rel->base_nrows = out;
+        rel->run_count = 0;
+        rel->dedup_count = 0;
+        memset(rel->run_ends, 0, sizeof(rel->run_ends));
+    }
+
+    return 0;
+}
+
+static int
+col_canonicalize_recursive_aggregates(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess)
+{
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const wl_plan_relation_t *rp = &sp->relations[ri];
+        const wl_plan_op_t *reduce_op = col_relation_recursive_reduce_op(rp);
+        if (!reduce_op)
+            continue;
+        col_rel_t *rel = session_find_rel(sess, rp->name);
+        int rc = col_canonicalize_recursive_aggregate_relation(rel, reduce_op);
+        if (rc != 0)
+            return rc;
+        col_session_invalidate_arrangements(&sess->base, rp->name);
+    }
+    return 0;
+}
 
 /*
  * col_eval_stratum:
@@ -1006,6 +1115,17 @@ stride_error:
                 sess->worker_id, stratum_idx, sess->outer_epoch,
                 strat_frontier.iteration);
         }
+    }
+
+    int agg_rc = col_canonicalize_recursive_aggregates(sp, sess);
+    if (agg_rc != 0) {
+        for (uint32_t ri = 0; ri < nrels; ri++) {
+            if (delta_rels[ri])
+                col_rel_destroy(delta_rels[ri]);
+        }
+        free(snap);
+        free(delta_rels);
+        return agg_rc;
     }
 
     /* Cleanup all delta relations after frontier has been computed */
@@ -7215,6 +7335,7 @@ done:
                 if (r && r->nrows > 1)
                     tdd_dedup_rel(r);
             }
+            rc = col_canonicalize_recursive_aggregates(sp, coord);
             coord->tdd_final_merge_ns += now_ns() - merge_t0;
         } else {
             /* Non-BDX: Merge worker IDB into coordinator */
@@ -7230,6 +7351,7 @@ done:
                     if (r && r->nrows > 1)
                         tdd_dedup_rel(r);
                 }
+                rc = col_canonicalize_recursive_aggregates(sp, coord);
             }
             coord->tdd_final_merge_ns += now_ns() - merge_t0;
         }
