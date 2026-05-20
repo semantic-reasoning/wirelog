@@ -1,6 +1,9 @@
 wirelog_agg_fn_str
 wirelog_arith_op_str
 wirelog_cmp_op_str
+wirelog_config_embedded
+wirelog_config_ipc
+wirelog_config_threads
 wirelog_easy_banner
 wirelog_easy_close
 wirelog_easy_insert
@@ -15,6 +18,10 @@ wirelog_easy_remove_sym
 wirelog_easy_set_delta_cb
 wirelog_easy_snapshot
 wirelog_easy_step
+wirelog_error_string
+wirelog_evaluate
+wirelog_executor_create
+wirelog_executor_free
 wirelog_io_ctx_col_type
 wirelog_io_ctx_intern_string
 wirelog_io_ctx_num_cols
@@ -32,6 +39,17 @@ wirelog_ir_node_get_relation_name
 wirelog_ir_node_get_type
 wirelog_ir_node_print
 wirelog_ir_node_to_string
+wirelog_load_all_facts
+wirelog_load_facts_from_csv
+wirelog_load_input_files
+wirelog_optimize
+wirelog_optimize_apply_pass
+wirelog_optimize_with_config
+wirelog_optimizer_cost_estimate
+wirelog_optimizer_debug
+wirelog_optimizer_debug_print
+wirelog_optimizer_get_default_config
+wirelog_optimizer_get_stats
 wirelog_parse
 wirelog_parse_string
 wirelog_parse_with_error_info
@@ -43,6 +61,10 @@ wirelog_program_get_schema
 wirelog_program_get_stratum
 wirelog_program_get_stratum_count
 wirelog_program_is_stratified
+wirelog_result_free
+wirelog_result_get_relation
+wirelog_result_relation_cardinality
+wirelog_result_write_csv
 wirelog_session_create
 wirelog_session_destroy
 wirelog_session_insert
@@ -51,3 +73,4 @@ wirelog_session_remove
 wirelog_session_set_delta_cb
 wirelog_session_snapshot
 wirelog_session_step
+wirelog_version_string

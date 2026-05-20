@@ -100,6 +100,15 @@ struct wirelog_program {
     wl_magic_demand_t *demands;
     uint32_t demand_count;
     uint32_t demand_capacity;
+
+    /* Public optimizer facade stats (#841). */
+    bool optimizer_stats_valid;
+    uint32_t optimizer_original_node_count;
+    uint32_t optimizer_optimized_node_count;
+    uint32_t optimizer_passes_applied;
+    uint32_t optimizer_fusion_count;
+    uint32_t optimizer_join_reorders;
+    double optimizer_time_ms;
 };
 
 /* ======================================================================== */

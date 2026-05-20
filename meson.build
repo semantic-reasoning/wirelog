@@ -287,6 +287,7 @@ wirelog_sources += wirelog_io_src
 wirelog_sources += wirelog_string_ops_src
 wirelog_sources += wirelog_wl_easy_src
 wirelog_sources += wirelog_advanced_src
+wirelog_sources += wirelog_api_facade_src
 wirelog_sources += wirelog_util_log_src
 
 #Public headers
