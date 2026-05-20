@@ -518,7 +518,7 @@ endif
 # Linux remains the hard v1.0 ABI gate.  These checks run on every
 # default `meson test` invocation but only emit GitHub warning
 # annotations when macOS/Windows export surfaces drift.
-if sh.found()
+if host_machine.system() == 'darwin' and sh.found()
   test('abi_symbols_macos', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols-macos.sh',
               meson.project_build_root()],
@@ -526,7 +526,7 @@ if sh.found()
 endif
 
 powershell = find_program('pwsh', 'powershell', required: false)
-if powershell.found()
+if host_machine.system() == 'windows' and powershell.found()
   test('abi_symbols_windows', powershell,
        args: ['-NoProfile',
               '-ExecutionPolicy', 'Bypass',
