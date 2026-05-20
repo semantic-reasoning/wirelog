@@ -196,29 +196,33 @@ wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
     uint32_t *num_cols);
 
 /**
- * Load all inline facts from the program into a DD worker.
+ * Load all inline facts from the program into a batch executor.
  *
  * Iterates over all relations with inline facts (fact_count > 0) and
- * loads each batch into the DD execution engine via the project's
- * internal EDB-load helper.  This bridges the parser's fact storage
- * with the DD execution engine.
+ * loads each batch into the batch executor created by
+ * wirelog_executor_create().  The @worker parameter is retained as
+ * void* for ABI compatibility with the legacy DD-era declaration; new
+ * callers must pass a wirelog_executor_t*.  Other public handles,
+ * including wirelog_session_t*, are rejected.
  *
  * @param prog    Compiled program with inline facts
- * @param worker  DD worker handle to load facts into
+ * @param worker  wirelog_executor_t* to load facts into
  * @return 0 on success, -1 on error (NULL args or EDB load failure)
  */
 WIRELOG_API int
 wirelog_load_all_facts(const wirelog_program_t *prog, void *worker);
 
 /**
- * Load CSV files for all relations with .input directives.
+ * Load CSV files for all relations with .input directives into a batch executor.
  *
  * Iterates over all relations with has_input=true, reads the "filename"
  * and "delimiter" parameters, parses the CSV file, and loads the data
- * into the DD worker via the project's internal EDB-load helper.
+ * into the batch executor created by wirelog_executor_create().  The
+ * @worker parameter is retained as void* for ABI compatibility with the
+ * legacy DD-era declaration; new callers must pass a wirelog_executor_t*.
  *
  * @param prog    Compiled program with .input directives
- * @param worker  DD worker handle to load facts into
+ * @param worker  wirelog_executor_t* to load facts into
  * @return 0 on success, -1 on error (NULL args, missing file, parse error)
  */
 WIRELOG_API int
@@ -238,6 +242,14 @@ wirelog_optimizer_debug(const wirelog_program_t *program);
 /* Executor API                                                             */
 /* ======================================================================== */
 
+/**
+ * Create a batch executor for a parsed program.
+ *
+ * The executor BORROWS @program; callers must keep the program alive
+ * until after wirelog_executor_free().  The executor owns its execution
+ * plan and backend session, and eagerly seeds inline facts and .input
+ * directive files before returning.
+ */
 WIRELOG_API wirelog_executor_t *
 wirelog_executor_create(wirelog_program_t *program, wirelog_error_t *error);
 

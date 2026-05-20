@@ -133,6 +133,12 @@ wirelog_wl_easy_src = files('wirelog-easy.c', )
 wirelog_advanced_src = files('wirelog_advanced.c', )
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Umbrella API Facade (Issue #841)
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+
+wirelog_api_facade_src = files('api_facade.c', )
+
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #Version header generation (Issue #688 / #704)
 #configure_file() runs in this subdir so the generated header lands at
 #build/wirelog/wirelog-version.h, matching the canonical include path
