@@ -71,13 +71,13 @@ typedef enum {
     WIRELOG_ARITH_HASH,      /* hash - xxHash3 64-bit (unary) */
     WIRELOG_ARITH_CRC32_ETH, /* crc32_ethernet() - CRC-32 Ethernet/ISO (unary) */
     WIRELOG_ARITH_CRC32_CAST, /* crc32_castagnoli() - CRC-32C iSCSI (unary) */
-    WIRELOG_ARITH_MD5,        /* md5() - MD5 hex digest (unary, mbedTLS) */
-    WIRELOG_ARITH_SHA1,       /* sha1() - SHA-1 hex digest (unary, mbedTLS) */
-    WIRELOG_ARITH_SHA256, /* sha256() - SHA-256 hex digest (unary, mbedTLS) */
-    WIRELOG_ARITH_SHA512, /* sha512() - SHA-512 hex digest (unary, mbedTLS) */
-    WIRELOG_ARITH_HMAC_SHA256, /* hmac_sha256(msg, key) - HMAC-SHA-256 hex digest (binary, mbedTLS) */
-    WIRELOG_ARITH_UUID4, /* uuid4() - random UUID v4 (mbedTLS CTR-DRBG) */
-    WIRELOG_ARITH_UUID5, /* uuid5(ns, name) - SHA-1 name-based UUID v5 (mbedTLS) */
+    WIRELOG_ARITH_MD5,        /* md5() - MD5 digest folded to int64 (unary, mbedTLS) */
+    WIRELOG_ARITH_SHA1,       /* sha1() - SHA-1 digest folded to int64 (unary, mbedTLS) */
+    WIRELOG_ARITH_SHA256, /* sha256() - SHA-256 digest folded to int64 (unary, mbedTLS) */
+    WIRELOG_ARITH_SHA512, /* sha512() - SHA-512 digest folded to int64 (unary, mbedTLS) */
+    WIRELOG_ARITH_HMAC_SHA256, /* hmac_sha256(msg, key) - HMAC-SHA-256 folded to int64 (binary, mbedTLS) */
+    WIRELOG_ARITH_UUID4, /* uuid4() - random UUID v4 prefix as int64 (mbedTLS) */
+    WIRELOG_ARITH_UUID5, /* uuid5(ns, name) - name-based UUID v5 prefix as int64 (mbedTLS) */
 } wirelog_arith_op_t;
 
 /* ======================================================================== */

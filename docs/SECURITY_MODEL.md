@@ -59,11 +59,20 @@ advertises mbedTLS support.
 ## 3. mbedTLS-enabled build
 
 When the build is configured with `-DmbedTLS=enabled` (or
-`-DmbedTLS=auto` and the system mbedTLS is detected), wirelog adds:
+`-DmbedTLS=auto` and a system PSA Crypto provider is detected),
+wirelog exposes the following mbedTLS-backed Datalog built-ins:
 
-- Cryptographic hash families: SHA-1, SHA-2 (224/256/384/512), SHA-3.
-- HMAC over the same hash families.
-- UUIDv4 generation backed by a CSPRNG.
+- Digest built-ins: `md5(x)`, `sha1(x)`, `sha256(x)`, `sha512(x)`.
+- HMAC built-in: `hmac_sha256(msg, key)`.
+- UUID built-ins: `uuid4()`, `uuid5(namespace, name)`.
+
+wirelog does not currently expose broader digest-family or generic
+HMAC-family built-ins as callable Datalog functions.
+Digest and HMAC built-ins operate on `int64` Datalog values. They
+compute mbedTLS digest/HMAC bytes and fold those bytes with
+`XXH3_64bits()` into the single `int64` value stored by wirelog;
+they do not return hex strings or byte arrays. `uuid4()` and
+`uuid5(namespace, name)` return the first 8 UUID bytes as an `int64`.
 
 These functions become callable as Datalog built-ins; the host has no
 control over whether a `.dl` program calls them once mbedTLS is
