@@ -1990,10 +1990,11 @@ test('hash_integration', test_hash_integration_exe)
 # Cryptographic Hash Function Tests (Issue #73)
 # ============================================================================
 #
-# Tests for md5(), sha1(), sha256(), sha512(), hmac_sha256() built-in functions.
-# When mbedTLS is enabled (-DWL_MBEDTLS_ENABLED=1), runs known-vector and
-# integration tests.  When disabled, runs error-path tests verifying that
-# each function fails gracefully at runtime.
+# Tests for md5(), sha1(), sha256(), sha512(), hmac_sha256(), uuid4(), and
+# uuid5() built-in functions.  When mbedTLS is enabled
+# (-DWL_MBEDTLS_ENABLED=1), runs determinism, sensitivity, UUID, and
+# integration tests.  When disabled, runs fallback tests verifying that each
+# function fails gracefully at runtime.
 
 test_cryptographic_hashes_exe = executable(
   'test_cryptographic_hashes',
@@ -2010,7 +2011,7 @@ test_cryptographic_hashes_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
-test('cryptographic_hashes', test_cryptographic_hashes_exe)
+test('cryptographic_hashes', test_cryptographic_hashes_exe, suite: 'crypto')
 
 # ============================================================================
 # CRC-32 Tests (Issue #145)

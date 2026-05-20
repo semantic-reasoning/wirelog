@@ -5,19 +5,19 @@
  * Licensed under LGPL-3.0
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
- * Unit tests for md5(), sha1(), sha256(), sha512(), hmac_sha256() functions.
+ * Unit tests for md5(), sha1(), sha256(), sha512(), hmac_sha256(), uuid4(),
+ * and uuid5() functions.
  *
  * These functions operate on int64_t inputs: the raw 8 bytes of the integer
  * are passed through the respective mbedTLS hash algorithm, and the digest
  * is then folded via XXH3_64bits() to produce a deterministic int64_t result.
  *
  * Actual behavior per function:
- *   md5(), sha1(), hmac_sha256(): parse OK, plan OK.
- *     - mbedTLS enabled:  evaluate correctly, produce deterministic int64_t.
+ *   md5(), sha1(), sha256(), sha512(), hmac_sha256(), uuid4(), uuid5():
+ *     parse OK, plan OK.
+ *     - mbedTLS enabled:  evaluate correctly and produce int64_t results.
  *     - mbedTLS disabled: evaluator hits error path (goto bad), snapshot
  *       still succeeds (rc=0) but tuple value is 0 (fallback).
- *   sha256(), sha512(): tokens exist in lexer but parser does not yet handle
- *     them; wirelog_parse_string() fails for programs using them (returns -1).
  *
  * Compilation guards:
  *   WL_MBEDTLS_ENABLED defined:   full determinism and integration tests.
@@ -47,24 +47,24 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                        \
-    do {                                  \
-        tests_run++;                      \
-        printf("  [TEST] %-60s", (name)); \
-        fflush(stdout);                   \
-    } while (0)
+        do {                                  \
+            tests_run++;                      \
+            printf("  [TEST] %-60s", (name)); \
+            fflush(stdout);                   \
+        } while (0)
 
 #define PASS()             \
-    do {                   \
-        tests_passed++;    \
-        printf(" PASS\n"); \
-    } while (0)
+        do {                   \
+            tests_passed++;    \
+            printf(" PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                     \
-    do {                              \
-        tests_failed++;               \
-        printf(" FAIL: %s\n", (msg)); \
-        return;                       \
-    } while (0)
+        do {                              \
+            tests_failed++;               \
+            printf(" FAIL: %s\n", (msg)); \
+            return;                       \
+        } while (0)
 
 /* ======================================================================== */
 /* Result Capture                                                           */
@@ -80,7 +80,7 @@ struct result_ctx {
 
 static void
 capture_cb(const char *relation, const int64_t *row, uint32_t ncols,
-           void *user_data)
+    void *user_data)
 {
     struct result_ctx *ctx = (struct result_ctx *)user_data;
     (void)relation;
@@ -156,9 +156,9 @@ test_sha256_determinism(void)
     TEST("sha256(): two evaluations of sha256(0) produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha256(x)) :- a(x).\n";
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(sha256(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     int rc1 = run_program_full(src, &ctx1);
@@ -172,14 +172,14 @@ test_sha256_determinism(void)
     if (ctx1.count != 1 || ctx2.count != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 1 tuple each run, got %u and %u",
-                 ctx1.count, ctx2.count);
+            ctx1.count, ctx2.count);
         FAIL(buf);
     }
     if (ctx1.col0[0] != ctx2.col0[0]) {
         char buf[128];
         snprintf(buf, sizeof(buf),
-                 "sha256(0) not deterministic: %" PRId64 " != %" PRId64,
-                 ctx1.col0[0], ctx2.col0[0]);
+            "sha256(0) not deterministic: %" PRId64 " != %" PRId64,
+            ctx1.col0[0], ctx2.col0[0]);
         FAIL(buf);
     }
     PASS();
@@ -191,9 +191,9 @@ test_sha512_determinism(void)
     TEST("sha512(): two evaluations of sha512(0) produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha512(x)) :- a(x).\n";
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(sha512(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     int rc1 = run_program_full(src, &ctx1);
@@ -207,14 +207,14 @@ test_sha512_determinism(void)
     if (ctx1.count != 1 || ctx2.count != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 1 tuple each run, got %u and %u",
-                 ctx1.count, ctx2.count);
+            ctx1.count, ctx2.count);
         FAIL(buf);
     }
     if (ctx1.col0[0] != ctx2.col0[0]) {
         char buf[128];
         snprintf(buf, sizeof(buf),
-                 "sha512(0) not deterministic: %" PRId64 " != %" PRId64,
-                 ctx1.col0[0], ctx2.col0[0]);
+            "sha512(0) not deterministic: %" PRId64 " != %" PRId64,
+            ctx1.col0[0], ctx2.col0[0]);
         FAIL(buf);
     }
     PASS();
@@ -230,15 +230,23 @@ test_sha512_determinism(void)
 /* and verify distinctness by running with multiple distinct inputs.        */
 /* ======================================================================== */
 
+static unsigned
+uuid_returned_prefix_version(int64_t value)
+{
+    unsigned char bytes[8];
+    memcpy(bytes, &value, sizeof(bytes));
+    return (unsigned)(bytes[6] >> 4);
+}
+
 static void
 test_md5_determinism_zero(void)
 {
     TEST("md5(0): two evaluations produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(md5(x)) :- a(x).\n";
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(md5(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     int rc1 = run_program_full(src, &ctx1);
@@ -255,8 +263,8 @@ test_md5_determinism_zero(void)
     if (ctx1.col0[0] != ctx2.col0[0]) {
         char buf[128];
         snprintf(buf, sizeof(buf),
-                 "md5(0) not deterministic: %" PRId64 " != %" PRId64,
-                 ctx1.col0[0], ctx2.col0[0]);
+            "md5(0) not deterministic: %" PRId64 " != %" PRId64,
+            ctx1.col0[0], ctx2.col0[0]);
         FAIL(buf);
     }
     PASS();
@@ -268,9 +276,9 @@ test_md5_determinism_one(void)
     TEST("md5(1): two evaluations produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(1).\n"
-                      ".decl r(z: int64)\n"
-                      "r(md5(x)) :- a(x).\n";
+        "a(1).\n"
+        ".decl r(z: int64)\n"
+        "r(md5(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -294,9 +302,9 @@ test_md5_determinism_fortytwo(void)
     TEST("md5(42): two evaluations produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(42).\n"
-                      ".decl r(z: int64)\n"
-                      "r(md5(x)) :- a(x).\n";
+        "a(42).\n"
+        ".decl r(z: int64)\n"
+        "r(md5(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -320,9 +328,9 @@ test_md5_distinct_inputs_distinct_outputs(void)
     TEST("md5: distinct inputs (0, 1, 42) produce distinct outputs");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0). a(1). a(42).\n"
-                      ".decl r(z: int64)\n"
-                      "r(md5(x)) :- a(x).\n";
+        "a(0). a(1). a(42).\n"
+        ".decl r(z: int64)\n"
+        "r(md5(x)) :- a(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -346,9 +354,9 @@ test_md5_idempotent(void)
     TEST("md5: md5(x) = md5(x) filter passes for same variable");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(ok: int64)\n"
-                      "r(1) :- a(x), md5(x) = md5(x).\n";
+        "a(0).\n"
+        ".decl r(ok: int64)\n"
+        "r(1) :- a(x), md5(x) = md5(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -366,9 +374,9 @@ test_sha1_determinism_zero(void)
     TEST("sha1(0): two evaluations produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha1(x)) :- a(x).\n";
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(sha1(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -392,9 +400,9 @@ test_sha1_determinism_one(void)
     TEST("sha1(1): two evaluations produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(1).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha1(x)) :- a(x).\n";
+        "a(1).\n"
+        ".decl r(z: int64)\n"
+        "r(sha1(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -418,9 +426,9 @@ test_sha1_determinism_fortytwo(void)
     TEST("sha1(42): two evaluations produce the same result");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(42).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha1(x)) :- a(x).\n";
+        "a(42).\n"
+        ".decl r(z: int64)\n"
+        "r(sha1(x)) :- a(x).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -444,9 +452,9 @@ test_sha1_distinct_inputs_distinct_outputs(void)
     TEST("sha1: distinct inputs (0, 1, 42) produce distinct outputs");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0). a(1). a(42).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha1(x)) :- a(x).\n";
+        "a(0). a(1). a(42).\n"
+        ".decl r(z: int64)\n"
+        "r(sha1(x)) :- a(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -470,9 +478,9 @@ test_sha1_idempotent(void)
     TEST("sha1: sha1(x) = sha1(x) filter passes for same variable");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(1).\n"
-                      ".decl r(ok: int64)\n"
-                      "r(1) :- a(x), sha1(x) = sha1(x).\n";
+        "a(1).\n"
+        ".decl r(ok: int64)\n"
+        "r(1) :- a(x), sha1(x) = sha1(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -480,6 +488,70 @@ test_sha1_idempotent(void)
     }
     if (ctx.count != 1 || ctx.col0[0] != 1) {
         FAIL("sha1(x) = sha1(x) filter should always pass");
+    }
+    PASS();
+}
+
+static void
+test_sha256_enabled_nonzero_distinct(void)
+{
+    TEST("sha256: enabled path returns non-zero distinct values");
+
+    const char *src = ".decl a(x: int64)\n"
+        "a(0). a(1). a(42).\n"
+        ".decl r(z: int64)\n"
+        "r(sha256(x)) :- a(x).\n";
+
+    struct result_ctx ctx;
+    if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
+        FAIL("evaluation failed");
+    }
+    if (ctx.count != 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 3 tuples, got %u", ctx.count);
+        FAIL(buf);
+    }
+    for (uint32_t i = 0; i < ctx.count; i++) {
+        if (ctx.col0[i] == 0) {
+            FAIL("sha256 produced 0: likely evaluator error path");
+        }
+        for (uint32_t j = i + 1; j < ctx.count; j++) {
+            if (ctx.col0[i] == ctx.col0[j]) {
+                FAIL("sha256 collision: distinct inputs produced same output");
+            }
+        }
+    }
+    PASS();
+}
+
+static void
+test_sha512_enabled_nonzero_distinct(void)
+{
+    TEST("sha512: enabled path returns non-zero distinct values");
+
+    const char *src = ".decl a(x: int64)\n"
+        "a(0). a(1). a(42).\n"
+        ".decl r(z: int64)\n"
+        "r(sha512(x)) :- a(x).\n";
+
+    struct result_ctx ctx;
+    if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
+        FAIL("evaluation failed");
+    }
+    if (ctx.count != 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 3 tuples, got %u", ctx.count);
+        FAIL(buf);
+    }
+    for (uint32_t i = 0; i < ctx.count; i++) {
+        if (ctx.col0[i] == 0) {
+            FAIL("sha512 produced 0: likely evaluator error path");
+        }
+        for (uint32_t j = i + 1; j < ctx.count; j++) {
+            if (ctx.col0[i] == ctx.col0[j]) {
+                FAIL("sha512 collision: distinct inputs produced same output");
+            }
+        }
     }
     PASS();
 }
@@ -494,9 +566,9 @@ test_hmac_sha256_determinism_msg0_key1(void)
     TEST("hmac_sha256(0, 1): two evaluations produce the same result");
 
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(0, 1).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(0, 1).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -520,9 +592,9 @@ test_hmac_sha256_determinism_msg1_key42(void)
     TEST("hmac_sha256(1, 42): two evaluations produce the same result");
 
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(1, 42).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(1, 42).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -546,9 +618,9 @@ test_hmac_sha256_determinism_msg42_key0(void)
     TEST("hmac_sha256(42, 0): two evaluations produce the same result");
 
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(42, 0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(42, 0).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
 
     struct result_ctx ctx1, ctx2;
     if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
@@ -572,9 +644,9 @@ test_hmac_sha256_key_sensitivity(void)
     TEST("hmac_sha256: different keys produce different outputs for same msg");
 
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(0, 1). a(0, 2).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(0, 1). a(0, 2).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -587,7 +659,7 @@ test_hmac_sha256_key_sensitivity(void)
     }
     if (ctx.col0[0] == ctx.col0[1]) {
         FAIL("hmac_sha256 key insensitive: same msg + different keys gave same "
-             "output");
+            "output");
     }
     PASS();
 }
@@ -598,9 +670,9 @@ test_hmac_sha256_msg_sensitivity(void)
     TEST("hmac_sha256: different msgs produce different outputs for same key");
 
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(0, 99). a(1, 99).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(0, 99). a(1, 99).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -613,7 +685,7 @@ test_hmac_sha256_msg_sensitivity(void)
     }
     if (ctx.col0[0] == ctx.col0[1]) {
         FAIL("hmac_sha256 msg insensitive: different msgs + same key gave same "
-             "output");
+            "output");
     }
     PASS();
 }
@@ -624,9 +696,9 @@ test_hmac_sha256_asymmetric(void)
     TEST("hmac_sha256(msg, key) != hmac_sha256(key, msg) in general");
 
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(0, 42). a(42, 0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(0, 42). a(42, 0).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -643,6 +715,108 @@ test_hmac_sha256_asymmetric(void)
     PASS();
 }
 
+static void
+test_uuid4_enabled_random_version_prefix(void)
+{
+    TEST("uuid4(): enabled path returns non-zero v4 UUID prefixes");
+
+    const char *src = ".decl a(x: int64)\n"
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(uuid4()) :- a(x).\n";
+
+    int64_t values[4];
+    for (uint32_t i = 0; i < 4; i++) {
+        struct result_ctx ctx;
+        if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
+            FAIL("evaluation failed");
+        }
+        if (ctx.count != 1) {
+            FAIL("expected 1 tuple");
+        }
+        if (ctx.col0[0] == 0) {
+            FAIL("uuid4 produced 0: likely evaluator error path");
+        }
+        if (uuid_returned_prefix_version(ctx.col0[0]) != 4) {
+            FAIL("uuid4 returned prefix does not carry version nibble 4");
+        }
+        values[i] = ctx.col0[0];
+    }
+
+    if (values[0] == values[1] && values[0] == values[2]
+        && values[0] == values[3]) {
+        FAIL("uuid4 produced the same prefix across four evaluations");
+    }
+    PASS();
+}
+
+static void
+test_uuid5_enabled_deterministic_version_prefix(void)
+{
+    TEST("uuid5(ns, name): same inputs are deterministic v5 prefixes");
+
+    const char *src = ".decl a(ns: int64, name: int64)\n"
+        "a(1234, 5678).\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(ns, name)) :- a(ns, name).\n";
+
+    struct result_ctx ctx1, ctx2;
+    if (run_program_full(src, &ctx1) != 0 || ctx1.snapshot_rc != 0) {
+        FAIL("first evaluation failed");
+    }
+    if (run_program_full(src, &ctx2) != 0 || ctx2.snapshot_rc != 0) {
+        FAIL("second evaluation failed");
+    }
+    if (ctx1.count != 1 || ctx2.count != 1) {
+        FAIL("expected 1 tuple each run");
+    }
+    if (ctx1.col0[0] == 0) {
+        FAIL("uuid5 produced 0: likely evaluator error path");
+    }
+    if (ctx1.col0[0] != ctx2.col0[0]) {
+        FAIL("uuid5 was not deterministic for identical namespace/name");
+    }
+    if (uuid_returned_prefix_version(ctx1.col0[0]) != 5) {
+        FAIL("uuid5 returned prefix does not carry version nibble 5");
+    }
+    PASS();
+}
+
+static void
+test_uuid5_enabled_namespace_name_sensitivity(void)
+{
+    TEST("uuid5(ns, name): namespace and name change output");
+
+    const char *src = ".decl a(ns: int64, name: int64)\n"
+        "a(1234, 5678). a(1234, 5679). a(1235, 5678).\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(ns, name)) :- a(ns, name).\n";
+
+    struct result_ctx ctx;
+    if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
+        FAIL("evaluation failed");
+    }
+    if (ctx.count != 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 3 tuples, got %u", ctx.count);
+        FAIL(buf);
+    }
+    for (uint32_t i = 0; i < ctx.count; i++) {
+        if (ctx.col0[i] == 0) {
+            FAIL("uuid5 produced 0: likely evaluator error path");
+        }
+        if (uuid_returned_prefix_version(ctx.col0[i]) != 5) {
+            FAIL("uuid5 returned prefix does not carry version nibble 5");
+        }
+        for (uint32_t j = i + 1; j < ctx.count; j++) {
+            if (ctx.col0[i] == ctx.col0[j]) {
+                FAIL("uuid5 collision across changed namespace/name inputs");
+            }
+        }
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* Edge-case tests (mbedTLS enabled)                                       */
 /* ======================================================================== */
@@ -653,9 +827,9 @@ test_md5_edge_zero_input(void)
     TEST("md5(0): zero integer input produces a non-zero hash value");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(md5(x)) :- a(x).\n";
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(md5(x)) :- a(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -678,9 +852,9 @@ test_sha1_edge_negative_input(void)
     TEST("sha1(-1): negative integer input produces a non-zero hash value");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(-1).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha1(x)) :- a(x).\n";
+        "a(-1).\n"
+        ".decl r(z: int64)\n"
+        "r(sha1(x)) :- a(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -701,9 +875,9 @@ test_md5_edge_max_int64(void)
     TEST("md5(9223372036854775807): max int64 input hashes without error");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(9223372036854775807).\n"
-                      ".decl r(z: int64)\n"
-                      "r(md5(x)) :- a(x).\n";
+        "a(9223372036854775807).\n"
+        ".decl r(z: int64)\n"
+        "r(md5(x)) :- a(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -722,9 +896,9 @@ test_sha1_edge_min_int64(void)
     TEST("sha1(-9223372036854775808): min int64 input hashes without error");
 
     const char *src = ".decl a(x: int64)\n"
-                      "a(-9223372036854775808).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha1(x)) :- a(x).\n";
+        "a(-9223372036854775808).\n"
+        ".decl r(z: int64)\n"
+        "r(sha1(x)) :- a(x).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -742,9 +916,9 @@ test_hmac_sha256_edge_zero_key(void)
     TEST("hmac_sha256(42, 0): zero key produces a non-zero hash value");
 
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(42, 0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(42, 0).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -767,12 +941,12 @@ static void
 test_integration_md5_datalog_rule(void)
 {
     TEST("Integration: md5(id) in Datalog rule produces 5 distinct "
-         "fingerprints");
+        "fingerprints");
 
     const char *src = ".decl item(id: int64)\n"
-                      "item(0). item(1). item(2). item(3). item(4).\n"
-                      ".decl fingerprint(fp: int64)\n"
-                      "fingerprint(md5(id)) :- item(id).\n";
+        "item(0). item(1). item(2). item(3). item(4).\n"
+        ".decl fingerprint(fp: int64)\n"
+        "fingerprint(md5(id)) :- item(id).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -781,7 +955,7 @@ test_integration_md5_datalog_rule(void)
     if (ctx.count != 5) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 5 distinct tuples, got %u",
-                 ctx.count);
+            ctx.count);
         FAIL(buf);
     }
     for (uint32_t i = 0; i < ctx.count; i++) {
@@ -800,9 +974,9 @@ test_integration_sha1_datalog_filter(void)
     TEST("Integration: sha1(x) = sha1(y) filter passes only when x == y");
 
     const char *src = ".decl pair(x: int64, y: int64)\n"
-                      "pair(1, 1). pair(1, 2).\n"
-                      ".decl match(x: int64)\n"
-                      "match(x) :- pair(x, y), sha1(x) = sha1(y).\n";
+        "pair(1, 1). pair(1, 2).\n"
+        ".decl match(x: int64)\n"
+        "match(x) :- pair(x, y), sha1(x) = sha1(y).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -811,13 +985,13 @@ test_integration_sha1_datalog_filter(void)
     if (ctx.count != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf),
-                 "expected 1 match tuple (x=y case only), got %u", ctx.count);
+            "expected 1 match tuple (x=y case only), got %u", ctx.count);
         FAIL(buf);
     }
     if (ctx.col0[0] != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected x=1 in result, got %" PRId64,
-                 ctx.col0[0]);
+            ctx.col0[0]);
         FAIL(buf);
     }
     PASS();
@@ -829,9 +1003,9 @@ test_integration_hmac_sha256_datalog_rule(void)
     TEST("Integration: hmac_sha256(msg, key) produces 3 distinct auth tokens");
 
     const char *src = ".decl auth(msg: int64, key: int64)\n"
-                      "auth(0, 100). auth(1, 100). auth(2, 100).\n"
-                      ".decl token(t: int64)\n"
-                      "token(hmac_sha256(msg, key)) :- auth(msg, key).\n";
+        "auth(0, 100). auth(1, 100). auth(2, 100).\n"
+        ".decl token(t: int64)\n"
+        "token(hmac_sha256(msg, key)) :- auth(msg, key).\n";
 
     struct result_ctx ctx;
     if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
@@ -840,7 +1014,7 @@ test_integration_hmac_sha256_datalog_rule(void)
     if (ctx.count != 3) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 3 distinct HMAC tokens, got %u",
-                 ctx.count);
+            ctx.count);
         FAIL(buf);
     }
     for (uint32_t i = 0; i < ctx.count; i++) {
@@ -858,32 +1032,25 @@ test_integration_hmac_sha256_datalog_rule(void)
 /* ======================================================================== */
 /* mbedTLS-disabled: runtime behavior tests                                */
 /*                                                                          */
-/* md5(), sha1(), hmac_sha256() parse and plan successfully but hit the     */
-/* evaluator error path (goto bad) at runtime.  The snapshot still returns  */
-/* 0 (success) and emits 1 tuple, but the tuple value is 0 (fallback).     */
+/* Crypto built-ins parse and plan successfully but hit the evaluator error */
+/* path (goto bad) at runtime. The snapshot still returns 0 (success) and   */
+/* emits 1 tuple, but the tuple value is 0 (fallback).                      */
 /* ======================================================================== */
 
 static void
-test_md5_evaluates_with_zero_fallback_no_mbedtls(void)
+test_unavailable_builtin_zero_fallback(const char *name, const char *src)
 {
-    TEST("md5(): without mbedTLS snapshot succeeds, tuple value is 0 "
-         "(fallback)");
-
-    const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(md5(x)) :- a(x).\n";
+    TEST(name);
 
     struct result_ctx ctx;
     int rc = run_program_full(src, &ctx);
     if (rc != 0) {
         FAIL("expected parse/plan/session to succeed even without mbedTLS");
     }
-    /* snapshot succeeds (rc=0) with 1 tuple; tuple value is 0 (fallback) */
     if (ctx.snapshot_rc != 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "snapshot_rc=%d, expected 0",
-                 ctx.snapshot_rc);
+            ctx.snapshot_rc);
         FAIL(buf);
     }
     if (ctx.count != 1) {
@@ -894,85 +1061,95 @@ test_md5_evaluates_with_zero_fallback_no_mbedtls(void)
     if (ctx.col0[0] != 0) {
         char buf[128];
         snprintf(buf, sizeof(buf),
-                 "expected fallback value 0 without mbedTLS, got %" PRId64,
-                 ctx.col0[0]);
+            "expected fallback value 0 without mbedTLS, got %" PRId64,
+            ctx.col0[0]);
         FAIL(buf);
     }
     PASS();
+}
+
+static void
+test_md5_evaluates_with_zero_fallback_no_mbedtls(void)
+{
+    const char *src = ".decl a(x: int64)\n"
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(md5(x)) :- a(x).\n";
+    test_unavailable_builtin_zero_fallback(
+        "md5(): without mbedTLS snapshot succeeds, tuple value is 0",
+        src);
 }
 
 static void
 test_sha1_evaluates_with_zero_fallback_no_mbedtls(void)
 {
-    TEST("sha1(): without mbedTLS snapshot succeeds, tuple value is 0 "
-         "(fallback)");
-
     const char *src = ".decl a(x: int64)\n"
-                      "a(0).\n"
-                      ".decl r(z: int64)\n"
-                      "r(sha1(x)) :- a(x).\n";
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(sha1(x)) :- a(x).\n";
+    test_unavailable_builtin_zero_fallback(
+        "sha1(): without mbedTLS snapshot succeeds, tuple value is 0",
+        src);
+}
 
-    struct result_ctx ctx;
-    int rc = run_program_full(src, &ctx);
-    if (rc != 0) {
-        FAIL("expected parse/plan/session to succeed even without mbedTLS");
-    }
-    if (ctx.snapshot_rc != 0) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "snapshot_rc=%d, expected 0",
-                 ctx.snapshot_rc);
-        FAIL(buf);
-    }
-    if (ctx.count != 1) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "expected 1 tuple, got %u", ctx.count);
-        FAIL(buf);
-    }
-    if (ctx.col0[0] != 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "expected fallback value 0 without mbedTLS, got %" PRId64,
-                 ctx.col0[0]);
-        FAIL(buf);
-    }
-    PASS();
+static void
+test_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
+{
+    const char *src = ".decl a(x: int64)\n"
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(sha256(x)) :- a(x).\n";
+    test_unavailable_builtin_zero_fallback(
+        "sha256(): without mbedTLS snapshot succeeds, tuple value is 0",
+        src);
+}
+
+static void
+test_sha512_evaluates_with_zero_fallback_no_mbedtls(void)
+{
+    const char *src = ".decl a(x: int64)\n"
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(sha512(x)) :- a(x).\n";
+    test_unavailable_builtin_zero_fallback(
+        "sha512(): without mbedTLS snapshot succeeds, tuple value is 0",
+        src);
 }
 
 static void
 test_hmac_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
 {
-    TEST("hmac_sha256(): without mbedTLS snapshot succeeds, value is 0 "
-         "(fallback)");
-
     const char *src = ".decl a(msg: int64, key: int64)\n"
-                      "a(0, 1).\n"
-                      ".decl r(z: int64)\n"
-                      "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+        "a(0, 1).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
+    test_unavailable_builtin_zero_fallback(
+        "hmac_sha256(): without mbedTLS snapshot succeeds, tuple value is 0",
+        src);
+}
 
-    struct result_ctx ctx;
-    int rc = run_program_full(src, &ctx);
-    if (rc != 0) {
-        FAIL("expected parse/plan/session to succeed even without mbedTLS");
-    }
-    if (ctx.snapshot_rc != 0) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "snapshot_rc=%d, expected 0",
-                 ctx.snapshot_rc);
-        FAIL(buf);
-    }
-    if (ctx.count != 1) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "expected 1 tuple, got %u", ctx.count);
-        FAIL(buf);
-    }
-    if (ctx.col0[0] != 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "expected fallback value 0 without mbedTLS, got %" PRId64,
-                 ctx.col0[0]);
-        FAIL(buf);
-    }
-    PASS();
+static void
+test_uuid4_evaluates_with_zero_fallback_no_mbedtls(void)
+{
+    const char *src = ".decl a(x: int64)\n"
+        "a(0).\n"
+        ".decl r(z: int64)\n"
+        "r(uuid4()) :- a(x).\n";
+    test_unavailable_builtin_zero_fallback(
+        "uuid4(): without mbedTLS snapshot succeeds, tuple value is 0",
+        src);
+}
+
+static void
+test_uuid5_evaluates_with_zero_fallback_no_mbedtls(void)
+{
+    const char *src = ".decl a(ns: int64, name: int64)\n"
+        "a(1234, 5678).\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(ns, name)) :- a(ns, name).\n";
+    test_unavailable_builtin_zero_fallback(
+        "uuid5(): without mbedTLS snapshot succeeds, tuple value is 0",
+        src);
 }
 
 #endif /* WL_MBEDTLS_ENABLED */
@@ -986,7 +1163,7 @@ main(void)
 {
 #ifdef WL_MBEDTLS_ENABLED
     printf("=== wirelog Cryptographic Hash Tests (Issue #73) [mbedTLS enabled] "
-           "===\n\n");
+        "===\n\n");
 
     printf("--- md5() Determinism Tests ---\n");
     test_md5_determinism_zero();
@@ -1002,6 +1179,10 @@ main(void)
     test_sha1_distinct_inputs_distinct_outputs();
     test_sha1_idempotent();
 
+    printf("\n--- sha256()/sha512() Enabled Coverage Tests ---\n");
+    test_sha256_enabled_nonzero_distinct();
+    test_sha512_enabled_nonzero_distinct();
+
     printf("\n--- hmac_sha256() Determinism Tests ---\n");
     test_hmac_sha256_determinism_msg0_key1();
     test_hmac_sha256_determinism_msg1_key42();
@@ -1009,6 +1190,13 @@ main(void)
     test_hmac_sha256_key_sensitivity();
     test_hmac_sha256_msg_sensitivity();
     test_hmac_sha256_asymmetric();
+
+    printf("\n--- UUID Built-in Tests ---\n");
+    /* uuid4()/uuid5() return the first 8 UUID bytes as int64_t. The version
+     * byte is visible in that prefix; the RFC variant byte is not. */
+    test_uuid4_enabled_random_version_prefix();
+    test_uuid5_enabled_deterministic_version_prefix();
+    test_uuid5_enabled_namespace_name_sensitivity();
 
     printf("\n--- Edge Case Tests ---\n");
     test_md5_edge_zero_input();
@@ -1028,12 +1216,16 @@ main(void)
 
 #else
     printf("=== wirelog Cryptographic Hash Tests (Issue #73) [mbedTLS "
-           "DISABLED] ===\n\n");
+        "DISABLED] ===\n\n");
 
     printf("--- Runtime Behavior Tests (mbedTLS unavailable) ---\n");
     test_md5_evaluates_with_zero_fallback_no_mbedtls();
     test_sha1_evaluates_with_zero_fallback_no_mbedtls();
+    test_sha256_evaluates_with_zero_fallback_no_mbedtls();
+    test_sha512_evaluates_with_zero_fallback_no_mbedtls();
     test_hmac_sha256_evaluates_with_zero_fallback_no_mbedtls();
+    test_uuid4_evaluates_with_zero_fallback_no_mbedtls();
+    test_uuid5_evaluates_with_zero_fallback_no_mbedtls();
 #endif
 
     printf("\n--- sha256()/sha512() Determinism Tests (always run) ---\n");
