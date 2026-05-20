@@ -191,7 +191,8 @@ When cutting a release tag:
 2. **Wait for the full CI matrix** to pass on the release PR
    (default + `--suite abi` + `--suite asan` + `--suite tsan`
    + `--suite perf` on a `WIRELOG_PERF_REQUIRE=1` runner per
-   #695 B8).
+   #695 B8, plus the `mbedtls-enabled / ubuntu-latest / gcc`
+   validation check once #843 lands).
 3. **Merge** the release PR via rebase (no squash, no merge
    commit; matches project convention).
 4. **Tag** on `main`:
@@ -231,10 +232,34 @@ When cutting a release tag:
 Per #746 B17, `release-1.x` requires:
 
 - At least one CODEOWNER review.
-- Required status checks (default + abi + asan + tsan + perf).
+- Required status checks (default + abi + asan + tsan + perf,
+  plus `mbedtls-enabled / ubuntu-latest / gcc` once #843 lands).
 - Linear history (no force-push, no merge commits).
 - Signed commits (GPG verified).
 - Tag protection on `v1.x.*`.
+
+### mbedTLS-enabled validation policy
+
+The stable check name for optional crypto validation is
+`mbedtls-enabled / ubuntu-latest / gcc`.  The check is validation
+coverage only: it proves that `-DmbedTLS=enabled` still configures,
+builds, and runs the crypto tests against a system PSA Crypto provider.
+It does **not** change the default release artifact posture, which
+remains `mbedTLS=disabled` unless a separate release-artifact issue
+changes that policy.
+
+- PRs to `main`: #843 must add this as a blocking PR check using
+  `-DmbedTLS=enabled`, not `auto`, so dependency absence cannot silently
+  downgrade coverage.
+- Pushes to `main`: `ci-main.yml` may mirror the same coverage as
+  monitoring only, consistent with its existing `continue-on-error`
+  posture.
+- `release-1.x`: #746 branch-protection work should require the same
+  stable check name once the branch is cut.
+- Release tags: #749 tag-time verification should include this enabled
+  crypto validation at minimum by running `cryptographic_hashes` under
+  `-DmbedTLS=enabled`; a full enabled suite may replace that minimum if
+  runtime stays acceptable.
 
 ---
 

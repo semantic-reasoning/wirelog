@@ -20,6 +20,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- Documented the required-check policy for mbedTLS-enabled validation,
+  including the stable `mbedtls-enabled / ubuntu-latest / gcc` check
+  name and its PR, main-monitoring, `release-1.x`, and release-tag
+  roles without changing the default `mbedTLS=disabled` artifact
+  posture (#849).
+
 ## [0.41.0] - 2026-05-20
 
 ### Added
