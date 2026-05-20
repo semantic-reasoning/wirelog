@@ -81,14 +81,12 @@ Apache-2.0 path by default.
 | wirelog itself | this repository | LGPL-3.0-or-later (or commercial) |
 | Hash built-in | xxHash3 | BSD-2-Clause |
 | CRC-32 | in-tree | LGPL-3.0-or-later |
-| Optional crypto | system mbedTLS | Apache-2.0 (default) or GPL-2.0-or-later |
-| Optional crypto | mbedTLS sub-deps (`mbedx509`, `tfpsacrypto`) | Apache-2.0 |
+| Optional crypto | system PSA Crypto provider (`tfpsacrypto`, `mbedcrypto`, or PSA-capable `mbedtls`) | Apache-2.0 (default) or GPL-2.0-or-later |
 
 LGPL-3.0-or-later is compatible with Apache-2.0 in the *consumer*
 direction (consumer of mbedTLS may be LGPL-licensed). Downstream
 redistributors of an `mbedTLS=enabled` build must include the
-upstream Apache-2.0 NOTICE for mbedTLS plus the mbedx509/tfpsacrypto
-notices.
+upstream Apache-2.0 NOTICE for the selected PSA Crypto provider.
 
 ### 3.2 Export-control self-classification
 
@@ -160,8 +158,8 @@ You are responsible for:
   jurisdiction.
 - Filing any required notifications (US ENC notification, EU dual-use
   reporting, Japanese METI, etc.) for the artifact you ship.
-- Including the upstream mbedTLS NOTICE files when you redistribute
-  an `mbedTLS=enabled` build.
+- Including the upstream NOTICE files for the selected PSA Crypto
+  provider when you redistribute an `mbedTLS=enabled` build.
 
 The project provides this self-classification in good faith and as a
 starting point; it is not a substitute for review by qualified export
@@ -187,8 +185,8 @@ counsel for your specific distribution model.
   Lists Annex 1 Category 5 Part 2 (post-Brexit).
 - **Japan FEFTA** — METI Foreign Exchange and Foreign Trade Act,
   publicly-available-software exemptions.
-- **Apache License 2.0 NOTICE** — required attribution for mbedTLS
-  redistributions.
+- **Apache License 2.0 NOTICE** — required attribution for
+  redistributions of the selected PSA Crypto provider.
 - **`meson_options.txt`** — the `mbedTLS` build option entry repeats
   the headline disclosure inline.
 - **`SECURITY.md`** — vulnerability reporting channel.

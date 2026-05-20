@@ -220,54 +220,57 @@ int main(void) {
   return 0;
 }
 '''
-if mbedtls_option == 'auto'
-  _mbedtls_crypto = dependency('tfpsacrypto', required: false)
-  if not _mbedtls_crypto.found()
-    _mbedtls_crypto = dependency('mbedcrypto', required: false)
-  endif
-  if not _mbedtls_crypto.found()
-    _mbedtls_crypto = dependency('mbedtls', required: false)
-  endif
-  if _mbedtls_crypto.found()
-    mbedtls_dep = [_mbedtls_crypto]
-    _mbedtls_psa_ok = true
+mbedtls_psa_candidates = [
+  'tfpsacrypto',
+  'mbedcrypto',
+  'mbedtls',
+]
+if mbedtls_option == 'auto' or mbedtls_option == 'enabled'
+  mbedtls_psa_provider = ''
+  mbedtls_psa_provider_version = ''
+  mbedtls_psa_rejections = []
+  foreach _mbedtls_candidate : mbedtls_psa_candidates
+    if mbedtls_psa_provider != ''
+      continue
+    endif
+    _mbedtls_crypto = dependency(_mbedtls_candidate, required: false)
+    if not _mbedtls_crypto.found()
+      mbedtls_psa_rejections += [_mbedtls_candidate + ': not found']
+      continue
+    endif
+
+    _mbedtls_candidate_dep = [_mbedtls_crypto]
+    _mbedtls_missing_headers = []
     foreach _mbedtls_header : mbedtls_required_headers
-      if not cc.has_header(_mbedtls_header, dependencies: mbedtls_dep)
-        _mbedtls_psa_ok = false
+      if not cc.has_header(_mbedtls_header, dependencies: _mbedtls_candidate_dep)
+        _mbedtls_missing_headers += [_mbedtls_header]
       endif
     endforeach
-    if _mbedtls_psa_ok and cc.links(mbedtls_psa_probe,
-        dependencies: mbedtls_dep,
-        name: 'PSA Crypto hash, HMAC, and random APIs')
-      add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
-    else
-      warning('mbedTLS auto-detection found a crypto package but not the required PSA Crypto public API; crypto built-ins will remain disabled')
-      mbedtls_dep = []
+
+    if _mbedtls_missing_headers.length() > 0
+      mbedtls_psa_rejections += [_mbedtls_candidate + ': missing headers <' + '>, <'.join(_mbedtls_missing_headers) + '>']
+      continue
     endif
-  endif
-elif mbedtls_option == 'enabled'
-  _mbedtls_crypto = dependency('tfpsacrypto', required: false)
-  if not _mbedtls_crypto.found()
-    _mbedtls_crypto = dependency('mbedcrypto', required: false)
-  endif
-  if not _mbedtls_crypto.found()
-    _mbedtls_crypto = dependency('mbedtls', required: false)
-  endif
-  if not _mbedtls_crypto.found()
-    error('mbedTLS enabled requires a PSA Crypto development package; install TF-PSA-Crypto (tfpsacrypto) or a distro mbedcrypto package exposing <psa/crypto.h>')
-  endif
-  mbedtls_dep = [_mbedtls_crypto]
-  foreach _mbedtls_header : mbedtls_required_headers
-    if not cc.has_header(_mbedtls_header, dependencies: mbedtls_dep)
-      error('mbedTLS enabled requires public PSA Crypto header <' + _mbedtls_header + '>')
+
+    if cc.links(mbedtls_psa_probe,
+        dependencies: _mbedtls_candidate_dep,
+        name: 'PSA Crypto hash, HMAC, and random APIs via ' + _mbedtls_candidate)
+      mbedtls_dep = _mbedtls_candidate_dep
+      mbedtls_psa_provider = _mbedtls_candidate
+      mbedtls_psa_provider_version = _mbedtls_crypto.version()
+    else
+      mbedtls_psa_rejections += [_mbedtls_candidate + ': failed PSA Crypto link probe']
     endif
   endforeach
-  if not cc.links(mbedtls_psa_probe,
-      dependencies: mbedtls_dep,
-      name: 'PSA Crypto hash, HMAC, and random APIs')
-    error('mbedTLS enabled requires linkable PSA Crypto hash, HMAC, and random APIs')
+
+  if mbedtls_psa_provider != ''
+    message('  mbedTLS PSA provider: ' + mbedtls_psa_provider + ' ' + mbedtls_psa_provider_version)
+    add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
+  elif mbedtls_option == 'auto'
+    warning('mbedTLS auto-detection did not find a linkable PSA Crypto provider; crypto built-ins will remain disabled. Candidates: ' + '; '.join(mbedtls_psa_rejections))
+  else
+    error('mbedTLS enabled requires a linkable PSA Crypto provider exposing <psa/crypto.h>. Candidates: ' + '; '.join(mbedtls_psa_rejections))
   endif
-  add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
 endif
 
 xxhash_dep = xxhash_proj.get_variable('xxhash_dep')
