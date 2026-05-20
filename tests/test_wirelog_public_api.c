@@ -1,0 +1,143 @@
+/*
+ * test_wirelog_public_api.c - public umbrella API regression tests (#841).
+ *
+ * Copyright (C) CleverPlant
+ * SPDX-License-Identifier: LGPL-3.0-or-later
+ */
+
+#include "wirelog/wirelog.h"
+
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+
+static int
+test_utility_api(void)
+{
+    if (!wirelog_version_string() || wirelog_version_string()[0] == '\0') {
+        fprintf(stderr, "version string is empty\n");
+        return 1;
+    }
+    if (!wirelog_error_string(WIRELOG_OK)
+        || !wirelog_error_string(WIRELOG_ERR_EXEC)) {
+        fprintf(stderr, "error strings are missing\n");
+        return 1;
+    }
+    if (!wirelog_config_threads()) {
+        fprintf(stderr, "threads config should be enabled in this build\n");
+        return 1;
+    }
+    (void)wirelog_config_embedded();
+    (void)wirelog_config_ipc();
+    return 0;
+}
+
+static int
+test_optimizer_api(void)
+{
+    const char *src =
+        ".decl edge(x:int32,y:int32)\n"
+        ".decl path(x:int32,y:int32)\n"
+        "edge(1,2).\n"
+        "path(X,Y) :- edge(X,Y).\n";
+    wirelog_error_t err = WIRELOG_ERR_UNKNOWN;
+    wirelog_program_t *program = wirelog_parse_string(src, &err);
+    if (!program || err != WIRELOG_OK) {
+        fprintf(stderr, "parse failed err=%d\n", err);
+        return 1;
+    }
+
+    wirelog_opt_config_t config = wirelog_optimizer_get_default_config();
+    if (!config.enable_logic_fusion || !config.enable_join_ordering
+        || !config.enable_semijoin) {
+        fprintf(stderr, "default optimizer config is incomplete\n");
+        wirelog_program_free(program);
+        return 1;
+    }
+    if (!wirelog_optimize(program, &err) || err != WIRELOG_OK) {
+        fprintf(stderr, "optimize failed err=%d\n", err);
+        wirelog_program_free(program);
+        return 1;
+    }
+    wirelog_opt_stats_t stats = { 0 };
+    if (!wirelog_optimizer_get_stats(program, &stats)
+        || stats.optimized_node_count == 0 || stats.passes_applied == 0) {
+        fprintf(stderr, "optimizer stats were not recorded\n");
+        wirelog_program_free(program);
+        return 1;
+    }
+    if (wirelog_optimizer_cost_estimate(program) == 0) {
+        fprintf(stderr, "cost estimate should be non-zero\n");
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_program_free(program);
+    return 0;
+}
+
+static int
+test_executor_result_api(void)
+{
+    const char *src =
+        ".decl edge(x:int32,y:int32)\n"
+        ".decl path(x:int32,y:int32)\n"
+        "edge(1,2).\n"
+        "path(X,Y) :- edge(X,Y).\n";
+    wirelog_error_t err = WIRELOG_ERR_UNKNOWN;
+    wirelog_program_t *program = wirelog_parse_string(src, &err);
+    if (!program || err != WIRELOG_OK) {
+        fprintf(stderr, "parse failed err=%d\n", err);
+        return 1;
+    }
+
+    wirelog_executor_t *executor = wirelog_executor_create(program, &err);
+    if (!executor || err != WIRELOG_OK) {
+        fprintf(stderr, "executor create failed err=%d\n", err);
+        wirelog_program_free(program);
+        return 1;
+    }
+    if (wirelog_load_all_facts(program, program) != -1
+        || wirelog_load_input_files(program, program) != -1) {
+        fprintf(stderr, "legacy loaders accepted a non-executor worker\n");
+        wirelog_executor_free(executor);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_result_t *result = wirelog_evaluate(executor, &err);
+    if (!result || err != WIRELOG_OK) {
+        fprintf(stderr, "evaluate failed err=%d\n", err);
+        wirelog_executor_free(executor);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    uint64_t rows = wirelog_result_relation_cardinality(result, "path");
+    const int64_t *path
+        = (const int64_t *)wirelog_result_get_relation(result, "path");
+    if (rows != 1 || !path || path[0] != 1 || path[1] != 2) {
+        fprintf(stderr, "unexpected path result rows=%" PRIu64 "\n", rows);
+        wirelog_result_free(result);
+        wirelog_executor_free(executor);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_result_free(result);
+    wirelog_executor_free(executor);
+    wirelog_program_free(program);
+    return 0;
+}
+
+int
+main(void)
+{
+    int failures = 0;
+    failures += test_utility_api();
+    failures += test_optimizer_api();
+    failures += test_executor_result_api();
+    if (failures == 0)
+        printf("test_wirelog_public_api: OK\n");
+    return failures == 0 ? 0 : 1;
+}
