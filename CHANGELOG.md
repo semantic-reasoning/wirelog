@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.41.0] - 2026-05-20
+
+### Added
+
 - **Android CI smoke + 16 KB alignment hard gate** (#465):
   new `.github/workflows/android.yml` with three jobs.  `alignment-arm64`
   cross-compiles `libwirelog.so` via `cross/android-arm64.ini` and runs
@@ -98,9 +116,9 @@ All notable changes to wirelog are documented in this file.
   test or carries a `/* PARITY: ... */` block-comment on its
   declaration line naming the structural reason no advanced
   analogue exists (12 facade-only annotations covering opts
-  struct, `*_sym` variadics, `wirelog_easy_print_delta`, plus 2
-  deferred-annotations for the #665 partial-conjunction tests
-  whose easy-side test helper is not yet ported to advanced).
+  struct, `*_sym` variadics, and `wirelog_easy_print_delta`;
+  the #665 partial-conjunction regression tests are now paired on
+  the advanced side via #825).
   New gate `scripts/ci/check-test-parity.py` (registered as
   `meson test --suite abi:test_parity`) enforces the rule
   per-test, not as a numeric ratio, so future additions on
@@ -191,6 +209,13 @@ All notable changes to wirelog are documented in this file.
 ### Removed
 
 ### Fixed
+
+- **Advanced-side #665 partial-conjunction parity** (#825):
+  `tests/test_wirelog_advanced.c` now mirrors the two easy-facade
+  #665 partial-conjunction regression tests under both default and
+  multi-worker execution.  The easy-side parity annotations now point
+  at the live paired advanced tests instead of a closed #785 follow-up,
+  and `scripts/ci/check-test-parity.py` continues to pass.
 
 ### Performance
 

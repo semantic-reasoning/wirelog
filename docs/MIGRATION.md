@@ -1,9 +1,37 @@
 # Migration Guide
 
-**Last Updated:** 2026-04-24
+**Last Updated:** 2026-05-20
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
+
+---
+
+## 0.40 -> 0.41
+
+0.41.0 is an ABI-infrastructure release.  It adds release gates,
+manifests, and cross-platform advisory checks around the public
+surface, but it does not introduce new source-level migration steps
+for applications already updated to the 0.40 public API.
+
+### ABI and release-process checks (#681)
+
+The release pins the v1.0 ABI baseline more tightly:
+
+- Linux x86_64 has both the existing 53-symbol allowlist gate and a
+  libabigail `.abi.json` manifest gate.
+- Linux arm64 participates in the default PR build and the
+  arch-agnostic `abi_symbols` gate; per #824, per-architecture
+  libabigail baselines are out of scope for this release.
+- macOS and Windows export-surface checks are warning-only advisory
+  checks, not hard ABI guarantees.
+- Installed public prototypes use `WIRELOG_API`; `WIRELOG_PUBLIC`
+  remains a compatibility alias for downstream code that referenced
+  it directly during the 0.40 cycle.
+
+No downstream code changes are required solely because of these
+checks.  Consumers that still use pre-0.40 names should follow the
+0.30 -> 1.0 migration entries below.
 
 ---
 
