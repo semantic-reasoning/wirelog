@@ -216,6 +216,12 @@ All notable changes to wirelog are documented in this file.
   multi-worker execution.  The easy-side parity annotations now point
   at the live paired advanced tests instead of a closed #785 follow-up,
   and `scripts/ci/check-test-parity.py` continues to pass.
+- **Platform ABI advisory test registration** (#788, #681):
+  the macOS advisory export check is registered only on Darwin hosts
+  and the Windows advisory export check only on Windows hosts.  This
+  keeps Linux arm64 runners that happen to have `pwsh` installed from
+  spending the Meson test timeout launching a Windows-only PowerShell
+  check that should never run on that platform.
 
 ### Performance
 
