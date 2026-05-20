@@ -508,6 +508,27 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #788: warning-only platform ABI surface advisory checks.
+# Linux remains the hard v1.0 ABI gate.  These checks run on every
+# default `meson test` invocation but only emit GitHub warning
+# annotations when macOS/Windows export surfaces drift.
+if sh.found()
+  test('abi_symbols_macos', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols-macos.sh',
+              meson.project_build_root()],
+       suite: 'abi_advisory')
+endif
+
+powershell = find_program('pwsh', 'powershell', required: false)
+if powershell.found()
+  test('abi_symbols_windows', powershell,
+       args: ['-NoProfile',
+              '-ExecutionPolicy', 'Bypass',
+              '-File', meson.project_source_root() / 'scripts/ci/check-abi-symbols-windows.ps1',
+              meson.project_build_root()],
+       suite: 'abi_advisory')
+endif
+
 # Issue #786 (cross-link #690 libabigail half): libabigail manifest gate.
 # Where abi_symbols only checks the dynamic-symbol set, abi_manifest uses
 # `abidiff` to catch struct member offsets, function signature changes,
