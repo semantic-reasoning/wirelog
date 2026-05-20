@@ -43,16 +43,7 @@
 #include <xxhash.h>
 
 #ifdef WL_MBEDTLS_ENABLED
-/* Issue #162: mbedTLS 4.0+ moved hash functions to private/ */
-/* Must define MBEDTLS_ALLOW_PRIVATE_ACCESS before including private headers */
-#define MBEDTLS_ALLOW_PRIVATE_ACCESS
-#include <mbedtls/private/md5.h>
-#include <mbedtls/private/sha1.h>
-#include <mbedtls/private/sha256.h>
-#include <mbedtls/private/sha512.h>
-#include <mbedtls/md.h>
-#include <mbedtls/private/entropy.h>
-#include <mbedtls/private/ctr_drbg.h>
+#include <psa/crypto.h>
 #endif
 
 #include <errno.h>
@@ -81,6 +72,88 @@ typedef struct {
     int64_t vals[COL_FILTER_STACK];
     uint32_t top;
 } filt_stack_t;
+
+#ifdef WL_MBEDTLS_ENABLED
+static int
+wl_columnar_ops_psa_init(void)
+{
+    return psa_crypto_init() == PSA_SUCCESS ? 0 : -1;
+}
+
+static int
+wl_columnar_ops_psa_hash_int64(psa_algorithm_t alg, int64_t value,
+    unsigned char *digest, size_t digest_len)
+{
+    size_t actual_len = 0;
+    if (wl_columnar_ops_psa_init() != 0)
+        return -1;
+    if (psa_hash_compute(alg, (const unsigned char *)&value, sizeof(value),
+        digest, digest_len, &actual_len) != PSA_SUCCESS)
+        return -1;
+    return actual_len == digest_len ? 0 : -1;
+}
+
+static int
+wl_columnar_ops_psa_hash_pair(psa_algorithm_t alg, int64_t first,
+    int64_t second, unsigned char *digest, size_t digest_len)
+{
+    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
+    size_t actual_len = 0;
+    int ret = -1;
+
+    if (wl_columnar_ops_psa_init() != 0)
+        return -1;
+    if (psa_hash_setup(&op, alg) != PSA_SUCCESS)
+        goto out;
+    if (psa_hash_update(&op, (const unsigned char *)&first, sizeof(first))
+        != PSA_SUCCESS)
+        goto out;
+    if (psa_hash_update(&op, (const unsigned char *)&second, sizeof(second))
+        != PSA_SUCCESS)
+        goto out;
+    if (psa_hash_finish(&op, digest, digest_len, &actual_len) != PSA_SUCCESS)
+        goto out;
+    ret = actual_len == digest_len ? 0 : -1;
+out:
+    if (ret != 0)
+        psa_hash_abort(&op);
+    return ret;
+}
+
+static int
+wl_columnar_ops_psa_hmac_sha256_int64(int64_t msg, int64_t key,
+    unsigned char *digest, size_t digest_len)
+{
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key_id = 0;
+    size_t actual_len = 0;
+    psa_status_t status;
+    int ret = -1;
+
+    if (wl_columnar_ops_psa_init() != 0)
+        return -1;
+
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+
+    status = psa_import_key(&attributes, (const unsigned char *)&key,
+            sizeof(key), &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS)
+        return -1;
+
+    status = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+            (const unsigned char *)&msg, sizeof(msg), digest, digest_len,
+            &actual_len);
+    if (status == PSA_SUCCESS && actual_len == digest_len)
+        ret = 0;
+
+    if (psa_destroy_key(key_id) != PSA_SUCCESS)
+        ret = -1;
+    return ret;
+}
+#endif
 
 static inline void
 filt_push(filt_stack_t *s, int64_t v)
@@ -242,12 +315,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[16];
-            mbedtls_md5_context ctx;
-            mbedtls_md5_init(&ctx);
-            mbedtls_md5_starts(&ctx);
-            mbedtls_md5_update(&ctx, (const unsigned char *)&a, sizeof(a));
-            mbedtls_md5_finish(&ctx, digest);
-            mbedtls_md5_free(&ctx);
+            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_MD5, a, digest,
+                sizeof(digest)) != 0)
+                goto bad;
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
             (void)filt_pop(&s);
@@ -260,25 +330,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[20];
-            mbedtls_sha1_context sha1_ctx;
-            mbedtls_sha1_init(&sha1_ctx);
-            int ret = mbedtls_sha1_starts(&sha1_ctx);
-            if (ret != 0) {
-                mbedtls_sha1_free(&sha1_ctx);
+            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_SHA_1, a, digest,
+                sizeof(digest)) != 0)
                 goto bad;
-            }
-            ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&a,
-                    sizeof(a));
-            if (ret != 0) {
-                mbedtls_sha1_free(&sha1_ctx);
-                goto bad;
-            }
-            ret = mbedtls_sha1_finish(&sha1_ctx, digest);
-            if (ret != 0) {
-                mbedtls_sha1_free(&sha1_ctx);
-                goto bad;
-            }
-            mbedtls_sha1_free(&sha1_ctx);
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
             (void)filt_pop(&s);
@@ -291,25 +345,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[32];
-            mbedtls_sha256_context sha256_ctx;
-            mbedtls_sha256_init(&sha256_ctx);
-            int ret = mbedtls_sha256_starts(&sha256_ctx, 0);
-            if (ret != 0) {
-                mbedtls_sha256_free(&sha256_ctx);
+            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_SHA_256, a,
+                digest, sizeof(digest)) != 0)
                 goto bad;
-            }
-            ret = mbedtls_sha256_update(&sha256_ctx, (const unsigned char *)&a,
-                    sizeof(a));
-            if (ret != 0) {
-                mbedtls_sha256_free(&sha256_ctx);
-                goto bad;
-            }
-            ret = mbedtls_sha256_finish(&sha256_ctx, digest);
-            if (ret != 0) {
-                mbedtls_sha256_free(&sha256_ctx);
-                goto bad;
-            }
-            mbedtls_sha256_free(&sha256_ctx);
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
             (void)filt_pop(&s);
@@ -322,25 +360,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[64];
-            mbedtls_sha512_context sha512_ctx;
-            mbedtls_sha512_init(&sha512_ctx);
-            int ret = mbedtls_sha512_starts(&sha512_ctx, 0);
-            if (ret != 0) {
-                mbedtls_sha512_free(&sha512_ctx);
+            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_SHA_512, a,
+                digest, sizeof(digest)) != 0)
                 goto bad;
-            }
-            ret = mbedtls_sha512_update(&sha512_ctx, (const unsigned char *)&a,
-                    sizeof(a));
-            if (ret != 0) {
-                mbedtls_sha512_free(&sha512_ctx);
-                goto bad;
-            }
-            ret = mbedtls_sha512_finish(&sha512_ctx, digest);
-            if (ret != 0) {
-                mbedtls_sha512_free(&sha512_ctx);
-                goto bad;
-            }
-            mbedtls_sha512_free(&sha512_ctx);
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
             (void)filt_pop(&s);
@@ -354,10 +376,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             int64_t key_val = filt_pop(&s);
             int64_t msg_val = filt_pop(&s);
             unsigned char digest[32];
-            mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                (const unsigned char *)&key_val, sizeof(key_val),
-                (const unsigned char *)&msg_val, sizeof(msg_val),
-                digest);
+            if (wl_columnar_ops_psa_hmac_sha256_int64(msg_val, key_val,
+                digest, sizeof(digest)) != 0)
+                goto bad;
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
             (void)filt_pop(&s);
@@ -370,21 +391,9 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         case WL_PLAN_EXPR_ARITH_UUID4: {
 #ifdef WL_MBEDTLS_ENABLED
             unsigned char uuid[16];
-            mbedtls_entropy_context entropy;
-            mbedtls_ctr_drbg_context ctr_drbg;
-            mbedtls_entropy_init(&entropy);
-            mbedtls_ctr_drbg_init(&ctr_drbg);
-            int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
-                    &entropy, NULL, 0);
-            if (ret != 0) {
-                mbedtls_ctr_drbg_free(&ctr_drbg);
-                mbedtls_entropy_free(&entropy);
+            if (wl_columnar_ops_psa_init() != 0)
                 goto bad;
-            }
-            ret = mbedtls_ctr_drbg_random(&ctr_drbg, uuid, 16);
-            mbedtls_ctr_drbg_free(&ctr_drbg);
-            mbedtls_entropy_free(&entropy);
-            if (ret != 0)
+            if (psa_generate_random(uuid, sizeof(uuid)) != PSA_SUCCESS)
                 goto bad;
             /* RFC 4122 v4: set version=4, variant=0b10 */
             uuid[6] = (uuid[6] & 0x0F) | 0x40;
@@ -404,28 +413,8 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             int64_t name = filt_pop(&s);
             int64_t ns = filt_pop(&s);
             unsigned char digest[20]; /* SHA-1 output */
-            mbedtls_sha1_context sha1_ctx;
-            mbedtls_sha1_init(&sha1_ctx);
-            int ret = mbedtls_sha1_starts(&sha1_ctx);
-            if (ret != 0) {
-                mbedtls_sha1_free(&sha1_ctx);
-                goto bad;
-            }
-            ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&ns,
-                    sizeof(ns));
-            if (ret != 0) {
-                mbedtls_sha1_free(&sha1_ctx);
-                goto bad;
-            }
-            ret = mbedtls_sha1_update(&sha1_ctx, (const unsigned char *)&name,
-                    sizeof(name));
-            if (ret != 0) {
-                mbedtls_sha1_free(&sha1_ctx);
-                goto bad;
-            }
-            ret = mbedtls_sha1_finish(&sha1_ctx, digest);
-            mbedtls_sha1_free(&sha1_ctx);
-            if (ret != 0)
+            if (wl_columnar_ops_psa_hash_pair(PSA_ALG_SHA_1, ns, name, digest,
+                sizeof(digest)) != 0)
                 goto bad;
             /* RFC 4122 v5: set version=5, variant=0b10 */
             digest[6] = (digest[6] & 0x0F) | 0x50;

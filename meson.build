@@ -181,32 +181,91 @@ xxhash_proj = subproject('xxhash', default_options: [])
 #Optional : mbedTLS for cryptographic functions (Issue #73)
 mbedtls_option = get_option('mbedTLS')
 mbedtls_dep = []
+mbedtls_required_headers = [
+  'psa/crypto.h',
+]
+mbedtls_psa_probe = '''
+#include <psa/crypto.h>
+
+int main(void) {
+  unsigned char input[8] = {0};
+  unsigned char output[64] = {0};
+  size_t output_len = 0;
+  psa_hash_operation_t hash_op = PSA_HASH_OPERATION_INIT;
+  psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+  psa_key_id_t key = 0;
+  psa_status_t status = psa_crypto_init();
+  if (status != PSA_SUCCESS) return 1;
+  (void)psa_hash_compute(PSA_ALG_MD5, input, sizeof(input),
+                         output, sizeof(output), &output_len);
+  (void)psa_hash_compute(PSA_ALG_SHA_1, input, sizeof(input),
+                         output, sizeof(output), &output_len);
+  (void)psa_hash_compute(PSA_ALG_SHA_256, input, sizeof(input),
+                         output, sizeof(output), &output_len);
+  (void)psa_hash_compute(PSA_ALG_SHA_512, input, sizeof(input),
+                         output, sizeof(output), &output_len);
+  (void)psa_hash_setup(&hash_op, PSA_ALG_SHA_1);
+  (void)psa_hash_update(&hash_op, input, sizeof(input));
+  (void)psa_hash_finish(&hash_op, output, sizeof(output), &output_len);
+  psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+  psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+  psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+  status = psa_import_key(&attributes, input, sizeof(input), &key);
+  psa_reset_key_attributes(&attributes);
+  if (status != PSA_SUCCESS) return 1;
+  (void)psa_mac_compute(key, PSA_ALG_HMAC(PSA_ALG_SHA_256), input,
+                        sizeof(input), output, sizeof(output), &output_len);
+  (void)psa_destroy_key(key);
+  (void)psa_generate_random(output, 16);
+  return 0;
+}
+'''
 if mbedtls_option == 'auto'
-  _mbedtls = dependency('mbedtls', required: false)
-  if _mbedtls.found()
-    # mbedTLS has private dependencies on mbedx509 and tfpsacrypto for linking
-    _mbedx509 = dependency('mbedx509', required: false)
-    _tfpsacrypto = dependency('tfpsacrypto', required: false)
-    mbedtls_dep = [_mbedtls]
-    if _mbedx509.found()
-      mbedtls_dep += [_mbedx509]
+  _mbedtls_crypto = dependency('tfpsacrypto', required: false)
+  if not _mbedtls_crypto.found()
+    _mbedtls_crypto = dependency('mbedcrypto', required: false)
+  endif
+  if not _mbedtls_crypto.found()
+    _mbedtls_crypto = dependency('mbedtls', required: false)
+  endif
+  if _mbedtls_crypto.found()
+    mbedtls_dep = [_mbedtls_crypto]
+    _mbedtls_psa_ok = true
+    foreach _mbedtls_header : mbedtls_required_headers
+      if not cc.has_header(_mbedtls_header, dependencies: mbedtls_dep)
+        _mbedtls_psa_ok = false
+      endif
+    endforeach
+    if _mbedtls_psa_ok and cc.links(mbedtls_psa_probe,
+        dependencies: mbedtls_dep,
+        name: 'PSA Crypto hash, HMAC, and random APIs')
+      add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
+    else
+      warning('mbedTLS auto-detection found a crypto package but not the required PSA Crypto public API; crypto built-ins will remain disabled')
+      mbedtls_dep = []
     endif
-    if _tfpsacrypto.found()
-      mbedtls_dep += [_tfpsacrypto]
-    endif
-    add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
   endif
 elif mbedtls_option == 'enabled'
-  _mbedtls = dependency('mbedtls', required: true)
-  # mbedTLS has private dependencies on mbedx509 and tfpsacrypto for linking
-  _mbedx509 = dependency('mbedx509', required: false)
-  _tfpsacrypto = dependency('tfpsacrypto', required: false)
-  mbedtls_dep = [_mbedtls]
-  if _mbedx509.found()
-    mbedtls_dep += [_mbedx509]
+  _mbedtls_crypto = dependency('tfpsacrypto', required: false)
+  if not _mbedtls_crypto.found()
+    _mbedtls_crypto = dependency('mbedcrypto', required: false)
   endif
-  if _tfpsacrypto.found()
-    mbedtls_dep += [_tfpsacrypto]
+  if not _mbedtls_crypto.found()
+    _mbedtls_crypto = dependency('mbedtls', required: false)
+  endif
+  if not _mbedtls_crypto.found()
+    error('mbedTLS enabled requires a PSA Crypto development package; install TF-PSA-Crypto (tfpsacrypto) or a distro mbedcrypto package exposing <psa/crypto.h>')
+  endif
+  mbedtls_dep = [_mbedtls_crypto]
+  foreach _mbedtls_header : mbedtls_required_headers
+    if not cc.has_header(_mbedtls_header, dependencies: mbedtls_dep)
+      error('mbedTLS enabled requires public PSA Crypto header <' + _mbedtls_header + '>')
+    endif
+  endforeach
+  if not cc.links(mbedtls_psa_probe,
+      dependencies: mbedtls_dep,
+      name: 'PSA Crypto hash, HMAC, and random APIs')
+    error('mbedTLS enabled requires linkable PSA Crypto hash, HMAC, and random APIs')
   endif
   add_project_arguments('-DWL_MBEDTLS_ENABLED=1', language: 'c')
 endif
