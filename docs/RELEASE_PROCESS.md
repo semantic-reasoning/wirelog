@@ -69,6 +69,39 @@ libabigail baselines are out of scope for #681 / v1.0 unless a later
 policy issue adds an arm64 baseline file and matching regeneration
 workflow.
 
+macOS and Windows export-surface checks are warning-only for v1.0
+(Issue #788).  They run in the `abi_advisory` suite as
+`abi_symbols_macos` and `abi_symbols_windows`, compare normalized
+public `wirelog_*` exports against `abi/libwirelog-1.0.macos.symbols`
+and `abi/libwirelog-1.0.windows.symbols`, and emit GitHub `::warning::`
+annotations instead of failing the build.  The
+platform baselines intentionally normalize Mach-O's leading `_`
+symbol spelling and inspect DLL exports rather than Windows import
+library `__imp_*` thunks; richer Mach-O / PE manifests remain a v1.x
+follow-up.
+
+Run the advisory suite with `meson test -C builddir --suite
+abi_advisory`, or run an individual check with `meson test -C builddir
+abi_symbols_macos` / `abi_symbols_windows`.
+
+After a deliberate public ABI addition, regenerate the advisory
+allowlists on the matching hosts:
+
+```bash
+nm -gU builddir/libwirelog.1.dylib \
+  | awk '{name = $NF; sub(/^_/, "", name); if (name ~ /^wirelog_/) print name}' \
+  | sort -u > abi/libwirelog-1.0.macos.symbols
+```
+
+```powershell
+dumpbin /EXPORTS builddir\wirelog-1.dll |
+  Select-String '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_]*)\b' |
+  ForEach-Object { $_.Matches[0].Groups[1].Value } |
+  Where-Object { $_ -like 'wirelog_*' } |
+  Sort-Object -Unique |
+  Set-Content abi\libwirelog-1.0.windows.symbols
+```
+
 ### Template (Markdown)
 
 ```md
