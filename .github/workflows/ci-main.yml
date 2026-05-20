@@ -172,6 +172,45 @@ jobs:
           echo "Status: **${STATUS}** (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
+  # Phase 2b: Optional crypto coverage (monitoring-only on main)
+  # Mirrors the PR check name and coverage policy from #849.
+  # ==========================================================================
+  mbedtls-enabled:
+    name: mbedtls-enabled / ubuntu-latest / gcc
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libmbedtls-dev
+
+      - name: Configure with mbedTLS enabled
+        run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
+        env:
+          CC: gcc
+
+      - name: Build with mbedTLS enabled
+        run: meson compile -C builddir-mbedtls
+
+      - name: Verify enabled compile flag
+        run: grep -R -- '-DWL_MBEDTLS_ENABLED=1' builddir-mbedtls/compile_commands.json
+
+      - name: Test mbedTLS crypto built-ins
+        run: meson test -C builddir-mbedtls cryptographic_hashes --print-errorlogs
+
+      - name: Publish results
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          echo "## mbedTLS-enabled Results: ubuntu-latest / gcc (main monitor)" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: **${STATUS}** (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
   # Phase 3: Sanitizers — ASan + UBSan (parallel, non-blocking)
   # Linux: GCC + Clang; macOS: Apple Clang
   # fail-fast: false — all configurations run to completion

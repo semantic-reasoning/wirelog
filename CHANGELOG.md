@@ -6,6 +6,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Added a dedicated `mbedtls-enabled / ubuntu-latest / gcc` CI leg
+  that configures with `-DmbedTLS=enabled`, verifies
+  `WL_MBEDTLS_ENABLED=1`, and runs `cryptographic_hashes` so optional
+  crypto paths are covered without changing the default disabled
+  artifact posture (#843).
+
 ### Changed
 
 ### Deprecated

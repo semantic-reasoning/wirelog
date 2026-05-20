@@ -161,6 +161,37 @@ jobs:
             ./builddir-path-a/pcap_skeleton
 
   # ==========================================================================
+  # Phase 2b: Optional crypto coverage
+  # Dedicated stable check name for branch-protection policy (#849).
+  # ==========================================================================
+  mbedtls-enabled:
+    name: mbedtls-enabled / ubuntu-latest / gcc
+    needs: [lint]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libmbedtls-dev
+
+      - name: Configure with mbedTLS enabled
+        run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
+        env:
+          CC: gcc
+
+      - name: Build with mbedTLS enabled
+        run: meson compile -C builddir-mbedtls
+
+      - name: Verify enabled compile flag
+        run: grep -R -- '-DWL_MBEDTLS_ENABLED=1' builddir-mbedtls/compile_commands.json
+
+      - name: Test mbedTLS crypto built-ins
+        run: meson test -C builddir-mbedtls cryptographic_hashes --print-errorlogs
+
+  # ==========================================================================
   # Phase 3a: ASan + UBSan matrix
   # Runs after lint and in parallel with the normal build matrix.
   # Linux: GCC + Clang; macOS: Clang
