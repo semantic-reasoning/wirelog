@@ -195,9 +195,25 @@ Supported column types:
 
 `hash(x)`, `md5(x)`, `sha1(x)`, `sha256(x)`, `sha512(x)`, `hmac_sha256(msg, key)`
 
+`hash(x)` returns an `int64` xxHash3 value. The mbedTLS-backed
+digest/HMAC built-ins also return `int64` values: digest or HMAC
+bytes are folded with `XXH3_64bits()` and are not exposed as hex
+strings or byte arrays. With `mbedTLS=disabled`, the crypto built-ins
+parse and plan; when they are used to compute relation values, the
+runtime fallback value is `0`. Some predicate/filter paths, including
+top-level filters, may pass rows through on disabled-crypto evaluator
+errors, so disabled crypto calls must not be used in predicates or
+security checks.
+
 ### UUID Functions
 
 `uuid4()`, `uuid5(namespace, name)`
+
+The UUID built-ins require mbedTLS for non-zero runtime output and
+return the first 8 UUID bytes as an `int64`, not formatted text. With
+`mbedTLS=disabled`, relation-value computations fall back to `0`;
+disabled UUID calls in predicate/filter expressions follow the same
+error-handling warning described for crypto hash functions.
 
 ### Comparison Operators
 

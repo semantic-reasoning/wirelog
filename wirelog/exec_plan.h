@@ -113,21 +113,21 @@ typedef enum {
     WL_PLAN_EXPR_ARITH_CRC32_CAST
         = 0x1D, /* CRC-32C Castagnoli (poly 0x1EDC6F41) */
 
-    /* Unary cryptographic hash functions (pop 1 push 1, requires mbedTLS) */
-    WL_PLAN_EXPR_ARITH_MD5 = 0x1E,  /* md5() - MD5 32-char hex digest */
-    WL_PLAN_EXPR_ARITH_SHA1 = 0x1F, /* sha1() - SHA-1 40-char hex digest */
+    /* Unary mbedTLS digest functions (pop 1, push folded int64) */
+    WL_PLAN_EXPR_ARITH_MD5 = 0x1E,  /* md5() - MD5 digest */
+    WL_PLAN_EXPR_ARITH_SHA1 = 0x1F, /* sha1() - SHA-1 digest */
     WL_PLAN_EXPR_ARITH_SHA256
-        = 0x20, /* sha256() - SHA-256 64-char hex digest */
+        = 0x20, /* sha256() - SHA-256 digest */
     WL_PLAN_EXPR_ARITH_SHA512
-        = 0x21, /* sha512() - SHA-512 128-char hex digest */
+        = 0x21, /* sha512() - SHA-512 digest */
 
-    /* Binary cryptographic hash functions (pop 2 push 1, requires mbedTLS) */
+    /* Binary mbedTLS HMAC function (pop 2, push folded int64) */
     WL_PLAN_EXPR_ARITH_HMAC_SHA256
-        = 0x28, /* hmac_sha256(msg, key) - HMAC-SHA-256 64-char hex digest */
+        = 0x28, /* hmac_sha256(msg, key) - HMAC-SHA-256 */
 
-    /* UUID functions (requires mbedTLS) */
-    WL_PLAN_EXPR_ARITH_UUID4 = 0x29, /* uuid4() - nullary, push 1 */
-    WL_PLAN_EXPR_ARITH_UUID5 = 0x2A, /* uuid5(ns, name) - pop 2 push 1 */
+    /* UUID functions (requires mbedTLS, push UUID prefix as int64) */
+    WL_PLAN_EXPR_ARITH_UUID4 = 0x29, /* uuid4() - nullary */
+    WL_PLAN_EXPR_ARITH_UUID5 = 0x2A, /* uuid5(ns, name) - pop 2 */
 
     /* Comparison operators (binary, pop 2 push 1) */
     WL_PLAN_EXPR_CMP_EQ = 0x22,
