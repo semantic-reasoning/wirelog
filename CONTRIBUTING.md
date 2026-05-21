@@ -53,7 +53,7 @@ Enhancement suggestions are tracked as GitHub issues. When creating an enhanceme
 
 ## Code Style
 
-wirelog uses automated formatting and linting. The `.clang-format` file is the source of truth for code style.
+wirelog uses automated formatting and linting. The `uncrustify.cfg` file is the source of truth for code style.
 
 ### Key Conventions
 
@@ -69,12 +69,12 @@ wirelog uses automated formatting and linting. The `.clang-format` file is the s
 
 **Format check (dry-run):**
 ```sh
-find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs clang-format-18 --dry-run --Werror
+find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs uncrustify -c uncrustify.cfg --check
 ```
 
 **Auto-format:**
 ```sh
-find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs clang-format-18 -i
+find wirelog/ tests/ -name '*.c' -o -name '*.h' | xargs uncrustify -c uncrustify.cfg --replace --no-backup
 ```
 
 **clang-tidy:**
@@ -94,7 +94,7 @@ run-clang-tidy-18 -p builddir-tidy wirelog/ tests/
 You can optionally set up a pre-commit hook for auto-formatting:
 ```sh
 echo '#!/bin/sh
-find wirelog/ tests/ -name "*.c" -o -name "*.h" | xargs clang-format-18 -i
+find wirelog/ tests/ -name "*.c" -o -name "*.h" | xargs uncrustify -c uncrustify.cfg --replace --no-backup
 git add -u' > .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
