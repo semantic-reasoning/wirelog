@@ -2311,6 +2311,131 @@ test_api_get_schema_null(void)
 }
 
 static void
+test_api_get_relation_ir_single_rule(void)
+{
+    TEST("wirelog_program_get_relation_ir returns single-rule root");
+
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
+            ".decl Reach(x: int32, y: int32)\n"
+            "Reach(x, y) :- Arc(x, y).\n",
+            NULL);
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    const wirelog_ir_node_t *root
+        = wirelog_program_get_relation_ir(prog, "Reach");
+    if (!root) {
+        wirelog_program_free(prog);
+        FAIL("Reach IR should not be NULL");
+        return;
+    }
+
+    if (wirelog_ir_node_get_type(root) != WIRELOG_IR_PROJECT) {
+        wirelog_program_free(prog);
+        FAIL("single-rule relation should expose PROJECT root");
+        return;
+    }
+
+    const char *relation = wirelog_ir_node_get_relation_name(root);
+    if (!relation || strcmp(relation, "Reach") != 0) {
+        wirelog_program_free(prog);
+        FAIL("root relation name should be Reach");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_get_relation_ir_multi_rule_union(void)
+{
+    TEST(
+        "wirelog_program_get_relation_ir returns UNION for multi-rule relation");
+
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+            NULL);
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    const wirelog_ir_node_t *root = wirelog_program_get_relation_ir(prog, "Tc");
+    if (!root) {
+        wirelog_program_free(prog);
+        FAIL("Tc IR should not be NULL");
+        return;
+    }
+
+    if (wirelog_ir_node_get_type(root) != WIRELOG_IR_UNION) {
+        wirelog_program_free(prog);
+        FAIL("multi-rule relation should expose UNION root");
+        return;
+    }
+
+    if (wirelog_ir_node_get_child_count(root) != 2) {
+        wirelog_program_free(prog);
+        FAIL("UNION root should have 2 children");
+        return;
+    }
+
+    if (!wirelog_ir_node_get_child(root, 0)
+        || !wirelog_ir_node_get_child(root, 1)) {
+        wirelog_program_free(prog);
+        FAIL("UNION children should be accessible");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_api_get_relation_ir_null_cases(void)
+{
+    TEST("wirelog_program_get_relation_ir returns NULL for absent IR roots");
+
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n", NULL);
+
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    if (wirelog_program_get_relation_ir(prog, "Arc") != NULL) {
+        wirelog_program_free(prog);
+        FAIL("EDB-only relation should return NULL");
+        return;
+    }
+
+    if (wirelog_program_get_relation_ir(prog, "Missing") != NULL) {
+        wirelog_program_free(prog);
+        FAIL("unknown relation should return NULL");
+        return;
+    }
+
+    if (wirelog_program_get_relation_ir(NULL, "Arc") != NULL
+        || wirelog_program_get_relation_ir(prog, NULL) != NULL) {
+        wirelog_program_free(prog);
+        FAIL("NULL inputs should return NULL");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
 test_api_get_stratum_count(void)
 {
     TEST("wirelog_program_get_stratum_count returns 1");
@@ -3042,6 +3167,9 @@ main(void)
     test_api_get_schema();
     test_api_get_schema_compound_columns();
     test_api_get_schema_null();
+    test_api_get_relation_ir_single_rule();
+    test_api_get_relation_ir_multi_rule_union();
+    test_api_get_relation_ir_null_cases();
     test_api_get_stratum_count();
     test_api_get_stratum();
     test_api_get_stratum_oob();

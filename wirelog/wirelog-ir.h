@@ -43,6 +43,7 @@ extern "C" {
 /* ======================================================================== */
 
 typedef struct wirelog_ir_node wirelog_ir_node_t;
+typedef struct wirelog_program wirelog_program_t;
 
 /**
  * wirelog_ir_node_type_t:
@@ -111,6 +112,27 @@ wirelog_ir_node_get_child_count(const wirelog_ir_node_t *node);
  */
 WIRELOG_API const wirelog_ir_node_t *
 wirelog_ir_node_get_child(const wirelog_ir_node_t *node, uint32_t index);
+
+/* ======================================================================== */
+/* Program IR Access                                                        */
+/* ======================================================================== */
+
+/**
+ * wirelog_program_get_relation_ir:
+ * @program: Parsed program
+ * @relation_name: Relation name
+ *
+ * Get the merged IR root for a derived relation. When multiple rules derive
+ * the relation, the returned root is a WIRELOG_IR_UNION node. The returned
+ * pointer is owned by @program, remains valid until wirelog_program_free(),
+ * and must not be freed by the caller.
+ *
+ * Returns: (transfer none): Relation IR root, or NULL for invalid arguments,
+ * unknown relations, EDB-only relations, or programs without built relation IRs.
+ */
+WIRELOG_API const wirelog_ir_node_t *
+wirelog_program_get_relation_ir(const wirelog_program_t *program,
+    const char *relation_name);
 
 /* ======================================================================== */
 /* IR Printing / Debugging                                                  */

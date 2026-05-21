@@ -11,6 +11,10 @@ All notable changes to wirelog are documented in this file.
   `WL_MBEDTLS_ENABLED=1`, and runs `cryptographic_hashes` so optional
   crypto paths are covered without changing the default disabled
   artifact posture (#843).
+- Added `wirelog_program_get_relation_ir()`, a relation-scoped public
+  accessor that returns the borrowed merged IR root for a derived
+  relation and exposes multi-rule relations as `WIRELOG_IR_UNION`
+  without inventing a program-level super-root (#860).
 
 ### Changed
 

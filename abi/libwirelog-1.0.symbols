@@ -56,6 +56,7 @@ wirelog_parse_with_error_info
 wirelog_program_free
 wirelog_program_get_facts
 wirelog_program_get_intern
+wirelog_program_get_relation_ir
 wirelog_program_get_rule_count
 wirelog_program_get_schema
 wirelog_program_get_stratum
