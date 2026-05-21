@@ -14,6 +14,7 @@
  * - wirelog_program_get_stratum_count
  * - wirelog_program_get_stratum
  * - wirelog_program_is_stratified
+ * - wirelog_program_get_relation_ir
  * - wirelog_program_free
  */
 
@@ -110,7 +111,7 @@ wirelog_parse(const char *filename, wirelog_error_t *error)
 
 wirelog_program_t *
 wirelog_parse_with_error_info(const char *filename,
-                              wirelog_parse_error_t *error_info)
+    wirelog_parse_error_t *error_info)
 {
     (void)filename;
     if (error_info) {
@@ -137,7 +138,7 @@ wirelog_program_get_rule_count(const wirelog_program_t *program)
 
 const wirelog_schema_t *
 wirelog_program_get_schema(const wirelog_program_t *program,
-                           const char *relation_name)
+    const char *relation_name)
 {
     if (!program || !relation_name || !program->schemas)
         return NULL;
@@ -161,7 +162,7 @@ wirelog_program_get_stratum_count(const wirelog_program_t *program)
 
 const wirelog_stratum_t *
 wirelog_program_get_stratum(const wirelog_program_t *program,
-                            uint32_t stratum_id)
+    uint32_t stratum_id)
 {
     if (!program || stratum_id >= program->stratum_count)
         return NULL;
@@ -176,14 +177,32 @@ wirelog_program_is_stratified(const wirelog_program_t *program)
     return program->is_stratified;
 }
 
+const wirelog_ir_node_t *
+wirelog_program_get_relation_ir(const wirelog_program_t *program,
+    const char *relation_name)
+{
+    if (!program || !relation_name || !program->relations
+        || !program->relation_irs)
+        return NULL;
+
+    for (uint32_t i = 0; i < program->relation_count; i++) {
+        if (program->relations[i].name
+            && strcmp(program->relations[i].name, relation_name) == 0) {
+            return program->relation_irs[i];
+        }
+    }
+
+    return NULL;
+}
+
 /* ======================================================================== */
 /* Fact Extraction                                                          */
 /* ======================================================================== */
 
 int
 wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
-                          int64_t **data, uint32_t *num_rows,
-                          uint32_t *num_cols)
+    int64_t **data, uint32_t *num_rows,
+    uint32_t *num_cols)
 {
     if (!prog || !relation || !data || !num_rows || !num_cols)
         return -1;
