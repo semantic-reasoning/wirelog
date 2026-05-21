@@ -35,6 +35,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Performance
 
+- **Stable snapshot fast path** (#811): clean sessions now read cached
+  materialized IDB rows directly on repeated snapshots instead of
+  re-running TDD evaluation when no input or retraction state is pending.
+
 ### Security
 
 ### Documentation

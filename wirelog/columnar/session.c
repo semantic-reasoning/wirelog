@@ -132,6 +132,7 @@ session_note_inserted_input(wl_col_session_t *sess, const char *relation,
         sess->pending_full_input_eval = true;
     sess->last_inserted_relation = relation;
     sess->pending_input_change = true;
+    sess->snapshot_stable_valid = false;
 }
 
 int
@@ -1886,6 +1887,9 @@ col_session_remove(wl_session_t *session, const char *relation,
         r->nrows = out_r;
 next_del:;
     }
+    session_invalidate_relation_caches(sess, relation);
+    sess->pending_input_change = true;
+    sess->snapshot_stable_valid = false;
     return 0;
 }
 
@@ -2136,6 +2140,12 @@ col_session_step(wl_session_t *session)
     sess->last_inserted_relation = NULL;
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        col_rel_t *r = sess->rels[i];
+        if (r)
+            r->base_nrows = r->nrows;
+    }
+    sess->snapshot_stable_valid = true;
     return 0;
 }
 
@@ -2163,36 +2173,9 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     sess->delta_data = user_data;
 }
 
-/*
- * col_session_snapshot: Evaluate all strata and emit current IDB tuples
- *
- * Implements wl_compute_backend_t.session_snapshot vtable slot.
- *
- * Evaluation order:
- *   1. Execute all strata in plan order (col_eval_stratum per stratum)
- *   2. For each IDB relation in each stratum, invoke callback once per row
- *
- * Complexity: O(S * R * N) where S=strata, R=relations per stratum, N=rows
- *
- * TODO(#811): Snapshot should read from stable R (not recompute);
- * currently re-evaluates on every call which is O(input) per snapshot.
- *
- * @param session:   wl_session_t* (cast to wl_col_session_t* internally)
- * @param callback:  Invoked once per output tuple (relation, row, ncols)
- * @param user_data: Opaque pointer passed through to callback
- * @return 0 on success, EINVAL if session/callback NULL, non-zero on eval error
- */
-static int
-col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
-    void *user_data)
+static void
+col_session_reset_snapshot_profile(wl_col_session_t *sess)
 {
-    if (!session || !callback)
-        return EINVAL;
-
-    wl_col_session_t *sess = COL_SESSION(session);
-    const wl_plan_t *plan = sess->plan;
-
-    /* Reset profiling counters for this evaluation pass */
     sess->consolidation_ns = 0;
     sess->kfusion_ns = 0;
     sess->kfusion_alloc_ns = 0;
@@ -2227,6 +2210,95 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         sizeof(sess->tdd_fallback_reason_counts));
     sess->tdd_last_fallback_reason = WL_COLUMNAR_INTERNAL_TDD_FALLBACK_NONE;
     sess->tdd_decision_tracking_active = false;
+}
+
+static int
+col_session_emit_snapshot(const wl_plan_t *plan, wl_col_session_t *sess,
+    wirelog_on_tuple_fn callback, void *user_data)
+{
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            const char *rname = sp->relations[ri].name;
+            col_rel_t *r = session_find_rel(sess, rname);
+            if (!r || r->nrows == 0)
+                continue;
+            for (uint32_t row = 0; row < r->nrows; row++) {
+                callback(rname, col_rel_row(r, row), r->ncols,
+                    user_data);
+            }
+        }
+    }
+    return 0;
+}
+
+static void
+col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
+{
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
+            if (!r)
+                continue;
+            r->nrows = 0;
+            r->sorted_nrows = 0;
+            r->run_count = 0;
+            r->base_nrows = 0;
+            col_session_invalidate_arrangements(&sess->base, r->name);
+        }
+    }
+    col_mat_cache_clear(&sess->mat_cache);
+}
+
+/*
+ * col_session_snapshot: Evaluate all strata and emit current IDB tuples
+ *
+ * Implements wl_compute_backend_t.session_snapshot vtable slot.
+ *
+ * Evaluation order:
+ *   1. If the session is already clean and stable, read cached IDB rows.
+ *   2. Otherwise execute all strata in plan order.
+ *   3. For each IDB relation in each stratum, invoke callback once per row
+ *
+ * Complexity: O(S * R * N) where S=strata, R=relations per stratum, N=rows
+ *
+ * Issue #811: clean snapshots read stable R without recomputing.
+ *
+ * @param session:   wl_session_t* (cast to wl_col_session_t* internally)
+ * @param callback:  Invoked once per output tuple (relation, row, ncols)
+ * @param user_data: Opaque pointer passed through to callback
+ * @return 0 on success, EINVAL if session/callback NULL, non-zero on eval error
+ */
+static int
+col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
+    void *user_data)
+{
+    if (!session || !callback)
+        return EINVAL;
+
+    wl_col_session_t *sess = COL_SESSION(session);
+    const wl_plan_t *plan = sess->plan;
+
+    /* Reset profiling counters for this evaluation pass */
+    col_session_reset_snapshot_profile(sess);
+
+    if (sess->snapshot_stable_valid
+        && !sess->pending_input_change
+        && !sess->pending_full_input_eval
+        && sess->last_inserted_relation == NULL
+        && sess->last_removed_relation == NULL
+        && !sess->delta_seeded
+        && !sess->retraction_seeded) {
+        return col_session_emit_snapshot(plan, sess, callback, user_data);
+    }
+
+    if (sess->total_iterations > 0
+        && (sess->pending_full_input_eval
+        || (sess->pending_input_change
+        && sess->last_inserted_relation == NULL))) {
+        col_session_clear_idb_rows(plan, sess);
+    }
 
     /* Phase 4 incremental skip: when last_inserted_relation is set, only
      * re-evaluate strata that transitively depend on the inserted relation.
@@ -2566,6 +2638,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     sess->delta_seeded = false;
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
+    sess->snapshot_stable_valid = true;
 
     /* Issue #83: Update base_nrows for all relations after convergence.
      * This marks the current state as "stable" so the next incremental
@@ -2585,21 +2658,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
             col_rel_compact(r);
     }
 
-    /* Invoke callback for every tuple in every IDB relation */
-    for (uint32_t si = 0; si < plan->stratum_count; si++) {
-        const wl_plan_stratum_t *sp = &plan->strata[si];
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-            const char *rname = sp->relations[ri].name;
-            col_rel_t *r = session_find_rel(sess, rname);
-            if (!r || r->nrows == 0)
-                continue;
-            for (uint32_t row = 0; row < r->nrows; row++) {
-                callback(rname, col_rel_row(r, row), r->ncols,
-                    user_data);
-            }
-        }
-    }
-    return 0;
+    return col_session_emit_snapshot(plan, sess, callback, user_data);
 }
 
 /* Affected strata/rules detection moved to columnar/frontier.c;

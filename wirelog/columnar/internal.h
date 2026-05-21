@@ -894,6 +894,10 @@ typedef struct wl_col_session_t {
      * stratum selection must conservatively evaluate every stratum while
      * preserving last_inserted_relation as the most recent input name. */
     bool pending_full_input_eval;
+    /* True after a successful step/snapshot has materialized stable IDB rows.
+     * A clean snapshot may enumerate those rows directly instead of running
+     * another evaluation pass. */
+    bool snapshot_stable_valid;
     /* Current fixed-point iteration counter within col_eval_stratum.
      * Set at the start of each iteration; operators use this to distinguish
      * iteration 0 (base case: FORCE_DELTA falls back to full relation) from
