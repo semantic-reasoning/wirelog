@@ -159,6 +159,75 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
 
 ---
 
+## Numerical fail-closed arithmetic (Status: Current)
+
+Tracked under #822. Milestone v0.43.
+
+### Rule
+
+Columnar expression evaluation is fail-closed for integer conditions
+that cannot be represented as an `int64_t` result:
+
+- `+`, `-`, and `*` use checked `int64_t` arithmetic.
+- `/` and `%` reject divide-by-zero and the `INT64_MIN / -1`
+  representability overflow.
+- `bshl` and `bshr` reject negative shift counts and shift counts
+  greater than or equal to 64.
+- `to_number()` inside columnar expressions rejects numeric prefixes
+  outside the `int64_t` range.  Non-numeric and empty strings remain a
+  successful conversion to `0`; numeric prefixes such as `"42abc"`
+  still parse the leading number.
+
+The failure mode depends on the operator context:
+
+- `FILTER` predicates reject the row and continue evaluation.
+- `MAP`/head expressions return `ERANGE` to the caller.
+- `REDUCE` aggregate expressions and `sum()` accumulation return
+  `ERANGE` to the caller.
+
+Bitwise `band`, `bor`, `bxor`, and `bnot` are total over the stored
+`int64_t` bit pattern.  Hash, CRC, crypto digest, HMAC, and UUID
+built-ins define their own folding or availability behavior and are not
+overflow-prone arithmetic operators under this rule.
+
+### Audit notes
+
+- `wirelog/columnar/ops.c` is the runtime enforcement point.  Both the
+  slow bytecode evaluator and compiled evaluator share checked
+  arithmetic helpers for `+`, `-`, `*`, `/`, `%`, `bshl`, and `bshr`.
+  The filter path fails closed by row rejection; MAP and REDUCE paths
+  propagate expression failure as `ERANGE`.
+- `wirelog/string_ops.c` keeps the legacy `string_ops_to_number()`
+  saturation behavior for direct internal callers, but exposes
+  `wl_string_ops_to_number_checked()` for columnar expression
+  evaluation.  The checked helper rejects `int64_t` range errors with
+  `ERANGE`.
+- `wirelog/passes/` rewrites and annotates IR but does not perform
+  runtime integer arithmetic for Datalog expression results.  The
+  serialized expression tags from `wirelog/exec_plan_gen.c` are
+  evaluated by the columnar runtime described above.
+- `col_op_reduce_weighted()` remains a weighted Z-set helper for signed
+  multiplicity accounting, not a Datalog arithmetic expression
+  evaluator.  It is outside the #822 user-expression fail-closed
+  contract.
+
+### Coverage
+
+`tests/test_arithmetic_overflow.c` covers overflow and invalid
+arithmetic in filters, MAP/head expressions, REDUCE aggregate
+expressions, `sum()` accumulation, shift bounds, and checked
+`to_number()` range errors.  `tests/test_string_ops.c` covers the
+checked and legacy `to_number()` contracts.
+
+### References
+
+- Issue #822 — numerical safety unified: overflow -> fail-closed.
+- `wirelog/columnar/ops.c` — runtime expression evaluators and REDUCE.
+- `wirelog/string_ops.c` — checked `to_number()` helper.
+- `tests/test_arithmetic_overflow.c` and `tests/test_string_ops.c`.
+
+---
+
 ## v0.40 API audit closure (Status: Current)
 
 The v0.40 API audit (epic #680, Risk-C and Blocker-B series catalogued

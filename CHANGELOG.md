@@ -18,6 +18,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Numerical safety fail-closed policy** (#822): columnar arithmetic
+  now rejects unrepresentable `int64` results instead of wrapping,
+  saturating, or leaking undefined behavior. Filters fail closed by
+  rejecting rows; MAP/head and REDUCE expression contexts propagate
+  `ERANGE`. The policy covers checked `+`, `-`, `*`, `/`, `%`,
+  `bshl`, `bshr`, checked `to_number()` range parsing, and `sum()`
+  accumulation, with the audit recorded in `docs/SEMANTICS.md`.
+
 ### Deprecated
 
 ### Removed
