@@ -2643,6 +2643,23 @@ test_expr_compile_exe = executable(
 
 test('expr_compile', test_expr_compile_exe)
 
+test_arithmetic_overflow_exe = executable(
+  'test_arithmetic_overflow',
+  files('test_arithmetic_overflow.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('arithmetic_overflow', test_arithmetic_overflow_exe)
+
 # ============================================================================
 # Pointer Swap Tests (Issue #300)
 # ============================================================================

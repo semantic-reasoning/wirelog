@@ -168,6 +168,61 @@ filt_pop(filt_stack_t *s)
     return s->top != 0 ? s->vals[--s->top] : 0;
 }
 
+/* Checked int64 arithmetic helpers shared by both slow and compiled evaluators. */
+static int
+wl_checked_add_int64(int64_t a, int64_t b, int64_t *out)
+{
+    return __builtin_add_overflow(a, b, out) ? ERANGE : 0;
+}
+
+static int
+wl_checked_sub_int64(int64_t a, int64_t b, int64_t *out)
+{
+    return __builtin_sub_overflow(a, b, out) ? ERANGE : 0;
+}
+
+static int
+wl_checked_mul_int64(int64_t a, int64_t b, int64_t *out)
+{
+    return __builtin_mul_overflow(a, b, out) ? ERANGE : 0;
+}
+
+static int
+wl_checked_div_int64(int64_t a, int64_t b, int64_t *out)
+{
+    if (b == 0 || (a == INT64_MIN && b == -1))
+        return ERANGE;
+    *out = a / b;
+    return 0;
+}
+
+static int
+wl_checked_mod_int64(int64_t a, int64_t b, int64_t *out)
+{
+    if (b == 0 || (a == INT64_MIN && b == -1))
+        return ERANGE;
+    *out = a % b;
+    return 0;
+}
+
+static int
+wl_checked_shl_int64(int64_t a, int64_t b, int64_t *out)
+{
+    if (b < 0 || b >= 64)
+        return ERANGE;
+    *out = (int64_t)((uint64_t)a << (uint32_t)b);
+    return 0;
+}
+
+static int
+wl_checked_shr_int64(int64_t a, int64_t b, int64_t *out)
+{
+    if (b < 0 || b >= 64)
+        return ERANGE;
+    *out = a >> (uint32_t)b;
+    return 0;
+}
+
 /*
  * col_eval_expr_run:
  * Core postfix expression evaluator. Runs the bytecode against a row and
@@ -252,27 +307,42 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         /* Arithmetic */
         case WL_PLAN_EXPR_ARITH_ADD: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a + b);
+            int64_t v;
+            if (wl_checked_add_int64(a, b, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_SUB: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a - b);
+            int64_t v;
+            if (wl_checked_sub_int64(a, b, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_MUL: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a * b);
+            int64_t v;
+            if (wl_checked_mul_int64(a, b, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_DIV: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, b != 0 ? a / b : 0);
+            int64_t v;
+            if (wl_checked_div_int64(a, b, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_MOD: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, b != 0 ? a % b : 0);
+            int64_t v;
+            if (wl_checked_mod_int64(a, b, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_BAND: {
@@ -297,12 +367,18 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         }
         case WL_PLAN_EXPR_ARITH_SHL: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a << b);
+            int64_t v;
+            if (wl_checked_shl_int64(a, b, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_SHR: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a >> b);
+            int64_t v;
+            if (wl_checked_shr_int64(a, b, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_HASH: {
@@ -610,22 +686,20 @@ col_eval_filter_row(const uint8_t *buf, uint32_t size, const int64_t *row,
 {
     int64_t val;
     int err = col_eval_expr_run(buf, size, row, ncols, &val, intern);
-    return err ? 1 : (val != 0 ? 1 : 0); /* on error: pass row through */
+    return err ? 0 : (val != 0 ? 1 : 0);
 }
 
 /*
  * col_eval_expr_i64:
- * Evaluate the postfix expression buffer and return the computed int64 value.
+ * Evaluate the postfix expression buffer and write the computed value to out_val.
  * Used by MAP operations to compute head argument expressions.
- * Returns 0 on empty expression or evaluation error.
+ * Returns 0 on success, non-zero on empty expression or evaluation error.
  */
-static int64_t
+static int
 col_eval_expr_i64(const uint8_t *buf, uint32_t size, const int64_t *row,
-    uint32_t ncols, wl_intern_t *intern)
+    uint32_t ncols, int64_t *out_val, wl_intern_t *intern)
 {
-    int64_t val;
-    col_eval_expr_run(buf, size, row, ncols, &val, intern);
-    return val;
+    return col_eval_expr_run(buf, size, row, ncols, out_val, intern);
 }
 
 /* ======================================================================== */
@@ -811,27 +885,52 @@ col_eval_expr_compiled(const col_expr_compiled_t *c, const int64_t *row,
             break;
         case WL_PLAN_EXPR_ARITH_ADD: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a + b);
+            int64_t v;
+            if (wl_checked_add_int64(a, b, &v) != 0) {
+                *out_val = 0;
+                return 1;
+            }
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_SUB: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a - b);
+            int64_t v;
+            if (wl_checked_sub_int64(a, b, &v) != 0) {
+                *out_val = 0;
+                return 1;
+            }
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_MUL: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a * b);
+            int64_t v;
+            if (wl_checked_mul_int64(a, b, &v) != 0) {
+                *out_val = 0;
+                return 1;
+            }
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_DIV: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, b != 0 ? a / b : 0);
+            int64_t v;
+            if (wl_checked_div_int64(a, b, &v) != 0) {
+                *out_val = 0;
+                return 1;
+            }
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_MOD: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, b != 0 ? a % b : 0);
+            int64_t v;
+            if (wl_checked_mod_int64(a, b, &v) != 0) {
+                *out_val = 0;
+                return 1;
+            }
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_BAND: {
@@ -856,12 +955,22 @@ col_eval_expr_compiled(const col_expr_compiled_t *c, const int64_t *row,
         }
         case WL_PLAN_EXPR_ARITH_SHL: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a << b);
+            int64_t v;
+            if (wl_checked_shl_int64(a, b, &v) != 0) {
+                *out_val = 0;
+                return 1;
+            }
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_ARITH_SHR: {
             int64_t b = filt_pop(&s), a = filt_pop(&s);
-            filt_push(&s, a >> b);
+            int64_t v;
+            if (wl_checked_shr_int64(a, b, &v) != 0) {
+                *out_val = 0;
+                return 1;
+            }
+            filt_push(&s, v);
             break;
         }
         case WL_PLAN_EXPR_CMP_EQ: {
@@ -1122,13 +1231,37 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 && op->map_exprs[c].size > 0) {
                 if (ce_map && c < ce_map_count && ce_map[c]) {
                     int64_t val = 0;
-                    col_eval_expr_compiled(ce_map[c], row, e.rel->ncols,
-                        &val);
+                    if (col_eval_expr_compiled(ce_map[c], row, e.rel->ncols,
+                        &val) != 0) {
+                        if (ce_map) {
+                            for (uint32_t i = 0; i < ce_map_count; i++)
+                                col_expr_compiled_free(ce_map[i]);
+                            free(ce_map);
+                        }
+                        free(tmp);
+                        col_rel_destroy(out);
+                        if (e.owned)
+                            col_rel_destroy(e.rel);
+                        return ERANGE;
+                    }
                     tmp[c] = val;
                 } else {
-                    tmp[c] = col_eval_expr_i64(op->map_exprs[c].data,
-                            op->map_exprs[c].size, row,
-                            e.rel->ncols, sess->intern);
+                    int64_t val = 0;
+                    if (col_eval_expr_i64(op->map_exprs[c].data,
+                        op->map_exprs[c].size, row, e.rel->ncols,
+                        &val, sess->intern) != 0) {
+                        if (ce_map) {
+                            for (uint32_t i = 0; i < ce_map_count; i++)
+                                col_expr_compiled_free(ce_map[i]);
+                            free(ce_map);
+                        }
+                        free(tmp);
+                        col_rel_destroy(out);
+                        if (e.owned)
+                            col_rel_destroy(e.rel);
+                        return ERANGE;
+                    }
+                    tmp[c] = val;
                 }
             } else {
                 uint32_t src = op->project_indices ? op->project_indices[c] : c;
@@ -1629,7 +1762,7 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
             int64_t val = 0;
             pass = (col_eval_expr_compiled(ce, row, e.rel->ncols, &val) == 0)
                        ? (val != 0 ? 1 : 0)
-                       : 1; /* on error: pass row through */
+                       : 0; /* on error: reject row */
         } else {
             pass = col_eval_filter_row(buf, bsz, row, e.rel->ncols,
                     sess->intern);
@@ -6118,9 +6251,27 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 int64_t val = 0;
                 if (col_eval_expr_compiled(agg_ce, row, in->ncols, &val) == 0)
                     agg_val = val;
+                else {
+                    col_expr_compiled_free(agg_ce);
+                    free(tmp);
+                    col_rel_destroy(out);
+                    if (e.owned)
+                        col_rel_destroy(in);
+                    return ERANGE;
+                }
             } else {
-                agg_val = col_eval_expr_i64(op->agg_expr.data,
-                        op->agg_expr.size, row, in->ncols, sess->intern);
+                int64_t val = 0;
+                if (col_eval_expr_i64(op->agg_expr.data, op->agg_expr.size,
+                    row, in->ncols, &val, sess->intern) == 0) {
+                    agg_val = val;
+                } else {
+                    col_expr_compiled_free(agg_ce);
+                    free(tmp);
+                    col_rel_destroy(out);
+                    if (e.owned)
+                        col_rel_destroy(in);
+                    return ERANGE;
+                }
             }
         }
 
