@@ -1088,7 +1088,7 @@ test_unavailable_builtin_fails_closed(const char *name, const char *src)
 }
 
 static void
-test_md5_evaluates_with_zero_fallback_no_mbedtls(void)
+test_md5_fails_closed_no_mbedtls(void)
 {
     const char *src = ".decl a(x: int64)\n"
         "a(0).\n"
@@ -1100,7 +1100,7 @@ test_md5_evaluates_with_zero_fallback_no_mbedtls(void)
 }
 
 static void
-test_sha1_evaluates_with_zero_fallback_no_mbedtls(void)
+test_sha1_fails_closed_no_mbedtls(void)
 {
     const char *src = ".decl a(x: int64)\n"
         "a(0).\n"
@@ -1112,7 +1112,7 @@ test_sha1_evaluates_with_zero_fallback_no_mbedtls(void)
 }
 
 static void
-test_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
+test_sha256_fails_closed_no_mbedtls(void)
 {
     const char *src = ".decl a(x: int64)\n"
         "a(0).\n"
@@ -1124,7 +1124,7 @@ test_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
 }
 
 static void
-test_sha512_evaluates_with_zero_fallback_no_mbedtls(void)
+test_sha512_fails_closed_no_mbedtls(void)
 {
     const char *src = ".decl a(x: int64)\n"
         "a(0).\n"
@@ -1136,7 +1136,7 @@ test_sha512_evaluates_with_zero_fallback_no_mbedtls(void)
 }
 
 static void
-test_hmac_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
+test_hmac_sha256_fails_closed_no_mbedtls(void)
 {
     const char *src = ".decl a(msg: int64, key: int64)\n"
         "a(0, 1).\n"
@@ -1148,7 +1148,7 @@ test_hmac_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
 }
 
 static void
-test_uuid4_evaluates_with_zero_fallback_no_mbedtls(void)
+test_uuid4_fails_closed_no_mbedtls(void)
 {
     const char *src = ".decl a(x: int64)\n"
         "a(0).\n"
@@ -1160,7 +1160,7 @@ test_uuid4_evaluates_with_zero_fallback_no_mbedtls(void)
 }
 
 static void
-test_uuid5_evaluates_with_zero_fallback_no_mbedtls(void)
+test_uuid5_fails_closed_no_mbedtls(void)
 {
     const char *src = ".decl a(ns: int64, name: int64)\n"
         "a(1234, 5678).\n"
@@ -1238,13 +1238,13 @@ main(void)
         "DISABLED] ===\n\n");
 
     printf("--- Runtime Behavior Tests (mbedTLS unavailable) ---\n");
-    test_md5_evaluates_with_zero_fallback_no_mbedtls();
-    test_sha1_evaluates_with_zero_fallback_no_mbedtls();
-    test_sha256_evaluates_with_zero_fallback_no_mbedtls();
-    test_sha512_evaluates_with_zero_fallback_no_mbedtls();
-    test_hmac_sha256_evaluates_with_zero_fallback_no_mbedtls();
-    test_uuid4_evaluates_with_zero_fallback_no_mbedtls();
-    test_uuid5_evaluates_with_zero_fallback_no_mbedtls();
+    test_md5_fails_closed_no_mbedtls();
+    test_sha1_fails_closed_no_mbedtls();
+    test_sha256_fails_closed_no_mbedtls();
+    test_sha512_fails_closed_no_mbedtls();
+    test_hmac_sha256_fails_closed_no_mbedtls();
+    test_uuid4_fails_closed_no_mbedtls();
+    test_uuid5_fails_closed_no_mbedtls();
 #endif
 
     printf("\n--- sha256()/sha512() Determinism Tests (always run) ---\n");
