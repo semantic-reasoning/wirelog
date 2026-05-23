@@ -213,10 +213,13 @@ native finalization paths using:
 wirelog_io_unregister_adapter("android_asset");
 ```
 
-## Follow-up work
+## Reference implementation
 
-`examples/android/asset_adapter` is planned for #466 follow-up.
-It is not part of this atomic unit.
+Use `examples/android/asset_adapter` as the reference implementation for a full
+`android_asset` adapter backed by `AAssetManager`, including native JNI state
+setup and `.input` usage.
+
+- [Asset adapter example README](../examples/android/asset_adapter/README.md)
 
 ## Cross references
 
