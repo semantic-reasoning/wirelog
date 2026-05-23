@@ -33,6 +33,7 @@ static void
 clear_asset_manager_state(void)
 {
     JNIEnv *env = NULL;
+    jobject old_manager = g_adapter_state.java_asset_manager;
     bool vm_attached = false;
 
     if (g_adapter_state.vm != NULL) {
@@ -54,13 +55,12 @@ clear_asset_manager_state(void)
         }
     }
 
-    if (env != NULL && g_adapter_state.java_asset_manager != NULL) {
-        (*env)->DeleteGlobalRef(env, g_adapter_state.java_asset_manager);
+    if (env != NULL && old_manager != NULL) {
+        (*env)->DeleteGlobalRef(env, old_manager);
         g_adapter_state.java_asset_manager = NULL;
-    } else if (g_adapter_state.java_asset_manager != NULL) {
+    } else if (old_manager != NULL) {
         __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
             "cannot clear old AssetManager global ref: JNIEnv unavailable");
-        g_adapter_state.java_asset_manager = NULL;
     }
 
     if (vm_attached) {

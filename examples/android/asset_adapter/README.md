@@ -33,6 +33,7 @@ public final class AssetAdapter {
     }
 
     public static native void setAssetManager(android.content.res.AssetManager manager);
+    public static native void unregister();
 }
 ```
 
@@ -40,6 +41,8 @@ Call from Java/Kotlin before the first `wirelog` run:
 
 ```kotlin
 AssetAdapter.setAssetManager(context.assets)
+// On shutdown (optional):
+// AssetAdapter.unregister()
 ```
 
 This stores an `AAssetManager*` in native state as the adapter `user_data`
@@ -70,8 +73,8 @@ In your Wirelog program:
 
 ```wire
 .decl seed_file(value: int64, label: int64)
-.input R(io="android_asset", filename="seed/input.csv")
-.output sum: sum(seed_file.value)
+.input seed_file(io="android_asset", filename="seed/input.csv")
+.output seed_file
 ```
 
 ## Asset payload
@@ -85,10 +88,6 @@ Store this CSV in `assets/seed/input.csv`:
 ```
 
 Each non-empty line maps to one row in the schema passed to your query.
-
-```wire
-.input R(io="android_asset", filename="seed/input.csv")
-```
 
 Each non-empty line in `seed/input.csv` must contain one value per
 `wirelog_io_ctx_num_cols()` column, all `int64`.
