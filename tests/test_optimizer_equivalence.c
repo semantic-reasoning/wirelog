@@ -314,78 +314,6 @@ check_matrix_case(const char *name, const char *src, const char *relation,
 }
 
 static int
-check_matrix_case_magic_only(const char *name, const char *src,
-    const char *relation, matrix_expectation_t expect)
-{
-    opt_flags_t baseline_flags = {
-        .magic_sets = true,
-        .sip = true,
-        .fusion = true,
-        .jpp = true,
-    };
-    row_set_t baseline;
-    wl_fusion_stats_t fusion = { 0 };
-    wl_sip_stats_t sip = { 0 };
-    wl_jpp_stats_t jpp = { 0 };
-    wl_magic_sets_stats_t magic = { 0 };
-    bool magic_applied = false;
-
-    if (!run_program_with_stats(src, relation, baseline_flags, &baseline,
-        &fusion,
-        &sip, &jpp, &magic, &magic_applied)) {
-        printf("%s baseline ... FAIL\n", name);
-        return 1;
-    }
-
-    if (expect.expect_fusion_activity && fusion.fusions_applied == 0) {
-        printf("%s baseline ... FAIL (fusion not active)\n", name);
-        return 1;
-    }
-    if (expect.expect_sip_activity && sip.semijoins_inserted == 0) {
-        printf("%s baseline ... FAIL (SIP not active)\n", name);
-        return 1;
-    }
-    if (expect.expect_jpp_activity
-        && jpp.joins_reordered == 0
-        && jpp.projections_inserted == 0) {
-        printf("%s baseline ... FAIL (JPP not active)\n", name);
-        return 1;
-    }
-    if (expect.expect_magic_active
-        && (!magic_applied || magic.adorned_predicates == 0
-        || magic.magic_rules_generated == 0)) {
-        printf("%s baseline ... FAIL (Magic Sets not active)\n", name);
-        return 1;
-    }
-    if (expect.expect_magic_noop
-        && (magic_applied || magic.adorned_predicates != 0
-        || magic.magic_rules_generated != 0
-        || magic.original_rules_modified != 0)) {
-        printf("%s baseline ... FAIL (Magic Sets should be all-free/no-op)\n",
-            name);
-        return 1;
-    }
-
-    for (uint32_t mask = 1; mask < 16; mask += 2) {
-        opt_flags_t flags = {
-            .magic_sets = (mask & 0x1) != 0,
-            .sip = (mask & 0x2) != 0,
-            .fusion = (mask & 0x4) != 0,
-            .jpp = (mask & 0x8) != 0,
-        };
-        row_set_t actual;
-        if (!run_program(src, relation, flags, &actual)
-            || !row_sets_equal(&baseline, &actual)) {
-            printf("%s mask=0x%x ... FAIL\n", name, mask);
-            return 1;
-        }
-    }
-
-    printf("%s ... PASS\n", name);
-    return 0;
-}
-
-static int
 test_row_set_multiset_equality(void)
 {
     row_set_t expected = { 0 };
@@ -577,18 +505,20 @@ main(void)
         "c(7, 8).\n"
         "out(x, z) :- a(x, y), c(w, z), b(y, w).\n";
     static const char *bounded_magic_src =
-        ".decl p(x: int32, y: int32)\n"
         ".decl edge(x: int32, y: int32)\n"
         ".decl q(x: int32, y: int32)\n"
-        ".output p\n"
+        ".decl r(x: int32, y: int32)\n"
+        ".output q\n"
         ".query q(b, f) .\n"
-        "p(1, 10).\n"
-        "p(2, 20).\n"
+        ".query r(b, f) .\n"
+        "q(1, 1).\n"
+        "q(1, 2).\n"
         "edge(1, 2).\n"
         "edge(2, 3).\n"
         "edge(3, 4).\n"
-        "q(x, y) :- edge(x, y).\n"
-        "q(x, y) :- edge(x, z), q(z, y).\n";
+        "q(1, y) :- q(1, z), edge(z, y).\n"
+        "r(x, y) :- q(x, y).\n"
+        "r(x, y) :- edge(x, z), r(z, y).\n";
     static const char *all_free_magic_src =
         ".decl af(x: int32, y: int32)\n"
         ".decl out(x: int32, y: int32)\n"
@@ -619,7 +549,7 @@ main(void)
             expect_sip);
     failed += check_matrix_case("optimizer matrix: jpp", jpp_src, "out",
             expect_jpp);
-    failed += check_matrix_case_magic_only("optimizer matrix: bounded magic",
+    failed += check_matrix_case("optimizer matrix: bounded magic",
             bounded_magic_src,
             "q", expect_magic);
     failed += check_matrix_case("optimizer matrix: all-free magic skip",
