@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.43.0] - 2026-05-24
+
+### Added
+
 - Added a dedicated `mbedtls-enabled / ubuntu-latest / gcc` CI leg
   that configures with `-DmbedTLS=enabled`, verifies
   `WL_MBEDTLS_ENABLED=1`, and runs `cryptographic_hashes` so optional
@@ -35,11 +53,13 @@ All notable changes to wirelog are documented in this file.
 - **Recursive aggregation conformance for columnar MIN/MAX** (#692):
   REDUCE plan ops now carry aggregate expressions, so recursive
   aggregates evaluate `min(l)` / `max(d + w)` instead of falling back to
-  a positional input column.  Recursive MIN/MAX IDBs are canonicalized
-  after sequential fixed-point convergence and TDD final merge so
-  dominated aggregate rows are removed from snapshots.  Adds
-  `recursive_agg_conformance` coverage for CC-min, SSSP-max, and
-  stratified COUNT at workers 1, 4, 8, and 16.
+  a positional input column. This release includes the #852 recursive
+  aggregation fix recorded under #859 while preserving #692 context.
+  Recursive MIN/MAX IDBs are canonicalized after sequential
+  fixed-point convergence and TDD final merge so dominated aggregate
+  rows are removed from snapshots. Adds `recursive_agg_conformance`
+  coverage for CC-min, SSSP-max, and stratified COUNT at workers 1,
+  4, 8, and 16.
 
 ### Performance
 
@@ -48,8 +68,9 @@ All notable changes to wirelog are documented in this file.
   re-running TDD evaluation when no input or retraction state is pending.
 - **CSPA W=1 perf gate** (#818): added `test_cspa_perf_gate` as a
   dedicated static `cspa-fast` regression guard for `W=1` using 9-trial
-  median timing, 20,381-tuple/6-iteration correctness sentinels, and the
-  shared `WIRELOG_PERF_GATE` / `WIRELOG_PERF_REQUIRE` control flow.
+  median timing, 20,381-tuple/6-iteration correctness sentinels, and
+  the shared `WIRELOG_PERF_GATE` / `WIRELOG_PERF_REQUIRE` control
+  flow.
 - **v0.43 benchmark speedup notes draft** (#794, #512, #791): added
   the portfolio speedup draft with #512 timing deltas, changed-commit
   provenance, and memory-trade-off context:
@@ -62,16 +83,16 @@ All notable changes to wirelog are documented in this file.
 - Documented the required-check policy for mbedTLS-enabled validation,
   including the stable `mbedtls-enabled / ubuntu-latest / gcc` check
   name and its PR, main-monitoring, `release-1.x`, and release-tag
-  roles without changing the default `mbedTLS=disabled` artifact
+  roles without changing the default `mbedtls=disabled` artifact
   posture (#849).
 - Added `docs/PLATFORM_SUPPORT.md` to classify Android/iOS release
   artifacts as Tier-2 for 1.x, documenting that Android AAR/Prefab and
   iOS XCFramework publication are deferred until explicit future
   promotion work is completed (#697).
-- Added `docs/ios.md` with iOS integration guidance for `wirelog.xcframework`
-  consumption, Swift callback registration with trailing `user_data`,
-  simulator architecture handling, and App Store/tooling constraints for
-  #470.
+- Added `docs/ios.md` with iOS integration guidance for
+  `wirelog.xcframework` consumption, Swift callback registration with
+  trailing `user_data`, simulator architecture handling, and
+  App Store/tooling constraints for #470.
 - Added `docs/android.md` with Android integration guidance for
   AAR/Prefab consumption patterns, JNI thread attachment patterns,
   `Context.getFilesDir()` path handling, and Android CI/alignment
