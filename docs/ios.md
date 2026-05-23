@@ -124,8 +124,9 @@ private func registerBuiltinAdapter(context: AdapterContext) -> Int32 {
 }
 ```
 
-Store `context` to keep it alive for the callback lifetime (the Swift side owns that
-lifetime):
+Store `context` to keep it alive for callback lifetime.
+The Swift side owns that lifetime, and keeps a single `AdapterContext`
+instance alive for as long as the adapter is registered.
 
 ```swift
 let context = AdapterContext(sourceURL: someURL)
@@ -150,7 +151,10 @@ than hard-coded `/tmp` or absolute paths:
 
 ```swift
 func resourcePath(_ name: String, ext: String) -> String? {
-    guard let url = Bundle.module.url(forResource: name, withExtension: ext) else {
+    guard let url = Bundle.module.url(
+        forResource: name,
+        withExtension: ext
+    ) else {
         return nil
     }
     return url.path
@@ -171,6 +175,9 @@ Parsing, planning, and evaluation should not run on the main actor.
   `DispatchQueue.global(qos: .userInitiated).async { ... }`.
 
 Return parsed results back to the UI on the main actor only.
+Also keep each `wirelog_session_t` / easy-session handle confined to one
+execution context, or externally serialize access. Do not invoke wirelog
+APIs concurrently on one shared handle from multiple threads or tasks.
 
 ## App Store / review constraints
 
@@ -192,10 +199,10 @@ Return parsed results back to the UI on the main actor only.
 
 ## Privacy manifest
 
-`wirelog` itself does not invoke privacy-sensitive Apple APIs. It can be
-integrated without adding privacy reasons to your package manifest for API access.
-Your app still needs a proper `PrivacyInfo.xcprivacy` if the app code itself
-uses APIs that require it (camera, location, contacts, etc.).
+`wirelog` itself does not invoke privacy-sensitive Apple APIs and does not
+require any Required Reason API entries in the app's `PrivacyInfo.xcprivacy`.
+The app still owns its own privacy manifest and must include Required Reason
+entries for APIs it uses directly (camera, location, contacts, etc.).
 
 ## Cross references
 
