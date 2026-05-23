@@ -25,6 +25,8 @@ parses comma/newline separated `int64` rows.
 a tiny Java/JNI bridge:
 
 ```java
+package com.wirelog.asset;
+
 public final class AssetAdapter {
     static {
         System.loadLibrary("asset_adapter");
@@ -46,6 +48,9 @@ payload alongside the `JavaVM*`.
 ## CMake usage
 
 ```cmake
+cmake_minimum_required(VERSION 3.22)
+project(asset_adapter LANGUAGES C)
+
 find_package(wirelog REQUIRED CONFIG)
 
 add_library(asset_adapter SHARED
@@ -59,9 +64,27 @@ target_link_libraries(asset_adapter
 )
 ```
 
-## `.input` usage
+## `.decl` + `.input`
 
 In your Wirelog program:
+
+```wire
+.decl seed_file(value: int64, label: int64)
+.input R(io="android_asset", filename="seed/input.csv")
+.output sum: sum(seed_file.value)
+```
+
+## Asset payload
+
+Store this CSV in `assets/seed/input.csv`:
+
+```text
+1,10
+2,20
+3,30
+```
+
+Each non-empty line maps to one row in the schema passed to your query.
 
 ```wire
 .input R(io="android_asset", filename="seed/input.csv")
