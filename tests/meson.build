@@ -1837,6 +1837,7 @@ test('multi_stratum_rule_frontier', test_multi_stratum_rule_frontier_exe)
 
 driver_src = files(
   '../wirelog/cli/driver.c',
+  '../wirelog/api_facade.c',
 )
 
 test_cli_exe = executable(
