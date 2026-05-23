@@ -186,8 +186,8 @@ The failure mode depends on the operator context:
   `ERANGE` to the caller.
 
 Bitwise `band`, `bor`, `bxor`, and `bnot` are total over the stored
-`int64_t` bit pattern.  Hash, CRC, crypto digest, HMAC, and UUID
-built-ins define their own folding or availability behavior and are not
+`int64_t` bit pattern.  Hash, crypto digest, HMAC, and UUID built-ins
+define their own folding or availability behavior and are not
 overflow-prone arithmetic operators under this rule.
 
 ### Audit notes

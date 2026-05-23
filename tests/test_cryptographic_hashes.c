@@ -17,7 +17,7 @@
  *     parse OK, plan OK.
  *     - mbedTLS enabled:  evaluate correctly and produce int64_t results.
  *     - mbedTLS disabled: evaluator hits error path (goto bad), snapshot
- *       still succeeds (rc=0) but tuple value is 0 (fallback).
+ *       fails closed and no tuple is emitted.
  *
  * Compilation guards:
  *   WL_MBEDTLS_ENABLED defined:   full determinism and integration tests.
@@ -148,7 +148,7 @@ run_program_full(const char *src, struct result_ctx *ctx)
 /*
  * sha256() and sha512() are fully implemented: lexer, parser, and backend.
  * These determinism tests are unconditional (run with or without mbedTLS).
- * Without mbedTLS, parse/plan succeed but snapshot emits tuple value 0 (fallback).
+ * Without mbedTLS, parse/plan succeed but snapshot fails closed.
  */
 static void
 test_sha256_determinism(void)
@@ -169,6 +169,19 @@ test_sha256_determinism(void)
     if (rc2 != 0) {
         FAIL("second evaluation failed (parse/plan/session error)");
     }
+#ifndef WL_MBEDTLS_ENABLED
+    if (ctx1.snapshot_rc == 0 || ctx2.snapshot_rc == 0) {
+        FAIL("expected fail-closed snapshot errors without mbedTLS");
+    }
+    if (ctx1.count != 0 || ctx2.count != 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 0 tuples each run, got %u and %u",
+            ctx1.count, ctx2.count);
+        FAIL(buf);
+    }
+    PASS();
+    return;
+#endif
     if (ctx1.count != 1 || ctx2.count != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 1 tuple each run, got %u and %u",
@@ -204,6 +217,19 @@ test_sha512_determinism(void)
     if (rc2 != 0) {
         FAIL("second evaluation failed (parse/plan/session error)");
     }
+#ifndef WL_MBEDTLS_ENABLED
+    if (ctx1.snapshot_rc == 0 || ctx2.snapshot_rc == 0) {
+        FAIL("expected fail-closed snapshot errors without mbedTLS");
+    }
+    if (ctx1.count != 0 || ctx2.count != 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 0 tuples each run, got %u and %u",
+            ctx1.count, ctx2.count);
+        FAIL(buf);
+    }
+    PASS();
+    return;
+#endif
     if (ctx1.count != 1 || ctx2.count != 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "expected 1 tuple each run, got %u and %u",
@@ -1033,12 +1059,12 @@ test_integration_hmac_sha256_datalog_rule(void)
 /* mbedTLS-disabled: runtime behavior tests                                */
 /*                                                                          */
 /* Crypto built-ins parse and plan successfully but hit the evaluator error */
-/* path (goto bad) at runtime. The snapshot still returns 0 (success) and   */
-/* emits 1 tuple, but the tuple value is 0 (fallback).                      */
+/* path (goto bad) at runtime. The snapshot returns an error and emits no   */
+/* tuple, matching the columnar fail-closed expression policy.              */
 /* ======================================================================== */
 
 static void
-test_unavailable_builtin_zero_fallback(const char *name, const char *src)
+test_unavailable_builtin_fails_closed(const char *name, const char *src)
 {
     TEST(name);
 
@@ -1047,22 +1073,15 @@ test_unavailable_builtin_zero_fallback(const char *name, const char *src)
     if (rc != 0) {
         FAIL("expected parse/plan/session to succeed even without mbedTLS");
     }
-    if (ctx.snapshot_rc != 0) {
+    if (ctx.snapshot_rc == 0) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "snapshot_rc=%d, expected 0",
+        snprintf(buf, sizeof(buf), "snapshot_rc=%d, expected non-zero",
             ctx.snapshot_rc);
         FAIL(buf);
     }
-    if (ctx.count != 1) {
+    if (ctx.count != 0) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "expected 1 tuple, got %u", ctx.count);
-        FAIL(buf);
-    }
-    if (ctx.col0[0] != 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-            "expected fallback value 0 without mbedTLS, got %" PRId64,
-            ctx.col0[0]);
+        snprintf(buf, sizeof(buf), "expected 0 tuples, got %u", ctx.count);
         FAIL(buf);
     }
     PASS();
@@ -1075,8 +1094,8 @@ test_md5_evaluates_with_zero_fallback_no_mbedtls(void)
         "a(0).\n"
         ".decl r(z: int64)\n"
         "r(md5(x)) :- a(x).\n";
-    test_unavailable_builtin_zero_fallback(
-        "md5(): without mbedTLS snapshot succeeds, tuple value is 0",
+    test_unavailable_builtin_fails_closed(
+        "md5(): without mbedTLS fails closed",
         src);
 }
 
@@ -1087,8 +1106,8 @@ test_sha1_evaluates_with_zero_fallback_no_mbedtls(void)
         "a(0).\n"
         ".decl r(z: int64)\n"
         "r(sha1(x)) :- a(x).\n";
-    test_unavailable_builtin_zero_fallback(
-        "sha1(): without mbedTLS snapshot succeeds, tuple value is 0",
+    test_unavailable_builtin_fails_closed(
+        "sha1(): without mbedTLS fails closed",
         src);
 }
 
@@ -1099,8 +1118,8 @@ test_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
         "a(0).\n"
         ".decl r(z: int64)\n"
         "r(sha256(x)) :- a(x).\n";
-    test_unavailable_builtin_zero_fallback(
-        "sha256(): without mbedTLS snapshot succeeds, tuple value is 0",
+    test_unavailable_builtin_fails_closed(
+        "sha256(): without mbedTLS fails closed",
         src);
 }
 
@@ -1111,8 +1130,8 @@ test_sha512_evaluates_with_zero_fallback_no_mbedtls(void)
         "a(0).\n"
         ".decl r(z: int64)\n"
         "r(sha512(x)) :- a(x).\n";
-    test_unavailable_builtin_zero_fallback(
-        "sha512(): without mbedTLS snapshot succeeds, tuple value is 0",
+    test_unavailable_builtin_fails_closed(
+        "sha512(): without mbedTLS fails closed",
         src);
 }
 
@@ -1123,8 +1142,8 @@ test_hmac_sha256_evaluates_with_zero_fallback_no_mbedtls(void)
         "a(0, 1).\n"
         ".decl r(z: int64)\n"
         "r(hmac_sha256(msg, key)) :- a(msg, key).\n";
-    test_unavailable_builtin_zero_fallback(
-        "hmac_sha256(): without mbedTLS snapshot succeeds, tuple value is 0",
+    test_unavailable_builtin_fails_closed(
+        "hmac_sha256(): without mbedTLS fails closed",
         src);
 }
 
@@ -1135,8 +1154,8 @@ test_uuid4_evaluates_with_zero_fallback_no_mbedtls(void)
         "a(0).\n"
         ".decl r(z: int64)\n"
         "r(uuid4()) :- a(x).\n";
-    test_unavailable_builtin_zero_fallback(
-        "uuid4(): without mbedTLS snapshot succeeds, tuple value is 0",
+    test_unavailable_builtin_fails_closed(
+        "uuid4(): without mbedTLS fails closed",
         src);
 }
 
@@ -1147,8 +1166,8 @@ test_uuid5_evaluates_with_zero_fallback_no_mbedtls(void)
         "a(1234, 5678).\n"
         ".decl r(z: int64)\n"
         "r(uuid5(ns, name)) :- a(ns, name).\n";
-    test_unavailable_builtin_zero_fallback(
-        "uuid5(): without mbedTLS snapshot succeeds, tuple value is 0",
+    test_unavailable_builtin_fails_closed(
+        "uuid5(): without mbedTLS fails closed",
         src);
 }
 
