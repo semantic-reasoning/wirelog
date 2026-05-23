@@ -36,6 +36,8 @@ int64_t string_ops_str_replace(int64_t id, int64_t old_id, int64_t new_id,
     wl_intern_t *intern);
 int64_t string_ops_trim(int64_t id, wl_intern_t *intern);
 int64_t string_ops_to_string(int64_t num, wl_intern_t *intern);
+int wl_string_ops_to_number_checked(int64_t id, wl_intern_t *intern,
+    int64_t *out);
 int64_t string_ops_to_number(int64_t id, wl_intern_t *intern);
 
 #endif /* WIRELOG_STRING_OPS_H */

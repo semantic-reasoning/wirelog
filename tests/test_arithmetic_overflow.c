@@ -283,6 +283,52 @@ test_slow_filter_to_number_expression_rejects_row(void)
 }
 
 static void
+test_filter_to_number_range_error_rejects_row(void)
+{
+    TEST("filter to_number out-of-range rejects row");
+
+    const char *src =
+        ".decl a(x: int64)\n"
+        "a(1).\n"
+        ".decl r(x: int64)\n"
+        "r(x) :- a(x), to_number(\"9223372036854775808\") > 0.\n";
+
+    struct result_ctx out;
+    int rc = run_snapshot(src, &out);
+    if (rc != 0) {
+        FAIL("snapshot returned error");
+        return;
+    }
+    if (out.count != 0) {
+        FAIL("expected 0 rows");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_map_to_number_range_error_fails_hard(void)
+{
+    TEST("map head to_number out-of-range returns ERANGE");
+
+    const char *src =
+        ".decl a(x: int64)\n"
+        "a(1).\n"
+        ".decl r(z: int64)\n"
+        "r(to_number(\"9223372036854775808\")) :- a(x).\n";
+
+    struct result_ctx out;
+    int rc = run_snapshot(src, &out);
+    if (rc != ERANGE) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected ERANGE, got %d", rc);
+        FAIL(msg);
+        return;
+    }
+    PASS();
+}
+
+static void
 test_reduce_expression_overflow_fails_hard(void)
 {
     TEST("reduce agg expression overflow returns error");
@@ -316,6 +362,8 @@ main(void)
     test_map_head_overflow_fails_hard();
     test_reduce_sum_accumulation_overflow_fails_hard();
     test_slow_filter_to_number_expression_rejects_row();
+    test_filter_to_number_range_error_rejects_row();
+    test_map_to_number_range_error_fails_hard();
     test_reduce_expression_overflow_fails_hard();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
