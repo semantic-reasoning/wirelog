@@ -25,8 +25,9 @@
  *   - median wall > target               -> FAIL
  *
  * Baseline provenance:
- *   README / issue baseline for #818: 1,950 ms median at W=1 for
- *   cspa-fast, repeat=1.  A 5% envelope yields 2050 ms target.
+ *   README / issue baseline for #818 and #736: 1,950 ms median at W=1
+ *   for cspa-fast with --repeat 5. A 5% envelope yields 2050 ms
+ *   target.
  *
  * The CSPA data fixtures live in bench/data/cspa/.  Meson registers this test
  * with WIRELOG_CSPA_DATA_DIR pointing at the project source tree so the
@@ -173,6 +174,7 @@ csv_to_inline_facts(const char *csv_path, const char *relation, char *buf,
     }
 
     size_t pos = 0;
+    buf[0] = '\0';
     int32_t count = 0;
     char line[256];
 
@@ -213,6 +215,11 @@ csv_to_inline_facts(const char *csv_path, const char *relation, char *buf,
             pos += (size_t)n;
         }
         count++;
+    }
+    if (pos >= 1 && pos < bufsz) {
+        buf[pos] = '\0';
+    } else if (pos == 0) {
+        buf[0] = '\0';
     }
     if (fclose(f) != 0) {
         fprintf(stderr, "warning: failed to close '%s'\n", csv_path);
