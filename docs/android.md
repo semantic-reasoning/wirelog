@@ -108,11 +108,11 @@ static int android_asset_read(
 
     JNIEnv* env = NULL;
     bool attached = false;
-    int rc = (*state->vm)->GetEnv((void**)&env, JNI_VERSION_1_6);
+    int rc = (*state->vm)->GetEnv(state->vm, (void**)&env, JNI_VERSION_1_6);
     if (rc != JNI_OK) {
         if ((*state->vm)->AttachCurrentThread(
                 state->vm,
-                (void**)&env,
+                &env,
                 NULL
             ) != 0) {
             return -1;
