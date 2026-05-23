@@ -1,6 +1,7 @@
 #include <android/log.h>
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
+#include <errno.h>
 #include <jni.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -16,6 +17,7 @@
 
 typedef struct {
     JavaVM *vm;
+    jobject java_asset_manager;
     AAssetManager *asset_manager;
 } app_adapter_state_t;
 
@@ -25,6 +27,74 @@ static void
 log_error(const char *message)
 {
     __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", message);
+}
+
+static void
+clear_asset_manager_state(void)
+{
+    JNIEnv *env = NULL;
+    bool vm_attached = false;
+
+    if (g_adapter_state.vm != NULL) {
+        jint get_env_status = (*g_adapter_state.vm)->GetEnv((void **)&env,
+                JNI_VERSION_1_6);
+        if (get_env_status == JNI_EDETACHED) {
+            if ((*g_adapter_state.vm)->AttachCurrentThread(
+                    g_adapter_state.vm,
+                    (void **)&env,
+                    NULL) == JNI_OK) {
+                vm_attached = true;
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
+                    "cannot clear old AssetManager global ref: failed to attach");
+            }
+        } else if (get_env_status != JNI_OK) {
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
+                "cannot clear old AssetManager global ref: GetEnv failed");
+        }
+    }
+
+    if (env != NULL && g_adapter_state.java_asset_manager != NULL) {
+        (*env)->DeleteGlobalRef(env, g_adapter_state.java_asset_manager);
+        g_adapter_state.java_asset_manager = NULL;
+    } else if (g_adapter_state.java_asset_manager != NULL) {
+        __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
+            "cannot clear old AssetManager global ref: JNIEnv unavailable");
+        g_adapter_state.java_asset_manager = NULL;
+    }
+
+    if (vm_attached) {
+        (*g_adapter_state.vm)->DetachCurrentThread(g_adapter_state.vm);
+    }
+
+    g_adapter_state.asset_manager = NULL;
+}
+
+static void
+set_asset_manager(JNIEnv *env, jobject java_asset_manager)
+{
+    clear_asset_manager_state();
+    if (java_asset_manager == NULL) {
+        log_error("received NULL AssetManager");
+        return;
+    }
+
+    jobject global_manager = (*env)->NewGlobalRef(env, java_asset_manager);
+    if (global_manager == NULL) {
+        log_error("failed to create global ref for AssetManager");
+        return;
+    }
+
+    AAssetManager *asset_manager = AAssetManager_fromJava(env,
+            java_asset_manager);
+    if (asset_manager == NULL) {
+        (*env)->DeleteGlobalRef(env, global_manager);
+        log_error("failed to convert Java AssetManager to native");
+        return;
+    }
+
+    g_adapter_state.java_asset_manager = global_manager;
+    g_adapter_state.asset_manager = asset_manager;
 }
 
 static bool
@@ -94,13 +164,42 @@ append_value(int64_t *row_values, uint32_t ncols, uint32_t row_idx,
     copy[token_len] = '\0';
 
     char *tail = NULL;
-    row_values[row_idx * ncols + col_idx] = strtoll(copy, &tail, 10);
+    errno = 0;
+    long long value = strtoll(copy, &tail, 10);
+    if (errno == ERANGE) {
+        if (errbuf_len > 0) {
+            snprintf(errbuf, errbuf_len,
+                "int64 token out of range: %s", copy);
+        }
+        return -1;
+    }
     if (!tail || *tail != '\0') {
         if (errbuf_len > 0) {
             snprintf(errbuf, errbuf_len, "non-integer token: %s", copy);
         }
         return -1;
     }
+    row_values[row_idx * ncols + col_idx] = value;
+    return 0;
+}
+
+static int
+read_asset_fully(AAsset *asset, char *buffer, size_t byte_count)
+{
+    size_t read_total = 0;
+    while (read_total < byte_count) {
+        int64_t chunk = AAsset_read(asset, buffer + read_total,
+                byte_count - read_total);
+        if (chunk < 0) {
+            return -1;
+        }
+        if (chunk == 0) {
+            return -1;
+        }
+
+        read_total += (size_t)chunk;
+    }
+
     return 0;
 }
 
@@ -156,13 +255,13 @@ android_asset_read(wirelog_io_ctx_t *ctx, int64_t **out_data,
         return -1;
     }
 
-    size_t read_bytes = AAsset_read(asset, text, byte_count);
-    AAsset_close(asset);
-    if (read_bytes != byte_count) {
+    if (read_asset_fully(asset, text, byte_count) != 0) {
         free(text);
+        AAsset_close(asset);
         log_error("failed to read full asset payload");
         return -1;
     }
+    AAsset_close(asset);
     text[byte_count] = '\0';
 
     size_t row_capacity = INITIAL_ROW_CAPACITY;
@@ -276,8 +375,7 @@ Java_com_wirelog_asset_AssetAdapter_setAssetManager(JNIEnv *env, jclass clazz,
     jobject java_asset_manager)
 {
     (void)clazz;
-    g_adapter_state.asset_manager = AAssetManager_fromJava(env,
-            java_asset_manager);
+    set_asset_manager(env, java_asset_manager);
 }
 
 JNIEXPORT jint JNICALL
@@ -286,6 +384,7 @@ JNI_OnLoad(JavaVM *vm, void *reserved)
     (void)reserved;
     g_adapter_state.vm = vm;
     g_adapter_state.asset_manager = NULL;
+    g_adapter_state.java_asset_manager = NULL;
 
     if (wirelog_io_register_adapter(&g_asset_adapter) != 0) {
         __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
@@ -301,5 +400,15 @@ Java_com_wirelog_asset_AssetAdapter_unregister(JNIEnv *env, jclass clazz)
 {
     (void)env;
     (void)clazz;
+    clear_asset_manager_state();
+    wirelog_io_unregister_adapter("android_asset");
+}
+
+JNIEXPORT void JNICALL
+JNI_OnUnload(JavaVM *vm, void *reserved)
+{
+    (void)reserved;
+    g_adapter_state.vm = vm;
+    clear_asset_manager_state();
     wirelog_io_unregister_adapter("android_asset");
 }
