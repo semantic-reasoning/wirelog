@@ -30,6 +30,9 @@ publication procedure) and is referenced by **#687** (v1.0.0 GA
 epic) which lists "CHANGELOG `[1.0.0]` section merged" as an exit
 condition without specifying the publication side.
 
+- Platform artifact policies for **Android** and **iOS** are tracked in
+  [`docs/PLATFORM_SUPPORT.md`](PLATFORM_SUPPORT.md).
+
 ---
 
 ## 1. Release-note template
