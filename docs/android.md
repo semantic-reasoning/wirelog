@@ -17,14 +17,31 @@ this version.
 
 ## AAR / Prefab consumption pattern
 
-The current v0.43 surface supports integration through Gradle/CMake
-linkage and JNI; if you already produce a local Prefab-capable `.aar`,
-consume it as a local artifact:
+The current v0.43 surface ships cross-build/source support only; it does not
+publish hosted Maven/JitPack artifacts. If you already produce a local
+Prefab-capable `.aar`, consume it as a local artifact:
 
 ```gradle
+android {
+    // Keep prefab generation enabled for native dependencies.
+    buildFeatures {
+        prefab true
+    }
+}
+
 dependencies {
     implementation(files("libs/wirelog-prefab-release.aar"))
 }
+
+// If the .aar does not include a CMake package, skip this and use
+// your own CMake wiring.
+```
+
+From `CMakeLists.txt`:
+
+```cmake
+find_package(wirelog REQUIRED CONFIG)
+target_link_libraries(mynativelib PRIVATE wirelog::wirelog)
 ```
 
 If you do not have an `.aar`, include wirelog as a native source
@@ -39,11 +56,20 @@ The supported cross-build entries are:
 
 ## Build compatibility contract
 
-- API level: minimum `21` (per shipped cross-files).
-- Page alignment:
+- API level and target policy:
+  - Native NDK API floor is `21` (from the cross-files).
+  - Current Play distribution requirements for new apps/updates submitted from
+    Aug 31 2025 on are API 35+ (Android 15); Wear/Auto/TV may have exception
+    paths.
+- Page-size and alignment:
   - `cross/android-arm64.ini` builds with the `aarch64` toolchain.
-  - `meson build -Dandroid=true` adds
+  - `meson build -Dandroid=true` applies
     `-Wl,-z,max-page-size=16384` for arm64-v8a.
+  - CI validates arm64 PT_LOAD alignment with readelf-backed checks.
+  - Android NDK guidance can also include
+    `-Wl,-z,common-page-size=16384`; if your app applies it, align your
+    entire native surface accordingly and validate every native library in your
+    APK/AAB against current Android guidance.
 - Toolchain pin: NDK `r27c` is pinned in `cross/android-arm64.ini`
   and `cross/android-x86_64.ini` as `ndk = '/opt/android-ndk-r27c'`.
 
@@ -58,6 +84,7 @@ Use the current public API names (`wirelog_io_register_adapter`,
 
 ```c
 #include <android/log.h>
+#include <stdbool.h>
 #include <jni.h>
 #include <wirelog/io/io_adapter.h>
 #include <wirelog/wirelog.h>
@@ -124,6 +151,12 @@ JNI_OnLoad(JavaVM* vm, void* reserved)
     adapter.user_data = &g_app_state;
 
     if (wirelog_io_register_adapter(&adapter) != 0) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            "wirelog",
+            "adapter register failed: %s",
+            wirelog_io_last_error()
+        );
         return JNI_ERR;
     }
     return JNI_VERSION_1_6;
@@ -132,12 +165,9 @@ JNI_OnLoad(JavaVM* vm, void* reserved)
 
 ### App side path handling
 
-Android apps should resolve custom payloads through app storage, not URI
-schemes that look like file paths.
-
-- `android_asset://` is an adapter scheme, not a filesystem path.
-- Convert packaged assets to app-private storage first, then pass
-  filesystem paths from `Context.getFilesDir()`.
+Built-in adapters (for example `io=\"csv\"`) expect real filesystem paths.
+Copy packaged assets to app-private storage and pass absolute paths to
+input params:
 
 From Kotlin:
 
@@ -147,13 +177,22 @@ val csvPath = File(assetDir, "seed/input.csv").absolutePath
 // Pass csvPath via io params in your .input directive.
 ```
 
+Planned/custom `io=\"android_asset\"` adapters are scheme-based.
+In that design, the `filename` value is interpreted through
+`AAssetManager` and is not a direct filesystem path. In that case,
+`android_asset://...` is a scheme marker, not a local file path.
+
 ## JNI/threading contract
 
-The native adapter callback may run on wirelog worker threads.
-Any JNI call site must follow:
+The native adapter callback in this integration path runs synchronously from
+`wirelog_session_load_input_files()` / `wl_session_load_input_files()` on the
+invoking thread. It is not automatically dispatched onto wirelog worker
+threads.
 
-- call `AttachCurrentThread()` before using `JNIEnv*` on a worker
-  thread not created by Java,
+When calling JNI from the callback, follow:
+
+- call `GetEnv()` to detect whether the thread is attached,
+- call `AttachCurrentThread()` only if the thread is not already attached,
 - keep the attached `JNIEnv*` only for that callback scope,
 - pair each successful attachment with `DetachCurrentThread()` before return.
 
@@ -170,7 +209,11 @@ Because `wirelog` is embedded into the app process, avoid keeping session
 handles global across unrelated work queues without external serialization.
 
 For clean shutdown, unregister adapter handles before library unload in
-native finalization paths.
+native finalization paths using:
+
+```c
+wirelog_io_unregister_adapter("android_asset");
+```
 
 ## Follow-up work
 
