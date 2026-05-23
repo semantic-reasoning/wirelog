@@ -43,11 +43,13 @@ struct wirelog_program;
  * @demand_semijoins_inserted: Number of demand SEMIJOIN nodes inserted for
  *                             2-atom joins with recursive left scans
  *                             (demand-driven filtering, Issue #192).
+ * @skipped_aggregate:         IR trees skipped because they contain AGGREGATE.
  */
 typedef struct {
     uint32_t semijoins_inserted;
     uint32_t chains_examined;
     uint32_t demand_semijoins_inserted;
+    uint32_t skipped_aggregate;
 } wl_sip_stats_t;
 
 /**

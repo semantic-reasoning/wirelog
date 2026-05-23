@@ -48,11 +48,13 @@ struct wirelog_ir_node;
  * @nodes_before:       Total IR nodes before fusion.
  * @nodes_after:        Total IR nodes after fusion.
  * @fusions_applied:    Number of FLATMAP fusions performed.
+ * @skipped_aggregate:  IR trees skipped because they contain AGGREGATE.
  */
 typedef struct {
     uint32_t nodes_before;
     uint32_t nodes_after;
     uint32_t fusions_applied;
+    uint32_t skipped_aggregate;
 } wl_fusion_stats_t;
 
 /* ======================================================================== */

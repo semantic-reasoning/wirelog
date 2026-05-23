@@ -46,6 +46,8 @@ struct wirelog_program;
  * @original_rules_modified: Original rules with magic guards inserted.
  * @skipped_all_free:       Adorned predicates skipped (all-free adornment).
  * @arity_mismatch_skipped: Demands skipped due to adornment count/arity mismatch.
+ * @skipped_aggregate:     Aggregate rules skipped because Magic Sets cannot
+ *                         safely insert magic guards into them yet.
  */
 typedef struct {
     uint32_t demand_roots;
@@ -54,6 +56,7 @@ typedef struct {
     uint32_t original_rules_modified;
     uint32_t skipped_all_free;
     uint32_t arity_mismatch_skipped;
+    uint32_t skipped_aggregate;
 } wl_magic_sets_stats_t;
 
 /* ======================================================================== */

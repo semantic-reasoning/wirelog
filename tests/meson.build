@@ -655,6 +655,23 @@ workqueue_src = files(
   '../wirelog/workqueue.c',
 )
 
+test_optimizer_equivalence_exe = executable(
+  'test_optimizer_equivalence',
+  files('test_optimizer_equivalence.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('optimizer_equivalence', test_optimizer_equivalence_exe, suite: 'optimizer')
+
 test_plan_gen_exe = executable(
   'test_plan_gen',
   files('test_plan_gen.c'),
@@ -3826,6 +3843,7 @@ test_wirelog_easy_exe = executable(
   thread_src,
   workqueue_src,
   '../wirelog/wirelog-easy.c',
+  '../wirelog/api_facade.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
@@ -3845,6 +3863,7 @@ test_wirelog_easy_inline_facts_exe = executable(
   thread_src,
   workqueue_src,
   '../wirelog/wirelog-easy.c',
+  '../wirelog/api_facade.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
@@ -3864,6 +3883,7 @@ test_wirelog_advanced_exe = executable(
   thread_src,
   workqueue_src,
   '../wirelog/wirelog-easy.c',
+  '../wirelog/api_facade.c',
   '../wirelog/wirelog_advanced.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],

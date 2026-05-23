@@ -202,7 +202,7 @@ manifest, branch-protection, signing) is tracked under v0.41+ blockers
 
 ---
 
-## Optimizer-equivalence conformance (Status: Future)
+## Optimizer-equivalence conformance (Status: Implemented)
 
 Tracked under #700. Milestone v0.43.
 
@@ -221,30 +221,23 @@ entry-point symbols are:
 | Logic Fusion | `wl_fusion_apply` |
 | JPP (Join-Project-Plan) | `wl_jpp_apply` |
 
-### Current state (v0.42)
+### Current state (v0.43)
 
-- **Harness absent.** No test in `tests/` or `scripts/` runs the matrix.
-  The equivalence property is unchecked at CI time.
-- **Toggle API declared but never consumed.** `wirelog_opt_config_t` at
-  `wirelog/wirelog-optimizer.h:71-79` exposes boolean fields
-  `enable_logic_fusion`, `enable_join_ordering`, `enable_semijoin`, and
-  `enable_subplan_sharing`. The paired entry point
-  `wirelog_optimize_with_config` is declared at `:134-137`. Neither is
-  called by any pass in `wirelog/passes/` or by any host application code.
-- **Unconditional pipelines.** The driver pipeline at
-  `wirelog/cli/driver.c:365-368` and the easy-facade pipeline at
-  `wirelog/wirelog-easy.c:139-159` unconditionally invoke all four pass
-  entry points. There is no runtime path today to disable a single pass.
-  Note: `wl_subsumption_apply` (called at `wirelog/cli/driver.c:364`,
-  before the four passes) is treated as canonicalization, not an optimizer
-  pass, and is not part of the toggle axis.
-- **Taxonomy mismatch.** The public enum `wirelog_opt_pass_t` at
+- **Harness present.** `tests/test_optimizer_equivalence.c` runs the 16-way
+  matrix over join, recursive, and aggregate programs and is registered as
+  `meson test --suite optimizer`.
+- **Toggle API consumed.** `wirelog_optimize_with_config` is the shared
+  optimizer facade for public callers. The CLI and easy facade call
+  `wirelog_optimize()`, which funnels through the config-aware path.
+- **Subsumption is canonicalization.** `wl_subsumption_apply` still runs
+  before the toggle axis and is intentionally not treated as an optimizer
+  pass in the matrix.
+- **Taxonomy decision.** The public enum `wirelog_opt_pass_t` at
   `wirelog/wirelog-optimizer.h:57-64` lists
   `WIRELOG_OPT_LOGIC_FUSION / WIRELOG_OPT_JOIN_PROJECT_PLAN /
   WIRELOG_OPT_SEMIJOIN / WIRELOG_OPT_SUBPLAN_SHARING /
-  WIRELOG_OPT_BOOLEAN_SPEC`. "Magic Sets" is absent from the enum despite
-  `wl_magic_sets_apply_with_demands` being a first-class pass in the
-  pipeline.
+  WIRELOG_OPT_BOOLEAN_SPEC`. Magic Sets remains outside that public enum for
+  v0.43; the matrix names the internal `wl_*_apply` symbols directly.
 
 ### Definition of "all-free adornment"
 
@@ -259,46 +252,17 @@ path.
 ### Definition of "aggregate-skip"
 
 When a pass encounters an AGGREGATE node it cannot safely rewrite, it must
-skip that rule entirely without miscompiling. Currently only Magic Sets
-implements this notion: `wirelog/passes/magic_sets.c:251-275` returns 0
-(skip) when the head-extraction routine encounters an AGGREGATE rule,
-leaving the rule untouched. SIP, Logic Fusion, and JPP have no aggregate
-detection and no equivalent skip path; their behavior on AGGREGATE rules is
-unspecified and untested.
+skip that rule entirely without miscompiling. Magic Sets, SIP, Logic Fusion,
+and JPP expose `skipped_aggregate` counters in their internal stats structs.
+The matrix test verifies those counters and asserts that Magic Sets leaves an
+aggregate demand untransformed.
 
-### Taxonomy reconciliation
+### v0.43 closure
 
-"Magic Sets" must be surfaced in the public API in one of two ways:
-
-1. Add `WIRELOG_OPT_MAGIC_SETS` to `wirelog_opt_pass_t` and wire it into
-   `wirelog_opt_config_t`.
-2. Express the matrix axis in terms of `wl_*_apply` symbols directly,
-   leaving the enum for the four currently-listed passes.
-
-Option 2 is preferred for clarity: the matrix test file can reference
-`wl_magic_sets_apply_with_demands` directly without requiring a new public
-enum value in a v0.43 minor release.
-
-### Path to residue = 0 in v0.43
-
-1. **Wire `wirelog_opt_config_t` into the driver and easy pipelines** —
-   replace the four unconditional call sites at `cli/driver.c:365-368` and
-   `wirelog-easy.c:139-159` with guarded calls that consult the config
-   struct. Estimated effort: 1 day.
-2. **Add `WIRELOG_OPT_MAGIC_SETS` to `wirelog_opt_pass_t`** — OR adopt
-   option 2 above and document the decision in this section.
-3. **Add `tests/test_optimizer_equivalence.c`** — drive 10–20 representative
-   programs through all 16 toggle combinations, diff result Z-sets against
-   the all-enabled baseline, and register the test under
-   `meson test --suite optimizer`.
-4. **Introduce a new `skipped_aggregate` counter in Magic Sets, SIP, Logic
-   Fusion, and JPP** — this counter does not yet exist in any pass.
-   Model it after the existing `skipped_all_free` pattern at
-   `wirelog/passes/magic_sets.c:551` and increment it whenever the pass
-   detects an AGGREGATE node it cannot handle (mirroring the silent-skip
-   already present in Magic Sets at `wirelog/passes/magic_sets.c:251-275`).
-   Once added, aggregate-skip behavior becomes observable and testable across
-   all four passes.
+The v0.43 implementation keeps Magic Sets off the public
+`wirelog_opt_pass_t` enum and expresses the conformance axis in terms of the
+internal `wl_*_apply` symbols. This avoids a public enum expansion while still
+testing the actual optimizer pipeline.
 
 ### References
 
@@ -306,8 +270,6 @@ enum value in a v0.43 minor release.
 - `wirelog/wirelog-optimizer.h:71-79` — `wirelog_opt_config_t` struct.
 - `wirelog/wirelog-optimizer.h:134-137` — `wirelog_optimize_with_config` declaration.
 - `wirelog/passes/magic_sets.c:251-275` — aggregate-skip in Magic Sets head extraction.
-- `wirelog/passes/magic_sets.c:551` — `skipped_all_free` counter (pattern to mirror for the new `skipped_aggregate` counter).
 - `wirelog/passes/magic_sets.c:571-575` — all-free adornment skip path.
-- `wirelog/cli/driver.c:365-368` — unconditional four-pass pipeline.
-- `wirelog/wirelog-easy.c:139-159` — unconditional four-pass pipeline (easy facade).
+- `tests/test_optimizer_equivalence.c` — 16-combination equivalence matrix.
 - `stable-release-plan.md` — v0.43 milestone scope.

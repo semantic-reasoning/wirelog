@@ -77,6 +77,49 @@ test_optimizer_api(void)
 }
 
 static int
+test_optimizer_config_disable_passes(void)
+{
+    const char *src =
+        ".decl edge(x:int32,y:int32)\n"
+        ".decl path(x:int32,y:int32)\n"
+        "edge(1,2).\n"
+        "path(X,Y) :- edge(X,Y).\n";
+    wirelog_error_t err = WIRELOG_ERR_UNKNOWN;
+    wirelog_program_t *program = wirelog_parse_string(src, &err);
+    if (!program || err != WIRELOG_OK) {
+        fprintf(stderr, "parse failed err=%d\n", err);
+        return 1;
+    }
+
+    wirelog_opt_config_t config = wirelog_optimizer_get_default_config();
+    config.enable_logic_fusion = false;
+    config.enable_join_ordering = false;
+    config.enable_semijoin = false;
+    config.enable_subplan_sharing = false;
+    config.enable_boolean_spec = false;
+
+    if (!wirelog_optimize_with_config(program, &config, &err)
+        || err != WIRELOG_OK) {
+        fprintf(stderr, "optimize_with_config failed err=%d\n", err);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_opt_stats_t stats = { 0 };
+    if (!wirelog_optimizer_get_stats(program, &stats)
+        || stats.passes_applied != 0) {
+        fprintf(stderr, "disabled optimizer config applied %" PRIu32
+            " pass(es)\n",
+            stats.passes_applied);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_program_free(program);
+    return 0;
+}
+
+static int
 test_executor_result_api(void)
 {
     const char *src =
@@ -136,6 +179,7 @@ main(void)
     int failures = 0;
     failures += test_utility_api();
     failures += test_optimizer_api();
+    failures += test_optimizer_config_disable_passes();
     failures += test_executor_result_api();
     if (failures == 0)
         printf("test_wirelog_public_api: OK\n");

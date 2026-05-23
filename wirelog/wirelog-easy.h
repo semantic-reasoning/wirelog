@@ -133,8 +133,8 @@ wirelog_easy_open_opts(const char *dl_src,
  * @dl_src: Datalog source text (must not be NULL).
  * @out:    (out) Receives the new session handle on success.
  *
- * Parse @dl_src, run the standard optimizer passes (fusion, jpp, sip), and
- * return a session handle.  The execution plan and underlying session are
+ * Parse @dl_src, run the standard optimizer pipeline, and return a session
+ * handle.  The execution plan and underlying session are
  * built lazily on the first call to wirelog_easy_insert/remove/step/set_delta_cb.
  * Symbol interning via wirelog_easy_intern() may happen before or after that
  * first step-class call; the intern table is shared through the whole

@@ -15,12 +15,6 @@
 #include "../exec_plan_gen.h"
 #include "../intern.h"
 #include "../ir/program.h"
-#include "../ir/stratify.h"
-#include "../passes/fusion.h"
-#include "../passes/jpp.h"
-#include "../passes/magic_sets.h"
-#include "../passes/sip.h"
-#include "../passes/subsumption.h"
 #include "../session.h"
 #include "../session_facts.h"
 #include "../wirelog.h"
@@ -361,18 +355,10 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
     }
 
     /* 2. Optimize */
-    wl_subsumption_apply(prog, NULL);
-    wl_fusion_apply(prog, NULL);
-    wl_jpp_apply(prog, NULL);
-    wl_sip_apply(prog, NULL);
-    wl_magic_sets_apply_with_demands(prog, prog->demands, prog->demand_count,
-        NULL);
-
-    /* 2a. Rebuild relation IR and re-stratify after magic sets */
-    if (prog->magic_sets_applied) {
-        wl_ir_program_rebuild_relation_irs(prog);
-        wl_ir_program_free_strata(prog);
-        wl_ir_stratify_program(prog);
+    if (!wirelog_optimize(prog, &err)) {
+        fprintf(stderr, "Optimization failed: err=%d\n", err);
+        wirelog_program_free(prog);
+        return -1;
     }
 
     /* 3. Generate execution plan */
