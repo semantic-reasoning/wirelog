@@ -12,6 +12,7 @@
 #include "../wirelog/string_ops.h"
 #include "../wirelog/intern.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1593,6 +1594,55 @@ test_to_number_empty(void)
     PASS();
 }
 
+static void
+test_to_number_checked_int64_bounds(void)
+{
+    TEST("to_number_checked: accepts int64 bounds");
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("create failed"); return;
+    }
+
+    int64_t max_id = wl_intern_put(intern, "9223372036854775807");
+    int64_t min_id = wl_intern_put(intern, "-9223372036854775808");
+    int64_t value = 0;
+    int rc = wl_string_ops_to_number_checked(max_id, intern, &value);
+    if (rc != 0 || value != INT64_MAX) {
+        wl_intern_free(intern);
+        FAIL("expected INT64_MAX success");
+        return;
+    }
+    rc = wl_string_ops_to_number_checked(min_id, intern, &value);
+    wl_intern_free(intern);
+    if (rc != 0 || value != INT64_MIN) {
+        FAIL("expected INT64_MIN success");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_to_number_checked_range_errors(void)
+{
+    TEST("to_number_checked: rejects out-of-range numeric prefixes");
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("create failed"); return;
+    }
+
+    int64_t pos_id = wl_intern_put(intern, "9223372036854775808");
+    int64_t neg_id = wl_intern_put(intern, "-9223372036854775809");
+    int64_t value = 123;
+    int pos_rc = wl_string_ops_to_number_checked(pos_id, intern, &value);
+    int neg_rc = wl_string_ops_to_number_checked(neg_id, intern, &value);
+    wl_intern_free(intern);
+    if (pos_rc != ERANGE || neg_rc != ERANGE) {
+        FAIL("expected ERANGE for both bounds");
+        return;
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* NULL intern error handling for all functions                            */
 /* ======================================================================== */
@@ -1765,6 +1815,8 @@ main(void)
     test_to_number_numeric_prefix();
     test_to_number_non_numeric();
     test_to_number_empty();
+    test_to_number_checked_int64_bounds();
+    test_to_number_checked_range_errors();
 
     printf("\n--- Error Handling ---\n");
     test_null_intern_all_functions();

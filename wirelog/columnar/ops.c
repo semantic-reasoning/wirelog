@@ -674,7 +674,10 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         }
         case WL_PLAN_EXPR_STR_FN_TO_NUMBER: {
             int64_t a = filt_pop(&s);
-            filt_push(&s, intern ? string_ops_to_number(a, intern) : 0);
+            int64_t v;
+            if (!intern || wl_string_ops_to_number_checked(a, intern, &v) != 0)
+                goto bad;
+            filt_push(&s, v);
             break;
         }
 

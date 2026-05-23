@@ -11,6 +11,7 @@
 
 #include "string_ops.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -489,13 +490,18 @@ string_ops_to_string(int64_t num, wl_intern_t *intern)
 }
 
 /**
- * string_ops_to_number:
+ * wl_string_ops_to_number_checked:
  * Parse interned string @id as a base-10 integer.
- * Parses a numeric prefix; returns 0 if the string has no valid numeric prefix.
+ * Parses a numeric prefix; returns 0 and writes 0 if the string has no valid
+ * numeric prefix. Returns ERANGE when the numeric prefix is outside int64_t.
  */
-int64_t
-string_ops_to_number(int64_t id, wl_intern_t *intern)
+int
+wl_string_ops_to_number_checked(int64_t id, wl_intern_t *intern, int64_t *out)
 {
+    if (out)
+        *out = 0;
+    if (!out)
+        return EINVAL;
     if (!intern)
         return 0;
 
@@ -504,9 +510,28 @@ string_ops_to_number(int64_t id, wl_intern_t *intern)
         return 0;
 
     char *endptr = NULL;
-    int64_t val = (int64_t)strtoll(str, &endptr, 10);
+    errno = 0;
+    intmax_t val = strtoimax(str, &endptr, 10);
     if (endptr == str)
         return 0; /* no valid numeric prefix */
+    if (errno == ERANGE || val < INT64_MIN || val > INT64_MAX)
+        return ERANGE;
 
+    *out = (int64_t)val;
+    return 0;
+}
+
+/**
+ * string_ops_to_number:
+ * Parse interned string @id as a base-10 integer.
+ * Parses a numeric prefix; returns 0 if the string has no valid numeric prefix
+ * or cannot be represented as int64_t.
+ */
+int64_t
+string_ops_to_number(int64_t id, wl_intern_t *intern)
+{
+    int64_t val = 0;
+    if (wl_string_ops_to_number_checked(id, intern, &val) != 0)
+        return 0;
     return val;
 }
