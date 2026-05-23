@@ -503,7 +503,7 @@ wl_string_ops_to_number_checked(int64_t id, wl_intern_t *intern, int64_t *out)
     if (!out)
         return EINVAL;
     if (!intern)
-        return 0;
+        return EINVAL;
 
     const char *str = wl_intern_reverse(intern, id);
     if (!str || !*str)
@@ -530,8 +530,17 @@ wl_string_ops_to_number_checked(int64_t id, wl_intern_t *intern, int64_t *out)
 int64_t
 string_ops_to_number(int64_t id, wl_intern_t *intern)
 {
-    int64_t val = 0;
-    if (wl_string_ops_to_number_checked(id, intern, &val) != 0)
+    if (!intern)
         return 0;
+
+    const char *str = wl_intern_reverse(intern, id);
+    if (!str || !*str)
+        return 0;
+
+    char *endptr = NULL;
+    int64_t val = (int64_t)strtoll(str, &endptr, 10);
+    if (endptr == str)
+        return 0; /* no valid numeric prefix */
+
     return val;
 }

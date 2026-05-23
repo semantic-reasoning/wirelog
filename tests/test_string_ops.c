@@ -1643,6 +1643,27 @@ test_to_number_checked_range_errors(void)
     PASS();
 }
 
+static void
+test_to_number_legacy_range_return(void)
+{
+    TEST("to_number: legacy range errors saturate");
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("create failed"); return;
+    }
+
+    int64_t pos_id = wl_intern_put(intern, "9223372036854775808");
+    int64_t neg_id = wl_intern_put(intern, "-9223372036854775809");
+    int64_t pos = string_ops_to_number(pos_id, intern);
+    int64_t neg = string_ops_to_number(neg_id, intern);
+    wl_intern_free(intern);
+    if (pos != INT64_MAX || neg != INT64_MIN) {
+        FAIL("expected legacy INT64 saturation");
+        return;
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* NULL intern error handling for all functions                            */
 /* ======================================================================== */
@@ -1817,6 +1838,7 @@ main(void)
     test_to_number_empty();
     test_to_number_checked_int64_bounds();
     test_to_number_checked_range_errors();
+    test_to_number_legacy_range_return();
 
     printf("\n--- Error Handling ---\n");
     test_null_intern_all_functions();
