@@ -168,23 +168,82 @@ filt_pop(filt_stack_t *s)
     return s->top != 0 ? s->vals[--s->top] : 0;
 }
 
+static inline uint64_t
+wl_abs_u64(int64_t v)
+{
+    return v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+}
+
+/* Use compiler-builtins where available; otherwise use explicit range checks. */
+#if (defined(__has_builtin) && (__has_builtin(__builtin_add_overflow) \
+    && __has_builtin(__builtin_sub_overflow) \
+    && __has_builtin(__builtin_mul_overflow))) || defined(__GNUC__) \
+    || defined(__clang__)
+#define WL_HAVE_INT64_OVERFLOW_BUILTIN 1
+#endif
+
 /* Checked int64 arithmetic helpers shared by both slow and compiled evaluators. */
 static int
 wl_checked_add_int64(int64_t a, int64_t b, int64_t *out)
 {
+#if defined(WL_HAVE_INT64_OVERFLOW_BUILTIN)
     return __builtin_add_overflow(a, b, out) ? ERANGE : 0;
+#else
+    if (b > 0) {
+        if (a > INT64_MAX - b)
+            return ERANGE;
+    } else {
+        if (a < INT64_MIN - b)
+            return ERANGE;
+    }
+    *out = a + b;
+    return 0;
+#endif
 }
 
 static int
 wl_checked_sub_int64(int64_t a, int64_t b, int64_t *out)
 {
+#if defined(WL_HAVE_INT64_OVERFLOW_BUILTIN)
     return __builtin_sub_overflow(a, b, out) ? ERANGE : 0;
+#else
+    if (b > 0) {
+        if (a < INT64_MIN + b)
+            return ERANGE;
+    } else {
+        if (a > INT64_MAX + b)
+            return ERANGE;
+    }
+    *out = a - b;
+    return 0;
+#endif
 }
 
 static int
 wl_checked_mul_int64(int64_t a, int64_t b, int64_t *out)
 {
+#if defined(WL_HAVE_INT64_OVERFLOW_BUILTIN)
     return __builtin_mul_overflow(a, b, out) ? ERANGE : 0;
+#else
+    if (a == 0 || b == 0) {
+        *out = 0;
+        return 0;
+    }
+    if ((a == -1 && b == INT64_MIN) || (b == -1 && a == INT64_MIN))
+        return ERANGE;
+
+    uint64_t ua = wl_abs_u64(a);
+    uint64_t ub = wl_abs_u64(b);
+    if ((a < 0) == (b < 0)) {
+        if (ua > (uint64_t)INT64_MAX / ub)
+            return ERANGE;
+    } else {
+        if (ua > ((uint64_t)INT64_MAX + 1ULL) / ub)
+            return ERANGE;
+    }
+    *out = a * b;
+    return 0;
+#endif
 }
 
 static int
@@ -6293,8 +6352,19 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_set(out, o, gc, cur + 1);
                     break;
                 case WIRELOG_AGG_SUM:
-                    col_rel_set(out, o, gc, cur + agg_val);
-                    break;
+                {
+                    int64_t next;
+                    if (wl_checked_add_int64(cur, agg_val, &next) != 0) {
+                        col_expr_compiled_free(agg_ce);
+                        free(tmp);
+                        col_rel_destroy(out);
+                        if (e.owned)
+                            col_rel_destroy(in);
+                        return ERANGE;
+                    }
+                    col_rel_set(out, o, gc, next);
+                }
+                break;
                 case WIRELOG_AGG_MIN:
                     if (agg_val < cur)
                         col_rel_set(out, o, gc, agg_val);
