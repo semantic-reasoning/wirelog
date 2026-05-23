@@ -187,11 +187,34 @@ csv_to_inline_facts(const char *csv_path, const char *relation, char *buf,
 
         int32_t vals[8];
         int ncols = 0;
-        char *saveptr = NULL;
-        char *tok = strtok_r(line, ",", &saveptr);
-        while (tok && ncols < 8) {
-            vals[ncols++] = (int32_t)strtol(tok, NULL, 10);
-            tok = strtok_r(NULL, ",", &saveptr);
+        size_t cursor = 0;
+        while (line[cursor] != '\0' && ncols < 8) {
+            while (line[cursor] == ',') {
+                ++cursor;
+            }
+            if (line[cursor] == '\0') {
+                break;
+            }
+
+            size_t tok_end = cursor;
+            while (line[tok_end] != '\0' && line[tok_end] != ',') {
+                ++tok_end;
+            }
+
+            char saved = '\0';
+            if (line[tok_end] != '\0') {
+                saved = line[tok_end];
+                line[tok_end] = '\0';
+            }
+
+            char *stop = NULL;
+            vals[ncols++] = (int32_t)strtol(line + cursor, &stop, 10);
+            (void)stop;
+
+            if (saved != '\0') {
+                line[tok_end] = saved;
+            }
+            cursor = tok_end + (line[tok_end] != '\0');
         }
         if (ncols == 0)
             continue;
