@@ -37,12 +37,14 @@ clear_asset_manager_state(void)
     bool vm_attached = false;
 
     if (g_adapter_state.vm != NULL) {
-        jint get_env_status = (*g_adapter_state.vm)->GetEnv((void **)&env,
-                JNI_VERSION_1_6);
+        jint get_env_status = (*g_adapter_state.vm)->GetEnv(
+            g_adapter_state.vm,
+            (void **)&env,
+            JNI_VERSION_1_6);
         if (get_env_status == JNI_EDETACHED) {
             if ((*g_adapter_state.vm)->AttachCurrentThread(
                     g_adapter_state.vm,
-                    (void **)&env,
+                    &env,
                     NULL) == JNI_OK) {
                 vm_attached = true;
             } else {
