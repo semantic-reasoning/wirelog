@@ -64,6 +64,10 @@ All notable changes to wirelog are documented in this file.
   artifacts as Tier-2 for 1.x, documenting that Android AAR/Prefab and
   iOS XCFramework publication are deferred until explicit future
   promotion work is completed (#697).
+- Added `docs/ios.md` with iOS integration guidance for `wirelog.xcframework`
+  consumption, Swift callback registration with trailing `user_data`,
+  simulator architecture handling, and App Store/tooling constraints for
+  issue #470 (#470).
 
 ## [0.41.0] - 2026-05-20
 
