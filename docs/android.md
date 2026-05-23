@@ -91,7 +91,6 @@ Use the current public API names (`wirelog_io_register_adapter`,
 
 typedef struct {
     JavaVM* vm;
-    jstring context_key;
 } app_jni_state_t;
 
 static app_jni_state_t g_app_state;
@@ -138,7 +137,6 @@ JNI_OnLoad(JavaVM* vm, void* reserved)
 {
     (void)reserved;
     g_app_state.vm = vm;
-    g_app_state.context_key = NULL;
 
     static wirelog_io_adapter_t adapter = {
         .abi_version = WIRELOG_IO_ABI_VERSION,
@@ -165,7 +163,7 @@ JNI_OnLoad(JavaVM* vm, void* reserved)
 
 ### App side path handling
 
-Built-in adapters (for example `io=\"csv\"`) expect real filesystem paths.
+Built-in adapters (for example `io="csv"`) expect real filesystem paths.
 Copy packaged assets to app-private storage and pass absolute paths to
 input params:
 
@@ -177,7 +175,7 @@ val csvPath = File(assetDir, "seed/input.csv").absolutePath
 // Pass csvPath via io params in your .input directive.
 ```
 
-Planned/custom `io=\"android_asset\"` adapters are scheme-based.
+Planned/custom `io="android_asset"` adapters are scheme-based.
 In that design, the `filename` value is interpreted through
 `AAssetManager` and is not a direct filesystem path. In that case,
 `android_asset://...` is a scheme marker, not a local file path.
@@ -185,8 +183,8 @@ In that design, the `filename` value is interpreted through
 ## JNI/threading contract
 
 The native adapter callback in this integration path runs synchronously from
-`wirelog_session_load_input_files()` / `wl_session_load_input_files()` on the
-invoking thread. It is not automatically dispatched onto wirelog worker
+`wirelog_load_input_files()` on the invoking thread. It is not automatically
+dispatched onto wirelog worker
 threads.
 
 When calling JNI from the callback, follow:
