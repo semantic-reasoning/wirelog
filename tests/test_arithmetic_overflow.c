@@ -214,9 +214,9 @@ test_filter_invalid_shift_rejects_row(void)
 }
 
 static void
-test_map_head_overflow_fails_hard_or_emits_no_row(void)
+test_map_head_overflow_fails_hard(void)
 {
-    TEST("map head r(x+1) with INT64_MAX returns error or emits no rows");
+    TEST("map head r(x+1) with INT64_MAX returns ERANGE");
 
     const char *src =
         ".decl a(x: int64)\n"
@@ -226,14 +226,33 @@ test_map_head_overflow_fails_hard_or_emits_no_row(void)
 
     struct result_ctx out;
     int rc = run_snapshot(src, &out);
-    if (rc != ERANGE && rc != 0) {
+    if (rc != ERANGE) {
         char msg[64];
-        snprintf(msg, sizeof(msg), "expected ERANGE/0, got %d", rc);
+        snprintf(msg, sizeof(msg), "expected ERANGE, got %d", rc);
         FAIL(msg);
         return;
     }
-    if (rc == 0 && out.count != 0) {
-        FAIL("map emitted wrapped row on overflow");
+    PASS();
+}
+
+static void
+test_reduce_sum_accumulation_overflow_fails_hard(void)
+{
+    TEST("reduce agg sum accumulation overflows in same group");
+
+    const char *src =
+        ".decl a(g: int64, x: int64)\n"
+        "a(1, 9223372036854775807).\n"
+        "a(1, 1).\n"
+        ".decl r(g: int64, s: int64)\n"
+        "r(g, sum(x)) :- a(g, x).\n";
+
+    struct result_ctx out;
+    int rc = run_snapshot(src, &out);
+    if (rc != ERANGE) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected ERANGE, got %d", rc);
+        FAIL(msg);
         return;
     }
     PASS();
@@ -294,7 +313,8 @@ main(void)
     test_filter_division_by_zero_rejects_row();
     test_filter_modulo_by_zero_rejects_row();
     test_filter_invalid_shift_rejects_row();
-    test_map_head_overflow_fails_hard_or_emits_no_row();
+    test_map_head_overflow_fails_hard();
+    test_reduce_sum_accumulation_overflow_fails_hard();
     test_slow_filter_to_number_expression_rejects_row();
     test_reduce_expression_overflow_fails_hard();
 
