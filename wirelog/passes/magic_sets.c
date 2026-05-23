@@ -172,6 +172,22 @@ is_idb(const struct wirelog_program *prog, const char *rel_name)
     return false;
 }
 
+static bool
+relation_has_aggregate_rule(const struct wirelog_program *prog,
+    const char *rel_name)
+{
+    if (!prog || !rel_name)
+        return false;
+    for (uint32_t i = 0; i < prog->rule_count; i++) {
+        if (prog->rules[i].head_relation
+            && strcmp(prog->rules[i].head_relation, rel_name) == 0
+            && prog->rules[i].ir_root
+            && prog->rules[i].ir_root->type == WIRELOG_IR_AGGREGATE)
+            return true;
+    }
+    return false;
+}
+
 static uint32_t
 get_arity(const struct wirelog_program *prog, const char *rel_name)
 {
@@ -550,6 +566,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
         stats->original_rules_modified = 0;
         stats->skipped_all_free = 0;
         stats->arity_mismatch_skipped = 0;
+        stats->skipped_aggregate = 0;
     }
 
     /* === Phase 1: Seed the worklist from explicit demands === */
@@ -572,6 +589,12 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
             if (stats)
                 stats->skipped_all_free++;
             continue; /* All-free optimization: skip */
+        }
+
+        if (relation_has_aggregate_rule(prog, d->relation_name)) {
+            if (stats)
+                stats->skipped_aggregate++;
+            continue;
         }
 
         uint32_t arity = d->arity;
@@ -632,6 +655,12 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                     goto next_atom;
 
                 if (is_idb(prog, atom->rel_name)) {
+                    if (relation_has_aggregate_rule(prog, atom->rel_name)) {
+                        if (stats)
+                            stats->skipped_aggregate++;
+                        goto next_atom;
+                    }
+
                     /* Compute adornment of this IDB body atom */
                     uint64_t atom_mask = 0;
                     for (uint32_t ci = 0; ci < atom->col_count && ci < 64;

@@ -32,6 +32,7 @@
 #include "../ir/ir.h"
 #include "../ir/program.h"
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -124,10 +125,24 @@ count_join_depth(const wirelog_ir_node_t *node)
             node = (node->child_count > 0) ? node->children[0] : NULL;
         /* Skip over any PROJECT inserted by JPP between joins */
         while (node && node->type == WIRELOG_IR_PROJECT
-               && node->child_count > 0)
+            && node->child_count > 0)
             node = node->children[0];
     }
     return depth;
+}
+
+static bool
+contains_aggregate(const wirelog_ir_node_t *node)
+{
+    if (!node)
+        return false;
+    if (node->type == WIRELOG_IR_AGGREGATE)
+        return true;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        if (contains_aggregate(node->children[i]))
+            return true;
+    }
+    return false;
 }
 
 /* ======================================================================== */
@@ -288,6 +303,7 @@ wl_sip_apply(struct wirelog_program *prog, wl_sip_stats_t *stats)
         stats->semijoins_inserted = 0;
         stats->chains_examined = 0;
         stats->demand_semijoins_inserted = 0;
+        stats->skipped_aggregate = 0;
     }
 
     if (!prog->relation_irs)
@@ -295,6 +311,11 @@ wl_sip_apply(struct wirelog_program *prog, wl_sip_stats_t *stats)
 
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         if (prog->relation_irs[i]) {
+            if (contains_aggregate(prog->relation_irs[i])) {
+                if (stats)
+                    stats->skipped_aggregate++;
+                continue;
+            }
             int rc = sip_process_tree(prog->relation_irs[i], stats);
             if (rc != 0)
                 return rc;

@@ -26,6 +26,7 @@
 #include "../ir/ir.h"
 #include "../ir/program.h"
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,6 +56,20 @@ count_all_nodes(const struct wirelog_program *prog)
         total += wl_fusion_count_nodes(prog->relation_irs[i]);
     }
     return total;
+}
+
+static bool
+contains_aggregate(const wirelog_ir_node_t *node)
+{
+    if (!node)
+        return false;
+    if (node->type == WIRELOG_IR_AGGREGATE)
+        return true;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        if (contains_aggregate(node->children[i]))
+            return true;
+    }
+    return false;
 }
 
 /* ======================================================================== */
@@ -145,16 +160,22 @@ wl_fusion_apply(struct wirelog_program *prog, wl_fusion_stats_t *stats)
             stats->nodes_before = 0;
             stats->nodes_after = 0;
             stats->fusions_applied = 0;
+            stats->skipped_aggregate = 0;
         }
         return 0;
     }
 
     uint32_t nodes_before = count_all_nodes(prog);
     uint32_t total_fusions = 0;
+    uint32_t skipped_aggregate = 0;
 
     /* Walk each relation's merged IR tree */
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         if (prog->relation_irs[i]) {
+            if (contains_aggregate(prog->relation_irs[i])) {
+                skipped_aggregate++;
+                continue;
+            }
             total_fusions += try_fuse_node(&prog->relation_irs[i]);
         }
     }
@@ -165,6 +186,7 @@ wl_fusion_apply(struct wirelog_program *prog, wl_fusion_stats_t *stats)
         stats->nodes_before = nodes_before;
         stats->nodes_after = nodes_after;
         stats->fusions_applied = total_fusions;
+        stats->skipped_aggregate = skipped_aggregate;
     }
 
     return 0;

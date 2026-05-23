@@ -26,9 +26,6 @@
 #include "wirelog/exec_plan.h"
 #include "wirelog/exec_plan_gen.h"
 #include "wirelog/intern.h"
-#include "wirelog/passes/fusion.h"
-#include "wirelog/passes/jpp.h"
-#include "wirelog/passes/sip.h"
 #include "wirelog/session.h"
 #include "wirelog/session_facts.h"
 #include "wirelog/wirelog-parser.h"
@@ -87,11 +84,9 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
 
     /* Issue #718: seed inline `.dl` facts into the freshly built session
      * so snapshots and IDB derivations observe them.  This mirrors the
-     * fact-load step of the CLI driver's session-build sequence
-     * (cli/driver.c:397); the wider optimizer pipeline alignment
-     * between wirelog_easy (fusion + jpp + sip) and the CLI (which also
-     * runs subsumption + magic_sets) is tracked separately and is not
-     * in scope here.  The load runs exactly once on the lazy
+     * fact-load step of the CLI driver's session-build sequence.  The
+     * optimizer pipeline is shared with the CLI via wirelog_optimize().
+     * The load runs exactly once on the lazy
      * plan/session boundary, before any host delta callback can be
      * installed, so col_session_insert takes the non-incremental path:
      * no spurious static deltas on the first step() and no outer-epoch
@@ -131,31 +126,11 @@ wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
     if (!prog)
         return (err != WIRELOG_OK) ? err : WIRELOG_ERR_PARSE;
 
-    /* Optimizer passes return 0 on success and negative rc on failure
-     * (see passes/fusion.h, passes/jpp.h, passes/sip.h).  A silent
-     * discard would leave the caller to discover the failure at plan
-     * build time with a misleading WIRELOG_ERR_EXEC; surface the real
-     * cause up front instead. */
-    int pass_rc = wl_fusion_apply(prog, NULL);
-    if (pass_rc != 0) {
-        fprintf(stderr,
-            "wirelog_easy_open: wl_fusion_apply failed (rc=%d)\n", pass_rc);
+    err = WIRELOG_OK;
+    if (!wirelog_optimize(prog, &err)) {
+        fprintf(stderr, "wirelog_easy_open: optimize failed (err=%d)\n", err);
         wirelog_program_free(prog);
-        return WIRELOG_ERR_EXEC;
-    }
-    pass_rc = wl_jpp_apply(prog, NULL);
-    if (pass_rc != 0) {
-        fprintf(stderr,
-            "wirelog_easy_open: wl_jpp_apply failed (rc=%d)\n", pass_rc);
-        wirelog_program_free(prog);
-        return WIRELOG_ERR_EXEC;
-    }
-    pass_rc = wl_sip_apply(prog, NULL);
-    if (pass_rc != 0) {
-        fprintf(stderr,
-            "wirelog_easy_open: wl_sip_apply failed (rc=%d)\n", pass_rc);
-        wirelog_program_free(prog);
-        return WIRELOG_ERR_EXEC;
+        return (err != WIRELOG_OK) ? err : WIRELOG_ERR_EXEC;
     }
 
     wirelog_easy_session_t *s
@@ -259,7 +234,8 @@ wirelog_easy_make_compound(wirelog_easy_session_t *s, const char *functor,
 /* ======================================================================== */
 
 wirelog_error_t
-wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation, const int64_t *row,
+wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation,
+    const int64_t *row,
     uint32_t ncols)
 {
     if (!s || !relation || !row)
@@ -272,7 +248,8 @@ wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation, const int64
 }
 
 wirelog_error_t
-wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation, const int64_t *row,
+wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation,
+    const int64_t *row,
     uint32_t ncols)
 {
     if (!s || !relation || !row)
@@ -289,7 +266,8 @@ wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation, const int64
 /* ======================================================================== */
 
 static wirelog_error_t
-collect_sym_row(wirelog_easy_session_t *s, va_list ap, int64_t *row, uint32_t *ncols)
+collect_sym_row(wirelog_easy_session_t *s, va_list ap, int64_t *row,
+    uint32_t *ncols)
 {
     uint32_t n = 0;
     while (n < WIRELOG_EASY_MAX_COLS) {
@@ -381,7 +359,8 @@ column_is_string(wirelog_column_type_t t)
 }
 
 void
-wirelog_easy_print_delta(const char *relation, const int64_t *row, uint32_t ncols,
+wirelog_easy_print_delta(const char *relation, const int64_t *row,
+    uint32_t ncols,
     int32_t diff, void *user_data)
 {
     wirelog_easy_session_t *s = (wirelog_easy_session_t *)user_data;
@@ -453,7 +432,8 @@ static void
 snapshot_trampoline(const char *relation, const int64_t *row, uint32_t ncols,
     void *user_data)
 {
-    wirelog_easy_snapshot_filter_t *f = (wirelog_easy_snapshot_filter_t *)user_data;
+    wirelog_easy_snapshot_filter_t *f =
+        (wirelog_easy_snapshot_filter_t *)user_data;
     if (!relation || !f || !f->wanted)
         return;
     if (strcmp(relation, f->wanted) != 0)

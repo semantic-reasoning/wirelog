@@ -44,11 +44,13 @@ struct wirelog_ir_node;
  * @joins_reordered:       Number of join chains that were reordered.
  * @projections_inserted:  Number of intermediate PROJECT nodes inserted.
  * @chains_examined:       Total join chains examined.
+ * @skipped_aggregate:     IR trees skipped because they contain AGGREGATE.
  */
 typedef struct {
     uint32_t joins_reordered;
     uint32_t projections_inserted;
     uint32_t chains_examined;
+    uint32_t skipped_aggregate;
 } wl_jpp_stats_t;
 
 /* ======================================================================== */

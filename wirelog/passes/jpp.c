@@ -909,6 +909,20 @@ optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
     *projections_inserted += result.projections_inserted;
 }
 
+static bool
+contains_aggregate(const wirelog_ir_node_t *ir)
+{
+    if (!ir)
+        return false;
+    if (ir->type == WIRELOG_IR_AGGREGATE)
+        return true;
+    for (uint32_t i = 0; i < ir->child_count; i++) {
+        if (contains_aggregate(ir->children[i]))
+            return true;
+    }
+    return false;
+}
+
 /* ======================================================================== */
 /* Public API                                                               */
 /* ======================================================================== */
@@ -924,6 +938,7 @@ wl_jpp_apply(struct wirelog_program *prog, wl_jpp_stats_t *stats)
             stats->joins_reordered = 0;
             stats->projections_inserted = 0;
             stats->chains_examined = 0;
+            stats->skipped_aggregate = 0;
         }
         return 0;
     }
@@ -931,6 +946,7 @@ wl_jpp_apply(struct wirelog_program *prog, wl_jpp_stats_t *stats)
     uint32_t chains_examined = 0;
     uint32_t joins_reordered = 0;
     uint32_t projections_inserted = 0;
+    uint32_t skipped_aggregate = 0;
 
     /* Build de-duplicated IDB relation name list for EDB tie-breaking.
      * A relation is IDB iff it appears as the head of at least one rule. */
@@ -958,6 +974,10 @@ wl_jpp_apply(struct wirelog_program *prog, wl_jpp_stats_t *stats)
     }
 
     for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (contains_aggregate(prog->relation_irs[i])) {
+            skipped_aggregate++;
+            continue;
+        }
         optimize_tree(prog->relation_irs[i], &chains_examined, &joins_reordered,
             &projections_inserted, idb_names, idb_count);
     }
@@ -968,6 +988,7 @@ wl_jpp_apply(struct wirelog_program *prog, wl_jpp_stats_t *stats)
         stats->joins_reordered = joins_reordered;
         stats->projections_inserted = projections_inserted;
         stats->chains_examined = chains_examined;
+        stats->skipped_aggregate = skipped_aggregate;
     }
 
     return 0;
