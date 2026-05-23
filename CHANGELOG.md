@@ -46,6 +46,10 @@ All notable changes to wirelog are documented in this file.
 - **Stable snapshot fast path** (#811): clean sessions now read cached
   materialized IDB rows directly on repeated snapshots instead of
   re-running TDD evaluation when no input or retraction state is pending.
+- **v0.43 benchmark speedup notes draft** (#794, #512, #791): added
+  the portfolio speedup draft with issue #794 timing deltas, changed-commit
+  provenance, and memory-trade-off context:
+  [docs/release-notes/v0.43.md](docs/release-notes/v0.43.md).
 
 ### Security
 
