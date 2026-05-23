@@ -46,6 +46,10 @@ All notable changes to wirelog are documented in this file.
 - **Stable snapshot fast path** (#811): clean sessions now read cached
   materialized IDB rows directly on repeated snapshots instead of
   re-running TDD evaluation when no input or retraction state is pending.
+- **CSPA W=1 perf gate** (#818): added `test_cspa_perf_gate` as a
+  dedicated static `cspa-fast` regression guard for `W=1` using 9-trial
+  median timing, 20,381-tuple/6-iteration correctness sentinels, and the
+  shared `WIRELOG_PERF_GATE` / `WIRELOG_PERF_REQUIRE` control flow.
 - **v0.43 benchmark speedup notes draft** (#794, #512, #791): added
   the portfolio speedup draft with #512 timing deltas, changed-commit
   provenance, and memory-trade-off context:

@@ -915,6 +915,36 @@ test('crdt_perf_gate', test_crdt_perf_gate_exe,
      ])
 
 # ============================================================================
+# CSPA W=1 perf-suite gate.
+#
+# Uses the same static-cspa-fast inline-fact assembly as
+# `bench_flowlog --workload cspa-fast` and asserts median wall <= TARGET_MS
+# (currently 2,050 ms = baseline 1,950 ms x 1.05).  Registered in suite 'perf'
+# so default invocation skips without WIRELOG_PERF_GATE=1.
+# ============================================================================
+
+test_cspa_perf_gate_exe = executable(
+  'test_cspa_perf_gate',
+  files('test_cspa_perf_gate.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('cspa_w1_gate', test_cspa_perf_gate_exe,
+     suite: 'perf',
+     timeout: 180,
+     env: [
+       'WIRELOG_CSPA_DATA_DIR=' + meson.project_source_root() / 'bench/data/cspa',
+     ])
+
+# ============================================================================
 # Consolidation Function Tests (US-003 TDD RED Phase)
 # ============================================================================
 
