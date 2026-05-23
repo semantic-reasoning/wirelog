@@ -68,6 +68,10 @@ All notable changes to wirelog are documented in this file.
   consumption, Swift callback registration with trailing `user_data`,
   simulator architecture handling, and App Store/tooling constraints for
   #470.
+- Added `docs/android.md` with Android integration guidance for
+  AAR/Prefab consumption patterns, JNI thread attachment patterns,
+  `Context.getFilesDir()` path handling, and Android CI/alignment
+  requirements for #466.
 
 ## [0.41.0] - 2026-05-20
 
