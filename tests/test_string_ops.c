@@ -1725,6 +1725,11 @@ test_null_intern_all_functions(void)
         FAIL("to_number: expected 0");
         return;
     }
+    int64_t out = 123;
+    if (wl_string_ops_to_number_checked(0, NULL, &out) != EINVAL) {
+        FAIL("to_number_checked: expected EINVAL");
+        return;
+    }
 
     PASS();
 }

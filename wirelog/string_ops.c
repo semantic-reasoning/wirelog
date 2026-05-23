@@ -524,8 +524,8 @@ wl_string_ops_to_number_checked(int64_t id, wl_intern_t *intern, int64_t *out)
 /**
  * string_ops_to_number:
  * Parse interned string @id as a base-10 integer.
- * Parses a numeric prefix; returns 0 if the string has no valid numeric prefix
- * or cannot be represented as int64_t.
+ * Parses a numeric prefix; returns 0 if the string has no valid numeric prefix.
+ * Out-of-range prefixes preserve the legacy strtoll saturation result.
  */
 int64_t
 string_ops_to_number(int64_t id, wl_intern_t *intern)
