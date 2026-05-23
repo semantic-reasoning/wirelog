@@ -51,7 +51,7 @@ All notable changes to wirelog are documented in this file.
 - Added `docs/PLATFORM_SUPPORT.md` to classify Android/iOS release
   artifacts as Tier-2 for 1.x, documenting that Android AAR/Prefab and
   iOS XCFramework publication are deferred until explicit future
-  promotion work is completed.
+  promotion work is completed (#697).
 
 ## [0.41.0] - 2026-05-20
 
