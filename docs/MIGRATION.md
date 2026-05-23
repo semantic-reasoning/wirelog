@@ -1,11 +1,30 @@
 # Migration Guide
 
-**Last Updated:** 2026-05-20
+**Last Updated:** 2026-05-24
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
+
+## 0.41 -> 0.43
+
+Version `0.43.0` follows `0.41.0` directly; `0.42` was skipped
+by maintainer decision for #859. No source-level migration steps are
+required for applications already on the 0.41 public API surface.
+
+- **Overflow handling is fail-closed for numerical operations.**  Columnar
+  numeric operators now return hard errors on overflow/underflow and
+  reject rows that cannot be represented safely (`ERANGE`), including
+  checked `sum()` and `to_number()` parsing paths.
+- **Recursive aggregation output is now canonicalized deterministically.**
+  Recursive columnar MIN/MAX behavior now consistently follows the fixed
+  MIN/MAX residue semantics and the associated conformance checks from
+  #692/#859/#852.
+- **Platform artifacts remain Tier-2/deferred for 0.43.**  Android AAR/
+  Prefab and iOS XCFramework publication continues to be deferred in
+  `docs/PLATFORM_SUPPORT.md`; there is no published binary-artifact policy
+  change in this point release.
 
 ## 0.40 -> 0.41
 
