@@ -136,6 +136,7 @@ jobs:
             -Wall \
             -fPIC \
             -shared \
+            -Wl,-z,max-page-size=16384 \
             -I"$PWD" \
             -I"$PWD/build-android-arm64" \
             -I"$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
@@ -151,6 +152,7 @@ jobs:
           file "$PWD/build-android-arm64/libasset_adapter.so"
           readelf -h "$PWD/build-android-arm64/libasset_adapter.so"
           readelf -lW "$PWD/build-android-arm64/libasset_adapter.so"
+          bash scripts/ci/check-android-alignment.sh build-android-arm64/libasset_adapter.so
 
       - name: Hard gate -- assert 16 KB PT_LOAD alignment
         run: |
@@ -165,6 +167,7 @@ jobs:
           name: readelf-arm64-on-fail
           path: |
             build-android-arm64/libwirelog.so
+            build-android-arm64/libasset_adapter.so
             build-android-arm64/meson-logs/meson-log.txt
           retention-days: 7
 
