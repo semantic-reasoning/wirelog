@@ -44,6 +44,8 @@ on:
     paths:
       - 'meson.build'
       - 'meson_options.txt'
+      - 'docs/android.md'
+      - 'examples/android/**'
       - 'wirelog/**'
       - 'cross/**'
       - 'scripts/ci/check-android-alignment.sh'
@@ -54,6 +56,8 @@ on:
     paths:
       - 'meson.build'
       - 'meson_options.txt'
+      - 'docs/android.md'
+      - 'examples/android/**'
       - 'wirelog/**'
       - 'cross/**'
       - 'scripts/ci/check-android-alignment.sh'
@@ -122,6 +126,31 @@ jobs:
 
       - name: Build
         run: meson compile -C build-android-arm64
+
+      - name: Compile asset adapter reference (arm64-v8a, compile-only)
+        run: |
+          set -x
+          NDK_PATH='${{ steps.setup-ndk.outputs.ndk-path }}'
+          CLANG="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          "$CLANG" \
+            -Wall \
+            -fPIC \
+            -shared \
+            -I"$PWD" \
+            -I"$PWD/build-android-arm64" \
+            -I"$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -I"$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android" \
+            "$PWD/examples/android/asset_adapter/asset_adapter.c" \
+            "$PWD/build-android-arm64/libwirelog.so" \
+            -L"$PWD/build-android-arm64" \
+            -lwirelog \
+            -landroid \
+            -llog \
+            -o "$PWD/build-android-arm64/libasset_adapter.so"
+
+          file "$PWD/build-android-arm64/libasset_adapter.so"
+          readelf -h "$PWD/build-android-arm64/libasset_adapter.so"
+          readelf -lW "$PWD/build-android-arm64/libasset_adapter.so"
 
       - name: Hard gate -- assert 16 KB PT_LOAD alignment
         run: |
