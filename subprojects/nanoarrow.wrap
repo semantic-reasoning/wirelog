@@ -1,7 +1,6 @@
 [wrap-git]
 url = https://github.com/apache/arrow-nanoarrow.git
-revision = main
-depth = 1
+revision = 8dcb55e735354ece7e1776d2d9577806cda3ee00
 
 [provide]
 nanoarrow = nanoarrow_dep

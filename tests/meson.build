@@ -617,6 +617,15 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #715: release dependency wraps must not float on main/master.
+# Wrap-file archives with source_hash/patch_hash (for example xxhash.wrap)
+# are allowed; git wraps must pin immutable revisions.
+if sh.found()
+  test('wrap_revisions', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-wrap-revisions.sh'],
+       suite: 'abi')
+endif
+
 # Issue #737: forbid new unanchored "Phase NX" labels in wirelog/ source.
 # Each Phase NX label must either carry an explicit issue cross-reference
 # on the same line ("#N", "Issue N", "US-N-NNN"), or be present in the
