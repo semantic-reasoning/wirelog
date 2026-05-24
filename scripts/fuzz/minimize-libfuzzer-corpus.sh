@@ -85,6 +85,32 @@ absolute_path() {
     esac
 }
 
+ensure_non_overlapping_corpora() {
+    local target=$1
+    local input_corpus=$2
+    local output_corpus=$3
+    local input_abs output_abs
+
+    input_abs=$(absolute_path "$input_corpus")
+    output_abs=$(absolute_path "$output_corpus")
+
+    if [ "$input_abs" = "$output_abs" ]; then
+        die "input and output corpora overlap for $target: both resolve to $input_abs"
+    fi
+
+    case "$output_abs" in
+        "$input_abs"/*)
+            die "output corpus is inside input corpus for $target: $output_abs inside $input_abs"
+            ;;
+    esac
+
+    case "$input_abs" in
+        "$output_abs"/*)
+            die "input corpus is inside output corpus for $target: $input_abs inside $output_abs"
+            ;;
+    esac
+}
+
 input_corpus_for_target() {
     local target=$1
     if [ "${#selected_targets[@]}" -eq 1 ] && [ -d "$input_dir" ] \
@@ -93,6 +119,20 @@ input_corpus_for_target() {
     else
         printf '%s/%s/corpus' "$input_dir" "$target"
     fi
+}
+
+preflight_target() {
+    local target=$1
+    local bin_name binary input_corpus output_corpus
+
+    bin_name=$(binary_name "$target")
+    binary="$build_dir/tests/$bin_name"
+    input_corpus=$(input_corpus_for_target "$target")
+    output_corpus="$out_dir/$target/corpus"
+
+    [ -x "$binary" ] || die "target binary not found or not executable: $binary"
+    [ -d "$input_corpus" ] || die "input corpus directory not found for $target: $input_corpus"
+    ensure_non_overlapping_corpora "$target" "$input_corpus" "$output_corpus"
 }
 
 run_target() {
@@ -112,6 +152,7 @@ run_target() {
 
     [ -x "$binary" ] || die "target binary not found or not executable: $binary"
     [ -d "$input_corpus" ] || die "input corpus directory not found for $target: $input_corpus"
+    ensure_non_overlapping_corpora "$target" "$input_corpus" "$output_corpus"
 
     mkdir -p "$output_corpus" "$artifact_dir" "$log_dir"
     start_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -234,6 +275,10 @@ case "$out_dir" in
         die "--out-dir must not be inside the input corpus/root"
         ;;
 esac
+
+for target in "${selected_targets[@]}"; do
+    preflight_target "$target"
+done
 
 mkdir -p "$out_dir"
 out_dir=$(cd "$out_dir" && pwd)
