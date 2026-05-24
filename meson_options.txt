@@ -29,6 +29,13 @@ option(
 )
 
 option(
+  'enable_fuzz',
+  type: 'boolean',
+  value: false,
+  description: 'Build parser fuzz target and corpus smoke test when using Clang/libFuzzer (Issue #743)'
+)
+
+option(
   'documentation',
   type: 'boolean',
   value: false,
