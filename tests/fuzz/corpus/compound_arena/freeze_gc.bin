@@ -1,0 +1,1 @@
+freeze gc alloc while frozen unfreeze alloc gc live
