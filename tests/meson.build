@@ -139,46 +139,72 @@ test('parse_duplicate_decl_no_leak', test_parse_duplicate_decl_no_leak_exe)
 
 if get_option('enable_fuzz')
   if cc.get_id() == 'clang'
-    parser_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/parser'
-    parser_fuzz = executable(
-      'parser_fuzz',
-      files('fuzz/parser_fuzz.c'),
-      parser_src,
-      c_args: ['-fsanitize=fuzzer'],
-      link_args: ['-fsanitize=fuzzer'],
-      include_directories: [wirelog_inc, wirelog_src_inc],
-      install: false,
-    )
+    bash = find_program('bash', required: false)
+    fuzz_smoke_helper = meson.current_source_dir() / 'fuzz/run_fuzz_smoke.sh'
+    fuzz_work_root = meson.current_build_dir() / 'fuzz-smoke'
 
-    test(
-      'parser_fuzz_smoke',
-      parser_fuzz,
-      args: [parser_fuzz_corpus, '-runs=1', '-max_total_time=1'],
-      suite: 'fuzz',
-      timeout: 30,
-    )
+    if not bash.found()
+      warning('enable_fuzz=true was requested, but bash was not found. '
+        + 'Skipping parser_fuzz and csv_reader_fuzz smoke tests.')
+    else
+      parser_fuzz_smoke_workdir = fuzz_work_root / 'parser'
+      csv_reader_fuzz_smoke_workdir = fuzz_work_root / 'csv_reader'
 
-    csv_reader_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/csv_reader'
-    csv_reader_fuzz = executable(
-      'csv_reader_fuzz',
-      files('fuzz/csv_reader_fuzz.c'),
-      files(
-        '../wirelog/io/csv_reader.c',
-        '../wirelog/intern.c',
-      ),
-      c_args: ['-fsanitize=fuzzer'],
-      link_args: ['-fsanitize=fuzzer'],
-      include_directories: [wirelog_inc, wirelog_src_inc],
-      install: false,
-    )
+      parser_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/parser'
+      parser_fuzz = executable(
+        'parser_fuzz',
+        files('fuzz/parser_fuzz.c'),
+        parser_src,
+        c_args: ['-fsanitize=fuzzer'],
+        link_args: ['-fsanitize=fuzzer'],
+        include_directories: [wirelog_inc, wirelog_src_inc],
+        install: false,
+      )
 
-    test(
-      'csv_reader_fuzz_smoke',
-      csv_reader_fuzz,
-      args: [csv_reader_fuzz_corpus, '-runs=1', '-max_total_time=1'],
-      suite: 'fuzz',
-      timeout: 30,
-    )
+      test(
+        'parser_fuzz_smoke',
+        bash,
+        args: [
+          fuzz_smoke_helper,
+          parser_fuzz.full_path(),
+          parser_fuzz_corpus,
+          parser_fuzz_smoke_workdir,
+          '-runs=1',
+          '-max_total_time=1',
+        ],
+        suite: 'fuzz',
+        timeout: 30,
+      )
+
+      csv_reader_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/csv_reader'
+      csv_reader_fuzz = executable(
+        'csv_reader_fuzz',
+        files('fuzz/csv_reader_fuzz.c'),
+        files(
+          '../wirelog/io/csv_reader.c',
+          '../wirelog/intern.c',
+        ),
+        c_args: ['-fsanitize=fuzzer'],
+        link_args: ['-fsanitize=fuzzer'],
+        include_directories: [wirelog_inc, wirelog_src_inc],
+        install: false,
+      )
+
+      test(
+        'csv_reader_fuzz_smoke',
+        bash,
+        args: [
+          fuzz_smoke_helper,
+          csv_reader_fuzz.full_path(),
+          csv_reader_fuzz_corpus,
+          csv_reader_fuzz_smoke_workdir,
+          '-runs=1',
+          '-max_total_time=1',
+        ],
+        suite: 'fuzz',
+        timeout: 30,
+      )
+    endif
   else
     warning('enable_fuzz=true was requested, but libFuzzer builds require clang. '
       + 'Skipping parser_fuzz and csv_reader_fuzz targets.')
