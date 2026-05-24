@@ -171,6 +171,11 @@ tooling gap and verify the script help and missing-tool error path instead.
 
 ## Follow-Ups
 
-Issue `#743` lands the harnesses, seed corpora, AFL++ entrypoints, and
-libFuzzer smoke scaffold only. Longer 24h soak runs, corpus workflow, and B7
-GitHub comment/reporting integration remain follow-ups under `#694` / `#874`.
+Issue `#743` landed the initial harnesses, seed corpora, AFL++ entrypoints, and
+libFuzzer smoke scaffold. Issue `#874` adds the reproducible libFuzzer soak
+runner, corpus minimizer, and manual evidence workflow in this branch.
+
+Actual pre-RC 24h evidence still requires executing the workflow, retaining the
+uploaded artifacts, and linking the run evidence before release. B7 / `#694`
+reporting also remains follow-up work until those retained artifacts are
+referenced from the release evidence trail.
