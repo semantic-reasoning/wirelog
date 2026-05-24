@@ -99,10 +99,11 @@ the confirmed 28.8ms median.
 
 Historic single-trial numbers from pre-2026-05-09 README revisions
 (before commit `1e6af00`) used `--repeat 1` and are not directly
-comparable to the current 5-trial medians. The delta on CSPA
-timings (for example W=1 from 1.95s in older single-trial snapshots to
-1.16s in this 5-trial table) is a measurement-methodology change, not
-a runtime regression; these values are descriptive.
+comparable to the current 5-trial medians. The previous repeat-5 README
+baseline reported CSPA W=1 at 1.95s on the 2026-05-06 host; this refresh
+reports 1.16s on the 2026-05-24 host/environment, so the delta is
+descriptive and should not be read as an isolated algorithmic speedup or
+regression.
 
 **Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.11s
 -> incremental re-eval 15.4ms (**71.9x faster**); W=8 baseline 594.1ms
