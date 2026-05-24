@@ -134,7 +134,7 @@ test('stratify', test_stratify_exe)
 test('parse_duplicate_decl_no_leak', test_parse_duplicate_decl_no_leak_exe)
 
 # ============================================================================
-# Parser fuzz scaffold (Issue #743). Build only with -Denable_fuzz=true.
+# Fuzz scaffolds (Issue #743). Build only with -Denable_fuzz=true.
 # ============================================================================
 
 if get_option('enable_fuzz')
@@ -145,11 +145,13 @@ if get_option('enable_fuzz')
 
     if not bash.found()
       warning('enable_fuzz=true was requested, but bash was not found. '
-        + 'Skipping parser_fuzz, csv_reader_fuzz, and intern_fuzz smoke tests.')
+        + 'Skipping parser_fuzz, csv_reader_fuzz, intern_fuzz, and '
+        + 'compound_arena_fuzz smoke tests.')
     else
       parser_fuzz_smoke_workdir = fuzz_work_root / 'parser'
       csv_reader_fuzz_smoke_workdir = fuzz_work_root / 'csv_reader'
       intern_fuzz_smoke_workdir = fuzz_work_root / 'intern'
+      compound_arena_fuzz_smoke_workdir = fuzz_work_root / 'compound_arena'
 
       parser_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/parser'
       parser_fuzz = executable(
@@ -231,10 +233,39 @@ if get_option('enable_fuzz')
         suite: 'fuzz',
         timeout: 30,
       )
+
+      compound_arena_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/compound_arena'
+      compound_arena_fuzz = executable(
+        'compound_arena_fuzz',
+        files('fuzz/compound_arena_fuzz.c',
+          '../wirelog/arena/compound_arena.c',
+          '../wirelog/util/log.c',
+          '../wirelog/util/log_emit.c'),
+        include_directories: [wirelog_inc, wirelog_src_inc],
+        c_args: ['-fsanitize=fuzzer'],
+        link_args: ['-fsanitize=fuzzer'],
+        install: false,
+      )
+
+      test(
+        'compound_arena_fuzz_smoke',
+        bash,
+        args: [
+          fuzz_smoke_helper,
+          compound_arena_fuzz.full_path(),
+          compound_arena_fuzz_corpus,
+          compound_arena_fuzz_smoke_workdir,
+          '-runs=1',
+          '-max_total_time=1',
+        ],
+        suite: 'fuzz',
+        timeout: 30,
+      )
     endif
   else
     warning('enable_fuzz=true was requested, but libFuzzer builds require clang. '
-      + 'Skipping parser_fuzz, csv_reader_fuzz, and intern_fuzz targets.')
+      + 'Skipping parser_fuzz, csv_reader_fuzz, intern_fuzz, and '
+      + 'compound_arena_fuzz targets.')
   endif
 endif
 
