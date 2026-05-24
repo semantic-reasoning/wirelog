@@ -241,6 +241,25 @@ Per #746 B17, `release-1.x` requires:
 - Signed commits (GPG verified).
 - Tag protection on `v1.x.*`.
 
+### Perf nightly monitoring posture
+
+For v1.0, `.github/workflows/perf-nightly.yml` remains
+`continue-on-error: true`.  GitHub-hosted perf runners are noisy enough
+that nightly performance checks should not directly block merges,
+release PRs, or release tags.
+
+The nightly `meson test --suite perf` run and the `bench_flowlog`
+portfolio artifacts/current-run summaries are monitoring evidence, not
+branch-protection gates.  The portfolio artifacts and current-run
+summary are required observability outputs for the nightly job so
+maintainers can inspect workload coverage and current results.
+
+Last-N SKIP-rate monitoring is the remaining #828 follow-up; it is
+intended to detect silently degraded coverage without claiming that the
+current run is a stable regression gate.  Promoting perf checks to
+blocking status requires a dedicated stable perf runner and a separate
+policy change.
+
 ### mbedTLS-enabled validation policy
 
 The stable check name for optional crypto validation is
