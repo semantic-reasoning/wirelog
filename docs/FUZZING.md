@@ -49,6 +49,26 @@ directory. The `24h` command is the intended release evidence producer for
 `#684` / `#694`, but the runner itself does not prove that a soak happened
 until that command has actually been executed and its artifacts retained.
 
+## libFuzzer Corpus Minimization
+
+After a successful soak, stage a minimized corpus into a separate output root:
+
+```sh
+scripts/fuzz/minimize-libfuzzer-corpus.sh \
+  --build-dir build-fuzz --input-dir path/to/soak-root \
+  --out-dir path/to/minimized-root --all
+```
+
+For a single target, `--input-dir` may point directly at that target's corpus.
+The output layout mirrors the soak evidence shape:
+`<out-dir>/<target>/corpus`, `<out-dir>/<target>/logs/minimize.log`,
+`<out-dir>/<target>/artifacts`, `<out-dir>/<target>/metadata.txt`, plus a
+top-level `manifest.txt`.
+
+Minimized corpora are not committed by the script. Committing any corpus update
+is a later reviewed step after successful soak and minimization evidence has
+been retained for `#874` / `#684`.
+
 ## AFL++
 
 The `scripts/afl/*.sh` entrypoints run AFL++ against the same four target
@@ -78,7 +98,7 @@ Concise local validation for fuzz scaffolding changes:
 
 ```sh
 git diff --check origin/main..HEAD
-bash -n tests/fuzz/run_fuzz_smoke.sh scripts/afl/*.sh
+bash -n tests/fuzz/run_fuzz_smoke.sh scripts/afl/*.sh scripts/fuzz/*.sh
 meson test -C build parser --print-errorlogs
 CC=gcc meson setup build-fuzz-gcc -Denable_fuzz=true
 ```
