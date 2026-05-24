@@ -104,11 +104,9 @@ if (err != WIRELOG_OK) {
 
 err = wirelog_session_insert(session, "edge", values, 1, 2);
 if (err == WIRELOG_OK) {
-    err = wirelog_session_step(session);
+    err = wirelog_session_snapshot(session, on_tuple, user_data);
 }
 
-wirelog_session_snapshot(session, on_tuple, user_data);
-wirelog_session_remove(session, "edge", values, 1, 2);
 wirelog_session_destroy(session);
 ```
 
@@ -119,11 +117,26 @@ only when the host deliberately requires the current columnar backend:
 wirelog_session_create(program, WIRELOG_BACKEND_COLUMNAR, 1, &session);
 ```
 
-### Inline facts are materialized at session creation (#718)
+For a given inserted batch, choose either step/delta mode or snapshot
+mode.  Do not call `wirelog_session_step()` and then
+`wirelog_session_snapshot()` on the same batch; both calls evaluate the
+batch and combining them can duplicate derived rows.
 
-Inline `.dl` facts are seeded before the session is returned from
-`wirelog_session_create()` or `wirelog_easy_open()`.  Hosts do not need
-to replay static facts into a newly opened session.
+### Inline facts are materialized before first use (#718)
+
+Inline `.dl` fact timing depends on the facade:
+
+- Advanced API: facts are seeded before `wirelog_session_create()`
+  returns.
+- Easy API default: `wirelog_easy_open()` is lazy; facts are seeded at
+  the first lazy build, before the first
+  `wirelog_easy_insert()`, `wirelog_easy_remove()`,
+  `wirelog_easy_step()`, `wirelog_easy_set_delta_cb()`, or
+  `wirelog_easy_snapshot()` operation completes.
+- Easy API eager mode: facts are seeded before
+  `wirelog_easy_open_opts(... eager_build=true ...)` returns.
+
+Hosts do not need to replay static facts into a newly opened session.
 
 Delta callbacks registered after open do not receive synthetic initial
 deltas for inline facts that were already materialized.  Register the
