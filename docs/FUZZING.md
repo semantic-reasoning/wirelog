@@ -24,6 +24,31 @@ tests use `tests/fuzz/run_fuzz_smoke.sh`, which copies each tracked seed corpus
 from `tests/fuzz/corpus/` into a build-tree work directory before running the
 target. Source corpora are not mutated.
 
+## libFuzzer Soak Runner
+
+Issue `#874` adds a release-evidence runner for longer libFuzzer campaigns.
+It uses the same compiled fuzz binaries and copies committed seeds into
+writable per-target corpus directories before each run.
+
+Short local validation:
+
+```sh
+scripts/fuzz/run-libfuzzer-soak.sh \
+  --build-dir build-fuzz --target parser --duration 5s
+```
+
+Release soak invocation:
+
+```sh
+scripts/fuzz/run-libfuzzer-soak.sh \
+  --build-dir build-fuzz --all --duration 24h
+```
+
+The runner writes per-target logs, artifacts, and metadata under its work
+directory. The `24h` command is the intended release evidence producer for
+`#684` / `#694`, but the runner itself does not prove that a soak happened
+until that command has actually been executed and its artifacts retained.
+
 ## AFL++
 
 The `scripts/afl/*.sh` entrypoints run AFL++ against the same four target
