@@ -28,7 +28,22 @@ on:
   schedule:
     # Daily at 04:00 UTC (overnight US Pacific / EU early morning).
     - cron: '0 4 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      portfolio_tier:
+        description: 'bench_flowlog portfolio tier'
+        type: choice
+        options:
+          - smoke
+          - light
+          - readme-full
+        default: light
+      portfolio_workers:
+        description: 'Comma-separated portfolio worker counts'
+        default: '1'
+      portfolio_repeat:
+        description: 'Portfolio repeat count'
+        default: '1'
 
 permissions:
   contents: read
@@ -128,6 +143,57 @@ jobs:
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
+
+      - name: Collect flowlog portfolio (Linux)
+        if: ${{ always() && runner.os == 'Linux' }}
+        shell: bash
+        env:
+          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'light' }}
+          PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
+          PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
+        run: |
+          set +e
+          python scripts/perf/run-flowlog-portfolio.py \
+            --bench build-perf/bench/bench_flowlog \
+            --tier "$PORTFOLIO_TIER" \
+            --workers "$PORTFOLIO_WORKERS" \
+            --repeat "$PORTFOLIO_REPEAT" \
+            --out-dir perf-artifacts/portfolio
+          rc=$?
+          echo "portfolio_exit=$rc" >> "$GITHUB_OUTPUT"
+          echo "PORTFOLIO_EXIT=$rc" >> "$GITHUB_ENV"
+          echo "portfolio_exit=$rc" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Collect flowlog portfolio (Windows)
+        if: ${{ always() && runner.os == 'Windows' }}
+        shell: bash
+        env:
+          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'light' }}
+          PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
+          PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
+        run: |
+          set +e
+          python scripts/perf/run-flowlog-portfolio.py \
+            --bench build-perf/bench/bench_flowlog.exe \
+            --tier "$PORTFOLIO_TIER" \
+            --workers "$PORTFOLIO_WORKERS" \
+            --repeat "$PORTFOLIO_REPEAT" \
+            --out-dir perf-artifacts/portfolio
+          rc=$?
+          echo "portfolio_exit=$rc" >> "$GITHUB_OUTPUT"
+          echo "PORTFOLIO_EXIT=$rc" >> "$GITHUB_ENV"
+          echo "portfolio_exit=$rc" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload flowlog portfolio artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-portfolio-${{ matrix.os }}-${{ matrix.compiler }}
+          path: perf-artifacts/portfolio
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Publish results
         if: always()
