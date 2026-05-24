@@ -99,6 +99,10 @@ typedef enum {
     WL_PARSER_LEXER_TOK_UUID4, /* uuid4 */
     WL_PARSER_LEXER_TOK_UUID5, /* uuid5 */
 
+    /* CRC-32 function keywords (Issue #884) */
+    WL_PARSER_LEXER_TOK_CRC32_ETH,  /* crc32_ethernet */
+    WL_PARSER_LEXER_TOK_CRC32_CAST, /* crc32_castagnoli */
+
     /* String function keywords */
     WL_PARSER_LEXER_TOK_STRLEN,      /* strlen */
     WL_PARSER_LEXER_TOK_CAT,         /* cat */

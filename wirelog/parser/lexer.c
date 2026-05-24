@@ -257,6 +257,12 @@ identifier_type(const char *start, uint32_t length)
     if (IS_KW("uuid5"))
         return WL_PARSER_LEXER_TOK_UUID5;
 
+    /* CRC-32 function keywords (Issue #884) */
+    if (IS_KW("crc32_ethernet"))
+        return WL_PARSER_LEXER_TOK_CRC32_ETH;
+    if (IS_KW("crc32_castagnoli"))
+        return WL_PARSER_LEXER_TOK_CRC32_CAST;
+
     /* String function keywords */
     if (IS_KW("strlen"))
         return WL_PARSER_LEXER_TOK_STRLEN;
@@ -589,6 +595,10 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "UUID4";
     case WL_PARSER_LEXER_TOK_UUID5:
         return "UUID5";
+    case WL_PARSER_LEXER_TOK_CRC32_ETH:
+        return "CRC32_ETHERNET";
+    case WL_PARSER_LEXER_TOK_CRC32_CAST:
+        return "CRC32_CASTAGNOLI";
     case WL_PARSER_LEXER_TOK_STRLEN:
         return "STRLEN";
     case WL_PARSER_LEXER_TOK_CAT:
