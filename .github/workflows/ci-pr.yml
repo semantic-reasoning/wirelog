@@ -135,6 +135,22 @@ jobs:
           meson test -C builddir --print-errorlogs
 
       # =======================================================================
+      # Issue #744: SBOM snapshot CI gate
+      # Only runs on Linux GCC + ubuntu-latest (to avoid ARM64 binary issues)
+      # =======================================================================
+      - name: Install syft
+        if: runner.os == 'Linux' && matrix.compiler == 'gcc' && matrix.os == 'ubuntu-latest'
+        run: |
+          SYFT_VERSION="1.7.0"
+          curl -sSfL \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin syft
+
+      - name: SBOM snapshot gate
+        if: runner.os == 'Linux' && matrix.compiler == 'gcc' && matrix.os == 'ubuntu-latest'
+        run: meson test -C builddir --suite sbom --print-errorlogs
+
+      # =======================================================================
       # Binary size regression gate (Issue #460)
       # Only runs on Linux GCC (reference platform for .text baseline)
       # =======================================================================

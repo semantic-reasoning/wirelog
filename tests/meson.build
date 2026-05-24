@@ -696,6 +696,17 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #744: SBOM snapshot gate.  Diffs the detected dependency list
+# (packages + versions) against the committed baseline (sbom/snapshot.txt).
+# SKIPs when syft is not on PATH or when the baseline has not been seeded yet
+# (run scripts/release/generate-sbom.sh to seed).  Fails when dependencies
+# change without a baseline update (enforces explicit review of dependency drift).
+if sh.found()
+  test('sbom_snapshot', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-sbom-snapshot.sh'],
+       suite: 'sbom')
+endif
+
 # Issue #689 / Blocker B2: standalone-include compile matrix for the
 # public-headers SSoT.  One executable per public header, each
 # compiled in isolation against tests/standalone/test_standalone_<H>.c

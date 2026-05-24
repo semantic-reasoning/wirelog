@@ -68,3 +68,7 @@ subprojects/nanoarrow/
 subprojects/xxHash-0.8.3/
 subprojects/packagecache/
 *.uncrustify
+
+# SBOM generation artifacts (timestamped, regenerated per release; only snapshot.txt committed)
+sbom/*.spdx.json
+sbom/*.cdx.json
