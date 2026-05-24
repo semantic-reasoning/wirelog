@@ -195,6 +195,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Summarize flowlog portfolio
+        if: always()
+        shell: bash
+        run: |
+          python scripts/perf/summarize-flowlog-portfolio.py \
+            --artifact-dir perf-artifacts/portfolio \
+            --artifact-name "perf-portfolio-${{ matrix.os }}-${{ matrix.compiler }}" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish results
         if: always()
         shell: bash
