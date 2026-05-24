@@ -219,6 +219,23 @@ When cutting a release tag:
 6. **Attach release artefacts** produced by the at-tag workflow:
    tarball + checksums + SBOM + ABI manifest + provenance file.
 
+### Perf-suite graph gate
+
+The `sub_ms_graph_perf_gate` entry in `--suite perf` covers the Reach,
+SSSP, SG, and Bipartite W=1 sub-ms graph workloads.  Like the other
+release perf gates, it is opt-in via `WIRELOG_PERF_GATE=1` and is meant
+for stable perf runners, not normal shared local/default runs.
+
+Use a release/perf build with `-Dwirelog_log_max_level=error` and a
+stable timing host, including the `performance` CPU governor where the
+platform exposes one.  `WIRELOG_PERF_REQUIRE=1` turns host or build
+misconfiguration from SKIP into FAIL for release runners.
+
+Current enforcement is correctness sentinels plus median/mean/stdev/CoV
+reporting with a CoV <= 5% noise ceiling.  There is no absolute
+wall-clock regression budget for these graph workloads yet; per-workload
+median targets should be added only after stable-run provenance exists.
+
 ---
 
 ## 3. Branch-protection and freeze rules
