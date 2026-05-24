@@ -24,22 +24,37 @@ on:
         required: true
         default: '["ubuntu-latest"]'
         type: string
+      timeout_minutes:
+        description: Job timeout in minutes; separate from per-target libFuzzer duration
+        required: true
+        default: "360"
+        type: string
 
 jobs:
   fuzz-evidence:
     name: libFuzzer evidence
     runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     env:
       FUZZ_TARGET: ${{ inputs.target }}
       FUZZ_DURATION: ${{ inputs.duration }}
       FUZZ_RUNS_ON: ${{ inputs.runs_on }}
+      FUZZ_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
 
     steps:
-      - name: Validate runner and duration
+      - name: Validate runner, duration, and timeout
         shell: bash
         run: |
+          readonly hosted_limit_minutes=360
+          readonly buffer_minutes=60
+
           if [[ ! "$FUZZ_DURATION" =~ ^[0-9]+([smh])?$ ]]; then
             echo "duration must be an integer number of seconds or use s/m/h suffix: $FUZZ_DURATION" >&2
+            exit 1
+          fi
+
+          if [[ ! "$FUZZ_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+            echo "timeout_minutes must be a positive integer: $FUZZ_TIMEOUT_MINUTES" >&2
             exit 1
           fi
 
@@ -51,9 +66,23 @@ jobs:
             s|"") seconds=$value ;;
           esac
 
+          if [ "$FUZZ_TARGET" = "all" ]; then
+            target_count=4
+          else
+            target_count=1
+          fi
+
+          required_minutes=$((((seconds * target_count) + 59) / 60 + buffer_minutes))
+          if [ "$FUZZ_TIMEOUT_MINUTES" -lt "$required_minutes" ]; then
+            echo "timeout_minutes=$FUZZ_TIMEOUT_MINUTES is too small for target=$FUZZ_TARGET duration=$FUZZ_DURATION." >&2
+            echo "Estimated minimum is ${required_minutes} minutes, including ${buffer_minutes} minutes for setup, minimization, and upload." >&2
+            exit 1
+          fi
+
           compact_runs_on="${FUZZ_RUNS_ON//[[:space:]]/}"
-          if [ "$compact_runs_on" = '["ubuntu-latest"]' ] && [ "$seconds" -ge 86400 ]; then
-            echo "duration=$FUZZ_DURATION is release-length evidence and cannot use the hosted default runs_on=$FUZZ_RUNS_ON." >&2
+          if [ "$compact_runs_on" = '["ubuntu-latest"]' ] && [ "$required_minutes" -gt "$hosted_limit_minutes" ]; then
+            echo "target=$FUZZ_TARGET duration=$FUZZ_DURATION needs about ${required_minutes} minutes and cannot use the hosted default runs_on=$FUZZ_RUNS_ON." >&2
+            echo "GitHub-hosted runners are limited to about ${hosted_limit_minutes} minutes." >&2
             echo "Use runs_on labels for a runner whose runtime policy supports the requested duration." >&2
             exit 1
           fi

@@ -83,28 +83,39 @@ Launch it before an RC from GitHub Actions with:
   (default: `60s`).
 - `runs_on`: JSON runner labels for the Actions job
   (default: `["ubuntu-latest"]`).
+- `timeout_minutes`: GitHub Actions job timeout in minutes, separate from the
+  per-target libFuzzer duration (default: `360`).
 
-The hosted default runner is only for smoke/evidence-path validation. The
-default `60s` run does not produce release evidence. Release evidence for
-`#874` / `#684` / `#694` requires an explicit long run, normally
-`duration=24h`, and a runner whose runtime policy supports the requested
-duration. Use `runs_on` to select appropriate self-hosted or larger runner
-labels for planned 24h evidence.
+The hosted default runner is only for smoke/evidence-path validation. For a
+hosted smoke run, leave `runs_on=["ubuntu-latest"]`, `duration=60s`, and
+`timeout_minutes=360`. That default path does not produce release evidence.
+Release evidence for `#874` / `#684` / `#694` requires an explicit long run,
+normally `duration=24h`, and a runner whose runtime policy supports the
+requested duration. Use `runs_on` to select appropriate self-hosted or larger
+runner labels for planned 24h evidence.
+
+For a single-target 24h release run, select one target such as `parser`, set
+`duration=24h`, set `runs_on` to the long-running runner labels, and set
+`timeout_minutes` above 1440 plus setup/minimization/upload buffer; `1500` is a
+reasonable starting point. The workflow validates the timeout estimate before
+building.
 
 The duration is per target. `target=all` runs the four targets sequentially for
 that duration each, so release evidence should usually be launched as separate
 per-target workflow runs or on a runner whose runtime policy covers the full
-all-target runtime. The workflow rejects `24h`-class durations on the hosted
-default `["ubuntu-latest"]` runner labels because GitHub-hosted runner limits
-cannot complete that release-evidence path.
+all-target runtime. `target=all` with `duration=24h` is about 96h plus
+overhead. The workflow rejects runs whose estimated runtime exceeds
+`timeout_minutes`, and rejects the hosted default `["ubuntu-latest"]` runner
+labels whenever the estimate exceeds the hosted 6h limit.
 
 The workflow builds the four libFuzzer targets with Clang, writes soak evidence
 under `fuzz-evidence/soak`, and, only if the soak step succeeds, writes
 minimized corpora under `fuzz-evidence/minimized`. Artifacts are uploaded with
 `if: always()`, so crashes and nonzero exits should still retain available soak
 logs and reproducers even when minimization does not run. Artifact upload after
-runner cancellation or timeout is best-effort; planned long-run evidence should
-use a runner that is not expected to time out.
+runner cancellation or timeout is best-effort, and long-run artifact upload,
+token, and runtime policies are runner-dependent. Planned release evidence
+should use a runner that is not expected to time out or be cancelled.
 
 Retained release evidence should include:
 
