@@ -61,6 +61,131 @@ during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
 for the full scope.  Entries are filed atomically as the renames land;
 #745 then consolidates the narrative for the GA migration guide.
 
+### Advanced session API is public via wirelog-advanced.h (#717)
+
+The canonical public advanced-session API is
+`#include <wirelog/wirelog-advanced.h>`.  Do not include or call
+internal `wl_session_*` helpers or `wirelog/session.h` from host
+applications; those names are private implementation details and are
+not part of the installed public API contract.
+
+Backend selection is public through `wirelog_backend_kind_t`:
+
+- `WIRELOG_BACKEND_DEFAULT` lets the engine choose the default backend.
+- `WIRELOG_BACKEND_COLUMNAR` selects the C columnar backend explicitly.
+
+Prefer `WIRELOG_BACKEND_DEFAULT` unless a host has a specific reason
+to pin the backend.  If you store or switch on `wirelog_backend_kind_t`,
+include a conservative default branch so future additive backend values
+do not break your code.
+
+Before, internal-only code often looked like this:
+
+```c
+#include "wirelog/session.h"
+
+wl_session_t *s = wl_session_create(program);
+wl_session_insert(s, "edge", values, 1, 2);
+wl_session_step(s);
+wl_session_destroy(s);
+```
+
+Migrate to the installed public surface:
+
+```c
+#include <wirelog/wirelog-advanced.h>
+
+wirelog_session_t *session = NULL;
+wirelog_error_t err = wirelog_session_create(program,
+    WIRELOG_BACKEND_DEFAULT, 0, &session);
+if (err != WIRELOG_OK) {
+    /* handle error */
+}
+
+err = wirelog_session_insert(session, "edge", values, 1, 2);
+if (err == WIRELOG_OK) {
+    err = wirelog_session_step(session);
+}
+
+wirelog_session_snapshot(session, on_tuple, user_data);
+wirelog_session_remove(session, "edge", values, 1, 2);
+wirelog_session_destroy(session);
+```
+
+Use `WIRELOG_BACKEND_COLUMNAR` instead of `WIRELOG_BACKEND_DEFAULT`
+only when the host deliberately requires the current columnar backend:
+
+```c
+wirelog_session_create(program, WIRELOG_BACKEND_COLUMNAR, 1, &session);
+```
+
+### Inline facts are materialized at session creation (#718)
+
+Inline `.dl` facts are seeded before the session is returned from
+`wirelog_session_create()` or `wirelog_easy_open()`.  Hosts do not need
+to replay static facts into a newly opened session.
+
+Delta callbacks registered after open do not receive synthetic initial
+deltas for inline facts that were already materialized.  Register the
+callback for runtime changes, and use `wirelog_session_snapshot()` or
+`wirelog_easy_snapshot()` if the host needs the initial derived state:
+
+```c
+wirelog_session_create(program, WIRELOG_BACKEND_DEFAULT, 0, &session);
+wirelog_session_set_delta_cb(session, on_delta, user_data);
+
+/* No synthetic callbacks for inline facts happen here. */
+wirelog_session_snapshot(session, on_tuple, user_data);
+```
+
+If a host mirrors inline facts itself and inserts the same row again,
+the duplicate host insert increases the Z-set multiplicity.  For
+set-like host behavior, either let wirelog seed inline facts on its own
+or inspect `wirelog_program_get_facts()` before inserting a mirrored
+row.
+
+### Z-set host insert/remove arithmetic
+
+Host inserts and removes are differential Z-set operations:
+
+- `wirelog_session_insert()` / `wirelog_easy_insert()` increments row
+  multiplicity by `+1`.
+- `wirelog_session_remove()` / `wirelog_easy_remove()` decrements row
+  multiplicity by `-1`.
+
+Removing a row that was seeded from inline `.dl` facts may leave the
+row present if multiplicity remains positive.  For example:
+
+```text
+inline fact edge(1, 2)     => multiplicity +1
+host insert edge(1, 2)     => multiplicity +2
+host remove edge(1, 2)     => multiplicity +1, still observable
+second host remove         => multiplicity  0, no longer observable
+```
+
+See `docs/SEMANTICS.md` for the full Z-set and inline-fact contract.
+
+### Public attributes and deprecation annotations
+
+New declarations in installed public headers should use `WIRELOG_API`
+as the visibility/export annotation:
+
+```c
+WIRELOG_API wirelog_error_t
+wirelog_example_public_function(void);
+```
+
+`WIRELOG_PUBLIC` remains available as a compatibility-level macro after
+the `WL_PUBLIC` rename, but consumers should prefer `WIRELOG_API` in
+new public declarations and examples.
+
+APIs scheduled for removal may be annotated with
+`WIRELOG_DEPRECATED_SINCE(major, minor)`.  When migrating off a
+deprecated compatibility shim, update to the replacement API directly.
+If a project must temporarily keep compatibility calls, suppress known
+deprecation warnings locally around that shim rather than disabling
+deprecation warnings globally.
+
 ### I/O adapter framework rename + ABI v2 bump (#762)
 
 The `wirelog/io/io_adapter.h` public-installed header carried
