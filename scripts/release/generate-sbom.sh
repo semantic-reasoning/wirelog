@@ -26,7 +26,7 @@ fi
 # Format: version: 'X.Y.Z-dev' or 'X.Y.Z-rcN' or 'X.Y.Z'
 # We strip the -dev/-rcN suffix and use major.minor.patch for filename.
 version=$(grep "^  version:" "$repo_root/meson.build" | head -1 \
-          | grep -oP "'[^']+'" | tr -d "'" | cut -d'-' -f1)
+          | sed -E "s/.*'([^']+)'.*/\1/" | cut -d'-' -f1)
 
 # Ensure sbom/ directory exists
 mkdir -p "$repo_root/sbom"
