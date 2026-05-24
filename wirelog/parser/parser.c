@@ -601,6 +601,50 @@ parse_factor(wl_parser_t *parser)
         return node;
     }
 
+    /* CRC-32 Ethernet/ISO function: crc32_ethernet(expr) (Issue #884) */
+    if (parser->current.type == WL_PARSER_LEXER_TOK_CRC32_ETH) {
+        parser_advance(parser); /* consume crc32_ethernet */
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+            "expected '(' after crc32_ethernet")) {
+            return NULL;
+        }
+        wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
+        if (!arg)
+            return NULL;
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+            "expected ')' after crc32_ethernet argument")) {
+            wl_parser_ast_node_free(arg);
+            return NULL;
+        }
+        wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        unary->arith_op = WIRELOG_ARITH_CRC32_ETH;
+        wl_parser_ast_node_add_child(unary, arg);
+        return unary;
+    }
+
+    /* CRC-32 Castagnoli (iSCSI) function: crc32_castagnoli(expr) (Issue #884) */
+    if (parser->current.type == WL_PARSER_LEXER_TOK_CRC32_CAST) {
+        parser_advance(parser); /* consume crc32_castagnoli */
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+            "expected '(' after crc32_castagnoli")) {
+            return NULL;
+        }
+        wl_parser_ast_node_t *arg = parse_arithmetic_expr(parser);
+        if (!arg)
+            return NULL;
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+            "expected ')' after crc32_castagnoli argument")) {
+            wl_parser_ast_node_free(arg);
+            return NULL;
+        }
+        wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
+            WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        unary->arith_op = WIRELOG_ARITH_CRC32_CAST;
+        wl_parser_ast_node_add_child(unary, arg);
+        return unary;
+    }
+
     /* UUID4 function: uuid4() - nullary */
     if (parser->current.type == WL_PARSER_LEXER_TOK_UUID4) {
         parser_advance(parser); /* consume uuid4 */
@@ -705,7 +749,9 @@ is_bitwise_token(wl_parser_lexer_token_type_t type)
            || type == WL_PARSER_LEXER_TOK_SHA512
            || type == WL_PARSER_LEXER_TOK_HMAC_SHA256
            || type == WL_PARSER_LEXER_TOK_UUID4
-           || type == WL_PARSER_LEXER_TOK_UUID5;
+           || type == WL_PARSER_LEXER_TOK_UUID5
+           || type == WL_PARSER_LEXER_TOK_CRC32_ETH
+           || type == WL_PARSER_LEXER_TOK_CRC32_CAST;
 }
 
 static wl_parser_ast_node_t *

@@ -2163,6 +2163,21 @@ test_hash_parser_exe = executable(
 
 test('hash_parser', test_hash_parser_exe)
 
+# CRC-32 parser tests (Issue #884): verify the lexer/parser accept
+# crc32_ethernet(...) and crc32_castagnoli(...) as built-in keywords.
+test_crc32_parser_exe = executable(
+  'test_crc32_parser',
+  files('test_crc32_parser.c'),
+  parser_src,
+  ir_src,
+  io_src,
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep],
+)
+
+test('crc32_parser', test_crc32_parser_exe)
+
 test_hash_eval_exe = executable(
   'test_hash_eval',
   files('test_hash_eval.c'),
