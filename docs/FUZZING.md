@@ -10,7 +10,7 @@ arena targets.
 - `compound_arena_fuzz` exercises bounded `wl_compound_arena_*()` allocation,
   lookup, retain, freeze/unfreeze, GC-boundary, and live-handle paths.
 
-## Build + run
+## libFuzzer Smoke
 
 ```sh
 CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address --wipe
@@ -18,8 +18,11 @@ meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_are
 meson test -C build-fuzz --suite fuzz --print-errorlogs
 ```
 
-The default profile remains unchanged. `-Denable_fuzz=true` gates the extra targets
-and requires a Clang + libFuzzer-capable toolchain.
+The default profile remains unchanged. `-Denable_fuzz=true` gates the extra
+targets and requires a Clang + libFuzzer-capable toolchain. The Meson smoke
+tests use `tests/fuzz/run_fuzz_smoke.sh`, which copies each tracked seed corpus
+from `tests/fuzz/corpus/` into a build-tree work directory before running the
+target. Source corpora are not mutated.
 
 ## AFL++
 
@@ -34,9 +37,33 @@ scripts/afl/compound_arena.sh --binary build-fuzz/tests/compound_arena_fuzz
 ```
 
 Each script assumes the target binary already exists from a fuzz build or a
-compatible AFL-instrumented build. The scripts do not rebuild the project.
-They copy the tracked seed corpus into a writable work directory before
-starting `afl-fuzz`, so source corpora under `tests/fuzz/corpus/` are not
-mutated. By default, work and output directories are created under
-`${TMPDIR:-/tmp}/wirelog-afl/`; pass `--work-dir` or `--out-dir` to override
-that location.
+compatible AFL-instrumented build. The scripts do not rebuild the project. For
+normal AFL++ campaigns, use AFL-compatible instrumentation unless deliberately
+testing one of AFL++'s uninstrumented modes.
+
+Like the Meson smoke helper, each AFL++ script copies the tracked seed corpus
+into a writable work directory before starting `afl-fuzz`, so source corpora
+under `tests/fuzz/corpus/` are not mutated. By default, work and output
+directories are created under `${TMPDIR:-/tmp}/wirelog-afl/`; pass `--work-dir`
+or `--out-dir` to override that location.
+
+## Validation
+
+Concise local validation for fuzz scaffolding changes:
+
+```sh
+git diff --check origin/main..HEAD
+bash -n tests/fuzz/run_fuzz_smoke.sh scripts/afl/*.sh
+meson test -C build parser --print-errorlogs
+CC=gcc meson setup build-fuzz-gcc -Denable_fuzz=true
+```
+
+When `clang` is unavailable, record libFuzzer smoke as a local toolchain gap.
+When `afl-fuzz` is unavailable, record AFL++ campaign execution as a local
+tooling gap and verify the script help and missing-tool error path instead.
+
+## Follow-Ups
+
+Issue `#743` lands the harnesses, seed corpora, AFL++ entrypoints, and
+libFuzzer smoke scaffold only. Longer 24h soak runs, corpus workflow, and B7
+GitHub comment/reporting integration remain follow-ups under `#694` / `#874`.
