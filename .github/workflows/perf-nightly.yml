@@ -47,6 +47,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   perf:
@@ -193,7 +194,7 @@ jobs:
           name: perf-portfolio-${{ matrix.os }}-${{ matrix.compiler }}
           path: perf-artifacts/portfolio
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 35
 
       - name: Summarize flowlog portfolio
         if: always()
@@ -222,6 +223,74 @@ jobs:
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             echo '</details>' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  portfolio-skip-rate:
+    name: Perf portfolio SKIP-rate history
+    needs: perf
+    if: always()
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download recent portfolio artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p perf-artifacts/history perf-artifacts/skip-rate
+          warnings=perf-artifacts/skip-rate/warnings.log
+          : > "$warnings"
+          cutoff="$(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
+          if ! gh run list \
+              --workflow perf-nightly.yml \
+              --created ">=$cutoff" \
+              --limit 100 \
+              --json databaseId \
+              --jq '.[].databaseId' > perf-artifacts/skip-rate/runs.txt; then
+            echo "gh run list failed; no history downloaded" >> "$warnings"
+          fi
+          while IFS= read -r run_id; do
+            [ -n "$run_id" ] || continue
+            dest="perf-artifacts/history/run-$run_id"
+            mkdir -p "$dest"
+            if ! gh run download "$run_id" \
+                --pattern 'perf-portfolio-*' \
+                --dir "$dest"; then
+              echo "failed to download perf portfolio artifacts for run $run_id" >> "$warnings"
+            fi
+          done < perf-artifacts/skip-rate/runs.txt
+
+      - name: Summarize portfolio SKIP-rate history
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p perf-artifacts/skip-rate
+          python scripts/perf/summarize-flowlog-portfolio-history.py \
+            --root perf-artifacts/history \
+            --window-days 30 \
+            --json-out perf-artifacts/skip-rate/skip-rate.json \
+            > perf-artifacts/skip-rate/skip-rate.md
+          if [ -s perf-artifacts/skip-rate/warnings.log ]; then
+            {
+              echo ''
+              echo '<details><summary>Artifact download warnings</summary>'
+              echo ''
+              sed 's/^/- /' perf-artifacts/skip-rate/warnings.log
+              echo ''
+              echo '</details>'
+            } >> perf-artifacts/skip-rate/skip-rate.md
+          fi
+          cat perf-artifacts/skip-rate/skip-rate.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload portfolio SKIP-rate summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-portfolio-skip-rate
+          path: perf-artifacts/skip-rate
+          if-no-files-found: warn
+          retention-days: 35
 
   # ==========================================================================
   # Stress nightly (Issue #594): runs the W=4 / R=500 freeze-cycle and
