@@ -1,24 +1,23 @@
-/*
- * wirelog/util/log.h - wirelog Structured Logger (GST_DEBUG style)
- *
- * Copyright (C) CleverPlant
- * Licensed under LGPL-3.0
- * For commercial licenses, contact: inquiry@cleverplant.com
+/**
+ * @file wirelog/util/log.h
+ * @brief Internal structured logger (GST_DEBUG style).
  *
  * INTERNAL HEADER - never transitively included by any installed/public header.
- * Enforced by scripts/check_log_header_not_public.sh.
+ * Enforced by scripts/check_log_header_not_public.sh. This header is not an
+ * installed/public API surface.
  *
  * Zero-overhead when disabled:
- *   - Levels above WL_LOG_COMPILE_MAX_LEVEL (-Dwirelog_log_max_level=...) are
- *     stripped at compile time; argument expressions are NOT evaluated.
- *   - Runtime-disabled sites are a single byte load + predicted-not-taken branch.
+ * - Levels above WL_LOG_COMPILE_MAX_LEVEL (-Dwirelog_log_max_level=...) are
+ *   stripped at compile time; argument expressions are NOT evaluated.
+ * - Runtime-disabled sites are a single byte load plus predicted-not-taken
+ *   branch.
  *
- * Safety:
- *   - WL_LOG is NOT async-signal-safe. Do not call from signal handlers.
- *   - No pthread_atfork is installed. After fork(), children that changed the
- *     sink must call wl_log_init() again.
- *   - Thresholds are written once at wl_log_init(); subsequent reads are
- *     lock-free byte loads. Emit uses FILE-internal locking via fwrite.
+ * Safety (see docs/ERROR_MODEL.md):
+ * - WL_LOG is NOT async-signal-safe. Do not call from signal handlers.
+ * - No pthread_atfork is installed. After fork(), children that changed the
+ *   sink must call wl_log_init() again.
+ * - Thresholds are written once at wl_log_init(); subsequent reads are
+ *   lock-free byte loads. Emit uses stdio/file I/O, including fwrite.
  */
 
 #ifndef WIRELOG_UTIL_LOG_H
