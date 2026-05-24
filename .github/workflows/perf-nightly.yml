@@ -37,7 +37,7 @@ on:
           - smoke
           - light
           - readme-full
-        default: light
+        default: readme-full
       portfolio_workers:
         description: 'Comma-separated portfolio worker counts'
         default: '1'
@@ -149,7 +149,7 @@ jobs:
         if: ${{ always() && runner.os == 'Linux' }}
         shell: bash
         env:
-          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'light' }}
+          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'readme-full' }}
           PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
           PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
         run: |
@@ -170,7 +170,7 @@ jobs:
         if: ${{ always() && runner.os == 'Windows' }}
         shell: bash
         env:
-          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'light' }}
+          PORTFOLIO_TIER: ${{ github.event.inputs.portfolio_tier || 'readme-full' }}
           PORTFOLIO_WORKERS: ${{ github.event.inputs.portfolio_workers || '1' }}
           PORTFOLIO_REPEAT: ${{ github.event.inputs.portfolio_repeat || '1' }}
         run: |
