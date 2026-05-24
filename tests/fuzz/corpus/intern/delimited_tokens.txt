@@ -1,0 +1,3 @@
+alpha,beta,gamma;delta|epsilon	zeta eta
+
+single	token

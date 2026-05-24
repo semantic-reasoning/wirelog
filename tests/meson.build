@@ -145,10 +145,11 @@ if get_option('enable_fuzz')
 
     if not bash.found()
       warning('enable_fuzz=true was requested, but bash was not found. '
-        + 'Skipping parser_fuzz and csv_reader_fuzz smoke tests.')
+        + 'Skipping parser_fuzz, csv_reader_fuzz, and intern_fuzz smoke tests.')
     else
       parser_fuzz_smoke_workdir = fuzz_work_root / 'parser'
       csv_reader_fuzz_smoke_workdir = fuzz_work_root / 'csv_reader'
+      intern_fuzz_smoke_workdir = fuzz_work_root / 'intern'
 
       parser_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/parser'
       parser_fuzz = executable(
@@ -204,10 +205,36 @@ if get_option('enable_fuzz')
         suite: 'fuzz',
         timeout: 30,
       )
+
+      intern_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/intern'
+      intern_fuzz = executable(
+        'intern_fuzz',
+        files('fuzz/intern_fuzz.c',
+          '../wirelog/intern.c'),
+        include_directories: [wirelog_inc, wirelog_src_inc],
+        c_args: ['-fsanitize=fuzzer'],
+        link_args: ['-fsanitize=fuzzer'],
+        install: false,
+      )
+
+      test(
+        'intern_fuzz_smoke',
+        bash,
+        args: [
+          fuzz_smoke_helper,
+          intern_fuzz.full_path(),
+          intern_fuzz_corpus,
+          intern_fuzz_smoke_workdir,
+          '-runs=1',
+          '-max_total_time=1',
+        ],
+        suite: 'fuzz',
+        timeout: 30,
+      )
     endif
   else
     warning('enable_fuzz=true was requested, but libFuzzer builds require clang. '
-      + 'Skipping parser_fuzz and csv_reader_fuzz targets.')
+      + 'Skipping parser_fuzz, csv_reader_fuzz, and intern_fuzz targets.')
   endif
 endif
 

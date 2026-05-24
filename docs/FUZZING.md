@@ -1,10 +1,11 @@
 # Fuzzing
 
-Current `#743` scaffolding includes parser and CSV reader line-level targets.
+Current `#743` scaffolding includes parser, CSV reader, and intern targets.
 
 - `parser_fuzz` exercises `wl_parser_parse_string()` via `LLVMFuzzerTestOneInput`.
 - `csv_reader_fuzz` exercises `wl_csv_parse_line()` and `wl_csv_parse_line_ex()`
   at the line level.
+- `intern_fuzz` exercises `wl_intern_*()` APIs with randomized symbol tokens.
 
 ## Build + run (parser only)
 
@@ -19,5 +20,5 @@ and requires a Clang + libFuzzer-capable toolchain.
 
 ## Follow-up targets (Issue #743)
 
-`#743` also tracks intern and compound arena fuzzers as follow-up scaffolds after
-parser and CSV reader line-level coverage lands.
+`#743` also tracks compound arena fuzzers as follow-up scaffolds after
+parser, CSV reader, and intern line-level coverage lands.
