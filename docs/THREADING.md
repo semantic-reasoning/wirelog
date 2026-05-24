@@ -495,9 +495,8 @@ above. No separate gate exists for TDD.
 wirelog is **not async-signal-safe**.
 
 - `WL_LOG` (the structured logger declared in `wirelog/util/log.h`)
-  is explicitly NOT async-signal-safe; see the comment block at
-  `wirelog/util/log.h:11-17` and the canonical statement in the
-  project `CLAUDE.md` Runtime Diagnostics section.
+  is explicitly NOT async-signal-safe; see `docs/ERROR_MODEL.md`
+  and the internal comment block in `wirelog/util/log.h`.
 - After `fork()`, if the child changes the log sink, the child
   must call `wl_log_init()` again.
 - The `mem_ledger`, the SPSC delta queue, the columnar evaluator,
@@ -510,8 +509,8 @@ If a host process needs to interrupt a long-running
 `wirelog_session_*` cancellation flag from the signal-handling
 thread (not from inside the handler itself).
 
-Cross-reference: Risk C6, issue #709 (WL_LOG signal-safety only
-documented in `CLAUDE.md`).
+Cross-reference: Risk C6, issue #709 (consolidated in
+`docs/ERROR_MODEL.md`).
 
 ---
 
@@ -621,9 +620,9 @@ process that will use it.** Crossing a `fork()` boundary without
 The `wirelog/util/log.h` structured logger has its own fork-safety
 note: after `fork()`, if the child changes the log sink, the child
 must call `wl_log_init()` again. This is documented in §9 (signal-
-safety) and in `CLAUDE.md` Runtime Diagnostics. It is reproduced
-here for completeness: the logger fits the same fork-without-exec
-hazard pattern as the I/O adapter registry.
+safety) and `docs/ERROR_MODEL.md`. It is reproduced here for
+completeness: the logger fits the same fork-without-exec hazard
+pattern as the I/O adapter registry.
 
 ### 10.5 What about `pthread_atfork`?
 
@@ -724,14 +723,13 @@ advisory leg); issue #826 (native TSan SEGV triage);
 - `wirelog/columnar/rotation_standard.c:28-32`,
   `rotation_pinned.c:50-56` — rotation strategy epoch-boundary
   callbacks.
-- `wirelog/util/log.h:11-17` — WL_LOG signal-safety statement.
-- `CLAUDE.md` Runtime Diagnostics section — canonical WL_LOG /
-  `WL_DEBUG_JOIN` / `WL_CONSOLIDATION_LOG` rules.
+- `wirelog/util/log.h` — internal WL_LOG safety summary.
+- `docs/ERROR_MODEL.md` — canonical WL_LOG signal/fork safety policy.
 - Issue #681 — v0.41 ABI Infrastructure epic.
 - Issue #734 — this document.
 - Issue #708 — TSan + `-Dthreads=posix` cross-link.
 - Issue #716 — io_adapter fork-safety (§10).
-- Issue #709 — WL_LOG signal-safety risk note.
+- Issue #709 — error-model and WL_LOG safety documentation.
 - Issue #731 — CRDT median-time perf gate (empirical anchor for
   K = 4 parallel threshold).
 - Commit `61e081b` — `fix(#579)`: skip compound-arena GC dispatch

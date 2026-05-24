@@ -16,6 +16,7 @@
  *     provides message atomicity on POSIX.
  *   - Not reentrant: wl_log_emit MUST NOT call WL_LOG.
  *   - Not async-signal-safe: vsnprintf and fwrite are not AS-safe.
+ *     See docs/ERROR_MODEL.md for the user-facing policy.
  */
 
 #include "wirelog/util/log.h"
