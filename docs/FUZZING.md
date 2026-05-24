@@ -69,6 +69,45 @@ Minimized corpora are not committed by the script. Committing any corpus update
 is a later reviewed step after successful soak and minimization evidence has
 been retained for `#874` / `#684`.
 
+## Manual Fuzz Evidence Workflow
+
+`.github/workflows/fuzz-evidence.yml` is a manual `workflow_dispatch` workflow
+for release-candidate evidence. It is not scheduled, it is not triggered on PR
+or push, and it is not a required CI gate.
+
+Launch it before an RC from GitHub Actions with:
+
+- `target`: `all`, `parser`, `csv_reader`, `intern`, or `compound_arena`
+  (default: `all`).
+- `duration`: per-target libFuzzer duration such as `60s`, `10m`, or `24h`
+  (default: `60s`).
+
+The default `60s` run is only a smoke/evidence-path validation. Release
+evidence for `#874` / `#684` / `#694` requires an explicit long run, normally
+`duration=24h`. The duration is per target; `target=all` runs the four targets
+sequentially for that duration each unless maintainers launch separate
+per-target workflow runs.
+
+The workflow builds the four libFuzzer targets with Clang, writes soak evidence
+under `fuzz-evidence/soak`, and, only if the soak step succeeds, writes
+minimized corpora under `fuzz-evidence/minimized`. Artifacts are uploaded with
+`if: always()`, so crashes and nonzero exits should still retain available soak
+logs and reproducers even when minimization does not run.
+
+Retained release evidence should include:
+
+- the GitHub workflow run URL,
+- the uploaded `fuzz-evidence` artifact bundle,
+- `soak/manifest.txt`,
+- each target's soak `metadata.txt` and `logs/libfuzzer.log`,
+- crash/reproducer artifacts under each target's `artifacts/`,
+- `minimized/manifest.txt` and minimized target corpus roots when soak succeeds.
+
+Pass/fail policy: any libFuzzer crash or nonzero target exit blocks the RC.
+Keep the uploaded reproducers/logs, file a follow-up with the failing target and
+artifact paths, fix the issue, and rerun the evidence workflow before retrying
+the RC.
+
 ## AFL++
 
 The `scripts/afl/*.sh` entrypoints run AFL++ against the same four target
