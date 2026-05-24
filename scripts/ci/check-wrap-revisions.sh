@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # check-wrap-revisions.sh - Issue #715 release dependency pin guard.
 #
-# Reject Meson wrap files that depend on floating git branch names. Release
-# dependency wraps must be pinned to immutable revisions or checksum-verified
-# archives.
+# Reject Meson wrap files that are not reproducible. Release dependency
+# wraps must pin git dependencies to immutable commits and checksum archive
+# downloads.
 
 set -euo pipefail
 
@@ -11,27 +11,127 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 fail=0
+
+trim() {
+    local s=$1
+    s=${s#"${s%%[![:space:]]*}"}
+    s=${s%"${s##*[![:space:]]}"}
+    printf '%s' "$s"
+}
+
+strip_inline_comment() {
+    local s=$1
+    s=${s%%#*}
+    trim "$s"
+}
+
+report_fail() {
+    if [ "$fail" -eq 0 ]; then
+        echo "check-wrap-revisions: FAIL: unreproducible wrap dependency found" >&2
+    fi
+    echo "  $1" >&2
+    fail=1
+}
+
+check_wrap() {
+    local wrap=$1
+    local rel=${wrap#$repo_root/}
+    local section=""
+    local section_line=0
+    local revision=""
+    local revision_line=0
+    local source_url_line=0
+    local source_hash=""
+    local patch_url_line=0
+    local patch_hash=""
+
+    finish_section() {
+        case "$section" in
+            wrap-git)
+                if [ -z "$revision" ]; then
+                    report_fail "$rel:$section_line: [wrap-git] missing revision"
+                elif ! [[ "$revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                    report_fail "$rel:$revision_line: revision must be a 40-hex commit, got '$revision'"
+                fi
+                ;;
+            wrap-file)
+                if [ "$source_url_line" -ne 0 ] && [ -z "$source_hash" ]; then
+                    report_fail "$rel:$source_url_line: source_url requires non-empty source_hash"
+                fi
+                if [ "$patch_url_line" -ne 0 ] && [ -z "$patch_hash" ]; then
+                    report_fail "$rel:$patch_url_line: patch_url requires non-empty patch_hash"
+                fi
+                ;;
+        esac
+    }
+
+    reset_section_state() {
+        revision=""
+        revision_line=0
+        source_url_line=0
+        source_hash=""
+        patch_url_line=0
+        patch_hash=""
+    }
+
+    local line_no=0
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_no=$((line_no + 1))
+        line=$(trim "$line")
+        [ -z "$line" ] && continue
+        [[ "$line" == \#* ]] && continue
+
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            local new_section=${BASH_REMATCH[1]}
+            finish_section
+            section=$new_section
+            section_line=$line_no
+            reset_section_state
+            continue
+        fi
+
+        if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+            key=$(trim "${BASH_REMATCH[1]}")
+            value=$(strip_inline_comment "${BASH_REMATCH[2]}")
+            case "$section:$key" in
+                wrap-git:revision)
+                    revision=$value
+                    revision_line=$line_no
+                    ;;
+                wrap-file:source_url)
+                    if [ -n "$value" ]; then
+                        source_url_line=$line_no
+                    fi
+                    ;;
+                wrap-file:source_hash)
+                    source_hash=$value
+                    ;;
+                wrap-file:patch_url)
+                    if [ -n "$value" ]; then
+                        patch_url_line=$line_no
+                    fi
+                    ;;
+                wrap-file:patch_hash)
+                    patch_hash=$value
+                    ;;
+            esac
+        fi
+    done <"$wrap"
+
+    finish_section
+}
+
 for wrap in "$repo_root"/subprojects/*.wrap; do
     [ -e "$wrap" ] || continue
-    matches=$(mktemp)
-    if grep -nEi '^[[:space:]]*revision[[:space:]]*=[[:space:]]*(main|master)([[:space:]]*(#.*)?)?$' \
-            "$wrap" >"$matches"; then
-        if [ "$fail" -eq 0 ]; then
-            echo "check-wrap-revisions: FAIL: floating wrap revisions found" >&2
-        fi
-        while IFS= read -r match; do
-            echo "  ${wrap#$repo_root/}:$match" >&2
-        done <"$matches"
-        fail=1
-    fi
-    rm -f "$matches"
+    check_wrap "$wrap"
 done
 
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
-    echo "Pin release dependency wraps to immutable commits or use" >&2
-    echo "checksum-verified wrap-file archives." >&2
+    echo "Pin [wrap-git] dependencies to 40-hex commits and provide" >&2
+    echo "source_hash/patch_hash for [wrap-file] archive URLs." >&2
     exit 1
 fi
 
-echo "check-wrap-revisions: OK; no revision=main/master in subprojects/*.wrap"
+echo "check-wrap-revisions: OK; release dependency wraps are reproducible"

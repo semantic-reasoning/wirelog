@@ -617,9 +617,9 @@ if sh.found()
        suite: 'abi')
 endif
 
-# Issue #715: release dependency wraps must not float on main/master.
-# Wrap-file archives with source_hash/patch_hash (for example xxhash.wrap)
-# are allowed; git wraps must pin immutable revisions.
+# Issue #715: release dependency wraps must be reproducible.  Git wraps
+# must pin immutable 40-hex commits; wrap-file archive URLs must have
+# matching source_hash/patch_hash entries.
 if sh.found()
   test('wrap_revisions', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-wrap-revisions.sh'],
