@@ -19,18 +19,50 @@ on:
         required: true
         default: 60s
         type: string
+      runs_on:
+        description: JSON runner labels; use a long-running self-hosted/larger runner for 24h evidence
+        required: true
+        default: '["ubuntu-latest"]'
+        type: string
 
 jobs:
   fuzz-evidence:
     name: libFuzzer evidence
-    runs-on: ubuntu-latest
-    timeout-minutes: 6000
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    env:
+      FUZZ_TARGET: ${{ inputs.target }}
+      FUZZ_DURATION: ${{ inputs.duration }}
+      FUZZ_RUNS_ON: ${{ inputs.runs_on }}
 
     steps:
+      - name: Validate runner and duration
+        shell: bash
+        run: |
+          if [[ ! "$FUZZ_DURATION" =~ ^[0-9]+([smh])?$ ]]; then
+            echo "duration must be an integer number of seconds or use s/m/h suffix: $FUZZ_DURATION" >&2
+            exit 1
+          fi
+
+          value="${FUZZ_DURATION%[smh]}"
+          suffix="${FUZZ_DURATION:${#value}}"
+          case "$suffix" in
+            h) seconds=$((value * 3600)) ;;
+            m) seconds=$((value * 60)) ;;
+            s|"") seconds=$value ;;
+          esac
+
+          compact_runs_on="${FUZZ_RUNS_ON//[[:space:]]/}"
+          if [ "$compact_runs_on" = '["ubuntu-latest"]' ] && [ "$seconds" -ge 86400 ]; then
+            echo "duration=$FUZZ_DURATION is release-length evidence and cannot use the hosted default runs_on=$FUZZ_RUNS_ON." >&2
+            echo "Use runs_on labels for a runner whose runtime policy supports the requested duration." >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v5
 
       - name: Install fuzz build dependencies
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y clang meson ninja-build
@@ -39,35 +71,39 @@ jobs:
           ninja --version
 
       - name: Configure fuzz build
+        shell: bash
         run: |
           CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address
 
       - name: Compile fuzz targets
+        shell: bash
         run: |
           meson compile -C build-fuzz \
             parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
 
       - name: Run libFuzzer soak
+        shell: bash
         run: |
-          if [ "${{ inputs.target }}" = "all" ]; then
+          if [ "$FUZZ_TARGET" = "all" ]; then
             target_args=(--all)
           else
-            target_args=(--target "${{ inputs.target }}")
+            target_args=(--target "$FUZZ_TARGET")
           fi
 
           scripts/fuzz/run-libfuzzer-soak.sh \
             --build-dir build-fuzz \
             --work-dir fuzz-evidence/soak \
-            --duration "${{ inputs.duration }}" \
+            --duration "$FUZZ_DURATION" \
             "${target_args[@]}"
 
       - name: Minimize corpus
         if: ${{ success() }}
+        shell: bash
         run: |
-          if [ "${{ inputs.target }}" = "all" ]; then
+          if [ "$FUZZ_TARGET" = "all" ]; then
             target_args=(--all)
           else
-            target_args=(--target "${{ inputs.target }}")
+            target_args=(--target "$FUZZ_TARGET")
           fi
 
           if [ ! -d fuzz-evidence/soak ]; then
@@ -88,3 +124,4 @@ jobs:
           name: fuzz-evidence-${{ inputs.target }}-${{ inputs.duration }}
           path: fuzz-evidence
           if-no-files-found: warn
+          retention-days: 30

@@ -81,18 +81,30 @@ Launch it before an RC from GitHub Actions with:
   (default: `all`).
 - `duration`: per-target libFuzzer duration such as `60s`, `10m`, or `24h`
   (default: `60s`).
+- `runs_on`: JSON runner labels for the Actions job
+  (default: `["ubuntu-latest"]`).
 
-The default `60s` run is only a smoke/evidence-path validation. Release
-evidence for `#874` / `#684` / `#694` requires an explicit long run, normally
-`duration=24h`. The duration is per target; `target=all` runs the four targets
-sequentially for that duration each unless maintainers launch separate
-per-target workflow runs.
+The hosted default runner is only for smoke/evidence-path validation. The
+default `60s` run does not produce release evidence. Release evidence for
+`#874` / `#684` / `#694` requires an explicit long run, normally
+`duration=24h`, and a runner whose runtime policy supports the requested
+duration. Use `runs_on` to select appropriate self-hosted or larger runner
+labels for planned 24h evidence.
+
+The duration is per target. `target=all` runs the four targets sequentially for
+that duration each, so release evidence should usually be launched as separate
+per-target workflow runs or on a runner whose runtime policy covers the full
+all-target runtime. The workflow rejects `24h`-class durations on the hosted
+default `["ubuntu-latest"]` runner labels because GitHub-hosted runner limits
+cannot complete that release-evidence path.
 
 The workflow builds the four libFuzzer targets with Clang, writes soak evidence
 under `fuzz-evidence/soak`, and, only if the soak step succeeds, writes
 minimized corpora under `fuzz-evidence/minimized`. Artifacts are uploaded with
 `if: always()`, so crashes and nonzero exits should still retain available soak
-logs and reproducers even when minimization does not run.
+logs and reproducers even when minimization does not run. Artifact upload after
+runner cancellation or timeout is best-effort; planned long-run evidence should
+use a runner that is not expected to time out.
 
 Retained release evidence should include:
 
