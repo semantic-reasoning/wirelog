@@ -1,0 +1,90 @@
+name: Fuzz Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Fuzz target to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - parser
+          - csv_reader
+          - intern
+          - compound_arena
+      duration:
+        description: Per-target libFuzzer duration, for example 60s or 24h
+        required: true
+        default: 60s
+        type: string
+
+jobs:
+  fuzz-evidence:
+    name: libFuzzer evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 6000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install fuzz build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang meson ninja-build
+          clang --version
+          meson --version
+          ninja --version
+
+      - name: Configure fuzz build
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address
+
+      - name: Compile fuzz targets
+        run: |
+          meson compile -C build-fuzz \
+            parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+
+      - name: Run libFuzzer soak
+        run: |
+          if [ "${{ inputs.target }}" = "all" ]; then
+            target_args=(--all)
+          else
+            target_args=(--target "${{ inputs.target }}")
+          fi
+
+          scripts/fuzz/run-libfuzzer-soak.sh \
+            --build-dir build-fuzz \
+            --work-dir fuzz-evidence/soak \
+            --duration "${{ inputs.duration }}" \
+            "${target_args[@]}"
+
+      - name: Minimize corpus
+        if: ${{ success() }}
+        run: |
+          if [ "${{ inputs.target }}" = "all" ]; then
+            target_args=(--all)
+          else
+            target_args=(--target "${{ inputs.target }}")
+          fi
+
+          if [ ! -d fuzz-evidence/soak ]; then
+            echo "No soak evidence root found; skipping minimization."
+            exit 0
+          fi
+
+          scripts/fuzz/minimize-libfuzzer-corpus.sh \
+            --build-dir build-fuzz \
+            --input-dir fuzz-evidence/soak \
+            --out-dir fuzz-evidence/minimized \
+            "${target_args[@]}"
+
+      - name: Upload fuzz evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-evidence-${{ inputs.target }}-${{ inputs.duration }}
+          path: fuzz-evidence
+          if-no-files-found: warn
