@@ -254,11 +254,12 @@ branch-protection gates.  The portfolio artifacts and current-run
 summary are required observability outputs for the nightly job so
 maintainers can inspect workload coverage and current results.
 
-Last-N SKIP-rate monitoring is the remaining #828 follow-up; it is
-intended to detect silently degraded coverage without claiming that the
-current run is a stable regression gate.  Promoting perf checks to
-blocking status requires a dedicated stable perf runner and a separate
-policy change.
+The workflow also produces best-effort 30-day/current-available
+SKIP-rate monitoring as a workflow summary and a
+`perf-portfolio-skip-rate` artifact.  This detects silently degraded
+coverage without adding thresholds, gates, or paging.  Promoting perf
+checks to blocking status requires a dedicated stable perf runner and a
+separate policy change.
 
 ### mbedTLS-enabled validation policy
 
