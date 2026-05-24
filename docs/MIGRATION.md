@@ -61,6 +61,33 @@ during the v0.40 API audit and subsequent v1.0 freeze.  See epic #755
 for the full scope.  Entries are filed atomically as the renames land;
 #745 then consolidates the narrative for the GA migration guide.
 
+### Completeness audit notes
+
+This subsection cross-checks user-facing categories visible in the
+local `git log v0.30.0..main` history.  It is a migration guide index,
+not a claim of external validation.
+
+| Category | Migration status |
+| --- | --- |
+| Advanced session API (#717) | Detailed recipe below.  Use `wirelog/wirelog-advanced.h`, `wirelog_session_create()`, and `wirelog_backend_kind_t`; do not include internal `wirelog/session.h`. |
+| Easy facade rename (#756) | Detailed recipe below.  Rename `wl_easy_*` / `WL_EASY_*` to `wirelog_easy_*` / `WIRELOG_EASY_*` and include `wirelog/wirelog-easy.h`. |
+| I/O adapter rename and ABI v2 (#762) | Detailed recipe below.  Rename `wl_io_*` / `WL_IO_*`, rebuild plugins, and export `wirelog_io_plugin_entry`. |
+| Callback typedefs (#758), intern typedef (#760), string enum constants (#757) | Detailed rename tables below.  Textual source migration is required only for consumers using the renamed public typedefs or enum constants. |
+| Export macros (#759/#782) | Detailed recipe below and in the public-attributes entry.  New public declarations use `WIRELOG_API`; `WIRELOG_PUBLIC` is compatibility-level after the `WL_PUBLIC` rename. |
+| Inline facts, Z-set arithmetic, and backend selection (#718/#717) | Detailed recipes below.  Review timing differences between advanced eager creation, easy lazy build, and easy eager mode. |
+| Build option `enable_fuzz` | No source migration needed for library consumers.  It enables fuzz harness build/smoke targets for maintainers and CI. |
+| Build options `android` and `ios` | No source migration needed for ordinary consumers.  They are opt-in platform build paths; Android/iOS packaged artifacts remain deferred platform posture unless a release explicitly says otherwise. |
+| Build option `mbedTLS` | No source migration needed when staying on the default `mbedTLS=disabled` artifact.  Enabling crypto built-ins changes dependency/export posture; see `docs/SECURITY_MODEL.md`. |
+| Build option `threads` | No source migration needed for public API consumers.  It selects the native or POSIX threading backend for builds and test configurations. |
+| Build option `crc32_variant` | No source migration needed for public API consumers.  It selects CRC32 implementation strategy at build time. |
+| Build option `io_plugin_dlopen` | No source migration needed unless packaging dynamic I/O plugins; plugin source migrations are covered by the I/O adapter ABI v2 recipe. |
+| Build option `wirelog_log_max_level` | No source migration needed.  It controls compiled logging threshold and release/perf build posture. |
+| Dependency/release reproducibility (#715) | No source migration needed unless vendoring or packaging dependencies.  Wraps are pinned for reproducible `xxHash` and `nanoarrow` dependency inputs. |
+| Platform buildability and artifact posture | No source migration needed for ordinary consumers.  Android and iOS are opt-in build paths; binary artifact publication remains a release/platform policy question. |
+| Numerical fail-closed overflow and recursive aggregation canonicalization | See the `0.41 -> 0.43` section.  No 0.30 public API rename is needed, but callers may observe fail-closed errors or canonicalized recursive aggregate results. |
+| Security/export posture | No source migration needed when using the default build.  `mbedTLS=disabled` remains the default; see `docs/SECURITY_MODEL.md` before enabling crypto built-ins. |
+| Fuzz, SBOM, security policy, and release gates | No source migration needed for library consumers.  These are release-process and maintainer-tooling changes unless your downstream packaging pipeline adopts them. |
+
 ### Advanced session API is public via wirelog-advanced.h (#717)
 
 The canonical public advanced-session API is
