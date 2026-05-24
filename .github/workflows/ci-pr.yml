@@ -148,7 +148,16 @@ jobs:
 
       - name: SBOM snapshot gate
         if: runner.os == 'Linux' && matrix.compiler == 'gcc' && matrix.os == 'ubuntu-latest'
-        run: meson test -C builddir --suite sbom --print-errorlogs
+        run: |
+          meson test -C builddir --suite sbom --print-errorlogs || {
+            echo "=== SBOM gate failed. Generating debug info..."
+            echo "=== Baseline snapshot:"
+            head -20 sbom/snapshot.txt
+            echo "..."
+            echo "=== Current scan (first 20):"
+            syft dir:. -o syft-json 2>/dev/null | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' | sort | head -20
+            exit 1
+          }
 
       # =======================================================================
       # Binary size regression gate (Issue #460)
