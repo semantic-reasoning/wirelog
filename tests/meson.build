@@ -1095,6 +1095,35 @@ test('cspa_w1_gate', test_cspa_perf_gate_exe,
      ])
 
 # ============================================================================
+# Sub-ms graph W=1 perf-suite gate.
+#
+# Batches small graph workloads so the suite can enforce timing stability
+# without yet setting absolute median regression targets.
+# ============================================================================
+
+test_sub_ms_graph_perf_gate_exe = executable(
+  'test_sub_ms_graph_perf_gate',
+  files('test_sub_ms_graph_perf_gate.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('sub_ms_graph_perf_gate', test_sub_ms_graph_perf_gate_exe,
+     suite: 'perf',
+     timeout: 180,
+     env: [
+       'WIRELOG_GRAPH_WORKLOAD_DIR=' + meson.project_source_root() / 'bench/workloads',
+       'WIRELOG_GRAPH_DATA_DIR=' + meson.project_source_root() / 'bench/data',
+     ])
+
+# ============================================================================
 # Consolidation Function Tests (US-003 TDD RED Phase)
 # ============================================================================
 
