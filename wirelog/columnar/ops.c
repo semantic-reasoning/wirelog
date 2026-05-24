@@ -37,6 +37,7 @@
 #include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
+#include "../crc32.h"
 #include "../intern.h"
 #include "../string_ops.h"
 
@@ -446,6 +447,22 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         case WL_PLAN_EXPR_ARITH_HASH: {
             int64_t a = filt_pop(&s);
             filt_push(&s, (int64_t)XXH3_64bits(&a, sizeof(a)));
+            break;
+        }
+
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH: {
+            int64_t a = filt_pop(&s);
+            uint8_t bytes[sizeof(a)];
+            memcpy(bytes, &a, sizeof(bytes));
+            filt_push(&s, (int64_t)ethernet_crc32(bytes, sizeof(bytes)));
+            break;
+        }
+
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST: {
+            int64_t a = filt_pop(&s);
+            uint8_t bytes[sizeof(a)];
+            memcpy(bytes, &a, sizeof(bytes));
+            filt_push(&s, (int64_t)castagnoli_crc32(bytes, sizeof(bytes)));
             break;
         }
 

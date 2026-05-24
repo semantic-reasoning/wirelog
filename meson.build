@@ -344,6 +344,7 @@ wirelog_sources += wirelog_optimizer_src
 wirelog_sources += wirelog_arena_src
 wirelog_sources += wirelog_thread_src
 wirelog_sources += wirelog_backend_src
+wirelog_sources += wirelog_crc32_src
 wirelog_sources += wirelog_workqueue_src
 wirelog_sources += wirelog_io_src
 wirelog_sources += wirelog_string_ops_src

@@ -789,6 +789,11 @@ backend_src = files(
   '../wirelog/util/log.c',
   '../wirelog/util/log_emit.c',
   '../wirelog/string_ops.c',
+  # Issue #884: the columnar evaluator's WL_PLAN_EXPR_ARITH_CRC32_*
+  # cases call ethernet_crc32()/castagnoli_crc32() from this TU.  Pull
+  # the engine in so every backend-test binary has the symbols at
+  # link time.
+  '../wirelog/crc32.c',
 )
 
 arena_src = files(
@@ -2295,6 +2300,28 @@ if cc.get_id() != 'msvc'
   )
 
   test('crc32_hw_equivalence', test_crc32_hw_equivalence_exe)
+
+  # CRC-32 evaluator tests (Issue #884): drive the columnar evaluator end
+  # to end and verify it matches the engine functions in wirelog/crc32.c.
+  # Reuses crc32_arch_c_args / crc32_src defined above.
+  test_crc32_eval_exe = executable(
+    'test_crc32_eval',
+    files('test_crc32_eval.c'),
+    parser_src,
+    ir_src,
+    optimizer_src,
+    backend_src,
+    io_src,
+    arena_src,
+    thread_src,
+    workqueue_src,
+    crc32_src,
+    c_args: crc32_arch_c_args,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  )
+
+  test('crc32_eval', test_crc32_eval_exe)
 endif
 
 # ============================================================================
