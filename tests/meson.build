@@ -133,6 +133,36 @@ test('program', test_program_exe)
 test('stratify', test_stratify_exe)
 test('parse_duplicate_decl_no_leak', test_parse_duplicate_decl_no_leak_exe)
 
+# ============================================================================
+# Parser fuzz scaffold (Issue #743). Build only with -Denable_fuzz=true.
+# ============================================================================
+
+if get_option('enable_fuzz')
+  if cc.get_id() == 'clang'
+    parser_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/parser'
+    parser_fuzz = executable(
+      'parser_fuzz',
+      files('fuzz/parser_fuzz.c'),
+      parser_src,
+      c_args: ['-fsanitize=fuzzer'],
+      link_args: ['-fsanitize=fuzzer'],
+      include_directories: [wirelog_inc, wirelog_src_inc],
+      install: false,
+    )
+
+    test(
+      'parser_fuzz_smoke',
+      parser_fuzz,
+      args: [parser_fuzz_corpus, '-runs=1', '-max_total_time=1'],
+      suite: 'fuzz',
+      timeout: 30,
+    )
+  else
+    warning('enable_fuzz=true was requested, but libFuzzer builds require clang. '
+      + 'Skipping parser_fuzz target.')
+  endif
+endif
+
 test_fusion_exe = executable(
   'test_fusion',
   files('test_fusion.c'),

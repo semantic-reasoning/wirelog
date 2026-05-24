@@ -1,0 +1,3 @@
+# stray token should be ignored gracefully by parser recovery
+.decl Bad(id: int32)
+# this file intentionally exercises parser error handling paths

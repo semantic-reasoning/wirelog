@@ -1,0 +1,7 @@
+// Minimal parsed program with declaration/input/output/query flow.
+.decl Node(id: int32)
+.input Node(id)
+.decl Path(a: int32, b: int32)
+.output Path(id)
+Node(1).
+Path(x, y) :- Node(x), Node(y), x = y.

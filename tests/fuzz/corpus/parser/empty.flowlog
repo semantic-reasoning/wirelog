@@ -1,0 +1,2 @@
+.decl Edge(x: int32)
+Edge(1).
