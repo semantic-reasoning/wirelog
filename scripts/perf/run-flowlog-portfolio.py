@@ -63,6 +63,7 @@ WORKLOADS: dict[str, dict[str, Any]] = {
     "cspa": {
         "args": ["--data-cspa", "cspa"],
         "data": ["cspa"],
+        "parser": "cspa_incremental_tsv",
     },
     "csda": {
         "args": ["--data-csda", "csda"],
@@ -225,7 +226,7 @@ def build_command(
         else:
             data_args.append(resolve_under(data_root, arg))
 
-    return [
+    command = [
         str(bench),
         "--workload",
         workload,
@@ -234,9 +235,10 @@ def build_command(
         str(workers),
         "--repeat",
         str(repeat),
-        "--format",
-        "json",
     ]
+    if spec.get("parser", "json") == "json":
+        command.extend(["--format", "json"])
+    return command
 
 
 def missing_data_paths(data_root: Path, workload: str) -> list[str]:
@@ -264,9 +266,76 @@ def parse_bench_json(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
     return parsed, None
 
 
+def parse_int(value: str) -> int:
+    return int(value, 10)
+
+
+def parse_float(value: str) -> float:
+    return float(value)
+
+
+def parse_cspa_incremental_tsv(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
+    columns = [
+        ("workload", str),
+        ("facts", parse_int),
+        ("baseline_ms", parse_float),
+        ("initial_ms", parse_float),
+        ("insert_ms", parse_float),
+        ("reeval_ms", parse_float),
+        ("speedup", parse_float),
+        ("tuples_before", parse_int),
+        ("tuples_after", parse_int),
+        ("iters_before", parse_int),
+        ("iters_after", parse_int),
+        ("peak_rss_kb", parse_int),
+        ("bench_status", str),
+    ]
+
+    for line in reversed(stdout.splitlines()):
+        if not line.startswith("cspa_incr\t"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != len(columns):
+            return None, f"cspa_incr row has {len(fields)} fields, expected {len(columns)}"
+
+        parsed: dict[str, Any] = {}
+        try:
+            for (name, converter), value in zip(columns, fields, strict=True):
+                parsed[name] = converter(value)
+        except ValueError as exc:
+            return None, f"invalid cspa_incr field: {exc}"
+        return parsed, None
+
+    return None, "missing cspa_incr TSV row"
+
+
+def parse_bench_output(
+    parser: str,
+    stdout: str,
+) -> tuple[dict[str, Any] | None, str | None, str]:
+    if parser == "json":
+        parsed, error = parse_bench_json(stdout)
+        return parsed, error, "json_parse_failed"
+    if parser == "cspa_incremental_tsv":
+        parsed, error = parse_cspa_incremental_tsv(stdout)
+        return parsed, error, "tsv_parse_failed"
+    return None, f"unknown parser: {parser}", "parse_failed"
+
+
 def summarize_bench(parsed: dict[str, Any] | None) -> dict[str, Any]:
     if parsed is None:
         return {}
+    if parsed.get("workload") == "cspa_incr":
+        reeval_ms = parsed.get("reeval_ms")
+        return {
+            "bench_workload": parsed.get("workload"),
+            "tuples": parsed.get("tuples_after"),
+            "iterations": parsed.get("iters_after"),
+            "peak_rss_kb": parsed.get("peak_rss_kb"),
+            "median_ms": reeval_ms,
+            "reeval_ms": reeval_ms,
+            "speedup": parsed.get("speedup"),
+        }
     wall = parsed.get("wall_time_ms")
     median_ms = wall.get("median") if isinstance(wall, dict) else None
     return {
@@ -311,6 +380,7 @@ def run_one(
     workers: int,
     repeat: int,
 ) -> dict[str, Any]:
+    spec = WORKLOADS.get(workload)
     command = build_command(bench, data_root, workload, workers, repeat)
     if command is None:
         return make_skip_record(workload, workers, repeat, None, "unknown_workload")
@@ -378,13 +448,18 @@ def run_one(
             "summary": {},
         }
 
-    parsed, parse_error = parse_bench_json(proc.stdout)
-    status = "ok" if proc.returncode == 0 and parse_error is None else "fail"
+    parser = spec.get("parser", "json") if spec else "json"
+    parsed, parse_error, parse_reason = parse_bench_output(parser, proc.stdout)
+    bench_status = parsed.get("bench_status") if isinstance(parsed, dict) else None
+    parser_ok = parse_error is None and (bench_status in (None, "OK"))
+    status = "ok" if proc.returncode == 0 and parser_ok else "fail"
     reason = None
     if proc.returncode != 0:
         reason = "bench_failed"
     elif parse_error is not None:
-        reason = "json_parse_failed"
+        reason = parse_reason
+    elif bench_status not in (None, "OK"):
+        reason = "bench_status_not_ok"
 
     return {
         "schema_version": SCHEMA_VERSION,
