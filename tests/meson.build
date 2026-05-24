@@ -157,9 +157,31 @@ if get_option('enable_fuzz')
       suite: 'fuzz',
       timeout: 30,
     )
+
+    csv_reader_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/csv_reader'
+    csv_reader_fuzz = executable(
+      'csv_reader_fuzz',
+      files('fuzz/csv_reader_fuzz.c'),
+      files(
+        '../wirelog/io/csv_reader.c',
+        '../wirelog/intern.c',
+      ),
+      c_args: ['-fsanitize=fuzzer'],
+      link_args: ['-fsanitize=fuzzer'],
+      include_directories: [wirelog_inc, wirelog_src_inc],
+      install: false,
+    )
+
+    test(
+      'csv_reader_fuzz_smoke',
+      csv_reader_fuzz,
+      args: [csv_reader_fuzz_corpus, '-runs=1', '-max_total_time=1'],
+      suite: 'fuzz',
+      timeout: 30,
+    )
   else
     warning('enable_fuzz=true was requested, but libFuzzer builds require clang. '
-      + 'Skipping parser_fuzz target.')
+      + 'Skipping parser_fuzz and csv_reader_fuzz targets.')
   endif
 endif
 
