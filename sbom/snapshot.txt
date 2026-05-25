@@ -56,7 +56,7 @@ actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 codecov/codecov-action@v6:NOASSERTION
-docker/login-action@v4.1.0:NOASSERTION
+docker/login-action@v4.2.0:NOASSERTION
 docker/setup-buildx-action@v4.0.0:NOASSERTION
 docker/setup-qemu-action@v4.0.0:NOASSERTION
 docker/setup-qemu-action@v4.0.0:NOASSERTION
