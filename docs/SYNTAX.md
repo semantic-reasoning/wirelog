@@ -204,6 +204,19 @@ predicates without crypto support, columnar expression evaluation fails
 closed. Filters reject the row, while MAP/head and REDUCE expression
 contexts return an evaluation error.
 
+### Checksum Functions
+
+`crc32_ethernet(x)`, `crc32_castagnoli(x)`
+
+Both compute a CRC-32 over the 8-byte `int64` representation of their
+argument and return the result as a non-negative `int64` in the range
+`[0, 2^32)`. `crc32_ethernet` uses the Ethernet/ISO-HDLC polynomial
+(0x04C11DB7, ISO 3309 / IEEE 802.3); `crc32_castagnoli` uses the
+Castagnoli polynomial (CRC-32C, iSCSI/SCTP). Unlike the crypto hash
+built-ins above, the CRC-32 functions are always available and do not
+depend on the `mbedTLS` build option. See `examples/05-crc32-checksum/`
+for a frame-integrity validation example.
+
 ### UUID Functions
 
 `uuid4()`, `uuid5(namespace, name)`
