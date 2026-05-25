@@ -657,7 +657,9 @@ if sh.found()
        args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols.sh',
               meson.project_build_root()],
        suite: 'abi')
+endif
 
+if host_machine.system() == 'linux' and sh.found()
   test('abi_symbols_locale', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols-locale.sh'],
        suite: 'abi')
