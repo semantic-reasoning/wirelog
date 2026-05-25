@@ -657,6 +657,10 @@ if sh.found()
        args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols.sh',
               meson.project_build_root()],
        suite: 'abi')
+
+  test('abi_symbols_locale', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols-locale.sh'],
+       suite: 'abi')
 endif
 
 # Issue #788: warning-only platform ABI surface advisory checks.

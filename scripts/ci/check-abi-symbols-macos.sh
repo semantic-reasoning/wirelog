@@ -51,9 +51,9 @@ fi
 actual="$(
     nm -gU "$lib" 2>/dev/null \
         | awk '{name = $NF; sub(/^_/, "", name); if (name ~ /^wirelog_/) print name}' \
-        | sort -u
+        | LC_ALL=C sort -u
 )"
-expected="$(sort -u "$allowlist")"
+expected="$(LC_ALL=C sort -u "$allowlist")"
 
 if [ "$actual" = "$expected" ]; then
     n="$(printf '%s\n' "$actual" | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -66,5 +66,5 @@ echo "" >&2
 diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
 echo "" >&2
 echo "Regenerate after a deliberate public ABI change:" >&2
-echo "  nm -gU $lib | awk '{name = \$NF; sub(/^_/, \"\", name); if (name ~ /^wirelog_/) print name}' | sort -u > abi/libwirelog-1.0.macos.symbols" >&2
+echo "  nm -gU $lib | awk '{name = \$NF; sub(/^_/, \"\", name); if (name ~ /^wirelog_/) print name}' | LC_ALL=C sort -u > abi/libwirelog-1.0.macos.symbols" >&2
 exit 0

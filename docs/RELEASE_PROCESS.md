@@ -93,16 +93,18 @@ allowlists on the matching hosts:
 ```bash
 nm -gU builddir/libwirelog.1.dylib \
   | awk '{name = $NF; sub(/^_/, "", name); if (name ~ /^wirelog_/) print name}' \
-  | sort -u > abi/libwirelog-1.0.macos.symbols
+  | LC_ALL=C sort -u > abi/libwirelog-1.0.macos.symbols
 ```
 
 ```powershell
-dumpbin /EXPORTS builddir\wirelog-1.dll |
+$symbols = dumpbin /EXPORTS builddir\wirelog-1.dll |
   Select-String '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_]*)\b' |
   ForEach-Object { $_.Matches[0].Groups[1].Value } |
-  Where-Object { $_ -like 'wirelog_*' } |
-  Sort-Object -Unique |
-  Set-Content abi\libwirelog-1.0.windows.symbols
+  Where-Object { $_ -like 'wirelog_*' }
+$set = [System.Collections.Generic.SortedSet[string]]::new(
+  [System.StringComparer]::Ordinal)
+$symbols | ForEach-Object { [void]$set.Add($_) }
+$set | Set-Content abi\libwirelog-1.0.windows.symbols
 ```
 
 ### Template (Markdown)
