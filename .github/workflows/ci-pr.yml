@@ -64,7 +64,7 @@ jobs:
       # =======================================================================
       - name: Install syft
         run: |
-          SYFT_VERSION="1.7.0"
+          SYFT_VERSION="1.44.0"
           curl -sSfL \
             "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
             | tar -xz -C /usr/local/bin syft
