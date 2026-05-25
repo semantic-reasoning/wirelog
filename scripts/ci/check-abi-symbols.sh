@@ -47,6 +47,13 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 allowlist="$repo_root/abi/libwirelog-1.0.symbols"
 
+case "$(uname -s)" in
+  MSYS*|MINGW*|CYGWIN*)
+    echo "check-abi-symbols: SKIP: Windows POSIX layer ($(uname -s)) detected" >&2
+    exit 0
+    ;;
+esac
+
 # Skip on platforms where libwirelog.so doesn't exist (Windows,
 # static-only builds).  The macOS dylib has different naming; this
 # gate is Linux/ELF-focused at v1.0 -- matching #690 B3's stated
