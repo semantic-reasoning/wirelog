@@ -5,6 +5,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Sort-OrdinalUnique {
+    param([string[]]$Items)
+
+    $Set = [System.Collections.Generic.SortedSet[string]]::new(
+        [System.StringComparer]::Ordinal)
+
+    foreach ($Item in $Items) {
+        if ($null -ne $Item -and $Item -ne "") {
+            [void]$Set.Add($Item)
+        }
+    }
+
+    foreach ($Item in $Set) {
+        Write-Output $Item
+    }
+}
+
 function Write-AdvisoryWarning {
     param([string]$Message)
     Write-Error "check-abi-symbols-windows: WARNING: $Message" -ErrorAction Continue
@@ -58,16 +75,16 @@ if (-not $Dumpbin) {
     exit 0
 }
 
-$Actual = @(& $Dumpbin.Source /EXPORTS $Dll |
+$ActualRaw = @(& $Dumpbin.Source /EXPORTS $Dll |
     ForEach-Object {
         if ($_ -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_]*)\b') {
             $Matches[1]
         }
     } |
-    Where-Object { $_ -like 'wirelog_*' } |
-    Sort-Object -Unique)
+    Where-Object { $_ -like 'wirelog_*' })
 
-$Expected = @(Get-Content $Allowlist | Where-Object { $_ -ne "" } | Sort-Object -Unique)
+$Actual = @(Sort-OrdinalUnique $ActualRaw)
+$Expected = @(Sort-OrdinalUnique @(Get-Content $Allowlist | Where-Object { $_ -ne "" }))
 
 $ActualText = ($Actual -join "`n")
 $ExpectedText = ($Expected -join "`n")
@@ -80,5 +97,5 @@ if ($ActualText -eq $ExpectedText) {
 Write-AdvisoryWarning "exported symbols differ from abi/libwirelog-1.0.windows.symbols"
 Compare-Object -ReferenceObject $Expected -DifferenceObject $Actual | Out-String | Write-Error -ErrorAction Continue
 Write-Error "Regenerate after a deliberate public ABI change:" -ErrorAction Continue
-Write-Error "  dumpbin /EXPORTS $Dll | <extract wirelog_* names> | sort > abi/libwirelog-1.0.windows.symbols" -ErrorAction Continue
+Write-Error "  dumpbin /EXPORTS $Dll | <extract wirelog_* names> | Sort-OrdinalUnique > abi/libwirelog-1.0.windows.symbols" -ErrorAction Continue
 exit 0

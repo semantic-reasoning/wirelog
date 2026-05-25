@@ -32,7 +32,7 @@
 #
 #   meson compile -C build
 #   nm -D --defined-only build/libwirelog.so \
-#       | awk '$2=="T"{print $3}' | sort -u \
+#       | awk '$2=="T"{print $3}' | LC_ALL=C sort -u \
 #       > abi/libwirelog-1.0.symbols
 
 set -euo pipefail
@@ -73,7 +73,7 @@ if [ ! -f "$allowlist" ]; then
 fi
 
 actual=$(nm -D --defined-only "$lib" 2>/dev/null \
-    | awk '$2=="T"{print $3}' | sort -u)
+    | awk '$2=="T"{print $3}' | LC_ALL=C sort -u)
 
 expected=$(cat "$allowlist")
 
@@ -91,7 +91,7 @@ echo "To accept the new symbol set (after a deliberate ABI-impacting" >&2
 echo "PR), regenerate the allowlist:" >&2
 echo "" >&2
 echo "  nm -D --defined-only $lib \\" >&2
-echo "      | awk '\$2==\"T\"{print \$3}' | sort -u \\" >&2
+echo "      | awk '\$2==\"T\"{print \$3}' | LC_ALL=C sort -u \\" >&2
 echo "      > abi/libwirelog-1.0.symbols" >&2
 echo "" >&2
 echo "and commit the diff alongside the API change." >&2
