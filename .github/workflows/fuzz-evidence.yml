@@ -30,6 +30,9 @@ on:
         default: "360"
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   fuzz-evidence:
     name: libFuzzer evidence
