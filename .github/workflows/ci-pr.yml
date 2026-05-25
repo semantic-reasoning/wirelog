@@ -1,13 +1,17 @@
 name: CI PR
 
-# PR-specific CI workflow with 3-phase validation.
+# PR-specific CI workflow with gated serial/parallel execution.
 #
-# Phase 1 (Lint):         lint-pr.yml — editorconfig -> uncrustify -> clang-tidy
-# Phase 2a (Build Primary): Linux GCC (ubuntu-latest) with SBOM/binary size/path-a gates
-# Phase 2b (Build Matrix):  Linux Clang + macOS Clang + Windows MSVC + ARM64 GCC (parallel)
-# Phase 3 (Sanitizers):     ASan/UBSan + TSan + TSan-native + mbedTLS (parallel)
+# Execution flow:
+#   lint
+#   ├─ build-primary (ubuntu-latest gcc, SBOM/size/path-a gates)
+#   │  ├─ build-arm (ubuntu-24.04-arm gcc, ABI #681)
+#   │  ├─ build-mbedtls (ubuntu-latest gcc, crypto coverage)
+#   │  ├─ tsan (independent, no gate)
+#   │  └─ tsan-native (independent, no gate)
+#   │     └─ build-matrix (Linux Clang, macOS, Windows)
+#   │        └─ sanitizer-matrix (ASan/UBSan)
 #
-# Execution order on PR: lint -> build-primary + build-matrix + mbedtls-enabled + sanitizer + tsan + tsan-native
 # CodeQL runs in its own workflow (GitHub default-setup); not invoked from here.
 
 on:
@@ -101,13 +105,43 @@ jobs:
             ./builddir-path-a/pcap_skeleton
 
   # ==========================================================================
-  # Phase 2b: Build Matrix (remaining platforms)
-  # Linux Clang + macOS Clang + Windows MSVC + ARM64 GCC
-  # Runs in parallel with build-primary.
+  # Phase: Build ARM (ubuntu-24.04-arm gcc, gated by build-primary)
+  # ABI compliance check (#681); must pass before build-matrix proceeds.
+  # ==========================================================================
+  build-arm:
+    name: Build / ubuntu-24.04-arm / gcc
+    needs: [build-primary]
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+    env:
+      CC: gcc
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools
+
+      - name: Configure
+        run: meson setup builddir -Dtests=true -DmbedTLS=disabled
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+
+  # ==========================================================================
+  # Phase: Build Matrix (gated by build-arm + build-mbedtls)
+  # Linux Clang + macOS Clang + Windows MSVC
+  # Only proceeds after build-primary's dependencies (ARM ABI, mbedTLS) pass.
   # ==========================================================================
   build-matrix:
     name: Build / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [lint]
+    needs: [build-arm, build-mbedtls]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -127,19 +161,6 @@ jobs:
           - os: windows-latest
             compiler: msvc
             cc: cl
-
-          # ARM64 - GCC (GitHub-hosted runner, #787)
-          # Mirrors the leg in ci-main.yml; required by the v0.41 ABI
-          # Infrastructure milestone (#681) to ensure the abi suite
-          # (abi_symbols, public_header_surface, public_prefix,
-          # public_doxygen_headers, public_api_macro, test_parity,
-          # threading_doc, version_sync, changelog_format,
-          # release_template, and the standalone-include compile
-          # tests) passes on the second supported architecture before
-          # v1.0 ABI freeze.
-          - os: ubuntu-24.04-arm
-            compiler: gcc
-            cc: gcc
 
     steps:
       - uses: actions/checkout@v5
@@ -203,12 +224,12 @@ jobs:
           meson test -C builddir --print-errorlogs
 
   # ==========================================================================
-  # Phase 2b: Optional crypto coverage
-  # Dedicated stable check name for branch-protection policy (#849).
+  # Phase: Build mbedTLS (gated by build-primary)
+  # Optional crypto coverage; must pass before build-matrix proceeds.
   # ==========================================================================
-  mbedtls-enabled:
-    name: mbedtls-enabled / ubuntu-latest / gcc
-    needs: [lint]
+  build-mbedtls:
+    name: Build / ubuntu-latest / gcc (mbedTLS-enabled)
+    needs: [build-primary]
     runs-on: ubuntu-latest
 
     steps:
@@ -234,13 +255,13 @@ jobs:
         run: meson test -C builddir-mbedtls cryptographic_hashes --print-errorlogs
 
   # ==========================================================================
-  # Phase 3a: ASan + UBSan matrix
-  # Runs after lint and in parallel with the normal build matrix.
+  # Phase: Sanitizer Matrix (gated by build-matrix)
+  # ASan + UBSan validation; runs after build-matrix passes.
   # Linux: GCC + Clang; macOS: Clang
   # ==========================================================================
-  sanitizer:
+  sanitizer-matrix:
     name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [lint]
+    needs: [build-matrix]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
