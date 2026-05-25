@@ -6,6 +6,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **CRC-32 checksum expressions** (#884): added the `crc32_ethernet(x)`
+  and `crc32_castagnoli(x)` columnar expression built-ins. Each accepts a
+  single arithmetic argument and returns the CRC-32 of its 8-byte `int64`
+  representation as a non-negative `int64` (CRC-32/ISO-HDLC and CRC-32C
+  respectively). Unlike the mbedTLS-backed digest/HMAC built-ins, the
+  CRC-32 functions are always available regardless of the `mbedTLS` build
+  option. See `docs/SYNTAX.md` and `examples/05-crc32-checksum/`.
+
 ### Changed
 
 ### Deprecated

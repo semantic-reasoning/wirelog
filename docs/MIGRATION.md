@@ -1,11 +1,24 @@
 # Migration Guide
 
-**Last Updated:** 2026-05-24
+**Last Updated:** 2026-05-25
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
+
+## 0.43 -> 0.44
+
+Version `0.44.0` is an additive, ABI-compatible release. No source-level
+migration steps are required for applications already on the 0.43 public
+API surface; the public ABI symbol set and struct layouts are unchanged.
+
+- **New CRC-32 checksum expressions are available** (#884).
+  `crc32_ethernet(x)` and `crc32_castagnoli(x)` are new columnar
+  expression built-ins (see `docs/SYNTAX.md`). They are purely additive
+  for existing programs, but note that `crc32_ethernet` and
+  `crc32_castagnoli` are now reserved keywords in the query syntax and
+  can no longer be used as bare identifiers.
 
 ## 0.41 -> 0.43
 
