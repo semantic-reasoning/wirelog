@@ -5,12 +5,10 @@ name: CI PR
 # Execution flow:
 #   lint
 #   ├─ build-primary (ubuntu-latest gcc, SBOM/size/path-a gates)
-#   │  ├─ build-arm (ubuntu-24.04-arm gcc, ABI #681)
-#   │  ├─ build-mbedtls (ubuntu-latest gcc, crypto coverage)
-#   │  ├─ tsan (independent, no gate)
-#   │  └─ tsan-native (independent, no gate)
-#   │     └─ build-matrix (Linux Clang, macOS, Windows)
-#   │        └─ sanitizer-matrix (ASan/UBSan)
+#   │  ├─ build-arm (ubuntu-24.04-arm gcc, ABI #681) ──┐
+#   │  ├─ build-mbedtls (ubuntu-latest gcc, crypto) ──┼─ build-matrix (parallel)
+#   │  ├─ tsan (independent, no gate) ────────────────┼─ sanitizer-matrix (parallel)
+#   │  └─ tsan-native (independent, no gate) ─────────┘
 #
 # CodeQL runs in its own workflow (GitHub default-setup); not invoked from here.
 
@@ -255,13 +253,13 @@ jobs:
         run: meson test -C builddir-mbedtls cryptographic_hashes --print-errorlogs
 
   # ==========================================================================
-  # Phase: Sanitizer Matrix (gated by build-matrix)
-  # ASan + UBSan validation; runs after build-matrix passes.
+  # Phase: Sanitizer Matrix (gated by build-arm + build-mbedtls, parallel with build-matrix)
+  # ASan + UBSan validation; runs in parallel with build-matrix.
   # Linux: GCC + Clang; macOS: Clang
   # ==========================================================================
   sanitizer-matrix:
     name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [build-matrix]
+    needs: [build-arm, build-mbedtls]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
