@@ -58,7 +58,7 @@ actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 codecov/codecov-action@v6:NOASSERTION
-docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121:NOASSERTION
+docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee:NOASSERTION
 docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd:NOASSERTION
 docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a:NOASSERTION
 docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a:NOASSERTION
@@ -76,4 +76,4 @@ r-lib/actions/setup-r-dependencies@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-tinytex@v2:NOASSERTION
-# nanoarrow-resolved-sha: 8dcb55e735354ece7e1776d2d9577806cda3ee00
+# nanoarrow-resolved-sha: 65ab7e9f29244589ccbe7f95900c1295633baf42
