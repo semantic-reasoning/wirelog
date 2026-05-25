@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.44.0] - 2026-05-25
+
+### Added
+
 - **CRC-32 checksum expressions** (#884): added the `crc32_ethernet(x)`
   and `crc32_castagnoli(x)` columnar expression built-ins. Each accepts a
   single arithmetic argument and returns the CRC-32 of its 8-byte `int64`
