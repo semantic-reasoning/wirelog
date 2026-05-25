@@ -97,5 +97,5 @@ if ($ActualText -eq $ExpectedText) {
 Write-AdvisoryWarning "exported symbols differ from abi/libwirelog-1.0.windows.symbols"
 Compare-Object -ReferenceObject $Expected -DifferenceObject $Actual | Out-String | Write-Error -ErrorAction Continue
 Write-Error "Regenerate after a deliberate public ABI change:" -ErrorAction Continue
-Write-Error "  dumpbin /EXPORTS $Dll | <extract wirelog_* names> | Sort-OrdinalUnique > abi/libwirelog-1.0.windows.symbols" -ErrorAction Continue
+Write-Error "  Use the ordinal-sorted Windows recipe in docs/RELEASE_PROCESS.md." -ErrorAction Continue
 exit 0
