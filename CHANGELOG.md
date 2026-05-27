@@ -28,6 +28,13 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **Docs-freeze readiness follow-up** (#900): updated
+  `docs/MIGRATION.md` external migration guidance to use public APIs
+  (`wirelog_session_make_compound()` / `wirelog_easy_make_compound()`
+  and `wirelog_session_step()` / `wirelog_easy_step()`), strengthened
+  GA deferral cross-links for #752 and #753 in release-facing docs, and
+  aligned the remaining current-source branch-name reference to `1.0`.
+
 - Clarified #746 release-branch readiness/cutover sequencing:
   preparatory repo-side CI targeting now lands before branch creation,
   while final `1.0` branch-protection acceptance is deferred to
@@ -481,7 +488,7 @@ All notable changes to wirelog are documented in this file.
   and carries at least one `#N` PR or issue reference.  Versioned
   section headers must use `## [X.Y.Z] - YYYY-MM-DD`.  CONTRIBUTING.md
   gains a "Changelog Conventions" section documenting the format,
-  cutover procedure, and the freeze rule for `release-1.x`
+  cutover procedure, and the freeze rule for `1.0`
   (cross-link with #747 B18).
 - **ABI symbol allowlist gate (#733 K2)**: `meson test --suite abi:abi_symbols`
   diffs `nm -D --defined-only build/libwirelog.so | awk '$2=="T"'`

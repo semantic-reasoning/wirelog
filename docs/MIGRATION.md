@@ -485,10 +485,11 @@ To add a compound column to an existing relation:
 2. Update any rules that reference that column to use compound pattern
    matching syntax (`f(x, y)` in rule bodies).
 3. Update any C API call sites that insert rows into the relation to supply
-   the compound arguments. For the side-relation tier, obtain a handle via
-   `wl_compound_arena_alloc` and store it in the column. For the inline
-   tier, pass the argument values directly as additional `int64` columns in
-   the row array.
+   the compound arguments. For advanced sessions, use
+   `wirelog_session_make_compound()` to construct side-tier compounds before
+   insertion. For easy sessions, use `wirelog_easy_make_compound()`. For the
+   inline tier, pass the argument values directly as additional `int64`
+   columns in the row array.
 
 No changes are needed to relations or rules that do not use compound columns.
 
@@ -527,7 +528,8 @@ from all graphs — no filtering is implicit.
 - [ ] Add `__graph_id: int64` to those relations' `.decl` statements.
 - [ ] Update fact insertion call sites to supply the graph ID.
 - [ ] If you need per-graph metadata, declare `__graph_metadata` and insert
-      graph attribute rows before calling `wl_session_step`.
+      graph attribute rows before calling `wirelog_session_step()` (advanced
+      sessions) or `wirelog_easy_step()` (easy sessions).
 - [ ] Review existing rules: rules that previously saw all rows continue to
       see all rows (graph ID is not an implicit filter). Add explicit graph
       ID constraints only where isolation is required.
