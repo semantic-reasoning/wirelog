@@ -608,6 +608,15 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #747 B18: RC changelog selftest for changelog-freeze checker.
+# Shell gate uses the same shared `sh` handle to keep skip behavior
+# consistent on platforms without bash.
+if sh.found()
+  test('changelog_rc_selftest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-check-changelog-rc.sh'],
+       suite: 'abi')
+endif
+
 # Issue #734: docs/THREADING.md atomics audit row count must match
 # the count of atomic_* call sites in wirelog/ production sources.
 # Static text scan; no build-tree input required.
