@@ -2299,12 +2299,11 @@ crc32_src = files(
 )
 
 # Architecture-specific flags to enable hardware CRC32 instructions.
-# Applied to all CRC-32 test executables so crc32.c compiles with the
-# correct feature macros on each platform.
-# Note: GCC/Clang only; MSVC doesn't support these flags and has built-in
-# support for CRC32 instructions without explicit flags.
+# Add GNU-style target feature flags only for compilers using GCC/Clang
+# argument syntax. MSVC-syntax builds, including clang-cl, rely on
+# crc32.c's compiler-specific paths and portable fallback.
 crc32_arch_c_args = []
-if cc.get_id() != 'msvc'
+if cc.get_argument_syntax() != 'msvc'
   if host_machine.cpu_family() == 'x86_64'
     crc32_arch_c_args = ['-msse4.2']
   elif host_machine.cpu_family() == 'aarch64'
@@ -2312,8 +2311,19 @@ if cc.get_id() != 'msvc'
   endif
 endif
 
+test_crc32_windows_fallback_exe = executable(
+  'test_crc32_windows_fallback',
+  files('test_crc32_windows_fallback.c'),
+  crc32_src,
+  c_args: crc32_arch_c_args,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+
+test('crc32_windows_fallback', test_crc32_windows_fallback_exe)
+
 # CRC-32 tests (Issue #145)
-# Note: MSVC has internal compiler errors on these test files; skip on Windows
+# These broader legacy CRC tests are still skipped under MSVC, but the
+# smoke test above keeps known-vector coverage on MSVC/clang-cl paths.
 if cc.get_id() != 'msvc'
   test_crc32_ethernet_exe = executable(
     'test_crc32_ethernet',
