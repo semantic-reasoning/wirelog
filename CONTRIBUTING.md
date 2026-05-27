@@ -246,10 +246,10 @@ When cutting a release tag (`vX.Y.Z`):
    that lack a #N reference, not on empty categories.
 3. Open the release PR; CI will refuse to merge if the gate fails.
 
-### Freeze rule (post-release-1.x cut)
+### Freeze rule (post-1.0 cut)
 
-After `release-1.x` is cut for v1.0 RC1 (#685), the `[Unreleased]`
-section on `release-1.x` is **frozen** — every hotfix landing on
-`release-1.x` between rc1 cut and GA tag updates the versioned
+After `1.0` is cut for v1.0 RC1 (#685), the `[Unreleased]`
+section on `1.0` is **frozen** — every hotfix landing on
+`1.0` between rc1 cut and GA tag updates the versioned
 section, not `[Unreleased]`.  This is mechanically enforced by
 the per-branch CI rule landed under #747 (B18).
