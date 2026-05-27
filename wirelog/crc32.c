@@ -28,33 +28,26 @@
 
 /* Hardware intrinsics headers (GCC/Clang only) */
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER)
-#define WL_ARCH_X86_64 1
+#define WL_HAVE_X86_CRC32_INTRINSICS 1
 #include <nmmintrin.h> /* _mm_crc32_u8 */
-#elif (defined(__aarch64__) || defined(_M_ARM64)) && !defined(_MSC_VER)
-#define WL_ARCH_ARM64 1
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && !defined(_MSC_VER) && \
+    defined(__ARM_FEATURE_CRC32)
+#define WL_HAVE_ARM_CRC32_INTRINSICS 1
 #include <arm_acle.h> /* __crc32cb */
-#endif
-
-/* Architecture detection for MSVC (no hardware acceleration) */
-#if defined(_M_X64) && defined(_MSC_VER)
-#define WL_ARCH_X86_64 1
-#elif defined(_M_ARM64) && defined(_MSC_VER)
-#define WL_ARCH_ARM64 1
 #endif
 
 /* Runtime detection: returns 1 if hardware CRC32 is available */
 static int
 crc32_hw_available(void)
 {
-#if defined(WL_ARCH_X86_64) && !defined(_MSC_VER)
+#if defined(WL_HAVE_X86_CRC32_INTRINSICS)
     /* CPUID leaf 1, ECX bit 20 = SSE4.2 (includes CRC32 instruction) */
-    /* Note: MSVC does not support GCC-style inline asm, disable HW accel on Windows */
     unsigned int eax, ebx, ecx, edx;
     __asm__ volatile ("cpuid"
     : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
     : "a" (1), "c" (0));
     return ((ecx >> 20) & 1U) != 0U;
-#elif defined(WL_ARCH_ARM64) && !defined(_MSC_VER)
+#elif defined(WL_HAVE_ARM_CRC32_INTRINSICS)
 #if defined(__APPLE__)
     /* Apple Silicon always has CRC32 extension */
     return 1;
@@ -67,12 +60,8 @@ crc32_hw_available(void)
     unsigned long hwcap = getauxval(AT_HWCAP);
     return (hwcap & HWCAP_CRC32) != 0;
 #else
-    /* Conservative: use compile-time feature macro */
-#ifdef __ARM_FEATURE_CRC32
+    /* Conservative: the intrinsic path is only compiled when the feature exists. */
     return 1;
-#else
-    return 0;
-#endif
 #endif
 #else
     return 0;
@@ -98,7 +87,7 @@ hw_crc32_check(void)
 uint32_t
 intel_crc32_hw_u8(uint32_t crc, uint8_t byte)
 {
-#if defined(WL_ARCH_X86_64)
+#if defined(WL_HAVE_X86_CRC32_INTRINSICS)
     return (uint32_t)_mm_crc32_u8((unsigned int)crc, byte);
 #else
     (void)crc;
@@ -114,7 +103,7 @@ intel_crc32_hw_u8(uint32_t crc, uint8_t byte)
 uint32_t
 arm_crc32_hw_u8(uint32_t crc, uint8_t byte)
 {
-#if defined(WL_ARCH_ARM64) && defined(__ARM_FEATURE_CRC32)
+#if defined(WL_HAVE_ARM_CRC32_INTRINSICS)
     return __crc32cb(crc, byte);
 #else
     (void)crc;
@@ -200,13 +189,14 @@ castagnoli_crc32(const uint8_t *data, size_t len)
     uint32_t crc = 0xFFFFFFFFu;
     size_t i;
 
-#if defined(WL_ARCH_X86_64) || defined(WL_ARCH_ARM64)
+#if defined(WL_HAVE_X86_CRC32_INTRINSICS) || \
+    defined(WL_HAVE_ARM_CRC32_INTRINSICS)
     if (hw_crc32_check()) {
         /* Hardware path: use CRC32 instruction (Castagnoli polynomial) */
-#if defined(WL_ARCH_X86_64)
+#if defined(WL_HAVE_X86_CRC32_INTRINSICS)
         for (i = 0; i < len; i++)
             crc = intel_crc32_hw_u8(crc, data[i]);
-#elif defined(WL_ARCH_ARM64) && defined(__ARM_FEATURE_CRC32)
+#elif defined(WL_HAVE_ARM_CRC32_INTRINSICS)
         for (i = 0; i < len; i++)
             crc = arm_crc32_hw_u8(crc, data[i]);
 #endif
