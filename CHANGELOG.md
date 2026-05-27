@@ -23,8 +23,13 @@ All notable changes to wirelog are documented in this file.
 - Clarified #746 release-branch readiness/cutover sequencing:
   preparatory repo-side CI targeting now lands before branch creation,
   while final `release-1.x` branch-protection acceptance is deferred to
-  the last-moment RC1 cutover when `project_version` is `1.0.0-rc1`,
-  including synthetic PR verification expectations.
+  the last-moment RC1 cutover when `project_version` is `1.0.0-rc1`.
+  Updated Phase B concrete required-check naming to
+  `mbedtls-enabled / ubuntu-latest / gcc`, removed the path-filtered
+  perf-suite context from required branch-protection checks, and
+  documented that final acceptance requires a dedicated always-emitting
+  release perf context (`WIRELOG_PERF_REQUIRE=1`) plus CODEOWNERS and
+  CLA workflow/context prerequisites verified by a synthetic PR.
 
 ## [0.44.0] - 2026-05-25
 

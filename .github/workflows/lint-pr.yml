@@ -7,6 +7,12 @@ name: Lint PR
 
 on:
   workflow_call:
+    inputs:
+      base-ref:
+        description: PR base branch to diff against for changed-file checks
+        required: false
+        default: main
+        type: string
 
 permissions:
   contents: read
@@ -76,8 +82,11 @@ jobs:
       - name: Run uncrustify (hard gate)
         run: |
           set -o pipefail
+          BASE_REF="${{ inputs.base-ref }}"
+          git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
           # Get list of changed .c and .h files in this PR
-          CHANGED_FILES=$(git diff origin/main...HEAD --name-only --diff-filter=ACM | grep -E '\.(c|h)$' | grep -E '^(wirelog|tests)/' || true)
+          CHANGED_FILES=$(git diff "origin/${BASE_REF}...HEAD" --name-only --diff-filter=ACM | grep -E '\.(c|h)$' | grep -E '^(wirelog|tests)/' || true)
 
           if [ -z "$CHANGED_FILES" ]; then
             echo "No C/H files changed in this PR."
