@@ -115,20 +115,16 @@ wirelog_backend_src = files('columnar/relation.c', 'columnar/cache.c',
 #poly) via SSE4.2 intrinsics on x86_64 and the ARMv8-A CRC extension on
 #aarch64.  The columnar evaluator's WL_PLAN_EXPR_ARITH_CRC32_* cases call
 #into these functions (Issue #884), so any test binary that pulls in the
-#columnar backend also pulls in crc32.c.  The architecture intrinsics
-#require their own compile flags; we apply them project-wide rather than
-#per-target because (a) the same flags were already required by the three
-#standalone crc32 tests, (b) all currently-supported deployment targets
-#predate-by-a-decade the relevant CPU features (SSE4.2 = Nehalem 2008,
-#ARMv8-A+CRC = ARMv8.1 2014), and (c) the alternative — threading
-#per-source compile flags through 130+ test binaries — is significantly
-#more fragile.
+#columnar backend also pulls in crc32.c.  GNU-style architecture flags are
+#applied project-wide only for compilers using GCC/Clang argument syntax;
+#MSVC-syntax compilers such as MSVC and clang-cl rely on crc32.c's
+#compiler-specific paths and portable fallback.
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_crc32_src = files('crc32.c')
 
 wirelog_crc32_arch_c_args = []
-if cc.get_id() != 'msvc'
+if cc.get_argument_syntax() != 'msvc'
   if host_machine.cpu_family() == 'x86_64'
     wirelog_crc32_arch_c_args = ['-msse4.2']
   elif host_machine.cpu_family() == 'aarch64'
