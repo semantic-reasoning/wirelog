@@ -242,20 +242,20 @@ median targets should be added only after stable-run provenance exists.
 
 ## 3. Branch-protection and freeze rules
 
-### After release-1.x cut (post-#685 v1.0 RC1)
+### After 1.0 cut (post-#685 v1.0 RC1)
 
 - The `[Unreleased]` section in `CHANGELOG.md` is **frozen** on
-  `release-1.x` between rc1 and GA.  Hotfixes update the `[1.0.0]`
+  `1.0` between rc1 and GA.  Hotfixes update the `[1.0.0]`
   versioned section, not `[Unreleased]`.  Mechanically enforced
   by the per-branch CI rule under #747 B18.
 
-### Branch-protection (release-1.x, #746 B17)
+### Branch-protection (1.0, #746 B17)
 
 #### Phase A — preparatory (repo-side readiness only)
 
 - Keep `.github/workflows/ci-pr.yml` subscribed to PR targets
-  `[main, release-1.x]` so the same CI contexts are emitted as soon as
-  `release-1.x` exists.
+  `[main, 1.0]` so the same CI contexts are emitted as soon as
+  `1.0` exists.
 - Do **not** configure GitHub branch protection yet; the branch does
   not exist before the last-moment RC1 cutover.
 - This phase is intentionally incomplete by itself: final #746
@@ -263,7 +263,7 @@ median targets should be added only after stable-run provenance exists.
 
 #### Phase B — final RC1 cutover (last moment)
 
-Execute only after `release-1.x` is created during the RC1 cutover and
+Execute only after `1.0` is created during the RC1 cutover and
 the cutover commit sets `project_version` to `1.0.0-rc1`.
 
 - At least one CODEOWNER review.
@@ -292,7 +292,7 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
 #### Synthetic PR verification plan (Phase B)
 
 After branch creation and protection rules are configured, open a
-synthetic PR targeting `release-1.x` and verify:
+synthetic PR targeting `1.0` and verify:
 
 1. The required check contexts above are present and enforced.
 2. Merge is blocked until at least one CODEOWNER review is granted.
@@ -307,7 +307,7 @@ those prerequisites before attempting final cutover verification.
 
 Close the synthetic PR after capturing verification evidence for #746.
 Final #746 acceptance is deferred until this Phase B verification passes
-on the real `release-1.x` branch at the `1.0.0-rc1` cutover.
+on the real `1.0` branch at the `1.0.0-rc1` cutover.
 
 ### Perf nightly monitoring posture
 
@@ -345,7 +345,7 @@ changes that policy.
 - Pushes to `main`: `ci-main.yml` may mirror the same coverage as
   monitoring only, consistent with its existing `continue-on-error`
   posture.
-- `release-1.x`: #746 branch-protection work should require the same
+- `1.0`: #746 branch-protection work should require the same
   stable check name once the branch is cut.
 - Release tags: #749 tag-time verification should include this enabled
   crypto validation at minimum by running `cryptographic_hashes` under
