@@ -304,9 +304,9 @@ synthetic PR targeting `1.0` and verify:
 5. Linear-history and signed-commit constraints are enforced.
 
 Phase B prerequisites for final #746 acceptance are not fully present in
-this repository state yet: `CODEOWNERS` is missing, and the CLA workflow
-plus its always-emitting required status context are also missing. Land
-those prerequisites before attempting final cutover verification.
+this repository state yet: `CODEOWNERS` is present, but the CLA workflow
+plus its always-emitting required status context remain missing. Land the
+remaining prerequisite before attempting final cutover verification.
 
 Close the synthetic PR after capturing verification evidence for #746.
 Final #746 acceptance is deferred until this Phase B verification passes
