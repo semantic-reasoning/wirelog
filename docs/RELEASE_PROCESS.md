@@ -379,5 +379,7 @@ changes that policy.
 - #749 (B19) — at-tag CI re-verification workflow.
 - #750 — GPG + cosign-keyless signing pipeline.
 - #751 — tarball + SHA256 + BLAKE3 + provenance attestation.
+- #752 — GA release-facing deferrals/readiness follow-up in release process docs.
+- #753 — GA PSIRT/CVE-intake activation and 1.x support-window declaration deferral.
 - #744 — SBOM automation (SPDX + CycloneDX).
 - `stable-release-plan.md` §12.8 — GA exit conditions.

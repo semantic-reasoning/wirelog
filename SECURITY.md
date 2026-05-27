@@ -5,6 +5,10 @@
 wirelog is still pre-1.0. Security fixes are currently made on `main`; release
 branch backports begin with supported 1.x release lines.
 
+Full GA PSIRT/CVE-intake activation and the explicit 1.x support-window
+declaration are deferred and tracked by #753. Until that lands, the pre-1.0
+policy in this file remains unchanged.
+
 | Version line | Security support |
 | --- | --- |
 | `main` / current pre-1.0 development | Supported for security fixes on `main` |
