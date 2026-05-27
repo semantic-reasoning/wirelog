@@ -7,9 +7,10 @@ name: CI PR
 #   └─ lint
 #      ├─ build-primary (ubuntu-latest gcc, SBOM/size/path-a gates)
 #      │  ├─ build-arm (ubuntu-24.04-arm gcc, ABI #681) ──┐
-#      │  ├─ build-mbedtls (ubuntu-latest gcc, crypto) ──┼─ build-matrix (parallel)
-#      │  ├─ tsan (independent, no gate) ────────────────┼─ sanitizer-matrix (parallel)
-#      │  └─ tsan-native (independent, no gate) ─────────┘
+#      │  └─ build-mbedtls (ubuntu-latest gcc, crypto) ──┼─ build-matrix (parallel)
+#      │                                                   └─ sanitizer-matrix (parallel)
+#      ├─ tsan (independent, no gate)
+#      └─ tsan-native (independent, no gate)
 #
 # CodeQL runs in its own workflow (GitHub default-setup); not invoked from here.
 
