@@ -249,16 +249,56 @@ median targets should be added only after stable-run provenance exists.
   versioned section, not `[Unreleased]`.  Mechanically enforced
   by the per-branch CI rule under #747 B18.
 
-### Branch-protection (release-1.x)
+### Branch-protection (release-1.x, #746 B17)
 
-Per #746 B17, `release-1.x` requires:
+#### Phase A — preparatory (repo-side readiness only)
+
+- Keep `.github/workflows/ci-pr.yml` subscribed to PR targets
+  `[main, release-1.x]` so the same CI contexts are emitted as soon as
+  `release-1.x` exists.
+- Do **not** configure GitHub branch protection yet; the branch does
+  not exist before the last-moment RC1 cutover.
+- This phase is intentionally incomplete by itself: final #746
+  acceptance remains gated on Phase B.
+
+#### Phase B — final RC1 cutover (last moment)
+
+Execute only after `release-1.x` is created during the RC1 cutover and
+the cutover commit sets `project_version` to `1.0.0-rc1`.
 
 - At least one CODEOWNER review.
-- Required status checks (default + abi + asan + tsan + perf,
-  plus `mbedtls-enabled / ubuntu-latest / gcc` once #843 lands).
 - Linear history (no force-push, no merge commits).
 - Signed commits (GPG verified).
 - Tag protection on `v1.x.*`.
+- Required status checks:
+  - Stable policy plan: `default`, `abi`, `asan`, `tsan`, `perf`,
+    plus `mbedtls-enabled / ubuntu-latest / gcc`.
+  - Currently known concrete PR contexts to require at cutover (unless
+    replaced by a later policy-consolidation change): `EditorConfig check`,
+    `uncrustify check`, `clang-tidy 22 check`,
+    `Build / ubuntu-latest / gcc`, `Build / ubuntu-24.04-arm / gcc`,
+    `Build / ubuntu-latest / gcc (mbedTLS-enabled)`,
+    `Build / ubuntu-latest / clang`, `Build / macos-latest / clang`,
+    `Build / windows-latest / msvc`,
+    `Sanitizers / ubuntu-latest / gcc`,
+    `Sanitizers / ubuntu-latest / clang`,
+    `Sanitizers / macos-latest / clang`,
+    `TSan / ubuntu-latest / gcc`,
+    `Perf Suite (col_rel_compact_runs / heap surfaces)`.
+
+#### Synthetic PR verification plan (Phase B)
+
+After branch creation and protection rules are configured, open a
+synthetic PR targeting `release-1.x` and verify:
+
+1. The required check contexts above are present and enforced.
+2. Merge is blocked until at least one CODEOWNER review is granted.
+3. Merge is blocked while any required check is failing or pending.
+4. Linear-history and signed-commit constraints are enforced.
+
+Close the synthetic PR after capturing verification evidence for #746.
+Final #746 acceptance is deferred until this Phase B verification passes
+on the real `release-1.x` branch at the `1.0.0-rc1` cutover.
 
 ### Perf nightly monitoring posture
 
