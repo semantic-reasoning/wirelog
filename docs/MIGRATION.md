@@ -1,11 +1,22 @@
 # Migration Guide
 
-**Last Updated:** 2026-05-25
+**Last Updated:** 2026-05-28
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
+
+## 0.44 -> 0.50
+
+Version `0.50.0` is a release-prep/docs-focused cut relative to `0.44.0`.
+No new source-level migration actions are required beyond the behavior and
+API migration guidance already captured in this document's `0.44`-and-earlier
+entries.
+
+- **Migration posture:** treat `0.44 -> 0.50` as ABI/public-surface
+  continuity for downstream consumers; update only if your integration depends
+  on release-process policy/docs details.
 
 ## 0.43 -> 0.44
 
