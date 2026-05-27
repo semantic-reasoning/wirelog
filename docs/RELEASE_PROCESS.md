@@ -247,7 +247,9 @@ median targets should be added only after stable-run provenance exists.
 - The `[Unreleased]` section in `CHANGELOG.md` is **frozen** on
   `1.0` between rc1 and GA.  Hotfixes update the `[1.0.0]`
   versioned section, not `[Unreleased]`.  Mechanically enforced
-  by the per-branch CI rule under #747 B18.
+  by `scripts/ci/check-changelog-rc.sh` (always-emitting check context
+  name: `RC changelog freeze gate`) under #747 B18.  The check enforces
+  only when a PR base branch is `1.0`; non-`1.0` PRs SKIP/pass.
 
 ### Branch-protection (1.0, #746 B17)
 
@@ -281,6 +283,7 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
     replaced by a later policy-consolidation change): `lint / EditorConfig check`,
     `lint / uncrustify check`, `lint / clang-tidy 22 check`,
     `Build / ubuntu-latest / gcc`, `Build / ubuntu-24.04-arm / gcc`,
+    `RC changelog freeze gate`,
     `mbedtls-enabled / ubuntu-latest / gcc`,
     `Build / ubuntu-latest / clang`, `Build / macos-latest / clang`,
     `Build / windows-latest / msvc`,

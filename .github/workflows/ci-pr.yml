@@ -22,10 +22,28 @@ permissions:
 
 jobs:
   # ==========================================================================
+  # Issue #747 B18: RC changelog freeze gate (stable always-emitting context)
+  # Enforces only for PRs whose base branch is `1.0`; non-1.0 PRs SKIP/pass.
+  # ==========================================================================
+  rc-changelog-freeze:
+    name: RC changelog freeze gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Enforce RC changelog freeze policy
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: scripts/ci/check-changelog-rc.sh
+
+  # ==========================================================================
   # Phase 1: Lint (import lint-pr.yml as prerequisite)
   # editorconfig -> uncrustify -> clang-tidy 22 (sequential, hard gates)
   # ==========================================================================
   lint:
+    needs: [rc-changelog-freeze]
     uses: ./.github/workflows/lint-pr.yml
     with:
       base-ref: ${{ github.base_ref }}

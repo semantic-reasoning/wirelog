@@ -8,6 +8,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **RC freeze PR gate for `1.0` branch targets** (#747): added
+  `scripts/ci/check-changelog-rc.sh` and wired it as an always-emitting
+  `RC changelog freeze gate` context in `.github/workflows/ci-pr.yml`.
+  The gate SKIPs/passes on non-`1.0` PRs, and enforces on `1.0` PRs:
+  `meson.build` project version must match `1.0.0` or `1.0.0-*`
+  (e.g. `1.0.0-rc1`), `CHANGELOG.md` `[Unreleased]` must remain frozen
+  versus base, and changelog edits must be confined to `## [1.0.0]`.
+
 ### Deprecated
 
 ### Removed
