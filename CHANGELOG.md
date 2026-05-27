@@ -22,7 +22,7 @@ All notable changes to wirelog are documented in this file.
 
 - Clarified #746 release-branch readiness/cutover sequencing:
   preparatory repo-side CI targeting now lands before branch creation,
-  while final `release-1.x` branch-protection acceptance is deferred to
+  while final `1.0` branch-protection acceptance is deferred to
   the last-moment RC1 cutover when `project_version` is `1.0.0-rc1`.
   Updated Phase B concrete required-check naming to
   `mbedtls-enabled / ubuntu-latest / gcc`, removed the path-filtered

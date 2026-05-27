@@ -14,7 +14,7 @@ name: CI PR
 
 on:
   pull_request:
-    branches: [main, release-1.x]
+    branches: [main, "1.0"]
 
 permissions:
   actions: read
