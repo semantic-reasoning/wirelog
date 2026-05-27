@@ -267,24 +267,27 @@ Execute only after `release-1.x` is created during the RC1 cutover and
 the cutover commit sets `project_version` to `1.0.0-rc1`.
 
 - At least one CODEOWNER review.
+- CLA signoff required (blocking CLA status context).
 - Linear history (no force-push, no merge commits).
 - Signed commits (GPG verified).
 - Tag protection on `v1.x.*`.
 - Required status checks:
   - Stable policy plan: `default`, `abi`, `asan`, `tsan`, `perf`,
     plus `mbedtls-enabled / ubuntu-latest / gcc`.
+  - `perf` must be represented by a dedicated always-emitting release
+    perf context that runs with `WIRELOG_PERF_REQUIRE=1`; do not rely on
+    path-filtered contexts for branch protection.
   - Currently known concrete PR contexts to require at cutover (unless
     replaced by a later policy-consolidation change): `EditorConfig check`,
     `uncrustify check`, `clang-tidy 22 check`,
     `Build / ubuntu-latest / gcc`, `Build / ubuntu-24.04-arm / gcc`,
-    `Build / ubuntu-latest / gcc (mbedTLS-enabled)`,
+    `mbedtls-enabled / ubuntu-latest / gcc`,
     `Build / ubuntu-latest / clang`, `Build / macos-latest / clang`,
     `Build / windows-latest / msvc`,
     `Sanitizers / ubuntu-latest / gcc`,
     `Sanitizers / ubuntu-latest / clang`,
     `Sanitizers / macos-latest / clang`,
-    `TSan / ubuntu-latest / gcc`,
-    `Perf Suite (col_rel_compact_runs / heap surfaces)`.
+    `TSan / ubuntu-latest / gcc`.
 
 #### Synthetic PR verification plan (Phase B)
 
@@ -293,8 +296,14 @@ synthetic PR targeting `release-1.x` and verify:
 
 1. The required check contexts above are present and enforced.
 2. Merge is blocked until at least one CODEOWNER review is granted.
-3. Merge is blocked while any required check is failing or pending.
-4. Linear-history and signed-commit constraints are enforced.
+3. Merge is blocked until CLA signoff is complete.
+4. Merge is blocked while any required check is failing or pending.
+5. Linear-history and signed-commit constraints are enforced.
+
+Phase B prerequisites for final #746 acceptance are not fully present in
+this repository state yet: `CODEOWNERS` is missing, and the CLA workflow
+plus its always-emitting required status context are also missing. Land
+those prerequisites before attempting final cutover verification.
 
 Close the synthetic PR after capturing verification evidence for #746.
 Final #746 acceptance is deferred until this Phase B verification passes

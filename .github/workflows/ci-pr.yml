@@ -27,6 +27,8 @@ jobs:
   # ==========================================================================
   lint:
     uses: ./.github/workflows/lint-pr.yml
+    with:
+      base-ref: ${{ github.base_ref }}
 
   # ==========================================================================
   # Phase 2a: Build Primary (ubuntu-latest + gcc)
@@ -226,7 +228,7 @@ jobs:
   # Optional crypto coverage; must pass before build-matrix proceeds.
   # ==========================================================================
   build-mbedtls:
-    name: Build / ubuntu-latest / gcc (mbedTLS-enabled)
+    name: mbedtls-enabled / ubuntu-latest / gcc
     needs: [build-primary]
     runs-on: ubuntu-latest
 
