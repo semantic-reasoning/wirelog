@@ -1,0 +1,85 @@
+name: CLA Required
+
+on:
+  pull_request:
+    branches: [main, "1.0"]
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  statuses: read
+
+jobs:
+  cla-signoff-gate:
+    name: CLA signoff gate
+    runs-on: ubuntu-latest
+    env:
+      CLA_CONTEXT: license/cla
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Verify hosted CLA status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          attempts=12
+          interval=10
+          status_url="https://api.github.com/repos/${REPOSITORY}/commits/${HEAD_SHA}/status"
+
+          echo "Checking ${CLA_CONTEXT} on PR head SHA ${HEAD_SHA}."
+
+          for attempt in $(seq 1 "$attempts"); do
+            response="$(
+              curl --fail --silent --show-error --location \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "$status_url"
+            )"
+
+            cla_state="$(
+              jq -r --arg context "$CLA_CONTEXT" \
+                '[.statuses[] | select(.context == $context)][0].state // "missing"' \
+                <<<"$response"
+            )"
+            cla_url="$(
+              jq -r --arg context "$CLA_CONTEXT" \
+                '[.statuses[] | select(.context == $context)][0].target_url // ""' \
+                <<<"$response"
+            )"
+
+            case "$cla_state" in
+              success)
+                echo "${CLA_CONTEXT} is success."
+                if [ -n "$cla_url" ]; then
+                  echo "Source: ${cla_url}"
+                fi
+                exit 0
+                ;;
+              pending)
+                echo "${CLA_CONTEXT} is pending (attempt ${attempt}/${attempts})."
+                ;;
+              failure|error)
+                echo "::error::${CLA_CONTEXT} is ${cla_state} on ${HEAD_SHA}; CLA signoff is required before merge."
+                if [ -n "$cla_url" ]; then
+                  echo "::error::Source: ${cla_url}"
+                fi
+                exit 1
+                ;;
+              missing)
+                echo "${CLA_CONTEXT} is missing on ${HEAD_SHA} (attempt ${attempt}/${attempts})."
+                ;;
+              *)
+                echo "::error::${CLA_CONTEXT} returned unexpected state '${cla_state}' on ${HEAD_SHA}."
+                exit 1
+                ;;
+            esac
+
+            if [ "$attempt" -lt "$attempts" ]; then
+              sleep "$interval"
+            fi
+          done
+
+          echo "::error::Timed out waiting for ${CLA_CONTEXT} to report success on ${HEAD_SHA}; latest state was ${cla_state}."
+          exit 1

@@ -269,7 +269,10 @@ Execute only after `1.0` is created during the RC1 cutover and
 the cutover commit sets `project_version` to `1.0.0-rc1`.
 
 - At least one CODEOWNER review.
-- CLA signoff required (blocking CLA status context).
+- CLA signoff required via branch protection on the stable
+  `CLA signoff gate` check.  This repository-owned gate verifies the
+  hosted cla-assistant external status context `license/cla`; do not
+  make `license/cla` itself the required protected check.
 - Linear history (no force-push, no merge commits).
 - Signed commits (GPG verified).
 - Tag protection on `v1.x.*`.
@@ -283,7 +286,7 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
     replaced by a later policy-consolidation change): `lint / EditorConfig check`,
     `lint / uncrustify check`, `lint / clang-tidy 22 check`,
     `Build / ubuntu-latest / gcc`, `Build / ubuntu-24.04-arm / gcc`,
-    `RC changelog freeze gate`,
+    `RC changelog freeze gate`, `CLA signoff gate`,
     `mbedtls-enabled / ubuntu-latest / gcc`,
     `Build / ubuntu-latest / clang`, `Build / macos-latest / clang`,
     `Build / windows-latest / msvc`,
@@ -299,14 +302,16 @@ synthetic PR targeting `1.0` and verify:
 
 1. The required check contexts above are present and enforced.
 2. Merge is blocked until at least one CODEOWNER review is granted.
-3. Merge is blocked until CLA signoff is complete.
+3. Merge is blocked until `CLA signoff gate` passes by observing
+   hosted `license/cla: success` on the PR head SHA.
 4. Merge is blocked while any required check is failing or pending.
 5. Linear-history and signed-commit constraints are enforced.
 
 Phase B prerequisites for final #746 acceptance are not fully present in
-this repository state yet: `CODEOWNERS` is present, but the CLA workflow
-plus its always-emitting required status context remain missing. Land the
-remaining prerequisite before attempting final cutover verification.
+this repository state yet: `CODEOWNERS` and the always-emitting
+`CLA signoff gate` workflow are present, but final synthetic PR
+validation remains a Phase B cutover task after `1.0` branch protection
+is configured.
 
 Close the synthetic PR after capturing verification evidence for #746.
 Final #746 acceptance is deferred until this Phase B verification passes
