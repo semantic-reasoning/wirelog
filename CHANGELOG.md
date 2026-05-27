@@ -8,6 +8,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.50.0] - 2026-05-28
+
+### Added
+
+### Changed
+
 - **RC freeze PR gate for `1.0` branch targets** (#747): added
   `scripts/ci/check-changelog-rc.sh` and wired it as an always-emitting
   `RC changelog freeze gate` context in `.github/workflows/ci-pr.yml`.
