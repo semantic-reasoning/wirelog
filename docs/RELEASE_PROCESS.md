@@ -278,8 +278,8 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
     perf context that runs with `WIRELOG_PERF_REQUIRE=1`; do not rely on
     path-filtered contexts for branch protection.
   - Currently known concrete PR contexts to require at cutover (unless
-    replaced by a later policy-consolidation change): `EditorConfig check`,
-    `uncrustify check`, `clang-tidy 22 check`,
+    replaced by a later policy-consolidation change): `lint / EditorConfig check`,
+    `lint / uncrustify check`, `lint / clang-tidy 22 check`,
     `Build / ubuntu-latest / gcc`, `Build / ubuntu-24.04-arm / gcc`,
     `mbedtls-enabled / ubuntu-latest / gcc`,
     `Build / ubuntu-latest / clang`, `Build / macos-latest / clang`,
