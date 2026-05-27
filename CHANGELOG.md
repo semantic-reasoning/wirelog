@@ -20,6 +20,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- Clarified #746 release-branch readiness/cutover sequencing:
+  preparatory repo-side CI targeting now lands before branch creation,
+  while final `release-1.x` branch-protection acceptance is deferred to
+  the last-moment RC1 cutover when `project_version` is `1.0.0-rc1`,
+  including synthetic PR verification expectations.
+
 ## [0.44.0] - 2026-05-25
 
 ### Added
