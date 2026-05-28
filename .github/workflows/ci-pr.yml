@@ -7,10 +7,10 @@ name: CI PR
 #   └─ lint
 #      ├─ build-primary (ubuntu-latest gcc, SBOM/size/path-a gates)
 #      │  ├─ build-arm (ubuntu-24.04-arm gcc, ABI #681) ──┐
-#      │  └─ build-mbedtls (ubuntu-latest gcc, crypto) ──┼─ build-matrix (parallel)
-#      │                                                   └─ sanitizer-matrix (parallel)
-#      ├─ tsan (independent, no gate)
-#      └─ tsan-native (independent, no gate)
+#      │  └─ build-mbedtls (ubuntu-latest gcc, crypto) ──┼─ build-matrix
+#      └─ sanitizer-matrix
+#         ├─ tsan
+#         └─ tsan-native
 #
 # CodeQL runs in its own workflow (GitHub default-setup); not invoked from here.
 
@@ -275,13 +275,13 @@ jobs:
         run: meson test -C builddir-mbedtls cryptographic_hashes --print-errorlogs
 
   # ==========================================================================
-  # Phase: Sanitizer Matrix (gated by build-arm + build-mbedtls, parallel with build-matrix)
+  # Phase: Sanitizer Matrix (starts after lint, parallel with build-primary)
   # ASan + UBSan validation; runs in parallel with build-matrix.
   # Linux: GCC + Clang; macOS: Clang
   # ==========================================================================
   sanitizer-matrix:
     name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [build-arm, build-mbedtls]
+    needs: [lint]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -340,14 +340,15 @@ jobs:
 
   # ==========================================================================
   # Phase 3b: TSan
-  # Runs after lint and in parallel with the normal build matrix.
+  # Runs after sanitizer-matrix to keep sanitizer coverage ahead of all
+  # TSan-instrumented jobs when PR runner capacity is constrained.
   # TSan forces POSIX pthreads via -Dthreads=posix.
   # TSan only intercepts pthread calls; C11 <threads.h> functions
   # (thrd_create, mtx_lock) are uninstrumented and cause false SEGV.
   # ==========================================================================
   tsan:
     name: TSan / ubuntu-latest / gcc
-    needs: [lint]
+    needs: [sanitizer-matrix]
     runs-on: ubuntu-latest
 
     steps:
@@ -379,6 +380,8 @@ jobs:
 
   # ==========================================================================
   # Phase 3b (advisory): TSan compile smoke with -Dthreads=native
+  # Runs after sanitizer-matrix for the same runner-pressure ordering as the
+  # gating TSan leg while preserving its advisory compile-smoke semantics.
   #
   # WHY THIS LEG EXISTS:
   #   The normal TSan job above forces -Dthreads=posix because libtsan's
@@ -404,7 +407,7 @@ jobs:
   # ==========================================================================
   tsan-native:
     name: TSan-native / ubuntu-latest / gcc
-    needs: [lint]
+    needs: [sanitizer-matrix]
     runs-on: ubuntu-latest
 
     steps:
