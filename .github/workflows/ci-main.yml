@@ -115,16 +115,44 @@ jobs:
 
       - name: Configure (Windows / MSVC)
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: pwsh
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstallDir = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstallDir) { throw 'Visual Studio with MSVC x86/x64 tools was not found' }
+          $vcvars = Join-Path $vsInstallDir 'VC\Auxiliary\Build\vcvars64.bat'
+          cmd /s /c "`"$vcvars`" && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+          }
+          $clExe = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe' | Select-Object -First 1
+          if (-not $clExe) { throw 'cl.exe was not found under the MSVC toolset' }
+          $env:PATH = "$(Split-Path -Parent $clExe);$env:PATH"
+          Get-Command cl.exe
+          $env:CC = 'cl'
+          $env:CXX = 'cl'
           meson setup builddir -Dtests=true -DmbedTLS=disabled
 
       - name: Build (Windows / MSVC)
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: pwsh
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstallDir = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstallDir) { throw 'Visual Studio with MSVC x86/x64 tools was not found' }
+          $vcvars = Join-Path $vsInstallDir 'VC\Auxiliary\Build\vcvars64.bat'
+          cmd /s /c "`"$vcvars`" && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+          }
+          $clExe = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe' | Select-Object -First 1
+          if (-not $clExe) { throw 'cl.exe was not found under the MSVC toolset' }
+          $env:PATH = "$(Split-Path -Parent $clExe);$env:PATH"
+          Get-Command cl.exe
+          $env:CC = 'cl'
+          $env:CXX = 'cl'
           meson compile -C builddir
 
       - name: Build (Linux / macOS)
@@ -133,9 +161,23 @@ jobs:
 
       - name: Test (Windows / MSVC)
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: pwsh
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstallDir = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstallDir) { throw 'Visual Studio with MSVC x86/x64 tools was not found' }
+          $vcvars = Join-Path $vsInstallDir 'VC\Auxiliary\Build\vcvars64.bat'
+          cmd /s /c "`"$vcvars`" && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+          }
+          $clExe = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe' | Select-Object -First 1
+          if (-not $clExe) { throw 'cl.exe was not found under the MSVC toolset' }
+          $env:PATH = "$(Split-Path -Parent $clExe);$env:PATH"
+          Get-Command cl.exe
+          $env:CC = 'cl'
+          $env:CXX = 'cl'
           meson test -C builddir --print-errorlogs
 
       - name: Test (Linux / macOS)
