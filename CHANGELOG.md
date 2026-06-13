@@ -20,6 +20,33 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+## [0.51.0] - 2026-06-13
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **Non-recursive strata after recursive evaluation** (#914): reset the
+  columnar evaluator's iteration context before non-recursive strata run,
+  preventing stale recursive iteration state from incorrectly suppressing
+  static EDB reads and dropping derived rows such as
+  `requires_review(...)`.
+- **Windows CI compiler selection** (#917): force the MSVC compiler in the
+  Windows PR and main workflows so the intended toolchain is selected
+  consistently.
+
+### Performance
+
+### Security
+
+### Documentation
+
 ## [0.50.0] - 2026-05-28
 
 ### Added

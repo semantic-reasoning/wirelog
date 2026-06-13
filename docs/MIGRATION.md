@@ -1,11 +1,27 @@
 # Migration Guide
 
-**Last Updated:** 2026-05-28
+**Last Updated:** 2026-06-13
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
+
+## 0.50 -> 0.51
+
+Version `0.51.0` is a stability-focused release after `0.50.0`.
+No source-level migration actions are required for applications already
+using the 0.50 public API surface.
+
+- **Columnar recursive-to-non-recursive evaluation correctness** (#914):
+  programs with a recursive stratum followed by a non-recursive stratum may
+  now derive rows that were previously dropped because stale recursive
+  iteration state suppressed static EDB reads.  No API changes are required;
+  downstream tests that encoded the incorrect missing-row behavior should be
+  updated to expect the corrected output.
+- **Windows CI compiler selection** (#917): project CI now forces MSVC on Windows
+  so release validation uses the intended compiler consistently.  This does
+  not change source compatibility for consumers.
 
 ## 0.44 -> 0.50
 
