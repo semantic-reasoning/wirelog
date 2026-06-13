@@ -1959,6 +1959,24 @@ test_delta_propagation_exe = executable(
 
 test('delta_propagation', test_delta_propagation_exe)
 
+# Issue #914: non-recursive stratum after a recursive one
+test_issue914_nonrec_exe = executable(
+  'test_issue914_nonrec_after_recursive',
+  files('test_issue914_nonrec_after_recursive.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('issue914_nonrec_after_recursive', test_issue914_nonrec_exe)
+
 # Issue #105: Monotone stratum detection
 test_monotone_detection_exe = executable(
   'test_monotone_detection',

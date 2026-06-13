@@ -485,6 +485,13 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
     if (!sp->is_recursive) {
+        /* Issue #914: a non-recursive stratum is always the base case. The
+         * recursive-stratum loop leaves sess->current_iteration > 0 and never
+         * resets it, which would wrongly trigger the base-case EDB VARIABLE
+         * skip (eval.c base-case skip) and drop this stratum's head tuples.
+         * Reset here so it covers both the parallel and sequential paths. */
+        sess->current_iteration = 0;
+
         /* Non-recursive: evaluate each relation plan once */
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             const wl_plan_relation_t *rp = &sp->relations[ri];
@@ -1090,6 +1097,11 @@ stride_error:
     sess->diff_operators_active = saved_diff_operators_active;
 
     sess->total_iterations = final_eff_iter;
+
+    /* Issue #914: current_iteration is deliberately left at final_eff_iter (> 0)
+     * here. The non-recursive branch of col_eval_stratum is responsible for
+     * resetting it to 0 before its base-case evaluation; do not add a second
+     * reset here (consensus declined that). See the non-recursive branch above. */
 
     /* Issue #106 (US-106-005): Record per-rule frontier at convergence with epoch.
      * When stratum converges at effective iteration I, record (outer_epoch, I).
