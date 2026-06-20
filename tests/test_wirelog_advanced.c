@@ -1174,6 +1174,70 @@ test_negated_side_compound_body_pattern_rejected(void)
     return rc;
 }
 
+/* Parity (#785): mirrors test_unsafe_negation_variable_rejected (issue #920).
+ * A variable bound only inside a negated atom is unsafe; IR lowering must
+ * reject it. */
+static int
+test_unsafe_negation_variable_rejected(void)
+{
+    const char *src
+        = ".decl a(x: symbol)\n"
+        ".decl b(x: symbol, y: symbol)\n"
+        ".decl c(x: symbol)\n"
+        "c(X) :- a(X), !b(X, Y).\n";
+    wirelog_error_t parse_err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(src, &parse_err);
+    if (!prog)
+        return parse_err == WIRELOG_OK ? 1 : 0;
+
+    wirelog_session_t *s = NULL;
+    wirelog_error_t err
+        = wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s);
+    int rc = 0;
+    if (err != WIRELOG_ERR_INVALID_IR || s) {
+        fprintf(stderr,
+            "expected invalid IR for unsafe negation variable, got %d\n", err);
+        wirelog_session_destroy(s);
+        rc = 1;
+    }
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#785): mirrors test_safe_negation_via_projection_accepted (#920).
+ * The projected-key form and wildcard columns are safe and must be accepted. */
+static int
+test_safe_negation_via_projection_accepted(void)
+{
+    const char *src
+        = ".decl a(x: symbol)\n"
+        ".decl b(x: symbol, y: symbol)\n"
+        ".decl b_key(x: symbol)\n"
+        ".decl c(x: symbol)\n"
+        ".decl d(x: symbol)\n"
+        "b_key(X) :- b(X, Y).\n"
+        "c(X) :- a(X), !b_key(X).\n"
+        "d(X) :- a(X), !b(X, _).\n";
+    wirelog_error_t parse_err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(src, &parse_err);
+    if (!prog) {
+        fprintf(stderr, "safe negation: parse failed, got %d\n", parse_err);
+        return 1;
+    }
+
+    wirelog_session_t *s = NULL;
+    wirelog_error_t err
+        = wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s);
+    int rc = 0;
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "safe negation: expected valid IR, got %d\n", err);
+        rc = 1;
+    }
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
 /* Parity (#785): mirrors test_wirelog_easy.c::test_intern_returns_same_id.
  * Interning the same string twice through wl_intern_put must return
  * the same int64 id; the advanced API exposes the intern table via
@@ -1570,6 +1634,8 @@ main(void)
     failures += test_side_compound_wrong_functor_handle_no_match();
     failures += test_side_compound_nested_child_no_match();
     failures += test_negated_side_compound_body_pattern_rejected();
+    failures += test_unsafe_negation_variable_rejected();
+    failures += test_safe_negation_via_projection_accepted();
     failures += test_intern_returns_same_id();
     failures += test_snapshot_filter();
     failures += test_cleanup_order_no_use_after_free();
