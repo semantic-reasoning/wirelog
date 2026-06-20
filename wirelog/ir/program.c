@@ -1843,7 +1843,10 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             if (atom_has_declared_side_compound_pattern(neg_atom, prog)) {
                 WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
                     "negated side compound body pattern is unsupported "
-                    "for relation=%s",
+                    "for relation=%s; extract the compound fields in a "
+                    "positive rule first, then negate the resulting flat "
+                    "relation (see docs/COMPOUND_TERMS.md, \"Negation and "
+                    "side compounds\")",
                     neg_atom->name ? neg_atom->name : "?");
                 for (uint32_t s = 0; s < scan_count; s++)
                     free_var_names(scan_vars[s], scan_vcounts[s]);

@@ -14,9 +14,10 @@
 5. [Nested Compounds](#nested-compounds)
 6. [Inline vs Side Decision Guide](#inline-vs-side-decision-guide)
 7. [Errors and Validation](#errors-and-validation)
-8. [Examples](#examples)
-9. [Observability](#observability)
-10. [Backward Compatibility](#backward-compatibility)
+8. [Negation and side compounds](#negation-and-side-compounds)
+9. [Examples](#examples)
+10. [Observability](#observability)
+11. [Backward Compatibility](#backward-compatibility)
 
 ---
 
@@ -299,9 +300,63 @@ When in doubt, omit the hint. The default (`side`) is always correct.
 | Nesting > 64 levels                      | Parse error: "compound term nesting too deep"         |
 | `inline` hint with arity > 4            | Parse error |
 | `inline` hint with depth > 1            | Schema-apply error; `WL_LOG=COMPOUND:2` emits `error=depth_overflow` |
-| Negated side compound body pattern       | IR conversion error; negated side-join lowering is not yet supported |
+| Negated side compound body pattern       | IR conversion error; not yet supported. See [Negation and side compounds](#negation-and-side-compounds) for the supported workaround |
 | Handle from session A used in session B  | `arena_lookup` returns NULL (session seed mismatch)   |
 | Handle after arena saturation (epoch 4095)| `arena_alloc` returns `WL_COMPOUND_HANDLE_NULL`      |
+
+---
+
+## Negation and side compounds
+
+Negation (`!Rel(...)`, lowered to an anti-join) works with scalar columns and
+with `inline` compound patterns. It does **not** yet support destructuring a
+`side`-tier compound inside the negated atom, because the negated side requires
+joining the parent scan with the generated `__compound_<functor>_<arity>`
+relation before the anti-join, and that lowering is not implemented. Such a rule
+is rejected at IR-conversion time.
+
+Note the constraint is narrow — it fires only when all three hold:
+
+1. the atom is negated (`!`),
+2. the column is a **side**-tier compound, and
+3. the body pattern destructures it with functor syntax (`metadata(...)`).
+
+Negating mere presence of the compound row (`!event(ID, _)` or binding the
+handle to a variable) is unaffected and works today, as does positive
+destructuring.
+
+### Not supported
+
+```
+.decl event(id: int64, meta: metadata/4 side)
+.decl candidate(id: int64)
+.decl flagged(id: int64)
+
+/* IR-conversion error: negated side compound body pattern */
+flagged(ID) :- candidate(ID), !event(ID, metadata(_, _, _, 99)).
+```
+
+### Supported workaround
+
+Extract the compound fields in a **positive** rule first (positive side-compound
+binding is fully supported), then negate the resulting flat relation:
+
+```
+.decl event(id: int64, meta: metadata/4 side)
+.decl candidate(id: int64)
+.decl risky(id: int64)
+.decl flagged(id: int64)
+
+/* 1. Positive destructuring lowers to parent JOIN __compound_metadata_4 */
+risky(ID) :- event(ID, metadata(_, _, _, 99)).
+
+/* 2. Negate the flat relation — a plain anti-join */
+flagged(ID) :- candidate(ID), !risky(ID).
+```
+
+This is equivalent in expressive power (no rule is inexpressible — only the
+single-line form is unavailable) and stratifies naturally: `risky` is fully
+computed in an earlier stratum than `flagged`, so there is no negation cycle.
 
 ---
 
