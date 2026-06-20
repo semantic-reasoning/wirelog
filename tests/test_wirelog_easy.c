@@ -1075,6 +1075,55 @@ test_negated_side_compound_body_pattern_rejected(void)
     PASS();
 }
 
+/* Issue #920: a variable that appears only inside a negated body atom has an
+ * unbounded range and must be rejected (range-restriction / safety). */
+static void
+test_unsafe_negation_variable_rejected(void)
+{
+    TEST("unsafe variable in negated atom is rejected");
+
+    const char *src
+        = ".decl a(x: symbol)\n"
+        ".decl b(x: symbol, y: symbol)\n"
+        ".decl c(x: symbol)\n"
+        "c(X) :- a(X), !b(X, Y).\n"; /* Y bound only under negation */
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) == WIRELOG_OK || s) {
+        wirelog_easy_close(s);
+        FAIL("unsafe negation rule should fail open");
+        return;
+    }
+    PASS();
+}
+
+/* Issue #920: the safe form, where the negated relation is projected to a key
+ * relation first so every negated variable is positively bound, is accepted.
+ * A wildcard under negation is likewise safe. */
+static void
+test_safe_negation_via_projection_accepted(void)
+{
+    TEST("safe negation (projected key / wildcard) is accepted");
+
+    const char *src
+        = ".decl a(x: symbol)\n"
+        ".decl b(x: symbol, y: symbol)\n"
+        ".decl b_key(x: symbol)\n"
+        ".decl c(x: symbol)\n"
+        ".decl d(x: symbol)\n"
+        "b_key(X) :- b(X, Y).\n"          /* project away Y */
+        "c(X) :- a(X), !b_key(X).\n"      /* X positively bound */
+        "d(X) :- a(X), !b(X, _).\n";      /* wildcard column is safe */
+
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("safe negation rule should open");
+        return;
+    }
+    wirelog_easy_close(s);
+    PASS();
+}
+
 static void
 test_side_compound_public_allocation_saturates(void)
 {
@@ -1790,6 +1839,8 @@ main(void)
     test_side_compound_wrong_functor_handle_no_match();
     test_side_compound_nested_child_no_match();
     test_negated_side_compound_body_pattern_rejected();
+    test_unsafe_negation_variable_rejected();
+    test_safe_negation_via_projection_accepted();
     test_side_compound_public_allocation_saturates();
     test_insert_sym_variadic();
     test_remove_sym();

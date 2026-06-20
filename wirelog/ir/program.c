@@ -1864,6 +1864,46 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             wirelog_ir_node_t *neg_scan
                 = build_atom_scan(neg_atom, prog, &neg_vars, &neg_vcount);
 
+            /* Safety / range restriction (issue #920): every named variable in
+             * a negated atom must also be bound by a positive body atom. A
+             * variable that occurs only under negation has an unbounded range,
+             * so the rule is unsafe and is rejected. build_atom_scan normalizes
+             * wildcards and constants to NULL, so only non-NULL entries are
+             * named variables that require a positive binding. */
+            for (uint32_t j = 0; j < neg_vcount; j++) {
+                if (!neg_vars[j])
+                    continue;
+                bool bound = false;
+                for (uint32_t c = 0; c < cur_vcount; c++) {
+                    if (cur_vars[c]
+                        && strcmp(cur_vars[c], neg_vars[j]) == 0) {
+                        bound = true;
+                        break;
+                    }
+                }
+                if (bound)
+                    continue;
+
+                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                    "unsafe variable '%s' appears only in negated atom '%s'; "
+                    "bind it in a positive body atom (e.g. project the negated "
+                    "relation first: key(...) :- %s(...); "
+                    "head :- ..., !key(...))",
+                    neg_vars[j], neg_atom->name ? neg_atom->name : "?",
+                    neg_atom->name ? neg_atom->name : "rel");
+                free_var_names(neg_vars, neg_vcount);
+                wl_ir_node_free(neg_scan);
+                for (uint32_t s = 0; s < scan_count; s++)
+                    free_var_names(scan_vars[s], scan_vcounts[s]);
+                if (cur_vars_is_merged)
+                    free_var_names(cur_vars, cur_vcount);
+                wl_ir_node_free(current);
+                free(scans);
+                free(scan_vars);
+                free(scan_vcounts);
+                return NULL;
+            }
+
             if (neg_scan) {
                 wirelog_ir_node_t *aj = wl_ir_node_create(WIRELOG_IR_ANTIJOIN);
                 if (aj) {
