@@ -22,6 +22,12 @@ permissions:
   actions: read
   contents: read
 
+# Compiler caching: route gcc/clang/MSVC through sccache with the GitHub
+# Actions cache backend. Set workflow-wide so every build job's compile steps
+# pick it up; non-build jobs simply ignore it.
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   # ==========================================================================
   # Issue #747 B18: RC changelog freeze gate (stable always-emitting context)
@@ -62,10 +68,13 @@ jobs:
     strategy:
       fail-fast: false
     env:
-      CC: gcc
+      CC: sccache gcc
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Install dependencies
         run: |
@@ -135,10 +144,13 @@ jobs:
     strategy:
       fail-fast: false
     env:
-      CC: gcc
+      CC: sccache gcc
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Install dependencies
         run: |
@@ -185,6 +197,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -212,7 +227,7 @@ jobs:
         if: runner.os != 'Windows'
         run: meson setup builddir -Dtests=true -DmbedTLS=disabled
         env:
-          CC: ${{ matrix.cc }}
+          CC: sccache ${{ matrix.cc }}
 
       - name: Configure (Windows / MSVC)
         if: runner.os == 'Windows'
@@ -231,8 +246,8 @@ jobs:
           if (-not $clExe) { throw 'cl.exe was not found under the MSVC toolset' }
           $env:PATH = "$(Split-Path -Parent $clExe);$env:PATH"
           Get-Command cl.exe
-          $env:CC = 'cl'
-          $env:CXX = 'cl'
+          $env:CC = 'sccache cl'
+          $env:CXX = 'sccache cl'
           meson setup builddir -Dtests=true -DmbedTLS=disabled
 
       - name: Build (Linux / macOS)
@@ -297,6 +312,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -305,7 +323,7 @@ jobs:
       - name: Configure with mbedTLS enabled
         run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
         env:
-          CC: gcc
+          CC: sccache gcc
 
       - name: Build with mbedTLS enabled
         run: meson compile -C builddir-mbedtls
@@ -347,6 +365,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -369,7 +390,7 @@ jobs:
           -Dtests=true
           --buildtype=debug
         env:
-          CC: ${{ matrix.cc }}
+          CC: sccache ${{ matrix.cc }}
 
       - name: Build with sanitizers
         run: meson compile -C builddir-san
@@ -396,6 +417,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -410,7 +434,7 @@ jobs:
             -Dtests=true \
             --buildtype=debug
         env:
-          CC: gcc
+          CC: sccache gcc
 
       - name: Build with TSan
         run: meson compile -C builddir-tsan
@@ -455,6 +479,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -469,7 +496,7 @@ jobs:
             -Dtests=true \
             --buildtype=debug
         env:
-          CC: gcc
+          CC: sccache gcc
 
       - name: Build with TSan (native threads)
         run: meson compile -C builddir-tsan-native
