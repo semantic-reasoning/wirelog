@@ -138,6 +138,12 @@ scan_string(wl_parser_lexer_t *lexer)
 {
     /* Opening quote already consumed */
     while (!is_at_end(lexer) && peek(lexer) != '"') {
+        if (peek(lexer) == '\\'
+            && (peek_next(lexer) == '"' || peek_next(lexer) == '\\')) {
+            advance(lexer);
+            advance(lexer);
+            continue;
+        }
         advance(lexer);
     }
 
@@ -649,13 +655,24 @@ char *
 wl_parser_lexer_token_to_string(const wl_parser_lexer_token_t *token)
 {
     if (token->type == WL_PARSER_LEXER_TOK_STRING) {
-        /* Strip surrounding quotes */
+        /* Strip surrounding quotes and decode supported string escapes. */
         if (token->length >= 2) {
             uint32_t inner_len = token->length - 2;
             char *str = (char *)malloc(inner_len + 1);
             if (str) {
-                memcpy(str, token->start + 1, inner_len);
-                str[inner_len] = '\0';
+                const char *p = token->start + 1;
+                const char *end = p + inner_len;
+                char *out = str;
+                while (p < end) {
+                    if (*p == '\\' && p + 1 < end
+                        && (p[1] == '"' || p[1] == '\\')) {
+                        *out++ = p[1];
+                        p += 2;
+                        continue;
+                    }
+                    *out++ = *p++;
+                }
+                *out = '\0';
             }
             return str;
         }

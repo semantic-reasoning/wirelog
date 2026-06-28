@@ -143,17 +143,7 @@ token_to_name(const wl_parser_lexer_token_t *token)
 static char *
 token_to_str_value(const wl_parser_lexer_token_t *token)
 {
-    /* Strip quotes from string token */
-    if (token->length >= 2) {
-        uint32_t inner = token->length - 2;
-        char *s = (char *)malloc(inner + 1);
-        if (s) {
-            memcpy(s, token->start + 1, inner);
-            s[inner] = '\0';
-        }
-        return s;
-    }
-    return (char *)calloc(1, 1);
+    return wl_parser_lexer_token_to_string(token);
 }
 
 static bool
