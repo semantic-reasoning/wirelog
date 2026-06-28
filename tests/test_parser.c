@@ -1510,6 +1510,52 @@ test_parse_fact_string_constant(void)
     PASS();
 }
 
+static void
+test_parse_fact_string_escaped_quote(void)
+{
+    TEST("fact string constant with escaped quote");
+    PARSE("relation(\"s\", \"r\", \"a\\\"b\").");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *fact = child(program, 0);
+    if (fact->type != WL_PARSER_AST_NODE_FACT || fact->child_count != 3) {
+        CLEANUP();
+        FAIL("expected relation fact with 3 args");
+        return;
+    }
+    const wl_parser_ast_node_t *arg2 = child(fact, 2);
+    if (arg2->type != WL_PARSER_AST_NODE_STRING || !arg2->str_value
+        || strcmp(arg2->str_value, "a\"b") != 0) {
+        CLEANUP();
+        FAIL("arg 2 should be STRING 'a\"b'");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_fact_string_escaped_backslash(void)
+{
+    TEST("fact string constant with escaped backslash");
+    PARSE("path(\"a\\\\b\").");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *fact = child(program, 0);
+    if (fact->type != WL_PARSER_AST_NODE_FACT || fact->child_count != 1) {
+        CLEANUP();
+        FAIL("expected path fact with 1 arg");
+        return;
+    }
+    const wl_parser_ast_node_t *arg0 = child(fact, 0);
+    if (arg0->type != WL_PARSER_AST_NODE_STRING || !arg0->str_value
+        || strcmp(arg0->str_value, "a\\b") != 0) {
+        CLEANUP();
+        FAIL("arg 0 should be STRING 'a\\b'");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
 /* ======================================================================== */
 /* Parser: Compound Terms (Issue #530)                                      */
 /* ======================================================================== */
@@ -1991,6 +2037,8 @@ main(void)
     test_parse_facts_mixed_with_rules();
     test_parse_fact_rejects_variables();
     test_parse_fact_string_constant();
+    test_parse_fact_string_escaped_quote();
+    test_parse_fact_string_escaped_backslash();
 
     printf("\n--- Compound Terms (Issue #530) ---\n");
     test_parser_compound_basic();

@@ -232,6 +232,28 @@ test_string_empty(void)
     PASS();
 }
 
+static void
+test_string_escaped_quote(void)
+{
+    TEST("string literal with escaped quote");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "\"a\\\"b\"");
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_STRING, "a\"b");
+    ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_EOF);
+    PASS();
+}
+
+static void
+test_string_escaped_backslash(void)
+{
+    TEST("string literal with escaped backslash");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "\"a\\\\b\"");
+    ASSERT_TOK_STR(lex, WL_PARSER_LEXER_TOK_STRING, "a\\b");
+    ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_EOF);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Lexer: Boolean Literals                                                  */
 /* ======================================================================== */
@@ -881,6 +903,8 @@ main(void)
     test_integer_large();
     test_string_literal();
     test_string_empty();
+    test_string_escaped_quote();
+    test_string_escaped_backslash();
 
     printf("\n--- Boolean Literals ---\n");
     test_true_literal();
