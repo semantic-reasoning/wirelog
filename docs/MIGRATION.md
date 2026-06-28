@@ -1,11 +1,31 @@
 # Migration Guide
 
-**Last Updated:** 2026-06-13
+**Last Updated:** 2026-06-28
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
+
+## 0.51 -> 0.52
+
+Version `0.52.0` is a correctness-focused release after `0.51.0`. Two
+parser/IR fixes can change behavior for programs that relied on previously
+accepted-but-unsafe input. No public API or ABI changes are required.
+
+- **Unsafe negated-atom variables now rejected** (#920): a rule where a named
+  variable appears only inside a negated body atom (e.g.
+  `c(X) :- a(X), !b(X, Y).`) is now rejected at IR lowering with
+  `WIRELOG_ERR_INVALID_IR`.  Such variables had an unbounded range and
+  produced range-dependent results when silently accepted.  Bind the variable
+  in a positive body atom, or project the negated relation to a key relation
+  first (the error message names the workaround).  Wildcards (`!b(X, _)`) and
+  constant columns are unaffected.
+- **String literal escape decoding** (#925): `\"` and `\\` inside a string
+  literal are now treated as escapes.  Strings that previously relied on a
+  literal backslash being preserved verbatim will decode differently; double
+  the backslash (`\\`) to keep a literal backslash, and use `\"` to embed a
+  quote without terminating the string.
 
 ## 0.50 -> 0.51
 

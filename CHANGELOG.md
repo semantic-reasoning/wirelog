@@ -20,6 +20,45 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+## [0.52.0] - 2026-06-28
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **Unsafe variables in negated body atoms** (#920): the IR lowering now
+  rejects rules where a named variable appears only inside a negated body
+  atom (e.g. `c(X) :- a(X), !b(X, Y).`).  Such variables have an unbounded
+  range and were previously treated like wildcards, silently accepting the
+  rule and producing range-dependent results.  Every named variable in a
+  negated atom must now also be bound by a positive body atom, otherwise the
+  rule is rejected with `WIRELOG_ERR_INVALID_IR`; the error names the
+  supported workaround (project the negated relation to a key relation
+  first).  Wildcards (`!b(X, _)`) and constant columns remain accepted.
+- **String literal escape decoding** (#925): the lexer now recognizes `\"`
+  and `\\` escapes inside string literals.  An escaped quote no longer
+  terminates the string early, and the decoded token value unescapes `\"`
+  and `\\` instead of preserving the backslash verbatim.
+
+### Performance
+
+### Security
+
+### Documentation
+
+- **Negation and side compounds** (#921): documented that negating a
+  side-tier compound body pattern (e.g. `!event(ID, metadata(...))`) is
+  rejected because negated side-join lowering is not yet implemented, and
+  the supported positive-extraction workaround that preserves the same
+  expressive power.  The IR-conversion error now names the workaround and
+  points at `docs/COMPOUND_TERMS.md`.
+
 ## [0.51.0] - 2026-06-13
 
 ### Added
