@@ -313,6 +313,7 @@ test_open_opts_null_equiv_to_open(void)
         return;
     }
     wirelog_easy_close(s);
+
     PASS();
 }
 
@@ -1806,6 +1807,8 @@ test_issue_665_partial_conjunction_multi_worker(void)
     PASS();
 }
 
+/* PARITY: facade-only -- this regression targets the easy query-mode API
+ * contract; the advanced API has no snapshot-by-relation facade. */
 static void
 test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
 {
