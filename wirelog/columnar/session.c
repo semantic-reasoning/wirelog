@@ -1683,6 +1683,10 @@ col_session_insert(wl_session_t *session, const char *relation,
     }
 
     session_note_inserted_input(sess, relation, false);
+    /* The non-incremental API must force a full epoch evaluation even when
+     * the previous update targeted the same relation. */
+    sess->last_inserted_relation = NULL;
+    sess->pending_full_input_eval = true;
 
     return 0;
 }

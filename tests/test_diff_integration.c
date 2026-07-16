@@ -626,9 +626,10 @@ test_guard_single_stratum(void)
     printf("(diff_active=%d nstrata=%u) ",
         (int)cs->diff_operators_active, cs->plan->stratum_count);
 
-    /* 1-stratum: all strata affected => full_mask => guard stays false */
-    ASSERT(cs->diff_operators_active == false,
-        "guard must be false for single-stratum program (full mask)");
+    /* Issue #275: full affected masks still use the differential path when
+     * the update was explicitly incremental. */
+    ASSERT(cs->diff_operators_active == true,
+        "incremental single-stratum update should activate diff");
 
     teardown(sess, plan, prog);
     PASS();
@@ -874,9 +875,9 @@ test_guard_true_then_false_transition(void)
 
     printf("(after_full=%d) ", (int)cs->diff_operators_active);
 
-    /* After inserting into "base", all strata affected => guard false */
-    ASSERT(cs->diff_operators_active == false,
-        "guard must be false after full-mask insert");
+    /* Issue #275: full affected masks remain eligible for incremental diff. */
+    ASSERT(cs->diff_operators_active == true,
+        "incremental full-mask insert should activate diff");
 
     teardown(sess, plan, prog);
     PASS();
