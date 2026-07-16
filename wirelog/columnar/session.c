@@ -2140,6 +2140,7 @@ col_session_step(wl_session_t *session)
     sess->last_inserted_relation = NULL;
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
+    sess->has_evaluated = true;
     for (uint32_t i = 0; i < sess->nrels; i++) {
         col_rel_t *r = sess->rels[i];
         if (r)
@@ -2293,7 +2294,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         return col_session_emit_snapshot(plan, sess, callback, user_data);
     }
 
-    if (sess->total_iterations > 0
+    if (sess->has_evaluated
         && (sess->pending_full_input_eval
         || (sess->pending_input_change
         && sess->last_inserted_relation == NULL))) {
@@ -2302,11 +2303,11 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 
     /* Phase 4 incremental skip: when last_inserted_relation is set, only
      * re-evaluate strata that transitively depend on the inserted relation.
-     * On the first snapshot (total_iterations == 0), always evaluate all strata
+     * On the first snapshot (has_evaluated == false), always evaluate all strata
      * to establish the baseline. */
     uint64_t affected_mask = UINT64_MAX;
     if (!sess->pending_full_input_eval && sess->last_inserted_relation != NULL
-        && sess->total_iterations > 0) {
+        && sess->has_evaluated) {
         affected_mask = col_compute_affected_strata(
             session, sess->last_inserted_relation);
 
@@ -2427,13 +2428,13 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     /* Issue #361: Use TDD parallel evaluation in snapshot when workers are
      * available and facts have been loaded (initial non-incremental eval).
      * col_eval_stratum_tdd falls back to single-threaded when W<=1.
-     * Issue #413: Enable TDD for initial snapshot (total_iterations == 0)
+     * Issue #413: Enable TDD for initial snapshot (has_evaluated == false)
      * OR incremental evaluation (last_inserted_relation != NULL). */
     bool snapshot_tdd_eligible = (affected_mask == UINT64_MAX
         && sess->num_workers > 1
         && ((!sess->pending_full_input_eval
         && sess->last_inserted_relation != NULL)
-        || sess->total_iterations == 0));
+        || !sess->has_evaluated));
     sess->tdd_decision_tracking_active = true;
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         if ((affected_mask & ((uint64_t)1 << si)) == 0)
@@ -2638,6 +2639,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     sess->delta_seeded = false;
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
+    sess->has_evaluated = true;
     sess->snapshot_stable_valid = true;
 
     /* Issue #83: Update base_nrows for all relations after convergence.

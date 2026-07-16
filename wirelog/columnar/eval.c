@@ -6637,11 +6637,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      * Also reset stratum frontier so should_skip_iteration does not skip
      * iterations beyond the previous step's convergence point.
      * When no new EDB was inserted, skip clearing to preserve frontier skip.
-     * Issue #372: Skip clearing on first snapshot (total_iterations == 0):
+     * Issue #372: Skip clearing on first snapshot (has_evaluated == false):
      * IDB relations may hold EDB seeds (e.g. r(1,2) for r(x,z):-r(x,y),r(y,z))
      * that must survive into the first evaluation pass. */
     if (coord->last_inserted_relation != NULL
-        && coord->total_iterations > 0) {
+        && coord->has_evaluated) {
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
             if (r && r->nrows > 0) {
