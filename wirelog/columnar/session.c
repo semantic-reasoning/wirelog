@@ -2420,8 +2420,14 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
             /* Else: rule's stratum affected but no pre-seeded delta → KEEP frontier */
         }
     } else {
-        /* Full re-evaluation (non-incremental call): reset ALL rule frontiers
-        * to (current_epoch, UINT32_MAX) sentinel. Prevents premature skip. */
+        /* Full re-evaluation (non-incremental call): reset all stratum and
+         * rule frontiers to (current_epoch, UINT32_MAX) so no stale frontier
+         * can skip required iterations after clearing IDB state. */
+        for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
+            si++) {
+            sess->frontier_ops->reset_stratum_frontier(sess, si,
+                sess->outer_epoch);
+        }
         for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
             sess->frontier_ops->reset_rule_frontier(sess, ri,
                 sess->outer_epoch);
