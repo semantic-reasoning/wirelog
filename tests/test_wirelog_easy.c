@@ -1817,9 +1817,12 @@ test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
     const char *src
         = ".decl A(x: int32)\n"
         ".decl B(x: int32)\n"
+        ".decl P(x: int32)\n"
         ".decl Q(x: int32)\n"
+        ".decl Alarm(x: int32)\n"
         "Q(x) :- A(x).\n"
-        "Q(x) :- B(x).\n";
+        "Q(x) :- B(x).\n"
+        "Alarm(x) :- P(x), !Q(x).\n";
     int64_t row[] = { 7 };
     wirelog_easy_session_t *s = NULL;
     if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
@@ -1827,7 +1830,8 @@ test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
         return;
     }
     if (wirelog_easy_insert(s, "A", row, 1) != WIRELOG_OK
-        || wirelog_easy_insert(s, "B", row, 1) != WIRELOG_OK) {
+        || wirelog_easy_insert(s, "B", row, 1) != WIRELOG_OK
+        || wirelog_easy_insert(s, "P", row, 1) != WIRELOG_OK) {
         FAIL("insert failed");
         wirelog_easy_close(s);
         return;
@@ -1855,6 +1859,13 @@ test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
         || wirelog_easy_snapshot(s, "Q", collect_tuple, &q) != WIRELOG_OK
         || q.count != 0) {
         FAIL("fully retracted Q row must not remain materialized");
+        wirelog_easy_close(s);
+        return;
+    }
+    memset(&q, 0, sizeof(q));
+    if (wirelog_easy_snapshot(s, "Alarm", collect_tuple, &q) != WIRELOG_OK
+        || q.count != 1) {
+        FAIL("retraction must expose the negation-derived alarm");
         wirelog_easy_close(s);
         return;
     }
