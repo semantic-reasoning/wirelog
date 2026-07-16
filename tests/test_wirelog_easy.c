@@ -1878,10 +1878,8 @@ test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
     }
     memset(&q, 0, sizeof(q));
     if (wirelog_easy_snapshot(s, "Q", collect_tuple, &q) != WIRELOG_OK
-        || q.count != 2) {
-        /* Snapshot emission preserves IDB multiplicity: A(7) and B(7)
-         * provide two supports for Q(7). */
-        FAIL("incremental insert must preserve Q support multiplicity");
+        || q.count != 1) {
+        FAIL("input change must not duplicate Q rows");
         wirelog_easy_close(s);
         return;
     }
