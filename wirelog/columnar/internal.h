@@ -769,6 +769,10 @@ typedef struct wl_col_session_t {
     wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
     col_mat_cache_t mat_cache; /* materialization cache (US-006)        */
     uint32_t total_iterations; /* fixed-point iterations in last eval   */
+    /* True after at least one evaluation pass has completed successfully.
+     * Unlike total_iterations, this remains true when a pass converges
+     * without performing a fixpoint iteration. */
+    bool has_evaluated;
     /* Issue #176: Per-iteration cache eviction for recursive strata.
      * cache_evict_threshold: target cache size (bytes) for LRU eviction
      * in recursive stratum iteration loop. When cache exceeds this threshold,

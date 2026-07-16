@@ -1806,6 +1806,86 @@ test_issue_665_partial_conjunction_multi_worker(void)
     PASS();
 }
 
+static void
+test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
+{
+    TEST("query snapshots rebuild IDB rows after input changes");
+
+    const char *src
+        = ".decl A(x: int32)\n"
+        ".decl B(x: int32)\n"
+        ".decl Q(x: int32)\n"
+        "Q(x) :- A(x).\n"
+        "Q(x) :- B(x).\n";
+    int64_t row[] = { 7 };
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+    if (wirelog_easy_insert(s, "A", row, 1) != WIRELOG_OK
+        || wirelog_easy_insert(s, "B", row, 1) != WIRELOG_OK) {
+        FAIL("insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    tuple_collector_t q;
+    memset(&q, 0, sizeof(q));
+    if (wirelog_easy_snapshot(s, "Q", collect_tuple, &q) != WIRELOG_OK
+        || q.count != 1) {
+        FAIL("initial snapshot should contain one Q row");
+        wirelog_easy_close(s);
+        return;
+    }
+    memset(&q, 0, sizeof(q));
+    if (wirelog_easy_remove(s, "A", row, 1) != WIRELOG_OK
+        || wirelog_easy_snapshot(s, "Q", collect_tuple, &q) != WIRELOG_OK
+        || q.count != 1) {
+        FAIL("retraction snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    memset(&q, 0, sizeof(q));
+    if (wirelog_easy_remove(s, "B", row, 1) != WIRELOG_OK
+        || wirelog_easy_snapshot(s, "Q", collect_tuple, &q) != WIRELOG_OK
+        || q.count != 0) {
+        FAIL("fully retracted Q row must not remain materialized");
+        wirelog_easy_close(s);
+        return;
+    }
+    wirelog_easy_close(s);
+
+    s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s
+        || wirelog_easy_insert(s, "B", row, 1) != WIRELOG_OK) {
+        FAIL("incremental-insert setup failed");
+        if (s)
+            wirelog_easy_close(s);
+        return;
+    }
+    memset(&q, 0, sizeof(q));
+    if (wirelog_easy_snapshot(s, "Q", collect_tuple, &q) != WIRELOG_OK
+        || q.count != 1
+        || wirelog_easy_insert(s, "A", row, 1) != WIRELOG_OK) {
+        FAIL("incremental-insert setup snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+    memset(&q, 0, sizeof(q));
+    if (wirelog_easy_snapshot(s, "Q", collect_tuple, &q) != WIRELOG_OK
+        || q.count != 2) {
+        /* Snapshot emission preserves IDB multiplicity: A(7) and B(7)
+         * provide two supports for Q(7). */
+        FAIL("incremental insert must preserve Q support multiplicity");
+        wirelog_easy_close(s);
+        return;
+    }
+    wirelog_easy_close(s);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1853,6 +1933,7 @@ main(void)
     test_delta_cb_multi_round_recursive_insert();
     test_issue_665_partial_conjunction_default_workers();
     test_issue_665_partial_conjunction_multi_worker();
+    test_snapshot_rebuilds_idb_after_query_mode_input_changes();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
