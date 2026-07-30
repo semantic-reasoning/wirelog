@@ -886,7 +886,9 @@ typedef struct wl_col_session_t {
     bool tdd_decision_tracking_active;
     /* Phase 4: tracks which relation was just inserted via
      * col_session_insert_incremental, enables affected-stratum skip
-     * optimization. Borrowed pointer; lifetime: until next session_step.
+     * optimization. Session-owned canonical relation name; base and
+     * compound-side relations remain registered while input work is pending,
+     * so the pointer stays valid until a successful step/snapshot clears it.
      * NULL when no incremental insert preceded the current step (all strata
      * evaluated normally via affected_mask = UINT64_MAX). */
     const char *last_inserted_relation;
@@ -938,7 +940,9 @@ typedef struct wl_col_session_t {
     bool stratum_is_monotone[MAX_STRATA];
     /* Retraction delta tracking (Issue #158): tracks which relation was just
      * removed via col_session_remove_incremental, enables delta retraction path.
-     * Borrowed pointer; lifetime: until next session_step.
+     * Session-owned canonical relation name; the base relation remains
+     * registered while retraction work is pending, so the pointer stays valid
+     * until a successful step clears it.
      * NULL when no incremental remove preceded the current step. */
     const char *last_removed_relation;
     /* Retraction-seeded incremental evaluation (Issue #158).

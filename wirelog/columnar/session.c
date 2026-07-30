@@ -121,16 +121,18 @@ session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
 }
 
 static void
-session_note_inserted_input(wl_col_session_t *sess, const char *relation,
+session_note_inserted_input(wl_col_session_t *sess, const col_rel_t *relation,
     bool advance_epoch)
 {
-    session_invalidate_relation_caches(sess, relation);
+    const char *relation_name = relation->name;
+
+    session_invalidate_relation_caches(sess, relation_name);
     if (advance_epoch)
         sess->outer_epoch++;
     if (sess->last_inserted_relation
-        && strcmp(sess->last_inserted_relation, relation) != 0)
+        && strcmp(sess->last_inserted_relation, relation_name) != 0)
         sess->pending_full_input_eval = true;
-    sess->last_inserted_relation = relation;
+    sess->last_inserted_relation = relation_name;
     sess->pending_input_change = true;
     sess->snapshot_stable_valid = false;
 }
@@ -1682,7 +1684,7 @@ col_session_insert(wl_session_t *session, const char *relation,
             return rc;
     }
 
-    session_note_inserted_input(sess, relation, false);
+    session_note_inserted_input(sess, r, false);
     /* The non-incremental API must force a full epoch evaluation even when
      * the previous update targeted the same relation. */
     sess->pending_full_input_eval = true;
@@ -1773,7 +1775,7 @@ col_session_make_compound(wl_session_t *session, const char *functor,
         return rc;
     }
 
-    session_note_inserted_input(sess, side_rel->name, true);
+    session_note_inserted_input(sess, side_rel, true);
     *handle_out = handle;
     return 0;
 }
@@ -1830,7 +1832,7 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     }
 
     wl_col_session_t *sess = COL_SESSION(session);
-    session_note_inserted_input(sess, relation, true);
+    session_note_inserted_input(sess, r, true);
     return 0;
 }
 
@@ -1890,7 +1892,7 @@ col_session_remove(wl_session_t *session, const char *relation,
         r->nrows = out_r;
 next_del:;
     }
-    session_invalidate_relation_caches(sess, relation);
+    session_invalidate_relation_caches(sess, r->name);
     sess->pending_input_change = true;
     sess->snapshot_stable_valid = false;
     return 0;
@@ -1930,7 +1932,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
 
     /* Allocate $r$<name> delta relation to collect removed rows */
     char rname[256];
-    snprintf(rname, sizeof(rname), "$r$%s", relation);
+    snprintf(rname, sizeof(rname), "$r$%s", r->name);
 
     col_rel_t *rdelta = col_rel_new_auto(rname, num_cols);
     if (!rdelta)
@@ -2004,10 +2006,10 @@ next_del_incr:;
      * so subsequent re-evaluation rebuilds hash indices without the removed
      * rows.  Without this, cached arrangements contain stale entries that
      * produce phantom join matches during full re-eval retraction. */
-    session_invalidate_relation_caches(sess, relation);
+    session_invalidate_relation_caches(sess, r->name);
 
     /* Mark removal for affected-stratum calculation */
-    sess->last_removed_relation = relation;
+    sess->last_removed_relation = r->name;
     sess->outer_epoch++;
     sess->pending_input_change = true;
 

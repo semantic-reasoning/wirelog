@@ -55,6 +55,11 @@ static const char *PROG_SRC =
     "path(X,Y) :- edge(X,Y).\n"
     "path(X,Z) :- path(X,Y), edge(Y,Z).\n";
 
+static const char *RELATION_NAME_LIFETIME_SRC
+    = ".decl edge(x: int64, y: int64)\n"
+    ".decl reach(x: int64, y: int64)\n"
+    "reach(X, Y) :- edge(X, Y).\n";
+
 static const char *PROG_RBAC_SRC =
     ".decl role_permission(role:symbol,perm:symbol)\n"
     ".decl member_of(user:symbol,role:symbol,scope:symbol)\n"
@@ -377,6 +382,158 @@ test_insert_step_delta(void)
         rc = 1;
     }
 
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* Parity (#931): mirrors test_wirelog_easy.c::test_relation_name_lifetime. */
+static int
+test_relation_name_lifetime(void)
+{
+    int rc = 0;
+    int64_t row[2] = { 1, 2 };
+    wirelog_program_t *prog
+        = parse_or_die(RELATION_NAME_LIFETIME_SRC, "relation-name lifetime");
+    if (!prog)
+        return 1;
+
+    wirelog_session_t *s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    struct tuple_filter tuples = { .target_relation = "reach" };
+    if (wirelog_session_snapshot(s, filter_tuples, &tuples) != WIRELOG_OK) {
+        fprintf(stderr, "relation-name lifetime: baseline snapshot failed\n");
+        rc = 1;
+        goto regular_out;
+    }
+
+    char regular_relation[8] = "edge";
+    if (wirelog_session_insert(s, regular_relation, row, 1, 2)
+        != WIRELOG_OK) {
+        fprintf(stderr, "relation-name lifetime: regular insert failed\n");
+        rc = 1;
+        goto regular_out;
+    }
+    strcpy(regular_relation, "bogus");
+
+    memset(&tuples, 0, sizeof(tuples));
+    tuples.target_relation = "reach";
+    if (wirelog_session_snapshot(s, filter_tuples, &tuples) != WIRELOG_OK) {
+        fprintf(stderr,
+            "relation-name lifetime: post-insert snapshot failed\n");
+        rc = 1;
+        goto regular_out;
+    }
+    bool found_snapshot = false;
+    for (int i = 0; i < tuples.count; i++) {
+        if (tuples.ncols[i] == 2 && tuples.rows[i][0] == row[0]
+            && tuples.rows[i][1] == row[1]) {
+            found_snapshot = true;
+            break;
+        }
+    }
+    if (!found_snapshot) {
+        fprintf(stderr,
+            "relation-name lifetime: mutable regular name suppressed "
+            "reach(1,2)\n");
+        rc = 1;
+    }
+
+regular_out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    if (rc != 0)
+        return rc;
+
+    prog = parse_or_die(
+        RELATION_NAME_LIFETIME_SRC, "relation-name delta lifetime");
+    if (!prog)
+        return 1;
+    s = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+        != WIRELOG_OK) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    struct delta_collector deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    if (wirelog_session_set_delta_cb(s, collect_delta_rows, &deltas)
+        != WIRELOG_OK) {
+        fprintf(stderr, "relation-name lifetime: set_delta_cb failed\n");
+        rc = 1;
+        goto delta_out;
+    }
+
+    char inserted_relation[8] = "edge";
+    if (wirelog_session_insert(s, inserted_relation, row, 1, 2)
+        != WIRELOG_OK) {
+        fprintf(stderr, "relation-name lifetime: delta insert failed\n");
+        rc = 1;
+        goto delta_out;
+    }
+    strcpy(inserted_relation, "bogus");
+    if (wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr,
+            "relation-name lifetime: post-insert step failed\n");
+        rc = 1;
+        goto delta_out;
+    }
+
+    bool found_insert = false;
+    for (int i = 0; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "reach") == 0
+            && deltas.ncols[i] == 2 && deltas.rows[i][0] == row[0]
+            && deltas.rows[i][1] == row[1] && deltas.diffs[i] == 1) {
+            found_insert = true;
+            break;
+        }
+    }
+    int before_remove = deltas.count;
+
+    char removed_relation[8] = "edge";
+    if (wirelog_session_remove(s, removed_relation, row, 1, 2)
+        != WIRELOG_OK) {
+        fprintf(stderr, "relation-name lifetime: delta remove failed\n");
+        rc = 1;
+        goto delta_out;
+    }
+    strcpy(removed_relation, "bogus");
+    if (wirelog_session_step(s) != WIRELOG_OK) {
+        fprintf(stderr,
+            "relation-name lifetime: post-remove step failed\n");
+        rc = 1;
+        goto delta_out;
+    }
+
+    bool found_remove = false;
+    for (int i = before_remove; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "reach") == 0
+            && deltas.ncols[i] == 2 && deltas.rows[i][0] == row[0]
+            && deltas.rows[i][1] == row[1] && deltas.diffs[i] == -1) {
+            found_remove = true;
+            break;
+        }
+    }
+    if (!found_insert) {
+        fprintf(stderr,
+            "relation-name lifetime: mutable inserted name suppressed "
+            "+reach(1,2)\n");
+        rc = 1;
+    }
+    if (!found_remove) {
+        fprintf(stderr,
+            "relation-name lifetime: mutable removed name suppressed "
+            "-reach(1,2)\n");
+        rc = 1;
+    }
+
+delta_out:
     wirelog_session_destroy(s);
     wirelog_program_free(prog);
     return rc;
@@ -1617,6 +1774,7 @@ main(void)
     failures += test_create_invalid_backend();
     failures += test_inline_facts_seeded();
     failures += test_insert_step_delta();
+    failures += test_relation_name_lifetime();
     failures += test_insert_remove_roundtrip();
     failures += test_null_safety();
     failures += test_open_parse_error();
