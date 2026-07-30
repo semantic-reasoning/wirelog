@@ -8,6 +8,7 @@
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/columnar_nanoarrow.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -127,6 +128,36 @@ test_tc_plan_generation(void)
             found_edge_edb = 1;
     }
     ASSERT(found_edge_edb, "edge not in EDB list");
+
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_plan_generation_preinterns_static_string_literals(void)
+{
+    TEST("plan generation pre-interns static string literals");
+
+    const char *src = ".decl trigger(value: symbol)\n"
+        ".decl unused(value: symbol, plane: symbol)\n"
+        "unused(X, \"data\") :- trigger(X).\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "parse failed");
+    ASSERT(wl_intern_get(prog->intern, "data") < 0,
+        "parser unexpectedly interned projection literal");
+
+    ASSERT(wl_fusion_apply(prog, NULL) == 0, "fusion failed");
+    ASSERT(wl_jpp_apply(prog, NULL) == 0, "JPP failed");
+    ASSERT(wl_sip_apply(prog, NULL) == 0, "SIP failed");
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    ASSERT(rc == 0, "plan generation failed");
+    ASSERT(wl_intern_get(prog->intern, "data") >= 0,
+        "plan generation did not intern projection literal");
 
     wl_plan_free(plan);
     wirelog_program_free(prog);
@@ -367,6 +398,7 @@ main(void)
     printf("=== Plan Generator Tests ===\n");
 
     test_tc_plan_generation();
+    test_plan_generation_preinterns_static_string_literals();
     test_tc_end_to_end();
     test_join_project_fusion_plan_shape();
     test_join_project_fusion_keeps_computed_map();
