@@ -78,6 +78,11 @@ static const char *ACCESS_CONTROL_SRC
     ".decl granted(user: symbol, perm: symbol)\n"
     "granted(U, P) :- can(U, P).\n";
 
+static const char *RELATION_NAME_LIFETIME_SRC
+    = ".decl edge(x: int64, y: int64)\n"
+    ".decl reach(x: int64, y: int64)\n"
+    "reach(X, Y) :- edge(X, Y).\n";
+
 /* ======================================================================== */
 /* Delta Collector                                                          */
 /* ======================================================================== */
@@ -617,6 +622,131 @@ test_eager_sessions_preintern_projection_literals(void)
     wirelog_easy_close(read_session);
     if (!found) {
         FAIL("expected +unused(seed,data) delta not seen");
+        return;
+    }
+    PASS();
+}
+
+/* PARITY: paired in test_wirelog_advanced.c by the same test name (#931). */
+static void
+test_relation_name_lifetime(void)
+{
+    TEST("insert/remove retain relation name until evaluation");
+
+    int64_t row[2] = { 1, 2 };
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(RELATION_NAME_LIFETIME_SRC, &s) != WIRELOG_OK
+        || !s) {
+        FAIL("regular-path open failed");
+        return;
+    }
+
+    tuple_collector_t tuples;
+    memset(&tuples, 0, sizeof(tuples));
+    if (wirelog_easy_snapshot(s, "reach", collect_tuple, &tuples)
+        != WIRELOG_OK) {
+        FAIL("baseline snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    char regular_relation[8] = "edge";
+    if (wirelog_easy_insert(s, regular_relation, row, 2) != WIRELOG_OK) {
+        FAIL("regular-path insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+    strcpy(regular_relation, "bogus");
+
+    memset(&tuples, 0, sizeof(tuples));
+    if (wirelog_easy_snapshot(s, "reach", collect_tuple, &tuples)
+        != WIRELOG_OK) {
+        FAIL("snapshot after mutable-name insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+    bool found_snapshot = false;
+    for (int i = 0; i < tuples.count; i++) {
+        if (strcmp(tuples.relations[i], "reach") == 0
+            && tuples.ncols[i] == 2 && tuples.rows[i][0] == row[0]
+            && tuples.rows[i][1] == row[1]) {
+            found_snapshot = true;
+            break;
+        }
+    }
+    wirelog_easy_close(s);
+    if (!found_snapshot) {
+        FAIL("mutable regular relation name suppressed reach(1,2)");
+        return;
+    }
+
+    s = NULL;
+    if (wirelog_easy_open(RELATION_NAME_LIFETIME_SRC, &s) != WIRELOG_OK
+        || !s) {
+        FAIL("delta-path open failed");
+        return;
+    }
+    delta_collector_t deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    if (wirelog_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK) {
+        FAIL("set_delta_cb failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    char inserted_relation[8] = "edge";
+    if (wirelog_easy_insert(s, inserted_relation, row, 2) != WIRELOG_OK) {
+        FAIL("delta-path insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+    strcpy(inserted_relation, "bogus");
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
+        FAIL("step after mutable-name insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    bool found_insert = false;
+    for (int i = 0; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "reach") == 0
+            && deltas.ncols[i] == 2 && deltas.rows[i][0] == row[0]
+            && deltas.rows[i][1] == row[1] && deltas.diffs[i] == 1) {
+            found_insert = true;
+            break;
+        }
+    }
+    int before_remove = deltas.count;
+
+    char removed_relation[8] = "edge";
+    if (wirelog_easy_remove(s, removed_relation, row, 2) != WIRELOG_OK) {
+        FAIL("delta-path remove failed");
+        wirelog_easy_close(s);
+        return;
+    }
+    strcpy(removed_relation, "bogus");
+    if (wirelog_easy_step(s) != WIRELOG_OK) {
+        FAIL("step after mutable-name remove failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    bool found_remove = false;
+    for (int i = before_remove; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "reach") == 0
+            && deltas.ncols[i] == 2 && deltas.rows[i][0] == row[0]
+            && deltas.rows[i][1] == row[1] && deltas.diffs[i] == -1) {
+            found_remove = true;
+            break;
+        }
+    }
+    wirelog_easy_close(s);
+    if (!found_insert) {
+        FAIL("mutable inserted relation name suppressed +reach(1,2)");
+        return;
+    }
+    if (!found_remove) {
+        FAIL("mutable removed relation name suppressed -reach(1,2)");
         return;
     }
     PASS();
@@ -1999,6 +2129,7 @@ main(void)
     test_intern_returns_same_id();
     test_insert_step_delta();
     test_eager_sessions_preintern_projection_literals();
+    test_relation_name_lifetime();
     test_inline_compound_body_binding();
     test_inline_compound_body_join_binding();
     test_inline_compound_functor_mismatch_is_empty();
