@@ -1,11 +1,32 @@
 # Migration Guide
 
-**Last Updated:** 2026-06-28
+**Last Updated:** 2026-07-31
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
+
+## 0.52 -> 0.53
+
+Version `0.53.0` is a correctness-focused release after `0.52.0`. It does
+not change the public API, ABI, or source compatibility.
+
+- **Query-mode snapshots now discard stale derived state** (#929): input
+  changes and retractions no longer leave materialized IDB state that can
+  produce duplicate or phantom tuples. Corrected evaluation may also produce
+  stratified-negation-derived rows that a stale phantom tuple previously
+  suppressed.
+- **Static program string literals are pre-interned** (#932): applications no
+  longer need to manually pre-intern literals used by program filter,
+  projection, or aggregate expressions to keep paired Easy read and delta
+  sessions aligned. This correction is limited to those static plan literals;
+  raw symbol IDs are not a general stable contract across sessions or runs
+  when hosts intern arbitrary strings in different orders.
+- **Pending relation names are session-owned** (#931): FFI integrations no
+  longer need to cache the relation-name buffer between an insert or remove
+  call and the following `step()` or snapshot. Keeping that buffer alive
+  remains safe, but is no longer required.
 
 ## 0.51 -> 0.52
 
