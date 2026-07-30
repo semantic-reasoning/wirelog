@@ -545,6 +545,82 @@ test_insert_step_delta(void)
 }
 
 static void
+test_eager_sessions_preintern_projection_literals(void)
+{
+    TEST("eager sessions pre-intern projection literals");
+
+    const char *src = ".decl trigger(value: symbol)\n"
+        ".decl unused(value: symbol, plane: symbol)\n"
+        "unused(X, \"data\") :- trigger(X).\n";
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    opts.eager_build = true;
+    wirelog_easy_session_t *read_session = NULL;
+    wirelog_easy_session_t *delta_session = NULL;
+
+    if (wirelog_easy_open_opts(src, &opts, &read_session) != WIRELOG_OK
+        || !read_session
+        || wirelog_easy_open_opts(src, &opts, &delta_session) != WIRELOG_OK
+        || !delta_session) {
+        FAIL("eager open failed");
+        wirelog_easy_close(delta_session);
+        wirelog_easy_close(read_session);
+        return;
+    }
+
+    int64_t read_seed = wirelog_easy_intern(read_session, "seed");
+    int64_t delta_seed = wirelog_easy_intern(delta_session, "seed");
+    if (read_seed < 0 || read_seed != delta_seed) {
+        FAIL("identical eager sessions assigned different seed ids");
+        wirelog_easy_close(delta_session);
+        wirelog_easy_close(read_session);
+        return;
+    }
+
+    delta_collector_t deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    if (wirelog_easy_set_delta_cb(delta_session, collect_delta, &deltas)
+        != WIRELOG_OK
+        || wirelog_easy_insert(read_session, "trigger", &read_seed, 1)
+        != WIRELOG_OK
+        || wirelog_easy_insert(delta_session, "trigger", &delta_seed, 1)
+        != WIRELOG_OK
+        || wirelog_easy_step(delta_session) != WIRELOG_OK) {
+        FAIL("incremental projection evaluation failed");
+        wirelog_easy_close(delta_session);
+        wirelog_easy_close(read_session);
+        return;
+    }
+
+    int64_t read_late = wirelog_easy_intern(read_session, "late");
+    int64_t delta_late = wirelog_easy_intern(delta_session, "late");
+    if (read_late < 0 || read_late != delta_late) {
+        FAIL("runtime projection literal changed later symbol ids");
+        wirelog_easy_close(delta_session);
+        wirelog_easy_close(read_session);
+        return;
+    }
+
+    int64_t data = wirelog_easy_intern(delta_session, "data");
+    bool found = false;
+    for (int i = 0; i < deltas.count; i++) {
+        if (strcmp(deltas.relations[i], "unused") == 0
+            && deltas.ncols[i] == 2 && deltas.rows[i][0] == delta_seed
+            && deltas.rows[i][1] == data && deltas.diffs[i] == 1) {
+            found = true;
+            break;
+        }
+    }
+
+    wirelog_easy_close(delta_session);
+    wirelog_easy_close(read_session);
+    if (!found) {
+        FAIL("expected +unused(seed,data) delta not seen");
+        return;
+    }
+    PASS();
+}
+
+static void
 test_inline_compound_body_binding(void)
 {
     TEST("inline compound body pattern binds public Datalog variables");
@@ -1920,6 +1996,7 @@ main(void)
     test_num_workers_explicit_four();
     test_intern_returns_same_id();
     test_insert_step_delta();
+    test_eager_sessions_preintern_projection_literals();
     test_inline_compound_body_binding();
     test_inline_compound_body_join_binding();
     test_inline_compound_functor_mismatch_is_empty();

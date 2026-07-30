@@ -12,6 +12,7 @@
 #include "exec_plan_gen.h"
 
 #include "columnar/columnar_nanoarrow.h"
+#include "intern.h"
 #include "ir/ir.h"
 #include "ir/program.h"
 #include "wirelog-ir.h"
@@ -69,6 +70,76 @@ make_delta_name(const char *name)
     memcpy(d, "$d$", 3);
     memcpy(d + 3, name, len + 1);
     return d;
+}
+
+/*
+ * Intern every static string literal that the plan evaluator may encounter
+ * before a session starts evaluating expressions.  Otherwise evaluation
+ * order can assign different symbol IDs to otherwise identical sessions.
+ */
+static int
+wl_exec_plan_gen_preintern_expr(
+    wl_intern_t *intern, const wl_ir_expr_t *expr)
+{
+    if (!expr)
+        return 0;
+
+    for (uint32_t i = 0; i < expr->child_count; i++) {
+        if (wl_exec_plan_gen_preintern_expr(intern, expr->children[i]) != 0)
+            return -1;
+    }
+
+    if (expr->type == WL_IR_EXPR_CONST_STR
+        && (!expr->str_value || wl_intern_put(intern, expr->str_value) < 0))
+        return -1;
+
+    return 0;
+}
+
+static int
+wl_exec_plan_gen_preintern_node(
+    wl_intern_t *intern, const wirelog_ir_node_t *node)
+{
+    if (!node)
+        return 0;
+
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        if (wl_exec_plan_gen_preintern_node(intern, node->children[i]) != 0)
+            return -1;
+    }
+
+    if (wl_exec_plan_gen_preintern_expr(intern, node->filter_expr) != 0)
+        return -1;
+    for (uint32_t i = 0; node->project_exprs && i < node->project_count; i++) {
+        if (wl_exec_plan_gen_preintern_expr(intern, node->project_exprs[i])
+            != 0)
+            return -1;
+    }
+    if (wl_exec_plan_gen_preintern_expr(intern, node->agg_expr) != 0)
+        return -1;
+
+    /*
+     * Compound-inline arguments and compound-side handles are excluded:
+     * translate_ir_node() does not serialize those expression fields for the
+     * current plan evaluator.
+     */
+    return 0;
+}
+
+static int
+wl_exec_plan_gen_preintern_static_strings(
+    const struct wirelog_program *prog)
+{
+    if (!prog->intern)
+        return -1;
+
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (wl_exec_plan_gen_preintern_node(
+                prog->intern, prog->relation_irs ? prog->relation_irs[i] : NULL)
+            != 0)
+            return -1;
+    }
+    return 0;
 }
 
 /* ======================================================================== */
@@ -2515,6 +2586,9 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         return -1;
 
     *out = NULL;
+
+    if (wl_exec_plan_gen_preintern_static_strings(prog) != 0)
+        return -1;
 
     wl_plan_t *plan = (wl_plan_t *)calloc(1, sizeof(wl_plan_t));
     if (!plan)
