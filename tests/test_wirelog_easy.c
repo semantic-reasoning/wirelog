@@ -544,6 +544,8 @@ test_insert_step_delta(void)
     PASS();
 }
 
+/* PARITY: facade-only -- advanced facade has no eager-open API or
+ * session-scoped public symbol interning API (#932). */
 static void
 test_eager_sessions_preintern_projection_literals(void)
 {
