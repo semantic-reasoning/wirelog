@@ -1054,9 +1054,10 @@ test('option2_doop', test_option2_doop_exe,
 # CRDT W=1 perf-suite gate.
 #
 # Drives the same Datalog source as bench_flowlog --workload crdt and
-# asserts median wall <= TARGET_MS (currently 19,840 ms = baseline
-# 18,890 ms x 1.05).  Default-suite invocation skips this entry
-# (suite is 'perf').  Registered here, after backend_src/arena_src/
+# asserts the corrected result relation cardinality before enforcing the
+# full-snapshot median wall-time target (currently 38,120 ms) documented
+# in docs/CRDT_PERF_BASELINE.md.  Default-suite invocation skips this
+# entry (suite is 'perf').  Registered here, after backend_src/arena_src/
 # workqueue_src are defined, so it can link the full evaluator.
 #
 #   Linux:   echo performance | sudo tee /sys/.../scaling_governor

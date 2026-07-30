@@ -29,10 +29,10 @@
  * leaves headroom and matches the historical CRDT_SRC_BUFSZ. */
 #define WL_BENCH_CRDT_SRC_BUFSZ ((size_t)8 * 1024)
 
-/* Gold output cardinality for the CRDT result relation on the shipped
- * bench/data/crdt fixtures.  Exposed as a header constant so the perf
- * gate can assert correctness without re-deriving the number. */
-#define WL_BENCH_CRDT_GOLD_TUPLES ((int64_t)1301914)
+/* Expected cardinality of the CRDT result relation on the shipped
+ * bench/data/crdt fixtures.  This is not the aggregate number of rows
+ * emitted for all relations by a full-session snapshot. */
+#define WL_BENCH_CRDT_RESULT_TUPLES ((int64_t)104851)
 
 static const char wl_bench_crdt_template[]
     = ".decl Insert_input(ctr: int32, node: int32, parent_ctr: int32, "

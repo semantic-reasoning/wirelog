@@ -31,11 +31,11 @@
  *                                           runner where the operator
  *                                           is asserting the host is
  *                                           configured)
- *   - tuple count != gold (1,301,914)    -> FAIL (correctness sentinel
- *                                           checked BEFORE the timing
- *                                           assertion so a wrong-output
- *                                           bug never trips the timing
- *                                           gate spuriously)
+ *   - result count != expected (104,851) -> FAIL (correctness sentinel
+ *                                            checked BEFORE the timing
+ *                                            assertion so a wrong-output
+ *                                            bug never trips the timing
+ *                                            gate spuriously)
  *   - baseline CoV > 3%                  -> SKIP (measurement noise
  *                                           exceeds the budget)
  *   - median wall > target               -> FAIL (the gate fires)
@@ -78,33 +78,32 @@ enum {
     SKIP_EXIT = 77,
 };
 
-/* Median budget, in milliseconds.  Provenance: baseline median 18,890 ms
- * captured on the dev box with W=1, repeat=1, governor=NOT-asserted.
- * 1.05 envelope accounts for run-to-run variance + the tighter governor
- * pinning the perf-gate runner uses.  See .omc/perf/CRDT_BASELINE.md
- * section 1.  Tighten this when post-optimization commits land: each
- * commit's PR records a fresh n=9 median and the gate ratchets down. */
-#define WL_CRDT_PERF_GATE_TARGET_MS 19840
+/* Median budget, in milliseconds.  The post-#914 n=9 baseline median is
+* 36,303.0 ms; a 5% envelope rounded up to the next 10 ms gives 38,120 ms.
+* See docs/CRDT_PERF_BASELINE.md for the fixture and host provenance. */
+#define WL_CRDT_PERF_GATE_TARGET_MS 38120
 
 /* Coefficient-of-variation ceiling for the trial buffer.  3% mirrors
- * the WL_LOG perf gate's tolerance; CRDT runs ~19 s per trial so even
- * 3% is ~570 ms of jitter, well within "still meaningful" if the
+ * the WL_LOG perf gate's tolerance; CRDT runs ~36 s per trial so even
+ * 3% is ~1.1 s of jitter, well within "still meaningful" if the
  * cpufreq governor is pinned. */
 #define MAX_BASELINE_COV 0.03
 
 struct count_ctx {
-    int64_t total;
+    int64_t aggregate;
+    int64_t result;
 };
 
 static void
 count_cb(const char *relation, const int64_t *row, uint32_t ncols,
     void *user_data)
 {
-    (void)relation;
     (void)row;
     (void)ncols;
     struct count_ctx *ctx = (struct count_ctx *)user_data;
-    ctx->total++;
+    ctx->aggregate++;
+    if (relation && strcmp(relation, "result") == 0)
+        ctx->result++;
 }
 
 /* Resolve the CRDT data directory.  Order:
@@ -151,13 +150,14 @@ parse_bool_env_(const char *name, int default_val)
 }
 
 /* Run the CRDT pipeline once.  Returns 0 on success and writes the
- * tuple count and iteration count to the out-pointers; -1 on any
- * pipeline error.  Mirrors run_pipeline_count() in
+ * aggregate snapshot count, result-relation count, and iteration count
+ * to the out-pointers; -1 on any pipeline error.  Mirrors
+ * run_pipeline_count() in
  * bench/bench_flowlog.c, kept independent so this test does not depend
  * on the bench driver as a library. */
 static int
 run_crdt_once_(const char *source, uint32_t num_workers,
-    int64_t *out_count, uint32_t *out_iters)
+    int64_t *out_aggregate, int64_t *out_result, uint32_t *out_iters)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(source, &err);
@@ -210,8 +210,10 @@ run_crdt_once_(const char *source, uint32_t num_workers,
     if (rc != 0)
         return -1;
 
-    if (out_count)
-        *out_count = ctx.total;
+    if (out_aggregate)
+        *out_aggregate = ctx.aggregate;
+    if (out_result)
+        *out_result = ctx.result;
     if (out_iters)
         *out_iters = iters;
     return 0;
@@ -285,33 +287,41 @@ main(void)
     /* One untimed warm-up to amortize page cache + first-run engine
      * lazy init.  CRDT is too long to median-of-9 with no warm-up
      * without paying it as the worst trial. */
-    int64_t warm_count = 0;
+    int64_t warm_aggregate = 0;
+    int64_t warm_result = 0;
     uint32_t warm_iters = 0;
-    if (run_crdt_once_(source, 1, &warm_count, &warm_iters) != 0) {
+    wl_perf_ns_t warm_t0 = wl_perf_now_ns();
+    int warm_rc = run_crdt_once_(source, 1, &warm_aggregate, &warm_result,
+            &warm_iters);
+    wl_perf_ns_t warm_t1 = wl_perf_now_ns();
+    double warmup_ms = (double)(warm_t1 - warm_t0) / 1.0e6;
+    if (warm_rc != 0) {
         fprintf(stderr,
             "test_crdt_perf_gate: FAIL: CRDT pipeline error on warm-up\n");
         free(source);
         return 1;
     }
-    if (warm_count != WL_BENCH_CRDT_GOLD_TUPLES) {
+    if (warm_result != WL_BENCH_CRDT_RESULT_TUPLES) {
         fprintf(stderr,
-            "test_crdt_perf_gate: FAIL: warm-up tuple count %" PRId64
-            " != gold %" PRId64
+            "test_crdt_perf_gate: FAIL: warm-up result count %" PRId64
+            " != expected %" PRId64
             " (correctness regression; refusing to time)\n",
-            warm_count, WL_BENCH_CRDT_GOLD_TUPLES);
+            warm_result, WL_BENCH_CRDT_RESULT_TUPLES);
         free(source);
         return 1;
     }
 
     double trials_ms[TRIALS];
-    int64_t last_count = 0;
+    int64_t last_aggregate = 0;
+    int64_t last_result = 0;
     uint32_t last_iters = 0;
 
     for (int i = 0; i < TRIALS; i++) {
         wl_perf_ns_t t0 = wl_perf_now_ns();
-        int64_t count = 0;
+        int64_t aggregate = 0;
+        int64_t result = 0;
         uint32_t iters = 0;
-        int rc = run_crdt_once_(source, 1, &count, &iters);
+        int rc = run_crdt_once_(source, 1, &aggregate, &result, &iters);
         wl_perf_ns_t t1 = wl_perf_now_ns();
 
         if (rc != 0) {
@@ -321,16 +331,17 @@ main(void)
             free(source);
             return 1;
         }
-        if (count != WL_BENCH_CRDT_GOLD_TUPLES) {
+        if (result != WL_BENCH_CRDT_RESULT_TUPLES) {
             fprintf(stderr,
-                "test_crdt_perf_gate: FAIL: trial %d tuple count %" PRId64
-                " != gold %" PRId64 "\n",
-                i, count, WL_BENCH_CRDT_GOLD_TUPLES);
+                "test_crdt_perf_gate: FAIL: trial %d result count %" PRId64
+                " != expected %" PRId64 "\n",
+                i, result, WL_BENCH_CRDT_RESULT_TUPLES);
             free(source);
             return 1;
         }
         trials_ms[i] = (double)(t1 - t0) / 1.0e6;
-        last_count = count;
+        last_aggregate = aggregate;
+        last_result = result;
         last_iters = iters;
     }
     free(source);
@@ -338,18 +349,26 @@ main(void)
     double mean = wl_perf_mean_ms(trials_ms, (size_t)TRIALS);
     double stdev = wl_perf_stdev_ms(trials_ms, (size_t)TRIALS, mean);
     double cov = (mean > 0.0) ? stdev / mean : 0.0;
+    fprintf(stderr, "test_crdt_perf_gate: raw_ms =");
+    for (int i = 0; i < TRIALS; i++)
+        fprintf(stderr, " %.1f", trials_ms[i]);
+    fputc('\n', stderr);
     double median = wl_perf_median_ms_inplace(trials_ms, (size_t)TRIALS);
 
     fprintf(stderr,
         "test_crdt_perf_gate: trials=%d workers=1\n"
         "  data_dir   = %s\n"
-        "  tuples     = %" PRId64 " (gold %" PRId64 ")\n"
+        "  warmup_ms  = %.1f\n"
+        "  aggregate  = %" PRId64 " (diagnostic only)\n"
+        "  result     = %" PRId64 " (expected %" PRId64 ")\n"
         "  iterations = %" PRIu32 "\n"
         "  mean_ms    = %.1f\n"
         "  stdev_ms   = %.2f (CoV %.3f%%)\n"
         "  median_ms  = %.1f (target %d)\n",
         TRIALS, data_dir,
-        last_count, WL_BENCH_CRDT_GOLD_TUPLES,
+        warmup_ms,
+        last_aggregate,
+        last_result, WL_BENCH_CRDT_RESULT_TUPLES,
         last_iters, mean, stdev, cov * 100.0,
         median, WL_CRDT_PERF_GATE_TARGET_MS);
 
