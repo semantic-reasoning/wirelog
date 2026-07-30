@@ -20,6 +20,45 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+## [0.53.0] - 2026-07-31
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **Query-mode snapshot correctness** (#929, #930): snapshots after input
+  changes or retractions no longer reuse stale materialized derived state that
+  could emit phantom or duplicate tuples and suppress valid
+  stratified-negation results. Completed evaluation state is now tracked
+  separately, bulk inserts force full recomputation, and full recomputation
+  resets each stratum and rule frontier.
+- **Static string literal interning** (#932, #933): plan generation now
+  pre-interns static filter, projection, and aggregate literals. Those plan
+  literals now stay consistent in paired Easy read and delta sessions
+  regardless of which evaluates first, preventing downstream host-row
+  mismatches and `UNKNOWN` failures.
+- **Relation-name buffer lifetime** (#931, #934): pending insert and remove
+  evaluation now retains the session-owned canonical relation name, so callers
+  and FFI bindings can reuse or release their relation-name buffer after the
+  API call returns without silently losing `step()` or snapshot deltas.
+- **CRDT release performance gate** (#935): the gate now validates the final
+  `result` relation instead of optimizer-sensitive aggregate snapshot rows,
+  while retaining aggregate counts as diagnostics. The corrected post-#914
+  full-snapshot evaluation had a 36,303 ms nine-run median, establishing a
+  38,120 ms gate target.
+
+### Performance
+
+### Security
+
+### Documentation
+
 ## [0.52.0] - 2026-06-28
 
 ### Added
