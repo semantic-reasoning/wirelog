@@ -1762,4 +1762,56 @@ tdd_reconstruct_delta_matrix(col_eval_tdd_worker_ctx_t *ctxs,
     const wl_delta_msg_t *msgs, uint32_t count,
     uint32_t num_workers, uint32_t nrels);
 
+/*
+ * COL_FILTER_SEL_SLACK:
+ * Spare uint32_t slots the caller must add to a col_filter_select_rows()
+ * selection buffer.  The AVX2 left-pack writes a full 8-lane vector even
+ * when fewer lanes are selected, so the buffer needs room for one whole
+ * vector past the largest possible selection count.
+ */
+#define COL_FILTER_SEL_SLACK 8u
+
+/*
+ * COL_FILTER_TILE:
+ * Rows scanned per selection pass before the passing ones are materialized.
+ *
+ * Tiling exists because scanning the whole column first and materializing
+ * afterwards measured slower than the fused loop on wide relations: by the
+ * time materialization reached a row it had been evicted.
+ *
+ * The exact value matters far less than having one.  Sweeping 256 / 1024 /
+ * 4096 / 16384 over 100k- and 1M-row relations barely moved scan throughput,
+ * so the win comes from separating the vectorizable scan from the
+ * materialize, not from fitting any particular cache level.  1024 is chosen
+ * because larger tiles cost more on 8-column relations at moderate
+ * selectivity: measured at 1M rows and 25% selectivity, 0.94x of the fused
+ * loop at 4096 and 0.92x at 16384, against ~0.96x here.  It halves that
+ * regression rather than removing it; smaller tiles recover no more of it
+ * and give up throughput on narrow relations.
+ */
+#define COL_FILTER_TILE 1024u
+
+/*
+ * col_filter_select_rows:
+ * Scan a contiguous int64_t column and record the indices of passing rows.
+ *
+ * @col_a    left operand column, @nrows entries (required)
+ * @col_b    right operand column when comparing two columns, else NULL
+ * @const_b  right operand value when @col_b is NULL
+ * @nrows    number of rows to scan
+ * @cmp_op   WL_PLAN_EXPR_CMP_* opcode; an unrecognized opcode selects nothing
+ * @out_sel  receives the passing row indices in ascending order; must have
+ *           capacity @nrows + COL_FILTER_SEL_SLACK
+ *
+ * Returns the number of indices written to @out_sel.
+ *
+ * Exposed (rather than static) so tests and benchmarks can drive the kernel
+ * directly.  It is not part of the public API and is not exported: the
+ * project builds with hidden symbol visibility.
+ */
+uint32_t
+col_filter_select_rows(const int64_t *col_a, const int64_t *col_b,
+    int64_t const_b, uint32_t nrows, wl_plan_expr_tag_t cmp_op,
+    uint32_t *out_sel);
+
 #endif /* WL_COLUMNAR_INTERNAL_H */

@@ -1050,6 +1050,23 @@ test('option2_doop', test_option2_doop_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
 )
 
+# Differential test for the column-native filter kernel: the AVX2 body and
+# the scalar body must select identical rows, including all 256 left-pack
+# LUT entries.  Drives col_filter_select_rows() directly.
+test_filter_select_rows_exe = executable(
+  'test_filter_select_rows',
+  files('test_filter_select_rows.c'),
+  backend_src,
+  files(subdir_wirelog / 'intern.c'),
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('filter_select_rows', test_filter_select_rows_exe)
+
 # ============================================================================
 # CRDT W=1 perf-suite gate.
 #

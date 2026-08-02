@@ -1548,6 +1548,421 @@ col_filter_cmp_row(const int64_t *row, uint32_t ncols,
     }
 }
 
+/* --- Column-native filter selection kernel -------------------------------
+ *
+ * col_filter_select_rows() scans one or two contiguous int64_t columns and
+ * writes the indices of the passing rows into a selection vector.  It is the
+ * scan half of col_op_filter()'s fast path; materialization is separate so
+ * the scan can run branchless over contiguous memory.
+ *
+ * This replaces the row-major SIMD kernels removed earlier: those gathered
+ * data[r * ncols + col_a], touching one cache line per row.  Column-native
+ * access is contiguous, so a whole vector loads in one instruction.
+ */
+
+#ifdef __AVX2__
+/*
+ * Left-pack table: for selection mask m, byte j holds the lane index of the
+ * j-th set bit of m; trailing bytes are 0 and are never consumed because the
+ * caller advances by popcount(m).  256 * 8 = 2048 bytes, and it lands in
+ * .rodata rather than .text.
+ *
+ * _mm256_cvtepu8_epi32 widens the 8 bytes to 8 uint32 lanes, which is the
+ * control operand _mm256_permutevar8x32_epi32 needs.
+ */
+static const uint8_t col_filter_leftpack_lut[256][8] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 0, 0, 0, 0, 0, 0 },
+    { 2, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 2, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 2, 0, 0, 0, 0, 0 },
+    { 3, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 3, 0, 0, 0, 0, 0, 0 },
+    { 1, 3, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 3, 0, 0, 0, 0, 0 },
+    { 2, 3, 0, 0, 0, 0, 0, 0 },
+    { 0, 2, 3, 0, 0, 0, 0, 0 },
+    { 1, 2, 3, 0, 0, 0, 0, 0 },
+    { 0, 1, 2, 3, 0, 0, 0, 0 },
+    { 4, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 4, 0, 0, 0, 0, 0, 0 },
+    { 1, 4, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 4, 0, 0, 0, 0, 0 },
+    { 2, 4, 0, 0, 0, 0, 0, 0 },
+    { 0, 2, 4, 0, 0, 0, 0, 0 },
+    { 1, 2, 4, 0, 0, 0, 0, 0 },
+    { 0, 1, 2, 4, 0, 0, 0, 0 },
+    { 3, 4, 0, 0, 0, 0, 0, 0 },
+    { 0, 3, 4, 0, 0, 0, 0, 0 },
+    { 1, 3, 4, 0, 0, 0, 0, 0 },
+    { 0, 1, 3, 4, 0, 0, 0, 0 },
+    { 2, 3, 4, 0, 0, 0, 0, 0 },
+    { 0, 2, 3, 4, 0, 0, 0, 0 },
+    { 1, 2, 3, 4, 0, 0, 0, 0 },
+    { 0, 1, 2, 3, 4, 0, 0, 0 },
+    { 5, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 5, 0, 0, 0, 0, 0, 0 },
+    { 1, 5, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 5, 0, 0, 0, 0, 0 },
+    { 2, 5, 0, 0, 0, 0, 0, 0 },
+    { 0, 2, 5, 0, 0, 0, 0, 0 },
+    { 1, 2, 5, 0, 0, 0, 0, 0 },
+    { 0, 1, 2, 5, 0, 0, 0, 0 },
+    { 3, 5, 0, 0, 0, 0, 0, 0 },
+    { 0, 3, 5, 0, 0, 0, 0, 0 },
+    { 1, 3, 5, 0, 0, 0, 0, 0 },
+    { 0, 1, 3, 5, 0, 0, 0, 0 },
+    { 2, 3, 5, 0, 0, 0, 0, 0 },
+    { 0, 2, 3, 5, 0, 0, 0, 0 },
+    { 1, 2, 3, 5, 0, 0, 0, 0 },
+    { 0, 1, 2, 3, 5, 0, 0, 0 },
+    { 4, 5, 0, 0, 0, 0, 0, 0 },
+    { 0, 4, 5, 0, 0, 0, 0, 0 },
+    { 1, 4, 5, 0, 0, 0, 0, 0 },
+    { 0, 1, 4, 5, 0, 0, 0, 0 },
+    { 2, 4, 5, 0, 0, 0, 0, 0 },
+    { 0, 2, 4, 5, 0, 0, 0, 0 },
+    { 1, 2, 4, 5, 0, 0, 0, 0 },
+    { 0, 1, 2, 4, 5, 0, 0, 0 },
+    { 3, 4, 5, 0, 0, 0, 0, 0 },
+    { 0, 3, 4, 5, 0, 0, 0, 0 },
+    { 1, 3, 4, 5, 0, 0, 0, 0 },
+    { 0, 1, 3, 4, 5, 0, 0, 0 },
+    { 2, 3, 4, 5, 0, 0, 0, 0 },
+    { 0, 2, 3, 4, 5, 0, 0, 0 },
+    { 1, 2, 3, 4, 5, 0, 0, 0 },
+    { 0, 1, 2, 3, 4, 5, 0, 0 },
+    { 6, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 6, 0, 0, 0, 0, 0, 0 },
+    { 1, 6, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 6, 0, 0, 0, 0, 0 },
+    { 2, 6, 0, 0, 0, 0, 0, 0 },
+    { 0, 2, 6, 0, 0, 0, 0, 0 },
+    { 1, 2, 6, 0, 0, 0, 0, 0 },
+    { 0, 1, 2, 6, 0, 0, 0, 0 },
+    { 3, 6, 0, 0, 0, 0, 0, 0 },
+    { 0, 3, 6, 0, 0, 0, 0, 0 },
+    { 1, 3, 6, 0, 0, 0, 0, 0 },
+    { 0, 1, 3, 6, 0, 0, 0, 0 },
+    { 2, 3, 6, 0, 0, 0, 0, 0 },
+    { 0, 2, 3, 6, 0, 0, 0, 0 },
+    { 1, 2, 3, 6, 0, 0, 0, 0 },
+    { 0, 1, 2, 3, 6, 0, 0, 0 },
+    { 4, 6, 0, 0, 0, 0, 0, 0 },
+    { 0, 4, 6, 0, 0, 0, 0, 0 },
+    { 1, 4, 6, 0, 0, 0, 0, 0 },
+    { 0, 1, 4, 6, 0, 0, 0, 0 },
+    { 2, 4, 6, 0, 0, 0, 0, 0 },
+    { 0, 2, 4, 6, 0, 0, 0, 0 },
+    { 1, 2, 4, 6, 0, 0, 0, 0 },
+    { 0, 1, 2, 4, 6, 0, 0, 0 },
+    { 3, 4, 6, 0, 0, 0, 0, 0 },
+    { 0, 3, 4, 6, 0, 0, 0, 0 },
+    { 1, 3, 4, 6, 0, 0, 0, 0 },
+    { 0, 1, 3, 4, 6, 0, 0, 0 },
+    { 2, 3, 4, 6, 0, 0, 0, 0 },
+    { 0, 2, 3, 4, 6, 0, 0, 0 },
+    { 1, 2, 3, 4, 6, 0, 0, 0 },
+    { 0, 1, 2, 3, 4, 6, 0, 0 },
+    { 5, 6, 0, 0, 0, 0, 0, 0 },
+    { 0, 5, 6, 0, 0, 0, 0, 0 },
+    { 1, 5, 6, 0, 0, 0, 0, 0 },
+    { 0, 1, 5, 6, 0, 0, 0, 0 },
+    { 2, 5, 6, 0, 0, 0, 0, 0 },
+    { 0, 2, 5, 6, 0, 0, 0, 0 },
+    { 1, 2, 5, 6, 0, 0, 0, 0 },
+    { 0, 1, 2, 5, 6, 0, 0, 0 },
+    { 3, 5, 6, 0, 0, 0, 0, 0 },
+    { 0, 3, 5, 6, 0, 0, 0, 0 },
+    { 1, 3, 5, 6, 0, 0, 0, 0 },
+    { 0, 1, 3, 5, 6, 0, 0, 0 },
+    { 2, 3, 5, 6, 0, 0, 0, 0 },
+    { 0, 2, 3, 5, 6, 0, 0, 0 },
+    { 1, 2, 3, 5, 6, 0, 0, 0 },
+    { 0, 1, 2, 3, 5, 6, 0, 0 },
+    { 4, 5, 6, 0, 0, 0, 0, 0 },
+    { 0, 4, 5, 6, 0, 0, 0, 0 },
+    { 1, 4, 5, 6, 0, 0, 0, 0 },
+    { 0, 1, 4, 5, 6, 0, 0, 0 },
+    { 2, 4, 5, 6, 0, 0, 0, 0 },
+    { 0, 2, 4, 5, 6, 0, 0, 0 },
+    { 1, 2, 4, 5, 6, 0, 0, 0 },
+    { 0, 1, 2, 4, 5, 6, 0, 0 },
+    { 3, 4, 5, 6, 0, 0, 0, 0 },
+    { 0, 3, 4, 5, 6, 0, 0, 0 },
+    { 1, 3, 4, 5, 6, 0, 0, 0 },
+    { 0, 1, 3, 4, 5, 6, 0, 0 },
+    { 2, 3, 4, 5, 6, 0, 0, 0 },
+    { 0, 2, 3, 4, 5, 6, 0, 0 },
+    { 1, 2, 3, 4, 5, 6, 0, 0 },
+    { 0, 1, 2, 3, 4, 5, 6, 0 },
+    { 7, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 7, 0, 0, 0, 0, 0, 0 },
+    { 1, 7, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 7, 0, 0, 0, 0, 0 },
+    { 2, 7, 0, 0, 0, 0, 0, 0 },
+    { 0, 2, 7, 0, 0, 0, 0, 0 },
+    { 1, 2, 7, 0, 0, 0, 0, 0 },
+    { 0, 1, 2, 7, 0, 0, 0, 0 },
+    { 3, 7, 0, 0, 0, 0, 0, 0 },
+    { 0, 3, 7, 0, 0, 0, 0, 0 },
+    { 1, 3, 7, 0, 0, 0, 0, 0 },
+    { 0, 1, 3, 7, 0, 0, 0, 0 },
+    { 2, 3, 7, 0, 0, 0, 0, 0 },
+    { 0, 2, 3, 7, 0, 0, 0, 0 },
+    { 1, 2, 3, 7, 0, 0, 0, 0 },
+    { 0, 1, 2, 3, 7, 0, 0, 0 },
+    { 4, 7, 0, 0, 0, 0, 0, 0 },
+    { 0, 4, 7, 0, 0, 0, 0, 0 },
+    { 1, 4, 7, 0, 0, 0, 0, 0 },
+    { 0, 1, 4, 7, 0, 0, 0, 0 },
+    { 2, 4, 7, 0, 0, 0, 0, 0 },
+    { 0, 2, 4, 7, 0, 0, 0, 0 },
+    { 1, 2, 4, 7, 0, 0, 0, 0 },
+    { 0, 1, 2, 4, 7, 0, 0, 0 },
+    { 3, 4, 7, 0, 0, 0, 0, 0 },
+    { 0, 3, 4, 7, 0, 0, 0, 0 },
+    { 1, 3, 4, 7, 0, 0, 0, 0 },
+    { 0, 1, 3, 4, 7, 0, 0, 0 },
+    { 2, 3, 4, 7, 0, 0, 0, 0 },
+    { 0, 2, 3, 4, 7, 0, 0, 0 },
+    { 1, 2, 3, 4, 7, 0, 0, 0 },
+    { 0, 1, 2, 3, 4, 7, 0, 0 },
+    { 5, 7, 0, 0, 0, 0, 0, 0 },
+    { 0, 5, 7, 0, 0, 0, 0, 0 },
+    { 1, 5, 7, 0, 0, 0, 0, 0 },
+    { 0, 1, 5, 7, 0, 0, 0, 0 },
+    { 2, 5, 7, 0, 0, 0, 0, 0 },
+    { 0, 2, 5, 7, 0, 0, 0, 0 },
+    { 1, 2, 5, 7, 0, 0, 0, 0 },
+    { 0, 1, 2, 5, 7, 0, 0, 0 },
+    { 3, 5, 7, 0, 0, 0, 0, 0 },
+    { 0, 3, 5, 7, 0, 0, 0, 0 },
+    { 1, 3, 5, 7, 0, 0, 0, 0 },
+    { 0, 1, 3, 5, 7, 0, 0, 0 },
+    { 2, 3, 5, 7, 0, 0, 0, 0 },
+    { 0, 2, 3, 5, 7, 0, 0, 0 },
+    { 1, 2, 3, 5, 7, 0, 0, 0 },
+    { 0, 1, 2, 3, 5, 7, 0, 0 },
+    { 4, 5, 7, 0, 0, 0, 0, 0 },
+    { 0, 4, 5, 7, 0, 0, 0, 0 },
+    { 1, 4, 5, 7, 0, 0, 0, 0 },
+    { 0, 1, 4, 5, 7, 0, 0, 0 },
+    { 2, 4, 5, 7, 0, 0, 0, 0 },
+    { 0, 2, 4, 5, 7, 0, 0, 0 },
+    { 1, 2, 4, 5, 7, 0, 0, 0 },
+    { 0, 1, 2, 4, 5, 7, 0, 0 },
+    { 3, 4, 5, 7, 0, 0, 0, 0 },
+    { 0, 3, 4, 5, 7, 0, 0, 0 },
+    { 1, 3, 4, 5, 7, 0, 0, 0 },
+    { 0, 1, 3, 4, 5, 7, 0, 0 },
+    { 2, 3, 4, 5, 7, 0, 0, 0 },
+    { 0, 2, 3, 4, 5, 7, 0, 0 },
+    { 1, 2, 3, 4, 5, 7, 0, 0 },
+    { 0, 1, 2, 3, 4, 5, 7, 0 },
+    { 6, 7, 0, 0, 0, 0, 0, 0 },
+    { 0, 6, 7, 0, 0, 0, 0, 0 },
+    { 1, 6, 7, 0, 0, 0, 0, 0 },
+    { 0, 1, 6, 7, 0, 0, 0, 0 },
+    { 2, 6, 7, 0, 0, 0, 0, 0 },
+    { 0, 2, 6, 7, 0, 0, 0, 0 },
+    { 1, 2, 6, 7, 0, 0, 0, 0 },
+    { 0, 1, 2, 6, 7, 0, 0, 0 },
+    { 3, 6, 7, 0, 0, 0, 0, 0 },
+    { 0, 3, 6, 7, 0, 0, 0, 0 },
+    { 1, 3, 6, 7, 0, 0, 0, 0 },
+    { 0, 1, 3, 6, 7, 0, 0, 0 },
+    { 2, 3, 6, 7, 0, 0, 0, 0 },
+    { 0, 2, 3, 6, 7, 0, 0, 0 },
+    { 1, 2, 3, 6, 7, 0, 0, 0 },
+    { 0, 1, 2, 3, 6, 7, 0, 0 },
+    { 4, 6, 7, 0, 0, 0, 0, 0 },
+    { 0, 4, 6, 7, 0, 0, 0, 0 },
+    { 1, 4, 6, 7, 0, 0, 0, 0 },
+    { 0, 1, 4, 6, 7, 0, 0, 0 },
+    { 2, 4, 6, 7, 0, 0, 0, 0 },
+    { 0, 2, 4, 6, 7, 0, 0, 0 },
+    { 1, 2, 4, 6, 7, 0, 0, 0 },
+    { 0, 1, 2, 4, 6, 7, 0, 0 },
+    { 3, 4, 6, 7, 0, 0, 0, 0 },
+    { 0, 3, 4, 6, 7, 0, 0, 0 },
+    { 1, 3, 4, 6, 7, 0, 0, 0 },
+    { 0, 1, 3, 4, 6, 7, 0, 0 },
+    { 2, 3, 4, 6, 7, 0, 0, 0 },
+    { 0, 2, 3, 4, 6, 7, 0, 0 },
+    { 1, 2, 3, 4, 6, 7, 0, 0 },
+    { 0, 1, 2, 3, 4, 6, 7, 0 },
+    { 5, 6, 7, 0, 0, 0, 0, 0 },
+    { 0, 5, 6, 7, 0, 0, 0, 0 },
+    { 1, 5, 6, 7, 0, 0, 0, 0 },
+    { 0, 1, 5, 6, 7, 0, 0, 0 },
+    { 2, 5, 6, 7, 0, 0, 0, 0 },
+    { 0, 2, 5, 6, 7, 0, 0, 0 },
+    { 1, 2, 5, 6, 7, 0, 0, 0 },
+    { 0, 1, 2, 5, 6, 7, 0, 0 },
+    { 3, 5, 6, 7, 0, 0, 0, 0 },
+    { 0, 3, 5, 6, 7, 0, 0, 0 },
+    { 1, 3, 5, 6, 7, 0, 0, 0 },
+    { 0, 1, 3, 5, 6, 7, 0, 0 },
+    { 2, 3, 5, 6, 7, 0, 0, 0 },
+    { 0, 2, 3, 5, 6, 7, 0, 0 },
+    { 1, 2, 3, 5, 6, 7, 0, 0 },
+    { 0, 1, 2, 3, 5, 6, 7, 0 },
+    { 4, 5, 6, 7, 0, 0, 0, 0 },
+    { 0, 4, 5, 6, 7, 0, 0, 0 },
+    { 1, 4, 5, 6, 7, 0, 0, 0 },
+    { 0, 1, 4, 5, 6, 7, 0, 0 },
+    { 2, 4, 5, 6, 7, 0, 0, 0 },
+    { 0, 2, 4, 5, 6, 7, 0, 0 },
+    { 1, 2, 4, 5, 6, 7, 0, 0 },
+    { 0, 1, 2, 4, 5, 6, 7, 0 },
+    { 3, 4, 5, 6, 7, 0, 0, 0 },
+    { 0, 3, 4, 5, 6, 7, 0, 0 },
+    { 1, 3, 4, 5, 6, 7, 0, 0 },
+    { 0, 1, 3, 4, 5, 6, 7, 0 },
+    { 2, 3, 4, 5, 6, 7, 0, 0 },
+    { 0, 2, 3, 4, 5, 6, 7, 0 },
+    { 1, 2, 3, 4, 5, 6, 7, 0 },
+    { 0, 1, 2, 3, 4, 5, 6, 7 },
+};
+#endif /* __AVX2__ */
+
+/*
+ * col_filter_cmp_scalar:
+ * Scalar comparison shared by the tail loop and the pure-scalar build, so
+ * both paths decide identically.  An unrecognized opcode rejects the row.
+ */
+static inline bool
+col_filter_cmp_scalar(int64_t a, int64_t b, wl_plan_expr_tag_t cmp_op)
+{
+    switch (cmp_op) {
+    case WL_PLAN_EXPR_CMP_EQ:
+        return a == b;
+    case WL_PLAN_EXPR_CMP_NEQ:
+        return a != b;
+    case WL_PLAN_EXPR_CMP_LT:
+        return a < b;
+    case WL_PLAN_EXPR_CMP_LTE:
+        return a <= b;
+    case WL_PLAN_EXPR_CMP_GT:
+        return a > b;
+    case WL_PLAN_EXPR_CMP_GTE:
+        return a >= b;
+    default:
+        return false;
+    }
+}
+
+uint32_t
+col_filter_select_rows(const int64_t *col_a, const int64_t *col_b,
+    int64_t const_b, uint32_t nrows, wl_plan_expr_tag_t cmp_op,
+    uint32_t *out_sel)
+{
+    uint32_t out = 0;
+    uint32_t r = 0;
+
+    if (nrows == 0)
+        return 0;
+
+    /* Reject unknown opcodes up front; the scalar helper rejects every row
+     * for these, so selecting nothing is the same answer. */
+    switch (cmp_op) {
+    case WL_PLAN_EXPR_CMP_EQ:
+    case WL_PLAN_EXPR_CMP_NEQ:
+    case WL_PLAN_EXPR_CMP_LT:
+    case WL_PLAN_EXPR_CMP_LTE:
+    case WL_PLAN_EXPR_CMP_GT:
+    case WL_PLAN_EXPR_CMP_GTE:
+        break;
+    default:
+        return 0;
+    }
+
+#ifdef __AVX2__
+    /*
+     * All six opcodes reduce to cmpeq/cmpgt plus an optional operand swap and
+     * an optional bitwise NOT, so one loop body covers them all:
+     *
+     *   EQ  : cmpeq(a, b)          NEQ : ~cmpeq(a, b)
+     *   GT  : cmpgt(a, b)          LTE : ~cmpgt(a, b)
+     *   LT  : cmpgt(b, a)          GTE : ~cmpgt(b, a)
+     *
+     * The three selectors are loop-invariant, so this stays a single compact
+     * body instead of six specialized copies competing for the .text budget.
+     */
+    const bool use_eq = (cmp_op == WL_PLAN_EXPR_CMP_EQ
+        || cmp_op == WL_PLAN_EXPR_CMP_NEQ);
+    const bool swap = (cmp_op == WL_PLAN_EXPR_CMP_LT
+        || cmp_op == WL_PLAN_EXPR_CMP_GTE);
+    const bool invert = (cmp_op == WL_PLAN_EXPR_CMP_NEQ
+        || cmp_op == WL_PLAN_EXPR_CMP_GTE
+        || cmp_op == WL_PLAN_EXPR_CMP_LTE);
+
+    const __m256i lane_id = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i all_ones = _mm256_set1_epi64x(-1LL);
+    const __m256i const_v = _mm256_set1_epi64x(const_b);
+
+    /* Equivalent to r + 8 <= nrows, but written so the bound cannot wrap:
+     * columns are allocated to exactly `capacity` int64_t and capacity ==
+     * nrows is reachable, so reading past nrows would be a heap over-read.
+     * The remainder runs in the scalar tail. */
+    for (; nrows >= 8 && r <= nrows - 8; r += 8) {
+        __m256i a0 = _mm256_loadu_si256((const __m256i *)(col_a + r));
+        __m256i a1 = _mm256_loadu_si256((const __m256i *)(col_a + r + 4));
+        __m256i b0 = const_v;
+        __m256i b1 = const_v;
+
+        if (col_b) {
+            b0 = _mm256_loadu_si256((const __m256i *)(col_b + r));
+            b1 = _mm256_loadu_si256((const __m256i *)(col_b + r + 4));
+        }
+
+        __m256i x0 = swap ? b0 : a0;
+        __m256i y0 = swap ? a0 : b0;
+        __m256i x1 = swap ? b1 : a1;
+        __m256i y1 = swap ? a1 : b1;
+
+        __m256i m0 = use_eq ? _mm256_cmpeq_epi64(x0, y0)
+                            : _mm256_cmpgt_epi64(x0, y0);
+        __m256i m1 = use_eq ? _mm256_cmpeq_epi64(x1, y1)
+                            : _mm256_cmpgt_epi64(x1, y1);
+
+        if (invert) {
+            m0 = _mm256_xor_si256(m0, all_ones);
+            m1 = _mm256_xor_si256(m1, all_ones);
+        }
+
+        /* One sign bit per 64-bit lane: 4 bits per vector, 8 bits total. */
+        uint32_t mask =
+            (uint32_t)_mm256_movemask_pd(_mm256_castsi256_pd(m0))
+            | ((uint32_t)_mm256_movemask_pd(_mm256_castsi256_pd(m1)) << 4);
+
+        if (mask == 0)
+            continue;
+
+        __m256i idx = _mm256_add_epi32(_mm256_set1_epi32((int)r), lane_id);
+        __m256i perm = _mm256_cvtepu8_epi32(
+            _mm_loadl_epi64((const __m128i *)col_filter_leftpack_lut[mask]));
+        __m256i packed = _mm256_permutevar8x32_epi32(idx, perm);
+
+        /* Always stores 8 lanes; only the first popcount(mask) are valid.
+         * out_sel must therefore carry COL_FILTER_SEL_SLACK spare slots. */
+        _mm256_storeu_si256((__m256i *)(out_sel + out), packed);
+        out += (uint32_t)__builtin_popcount(mask);
+    }
+#endif /* __AVX2__ */
+
+    for (; r < nrows; r++) {
+        int64_t b_val = col_b ? col_b[r] : const_b;
+        if (col_filter_cmp_scalar(col_a[r], b_val, cmp_op))
+            out_sel[out++] = r;
+    }
+    return out;
+}
+
 int
 col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -1591,26 +2006,96 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
             return ENOMEM;
         }
 
-        /* Scan col_a (contiguous), gather passing rows into flat output */
         uint32_t nout = 0;
-        for (uint32_t r = 0; r < nrows; r++) {
-            int64_t a_val = col_a[r];
-            int64_t b_val = cmp.b_is_const ? cmp.const_b
-                : (col_b_ptr ? col_b_ptr[r] : 0);
-            bool pass = false;
-            switch (cmp.cmp_op) {
-            case WL_PLAN_EXPR_CMP_EQ:  pass = (a_val == b_val); break;
-            case WL_PLAN_EXPR_CMP_NEQ: pass = (a_val != b_val); break;
-            case WL_PLAN_EXPR_CMP_LT:  pass = (a_val < b_val); break;
-            case WL_PLAN_EXPR_CMP_LTE: pass = (a_val <= b_val); break;
-            case WL_PLAN_EXPR_CMP_GT:  pass = (a_val > b_val); break;
-            case WL_PLAN_EXPR_CMP_GTE: pass = (a_val >= b_val); break;
-            default: break;
+        /*
+         * The selection vector only pays for itself when the scan is
+         * vectorized.  With the scalar kernel it adds a store, a load and a
+         * second traversal per row and measured 0.70x of the fused loop on a
+         * 1M-row 8-column relation, so non-AVX2 targets keep the fused form.
+         */
+#ifdef __AVX2__
+        bool use_selection = true;
+#else
+        bool use_selection = false;
+#endif
+
+        if (use_selection) {
+            /* COL_FILTER_SEL_SLACK spare slots let the AVX2 left-pack store a
+            * full 8-lane vector on its last iteration without overrunning. */
+            uint32_t *sel = (uint32_t *)malloc(
+                ((size_t)COL_FILTER_TILE + COL_FILTER_SEL_SLACK)
+                * sizeof(uint32_t));
+            if (!sel) {
+                free(tmp);
+                col_rel_destroy(out);
+                if (e.owned)
+                    col_rel_destroy(e.rel);
+                return ENOMEM;
             }
-            if (pass) {
-                for (uint32_t c = 0; c < ncols; c++)
-                    tmp[nout * ncols + c] = columns[c][r];
-                nout++;
+
+            /*
+             * Scan and materialize a tile at a time.  Scanning the whole
+             * column first, then materializing, measured slower than the
+             * fused loop on a 1M-row 8-column relation.  Tiling recovers
+             * that and bounds the selection vector.
+             *
+             * Wide relations stay materialize-bound whatever the tile size:
+             * at 1M rows, 8 columns and 25% selectivity the scan is under a
+             * millisecond of a ~6ms total, so this path still runs at about
+             * 0.96x of the fused loop there.  That corner is accepted -- the
+             * cost is the sel[] indirection during materialize, which is
+             * exactly what the fused loop avoids, and no scan-side change
+             * can reach it.
+             */
+            for (uint32_t base = 0; base < nrows;) {
+                uint32_t chunk = nrows - base;
+                if (chunk > COL_FILTER_TILE)
+                    chunk = COL_FILTER_TILE;
+
+                uint32_t nsel = col_filter_select_rows(col_a + base,
+                        col_b_ptr ? col_b_ptr + base : NULL, cmp.const_b,
+                        chunk, cmp.cmp_op, sel);
+
+                /*
+                 * A predicate that keeps almost every row is materialized
+                 * faster by the fused loop: there the row index is the loop
+                 * counter, while here every row costs an extra load from
+                 * sel[].  Decide once, from the first tile.
+                 *
+                 * One tile is a sample, so sorted or clustered input whose
+                 * first tile is unrepresentative can pick the fused loop and
+                 * forgo the vectorized win.  That costs nothing against the
+                 * pre-kernel baseline -- it lands at ~1.00x, not below -- so
+                 * it is a missed optimization rather than a regression.
+                 */
+                if (base == 0 && nsel > chunk - (chunk / 8)) {
+                    use_selection = false;
+                    break;
+                }
+
+                for (uint32_t i = 0; i < nsel; i++) {
+                    uint32_t src_row = base + sel[i];
+                    for (uint32_t c = 0; c < ncols; c++)
+                        tmp[(size_t)nout * ncols + c] = columns[c][src_row];
+                    nout++;
+                }
+
+                /* Advance by the clamped chunk, never by the tile size:
+                 * base + COL_FILTER_TILE could wrap past UINT32_MAX. */
+                base += chunk;
+            }
+            free(sel);
+        }
+
+        if (!use_selection) {
+            nout = 0;
+            for (uint32_t r = 0; r < nrows; r++) {
+                int64_t b_val = col_b_ptr ? col_b_ptr[r] : cmp.const_b;
+                if (col_filter_cmp_scalar(col_a[r], b_val, cmp.cmp_op)) {
+                    for (uint32_t c = 0; c < ncols; c++)
+                        tmp[(size_t)nout * ncols + c] = columns[c][r];
+                    nout++;
+                }
             }
         }
 
