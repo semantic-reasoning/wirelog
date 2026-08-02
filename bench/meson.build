@@ -144,6 +144,41 @@ bench_compound_exe = executable(
   install: false,
 )
 
+# Filter scan microbenchmark (fused vs split vs scan-only).
+#
+# Built twice so the AVX2 and scalar bodies of col_filter_select_rows can be
+# compared without a runtime switch inside the measured loop -- the same
+# two-binary approach bench_flowlog / bench_flowlog_seq use for K-Fusion.
+# The scalar variant only exists where -mno-avx2 is meaningful.
+bench_filter_scan_srcs = [
+  files('bench_filter_scan.c'),
+  bench_backend_src,
+  files(subdir_wirelog / 'intern.c'),
+  bench_arena_src,
+  bench_thread_src,
+  bench_workqueue_src,
+]
+
+bench_filter_scan = executable(
+  'bench_filter_scan',
+  bench_filter_scan_srcs,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+
+if host_machine.cpu_family() == 'x86_64' and cc.get_id() != 'msvc'
+  bench_filter_scan_scalar = executable(
+    'bench_filter_scan_scalar',
+    bench_filter_scan_srcs,
+    c_args: ['-mno-avx2'],
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep,
+      math_dep],
+    install: false,
+  )
+endif
+
 datagen = executable(
   'datagen',
   files('datagen.c'),
