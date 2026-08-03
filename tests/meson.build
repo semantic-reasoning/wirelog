@@ -1067,6 +1067,24 @@ test_filter_select_rows_exe = executable(
 
 test('filter_select_rows', test_filter_select_rows_exe)
 
+# Differential test for the batch join-hash kernel: the AVX2 and scalar
+# bodies must agree with col_join_hash_rel_keys bit for bit, because the
+# session-cached diff arrangement is extended incrementally and any
+# divergence loses join results silently.
+test_hash_rows_batch_exe = executable(
+  'test_hash_rows_batch',
+  files('test_hash_rows_batch.c'),
+  backend_src,
+  files(subdir_wirelog / 'intern.c'),
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('hash_rows_batch', test_hash_rows_batch_exe)
+
 # ============================================================================
 # CRDT W=1 perf-suite gate.
 #

@@ -2951,6 +2951,89 @@ col_join_hash_rel_keys(const col_rel_t *rel, uint32_t row,
     return h;
 }
 
+/*
+ * col_hash_rows_batch:
+ * Hash a contiguous run of rows in one call.  See internal.h for the
+ * contract; the invariant that matters is bit-identity with
+ * col_join_hash_rel_keys(), which the scalar tail below guarantees
+ * structurally by calling it.
+ *
+ * Bit-identity is not a nicety here.  col_session_get_diff_arrangement()
+ * caches an arrangement in the session and extends it incrementally across
+ * iterations, so build and probe can land in different iterations and even
+ * different code paths.  A single differing bit would strand earlier rows in
+ * buckets computed under the other function and lose join results silently,
+ * with no crash and no error.
+ */
+void
+col_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
+    const uint32_t *key_cols, uint32_t kc, uint32_t *out_hashes)
+{
+    if (row_begin >= row_end)
+        return;
+
+    const uint32_t n = row_end - row_begin;
+    uint32_t r = 0;
+
+#ifdef __AVX2__
+    /*
+     * Eight rows per iteration, accumulating FNV-1a in eight 32-bit lanes.
+     *
+     * Each 256-bit load holds four int64_t as [l0,h0,l1,h1 | l2,h2,l3,h3].
+     * shuffle_epi32(_, 0xD8) reorders within each 128-bit half to
+     * [l0,l1,h0,h1 | l2,l3,h2,h3], after which unpacklo/unpackhi_epi64
+     * across the two loads separate the low and high words:
+     *
+     *   lo = [l0,l1,l4,l5 | l2,l3,l6,l7]
+     *   hi = [h0,h1,h4,h5 | h2,h3,h6,h7]
+     *
+     * Both carry the SAME lane permutation, sigma = [0,1,4,5,2,3,6,7].  xor
+     * and mullo are lane-wise, so accumulating in permuted order is exact;
+     * one permute at the store puts rows back in order.  sigma is its own
+     * inverse, so it doubles as the control vector.
+     *
+     * Deliberately NOT done with permutevar + blend: blend selects per lane
+     * from two sources and cannot swap the 128-bit halves, so it would pair
+     * row i's low word with row (i+4)%8's high word -- a silent wrong hash.
+     *
+     * _mm256_mullo_epi32 keeps the low 32 bits of each product, which is
+     * exactly uint32_t multiply, so this matches the scalar FNV-1a bit for
+     * bit.  kc == 0 leaves h at the broadcast offset basis, as the scalar
+     * function's zero-trip loop does.
+     */
+    const __m256i prime = _mm256_set1_epi32((int)16777619u);
+    const __m256i sigma = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+
+    /* Written so the bound cannot wrap; rows past row_end are never read. */
+    for (; n >= 8 && r <= n - 8; r += 8) {
+        __m256i h = _mm256_set1_epi32((int)2166136261u);
+
+        for (uint32_t i = 0; i < kc; i++) {
+            const int64_t *col = rel->columns[key_cols[i]] + row_begin + r;
+            __m256i a0 = _mm256_loadu_si256((const __m256i *)col);
+            __m256i a1 = _mm256_loadu_si256((const __m256i *)(col + 4));
+
+            __m256i t0 = _mm256_shuffle_epi32(a0, 0xD8);
+            __m256i t1 = _mm256_shuffle_epi32(a1, 0xD8);
+            __m256i lo = _mm256_unpacklo_epi64(t0, t1);
+            __m256i hi = _mm256_unpackhi_epi64(t0, t1);
+
+            h = _mm256_mullo_epi32(_mm256_xor_si256(h, lo), prime);
+            h = _mm256_mullo_epi32(_mm256_xor_si256(h, hi), prime);
+        }
+
+        _mm256_storeu_si256((__m256i *)(out_hashes + r),
+            _mm256_permutevar8x32_epi32(h, sigma));
+    }
+#endif /* __AVX2__ */
+
+    /* Scalar tail calls the live function directly, so the two can never
+     * drift apart under maintenance. */
+    for (; r < n; r++)
+        out_hashes[r] = col_join_hash_rel_keys(rel, row_begin + r, key_cols,
+                kc);
+}
+
 static WL_OPS_ALWAYS_INLINE bool
 col_join_keys_match_rel(const col_rel_t *left, uint32_t lr,
     const uint32_t *lk, const col_rel_t *right, uint32_t rr,
