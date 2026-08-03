@@ -35,8 +35,9 @@
  * sequential copies joined by CONCAT+CONSOLIDATE.  The K_FUSION path enables
  * parallel workqueue execution in the columnar backend.
  *
- * Set to 0 (default) for the proven sequential expansion path.
- * Set to 1 for parallel K-fusion execution (Phase 2C performance testing).
+ * Set to 1 (the default) for parallel K-fusion execution.
+ * Set to 0 for the proven sequential expansion path; bench_flowlog_seq
+ * builds that way via -DENABLE_K_FUSION=0.
  */
 #ifndef ENABLE_K_FUSION
 #define ENABLE_K_FUSION 1
@@ -1610,6 +1611,10 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
     return 0;
 }
 
+/* Only the non-K-Fusion build calls this: the multi-way expansion site
+ * below selects it from the #else of its #if ENABLE_K_FUSION.  Compiling it
+ * unconditionally leaves an unused static in every default build. */
+#if !ENABLE_K_FUSION
 /**
  * Rewrite a single relation plan for multi-way delta expansion with
  * CSE materialization hints.
@@ -1746,6 +1751,7 @@ expand_multiway_delta(const wl_plan_op_t *ops, uint32_t op_count,
     *out_count = wi;
     return new_ops;
 }
+#endif /* !ENABLE_K_FUSION */
 
 #if ENABLE_K_FUSION
 /**
