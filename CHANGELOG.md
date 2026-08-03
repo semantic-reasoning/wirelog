@@ -8,13 +8,49 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Warning-clean library build** (#940): the last three `-Wunused-function`
+  warnings in library code are gone. `expand_multiway_delta` is now compiled only under
+  `#if !ENABLE_K_FUSION`, the configuration that actually calls it (used by
+  `bench_flowlog_seq`); it was previously compiled and unused in every default
+  build. `col_stratum_step_retraction_nonrecursive` is marked `UNUSED` rather
+  than deleted, since it remains the reference implementation for the deferred
+  Issue #158 retraction path.
+
 ### Deprecated
 
 ### Removed
 
+- **Dead row-major SIMD kernels** (#939): the compile-time dispatchers
+  `col_filter_fast`, `hash_int64_keys_fast` and `keys_match_fast` had no call
+  sites on any target, so the AVX2 and NEON kernels they selected were
+  unreachable. They took row-major row pointers while the filter and join hot
+  paths had moved to column-native access, so they could not be reconnected as
+  written.
+- **Unreachable session helper** (#940): `col_session_cleanup_old_data` had no
+  callers anywhere and is removed.
+
 ### Fixed
 
+- **Unbounded source construction in a filter test** (#939, #940): a test-source
+  builder accumulated `snprintf` return values, which report the length that
+  would have been written rather than the length written, so the write cursor
+  could advance past the buffer once anything truncated. It now shares the
+  bounds-checked builder, which treats truncation as an explicit failure.
+  Latent only: the buffer was oversized, so nothing truncated in practice.
+
 ### Performance
+
+- **Column-native SIMD filter scan** (#939): `col_op_filter`'s
+  simple-comparison fast path now scans a contiguous key column with an AVX2
+  kernel that processes 8 rows per iteration and left-packs surviving row
+  indices through a 2 KB `.rodata` table. Scan throughput is roughly 10x the
+  scalar loop; end to end the path measures 1.5x-3.3x the previous fused loop
+  on narrow relations. Scanning is tiled and falls back to the fused loop when
+  the first tile keeps more than seven eighths of its rows, since a
+  near-total-pass predicate materializes faster without the selection-vector
+  indirection. Wide relations remain materialize-bound and are unchanged to
+  within a few percent. Builds without AVX2 keep the previous fused loop, which
+  measured faster there than the selection vector.
 
 ### Security
 
