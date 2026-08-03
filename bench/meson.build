@@ -179,39 +179,6 @@ if host_machine.cpu_family() == 'x86_64' and cc.get_id() != 'msvc'
   )
 endif
 
-# Join hash-table build microbenchmark (Issue #938).
-#
-# Built twice for the same reason bench_filter_scan is: the kernel body is a
-# compile-time choice, and a runtime switch would sit inside the hash loop.
-bench_join_hash_srcs = [
-  files('bench_join_hash.c'),
-  bench_backend_src,
-  files(subdir_wirelog / 'intern.c'),
-  bench_arena_src,
-  bench_thread_src,
-  bench_workqueue_src,
-]
-
-bench_join_hash = executable(
-  'bench_join_hash',
-  bench_join_hash_srcs,
-  include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  install: false,
-)
-
-if host_machine.cpu_family() == 'x86_64' and cc.get_id() != 'msvc'
-  bench_join_hash_scalar = executable(
-    'bench_join_hash_scalar',
-    bench_join_hash_srcs,
-    c_args: ['-mno-avx2'],
-    include_directories: [wirelog_inc, wirelog_src_inc],
-    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep,
-      math_dep],
-    install: false,
-  )
-endif
-
 datagen = executable(
   'datagen',
   files('datagen.c'),
