@@ -34,6 +34,36 @@ The shipped fixtures prove the expected result cardinality:
   one visible sequence. The `result` relation represents adjacent
   visible-element pairs, so its cardinality is `104,852 - 1 = 104,851`.
 
+### Subset fixture (`bench/data/crdt-small`)
+
+The full fixture takes roughly 23 seconds to evaluate, and about eight times
+that in the `-O0` sanitizer legs, so it is too slow to validate on every
+`meson test`. `scripts/perf/make_crdt_subset.py` derives a smaller one:
+
+- Breadth-first descendant closure of the single root, restricted to insert
+  counters `<= 2000`, with removals restricted to the kept keys. Taking a
+  closure rather than a prefix is what keeps the subset valid: every kept
+  node's parent is kept, so the tree stays connected and single-rooted.
+- 1,674 insertion records, SHA-256
+  `51ded7b31b061460dc13ceb044865c5cdbb8f4915ce2aa8fd9d22d4665959409`.
+- 1,412 removal records, SHA-256
+  `2eef4586fa3a043d52e255f4d555289e890fef4dee49ac7f5ca0895c97813386`.
+- Expected `result` cardinality `1,674 - 1,412 - 1 = 261`, confirmed by
+  running it.
+
+The `- 1` is the root, which has no predecessor. Note the derivation above
+rests on an independent traversal check of the *shipped* fixture, which does
+not transfer to a subset; for the subset it holds because
+`result(c1, c2, v) :- nextVisible(c1, _, c2, n2), currentValue(c2, n2, v)`
+projects away `prev_node` and `assign(ctr, n, ctr, n, n)` forces `v == n2`,
+so each tuple is `(c1, c2, n2)`. In a chain every visible node has exactly
+one predecessor, so distinct edges carry distinct `(c2, n2)` and the
+projection cannot collide.
+
+`tests/meson.build` registers this as `crdt_correctness_small` in the default
+suite (Issue #947), so the result cardinality is checked on every test run
+rather than only on a machine with a pinned cpufreq governor.
+
 ## Measurement environment
 
 The 2026-07-31 calibration used:

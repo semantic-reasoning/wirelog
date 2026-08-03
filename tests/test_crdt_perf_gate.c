@@ -31,14 +31,32 @@
  *                                           runner where the operator
  *                                           is asserting the host is
  *                                           configured)
- *   - result count != expected (104,851) -> FAIL (correctness sentinel
- *                                            checked BEFORE the timing
- *                                            assertion so a wrong-output
- *                                            bug never trips the timing
- *                                            gate spuriously)
+ *   - result count != expected -> FAIL (correctness sentinel, checked
+ *                                  BEFORE the timing assertion so a
+ *                                  wrong-output bug never trips the timing
+ *                                  gate spuriously)
  *   - baseline CoV > 3%                  -> SKIP (measurement noise
  *                                           exceeds the budget)
  *   - median wall > target               -> FAIL (the gate fires)
+ *
+ * Correctness-only mode (Issue #947):
+ *   WIRELOG_GATE_CORRECTNESS_ONLY=1 runs the result-count sentinel and
+ *   exits, requiring neither a stripped log ceiling nor a pinned cpufreq
+ *   governor.  Output validation is deterministic, so neither is relevant to
+ *   it; gating it behind them meant the sentinel never executed anywhere --
+ *   not on a developer machine and not in CI, where the perf workflows
+ *   configure a trace ceiling and skip before the governor check is even
+ *   reached.
+ *
+ *   The full fixture additionally keeps the WIRELOG_PERF_GATE=1 opt-in,
+ *   because one run costs ~23s (and ~126s in the -O0 sanitizer legs); see
+ *   the check at the top of main().  WIRELOG_CRDT_SMALL=1 selects the
+ *   closure-derived subset fixture instead (bench/data/crdt-small, see
+ *   scripts/perf/make_crdt_subset.py), which is cheap enough to validate on
+ *   every default test run and needs no opt-in.
+ *
+ *   Both gold values are compiled in, never taken from the environment, so a
+ *   run cannot be made to pass by changing what a runner exports.
  *
  * The CRDT data fixtures live in bench/data/crdt/.  meson registers
  * the test with WIRELOG_CRDT_DATA_DIR pointing at the project source
@@ -106,6 +124,17 @@ count_cb(const char *relation, const int64_t *row, uint32_t ncols,
         ctx->result++;
 }
 
+static int
+parse_bool_env_(const char *name, int default_val)
+{
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return default_val;
+    if (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F')
+        return 0;
+    return 1;
+}
+
 /* Resolve the CRDT data directory.  Order:
  *   1. WIRELOG_CRDT_DATA_DIR (set by meson at test time).
  *   2. Relative-from-build-dir candidates so a hand-run binary still
@@ -117,11 +146,20 @@ resolve_crdt_data_dir_(void)
 {
     static char buf[1024];
 
+    /* Issue #947: the subset fixture is small enough to validate on every
+     * default test run; the full one takes ~23s (and roughly eight times
+     * that in the -O0 sanitizer legs). */
+    const int small = parse_bool_env_("WIRELOG_CRDT_SMALL", 0);
     const char *env = getenv("WIRELOG_CRDT_DATA_DIR");
     const char *candidates[8];
     int nc = 0;
     if (env && *env)
         candidates[nc++] = env;
+    if (small) {
+        candidates[nc++] = "../bench/data/crdt-small";
+        candidates[nc++] = "bench/data/crdt-small";
+        candidates[nc++] = "../../bench/data/crdt-small";
+    }
     candidates[nc++] = "../bench/data/crdt";
     candidates[nc++] = "bench/data/crdt";
     candidates[nc++] = "../../bench/data/crdt";
@@ -136,17 +174,6 @@ resolve_crdt_data_dir_(void)
         }
     }
     return NULL;
-}
-
-static int
-parse_bool_env_(const char *name, int default_val)
-{
-    const char *v = getenv(name);
-    if (!v || !*v)
-        return default_val;
-    if (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F')
-        return 0;
-    return 1;
 }
 
 /* Run the CRDT pipeline once.  Returns 0 on success and writes the
@@ -222,14 +249,32 @@ run_crdt_once_(const char *source, uint32_t num_workers,
 int
 main(void)
 {
-    if (!parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
+    const int correctness_only
+        = parse_bool_env_("WIRELOG_GATE_CORRECTNESS_ONLY", 0);
+
+    /* The subset fixture is cheap enough to validate unconditionally; the
+     * full one takes ~23s (and ~126s in the -O0 sanitizer legs), so
+     * full-fixture correctness keeps the same opt-in as the timing gate.
+     * Note suite membership does not gate anything here -- there is no
+     * add_test_setup in this project, so a perf-suite entry still runs in a
+     * default `meson test` and must opt out at runtime. */
+    if (correctness_only && !parse_bool_env_("WIRELOG_CRDT_SMALL", 0)
+        && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
+        fprintf(stderr,
+            "test_crdt_perf_gate: SKIP: full-fixture correctness needs "
+            "WIRELOG_PERF_GATE=1 (~23s); WIRELOG_CRDT_SMALL=1 runs the "
+            "subset instead\n");
+        return SKIP_EXIT;
+    }
+
+    if (!correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
         fprintf(stderr,
             "test_crdt_perf_gate: SKIP: set WIRELOG_PERF_GATE=1 to run "
             "(designed for dedicated perf hardware, not shared CI runners)\n");
         return SKIP_EXIT;
     }
 
-    if (WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
+    if (!correctness_only && WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_crdt_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but "
@@ -248,7 +293,7 @@ main(void)
         return SKIP_EXIT;
     }
 
-    if (!wl_perf_stability_env_ok()) {
+    if (!correctness_only && !wl_perf_stability_env_ok()) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_crdt_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but the "
@@ -301,14 +346,31 @@ main(void)
         free(source);
         return 1;
     }
-    if (warm_result != WL_BENCH_CRDT_RESULT_TUPLES) {
+    const int64_t gold = parse_bool_env_("WIRELOG_CRDT_SMALL", 0)
+        ? WL_BENCH_CRDT_SMALL_RESULT_TUPLES
+        : WL_BENCH_CRDT_RESULT_TUPLES;
+
+    if (warm_result != gold) {
         fprintf(stderr,
             "test_crdt_perf_gate: FAIL: warm-up result count %" PRId64
             " != expected %" PRId64
             " (correctness regression; refusing to time)\n",
-            warm_result, WL_BENCH_CRDT_RESULT_TUPLES);
+            warm_result, gold);
         free(source);
         return 1;
+    }
+
+    if (correctness_only) {
+        printf("test_crdt_perf_gate: correctness OK\n"
+            "  fixture    = %s\n"
+            "  result     = %" PRId64 " (expected %" PRId64 ")\n"
+            "  aggregate  = %" PRId64 "\n"
+            "  iterations = %u\n"
+            "  elapsed    = %.1f ms\n",
+            data_dir, warm_result, gold, warm_aggregate, warm_iters,
+            warmup_ms);
+        free(source);
+        return 0;
     }
 
     double trials_ms[TRIALS];
@@ -331,11 +393,11 @@ main(void)
             free(source);
             return 1;
         }
-        if (result != WL_BENCH_CRDT_RESULT_TUPLES) {
+        if (result != gold) {
             fprintf(stderr,
                 "test_crdt_perf_gate: FAIL: trial %d result count %" PRId64
                 " != expected %" PRId64 "\n",
-                i, result, WL_BENCH_CRDT_RESULT_TUPLES);
+                i, result, gold);
             free(source);
             return 1;
         }
@@ -368,7 +430,7 @@ main(void)
         TRIALS, data_dir,
         warmup_ms,
         last_aggregate,
-        last_result, WL_BENCH_CRDT_RESULT_TUPLES,
+        last_result, gold,
         last_iters, mean, stdev, cov * 100.0,
         median, WL_CRDT_PERF_GATE_TARGET_MS);
 

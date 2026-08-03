@@ -9,6 +9,12 @@
  * Failure semantics (same as tests/test_crdt_perf_gate.c):
  *
  *   - WIRELOG_PERF_GATE != "1"           -> SKIP (exit 77)
+ *
+ * Correctness-only mode (Issue #947): WIRELOG_GATE_CORRECTNESS_ONLY=1 runs
+ * the workload once, checks the gold tuple and iteration counts and exits,
+ * requiring neither WIRELOG_PERF_GATE nor a stripped log ceiling nor a pinned
+ * governor.  Output validation is deterministic; gating it behind those meant
+ * it never executed anywhere.
  *   - WL_LOG_COMPILE_MAX_LEVEL > ERROR:
  *       WIRELOG_PERF_REQUIRE != "1"      -> SKIP (default)
  *       WIRELOG_PERF_REQUIRE == "1"      -> FAIL (measurement build must
@@ -369,14 +375,17 @@ run_cspa_once_(const char *data_dir, uint32_t num_workers,
 int
 main(void)
 {
-    if (!parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
+    const int correctness_only
+        = parse_bool_env_("WIRELOG_GATE_CORRECTNESS_ONLY", 0);
+
+    if (!correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
         fprintf(stderr,
             "test_cspa_perf_gate: SKIP: set WIRELOG_PERF_GATE=1 to run "
             "(designed for dedicated perf hardware, not shared CI runners)\n");
         return SKIP_EXIT;
     }
 
-    if (WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
+    if (!correctness_only && WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_cspa_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but "
@@ -395,7 +404,7 @@ main(void)
         return SKIP_EXIT;
     }
 
-    if (!wl_perf_stability_env_ok()) {
+    if (!correctness_only && !wl_perf_stability_env_ok()) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_cspa_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but host "
@@ -428,6 +437,12 @@ main(void)
             " != gold 20381 or iterations %" PRIu32 " != gold 6\n",
             warm_count, warm_iters);
         return 1;
+    }
+
+    if (correctness_only) {
+        printf("test_cspa_perf_gate: correctness OK (tuples=%" PRId64
+            " iters=%" PRIu32 ")\n", warm_count, warm_iters);
+        return 0;
     }
 
     double trials_ms[TRIALS];

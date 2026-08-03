@@ -438,7 +438,10 @@ if not is_windows
        timeout: 30)
 endif
 
-# Issue #287: release-mode perf gate (suite 'perf', excluded from default run).
+# Issue #287: release-mode perf gate (suite 'perf').  Note suite membership
+# does not exclude anything -- there is no add_test_setup in this project, so
+# every perf entry runs in a default `meson test` and opts out at runtime via
+# WIRELOG_PERF_GATE.
 # Requires WIRELOG_PERF_GATE=1 and -Dwirelog_log_max_level=trace. Linux also
 # requires a 'performance' cpufreq governor; Windows uses thread affinity +
 # HIGH_PRIORITY_CLASS via bench_stability_prep() (issue #508 Phase 2).
@@ -1126,13 +1129,49 @@ test('crdt_perf_gate', test_crdt_perf_gate_exe,
        'WIRELOG_CRDT_DATA_DIR=' + meson.project_source_root() / 'bench/data/crdt',
      ])
 
+# NOTE: the three *timing* gates (crdt_perf_gate, cspa_w1_gate,
+# sub_ms_graph_perf_gate) remain unreachable in CI, and the correctness
+# entries below do not change that.  They require
+# WL_LOG_COMPILE_MAX_LEVEL <= ERROR, while test_log_perf_gate.c requires
+# >= TRACE; one build dir cannot satisfy both, and both perf workflows
+# configure -Dwirelog_log_max_level=trace.  So seeing `crdt_correctness_full
+# OK` in the perf job does not mean the timing gates ran.  Tracked separately.
+#
+# Issue #947: the result-count sentinel inside the gate above never executed,
+# because the perf-host skips (WIRELOG_PERF_GATE, log ceiling, cpufreq
+# governor) are evaluated before it.  Output validation is deterministic and
+# needs none of them, so it gets its own registrations.
+#
+# The default-suite entry uses the closure-derived subset
+# (scripts/perf/make_crdt_subset.py); the full fixture takes ~23s, which is
+# ~8x worse in the -O0 sanitizer legs and far too slow to run on every
+# `meson test`.  The full-fixture entry stays in suite 'perf' but no longer
+# requires a pinned governor or a stripped log ceiling, so the nightly and
+# the perf PR job -- which set WIRELOG_PERF_GATE=1 and previously produced
+# nothing but exit 77 -- now actually validate 104,851.
+test('crdt_correctness_small', test_crdt_perf_gate_exe,
+     timeout: 120,
+     env: [
+       'WIRELOG_GATE_CORRECTNESS_ONLY=1',
+       'WIRELOG_CRDT_SMALL=1',
+       'WIRELOG_CRDT_DATA_DIR=' + meson.project_source_root() / 'bench/data/crdt-small',
+     ])
+
+test('crdt_correctness_full', test_crdt_perf_gate_exe,
+     suite: 'perf',
+     timeout: 600,
+     env: [
+       'WIRELOG_GATE_CORRECTNESS_ONLY=1',
+       'WIRELOG_CRDT_DATA_DIR=' + meson.project_source_root() / 'bench/data/crdt',
+     ])
+
 # ============================================================================
 # CSPA W=1 perf-suite gate.
 #
 # Uses the same static-cspa-fast inline-fact assembly as
 # `bench_flowlog --workload cspa-fast` and asserts median wall <= TARGET_MS
 # (currently 2,050 ms = baseline 1,950 ms x 1.05).  Registered in suite 'perf'
-# so default invocation skips without WIRELOG_PERF_GATE=1.
+# so a default invocation skips it at runtime via WIRELOG_PERF_GATE.
 # ============================================================================
 
 test_cspa_perf_gate_exe = executable(
@@ -1153,6 +1192,16 @@ test('cspa_w1_gate', test_cspa_perf_gate_exe,
      suite: 'perf',
      timeout: 180,
      env: [
+       'WIRELOG_CSPA_DATA_DIR=' + meson.project_source_root() / 'bench/data/cspa',
+     ])
+
+# Issue #947: gold tuple and iteration counts, without a perf host.  Measured
+# at ~1.35s release on the dev host, so it is affordable in the default suite
+# even at the sanitizer legs' ~8x.
+test('cspa_correctness', test_cspa_perf_gate_exe,
+     timeout: 300,
+     env: [
+       'WIRELOG_GATE_CORRECTNESS_ONLY=1',
        'WIRELOG_CSPA_DATA_DIR=' + meson.project_source_root() / 'bench/data/cspa',
      ])
 
@@ -1181,6 +1230,15 @@ test('sub_ms_graph_perf_gate', test_sub_ms_graph_perf_gate_exe,
      suite: 'perf',
      timeout: 180,
      env: [
+       'WIRELOG_GRAPH_WORKLOAD_DIR=' + meson.project_source_root() / 'bench/workloads',
+       'WIRELOG_GRAPH_DATA_DIR=' + meson.project_source_root() / 'bench/data',
+     ])
+
+# Issue #947: gold tuple/iteration/per-relation counts, without a perf host.
+test('sub_ms_graph_correctness', test_sub_ms_graph_perf_gate_exe,
+     timeout: 120,
+     env: [
+       'WIRELOG_GATE_CORRECTNESS_ONLY=1',
        'WIRELOG_GRAPH_WORKLOAD_DIR=' + meson.project_source_root() / 'bench/workloads',
        'WIRELOG_GRAPH_DATA_DIR=' + meson.project_source_root() / 'bench/data',
      ])
