@@ -6,7 +6,8 @@
  *
  * Tests that the FILTER operator produces correct results for simple
  * comparison predicates via the real session API.  Validates the
- * scalar fast-path and (when compiled with AVX2/NEON) the SIMD path.
+ * scalar fast path and, on AVX2 builds, the column-native SIMD scan kernel.
+ * There is no NEON body; ARM runs the scalar path.
  *
  * Test cases:
  *   1. Simple EQ filter: x == 1 keeps only matching rows
@@ -172,6 +173,64 @@ run_program_with_facts(const char *src, const char *tracked_rel, collect_t *out)
     return rc;
 }
 
+/* ----------------------------------------------------------------
+ * Source builders (shared by the row-count-driven cases)
+ * ---------------------------------------------------------------- */
+
+/*
+ * append_fmt:
+ * Append to @buf at @*pos, treating truncation as failure.
+ *
+ * snprintf returns the length it *would* have written, not the length it
+ * wrote, so accumulating that return value directly lets @*pos run past
+ * @bufsize once anything truncates -- and the next `bufsize - *pos` then
+ * underflows into a huge size_t.  Returning false on truncation keeps @*pos
+ * bounded by @bufsize at all times.
+ */
+static bool
+append_fmt(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (*pos >= bufsize)
+        return false;
+
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+    va_end(ap);
+
+    if (n < 0 || (size_t)n >= bufsize - *pos)
+        return false;
+
+    *pos += (size_t)n;
+    return true;
+}
+
+static char *
+build_edge_facts(int nrows, const char *rule)
+{
+    size_t bufsize = (size_t)nrows * 32 + strlen(rule) + 256;
+    char *src = (char *)malloc(bufsize);
+    if (!src)
+        return NULL;
+
+    size_t pos = 0;
+    bool ok = append_fmt(src, bufsize, &pos,
+            ".decl edge(x: int32, y: int32)\n");
+
+    for (int i = 0; ok && i < nrows; i++)
+        ok = append_fmt(src, bufsize, &pos, "edge(%d, %d).\n", i, i * 2);
+
+    if (ok)
+        ok = append_fmt(src, bufsize, &pos, "%s", rule);
+
+    if (!ok) {
+        free(src);
+        return NULL;
+    }
+    return src;
+}
+
 /* ================================================================
  * Test 1: Simple EQ filter -- x == 1 keeps only matching rows.
  *
@@ -292,22 +351,16 @@ test_filter_large_relation(void)
 {
     TEST("EQ filter on 1024-row relation returns 1 tuple");
 
-    /* Build source with 1024 inline facts */
+    /* Build source with 1024 inline facts.  Shares build_edge_facts with the
+     * multi-tile cases, which bounds every write and treats truncation as
+     * failure -- the hand-rolled loop this replaced accumulated snprintf
+     * return values, which report the length that *would* have been written
+     * and so can walk the cursor past the buffer once anything truncates. */
     const int NROWS = 1024;
-    const int BUFSIZE = 1024 * 24 + 512;
-    char *src = (char *)malloc((size_t)BUFSIZE);
-    ASSERT(src != NULL, "malloc failed");
-
-    int pos = 0;
-    pos += snprintf(src + pos, (size_t)(BUFSIZE - pos),
-            ".decl edge(x: int32, y: int32)\n");
-    for (int i = 0; i < NROWS; i++) {
-        pos += snprintf(src + pos, (size_t)(BUFSIZE - pos), "edge(%d, %d).\n",
-                i, i * 2);
-    }
-    pos += snprintf(src + pos, (size_t)(BUFSIZE - pos),
+    char *src = build_edge_facts(NROWS,
             ".decl filtered(x: int32, y: int32)\n"
             "filtered(x, y) :- edge(x, y), x = 512.\n");
+    ASSERT(src != NULL, "source construction failed");
 
     collect_t out;
     int rc = run_program_with_facts(src, "filtered", &out);
@@ -418,60 +471,6 @@ test_lt_filter(void)
  * the short final tile is exercised too.
  * ================================================================ */
 #define MULTI_TILE_NROWS ((int)(COL_FILTER_TILE * 3u + 7u))
-
-/*
- * append_fmt:
- * Append to @buf at @*pos, treating truncation as failure.
- *
- * snprintf returns the length it *would* have written, not the length it
- * wrote, so accumulating that return value directly lets @*pos run past
- * @bufsize once anything truncates -- and the next `bufsize - *pos` then
- * underflows into a huge size_t.  Returning false on truncation keeps @*pos
- * bounded by @bufsize at all times.
- */
-static bool
-append_fmt(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
-{
-    va_list ap;
-
-    if (*pos >= bufsize)
-        return false;
-
-    va_start(ap, fmt);
-    int n = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
-    va_end(ap);
-
-    if (n < 0 || (size_t)n >= bufsize - *pos)
-        return false;
-
-    *pos += (size_t)n;
-    return true;
-}
-
-static char *
-build_edge_facts(int nrows, const char *rule)
-{
-    size_t bufsize = (size_t)nrows * 32 + strlen(rule) + 256;
-    char *src = (char *)malloc(bufsize);
-    if (!src)
-        return NULL;
-
-    size_t pos = 0;
-    bool ok = append_fmt(src, bufsize, &pos,
-            ".decl edge(x: int32, y: int32)\n");
-
-    for (int i = 0; ok && i < nrows; i++)
-        ok = append_fmt(src, bufsize, &pos, "edge(%d, %d).\n", i, i * 2);
-
-    if (ok)
-        ok = append_fmt(src, bufsize, &pos, "%s", rule);
-
-    if (!ok) {
-        free(src);
-        return NULL;
-    }
-    return src;
-}
 
 /* Sparse predicate across several tiles: exercises the tiled selection path
  * and output accumulation past the first tile. */
