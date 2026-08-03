@@ -1085,6 +1085,23 @@ test_hash_rows_batch_exe = executable(
 
 test('hash_rows_batch', test_hash_rows_batch_exe)
 
+# Differential test for the arrangement batch hash. The kernel runs the
+# arrangement's 64-bit FNV chain in 32-bit arithmetic; the oracle here is the
+# 64-bit form, so a mistake in that width argument surfaces as a mismatch.
+test_arr_hash_rows_batch_exe = executable(
+  'test_arr_hash_rows_batch',
+  files('test_arr_hash_rows_batch.c'),
+  backend_src,
+  files(subdir_wirelog / 'intern.c'),
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('arr_hash_rows_batch', test_arr_hash_rows_batch_exe)
+
 # ============================================================================
 # CRDT W=1 perf-suite gate.
 #

@@ -1854,4 +1854,43 @@ void
 col_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
     const uint32_t *key_cols, uint32_t kc, uint32_t *out_hashes);
 
+/*
+ * ARR_HASH_TILE:
+ * Rows hashed per arr_hash_rows_batch() call when a caller tiles a large
+ * range.  Bounds the scratch buffer an arrangement build needs.
+ */
+#define ARR_HASH_TILE 1024u
+
+/*
+ * arr_hash_rows_batch:
+ * Hash rows [@row_begin, @row_end) of @rel over @key_count key columns,
+ * writing @row_end - @row_begin results to @out_hashes, indexed RELATIVE to
+ * @row_begin.
+ *
+ * Returns the low 32 bits of the arrangement's FNV-1a chain, UNMASKED.  A
+ * caller reproduces the arrangement bucket with `out_hashes[j] & (nbuckets -
+ * 1)`, which must equal what arr_hash_key() computes on the probe side for
+ * the same key values.
+ *
+ * Only the low 32 bits are needed because nbuckets is a uint32_t, so the
+ * mask can never expose more; and those low bits are exactly reproducible in
+ * 32-bit arithmetic, since multiplication modulo 2^32 depends only on its
+ * operands modulo 2^32.  See the definition for the full argument.
+ *
+ * Bucket equality is load-bearing, not incidental: arr_update_incremental()
+ * extends a cached arrangement in place, so rows indexed by one code path are
+ * probed against rows indexed by another.  A divergence would leave earlier
+ * rows in buckets the probe never visits and silently drop join matches.
+ *
+ * @row_end must not exceed rel->nrows; row_begin >= row_end is a no-op.  No
+ * slack is required in @out_hashes: the vector loop runs only while eight
+ * whole rows remain and writes exactly eight lanes for them.
+ *
+ * Exposed (not static) so tests and benchmarks can drive it directly.  Not
+ * public API and not exported: the library builds with hidden visibility.
+ */
+void
+arr_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
+    const uint32_t *key_cols, uint32_t key_count, uint32_t *out_hashes);
+
 #endif /* WL_COLUMNAR_INTERNAL_H */
