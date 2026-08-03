@@ -1265,8 +1265,14 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
  *   4. Reset retraction_seeded = false
  *
  * Falls back to full re-eval (col_stratum_step_with_delta) for recursive strata.
+ *
+ * Retained but not yet wired: col_stratum_step_with_delta() still uses full
+ * re-evaluation for retraction pending Issue #158 (see the note at its head).
+ * internal.h and tests/test_pointer_swap.c both name this function as the
+ * specification for the pointer-swap contract, so it is kept rather than
+ * deleted; UNUSED suppresses the warning until it is wired up.
  */
-static int
+static int UNUSED
 col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess,
     uint32_t stratum_idx)
@@ -1516,8 +1522,9 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * When retraction_seeded is set, the standard delta callback logic
      * compares prev state with new state (recomputed from affected input),
      * and diff=-1 callbacks are fired for removed tuples.
-     * Future optimization: implement col_stratum_step_retraction_nonrecursive
-     * for direct delta-only propagation of retractions. */
+     * Future optimization: wire up col_stratum_step_retraction_nonrecursive
+     * (implemented above, not yet called) for direct delta-only propagation
+     * of retractions. */
 
     uint32_t rc_cnt = sp->relation_count;
 
