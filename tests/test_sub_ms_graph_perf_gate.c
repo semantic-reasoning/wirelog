@@ -407,7 +407,7 @@ validate_counts_(const struct workload_spec *spec, const char *phase,
 
 static int
 run_workload_(const struct workload_spec *spec, const char *workload_dir,
-    const char *data_dir)
+    const char *data_dir, int correctness_only)
 {
     char *source = build_source_(spec, workload_dir, data_dir);
     if (!source) {
@@ -434,6 +434,13 @@ run_workload_(const struct workload_spec *spec, const char *workload_dir,
         != 0) {
         free(source);
         return 1;
+    }
+
+    if (correctness_only) {
+        printf("  %-10s correctness OK (tuples=%" PRId64 " iters=%u)\n",
+            spec->name, warm_count, warm_iters);
+        free(source);
+        return 0;
     }
 
     double trials_ms[TRIALS];
@@ -502,7 +509,10 @@ run_workload_(const struct workload_spec *spec, const char *workload_dir,
 int
 main(void)
 {
-    if (!parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
+    const int correctness_only
+        = parse_bool_env_("WIRELOG_GATE_CORRECTNESS_ONLY", 0);
+
+    if (!correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
         fprintf(stderr,
             "test_sub_ms_graph_perf_gate: SKIP: set WIRELOG_PERF_GATE=1 to "
             "run (designed for dedicated perf hardware, not shared CI "
@@ -510,7 +520,7 @@ main(void)
         return SKIP_EXIT;
     }
 
-    if (WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
+    if (!correctness_only && WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_sub_ms_graph_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 "
@@ -528,7 +538,7 @@ main(void)
         return SKIP_EXIT;
     }
 
-    if (!wl_perf_stability_env_ok()) {
+    if (!correctness_only && !wl_perf_stability_env_ok()) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
                 "test_sub_ms_graph_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 "
@@ -551,7 +561,8 @@ main(void)
 
     int saw_skip = 0;
     for (size_t i = 0; i < sizeof(workloads) / sizeof(workloads[0]); i++) {
-        int rc = run_workload_(&workloads[i], workload_dir, data_dir);
+        int rc = run_workload_(&workloads[i], workload_dir, data_dir,
+                correctness_only);
         if (rc == SKIP_EXIT) {
             saw_skip = 1;
             continue;
