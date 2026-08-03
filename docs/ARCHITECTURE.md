@@ -213,7 +213,7 @@ Timely-Differential provides:
 
 ### Why Columnar (not row-major)?
 
-- **SIMD acceleration**: Vectorized comparison, hash, join operations
+- **SIMD acceleration**: Vectorized row comparison and filter scan kernels
 - **Cache efficiency**: Sequential column access improves L1/L2 hit rate
 - **Arrow ecosystem**: Direct mapping to Apache Arrow format
 
