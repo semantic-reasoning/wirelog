@@ -1,20 +1,24 @@
 /*
- * test_simd_join.c - SIMD JOIN Hash and Key-Match Tests (Issue #231)
+ * test_simd_join.c - JOIN Hash and Key-Match Tests (Issue #231)
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
  *
- * Validates correctness of the AVX2-accelerated hash (hash_int64_keys_avx2)
- * and key-match (keys_match_avx2) paths used in the JOIN, anti-join, and
- * semi-join operators.  Tests are performed via the real session API so that
- * both the build phase (hash) and the probe phase (key comparison) are
- * exercised together.
+ * Validates JOIN, anti-join and semi-join correctness across key widths,
+ * driven through the real session API so that both the build phase (hashing)
+ * and the probe phase (key comparison) are exercised together.
+ *
+ * These cases once targeted per-key-column SIMD kernels (hash_int64_keys_avx2,
+ * keys_match_avx2).  Those were never reachable -- their dispatcher macros had
+ * no call sites -- and were removed; the join hash and key-match are scalar on
+ * every target today.  The cases are kept because varying the key width is
+ * still worthwhile coverage, but they no longer exercise any SIMD path.
  *
  * Test cases:
- *   1. kc=1  JOIN: scalar FNV-1a path (kc < 4 fallback)
+ *   1. kc=1  JOIN: single-key special case
  *   2. kc=2  JOIN: two-key join, still scalar path
- *   3. kc=4  JOIN: four-key join — first AVX2 SIMD iteration
- *   4. kc=8  JOIN: eight-key join — two full AVX2 SIMD iterations
+ *   3. kc=4  JOIN: four-key join — generic (non-special-cased) arm
+ *   4. kc=8  JOIN: eight-key join — generic arm, wider key
  *   5. Large kc=1 JOIN: 200 rows — hash distribution stress
  *   6. kc=4  JOIN no match: no common key values, empty result
  *   7. kc=1  JOIN negative values: hash correctness with negatives
@@ -46,29 +50,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Helper: tuple counter callback
@@ -141,7 +145,7 @@ run_program(const char *src, const char *rel, int64_t *out_count)
  * Test 1: kc=1 JOIN (scalar FNV-1a path)
  *
  * Transitive closure: r(1,2), r(2,3), r(3,4) -> 6 tuples.
- * JOIN on 1 key column (kc=1 < 4 falls through to scalar).
+ * JOIN on 1 key column, which the join hash and key match special-case.
  * ================================================================ */
 static void
 test_kc1_join_tc_3edge(void)
@@ -149,8 +153,8 @@ test_kc1_join_tc_3edge(void)
     TEST("kc=1 JOIN (scalar path): TC 3-edge produces 6 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 3). r(3, 4).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 3). r(3, 4).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "r", &count);
@@ -174,11 +178,11 @@ test_kc2_join_two_key(void)
     TEST("kc=2 JOIN (scalar path): two-key join produces 2 tuples");
 
     const char *src = ".decl lhs(a: int32, b: int32, e: int32)\n"
-                      ".decl rhs(a: int32, b: int32, f: int32)\n"
-                      ".decl out(a: int32, b: int32, e: int32, f: int32)\n"
-                      "lhs(1, 2, 10). lhs(3, 4, 20). lhs(5, 6, 30).\n"
-                      "rhs(1, 2, 100). rhs(5, 6, 200).\n"
-                      "out(a, b, e, f) :- lhs(a, b, e), rhs(a, b, f).\n";
+        ".decl rhs(a: int32, b: int32, f: int32)\n"
+        ".decl out(a: int32, b: int32, e: int32, f: int32)\n"
+        "lhs(1, 2, 10). lhs(3, 4, 20). lhs(5, 6, 30).\n"
+        "rhs(1, 2, 100). rhs(5, 6, 200).\n"
+        "out(a, b, e, f) :- lhs(a, b, e), rhs(a, b, f).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "out", &count);
@@ -189,28 +193,28 @@ test_kc2_join_two_key(void)
 }
 
 /* ================================================================
- * Test 3: kc=4 JOIN (four-column key — first AVX2 SIMD iteration)
+ * Test 3: kc=4 JOIN (four-column key — generic arm)
  *
  * join on (a,b,c,d): out(a,b,c,d,e,f) :- lhs(a,b,c,d,e), rhs(a,b,c,d,f).
  * lhs: (1,2,3,4,10), (1,2,3,4,11), (5,6,7,8,20)
  * rhs: (1,2,3,4,100), (9,9,9,9,200)
  * Expected: 2 tuples (both lhs rows with key (1,2,3,4) match rhs row).
- * AVX2 path: hash_int64_keys_avx2 processes all 4 key cols in one iteration;
- * keys_match_avx2 compares all 4 cols in one _mm256_cmpeq_epi64.
+ * Four key columns: exercises the generic (non-special-cased) arm of the
+ * join hash and key-match, which handle kc == 1 and kc == 2 separately.
  * ================================================================ */
 static void
 test_kc4_join_avx2_path(void)
 {
-    TEST("kc=4 JOIN (AVX2 path): four-key join produces 2 tuples");
+    TEST("kc=4 JOIN: four-key join produces 2 tuples");
 
     const char *src
         = ".decl lhs(a: int32, b: int32, c: int32, d: int32, e: int32)\n"
-          ".decl rhs(a: int32, b: int32, c: int32, d: int32, f: int32)\n"
-          ".decl out(a: int32, b: int32, c: int32, d: int32, e: int32, "
-          "f: int32)\n"
-          "lhs(1, 2, 3, 4, 10). lhs(1, 2, 3, 4, 11). lhs(5, 6, 7, 8, 20).\n"
-          "rhs(1, 2, 3, 4, 100). rhs(9, 9, 9, 9, 200).\n"
-          "out(a, b, c, d, e, f) :- lhs(a, b, c, d, e), rhs(a, b, c, d, f).\n";
+        ".decl rhs(a: int32, b: int32, c: int32, d: int32, f: int32)\n"
+        ".decl out(a: int32, b: int32, c: int32, d: int32, e: int32, "
+        "f: int32)\n"
+        "lhs(1, 2, 3, 4, 10). lhs(1, 2, 3, 4, 11). lhs(5, 6, 7, 8, 20).\n"
+        "rhs(1, 2, 3, 4, 100). rhs(9, 9, 9, 9, 200).\n"
+        "out(a, b, c, d, e, f) :- lhs(a, b, c, d, e), rhs(a, b, c, d, f).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "out", &count);
@@ -221,7 +225,7 @@ test_kc4_join_avx2_path(void)
 }
 
 /* ================================================================
- * Test 4: kc=8 JOIN (eight-column key — two full AVX2 SIMD iterations)
+ * Test 4: kc=8 JOIN (eight-column key — generic arm, wider key)
  *
  * join on all 8 columns (a..h).
  * lhs: two rows with key (1,2,3,4,5,6,7,8) + payload p
@@ -231,20 +235,20 @@ test_kc4_join_avx2_path(void)
 static void
 test_kc8_join_two_avx2_iters(void)
 {
-    TEST("kc=8 JOIN (2x AVX2 iterations): eight-key join produces 2 tuples");
+    TEST("kc=8 JOIN: eight-key join produces 2 tuples");
 
     const char *src
         = ".decl lhs(a:int32,b:int32,c:int32,d:int32,e:int32,f:int32,g:int32,"
-          "h:int32,p:int32)\n"
-          ".decl rhs(a:int32,b:int32,c:int32,d:int32,e:int32,f:int32,g:int32,"
-          "h:int32,q:int32)\n"
-          ".decl out(a:int32,b:int32,c:int32,d:int32,e:int32,f:int32,g:int32,"
-          "h:int32,p:int32,q:int32)\n"
-          "lhs(1,2,3,4,5,6,7,8,10). lhs(1,2,3,4,5,6,7,8,11).\n"
-          "lhs(9,9,9,9,9,9,9,9,99).\n"
-          "rhs(1,2,3,4,5,6,7,8,100). rhs(0,0,0,0,0,0,0,0,200).\n"
-          "out(a,b,c,d,e,f,g,h,p,q) :- "
-          "lhs(a,b,c,d,e,f,g,h,p), rhs(a,b,c,d,e,f,g,h,q).\n";
+        "h:int32,p:int32)\n"
+        ".decl rhs(a:int32,b:int32,c:int32,d:int32,e:int32,f:int32,g:int32,"
+        "h:int32,q:int32)\n"
+        ".decl out(a:int32,b:int32,c:int32,d:int32,e:int32,f:int32,g:int32,"
+        "h:int32,p:int32,q:int32)\n"
+        "lhs(1,2,3,4,5,6,7,8,10). lhs(1,2,3,4,5,6,7,8,11).\n"
+        "lhs(9,9,9,9,9,9,9,9,99).\n"
+        "rhs(1,2,3,4,5,6,7,8,100). rhs(0,0,0,0,0,0,0,0,200).\n"
+        "out(a,b,c,d,e,f,g,h,p,q) :- "
+        "lhs(a,b,c,d,e,f,g,h,p), rhs(a,b,c,d,e,f,g,h,q).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "out", &count);
@@ -269,9 +273,9 @@ test_kc1_join_large(void)
     TEST("kc=1 JOIN (200+ rows): 10-node chain TC produces 45 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1,2). r(2,3). r(3,4). r(4,5). r(5,6).\n"
-                      "r(6,7). r(7,8). r(8,9). r(9,10).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1,2). r(2,3). r(3,4). r(4,5). r(5,6).\n"
+        "r(6,7). r(7,8). r(8,9). r(9,10).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "r", &count);
@@ -285,21 +289,21 @@ test_kc1_join_large(void)
 /* ================================================================
  * Test 6: kc=4 JOIN with no matching keys — empty result
  *
- * lhs and rhs have disjoint keys; AVX2 SIMD comparison detects mismatch.
+ * lhs and rhs have disjoint keys; the key comparison must reject every pair.
  * ================================================================ */
 static void
 test_kc4_join_no_match(void)
 {
-    TEST("kc=4 JOIN (AVX2 path): no matching keys produces 0 tuples");
+    TEST("kc=4 JOIN: no matching keys produces 0 tuples");
 
     const char *src
         = ".decl lhs(a: int32, b: int32, c: int32, d: int32, e: int32)\n"
-          ".decl rhs(a: int32, b: int32, c: int32, d: int32, f: int32)\n"
-          ".decl out(a: int32, b: int32, c: int32, d: int32, e: int32, "
-          "f: int32)\n"
-          "lhs(1, 2, 3, 4, 10). lhs(5, 6, 7, 8, 20).\n"
-          "rhs(9, 9, 9, 9, 100). rhs(0, 0, 0, 0, 200).\n"
-          "out(a, b, c, d, e, f) :- lhs(a, b, c, d, e), rhs(a, b, c, d, f).\n";
+        ".decl rhs(a: int32, b: int32, c: int32, d: int32, f: int32)\n"
+        ".decl out(a: int32, b: int32, c: int32, d: int32, e: int32, "
+        "f: int32)\n"
+        "lhs(1, 2, 3, 4, 10). lhs(5, 6, 7, 8, 20).\n"
+        "rhs(9, 9, 9, 9, 100). rhs(0, 0, 0, 0, 200).\n"
+        "out(a, b, c, d, e, f) :- lhs(a, b, c, d, e), rhs(a, b, c, d, f).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "out", &count);
@@ -323,8 +327,8 @@ test_kc1_join_large_values(void)
 
     /* 3000000000 > 2^31-1, so hi32 != 0 -- exercises hi32 FNV-1a round. */
     const char *src = ".decl r(x: int64, y: int64)\n"
-                      "r(3000000000, 4000000000). r(4000000000, 3000000000).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(3000000000, 4000000000). r(4000000000, 3000000000).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "r", &count);
@@ -338,27 +342,27 @@ test_kc1_join_large_values(void)
  * Test 8: kc=4 JOIN partial match — only a subset of rows match
  *
  * 5 lhs rows, 3 rhs rows; only 2 lhs rows match any rhs row.
- * Validates that the SIMD comparison correctly rejects non-matching rows.
+ * Validates that the key comparison correctly rejects non-matching rows.
  * ================================================================ */
 static void
 test_kc4_join_partial_match(void)
 {
-    TEST("kc=4 JOIN (AVX2 path): partial match produces 2 tuples");
+    TEST("kc=4 JOIN: partial match produces 2 tuples");
 
     const char *src
         = ".decl lhs(a: int32, b: int32, c: int32, d: int32, e: int32)\n"
-          ".decl rhs(a: int32, b: int32, c: int32, d: int32, f: int32)\n"
-          ".decl out(a: int32, b: int32, c: int32, d: int32, e: int32, "
-          "f: int32)\n"
-          "lhs(1, 2, 3, 4, 10).\n"
-          "lhs(1, 2, 3, 5, 11).\n" /* differs at col d */
-          "lhs(5, 6, 7, 8, 20).\n"
-          "lhs(1, 2, 4, 4, 30).\n" /* differs at col c */
-          "lhs(2, 2, 3, 4, 40).\n" /* differs at col a */
-          "rhs(1, 2, 3, 4, 100).\n"
-          "rhs(5, 6, 7, 8, 200).\n"
-          "rhs(9, 9, 9, 9, 300).\n"
-          "out(a, b, c, d, e, f) :- lhs(a, b, c, d, e), rhs(a, b, c, d, f).\n";
+        ".decl rhs(a: int32, b: int32, c: int32, d: int32, f: int32)\n"
+        ".decl out(a: int32, b: int32, c: int32, d: int32, e: int32, "
+        "f: int32)\n"
+        "lhs(1, 2, 3, 4, 10).\n"
+        "lhs(1, 2, 3, 5, 11).\n"   /* differs at col d */
+        "lhs(5, 6, 7, 8, 20).\n"
+        "lhs(1, 2, 4, 4, 30).\n"   /* differs at col c */
+        "lhs(2, 2, 3, 4, 40).\n"   /* differs at col a */
+        "rhs(1, 2, 3, 4, 100).\n"
+        "rhs(5, 6, 7, 8, 200).\n"
+        "rhs(9, 9, 9, 9, 300).\n"
+        "out(a, b, c, d, e, f) :- lhs(a, b, c, d, e), rhs(a, b, c, d, f).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "out", &count);
@@ -369,13 +373,15 @@ test_kc4_join_partial_match(void)
 }
 
 /* ================================================================
- * Test 9: kc=1 JOIN with 3-cycle (Issue #234 dispatch)
+ * Test 9: kc=1 JOIN with 3-cycle (recursive)
  *
- * Validates that the internal scalar_inline fallback in NEON dispatch
- * produces correct hash/match results for a recursive 3-cycle.
- * This exercises the kc<2 branch inside hash_int64_keys_neon and
- * keys_match_neon after Issue #234 moved dispatch from ternary macro
- * to internal inline fallback.
+ * Validates correct hash/match results for a recursive 3-cycle at kc == 1,
+ * where the join hash and key-match both take their single-key special case
+ * and the same relation is joined against itself across iterations.
+ *
+ * Originally written for the Issue #234 NEON dispatch fallback; that
+ * dispatcher and its kernels no longer exist, but the recursive kc == 1
+ * shape is still worth covering.
  * ================================================================ */
 static void
 test_kc1_join_3cycle_dispatch(void)
@@ -383,8 +389,8 @@ test_kc1_join_3cycle_dispatch(void)
     TEST("kc=1 JOIN (Issue #234 dispatch): 3-cycle recursive join");
 
     const char *src = ".decl r(x: int64, y: int64)\n"
-                      "r(100, 200). r(200, 300). r(300, 100).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(100, 200). r(200, 300). r(300, 100).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "r", &count);
@@ -399,7 +405,7 @@ test_kc1_join_3cycle_dispatch(void)
  * Test 10: kc=1 JOIN with zero key (Issue #234 dispatch)
  *
  * Zero key has hi32=0, lo32=0, testing edge case of FNV-1a hash
- * in the scalar_inline path. Must produce correct join results.
+ * at kc == 1. Must produce correct join results.
  * ================================================================ */
 static void
 test_kc1_join_zero_key(void)
@@ -407,11 +413,11 @@ test_kc1_join_zero_key(void)
     TEST("kc=1 JOIN (Issue #234 dispatch): zero-value key hashes correctly");
 
     const char *src = ".decl lhs(a: int64, b: int64)\n"
-                      ".decl rhs(a: int64, c: int64)\n"
-                      ".decl out(a: int64, b: int64, c: int64)\n"
-                      "lhs(0, 10). lhs(1, 20). lhs(0, 30).\n"
-                      "rhs(0, 100). rhs(2, 200).\n"
-                      "out(a, b, c) :- lhs(a, b), rhs(a, c).\n";
+        ".decl rhs(a: int64, c: int64)\n"
+        ".decl out(a: int64, b: int64, c: int64)\n"
+        "lhs(0, 10). lhs(1, 20). lhs(0, 30).\n"
+        "rhs(0, 100). rhs(2, 200).\n"
+        "out(a, b, c) :- lhs(a, b), rhs(a, c).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "out", &count);
@@ -423,23 +429,23 @@ test_kc1_join_zero_key(void)
 }
 
 /* ================================================================
- * Test 11: kc=2 NEON boundary (Issue #234 dispatch)
+ * Test 11: kc=2 recursive join
  *
- * kc=2 is the exact boundary where NEON SIMD path activates
- * (kc<2 uses scalar_inline, kc>=2 uses NEON vectorized).
+ * kc == 2 has its own special case in both the join hash and the key match,
+ * so a recursive two-key join is worth covering separately from kc == 1.
  * This test validates correctness at the boundary with a recursive
  * join that exercises both hash and key-match paths extensively.
  * ================================================================ */
 static void
 test_kc2_join_neon_boundary(void)
 {
-    TEST("kc=2 JOIN (NEON boundary): two-key recursive join");
+    TEST("kc=2 JOIN: two-key recursive join");
 
     const char *src = ".decl edge(x: int32, y: int32, w: int32)\n"
-                      ".decl path(x: int32, y: int32, w: int32)\n"
-                      "edge(1, 2, 10). edge(2, 3, 20). edge(3, 1, 30).\n"
-                      "path(x, y, w) :- edge(x, y, w).\n"
-                      "path(x, z, w) :- path(x, y, _), edge(y, z, w).\n";
+        ".decl path(x: int32, y: int32, w: int32)\n"
+        "edge(1, 2, 10). edge(2, 3, 20). edge(3, 1, 30).\n"
+        "path(x, y, w) :- edge(x, y, w).\n"
+        "path(x, z, w) :- path(x, y, _), edge(y, z, w).\n";
 
     int64_t count = 0;
     int rc = run_program(src, "path", &count);
@@ -458,16 +464,10 @@ int
 main(void)
 {
     printf(
-        "\n=== SIMD JOIN Hash and Key-Match Tests (Issue #231, #234) ===\n\n");
+        "\n=== JOIN Hash and Key-Match Tests (Issue #231, #234) ===\n\n");
 
-#ifdef __AVX2__
-    printf("INFO: AVX2 available — SIMD paths will be exercised\n\n");
-#elif defined(__ARM_NEON__)
-    printf("INFO: ARM NEON available — NEON dispatch paths will be "
-           "exercised\n\n");
-#else
-    printf("INFO: No SIMD available — scalar fallback paths will be used\n\n");
-#endif
+    printf("INFO: the join hash and key match are scalar on every target;\n"
+        "      these cases vary key width, not instruction set.\n\n");
 
     test_kc1_join_tc_3edge();
     test_kc2_join_two_key();
