@@ -1815,46 +1815,6 @@ col_filter_select_rows(const int64_t *col_a, const int64_t *col_b,
     uint32_t *out_sel);
 
 /*
- * COL_HASH_TILE:
- * Rows hashed per col_hash_rows_batch() call when a caller tiles a large
- * range.  Bounds the scratch buffer a build loop needs (COL_HASH_TILE *
- * sizeof(uint32_t)) without giving up batch width.
- */
-#define COL_HASH_TILE 1024u
-
-/*
- * col_hash_rows_batch:
- * Hash rows [@row_begin, @row_end) of @rel over @kc key columns, writing
- * @row_end - @row_begin results to @out_hashes.
- *
- * @out_hashes is indexed RELATIVE to @row_begin: out_hashes[j] corresponds
- * to row row_begin + j.  Callers wanting absolute indexing pass a shifted
- * pointer.
- *
- * Hashes are RAW and unmasked.  Bucket masking stays at the call site, where
- * the table width is known and the mask folds into the loop that already
- * reads the value.
- *
- * Guarantees out_hashes[j] == col_join_hash_rel_keys(rel, row_begin + j,
- * key_cols, kc), bit for bit, including kc == 0 (every row hashes to the FNV
- * offset basis).  That equality is load-bearing: the session-cached diff
- * arrangement is extended incrementally, so build and probe may run through
- * different code paths in different iterations, and any divergence would
- * lose join results silently rather than failing.
- *
- * @row_end must not exceed rel->nrows; row_begin >= row_end is a no-op.
- * Unlike col_filter_select_rows() this needs NO slack in @out_hashes -- the
- * vector loop runs only while eight whole rows remain and writes exactly
- * eight lanes for those eight rows.
- *
- * Exposed (not static) so tests and benchmarks can drive it directly.  Not
- * public API and not exported: the library builds with hidden visibility.
- */
-void
-col_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
-    const uint32_t *key_cols, uint32_t kc, uint32_t *out_hashes);
-
-/*
  * ARR_HASH_TILE:
  * Rows hashed per arr_hash_rows_batch() call when a caller tiles a large
  * range.  Bounds the scratch buffer an arrangement build needs.
