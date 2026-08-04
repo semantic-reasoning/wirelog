@@ -22,21 +22,37 @@ if ! unzip -tq "$TMPZIP" > /dev/null 2>&1; then
     exit 1
 fi
 
-echo "Extracting required CSV files..."
+echo "Extracting required fact files..."
 mkdir -p "$TMPDIR"
 unzip -o "$TMPZIP" -d "$TMPDIR" > /dev/null
 
+# The archive ships DOOP .facts (tab-separated, string-valued).  They are
+# copied verbatim: the benchmark reads them directly, so there is no encoding
+# step that could drift between refreshes.  Issue #950.
 REQUIRED="DirectSuperclass DirectSuperinterface MainClass FormalParam
-ComponentType AssignReturnValue ActualParam Method_Modifier Var_Type
-HeapAllocation_Type ClassType ArrayType InterfaceType Var_DeclaringMethod
-ApplicationClass ThisVar NormalHeap StringConstant AssignHeapAllocation
-AssignLocal AssignCast Field StaticMethodInvocation SpecialMethodInvocation
-VirtualMethodInvocation Method Method_Descriptor StoreInstanceField
-LoadInstanceField StoreStaticField LoadStaticField StoreArrayIndex
-LoadArrayIndex Return"
+ComponentType AssignReturnValue ActualParam Method-Modifier Var-Type
+ClassType ArrayType InterfaceType Var-DeclaringMethod ApplicationClass
+ThisVar NormalHeap StringConstant AssignHeapAllocation AssignLocal AssignCast
+Field StaticMethodInvocation SpecialMethodInvocation VirtualMethodInvocation
+Method StoreInstanceField LoadInstanceField StoreStaticField LoadStaticField
+StoreArrayIndex LoadArrayIndex Return ClassHeap MethodHandleConstant
+MethodTypeConstant"
+
+missing=""
+for f in $REQUIRED; do
+    [ -f "$TMPDIR/zxing/${f}.facts" ] || missing="$missing $f"
+done
+if [ -n "$missing" ]; then
+    echo "ERROR: the archive is missing required relations:" >&2
+    for f in $missing; do echo "         ${f}.facts" >&2; done
+    echo "       Downloaded from: $URL" >&2
+    echo "       The upstream artifact may have changed; see issue #950." >&2
+    exit 1
+fi
 
 for f in $REQUIRED; do
-    cp "$TMPDIR/zxing/${f}.csv" "$SCRIPT_DIR/"
+    cp "$TMPDIR/zxing/${f}.facts" "$SCRIPT_DIR/"
 done
 
-echo "Done. 34 CSV files copied to $SCRIPT_DIR/"
+echo "Done. $(echo $REQUIRED | wc -w) fact files copied to $SCRIPT_DIR/"
+echo "Archive sha256: $(sha256sum "$TMPZIP" | cut -d" " -f1)"

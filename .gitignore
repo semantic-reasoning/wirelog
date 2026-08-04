@@ -57,7 +57,7 @@ third_party/nanoarrow-vendor/
 .claude/
 
 # Large benchmark datasets (download via bench/data/*/download.sh)
-bench/data/doop/*.csv
+bench/data/doop/*.facts
 
 # OS specific
 .DS_Store
