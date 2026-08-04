@@ -2608,7 +2608,8 @@ static const char *doop_rules
     "!Method_Modifier(\"abstract\", m).\n"
     "MainMethodDeclaration(m) :- MainClass(t), "
     "Method_DeclaringType(m, t), Method_SimpleName(m, \"main\"), "
-    "Method_Descriptor(m, \"java.lang.String[]\"), Method_Modifier(\"public\", m), "
+    "Method_Descriptor(m, \"void(java.lang.String[])\"), "
+    "Method_Modifier(\"public\", m), "
     "Method_Modifier(\"static\", m).\n"
     "DirectSubclass(a, c) :- DirectSuperclass(a, c).\n"
     "Subclass(c, a) :- DirectSubclass(a, c).\n"
@@ -2637,7 +2638,8 @@ static const char *doop_rules
     "SupertypeOf(s, t) :- SubtypeOf(t, s).\n"
     "SubtypeOfDifferent(s, t) :- SubtypeOf(s, t), s != t.\n"
     /* Phase 3: Class initialization */
-    "ClassInitializer(t, m) :- MethodImplemented(\"<clinit>\", \"\", t, m).\n"
+    "ClassInitializer(t, m) :- "
+    "MethodImplemented(\"<clinit>\", \"void()\", t, m).\n"
     "InitializedClass(sc) :- InitializedClass(c), "
     "DirectSuperclass(c, sc).\n"
     "InitializedClass(si) :- InitializedClass(ci), "
@@ -2753,10 +2755,19 @@ static const char *doop_rules
     "_MethodHandleConstant(h, _, _, _, _).\n"
     "HeapAllocation_Type(cat(cat(\"<method type \", d), \">\"), "
     "\"java.lang.invoke.MethodType\") :- _MethodTypeConstant(d, _, _, _).\n"
-    /* Method.facts column 3 is the Java-style descriptor (main ->
-     * java.lang.String[]); column 6 is the JVM one. */
+    /* DOOP's Method_Descriptor is ?returnType "(" ?paramTypes ")" -- not
+     * Method.facts column 3, which is the parameter list alone.  Confirmed
+     * against the recovered 2026-05-24 archive's own Method_Descriptor.csv:
+     * returnType+"("+params+")" matches all 70,373 rows, params alone
+     * matches none (#956).  Column 6 is the JVM descriptor, a third form.
+     *
+     * Binding params alone loses 562 MethodLookup rows to the
+     * !MethodImplemented antijoin and, worse, coarsens the dispatch key so
+     * covariant overrides and bridge methods collapse together: 1,829
+     * ambiguous dispatch keys instead of 625. */
     ".decl Method_Descriptor(method: string, descriptor: string)\n"
-    "Method_Descriptor(m, d) :- _Method(m, _, d, _, _, _, _).\n";
+    "Method_Descriptor(m, cat(cat(cat(rt, \"(\"), p), \")\")) :- "
+    "_Method(m, _, p, _, rt, _, _).\n";
 
 static int
 run_doop_workload(const char *data_dir, uint32_t workers, int repeat)

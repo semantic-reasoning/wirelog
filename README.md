@@ -89,7 +89,16 @@ block below runs them separately for the same reason.
 | Borrow Check | Polonius | 4.4ms | 3.8ms | 3.6ms | 1,999 | 23 / 25 / 25 | 3.5MB / 3.4MB / 3.5MB |
 | Disassembly | DDISASM | 2.4ms | 3.8ms | 3.3ms | 900 | 0 / 19 / 19 | 3.5MB / 3.7MB / 3.7MB |
 | CRDT | CRDT | 23.36s | 24.01s | 23.65s | 2,156,530 | 14,148 | 108MB / 345MB / 462MB |
-| Program Analysis | DOOP (zxing) | 92.77s | 51.14s | 44.05s | 6,069,774 | 28 | 31.1GB / 32.7GB / 32.8GB |
+| Program Analysis | DOOP (zxing) | 91.31s | 50.72s | 44.02s | 6,070,090 [^doop] | 28 | 31.1GB / 32.8GB / 32.8GB |
+
+[^doop]: DOOP's tuple total is the **W=1** figure and is reproducible only
+    there. At W>1 it varies run to run -- 6,070,123 / 6,070,238 / 6,070,274
+    across three W=8 runs of the same binary (#958). The W=8 and W=16
+    timings in this row are still meaningful; the tuple count is not.
+    Two further open defects ride on this number: the fixpoint is not
+    closed under its own rules (#955), and the total counts duplicate
+    rows rather than distinct tuples (#957). Treat it as a fingerprint of
+    current code, not as a statement about what DOOP should compute.
 
 Numbers are 5-trial medians (`--repeat 5`) on a single dev host with
 cpufreq governor `schedutil`; treat them as descriptive, not gated.
@@ -148,11 +157,11 @@ that are now derived:
 | | comparable total |
 |---|---|
 | `70f4d84` engine, old archive (the old row) | 6,276,657 |
-| today's engine and rules, old archive | 6,395,438 |
-| today's engine and rules, current archive | 5,912,677 |
+| today's engine and rules, old archive | 6,395,752 |
+| today's engine and rules, current archive | 5,912,993 |
 
-So the archive change accounts for **-482,761** and everything else since
-`70f4d84` for **+118,781**. The dominant single input change is
+So the archive change accounts for **-482,759** and everything else since
+`70f4d84` for **+119,095**. The dominant single input change is
 `AssignLocal`, 306,227 -> 144,124 rows: it is the main source of `Assign`,
 and `VarPointsTo` closure over `Assign` dominates the total. 32 of the 34
 shared relations changed; only `MainClass` and `ApplicationClass` did not.
