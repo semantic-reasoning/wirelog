@@ -659,6 +659,19 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #952 (follow-up to #950): the DOOP .facts catalogue is written down
+# in four places -- download.sh, doop_edbs[], doop_fact_files[], and the
+# fact-file count in run_doop_validation.sh.  They drifted apart silently
+# once already, and the test that should have caught it skipped itself
+# instead.  Static text scan; needs no dataset, so it runs on hosts that
+# will never fetch the 740 MB archive.
+if sh.found()
+  test('doop_catalogue', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-doop-catalogue.sh',
+              meson.project_source_root()],
+       suite: 'abi')
+endif
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss
@@ -1031,7 +1044,7 @@ test('option2_cse', test_option2_cse_exe)
 # ============================================================================
 #
 # Infrastructure tests (file checks, parse, synthetic 8-way join) run without
-# the 83MB DOOP dataset.  Data-dependent tests auto-skip when bench/data/doop
+# the ~740MB DOOP dataset.  Data-dependent tests auto-skip when bench/data/doop
 # is absent.  Full DOOP execution uses scripts/run_doop_validation.sh.
 
 test_option2_doop_exe = executable(
