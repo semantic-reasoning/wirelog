@@ -57,7 +57,9 @@ grep -o '"[A-Za-z0-9_-]*\.facts"' "$TEST" | tr -d '"' | sort -u > "$tmp/test"
 # the exact shape of failure this check exists to catch.  Demand a plausible
 # floor rather than merely non-empty.
 for name in download bench test; do
-    n=$(wc -l < "$tmp/$name")
+    # BSD wc pads its output with leading spaces; strip so the value is
+    # usable in string comparisons as well as arithmetic ones.
+    n=$(wc -l < "$tmp/$name" | tr -d '[:space:]')
     if [[ "$n" -lt 30 ]]; then
         echo "ERROR: extracted only $n .facts names from the '$name' catalogue." >&2
         echo "       The catalogue shrank drastically or this parser broke;" >&2
@@ -81,7 +83,7 @@ if ! diff -u "$tmp/download" "$tmp/test" > "$tmp/d2"; then
     rc=1
 fi
 
-EXPECTED=$(wc -l < "$tmp/download")
+EXPECTED=$(wc -l < "$tmp/download" | tr -d '[:space:]')
 
 # DOOP_NRELS sizes doop_edbs[]; a mismatch is a compile error there, but it is
 # still worth naming here so the count appears in one report.
