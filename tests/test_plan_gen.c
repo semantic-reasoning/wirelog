@@ -364,6 +364,248 @@ test_k_fusion_sequences_fuse_join_project(void)
 }
 
 /* ----------------------------------------------------------------
+ * Test: SIP-inserted SEMIJOINs must not shift column indices (#955)
+ *
+ * A SEMIJOIN filters its left input and emits the left columns only.
+ * When the plan generator resolved join keys and projections against a
+ * column layout that also counted the SEMIJOIN's right side, every index
+ * past the first SEMIJOIN was shifted; out-of-range "colN" names then fell
+ * back to column 0 in the evaluator, silently dropping derivations.
+ *
+ * The chain below is the smallest shape that exposes it: five atoms, all
+ * variables live in the head (so no projection re-bases the layout), each
+ * atom introducing a fresh variable.
+ * ---------------------------------------------------------------- */
+
+static const char *k_semijoin_chain_src
+    = ".decl a(p1: int64, p2: int64)\n"
+    "a(1, 2).\n"
+    ".decl b(q1: int64, q2: int64)\n"
+    "b(2, 3).\n"
+    ".decl c(r1: int64, r2: int64)\n"
+    "c(3, 4).\n"
+    ".decl d(s1: int64, s2: int64)\n"
+    "d(4, 5).\n"
+    ".decl e(t1: int64, t2: int64)\n"
+    "e(5, 6).\n"
+    ".decl chain(c1: int64, c2: int64, c3: int64, c4: int64, c5: int64,"
+    " c6: int64)\n"
+    "chain(v1, v2, v3, v4, v5, v6) :- a(v1, v2), b(v2, v3), c(v3, v4),"
+    " d(v4, v5), e(v5, v6).\n";
+
+/* Declared arity of the relations in k_semijoin_chain_src. */
+static uint32_t
+chain_rel_width(const char *name)
+{
+    if (!name)
+        return 0;
+    if (strcmp(name, "chain") == 0)
+        return 6;
+    return 2; /* a, b, c, d, e are all binary */
+}
+
+static void
+test_semijoin_does_not_shift_column_indices(void)
+{
+    TEST("SEMIJOIN does not shift join key/projection indices");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(k_semijoin_chain_src, &err);
+    ASSERT(prog != NULL, "parse failed");
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    ASSERT(rc == 0, "plan generation failed");
+
+    const wl_plan_relation_t *rp = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count && !rp; s++) {
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
+            const wl_plan_relation_t *cand = &plan->strata[s].relations[r];
+            if (cand->name && strcmp(cand->name, "chain") == 0) {
+                rp = cand;
+                break;
+            }
+        }
+    }
+    ASSERT(rp != NULL, "relation chain not found");
+
+    /* Replay the operator sequence, tracking the width of the relation on
+     * top of the evaluator stack, and check every resolved index against
+     * the operand widths it will actually see at run time. */
+    uint32_t width = 0;
+    int saw_semijoin = 0;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        uint32_t rw = op->right_relation ? chain_rel_width(op->right_relation)
+                                         : 0;
+        if (op->op == WL_PLAN_OP_SEMIJOIN)
+            saw_semijoin = 1;
+        if (op->op == WL_PLAN_OP_JOIN || op->op == WL_PLAN_OP_SEMIJOIN
+            || op->op == WL_PLAN_OP_ANTIJOIN) {
+            for (uint32_t k = 0; k < op->key_count; k++) {
+                const char *lk = op->left_keys ? op->left_keys[k] : NULL;
+                ASSERT(lk != NULL, "missing left key");
+                ASSERT(strncmp(lk, "col", 3) == 0, "left key is not colN");
+                ASSERT((uint32_t)atoi(lk + 3) < width,
+                    "left join key column index out of range");
+            }
+            uint32_t concat = (op->op == WL_PLAN_OP_JOIN) ? width + rw : width;
+            for (uint32_t p = 0; p < op->project_count; p++) {
+                if (!op->project_indices)
+                    break;
+                ASSERT(op->project_indices[p] < concat,
+                    "projection index out of range");
+            }
+        }
+        switch (op->op) {
+        case WL_PLAN_OP_VARIABLE:
+            width = chain_rel_width(op->relation_name);
+            break;
+        case WL_PLAN_OP_JOIN:
+            width = op->project_count ? op->project_count : width + rw;
+            break;
+        case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_SEMIJOIN:
+        case WL_PLAN_OP_ANTIJOIN:
+            if (op->project_count)
+                width = op->project_count;
+            break;
+        default:
+            break;
+        }
+    }
+    ASSERT(saw_semijoin, "SIP inserted no SEMIJOIN -- test no longer covers "
+        "the regression");
+
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+struct chain_ctx {
+    int64_t count;
+    int64_t row[8];
+    uint32_t ncols;
+};
+
+static void
+chain_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    struct chain_ctx *ctx = (struct chain_ctx *)user_data;
+    if (!relation || strcmp(relation, "chain") != 0)
+        return;
+    ctx->count++;
+    if (ctx->count == 1) {
+        ctx->ncols = ncols < 8 ? ncols : 8;
+        for (uint32_t i = 0; i < ctx->ncols; i++)
+            ctx->row[i] = row[i];
+    }
+}
+
+static void
+test_semijoin_chain_end_to_end(void)
+{
+    TEST("five-atom chain with SEMIJOINs derives its one tuple");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(k_semijoin_chain_src, &err);
+    ASSERT(prog != NULL, "parse failed");
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    ASSERT(rc == 0, "plan generation failed");
+
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 1, &sess);
+    ASSERT(rc == 0, "session create failed");
+
+    rc = wl_session_load_facts(sess, prog);
+    ASSERT(rc == 0, "load facts failed");
+
+    struct chain_ctx ctx = { 0, { 0 }, 0 };
+    rc = wl_session_snapshot(sess, chain_cb, &ctx);
+    ASSERT(rc == 0, "snapshot failed");
+
+    ASSERT(ctx.count == 1, "expected exactly one chain tuple");
+    ASSERT(ctx.ncols == 6, "expected six columns");
+    for (uint32_t i = 0; i < 6; i++)
+        ASSERT(ctx.row[i] == (int64_t)(i + 1), "unexpected chain tuple value");
+
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* Same chain shape, but with a negated atom so the head projection stays a
+ * separate MAP instead of being fused into the last JOIN.  The shifted
+ * layout corrupted that projection too: the tuple was still derived, with
+ * an out-of-range index silently yielding 0 in the last column. */
+static const char *k_semijoin_negation_src
+    = ".decl a(p1: int64, p2: int64)\n"
+    "a(1, 2).\n"
+    ".decl b(q1: int64, q2: int64)\n"
+    "b(2, 3).\n"
+    ".decl n(z1: int64)\n"
+    "n(99).\n"
+    ".decl c(r1: int64, r2: int64)\n"
+    "c(3, 4).\n"
+    ".decl d(s1: int64, s2: int64)\n"
+    "d(4, 5).\n"
+    ".decl chain(c1: int64, c2: int64, c3: int64, c4: int64, c5: int64)\n"
+    "chain(v1, v2, v3, v4, v5) :- a(v1, v2), b(v2, v3), !n(v3),"
+    " c(v3, v4), d(v4, v5).\n";
+
+static void
+test_semijoin_head_projection_values(void)
+{
+    TEST("SEMIJOIN chain keeps head projection values intact");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(k_semijoin_negation_src, &err);
+    ASSERT(prog != NULL, "parse failed");
+
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    ASSERT(rc == 0, "plan generation failed");
+
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 1, &sess);
+    ASSERT(rc == 0, "session create failed");
+
+    rc = wl_session_load_facts(sess, prog);
+    ASSERT(rc == 0, "load facts failed");
+
+    struct chain_ctx ctx = { 0, { 0 }, 0 };
+    rc = wl_session_snapshot(sess, chain_cb, &ctx);
+    ASSERT(rc == 0, "snapshot failed");
+
+    ASSERT(ctx.count == 1, "expected exactly one chain tuple");
+    ASSERT(ctx.ncols == 5, "expected five columns");
+    for (uint32_t i = 0; i < 5; i++)
+        ASSERT(ctx.row[i] == (int64_t)(i + 1), "unexpected chain tuple value");
+
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* ----------------------------------------------------------------
  * Test: wl_plan_free NULL-safe
  * ---------------------------------------------------------------- */
 
@@ -403,6 +645,9 @@ main(void)
     test_join_project_fusion_plan_shape();
     test_join_project_fusion_keeps_computed_map();
     test_k_fusion_sequences_fuse_join_project();
+    test_semijoin_does_not_shift_column_indices();
+    test_semijoin_chain_end_to_end();
+    test_semijoin_head_projection_values();
     test_plan_free_null();
     test_load_facts_null_safe();
 
