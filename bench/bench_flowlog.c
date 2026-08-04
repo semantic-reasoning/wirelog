@@ -2259,7 +2259,7 @@ run_crdt_workload(const char *data_dir, uint32_t workers, int repeat)
  * Magic constants are zxing-specific pre-hashed integer IDs. */
 
 #define DOOP_SRC_BUFSZ ((size_t)64 * 1024)
-#define DOOP_NRELS 34
+#define DOOP_NRELS 35
 
 struct doop_edb {
     const char *name;
@@ -2268,179 +2268,184 @@ struct doop_edb {
 };
 
 static const struct doop_edb doop_edbs[DOOP_NRELS] = {
-    { "DirectSuperclass", "(class: int32, superclass: int32)",
-      "DirectSuperclass.csv" },
-    { "DirectSuperinterface", "(ref: int32, interface: int32)",
-      "DirectSuperinterface.csv" },
-    { "MainClass", "(class: int32)", "MainClass.csv" },
-    { "FormalParam", "(index: int32, method: int32, var: int32)",
-      "FormalParam.csv" },
-    { "ComponentType", "(arrayType: int32, componentType: int32)",
-      "ComponentType.csv" },
-    { "AssignReturnValue", "(invocation: int32, to: int32)",
-      "AssignReturnValue.csv" },
-    { "ActualParam", "(index: int32, invocation: int32, var: int32)",
-      "ActualParam.csv" },
-    { "Method_Modifier", "(mod: int32, method: int32)", "Method_Modifier.csv" },
-    { "Var_Type", "(var: int32, type: int32)", "Var_Type.csv" },
-    { "HeapAllocation_Type", "(heap: int32, type: int32)",
-      "HeapAllocation_Type.csv" },
-    { "_ClassType", "(class: int32)", "ClassType.csv" },
-    { "_ArrayType", "(arrayType: int32)", "ArrayType.csv" },
-    { "_InterfaceType", "(interface: int32)", "InterfaceType.csv" },
-    { "_Var_DeclaringMethod", "(var: int32, method: int32)",
-      "Var_DeclaringMethod.csv" },
-    { "_ApplicationClass", "(type: int32)", "ApplicationClass.csv" },
-    { "_ThisVar", "(method: int32, var: int32)", "ThisVar.csv" },
-    { "_NormalHeap", "(id: int32, type: int32)", "NormalHeap.csv" },
-    { "_StringConstant", "(id: int32)", "StringConstant.csv" },
+    { "DirectSuperclass", "(class: string, superclass: string)",
+      "DirectSuperclass.facts" },
+    { "DirectSuperinterface", "(ref: string, interface: string)",
+      "DirectSuperinterface.facts" },
+    { "MainClass", "(class: string)", "MainClass.facts" },
+    { "FormalParam", "(index: string, method: string, var: string)",
+      "FormalParam.facts" },
+    { "ComponentType", "(arrayType: string, componentType: string)",
+      "ComponentType.facts" },
+    { "AssignReturnValue", "(invocation: string, to: string)",
+      "AssignReturnValue.facts" },
+    { "ActualParam", "(index: string, invocation: string, var: string)",
+      "ActualParam.facts" },
+    { "Method_Modifier", "(mod: string, method: string)",
+      "Method-Modifier.facts" },
+    { "Var_Type", "(var: string, type: string)", "Var-Type.facts" },
+    { "_ClassType", "(class: string)", "ClassType.facts" },
+    { "_ArrayType", "(arrayType: string)", "ArrayType.facts" },
+    { "_InterfaceType", "(interface: string)", "InterfaceType.facts" },
+    { "_Var_DeclaringMethod", "(var: string, method: string)",
+      "Var-DeclaringMethod.facts" },
+    { "_ApplicationClass", "(type: string)", "ApplicationClass.facts" },
+    { "_ThisVar", "(method: string, var: string)", "ThisVar.facts" },
+    { "_NormalHeap", "(id: string, type: string)", "NormalHeap.facts" },
+    { "_StringConstant", "(id: string)", "StringConstant.facts" },
     { "_AssignHeapAllocation",
-      "(instruction: int32, idx: int32, heap: int32, to: int32, "
-      "inmethod: int32, linenumber: int32)",
-      "AssignHeapAllocation.csv" },
+      "(instruction: string, idx: string, heap: string, to: string, "
+      "inmethod: string, linenumber: string)",
+      "AssignHeapAllocation.facts" },
     { "_AssignLocal",
-      "(instruction: int32, idx: int32, from: int32, to: int32, "
-      "inmethod: int32)",
-      "AssignLocal.csv" },
+      "(instruction: string, idx: string, from: string, to: string, "
+      "inmethod: string)",
+      "AssignLocal.facts" },
     { "_AssignCast",
-      "(instruction: int32, idx: int32, from: int32, to: int32, "
-      "type: int32, inmethod: int32)",
-      "AssignCast.csv" },
+      "(instruction: string, idx: string, from: string, to: string, "
+      "type: string, inmethod: string)",
+      "AssignCast.facts" },
     { "_Field",
-      "(signature: int32, declaringClass: int32, simplename: int32, "
-      "type: int32)",
-      "Field.csv" },
+      "(signature: string, declaringClass: string, simplename: string, "
+      "type: string)",
+      "Field.facts" },
     { "_StaticMethodInvocation",
-      "(instruction: int32, idx: int32, signature: int32, method: int32)",
-      "StaticMethodInvocation.csv" },
+      "(instruction: string, idx: string, signature: string, method: string)",
+      "StaticMethodInvocation.facts" },
     { "_SpecialMethodInvocation",
-      "(instruction: int32, idx: int32, signature: int32, base: int32, "
-      "method: int32)",
-      "SpecialMethodInvocation.csv" },
+      "(instruction: string, idx: string, signature: string, base: string, "
+      "method: string)",
+      "SpecialMethodInvocation.facts" },
     { "_VirtualMethodInvocation",
-      "(instruction: int32, idx: int32, signature: int32, base: int32, "
-      "method: int32)",
-      "VirtualMethodInvocation.csv" },
+      "(instruction: string, idx: string, signature: string, base: string, "
+      "method: string)",
+      "VirtualMethodInvocation.facts" },
     { "_Method",
-      "(method: int32, simplename: int32, params: int32, "
-      "declaringType: int32, returnType: int32, jvmDescriptor: int32, "
-      "arity: int32)",
-      "Method.csv" },
-    { "Method_Descriptor", "(method: int32, descriptor: int32)",
-      "Method_Descriptor.csv" },
+      "(method: string, simplename: string, params: string, "
+      "declaringType: string, returnType: string, jvmDescriptor: string, "
+      "arity: string)",
+      "Method.facts" },
     { "_StoreInstanceField",
-      "(instruction: int32, idx: int32, from: int32, base: int32, "
-      "signature: int32, method: int32)",
-      "StoreInstanceField.csv" },
+      "(instruction: string, idx: string, from: string, base: string, "
+      "signature: string, method: string)",
+      "StoreInstanceField.facts" },
     { "_LoadInstanceField",
-      "(instruction: int32, idx: int32, to: int32, base: int32, "
-      "signature: int32, method: int32)",
-      "LoadInstanceField.csv" },
+      "(instruction: string, idx: string, to: string, base: string, "
+      "signature: string, method: string)",
+      "LoadInstanceField.facts" },
     { "_StoreStaticField",
-      "(instruction: int32, idx: int32, from: int32, signature: int32, "
-      "method: int32)",
-      "StoreStaticField.csv" },
+      "(instruction: string, idx: string, from: string, signature: string, "
+      "method: string)",
+      "StoreStaticField.facts" },
     { "_LoadStaticField",
-      "(instruction: int32, idx: int32, to: int32, signature: int32, "
-      "method: int32)",
-      "LoadStaticField.csv" },
+      "(instruction: string, idx: string, to: string, signature: string, "
+      "method: string)",
+      "LoadStaticField.facts" },
     { "_StoreArrayIndex",
-      "(instruction: int32, idx: int32, from: int32, base: int32, "
-      "method: int32)",
-      "StoreArrayIndex.csv" },
+      "(instruction: string, idx: string, from: string, base: string, "
+      "method: string)",
+      "StoreArrayIndex.facts" },
     { "_LoadArrayIndex",
-      "(instruction: int32, idx: int32, to: int32, base: int32, "
-      "method: int32)",
-      "LoadArrayIndex.csv" },
-    { "_Return", "(instruction: int32, idx: int32, var: int32, method: int32)",
-      "Return.csv" },
+      "(instruction: string, idx: string, to: string, base: string, "
+      "method: string)",
+      "LoadArrayIndex.facts" },
+    { "_Return",
+      "(instruction: string, idx: string, var: string, method: string)",
+      "Return.facts" },
+    { "_ClassHeap", "(heap: string, type: string)", "ClassHeap.facts" },
+    { "_MethodHandleConstant",
+      "(id: string, type: string, a: string, b: string, c: string)",
+      "MethodHandleConstant.facts" },
+    { "_MethodTypeConstant",
+      "(descriptor: string, idx: string, type: string, d: string)",
+      "MethodTypeConstant.facts" },
 };
 
 /* IDB declarations + all ~130 rules */
 static const char *doop_rules
 /* IDB: Narrow schema */
-    = ".decl isType(t: int32)\n"
-    ".decl isReferenceType(t: int32)\n"
-    ".decl isArrayType(t: int32)\n"
-    ".decl isClassType(t: int32)\n"
-    ".decl isInterfaceType(t: int32)\n"
-    ".decl ApplicationClass(ref: int32)\n"
-    ".decl Field_DeclaringType(field: int32, declaringClass: int32)\n"
-    ".decl Method_DeclaringType(method: int32, declaringType: int32)\n"
-    ".decl Method_SimpleName(method: int32, simpleName: int32)\n"
-    ".decl ThisVar(method: int32, var: int32)\n"
-    ".decl Var_DeclaringMethod(var: int32, method: int32)\n"
-    ".decl Instruction_Method(insn: int32, inMethod: int32)\n"
-    ".decl isVirtualMethodInvocation_Insn(insn: int32)\n"
-    ".decl isStaticMethodInvocation_Insn(insn: int32)\n"
-    ".decl FieldInstruction_Signature(insn: int32, sign: int32)\n"
-    ".decl LoadInstanceField_Base(insn: int32, var: int32)\n"
-    ".decl LoadInstanceField_To(insn: int32, var: int32)\n"
-    ".decl StoreInstanceField_From(insn: int32, var: int32)\n"
-    ".decl StoreInstanceField_Base(insn: int32, var: int32)\n"
-    ".decl LoadStaticField_To(insn: int32, var: int32)\n"
-    ".decl StoreStaticField_From(insn: int32, var: int32)\n"
-    ".decl LoadArrayIndex_Base(insn: int32, var: int32)\n"
-    ".decl LoadArrayIndex_To(insn: int32, var: int32)\n"
-    ".decl StoreArrayIndex_From(insn: int32, var: int32)\n"
-    ".decl StoreArrayIndex_Base(insn: int32, var: int32)\n"
-    ".decl AssignInstruction_To(insn: int32, to: int32)\n"
-    ".decl AssignCast_From(insn: int32, from: int32)\n"
-    ".decl AssignCast_Type(insn: int32, type: int32)\n"
-    ".decl AssignLocal_From(insn: int32, from: int32)\n"
-    ".decl AssignHeapAllocation_Heap(insn: int32, heap: int32)\n"
-    ".decl ReturnNonvoid_Var(ret: int32, var: int32)\n"
-    ".decl MethodInvocation_Method(invocation: int32, signature: int32)\n"
-    ".decl VirtualMethodInvocation_Base(invocation: int32, base: int32)\n"
-    ".decl VirtualMethodInvocation_SimpleName(invocation: int32, "
-    "simplename: int32)\n"
-    ".decl VirtualMethodInvocation_Descriptor(invocation: int32, "
-    "descriptor: int32)\n"
-    ".decl SpecialMethodInvocation_Base(invocation: int32, base: int32)\n"
-    ".decl MethodInvocation_Base(invocation: int32, base: int32)\n"
+    = ".decl isType(t: string)\n"
+    ".decl isReferenceType(t: string)\n"
+    ".decl isArrayType(t: string)\n"
+    ".decl isClassType(t: string)\n"
+    ".decl isInterfaceType(t: string)\n"
+    ".decl ApplicationClass(ref: string)\n"
+    ".decl Field_DeclaringType(field: string, declaringClass: string)\n"
+    ".decl Method_DeclaringType(method: string, declaringType: string)\n"
+    ".decl Method_SimpleName(method: string, simpleName: string)\n"
+    ".decl ThisVar(method: string, var: string)\n"
+    ".decl Var_DeclaringMethod(var: string, method: string)\n"
+    ".decl Instruction_Method(insn: string, inMethod: string)\n"
+    ".decl isVirtualMethodInvocation_Insn(insn: string)\n"
+    ".decl isStaticMethodInvocation_Insn(insn: string)\n"
+    ".decl FieldInstruction_Signature(insn: string, sign: string)\n"
+    ".decl LoadInstanceField_Base(insn: string, var: string)\n"
+    ".decl LoadInstanceField_To(insn: string, var: string)\n"
+    ".decl StoreInstanceField_From(insn: string, var: string)\n"
+    ".decl StoreInstanceField_Base(insn: string, var: string)\n"
+    ".decl LoadStaticField_To(insn: string, var: string)\n"
+    ".decl StoreStaticField_From(insn: string, var: string)\n"
+    ".decl LoadArrayIndex_Base(insn: string, var: string)\n"
+    ".decl LoadArrayIndex_To(insn: string, var: string)\n"
+    ".decl StoreArrayIndex_From(insn: string, var: string)\n"
+    ".decl StoreArrayIndex_Base(insn: string, var: string)\n"
+    ".decl AssignInstruction_To(insn: string, to: string)\n"
+    ".decl AssignCast_From(insn: string, from: string)\n"
+    ".decl AssignCast_Type(insn: string, type: string)\n"
+    ".decl AssignLocal_From(insn: string, from: string)\n"
+    ".decl AssignHeapAllocation_Heap(insn: string, heap: string)\n"
+    ".decl ReturnNonvoid_Var(ret: string, var: string)\n"
+    ".decl MethodInvocation_Method(invocation: string, signature: string)\n"
+    ".decl VirtualMethodInvocation_Base(invocation: string, base: string)\n"
+    ".decl VirtualMethodInvocation_SimpleName(invocation: string, "
+    "simplename: string)\n"
+    ".decl VirtualMethodInvocation_Descriptor(invocation: string, "
+    "descriptor: string)\n"
+    ".decl SpecialMethodInvocation_Base(invocation: string, base: string)\n"
+    ".decl MethodInvocation_Base(invocation: string, base: string)\n"
     /* IDB: Fat schema */
-    ".decl LoadInstanceField(base: int32, sig: int32, to: int32, "
-    "inmethod: int32)\n"
-    ".decl StoreInstanceField(from: int32, base: int32, signature: int32, "
-    "inmethod: int32)\n"
-    ".decl LoadStaticField(sig: int32, to: int32, inmethod: int32)\n"
-    ".decl StoreStaticField(from: int32, signature: int32, "
-    "inmethod: int32)\n"
-    ".decl LoadArrayIndex(base: int32, to: int32, inmethod: int32)\n"
-    ".decl StoreArrayIndex(from: int32, base: int32, inmethod: int32)\n"
-    ".decl AssignCast(type: int32, from: int32, to: int32, "
-    "inmethod: int32)\n"
-    ".decl AssignLocal(from: int32, to: int32, inmethod: int32)\n"
-    ".decl AssignHeapAllocation(heap: int32, to: int32, "
-    "inmethod: int32)\n"
-    ".decl ReturnVar(var: int32, method: int32)\n"
-    ".decl StaticMethodInvocation(invocation: int32, signature: int32, "
-    "inmethod: int32)\n"
+    ".decl LoadInstanceField(base: string, sig: string, to: string, "
+    "inmethod: string)\n"
+    ".decl StoreInstanceField(from: string, base: string, signature: string, "
+    "inmethod: string)\n"
+    ".decl LoadStaticField(sig: string, to: string, inmethod: string)\n"
+    ".decl StoreStaticField(from: string, signature: string, "
+    "inmethod: string)\n"
+    ".decl LoadArrayIndex(base: string, to: string, inmethod: string)\n"
+    ".decl StoreArrayIndex(from: string, base: string, inmethod: string)\n"
+    ".decl AssignCast(type: string, from: string, to: string, "
+    "inmethod: string)\n"
+    ".decl AssignLocal(from: string, to: string, inmethod: string)\n"
+    ".decl AssignHeapAllocation(heap: string, to: string, "
+    "inmethod: string)\n"
+    ".decl ReturnVar(var: string, method: string)\n"
+    ".decl StaticMethodInvocation(invocation: string, signature: string, "
+    "inmethod: string)\n"
     /* IDB: Type hierarchy */
-    ".decl MethodLookup(simplename: int32, descriptor: int32, "
-    "type: int32, method: int32)\n"
-    ".decl MethodImplemented(simplename: int32, descriptor: int32, "
-    "type: int32, method: int32)\n"
-    ".decl DirectSubclass(a: int32, c: int32)\n"
-    ".decl Subclass(c: int32, a: int32)\n"
-    ".decl Superclass(c: int32, a: int32)\n"
-    ".decl Superinterface(k: int32, c: int32)\n"
-    ".decl SubtypeOf(subtype: int32, type: int32)\n"
-    ".decl SupertypeOf(supertype: int32, type: int32)\n"
-    ".decl SubtypeOfDifferent(subtype: int32, type: int32)\n"
-    ".decl MainMethodDeclaration(method: int32)\n"
+    ".decl MethodLookup(simplename: string, descriptor: string, "
+    "type: string, method: string)\n"
+    ".decl MethodImplemented(simplename: string, descriptor: string, "
+    "type: string, method: string)\n"
+    ".decl DirectSubclass(a: string, c: string)\n"
+    ".decl Subclass(c: string, a: string)\n"
+    ".decl Superclass(c: string, a: string)\n"
+    ".decl Superinterface(k: string, c: string)\n"
+    ".decl SubtypeOf(subtype: string, type: string)\n"
+    ".decl SupertypeOf(supertype: string, type: string)\n"
+    ".decl SubtypeOfDifferent(subtype: string, type: string)\n"
+    ".decl MainMethodDeclaration(method: string)\n"
     /* IDB: Class initialization */
-    ".decl ClassInitializer(type: int32, method: int32)\n"
-    ".decl InitializedClass(classOrInterface: int32)\n"
+    ".decl ClassInitializer(type: string, method: string)\n"
+    ".decl InitializedClass(classOrInterface: string)\n"
     /* IDB: Main analysis */
-    ".decl Assign(to: int32, from: int32)\n"
-    ".decl VarPointsTo(heap: int32, var: int32)\n"
-    ".decl InstanceFieldPointsTo(heap: int32, fld: int32, "
-    "baseheap: int32)\n"
-    ".decl StaticFieldPointsTo(heap: int32, fld: int32)\n"
-    ".decl CallGraphEdge(invocation: int32, meth: int32)\n"
-    ".decl ArrayIndexPointsTo(baseheap: int32, heap: int32)\n"
-    ".decl Reachable(method: int32)\n"
+    ".decl Assign(to: string, from: string)\n"
+    ".decl VarPointsTo(heap: string, var: string)\n"
+    ".decl InstanceFieldPointsTo(heap: string, fld: string, "
+    "baseheap: string)\n"
+    ".decl StaticFieldPointsTo(heap: string, fld: string)\n"
+    ".decl CallGraphEdge(invocation: string, meth: string)\n"
+    ".decl ArrayIndexPointsTo(baseheap: string, heap: string)\n"
+    ".decl Reachable(method: string)\n"
     /* Phase 1: EDB staging & decomposition */
     "isType(class) :- _ClassType(class).\n"
     "isReferenceType(class) :- _ClassType(class).\n"
@@ -2594,12 +2599,11 @@ static const char *doop_rules
     "MethodLookup(sn, d, st, m), !MethodImplemented(sn, d, t, _).\n"
     "MethodImplemented(sn, d, t, m) :- Method_SimpleName(m, sn), "
     "Method_Descriptor(m, d), Method_DeclaringType(m, t), "
-    "!Method_Modifier(1928492, m).\n"
+    "!Method_Modifier(\"abstract\", m).\n"
     "MainMethodDeclaration(m) :- MainClass(t), "
-    "Method_DeclaringType(m, t), m != 536048, m != 1057660, "
-    "m != 796639, Method_SimpleName(m, 2648290), "
-    "Method_Descriptor(m, 2671384), Method_Modifier(760051, m), "
-    "Method_Modifier(841804, m).\n"
+    "Method_DeclaringType(m, t), Method_SimpleName(m, \"main\"), "
+    "Method_Descriptor(m, \"java.lang.String[]\"), Method_Modifier(\"public\", m), "
+    "Method_Modifier(\"static\", m).\n"
     "DirectSubclass(a, c) :- DirectSuperclass(a, c).\n"
     "Subclass(c, a) :- DirectSubclass(a, c).\n"
     "Subclass(c, a) :- Subclass(b, a), DirectSubclass(b, c).\n"
@@ -2614,20 +2618,20 @@ static const char *doop_rules
     "SubtypeOf(s, t) :- Subclass(t, s).\n"
     "SubtypeOf(s, s) :- isInterfaceType(s).\n"
     "SubtypeOf(s, t) :- isClassType(s), Superinterface(t, s).\n"
-    "SubtypeOf(s, t) :- isInterfaceType(s), isType(t), t = 613907.\n"
-    "SubtypeOf(s, t) :- isArrayType(s), isType(t), t = 613907.\n"
+    "SubtypeOf(s, t) :- isInterfaceType(s), isType(t), t = \"java.lang.Object\".\n"
+    "SubtypeOf(s, t) :- isArrayType(s), isType(t), t = \"java.lang.Object\".\n"
     "SubtypeOf(s, t) :- isInterfaceType(s), Superinterface(t, s).\n"
     "SubtypeOf(s, t) :- SubtypeOf(sc, tc), ComponentType(s, sc), "
     "ComponentType(t, tc), isReferenceType(sc), "
     "isReferenceType(tc).\n"
     "SubtypeOf(s, t) :- isArrayType(s), isInterfaceType(t), "
-    "isType(t), t = 935673.\n"
+    "isType(t), t = \"java.lang.Cloneable\".\n"
     "SubtypeOf(s, t) :- isArrayType(s), isInterfaceType(t), "
-    "isType(t), t = 619327.\n"
+    "isType(t), t = \"java.io.Serializable\".\n"
     "SupertypeOf(s, t) :- SubtypeOf(t, s).\n"
     "SubtypeOfDifferent(s, t) :- SubtypeOf(s, t), s != t.\n"
     /* Phase 3: Class initialization */
-    "ClassInitializer(t, m) :- MethodImplemented(777634, 2670449, t, m).\n"
+    "ClassInitializer(t, m) :- MethodImplemented(\"<clinit>\", \"\", t, m).\n"
     "InitializedClass(sc) :- InitializedClass(c), "
     "DirectSuperclass(c, sc).\n"
     "InitializedClass(si) :- InitializedClass(ci), "
@@ -2721,7 +2725,31 @@ static const char *doop_rules
     "SpecialMethodInvocation_Base(inv, base), "
     "VarPointsTo(h, base), "
     "MethodInvocation_Method(inv, tm), ThisVar(tm, this).\n"
-    "Reachable(m) :- MainMethodDeclaration(m).\n";
+    "Reachable(m) :- MainMethodDeclaration(m).\n"
+    /* Issue #950: HeapAllocation_Type and Method_Descriptor used to be
+     * shipped as pre-computed CSV files.  The upstream artifact no longer
+     * contains them -- FlowLog's own zxing.dl notes HeapAllocation_Type was
+     * "modified to be an EDB now", i.e. materialised from a fuller DOOP run.
+     * Both are derived here instead, so the benchmark needs only the raw
+     * .facts the archive actually ships.
+     *
+     * The heap rules are the ones zxing.dl carries commented out, plus the
+     * three heap kinds it dropped when it switched to the materialised file.
+     * Verified against the archive: these five rules cover all 75,106
+     * distinct heaps _AssignHeapAllocation references, with none left over.
+     * Method-type heaps are the one case whose id must be synthesised --
+     * DOOP names them "<method type D>" for descriptor D. */
+    ".decl HeapAllocation_Type(heap: string, type: string)\n"
+    "HeapAllocation_Type(h, t) :- _NormalHeap(h, t).\n"
+    "HeapAllocation_Type(h, \"java.lang.String\") :- _StringConstant(h).\n"
+    "HeapAllocation_Type(h, t) :- _ClassHeap(h, t).\n"
+    "HeapAllocation_Type(h, t) :- _MethodHandleConstant(h, t, _, _, _).\n"
+    "HeapAllocation_Type(cat(cat(\"<method type \", d), \">\"), t) :- "
+    "_MethodTypeConstant(d, _, t, _).\n"
+    /* Method.facts column 3 is the Java-style descriptor (main ->
+     * java.lang.String[]); column 6 is the JVM one. */
+    ".decl Method_Descriptor(method: string, descriptor: string)\n"
+    "Method_Descriptor(m, d) :- _Method(m, _, d, _, _, _, _).\n";
 
 static int
 run_doop_workload(const char *data_dir, uint32_t workers, int repeat)
@@ -2735,7 +2763,7 @@ run_doop_workload(const char *data_dir, uint32_t workers, int repeat)
     for (int i = 0; i < DOOP_NRELS; i++) {
         int n = snprintf(source + pos, DOOP_SRC_BUFSZ - pos,
                 ".decl %s%s\n"
-                ".input %s(filename=\"%s/%s\", delimiter=\",\")\n",
+                ".input %s(filename=\"%s/%s\", delimiter=\"\\t\")\n",
                 doop_edbs[i].name, doop_edbs[i].cols,
                 doop_edbs[i].name, data_dir, doop_edbs[i].csv);
         if (n < 0 || pos + (size_t)n >= DOOP_SRC_BUFSZ) {
@@ -2754,19 +2782,35 @@ run_doop_workload(const char *data_dir, uint32_t workers, int repeat)
         return -1;
     }
 
-    /* Count total input facts across all 34 CSV files */
+    /* Count total input facts across every EDB file.
+     *
+     * Counts newlines rather than fgets() calls: DOOP method signatures run
+     * well past any fixed line buffer, and a short buffer would count one
+     * long row several times.  A missing file is an error -- silently
+     * skipping it would under-report the fact count for a run that is also
+     * about to produce wrong results. */
     int32_t total_facts = 0;
     {
         char path[1024];
-        char line[256];
+        char buf[65536];
         for (int i = 0; i < DOOP_NRELS; i++) {
             snprintf(path, sizeof(path), "%s/%s", data_dir, doop_edbs[i].csv);
             FILE *f = fopen(path, "r");
-            if (f) {
-                while (fgets(line, sizeof(line), f))
-                    total_facts++;
-                fclose(f);
+            if (!f) {
+                fprintf(stderr,
+                    "error: DOOP input file missing: %s\n"
+                    "       run bench/data/doop/download.sh\n", path);
+                free(source);
+                return -1;
             }
+            size_t got;
+            while ((got = fread(buf, 1, sizeof(buf), f)) > 0) {
+                for (size_t k = 0; k < got; k++) {
+                    if (buf[k] == '\n')
+                        total_facts++;
+                }
+            }
+            fclose(f);
         }
     }
 
