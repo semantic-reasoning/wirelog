@@ -521,6 +521,8 @@ dup_indices(const uint32_t *src, uint32_t count)
  * Collect the output column names produced by an IR node.
  * For SCAN: returns the declared column_names.
  * For JOIN: concatenates left + right child column names.
+ * For SEMIJOIN/ANTIJOIN: the left child's columns only -- these operators
+ * filter rows and never widen their input.
  * For PROJECT/FILTER/FLATMAP/UNION: delegates to child[0].
  *
  * out_names and out_count are set on success (caller must free out_names
@@ -553,9 +555,54 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
         return 0;
     }
 
-    case WIRELOG_IR_JOIN:
     case WIRELOG_IR_ANTIJOIN:
     case WIRELOG_IR_SEMIJOIN: {
+        /* SEMIJOIN/ANTIJOIN filter their left input: col_op_semijoin and
+         * col_op_antijoin emit the left columns only (optionally narrowed
+         * by the node's own projection).  Concatenating the right child's
+         * columns here would shift every column index resolved above this
+         * node -- join keys and fused projections alike.  Out-of-range
+         * "colN" names then silently resolve to column 0 in the evaluator,
+         * so the rule joins on the wrong column and under-derives (#955). */
+        char **left_names = NULL;
+        uint32_t left_count = 0;
+        if (node->child_count == 0
+            || collect_output_columns(node->children[0], &left_names,
+            &left_count)
+            != 0) {
+            *out_names = NULL;
+            *out_count = 0;
+            return -1;
+        }
+        /* Only SEMIJOIN carries its projection into the plan operator
+         * (see translate_ir_node); ANTIJOIN always emits all left columns. */
+        if (node->type == WIRELOG_IR_SEMIJOIN && node->project_count > 0
+            && node->project_indices) {
+            uint32_t pc = node->project_count;
+            char **names = (char **)calloc(pc, sizeof(char *));
+            if (!names) {
+                for (uint32_t i = 0; i < left_count; i++)
+                    free(left_names[i]);
+                free((void *)left_names);
+                return -1;
+            }
+            for (uint32_t i = 0; i < pc; i++) {
+                uint32_t idx = node->project_indices[i];
+                names[i] = (idx < left_count) ? dup_str(left_names[idx]) : NULL;
+            }
+            for (uint32_t i = 0; i < left_count; i++)
+                free(left_names[i]);
+            free((void *)left_names);
+            *out_names = names;
+            *out_count = pc;
+            return 0;
+        }
+        *out_names = left_names;
+        *out_count = left_count;
+        return 0;
+    }
+
+    case WIRELOG_IR_JOIN: {
         /* Concatenate left child columns + right child columns */
         char **left_names = NULL, **right_names = NULL;
         uint32_t left_count = 0, right_count = 0;
