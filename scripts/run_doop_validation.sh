@@ -23,13 +23,13 @@
 #   --expected-tuples N
 #                     Expected DOOP output tuple count. Defaults to
 #                     DOOP_EXPECTED_TUPLES when set; otherwise defaults to
-#                     6070090 for the bundled bench/data/doop zxing dataset
-#                     at --workers 1.  See "Oracles" below: W>1 is not
-#                     currently reproducible (#958).
+#                     14096448 for the bundled bench/data/doop zxing
+#                     dataset at --workers 1.  W>1 does not complete at all
+#                     (#959); see "Oracles" below.
 #   --expected-iterations N
 #                     Expected fixpoint iteration count. Defaults to
 #                     DOOP_EXPECTED_ITERATIONS when set; otherwise defaults
-#                     to 28 for the bundled dataset.  See "Oracles" below.
+#                     to 153 for the bundled dataset.  See "Oracles" below.
 #   --save-results    Write a validation TSV under docs/performance
 #
 # Environment:
@@ -43,7 +43,8 @@
 # Oracles:
 #   Both defaults describe the archive with sha256
 #   154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7,
-#   measured at --workers 1 on 2026-08-04 (issues #952, #956).  Supply
+#   measured at --workers 1 on 2026-08-05 (issues #952, #955, #956).
+#   The run takes about 23 minutes and peaks near 40 GB.  Supply
 #   --expected-tuples on any other dataset; the tuple count is
 #   dataset-specific.  An explicitly supplied --expected-tuples, and a
 #   --baseline TSV, are both applied at any width: comparing against a
@@ -51,16 +52,16 @@
 #   run warns rather than refusing.
 #
 #   The oracle is a FINGERPRINT of current code, not a statement about
-#   what DOOP should compute.  Three open defects pass through it:
-#   #955 (the fixpoint is not closed under its own rules), #957 (the
-#   total counts duplicate rows, so it is a row count and not a tuple
-#   count), and #958 (W>1 varies run to run, which is why this default
-#   is W=1-specific -- do not reuse it with --workers > 1).
+#   what DOOP should compute.  #957 still passes through it: the total
+#   counts duplicate rows, so it is a row count and not a tuple count.
+#   It is W=1-only because W>1 does not complete -- the per-worker
+#   join-output cap is the session cap divided by the worker count
+#   (#959) -- and because W>1 totals varied run to run when they did
+#   complete (#958).
 #
-#   The iteration oracle is NOT gated on W=1.  Unlike the tuple total, 28
-#   was observed at W=8 and W=16 in every run taken while the tuple count
-#   was varying (#958), so it is stable at the widths that matter here.  If
-#   a future run shows it moving, gate it the same way as the tuple oracle.
+#   #955 is fixed as of 2026-08-05.  Before it, this workload derived
+#   VarPointsTo = 5,266 against a true value near 4.1 million; any oracle
+#   recorded before that date describes a broken analysis.
 #
 #   The iteration count is checked as a cheap second signal, not as a
 #   sensitive one.  It does catch some rule defects the tuple total hides:
@@ -205,7 +206,7 @@ fi
 # call to make, not ours.
 if [[ -z "$EXPECTED_TUPLES" && "$DOOP_DATA" == "$DEFAULT_DOOP_DATA" ]]; then
     if [[ "$WORKERS" -eq 1 ]]; then
-        EXPECTED_TUPLES=6070090
+        EXPECTED_TUPLES=14096448
     else
         echo "note: no default tuple oracle at --workers $WORKERS;" \
              "W>1 is not reproducible (#958)"
@@ -218,7 +219,7 @@ fi
 echo "Expected tuples: ${EXPECTED_TUPLES:-not supplied}"
 
 if [[ -z "$EXPECTED_ITERATIONS" && "$DOOP_DATA" == "$DEFAULT_DOOP_DATA" ]]; then
-    EXPECTED_ITERATIONS=28
+    EXPECTED_ITERATIONS=153
 fi
 if [[ -n "$EXPECTED_ITERATIONS" && ! "$EXPECTED_ITERATIONS" =~ ^[0-9]+$ ]]; then
     echo "ERROR: expected iteration count must be a non-negative integer"

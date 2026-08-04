@@ -47,7 +47,8 @@ All notable changes to wirelog are documented in this file.
   `ActualParam.csv`, so after the archive switched to 35 string-valued
   `.facts` (#950) it failed for every user with `expected 34 CSV files,
   found 0`. It now counts `.facts`, points at the download script when the
-  dataset is absent, and carries the reconciled tuple oracle 6,070,090 --
+  dataset is absent, and carries the reconciled tuple oracle
+  (14,096,448 after #955) --
   the previous 6276338 matched neither the measurement nor the README's
   6,276,657, so the two in-tree "expected" values for one workload had
   disagreed by 319 for some time. The default is W=1-specific and is not
@@ -59,6 +60,32 @@ All notable changes to wirelog are documented in this file.
   rows, so a matching iteration count proves nothing on its own.
   `--help` printed a fixed `head -40` window and had silently begun
   truncating its own options list.
+
+- **SEMIJOIN/ANTIJOIN widened the plan's output layout** (#955):
+  `collect_output_columns` grouped them with JOIN and concatenated the right
+  child's columns, but both operators only filter and emit the left side.
+  Every SIP-inserted semijoin therefore inflated the reported layout by the
+  right relation's arity, shifting every join key and fused projection
+  resolved above it; `col_rel_col_idx` returned -1 for the out-of-range
+  `colN` and the resolution sites silently fell back to column 0.  A plan
+  bug became a wrong answer instead of an error.
+
+  The engine's output stopped being a model of its own program.  In DOOP a
+  `VarPointsTo` rule generated `col7=col0` over a six-column left input, so
+  it compared `inv` against `sn`; 354 immediate consequences of that one
+  rule were missing from the final fixpoint with every body atom present,
+  and `ArrayIndexPointsTo` derived nothing at all.  Against the full-DOOP
+  reference outputs in the recovered archive, `VarPointsTo` measured 5,266
+  where the reference has 4,455,314.  After the fix: 4,121,488.
+
+  SIP is on by default, so this reached user programs with a rule of this
+  shape, not only benchmarks.  Among the 15 shipped workloads only DOOP's
+  plan changes; out-of-range resolutions go 47 to 0 there and are 0
+  everywhere else both before and after.
+
+  DOOP's cost changes accordingly -- 94 s to about 23 minutes at W=1, 28 to
+  153 iterations, 39 GB peak -- and it no longer completes at W>1 (#959).
+  The old speed was under-derivation.
 
 - **DOOP `Method_Descriptor` derived from the wrong column** (#956): #951
   reconstructed the relation (the archive stopped shipping it) by projecting
@@ -133,9 +160,10 @@ All notable changes to wirelog are documented in this file.
   a pinned revision of the same git-backed mirror, and building the
   benchmark at `70f4d84` against it reproduces the old row exactly
   (6,276,657 tuples, 28 iterations, 11.8 GB). On a basis excluding the two
-  now-derived relations, the archive change accounts for -482,759 and all
-  engine and rule changes since for +119,095; `AssignLocal` alone dropped
-  306,227 -> 144,124 rows.
+  now-derived relations the archive change was the smaller term; after
+  #955 landed, the engine change dominates and no tuple-level
+  decomposition against the old row is meaningful.  `AssignLocal` alone
+  dropped 306,227 -> 144,124 rows between the two archives.
 
 ## [0.53.0] - 2026-07-31
 
