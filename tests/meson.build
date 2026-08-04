@@ -1049,6 +1049,27 @@ test_option2_doop_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
+# Issue #950: pins what each DOOP rule constant MEANS, on a hand-written
+# miniature dataset.  The real 68 MB archive cannot be fetched in CI (and has
+# already disappeared once), so these semantics have to be fixed independently
+# of it.  Each case carries the negative that makes it non-vacuous.
+test_doop_strings_exe = executable(
+  'test_doop_strings',
+  files('test_doop_strings.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('doop_strings', test_doop_strings_exe)
+
 test('option2_doop', test_option2_doop_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
 )
