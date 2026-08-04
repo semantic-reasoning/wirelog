@@ -132,14 +132,31 @@ with sha256
 `bench/data/doop/download.sh`. **It needs roughly 33 GB of RAM** -- the
 2026-05-24 row's 12 GB no longer describes what running this costs.
 
-After subtracting the 157,097 schema tuples, this run is still 363,980
-(5.8%) short of the previous row, and that gap is **not** explained by
-#914: reverting only its `eval.c` hunk and re-running DOOP on today's
-dataset gives 5,857,332 tuples, so #914 *adds* 212,442 here and correcting
-for it widens the gap rather than closing it. What remains is the dataset
-itself, the fidelity of the two reconstructed relations, or both -- neither
-is decidable without the artifact the old row was measured on, which is no
-longer available at its original host. Tracked in #952.
+**The difference from the 2026-05-24 row is accounted for.** Upstream
+replaced the archive at that URL on 2026-05-24, 51 minutes after the old
+row was measured, with a regenerated Soot fact dump rather than a
+re-encoding. The HuggingFace mirror is git-backed, so the original is still
+served at revision `e9d2e0e` (117,156,975 bytes, sha256 `dcd842b8...`) --
+which is what the "~112 MB" in `download.sh` had been describing all along.
+Building the benchmark at `70f4d84` and running it against that recovered
+archive reproduces the old row exactly: **6,276,657 tuples, 28 iterations,
+11.8 GB**.
+
+With both endpoints measured, on a basis that excludes the two relations
+that are now derived:
+
+| | comparable total |
+|---|---|
+| `70f4d84` engine, old archive (the old row) | 6,276,657 |
+| today's engine and rules, old archive | 6,395,438 |
+| today's engine and rules, current archive | 5,912,677 |
+
+So the archive change accounts for **-482,761** and everything else since
+`70f4d84` for **+118,781**. The dominant single input change is
+`AssignLocal`, 306,227 -> 144,124 rows: it is the main source of `Assign`,
+and `VarPointsTo` closure over `Assign` dominates the total. 32 of the 34
+shared relations changed; only `MainClass` and `ApplicationClass` did not.
+See #952.
 
 **Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.31s
 -> incremental re-eval 15.3ms (**86.0x faster**); W=8 baseline 691.3ms

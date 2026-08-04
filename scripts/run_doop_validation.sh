@@ -44,11 +44,14 @@
 #   measured on 2026-08-04 (issue #952).  Supply --expected-tuples on any
 #   other dataset; the tuple count is dataset-specific.
 #
-#   The iteration count is checked because it is the more sensitive of the
-#   two.  Fixpoint depth responds to the *shape* of the derived relations,
-#   so a rule defect moves it even when the tuple total looks plausible: the
-#   heap-typing bug fixed in #951 ran 70 iterations while producing a tuple
-#   count within 3% of the correct one.
+#   The iteration count is checked as a cheap second signal, not as a
+#   sensitive one.  It does catch some rule defects the tuple total hides:
+#   the heap-typing bug fixed in #951 ran 70 iterations while its tuple
+#   count stayed within 3% of correct.  But it is insensitive in the other
+#   direction -- 28 is pinned by the depth of the points-to fixpoint and
+#   survives configurations in which the entire type hierarchy derives
+#   zero rows.  Do not read a matching iteration count as evidence that
+#   the analysis is right.
 #
 # Output:
 #   Benchmark output plus validation summary printed to stdout.
