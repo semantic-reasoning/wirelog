@@ -11,10 +11,10 @@
  * Validates DOOP (Java points-to analysis) infrastructure for Option 2.
  * This file covers US-009 preparation tasks:
  *
- *   1. Verify DOOP data directory has all 34 expected CSV files.
+ *   1. Verify DOOP data directory has all 35 expected fact files.
  *   2. Verify DOOP declarations parse without error (syntax check).
  *   3. Verify 8-way virtual-dispatch join produces correct results
- *      using synthetic inline data (avoids loading 83MB dataset).
+ *      using synthetic inline data (avoids loading the full dataset).
  *
  * Full DOOP benchmark execution (US-010) uses the shell script:
  *   scripts/run_doop_validation.sh
@@ -23,7 +23,7 @@
  * DATA DIRECTORY
  * ========================================================================
  *
- * The DOOP zxing CSV dataset lives at bench/data/doop/ relative to the
+ * The DOOP zxing fact dataset lives at bench/data/doop/ relative to the
  * project root.  When running under meson test the CWD is the build
  * directory, so we try "../bench/data/doop" first and fall back to the
  * DOOP_DATA_DIR environment variable.
@@ -108,47 +108,53 @@ static int skip_count = 0;
 /* *INDENT-ON* */
 
 /* ========================================================================
- * DOOP EDB catalogue: the 34 CSV files expected in the data directory.
+ * DOOP EDB catalogue: the 35 .facts files expected in the data
+ * directory.  Issue #950: the benchmark reads DOOP's own fact files
+ * directly, so this list must track doop_edbs[] in bench_flowlog.c --
+ * if it drifts, this test skips instead of failing and the only
+ * end-to-end check against real data silently stops running.
  * ======================================================================== */
 
-static const char *doop_csv_files[] = {
-    "ActualParam.csv",
-    "ApplicationClass.csv",
-    "ArrayType.csv",
-    "AssignCast.csv",
-    "AssignHeapAllocation.csv",
-    "AssignLocal.csv",
-    "AssignReturnValue.csv",
-    "ClassType.csv",
-    "ComponentType.csv",
-    "DirectSuperclass.csv",
-    "DirectSuperinterface.csv",
-    "Field.csv",
-    "FormalParam.csv",
-    "HeapAllocation_Type.csv",
-    "InterfaceType.csv",
-    "LoadArrayIndex.csv",
-    "LoadInstanceField.csv",
-    "LoadStaticField.csv",
-    "MainClass.csv",
-    "Method.csv",
-    "Method_Descriptor.csv",
-    "Method_Modifier.csv",
-    "NormalHeap.csv",
-    "Return.csv",
-    "SpecialMethodInvocation.csv",
-    "StaticMethodInvocation.csv",
-    "StoreArrayIndex.csv",
-    "StoreInstanceField.csv",
-    "StoreStaticField.csv",
-    "StringConstant.csv",
-    "ThisVar.csv",
-    "Var_DeclaringMethod.csv",
-    "Var_Type.csv",
-    "VirtualMethodInvocation.csv",
+static const char *doop_fact_files[] = {
+    "ActualParam.facts",
+    "ApplicationClass.facts",
+    "ArrayType.facts",
+    "AssignCast.facts",
+    "AssignHeapAllocation.facts",
+    "AssignLocal.facts",
+    "AssignReturnValue.facts",
+    "ClassHeap.facts",
+    "ClassType.facts",
+    "ComponentType.facts",
+    "DirectSuperclass.facts",
+    "DirectSuperinterface.facts",
+    "Field.facts",
+    "FormalParam.facts",
+    "InterfaceType.facts",
+    "LoadArrayIndex.facts",
+    "LoadInstanceField.facts",
+    "LoadStaticField.facts",
+    "MainClass.facts",
+    "Method.facts",
+    "Method-Modifier.facts",
+    "MethodHandleConstant.facts",
+    "MethodTypeConstant.facts",
+    "NormalHeap.facts",
+    "Return.facts",
+    "SpecialMethodInvocation.facts",
+    "StaticMethodInvocation.facts",
+    "StoreArrayIndex.facts",
+    "StoreInstanceField.facts",
+    "StoreStaticField.facts",
+    "StringConstant.facts",
+    "ThisVar.facts",
+    "Var-DeclaringMethod.facts",
+    "Var-Type.facts",
+    "VirtualMethodInvocation.facts",
 };
 
-#define DOOP_NCSV ((int)(sizeof(doop_csv_files) / sizeof(doop_csv_files[0])))
+#define DOOP_NFACTS ((int)(sizeof(doop_fact_files) / \
+        sizeof(doop_fact_files[0])))
 
 /* ========================================================================
  * Helper: resolve DOOP data directory
@@ -382,7 +388,7 @@ run_program_count_rel_with_jpp(const char *src, uint32_t num_workers,
 /*
  * Test 1: DOOP data directory is accessible.
  *
- * Resolves the DOOP CSV directory via env var or relative path.
+ * Resolves the DOOP fact directory via env var or relative path.
  * SKIP if not found (no DOOP data installed — CI without large assets).
  */
 static void
@@ -400,15 +406,15 @@ test_doop_data_dir_accessible(void)
 }
 
 /*
- * Test 2: All 34 DOOP CSV files exist and are non-empty.
+ * Test 2: All 35 DOOP fact files exist and are non-empty.
  *
- * Spot-checks 5 representative files from the 34-file EDB.
+ * Spot-checks 5 representative files from the 35-file EDB.
  * SKIP if data dir not found.
  */
 static void
-test_doop_all_csv_files_exist(void)
+test_doop_all_fact_files_exist(void)
 {
-    TEST("doop_infra: all 34 CSV files exist and are non-empty");
+    TEST("doop_infra: all 35 fact files exist and are non-empty");
 
     const char *dir = resolve_doop_data_dir();
     if (!dir)
@@ -418,49 +424,53 @@ test_doop_all_csv_files_exist(void)
     int missing = 0;
     int empty = 0;
 
-    for (int i = 0; i < DOOP_NCSV; i++) {
-        snprintf(path, sizeof(path), "%s/%s", dir, doop_csv_files[i]);
+    for (int i = 0; i < DOOP_NFACTS; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dir, doop_fact_files[i]);
         struct stat st;
         if (stat(path, &st) != 0) {
-            fprintf(stderr, "\n  missing: %s", doop_csv_files[i]);
+            fprintf(stderr, "\n  missing: %s", doop_fact_files[i]);
             missing++;
         } else if (st.st_size == 0) {
-            fprintf(stderr, "\n  empty: %s", doop_csv_files[i]);
+            fprintf(stderr, "\n  empty: %s", doop_fact_files[i]);
             empty++;
         }
     }
 
     char msg[128];
-    if (missing == DOOP_NCSV) {
-        SKIP("DOOP CSV data files not installed");
+    if (missing == DOOP_NFACTS) {
+        SKIP("DOOP .facts data files not installed; "
+            "run bench/data/doop/download.sh");
         return;
     }
     if (missing > 0) {
-        snprintf(msg, sizeof(msg), "%d of %d CSV files missing", missing,
-            DOOP_NCSV);
+        snprintf(msg, sizeof(msg), "%d of %d fact files missing", missing,
+            DOOP_NFACTS);
         FAIL(msg);
         return;
     }
     if (empty > 0) {
-        snprintf(msg, sizeof(msg), "%d CSV files are empty", empty);
+        snprintf(msg, sizeof(msg), "%d fact files are empty", empty);
         FAIL(msg);
         return;
     }
 
-    printf("[%d files OK] ", DOOP_NCSV);
+    printf("[%d files OK] ", DOOP_NFACTS);
     PASS();
 }
 
 /*
- * Test 3: Total dataset size is in the expected range (70–100 MB).
+ * Test 3: Total dataset size is in the expected range.
  *
- * The zxing DOOP dataset is documented as ~83MB.  A significant
- * deviation indicates a corrupted or wrong dataset.
+ * Issue #950: the benchmark reads DOOP's .facts directly rather than a
+ * pre-encoded integer CSV set, so the on-disk size is dominated by fully
+ * qualified Java signatures -- about 740 MB, against ~83 MB for the
+ * integer encoding this replaced.  A large deviation still indicates a
+ * corrupted or wrong dataset.
  */
 static void
 test_doop_dataset_size_in_range(void)
 {
-    TEST("doop_infra: total dataset size is 70–100 MB");
+    TEST("doop_infra: total dataset size is 600–900 MB");
 
     const char *dir = resolve_doop_data_dir();
     if (!dir)
@@ -469,8 +479,8 @@ test_doop_dataset_size_in_range(void)
     char path[1024];
     off_t total = 0;
 
-    for (int i = 0; i < DOOP_NCSV; i++) {
-        snprintf(path, sizeof(path), "%s/%s", dir, doop_csv_files[i]);
+    for (int i = 0; i < DOOP_NFACTS; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dir, doop_fact_files[i]);
         struct stat st;
         if (stat(path, &st) == 0)
             total += st.st_size;
@@ -480,11 +490,12 @@ test_doop_dataset_size_in_range(void)
     printf("[%lld MB] ", mb);
 
     if (total == 0)
-        SKIP("DOOP CSV data files not installed");
+        SKIP("DOOP .facts data files not installed; "
+            "run bench/data/doop/download.sh");
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "expected 70–100 MB, got %lld MB", mb);
-    ASSERT(mb >= 70 && mb <= 100, msg);
+    snprintf(msg, sizeof(msg), "expected 600–900 MB, got %lld MB", mb);
+    ASSERT(mb >= 600 && mb <= 900, msg);
 
     PASS();
 }
@@ -1222,7 +1233,7 @@ main(void)
     /* --- Infrastructure: data files --- */
     printf("--- Infrastructure: Data Files ---\n");
     test_doop_data_dir_accessible();
-    test_doop_all_csv_files_exist();
+    test_doop_all_fact_files_exist();
     test_doop_dataset_size_in_range();
 
     /* --- Infrastructure: parser --- */

@@ -2253,10 +2253,12 @@ run_crdt_workload(const char *data_dir, uint32_t workers, int repeat)
  * DOOP - Java Points-to Analysis (zxing dataset)
  * ---------------------------------------------------------------- */
 
-/* DOOP uses .input directives to load 34 CSV files (~3.5M tuples).
+/* DOOP uses .input directives to load 35 DOOP .facts files (~3.9M tuples).
  * EDB definitions are generated programmatically; rules are a static string.
  * Dataset: zxing (smallest FlowLog DOOP artifact, 83MB).
- * Magic constants are zxing-specific pre-hashed integer IDs. */
+ * Columns are string-typed and the facts are read as shipped, so the
+ * benchmark no longer depends on any particular integer encoding
+ * (Issue #950). */
 
 #define DOOP_SRC_BUFSZ ((size_t)64 * 1024)
 #define DOOP_NRELS 35
@@ -2352,12 +2354,15 @@ static const struct doop_edb doop_edbs[DOOP_NRELS] = {
     { "_Return",
       "(instruction: string, idx: string, var: string, method: string)",
       "Return.facts" },
-    { "_ClassHeap", "(heap: string, type: string)", "ClassHeap.facts" },
+    { "_ClassHeap", "(heap: string, instanceType: string)",
+      "ClassHeap.facts" },
     { "_MethodHandleConstant",
-      "(id: string, type: string, a: string, b: string, c: string)",
+      "(id: string, method: string, retType: string, paramTypes: string, "
+      "arity: string)",
       "MethodHandleConstant.facts" },
     { "_MethodTypeConstant",
-      "(descriptor: string, idx: string, type: string, d: string)",
+      "(descriptor: string, arity: string, retType: string, "
+      "paramTypes: string)",
       "MethodTypeConstant.facts" },
 };
 
@@ -2742,10 +2747,11 @@ static const char *doop_rules
     ".decl HeapAllocation_Type(heap: string, type: string)\n"
     "HeapAllocation_Type(h, t) :- _NormalHeap(h, t).\n"
     "HeapAllocation_Type(h, \"java.lang.String\") :- _StringConstant(h).\n"
-    "HeapAllocation_Type(h, t) :- _ClassHeap(h, t).\n"
-    "HeapAllocation_Type(h, t) :- _MethodHandleConstant(h, t, _, _, _).\n"
-    "HeapAllocation_Type(cat(cat(\"<method type \", d), \">\"), t) :- "
-    "_MethodTypeConstant(d, _, t, _).\n"
+    "HeapAllocation_Type(h, \"java.lang.Class\") :- _ClassHeap(h, _).\n"
+    "HeapAllocation_Type(h, \"java.lang.invoke.MethodHandle\") :- "
+    "_MethodHandleConstant(h, _, _, _, _).\n"
+    "HeapAllocation_Type(cat(cat(\"<method type \", d), \">\"), "
+    "\"java.lang.invoke.MethodType\") :- _MethodTypeConstant(d, _, _, _).\n"
     /* Method.facts column 3 is the Java-style descriptor (main ->
      * java.lang.String[]); column 6 is the JVM one. */
     ".decl Method_Descriptor(method: string, descriptor: string)\n"
@@ -3073,7 +3079,7 @@ usage(const char *prog)
         "CSVs\n"
         "  --data-ddisasm DIR    Directory with DDISASM disassembly CSVs\n"
         "  --data-crdt DIR       Directory with CRDT Insert/Remove CSVs\n"
-        "  --data-doop DIR       Directory with DOOP zxing CSVs\n",
+        "  --data-doop DIR       Directory with DOOP zxing .facts\n",
         prog);
 }
 
