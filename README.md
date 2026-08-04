@@ -60,31 +60,36 @@ For fine-grained control over plans, backends, or worker counts, use the `wirelo
 ## Performance
 
 15-workload static benchmark portfolio plus CSPA incremental check
-(2026-05-24, `chore/0.43.99-dev-bench` at `70f4d84`,
-release/LTO build, GCC 16.1.1, `--repeat 5` medians):
+(2026-08-04, `main` at `7e498e7`, release/LTO build, GCC 16.1.1,
+`--repeat 5` medians):
 
-**Test environment**: Intel Xeon E5-2696 v4 (2 sockets, 44C/88T), Linux 7.0.9
-(Arch), 88 logical CPUs across two NUMA nodes. Measurements were collected
-from `./build-readme-bench/bench/bench_flowlog`; wall-clock results vary
-with CPU governor, thermal state, and memory pressure.
+**Test environment**: Intel Xeon E5-2696 v4 (2 sockets, 44C/88T), Linux 7.1.5
+(Arch), 88 logical CPUs across two NUMA nodes, 125 GB RAM. Measurements were
+collected from `./build-readme-bench/bench/bench_flowlog`; wall-clock results
+vary with CPU governor, thermal state, and memory pressure.
+
+Each workload was run in its own process. Peak RSS is a process-wide
+high-water mark, so a single `--workload all` invocation reports the largest
+workload's footprint for every workload that follows it -- the reproduction
+block below runs them separately for the same reason.
 
 | Category | Workload | W=1 median | W=8 median | W=16 median | Tuples | Iterations | Peak RSS (W=1 / W=8 / W=16) |
 |----------|----------|------------|------------|-------------|--------|------------|-------------------------------|
-| Graph | TC (Transitive Closure) | 7.9ms | 5.9ms | 5.9ms | 4,950 | 98 | 3.1MB / 3.3MB / 3.3MB |
-| Graph | Reach | 0.6ms | 0.4ms | 0.4ms | 100 | 98 | 2.7MB / 2.8MB / 2.7MB |
-| Graph | CC (Connected Components) | 8.6ms | 8.8ms | 11.0ms | 100 | 99 | 3.2MB / 3.1MB / 3.1MB |
-| Graph | SSSP (Shortest Path) | 0.6ms | 0.6ms | 0.8ms | 100 | 98 | 2.8MB / 2.8MB / 2.8MB |
-| Graph | SG (Subgraph) | 0.3ms | 0.4ms | 0.4ms | 0 | 0 | 2.8MB / 2.7MB / 2.8MB |
-| Graph | Bipartite | 0.6ms | 0.9ms | 0.8ms | 100 | 73 | 2.9MB / 2.9MB / 2.9MB |
-| Pointer Analysis | Andersen | 1.8ms | 2.9ms | 3.2ms | 155 | 8 | 4.8MB / 6.5MB / 3.4MB |
-| Pointer Analysis | Dyck-2 | 10.0ms | 9.8ms | 9.2ms | 2,120 | 8 | 5.6MB / 9.1MB / 9.2MB |
-| Pointer Analysis | CSPA | 1.16s | 588.6ms | 583.2ms | 20,381 | 6 | 339MB / 456MB / 482MB |
-| Data Flow | CSDA | 2.7ms | 2.7ms | 2.7ms | 2,986 | 29 | 3.1MB / 3.2MB / 3.2MB |
-| Ontology | Galen | 21.7ms | 28.8ms | 32.4ms | 5,568 | 23 | 6.1MB / 24MB / 24MB |
-| Borrow Check | Polonius | 3.7ms | 4.5ms | 3.6ms | 1,807 | 23 | 5.2MB / 5.2MB / 5.2MB |
-| Disassembly | DDISASM | 3.3ms | 3.9ms | 3.8ms | 531 | 0 / 16 / 16 | 5.0MB / 5.1MB / 5.1MB |
-| CRDT | CRDT | 12.78s | 12.87s | 12.73s | 1,301,914 | 0 / 7,603 / 7,603 | 79MB / 281MB / 322MB |
-| Program Analysis | DOOP (zxing) | 33.18s | 19.31s | 17.01s | 6,276,657 | 28 | 12.0GB / 12.7GB / 12.9GB |
+| Graph | TC (Transitive Closure) | 6.1ms | 6.0ms | 7.6ms | 4,950 | 98 | 3.2MB / 3.5MB / 3.4MB |
+| Graph | Reach | 0.6ms | 0.6ms | 0.4ms | 100 | 98 | 2.9MB / 2.9MB / 2.9MB |
+| Graph | CC (Connected Components) | 8.7ms | 8.4ms | 12.7ms | 100 | 99 | 3.2MB / 3.1MB / 3.2MB |
+| Graph | SSSP (Shortest Path) | 0.8ms | 0.6ms | 0.8ms | 100 | 98 | 2.8MB / 2.8MB / 2.8MB |
+| Graph | SG (Subgraph) | 0.5ms | 0.4ms | 0.5ms | 0 | 0 | 2.8MB / 2.9MB / 2.8MB |
+| Graph | Bipartite | 0.9ms | 0.7ms | 0.8ms | 100 | 73 | 3.0MB / 2.9MB / 2.9MB |
+| Pointer Analysis | Andersen | 2.4ms | 3.1ms | 3.2ms | 155 | 8 | 3.1MB / 3.4MB / 3.5MB |
+| Pointer Analysis | Dyck-2 | 10.2ms | 10.3ms | 9.5ms | 2,120 | 8 | 3.5MB / 7.2MB / 7.3MB |
+| Pointer Analysis | CSPA | 1.32s | 716.9ms | 695.9ms | 20,381 | 6 | 325MB / 459MB / 453MB |
+| Data Flow | CSDA | 2.7ms | 2.3ms | 2.3ms | 2,986 | 29 | 3.2MB / 3.4MB / 3.3MB |
+| Ontology | Galen | 21.1ms | 31.0ms | 33.9ms | 5,568 | 23 | 4.2MB / 8.8MB / 9.0MB |
+| Borrow Check | Polonius | 4.4ms | 3.8ms | 3.6ms | 1,999 | 23 / 25 / 25 | 3.5MB / 3.4MB / 3.5MB |
+| Disassembly | DDISASM | 2.4ms | 3.8ms | 3.3ms | 900 | 0 / 19 / 19 | 3.5MB / 3.7MB / 3.7MB |
+| CRDT | CRDT | 23.36s | 24.01s | 23.65s | 2,156,530 | 14,148 | 108MB / 345MB / 462MB |
+| Program Analysis | DOOP (zxing) | 92.77s | 51.14s | 44.05s | 6,069,774 | 28 | 31.1GB / 32.7GB / 32.8GB |
 
 Numbers are 5-trial medians (`--repeat 5`) on a single dev host with
 cpufreq governor `schedutil`; treat them as descriptive, not gated.
@@ -93,22 +98,53 @@ under `-Dwirelog_log_max_level=error` plus a `performance` governor
 (see `tests/test_crdt_perf_gate.c`).
 
 The CSPA table row is the static `cspa-fast` workload. The separate
-incremental CSPA check exercises `--workload cspa`. Galen W=8 had one
-outlier pass during regression triage and was rerun before documenting
-the confirmed 28.8ms median.
+incremental CSPA check exercises `--workload cspa`, which runs *only* the
+incremental variant -- the two are different entry points, not two
+reports from one run.
 
 Historic single-trial numbers from pre-2026-05-09 README revisions
 (before commit `1e6af00`) used `--repeat 1` and are not directly
-comparable to the current 5-trial medians. The previous repeat-5 README
-baseline reported CSPA W=1 at 1.95s on the 2026-05-06 host; this refresh
-reports 1.16s on the 2026-05-24 host/environment, so the delta is
-descriptive and should not be read as an isolated algorithmic speedup or
-regression.
+comparable to the current 5-trial medians. Wall-clock deltas between
+successive refreshes on this host are descriptive and should not be read
+as isolated algorithmic speedups or regressions.
 
-**Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.11s
--> incremental re-eval 15.4ms (**71.9x faster**); W=8 baseline 594.1ms
--> incremental re-eval 29.1ms (**20.4x faster**); W=16 baseline 608.1ms
--> incremental re-eval 29.9ms (**20.3x faster**). Each run inserted one
+**Output changed for four workloads since the 2026-05-24 revision.** These
+are result-set changes, not timing noise, and they have separate causes:
+
+- **CRDT** (1,301,914 -> 2,156,530 tuples), **DDISASM** (531 -> 900), and
+  **Polonius** (1,807 -> 1,999) changed under `61e2530` (#914), which reset
+  the iteration context for non-recursive strata; the previous table was
+  never re-measured afterwards. Confirmed by building both sides of that
+  commit: at W=1, `61e2530^` reproduces the previous table's three values
+  exactly and `61e2530` reproduces the current ones exactly. CRDT's
+  iteration count moves with it, 0 -> 14,148.
+- **DOOP** changed under #950/#951, which converted the benchmark to read
+  the archive's string-valued `.facts` as shipped instead of a vanished
+  integer encoding, and derived two relations the archive does not ship.
+  The tuple total is therefore not comparable to the previous row: 157,097
+  of it is `Method_Descriptor` and `HeapAllocation_Type`, which are now IDBs
+  and so enter a count that never included them.
+
+**The DOOP row describes a specific artifact**: the FlowLog zxing archive
+with sha256
+`154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`
+(35 `.facts` files, ~740 MB unpacked), fetched by
+`bench/data/doop/download.sh`. **It needs roughly 33 GB of RAM** -- the
+2026-05-24 row's 12 GB no longer describes what running this costs.
+
+After subtracting the 157,097 schema tuples, this run is still 363,980
+(5.8%) short of the previous row, and that gap is **not** explained by
+#914: reverting only its `eval.c` hunk and re-running DOOP on today's
+dataset gives 5,857,332 tuples, so #914 *adds* 212,442 here and correcting
+for it widens the gap rather than closing it. What remains is the dataset
+itself, the fidelity of the two reconstructed relations, or both -- neither
+is decidable without the artifact the old row was measured on, which is no
+longer available at its original host. Tracked in #952.
+
+**Incremental evaluation** (CSPA, delta-seeded): W=1 baseline 1.31s
+-> incremental re-eval 15.3ms (**86.0x faster**); W=8 baseline 691.3ms
+-> incremental re-eval 27.5ms (**25.1x faster**); W=16 baseline 673.9ms
+-> incremental re-eval 27.1ms (**24.9x faster**). Each run inserted one
 fact and changed the result from 20,381 to 21,063 tuples.
 
 `--workers N` means "use up to N workers", not "force exactly N workers for
@@ -167,7 +203,7 @@ done
 ```bash
 meson setup build
 meson compile -C build
-meson test -C build --print-errorlogs    # 126 tests
+meson test -C build --print-errorlogs    # 268 tests
 
 # Sanitizer build (optional)
 meson setup build-san -Db_sanitize=address,undefined

@@ -6,6 +6,17 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **DOOP fact-catalogue drift gate** (#952): the set of DOOP `.facts` files is
+  written down in four places -- `download.sh`, `doop_edbs[]`,
+  `doop_fact_files[]`, and the file count in `run_doop_validation.sh`. They
+  drifted apart silently once (#950) and the test that should have caught it
+  skipped itself instead. `scripts/ci/check-doop-catalogue.sh` now compares
+  all four and fails the `abi` suite on disagreement. It parses sources only,
+  so it runs on hosts that will never fetch the 740 MB archive, and it refuses
+  to compare catalogues it could not parse -- a parser returning nothing would
+  otherwise make every set trivially equal, which is the exact shape of
+  failure it exists to catch.
+
 ### Changed
 
 - **Warning-clean library build** (#940): the last three `-Wunused-function`
@@ -31,6 +42,20 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`scripts/run_doop_validation.sh` no longer expects the vanished CSV
+  layout** (#952): it counted 34 `*.csv` files and spot-checked
+  `ActualParam.csv`, so after the archive switched to 35 string-valued
+  `.facts` (#950) it failed for every user with `expected 34 CSV files,
+  found 0`. It now counts `.facts`, points at the download script when the
+  dataset is absent, and carries the reconciled tuple oracle 6,069,774 --
+  the previous 6276338 matched neither the measurement nor the README's
+  6,276,657, so the two in-tree "expected" values for one workload had
+  disagreed by 319 for some time. It also gained an iteration oracle,
+  because iteration count is the more sensitive signal: the heap-typing
+  defect fixed in #951 ran 70 iterations while its tuple total stayed
+  within 3% of the correct one. `--help` printed a fixed `head -40` window
+  and had silently begun truncating its own options list.
+
 - **Unbounded source construction in a filter test** (#939, #940): a test-source
   builder accumulated `snprintf` return values, which report the length that
   would have been written rather than the length written, so the write cursor
@@ -55,6 +80,25 @@ All notable changes to wirelog are documented in this file.
 ### Security
 
 ### Documentation
+
+- **Benchmark table re-measured** (#952): the README portfolio was last
+  measured 2026-05-24 and four workloads' *output* had changed since. CRDT
+  (1,301,914 -> 2,156,530 tuples), DDISASM (531 -> 900) and Polonius
+  (1,807 -> 1,999) moved under `61e2530` (#914); this was confirmed rather
+  than assumed by building both sides of that commit, which reproduce the
+  old and new values exactly. DOOP moved under #950/#951.
+
+  Each workload is now measured in its own process. Peak RSS is a
+  process-wide high-water mark, so the convenient single `--workload all`
+  invocation reports the largest workload's footprint for everything that
+  follows it -- CSPA's 325 MB was being attributed to five later rows.
+
+  The DOOP row carries the archive sha256 it describes and its ~33 GB
+  memory requirement, which is a barrier for anyone following the
+  reproduction block. Its remaining 363,980-tuple difference from the old
+  row is stated as unexplained rather than presented as a refresh, and
+  #914 is ruled out as the cause by direct measurement: reverting only its
+  `eval.c` hunk *lowers* DOOP to 5,857,332, so it widens the gap.
 
 ## [0.53.0] - 2026-07-31
 
