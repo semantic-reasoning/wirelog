@@ -43,18 +43,18 @@
  *
  *   test_main_method_declaration
  *       The conjunction of MainClass, simple name "main", descriptor
- *       "java.lang.String[]", and modifiers "public" and "static".  Five
- *       negatives: wrong class, wrong name, wrong descriptor, missing
- *       static, missing public.  Both modifier negatives are needed --
+ *       "void(java.lang.String[])", and modifiers "public" and "static".
+ *       Five negatives: wrong class, wrong name, wrong descriptor,
+ *       missing static, missing public.  Both modifier negatives are needed --
  *       with only one, the other conjunct could be dropped or duplicated
  *       and nothing would notice.  The two conjuncts are symmetric, so
  *       this pins the SET {public, static} and not which literal was
  *       which; nothing can distinguish that, and nothing needs to.
  *
  *   test_class_initializer
- *       MethodImplemented("<clinit>", "", t, m) -- the class initializer is
- *       matched by simple name AND empty descriptor.  Negative: a same-named
- *       method with a non-empty descriptor must not match.
+ *       MethodImplemented("<clinit>", "void()", t, m) -- the class
+ *       initializer is matched by simple name AND descriptor.  Negative: a
+ *       same-named method with a different descriptor must not match.
  *
  *   test_subtype_of_object_and_array_interfaces
  *       Every interface and every array type is a subtype of
@@ -219,8 +219,8 @@ test_method_implemented_excludes_abstract(void)
         ".decl Method_Modifier(mod: string, m: string)\n"
         "Method_SimpleName(\"<A: void f()>\", \"f\").\n"
         "Method_SimpleName(\"<A: void g()>\", \"g\").\n"
-        "Method_Descriptor(\"<A: void f()>\", \"\").\n"
-        "Method_Descriptor(\"<A: void g()>\", \"\").\n"
+        "Method_Descriptor(\"<A: void f()>\", \"void()\").\n"
+        "Method_Descriptor(\"<A: void g()>\", \"void()\").\n"
         "Method_DeclaringType(\"<A: void f()>\", \"A\").\n"
         "Method_DeclaringType(\"<A: void g()>\", \"A\").\n"
         "Method_Modifier(\"abstract\", \"<A: void g()>\").\n"
@@ -233,7 +233,7 @@ test_method_implemented_excludes_abstract(void)
     ASSERT(eval_relation(src, "MethodImplemented", &c) == 0,
         "evaluation failed");
     ASSERT(c.count == 1, "expected exactly the non-abstract method");
-    ASSERT(saw(&c, "f||A|<A: void f()>"),
+    ASSERT(saw(&c, "f|void()|A|<A: void f()>"),
         "expected f(), the method with a body");
     PASS();
 }
@@ -250,7 +250,7 @@ test_method_implemented_excludes_abstract(void)
         ".decl MainMethodDeclaration(m: string)\n"                           \
         "MainMethodDeclaration(m) :- MainClass(t), "                         \
         "Method_DeclaringType(m, t), Method_SimpleName(m, \"main\"), "       \
-        "Method_Descriptor(m, \"java.lang.String[]\"), "                     \
+        "Method_Descriptor(m, \"void(java.lang.String[])\"), "              \
         "Method_Modifier(\"public\", m), Method_Modifier(\"static\", m).\n"
 
 static void
@@ -267,27 +267,27 @@ test_main_method_declaration(void)
         "Method_DeclaringType(\"<App: void main(String[])>\", \"App\").\n"
         "Method_SimpleName(\"<App: void main(String[])>\", \"main\").\n"
         "Method_Descriptor(\"<App: void main(String[])>\", "
-        "\"java.lang.String[]\").\n"
+        "\"void(java.lang.String[])\").\n"
         "Method_Modifier(\"public\", \"<App: void main(String[])>\").\n"
         "Method_Modifier(\"static\", \"<App: void main(String[])>\").\n"
         /* not the main class */
         "Method_DeclaringType(\"<Other: void main(String[])>\", \"Other\").\n"
         "Method_SimpleName(\"<Other: void main(String[])>\", \"main\").\n"
         "Method_Descriptor(\"<Other: void main(String[])>\", "
-        "\"java.lang.String[]\").\n"
+        "\"void(java.lang.String[])\").\n"
         "Method_Modifier(\"public\", \"<Other: void main(String[])>\").\n"
         "Method_Modifier(\"static\", \"<Other: void main(String[])>\").\n"
         /* right class, wrong simple name */
         "Method_DeclaringType(\"<App: void run(String[])>\", \"App\").\n"
         "Method_SimpleName(\"<App: void run(String[])>\", \"run\").\n"
         "Method_Descriptor(\"<App: void run(String[])>\", "
-        "\"java.lang.String[]\").\n"
+        "\"void(java.lang.String[])\").\n"
         "Method_Modifier(\"public\", \"<App: void run(String[])>\").\n"
         "Method_Modifier(\"static\", \"<App: void run(String[])>\").\n"
         /* right name, wrong descriptor */
         "Method_DeclaringType(\"<App: void main(int)>\", \"App\").\n"
         "Method_SimpleName(\"<App: void main(int)>\", \"main\").\n"
-        "Method_Descriptor(\"<App: void main(int)>\", \"int\").\n"
+        "Method_Descriptor(\"<App: void main(int)>\", \"void(int)\").\n"
         "Method_Modifier(\"public\", \"<App: void main(int)>\").\n"
         "Method_Modifier(\"static\", \"<App: void main(int)>\").\n"
         /* right name and descriptor and static, but not public: this is
@@ -297,13 +297,13 @@ test_main_method_declaration(void)
         "Method_DeclaringType(\"<App: void main3(String[])>\", \"App\").\n"
         "Method_SimpleName(\"<App: void main3(String[])>\", \"main\").\n"
         "Method_Descriptor(\"<App: void main3(String[])>\", "
-        "\"java.lang.String[]\").\n"
+        "\"void(java.lang.String[])\").\n"
         "Method_Modifier(\"static\", \"<App: void main3(String[])>\").\n"
         /* right name and descriptor, but not static */
         "Method_DeclaringType(\"<App: void main2(String[])>\", \"App\").\n"
         "Method_SimpleName(\"<App: void main2(String[])>\", \"main\").\n"
         "Method_Descriptor(\"<App: void main2(String[])>\", "
-        "\"java.lang.String[]\").\n"
+        "\"void(java.lang.String[])\").\n"
         "Method_Modifier(\"public\", \"<App: void main2(String[])>\").\n"
         MAIN_RULE;
 
@@ -320,24 +320,26 @@ test_main_method_declaration(void)
 }
 
 /*
- * The class initializer is matched by simple name AND empty descriptor.  A
+ * The class initializer is matched by simple name AND descriptor.  A
  * same-named method taking arguments must not match, which is what makes the
  * descriptor constant load-bearing rather than decorative.
  */
 static void
 test_class_initializer(void)
 {
-    TEST("ClassInitializer matches <clinit> with the empty descriptor");
+    TEST("ClassInitializer matches <clinit> with the void() descriptor");
 
     const char *src =
         ".decl MethodImplemented(sn: string, d: string, t: string, m: string)\n"
-        "MethodImplemented(\"<clinit>\", \"\", \"A\", \"<A: void clinit()>\").\n"
-        "MethodImplemented(\"<clinit>\", \"int\", \"A\", "
+        "MethodImplemented(\"<clinit>\", \"void()\", \"A\", "
+        "\"<A: void clinit()>\").\n"
+        "MethodImplemented(\"<clinit>\", \"void(int)\", \"A\", "
         "\"<A: void clinit(int)>\").\n"
-        "MethodImplemented(\"<init>\", \"\", \"A\", \"<A: void init()>\").\n"
+        "MethodImplemented(\"<init>\", \"void()\", \"A\", "
+        "\"<A: void init()>\").\n"
         ".decl ClassInitializer(t: string, m: string)\n"
         "ClassInitializer(t, m) :- "
-        "MethodImplemented(\"<clinit>\", \"\", t, m).\n";
+        "MethodImplemented(\"<clinit>\", \"void()\", t, m).\n";
 
     collect_t c;
     ASSERT(eval_relation(src, "ClassInitializer", &c) == 0,
@@ -397,11 +399,133 @@ test_subtype_of_object_and_array_interfaces(void)
     PASS();
 }
 
+/*
+ * Issue #956.  Every other test here supplies Method_Descriptor as EDB
+ * facts, so none of them reaches the rule that DERIVES it from _Method --
+ * which is exactly how the wrong column survived review.  This one derives
+ * it.  The rule text is DUPLICATED from bench/bench_flowlog.c by hand and
+ * kept in step by hand -- reverting the benchmark's rule alone breaks
+ * nothing here.  Only scripts/run_doop_validation.sh would catch that,
+ * and it is not in CI.
+ *
+ * Two things must be pinned, and a count alone pins neither:
+ *
+ *   1. The FORMAT.  Asserting only cardinality passes under cat(rt, p)
+ *      with no parens, and under the arguments transposed, because every
+ *      descriptor stays distinct either way.  So the exact strings are
+ *      asserted, including one with NON-EMPTY params -- with only
+ *      empty-parameter methods, "void()" and "()void" are the same string
+ *      reversed and transposition survives.
+ *
+ *   2. The CONSEQUENCE.  The reason the column matters is that params
+ *      alone collapses covariant overrides: LongPipeline declares two
+ *      iterator() methods differing only in return type, so under the
+ *      params reading the subclass entry shadows the inherited one and
+ *      the !MethodImplemented antijoin deletes it.  Under the correct
+ *      reading the descriptors differ and both survive.  The grounding
+ *      pair is real -- 456 such superclass-spanning pairs exist in
+ *      Method.facts.
+ */
+static void
+test_method_descriptor_is_return_type_and_params(void)
+{
+    TEST("Method_Descriptor derives returnType(params), not params alone");
+
+    /* _Method columns, per doop_edbs[] in bench/bench_flowlog.c:
+     * (method, simplename, params, declaringType, returnType,
+     *  jvmDescriptor, arity) */
+    const char *src =
+        ".decl _Method(m: string, sn: string, p: string, t: string, "
+        "rt: string, jvm: string, ar: string)\n"
+        "_Method(\"<App: void main(java.lang.String[])>\", \"main\", "
+        "\"java.lang.String[]\", \"App\", \"void\", "
+        "\"([Ljava/lang/String;)V\", \"1\").\n"
+        "_Method(\"<App: void <clinit>()>\", \"<clinit>\", \"\", \"App\", "
+        "\"void\", \"()V\", \"0\").\n"
+        ".decl Method_Descriptor(method: string, descriptor: string)\n"
+        "Method_Descriptor(m, cat(cat(cat(rt, \"(\"), p), \")\")) :- "
+        "_Method(m, _, p, _, rt, _, _).\n";
+
+    collect_t c;
+    ASSERT(eval_relation(src, "Method_Descriptor", &c) == 0,
+        "evaluation failed");
+    ASSERT(c.count == 2, "expected one descriptor per method");
+    /* Non-empty params: kills transposition and the missing-paren forms. */
+    ASSERT(saw(&c, "<App: void main(java.lang.String[])>|"
+        "void(java.lang.String[])"),
+        "expected returnType(params), not params alone");
+    /* Empty params: pins that the parens are emitted even when empty, so
+     * <clinit> still matches the "void()" constant the rules use. */
+    ASSERT(saw(&c, "<App: void <clinit>()>|void()"),
+        "expected void() for a no-argument method, not the empty string");
+    PASS();
+}
+
+/*
+ * The consequence of getting that column wrong, in miniature: a covariant
+ * override across a DirectSuperclass edge.  Under the params reading both
+ * iterator() methods carry the same descriptor, the subclass entry shadows
+ * the superclass one, and the antijoin drops the inherited tuple.
+ */
+static void
+test_covariant_override_survives_lookup(void)
+{
+    TEST("MethodLookup keeps covariant overrides distinct");
+
+    const char *src =
+        ".decl Method_SimpleName(m: string, sn: string)\n"
+        ".decl Method_DeclaringType(m: string, t: string)\n"
+        ".decl Method_Modifier(mod: string, m: string)\n"
+        ".decl DirectSuperclass(t: string, st: string)\n"
+        ".decl _Method(m: string, sn: string, p: string, t: string, "
+        "rt: string, jvm: string, ar: string)\n"
+        /* Superclass declares the covariant pair; the subclass declares
+         * only the erased one.  Return types differ, params do not. */
+        "_Method(\"<Sup: I it()>\", \"it\", \"\", \"Sup\", \"I\", "
+        "\"()LI;\", \"0\").\n"
+        "_Method(\"<Sup: OfLong it()>\", \"it\", \"\", \"Sup\", "
+        "\"OfLong\", \"()LOfLong;\", \"0\").\n"
+        "_Method(\"<Sub: I it()>\", \"it\", \"\", \"Sub\", \"I\", "
+        "\"()LI;\", \"0\").\n"
+        "Method_SimpleName(\"<Sup: I it()>\", \"it\").\n"
+        "Method_SimpleName(\"<Sup: OfLong it()>\", \"it\").\n"
+        "Method_SimpleName(\"<Sub: I it()>\", \"it\").\n"
+        "Method_DeclaringType(\"<Sup: I it()>\", \"Sup\").\n"
+        "Method_DeclaringType(\"<Sup: OfLong it()>\", \"Sup\").\n"
+        "Method_DeclaringType(\"<Sub: I it()>\", \"Sub\").\n"
+        "DirectSuperclass(\"Sub\", \"Sup\").\n"
+        ".decl Method_Descriptor(method: string, descriptor: string)\n"
+        "Method_Descriptor(m, cat(cat(cat(rt, \"(\"), p), \")\")) :- "
+        "_Method(m, _, p, _, rt, _, _).\n"
+        ".decl MethodImplemented(sn: string, d: string, t: string, "
+        "m: string)\n"
+        "MethodImplemented(sn, d, t, m) :- Method_SimpleName(m, sn), "
+        "Method_Descriptor(m, d), Method_DeclaringType(m, t), "
+        "!Method_Modifier(\"abstract\", m).\n"
+        ".decl MethodLookup(sn: string, d: string, t: string, m: string)\n"
+        "MethodLookup(sn, d, t, m) :- MethodImplemented(sn, d, t, m).\n"
+        "MethodLookup(sn, d, t, m) :- DirectSuperclass(t, st), "
+        "MethodLookup(sn, d, st, m), !MethodImplemented(sn, d, t, _).\n";
+
+    collect_t c;
+    ASSERT(eval_relation(src, "MethodLookup", &c) == 0,
+        "evaluation failed");
+    /* 3 declared + the OfLong variant inherited by Sub.  Under the params
+     * reading the inherited tuple is shadowed and this is 3. */
+    ASSERT(c.count == 4, "expected the inherited covariant variant to "
+        "survive; params-only descriptors shadow it");
+    ASSERT(saw(&c, "it|OfLong()|Sub|<Sup: OfLong it()>"),
+        "Sub must inherit the covariant OfLong variant from Sup");
+    PASS();
+}
+
 int
 main(void)
 {
     printf("=== DOOP string-constant rule semantics (Issue #950) ===\n");
 
+    test_method_descriptor_is_return_type_and_params();
+    test_covariant_override_survives_lookup();
     test_method_implemented_excludes_abstract();
     test_main_method_declaration();
     test_class_initializer();

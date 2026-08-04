@@ -23,7 +23,9 @@
 #   --expected-tuples N
 #                     Expected DOOP output tuple count. Defaults to
 #                     DOOP_EXPECTED_TUPLES when set; otherwise defaults to
-#                     6069774 for the bundled bench/data/doop zxing dataset.
+#                     6070090 for the bundled bench/data/doop zxing dataset
+#                     at --workers 1.  See "Oracles" below: W>1 is not
+#                     currently reproducible (#958).
 #   --expected-iterations N
 #                     Expected fixpoint iteration count. Defaults to
 #                     DOOP_EXPECTED_ITERATIONS when set; otherwise defaults
@@ -41,8 +43,24 @@
 # Oracles:
 #   Both defaults describe the archive with sha256
 #   154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7,
-#   measured on 2026-08-04 (issue #952).  Supply --expected-tuples on any
-#   other dataset; the tuple count is dataset-specific.
+#   measured at --workers 1 on 2026-08-04 (issues #952, #956).  Supply
+#   --expected-tuples on any other dataset; the tuple count is
+#   dataset-specific.  An explicitly supplied --expected-tuples, and a
+#   --baseline TSV, are both applied at any width: comparing against a
+#   baseline captured at a different width is the caller's call, and the
+#   run warns rather than refusing.
+#
+#   The oracle is a FINGERPRINT of current code, not a statement about
+#   what DOOP should compute.  Three open defects pass through it:
+#   #955 (the fixpoint is not closed under its own rules), #957 (the
+#   total counts duplicate rows, so it is a row count and not a tuple
+#   count), and #958 (W>1 varies run to run, which is why this default
+#   is W=1-specific -- do not reuse it with --workers > 1).
+#
+#   The iteration oracle is NOT gated on W=1.  Unlike the tuple total, 28
+#   was observed at W=8 and W=16 in every run taken while the tuple count
+#   was varying (#958), so it is stable at the widths that matter here.  If
+#   a future run shows it moving, gate it the same way as the tuple oracle.
 #
 #   The iteration count is checked as a cheap second signal, not as a
 #   sensitive one.  It does catch some rule defects the tuple total hides:
@@ -181,8 +199,17 @@ if [[ "$FACT_COUNT" -ne "$DOOP_FACT_COUNT_EXPECTED" ]]; then
     exit 1
 fi
 
+# The default tuple oracle is W=1-specific: W>1 varies run to run (#958),
+# so applying it there would report a spurious FAIL.  An explicitly supplied
+# --expected-tuples is still honoured at any width -- that is the caller's
+# call to make, not ours.
 if [[ -z "$EXPECTED_TUPLES" && "$DOOP_DATA" == "$DEFAULT_DOOP_DATA" ]]; then
-    EXPECTED_TUPLES=6069774
+    if [[ "$WORKERS" -eq 1 ]]; then
+        EXPECTED_TUPLES=6070090
+    else
+        echo "note: no default tuple oracle at --workers $WORKERS;" \
+             "W>1 is not reproducible (#958)"
+    fi
 fi
 if [[ -n "$EXPECTED_TUPLES" && ! "$EXPECTED_TUPLES" =~ ^[0-9]+$ ]]; then
     echo "ERROR: expected tuple count must be a non-negative integer"
@@ -347,6 +374,11 @@ if [[ -n "$BASELINE_FILE" && -f "$BASELINE_FILE" ]]; then
     echo "Baseline median  : ${BASE_MEDIAN:-?}ms"
     echo "Baseline tuples  : ${BASE_TUPLES:-?}"
     echo "Baseline iterations: ${BASE_ITERATIONS:-not recorded}"
+    if [[ "$WORKERS" -ne 1 ]]; then
+        echo "warning: comparing tuple counts against a baseline at" \
+             "--workers $WORKERS; W>1 is not reproducible (#958), so a" \
+             "mismatch here may be nondeterminism rather than a regression"
+    fi
     echo ""
 
     # Tuple correctness: must match baseline exactly

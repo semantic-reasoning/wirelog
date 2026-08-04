@@ -47,14 +47,46 @@ All notable changes to wirelog are documented in this file.
   `ActualParam.csv`, so after the archive switched to 35 string-valued
   `.facts` (#950) it failed for every user with `expected 34 CSV files,
   found 0`. It now counts `.facts`, points at the download script when the
-  dataset is absent, and carries the reconciled tuple oracle 6,069,774 --
+  dataset is absent, and carries the reconciled tuple oracle 6,070,090 --
   the previous 6276338 matched neither the measurement nor the README's
   6,276,657, so the two in-tree "expected" values for one workload had
-  disagreed by 319 for some time. It also gained an iteration oracle,
-  because iteration count is the more sensitive signal: the heap-typing
-  defect fixed in #951 ran 70 iterations while its tuple total stayed
-  within 3% of the correct one. `--help` printed a fixed `head -40` window
-  and had silently begun truncating its own options list.
+  disagreed by 319 for some time. The default is W=1-specific and is not
+  applied at W>1, which is not reproducible (#958). It also gained an
+  iteration oracle as a cheap second signal -- it does catch defects the
+  tuple total hides (the heap-typing bug fixed in #951 ran 70 iterations
+  while its total stayed within 3% of correct), but not the converse: 28
+  survives configurations where the whole type hierarchy derives zero
+  rows, so a matching iteration count proves nothing on its own.
+  `--help` printed a fixed `head -40` window and had silently begun
+  truncating its own options list.
+
+- **DOOP `Method_Descriptor` derived from the wrong column** (#956): #951
+  reconstructed the relation (the archive stopped shipping it) by projecting
+  `Method.facts` column 3, the parameter list.  DOOP's convention is
+  `?returnType "(" ?paramTypes ")"`.  Confirmed against the recovered
+  2026-05-24 archive's own `Method_Descriptor.csv`: the descriptor form
+  matches all 70,373 rows, the params form matches none.
+
+  Two consequences.  562 `MethodLookup` rows were lost to the
+  `!MethodImplemented` antijoin, and -- less visibly -- the coarser key
+  merged covariant overrides and bridge methods, leaving 1,829 ambiguous
+  virtual-dispatch keys where the correct reading leaves 625.  Wrong
+  dispatch targets, not just missing rows.
+
+  The constant sites move with it: `MainMethodDeclaration` from
+  `"java.lang.String[]"` to `"void(java.lang.String[])"`, and
+  `ClassInitializer` from `""` to `"void()"`.  Missing the second would
+  have silently emptied `ClassInitializer` -- all 1,900 `<clinit>` rows
+  carry the empty parameter list, and no `rt(params)` descriptor can be
+  empty.
+
+  Every existing test supplied `Method_Descriptor` as EDB facts, so none
+  reached the derivation and no amount of constant-pinning could have
+  caught this.  Two tests now derive it, and the assertions include a
+  method with non-empty parameters -- with only no-argument methods,
+  `cat(rt, p)` without parentheses and the arguments transposed both
+  produce the same partition as the correct rule and survive a
+  count-only test.
 
 - **Unbounded source construction in a filter test** (#939, #940): a test-source
   builder accumulated `snprintf` return values, which report the length that
@@ -101,8 +133,8 @@ All notable changes to wirelog are documented in this file.
   a pinned revision of the same git-backed mirror, and building the
   benchmark at `70f4d84` against it reproduces the old row exactly
   (6,276,657 tuples, 28 iterations, 11.8 GB). On a basis excluding the two
-  now-derived relations, the archive change accounts for -482,761 and all
-  engine and rule changes since for +118,781; `AssignLocal` alone dropped
+  now-derived relations, the archive change accounts for -482,759 and all
+  engine and rule changes since for +119,095; `AssignLocal` alone dropped
   306,227 -> 144,124 rows.
 
 ## [0.53.0] - 2026-07-31
