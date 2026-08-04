@@ -95,10 +95,15 @@ All notable changes to wirelog are documented in this file.
 
   The DOOP row carries the archive sha256 it describes and its ~33 GB
   memory requirement, which is a barrier for anyone following the
-  reproduction block. Its remaining 363,980-tuple difference from the old
-  row is stated as unexplained rather than presented as a refresh, and
-  #914 is ruled out as the cause by direct measurement: reverting only its
-  `eval.c` hunk *lowers* DOOP to 5,857,332, so it widens the gap.
+  reproduction block. Its difference from the old row is accounted for
+  rather than presented as a refresh: upstream replaced the archive 51
+  minutes after the old row was measured, the original is still served at
+  a pinned revision of the same git-backed mirror, and building the
+  benchmark at `70f4d84` against it reproduces the old row exactly
+  (6,276,657 tuples, 28 iterations, 11.8 GB). On a basis excluding the two
+  now-derived relations, the archive change accounts for -482,761 and all
+  engine and rule changes since for +118,781; `AssignLocal` alone dropped
+  306,227 -> 144,124 rows.
 
 ## [0.53.0] - 2026-07-31
 
