@@ -4,15 +4,16 @@
 # Copyright (C) CleverPlant
 # Licensed under LGPL-3.0
 #
-# Runs the DOOP Java points-to analysis (zxing dataset, 83MB, 34 CSV files)
-# using the bench_flowlog binary and captures wall time, peak RSS, and tuple
-# count.  Reports PASS/FAIL based on completion plus a tuple-count oracle when
-# one is provided.
+# Runs the DOOP Java points-to analysis (zxing dataset, ~740MB, 35 .facts
+# files) using the bench_flowlog binary and captures wall time, peak RSS,
+# tuple count, and iteration count.  Reports PASS/FAIL based on completion
+# plus tuple- and iteration-count oracles when they are provided.
 #
 # Usage:
 #   scripts/run_doop_validation.sh [--build-dir DIR] [--workers N]
 #                                  [--repeat N] [--baseline FILE]
-#                                  [--expected-tuples N] [--save-results]
+#                                  [--expected-tuples N]
+#                                  [--expected-iterations N] [--save-results]
 #
 # Options:
 #   --build-dir DIR   Meson build directory (default: build)
@@ -22,14 +23,32 @@
 #   --expected-tuples N
 #                     Expected DOOP output tuple count. Defaults to
 #                     DOOP_EXPECTED_TUPLES when set; otherwise defaults to
-#                     6276338 for the bundled bench/data/doop zxing dataset.
+#                     6069774 for the bundled bench/data/doop zxing dataset.
+#   --expected-iterations N
+#                     Expected fixpoint iteration count. Defaults to
+#                     DOOP_EXPECTED_ITERATIONS when set; otherwise defaults
+#                     to 28 for the bundled dataset.  See "Oracles" below.
 #   --save-results    Write a validation TSV under docs/performance
 #
 # Environment:
-#   DOOP_DATA_DIR     Override for DOOP CSV data directory
+#   DOOP_DATA_DIR     Override for the DOOP .facts data directory
 #                     (default: bench/data/doop relative to project root)
 #   DOOP_EXPECTED_TUPLES
 #                     Expected DOOP output tuple count
+#   DOOP_EXPECTED_ITERATIONS
+#                     Expected fixpoint iteration count
+#
+# Oracles:
+#   Both defaults describe the archive with sha256
+#   154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7,
+#   measured on 2026-08-04 (issue #952).  Supply --expected-tuples on any
+#   other dataset; the tuple count is dataset-specific.
+#
+#   The iteration count is checked because it is the more sensitive of the
+#   two.  Fixpoint depth responds to the *shape* of the derived relations,
+#   so a rule defect moves it even when the tuple total looks plausible: the
+#   heap-typing bug fixed in #951 ran 70 iterations while producing a tuple
+#   count within 3% of the correct one.
 #
 # Output:
 #   Benchmark output plus validation summary printed to stdout.
@@ -55,7 +74,13 @@ WORKERS="${WORKERS:-1}"
 REPEAT="${REPEAT:-1}"
 BASELINE_FILE=""
 EXPECTED_TUPLES="${DOOP_EXPECTED_TUPLES:-}"
+EXPECTED_ITERATIONS="${DOOP_EXPECTED_ITERATIONS:-}"
 SAVE_RESULTS=0
+
+# Number of .facts files the bundled dataset must contain.  Kept in step with
+# download.sh, doop_edbs[], and doop_fact_files[] by
+# scripts/ci/check-doop-catalogue.sh -- that check greps this exact name.
+DOOP_FACT_COUNT_EXPECTED=35
 
 # -------------------------------------------------------------------------
 # Argument parsing
@@ -83,12 +108,18 @@ while [[ $# -gt 0 ]]; do
             EXPECTED_TUPLES="$2"
             shift 2
             ;;
+        --expected-iterations)
+            EXPECTED_ITERATIONS="$2"
+            shift 2
+            ;;
         --save-results)
             SAVE_RESULTS=1
             shift
             ;;
         -h|--help)
-            head -40 "$0" | grep '^#' | sed 's/^# \?//'
+            # Print the whole leading comment block, however long it grows;
+            # a fixed head -N silently truncated the options list once.
+            awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
             exit 0
             ;;
         *)
@@ -130,20 +161,25 @@ fi
 # Check DOOP data directory
 if [[ ! -d "$DOOP_DATA" ]]; then
     echo "ERROR: DOOP data directory not found: $DOOP_DATA"
-    echo "Set DOOP_DATA_DIR to the zxing CSV directory."
+    echo "Set DOOP_DATA_DIR to the zxing .facts directory, or run"
+    echo "  bench/data/doop/download.sh"
     exit 1
 fi
 
-# Count CSV files
-CSV_COUNT=$(find "$DOOP_DATA" -maxdepth 1 -name "*.csv" | wc -l | tr -d ' ')
-echo "DOOP CSV files found: $CSV_COUNT (expected: 34)"
-if [[ "$CSV_COUNT" -ne 34 ]]; then
-    echo "ERROR: expected 34 CSV files, found $CSV_COUNT"
+# Count fact files
+FACT_COUNT=$(find "$DOOP_DATA" -maxdepth 1 -name "*.facts" | wc -l | tr -d ' ')
+echo "DOOP fact files found: $FACT_COUNT (expected: $DOOP_FACT_COUNT_EXPECTED)"
+if [[ "$FACT_COUNT" -ne "$DOOP_FACT_COUNT_EXPECTED" ]]; then
+    echo "ERROR: expected $DOOP_FACT_COUNT_EXPECTED .facts files, found $FACT_COUNT"
+    if [[ "$FACT_COUNT" -eq 0 ]]; then
+        echo "Fetch the dataset first:"
+        echo "  bench/data/doop/download.sh"
+    fi
     exit 1
 fi
 
 if [[ -z "$EXPECTED_TUPLES" && "$DOOP_DATA" == "$DEFAULT_DOOP_DATA" ]]; then
-    EXPECTED_TUPLES=6276338
+    EXPECTED_TUPLES=6069774
 fi
 if [[ -n "$EXPECTED_TUPLES" && ! "$EXPECTED_TUPLES" =~ ^[0-9]+$ ]]; then
     echo "ERROR: expected tuple count must be a non-negative integer"
@@ -151,15 +187,24 @@ if [[ -n "$EXPECTED_TUPLES" && ! "$EXPECTED_TUPLES" =~ ^[0-9]+$ ]]; then
 fi
 echo "Expected tuples: ${EXPECTED_TUPLES:-not supplied}"
 
+if [[ -z "$EXPECTED_ITERATIONS" && "$DOOP_DATA" == "$DEFAULT_DOOP_DATA" ]]; then
+    EXPECTED_ITERATIONS=28
+fi
+if [[ -n "$EXPECTED_ITERATIONS" && ! "$EXPECTED_ITERATIONS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: expected iteration count must be a non-negative integer"
+    exit 1
+fi
+echo "Expected iterations: ${EXPECTED_ITERATIONS:-not supplied}"
+
 # Spot-check a key file
-ACTPARAM="$DOOP_DATA/ActualParam.csv"
+ACTPARAM="$DOOP_DATA/ActualParam.facts"
 if [[ ! -s "$ACTPARAM" ]]; then
-    echo "ERROR: ActualParam.csv is missing or empty"
+    echo "ERROR: ActualParam.facts is missing or empty"
     exit 1
 fi
 
 TOTAL_BYTES=$(du -sb "$DOOP_DATA" 2>/dev/null | awk '{print $1}' || \
-              find "$DOOP_DATA" -maxdepth 1 -name "*.csv" -exec stat -f%z {} \; 2>/dev/null | \
+              find "$DOOP_DATA" -maxdepth 1 -name "*.facts" -exec stat -f%z {} \; 2>/dev/null | \
               awk '{s+=$1} END{print s}')
 TOTAL_MB=$(( TOTAL_BYTES / 1048576 ))
 echo "Dataset size : ~${TOTAL_MB} MB"
@@ -253,6 +298,16 @@ if [[ -n "$EXPECTED_TUPLES" ]]; then
     echo "Tuple count: MATCH ($TUPLES)"
 else
     echo "Tuple count: not checked (no oracle supplied)"
+fi
+
+if [[ -n "$EXPECTED_ITERATIONS" ]]; then
+    if [[ "$ITERATIONS" != "$EXPECTED_ITERATIONS" ]]; then
+        echo "RESULT: FAIL - iteration count mismatch (got $ITERATIONS, expected $EXPECTED_ITERATIONS)"
+        exit 1
+    fi
+    echo "Iterations: MATCH ($ITERATIONS)"
+else
+    echo "Iterations: not checked (no oracle supplied)"
 fi
 
 echo "RESULT: PASS - DOOP completed successfully"

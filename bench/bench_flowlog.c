@@ -2255,7 +2255,8 @@ run_crdt_workload(const char *data_dir, uint32_t workers, int repeat)
 
 /* DOOP uses .input directives to load 35 DOOP .facts files (~3.9M tuples).
  * EDB definitions are generated programmatically; rules are a static string.
- * Dataset: zxing (smallest FlowLog DOOP artifact, 83MB).
+ * Dataset: zxing (smallest FlowLog DOOP artifact, ~740MB unpacked -- the
+ * "83MB" in older comments was the encoded .csv form that no longer ships).
  * Columns are string-typed and the facts are read as shipped, so the
  * benchmark no longer depends on any particular integer encoding
  * (Issue #950). */
