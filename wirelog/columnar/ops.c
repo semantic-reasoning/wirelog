@@ -1160,6 +1160,29 @@ eval_stack_drain(eval_stack_t *s)
 
 /* Cross-module function declarations are in columnar/internal.h */
 
+/*
+ * col_op_resolve_key:
+ *   Resolve a plan-supplied "colN" join key against @rel.  A key that does
+ *   not resolve means the plan carries a column layout that disagrees with
+ *   the relation the operator actually sees; the operator then degrades to
+ *   column 0 and joins on the wrong column, which under-derives silently.
+ *   Log it under JOIN so the condition is observable (issue #955).
+ */
+static uint32_t
+col_op_resolve_key(const col_rel_t *rel, const char *name, const char *side,
+    const char *op_name, const char *right_relation)
+{
+    int idx = col_rel_col_idx(rel, name);
+    if (idx >= 0)
+        return (uint32_t)idx;
+    WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_ERROR,
+        "%s: unresolved %s key '%s' (right=%s, ncols=%u) -- falling back to "
+        "column 0",
+        op_name, side, name ? name : "(null)",
+        right_relation ? right_relation : "-", rel->ncols);
+    return 0;
+}
+
 /* --- VARIABLE ------------------------------------------------------------ */
 
 int
@@ -3178,11 +3201,12 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         return ENOMEM;
     }
     for (uint32_t k = 0; k < kc; k++) {
-        int li = col_rel_col_idx(left, op->left_keys ? op->left_keys[k] : NULL);
-        int ri
-            = col_rel_col_idx(right, op->right_keys ? op->right_keys[k] : NULL);
-        lk[k] = (li >= 0) ? (uint32_t)li : 0;
-        rk[k] = (ri >= 0) ? (uint32_t)ri : 0;
+        lk[k] = col_op_resolve_key(left,
+                op->left_keys ? op->left_keys[k] : NULL, "left", "JOIN",
+                op->right_relation);
+        rk[k] = col_op_resolve_key(right,
+                op->right_keys ? op->right_keys[k] : NULL, "right", "JOIN",
+                op->right_relation);
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);
@@ -3618,11 +3642,12 @@ col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
     for (uint32_t k = 0; k < kc; k++) {
-        int li = col_rel_col_idx(left, op->left_keys ? op->left_keys[k] : NULL);
-        int ri
-            = col_rel_col_idx(right, op->right_keys ? op->right_keys[k] : NULL);
-        lk[k] = (li >= 0) ? (uint32_t)li : 0;
-        rk[k] = (ri >= 0) ? (uint32_t)ri : 0;
+        lk[k] = col_op_resolve_key(left,
+                op->left_keys ? op->left_keys[k] : NULL, "left", "ANTIJOIN",
+                op->right_relation);
+        rk[k] = col_op_resolve_key(right,
+                op->right_keys ? op->right_keys[k] : NULL, "right", "ANTIJOIN",
+                op->right_relation);
     }
 
     col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$antijoin", left);
@@ -6141,11 +6166,12 @@ col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
     for (uint32_t k = 0; k < kc; k++) {
-        int li = col_rel_col_idx(left, op->left_keys ? op->left_keys[k] : NULL);
-        int ri
-            = col_rel_col_idx(right, op->right_keys ? op->right_keys[k] : NULL);
-        lk[k] = (li >= 0) ? (uint32_t)li : 0;
-        rk[k] = (ri >= 0) ? (uint32_t)ri : 0;
+        lk[k] = col_op_resolve_key(left,
+                op->left_keys ? op->left_keys[k] : NULL, "left", "SEMIJOIN",
+                op->right_relation);
+        rk[k] = col_op_resolve_key(right,
+                op->right_keys ? op->right_keys[k] : NULL, "right", "SEMIJOIN",
+                op->right_relation);
     }
 
     /* Output: project_indices selects output columns from left */
@@ -6903,11 +6929,13 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
     for (uint32_t k = 0; k < kc; k++) {
-        int li = col_rel_col_idx(left, op->left_keys ? op->left_keys[k] : NULL);
-        int ri
-            = col_rel_col_idx(right, op->right_keys ? op->right_keys[k] : NULL);
-        lk[k] = (li >= 0) ? (uint32_t)li : 0;
-        rk[k] = (ri >= 0) ? (uint32_t)ri : 0;
+        lk[k] = col_op_resolve_key(left,
+                op->left_keys ? op->left_keys[k] : NULL, "left", "JOIN(diff)",
+                op->right_relation);
+        rk[k] = col_op_resolve_key(right,
+                op->right_keys ? op->right_keys[k] : NULL, "right",
+                "JOIN(diff)",
+                op->right_relation);
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);
