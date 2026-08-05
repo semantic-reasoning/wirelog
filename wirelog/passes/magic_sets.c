@@ -256,6 +256,40 @@ collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms)
     return count;
 }
 
+/*
+ * The value domain of variable @var as bound somewhere under @node.
+ *
+ * Used to type the magic guard SCAN, whose columns hold the same values as
+ * the body variables they are named after.  The guard SCAN is joined in as
+ * the LEFT child, so its columns come first in the rule's column layout and
+ * a comparison on a bound variable resolves against them.  Leaving them
+ * untyped would silently return string comparisons in magic-set-rewritten
+ * rules to comparing intern ids (Issue #962).
+ *
+ * First match wins, which is the same rule collect_output_columns() and
+ * serialize_expr() use to resolve a name to a column.
+ */
+static wl_ir_coltype_t
+ms_lookup_var_type(const wirelog_ir_node_t *node, const char *var)
+{
+    if (!node || !var)
+        return WL_IR_COLTYPE_UNKNOWN;
+
+    if (node->column_names && node->column_types) {
+        for (uint32_t i = 0; i < node->column_count; i++) {
+            if (node->column_names[i]
+                && strcmp(node->column_names[i], var) == 0)
+                return node->column_types[i];
+        }
+    }
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        wl_ir_coltype_t t = ms_lookup_var_type(node->children[i], var);
+        if (t != WL_IR_COLTYPE_UNKNOWN)
+            return t;
+    }
+    return WL_IR_COLTYPE_UNKNOWN;
+}
+
 /* ======================================================================== */
 /* Head Variable Extraction                                                 */
 /* ======================================================================== */
@@ -330,8 +364,15 @@ build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
     const ms_atom_t *prefix_atoms, uint32_t prefix_count,
     const ms_atom_t *target_atom, uint64_t target_bound_mask)
 {
-    /* === Step 1: Start with the guard magic SCAN === */
-
+    /*
+     * === Step 1: Start with the guard magic SCAN ===
+     *
+     * The SCANs built here carry names but no column_types.  A demand rule
+     * is only SCAN/JOIN/PROJECT -- it holds no filter or projection
+     * expression -- so nothing in it consults a column type.  (The guard
+     * inserted into the ORIGINAL rule does, and is typed; see
+     * insert_magic_guard.)
+     */
     wirelog_ir_node_t *current = wl_ir_node_create(WIRELOG_IR_SCAN);
     if (!current)
         return NULL;
@@ -502,14 +543,24 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
     wl_ir_node_set_relation(magic_scan, magic_name);
 
     magic_scan->column_names = (char **)calloc(bound_count, sizeof(char *));
-    if (!magic_scan->column_names) {
+    magic_scan->column_types
+        = (wl_ir_coltype_t *)calloc(bound_count, sizeof(wl_ir_coltype_t));
+    if (!magic_scan->column_names || !magic_scan->column_types) {
         wl_ir_node_free(magic_scan);
         return -1;
     }
     magic_scan->column_count = bound_count;
     for (uint32_t i = 0; i < bound_count; i++) {
-        if (bound_vars[i])
+        if (bound_vars[i]) {
             magic_scan->column_names[i] = strdup_safe(bound_vars[i]);
+            /* The magic relation carries the same values as the body
+             * variables it is keyed on, so it inherits their types.
+             * Not observable today -- no expression is serialized against
+             * this guard's layout -- but wrong types here would be a
+             * silent mistype if one ever were (Issue #962). */
+            magic_scan->column_types[i]
+                = ms_lookup_var_type(body, bound_vars[i]);
+        }
     }
 
     /* JOIN(magic_scan, body) keyed on bound variables */

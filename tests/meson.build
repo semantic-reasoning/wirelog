@@ -1093,6 +1093,28 @@ test_doop_strings_exe = executable(
 
 test('doop_strings', test_doop_strings_exe)
 
+# Issue #962: `<`, `>`, `<=`, `>=` on symbol columns used to compare intern
+# ids, so the answer depended on the order strings happened to be interned.
+# Asserts exact tuples in both directions, across all four operators and both
+# the `a op b` and `a op "literal"` forms, and pins that integer comparisons
+# are untouched.
+test_symbol_ordering_exe = executable(
+  'test_symbol_ordering',
+  files('test_symbol_ordering.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('symbol_ordering', test_symbol_ordering_exe)
+
 test('option2_doop', test_option2_doop_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
 )

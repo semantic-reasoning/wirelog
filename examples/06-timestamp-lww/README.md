@@ -163,5 +163,14 @@ most common choice for simplicity.
 
 - Extend with a `tiebreak(Id, Val)` rule using `min(Val)` to resolve ties
   deterministically
+
+  > **Warning:** this is not deterministic today if `Val` is a `string` or
+  > `symbol` column. `min()`/`max()` reduce over the interned integer id of
+  > a symbol, and ids are assigned in the order strings are first
+  > encountered, so `min(Val)` picks whichever value happened to be interned
+  > first — which changes when unrelated facts are added. Lexicographic
+  > `min`/`max` over symbols is not yet implemented; ordering comparisons
+  > (`<`, `>`, `<=`, `>=`) already are (Issue #962). Until then, tiebreak on
+  > a numeric column, or compare with `<` in a rule instead of reducing.
 - Add a `stale(Id, Val, Ts)` output to capture discarded versions for auditing
 - Combine with `02-graph-reachability` to propagate LWW state across a network

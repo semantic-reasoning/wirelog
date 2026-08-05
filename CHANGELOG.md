@@ -42,6 +42,56 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Ordering comparisons on symbols compare strings, not intern ids** (#962):
+  `<`, `>`, `<=` and `>=` mapped to the integer opcodes regardless of operand
+  type, so on `string`/`symbol` columns they compared the interned integer
+  ids. Ids are assigned in first-appearance order, so `S("zz", "aa").` with
+  `R(a, b) :- S(a, b), a < b.` derived a row -- `"zz"` was seen first and
+  therefore held the smaller id -- and inserting an unrelated *earlier* fact
+  silently changed the answer. `exec_plan_gen.c` now types both operands and
+  emits `WL_PLAN_EXPR_CMP_STR_LT`/`GT`/`LTE`/`GTE`, which reverse the ids and
+  `strcmp` the strings. Those opcodes were already implemented in
+  `columnar/ops.c` and simply had no emitter.
+
+  Only the four ordering operators are converted, and only when *both*
+  operands are string-typed. `=` and `!=` are unchanged: interning is
+  canonical, so id equality already is string equality. A one-sided type
+  match keeps the integer opcode, because the string opcodes return false
+  whenever `wl_intern_reverse()` yields NULL -- applied to an integer operand
+  they would drop every row rather than misorder them. String-function
+  results (`cat`, `substr`, `to_upper`, `to_lower`, `str_replace`, `trim`,
+  `to_string`) are runtime-interned ids and count as string-typed, so
+  `to_upper(a) < to_upper(b)` is lexicographic too.
+
+  Columns with no declared type keep the old id-order behaviour: undeclared
+  relations are legitimate (head and intermediate relations need no `.decl`)
+  and rejecting them would break programs that work today. Each such
+  comparison, and each string-vs-numeric mix, is now reported at
+  `WL_LOG=EVAL:2`.
+
+  `min()` and `max()` over symbol columns still reduce by id and remain
+  non-lexicographic; that is #965. `examples/06-timestamp-lww` and
+  `examples/07-multi-source-analysis` recommended `min(Val)`/`min(Name)` as a
+  *deterministic* tiebreak, which was never true; both READMEs now say so.
+
+  Cost: a converted comparison falls off the compiled and column-native SIMD
+  filter paths onto the bytecode interpreter, because `col_expr_compile()`
+  and `filter_is_simple_cmp()` both reject unrecognised opcodes. Measured at
+  1M comparisons, 34 ms -> 111 ms (+77 ns per comparison); about 86% of that
+  is the demotion and 14% the two `wl_intern_reverse()` calls plus `strcmp`.
+  Integer filters are untouched and keep both fast paths -- a separate
+  integer-comparison program over the same 1M rows measures 40 ms before
+  and after, and does not become comparable to the 34 ms string baseline
+  above because the two programs differ in more than the operator.
+  Recovering a fast path for string comparisons is #966.
+
+  **Out-of-tree backends:** plans now contain expression opcodes `0x52`..`0x55`
+  where only `0x24`..`0x27` appeared before. A `wirelog/backend.h` consumer
+  that decodes expression buffers and treats unknown opcodes permissively --
+  as the in-tree `tests/fpga_backend.c` did -- will silently *admit every row*
+  through such a filter rather than fail. Decode the four new opcodes, or
+  reject unknown ones. This is not an installed-ABI break: `exec_plan.h` is
+  not in `wirelog_public_headers`.
 - **Shared intern table is now safe under parallel evaluation** (#958): every
   worker borrows the coordinator's `wl_intern_t` -- it is propagated by the
   bitwise session copy and is absent from both borrowed-field null-out lists --
@@ -61,11 +111,11 @@ All notable changes to wirelog are documented in this file.
 
   Ids are assigned in worker-interleaving order, so an id is unique and
   stable within a run but not reproducible across runs. That is visible in
-  results, not just internally: `<`, `>`, `<=`, `>=`, `min` and `max` on
-  symbols are evaluated as comparisons of the intern id rather than of the
-  string (`exec_plan_gen.c` maps them to the integer opcodes unconditionally,
-  and the implemented `CMP_STR_*` opcodes have no emitter), and `hash()`,
-  `crc32`, `md5`, `sha*`, `hmac` and `uuid5` digest the id rather than the
+  results, not just internally. At the time of this change `<`, `>`, `<=`,
+  `>=`, `min` and `max` on symbols all compared the intern id rather than
+  the string; the four ordering operators are fixed by #962, recorded above
+  in this same section, and `min`/`max` are #965. `hash()`, `crc32`,
+  `md5`, `sha*`, `hmac` and `uuid5` still digest the id rather than the
   string bytes. Queries using any of those over symbols produced during
   evaluation can therefore give different answers on different runs. Those
   are pre-existing defects, filed separately; before this change the same

@@ -34,6 +34,27 @@ strdup_safe(const char *s)
     return dup;
 }
 
+wl_ir_coltype_t
+wl_ir_coltype_from_column_type(wirelog_column_type_t type)
+{
+    /* Only WIRELOG_TYPE_STRING carries interned symbol ids; everything else
+     * is a value that compares as a number.  Written as an exhaustive switch
+     * so a newly added column type has to be classified here rather than
+     * defaulting into SCALAR by accident. */
+    switch (type) {
+    case WIRELOG_TYPE_STRING:
+        return WL_IR_COLTYPE_STRING;
+    case WIRELOG_TYPE_INT32:
+    case WIRELOG_TYPE_INT64:
+    case WIRELOG_TYPE_UINT32:
+    case WIRELOG_TYPE_UINT64:
+    case WIRELOG_TYPE_FLOAT:
+    case WIRELOG_TYPE_BOOL:
+        return WL_IR_COLTYPE_SCALAR;
+    }
+    return WL_IR_COLTYPE_UNKNOWN;
+}
+
 /* ======================================================================== */
 /* Expression API                                                           */
 /* ======================================================================== */
@@ -195,6 +216,7 @@ wl_ir_node_free(wirelog_ir_node_t *node)
         }
         free(node->column_names);
     }
+    free(node->column_types);
 
     /* Free PROJECT data */
     free(node->project_indices);

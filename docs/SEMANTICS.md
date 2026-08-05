@@ -72,6 +72,18 @@ Two patterns are supported:
   ordering.
 - The *identity* of intern ids assigned to symbols in inline facts is
   not stable across runs of the same program.
+
+  Because ids are unstable, nothing observable may be derived from their
+  order. The ordering operators (`<`, `>`, `<=`, `>=`) therefore compare
+  `string`/`symbol` columns **lexicographically**, not by id — see
+  `docs/SYNTAX.md`, "Comparison Operators". Id order still leaks through
+  in three places. A column with no declared type: the engine has nothing
+  to compare but the ids, so the result is as unstable as they are --
+  declare the relation. A comparison with one string and one numeric
+  operand: it stays an integer comparison, described in `docs/SYNTAX.md`.
+  And `min()`/`max()` over symbol columns, which still reduce by id.
+  Separately, `hash()` and the digest family take the id rather than the
+  string bytes.
 - Multiplicities other than the basic z-set arithmetic above (e.g.
   weighted aggregates) are subject to the engine's
   multiplicity-tracking rules, not promised by this document.
