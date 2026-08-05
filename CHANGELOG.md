@@ -42,6 +42,43 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Shared intern table is now safe under parallel evaluation** (#958): every
+  worker borrows the coordinator's `wl_intern_t` -- it is propagated by the
+  bitwise session copy and is absent from both borrowed-field null-out lists --
+  so all three worker families (non-recursive, TDD, K-fusion) called an
+  unsynchronized hash table concurrently. A rule that builds strings in a head
+  position could therefore hand two ids to one string, and the `realloc()` that
+  doubled the id -> string array could relocate it out from under a worker
+  mid-dereference: measured at 100% SIGSEGV for a 31k-row recursive rule and a
+  100k-row non-recursive rule at W >= 8. The id -> string storage is now
+  segmented and never moves, `count` is published with a release store after
+  the entry is complete and read with an acquire load, and writers serialize on
+  a mutex. `wl_intern_reverse()` and `wl_intern_count()` stay lock-free: reverse
+  runs once or twice per row inside `contains`/`strlen`/`substr`/`to_number`,
+  a lock there measured 10.9x slower at W=8 than the unlocked baseline.
+
+  Two consequences to know about, both of which only affect W > 1.
+
+  Ids are assigned in worker-interleaving order, so an id is unique and
+  stable within a run but not reproducible across runs. That is visible in
+  results, not just internally: `<`, `>`, `<=`, `>=`, `min` and `max` on
+  symbols are evaluated as comparisons of the intern id rather than of the
+  string (`exec_plan_gen.c` maps them to the integer opcodes unconditionally,
+  and the implemented `CMP_STR_*` opcodes have no emitter), and `hash()`,
+  `crc32`, `md5`, `sha*`, `hmac` and `uuid5` digest the id rather than the
+  string bytes. Queries using any of those over symbols produced during
+  evaluation can therefore give different answers on different runs. Those
+  are pre-existing defects, filed separately; before this change the same
+  programs crashed instead.
+
+  Serializing writers costs throughput on workloads that intern heavily
+  during evaluation -- a rule with `cat()` in head position, say. Measured
+  at a fixed 1.6M unique inserts split across workers: 561 ms at W=1
+  against 2,224 ms at W=8, with 8.8 s of system time and 938k voluntary
+  context switches. That is futex convoy rather than plain serialization,
+  and it is a follow-up. The comparison is against a baseline that
+  SIGSEGVs on the same input, so there is no correct prior timing to
+  regress from.
 - **`scripts/run_doop_validation.sh` no longer expects the vanished CSV
   layout** (#952): it counted 34 `*.csv` files and spot-checked
   `ActualParam.csv`, so after the archive switched to 35 string-valued
