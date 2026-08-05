@@ -34,9 +34,13 @@ optimizer_src = files(
   '../wirelog/passes/magic_sets.c',
 )
 
-intern_src = files(
-  '../wirelog/intern.c',
-)
+# intern.c takes the writer mutex from wirelog/thread.h (Issue #958), so
+# every target that compiles it must also link the threading backend.
+# Meson deduplicates against targets that already list thread_src.
+intern_src = [
+  files('../wirelog/intern.c'),
+  wirelog_thread_src,
+]
 
 string_ops_src = files(
   '../wirelog/string_ops.c',
@@ -187,9 +191,11 @@ if get_option('enable_fuzz')
           '../wirelog/io/csv_reader.c',
           '../wirelog/intern.c',
         ),
+        wirelog_thread_src,
         c_args: ['-fsanitize=fuzzer'],
         link_args: ['-fsanitize=fuzzer'],
         include_directories: [wirelog_inc, wirelog_src_inc],
+        dependencies: [threads_dep],
         install: false,
       )
 
@@ -213,9 +219,11 @@ if get_option('enable_fuzz')
         'intern_fuzz',
         files('fuzz/intern_fuzz.c',
           '../wirelog/intern.c'),
+        wirelog_thread_src,
         include_directories: [wirelog_inc, wirelog_src_inc],
         c_args: ['-fsanitize=fuzzer'],
         link_args: ['-fsanitize=fuzzer'],
+        dependencies: [threads_dep],
         install: false,
       )
 
@@ -341,6 +349,7 @@ test_csv_exe = executable(
   csv_src,
   intern_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('csv', test_csv_exe)
@@ -793,6 +802,7 @@ test_intern_exe = executable(
   files('test_intern.c'),
   intern_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('intern', test_intern_exe)
@@ -4213,6 +4223,26 @@ test('queue_transport', test_queue_transport_exe)
 # DOOP Multi-Worker Stability Tests (Issue #416)
 # ============================================================================
 
+# Issue #958: the intern table is shared by every parallel worker.  The
+# K-fusion path (recursive rule, 4 IDB body atoms, cat() in the head) is
+# the cheapest way to reach it -- no row-count gate, 30 facts suffice.
+test_intern_parallel_determinism_exe = executable(
+  'test_intern_parallel_determinism',
+  files('test_intern_parallel_determinism.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('intern_parallel_determinism', test_intern_parallel_determinism_exe)
+
 test_doop_multiworker_exe = executable(
   'test_doop_multiworker',
   files('test_doop_multiworker.c'),
@@ -4242,6 +4272,7 @@ test_string_ops_exe = executable(
   intern_src,
   string_ops_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
 )
 
 test('string_ops', test_string_ops_exe)
@@ -4442,6 +4473,7 @@ test_io_ctx_exe = executable(
   intern_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],
+  dependencies: [threads_dep],
   install: false,
 )
 test('io_ctx', test_io_ctx_exe)

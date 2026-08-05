@@ -192,12 +192,32 @@ On non-MSVC builds the same macros expand to
 `atomic_load_explicit(p, memory_order_relaxed)` and friends
 (`lockfree_queue.c:47-57`).
 
-### 4.4 Type aliases
+### 4.4 MSVC shim in `intern.c`
+
+`wirelog/intern.c:63-88` provides the same shape of shim for the
+`uint32_t` published-entry counter of the shared symbol table
+(Issue #958):
+
+- `WL_INTERN_LOAD_ACQUIRE(p)` / `WL_INTERN_LOAD_RELAXED(p)` both expand
+  to `(*(p))` on MSVC, a plain read of a `volatile uint32_t`.
+- `WL_INTERN_STORE_RELEASE(p, v)` expands to a plain assignment.
+  Aligned 32-bit accesses are atomic on x86/x86-64 and ARM64, and
+  under MSVC's `/volatile:ms` model -- the default on x86/x64, but not
+  on ARM64, where MSVC defaults to `/volatile:iso` -- a volatile store
+  carries release
+  semantics -- the same assumption `mem_ledger.h` already makes.
+
+On non-MSVC builds (including the MinGW GCC Windows job) the macros
+expand to `atomic_load_explicit` / `atomic_store_explicit` with the
+orders named above.
+
+### 4.5 Type aliases
 
 - `wirelog/columnar/mem_ledger.h:33-42` defines `wl_atomic_u64`,
   `atomic_bool`, `atomic_uint_fast64_t` as MSVC-compatible aliases.
 - `wirelog/util/lockfree_queue.c:31,48` defines `wl_atomic_u32` per
   branch.
+- `wirelog/intern.c:74,80` defines `wl_intern_atomic_u32` per branch.
 
 These exist so struct fields can be declared portably; the audit in
 §5 below covers only call sites, not type-declaration sites.
@@ -208,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **40**).
+match the script's count (currently **43**).
 
 Format: `file:line` | field | operation | order | justification.
 
@@ -303,9 +323,25 @@ and the wasted work is bounded.
 |---|---|---|---|---|
 | `session.c:1484` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
 
-### 5.7 Total
+### 5.7 `wirelog/intern.c` — shared symbol table (3 rows)
 
-22 + 4 + 2 + 10 + 1 + 1 = **40 atomic call sites**.
+The intern table is shared, unsynchronized, by every parallel worker
+(Issue #958). Writers (`wl_intern_put`, `wl_intern_get`) serialize on
+`intern->lock`; `wl_intern_reverse` and `wl_intern_count` are lock-free
+because reverse lookup runs once or twice per row in the string
+operations and a lock there costs more than the parallelism is worth.
+The three sites are the macro bodies; the call sites they serve are
+named in the justification.
+
+| `file:line` | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `intern.c:82` | `intern->count` | `atomic_load_explicit` | `acquire` | `WL_INTERN_LOAD_ACQUIRE`, used by `wl_intern_reverse`/`wl_intern_count`. Pairs with the release store below: an id below the observed count names a fully written entry, and the segment holding it is allocated and never moves |
+| `intern.c:84` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize` and `wl_intern_free`. The writer holds `intern->lock` (or, in `free`, has exclusive access), so no edge is needed |
+| `intern.c:86` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by `wl_intern_put` after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
+
+### 5.8 Total
+
+22 + 4 + 2 + 10 + 1 + 1 + 3 = **43 atomic call sites**.
 
 `scripts/ci/check-threading-doc.sh` extracts the same count from
 `grep -rE '\batomic_(load|store|fetch_add|fetch_sub|compare_exchange|exchange|init|thread_fence)(_explicit)?\s*\(' wirelog/ --include='*.c' --include='*.h'`

@@ -9,6 +9,23 @@
  * Bidirectional mapping between strings and integer IDs for symbol
  * interning.  Strings are interned at parse/load time; integer IDs
  * are used throughout the DD execution pipeline.
+ *
+ * Thread safety (Issue #958): one table is shared by every parallel
+ * evaluation worker, so all four accessors below are safe to call
+ * concurrently on the same table.  wl_intern_put() and wl_intern_get()
+ * serialize with each other; wl_intern_reverse() and wl_intern_count()
+ * are lock-free and may run concurrently with a put().  Note that this
+ * makes the id a string receives dependent on worker interleaving:
+ * ids are unique and stable for the lifetime of the table, but not
+ * reproducible across runs when workers intern in parallel.
+ * That is user-visible, not merely internal: ordering comparisons and
+ * digests over symbols resolve through the id rather than the string
+ * bytes, so a query using them over symbols created during evaluation
+ * can give a different answer on a different run at W > 1.  Those are
+ * pre-existing defects tracked separately; they are reachable now
+ * because the same programs used to crash instead.
+ * wl_intern_create() and wl_intern_free() are not thread-safe and must
+ * not overlap any other call on the same table.
  */
 
 #ifndef WIRELOG_INTERN_H

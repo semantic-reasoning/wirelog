@@ -10,6 +10,8 @@
 
 #include "../wirelog/intern.h"
 
+#include "../wirelog/thread.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,22 +25,22 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Tests                                                                    */
@@ -326,6 +328,167 @@ test_many_strings(void)
     PASS();
 }
 
+/*
+ * Issue #958: one intern table is shared, unsynchronized, by every
+ * parallel evaluation worker.  Two threads interning the same strings
+ * must agree on every id, and reverse lookups issued while the other
+ * thread is still interning must return complete strings.
+ *
+ * Before the fix this reported a count overshoot (e.g. 2083 for 2000
+ * distinct strings, because count was a non-atomic read-modify-write),
+ * disagreeing ids, and -- driven by the realloc() of the id -> string
+ * array under a concurrent reader -- heap corruption and SIGSEGV.
+ */
+
+#define CONCURRENT_STRINGS 2000
+#define CONCURRENT_THREADS 4
+
+typedef struct {
+    wl_intern_t *intern;
+    int64_t ids[CONCURRENT_STRINGS];
+    int bad_reverse; /* reverse() disagreed with the string just interned */
+    int bad_put;     /* put() failed outright */
+} concurrent_ctx_t;
+
+static void *
+concurrent_put_worker(void *arg)
+{
+    concurrent_ctx_t *ctx = (concurrent_ctx_t *)arg;
+    char buf[32];
+
+    for (int i = 0; i < CONCURRENT_STRINGS; i++) {
+        snprintf(buf, sizeof(buf), "sym_%d", i);
+        int64_t id = wl_intern_put(ctx->intern, buf);
+        ctx->ids[i] = id;
+        if (id < 0) {
+            ctx->bad_put++;
+            continue;
+        }
+        /* Lock-free read racing the other thread's writes. */
+        const char *rev = wl_intern_reverse(ctx->intern, id);
+        if (!rev || strcmp(rev, buf) != 0)
+            ctx->bad_reverse++;
+    }
+
+    return NULL;
+}
+
+static void
+test_concurrent_put(void)
+{
+    TEST("concurrent put from two threads (Issue #958)");
+
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("create failed");
+        return;
+    }
+
+    concurrent_ctx_t *ctx
+        = (concurrent_ctx_t *)calloc(CONCURRENT_THREADS, sizeof(*ctx));
+    if (!ctx) {
+        FAIL("calloc failed");
+        wl_intern_free(intern);
+        return;
+    }
+
+    thread_t threads[CONCURRENT_THREADS];
+    int started = 0;
+    for (int t = 0; t < CONCURRENT_THREADS; t++) {
+        ctx[t].intern = intern;
+        if (thread_create(&threads[t], concurrent_put_worker, &ctx[t]) != 0)
+            break;
+        started++;
+    }
+    for (int t = 0; t < started; t++)
+        thread_join(&threads[t]);
+
+    if (started != CONCURRENT_THREADS) {
+        FAIL("thread_create failed");
+        free(ctx);
+        wl_intern_free(intern);
+        return;
+    }
+
+    /* Every string is interned exactly once, however the threads raced. */
+    if (wl_intern_count(intern) != (uint32_t)CONCURRENT_STRINGS) {
+        FAIL("count != number of distinct strings");
+        free(ctx);
+        wl_intern_free(intern);
+        return;
+    }
+
+    for (int t = 0; t < CONCURRENT_THREADS; t++) {
+        if (ctx[t].bad_put) {
+            FAIL("put returned -1");
+            free(ctx);
+            wl_intern_free(intern);
+            return;
+        }
+        if (ctx[t].bad_reverse) {
+            FAIL("concurrent reverse returned the wrong string");
+            free(ctx);
+            wl_intern_free(intern);
+            return;
+        }
+    }
+
+    /* Both threads must have been handed the same id for each string,
+     * and that id must still reverse-map correctly afterwards. */
+    char buf[32];
+    char *seen = (char *)calloc(CONCURRENT_STRINGS, 1);
+    if (!seen) {
+        FAIL("calloc failed");
+        free(ctx);
+        wl_intern_free(intern);
+        return;
+    }
+
+    for (int i = 0; i < CONCURRENT_STRINGS; i++) {
+        int64_t id = ctx[0].ids[i];
+
+        snprintf(buf, sizeof(buf), "sym_%d", i);
+        for (int t = 1; t < CONCURRENT_THREADS; t++) {
+            if (ctx[t].ids[i] != id) {
+                FAIL("threads disagree on the id of a string");
+                free(seen);
+                free(ctx);
+                wl_intern_free(intern);
+                return;
+            }
+        }
+        if (id < 0 || id >= CONCURRENT_STRINGS || seen[id]) {
+            FAIL("ids are not a permutation of 0..N-1");
+            free(seen);
+            free(ctx);
+            wl_intern_free(intern);
+            return;
+        }
+        seen[id] = 1;
+
+        const char *rev = wl_intern_reverse(intern, id);
+        if (!rev || strcmp(rev, buf) != 0) {
+            FAIL("reverse returned the wrong string");
+            free(seen);
+            free(ctx);
+            wl_intern_free(intern);
+            return;
+        }
+        if (wl_intern_get(intern, buf) != id) {
+            FAIL("get returned an id other than the one put returned");
+            free(seen);
+            free(ctx);
+            wl_intern_free(intern);
+            return;
+        }
+    }
+
+    free(seen);
+    free(ctx);
+    wl_intern_free(intern);
+    PASS();
+}
+
 static void
 test_free_null(void)
 {
@@ -352,10 +515,11 @@ main(void)
     test_reverse_lookup();
     test_null_and_empty();
     test_many_strings();
+    test_concurrent_put();
     test_free_null();
 
     printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,
-           tests_failed);
+        tests_failed);
 
     return tests_failed > 0 ? 1 : 0;
 }
