@@ -15,6 +15,7 @@
 #include "intern.h"
 #include "ir/ir.h"
 #include "ir/program.h"
+#include "util/log.h"
 #include "wirelog-ir.h"
 #include "wirelog-types.h"
 
@@ -224,6 +225,96 @@ expr_buf_push_bytes(expr_buf_t *buf, const uint8_t *data, uint32_t len)
     return 0;
 }
 
+/* ======================================================================== */
+/* Column layout context                                                    */
+/* ======================================================================== */
+
+/**
+ * col_ctx_t:
+ *
+ * The column layout an expression is resolved against: one name and one
+ * value domain per column.  @types is allocated whenever @names is, so a
+ * type is never simply missing -- it is WL_IR_COLTYPE_UNKNOWN, which the
+ * comparison emitter can see and report.  @types is NULL only for an empty
+ * context; col_ctx_type_at() treats that as all-UNKNOWN.
+ */
+typedef struct {
+    char **names;           /* owned; @count entries, each possibly NULL */
+    wl_ir_coltype_t *types; /* owned; @count entries */
+    uint32_t count;
+} col_ctx_t;
+
+static void
+col_ctx_free(col_ctx_t *ctx)
+{
+    if (!ctx)
+        return;
+    if (ctx->names) {
+        for (uint32_t i = 0; i < ctx->count; i++)
+            free(ctx->names[i]);
+        free((void *)ctx->names);
+    }
+    free(ctx->types);
+    ctx->names = NULL;
+    ctx->types = NULL;
+    ctx->count = 0;
+}
+
+/* Allocate @count names and types.  Returns 0 on success. */
+static int
+col_ctx_alloc(col_ctx_t *ctx, uint32_t count)
+{
+    ctx->count = count;
+    ctx->names = (char **)calloc(count ? count : 1, sizeof(char *));
+    ctx->types
+        = (wl_ir_coltype_t *)calloc(count ? count : 1, sizeof(wl_ir_coltype_t));
+    if (!ctx->names || !ctx->types) {
+        col_ctx_free(ctx);
+        return -1;
+    }
+    return 0;
+}
+
+static wl_ir_coltype_t
+col_ctx_type_at(const col_ctx_t *ctx, uint32_t idx)
+{
+    if (!ctx || !ctx->types || idx >= ctx->count)
+        return WL_IR_COLTYPE_UNKNOWN;
+    return ctx->types[idx];
+}
+
+/**
+ * Resolve a variable name to its column's value domain.
+ *
+ * Names are matched the same way serialize_expr() matches them for emission,
+ * so typing and emission cannot disagree about which column a variable
+ * refers to: first by declared name, then -- for expressions whose variables
+ * were already rewritten to positional form by
+ * rewrite_expr_vars_to_columns() -- by parsing "colN".
+ */
+static wl_ir_coltype_t
+col_ctx_lookup_type(const col_ctx_t *ctx, const char *var_name)
+{
+    if (!ctx || !var_name)
+        return WL_IR_COLTYPE_UNKNOWN;
+
+    for (uint32_t c = 0; c < ctx->count; c++) {
+        if (ctx->names && ctx->names[c]
+            && strcmp(ctx->names[c], var_name) == 0)
+            return col_ctx_type_at(ctx, c);
+    }
+
+    if (strncmp(var_name, "col", 3) == 0
+        && isdigit((unsigned char)var_name[3])) {
+        char *end = NULL;
+        unsigned long idx = strtoul(var_name + 3, &end, 10);
+        if (end && *end == '\0' && idx < ctx->count)
+            return col_ctx_type_at(ctx, (uint32_t)idx);
+    }
+
+    return WL_IR_COLTYPE_UNKNOWN;
+}
+
 /* Map IR arith op -> plan expr tag */
 static uint8_t
 arith_to_tag(wirelog_arith_op_t op)
@@ -297,9 +388,51 @@ str_fn_to_tag(wirelog_str_fn_t fn)
     return WL_PLAN_EXPR_STR_FN_STRLEN; /* fallback */
 }
 
-/* Map IR cmp op -> plan expr tag */
+static const char *
+cmp_op_name(wirelog_cmp_op_t op)
+{
+    switch (op) {
+    case WIRELOG_CMP_EQ:  return "=";
+    case WIRELOG_CMP_NEQ: return "!=";
+    case WIRELOG_CMP_LT:  return "<";
+    case WIRELOG_CMP_GT:  return ">";
+    case WIRELOG_CMP_LTE: return "<=";
+    case WIRELOG_CMP_GTE: return ">=";
+    }
+    return "?";
+}
+
+/**
+ * Map an IR comparison to a plan expr tag, given the value domains of its
+ * two operands (Issue #962).
+ *
+ * Symbols are stored as intern ids, and ids are assigned in first-appearance
+ * order, so the integer opcodes order symbols by when they were first seen.
+ * WL_PLAN_EXPR_CMP_STR_* reverse the ids through wl_intern_reverse() and
+ * strcmp() the strings instead, which is the ordering the language means.
+ *
+ * Only LT/GT/LTE/GTE are converted:
+ *
+ *   - EQ and NEQ are already correct.  Interning is canonical -- one id per
+ *     distinct string -- so id equality IS string equality.  Converting them
+ *     would buy nothing and cost the demotion described below on every
+ *     equality filter in every program.
+ *
+ *   - The conversion is only sound when BOTH operands are strings.
+ *     col_eval_expr() returns false as soon as wl_intern_reverse() yields
+ *     NULL for either side, so a string opcode applied to an integer operand
+ *     does not misorder rows, it drops all of them.  A one-sided type match
+ *     therefore keeps the integer opcode.
+ *
+ * Emitting a CMP_STR_* opcode also demotes the filter from the compiled and
+ * column-native SIMD paths to the bytecode interpreter: col_expr_compile()
+ * and filter_is_simple_cmp() both reject unrecognised opcodes.  That is the
+ * bulk of the measured cost (~66 ns of ~77 ns per comparison) and is why the
+ * conversion is kept as narrow as it is.  Integer filters keep the fast
+ * paths untouched.
+ */
 static uint8_t
-cmp_to_tag(wirelog_cmp_op_t op)
+cmp_to_tag(wirelog_cmp_op_t op, wl_ir_coltype_t lhs, wl_ir_coltype_t rhs)
 {
     switch (op) {
     case WIRELOG_CMP_EQ:
@@ -307,15 +440,52 @@ cmp_to_tag(wirelog_cmp_op_t op)
     case WIRELOG_CMP_NEQ:
         return WL_PLAN_EXPR_CMP_NEQ;
     case WIRELOG_CMP_LT:
-        return WL_PLAN_EXPR_CMP_LT;
     case WIRELOG_CMP_GT:
-        return WL_PLAN_EXPR_CMP_GT;
     case WIRELOG_CMP_LTE:
-        return WL_PLAN_EXPR_CMP_LTE;
     case WIRELOG_CMP_GTE:
-        return WL_PLAN_EXPR_CMP_GTE;
+        break;
+    default:
+        return WL_PLAN_EXPR_CMP_EQ; /* fallback */
     }
-    return WL_PLAN_EXPR_CMP_EQ; /* fallback */
+
+    if (lhs == WL_IR_COLTYPE_STRING && rhs == WL_IR_COLTYPE_STRING) {
+        switch (op) {
+        case WIRELOG_CMP_LT:  return WL_PLAN_EXPR_CMP_STR_LT;
+        case WIRELOG_CMP_GT:  return WL_PLAN_EXPR_CMP_STR_GT;
+        case WIRELOG_CMP_LTE: return WL_PLAN_EXPR_CMP_STR_LTE;
+        default:              return WL_PLAN_EXPR_CMP_STR_GTE;
+        }
+    }
+
+    /*
+     * Anything else keeps the integer opcode, but says so.  Rejecting these
+     * at lowering time would break programs that work today: head and
+     * intermediate relations need no .decl, undeclared relations have no
+     * column types at all, and a rule over an undeclared integer relation
+     * evaluates perfectly well.  A warning is the most that can be done
+     * without breaking them, and the UNKNOWN sentinel is what makes the two
+     * cases distinguishable -- a conflict between two known types is a
+     * different report from a type that was never established.
+     */
+    if (lhs == WL_IR_COLTYPE_UNKNOWN || rhs == WL_IR_COLTYPE_UNKNOWN) {
+        WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_WARN,
+            "ordering comparison '%s' on a column with no declared type: "
+            "comparing interned ids, not strings. Declare the relation "
+            "(.decl R(c: string)) if the column holds symbols",
+            cmp_op_name(op));
+    } else if (lhs != rhs) {
+        WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_WARN,
+            "ordering comparison '%s' mixes a string operand with a numeric "
+            "one: comparing interned ids, not strings",
+            cmp_op_name(op));
+    }
+
+    switch (op) {
+    case WIRELOG_CMP_LT:  return WL_PLAN_EXPR_CMP_LT;
+    case WIRELOG_CMP_GT:  return WL_PLAN_EXPR_CMP_GT;
+    case WIRELOG_CMP_LTE: return WL_PLAN_EXPR_CMP_LTE;
+    default:              return WL_PLAN_EXPR_CMP_GTE;
+    }
 }
 
 /* Map IR agg fn -> plan expr tag */
@@ -338,12 +508,67 @@ agg_to_tag(wirelog_agg_fn_t fn)
 }
 
 /**
+ * The value domain an expression evaluates to (Issue #962).
+ *
+ * Everything the postfix evaluator pushes is an int64_t; what differs is
+ * whether that int64_t is a value or an interned symbol id.  String
+ * functions return runtime-interned ids, which is why to_upper(a) < to_upper(b)
+ * is a string comparison even though neither operand is a bare column.
+ * Comparisons and aggregates push counts and booleans, which are values.
+ */
+static wl_ir_coltype_t
+expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
+{
+    if (!expr)
+        return WL_IR_COLTYPE_UNKNOWN;
+
+    switch (expr->type) {
+    case WL_IR_EXPR_VAR:
+        return col_ctx_lookup_type(ctx, expr->var_name);
+
+    case WL_IR_EXPR_CONST_STR:
+        return WL_IR_COLTYPE_STRING;
+
+    case WL_IR_EXPR_CONST_INT:
+    case WL_IR_EXPR_BOOL:
+    case WL_IR_EXPR_ARITH:
+    case WL_IR_EXPR_CMP:
+    case WL_IR_EXPR_AGG:
+        return WL_IR_COLTYPE_SCALAR;
+
+    case WL_IR_EXPR_STR_FN:
+        switch (expr->str_fn) {
+        /* Produce a new interned string. */
+        case WIRELOG_STR_FN_CAT:
+        case WIRELOG_STR_FN_SUBSTR:
+        case WIRELOG_STR_FN_TO_UPPER:
+        case WIRELOG_STR_FN_TO_LOWER:
+        case WIRELOG_STR_FN_STR_REPLACE:
+        case WIRELOG_STR_FN_TRIM:
+        case WIRELOG_STR_FN_TO_STRING:
+            return WL_IR_COLTYPE_STRING;
+        /* Produce a length, a code point, a boolean or a number. */
+        case WIRELOG_STR_FN_STRLEN:
+        case WIRELOG_STR_FN_CONTAINS:
+        case WIRELOG_STR_FN_STR_PREFIX:
+        case WIRELOG_STR_FN_STR_SUFFIX:
+        case WIRELOG_STR_FN_STR_ORD:
+        case WIRELOG_STR_FN_TO_NUMBER:
+            return WL_IR_COLTYPE_SCALAR;
+        }
+        return WL_IR_COLTYPE_UNKNOWN;
+    }
+
+    return WL_IR_COLTYPE_UNKNOWN;
+}
+
+/**
  * Serialize an IR expression tree into postfix (RPN) byte encoding.
  * Walks the tree recursively: children first (postfix), then operator.
  */
 static int
-serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
-    uint32_t col_count)
+serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
+    const col_ctx_t *ctx)
 {
     if (!expr)
         return -1;
@@ -355,9 +580,10 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
         /* Resolve variable name to "colN" using column name context */
         char resolved[32];
         const char *emit_name = expr->var_name;
-        if (col_names && col_count > 0) {
-            for (uint32_t c = 0; c < col_count; c++) {
-                if (col_names[c] && strcmp(col_names[c], expr->var_name) == 0) {
+        if (ctx && ctx->names && ctx->count > 0) {
+            for (uint32_t c = 0; c < ctx->count; c++) {
+                if (ctx->names[c]
+                    && strcmp(ctx->names[c], expr->var_name) == 0) {
                     snprintf(resolved, sizeof(resolved), "col%u", c);
                     emit_name = resolved;
                     break;
@@ -399,24 +625,28 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
     case WL_IR_EXPR_ARITH:
         /* Serialize children first (postfix) */
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], col_names, col_count)
-                != 0)
+            if (serialize_expr(buf, expr->children[i], ctx) != 0)
                 return -1;
         }
         return expr_buf_push_u8(buf, arith_to_tag(expr->arith_op));
 
-    case WL_IR_EXPR_CMP:
+    case WL_IR_EXPR_CMP: {
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], col_names, col_count)
-                != 0)
+            if (serialize_expr(buf, expr->children[i], ctx) != 0)
                 return -1;
         }
-        return expr_buf_push_u8(buf, cmp_to_tag(expr->cmp_op));
+        wl_ir_coltype_t lhs = (expr->child_count > 0)
+            ? expr_result_type(expr->children[0], ctx)
+            : WL_IR_COLTYPE_UNKNOWN;
+        wl_ir_coltype_t rhs = (expr->child_count > 1)
+            ? expr_result_type(expr->children[1], ctx)
+            : WL_IR_COLTYPE_UNKNOWN;
+        return expr_buf_push_u8(buf, cmp_to_tag(expr->cmp_op, lhs, rhs));
+    }
 
     case WL_IR_EXPR_AGG:
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], col_names, col_count)
-                != 0)
+            if (serialize_expr(buf, expr->children[i], ctx) != 0)
                 return -1;
         }
         return expr_buf_push_u8(buf, agg_to_tag(expr->agg_fn));
@@ -424,8 +654,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
     case WL_IR_EXPR_STR_FN:
         /* Serialize arguments first (postfix), then emit the function opcode */
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], col_names, col_count)
-                != 0)
+            if (serialize_expr(buf, expr->children[i], ctx) != 0)
                 return -1;
         }
         return expr_buf_push_u8(buf, str_fn_to_tag(expr->str_fn));
@@ -436,12 +665,13 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr, char **col_names,
 
 /**
  * Serialize an IR expression into a wl_plan_expr_buffer_t.
- * col_names/col_count provide variable name -> column index resolution.
+ * @ctx provides variable name -> column index resolution and the column
+ * types the comparison emitter needs.
  * Returns 0 on success. On NULL expr, produces empty buffer (valid no-op).
  */
 static int
-serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, char **col_names,
-    uint32_t col_count, wl_plan_expr_buffer_t *out_buf)
+serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, const col_ctx_t *ctx,
+    wl_plan_expr_buffer_t *out_buf)
 {
     out_buf->data = NULL;
     out_buf->size = 0;
@@ -453,7 +683,7 @@ serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, char **col_names,
     if (expr_buf_init(&buf) != 0)
         return -1;
 
-    if (serialize_expr(&buf, expr, col_names, col_count) != 0) {
+    if (serialize_expr(&buf, expr, ctx) != 0) {
         free(buf.data);
         return -1;
     }
@@ -518,40 +748,41 @@ dup_indices(const uint32_t *src, uint32_t count)
 /* ======================================================================== */
 
 /**
- * Collect the output column names produced by an IR node.
- * For SCAN: returns the declared column_names.
- * For JOIN: concatenates left + right child column names.
+ * Collect the output column layout produced by an IR node.
+ * For SCAN: returns the declared column_names and column_types.
+ * For JOIN: concatenates left + right child columns.
  * For SEMIJOIN/ANTIJOIN: the left child's columns only -- these operators
  * filter rows and never widen their input.
  * For PROJECT/FILTER/FLATMAP/UNION: delegates to child[0].
  *
- * out_names and out_count are set on success (caller must free out_names
- * array AND each string in it).  Returns 0 on success, -1 on failure.
+ * Types ride the same recursion as names, position for position, so a layout
+ * that resolves a variable to column N also reports column N's type.  Any
+ * column whose type could not be established is WL_IR_COLTYPE_UNKNOWN
+ * (Issue #962).
+ *
+ * @out is filled on success and left empty on failure; the caller frees it
+ * with col_ctx_free() either way.  Returns 0 on success, -1 on failure.
  */
 static int
-collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
-    uint32_t *out_count)
+collect_output_columns(const wirelog_ir_node_t *node, col_ctx_t *out)
 {
-    if (!node) {
-        *out_names = NULL;
-        *out_count = 0;
+    memset(out, 0, sizeof(*out));
+
+    if (!node)
         return -1;
-    }
 
     switch (node->type) {
     case WIRELOG_IR_SCAN:
     case WIRELOG_IR_COMPOUND_INLINE:
     case WIRELOG_IR_COMPOUND_SIDE: {
-        uint32_t nc = node->column_count;
-        char **names = (char **)calloc(nc ? nc : 1, sizeof(char *));
-        if (!names)
+        if (col_ctx_alloc(out, node->column_count) != 0)
             return -1;
-        for (uint32_t i = 0; i < nc; i++) {
-            names[i]
+        for (uint32_t i = 0; i < out->count; i++) {
+            out->names[i]
                 = dup_str(node->column_names ? node->column_names[i] : NULL);
+            out->types[i] = node->column_types ? node->column_types[i]
+                                               : WL_IR_COLTYPE_UNKNOWN;
         }
-        *out_names = names;
-        *out_count = nc;
         return 0;
     }
 
@@ -564,73 +795,64 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
          * node -- join keys and fused projections alike.  Out-of-range
          * "colN" names then silently resolve to column 0 in the evaluator,
          * so the rule joins on the wrong column and under-derives (#955). */
-        char **left_names = NULL;
-        uint32_t left_count = 0;
+        col_ctx_t left;
+        memset(&left, 0, sizeof(left));
         if (node->child_count == 0
-            || collect_output_columns(node->children[0], &left_names,
-            &left_count)
-            != 0) {
-            *out_names = NULL;
-            *out_count = 0;
+            || collect_output_columns(node->children[0], &left) != 0) {
+            col_ctx_free(&left);
             return -1;
         }
         /* Only SEMIJOIN carries its projection into the plan operator
          * (see translate_ir_node); ANTIJOIN always emits all left columns. */
         if (node->type == WIRELOG_IR_SEMIJOIN && node->project_count > 0
             && node->project_indices) {
-            uint32_t pc = node->project_count;
-            char **names = (char **)calloc(pc, sizeof(char *));
-            if (!names) {
-                for (uint32_t i = 0; i < left_count; i++)
-                    free(left_names[i]);
-                free((void *)left_names);
+            col_ctx_t proj;
+            if (col_ctx_alloc(&proj, node->project_count) != 0) {
+                col_ctx_free(&left);
                 return -1;
             }
-            for (uint32_t i = 0; i < pc; i++) {
+            for (uint32_t i = 0; i < proj.count; i++) {
                 uint32_t idx = node->project_indices[i];
-                names[i] = (idx < left_count) ? dup_str(left_names[idx]) : NULL;
+                if (idx < left.count) {
+                    proj.names[i] = dup_str(left.names[idx]);
+                    proj.types[i] = col_ctx_type_at(&left, idx);
+                }
             }
-            for (uint32_t i = 0; i < left_count; i++)
-                free(left_names[i]);
-            free((void *)left_names);
-            *out_names = names;
-            *out_count = pc;
+            col_ctx_free(&left);
+            *out = proj;
             return 0;
         }
-        *out_names = left_names;
-        *out_count = left_count;
+        *out = left;
         return 0;
     }
 
     case WIRELOG_IR_JOIN: {
         /* Concatenate left child columns + right child columns */
-        char **left_names = NULL, **right_names = NULL;
-        uint32_t left_count = 0, right_count = 0;
+        col_ctx_t left, right;
+        memset(&left, 0, sizeof(left));
+        memset(&right, 0, sizeof(right));
         if (node->child_count > 0)
-            collect_output_columns(node->children[0], &left_names, &left_count);
+            collect_output_columns(node->children[0], &left);
         if (node->child_count > 1)
-            collect_output_columns(node->children[1], &right_names,
-                &right_count);
+            collect_output_columns(node->children[1], &right);
 
-        uint32_t total = left_count + right_count;
-        char **names = (char **)calloc(total ? total : 1, sizeof(char *));
-        if (!names) {
-            for (uint32_t i = 0; i < left_count; i++)
-                free(left_names[i]);
-            free((void *)left_names);
-            for (uint32_t i = 0; i < right_count; i++)
-                free(right_names[i]);
-            free((void *)right_names);
+        if (col_ctx_alloc(out, left.count + right.count) != 0) {
+            col_ctx_free(&left);
+            col_ctx_free(&right);
             return -1;
         }
-        for (uint32_t i = 0; i < left_count; i++)
-            names[i] = left_names[i]; /* transfer ownership */
-        for (uint32_t i = 0; i < right_count; i++)
-            names[left_count + i] = right_names[i]; /* transfer ownership */
-        free((void *)left_names);
-        free((void *)right_names);
-        *out_names = names;
-        *out_count = total;
+        for (uint32_t i = 0; i < left.count; i++) {
+            out->names[i] = left.names[i]; /* transfer ownership */
+            left.names[i] = NULL;
+            out->types[i] = col_ctx_type_at(&left, i);
+        }
+        for (uint32_t i = 0; i < right.count; i++) {
+            out->names[left.count + i] = right.names[i]; /* transfer */
+            right.names[i] = NULL;
+            out->types[left.count + i] = col_ctx_type_at(&right, i);
+        }
+        col_ctx_free(&left);
+        col_ctx_free(&right);
         return 0;
     }
 
@@ -641,24 +863,37 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
          * sees the correct (narrowed) column set. */
         if (!node->project_exprs && node->column_names
             && node->column_count > 0) {
-            uint32_t nc = node->column_count;
-            char **names = (char **)calloc(nc ? nc : 1, sizeof(char *));
-            if (!names)
+            /* The node records the projected names but not their types, so
+             * the types are recovered from the child through
+             * project_indices -- the same mapping the MAP operator applies
+             * at run time.  Without this the whole layout above any jpp
+             * projection would read as untyped. */
+            col_ctx_t child;
+            memset(&child, 0, sizeof(child));
+            if (node->child_count > 0)
+                collect_output_columns(node->children[0], &child);
+
+            if (col_ctx_alloc(out, node->column_count) != 0) {
+                col_ctx_free(&child);
                 return -1;
-            for (uint32_t i = 0; i < nc; i++)
-                names[i] = dup_str(node->column_names[i]);
-            *out_names = names;
-            *out_count = nc;
+            }
+            for (uint32_t i = 0; i < out->count; i++) {
+                out->names[i] = dup_str(node->column_names[i]);
+                if (node->project_indices && i < node->project_count)
+                    out->types[i]
+                        = col_ctx_type_at(&child, node->project_indices[i]);
+                else
+                    out->types[i]
+                        = col_ctx_lookup_type(&child, node->column_names[i]);
+            }
+            col_ctx_free(&child);
             return 0;
         }
         /* Head PROJECT nodes have project_exprs; delegate to child so
          * resolve_project_indices can map expression variables to child
          * column positions. */
         if (node->child_count > 0)
-            return collect_output_columns(node->children[0], out_names,
-                       out_count);
-        *out_names = NULL;
-        *out_count = 0;
+            return collect_output_columns(node->children[0], out);
         return -1;
 
     case WIRELOG_IR_FILTER:
@@ -667,15 +902,10 @@ collect_output_columns(const wirelog_ir_node_t *node, char ***out_names,
     case WIRELOG_IR_UNION:
         /* Delegate to first child */
         if (node->child_count > 0)
-            return collect_output_columns(node->children[0], out_names,
-                       out_count);
-        *out_names = NULL;
-        *out_count = 0;
+            return collect_output_columns(node->children[0], out);
         return -1;
     }
 
-    *out_names = NULL;
-    *out_count = 0;
     return -1;
 }
 
@@ -696,17 +926,16 @@ resolve_project_indices(const wirelog_ir_node_t *project_node)
     if (project_node->child_count > 0)
         child = project_node->children[0];
 
-    char **col_names = NULL;
-    uint32_t col_count = 0;
-    if (collect_output_columns(child, &col_names, &col_count) != 0)
+    col_ctx_t ctx;
+    if (collect_output_columns(child, &ctx) != 0) {
+        col_ctx_free(&ctx);
         return NULL;
+    }
 
     uint32_t pc = project_node->project_count;
     uint32_t *indices = (uint32_t *)malloc(pc * sizeof(uint32_t));
     if (!indices) {
-        for (uint32_t i = 0; i < col_count; i++)
-            free(col_names[i]);
-        free((void *)col_names);
+        col_ctx_free(&ctx);
         return NULL;
     }
 
@@ -714,8 +943,9 @@ resolve_project_indices(const wirelog_ir_node_t *project_node)
         indices[i] = i; /* fallback: identity */
         const wl_ir_expr_t *expr = project_node->project_exprs[i];
         if (expr && expr->type == WL_IR_EXPR_VAR && expr->var_name) {
-            for (uint32_t c = 0; c < col_count; c++) {
-                if (col_names[c] && strcmp(col_names[c], expr->var_name) == 0) {
+            for (uint32_t c = 0; c < ctx.count; c++) {
+                if (ctx.names[c]
+                    && strcmp(ctx.names[c], expr->var_name) == 0) {
                     indices[i] = c;
                     break;
                 }
@@ -723,9 +953,7 @@ resolve_project_indices(const wirelog_ir_node_t *project_node)
         }
     }
 
-    for (uint32_t i = 0; i < col_count; i++)
-        free(col_names[i]);
-    free((void *)col_names);
+    col_ctx_free(&ctx);
     return indices;
 }
 
@@ -741,19 +969,16 @@ resolve_key_to_colN(const char *key_name, const wirelog_ir_node_t *child)
     uint32_t idx = 0; /* fallback */
 
     if (key_name && child) {
-        char **col_names = NULL;
-        uint32_t col_count = 0;
-        if (collect_output_columns(child, &col_names, &col_count) == 0) {
-            for (uint32_t c = 0; c < col_count; c++) {
-                if (col_names[c] && strcmp(col_names[c], key_name) == 0) {
+        col_ctx_t ctx;
+        if (collect_output_columns(child, &ctx) == 0) {
+            for (uint32_t c = 0; c < ctx.count; c++) {
+                if (ctx.names[c] && strcmp(ctx.names[c], key_name) == 0) {
                     idx = c;
                     break;
                 }
             }
-            for (uint32_t c = 0; c < col_count; c++)
-                free(col_names[c]);
-            free((void *)col_names);
         }
+        col_ctx_free(&ctx);
     }
 
     snprintf(buf, sizeof(buf), "col%u", idx);
@@ -823,9 +1048,8 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
         return node;
 
     /* Resolve column names from the base SCAN for variable resolution */
-    char **col_names = NULL;
-    uint32_t col_count = 0;
-    collect_output_columns(node, &col_names, &col_count);
+    col_ctx_t ctx;
+    collect_output_columns(node, &ctx);
 
     expr_buf_t combined;
     if (expr_buf_init(&combined) != 0)
@@ -838,7 +1062,7 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
             ok = false;
             break;
         }
-        if (serialize_expr(&tmp, filt_exprs[i], col_names, col_count) != 0) {
+        if (serialize_expr(&tmp, filt_exprs[i], &ctx) != 0) {
             free(tmp.data);
             ok = false;
             break;
@@ -870,9 +1094,7 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
     }
 
 cleanup:
-    for (uint32_t c = 0; c < col_count; c++)
-        free(col_names[c]);
-    free((void *)col_names);
+    col_ctx_free(&ctx);
     return node;
 }
 
@@ -940,28 +1162,23 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             if (!op->map_exprs)
                 return -1;
             op->map_expr_count = node->project_count;
-            /* Collect child column names for variable name resolution */
-            char **child_col_names = NULL;
-            uint32_t child_col_count = 0;
+            /* Collect the child column layout for name and type resolution */
+            col_ctx_t child_ctx;
             const wirelog_ir_node_t *child0
                 = (node->child_count > 0) ? node->children[0] : NULL;
-            collect_output_columns(child0, &child_col_names, &child_col_count);
+            collect_output_columns(child0, &child_ctx);
             for (uint32_t i = 0; i < node->project_count; i++) {
                 if (node->project_exprs[i]) {
                     if (serialize_expr_to_buffer_ctx(
-                            node->project_exprs[i], child_col_names,
-                            child_col_count, &op->map_exprs[i])
+                            node->project_exprs[i], &child_ctx,
+                            &op->map_exprs[i])
                         != 0) {
-                        for (uint32_t c = 0; c < child_col_count; c++)
-                            free(child_col_names[c]);
-                        free((void *)child_col_names);
+                        col_ctx_free(&child_ctx);
                         return -1;
                     }
                 }
             }
-            for (uint32_t c = 0; c < child_col_count; c++)
-                free(child_col_names[c]);
-            free((void *)child_col_names);
+            col_ctx_free(&child_ctx);
         }
         return 0;
     }
@@ -977,17 +1194,13 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             return -1;
         op->op = WL_PLAN_OP_FILTER;
         {
-            char **filt_col_names = NULL;
-            uint32_t filt_col_count = 0;
+            col_ctx_t filt_ctx;
             const wirelog_ir_node_t *fchild
                 = (node->child_count > 0) ? node->children[0] : NULL;
-            collect_output_columns(fchild, &filt_col_names, &filt_col_count);
+            collect_output_columns(fchild, &filt_ctx);
             int rc = serialize_expr_to_buffer_ctx(
-                node->filter_expr, filt_col_names, filt_col_count,
-                &op->filter_expr);
-            for (uint32_t c = 0; c < filt_col_count; c++)
-                free(filt_col_names[c]);
-            free((void *)filt_col_names);
+                node->filter_expr, &filt_ctx, &op->filter_expr);
+            col_ctx_free(&filt_ctx);
             if (rc != 0)
                 return -1;
         }
@@ -1091,27 +1304,43 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             = dup_indices(node->group_by_indices, node->group_by_count);
         op->group_by_count = node->group_by_count;
         if (node->agg_expr) {
-            char **child_col_names = NULL;
-            uint32_t child_col_count = 0;
+            const wirelog_ir_node_t *child0
+                = (node->child_count > 0) ? node->children[0] : NULL;
+            col_ctx_t agg_ctx;
             if (node->column_names && node->column_count > 0) {
-                child_col_count = node->column_count;
-                child_col_names = (char **)calloc(child_col_count,
-                        sizeof(char *));
-                if (!child_col_names)
+                /*
+                 * The AGGREGATE node records the body's variable names but
+                 * no types, and it is the one serialize_expr() entry point
+                 * that does not take its layout from collect_output_columns()
+                 * -- so without this the aggregated expression would be the
+                 * only untyped expression in the plan.  The names here are
+                 * the body variables, which is exactly what the child's
+                 * layout is keyed by, so the types come across by name.
+                 */
+                col_ctx_t child_ctx;
+                collect_output_columns(child0, &child_ctx);
+                if (col_ctx_alloc(&agg_ctx, node->column_count) != 0) {
+                    col_ctx_free(&child_ctx);
                     return -1;
-                for (uint32_t i = 0; i < child_col_count; i++)
-                    child_col_names[i] = dup_str(node->column_names[i]);
+                }
+                for (uint32_t i = 0; i < agg_ctx.count; i++) {
+                    agg_ctx.names[i] = dup_str(node->column_names[i]);
+                    /* Positional first: the AGGREGATE's column list is the
+                     * body layout verbatim, and agg_expr's variables were
+                     * rewritten to "colN" against that same list.  Fall back
+                     * to the name only where the child is narrower. */
+                    agg_ctx.types[i] = (i < child_ctx.count)
+                        ? col_ctx_type_at(&child_ctx, i)
+                        : col_ctx_lookup_type(&child_ctx,
+                            node->column_names[i]);
+                }
+                col_ctx_free(&child_ctx);
             } else {
-                const wirelog_ir_node_t *child0
-                    = (node->child_count > 0) ? node->children[0] : NULL;
-                collect_output_columns(child0, &child_col_names,
-                    &child_col_count);
+                collect_output_columns(child0, &agg_ctx);
             }
             int agg_rc = serialize_expr_to_buffer_ctx(node->agg_expr,
-                    child_col_names, child_col_count, &op->agg_expr);
-            for (uint32_t c = 0; c < child_col_count; c++)
-                free(child_col_names[c]);
-            free((void *)child_col_names);
+                    &agg_ctx, &op->agg_expr);
+            col_ctx_free(&agg_ctx);
             if (agg_rc != 0)
                 return -1;
         }
@@ -1156,17 +1385,13 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             if (!filt)
                 return -1;
             filt->op = WL_PLAN_OP_FILTER;
-            char **filt2_names = NULL;
-            uint32_t filt2_count = 0;
+            col_ctx_t filt2_ctx;
             const wirelog_ir_node_t *fchild2
                 = (node->child_count > 0) ? node->children[0] : NULL;
-            collect_output_columns(fchild2, &filt2_names, &filt2_count);
-            int frc
-                = serialize_expr_to_buffer_ctx(node->filter_expr, filt2_names,
-                    filt2_count, &filt->filter_expr);
-            for (uint32_t c = 0; c < filt2_count; c++)
-                free(filt2_names[c]);
-            free((void *)filt2_names);
+            collect_output_columns(fchild2, &filt2_ctx);
+            int frc = serialize_expr_to_buffer_ctx(node->filter_expr,
+                    &filt2_ctx, &filt->filter_expr);
+            col_ctx_free(&filt2_ctx);
             if (frc != 0)
                 return -1;
         }
@@ -1200,29 +1425,23 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                 if (!map->map_exprs)
                     return -1;
                 map->map_expr_count = node->project_count;
-                /* Collect child column names for variable name resolution */
-                char **child_col_names2 = NULL;
-                uint32_t child_col_count2 = 0;
+                /* Collect the child column layout for name/type resolution */
+                col_ctx_t child_ctx2;
                 const wirelog_ir_node_t *child2
                     = (node->child_count > 0) ? node->children[0] : NULL;
-                collect_output_columns(child2, &child_col_names2,
-                    &child_col_count2);
+                collect_output_columns(child2, &child_ctx2);
                 for (uint32_t i = 0; i < node->project_count; i++) {
                     if (node->project_exprs[i]) {
                         if (serialize_expr_to_buffer_ctx(
-                                node->project_exprs[i], child_col_names2,
-                                child_col_count2, &map->map_exprs[i])
+                                node->project_exprs[i], &child_ctx2,
+                                &map->map_exprs[i])
                             != 0) {
-                            for (uint32_t c = 0; c < child_col_count2; c++)
-                                free(child_col_names2[c]);
-                            free((void *)child_col_names2);
+                            col_ctx_free(&child_ctx2);
                             return -1;
                         }
                     }
                 }
-                for (uint32_t c = 0; c < child_col_count2; c++)
-                    free(child_col_names2[c]);
-                free((void *)child_col_names2);
+                col_ctx_free(&child_ctx2);
             }
         }
         return 0;
@@ -2639,6 +2858,21 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         return -1;
 
     *out = NULL;
+
+    /* Issue #287/#962: plan generation is the first stage that emits WL_LOG
+     * diagnostics -- cmp_to_tag() reports ordering comparisons that fall back
+     * to intern-id order -- and it runs before any session exists, so the
+     * logger would still be at its all-silent default.  wl_log_init() is
+     * idempotent and cheap on re-entry; col_session_create() calls it for the
+     * same reason.
+     *
+     * Two caveats, both inherited rather than introduced.  It rewrites the
+     * sink and thresholds without a lock, so calling it while another
+     * thread logs is unsafe -- the same hazard col_session_create() already
+     * carries.  And at the release ceiling -Dwirelog_log_max_level=error the
+     * WARN sites below compile out entirely, so this call does nothing
+     * there. */
+    wl_log_init();
 
     if (wl_exec_plan_gen_preintern_static_strings(prog) != 0)
         return -1;

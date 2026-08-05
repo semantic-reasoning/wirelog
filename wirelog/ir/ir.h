@@ -57,6 +57,46 @@ struct wl_ir_expr {
 };
 
 /* ======================================================================== */
+/* Column Value Domain (Issue #962)                                         */
+/* ======================================================================== */
+
+/**
+ * wl_ir_coltype_t:
+ *
+ * The value domain of a physical column, as far as expression typing cares.
+ *
+ * This deliberately is NOT wirelog_column_type_t.  WIRELOG_TYPE_INT32 == 0,
+ * so an array of wirelog_column_type_t that was calloc()'d -- or that some
+ * path forgot to fill in -- is bit-identical to "every column is INT32".
+ * That is precisely the value that makes the comparison emitter keep the
+ * integer opcode, so a plumbing gap would degrade silently to the very bug
+ * being fixed and no test could tell the difference.
+ *
+ * Here UNKNOWN is 0 instead: a zero-filled or unpropagated array reads as
+ * "type not established", which the emitter detects and reports.
+ *
+ * Only the string/non-string distinction is represented, because that is
+ * the only distinction the comparison emitter can act on: every non-string
+ * column is compared by value exactly as it is today.  Collapsing
+ * int32/int64/float/bool into one SCALAR value also keeps the "both sides
+ * known and in conflict" warning from firing on int32-vs-int64 pairs, which
+ * are not a conflict at all.
+ */
+typedef enum {
+    WL_IR_COLTYPE_UNKNOWN = 0, /* not established -- calloc() default */
+    WL_IR_COLTYPE_SCALAR = 1,  /* int/uint/float/bool: compared by value */
+    WL_IR_COLTYPE_STRING = 2,  /* interned symbol id: compared by content */
+} wl_ir_coltype_t;
+
+/**
+ * wl_ir_coltype_from_column_type:
+ *
+ * Project a declared column type onto the comparison lattice.
+ */
+wl_ir_coltype_t
+wl_ir_coltype_from_column_type(wirelog_column_type_t type);
+
+/* ======================================================================== */
 /* IR Node Internal Definition                                              */
 /* ======================================================================== */
 
@@ -67,6 +107,11 @@ struct wirelog_ir_node {
     /* Operator-specific data */
     char **column_names;   /* SCAN: declared column names (NULL for wildcard) */
     uint32_t column_count; /* SCAN: column count */
+    /* SCAN: value domain of each column, parallel to column_names and the
+     * same column_count entries.  NULL means "nothing established", which
+     * every consumer must read as all-UNKNOWN rather than as a default
+     * type (Issue #962). */
+    wl_ir_coltype_t *column_types;
 
     uint32_t *project_indices; /* PROJECT: column index mapping */
     uint32_t project_count;    /* PROJECT: number of projected columns */

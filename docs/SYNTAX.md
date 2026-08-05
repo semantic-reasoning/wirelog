@@ -229,3 +229,32 @@ crypto hash functions.
 ### Comparison Operators
 
 `=`, `!=`, `<`, `>`, `<=`, `>=`
+
+The ordering operators (`<`, `>`, `<=`, `>=`) compare **numerically** on
+numeric columns and **lexicographically** (byte-wise, as `strcmp`) on
+`string`/`symbol` columns. Which one applies is decided from the declared
+column types, so a rule like
+
+```
+Before(a, b) :- Event(a), Event(b), a < b.
+```
+
+sorts event names alphabetically when `Event` is declared
+`.decl Event(name: string)`.
+
+`=` and `!=` are type-independent: symbols are interned canonically — one
+id per distinct string — so id equality already is string equality.
+
+**Undeclared columns compare by intern id.** Symbols are stored as
+interned integer ids, and ids are assigned in the order strings are first
+encountered. When a column has no declared type — the relation has no
+`.decl`, or the ordering operates on a value the declaration does not
+describe, such as an argument of an inline compound — the ordering
+operators fall back to comparing those ids, which orders symbols by when
+they were first seen rather than alphabetically. That result is *not*
+stable: adding an unrelated earlier fact changes it. Declare the relation
+to get lexicographic ordering. `WL_LOG=EVAL:2` reports each ordering
+comparison that falls back this way.
+
+Mixing a string operand with a numeric one in an ordering comparison also
+falls back to id order, and is likewise reported at `EVAL:2`.

@@ -65,6 +65,21 @@ clone_scan_metadata(const wirelog_ir_node_t *scan)
             if (scan->column_names[i])
                 clone->column_names[i] = strdup_safe(scan->column_names[i]);
         }
+        /* Column types travel with the names so the clone stays a faithful
+         * copy.  Nothing observes them today: this clone becomes the
+         * SEMIJOIN's child[1], and collect_output_columns reads only
+         * child[0] for SEMIJOIN/ANTIJOIN.  Kept so the invariant holds if
+         * that ever changes (Issue #962). */
+        if (scan->column_types) {
+            clone->column_types = (wl_ir_coltype_t *)calloc(
+                scan->column_count, sizeof(wl_ir_coltype_t));
+            if (!clone->column_types) {
+                wl_ir_node_free(clone);
+                return NULL;
+            }
+            memcpy(clone->column_types, scan->column_types,
+                scan->column_count * sizeof(wl_ir_coltype_t));
+        }
     }
 
     return clone;

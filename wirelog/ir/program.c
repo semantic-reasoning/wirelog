@@ -1040,6 +1040,26 @@ compound_arg_functor_matches(const wl_parser_ast_node_t *arg,
     return functor_id >= 0 && (uint32_t)functor_id == col->compound_functor_id;
 }
 
+/*
+ * The comparison lattice value of logical column @logical_idx, or UNKNOWN
+ * when the relation was never declared, was declared with fewer columns than
+ * the atom uses, or the column is a compound.  Compound columns carry no
+ * meaningful `type`: type_name_to_column_type() does not recognise
+ * "pair/2 inline" and falls through to its INT32 default, so reporting that
+ * would be reporting a parser artifact as a declaration (Issue #962).
+ */
+static wl_ir_coltype_t
+declared_coltype(const wl_ir_relation_info_t *rel_info, uint32_t logical_idx)
+{
+    if (!rel_info || !rel_info->columns
+        || logical_idx >= rel_info->column_count)
+        return WL_IR_COLTYPE_UNKNOWN;
+    const wirelog_column_t *col = &rel_info->columns[logical_idx];
+    if (col->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+        return WL_IR_COLTYPE_UNKNOWN;
+    return wl_ir_coltype_from_column_type(col->type);
+}
+
 static uint32_t
 atom_physical_column_count(const wl_parser_ast_node_t *atom,
     const wl_ir_relation_info_t *rel_info, const struct wirelog_program *prog)
@@ -1255,12 +1275,19 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
     uint32_t count = compound_arg->child_count + 1u;
     scan->column_names = (char **)calloc(count, sizeof(char *));
     char **var_names = (char **)calloc(count, sizeof(char *));
-    if (!scan->column_names || !var_names) {
+    /* __compound_<f>_<n> is (handle: int64, arg0..arg{n-1}: int64) -- see
+     * docs/COMPOUND_TERMS.md, "Side-relation tier".  The argument columns
+     * hold values whose original type the side relation does not record, so
+     * they stay UNKNOWN; only the handle is known to be an integer. */
+    scan->column_types = (wl_ir_coltype_t *)calloc(count,
+            sizeof(wl_ir_coltype_t));
+    if (!scan->column_names || !var_names || !scan->column_types) {
         free_var_names(var_names, count);
         wl_ir_node_free(scan);
         return NULL;
     }
     scan->column_count = count;
+    scan->column_types[0] = WL_IR_COLTYPE_SCALAR;
 
     scan->column_names[0] = strdup_safe(handle_var);
     var_names[0] = strdup_safe(handle_var);
@@ -1368,6 +1395,11 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     scan->column_names
         = (char **)calloc(physical_count > 0 ? physical_count : 1,
             sizeof(char *));
+    /* calloc leaves every entry WL_IR_COLTYPE_UNKNOWN, which is what an
+     * undeclared or partially declared relation must read as (Issue #962). */
+    scan->column_types
+        = (wl_ir_coltype_t *)calloc(physical_count > 0 ? physical_count : 1,
+            sizeof(wl_ir_coltype_t));
     scan->column_count = physical_count;
 
     char **var_names
@@ -1380,8 +1412,8 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     side_compound_binding_t *side_bindings
         = (side_compound_binding_t *)calloc(
             arg_count > 0 ? arg_count : 1, sizeof(side_compound_binding_t));
-    if (!scan->column_names || !var_names || !physical_args
-        || !side_bindings) {
+    if (!scan->column_names || !scan->column_types || !var_names
+        || !physical_args || !side_bindings) {
         free(side_bindings);
         free(physical_args);
         free(var_names);
@@ -1389,7 +1421,20 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         return NULL;
     }
 
-    /* Collect column names from atom arguments */
+    /*
+     * Collect column names from atom arguments.
+     *
+     * This loop IS the logical -> physical column mapping: an inline
+     * compound argument that matches its declaration expands into
+     * arg->child_count physical slots, everything else takes one.  Column
+     * types are assigned here, in lockstep with phys_idx, for exactly that
+     * reason.  Deriving them anywhere else -- in particular by indexing
+     * rel_info->columns[] with a physical position -- shifts every type
+     * after the first inline compound and reads past column_count on the
+     * last one, and the resulting mistype is silent: a physical integer
+     * column that inherits `string` makes wl_intern_reverse return NULL, and
+     * WL_PLAN_EXPR_CMP_STR_LT then drops every row (Issue #962).
+     */
     uint32_t phys_idx = 0;
     uint32_t side_binding_count = 0;
     for (uint32_t i = 0; i < arg_count; i++) {
@@ -1397,6 +1442,7 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         if (arg->type == WL_PARSER_AST_NODE_VARIABLE) {
             physical_args[phys_idx] = arg;
             scan->column_names[phys_idx] = strdup_safe(arg->name);
+            scan->column_types[phys_idx] = declared_coltype(rel_info, i);
             var_names[phys_idx] = strdup_safe(arg->name);
             phys_idx++;
         } else if (rel_info && i < rel_info->column_count
@@ -1413,6 +1459,10 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
                     scan->column_names[phys_idx] = NULL;
                     var_names[phys_idx] = NULL;
                 }
+                /* A declaration names the functor and arity of an inline
+                 * compound but not the types of its arguments, so these
+                 * slots genuinely have no declared type. */
+                scan->column_types[phys_idx] = WL_IR_COLTYPE_UNKNOWN;
                 phys_idx++;
             }
         } else if (rel_info && i < rel_info->column_count
@@ -1428,11 +1478,14 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
                 side_bindings[side_binding_count].handle_var = handle_var;
                 side_binding_count++;
             }
+            /* The physical slot holds a side-relation handle, an int64. */
+            scan->column_types[phys_idx] = WL_IR_COLTYPE_SCALAR;
             phys_idx++;
         } else {
             /* Wildcard, integer, string -> NULL (anonymous position) */
             physical_args[phys_idx] = arg;
             scan->column_names[phys_idx] = NULL;
+            scan->column_types[phys_idx] = declared_coltype(rel_info, i);
             var_names[phys_idx] = NULL;
             phys_idx++;
         }

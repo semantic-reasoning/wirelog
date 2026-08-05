@@ -31,6 +31,7 @@
  */
 
 #include "fpga_backend.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/session.h"
 
 #include <stdio.h>
@@ -273,9 +274,20 @@ fpga_parse_col_name_z(const char *name)
 
 #define EXPR_STACK_MAX 64
 
+/*
+ * Issue #962: the plan generator emits WL_PLAN_EXPR_CMP_STR_* (0x52..0x55)
+ * for ordering comparisons whose operands are both string-typed.  This
+ * evaluator's default arm is permissive -- an unknown opcode returns "row
+ * passes" -- so without the four cases below every such filter would be
+ * silently disabled here rather than merely unsupported.  @intern is the
+ * plan's borrowed table (wl_plan_t::intern); when it is NULL the ids cannot
+ * be reversed and the comparison degrades to id order.  Note this differs
+ * from col_eval_expr(), which returns false when a reverse lookup fails
+ * (ops.c) rather than falling back to id order.
+ */
 static int64_t
 fpga_eval_expr(const wl_plan_expr_buffer_t *expr, const int64_t *row,
-    uint32_t ncols)
+    uint32_t ncols, const wl_intern_t *intern)
 {
     if (!expr || !expr->data || expr->size == 0)
         return 1; /* no filter = pass */
@@ -435,6 +447,28 @@ fpga_eval_expr(const wl_plan_expr_buffer_t *expr, const int64_t *row,
                 sp--; stack[sp - 1] = stack[sp - 1] >= stack[sp] ? 1 : 0;
             }
             break;
+        /* String comparisons: intern ids reversed, then strcmp (0x52..0x55) */
+        case WL_PLAN_EXPR_CMP_STR_LT:  /* 0x52 */
+        case WL_PLAN_EXPR_CMP_STR_GT:  /* 0x53 */
+        case WL_PLAN_EXPR_CMP_STR_LTE: /* 0x54 */
+        case WL_PLAN_EXPR_CMP_STR_GTE: /* 0x55 */
+            if (sp >= 2) {
+                sp--;
+                int64_t a = stack[sp - 1], b = stack[sp];
+                const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+                const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+                int c = (sa && sb) ? strcmp(sa, sb)
+                                   : (a < b ? -1 : (a > b ? 1 : 0));
+                int64_t r;
+                switch (tag) {
+                case WL_PLAN_EXPR_CMP_STR_LT:  r = c < 0; break;
+                case WL_PLAN_EXPR_CMP_STR_GT:  r = c > 0; break;
+                case WL_PLAN_EXPR_CMP_STR_LTE: r = c <= 0; break;
+                default:                       r = c >= 0; break;
+                }
+                stack[sp - 1] = r;
+            }
+            break;
         /* Aggregates (used in REDUCE, not in filter context) */
         case WL_PLAN_EXPR_AGG_COUNT: /* 0x30 */
         case WL_PLAN_EXPR_AGG_SUM:   /* 0x31 */
@@ -533,7 +567,8 @@ fpga_eval_ops(wl_fpga_session_t *s, const wl_plan_op_t *ops, uint32_t op_count)
             fpga_rowset_init(&result, top->ncols);
             for (uint32_t r = 0; r < top->nrows; r++) {
                 const int64_t *row = fpga_rowset_row(top, r);
-                if (fpga_eval_expr(&op->filter_expr, row, top->ncols))
+                if (fpga_eval_expr(&op->filter_expr, row, top->ncols,
+                    s->plan ? s->plan->intern : NULL))
                     fpga_rowset_append(&result, row, top->ncols);
             }
             fpga_rowset_free(top);
@@ -585,7 +620,8 @@ fpga_eval_ops(wl_fpga_session_t *s, const wl_plan_op_t *ops, uint32_t op_count)
                         if (op->right_filter_expr.data
                             && op->right_filter_expr.size > 0) {
                             if (!fpga_eval_expr(&op->right_filter_expr,
-                                rrow, rrel->rows.ncols))
+                                rrow, rrel->rows.ncols,
+                                s->plan ? s->plan->intern : NULL))
                                 continue;
                         }
                         int64_t combined[128];
