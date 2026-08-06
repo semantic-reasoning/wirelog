@@ -497,6 +497,10 @@ endif
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 if not mobile_cross
+  # 04 and 05 are golden-diff tests over wirelog_cli rather than their own
+  # executables; they run the committed .dl programs in a temporary tree.
+  subdir('examples/04-hash-functions')
+  subdir('examples/05-crc32-checksum')
   subdir('examples/08-delta-queries')
   subdir('examples/09-retraction-basics')
   subdir('examples/10-recursive-under-update')
