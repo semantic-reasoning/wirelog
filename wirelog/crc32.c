@@ -36,6 +36,15 @@
 #include <arm_acle.h> /* __crc32cb */
 #endif
 
+/* MSVC spells it differently and rejects the GNU attribute outright. */
+#if defined(_MSC_VER)
+#define WL_CRC32_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define WL_CRC32_NOINLINE __attribute__((noinline))
+#else
+#define WL_CRC32_NOINLINE
+#endif
+
 /* Runtime detection: returns 1 if hardware CRC32 is available */
 static int
 crc32_hw_available(void)
@@ -183,7 +192,19 @@ castagnoli_crc32_init(void)
     castagnoli_table_ready = 1;
 }
 
-uint32_t
+/*
+ * noinline is load-bearing, not a style choice.  Under clang 18 with LTO
+ * and AddressSanitizer, inlining this function across the TU boundary into
+ * col_eval_expr_run() produces a copy whose references to this file's
+ * statics -- castagnoli_table, castagnoli_table_ready, and the cached
+ * g_hw_crc32_available behind hw_crc32_check() -- resolve to unmapped
+ * addresses, and the very first read of one segfaults.  ethernet_crc32(),
+ * which is not inlined at that call site, reads its own statics correctly
+ * on the identical arguments.  Bisected on CI: forcing the software path
+ * did not help, a global-free rewrite did, and restoring the table with
+ * only this attribute added also does.  See #970.
+ */
+WL_CRC32_NOINLINE uint32_t
 castagnoli_crc32(const uint8_t *data, size_t len)
 {
     uint32_t crc = 0xFFFFFFFFu;
