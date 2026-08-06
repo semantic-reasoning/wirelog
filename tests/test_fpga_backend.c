@@ -511,6 +511,98 @@ test_filter(void)
     PASS();
 }
 
+/*
+ * Run @src against the fpga backend with a(1,3,7,10,5) and report which of
+ * those five values reached relation "r".  Returns -1 on setup failure.
+ */
+static int
+fpga_filter_survivors(const char *src, bool *out_seen)
+{
+    static const int64_t data[] = { 1, 3, 7, 10, 5 };
+
+    wl_plan_t *plan = build_plan(src);
+    if (!plan)
+        return -1;
+    wl_session_t *session = NULL;
+    if (wl_session_create(wl_backend_fpga(), plan, 1, &session) != 0
+        || !session) {
+        wl_plan_free(plan);
+        return -1;
+    }
+    int rc = wl_session_insert(session, "a", data, 5, 1);
+    tuple_collector_t tc;
+    memset(&tc, 0, sizeof(tc));
+    if (rc == 0)
+        rc = wl_session_snapshot(session, collect_tuple, &tc);
+    if (rc == 0) {
+        for (int i = 0; i < 5; i++)
+            out_seen[i] = has_tuple(&tc, "r", &data[i], 1);
+    }
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    return rc == 0 ? tc.count : -1;
+}
+
+/*
+ * hash() used to be decoded as "pass through value", which silently turns
+ * `hash(x) = k` into `x = k`.  With the constant set to XXH3_64bits of the
+ * int64 1, the pass-through arm derives nothing (no row holds that value)
+ * while a real hash derives r(1).
+ */
+static void
+test_hash_filter_is_evaluated(void)
+{
+    TEST("fpga: hash(x) = XXH3(1) selects a(1), not a(XXH3(1))");
+
+    bool seen[5];
+    int count = fpga_filter_survivors(
+        ".decl a(x: int64)\n"
+        ".decl r(x: int64)\n"
+        "r(x) :- a(x), hash(x) = 3439722301264460078.\n", seen);
+    if (count < 0) {
+        FAIL("setup failed");
+        return;
+    }
+    if (count != 1 || !seen[0]) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "expected exactly r(1), got %d tuples", count);
+        FAIL(msg);
+        return;
+    }
+    PASS();
+}
+
+/*
+ * The decoder's default arm used to return 1, admitting every row for any
+ * opcode it did not recognise -- which means a filter it cannot evaluate
+ * stops filtering rather than failing.  sha256() is decoded by nothing in
+ * this backend, so it exercises that arm directly.
+ */
+static void
+test_unknown_opcode_rejects_rows(void)
+{
+    TEST("fpga: an unimplemented opcode rejects rows, it does not admit them");
+
+    bool seen[5];
+    int count = fpga_filter_survivors(
+        ".decl a(x: int64)\n"
+        ".decl r(x: int64)\n"
+        "r(x) :- a(x), sha256(x) = 0.\n", seen);
+    if (count < 0) {
+        FAIL("setup failed");
+        return;
+    }
+    if (count != 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "an unevaluated predicate admitted %d rows", count);
+        FAIL(msg);
+        return;
+    }
+    PASS();
+}
+
 static void
 test_transitive_closure(void)
 {
@@ -720,6 +812,8 @@ main(void)
     test_passthrough();
     test_join();
     test_filter();
+    test_hash_filter_is_evaluated();
+    test_unknown_opcode_rejects_rows();
     test_transitive_closure();
     test_delta_callback();
     test_backend_specific_ops();

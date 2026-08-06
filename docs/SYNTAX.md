@@ -204,18 +204,58 @@ predicates without crypto support, columnar expression evaluation fails
 closed. Filters reject the row, while MAP/head and REDUCE expression
 contexts return an evaluation error.
 
+**`sha256(x)` is not SHA-256 of `x`.** These built-ins return
+`XXH3_64bits(digest)`, so the result is 64 bits wide and is not the
+digest itself. It is still reproducible outside wirelog, in two steps:
+
+```
+printf 'abc' | sha256sum | cut -d' ' -f1 | xxd -r -p | xxhsum -H3
+```
+
+The same recipe works for `md5`, `sha1`, `sha512` and `hmac_sha256`
+(via `openssl dgst -mac hmac`). Use the digest for fingerprinting and
+change detection, not where a full-width cryptographic digest is
+required — 64 bits is not collision-resistant at scale.
+
+### What the digest functions cover
+
+`hash`, `crc32_ethernet`, `crc32_castagnoli`, `md5`, `sha1`, `sha256`,
+`sha512`, `hmac_sha256` and `uuid5` all take their bytes from the
+**declared type** of the operand:
+
+- A `symbol`/`string` operand digests the string's own bytes,
+  `strlen()` many, **with no NUL terminator**. `hash("abc")` is
+  therefore the value `printf 'abc' | xxhsum -H3` prints, and
+  `crc32_ethernet(payload)` is the value `zlib.crc32(payload)` prints.
+- A numeric operand digests the 8-byte little-endian `int64`
+  representation of its value.
+
+`hmac_sha256(msg, key)` and `uuid5(namespace, name)` decide the two
+operands independently, so `hmac_sha256(sym, 42)` keys the HMAC with the
+8 bytes of `42` and messages it with the symbol's bytes.
+
+**The guarantee is only as good as the `.decl`.** Column types are not
+enforced: a column declared `symbol` that actually holds integers which
+were never interned digests their `int64` representation instead — the
+same answer the numeric form would have given, and the query still runs
+rather than failing. A column with no declared type at all digests the
+interned id, which is *not* stable across runs; `WL_LOG=EVAL:2` reports
+each digest that falls back this way, and `WL_LOG=EVAL:4` reports each
+value whose reverse lookup failed. Declare the relation.
+
 ### Checksum Functions
 
 `crc32_ethernet(x)`, `crc32_castagnoli(x)`
 
-Both compute a CRC-32 over the 8-byte `int64` representation of their
-argument and return the result as a non-negative `int64` in the range
-`[0, 2^32)`. `crc32_ethernet` uses the Ethernet/ISO-HDLC polynomial
-(0x04C11DB7, ISO 3309 / IEEE 802.3); `crc32_castagnoli` uses the
-Castagnoli polynomial (CRC-32C, iSCSI/SCTP). Unlike the crypto hash
-built-ins above, the CRC-32 functions are always available and do not
-depend on the `mbedTLS` build option. See `examples/05-crc32-checksum/`
-for a frame-integrity validation example.
+Both return a non-negative `int64` in the range `[0, 2^32)`, computed
+over the operand's bytes as described above: the string's bytes for a
+`symbol` column, the 8-byte `int64` representation for a numeric one.
+`crc32_ethernet` uses the Ethernet/ISO-HDLC polynomial (0x04C11DB7,
+ISO 3309 / IEEE 802.3); `crc32_castagnoli` uses the Castagnoli
+polynomial (CRC-32C, iSCSI/SCTP). Unlike the crypto hash built-ins
+above, the CRC-32 functions are always available and do not depend on
+the `mbedTLS` build option. See `examples/05-crc32-checksum/` for a
+frame-integrity validation example.
 
 ### UUID Functions
 
@@ -225,6 +265,39 @@ The UUID built-ins require mbedTLS for non-zero runtime output and
 return the first 8 UUID bytes as an `int64`, not formatted text.
 Disabled UUID calls follow the same fail-closed behavior described for
 crypto hash functions.
+
+**Operand boundaries are unambiguous.** With a `symbol` operand,
+`uuid5()` length-prefixes each operand before hashing — the length as a
+little-endian `uint64` — so distinct `(namespace, name)` pairs always
+hash distinct bytes:
+
+```
+uuid5("ab", "c")  !=  uuid5("a", "bc")
+```
+
+A bare concatenation could not promise that: `"ab" + "c"` and
+`"a" + "bc"` are the same three bytes. RFC 4122 sidesteps the question
+by fixing the namespace at 16 bytes, making the split point unambiguous
+by construction; wirelog adopted the two-operand signature without that
+property, so it makes the framing explicit instead. In Python:
+
+```python
+buf = pack('<Q', len(ns)) + ns + pack('<Q', len(name)) + name
+d = bytearray(sha1(buf).digest())
+d[6] = (d[6] & 0x0F) | 0x50
+d[8] = (d[8] & 0x3F) | 0x80
+value = unpack('<q', bytes(d[:8]))[0]
+```
+
+`uuid5(int64, int64)` keeps the older unframed `SHA-1(ns || name)` — its
+operands are 8 bytes each, so its split point is already fixed and its
+values are unchanged.
+
+**`uuid5()` is still not RFC 4122**, and being unambiguous does not make
+it so. RFC 4122 requires the namespace to *be* a 16-byte UUID and defines
+a 128-bit result; wirelog accepts whatever bytes the operand carries and
+returns only the first 8 of the 16 digest bytes. Treat the result as a
+namespaced fingerprint, not as a UUID.
 
 ### Comparison Operators
 
@@ -258,3 +331,13 @@ comparison that falls back this way.
 
 Mixing a string operand with a numeric one in an ordering comparison also
 falls back to id order, and is likewise reported at `EVAL:2`.
+
+**The digest built-ins deliberately do not follow that last rule.** An
+ordering comparison needs *both* operands reversed to the strings they
+name before it means anything, so a one-sided type match keeps the
+integer comparison. A digest has no such coupling: each operand
+contributes its own bytes, so `hmac_sha256(sym, 42)` and
+`uuid5(42, sym)` take the symbol's bytes for the symbol operand and the
+`int64` bytes for the numeric one. Applying the comparison rule here
+would leave every mixed call digesting an interned id, which is the
+defect the digest functions were fixed for.

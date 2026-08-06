@@ -42,6 +42,95 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`hash()` and the digest family digest string bytes, not intern ids**
+  (#963): `hash`, `crc32_ethernet`, `crc32_castagnoli`, `md5`, `sha1`,
+  `sha256`, `sha512`, `hmac_sha256` and `uuid5` digested the `int64_t` on the
+  evaluation stack. For a `symbol` column that `int64_t` is an interned id, so
+  the result described the intern table rather than the string:
+  `hash("abc")` matched no external tool, and the same string digested
+  differently depending on what had been interned first.
+  `examples/04-hash-functions` showed both failures at once. Prepending one
+  row to `records.csv` gave alice bob's fingerprint, and
+  `hash("carol@example.com")` collided with the Part 3 checksum `hash(5)`
+  over a genuine integer -- both were really digests of small ids. `examples/05-crc32-checksum` was outright broken: its
+  committed checksums are `crc32(payload)`, so every one of its six frames was
+  reported corrupt and the `diff` its README documents failed.
+
+  `exec_plan_gen.c` now types the operands of a digest the same way #962 types
+  the operands of a comparison, and emits one of thirteen new payload-free
+  opcodes, `0x60`..`0x6C`, when an operand is string-typed. Those digest the
+  string's own bytes -- `strlen()` many, **no NUL terminator** -- which is what
+  `xxhsum -H3`, `zlib.crc32` and `sha256sum` see for the same input.
+  `examples/05` now reproduces its committed output exactly, byte for byte,
+  with no edit to any golden; `examples/04`'s fingerprints move to the values
+  `xxhsum -H3` prints, and its checksum and deduplication outputs do not move
+  at all.
+
+  `hmac_sha256(msg, key)` and `uuid5(ns, name)` type their two operands
+  independently and so get three opcodes each (`_SS`, `_SI`, `_IS`); the
+  all-integer case keeps the existing opcode. This deliberately diverges from
+  #962's rule that a one-sided type match keeps the integer opcode: an
+  ordering comparison needs *both* ids reversed to mean anything, while each
+  digest operand contributes its own bytes, so following that rule would leave
+  every mixed call digesting an id -- the defect itself.
+
+  **Column types are not enforced, and the fix inherits that.** A column
+  declared `symbol` that holds values which were never interned digests their
+  `int64` representation, i.e. exactly what the numeric opcode would have
+  produced, and the query still runs. Failing the row instead was considered
+  and rejected: in head position an expression failure is not a dropped row
+  but an `ERANGE` that aborts the entire `PROJECT` operator, so a query that
+  runs today would become `error: execution failed` with no output. A column
+  with no declared type at all still digests the id and is reported at
+  `WL_LOG=EVAL:2`; a failed reverse lookup is reported at `WL_LOG=EVAL:4`.
+  `docs/SEMANTICS.md` and `docs/SYNTAX.md` state the limit.
+
+  One thing the docs now say plainly that is not new behaviour:
+  `md5`/`sha*`/`hmac_sha256` return `XXH3_64bits(digest)`, not the digest --
+  reproducible as `printf 'abc' | sha256sum | cut -d' ' -f1 | xxd -r -p |
+  xxhsum -H3`. `sha256("abc")` is not SHA-256 of "abc" and never was.
+
+  One thing that *is* new, because this change would otherwise have created
+  it: `uuid5()` concatenated its two operands, which is unambiguous only
+  while both are fixed-width. Giving it variable-length operands would have
+  made `uuid5("ab", "c")` and `uuid5("a", "bc")` hash identical bytes and
+  return one value, and two distinct `(namespace, name)` pairs colliding is
+  the one thing a namespaced identifier must not do. RFC 4122 avoids this by
+  requiring the namespace to be exactly 16 bytes; wirelog adopted the
+  two-operand signature without that property, so the three symbol-bearing
+  opcodes length-prefix each operand -- its length as a little-endian
+  `uint64` -- before hashing. `uuid5(int64, int64)` keeps the unframed
+  construction and its exact previous values: its operands are 8 bytes each,
+  so nothing was ambiguous there, and an out-of-tree decoder that already
+  implements `0x2A` keeps computing the same answer. Rejected alternatives:
+  reducing the namespace to a fixed 16 bytes by digesting it, which is
+  lossy, costs a second SHA-1 per row, treats the two operands asymmetrically
+  and makes the result *look* RFC-conformant when it is not; and applying
+  the framing to `0x2A` as well, which would have changed values that were
+  never wrong. `uuid5()` remains non-conformant either way -- the namespace
+  need not be a UUID and only 8 of the 16 bytes are returned -- and
+  `docs/SYNTAX.md` keeps "unambiguous" and "RFC 4122" as separate claims.
+  `hmac_sha256()` has no such exposure: it passes message and key to the
+  HMAC primitive as distinct inputs rather than concatenating them, verified
+  by evaluating both splits.
+
+  Cost: none of these functions was ever on a fast path -- `col_expr_compile()`
+  returns NULL for them and `filter_is_simple_cmp()` rejects them on shape --
+  so unlike #962 there is no demotion. End-to-end over 1M rows of ~20-byte
+  symbols, a program computing `hash(sym)` in a head position measures within
+  a few percent of the same program over an `int64` column.
+
+  **Out-of-tree backends:** plans now contain expression opcodes `0x60`..`0x6C`.
+  They are payload-free, exactly like the opcodes they shadow, so a decoder
+  that skips one byte per unknown opcode stays in sync with the rest of the
+  stream -- this is why a flag byte on the existing opcodes was rejected. A
+  decoder that treats unknown opcodes *permissively*, however, will admit rows
+  through a filter it did not evaluate. `tests/fpga_backend.c` did exactly
+  that; its default arm now rejects instead, matching `columnar/ops.c`, and it
+  decodes the new opcodes. Its `WL_PLAN_EXPR_ARITH_HASH` arm was also a
+  no-op that silently degraded `hash(x) = k` to `x = k`, and is now a real
+  digest. `exec_plan.h` is not in `wirelog_public_headers`, so this is not an
+  installed-ABI break.
 - **Ordering comparisons on symbols compare strings, not intern ids** (#962):
   `<`, `>`, `<=` and `>=` mapped to the integer opcodes regardless of operand
   type, so on `string`/`symbol` columns they compared the interned integer

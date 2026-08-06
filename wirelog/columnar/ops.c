@@ -48,6 +48,7 @@
 #endif
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,21 +83,42 @@ wl_columnar_ops_psa_init(void)
 }
 
 static int
-wl_columnar_ops_psa_hash_int64(psa_algorithm_t alg, int64_t value,
-    unsigned char *digest, size_t digest_len)
+wl_columnar_ops_psa_hash_bytes(psa_algorithm_t alg, const void *data,
+    size_t len, unsigned char *digest, size_t digest_len)
 {
     size_t actual_len = 0;
     if (wl_columnar_ops_psa_init() != 0)
         return -1;
-    if (psa_hash_compute(alg, (const unsigned char *)&value, sizeof(value),
+    if (psa_hash_compute(alg, (const unsigned char *)data, len,
         digest, digest_len, &actual_len) != PSA_SUCCESS)
         return -1;
     return actual_len == digest_len ? 0 : -1;
 }
 
+/**
+ * Digest @first followed by @second.  uuid5()'s only caller.
+ *
+ * When @framed, each operand is preceded by its length as a little-endian
+ * uint64, so the pair maps to exactly one byte string and no two distinct
+ * (namespace, name) pairs can produce the same digest input.  A bare
+ * concatenation cannot promise that once the operands are variable-length:
+ * uuid5("ab", "c") and uuid5("a", "bc") would hash identical bytes.
+ *
+ * @framed is false only for WL_PLAN_EXPR_ARITH_UUID5, the int64-only opcode,
+ * whose two operands are 8 bytes each.  The split point there is fixed, so
+ * the concatenation is already unambiguous and there is nothing to fix --
+ * and leaving its bytes alone is what lets an out-of-tree decoder that
+ * already implements 0x2A keep computing the same answer.
+ *
+ * Reproducible outside wirelog:
+ *
+ *     buf = pack('<Q', len(ns)) + ns + pack('<Q', len(name)) + name
+ *     d   = bytearray(sha1(buf).digest())
+ */
 static int
-wl_columnar_ops_psa_hash_pair(psa_algorithm_t alg, int64_t first,
-    int64_t second, unsigned char *digest, size_t digest_len)
+wl_columnar_ops_psa_hash_pair(psa_algorithm_t alg, bool framed,
+    const void *first, size_t first_len, const void *second, size_t second_len,
+    unsigned char *digest, size_t digest_len)
 {
     psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
     size_t actual_len = 0;
@@ -106,10 +128,26 @@ wl_columnar_ops_psa_hash_pair(psa_algorithm_t alg, int64_t first,
         return -1;
     if (psa_hash_setup(&op, alg) != PSA_SUCCESS)
         goto out;
-    if (psa_hash_update(&op, (const unsigned char *)&first, sizeof(first))
+    if (framed) {
+        uint8_t len_le[8];
+        uint64_t n = (uint64_t)first_len;
+        for (unsigned i = 0; i < 8; i++)
+            len_le[i] = (uint8_t)(n >> (8 * i));
+        if (psa_hash_update(&op, len_le, sizeof(len_le)) != PSA_SUCCESS)
+            goto out;
+    }
+    if (psa_hash_update(&op, (const unsigned char *)first, first_len)
         != PSA_SUCCESS)
         goto out;
-    if (psa_hash_update(&op, (const unsigned char *)&second, sizeof(second))
+    if (framed) {
+        uint8_t len_le[8];
+        uint64_t n = (uint64_t)second_len;
+        for (unsigned i = 0; i < 8; i++)
+            len_le[i] = (uint8_t)(n >> (8 * i));
+        if (psa_hash_update(&op, len_le, sizeof(len_le)) != PSA_SUCCESS)
+            goto out;
+    }
+    if (psa_hash_update(&op, (const unsigned char *)second, second_len)
         != PSA_SUCCESS)
         goto out;
     if (psa_hash_finish(&op, digest, digest_len, &actual_len) != PSA_SUCCESS)
@@ -122,8 +160,8 @@ out:
 }
 
 static int
-wl_columnar_ops_psa_hmac_sha256_int64(int64_t msg, int64_t key,
-    unsigned char *digest, size_t digest_len)
+wl_columnar_ops_psa_hmac_sha256(const void *msg, size_t msg_len,
+    const void *key, size_t key_len, unsigned char *digest, size_t digest_len)
 {
     psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
     psa_key_id_t key_id = 0;
@@ -138,14 +176,29 @@ wl_columnar_ops_psa_hmac_sha256_int64(int64_t msg, int64_t key,
     psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
     psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
 
-    status = psa_import_key(&attributes, (const unsigned char *)&key,
-            sizeof(key), &key_id);
+    /*
+     * A symbol key can be the empty string, which PSA refuses to import.
+     * RFC 2104 zero-pads the key to the block size, so an empty key and a
+     * one-byte zero key produce the same MAC -- verified against
+     * hmac.new(b"", ...) == hmac.new(b"\0", ...).  Substituting it keeps
+     * hmac_sha256(x, "") externally reproducible instead of failing the
+     * query.  (Before #963 both operands were 8 bytes, so this could not
+     * arise.)
+     */
+    static const unsigned char empty_key[1] = { 0 };
+    if (key_len == 0) {
+        key = empty_key;
+        key_len = sizeof(empty_key);
+    }
+
+    status = psa_import_key(&attributes, (const unsigned char *)key,
+            key_len, &key_id);
     psa_reset_key_attributes(&attributes);
     if (status != PSA_SUCCESS)
         return -1;
 
     status = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-            (const unsigned char *)&msg, sizeof(msg), digest, digest_len,
+            (const unsigned char *)msg, msg_len, digest, digest_len,
             &actual_len);
     if (status == PSA_SUCCESS && actual_len == digest_len)
         ret = 0;
@@ -155,6 +208,65 @@ wl_columnar_ops_psa_hmac_sha256_int64(int64_t msg, int64_t key,
     return ret;
 }
 #endif
+
+/* ======================================================================== */
+/* Digest operand bytes (Issue #963)                                        */
+/* ======================================================================== */
+
+/**
+ * filt_bytes_t: the byte range a digest opcode consumes for one operand.
+ *
+ * @ptr either aliases the interned string or points into @inl, so the value
+ * must outlive its use and must not be copied after being filled.
+ */
+typedef struct {
+    const uint8_t *ptr;
+    size_t len;
+    uint8_t inl[sizeof(int64_t)];
+} filt_bytes_t;
+
+/**
+ * Fill @out with the bytes @v contributes to a digest.
+ *
+ * @as_symbol is set by the caller for the WL_PLAN_EXPR_ARITH_*_S opcode
+ * family, which the plan generator emits when the operand's declared type
+ * is `symbol`/`string`.  Then @v is an intern id and the digest covers the
+ * string's own bytes -- strlen(@v) of them, with no NUL terminator, which
+ * is what `xxhsum`, `crc32` and `sha256sum` see for the same input.
+ * Otherwise @v is a value and the digest covers its 8-byte int64
+ * representation, unchanged from before #963.
+ *
+ * The reverse lookup can fail even under an _S opcode, because `.decl`
+ * types are not enforced: a column declared `symbol` may hold raw integers
+ * that were never interned.  This falls back to the int64 representation
+ * rather than failing the row.  The alternative -- failing -- is not a
+ * dropped row in MAP position but an ERANGE that aborts the whole PROJECT
+ * operator (col_op_project()), turning a query that runs today into
+ * `error: execution failed` with no output.  The fallback instead gives
+ * exactly what the integer opcode would have given for that value, which
+ * for data that is genuinely integral is the right answer; nothing that is
+ * genuinely a symbol reaches it.  The guarantee #963 establishes is
+ * therefore only as strong as the `.decl`, and docs/SEMANTICS.md says so.
+ */
+static void
+filt_digest_bytes(filt_bytes_t *out, int64_t v, bool as_symbol,
+    wl_intern_t *intern)
+{
+    if (as_symbol) {
+        const char *str = intern ? wl_intern_reverse(intern, v) : NULL;
+        if (str) {
+            out->ptr = (const uint8_t *)str;
+            out->len = strlen(str);
+            return;
+        }
+        WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
+            "digest operand %" PRId64 " is declared symbol but names no "
+            "interned string: digesting its int64 representation", v);
+    }
+    memcpy(out->inl, &v, sizeof(v));
+    out->ptr = out->inl;
+    out->len = sizeof(v);
+}
 
 static inline void
 filt_push(filt_stack_t *s, int64_t v)
@@ -444,34 +556,50 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             filt_push(&s, v);
             break;
         }
-        case WL_PLAN_EXPR_ARITH_HASH: {
+        /*
+         * Digest opcodes.  Each integer opcode is paired with the _S
+         * variant the plan generator emits when the operand is
+         * symbol-typed (Issue #963); filt_digest_bytes() is the only
+         * place the two differ.
+         */
+        case WL_PLAN_EXPR_ARITH_HASH:
+        case WL_PLAN_EXPR_ARITH_HASH_S: {
             int64_t a = filt_pop(&s);
-            filt_push(&s, (int64_t)XXH3_64bits(&a, sizeof(a)));
+            filt_bytes_t m;
+            filt_digest_bytes(&m, a, tag == WL_PLAN_EXPR_ARITH_HASH_S, intern);
+            filt_push(&s, (int64_t)XXH3_64bits(m.ptr, m.len));
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_CRC32_ETH: {
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH_S: {
             int64_t a = filt_pop(&s);
-            uint8_t bytes[sizeof(a)];
-            memcpy(bytes, &a, sizeof(bytes));
-            filt_push(&s, (int64_t)ethernet_crc32(bytes, sizeof(bytes)));
+            filt_bytes_t m;
+            filt_digest_bytes(&m, a,
+                tag == WL_PLAN_EXPR_ARITH_CRC32_ETH_S, intern);
+            filt_push(&s, (int64_t)ethernet_crc32(m.ptr, m.len));
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_CRC32_CAST: {
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST:
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST_S: {
             int64_t a = filt_pop(&s);
-            uint8_t bytes[sizeof(a)];
-            memcpy(bytes, &a, sizeof(bytes));
-            filt_push(&s, (int64_t)castagnoli_crc32(bytes, sizeof(bytes)));
+            filt_bytes_t m;
+            filt_digest_bytes(&m, a,
+                tag == WL_PLAN_EXPR_ARITH_CRC32_CAST_S, intern);
+            filt_push(&s, (int64_t)castagnoli_crc32(m.ptr, m.len));
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_MD5: {
+        case WL_PLAN_EXPR_ARITH_MD5:
+        case WL_PLAN_EXPR_ARITH_MD5_S: {
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[16];
-            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_MD5, a, digest,
-                sizeof(digest)) != 0)
+            filt_bytes_t m;
+            filt_digest_bytes(&m, a, tag == WL_PLAN_EXPR_ARITH_MD5_S, intern);
+            if (wl_columnar_ops_psa_hash_bytes(PSA_ALG_MD5, m.ptr, m.len,
+                digest, sizeof(digest)) != 0)
                 goto bad;
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
@@ -481,12 +609,15 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_SHA1: {
+        case WL_PLAN_EXPR_ARITH_SHA1:
+        case WL_PLAN_EXPR_ARITH_SHA1_S: {
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[20];
-            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_SHA_1, a, digest,
-                sizeof(digest)) != 0)
+            filt_bytes_t m;
+            filt_digest_bytes(&m, a, tag == WL_PLAN_EXPR_ARITH_SHA1_S, intern);
+            if (wl_columnar_ops_psa_hash_bytes(PSA_ALG_SHA_1, m.ptr, m.len,
+                digest, sizeof(digest)) != 0)
                 goto bad;
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
 #else
@@ -496,11 +627,15 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_SHA256: {
+        case WL_PLAN_EXPR_ARITH_SHA256:
+        case WL_PLAN_EXPR_ARITH_SHA256_S: {
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[32];
-            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_SHA_256, a,
+            filt_bytes_t m;
+            filt_digest_bytes(&m, a, tag == WL_PLAN_EXPR_ARITH_SHA256_S,
+                intern);
+            if (wl_columnar_ops_psa_hash_bytes(PSA_ALG_SHA_256, m.ptr, m.len,
                 digest, sizeof(digest)) != 0)
                 goto bad;
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
@@ -511,11 +646,15 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_SHA512: {
+        case WL_PLAN_EXPR_ARITH_SHA512:
+        case WL_PLAN_EXPR_ARITH_SHA512_S: {
 #ifdef WL_MBEDTLS_ENABLED
             int64_t a = filt_pop(&s);
             unsigned char digest[64];
-            if (wl_columnar_ops_psa_hash_int64(PSA_ALG_SHA_512, a,
+            filt_bytes_t m;
+            filt_digest_bytes(&m, a, tag == WL_PLAN_EXPR_ARITH_SHA512_S,
+                intern);
+            if (wl_columnar_ops_psa_hash_bytes(PSA_ALG_SHA_512, m.ptr, m.len,
                 digest, sizeof(digest)) != 0)
                 goto bad;
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
@@ -526,12 +665,22 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_HMAC_SHA256: {
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS: {
 #ifdef WL_MBEDTLS_ENABLED
             int64_t key_val = filt_pop(&s);
             int64_t msg_val = filt_pop(&s);
             unsigned char digest[32];
-            if (wl_columnar_ops_psa_hmac_sha256_int64(msg_val, key_val,
+            bool msg_sym = (tag == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS
+                || tag == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI);
+            bool key_sym = (tag == WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS
+                || tag == WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS);
+            filt_bytes_t m, k;
+            filt_digest_bytes(&m, msg_val, msg_sym, intern);
+            filt_digest_bytes(&k, key_val, key_sym, intern);
+            if (wl_columnar_ops_psa_hmac_sha256(m.ptr, m.len, k.ptr, k.len,
                 digest, sizeof(digest)) != 0)
                 goto bad;
             filt_push(&s, (int64_t)XXH3_64bits(digest, sizeof(digest)));
@@ -563,13 +712,32 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             break;
         }
 
-        case WL_PLAN_EXPR_ARITH_UUID5: {
+        /*
+         * uuid5(ns, name) over symbols length-prefixes each operand before
+         * hashing, so distinct (namespace, name) pairs always hash distinct
+         * bytes.  A bare concatenation -- what the int64-only opcode does,
+         * and what it can safely keep doing with two fixed-width operands --
+         * would make uuid5("ab", "c") and uuid5("a", "bc") the same value
+         * the moment the operands became variable-length.
+         */
+        case WL_PLAN_EXPR_ARITH_UUID5:
+        case WL_PLAN_EXPR_ARITH_UUID5_SS:
+        case WL_PLAN_EXPR_ARITH_UUID5_SI:
+        case WL_PLAN_EXPR_ARITH_UUID5_IS: {
 #ifdef WL_MBEDTLS_ENABLED
             int64_t name = filt_pop(&s);
             int64_t ns = filt_pop(&s);
             unsigned char digest[20]; /* SHA-1 output */
-            if (wl_columnar_ops_psa_hash_pair(PSA_ALG_SHA_1, ns, name, digest,
-                sizeof(digest)) != 0)
+            bool ns_sym = (tag == WL_PLAN_EXPR_ARITH_UUID5_SS
+                || tag == WL_PLAN_EXPR_ARITH_UUID5_SI);
+            bool name_sym = (tag == WL_PLAN_EXPR_ARITH_UUID5_SS
+                || tag == WL_PLAN_EXPR_ARITH_UUID5_IS);
+            filt_bytes_t nsb, nmb;
+            filt_digest_bytes(&nsb, ns, ns_sym, intern);
+            filt_digest_bytes(&nmb, name, name_sym, intern);
+            if (wl_columnar_ops_psa_hash_pair(PSA_ALG_SHA_1,
+                tag != WL_PLAN_EXPR_ARITH_UUID5, nsb.ptr, nsb.len,
+                nmb.ptr, nmb.len, digest, sizeof(digest)) != 0)
                 goto bad;
             /* RFC 4122 v5: set version=5, variant=0b10 */
             digest[6] = (digest[6] & 0x0F) | 0x50;

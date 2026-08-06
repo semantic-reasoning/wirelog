@@ -165,6 +165,49 @@ typedef enum {
     WL_PLAN_EXPR_CMP_STR_GT  = 0x53,
     WL_PLAN_EXPR_CMP_STR_LTE = 0x54,
     WL_PLAN_EXPR_CMP_STR_GTE = 0x55,
+
+    /*
+     * Digest opcodes whose operands are symbols (Issue #963).
+     *
+     * The 0x1B..0x2A family digests the int64_t on the stack.  When that
+     * int64_t is an interned symbol id, digesting it answers a question
+     * about the intern table rather than about the string: hash("abc")
+     * matches no external tool, and the same string digests differently
+     * depending on what was interned first.  These opcodes reverse the id
+     * and digest the string's own bytes instead.
+     *
+     * Byte convention: strlen(s) bytes, no NUL terminator.  That is what
+     * `printf '%s' abc | xxhsum -H3` and `crc32(payload)` see, so the
+     * values are reproducible outside wirelog.
+     *
+     * All are payload-free, exactly like the integer opcodes they shadow,
+     * so a decoder that does not know them still advances by one byte and
+     * stays in sync with the rest of the stream.
+     *
+     * hmac_sha256() and uuid5() take two operands that type independently,
+     * so each gets three opcodes; the II case keeps the existing opcode.
+     * _SS = both symbols, _SI = first symbol, _IS = second symbol.
+     *
+     * The UUID5_* opcodes additionally length-prefix each operand (its
+     * length as a little-endian uint64) before hashing, which the 0x2A
+     * opcode does not.  Without it two variable-length operands could be
+     * split at more than one point -- uuid5("ab", "c") and uuid5("a", "bc")
+     * would hash the same bytes.  0x2A's operands are 8 bytes each, so its
+     * split point is fixed and its bytes are unchanged.
+     */
+    WL_PLAN_EXPR_ARITH_HASH_S        = 0x60, /* unary:  pop 1 push 1 */
+    WL_PLAN_EXPR_ARITH_CRC32_ETH_S   = 0x61,
+    WL_PLAN_EXPR_ARITH_CRC32_CAST_S  = 0x62,
+    WL_PLAN_EXPR_ARITH_MD5_S         = 0x63,
+    WL_PLAN_EXPR_ARITH_SHA1_S        = 0x64,
+    WL_PLAN_EXPR_ARITH_SHA256_S      = 0x65,
+    WL_PLAN_EXPR_ARITH_SHA512_S      = 0x66,
+    WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS = 0x67, /* binary: pop 2 push 1 */
+    WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI = 0x68,
+    WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS = 0x69,
+    WL_PLAN_EXPR_ARITH_UUID5_SS      = 0x6A, /* binary: pop 2 push 1 */
+    WL_PLAN_EXPR_ARITH_UUID5_SI      = 0x6B,
+    WL_PLAN_EXPR_ARITH_UUID5_IS      = 0x6C,
 } wl_plan_expr_tag_t;
 
 /**

@@ -44,11 +44,30 @@ the same fingerprint, making duplicate detection a simple integer comparison.
 
 Example output (fingerprints_output.csv):
 ```
-1,alice,alice@example.com,3439722301264460078
-4,alice_dup,alice@example.com,3439722301264460078   <- same fp as id=1
-2,bob,bob@example.com,5589565451239960189
-6,bob_dup,bob@example.com,5589565451239960189       <- same fp as id=2
+1,alice,alice@example.com,8569093714482247167
+4,alice_dup,alice@example.com,8569093714482247167   <- same fp as id=1
+2,bob,bob@example.com,8153412963705046890
+6,bob_dup,bob@example.com,8153412963705046890       <- same fp as id=2
 ```
+
+The fingerprint is a property of the address, nothing else. It is xxHash3 over the
+address's own bytes, so it reproduces outside wirelog:
+
+```
+$ printf 'alice@example.com' | xxhsum -H3
+XXH3_76eb895512bf35ff  stdin        # = 8569093714482247167 as int64
+```
+
+That also means the values do not move when the input file changes around them.
+Until #963, `hash()` digested the *interned id* of the string rather than the string,
+so inserting one row at the top of `records.csv` renumbered the ids and gave every
+record below it a different fingerprint. It also put the fingerprints in the same
+value domain as the Part 3 checksums, which hash genuine integers — `hash("carol@example.com")`
+and `hash(5)` were the same number.
+
+This depends on `email` being declared `symbol` in `.decl record(...)`. Column types
+are not enforced, so an undeclared column still digests its id — see
+`docs/SYNTAX.md`, "What the digest functions cover".
 
 ### Part 2: Deduplication
 
@@ -129,7 +148,13 @@ No output means the files match.
 ### hash() Function
 
 - Accepts `int64` or `symbol` arguments and returns `int64`.
-- Deterministic within a single evaluation: the same input always produces the same output.
+- The bytes it digests come from the operand's **declared type**: a `symbol` column
+  digests the string's own bytes (`strlen()` many, no NUL terminator), a numeric column
+  digests the 8-byte `int64`. This example uses both — `hash(email)` in Part 1 and
+  `hash(id)` in Part 3 — and they no longer share a value domain, which they did before
+  #963.
+- Deterministic across runs and across machines: the same input always produces the same
+  output, and it is the output `xxhsum -H3` produces for the same bytes.
 - Built on xxHash3, a fast non-cryptographic hash suitable for fingerprinting and
   deduplication. Do not use it for security-sensitive purposes (passwords, signatures).
 
