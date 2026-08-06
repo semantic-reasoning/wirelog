@@ -1115,6 +1115,29 @@ test_symbol_ordering_exe = executable(
 
 test('symbol_ordering', test_symbol_ordering_exe)
 
+# Issue #963: hash() and the CRC-32 built-ins digested the intern id of a
+# symbol column rather than the string's bytes, so hash("abc") matched no
+# external tool and the answer depended on what was interned first.  Every
+# expected value here was derived outside wirelog (xxhsum -H3, zlib.crc32).
+# The mbedTLS-backed half lives in test_cryptographic_hashes.c so that this
+# binary runs in every build configuration.
+test_symbol_digests_exe = executable(
+  'test_symbol_digests',
+  files('test_symbol_digests.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('symbol_digests', test_symbol_digests_exe)
+
 test('option2_doop', test_option2_doop_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
 )

@@ -19,9 +19,15 @@
  * 2. wirelog-easy.h hardcodes the columnar backend via wl_backend_columnar().
  *    Alternative backends require manual wl_session_create() calls.
  *
- * 3. Expression opcode coverage: only arithmetic and comparison opcodes
- *    are validated by this backend.  String, hash, and cryptographic
- *    opcodes are treated as pass-through (permissive).
+ * 3. Expression opcode coverage: arithmetic, comparison, string-comparison
+ *    (#962) and non-cryptographic digest opcodes (hash, both CRC-32
+ *    variants, in their int64 and symbol forms -- #963) are evaluated.
+ *    The mbedTLS-backed digest and UUID opcodes are not implemented here,
+ *    and the default arm rejects the row rather than admitting it, which
+ *    matches the production interpreter (ops.c's `goto bad`).  A permissive
+ *    default silently disables filtering whenever plan generation learns a
+ *    new opcode, which is how a filter can appear to work while comparing
+ *    nothing at all.
  *
  * 4. Positive findings: intern sharing via plan->intern works cleanly.
  *    Session embedding (wl_session_t as first field) and the wrapper
@@ -31,9 +37,13 @@
  */
 
 #include "fpga_backend.h"
+#include "../wirelog/crc32.h"
 #include "../wirelog/intern.h"
 #include "../wirelog/session.h"
 
+#include <xxhash.h>
+
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -413,8 +423,49 @@ fpga_eval_expr(const wl_plan_expr_buffer_t *expr, const int64_t *row,
         case WL_PLAN_EXPR_ARITH_BNOT: /* 0x1A */
             if (sp >= 1) stack[sp - 1] = ~stack[sp - 1];
             break;
-        case WL_PLAN_EXPR_ARITH_HASH: /* 0x1B */
-            /* Hash: pass through value (no xxhash dependency) */
+        /*
+         * Digests.  The _S opcodes (#963) reverse the intern id and digest
+         * the string's bytes -- strlen many, no NUL -- while the int64
+         * forms digest the 8-byte representation.  An id that names no
+         * string falls back to the int64 form, matching ops.c.
+         *
+         * The previous "pass through value" arm for 0x1B was worse than
+         * unimplemented: it silently degraded `hash(x) = k` to `x = k`,
+         * which admits rows no digest would.
+         */
+        case WL_PLAN_EXPR_ARITH_HASH:        /* 0x1B */
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH:   /* 0x1C */
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST:  /* 0x1D */
+        case WL_PLAN_EXPR_ARITH_HASH_S:      /* 0x60 */
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH_S: /* 0x61 */
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST_S: /* 0x62 */
+            if (sp >= 1) {
+                int64_t v = stack[sp - 1];
+                bool as_sym = (tag == WL_PLAN_EXPR_ARITH_HASH_S
+                    || tag == WL_PLAN_EXPR_ARITH_CRC32_ETH_S
+                    || tag == WL_PLAN_EXPR_ARITH_CRC32_CAST_S);
+                const char *str = (as_sym && intern)
+                    ? wl_intern_reverse(intern, v) : NULL;
+                uint8_t inl[sizeof(int64_t)];
+                const uint8_t *bytes;
+                size_t len;
+                if (str) {
+                    bytes = (const uint8_t *)str;
+                    len = strlen(str);
+                } else {
+                    memcpy(inl, &v, sizeof(v));
+                    bytes = inl;
+                    len = sizeof(v);
+                }
+                if (tag == WL_PLAN_EXPR_ARITH_CRC32_ETH
+                    || tag == WL_PLAN_EXPR_ARITH_CRC32_ETH_S)
+                    stack[sp - 1] = (int64_t)ethernet_crc32(bytes, len);
+                else if (tag == WL_PLAN_EXPR_ARITH_CRC32_CAST
+                    || tag == WL_PLAN_EXPR_ARITH_CRC32_CAST_S)
+                    stack[sp - 1] = (int64_t)castagnoli_crc32(bytes, len);
+                else
+                    stack[sp - 1] = (int64_t)XXH3_64bits(bytes, len);
+            }
             break;
         /* Comparisons */
         case WL_PLAN_EXPR_CMP_EQ: /* 0x22 */
@@ -477,8 +528,15 @@ fpga_eval_expr(const wl_plan_expr_buffer_t *expr, const int64_t *row,
             /* In filter context, pass through */
             break;
         default:
-            /* Unknown/unsupported opcode: permissive, return true */
-            return 1;
+            /*
+             * Unknown or unimplemented opcode: reject the row.  ops.c's
+             * evaluator does the same (`goto bad`), and it is the only
+             * safe answer -- a permissive default answers "yes" to a
+             * predicate it did not evaluate, so a filter this backend does
+             * not understand stops filtering without saying so.  The
+             * mbedTLS digest and UUID opcodes land here.
+             */
+            return 0;
         }
     }
 

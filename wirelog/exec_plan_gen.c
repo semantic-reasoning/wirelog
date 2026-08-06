@@ -315,10 +315,149 @@ col_ctx_lookup_type(const col_ctx_t *ctx, const char *var_name)
     return WL_IR_COLTYPE_UNKNOWN;
 }
 
-/* Map IR arith op -> plan expr tag */
-static uint8_t
-arith_to_tag(wirelog_arith_op_t op)
+static const char *
+arith_op_name(wirelog_arith_op_t op)
 {
+    switch (op) {
+    case WIRELOG_ARITH_HASH:        return "hash";
+    case WIRELOG_ARITH_CRC32_ETH:   return "crc32_ethernet";
+    case WIRELOG_ARITH_CRC32_CAST:  return "crc32_castagnoli";
+    case WIRELOG_ARITH_MD5:         return "md5";
+    case WIRELOG_ARITH_SHA1:        return "sha1";
+    case WIRELOG_ARITH_SHA256:      return "sha256";
+    case WIRELOG_ARITH_SHA512:      return "sha512";
+    case WIRELOG_ARITH_HMAC_SHA256: return "hmac_sha256";
+    case WIRELOG_ARITH_UUID5:       return "uuid5";
+    default:                        return "?";
+    }
+}
+
+/**
+ * Map an IR arith op to a plan expr tag, given the value domains of its
+ * operands (Issue #963).
+ *
+ * @t0 and @t1 are the domains of the first and second child; @t1 is
+ * WL_IR_COLTYPE_UNKNOWN for unary operators.
+ *
+ * Symbols are stored as intern ids.  The 0x1B..0x2A digest opcodes digest
+ * that id, which makes hash("abc") a fact about the intern table rather
+ * than about "abc": it matches no external tool, and the same string
+ * digests differently depending on what was interned first.  When an
+ * operand is string-typed the emitter picks the shadow opcode that reverses
+ * the id and digests the string's own bytes instead.
+ *
+ * Two points where this diverges from cmp_to_tag()'s rules, deliberately:
+ *
+ *   - #962 keeps the integer opcode when only one operand of a comparison
+ *     is a string, because CMP_STR_* needs *both* sides reversed and a
+ *     one-sided match would drop every row.  hmac_sha256() and uuid5()
+ *     have no such coupling -- each operand contributes its own bytes --
+ *     so applying that rule here would leave the mixed case digesting an
+ *     id, i.e. would preserve the defect.  Each therefore gets three
+ *     opcodes (_SS/_SI/_IS) and only the all-integer case keeps 0x28/0x2A.
+ *
+ *   - EQ/NEQ are exempt in #962 because interning is canonical.  Nothing
+ *     analogous applies to a digest: the digest of an id is not the digest
+ *     of the string under any convention.
+ *
+ * WL_IR_EXPR_ARITH itself reports SCALAR from expr_result_type(), which is
+ * correct -- no arith op produces a string -- so hash(hash(x)) digests the
+ * inner result as the integer it is.
+ */
+static uint8_t
+arith_digest_tag(wirelog_arith_op_t op, wl_ir_coltype_t t0, wl_ir_coltype_t t1)
+{
+    bool s0 = (t0 == WL_IR_COLTYPE_STRING);
+    bool s1 = (t1 == WL_IR_COLTYPE_STRING);
+
+    switch (op) {
+    case WIRELOG_ARITH_HASH:
+        return s0 ? WL_PLAN_EXPR_ARITH_HASH_S : WL_PLAN_EXPR_ARITH_HASH;
+    case WIRELOG_ARITH_CRC32_ETH:
+        return s0 ? WL_PLAN_EXPR_ARITH_CRC32_ETH_S
+                  : WL_PLAN_EXPR_ARITH_CRC32_ETH;
+    case WIRELOG_ARITH_CRC32_CAST:
+        return s0 ? WL_PLAN_EXPR_ARITH_CRC32_CAST_S
+                  : WL_PLAN_EXPR_ARITH_CRC32_CAST;
+    case WIRELOG_ARITH_MD5:
+        return s0 ? WL_PLAN_EXPR_ARITH_MD5_S : WL_PLAN_EXPR_ARITH_MD5;
+    case WIRELOG_ARITH_SHA1:
+        return s0 ? WL_PLAN_EXPR_ARITH_SHA1_S : WL_PLAN_EXPR_ARITH_SHA1;
+    case WIRELOG_ARITH_SHA256:
+        return s0 ? WL_PLAN_EXPR_ARITH_SHA256_S : WL_PLAN_EXPR_ARITH_SHA256;
+    case WIRELOG_ARITH_SHA512:
+        return s0 ? WL_PLAN_EXPR_ARITH_SHA512_S : WL_PLAN_EXPR_ARITH_SHA512;
+    case WIRELOG_ARITH_HMAC_SHA256:
+        if (s0 && s1)
+            return WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS;
+        if (s0)
+            return WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI;
+        if (s1)
+            return WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS;
+        return WL_PLAN_EXPR_ARITH_HMAC_SHA256;
+    case WIRELOG_ARITH_UUID5:
+        if (s0 && s1)
+            return WL_PLAN_EXPR_ARITH_UUID5_SS;
+        if (s0)
+            return WL_PLAN_EXPR_ARITH_UUID5_SI;
+        if (s1)
+            return WL_PLAN_EXPR_ARITH_UUID5_IS;
+        return WL_PLAN_EXPR_ARITH_UUID5;
+    default:
+        break;
+    }
+    return WL_PLAN_EXPR_ARITH_ADD; /* unreachable: caller filters */
+}
+
+/* True for the ops whose operand domain selects between opcode families. */
+static bool
+arith_op_is_digest(wirelog_arith_op_t op)
+{
+    switch (op) {
+    case WIRELOG_ARITH_HASH:
+    case WIRELOG_ARITH_CRC32_ETH:
+    case WIRELOG_ARITH_CRC32_CAST:
+    case WIRELOG_ARITH_MD5:
+    case WIRELOG_ARITH_SHA1:
+    case WIRELOG_ARITH_SHA256:
+    case WIRELOG_ARITH_SHA512:
+    case WIRELOG_ARITH_HMAC_SHA256:
+    case WIRELOG_ARITH_UUID5:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Map IR arith op -> plan expr tag.
+ *
+ * @t0/@t1 are the operand value domains (Issue #963); pass UNKNOWN for
+ * operands that do not exist.  Only the digest family reads them. */
+static uint8_t
+arith_to_tag(wirelog_arith_op_t op, wl_ir_coltype_t t0, wl_ir_coltype_t t1)
+{
+    if (arith_op_is_digest(op)) {
+        /*
+         * An operand with no declared type keeps the integer opcode, so it
+         * digests an id.  Rejecting it would break programs that work
+         * today -- head and intermediate relations need no .decl -- but the
+         * result is as unstable as the id assignment, so say so.  The
+         * UNKNOWN sentinel is what makes "never declared" distinguishable
+         * from "declared numeric", which is a legitimate integer digest.
+         */
+        bool binary = (op == WIRELOG_ARITH_HMAC_SHA256
+            || op == WIRELOG_ARITH_UUID5);
+        if (t0 == WL_IR_COLTYPE_UNKNOWN
+            || (binary && t1 == WL_IR_COLTYPE_UNKNOWN)) {
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_WARN,
+                "'%s' applied to a column with no declared type: digesting "
+                "the interned id, not the string bytes. Declare the relation "
+                "(.decl R(c: symbol)) if the column holds symbols",
+                arith_op_name(op));
+        }
+        return arith_digest_tag(op, t0, t1);
+    }
+
     switch (op) {
     case WIRELOG_ARITH_ADD:
         return WL_PLAN_EXPR_ARITH_ADD;
@@ -622,13 +761,22 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
             return -1;
         return expr_buf_push_u8(buf, expr->bool_value ? 1 : 0);
 
-    case WL_IR_EXPR_ARITH:
+    case WL_IR_EXPR_ARITH: {
         /* Serialize children first (postfix) */
         for (uint32_t i = 0; i < expr->child_count; i++) {
             if (serialize_expr(buf, expr->children[i], ctx) != 0)
                 return -1;
         }
-        return expr_buf_push_u8(buf, arith_to_tag(expr->arith_op));
+        /* Operand domains select between the integer and the string digest
+         * opcode families (Issue #963). */
+        wl_ir_coltype_t t0 = (expr->child_count > 0)
+            ? expr_result_type(expr->children[0], ctx)
+            : WL_IR_COLTYPE_UNKNOWN;
+        wl_ir_coltype_t t1 = (expr->child_count > 1)
+            ? expr_result_type(expr->children[1], ctx)
+            : WL_IR_COLTYPE_UNKNOWN;
+        return expr_buf_push_u8(buf, arith_to_tag(expr->arith_op, t0, t1));
+    }
 
     case WL_IR_EXPR_CMP: {
         for (uint32_t i = 0; i < expr->child_count; i++) {

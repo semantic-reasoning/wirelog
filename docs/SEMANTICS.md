@@ -82,8 +82,19 @@ Two patterns are supported:
   declare the relation. A comparison with one string and one numeric
   operand: it stays an integer comparison, described in `docs/SYNTAX.md`.
   And `min()`/`max()` over symbol columns, which still reduce by id.
-  Separately, `hash()` and the digest family take the id rather than the
-  string bytes.
+
+  `hash()` and the digest family — `crc32_*`, `md5`, `sha*`,
+  `hmac_sha256`, `uuid5` — take the **string's bytes** for a column
+  declared `symbol`/`string`, `strlen()` many with no NUL terminator, and
+  the 8-byte `int64` representation for a numeric one. So a fingerprint
+  is a property of the data and reproduces outside wirelog. Two caveats,
+  both consequences of `.decl` types not being enforced. A column with no
+  declared type digests the id, and is therefore as unstable as the id
+  assignment. A column declared `symbol` whose values were never interned
+  digests their `int64` representation — the numeric answer for numeric
+  data — rather than failing the query; in head position a failure would
+  abort the whole projection, not drop a row. Both are reported under
+  `WL_LOG=EVAL`. The guarantee is only as good as the declaration.
 - Multiplicities other than the basic z-set arithmetic above (e.g.
   weighted aggregates) are subject to the engine's
   multiplicity-tracking rules, not promised by this document.

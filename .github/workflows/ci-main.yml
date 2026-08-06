@@ -241,8 +241,12 @@ jobs:
       - name: Verify enabled compile flag
         run: grep -R -- '-DWL_MBEDTLS_ENABLED=1' builddir-mbedtls/compile_commands.json
 
+      # symbol_digests covers the half of #963 that needs no mbedTLS and so
+      # already runs in every other job; it is listed here as well because
+      # this is the only job that exercises the emitter with the crypto
+      # evaluator arms compiled in.
       - name: Test mbedTLS crypto built-ins
-        run: meson test -C builddir-mbedtls cryptographic_hashes --print-errorlogs
+        run: meson test -C builddir-mbedtls cryptographic_hashes symbol_digests --print-errorlogs
 
       - name: Publish results
         if: always()

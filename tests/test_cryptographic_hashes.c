@@ -1053,6 +1053,197 @@ test_integration_hmac_sha256_datalog_rule(void)
     PASS();
 }
 
+/* ======================================================================== */
+/* Symbol operands (Issue #963)                                             */
+/*                                                                          */
+/* The digests above take the 8-byte int64 representation of their operand. */
+/* When the operand is a symbol that int64 is an *intern id*, so the digest */
+/* answered a question about the intern table, not about the string: the    */
+/* same string digested differently depending on what had been interned     */
+/* first.  Symbol operands now digest the string's own bytes -- strlen      */
+/* many, no NUL -- which is what an external tool sees.                     */
+/*                                                                          */
+/* Every expected value below was derived outside wirelog, e.g.             */
+/*                                                                          */
+/*     printf 'aa' | sha256sum | cut -d' ' -f1 | xxd -r -p | xxhsum -H3     */
+/*                                                                          */
+/* which is also the two-step recipe docs/SYNTAX.md documents.  Note what   */
+/* it says about these built-ins: sha256("aa") is not SHA-256 of "aa", it   */
+/* is XXH3_64bits of the SHA-256 digest of "aa".                            */
+/* ======================================================================== */
+
+#define XXH3_OF_MD5_AA     8108801538665929855LL
+#define XXH3_OF_SHA1_AA    4228114194375067801LL
+#define XXH3_OF_SHA256_AA  (-8977746440570084450LL)
+#define XXH3_OF_SHA512_AA  (-3394976671127927984LL)
+/* HMAC-SHA-256, msg first and key second, in the four operand typings. */
+#define XXH3_OF_HMAC_SS    1125073340110602348LL  /* msg "aa", key "zz"   */
+#define XXH3_OF_HMAC_SI    (-1543635408773734377LL) /* msg "aa", key 1    */
+#define XXH3_OF_HMAC_IS    (-5755376871629748970LL) /* msg 1,    key "zz" */
+#define XXH3_OF_HMAC_II    5350477797202862412LL  /* msg 1,    key 1      */
+#define XXH3_OF_HMAC_EMPTY_KEY 5217900878614730541LL /* msg "msg", key "" */
+/*
+ * uuid5 over symbols returns the first 8 bytes of the tagged SHA-1 of
+ * u64le(len(ns)) || ns || u64le(len(name)) || name, as int64.  In Python:
+ *
+ *   buf = pack('<Q', len(ns)) + ns + pack('<Q', len(name)) + name
+ *   d = bytearray(sha1(buf).digest())
+ *   d[6] = (d[6] & 0x0F) | 0x50; d[8] = (d[8] & 0x3F) | 0x80
+ *   unpack('<q', bytes(d[:8]))[0]
+ */
+#define UUID5_SS_AA_ZZ     (-985806390465751602LL)
+#define UUID5_SI_AA_1      6942838433878392903LL
+#define UUID5_IS_1_ZZ      7085806886377378579LL
+#define UUID5_AB_C         (-5235876162600150845LL)
+#define UUID5_A_BC         2187083094203415983LL
+
+/* Run @src and require exactly one row whose first column is @want. */
+static void
+expect_single_value(const char *name, const char *src, int64_t want)
+{
+    TEST(name);
+
+    struct result_ctx ctx;
+    if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0) {
+        FAIL("evaluation failed");
+    }
+    if (ctx.count != 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "expected 1 row, got %u", ctx.count);
+        FAIL(buf);
+    }
+    if (ctx.col0[0] != want) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "expected %" PRId64 ", got %" PRId64, want, ctx.col0[0]);
+        FAIL(buf);
+    }
+    PASS();
+}
+
+#define SYM_FACT ".decl s(v: symbol)\ns(\"aa\").\n"
+
+static void
+test_digests_of_symbol_operands(void)
+{
+    expect_single_value("md5(sym) digests the string's bytes",
+        SYM_FACT ".decl r(z: int64)\nr(md5(v)) :- s(v).\n",
+        XXH3_OF_MD5_AA);
+    expect_single_value("sha1(sym) digests the string's bytes",
+        SYM_FACT ".decl r(z: int64)\nr(sha1(v)) :- s(v).\n",
+        XXH3_OF_SHA1_AA);
+    expect_single_value("sha256(sym) digests the string's bytes",
+        SYM_FACT ".decl r(z: int64)\nr(sha256(v)) :- s(v).\n",
+        XXH3_OF_SHA256_AA);
+    expect_single_value("sha512(sym) digests the string's bytes",
+        SYM_FACT ".decl r(z: int64)\nr(sha512(v)) :- s(v).\n",
+        XXH3_OF_SHA512_AA);
+}
+
+/*
+ * hmac_sha256() and uuid5() take two operands that type independently, so
+ * each has three symbol-bearing opcodes rather than one.  #962's rule for
+ * comparisons -- a one-sided type match keeps the integer opcode -- is
+ * deliberately not followed here: a comparison needs both ids reversed to
+ * mean anything, while each digest operand contributes its own bytes, so
+ * applying that rule would leave the mixed cases digesting an id.
+ */
+static void
+test_two_operand_digests_type_each_operand(void)
+{
+    expect_single_value("hmac_sha256(sym, sym) keys and messages with bytes",
+        SYM_FACT ".decl k(v: symbol)\nk(\"zz\").\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(m, key)) :- s(m), k(key).\n",
+        XXH3_OF_HMAC_SS);
+    expect_single_value("hmac_sha256(sym, int) uses the int64 key bytes",
+        SYM_FACT ".decl r(z: int64)\n"
+        "r(hmac_sha256(v, 1)) :- s(v).\n",
+        XXH3_OF_HMAC_SI);
+    expect_single_value("hmac_sha256(int, sym) uses the int64 message bytes",
+        ".decl k(v: symbol)\nk(\"zz\").\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(1, key)) :- k(key).\n",
+        XXH3_OF_HMAC_IS);
+    expect_single_value("hmac_sha256(int, int) is unchanged",
+        ".decl n(x: int64)\nn(1).\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(x, 1)) :- n(x).\n",
+        XXH3_OF_HMAC_II);
+    /*
+     * An empty symbol key is zero bytes, which PSA will not import; before
+     * #963 both operands were 8 bytes so it could not arise.  RFC 2104
+     * zero-pads the key, so this must equal Python's hmac.new(b"", ...) and
+     * not fail the query.
+     */
+    expect_single_value("hmac_sha256(sym, \"\") uses the RFC 2104 empty key",
+        ".decl p(m: symbol, k: symbol)\n"
+        "p(\"msg\", \"\").\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(m, k)) :- p(m, k).\n",
+        XXH3_OF_HMAC_EMPTY_KEY);
+
+    expect_single_value("uuid5(sym, sym) hashes both strings' bytes",
+        SYM_FACT ".decl k(v: symbol)\nk(\"zz\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(ns, nm)) :- s(ns), k(nm).\n",
+        UUID5_SS_AA_ZZ);
+    expect_single_value("uuid5(sym, int) hashes bytes then int64",
+        SYM_FACT ".decl r(z: int64)\n"
+        "r(uuid5(v, 1)) :- s(v).\n",
+        UUID5_SI_AA_1);
+    expect_single_value("uuid5(int, sym) hashes int64 then bytes",
+        ".decl k(v: symbol)\nk(\"zz\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(1, nm)) :- k(nm).\n",
+        UUID5_IS_1_ZZ);
+}
+
+/*
+ * Distinct (namespace, name) pairs produce distinct values.
+ *
+ * Giving uuid5() variable-length operands is what makes this possible to
+ * get wrong.  A bare concatenation of "ab" + "c" and of "a" + "bc" is the
+ * same three bytes, so both calls would hash identical input and return one
+ * value -- a collision that could not arise while both operands were
+ * fixed-width int64s, and which this change would therefore have created
+ * rather than exposed.  RFC 4122 does not have the problem because it fixes
+ * the namespace at 16 bytes, making the split point unambiguous by
+ * construction; wirelog inherited the two-operand signature without that
+ * property, so the symbol opcodes length-prefix each operand instead.
+ *
+ * Both the inequality and the two values are asserted.  The inequality
+ * alone would be satisfied by any construction that merely differs, and
+ * pinned values alone would not say what property they encode.
+ *
+ * Unambiguous is still not RFC 4122: the namespace need not be a UUID and
+ * only 8 of the 16 bytes are returned.  Those are separate claims.
+ */
+static void
+test_uuid5_distinguishes_operand_boundaries(void)
+{
+    expect_single_value("uuid5(\"ab\",\"c\") length-frames its operands",
+        ".decl p(a: symbol, b: symbol)\n"
+        "p(\"ab\", \"c\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(a, b)) :- p(a, b).\n",
+        UUID5_AB_C);
+    expect_single_value("uuid5(\"a\",\"bc\") differs from uuid5(\"ab\",\"c\")",
+        ".decl q(a: symbol, b: symbol)\n"
+        "q(\"a\", \"bc\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(a, b)) :- q(a, b).\n",
+        UUID5_A_BC);
+
+    /* Stated as a property too, so a future change to the pinned values
+     * cannot quietly reintroduce the collision. */
+    TEST("uuid5 operand boundaries are unambiguous");
+    if (UUID5_AB_C == UUID5_A_BC) {
+        FAIL("the two pinned values are equal: the framing is not working");
+    }
+    PASS();
+}
+
 #else /* !WL_MBEDTLS_ENABLED */
 
 /* ======================================================================== */
@@ -1171,6 +1362,34 @@ test_uuid5_fails_closed_no_mbedtls(void)
         src);
 }
 
+/*
+ * The symbol-operand opcodes (#963) are emitted unconditionally -- only the
+ * evaluator arms behind them are #ifdef'd -- so the new opcodes must fail
+ * closed here too, not fall through to some permissive default.
+ */
+static void
+test_symbol_operand_digests_fail_closed_no_mbedtls(void)
+{
+    test_unavailable_builtin_fails_closed(
+        "sha256(sym): without mbedTLS fails closed",
+        ".decl s(v: symbol)\n"
+        "s(\"aa\").\n"
+        ".decl r(z: int64)\n"
+        "r(sha256(v)) :- s(v).\n");
+    test_unavailable_builtin_fails_closed(
+        "hmac_sha256(sym, sym): without mbedTLS fails closed",
+        ".decl p(m: symbol, k: symbol)\n"
+        "p(\"aa\", \"zz\").\n"
+        ".decl r(z: int64)\n"
+        "r(hmac_sha256(m, k)) :- p(m, k).\n");
+    test_unavailable_builtin_fails_closed(
+        "uuid5(sym, sym): without mbedTLS fails closed",
+        ".decl p(a: symbol, b: symbol)\n"
+        "p(\"aa\", \"zz\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(a, b)) :- p(a, b).\n");
+}
+
 #endif /* WL_MBEDTLS_ENABLED */
 
 /* ======================================================================== */
@@ -1233,6 +1452,11 @@ main(void)
     test_integration_sha1_datalog_filter();
     test_integration_hmac_sha256_datalog_rule();
 
+    printf("\n--- Symbol Operand Tests (Issue #963) ---\n");
+    test_digests_of_symbol_operands();
+    test_two_operand_digests_type_each_operand();
+    test_uuid5_distinguishes_operand_boundaries();
+
 #else
     printf("=== wirelog Cryptographic Hash Tests (Issue #73) [mbedTLS "
         "DISABLED] ===\n\n");
@@ -1245,6 +1469,7 @@ main(void)
     test_hmac_sha256_fails_closed_no_mbedtls();
     test_uuid4_fails_closed_no_mbedtls();
     test_uuid5_fails_closed_no_mbedtls();
+    test_symbol_operand_digests_fail_closed_no_mbedtls();
 #endif
 
     printf("\n--- sha256()/sha512() Determinism Tests (always run) ---\n");

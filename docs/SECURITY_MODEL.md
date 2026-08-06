@@ -68,11 +68,19 @@ wirelog exposes the following mbedTLS-backed Datalog built-ins:
 
 wirelog does not currently expose broader digest-family or generic
 HMAC-family built-ins as callable Datalog functions.
-Digest and HMAC built-ins operate on `int64` Datalog values. They
-compute mbedTLS digest/HMAC bytes and fold those bytes with
+Digest and HMAC built-ins take their input bytes from the operand's
+declared type (#963): the string's own bytes for a `symbol`/`string`
+column, `strlen()` many with no NUL terminator, and the 8-byte `int64`
+representation for a numeric one. `.decl` types are not enforced, so a
+`symbol` column holding values that were never interned falls back to
+the `int64` form — the guarantee is only as strong as the declaration.
+They compute mbedTLS digest/HMAC bytes and fold those bytes with
 `XXH3_64bits()` into the single `int64` value stored by wirelog;
-they do not return hex strings or byte arrays. `uuid4()` and
-`uuid5(namespace, name)` return the first 8 UUID bytes as an `int64`.
+they do not return hex strings or byte arrays. **The fold means these
+are 64-bit fingerprints, not full-width digests**, and must not be
+relied on for collision resistance at scale. `uuid4()` and
+`uuid5(namespace, name)` return the first 8 UUID bytes as an `int64`;
+`uuid5()` is not RFC 4122 (see `docs/SYNTAX.md`).
 
 These functions become callable as Datalog built-ins; the host has no
 control over whether a `.dl` program calls them once mbedTLS is
