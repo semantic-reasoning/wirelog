@@ -1050,9 +1050,13 @@ test_aggregation_multi_head_rejected(void)
      * before the fix it reached col_op_reduce()/col_rel_append_all() with an
      * emitted arity of 2 against a 3-arity .decl and segfaulted during
      * col_eval_stratum().  Rejecting at lowering keeps it from ever getting
-     * that far.  (Note: the single-aggregate variant
-     * "cc(y, min(c)) :- cc(x, c, d), edge(x, y)." crashes the same way and is
-     * deliberately NOT caught here -- that is issue #977.) */
+     * that far.  (The single-aggregate variant
+     * "cc(y, min(c)) :- cc(x, c, d), edge(x, y)." crashes the same way but
+     * has nothing wrong with its aggregate count, so this check cannot see
+     * it; it is rejected earlier by the #977 rule-head arity pass -- see
+     * test_head_arity_recursive_aggregate_rejected().  This head has three
+     * arguments against a 3-arity .decl, so that pass accepts it and it does
+     * reach this check.) */
     bad = make_program_with_rules(".decl edge(x: int64, y: int64)\n"
             ".decl cc(n: int64, lo: int64, hi: int64)\n"
             "cc(y, min(c), max(c)) :- cc(x, c, d), edge(x, y).\n");
@@ -2955,11 +2959,16 @@ test_fact_arity_wider_than_decl_rejected(void)
      * stride by rel->column_count, which is the logical width.
      *
      * Pre-fix this was accepted and silently dropped the third value.
-     * Note this is the one place where the fact rule and the coming
-     * rule-head rule diverge -- head lowering does expand compound columns,
-     * so the head check (#977 unit 3) must compare *physical* width via
-     * atom_physical_column_count().  If compound terms ever become
-     * expressible in facts, this comparison has to move with it. */
+     * Note this is the one place where the fact rule and the rule-head rule
+     * diverge: validate_head_arities() (#977 unit 3) compares *physical*
+     * width via atom_physical_column_count(), so the head spelling of this
+     * same shape -- pred(x,y,z) against .decl pred(id, payload: f/2 inline)
+     * -- is accepted, and is pinned by
+     * test_head_arity_inline_compound_accepted().  The divergence is not an
+     * oversight: the head grammar has no compound-term production, so the
+     * flattened spelling is the only one available to a rule, while facts
+     * are packed and read back at the logical width.  If compound terms ever
+     * become expressible in facts, this comparison has to move with it. */
     bad = make_program(".decl p(id: int64, lbl: pair/2 inline)\n"
             "p(1, 2, 3).\n");
     if (bad) {
@@ -3102,9 +3111,10 @@ test_fact_arity_undeclared_relations_unaffected(void)
      * collection: column_count is 0 because no .decl was seen, and the
      * guard keys off has_decl, so the pass stays out of the way.  Such a
      * program still fails later at session load ("failed to load facts for
-     * 'q'", exit 1) -- that is issue #977 unit 3, deliberately not this
-     * unit's scope.  This case is what pins the has_decl condition: drop
-     * it and this program is rejected at parse time instead. */
+     * 'q'", exit 1) -- facts on undeclared relations are still unvalidated
+     * under #977, and remain so after the rule-head pass (unit 3) landed.
+     * This case is what pins the has_decl condition: drop it and this
+     * program is rejected at parse time instead. */
     struct wirelog_program *undecl = make_program("q(1, 2).\n"
             "q(3, 4).\n");
     if (!undecl) {
@@ -3169,6 +3179,354 @@ test_fact_arity_mismatch_maps_to_parse_error(void)
     }
     free(data);
     wirelog_program_free(ok);
+
+    PASS();
+}
+
+/* ======================================================================== */
+/* Issue #977 (unit 3): rule-head arity must match the .decl                */
+/* ======================================================================== */
+
+/* A rule head whose arity disagrees with its relation's `.decl` was accepted
+ * silently.  In a recursive stratum that is a heap over-read: col_op_reduce()
+ * (columnar/ops.c) sizes its output region as group_by_count + 1 while
+ * col_rel_append_all() (columnar/relation.c) copies dst->ncols columns from
+ * it, unclamped against src->ncols -- ASAN reports
+ * "heap-buffer-overflow READ of size 8" in col_rel_append_all under
+ * col_eval_stratum() (columnar/eval.c), exit 139.  Outside a recursive
+ * stratum it is a silent wrong answer instead.
+ *
+ * The predicate compares PHYSICAL width, not logical, and that is the whole
+ * subtlety of this unit.  Unit 2 deliberately does the opposite for facts:
+ * collect_fact() packs one slot per written argument and both readers stride
+ * by the logical rel->column_count, so facts compare logically.  A rule head
+ * is different -- it is written flat, one head argument per *physical*
+ * column, because the head grammar has no compound-term production at all
+ * (parse_head_arg() dispatches only to aggregate and arithmetic expressions,
+ * so `pred(x, f(y,z))` is a parse error).  The only spelling available for
+ * an inline-compound relation is the expanded one, `pred(x,y,z)`, which is
+ * three head arguments against a two-column .decl.  A logical
+ * `child_count != column_count` check would reject working code;
+ * test_head_arity_inline_compound_accepted() is the case that pins this.
+ *
+ * Entry point: these tests go through make_program(), which calls
+ * wl_ir_program_collect_metadata() directly -- the same tail pass that holds
+ * the fact check -- so a NULL return is this rejection and not a later stage.
+ * The positive controls use make_program_with_rules() so they additionally
+ * prove the rule still lowers. */
+
+static void
+test_head_arity_recursive_aggregate_rejected(void)
+{
+    TEST("Head arity: the recursive single-aggregate crash shape is rejected");
+
+    /* THE memory-safety case.  Before this check the program below
+     * segfaulted (exit 139) inside col_eval_stratum().  Issue #973 rejects
+     * the *multi*-aggregate spelling of the same crash; this single-aggregate
+     * spelling reached evaluation untouched, because it is not the aggregate
+     * count that is wrong -- the head emits 2 columns into a 3-column
+     * relation that facts have already materialised at width 3. */
+    struct wirelog_program *bad
+        = make_program(".decl edge(x: int64, y: int64)\n"
+            ".decl cc(n: int64, lo: int64, hi: int64)\n"
+            "edge(1,2). edge(2,3). edge(3,1).\n"
+            "cc(1,10,10).\n"
+            "cc(y, min(c)) :- cc(x, c, d), edge(x, y).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("cc(y, min(c)) against a 3-column .decl should be rejected");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_head_arity_narrower_than_decl_rejected(void)
+{
+    TEST("Head arity: head narrower than .decl is rejected");
+
+    /* This program has no producer of t at the declared width, so pre-fix it
+     * evaluated cleanly with exit 0 and emitted one column into a relation
+     * declared with three -- a silent wrong answer.  Add a `t(9,9,9).` fact
+     * and the same non-recursive shape becomes a heap over-read through
+     * col_op_map(); recursion is not what makes this unsafe, a
+     * declared-width producer is. */
+    struct wirelog_program *bad
+        = make_program(".decl val(g: int64, v: int64)\n"
+            ".decl t(a: int64, b: int64, c: int64)\n"
+            "val(1,10). val(2,20).\n"
+            "t(g) :- val(g, v).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("t(g) against .decl t/3 should be rejected");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_head_arity_wider_than_decl_rejected(void)
+{
+    TEST("Head arity: head wider than .decl is rejected");
+
+    /* Emitted four columns against a two-column .decl, exit 0, printing
+     * t(1, 10, 1, 10). */
+    struct wirelog_program *bad
+        = make_program(".decl val(g: int64, v: int64)\n"
+            ".decl t(a: int64, b: int64)\n"
+            "val(1,10). val(2,20).\n"
+            "t(g, v, g, v) :- val(g, v).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("t(g,v,g,v) against .decl t/2 should be rejected");
+        return;
+    }
+
+    /* The .decl may follow its rules, exactly as it may follow its facts;
+     * the pass runs after the whole source-order collection loop. */
+    bad = make_program("t(g, v, g, v) :- val(g, v).\n"
+            ".decl val(g: int64, v: int64)\n"
+            ".decl t(a: int64, b: int64)\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL(".decl written after the rule should still be checked");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_head_arity_inline_compound_accepted(void)
+{
+    TEST("Head arity: flattened inline-compound head is accepted");
+
+    /* POSITIVE CONTROL for the physical-width predicate.  `pred` is declared
+    * with two *logical* columns and three *physical* ones (id, plus f/2
+    * expanded into two slots).  The head writes three arguments, which is
+    * the only spelling the grammar allows, and evaluation produces
+    * pred(1, 10, 20).
+    *
+    * If anyone "simplifies" the predicate to the logical comparison unit 2
+    * uses for facts (head->child_count != rel->column_count), this test
+    * fails with "flattened inline-compound head should be accepted" --
+    * 3 != 2.  That is the entire reason this test exists.
+    *
+    * test_wirelog_easy_inline_facts.c (T4) carries the evaluation half:
+    * this binary links parser/ir/io/thread only and cannot run a program. */
+    struct wirelog_program *ok
+        = make_program_with_rules(".decl src(a: int64, b: int64, c: int64)\n"
+            ".decl pred(id: int64, payload: f/2 inline)\n"
+            "src(1,10,20).\n"
+            "pred(x, y, z) :- src(x, y, z).\n");
+    if (!ok) {
+        FAIL("flattened inline-compound head should be accepted");
+        return;
+    }
+    if (ok->rule_count != 1 || !ok->rules[0].ir_root
+        || ok->rules[0].ir_root->type != WIRELOG_IR_PROJECT
+        || ok->rules[0].ir_root->project_count != 3) {
+        wl_ir_program_free(ok);
+        FAIL("head should lower to a PROJECT of 3 physical columns");
+        return;
+    }
+    wl_ir_program_free(ok);
+
+    PASS();
+}
+
+static void
+test_head_arity_compound_handle_form_rejected(void)
+{
+    TEST("Head arity: handle-form head into a compound relation is rejected");
+
+    /* The open question this unit had to settle.  `pred(1, 99).` is a legal
+     * *fact* -- unit 2 compares facts logically, and 2 == 2 -- so it is not
+     * obvious that the head analogue `pred(x, y) :- src(x, y).` should be
+     * illegal.  It is, and the reason is not symmetry but a fabricated
+     * value: the head leaves the second inline slot never written, and a
+     * body pattern that destructures the column reads it anyway.
+     *
+     *   .decl src(a: int64, b: int64)
+     *   .decl pred(id: int64, payload: f/2 inline)
+     *   .decl outr(id: int64, p: int64, q: int64)
+     *   src(1,99).
+     *   pred(x, y)        :- src(x, y).
+     *   outr(id, p, q)    :- pred(id, f(p, q)).
+     *
+     * evaluated to outr(1, 99, 0) with exit 0 and ASAN silent -- the 0 is
+     * an unwritten physical slot, present in no source data.  The
+     * three-argument spelling of the same program yields outr(1, 10, 20)
+     * from src(1,10,20), which is correct.  So the physical width is the
+     * one the relation must be written at, and this shape is rejected.
+     *
+     * (The identical defect via the *fact* form -- `pred(1, 99).` plus the
+     * same destructuring rule, also outr(1, 99, 0) -- is still accepted,
+     * because unit 2 must compare facts logically: wl_session_load_facts()
+     * and wirelog_program_get_facts() both stride by column_count.  That
+     * asymmetry is real and is not resolved here -- issue #985 tracks it,
+     * along with the fact that an inline-compound relation cannot be
+     * populated correctly by an inline fact at all.) */
+    struct wirelog_program *bad
+        = make_program(".decl src(a: int64, b: int64)\n"
+            ".decl pred(id: int64, payload: f/2 inline)\n"
+            "src(1,99).\n"
+            "pred(x, y) :- src(x, y).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("2-argument head into an inline f/2 relation should be rejected");
+        return;
+    }
+
+    /* A `side` compound occupies one physical slot, not compound_arity of
+     * them, so the handle form is the *only* form there and must pass.
+     * This is what stops the physical-width sum from being written as a
+     * blanket `+= compound_arity`. */
+    struct wirelog_program *ok
+        = make_program_with_rules(".decl src(a: int64, b: int64)\n"
+            ".decl sref(id: int64, meta: m/4 side)\n"
+            "src(1,99).\n"
+            "sref(x, y) :- src(x, y).\n");
+    if (!ok) {
+        FAIL("2-argument head into a side-compound relation must be accepted");
+        return;
+    }
+    wl_ir_program_free(ok);
+
+    PASS();
+}
+
+static void
+test_head_arity_undeclared_head_accepted(void)
+{
+    TEST("Head arity: undeclared heads keep their current behaviour");
+
+    /* POSITIVE CONTROL for the has_decl guard.  Undeclared derived heads are
+     * widespread and legitimate -- bench/workloads/doop.dl alone has ~90 --
+     * and the check must never see them.  Drop has_decl from the guard and
+     * this fails: column_count is 0 for an undeclared relation, so the
+     * comparison becomes 1 != 0. */
+    struct wirelog_program *ok
+        = make_program_with_rules(".decl val(g: int64, v: int64)\n"
+            "val(1,10).\n"
+            "t(g) :- val(g, v).\n");
+    if (!ok) {
+        FAIL("undeclared head must still be accepted");
+        return;
+    }
+    wl_ir_program_free(ok);
+
+    PASS();
+}
+
+static void
+test_head_arity_matching_accepted(void)
+{
+    TEST("Head arity: matching plain and aggregate heads are accepted");
+
+    /* Plain head, matching arity. */
+    struct wirelog_program *plain
+        = make_program_with_rules(".decl val(g: int64, v: int64)\n"
+            ".decl t(a: int64, b: int64)\n"
+            "val(1,10).\n"
+            "t(g, v) :- val(g, v).\n");
+    if (!plain) {
+        FAIL("matching plain head should be accepted");
+        return;
+    }
+    wl_ir_program_free(plain);
+
+    /* Aggregate head, matching arity.  An AGGREGATE head argument is one
+     * direct HEAD child (parse_aggregate_expr() is reached only from
+     * parse_head_arg()), so t(g, min(v)) has child_count 2 and lowers to
+     * group_by_count + 1 == 2 emitted columns.  The head arity is therefore
+     * counted the same way for aggregate and non-aggregate heads, and the
+     * check needs no aggregate-specific case. */
+    struct wirelog_program *agg
+        = make_program_with_rules(".decl val(g: int64, v: int64)\n"
+            ".decl t(a: int64, b: int64)\n"
+            "val(1,10).\n"
+            "t(g, min(v)) :- val(g, v).\n");
+    if (!agg) {
+        FAIL("matching single-aggregate head should be accepted");
+        return;
+    }
+    if (agg->rules[0].ir_root->type != WIRELOG_IR_AGGREGATE
+        || agg->rules[0].ir_root->group_by_count != 1) {
+        wl_ir_program_free(agg);
+        FAIL("aggregate head should lower to AGGREGATE/group_by_count==1");
+        return;
+    }
+    wl_ir_program_free(agg);
+
+    /* The two live single-aggregate workloads, bench/workloads/cc.dl:6 and
+     * sssp.dl:5, in their exact declared shapes.  Both are recursive and
+     * both must keep working. */
+    struct wirelog_program *cc
+        = make_program_with_rules(".decl edge(x: int32, y: int32)\n"
+            ".decl cc(x: int32, c: int32)\n"
+            "cc(x, x) :- edge(x, _).\n"
+            "cc(x, x) :- edge(_, x).\n"
+            "cc(y, min(c)) :- cc(x, c), edge(x, y).\n");
+    if (!cc) {
+        FAIL("bench/workloads/cc.dl head shape must still lower");
+        return;
+    }
+    wl_ir_program_free(cc);
+
+    struct wirelog_program *sssp
+        = make_program_with_rules(".decl wedge(x: int32, y: int32, w: int32)\n"
+            ".decl dist(x: int32, d: int32)\n"
+            "dist(1, 0).\n"
+            "dist(y, min(d + w)) :- dist(x, d), wedge(x, y, w).\n");
+    if (!sssp) {
+        FAIL("bench/workloads/sssp.dl head shape must still lower");
+        return;
+    }
+    wl_ir_program_free(sssp);
+
+    /* Issue #980: aggregate *position* is ignored -- t(min(v), g) lowers
+     * group-by-first regardless of how it was written.  That is out of
+     * scope here, but the check must not accidentally depend on position:
+     * both spellings have the same arity and both must be accepted. */
+    struct wirelog_program *swapped
+        = make_program_with_rules(".decl val(g: int64, v: int64)\n"
+            ".decl t(a: int64, b: int64)\n"
+            "val(1,10).\n"
+            "t(min(v), g) :- val(g, v).\n");
+    if (!swapped) {
+        FAIL("aggregate-first head has matching arity and must be accepted");
+        return;
+    }
+    wl_ir_program_free(swapped);
+
+    PASS();
+}
+
+static void
+test_head_arity_mismatch_maps_to_parse_error(void)
+{
+    TEST("Head arity: public API reports WIRELOG_ERR_PARSE");
+
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *bad
+        = wirelog_parse_string(".decl edge(x: int64, y: int64)\n"
+            ".decl cc(n: int64, lo: int64, hi: int64)\n"
+            "edge(1,2).\n"
+            "cc(1,10,10).\n"
+            "cc(y, min(c)) :- cc(x, c, d), edge(x, y).\n",
+            &err);
+    if (bad) {
+        wirelog_program_free(bad);
+        FAIL("public API should reject the head arity mismatch");
+        return;
+    }
+    if (err != WIRELOG_ERR_PARSE) {
+        FAIL("error should be WIRELOG_ERR_PARSE");
+        return;
+    }
 
     PASS();
 }
@@ -3622,6 +3980,16 @@ main(void)
     test_fact_arity_matching_accepted();
     test_fact_arity_undeclared_relations_unaffected();
     test_fact_arity_mismatch_maps_to_parse_error();
+
+    /* Issue #977 unit 3: rule-head arity vs .decl */
+    test_head_arity_recursive_aggregate_rejected();
+    test_head_arity_narrower_than_decl_rejected();
+    test_head_arity_wider_than_decl_rejected();
+    test_head_arity_inline_compound_accepted();
+    test_head_arity_compound_handle_form_rejected();
+    test_head_arity_undeclared_head_accepted();
+    test_head_arity_matching_accepted();
+    test_head_arity_mismatch_maps_to_parse_error();
 
     /* Fact extraction API */
     test_api_get_facts();

@@ -73,8 +73,60 @@ All notable changes to wirelog are documented in this file.
   Datalog program in the tree, including those the benchmarks generate from
   CSV at runtime: no in-tree program changes behaviour.
 
-  This covers the inline-fact half of #977 only. Rule heads, rule bodies and
-  facts on undeclared relations remain unvalidated.
+  This covers the inline-fact half of #977. Rule bodies and facts on
+  undeclared relations remain unvalidated; rule heads are covered by the
+  entry below.
+
+- **Rule heads are validated against their relation's declared arity**
+  (#977): a head emitting a different number of columns than its `.decl`
+  declares was accepted silently. In a recursive stratum it is a heap
+  over-read -- `col_op_reduce` sizes its output region as
+  `group_by_count + 1` while `col_rel_append_all` copies `dst->ncols` columns
+  out of it with no clamp, so `cc(y, min(c)) :- cc(x, c, d), edge(x, y).`
+  against a three-column `cc` seeded by a fact segfaulted (exit 139;
+  AddressSanitizer reports `heap-buffer-overflow READ of size 8` in
+  `col_rel_append_all` under `col_eval_stratum`).
+
+  Recursion is not the precondition — a producer at the declared width is.
+  The non-recursive `t(g) :- val(g, v).` against `.decl t/3` is the same
+  over-read once a `t(9,9,9).` fact fixes the relation's width, reached
+  through `col_op_map` rather than `col_op_reduce`. Absent such a producer
+  the relation materialises at the narrower width and the mismatch is a
+  silent wrong answer instead: one column emitted with exit status 0, or four
+  for `t(g,v,g,v)` against `.decl t/2`.
+
+  Such heads are now rejected during metadata collection, reported through
+  `WL_LOG=PARSER:1` with the relation name and both arities, and surfaced as
+  `WIRELOG_ERR_PARSE`. As with the fact check, the pass runs after all
+  declarations are collected, so a `.decl` may follow its rules, and it keys
+  off `has_decl`, so undeclared derived heads -- ordinary Datalog, ~90 of
+  them in `bench/workloads/doop.dl` alone -- are not checked. This completes
+  the rule-head half of the single-aggregate recursive crash that #973 could
+  not reach.
+
+  Heads are compared against the declared **physical** width, where an
+  `inline` compound column counts as its full arity and a `side` compound as
+  one handle column -- deliberately unlike the fact check above, which
+  compares logically. The head grammar has no compound-term production
+  (`pred(x, f(y, z))` is a parse error), so the flattened spelling
+  `pred(x, y, z) :- src(x, y, z).` is the only way to write an
+  inline-compound relation from a rule, and a logical comparison would reject
+  it.
+
+  **Compatibility:** programs that previously loaded now fail to load. Every
+  rejected shape was already a crash or a wrong answer. One shape worth
+  naming: the two-argument handle form `pred(x, y)` into
+  `.decl pred(id: int64, payload: f/2 inline)` is now rejected, because it
+  leaves the second inline slot unwritten and a body pattern that
+  destructures the column reads it anyway --
+  `outr(id, p, q) :- pred(id, f(p, q)).` produced `outr(1, 99, 0)`, a value
+  present in no source data. Verified across every Datalog program in the
+  tree -- standalone `.dl` files, programs embedded in C string literals and
+  markdown fences: roughly 1500 declared rule heads across some 1300
+  programs, no arity mismatch under either the logical
+  or the physical rule, and no rule head anywhere in the tree writes into a
+  relation with an inline-compound column. No in-tree program changes
+  behaviour.
 
 - **`min()`/`max()` over a symbol column compare strings, not intern ids**
   (#965): both reduced over the raw `int64`, which for a `symbol` column is
@@ -133,15 +185,17 @@ All notable changes to wirelog are documented in this file.
   both cases: the previous result was not correct for any reading of the
   rule, whether or not its arity happened to match.
 
-  **This does not close the whole crash class.** The underlying trigger is
-  emitted arity differing from declared arity inside a recursive stratum, and
-  multiple aggregates are only one way to produce it. A *single*-aggregate
-  head with too few arguments -- `cc(y, min(c)) :- cc(x, c, d), edge(x, y).`
-  against a three-column `cc` -- still crashes identically and is not caught
-  here. General `.decl`-versus-rule arity validation is tracked as #977; the
-  two fixes are complementary and neither subsumes the other. The check also
-  gates the parser path only: IR built directly through the API is still
-  unvalidated.
+  **This does not close the whole crash class on its own.** The underlying
+  trigger is emitted arity differing from declared arity inside a recursive
+  stratum, and multiple aggregates are only one way to produce it. A
+  *single*-aggregate head with too few arguments --
+  `cc(y, min(c)) :- cc(x, c, d), edge(x, y).` against a three-column `cc` --
+  crashes identically with only one aggregate; that shape is rejected by the
+  rule-head arity check, also under #977 (see the entry above). The two fixes
+  are complementary and neither subsumes the other: an arity check accepts
+  `t(g, min(v), max(v))` against a three-column `.decl`, and the
+  aggregate-count check accepts `cc(y, min(c))`. Both gate the parser path
+  only: IR built directly through the API is still unvalidated.
 
 - **`uuid5()` framing carries the operand's type, not only its length**
   (#968): #963 length-prefixed each operand of the three symbol-bearing

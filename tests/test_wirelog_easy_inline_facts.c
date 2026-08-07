@@ -185,6 +185,81 @@ test_matching_arity_facts_evaluate_exactly(void)
     return rc;
 }
 
+/* T4 (issue #977 unit 3): the flattened inline-compound rule head must still
+ *     evaluate, and still produce all three physical columns.
+ *
+ *     This is the positive control for the rule-head arity pass comparing
+ *     *physical* width rather than the logical width unit 2 uses for facts.
+ *     `pred` is declared with two logical columns (id, payload: f/2 inline)
+ *     and three physical ones; `pred(x, y, z)` is three head arguments, and
+ *     it is the only spelling the grammar allows, because parse_head_arg()
+ *     has no compound-term production and `pred(x, f(y, z))` is a parse
+ *     error.  A logical comparison would reject this program (3 != 2).
+ *
+ *     tests/test_program.c asserts the lowering; that binary links only
+ *     parser/ir/io/thread and cannot evaluate.  This one links the full
+ *     library, so it can assert the values -- which is what distinguishes
+ *     "accepted" from "accepted and correct": the 2-argument spelling is
+ *     also accepted by a logical check and evaluates to a fabricated
+ *     unwritten slot. */
+struct triple_state {
+    uint32_t rows;
+    int64_t seen[8][3];
+};
+
+static void
+collect_triples(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    (void)relation;
+    struct triple_state *st = (struct triple_state *)user_data;
+    if (ncols != 3 || st->rows >= 8) {
+        st->rows = 0xFFFFFFFFu;
+        return;
+    }
+    st->seen[st->rows][0] = row[0];
+    st->seen[st->rows][1] = row[1];
+    st->seen[st->rows][2] = row[2];
+    st->rows++;
+}
+
+static int
+test_inline_compound_head_evaluates_exactly(void)
+{
+    static const char *src = ".decl src(a: int64, b: int64, c: int64)\n"
+        ".decl pred(id: int64, payload: f/2 inline)\n"
+        "src(1, 10, 20).\n"
+        "pred(x, y, z) :- src(x, y, z).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(src, &s);
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T4 open err=%d (flattened inline-compound head must "
+            "be accepted; a logical arity check rejects it)\n", err);
+        return 1;
+    }
+
+    struct triple_state st = { 0, { { 0, 0, 0 } } };
+    err = wirelog_easy_snapshot(s, "pred", collect_triples, &st);
+    int rc = 0;
+    if (err != WIRELOG_OK) {
+        fprintf(stderr, "T4 snapshot err=%d\n", err);
+        rc = 1;
+    } else if (st.rows != 1) {
+        fprintf(stderr, "T4: expected 1 pred row, got %u\n", st.rows);
+        rc = 1;
+    } else if (st.seen[0][0] != 1 || st.seen[0][1] != 10
+        || st.seen[0][2] != 20) {
+        fprintf(stderr,
+            "T4: expected pred(1,10,20), got pred(%lld,%lld,%lld)\n",
+            (long long)st.seen[0][0], (long long)st.seen[0][1],
+            (long long)st.seen[0][2]);
+        rc = 1;
+    }
+    wirelog_easy_close(s);
+    return rc;
+}
+
 int
 main(void)
 {
@@ -192,6 +267,7 @@ main(void)
     failures += test_static_fact_drives_idb_snapshot();
     failures += test_static_fact_joins_with_host_insert();
     failures += test_matching_arity_facts_evaluate_exactly();
+    failures += test_inline_compound_head_evaluates_exactly();
     if (failures == 0)
         printf("test_wl_easy_inline_facts: OK\n");
     else

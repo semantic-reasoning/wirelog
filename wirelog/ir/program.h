@@ -33,8 +33,8 @@ typedef struct {
      * Distinguishes "declared with zero columns" (`.decl p()`, which parses
      * and leaves column_count == 0) from "never declared" -- a relation
      * created implicitly by a rule head or by a fact.  `column_count > 0`
-     * cannot make that distinction, so fact-arity validation keys off this
-     * flag instead.
+     * cannot make that distinction, so both the fact-arity and the
+     * rule-head-arity validation passes key off this flag instead.
      *
      * The predicate is specifically "the user wrote a `.decl`", not "some
      * arity is on record".  wl_ir_program_add_magic_relation() sets a real

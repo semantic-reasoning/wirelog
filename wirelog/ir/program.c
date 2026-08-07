@@ -687,6 +687,16 @@ collect_fact(struct wirelog_program *prog,
     return 0;
 }
 
+/* Both defined further down, next to the rule-lowering code that is their
+ * other caller.  Forward-declared here so the validation passes below can
+ * measure an atom exactly the way lowering does, rather than growing a
+ * second, drifting definition of "physical width". */
+static wl_ir_relation_info_t *
+find_relation_info(const struct wirelog_program *prog, const char *name);
+static uint32_t
+atom_physical_column_count(const wl_parser_ast_node_t *atom,
+    const wl_ir_relation_info_t *rel_info, const struct wirelog_program *prog);
+
 /* Issue #977: validate every inline fact against its relation's declared
  * arity.
  *
@@ -752,6 +762,155 @@ validate_fact_arities(const struct wirelog_program *program,
     return 0;
 }
 
+/* The number of PHYSICAL columns a relation's `.decl` describes.
+ *
+ * An `inline` compound column is stored as `compound_arity` contiguous
+ * physical slots; a `side` compound is a single handle slot, and so is every
+ * scalar.  This is the same walk collect_decl() runs to assign
+ * compound_inline_col_offset -- for every declaration the parser can
+ * produce, the prefix sum there ends at exactly this value -- and the same
+ * layout col_rel_t records in compound_arity_map.
+ *
+ * The INLINE arm deliberately adds compound_arity unguarded, mirroring
+ * collect_decl() exactly rather than defending against a zero arity.  A
+ * guard such as `compound_arity > 0 ? compound_arity : 1` would look safer
+ * but is the opposite: it is the only construct that could make the two
+ * walks disagree (1 here against 0 there), turning an invariant violation
+ * into a silent width mismatch instead of an obvious one.
+ *
+ * The invariant holds regardless: parse_compound_metadata() resets the whole
+ * metadata struct -- kind included -- on every failure path, returning
+ * kind = NONE for a non-positive arity and for an inline arity above
+ * WL_IR_COMPOUND_INLINE_MAX_ARITY, and program.c's collect_decl() is the
+ * only writer of columns[].compound_kind.  So INLINE implies
+ * 1 <= compound_arity <= WL_IR_COMPOUND_INLINE_MAX_ARITY. */
+static uint32_t
+declared_physical_column_count(const wl_ir_relation_info_t *rel)
+{
+    uint32_t phys = 0;
+
+    if (!rel)
+        return 0;
+    if (!rel->columns)
+        return rel->column_count;
+
+    for (uint32_t i = 0; i < rel->column_count; i++) {
+        const wirelog_column_t *col = &rel->columns[i];
+        phys += (col->compound_kind == WIRELOG_COMPOUND_KIND_INLINE)
+            ? col->compound_arity
+            : 1u;
+    }
+    return phys;
+}
+
+/* Issue #977: validate every rule head against its relation's declared
+ * arity.
+ *
+ * A head whose arity disagrees with its `.decl` was accepted silently.  In a
+ * recursive stratum that is a heap over-read: col_op_reduce()
+ * (columnar/ops.c) sizes its output region as group_by_count + 1, while
+ * col_rel_append_all() (columnar/relation.c) copies dst->ncols columns out of
+ * it with no clamp against src->ncols.  dst->ncols comes from the declared
+ * width -- the facts materialised the relation at it -- so a narrower head
+ * reads past the region:
+ *
+ *   .decl cc(n: int64, lo: int64, hi: int64)
+ *   cc(1,10,10).
+ *   cc(y, min(c)) :- cc(x, c, d), edge(x, y).   -> SIGSEGV (exit 139)
+ *
+ * ASAN reports "heap-buffer-overflow READ of size 8" in col_rel_append_all()
+ * under col_eval_stratum() (columnar/eval.c).  Issue #973 rejects the
+ * multi-aggregate spelling of the same crash; this is the single-aggregate
+ * one, which that check cannot see because nothing about its aggregate count
+ * is wrong.
+ *
+ * Recursion is not the precondition -- a producer at the declared width is.
+ * The non-recursive `t(g) :- val(g, v).` against `.decl t/3` is the same
+ * over-read once a `t(9,9,9).` fact fixes the relation's width, reached via
+ * col_op_map() rather than col_op_reduce().  With no such producer the
+ * relation just materialises narrower and the mismatch is a silent wrong
+ * answer instead: one column emitted with exit 0, or four for `t(g,v,g,v)`
+ * against `.decl t/2`.
+ *
+ * PHYSICAL width, not logical -- this is the one thing that must not be
+ * "simplified".  Unit 2 compares facts LOGICALLY, and deliberately so:
+ * collect_fact() packs one slot per written argument and both readers
+ * (wl_session_load_facts, wirelog_program_get_facts) stride by the logical
+ * rel->column_count.  A rule head is the opposite.  The head grammar has no
+ * compound-term production at all -- parse_head_arg() (parser/parser.c)
+ * dispatches only to aggregate and arithmetic expressions, so
+ * `pred(x, f(y, z))` is a parse error -- which leaves the flattened spelling
+ * as the only way to write an inline-compound relation from a rule:
+ *
+ *   .decl pred(id: int64, payload: f/2 inline)
+ *   pred(x, y, z) :- src(x, y, z).              -> pred(1, 10, 20)
+ *
+ * Three head arguments against a two-column .decl.  `child_count !=
+ * column_count` would reject that working program.  The three arguments are
+ * three physical columns, and the declaration describes three physical
+ * columns, so measured physically it agrees.
+ *
+ * The head side is measured with atom_physical_column_count() rather than
+ * head->child_count.  Today the two are identical for heads, precisely
+ * because no head argument can be a COMPOUND_TERM; using the shared helper
+ * keeps one definition of "physical width of this atom against this
+ * relation" for heads, body scans (build_atom_scan) and any future head
+ * compound support, instead of two that can drift apart.
+ *
+ * The two-argument handle form -- `pred(x, y)` against the same .decl -- is
+ * rejected, even though the corresponding *fact* `pred(1, 99).` is accepted
+ * by the logical fact rule.  The asymmetry is deliberate: the head leaves
+ * the second inline slot never written, and a body pattern that destructures
+ * the column reads it regardless, so
+ * `outr(id, p, q) :- pred(id, f(p, q)).` evaluated to outr(1, 99, 0) with
+ * exit 0 and ASAN silent -- a fabricated value, the failure mode this issue
+ * exists to remove.  The three-argument spelling of the same program yields
+ * outr(1, 10, 20), which is correct.
+ *
+ * Aggregate heads need no special case.  parse_aggregate_expr() has exactly
+ * one caller, parse_head_arg(), so an AGGREGATE node is always a direct
+ * top-level head child and counts as one argument -- `t(g, min(v))` has
+ * child_count 2 and lowers to group_by_count + 1 == 2 emitted columns.  The
+ * check is also position-independent, so `t(min(v), g)` (issue #980, where
+ * position is ignored and the group-by is emitted first) is unaffected.
+ *
+ * Like the fact pass this runs after the whole collection loop, so a `.decl`
+ * may legally follow its rules, and it keys off has_decl rather than
+ * `column_count > 0` so that `.decl p()` is checked instead of skipped.
+ * Undeclared heads are skipped: they are widespread and legitimate
+ * (bench/workloads/doop.dl has ~90). */
+static int
+validate_head_arities(const struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast)
+{
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *node = ast->children[i];
+        if (node->type != WL_PARSER_AST_NODE_RULE || node->child_count < 1)
+            continue;
+
+        const wl_parser_ast_node_t *head = node->children[0];
+        if (!head || head->type != WL_PARSER_AST_NODE_HEAD || !head->name)
+            continue;
+
+        const wl_ir_relation_info_t *rel
+            = find_relation_info(program, head->name);
+        if (!rel || !rel->has_decl)
+            continue;
+
+        uint32_t emitted = atom_physical_column_count(head, rel, program);
+        uint32_t declared = declared_physical_column_count(rel);
+        if (emitted != declared) {
+            WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                "rule head for relation '%s' emits %u column(s) but '%s' is"
+                " declared with %u column(s) (line %u)",
+                rel->name, emitted, rel->name, declared, head->line);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -795,8 +954,13 @@ wl_ir_program_collect_metadata(struct wirelog_program *program,
     }
 
     /* Issue #977: run after the loop so that every `.decl` in the program
-    * has been seen, regardless of where it sits relative to its facts. */
-    return validate_fact_arities(program, ast);
+     * has been seen, regardless of where it sits relative to its facts and
+     * rules.  Facts first only because that pass landed first; the two are
+     * independent and a program failing both is reported by whichever runs
+     * first. */
+    if (validate_fact_arities(program, ast) != 0)
+        return -1;
+    return validate_head_arities(program, ast);
 }
 
 /* ======================================================================== */
@@ -1855,14 +2019,19 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
      *   .decl cc(n:int64, lo:int64, hi:int64)
      *   cc(y, min(c), max(c)) :- cc(x, c, d), edge(x, y).   -> SIGSEGV
      *
-     * This check does NOT close that crash class.  The trigger is emitted
-     * arity != declared arity in a recursive stratum; multiple aggregates are
-     * one route to it.  A single-aggregate head is another and still crashes:
+     * This check does not close that crash class on its own.  The trigger is
+     * emitted arity != declared arity in a recursive stratum; multiple
+     * aggregates are one route to it.  A single-aggregate head is another and
+     * crashes identically:
      *   cc(y, min(c)) :- cc(x, c, d), edge(x, y).           -> SIGSEGV
-     * That is issue #977, and neither fix subsumes the other -- a .decl-arity
-     * check passes t(g, min(v), max(v)), which has three textual arguments
-     * against a 3-arity .decl.  See docs/SEMANTICS.md for why this rejects
-     * rather than supports multiple aggregates.
+     * That route is closed by validate_head_arities() (issue #977), which
+     * runs earlier, in wl_ir_program_collect_metadata().  Neither fix
+     * subsumes the other: an arity check passes t(g, min(v), max(v)), which
+     * has three textual arguments against a 3-arity .decl, so by the time
+     * control reaches here the head arity is already known to match and only
+     * the aggregate count can still be wrong.
+     * See docs/SEMANTICS.md for why this rejects rather than supports
+     * multiple aggregates.
      *
      * Counting direct HEAD children suffices because parse_aggregate_expr()
      * has exactly one caller, parse_head_arg() (parser/parser.c), so an

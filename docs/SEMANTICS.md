@@ -191,16 +191,26 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
   `convert_rule` cannot know whether the head relation is recursive, and
   `col_canonicalize_recursive_aggregate_relation` is on the hot path for
   recursive aggregate rules regardless of the MIN/MAX guard.
-- The #973 rejection does not cover every arity mismatch. A single-aggregate
-  head with too few arguments for its `.decl` is still accepted and still
-  unsafe in a recursive stratum; general `.decl`-versus-rule arity validation
-  is tracked as #977.
+- The #973 rejection does not, on its own, cover every arity mismatch: a
+  single-aggregate head with too few arguments for its `.decl`, such as
+  `cc(y, min(c))` against a 3-column `cc`, reaches the same out-of-bounds
+  read without ever having two aggregates. That shape is now rejected
+  separately, before lowering, by the rule-head arity check in
+  `wl_ir_program_collect_metadata` (#977). The two checks are complementary
+  and neither subsumes the other — an arity check passes
+  `t(g, min(v), max(v))`, which has three head arguments against a 3-column
+  `.decl`, and the aggregate-count check passes `cc(y, min(c))`, which has
+  one aggregate.
+- Both checks cover the parser path only. IR built directly through the API
+  still reaches the crash.
 
 ### References
 
 - Issue #692 — Blocker B5: Recursive aggregation residue = 0.
 - Issue #973 — at most one aggregate per rule head.
-- Issue #977 — general `.decl`-versus-rule arity validation (open).
+- Issue #977 — `.decl`-versus-program arity validation: inline facts and
+  rule heads are validated; rule *bodies* and facts on undeclared relations
+  are not.
 - `wirelog/columnar/ops.c` — `col_op_reduce`.
 - `wirelog/columnar/eval.c` — recursive aggregate canonicalization.
 - `wirelog/ir/program.c` — `convert_rule` multi-aggregate head rejection.

@@ -108,12 +108,15 @@ Two scope notes:
   is not validated — neither the optimizer, the plan generator, nor the
   columnar REDUCE checks that the group-by width plus one matches the head
   arity.
-- The check does **not** cover every arity mismatch. A single-aggregate head
-  with too few arguments for its `.decl`, such as
+- The check does **not**, by itself, cover every arity mismatch. A
+  single-aggregate head with too few arguments for its `.decl`, such as
   `cc(y, min(c)) :- cc(x, c, d), edge(x, y).` against a 3-column `cc`, is
-  still accepted and still unsafe in a recursive stratum. General
-  `.decl`-versus-rule arity validation is tracked separately as #977, whose
-  fact half has since landed (see below) while the rule-head half has not.
+  unsafe in a recursive stratum for the same reason but has only one
+  aggregate. That shape is rejected by the separate rule-head arity check
+  described in [Rule heads must match their declared
+  arity](#rule-heads-must-match-their-declared-arity) below (#977). The two
+  are complementary: an arity check accepts `t(g, min(v), max(v))`, and the
+  aggregate-count check accepts `cc(y, min(c))`.
 
 ### Inline facts must match their declared arity
 
@@ -137,13 +140,88 @@ query answers with exit status 0, or a tuple assembled from two different
 facts. Loading fails with `WIRELOG_ERR_PARSE`; run with `WL_LOG=PARSER:1` to
 see which relation and which arities.
 
-A relation with an inline-compound column must be given the compound form,
-not a flattened one — `p(1,2,3).` against `.decl p(id: int64, lbl: pair/2
-inline)` is rejected, because the fact is compared against the declared
-*logical* width.
+Facts are compared against the declared **logical** width — one argument per
+declared column. For a relation with an `inline` compound column that has an
+awkward consequence: `p(1,2,3).` against `.decl p(id: int64, lbl: pair/2
+inline)` is rejected as three arguments against two columns, while `p(1,2).`
+is accepted and writes only the first of the two inline slots.
+
+There is no compound spelling to reach for instead — `p(1, pair(2,3)).` is a
+parse error, because facts admit only integer and string constants. So an
+inline-compound relation currently cannot be populated correctly by an inline
+fact at all: the accepted form leaves a slot unwritten and produces no output.
+Use `.input` or derive the relation from a rule. Tracked as #985.
 
 Facts on a relation with **no** `.decl` at all are unaffected by this check
 and continue to fail later, during loading, with a less specific message.
+
+### Rule heads must match their declared arity
+
+A rule head that emits a different number of columns than its relation's
+`.decl` declares is rejected when the program is loaded (#977):
+
+```
+.decl val(g: int64, v: int64)
+.decl t(a: int64, b: int64)
+t(g)          :- val(g, v).    /* rejected: emits 1, declared 2 */
+t(g,v,g,v)    :- val(g, v).    /* rejected: emits 4, declared 2 */
+t(g, v)       :- val(g, v).    /* accepted */
+t(g, min(v))  :- val(g, v).    /* accepted: an aggregate is one column */
+```
+
+As with facts, the `.decl` may appear before or after its rules, and heads on
+a relation with **no** `.decl` are not checked at all — undeclared derived
+heads are ordinary Datalog and are used throughout the benchmark workloads.
+
+This is a memory-safety guard. A head narrower than its `.decl` is an
+out-of-bounds read whenever some *other* producer has already established the
+relation at the declared width: the narrow head's operator sizes its output
+region from the emitted arity, while `col_rel_append_all` copies the declared
+arity out of it with no clamp. `cc(y, min(c)) :- cc(x, c, d), edge(x, y).`
+against a 3-column `cc` seeded by a fact segfaulted.
+
+Recursion is not the precondition — a declared-width producer is. The
+non-recursive `t(g) :- val(g, v).` against a 3-column `t` is equally an
+over-read once a `t(9,9,9).` fact fixes the width, this time through
+`col_op_map` rather than `col_op_reduce`. With no such producer the relation
+simply materialises at the narrower width and the mismatch is a silent wrong
+answer instead.
+
+Loading fails with `WIRELOG_ERR_PARSE`; run with `WL_LOG=PARSER:1` to see
+which relation and which arities.
+
+Unlike the fact check, heads are compared against the declared **physical**
+width — an `inline` compound column counts as its full arity, a `side`
+compound as the single handle column it is stored in. The reason is that the
+head grammar has no compound-term production (`pred(x, f(y, z))` is a parse
+error), so the flattened spelling is the only way to write an
+inline-compound relation from a rule:
+
+```
+.decl src(a: int64, b: int64, c: int64)
+.decl pred(id: int64, payload: f/2 inline)
+pred(x, y, z) :- src(x, y, z).   /* accepted: 3 physical columns */
+pred(x, y)    :- src(x, y).      /* rejected: 2, and leaves a slot unwritten */
+```
+
+The two-argument form is rejected simply because the comparison is physical
+and 2 is not 3. Since the flattened spelling is the only one a rule can use,
+a head that writes fewer columns than the relation physically has is an
+under-write, not an alternative notation.
+
+That it is not a *false* rejection is worth demonstrating separately: the
+two-argument head leaves the second inline slot unwritten, and a body pattern
+that destructures the column reads it anyway — `outr(id, p, q) :- pred(id,
+f(p, q)).` produced `outr(1, 99, 0)`, a value present in no source data,
+where the three-argument spelling correctly produces `outr(1, 10, 20)`.
+
+The corresponding *fact* `pred(1, 99).` is accepted, because facts must be
+compared logically (see [Inline facts must match their declared
+arity](#inline-facts-must-match-their-declared-arity) above) and so cannot be
+held to the physical width. That asymmetry is real and is tracked as #985 —
+it is a limitation of the width model, not of this check.
+
+Rule **bodies** are still not validated against their `.decl`.
 
 The count is not the only constraint on aggregates in a head — the aggregate
 must also be written **last**. `t(min(v), g) :- val(g, v).` lowers with a
