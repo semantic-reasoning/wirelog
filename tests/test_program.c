@@ -2830,6 +2830,350 @@ test_fact_collection_single_relation(void)
 }
 
 /* ======================================================================== */
+/* Issue #977 (unit 2): inline fact arity must match the .decl              */
+/* ======================================================================== */
+
+/* collect_fact() packs fact_data using the *fact's own* child_count as the
+ * row stride, while both readers of that buffer stride by the *declared*
+ * rel->column_count: wl_session_load_facts (session_facts.c) and
+ * wirelog_program_get_facts (the public API, ir/api.c).
+ * Nothing reconciled the two, so an arity disagreement produced a heap
+ * over-read, an uninitialised read inside the allocation, or a silently
+ * fabricated tuple -- depending on which side was wider.
+ *
+ * Entry point: these tests go through make_program(), which calls
+ * wl_ir_program_collect_metadata() directly.  That is exactly where the
+ * validation pass lives (tail of the function, after the source-order
+ * loop), so a NULL return here is this rejection and not a later stage.
+ * ir/api.c maps the same non-zero return to WIRELOG_ERR_PARSE, which
+ * test_fact_arity_mismatch_maps_to_parse_error() pins separately.
+ *
+ * The check deliberately does NOT live inside collect_fact():
+ * wl_ir_program_collect_metadata() is a single source-order loop, so a
+ * .decl written after its facts has not been seen when collect_fact() runs.
+ * test_fact_arity_decl_after_facts_rejected() is the case that a
+ * collect_fact-internal check would wrongly accept. */
+
+static void
+test_fact_arity_narrower_than_decl_rejected(void)
+{
+    TEST("Fact arity: fact narrower than .decl is rejected");
+
+    /* 1-arity fact against a 9-column .decl.  Pre-fix the readers strided
+     * the declared width per row over a buffer packed at the fact's own
+     * width.  collect_fact seeds fact_capacity at ncols * 8, so with a
+     * 1-arity fact the buffer holds 8 slots: a 9-column read runs one slot
+     * past the allocation -- heap-buffer-overflow in col_rel_row_copy_in
+     * <- col_rel_append_row <- col_session_insert <- wl_session_load_facts.
+     *
+     * The width has to exceed 8 for that.  At exactly .decl p/8 the read
+     * lands on the last slot rather than past it, so ASAN stays silent and
+     * the program exits 0 emitting uninitialised heap as answers -- the
+     * quieter defect, covered by the second case below. */
+    struct wirelog_program *bad = make_program(
+        ".decl p(a: int32, b: int32, c: int32, d: int32, e: int32,"
+        " f: int32, g: int32, h: int32, i: int32)\n"
+        "p(1).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("p(1). against .decl p/9 should be rejected");
+        return;
+    }
+
+    /* Two 1-arity facts against .decl p/8: 2 rows * 8 columns = 16 slots
+     * read from the same 8-slot buffer, so this over-reads too even though
+     * the declared width does not exceed the seed capacity. */
+    bad = make_program(
+        ".decl p(a: int32, b: int32, c: int32, d: int32,"
+        " e: int32, f: int32, g: int32, h: int32)\n"
+        "p(1). p(2).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("p(1). p(2). against .decl p/8 should be rejected");
+        return;
+    }
+
+    /* The ASAN-silent shape: one 1-arity fact against .decl p/8 reads
+     * within the allocation but past what was written. */
+    bad = make_program(
+        ".decl p(a: int32, b: int32, c: int32, d: int32,"
+        " e: int32, f: int32, g: int32, h: int32)\n"
+        "p(1).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("p(1). against .decl p/8 should be rejected");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_fact_arity_decl_after_facts_rejected(void)
+{
+    TEST("Fact arity: .decl written after the facts is still checked");
+
+    /* Same mismatch as above, source order reversed.  This is the case
+     * that proves the pass must re-walk the AST after the collection loop
+     * rather than validate inside collect_fact(). */
+    struct wirelog_program *bad = make_program(
+        "p(1).\n"
+        ".decl p(a: int32, b: int32, c: int32, d: int32,"
+        " e: int32, f: int32, g: int32, h: int32)\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("p(1). before .decl p/8 should be rejected");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_fact_arity_wider_than_decl_rejected(void)
+{
+    TEST("Fact arity: fact wider than .decl is rejected");
+
+    /* Pre-fix this was the silent-corruption case: val(1,5,7). val(2,6,8).
+     * packed 3 values per row but was read back 2 per row, so the program
+     * evaluated to t(1,5) and t(7,2) -- a tuple present in no source fact --
+     * and dropped (6,8) entirely.  Exit status was 0. */
+    struct wirelog_program *bad
+        = make_program(".decl val(g: int32, v: int32)\n"
+            "val(1, 5, 7).\n"
+            "val(2, 6, 8).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("val(1,5,7). against .decl val/2 should be rejected");
+        return;
+    }
+
+    /* Inline-compound columns.  `.decl p(id, lbl: pair/2 inline)` has a
+     * *logical* width of 2 and a *physical* width of 3, and this fact is
+     * written flat.  It is rejected, because facts are compared logically:
+     * collect_fact packs one slot per written argument and both readers
+     * stride by rel->column_count, which is the logical width.
+     *
+     * Pre-fix this was accepted and silently dropped the third value.
+     * Note this is the one place where the fact rule and the coming
+     * rule-head rule diverge -- head lowering does expand compound columns,
+     * so the head check (#977 unit 3) must compare *physical* width via
+     * atom_physical_column_count().  If compound terms ever become
+     * expressible in facts, this comparison has to move with it. */
+    bad = make_program(".decl p(id: int64, lbl: pair/2 inline)\n"
+            "p(1, 2, 3).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("flat p(1,2,3). against inline-compound .decl p/2 rejected");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_fact_arity_mixed_across_facts_rejected(void)
+{
+    TEST("Fact arity: mixed arities across facts are rejected");
+
+    /* collect_fact() computes offset = fact_count * ncols with a *per-fact*
+     * ncols, so p(1). writes index 0 and p(2,3). writes indices 2..3,
+     * leaving index 1 never written.  realloc does not zero, so the reader
+     * returned uninitialised heap (observed: 0xBEBEBEBEBEBEBEBE) with ASAN
+     * silent and exit 0, because the read stayed inside the allocation. */
+    struct wirelog_program *bad = make_program(".decl p(a: int32, b: int32)\n"
+            "p(1).\n"
+            "p(2, 3).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("p(1). p(2,3). against .decl p/2 should be rejected");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_fact_arity_zero_param_decl_rejected(void)
+{
+    TEST("Fact arity: .decl p() with a 1-arity fact is rejected");
+
+    /* `.decl p()` parses and leaves column_count == 0 (see
+     * test_parse_decl_empty_params in test_parser.c), which is precisely
+     * why the guard keys off has_decl rather than the column_count > 0
+     * proxy -- the proxy would skip exactly these relations.
+     *
+     * Deliberate decision: p(1). against a zero-column declaration IS an
+     * arity mismatch and is rejected.  Pre-fix it reached the session and
+     * died at runtime with "error: failed to load facts for 'p'" (exit 1),
+     * so nothing that used to work stops working; the diagnostic just moves
+     * to parse time and names both arities. */
+    struct wirelog_program *bad = make_program(".decl p()\n"
+            "p(1).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("p(1). against .decl p() should be rejected");
+        return;
+    }
+
+    /* A zero-arity fact against a zero-column .decl matches and is
+     * accepted.  Note what "accepted" means here: collect_fact computes
+     * needed = fact_count * 0 == 0 and never allocates, so fact_data stays
+     * NULL and wl_session_load_facts skips the relation entirely.  The fact
+     * is silently *dropped*, and p() evaluates to false -- pre-existing
+     * behaviour this check neither causes nor fixes.  Do not read this test
+     * as evidence that zero-arity facts work. */
+    struct wirelog_program *ok = make_program(".decl p()\n"
+            "p().\n");
+    if (!ok) {
+        FAIL("p(). against .decl p() should be accepted");
+        return;
+    }
+    wl_ir_program_free(ok);
+
+    PASS();
+}
+
+static void
+test_fact_arity_matching_accepted(void)
+{
+    TEST("Fact arity: matching facts still load and lower correctly");
+
+    /* Positive control: the exact shape of the wider-fact case above, with
+     * the correct arity.  Assert the stored values, not just non-NULL --
+     * a pass that rejected everything would still return non-NULL here if
+     * we only checked for a program. */
+    struct wirelog_program *prog
+        = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            ".decl t(x: int32, y: int32)\n"
+            "val(1, 2).\n"
+            "val(3, 4).\n"
+            "t(x, y) :- val(x, y).\n");
+    if (!prog) {
+        FAIL("matching-arity program should be accepted");
+        return;
+    }
+
+    const wl_ir_relation_info_t *val = NULL;
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        if (strcmp(prog->relations[i].name, "val") == 0)
+            val = &prog->relations[i];
+    }
+    if (!val || val->column_count != 2 || val->fact_count != 2
+        || !val->fact_data) {
+        wl_ir_program_free(prog);
+        FAIL("val should hold 2 facts of 2 columns");
+        return;
+    }
+    if (val->fact_data[0] != 1 || val->fact_data[1] != 2
+        || val->fact_data[2] != 3 || val->fact_data[3] != 4) {
+        wl_ir_program_free(prog);
+        FAIL("val fact_data should be {1,2,3,4}");
+        return;
+    }
+    if (prog->rule_count != 1 || !prog->rules[0].ir_root) {
+        wl_ir_program_free(prog);
+        FAIL("the rule should still lower");
+        return;
+    }
+    wl_ir_program_free(prog);
+
+    PASS();
+}
+
+static void
+test_fact_arity_undeclared_relations_unaffected(void)
+{
+    TEST("Fact arity: undeclared relations keep their current behaviour");
+
+    /* An undeclared *derived* head is widespread and legitimate
+     * (bench/workloads/doop.dl alone has ~90).  It must not be rejected. */
+    struct wirelog_program *derived
+        = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            "val(1, 2).\n"
+            "t(g) :- val(g, v).\n");
+    if (!derived) {
+        FAIL("undeclared derived head must still be accepted");
+        return;
+    }
+    wl_ir_program_free(derived);
+
+    /* An undeclared relation *with facts* keeps working through metadata
+     * collection: column_count is 0 because no .decl was seen, and the
+     * guard keys off has_decl, so the pass stays out of the way.  Such a
+     * program still fails later at session load ("failed to load facts for
+     * 'q'", exit 1) -- that is issue #977 unit 3, deliberately not this
+     * unit's scope.  This case is what pins the has_decl condition: drop
+     * it and this program is rejected at parse time instead. */
+    struct wirelog_program *undecl = make_program("q(1, 2).\n"
+            "q(3, 4).\n");
+    if (!undecl) {
+        FAIL("undeclared relation with facts must still collect");
+        return;
+    }
+    wl_ir_program_free(undecl);
+
+    PASS();
+}
+
+static void
+test_fact_arity_mismatch_maps_to_parse_error(void)
+{
+    TEST("Fact arity: public API reports WIRELOG_ERR_PARSE");
+
+    /* The public reader wirelog_program_get_facts() memcpy's
+     * fact_count * column_count from the mismatched buffer, so an embedder
+     * hit the over-read with no session involved at all.  Confirm the
+     * program never gets built, and that the error is the documented one. */
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *bad
+        = wirelog_parse_string(".decl val(g: int32, v: int32)\n"
+            "val(1, 5, 7).\n",
+            &err);
+    if (bad) {
+        wirelog_program_free(bad);
+        FAIL("public API should reject the arity mismatch");
+        return;
+    }
+    if (err != WIRELOG_ERR_PARSE) {
+        FAIL("error should be WIRELOG_ERR_PARSE");
+        return;
+    }
+
+    /* Control: the matching program still round-trips through the public
+     * reader with the right values. */
+    wirelog_program_t *ok = wirelog_parse_string(
+        ".decl val(g: int32, v: int32)\n"
+        "val(1, 2).\n"
+        "val(3, 4).\n",
+        &err);
+    if (!ok || err != WIRELOG_OK) {
+        if (ok)
+            wirelog_program_free(ok);
+        FAIL("control: matching program should parse");
+        return;
+    }
+    int64_t *data = NULL;
+    uint32_t nrows = 0, ncols = 0;
+    if (wirelog_program_get_facts(ok, "val", &data, &nrows, &ncols) != 0) {
+        wirelog_program_free(ok);
+        FAIL("control: get_facts should succeed");
+        return;
+    }
+    if (nrows != 2 || ncols != 2 || data[0] != 1 || data[1] != 2
+        || data[2] != 3 || data[3] != 4) {
+        free(data);
+        wirelog_program_free(ok);
+        FAIL("control: get_facts should return {1,2,3,4}");
+        return;
+    }
+    free(data);
+    wirelog_program_free(ok);
+
+    PASS();
+}
+
+/* ======================================================================== */
 /* Fact Extraction API Tests                                                */
 /* ======================================================================== */
 
@@ -3268,6 +3612,16 @@ main(void)
 
     /* Fact collection */
     test_fact_collection_single_relation();
+
+    /* Issue #977 unit 2: inline fact arity vs .decl */
+    test_fact_arity_narrower_than_decl_rejected();
+    test_fact_arity_decl_after_facts_rejected();
+    test_fact_arity_wider_than_decl_rejected();
+    test_fact_arity_mixed_across_facts_rejected();
+    test_fact_arity_zero_param_decl_rejected();
+    test_fact_arity_matching_accepted();
+    test_fact_arity_undeclared_relations_unaffected();
+    test_fact_arity_mismatch_maps_to_parse_error();
 
     /* Fact extraction API */
     test_api_get_facts();

@@ -29,6 +29,21 @@ typedef struct {
     char *name;
     wirelog_column_t *columns;
     uint32_t column_count;
+    /* Issue #977: true once a `.decl` for this relation has been collected.
+     * Distinguishes "declared with zero columns" (`.decl p()`, which parses
+     * and leaves column_count == 0) from "never declared" -- a relation
+     * created implicitly by a rule head or by a fact.  `column_count > 0`
+     * cannot make that distinction, so fact-arity validation keys off this
+     * flag instead.
+     *
+     * The predicate is specifically "the user wrote a `.decl`", not "some
+     * arity is on record".  wl_ir_program_add_magic_relation() sets a real
+     * column_count without setting this, deliberately: magic relations are
+     * compiler-generated and must not be validated against user-facing
+     * arity rules.  That is inert today -- they are created after metadata
+     * collection and never carry facts -- but any future consumer of this
+     * flag should read it as "user-declared", not "has a known width". */
+    bool has_decl;
     bool has_input;
     bool has_output;
     bool has_printsize;

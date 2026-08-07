@@ -112,7 +112,38 @@ Two scope notes:
   with too few arguments for its `.decl`, such as
   `cc(y, min(c)) :- cc(x, c, d), edge(x, y).` against a 3-column `cc`, is
   still accepted and still unsafe in a recursive stratum. General
-  `.decl`-versus-rule arity validation is tracked separately as #977.
+  `.decl`-versus-rule arity validation is tracked separately as #977, whose
+  fact half has since landed (see below) while the rule-head half has not.
+
+### Inline facts must match their declared arity
+
+A fact whose argument count differs from its relation's `.decl` is rejected
+when the program is loaded (#977):
+
+```
+.decl val(g: int64, v: int64)
+val(1, 5, 7).       /* rejected: 3 arguments, 2 declared */
+val(1).             /* rejected: 1 argument, 2 declared */
+val(1, 5).          /* accepted */
+```
+
+The `.decl` may appear before or after its facts; the check runs once all
+declarations have been collected.
+
+This is a memory-safety guard. Facts are packed at the width they are
+written and read back at the declared width, so a mismatch previously caused
+an out-of-bounds read, or an uninitialised read that produced heap bytes as
+query answers with exit status 0, or a tuple assembled from two different
+facts. Loading fails with `WIRELOG_ERR_PARSE`; run with `WL_LOG=PARSER:1` to
+see which relation and which arities.
+
+A relation with an inline-compound column must be given the compound form,
+not a flattened one — `p(1,2,3).` against `.decl p(id: int64, lbl: pair/2
+inline)` is rejected, because the fact is compared against the declared
+*logical* width.
+
+Facts on a relation with **no** `.decl` at all are unaffected by this check
+and continue to fail later, during loading, with a less specific message.
 
 The count is not the only constraint on aggregates in a head — the aggregate
 must also be written **last**. `t(min(v), g) :- val(g, v).` lowers with a
