@@ -4566,6 +4566,31 @@ test_io_dispatch_exe = executable(
 test('io_dispatch', test_io_dispatch_exe)
 
 # ============================================================================
+# .input CSV Arity Validation Tests (#977)
+# Drives the full pipeline (parse -> plan -> load .input -> evaluate) so the
+# columnar insert path sees the loaded rows; a width mismatch between the CSV
+# and the .decl must fail the load instead of re-striding (or over-reading).
+# ============================================================================
+
+test_input_arity_exe = executable(
+  'test_input_arity',
+  files('test_input_arity.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  driver_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+test('input_arity', test_input_arity_exe)
+
+# ============================================================================
 # Concurrent I/O Adapter Registry Stress Test (#459)
 # Exercises mutex safety under TSan: concurrent find, register/unregister,
 # and mixed readers+writers.  Linux/macOS only (pthreads; skipped on Windows).
