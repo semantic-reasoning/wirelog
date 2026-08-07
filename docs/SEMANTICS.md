@@ -74,14 +74,22 @@ Two patterns are supported:
   not stable across runs of the same program.
 
   Because ids are unstable, nothing observable may be derived from their
-  order. The ordering operators (`<`, `>`, `<=`, `>=`) therefore compare
-  `string`/`symbol` columns **lexicographically**, not by id — see
-  `docs/SYNTAX.md`, "Comparison Operators". Id order still leaks through
-  in three places. A column with no declared type: the engine has nothing
-  to compare but the ids, so the result is as unstable as they are --
-  declare the relation. A comparison with one string and one numeric
-  operand: it stays an integer comparison, described in `docs/SYNTAX.md`.
-  And `min()`/`max()` over symbol columns, which still reduce by id.
+  order. The ordering operators (`<`, `>`, `<=`, `>=`) and the ordering
+  aggregates `min()`/`max()` therefore compare `string`/`symbol` columns
+  **lexicographically**, not by id — see `docs/SYNTAX.md`, "Comparison
+  Operators". Id order still leaks through in two places. A column with no
+  declared type: the engine has nothing to compare but the ids, so the
+  result is as unstable as they are -- declare the relation. And a
+  comparison with one string and one numeric operand: it stays an integer
+  comparison, described in `docs/SYNTAX.md`.
+
+  A column declared `symbol` whose values were never interned is the
+  aggregate's version of the same caveat as the digests below: `min()` and
+  `max()` reduce it numerically -- the numeric answer for numeric data --
+  rather than failing the query, and report the mistype under `WL_LOG=EVAL`.
+  Where a group mixes interned and un-interned values, the interned ones
+  win, in both directions, so the comparison does not depend on how many
+  strings happen to have been interned when the row is visited.
 
   `hash()` and the digest family — `crc32_*`, `md5`, `sha*`,
   `hmac_sha256`, `uuid5` — take the **string's bytes** for a column

@@ -401,7 +401,7 @@ col_relation_recursive_reduce_op(const wl_plan_relation_t *rp)
 
 static int
 col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
-    const wl_plan_op_t *reduce_op)
+    const wl_plan_op_t *reduce_op, const wl_intern_t *intern)
 {
     if (!rel || !reduce_op || rel->nrows < 2)
         return 0;
@@ -423,8 +423,11 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
         if (found != UINT32_MAX) {
             int64_t cur = col_rel_get(rel, found, gc);
             int64_t val = col_rel_get(rel, row, gc);
-            bool better = (reduce_op->agg_fn == WIRELOG_AGG_MIN)
-                ? val < cur : val > cur;
+            /* Same comparator as col_op_reduce(): a fixpoint that ordered
+             * lexicographically within an iteration and by intern id across
+             * iterations would be worse than the original bug (#965). */
+            bool better = col_agg_better(reduce_op->agg_fn,
+                    reduce_op->agg_operand_type, intern, val, cur);
             if (better) {
                 col_rel_set(rel, found, gc, val);
                 if (rel->timestamps)
@@ -464,7 +467,8 @@ col_canonicalize_recursive_aggregates(const wl_plan_stratum_t *sp,
         if (!reduce_op)
             continue;
         col_rel_t *rel = session_find_rel(sess, rp->name);
-        int rc = col_canonicalize_recursive_aggregate_relation(rel, reduce_op);
+        int rc = col_canonicalize_recursive_aggregate_relation(rel, reduce_op,
+                sess->intern);
         if (rc != 0)
             return rc;
         col_session_invalidate_arrangements(&sess->base, rp->name);

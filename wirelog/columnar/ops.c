@@ -6671,11 +6671,12 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
                 break;
                 case WIRELOG_AGG_MIN:
-                    if (agg_val < cur)
-                        col_rel_set(out, o, gc, agg_val);
-                    break;
                 case WIRELOG_AGG_MAX:
-                    if (agg_val > cur)
+                    /* Ordered by the operand's declared domain, not by the
+                     * raw int64 -- for a symbol column that int64 is an
+                     * intern id (Issue #965). */
+                    if (col_agg_better(op->agg_fn, op->agg_operand_type,
+                        sess->intern, agg_val, cur))
                         col_rel_set(out, o, gc, agg_val);
                     break;
                 default:

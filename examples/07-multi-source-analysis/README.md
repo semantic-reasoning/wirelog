@@ -181,17 +181,10 @@ efficient for streaming MDM pipelines where new records arrive continuously.
 ## Next Steps
 
 - Add a `tiebreak` rule using `min(Name)` to resolve conflicts deterministically
-  without human intervention
-
-  > **Warning:** this is not deterministic today. `Name` is a `string`
-  > column, and `min()`/`max()` reduce over its interned integer id, not
-  > the string. Ids are assigned in the order strings are first encountered,
-  > so `min(Name)` picks whichever name happened to be interned first — which
-  > changes when unrelated facts are added. Lexicographic `min`/`max` over
-  > symbols is not yet implemented; ordering comparisons (`<`, `>`, `<=`,
-  > `>=`) already are (Issue #962). Until then, tiebreak on a numeric column
-  > such as an update timestamp, or compare with `<` in a rule instead of
-  > reducing.
+  without human intervention. `Name` is a `string` column, and `min()`/`max()`
+  compare the strings themselves rather than their interned ids, so the name
+  chosen is the lexicographically smallest one and does not change when
+  unrelated facts are added (Issue #965)
 - Extend with a third source `src_c` and a priority chain (A > B > C)
 - Combine with `06-timestamp-lww` to use update timestamps as tiebreakers
 - Add a `merged(id, name_a, name_b, country_a, country_b)` relation to expose

@@ -1138,6 +1138,30 @@ test_symbol_digests_exe = executable(
 
 test('symbol_digests', test_symbol_digests_exe)
 
+# Issue #965: min()/max() over a symbol column reduced by intern id rather
+# than lexicographically, so prepending one unrelated fact flipped the
+# answer.  Every case is framed as intern-order independence.
+test_symbol_aggregates_exe = executable(
+  'test_symbol_aggregates',
+  files('test_symbol_aggregates.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+# The mistyped-column case is recursive on purpose: a comparator whose
+# verdicts depend on an intern table that grows during evaluation has no
+# termination argument, so that failure mode is a hang, not a wrong answer.
+# The whole binary runs in well under a second; the timeout bounds the hang.
+test('symbol_aggregates', test_symbol_aggregates_exe, timeout: 60)
+
 test('option2_doop', test_option2_doop_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
 )
