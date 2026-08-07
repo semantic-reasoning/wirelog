@@ -972,6 +972,122 @@ test_aggregation_constant(void)
     PASS();
 }
 
+/* Issue #973: a rule head may carry at most one aggregate.  The AGGREGATE IR
+ * node has one agg_fn / one agg_expr, so lowering used to keep only the last
+ * aggregate and emit a tuple of the wrong arity with no diagnostic.
+ *
+ * make_program_with_rules() calls wl_ir_program_convert_rules() directly, so a
+ * NULL return here is exactly the lowering rejection and not some later stage.
+ * Each test pairs its negatives with a positive control so that a blanket
+ * parser breakage cannot make the negatives pass for the wrong reason. */
+static void
+test_aggregation_multi_head_rejected(void)
+{
+    TEST("Aggregation: multiple aggregates in one head are rejected");
+
+    /* Positive control: a single aggregate must still lower correctly. */
+    struct wirelog_program *ok
+        = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            ".decl t(g: int32, a: int32)\n"
+            "t(g, min(v)) :- val(g, v).\n");
+    if (!ok) {
+        FAIL("control: single-aggregate head should still lower");
+        return;
+    }
+    if (ok->rules[0].ir_root->type != WIRELOG_IR_AGGREGATE
+        || ok->rules[0].ir_root->agg_fn != WIRELOG_AGG_MIN
+        || ok->rules[0].ir_root->group_by_count != 1) {
+        wl_ir_program_free(ok);
+        FAIL("control: expected AGGREGATE/MIN/group_by_count==1");
+        return;
+    }
+    wl_ir_program_free(ok);
+
+    /* Negative: two different aggregates, with a group-by column. */
+    struct wirelog_program *bad
+        = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            ".decl t(g: int32, a: int32, b: int32)\n"
+            "t(g, min(v), max(v)) :- val(g, v).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("t(g, min(v), max(v)) should be rejected");
+        return;
+    }
+
+    /* Negative: two aggregates and no group-by column at all. */
+    bad = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            ".decl t(a: int32, b: int32)\n"
+            "t(min(v), max(v)) :- val(g, v).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("t(min(v), max(v)) should be rejected");
+        return;
+    }
+
+    /* Negative: three aggregates. */
+    bad = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            ".decl t(g: int32, a: int32, b: int32, c: int32)\n"
+            "t(g, min(v), max(v), sum(v)) :- val(g, v).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("three aggregates should be rejected");
+        return;
+    }
+
+    /* Negative: same agg_fn twice.  This one passes the downstream
+     * col_relation_recursive_reduce_op() mixed-agg_fn guard (#692 B5) and
+     * would canonicalise only one column, so it must be caught here. */
+    bad = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            ".decl t(g: int32, a: int32, b: int32)\n"
+            "t(g, min(v), min(v)) :- val(g, v).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("t(g, min(v), min(v)) should be rejected");
+        return;
+    }
+
+    /* Negative: the recursive shape.  This one is the memory-safety case --
+     * before the fix it reached col_op_reduce()/col_rel_append_all() with an
+     * emitted arity of 2 against a 3-arity .decl and segfaulted during
+     * col_eval_stratum().  Rejecting at lowering keeps it from ever getting
+     * that far.  (Note: the single-aggregate variant
+     * "cc(y, min(c)) :- cc(x, c, d), edge(x, y)." crashes the same way and is
+     * deliberately NOT caught here -- that is issue #977.) */
+    bad = make_program_with_rules(".decl edge(x: int64, y: int64)\n"
+            ".decl cc(n: int64, lo: int64, hi: int64)\n"
+            "cc(y, min(c), max(c)) :- cc(x, c, d), edge(x, y).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("recursive multi-aggregate head should be rejected");
+        return;
+    }
+
+    /* Control again: the documented workaround -- one aggregate per rule,
+     * joined -- must still lower cleanly. */
+    struct wirelog_program *workaround
+        = make_program_with_rules(".decl val(g: int32, v: int32)\n"
+            ".decl tmin(g: int32, a: int32)\n"
+            ".decl tmax(g: int32, b: int32)\n"
+            ".decl t(g: int32, a: int32, b: int32)\n"
+            "tmin(g, min(v)) :- val(g, v).\n"
+            "tmax(g, max(v)) :- val(g, v).\n"
+            "t(g, a, b) :- tmin(g, a), tmax(g, b).\n");
+    if (!workaround) {
+        FAIL("control: documented per-rule workaround must lower");
+        return;
+    }
+    if (workaround->rules[0].ir_root->type != WIRELOG_IR_AGGREGATE
+        || workaround->rules[1].ir_root->type != WIRELOG_IR_AGGREGATE
+        || workaround->rules[2].ir_root->type != WIRELOG_IR_PROJECT) {
+        wl_ir_program_free(workaround);
+        FAIL("control: workaround should lower to AGGREGATE/AGGREGATE/PROJECT");
+        return;
+    }
+    wl_ir_program_free(workaround);
+
+    PASS();
+}
+
 static void
 test_three_body_join(void)
 {
@@ -3112,6 +3228,7 @@ main(void)
     test_aggregation_simple();
     test_aggregation_with_join();
     test_aggregation_constant();
+    test_aggregation_multi_head_rejected();
     test_three_body_join();
     test_duplicate_variable();
     test_constant_in_atom();

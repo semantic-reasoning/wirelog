@@ -180,12 +180,30 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
   harness is the active replacement.
 - `col_op_reduce_weighted` remains a weighted Z-set helper and is not part
   of the #692 MIN/MAX recursive aggregate closure.
+- A rule head carries **at most one** aggregate (#973). `AGGREGATE` holds a
+  single `agg_fn`/`agg_expr` pair, so a head such as `t(g, min(v), max(v))`
+  kept only the last aggregate and emitted fewer columns than its `.decl`
+  declared. In a recursive stratum that mismatch is an out-of-bounds read:
+  `col_op_reduce` sizes the output region from the emitted arity while
+  `col_rel_append_all` reads the declared arity. Such heads are now rejected
+  during lowering. Supporting them only in non-recursive strata was
+  considered and rejected — stratification runs *after* rule lowering, so
+  `convert_rule` cannot know whether the head relation is recursive, and
+  `col_canonicalize_recursive_aggregate_relation` is on the hot path for
+  recursive aggregate rules regardless of the MIN/MAX guard.
+- The #973 rejection does not cover every arity mismatch. A single-aggregate
+  head with too few arguments for its `.decl` is still accepted and still
+  unsafe in a recursive stratum; general `.decl`-versus-rule arity validation
+  is tracked as #977.
 
 ### References
 
 - Issue #692 — Blocker B5: Recursive aggregation residue = 0.
+- Issue #973 — at most one aggregate per rule head.
+- Issue #977 — general `.decl`-versus-rule arity validation (open).
 - `wirelog/columnar/ops.c` — `col_op_reduce`.
 - `wirelog/columnar/eval.c` — recursive aggregate canonicalization.
+- `wirelog/ir/program.c` — `convert_rule` multi-aggregate head rejection.
 - `tests/test_recursive_agg_conformance.c` — active columnar harness.
 
 ---

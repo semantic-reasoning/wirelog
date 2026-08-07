@@ -3068,12 +3068,26 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
 
     *out = NULL;
 
-    /* Issue #287/#962: plan generation is the first stage that emits WL_LOG
-     * diagnostics -- cmp_to_tag() reports ordering comparisons that fall back
-     * to intern-id order -- and it runs before any session exists, so the
-     * logger would still be at its all-silent default.  wl_log_init() is
-     * idempotent and cheap on re-entry; col_session_create() calls it for the
-     * same reason.
+    /* Issue #287/#962: plan generation emits WL_LOG diagnostics -- cmp_to_tag()
+     * reports ordering comparisons that fall back to intern-id order -- and it
+     * runs before any session exists, so the logger would still be at its
+     * all-silent default.  wl_log_init() is idempotent on re-entry;
+     * col_session_create() calls it for the same reason.  It is not free,
+     * though: with WL_LOG_FILE set it reopens the sink each time, so a caller
+     * in a tight parse/plan loop pays an fopen+fclose per iteration.
+     *
+     * Correction (#973): this was never the first stage to *emit*.  Rule
+     * lowering (wl_ir_program_convert_rules, ir/program.c) rejects programs
+     * and explains why through WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR, ...)
+     * well before this point, so every such message was written into an
+     * uninitialized logger and dropped -- WL_LOG=PARSER:1 could not surface
+     * them, because parsing was over before anything read the variable.
+     * wirelog_parse_string() (ir/api.c) now calls wl_log_init() first, which
+     * is why this call is merely idempotent re-entry rather than the one that
+     * matters.  Getting a message to a user who sets nothing at all is a
+     * further step: the gate is LVL <= threshold and the default
+     * WL_LOG_NONE (0) still suppresses WL_LOG_ERROR (1), so that needs the
+     * errbuf wirelog_parse_string() builds and discards -- issue #979.
      *
      * Two caveats, both inherited rather than introduced.  It rewrites the
      * sink and thresholds without a lock, so calling it while another

@@ -46,8 +46,84 @@ Features:
 - **Comparisons**: `x < y`, `x = y`, `x != y`, `x >= y`, etc.
 - **Arithmetic**: `x + 1`, `x * y`, `x % 2` in head or comparisons
 - **Aggregation**: `min(x)`, `max(x)`, `sum(x)`, `count(x)`, `average(x)` in head
+  (at most one per head — see below)
 - **Wildcards**: `_` for anonymous variables
 - **Plan marker**: `.plan` before a rule for optimization hints
+
+### Limitation: one aggregate per rule head
+
+A rule head may contain **at most one** aggregate. The internal `AGGREGATE`
+node carries a single aggregate function and a single aggregate expression,
+so there is nowhere to record a second one. Programs such as
+
+```
+t(g, min(v), max(v)) :- val(g, v).      /* rejected */
+t(min(v), max(v))    :- val(g, v).      /* rejected */
+t(g, min(v), min(w)) :- val(g, v, w).   /* rejected */
+```
+
+are rejected when the rule is lowered. Loading fails with
+`WIRELOG_ERR_PARSE`, which the CLI prints as a bare `Parse error`. To see
+which relation was rejected and why, run with `WL_LOG=PARSER:1`:
+
+```
+$ WL_LOG=PARSER:1 wirelog_cli prog.dl
+[ERROR][PARSER] .../wirelog/ir/program.c:1811: relation 't' has 2 aggregates
+in one rule head; at most one is supported. Derive each aggregate in its own
+rule and join the results ...
+```
+
+Without `WL_LOG` set there is still no explanation — surfacing one by
+default is tracked as #979.
+
+Derive each aggregate in its own rule and join the results:
+
+```
+.decl val(g: int64, v: int64)
+.decl tmin(g: int64, a: int64)
+.decl tmax(g: int64, b: int64)
+.decl t(g: int64, a: int64, b: int64)
+
+tmin(g, min(v)) :- val(g, v).
+tmax(g, max(v)) :- val(g, v).
+t(g, a, b) :- tmin(g, a), tmax(g, b).
+```
+
+This rewrite is exact, not an approximation, and the reason is worth stating:
+the split rules keep **identical bodies**, so they group over the same tuple
+set and produce the same group keys. `REDUCE` emits one row per group, so the
+join is total on both sides and no group can be dropped. That property holds
+only while the bodies stay identical — if you later add a filter to one of
+them, the join stops being total and groups can disappear.
+
+This restriction is a memory-safety guard, not only a clarity one. A head
+that emits a different number of columns than its `.decl` declares causes an
+out-of-bounds read in the columnar REDUCE path when the relation is
+recursive; multiple aggregates were one way to reach that state.
+
+Two scope notes:
+
+- The check covers the **parser path only**. A caller that builds an
+  `AGGREGATE` IR node directly, without going through `wirelog_parse_string`,
+  is not validated — neither the optimizer, the plan generator, nor the
+  columnar REDUCE checks that the group-by width plus one matches the head
+  arity.
+- The check does **not** cover every arity mismatch. A single-aggregate head
+  with too few arguments for its `.decl`, such as
+  `cc(y, min(c)) :- cc(x, c, d), edge(x, y).` against a 3-column `cc`, is
+  still accepted and still unsafe in a recursive stratum. General
+  `.decl`-versus-rule arity validation is tracked separately as #977.
+
+The count is not the only constraint on aggregates in a head — the aggregate
+must also be written **last**. `t(min(v), g) :- val(g, v).` lowers with a
+single aggregate and the correct arity, but emits its columns group-by-first
+regardless of the order written, so the values land in the wrong columns with
+no diagnostic. That is tracked as #980 and is not affected by this check.
+
+Aggregate names are matched as exact keywords. `average` and `AVG` are
+recognized; `avg` and `AVERAGE` are not. An unrecognized name followed by `(`
+has no production in head-argument position, so `t(g, avg(v), max(v))` is a
+plain syntax error rather than a rule that bypasses this check.
 
 ---
 
