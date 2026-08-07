@@ -128,10 +128,43 @@ csv_read(wirelog_io_ctx_t *ctx, int64_t **out_data,
         return rc;
     }
 
-    /* Integer-only path */
+    /*
+     * Integer-only path.
+     *
+     * wl_csv_read_file() takes no expected width: it auto-detects the
+     * column count from the file's first line and only reports it via
+     * out_ncols.  The caller (wl_session_load_input_files) then inserts
+     * the rows at the relation's *declared* arity, so a file whose width
+     * disagrees with the .decl is packed at one stride and read back at
+     * another -- a heap over-read when the file is narrower, silently
+     * re-strided tuples when it is wider (#977).
+     *
+     * The invariant being restored is the adapter contract itself:
+     * docs/io-adapters.md requires read() to produce a buffer of
+     * *out_nrows * wirelog_io_ctx_num_cols(ctx) elements, and
+     * wirelog_io_ctx_num_cols() is set from rel->column_count
+     * (io/io_ctx.c) -- the very stride wl_session_load_input_files()
+     * inserts at.  This branch was violating the contract it publishes.
+     *
+     * -2 is the code wl_csv_read_file_via_ctx() uses for a width
+     * mismatch, reused for consistency of the return value only.  Note
+     * that path's own width check is presently unreachable (#982), so
+     * this is not an appeal to it as a working precedent.
+     *
+     * An empty file yields nrows == 0 / ncols == 0 with rc == 0; there is
+     * no row to mis-stride and an empty .input file is legal, so the
+     * check only applies once a width has actually been detected.
+     */
     uint32_t out_ncols = 0;
-    return wl_csv_read_file(resolved_path, delimiter,
-               out_data, out_nrows, &out_ncols);
+    int rc = wl_csv_read_file(resolved_path, delimiter,
+            out_data, out_nrows, &out_ncols);
+    if (rc == 0 && *out_nrows > 0 && out_ncols != num_cols) {
+        free(*out_data);
+        *out_data = NULL;
+        *out_nrows = 0;
+        return -2; /* arity mismatch */
+    }
+    return rc;
 }
 
 /* ======================================================================== */
