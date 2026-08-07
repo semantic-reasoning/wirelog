@@ -490,6 +490,82 @@ col_rel_binary_search_row(const col_rel_t *rel, uint32_t lo, uint32_t hi,
     return false;
 }
 
+/**
+ * col_agg_better - does @cand beat the running @cur for a MIN/MAX reduce?
+ *                  (Issue #965)
+ *
+ * MIN/MAX used to compare the raw int64 in every case, which for a `symbol`
+ * column is its interned id.  Ids are handed out in first-appearance order,
+ * so prepending one unrelated fact flipped min() from "zz" to "aa" with no
+ * change to the data being reduced.  When the plan says the operand is a
+ * string, the comparison is therefore over the strings.
+ *
+ * There are two reducers -- col_op_reduce() in ops.c and the recursive
+ * canonicalisation in eval.c -- and they must agree.  Two copies could
+ * drift into a fixpoint that is lexicographic within an iteration and
+ * id-ordered across iterations, which is worse than the original bug, so
+ * both call this.
+ *
+ * Ordering, given the intern table @intern:
+ *
+ *   rank(v) = 1 if wl_intern_reverse(intern, v) != NULL, else 0
+ *
+ *   - different rank: the rank-1 value wins, for MIN *and* for MAX.
+ *   - both rank 1: strcmp of the two strings.
+ *   - both rank 0: the int64 comparison, i.e. today's behaviour.
+ *
+ * A genuine symbol column has rank 1 everywhere and reduces purely
+ * lexicographically; rank 0 only appears for a column declared `symbol`
+ * whose values were never interned.  Following #963, that mistype is not
+ * failed closed: `.decl E(x: symbol, y: symbol)` with integer facts is
+ * accepted by the parser and evaluates fine today, and erroring out would
+ * turn a working query into no output at all.  The mistype is reported at
+ * plan generation instead.
+ *
+ * Termination.  The naive argument -- "the stored value descends a fixed
+ * total order, which is finite, so the fixpoint stops" -- does not hold if
+ * rank is read as a property of the value: wl_intern_reverse() succeeds iff
+ * `0 <= id < count`, and count *grows during evaluation*, because cat(),
+ * substr(), to_upper(), to_lower(), str_replace(), trim() and to_string()
+ * all intern their results.  The same pair of values can therefore compare
+ * one way early and the other way later, and the order is not fixed.
+ *
+ * What is true is that rank is monotone.  count never shrinks and entry v
+ * is written before count exceeds v, so `rank(v) = 0 -> 1` happens at most
+ * once per v and never reverses; and rank 1 always wins.  So a rank change
+ * moves a value strictly *towards* better, whichever aggregate is running.
+ * Hence at every update the stored value's key strictly improves in the
+ * fixed order on the pair set {(rank, string-or-id)}, and both the stored
+ * key before and after are drawn from the finitely many keys the finitely
+ * many distinct values V can ever take -- at most 2|V| of them, since each
+ * value realises at most two.  So each group updates at most 2|V| times and
+ * the whole reduction at most 2|G||V| times.  Finite, therefore terminating,
+ * without assuming the intern table holds still.
+ */
+static inline bool
+col_agg_better(wirelog_agg_fn_t fn, wl_plan_agg_operand_t domain,
+    const wl_intern_t *intern, int64_t cand, int64_t cur)
+{
+    bool want_max = (fn == WIRELOG_AGG_MAX);
+
+    if (domain == WL_PLAN_AGG_OPERAND_STRING) {
+        const char *a = wl_intern_reverse(intern, cand);
+        const char *b = wl_intern_reverse(intern, cur);
+        if (a && b) {
+            int c = strcmp(a, b);
+            return want_max ? c > 0 : c < 0;
+        }
+        /* At most one of the two names a string.  Prefer it -- see the
+         * termination note above; this is the step that must not depend on
+         * which direction the aggregate runs. */
+        if (a || b)
+            return a != NULL;
+        /* Neither: fall through to the int64 comparison. */
+    }
+
+    return want_max ? cand > cur : cand < cur;
+}
+
 /** Copy row src_row to dst_row within the same relation.
  *  Column-major: each column copy is independent, no temp buffer needed. */
 static inline void

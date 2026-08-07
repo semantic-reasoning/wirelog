@@ -42,6 +42,37 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`min()`/`max()` over a symbol column compare strings, not intern ids**
+  (#965): both reduced over the raw `int64`, which for a `symbol` column is
+  its interned id. Ids are handed out in first-appearance order, so
+  prepending one unrelated fact that claimed the lower ids flipped
+  `min(v)` from `"zz"` to `"aa"` with no change to the data being reduced.
+  #962 fixed this class for `<`/`>`/`<=`/`>=`; this is the aggregate half,
+  and it applies to both reducers -- `col_op_reduce()` and the
+  recursive-aggregate canonicalisation, which flipped independently at
+  every worker count.
+
+  The plan's REDUCE operator now carries the operand's value domain,
+  derived at lowering time from `expr_result_type()` -- a bare column
+  lookup would not do, since `min(to_upper(v))` reduces a runtime-interned
+  id belonging to no column. An internal opcode in the manner of #962's
+  `WL_PLAN_EXPR_CMP_STR_*` was the other candidate and would have been
+  equally non-public; it was rejected because `col_op_reduce()` already
+  dispatches on `op->agg_fn`, so an opcode would be a second source of
+  truth for the same decision rather than a refinement of it.
+
+  Following #963, a column declared `symbol` whose values were never
+  interned is reported rather than failed closed: it still reduces
+  numerically, which is the right answer for numeric data, and erroring
+  out would turn programs that work today into no output at all. Where a
+  group mixes interned and un-interned values the interned ones win, for
+  `min` and `max` alike.  That rule is a correctness choice, not a
+  termination one: the intern table grows *during* evaluation, so
+  "reversible" is a property of the value and the table, not of the value
+  alone.  Termination holds either way -- the table only grows, so between
+  two of its sizes the comparator is a fixed total order and each group's
+  stored value strictly improves.
+
 - **`uuid5()` framing carries the operand's type, not only its length**
   (#968): #963 length-prefixed each operand of the three symbol-bearing
   `uuid5` opcodes, which fixed the split point but not the *domain*. Two

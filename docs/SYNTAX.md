@@ -343,6 +343,19 @@ sorts event names alphabetically when `Event` is declared
 `=` and `!=` are type-independent: symbols are interned canonically — one
 id per distinct string — so id equality already is string equality.
 
+The ordering **aggregates** `min()` and `max()` follow the same rule from
+the same declared types, so `min(Name)` over a `symbol` column is the
+alphabetically smallest name and not whichever was interned first.
+
+Two of the paragraphs below read differently for aggregates. The
+mixed-operand rule does not apply at all -- an aggregate compares values
+drawn from one column, not two operands of different types. Where such a
+column holds both interned and un-interned values, the interned ones win,
+for `min` and `max` alike; that is the opposite of the ordering
+comparisons, which fall back to comparing ids. And the undeclared-column
+report is emitted once per aggregate at plan generation rather than per
+comparison, so `WL_LOG=EVAL:2` names the aggregate, not each row.
+
 **Undeclared columns compare by intern id.** Symbols are stored as
 interned integer ids, and ids are assigned in the order strings are first
 encountered. When a column has no declared type — the relation has no
