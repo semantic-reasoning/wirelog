@@ -73,6 +73,42 @@ All notable changes to wirelog are documented in this file.
   two of its sizes the comparator is a fixed total order and each group's
   stored value strictly improves.
 
+- **Rule heads with more than one aggregate are rejected instead of
+  miscompiled** (#973): `t(g, min(v), max(v)) :- val(g, v).` kept only the
+  last aggregate and emitted a two-column tuple against a three-column
+  `.decl`. Outside a recursive stratum that was a wrong answer with exit
+  status 0 and no diagnostic; **inside** one it was a segfault -- the
+  columnar REDUCE path sizes its output region from the emitted arity while
+  the append path reads the declared arity, so evaluation walked off the end
+  of the region. Such rules now fail to lower, surfacing as
+  `WIRELOG_ERR_PARSE`, with a `PARSER`-section `WL_LOG` error naming the fix
+  (derive each aggregate in its own rule and join them).
+
+  `wirelog_parse_string()` now calls `wl_log_init()` before parsing, so
+  `WL_LOG=PARSER:1` surfaces that message and the other lowering rejections
+  (`__graph_metadata` arity, unsafe variables). Previously the logger was
+  initialized only in plan generation and session creation, both of which run
+  after parsing, so no `WL_LOG` value could reach a lowering diagnostic.
+  Default output is unchanged; a user who sets nothing still sees only
+  `Parse error`, which is #979.
+
+  **Compatibility:** programs that previously loaded now fail to load. This
+  is not limited to wrong-arity results — `t(g, min(v), max(v))` against a
+  *two*-column `.decl t(g, a)` emitted a correctly-sized two-column relation,
+  exit status 0, and is now rejected as well. The rejection is intentional in
+  both cases: the previous result was not correct for any reading of the
+  rule, whether or not its arity happened to match.
+
+  **This does not close the whole crash class.** The underlying trigger is
+  emitted arity differing from declared arity inside a recursive stratum, and
+  multiple aggregates are only one way to produce it. A *single*-aggregate
+  head with too few arguments -- `cc(y, min(c)) :- cc(x, c, d), edge(x, y).`
+  against a three-column `cc` -- still crashes identically and is not caught
+  here. General `.decl`-versus-rule arity validation is tracked as #977; the
+  two fixes are complementary and neither subsumes the other. The check also
+  gates the parser path only: IR built directly through the API is still
+  unvalidated.
+
 - **`uuid5()` framing carries the operand's type, not only its length**
   (#968): #963 length-prefixed each operand of the three symbol-bearing
   `uuid5` opcodes, which fixed the split point but not the *domain*. Two

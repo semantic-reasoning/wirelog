@@ -1768,6 +1768,56 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     if (head->type != WL_PARSER_AST_NODE_HEAD)
         return NULL;
 
+    /* Issue #973: at most one aggregate per rule head.  Memory safety, not
+     * just diagnostics.
+     *
+     * The AGGREGATE IR node carries one agg_fn and one agg_expr, so
+     * t(g, min(v), max(v)) has nowhere to put the second aggregate.  Step 5
+     * used to overwrite agg_node per aggregate child and set
+     * group_by_count = non_agg_count, keeping only the last and emitting a
+     * tuple narrower than the .decl.  col_op_reduce() (columnar/ops.c) then
+     * sizes its output region as group_by_count + 1 while col_rel_append_all()
+     * (columnar/relation.c) copies dst->ncols columns from it, unclamped -- an
+     * out-of-bounds read under col_eval_stratum() (columnar/eval.c):
+     *   .decl cc(n:int64, lo:int64, hi:int64)
+     *   cc(y, min(c), max(c)) :- cc(x, c, d), edge(x, y).   -> SIGSEGV
+     *
+     * This check does NOT close that crash class.  The trigger is emitted
+     * arity != declared arity in a recursive stratum; multiple aggregates are
+     * one route to it.  A single-aggregate head is another and still crashes:
+     *   cc(y, min(c)) :- cc(x, c, d), edge(x, y).           -> SIGSEGV
+     * That is issue #977, and neither fix subsumes the other -- a .decl-arity
+     * check passes t(g, min(v), max(v)), which has three textual arguments
+     * against a 3-arity .decl.  See docs/SEMANTICS.md for why this rejects
+     * rather than supports multiple aggregates.
+     *
+     * Counting direct HEAD children suffices because parse_aggregate_expr()
+     * has exactly one caller, parse_head_arg() (parser/parser.c), so an
+     * AGGREGATE node can only ever be a direct top-level head argument.
+     * The check precedes the first allocation, so return NULL cannot leak.
+     *
+     * Scope: the parser path only.  A caller building a WIRELOG_IR_AGGREGATE
+     * node directly still reaches the crash -- neither wirelog_optimize(),
+     * wl_plan_from_program() nor the columnar REDUCE validates that
+     * group_by_count + 1 matches the head arity.  Nor does this constrain
+     * aggregate *position*: t(min(v), g) emits group-by-first regardless of
+     * how it was written (issue #980). */
+    uint32_t head_agg_count = 0;
+    for (uint32_t i = 0; i < head->child_count; i++) {
+        if (head->children[i]->type == WL_PARSER_AST_NODE_AGGREGATE)
+            head_agg_count++;
+    }
+    if (head_agg_count > 1) {
+        WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+            "relation '%s' has %u aggregates in one rule head; at most one is "
+            "supported. Derive each aggregate in its own rule and join the "
+            "results (e.g. tmin(g, min(v)) :- val(g, v); "
+            "tmax(g, max(v)) :- val(g, v); "
+            "t(g, a, b) :- tmin(g, a), tmax(g, b))",
+            head->name ? head->name : "?", head_agg_count);
+        return NULL;
+    }
+
     uint32_t body_count = rule_node->child_count - 1;
 
     /* ---- Step 1: Collect positive atoms -> SCANs ---- */

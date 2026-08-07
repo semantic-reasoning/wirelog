@@ -21,6 +21,7 @@
 #include "program.h"
 #include "stratify.h"
 #include "../parser/parser.h"
+#include "../util/log.h"
 #include "../wirelog-parser.h"
 
 #include <stdlib.h>
@@ -33,11 +34,42 @@
 wirelog_program_t *
 wirelog_parse_string(const char *program_text, wirelog_error_t *error)
 {
+    /* Issue #973: the post-parse stages below reject some programs and explain
+     * why through WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR, ...) -- the
+     * __graph_metadata arity guard, the #920 unsafe-variable check, and the
+     * one-aggregate-per-head check, all in ir/program.c.  Until now none of
+     * those messages could reach anyone: wl_log_thresholds is a zero-init
+     * global read only by wl_log_init(), whose two call sites
+     * (exec_plan_gen.c, columnar/session.c) both run strictly after parsing,
+     * so the process returned before the logger existed and no WL_LOG value
+     * could help.  Initializing here makes WL_LOG=PARSER:1 actually work.
+     *
+     * This does not change default output -- the gate is LVL <= threshold and
+     * the default WL_LOG_NONE (0) still suppresses WL_LOG_ERROR (1).  A user
+     * who sets nothing still sees only "Parse error" from cli/driver.c; giving
+     * them a message by default requires surfacing the errbuf below, which is
+     * issue #979.  This is the opt-in half of that.
+     *
+     * Thread-safety caveat, and note this is a *new* exposure rather than
+     * purely an inherited one.  wl_log_init() fcloses the old sink, NULLs it
+     * and memsets the thresholds before repopulating, all without a lock.
+     * With WL_LOG_FILE set, a thread parsing here can therefore fclose a
+     * FILE* another thread is mid-fprintf on.  Parsing used to be race-free
+     * against a concurrently logging thread; it no longer is.  (There is no
+     * NULL-sink deref -- wl_log_sink_get_() falls back to stderr.)  Callers
+     * that parse concurrently with evaluation should parse before starting
+     * worker threads, which is already the usual shape.
+     *
+     * Cost: with WL_LOG_FILE set this reopens the sink on every call, so a
+     * caller parsing many programs in a loop pays an fopen+fclose each time.
+     * Unset -- the default -- it is just a threshold recompute. */
     if (!program_text) {
         if (error)
             *error = WIRELOG_ERR_PARSE;
         return NULL;
     }
+
+    wl_log_init();
 
     char errbuf[512] = { 0 };
     wl_parser_ast_node_t *ast
