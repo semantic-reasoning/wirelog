@@ -1083,19 +1083,49 @@ test_integration_hmac_sha256_datalog_rule(void)
 #define XXH3_OF_HMAC_II    5350477797202862412LL  /* msg 1,    key 1      */
 #define XXH3_OF_HMAC_EMPTY_KEY 5217900878614730541LL /* msg "msg", key "" */
 /*
- * uuid5 over symbols returns the first 8 bytes of the tagged SHA-1 of
- * u64le(len(ns)) || ns || u64le(len(name)) || name, as int64.  In Python:
+ * uuid5 over symbols frames each operand as
  *
- *   buf = pack('<Q', len(ns)) + ns + pack('<Q', len(name)) + name
+ *     tag || u64le(len(operand)) || operand
+ *
+ * where tag is 'S' for a symbol's bytes and 'I' for an int64's eight
+ * little-endian bytes, and returns the first 8 bytes of the version-tagged
+ * SHA-1 of the two frames, as int64.  In Python:
+ *
+ *   frame = lambda t, b: t + pack('<Q', len(b)) + b
+ *   buf = frame(b'S', ns) + frame(b'I', pack('<q', name))   # the _SI case
  *   d = bytearray(sha1(buf).digest())
  *   d[6] = (d[6] & 0x0F) | 0x50; d[8] = (d[8] & 0x3F) | 0x80
  *   unpack('<q', bytes(d[:8]))[0]
+ *
+ * Only the three symbol-bearing opcodes frame.  The int64-only opcode
+ * (0x2A) still hashes a bare u64le(ns) || u64le(name), so uuid5(int, int)
+ * keeps every value it has ever returned.
  */
-#define UUID5_SS_AA_ZZ     (-985806390465751602LL)
-#define UUID5_SI_AA_1      6942838433878392903LL
-#define UUID5_IS_1_ZZ      7085806886377378579LL
-#define UUID5_AB_C         (-5235876162600150845LL)
-#define UUID5_A_BC         2187083094203415983LL
+#define UUID5_SS_AA_ZZ     (-551394562050983893LL)
+#define UUID5_SI_AA_1      (-7614036125174443443LL)
+#define UUID5_IS_1_ZZ      (-5165379894741549620LL)
+#define UUID5_AB_C         (-3651962211908811388LL)
+#define UUID5_A_BC         (-1560628122420165596LL)
+/*
+ * The two operand pairs that the domain tag exists to separate.
+ *
+ *   UUID5_SS_EMPTY  uuid5("", "")   -- two empty symbols
+ *   UUID5_II_ZERO   uuid5(0, 0)     -- the 0x2A opcode, value unchanged
+ *
+ * Without the tag both hash sixteen zero bytes: an empty framed pair was
+ * u64le(0) || "" || u64le(0) || "", which is exactly what two zero int64s
+ * concatenate to.
+ *
+ *   UUID5_SS_8BYTE  uuid5("abcdefgh", "x")
+ *   UUID5_IS_8BYTE  uuid5(7523094288207667809, "x")
+ *
+ * 7523094288207667809 is unpack('<q', b"abcdefgh"), so without the tag the
+ * two hash identical bytes however they are length-prefixed.
+ */
+#define UUID5_SS_EMPTY     (-5593758115287104118LL)
+#define UUID5_II_ZERO      6655197997870229985LL
+#define UUID5_SS_8BYTE     1250797450875576375LL
+#define UUID5_IS_8BYTE     4854796543189122013LL
 
 /* Run @src and require exactly one row whose first column is @want. */
 static void
@@ -1119,6 +1149,26 @@ expect_single_value(const char *name, const char *src, int64_t want)
         FAIL(buf);
     }
     PASS();
+}
+
+/*
+ * Run @src and hand back the single value it produced.  Returns 0 on
+ * success.  Unlike expect_single_value() this asserts nothing about the
+ * value, so callers can compare two evaluator results against each other
+ * rather than comparing two compile-time constants -- which is what makes
+ * an inequality test able to fail when the evaluator changes.
+ */
+static int
+eval_single_value(const char *src, int64_t *out)
+{
+    struct result_ctx ctx;
+
+    if (run_program_full(src, &ctx) != 0 || ctx.snapshot_rc != 0)
+        return -1;
+    if (ctx.count != 1)
+        return -1;
+    *out = ctx.col0[0];
+    return 0;
 }
 
 #define SYM_FACT ".decl s(v: symbol)\ns(\"aa\").\n"
@@ -1200,24 +1250,32 @@ test_two_operand_digests_type_each_operand(void)
 }
 
 /*
- * Distinct (namespace, name) pairs produce distinct values.
+ * Distinct typed (namespace, name) pairs produce distinct digest inputs.
  *
  * Giving uuid5() variable-length operands is what makes this possible to
- * get wrong.  A bare concatenation of "ab" + "c" and of "a" + "bc" is the
+ * get wrong, in two independent ways.
+ *
+ * The split.  A bare concatenation of "ab" + "c" and of "a" + "bc" is the
  * same three bytes, so both calls would hash identical input and return one
  * value -- a collision that could not arise while both operands were
- * fixed-width int64s, and which this change would therefore have created
- * rather than exposed.  RFC 4122 does not have the problem because it fixes
- * the namespace at 16 bytes, making the split point unambiguous by
- * construction; wirelog inherited the two-operand signature without that
- * property, so the symbol opcodes length-prefix each operand instead.
+ * fixed-width int64s.  A length prefix per operand fixes it.
  *
- * Both the inequality and the two values are asserted.  The inequality
+ * The type.  A length prefix says nothing about what an operand *is*, so
+ * the symbol "abcdefgh" and the int64 whose eight little-endian bytes spell
+ * it are still the same framed operand.  A one-byte domain tag per operand
+ * -- 'S' or 'I' -- fixes that, and as a side effect separates uuid5("", "")
+ * from uuid5(0, 0), whose framings were both sixteen zero bytes.
+ *
+ * Both the inequalities and the values are asserted.  The inequalities
  * alone would be satisfied by any construction that merely differs, and
  * pinned values alone would not say what property they encode.
  *
- * Unambiguous is still not RFC 4122: the namespace need not be a UUID and
- * only 8 of the 16 bytes are returned.  Those are separate claims.
+ * Unambiguous is still not injective, and not RFC 4122.  The digest input
+ * is one-to-one with the typed operand pair, but only 8 of the 16 digest
+ * bytes are returned and 4 bits of those are overwritten with the version
+ * nibble, so uuid5() has at most 2^60 outputs and collides at scale like
+ * any 60-bit fingerprint.  Separately, the namespace need not be a UUID.
+ * Those are separate claims from the ones tested here.
  */
 static void
 test_uuid5_distinguishes_operand_boundaries(void)
@@ -1235,11 +1293,128 @@ test_uuid5_distinguishes_operand_boundaries(void)
         "r(uuid5(a, b)) :- q(a, b).\n",
         UUID5_A_BC);
 
-    /* Stated as a property too, so a future change to the pinned values
-     * cannot quietly reintroduce the collision. */
+    /*
+     * Stated as a property too.  Comparing the two #defines would be a
+     * preprocessor comparison that no source change can ever falsify, so
+     * re-evaluate both programs instead.
+     */
     TEST("uuid5 operand boundaries are unambiguous");
-    if (UUID5_AB_C == UUID5_A_BC) {
-        FAIL("the two pinned values are equal: the framing is not working");
+    int64_t ab_c = 0, a_bc = 0;
+    if (eval_single_value(
+            ".decl p(a: symbol, b: symbol)\n"
+            "p(\"ab\", \"c\").\n"
+            ".decl r(z: int64)\n"
+            "r(uuid5(a, b)) :- p(a, b).\n", &ab_c) != 0
+        || eval_single_value(
+            ".decl p(a: symbol, b: symbol)\n"
+            "p(\"a\", \"bc\").\n"
+            ".decl r(z: int64)\n"
+            "r(uuid5(a, b)) :- p(a, b).\n", &a_bc) != 0) {
+        FAIL("evaluation failed");
+    } else if (ab_c == a_bc) {
+        FAIL("uuid5(\"ab\",\"c\") still equals uuid5(\"a\",\"bc\")");
+    } else {
+        PASS();
+    }
+}
+
+/*
+ * The operand's *type* is part of the digest input too (Issue #968).
+ *
+ * These are the two pairs that a length prefix alone cannot separate.  Each
+ * is asserted as a value and then as an inequality, so removing the domain
+ * tag fails the property and not only the pin.
+ *
+ * uuid5(0, 0) goes through the int64-only opcode 0x2A, which is deliberately
+ * left unframed and untagged: it is the one uuid5 encoding that has shipped,
+ * and UUID5_II_ZERO is the value it returned before #968.
+ */
+static void
+test_uuid5_distinguishes_operand_types(void)
+{
+    /* Two empty symbols; framed, they were sixteen zero bytes. */
+    static const char *const src_ss_empty =
+        ".decl p(a: symbol, b: symbol)\n"
+        "p(\"\", \"\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(a, b)) :- p(a, b).\n";
+    /* Two zero int64s, via the unframed 0x2A opcode. */
+    static const char *const src_ii_zero =
+        ".decl n(a: int64, b: int64)\n"
+        "n(0, 0).\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(a, b)) :- n(a, b).\n";
+    /* An 8-byte symbol namespace... */
+    static const char *const src_ss_8byte =
+        ".decl p(a: symbol, b: symbol)\n"
+        "p(\"abcdefgh\", \"x\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(a, b)) :- p(a, b).\n";
+    /* ...and the int64 whose little-endian bytes are that same "abcdefgh",
+     * i.e. unpack('<q', b"abcdefgh") == 7523094288207667809. */
+    static const char *const src_is_8byte =
+        ".decl k(b: symbol)\n"
+        "k(\"x\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(7523094288207667809, b)) :- k(b).\n";
+
+    /*
+     * The tag comes from what filt_digest_bytes() actually emitted, not
+     * from the operand's declared type -- and that distinction is the
+     * whole fix.  .decl types are not enforced, so a symbol-declared
+     * column can hold a value that names no interned string; the digest
+     * then falls back to the int64 bytes.  Tagging that 'S' because the
+     * column says symbol would put those bytes back in the symbol domain
+     * and restore the very collision this test pins apart.  Without this
+     * case that mutation passes the entire suite.
+     */
+    static const char *const src_mistyped =
+        ".decl S(s: symbol)\n"
+        "S(7523094288207667809).\n"
+        ".decl k(b: symbol)\n"
+        "k(\"x\").\n"
+        ".decl r(z: int64)\n"
+        "r(uuid5(s, b)) :- S(s), k(b).\n";
+
+    expect_single_value("uuid5(\"\",\"\") tags its empty symbol operands",
+        src_ss_empty, UUID5_SS_EMPTY);
+    expect_single_value("uuid5(0,0) keeps the unframed int64 encoding",
+        src_ii_zero, UUID5_II_ZERO);
+    expect_single_value("uuid5(sym, sym) tags an 8-byte symbol namespace",
+        src_ss_8byte, UUID5_SS_8BYTE);
+    expect_single_value("uuid5(int, sym) tags the int64 namespace",
+        src_is_8byte, UUID5_IS_8BYTE);
+    /* The mistyped column: declared symbol, holding a value that names no
+     * interned string.  It must land in the int64 domain, i.e. agree with
+     * the genuine int64 call above rather than the 8-byte symbol one. */
+    expect_single_value("a symbol column holding an un-interned value is "
+        "tagged int64", src_mistyped, UUID5_IS_8BYTE);
+
+    /*
+     * The same two facts as properties.  These re-evaluate rather than
+     * comparing the pinned macros above: a macro-vs-macro assertion is
+     * decided by the preprocessor and cannot fail however the encoding
+     * changes, so it would not catch the domain tag being dropped.
+     */
+    int64_t ss_empty = 0, ii_zero = 0, ss_8byte = 0, is_8byte = 0;
+
+    TEST("uuid5(\"\",\"\") differs from uuid5(0,0)");
+    if (eval_single_value(src_ss_empty, &ss_empty) != 0
+        || eval_single_value(src_ii_zero, &ii_zero) != 0) {
+        FAIL("evaluation failed");
+    }
+    if (ss_empty == ii_zero) {
+        FAIL("empty symbols and zero int64s hash alike: the tag is missing");
+    }
+    PASS();
+
+    TEST("uuid5(\"abcdefgh\",x) differs from uuid5(<same bytes as int64>,x)");
+    if (eval_single_value(src_ss_8byte, &ss_8byte) != 0
+        || eval_single_value(src_is_8byte, &is_8byte) != 0) {
+        FAIL("evaluation failed");
+    }
+    if (ss_8byte == is_8byte) {
+        FAIL("a symbol and the int64 spelling it hash alike: tag is missing");
     }
     PASS();
 }
@@ -1456,6 +1631,7 @@ main(void)
     test_digests_of_symbol_operands();
     test_two_operand_digests_type_each_operand();
     test_uuid5_distinguishes_operand_boundaries();
+    test_uuid5_distinguishes_operand_types();
 
 #else
     printf("=== wirelog Cryptographic Hash Tests (Issue #73) [mbedTLS "

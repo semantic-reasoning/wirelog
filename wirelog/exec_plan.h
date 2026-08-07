@@ -188,12 +188,21 @@ typedef enum {
      * so each gets three opcodes; the II case keeps the existing opcode.
      * _SS = both symbols, _SI = first symbol, _IS = second symbol.
      *
-     * The UUID5_* opcodes additionally length-prefix each operand (its
-     * length as a little-endian uint64) before hashing, which the 0x2A
-     * opcode does not.  Without it two variable-length operands could be
-     * split at more than one point -- uuid5("ab", "c") and uuid5("a", "bc")
-     * would hash the same bytes.  0x2A's operands are 8 bytes each, so its
-     * split point is fixed and its bytes are unchanged.
+     * The UUID5_* opcodes additionally frame each operand -- a one-byte
+     * domain tag ('S' for a symbol's bytes, 'I' for an int64's) followed by
+     * its length as a little-endian uint64 -- which the 0x2A opcode does
+     * not.  Without the length, two variable-length operands could be split
+     * at more than one point: uuid5("ab", "c") and uuid5("a", "bc") would
+     * hash the same bytes.  Without the tag, an operand's type would not be
+     * recoverable either: uuid5("abcdefgh", x) and uuid5(<the int64 whose
+     * little-endian bytes are "abcdefgh">, x) would hash the same bytes.
+     * 0x2A's two operands are 8 bytes each and both int64, so neither
+     * ambiguity exists there and its bytes are unchanged.
+     *
+     * The framing makes the digest *input* injective over typed operand
+     * pairs.  It does not make uuid5() injective: the return is the first 8
+     * bytes of the digest with a version nibble forced, so at most 2^60
+     * distinct values exist regardless.  See docs/SECURITY_MODEL.md.
      */
     WL_PLAN_EXPR_ARITH_HASH_S        = 0x60, /* unary:  pop 1 push 1 */
     WL_PLAN_EXPR_ARITH_CRC32_ETH_S   = 0x61,
