@@ -702,6 +702,32 @@ expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
 }
 
 /**
+ * Carry an IR column type across into the plan's aggregate operand domain
+ * (Issue #965).
+ *
+ * The two enumerations agree numerically today, and they are deliberately
+ * not cast into one another: wl_ir_coltype_t belongs to the IR (ir/ir.h)
+ * and wl_plan_agg_operand_t to the plan (exec_plan.h), which no IR header
+ * reaches, so a _Static_assert tying them together is not even expressible
+ * at either definition site.  An explicit switch costs nothing, and the
+ * compiler's -Wswitch flags a new IR column type here rather than letting
+ * it arrive in the backend as a silent SCALAR.
+ */
+static wl_plan_agg_operand_t
+agg_operand_from_coltype(wl_ir_coltype_t t)
+{
+    switch (t) {
+    case WL_IR_COLTYPE_SCALAR:
+        return WL_PLAN_AGG_OPERAND_SCALAR;
+    case WL_IR_COLTYPE_STRING:
+        return WL_PLAN_AGG_OPERAND_STRING;
+    case WL_IR_COLTYPE_UNKNOWN:
+        break;
+    }
+    return WL_PLAN_AGG_OPERAND_UNKNOWN;
+}
+
+/**
  * Serialize an IR expression tree into postfix (RPN) byte encoding.
  * Walks the tree recursively: children first (postfix), then operator.
  */
@@ -1488,9 +1514,35 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             }
             int agg_rc = serialize_expr_to_buffer_ctx(node->agg_expr,
                     &agg_ctx, &op->agg_expr);
+            /*
+             * The operand's domain, which is what tells REDUCE whether
+             * MIN/MAX order by number or by string (Issue #965).  It has to
+             * come from expr_result_type() rather than from a column lookup:
+             * min(to_upper(v)) parses and runs, and its operand is a
+             * runtime-interned id belonging to no column at all.
+             */
+            op->agg_operand_type = agg_operand_from_coltype(
+                expr_result_type(node->agg_expr, &agg_ctx));
             col_ctx_free(&agg_ctx);
             if (agg_rc != 0)
                 return -1;
+        }
+
+        /*
+         * Say so once, here, when an ordering aggregate cannot be typed --
+         * matching the ordering-comparison diagnostic of #962 rather than
+         * logging per row.  As there, refusing to lower these would break
+         * programs that work today: undeclared relations have no column
+         * types at all, and min() over an undeclared integer relation
+         * evaluates perfectly well.
+         */
+        if ((op->agg_fn == WIRELOG_AGG_MIN || op->agg_fn == WIRELOG_AGG_MAX)
+            && op->agg_operand_type == WL_PLAN_AGG_OPERAND_UNKNOWN) {
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_WARN,
+                "'%s' over an operand with no established type: reducing by "
+                "interned id, not by string. Declare the relation "
+                "(.decl R(c: symbol)) if the column holds symbols",
+                op->agg_fn == WIRELOG_AGG_MIN ? "min" : "max");
         }
         return 0;
     }
@@ -1924,6 +1976,15 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
     dst->delta_mode = src->delta_mode;
     dst->materialized = src->materialized;
     dst->agg_fn = src->agg_fn;
+    /* Travels with agg_fn.  The join-chain (LFTJ), K-fusion and multiway
+     * rewrites all rebuild a relation's ops through here, so a REDUCE that
+     * loses its operand domain reverts to id ordering for every rule those
+     * passes touch -- in a default build the join-chain rewrite is the one
+     * that shows it: detect_lftj_chain() needs a VARIABLE plus two
+     * consecutive JOINs, so a three-atom body already triggers it
+     * (Issue #965).  The lookup itself is skipped entirely under
+     * K-fusion -- see #975, which is a separate defect. */
+    dst->agg_operand_type = src->agg_operand_type;
     dst->key_count = src->key_count;
     dst->project_count = src->project_count;
     dst->group_by_count = src->group_by_count;

@@ -278,6 +278,29 @@ typedef enum {
     WL_DELTA_FORCE_EMPTY_AFTER_SEED = 4,
 } wl_delta_mode_t;
 
+/**
+ * wl_plan_agg_operand_t:
+ *
+ * The value domain of a REDUCE operator's aggregated operand (Issue #965).
+ *
+ * Every value a plan moves is an int64_t.  What differs is whether MIN/MAX
+ * should order it as a number or as the string whose interned id it is --
+ * ids are assigned in first-appearance order, so ordering symbols by id
+ * makes the answer depend on which unrelated facts happened to be parsed
+ * first.  Only the plan generator knows which of the two a column holds,
+ * because only it has the `.decl` types.
+ *
+ * UNKNOWN is the zero value on purpose.  op_list_push() and clone_plan_op()
+ * both memset() their op before filling it in, so an op that no producer
+ * typed is structurally distinguishable from one deliberately typed
+ * SCALAR, rather than silently claiming to be numeric.
+ */
+typedef enum {
+    WL_PLAN_AGG_OPERAND_UNKNOWN = 0,
+    WL_PLAN_AGG_OPERAND_SCALAR = 1,
+    WL_PLAN_AGG_OPERAND_STRING = 2,
+} wl_plan_agg_operand_t;
+
 /* ======================================================================== */
 /* Operator Types                                                           */
 /* ======================================================================== */
@@ -425,6 +448,13 @@ typedef struct {
     * Placed after opaque_data to avoid shifting hot fields (delta_mode,
     * opaque_data) that were present in the original 136-byte layout. */
     wl_plan_expr_buffer_t right_filter_expr;
+
+    /* REDUCE only: the value domain of the aggregated operand, which is what
+     * decides whether MIN/MAX order by number or by string (Issue #965).
+     * Appended at the end so no existing field shifts.  UNKNOWN on every
+     * other operator, and on a REDUCE whose operand type could not be
+     * established. */
+    wl_plan_agg_operand_t agg_operand_type;
 } wl_plan_op_t;
 
 /* ======================================================================== */
