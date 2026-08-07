@@ -42,6 +42,40 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Inline facts are validated against their relation's declared arity**
+  (#977): `collect_fact` packed `fact_data` using each fact's *own*
+  argument count as the row stride, while both readers of that buffer --
+  `wl_session_load_facts` and the public `wirelog_program_get_facts`, the
+  latter reachable by an embedder with no session at all -- strided by the
+  *declared* `column_count`. Nothing reconciled the two. Depending on which
+  side was wider this produced a heap over-read, an uninitialised read
+  *inside* the allocation that AddressSanitizer cannot see (exit status 0,
+  emitting heap bytes as query answers), or a fabricated tuple: `val(1,5,7).
+  val(2,6,8).` against a two-column `.decl` emitted `t(7,2)`, a pair present
+  in no source fact, and dropped `(6,8)`.
+
+  Such facts are now rejected during metadata collection, reported through
+  `WL_LOG=PARSER:1` with the relation name and both arities, and surfaced as
+  `WIRELOG_ERR_PARSE`. The check runs as a pass after all declarations are
+  collected rather than inside `collect_fact`, because a `.decl` may legally
+  follow its own facts in source order.
+
+  Relations are tracked by a new `has_decl` flag rather than by
+  `column_count > 0`, since `.decl p()` parses and leaves `column_count` at
+  zero; without the flag exactly those relations would be skipped.
+
+  **Compatibility:** programs that previously loaded now fail to load. Every
+  rejected shape was already producing a crash, uninitialised heap, or a
+  fabricated tuple, so nothing correct is lost. One shape worth naming:
+  flattened facts against an inline-compound column -- `p(1,2,3).` against
+  `.decl p(id: int64, lbl: pair/2 inline)` -- were accepted and silently
+  dropped the third value; they are now rejected. Verified across every
+  Datalog program in the tree, including those the benchmarks generate from
+  CSV at runtime: no in-tree program changes behaviour.
+
+  This covers the inline-fact half of #977 only. Rule heads, rule bodies and
+  facts on undeclared relations remain unvalidated.
+
 - **`min()`/`max()` over a symbol column compare strings, not intern ids**
   (#965): both reduced over the raw `int64`, which for a `symbol` column is
   its interned id. Ids are handed out in first-appearance order, so

@@ -385,6 +385,12 @@ collect_decl(struct wirelog_program *prog,
     rel->has_graph_column = false;
     rel->graph_column_index = 0;
 
+    /* Issue #977: record that this relation carries a declared arity.  Set
+     * unconditionally so a second `.decl` for the same relation (#724) is
+     * idempotent -- the flag simply stays true while column_count is
+     * refreshed from the newest declaration below. */
+    rel->has_decl = true;
+
     /* Extract typed params as columns */
     uint32_t col_count = 0;
     for (uint32_t i = 0; i < decl_node->child_count; i++) {
@@ -681,6 +687,71 @@ collect_fact(struct wirelog_program *prog,
     return 0;
 }
 
+/* Issue #977: validate every inline fact against its relation's declared
+ * arity.
+ *
+ * collect_fact() packs fact_data with the *fact's own* child_count as the
+ * row stride, but both readers of that buffer -- wl_session_load_facts()
+ * (session_facts.c) and the public wirelog_program_get_facts() (ir/api.c),
+ * the latter reachable by an embedder with no session at all -- stride by
+ * the *declared* rel->column_count.  (exec_plan_gen.c only tests
+ * fact_data != NULL; it never reads the contents.)  Nothing reconciled the
+ * two, so a mismatch produced, depending on direction:
+ *
+ *   - a heap over-read (fact narrower than the .decl, crashing in
+ *     col_rel_row_copy_in via col_session_insert);
+ *   - an uninitialised read inside the allocation when facts of mixed
+ *     arity left interior slots never written (realloc does not zero);
+ *   - a silently fabricated tuple present in no source fact, plus dropped
+ *     values, when the fact was wider than the .decl.
+ *
+ * This must be a separate pass rather than a check inside collect_fact()
+ * for two reasons.  wl_ir_program_collect_metadata() walks the AST in
+ * source order, so a `.decl` that follows its facts has not been seen when
+ * collect_fact() runs on them; and collect_fact() discards each fact's
+ * arity, leaving only fact_count and a mixed-stride buffer, so the
+ * information is gone by the time the loop ends.  Hence the re-walk.
+ *
+ * Relations with no `.decl` are skipped: undeclared derived heads are
+ * widespread and legitimate (bench/workloads/doop.dl has ~90 of them).  An
+ * undeclared relation that carries facts still fails later at session load
+ * because column_count is 0; that is a separate defect and is deliberately
+ * left unchanged here.  The guard keys off has_decl rather than
+ * `column_count > 0` because `.decl p()` parses and leaves column_count
+ * == 0, and those relations must be checked, not skipped. */
+static int
+validate_fact_arities(const struct wirelog_program *program,
+    const wl_parser_ast_node_t *ast)
+{
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        const wl_parser_ast_node_t *node = ast->children[i];
+        if (node->type != WL_PARSER_AST_NODE_FACT || !node->name)
+            continue;
+
+        const wl_ir_relation_info_t *rel = NULL;
+        for (uint32_t r = 0; r < program->relation_count; r++) {
+            if (program->relations[r].name
+                && strcmp(program->relations[r].name, node->name) == 0) {
+                rel = &program->relations[r];
+                break;
+            }
+        }
+        if (!rel || !rel->has_decl)
+            continue;
+
+        if (node->child_count != rel->column_count) {
+            WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                "fact for relation '%s' has %u argument(s) but '%s' is"
+                " declared with %u column(s) (line %u)",
+                rel->name, node->child_count, rel->name, rel->column_count,
+                node->line);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -723,7 +794,9 @@ wl_ir_program_collect_metadata(struct wirelog_program *program,
             return rc;
     }
 
-    return 0;
+    /* Issue #977: run after the loop so that every `.decl` in the program
+    * has been seen, regardless of where it sits relative to its facts. */
+    return validate_fact_arities(program, ast);
 }
 
 /* ======================================================================== */

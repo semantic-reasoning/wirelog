@@ -108,12 +108,90 @@ test_static_fact_joins_with_host_insert(void)
     return rc;
 }
 
+/* T3 (issue #977): inline facts whose arity matches the .decl must still
+ *     evaluate to exactly the source tuples -- values, not just row counts.
+ *
+ *     This is the positive control for the fact-arity validation pass added
+ *     in wl_ir_program_collect_metadata().  The pass rejects arity
+ *     mismatches at parse time; this asserts it did not disturb the
+ *     matching case.  Value equality matters here because the pre-fix
+ *     wider-fact bug (val(1,5,7). against .decl val/2) evaluated cleanly
+ *     with exit 0 while emitting t(7,2) -- a tuple present in no source
+ *     fact -- and dropping (6,8).  A row-count-only assertion would not
+ *     have caught that: the row count was right. */
+struct pair_state {
+    uint32_t rows;
+    int64_t seen[8][2];
+};
+
+static void
+collect_pairs(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    (void)relation;
+    struct pair_state *st = (struct pair_state *)user_data;
+    if (ncols != 2 || st->rows >= 8) {
+        st->rows = 0xFFFFFFFFu;
+        return;
+    }
+    st->seen[st->rows][0] = row[0];
+    st->seen[st->rows][1] = row[1];
+    st->rows++;
+}
+
+static int
+has_pair(const struct pair_state *st, int64_t a, int64_t b)
+{
+    for (uint32_t i = 0; i < st->rows; i++) {
+        if (st->seen[i][0] == a && st->seen[i][1] == b)
+            return 1;
+    }
+    return 0;
+}
+
+static int
+test_matching_arity_facts_evaluate_exactly(void)
+{
+    static const char *src = ".decl val(g: int32, v: int32)\n"
+        ".decl t(x: int32, y: int32)\n"
+        "val(1, 5).\n"
+        "val(2, 6).\n"
+        "t(x, y) :- val(x, y).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(src, &s);
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T3 open err=%d\n", err);
+        return 1;
+    }
+
+    struct pair_state st = { 0, { { 0, 0 } } };
+    err = wirelog_easy_snapshot(s, "t", collect_pairs, &st);
+    int rc = 0;
+    if (err != WIRELOG_OK) {
+        fprintf(stderr, "T3 snapshot err=%d\n", err);
+        rc = 1;
+    } else if (st.rows != 2) {
+        fprintf(stderr, "T3: expected 2 t rows, got %u\n", st.rows);
+        rc = 1;
+    } else if (!has_pair(&st, 1, 5) || !has_pair(&st, 2, 6)) {
+        fprintf(stderr, "T3: expected exactly t(1,5) and t(2,6), got "
+            "t(%lld,%lld) and t(%lld,%lld)\n",
+            (long long)st.seen[0][0], (long long)st.seen[0][1],
+            (long long)st.seen[1][0], (long long)st.seen[1][1]);
+        rc = 1;
+    }
+    wirelog_easy_close(s);
+    return rc;
+}
+
 int
 main(void)
 {
     int failures = 0;
     failures += test_static_fact_drives_idb_snapshot();
     failures += test_static_fact_joins_with_host_insert();
+    failures += test_matching_arity_facts_evaluate_exactly();
     if (failures == 0)
         printf("test_wl_easy_inline_facts: OK\n");
     else
