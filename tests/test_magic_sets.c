@@ -38,22 +38,22 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Helper: check if a magic relation exists in the program                 */
@@ -119,11 +119,11 @@ test_adornment_basic(void)
      *   - Edge is EDB -> skip
      */
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Reach(x: int32, y: int32)\n"
-                      ".decl Out(x: int32)\n"
-                      ".output Out\n"
-                      "Reach(x, y) :- Edge(x, y).\n"
-                      "Out(x) :- Reach(x, y).\n";
+        ".decl Reach(x: int32, y: int32)\n"
+        ".decl Out(x: int32)\n"
+        ".output Out\n"
+        "Reach(x, y) :- Edge(x, y).\n"
+        "Out(x) :- Reach(x, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -191,10 +191,10 @@ test_adornment_recursive(void)
      *   -> adorned_predicates = 1 (only Path_bf)
      */
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Path(x: int32, y: int32)\n"
-                      ".output Path\n"
-                      "Path(x, y) :- Edge(x, y).\n"
-                      "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+        ".decl Path(x: int32, y: int32)\n"
+        ".output Path\n"
+        "Path(x, y) :- Edge(x, y).\n"
+        "Path(x, y) :- Edge(x, z), Path(z, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -226,7 +226,7 @@ test_adornment_recursive(void)
     if (stats.adorned_predicates != 1) {
         char msg[64];
         snprintf(msg, sizeof(msg), "expected adorned_predicates=1, got %u",
-                 stats.adorned_predicates);
+            stats.adorned_predicates);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -253,10 +253,10 @@ test_magic_rule_generation(void)
      *   Demand rule: $m$Path_bf(z) :- $m$Path_bf(x), Edge(x, z).
      */
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Path(x: int32, y: int32)\n"
-                      ".output Path\n"
-                      "Path(x, y) :- Edge(x, y).\n"
-                      "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+        ".decl Path(x: int32, y: int32)\n"
+        ".output Path\n"
+        "Path(x, y) :- Edge(x, y).\n"
+        "Path(x, y) :- Edge(x, z), Path(z, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -295,7 +295,7 @@ test_magic_rule_generation(void)
     if (stats.original_rules_modified != 2) {
         char msg[64];
         snprintf(msg, sizeof(msg), "expected original_rules_modified=2, got %u",
-                 stats.original_rules_modified);
+            stats.original_rules_modified);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -316,10 +316,10 @@ test_all_free_skip(void)
     TEST("test_all_free_skip");
 
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Path(x: int32, y: int32)\n"
-                      ".output Path\n"
-                      "Path(x, y) :- Edge(x, y).\n"
-                      "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+        ".decl Path(x: int32, y: int32)\n"
+        ".output Path\n"
+        "Path(x, y) :- Edge(x, y).\n"
+        "Path(x, y) :- Edge(x, z), Path(z, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -351,7 +351,7 @@ test_all_free_skip(void)
     if (stats.adorned_predicates != 0) {
         char msg[64];
         snprintf(msg, sizeof(msg), "expected adorned_predicates=0, got %u",
-                 stats.adorned_predicates);
+            stats.adorned_predicates);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -389,12 +389,12 @@ test_negation_no_demand(void)
      *   -> NO magic relation for Exclude.
      */
     const char *src = ".decl Base(x: int32)\n"
-                      ".decl BadBase(x: int32)\n"
-                      ".decl Exclude(x: int32)\n"
-                      ".decl IDB(x: int32)\n"
-                      ".output IDB\n"
-                      "Exclude(x) :- BadBase(x).\n"
-                      "IDB(x) :- Base(x), !Exclude(x).\n";
+        ".decl BadBase(x: int32)\n"
+        ".decl Exclude(x: int32)\n"
+        ".decl IDB(x: int32)\n"
+        ".output IDB\n"
+        "Exclude(x) :- BadBase(x).\n"
+        "IDB(x) :- Base(x), !Exclude(x).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -419,7 +419,7 @@ test_negation_no_demand(void)
     if (has_relation(prog, "$m$Exclude_b")) {
         wirelog_program_free(prog);
         FAIL("demand must not flow through negation: $m$Exclude_b should not "
-             "exist");
+            "exist");
         return;
     }
 
@@ -452,11 +452,11 @@ test_multiple_adornments(void)
      *   -> adorned: {A_bf, B_bf}
      */
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl A(x: int32, y: int32)\n"
-                      ".decl B(x: int32, y: int32)\n"
-                      ".output A\n"
-                      "A(x, y) :- Edge(x, z), B(z, y).\n"
-                      "B(x, y) :- Edge(y, z), A(z, x).\n";
+        ".decl A(x: int32, y: int32)\n"
+        ".decl B(x: int32, y: int32)\n"
+        ".output A\n"
+        "A(x, y) :- Edge(x, z), B(z, y).\n"
+        "B(x, y) :- Edge(y, z), A(z, x).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -483,7 +483,7 @@ test_multiple_adornments(void)
     if (!has_a_magic || !has_b_magic) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected $m$A_bf=%s $m$B_bf=%s",
-                 has_a_magic ? "yes" : "NO", has_b_magic ? "yes" : "NO");
+            has_a_magic ? "yes" : "NO", has_b_magic ? "yes" : "NO");
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -494,7 +494,7 @@ test_multiple_adornments(void)
     if (stats.adorned_predicates < 2) {
         char msg[64];
         snprintf(msg, sizeof(msg), "expected adorned_predicates>=2, got %u",
-                 stats.adorned_predicates);
+            stats.adorned_predicates);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -528,11 +528,11 @@ test_mutual_recursion(void)
      *   -> adorned: {VPT_bf}
      */
     const char *src = ".decl Assign(v: int32, h: int32)\n"
-                      ".decl Load(u: int32, v: int32)\n"
-                      ".decl VPT(h: int32, v: int32)\n"
-                      ".output VPT\n"
-                      "VPT(h, v) :- Assign(v, h).\n"
-                      "VPT(h, v) :- VPT(h, u), Load(u, v).\n";
+        ".decl Load(u: int32, v: int32)\n"
+        ".decl VPT(h: int32, v: int32)\n"
+        ".output VPT\n"
+        "VPT(h, v) :- Assign(v, h).\n"
+        "VPT(h, v) :- VPT(h, u), Load(u, v).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -563,7 +563,7 @@ test_mutual_recursion(void)
     if (stats.original_rules_modified != 2) {
         char msg[64];
         snprintf(msg, sizeof(msg), "expected original_rules_modified=2, got %u",
-                 stats.original_rules_modified);
+            stats.original_rules_modified);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -592,10 +592,10 @@ test_edb_skip(void)
      *   Edge: EDB -> no $m$Edge_XX created.
      */
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Path(x: int32, y: int32)\n"
-                      ".output Path\n"
-                      "Path(x, y) :- Edge(x, y).\n"
-                      "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+        ".decl Path(x: int32, y: int32)\n"
+        ".output Path\n"
+        "Path(x, y) :- Edge(x, y).\n"
+        "Path(x, y) :- Edge(x, z), Path(z, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -647,10 +647,10 @@ test_standard_apply_noop(void)
     TEST("test_standard_apply_noop");
 
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Path(x: int32, y: int32)\n"
-                      ".output Path\n"
-                      "Path(x, y) :- Edge(x, y).\n"
-                      "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+        ".decl Path(x: int32, y: int32)\n"
+        ".output Path\n"
+        "Path(x, y) :- Edge(x, y).\n"
+        "Path(x, y) :- Edge(x, z), Path(z, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -673,7 +673,7 @@ test_standard_apply_noop(void)
     if (prog->rule_count != rule_count_before) {
         char msg[64];
         snprintf(msg, sizeof(msg), "rule count changed: before=%u after=%u",
-                 rule_count_before, prog->rule_count);
+            rule_count_before, prog->rule_count);
         wirelog_program_free(prog);
         FAIL(msg);
         return;
@@ -709,12 +709,12 @@ test_magic_correctness_noop(void)
      * Verify no crash and program still stratified.
      */
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Path(x: int32, y: int32)\n"
-                      ".output Path\n"
-                      "Edge(1, 2).\n"
-                      "Edge(2, 3).\n"
-                      "Path(x, y) :- Edge(x, y).\n"
-                      "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+        ".decl Path(x: int32, y: int32)\n"
+        ".output Path\n"
+        "Edge(1, 2).\n"
+        "Edge(2, 3).\n"
+        "Path(x, y) :- Edge(x, y).\n"
+        "Path(x, y) :- Edge(x, z), Path(z, y).\n";
 
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -757,10 +757,10 @@ test_magic_rebuild_and_stratify(void)
     TEST("test_magic_rebuild_and_stratify (integration)");
 
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-                      ".decl Path(x: int32, y: int32)\n"
-                      ".output Path\n"
-                      "Path(x, y) :- Edge(x, y).\n"
-                      "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+        ".decl Path(x: int32, y: int32)\n"
+        ".output Path\n"
+        "Path(x, y) :- Edge(x, y).\n"
+        "Path(x, y) :- Edge(x, z), Path(z, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -819,6 +819,98 @@ test_magic_rebuild_and_stratify(void)
     PASS();
 }
 
+/* Issue #987: re-stratification after magic sets wrote past the end of a
+ * stratum's rule_names array.
+ *
+ * wl_ir_stratify_program() sizes strata[s].rule_names from a counting loop
+ * that skips rules whose head is absent from the dependency graph, then
+ * filled it from a loop that did not skip them -- a skipped rule keeps
+ * rule_stratum[r] == 0 from calloc and landed in stratum 0 regardless.
+ * Magic-set rewriting manufactures those graph-absent heads because it
+ * names demand relations from an atom's physical width while get_arity()
+ * reports the declared logical width.
+ *
+ * The write is out of bounds.  One offending rule overwrites allocator
+ * slack and is silent without a sanitizer; several corrupt the glibc heap
+ * outright ("double free or corruption", "malloc(): corrupted top size"),
+ * so this test uses several deliberately -- a single-rule version would
+ * pass on the unfixed code in an ordinary build.
+ *
+ * All three shapes below crash on the unfixed code, and none is caught by
+ * the #977 arity checks: the first has a correct head and a wrong body, the
+ * second is undeclared so has_decl skips it, and in the third every atom
+ * already measures at the correct physical width. */
+static void
+test_stratify_no_oob_on_graph_absent_head(void)
+{
+    TEST("Magic sets: re-stratification stays in bounds (#987)");
+
+    static const char *const srcs[] = {
+        /* declared, body atom wider than the .decl, several rules */
+        ".decl edge(a: int64, b: int64)\n"
+        ".decl path(a: int64, b: int64)\n"
+        "path(x,z) :- path(x,y,q1), edge(y,z).\n"
+        "path(x,z) :- path(x,y,q2), edge(y,z).\n"
+        "path(x,z) :- path(x,y,q3), edge(y,z).\n"
+        "path(x,z) :- path(x,y,q4), edge(y,z).\n",
+        /* undeclared head relation -- has_decl gates the #977 checks off */
+        ".decl edge(a: int64, b: int64)\n"
+        "edge(1,2).\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y,q1), edge(y,z).\n"
+        "path(x,z) :- path(x,y,q2), edge(y,z).\n"
+        "path(x,z) :- path(x,y,q3), edge(y,z).\n",
+    };
+
+    for (size_t i = 0; i < sizeof(srcs) / sizeof(srcs[0]); i++) {
+        wirelog_error_t err;
+        wirelog_program_t *prog = wirelog_parse_string(srcs[i], &err);
+        if (!prog)
+            continue; /* rejected earlier by an arity check: also fine */
+
+        wl_magic_demand_t demands[1];
+        demands[0].relation_name = "path";
+        demands[0].bound_mask = 0x1;
+        demands[0].arity = 2;
+
+        if (wl_magic_sets_apply_with_demands(prog, demands, 1, NULL) != 0) {
+            wirelog_program_free(prog);
+            continue;
+        }
+        if (wl_ir_program_rebuild_relation_irs(prog) != 0) {
+            wirelog_program_free(prog);
+            FAIL("rebuild_relation_irs failed");
+            return;
+        }
+
+        wl_ir_program_free_strata(prog);
+        if (wl_ir_stratify_program(prog) != 0) {
+            wirelog_program_free(prog);
+            FAIL("re-stratification failed");
+            return;
+        }
+
+        /* Every stratum must have filled exactly as many names as it
+         * declares, and no NULL may remain -- a short fill is the
+         * non-sanitizer-visible half of the same loop disagreement. */
+        for (uint32_t s = 0; s < prog->stratum_count; s++) {
+            if (!prog->strata[s].rule_names)
+                continue;
+            for (uint32_t k = 0; k < prog->strata[s].rule_count; k++) {
+                if (!prog->strata[s].rule_names[k]) {
+                    wirelog_program_free(prog);
+                    FAIL("stratum rule_names shorter than rule_count");
+                    return;
+                }
+            }
+        }
+
+        wirelog_program_free(prog);
+    }
+
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -842,6 +934,7 @@ main(void)
     printf("\nIntegration Tests:\n");
     test_magic_correctness_noop();
     test_magic_rebuild_and_stratify();
+    test_stratify_no_oob_on_graph_absent_head();
 
     printf("\n=== Results ===\n");
     printf("Tests run:    %d\n", tests_run);

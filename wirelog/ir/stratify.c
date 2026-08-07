@@ -562,11 +562,29 @@ wl_ir_stratify_program(struct wirelog_program *program)
         return -1;
     }
 
+    /* Issue #987: the fill must honour the same bound the counting loop
+     * above established.  That loop only counts a rule when its head is
+     * found in the dependency graph; a rule whose head is absent keeps
+     * rule_stratum[r] == 0 from calloc and would otherwise be written into
+     * stratum 0 anyway -- past the end of an array sized without it.  That
+     * is an out-of-bounds *write*, and with more than one such rule it
+     * corrupts the glibc heap in a plain release build.
+     *
+     * Magic-set rewriting manufactures those graph-absent heads: it names
+     * demand relations from an atom's physical width while get_arity()
+     * reports the declared logical width (passes/magic_sets.c), so the
+     * rewritten head can carry a name no relation in the graph matches.
+     * Fixing that confusion is tracked separately; this bound is correct
+     * regardless of how a head comes to be missing.
+     *
+     * rules_per_stratum[] is also what :rule_count is set from below, so
+     * the two loops have to agree here even setting memory safety aside. */
     for (uint32_t r = 0; r < program->rule_count; r++) {
         if (!program->rules[r].head_relation)
             continue;
         uint32_t s = rule_stratum[r];
-        if (s < num_strata && program->strata[s].rule_names) {
+        if (s < num_strata && program->strata[s].rule_names
+            && fill_idx[s] < rules_per_stratum[s]) {
             program->strata[s].rule_names[fill_idx[s]++]
                 = program->rules[r].head_relation;
         }
