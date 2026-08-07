@@ -82,6 +82,41 @@ relied on for collision resistance at scale. `uuid4()` and
 `uuid5(namespace, name)` return the first 8 UUID bytes as an `int64`;
 `uuid5()` is not RFC 4122 (see `docs/SYNTAX.md`).
 
+**The digest built-ins do not separate operand domains.** A `symbol`
+operand contributes its own bytes and an `int64` operand contributes its
+8-byte little-endian representation, with nothing recording which of the
+two it was. A symbol whose bytes coincide with an `int64`'s therefore
+digests identically to that integer:
+
+```
+hash("abcdefgh")  ==  hash(7523094288207667809)
+```
+
+This is the documented behaviour, not a defect, and it is not being
+fixed. It falls out of the byte-transparency contract from #963 — the
+whole point of digesting a symbol's own bytes is that
+`printf '%s' abcdefgh | xxhsum -H3` reproduces `hash("abcdefgh")`, which
+leaves no room for a type tag in the digest input. It applies to every
+single-operand digest — `hash()`, `crc32_ethernet()`,
+`crc32_castagnoli()`, `md5()`, `sha1()`, `sha256()`, `sha512()`
+(the first three are available in every build) — and to both operands of
+`hmac_sha256(msg, key)`. If a relation mixes typed operands and the
+distinction matters, digest a value that carries the type, or key the
+relation on the type as well.
+
+Note that this is a *separate* caveat from the 64-bit fold above. That
+one is a birthday bound: collisions exist but cost work to find. This
+one is constructible at zero cost by anyone who can choose an operand.
+
+`uuid5()` is the one exception. Its symbol-bearing opcodes prefix each
+operand with a one-byte domain tag and its length (#968), so
+`uuid5("abcdefgh", x)` and `uuid5(7523094288207667809, x)` differ. That
+buys an unambiguous *digest input* and nothing more: the return value is
+the first 8 digest bytes with 4 bits overwritten by the version nibble,
+so `uuid5()` has at most 2^60 distinct outputs and is subject to the
+same birthday bound as everything else here. Injective encoding is not
+collision-free output.
+
 These functions become callable as Datalog built-ins; the host has no
 control over whether a `.dl` program calls them once mbedTLS is
 linked in.

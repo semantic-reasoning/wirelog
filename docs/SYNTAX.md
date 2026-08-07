@@ -234,6 +234,15 @@ required — 64 bits is not collision-resistant at scale.
 operands independently, so `hmac_sha256(sym, 42)` keys the HMAC with the
 8 bytes of `42` and messages it with the symbol's bytes.
 
+**Nothing records which of the two forms was used**, so a symbol whose
+bytes coincide with an `int64`'s digests identically to that integer:
+`hash("abcdefgh") == hash(7523094288207667809)`. That is the price of
+the byte transparency above — a type tag in the digest input is exactly
+what would stop `printf '%s' abcdefgh | xxhsum -H3` from reproducing
+`hash("abcdefgh")` — and it is not being changed. `uuid5()` is the one
+exception; see below. `docs/SECURITY_MODEL.md` states the caveat in
+full.
+
 **The guarantee is only as good as the `.decl`.** Column types are not
 enforced: a column declared `symbol` that actually holds integers which
 were never interned digests their `int64` representation instead — the
@@ -266,23 +275,32 @@ return the first 8 UUID bytes as an `int64`, not formatted text.
 Disabled UUID calls follow the same fail-closed behavior described for
 crypto hash functions.
 
-**Operand boundaries are unambiguous.** With a `symbol` operand,
-`uuid5()` length-prefixes each operand before hashing — the length as a
-little-endian `uint64` — so distinct `(namespace, name)` pairs always
-hash distinct bytes:
+**Operands are framed, so the digest input is unambiguous.** With a
+`symbol` operand, `uuid5()` prefixes each operand with a one-byte domain
+tag — `'S'` for a symbol's bytes, `'I'` for an `int64`'s eight
+little-endian bytes — and then its length as a little-endian `uint64`.
+Distinct `(namespace, name)` pairs therefore always hash distinct bytes,
+whether they differ in where they split or in what they are:
 
 ```
-uuid5("ab", "c")  !=  uuid5("a", "bc")
+uuid5("ab", "c")       !=  uuid5("a", "bc")
+uuid5("abcdefgh", "x") !=  uuid5(7523094288207667809, "x")
 ```
 
-A bare concatenation could not promise that: `"ab" + "c"` and
-`"a" + "bc"` are the same three bytes. RFC 4122 sidesteps the question
-by fixing the namespace at 16 bytes, making the split point unambiguous
-by construction; wirelog adopted the two-operand signature without that
-property, so it makes the framing explicit instead. In Python:
+Neither holds for a bare concatenation: `"ab" + "c"` and `"a" + "bc"`
+are the same three bytes, and `7523094288207667809` is exactly the
+`int64` whose little-endian bytes are `abcdefgh`. The length settles the
+first, the tag the second. RFC 4122 sidesteps both by fixing the
+namespace at 16 bytes of one type; wirelog adopted the two-operand
+signature without that property, so it makes the framing explicit
+instead. In Python:
 
 ```python
-buf = pack('<Q', len(ns)) + ns + pack('<Q', len(name)) + name
+frame = lambda tag, b: tag + pack('<Q', len(b)) + b
+
+buf = frame(b'S', ns) + frame(b'S', name)      # uuid5(symbol, symbol)
+# frame(b'I', pack('<q', v)) for an int64 operand
+
 d = bytearray(sha1(buf).digest())
 d[6] = (d[6] & 0x0F) | 0x50
 d[8] = (d[8] & 0x3F) | 0x80
@@ -290,8 +308,15 @@ value = unpack('<q', bytes(d[:8]))[0]
 ```
 
 `uuid5(int64, int64)` keeps the older unframed `SHA-1(ns || name)` — its
-operands are 8 bytes each, so its split point is already fixed and its
-values are unchanged.
+operands are 8 bytes each and both `int64`, so neither ambiguity can
+arise and its values are unchanged.
+
+**Unambiguous input is not a collision-free output.** The framing makes
+the bytes fed to SHA-1 one-to-one with the typed operand pair. It says
+nothing about the return value, which is the first 8 of the 16 digest
+bytes with 4 bits overwritten by the version nibble: at most 2^60
+distinct results exist, so `uuid5()` collides at scale like any 60-bit
+fingerprint. See `docs/SECURITY_MODEL.md`.
 
 **`uuid5()` is still not RFC 4122**, and being unambiguous does not make
 it so. RFC 4122 requires the namespace to *be* a 16-byte UUID and defines

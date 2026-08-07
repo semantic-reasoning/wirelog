@@ -42,6 +42,50 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **`uuid5()` framing carries the operand's type, not only its length**
+  (#968): #963 length-prefixed each operand of the three symbol-bearing
+  `uuid5` opcodes, which fixed the split point but not the *domain*. Two
+  collisions survived it, both reproduced end to end. `uuid5("", "")`
+  framed to `LE64(0) || "" || LE64(0) || ""` -- sixteen zero bytes, exactly
+  what the unframed int64-only opcode emits for `uuid5(0, 0)` -- so both
+  returned `6655197997870229985`. And a length prefix says nothing about
+  what an operand *is*, so `uuid5("abcdefgh", x)` equalled
+  `uuid5(7523094288207667809, x)`, that integer being precisely the `int64`
+  whose little-endian bytes spell `abcdefgh`.
+
+  Each framed operand is now `tag || LE64(len) || bytes`, where the tag is
+  one byte: `'S'` for a symbol's bytes, `'I'` for an `int64`'s. The encoding
+  is thereby injective over *typed* operand pairs rather than only over byte
+  strings. The tag is taken from the bytes actually emitted, not from the
+  opcode's declared operand type, so the documented fallback -- a `symbol`
+  column holding a value that was never interned digests its `int64` form --
+  is tagged `'I'` and cannot collide with the symbol spelling those same
+  eight bytes.
+
+  **`0x2A`, the int64-only opcode, is untouched**: still unframed, still
+  untagged, still returning every value it ever has. It is the only `uuid5`
+  encoding that has shipped, and its two operands are 8 bytes each and both
+  `int64`, so neither ambiguity can arise there. Adding a framed `UUID5_II`
+  opcode was considered and rejected: the unframed 16-byte encoding is
+  currently the *only* domain separation `uuid5` has, so framing the integer
+  path would have pulled it into the second collision's family -- trading
+  one degenerate collision for an unbounded one. No opcode was added;
+  `0x6A`..`0x6C` and their framing are unreleased, so only their values
+  moved, and the five pinned constants in `tests/test_cryptographic_hashes.c`
+  move with them.
+
+  **Injective encoding is not collision-free output**, and the docs no
+  longer let that read as if it were. `uuid5()` returns `digest[0..7]` with
+  four bits overwritten by the version nibble, so it has at most 2^60
+  distinct results however unambiguous its input. Separately,
+  `docs/SECURITY_MODEL.md` now states domain non-separation as its own
+  caveat for the unary digests and `hmac_sha256()`, where it is *not* being
+  fixed: those are bound by #963's byte-transparency contract -- `printf
+  '%s' abcdefgh | xxhsum -H3` must reproduce `hash("abcdefgh")` -- which
+  leaves no room for a type tag. That caveat is distinct from the 64-bit
+  fold already documented: the fold is a birthday bound, while this is
+  constructible at zero cost.
+
 - **`hash()` and the digest family digest string bytes, not intern ids**
   (#963): `hash`, `crc32_ethernet`, `crc32_castagnoli`, `md5`, `sha1`,
   `sha256`, `sha512`, `hmac_sha256` and `uuid5` digested the `int64_t` on the
@@ -98,8 +142,9 @@ All notable changes to wirelog are documented in this file.
   the one thing a namespaced identifier must not do. RFC 4122 avoids this by
   requiring the namespace to be exactly 16 bytes; wirelog adopted the
   two-operand signature without that property, so the three symbol-bearing
-  opcodes length-prefix each operand -- its length as a little-endian
-  `uint64` -- before hashing. `uuid5(int64, int64)` keeps the unframed
+  opcodes frame each operand -- a one-byte domain tag and its length as a
+  little-endian `uint64` (the tag was added by #968, below, before either
+  shipped) -- before hashing. `uuid5(int64, int64)` keeps the unframed
   construction and its exact previous values: its operands are 8 bytes each,
   so nothing was ambiguous there, and an out-of-tree decoder that already
   implements `0x2A` keeps computing the same answer. Rejected alternatives:

@@ -95,29 +95,67 @@ wl_columnar_ops_psa_hash_bytes(psa_algorithm_t alg, const void *data,
     return actual_len == digest_len ? 0 : -1;
 }
 
+/*
+ * Domain tags for framed digest operands (Issue #968).  One byte, chosen to
+ * be legible in a hexdump of the digest input.
+ */
+#define WL_DIGEST_TAG_SYMBOL ((uint8_t)'S')
+#define WL_DIGEST_TAG_INT64  ((uint8_t)'I')
+
+/**
+ * Emit one framed operand's header: its domain tag, then its length as a
+ * little-endian uint64.
+ */
+static int
+wl_columnar_ops_psa_hash_frame(psa_hash_operation_t *op, uint8_t tag,
+    size_t len)
+{
+    uint8_t hdr[1 + 8];
+    uint64_t n = (uint64_t)len;
+
+    hdr[0] = tag;
+    for (unsigned i = 0; i < 8; i++)
+        hdr[1 + i] = (uint8_t)(n >> (8 * i));
+    return psa_hash_update(op, hdr, sizeof(hdr)) == PSA_SUCCESS ? 0 : -1;
+}
+
 /**
  * Digest @first followed by @second.  uuid5()'s only caller.
  *
- * When @framed, each operand is preceded by its length as a little-endian
- * uint64, so the pair maps to exactly one byte string and no two distinct
- * (namespace, name) pairs can produce the same digest input.  A bare
- * concatenation cannot promise that once the operands are variable-length:
- * uuid5("ab", "c") and uuid5("a", "bc") would hash identical bytes.
+ * When @framed, each operand is preceded by a one-byte domain tag and its
+ * length as a little-endian uint64, so the encoding is injective over
+ * (type, bytes) pairs: the tag separates a symbol from an int64 whose
+ * little-endian bytes happen to spell it, and the length fixes the split
+ * point.  A bare concatenation promises neither once the operands are
+ * variable-length: uuid5("ab", "c") and uuid5("a", "bc") would hash
+ * identical bytes, and so would uuid5("abcdefgh", x) and uuid5(<the int64
+ * with those bytes>, x).  @first_tag and @second_tag must describe the bytes
+ * actually passed, not the opcode's declared operand types -- see
+ * filt_bytes_t::is_symbol.
+ *
+ * Injective is not collision-free.  uuid5() returns digest[0..7] with a
+ * version nibble forced, so it has at most 2^60 distinct outputs however
+ * unambiguous its input encoding is; see docs/SECURITY_MODEL.md.
  *
  * @framed is false only for WL_PLAN_EXPR_ARITH_UUID5, the int64-only opcode,
- * whose two operands are 8 bytes each.  The split point there is fixed, so
- * the concatenation is already unambiguous and there is nothing to fix --
- * and leaving its bytes alone is what lets an out-of-tree decoder that
- * already implements 0x2A keep computing the same answer.
+ * whose two operands are 8 bytes each.  The split point there is fixed and
+ * both operands are int64s, so there is nothing to disambiguate -- and
+ * leaving its bytes alone is what lets an out-of-tree decoder that already
+ * implements 0x2A keep computing the same answer.  Its input is always
+ * exactly 16 bytes, so the framed encoding must never be 16 bytes: the two
+ * headers alone are 18, which is why uuid5("", "") no longer collides with
+ * uuid5(0, 0) the way a bare 8-byte length prefix left it doing.
  *
  * Reproducible outside wirelog:
  *
- *     buf = pack('<Q', len(ns)) + ns + pack('<Q', len(name)) + name
- *     d   = bytearray(sha1(buf).digest())
+ *     frame = lambda t, b: t + pack('<Q', len(b)) + b
+ *     buf   = frame(b'S', ns) + frame(b'S', name)
+ *     d     = bytearray(sha1(buf).digest())
  */
 static int
 wl_columnar_ops_psa_hash_pair(psa_algorithm_t alg, bool framed,
-    const void *first, size_t first_len, const void *second, size_t second_len,
+    uint8_t first_tag, const void *first, size_t first_len,
+    uint8_t second_tag, const void *second, size_t second_len,
     unsigned char *digest, size_t digest_len)
 {
     psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
@@ -128,25 +166,15 @@ wl_columnar_ops_psa_hash_pair(psa_algorithm_t alg, bool framed,
         return -1;
     if (psa_hash_setup(&op, alg) != PSA_SUCCESS)
         goto out;
-    if (framed) {
-        uint8_t len_le[8];
-        uint64_t n = (uint64_t)first_len;
-        for (unsigned i = 0; i < 8; i++)
-            len_le[i] = (uint8_t)(n >> (8 * i));
-        if (psa_hash_update(&op, len_le, sizeof(len_le)) != PSA_SUCCESS)
-            goto out;
-    }
+    if (framed
+        && wl_columnar_ops_psa_hash_frame(&op, first_tag, first_len) != 0)
+        goto out;
     if (psa_hash_update(&op, (const unsigned char *)first, first_len)
         != PSA_SUCCESS)
         goto out;
-    if (framed) {
-        uint8_t len_le[8];
-        uint64_t n = (uint64_t)second_len;
-        for (unsigned i = 0; i < 8; i++)
-            len_le[i] = (uint8_t)(n >> (8 * i));
-        if (psa_hash_update(&op, len_le, sizeof(len_le)) != PSA_SUCCESS)
-            goto out;
-    }
+    if (framed
+        && wl_columnar_ops_psa_hash_frame(&op, second_tag, second_len) != 0)
+        goto out;
     if (psa_hash_update(&op, (const unsigned char *)second, second_len)
         != PSA_SUCCESS)
         goto out;
@@ -218,10 +246,19 @@ wl_columnar_ops_psa_hmac_sha256(const void *msg, size_t msg_len,
  *
  * @ptr either aliases the interned string or points into @inl, so the value
  * must outlive its use and must not be copied after being filled.
+ *
+ * @is_symbol reports which of those two happened.  It is not the caller's
+ * @as_symbol: a symbol-typed operand whose reverse lookup fails falls back
+ * to int64 bytes, and @is_symbol is then false.  Framed digests tag the
+ * operand from this field, so that fallback is tagged for the bytes it
+ * really emitted; tagging it from the opcode's declared type instead would
+ * label an int64 a symbol and let it collide with the symbol spelling those
+ * same eight bytes -- the very collision the tag exists to prevent.
  */
 typedef struct {
     const uint8_t *ptr;
     size_t len;
+    bool is_symbol;
     uint8_t inl[sizeof(int64_t)];
 } filt_bytes_t;
 
@@ -257,6 +294,7 @@ filt_digest_bytes(filt_bytes_t *out, int64_t v, bool as_symbol,
         if (str) {
             out->ptr = (const uint8_t *)str;
             out->len = strlen(str);
+            out->is_symbol = true;
             return;
         }
         WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
@@ -266,6 +304,7 @@ filt_digest_bytes(filt_bytes_t *out, int64_t v, bool as_symbol,
     memcpy(out->inl, &v, sizeof(v));
     out->ptr = out->inl;
     out->len = sizeof(v);
+    out->is_symbol = false;
 }
 
 static inline void
@@ -713,12 +752,19 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         }
 
         /*
-         * uuid5(ns, name) over symbols length-prefixes each operand before
-         * hashing, so distinct (namespace, name) pairs always hash distinct
-         * bytes.  A bare concatenation -- what the int64-only opcode does,
-         * and what it can safely keep doing with two fixed-width operands --
+         * uuid5(ns, name) over symbols prefixes each operand with a one-byte
+         * domain tag and its length before hashing, so distinct typed
+         * (namespace, name) pairs always hash distinct bytes.  A bare
+         * concatenation -- what the int64-only opcode does, and what it can
+         * safely keep doing with two fixed-width operands of one type --
          * would make uuid5("ab", "c") and uuid5("a", "bc") the same value
-         * the moment the operands became variable-length.
+         * the moment the operands became variable-length; a length prefix
+         * without the tag would still equate uuid5("abcdefgh", x) with
+         * uuid5(<the int64 spelling those bytes>, x).
+         *
+         * "Distinct bytes" is a claim about the digest input only.  The
+         * digest is then truncated to 8 bytes with a version nibble forced,
+         * so distinct inputs can still return the same int64.
          */
         case WL_PLAN_EXPR_ARITH_UUID5:
         case WL_PLAN_EXPR_ARITH_UUID5_SS:
@@ -736,7 +782,10 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             filt_digest_bytes(&nsb, ns, ns_sym, intern);
             filt_digest_bytes(&nmb, name, name_sym, intern);
             if (wl_columnar_ops_psa_hash_pair(PSA_ALG_SHA_1,
-                tag != WL_PLAN_EXPR_ARITH_UUID5, nsb.ptr, nsb.len,
+                tag != WL_PLAN_EXPR_ARITH_UUID5,
+                nsb.is_symbol ? WL_DIGEST_TAG_SYMBOL : WL_DIGEST_TAG_INT64,
+                nsb.ptr, nsb.len,
+                nmb.is_symbol ? WL_DIGEST_TAG_SYMBOL : WL_DIGEST_TAG_INT64,
                 nmb.ptr, nmb.len, digest, sizeof(digest)) != 0)
                 goto bad;
             /* RFC 4122 v5: set version=5, variant=0b10 */
