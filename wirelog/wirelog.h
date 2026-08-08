@@ -122,7 +122,10 @@ typedef enum {
  * - Facts (extensional database)
  * - Rules with recursion
  * - Negation (stratified)
- * - Aggregation (COUNT, SUM, MIN, MAX, AVG)
+ * - Aggregation (COUNT, SUM, MIN, MAX). AVG/average parses but is rejected
+ *   when the rule is lowered: every value is a 64-bit integer, so there is
+ *   no type to return a mean in. Compute it as sum/count -- see
+ *   docs/SYNTAX.md, "average() is not supported".
  * - Built-in predicates (=, <, >, <=, >=, !=)
  * - Comments (% line comments)
  *

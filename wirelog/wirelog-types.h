@@ -89,7 +89,14 @@ typedef enum {
     WIRELOG_AGG_SUM,   /* sum / SUM */
     WIRELOG_AGG_MIN,   /* min / MIN */
     WIRELOG_AGG_MAX,   /* max / MAX */
-    WIRELOG_AGG_AVG,   /* average / AVG */
+    /*
+     * average / AVG.  Parses into this value, but a rule carrying it is
+     * rejected when it is lowered (#978): every value is a 64-bit integer,
+     * so there is no type to return a mean in.  Kept in the enum, and kept
+     * a reserved keyword, so the surface syntax does not have to change if
+     * a float type arrives.  Compute a mean as sum/count.
+     */
+    WIRELOG_AGG_AVG,
 } wirelog_agg_fn_t;
 
 /* ======================================================================== */
@@ -120,6 +127,12 @@ WIRELOG_API const char *
 wirelog_cmp_op_str(wirelog_cmp_op_t op);
 WIRELOG_API const char *
 wirelog_arith_op_str(wirelog_arith_op_t op);
+/*
+ * Returns the aggregate's source spelling, i.e. a name the lexer accepts.
+ * WIRELOG_AGG_AVG returns "average", not "avg" -- `avg` is not a keyword
+ * (see docs/SYNTAX.md), so the old spelling did not parse back.  Intended
+ * for diagnostics and program dumps; the returned string is static.
+ */
 WIRELOG_API const char *
 wirelog_agg_fn_str(wirelog_agg_fn_t fn);
 

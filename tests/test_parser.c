@@ -947,6 +947,61 @@ test_parse_avg_aggregate(void)
     PASS();
 }
 
+/*
+ * Issue #978: wirelog_agg_fn_str() must print a spelling the lexer accepts.
+ * It printed "avg" for WIRELOG_AGG_AVG, and `avg` is deliberately *not* a
+ * keyword (docs/SYNTAX.md: `average` and `AVG` are recognized, `avg` and
+ * `AVERAGE` are not), so every AST dump and IR dump named an aggregate that
+ * could not be read back.  Asserting the round trip for all five functions
+ * rather than only for AVG is what stops the next one from drifting: the
+ * other four happen to agree today, and nothing but this test says they must.
+ */
+static void
+test_agg_fn_str_round_trip(void)
+{
+    TEST("wirelog_agg_fn_str() prints a spelling the lexer accepts");
+
+    static const wirelog_agg_fn_t fns[] = {
+        WIRELOG_AGG_COUNT, WIRELOG_AGG_SUM, WIRELOG_AGG_MIN,
+        WIRELOG_AGG_MAX, WIRELOG_AGG_AVG,
+    };
+
+    for (size_t i = 0; i < sizeof(fns) / sizeof(fns[0]); i++) {
+        const char *name = wirelog_agg_fn_str(fns[i]);
+        char src[128];
+        snprintf(src, sizeof(src), "t(g, %s(v)) :- s(g, v).", name);
+
+        char errbuf[512] = { 0 };
+        wl_parser_ast_node_t *prog
+            = wl_parser_parse_string(src, errbuf, sizeof(errbuf));
+        if (!prog) {
+            char buf[700];
+            snprintf(buf, sizeof(buf),
+                "printed name \"%s\" does not lex back: %s", name, errbuf);
+            FAIL(buf);
+            return;
+        }
+
+        const wl_parser_ast_node_t *agg
+            = child(child(child(prog, 0), 0), 1);
+        if (!agg || agg->type != WL_PARSER_AST_NODE_AGGREGATE) {
+            wl_parser_ast_node_free(prog);
+            FAIL("printed name did not parse as an aggregate");
+            return;
+        }
+        if (agg->agg_fn != fns[i]) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "\"%s\" round-tripped to a different aggregate", name);
+            wl_parser_ast_node_free(prog);
+            FAIL(buf);
+            return;
+        }
+        wl_parser_ast_node_free(prog);
+    }
+    PASS();
+}
+
 static void
 test_parse_aggregate_with_arithmetic(void)
 {
@@ -2013,6 +2068,7 @@ main(void)
     test_parse_sum_aggregate();
     test_parse_max_aggregate();
     test_parse_avg_aggregate();
+    test_agg_fn_str_round_trip();
     test_parse_aggregate_with_arithmetic();
     test_parse_aggregate_with_constant();
 

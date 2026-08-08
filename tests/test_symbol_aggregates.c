@@ -83,9 +83,11 @@
  *       occupies several physical columns behind one logical one.  If the
  *       type is lost there the aggregate silently returns to ids.
  *
- *   test_count_sum_average_unchanged
- *       count()/sum()/average() over a symbol column are not ordering
- *       aggregates and must not acquire the string comparison.
+ *   test_count_sum_unchanged
+ *       count()/sum() over a symbol column are not ordering aggregates and
+ *       must not acquire the string comparison.  average() belongs to the
+ *       same non-ordering group but is rejected at lowering (#978), so the
+ *       property asserted for it is that it never reaches the reducer.
  */
 
 #include "../wirelog/backend.h"
@@ -748,9 +750,9 @@ test_inline_compound_relation(void)
 /* ---------------------------------------------------------------------- */
 
 static void
-test_count_sum_average_unchanged(void)
+test_count_sum_unchanged(void)
 {
-    TEST("count()/sum()/average() over a symbol column are unchanged");
+    TEST("count()/sum() over a symbol column are unchanged");
 
     /*
      * These reduce over the id and always did; they are not ordering
@@ -768,15 +770,6 @@ test_count_sum_average_unchanged(void)
         /* ids: "aa"=0, "mm"=1, "zz"=2 -- SHIFT interns them in that order */
         { SHIFT S_FACTS ".decl C(g: symbol, n: int64)\n"
           "C(g, sum(v)) :- S(g, v).\n", 0 + 1 + 2 },
-        /*
-         * average() is not reduced by col_op_reduce() at all -- its switch
-         * has no AVG arm -- so it keeps the first operand it sees, which
-         * SHIFT pins to id("zz") = 2.  That is orthogonal to this issue and
-         * is asserted as-is: what must not happen is average() acquiring the
-         * ordering path, which is the arm right next to it.
-         */
-        { SHIFT S_FACTS ".decl C(g: symbol, n: int64)\n"
-          "C(g, average(v)) :- S(g, v).\n", 2 },
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -787,6 +780,35 @@ test_count_sum_average_unchanged(void)
         ASSERT(saw_value_at(&c, 1, cases[i].expect),
             "a non-ordering aggregate changed value");
     }
+    PASS();
+}
+
+/* ---------------------------------------------------------------------- */
+
+static void
+test_average_never_reaches_the_reducer(void)
+{
+    TEST("average() over a symbol column is rejected, not reduced");
+
+    /*
+     * average() belongs with count()/sum() above -- it is not an ordering
+     * aggregate and must never acquire the string comparison that lives in
+     * the arm beside it.  It cannot be asserted by value, because
+     * col_op_reduce() never had an AVG arm: each group kept whichever
+     * operand the scan reached first, which under SHIFT was id("zz") = 2.
+     * That is not a mean of anything, and #978 rejects average() at
+     * lowering rather than freezing an arbitrary number here.
+     *
+     * Asserting the rejection is still the right guard for *this* issue:
+     * the way average() could acquire the ordering path is by being added
+     * to the reducer's string branch, and a program that does not lower can
+     * never get there.  The rejection's own coverage is
+     * tests/test_average_rejected.c.
+     */
+    collect_t c;
+    ASSERT(eval_relation(SHIFT S_FACTS ".decl C(g: symbol, n: int64)\n"
+        "C(g, average(v)) :- S(g, v).\n", "C", &c) != 0,
+        "average() should not have lowered");
     PASS();
 }
 
@@ -808,7 +830,8 @@ main(void)
     test_mixed_interned_and_uninterned_group();
     test_undeclared_relation();
     test_inline_compound_relation();
-    test_count_sum_average_unchanged();
+    test_count_sum_unchanged();
+    test_average_never_reaches_the_reducer();
 
     printf("\n%d/%d passed, %d failed\n", pass_count, test_count, fail_count);
     return fail_count == 0 ? 0 : 1;

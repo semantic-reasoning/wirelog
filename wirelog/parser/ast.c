@@ -248,6 +248,15 @@ wirelog_arith_op_str(wirelog_arith_op_t op)
     return "?";
 }
 
+/*
+ * Every name here must be one the lexer accepts, because these strings are
+ * what AST and IR dumps print and what a reader would paste back into a
+ * program.  WIRELOG_AGG_AVG printed "avg", which is deliberately not a
+ * keyword -- docs/SYNTAX.md fixes the accepted spellings as `average` and
+ * `AVG`, and `avg`/`AVERAGE` are excluded so they stay usable as ordinary
+ * identifiers.  tests/test_parser.c asserts the round trip for all five
+ * (Issue #978).
+ */
 const char *
 wirelog_agg_fn_str(wirelog_agg_fn_t fn)
 {
@@ -261,7 +270,7 @@ wirelog_agg_fn_str(wirelog_agg_fn_t fn)
     case WIRELOG_AGG_MAX:
         return "max";
     case WIRELOG_AGG_AVG:
-        return "avg";
+        return "average";
     }
     return "?";
 }

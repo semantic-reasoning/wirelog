@@ -45,8 +45,10 @@ Features:
 - **Negation**: `!Rel(x)` in rule body (stratified negation)
 - **Comparisons**: `x < y`, `x = y`, `x != y`, `x >= y`, etc.
 - **Arithmetic**: `x + 1`, `x * y`, `x % 2` in head or comparisons
-- **Aggregation**: `min(x)`, `max(x)`, `sum(x)`, `count(x)`, `average(x)` in head
-  (at most one per head — see below)
+- **Aggregation**: `min(x)`, `max(x)`, `sum(x)`, `count(x)` in head
+  (at most one per head — see below). `average(x)` parses but is **rejected**
+  when the rule is lowered — see [average() is not
+  supported](#average-is-not-supported)
 - **Wildcards**: `_` for anonymous variables
 - **Plan marker**: `.plan` before a rule for optimization hints
 
@@ -117,6 +119,90 @@ Two scope notes:
   arity](#rule-heads-must-match-their-declared-arity) below (#977). The two
   are complementary: an arity check accepts `t(g, min(v), max(v))`, and the
   aggregate-count check accepts `cc(y, min(c))`.
+
+### `average()` is not supported
+
+`average(x)` and `AVG(x)` tokenize and parse, but a rule that uses either is
+**rejected when it is lowered** (#978). `min`, `max`, `sum` and `count` are
+unaffected.
+
+Before this rejection, `average()` returned an arbitrary operand rather than
+a mean. The columnar `REDUCE` kernel seeds each group with the group's first
+operand and its update step has cases for `count`, `sum`, `min` and `max`
+only, so the seed was never updated. The answer therefore tracked scan order,
+not the data:
+
+```
+val(1, 9). val(1, 5). val(1, 2).     /* answered t(1, 9);  mean is 5 */
+val(1, 1). val(1, 2). val(1, 9).     /* answered t(1, 1);  mean is 4 */
+```
+
+Both were wrong, silently, with exit status 0.
+
+It is rejected rather than implemented because there is no type to return a
+mean in. Every value in the engine is a 64-bit integer; `float` is not a
+`.decl` type keyword and there is no decimal literal, so `.decl v(x: float)`
+and `1.5` are both syntax errors. The only implementable semantics today is
+truncating integer division — and that is precisely the choice that could
+not be corrected later, because replacing it with a real mean would change
+the numbers every existing program prints, with no error anywhere. Widening
+a rejection to a real mean, by contrast, accepts strictly more programs and
+rewrites none. This follows the sequence used for the one-aggregate-per-head
+restriction above: reject first, support later.
+
+Compute the mean from `sum` and `count`, which works today:
+
+```
+.decl val(g: int64, v: int64)
+.decl s(g: int64, x: int64)
+.decl c(g: int64, y: int64)
+.decl t(g: int64, a: int64)
+
+s(g, sum(v))   :- val(g, v).
+c(g, count(v)) :- val(g, v).
+t(g, x / y)    :- s(g, x), c(g, y).
+```
+
+The division truncates, but here that is the program's own visible choice
+rather than a hidden one — the sum and the count are both available if a
+different rounding is wanted.
+
+The rejection is at plan generation, not at parsing, so unlike the
+one-aggregate-per-head check above it is not a `WIRELOG_ERR_PARSE`.
+`wl_plan_from_program()` returns `-1` and the CLI prints:
+
+```
+$ wirelog_cli prog.dl
+Plan generation failed: rc=-1
+error: execution failed
+```
+
+Run with `WL_LOG=EVAL:1` to see which aggregate was rejected and why:
+
+```
+$ WL_LOG=EVAL:1 wirelog_cli prog.dl
+[ERROR][EVAL] .../wirelog/exec_plan_gen.c:1516: 'average' is not supported:
+every value is a 64-bit integer, so there is no type to return a mean in.
+Compute it from sum and count instead: ...
+```
+
+Without `WL_LOG` set there is no explanation at all — the workaround above
+exists only inside that log line, so a user who sets nothing sees `rc=-1` and
+nothing else. Surfacing lowering diagnostics by default is tracked as #979,
+which was filed against the parse stage and needs widening to cover this
+`EVAL`-section message too.
+
+`average` stays a reserved keyword and `WIRELOG_AGG_AVG` stays in the public
+enum, so nothing about the surface syntax has to be un-done if a float type
+arrives later.
+
+**One caveat on the workaround.** It is exact for a non-recursive rule. Do not
+reach for it inside a *recursive* stratum: recursive `sum` and `count` are
+themselves broken today — canonicalisation is skipped for anything that is not
+`min`/`max`, so they emit multiple rows per group and violate the functional
+dependency the head declares, silently and at exit 0. That is issue #991. A
+recursive `average` is rejected here; substituting recursive `sum`/`count` for
+it trades a loud failure for a quiet wrong answer.
 
 ### Inline facts must match their declared arity
 
@@ -232,7 +318,11 @@ no diagnostic. That is tracked as #980 and is not affected by this check.
 Aggregate names are matched as exact keywords. `average` and `AVG` are
 recognized; `avg` and `AVERAGE` are not. An unrecognized name followed by `(`
 has no production in head-argument position, so `t(g, avg(v), max(v))` is a
-plain syntax error rather than a rule that bypasses this check.
+plain syntax error rather than a rule that bypasses this check. (`average`
+and `AVG` are recognized by the lexer but rejected at lowering — see
+[`average()` is not supported](#average-is-not-supported). The keywords are
+kept reserved so that `avg`/`AVERAGE` do not have to be taken away from user
+identifiers later.)
 
 ---
 
@@ -391,6 +481,11 @@ Supported column types:
 - `functor/arity` -- compound term handle stored in a 64-bit column
 - `functor/arity side` -- explicit side-relation compound storage
 - `functor/arity inline` -- inline compound storage, limited to arity 4
+
+There is **no floating-point type**. `float` is not a type keyword and there
+is no decimal literal, so `.decl v(x: float)` and `1.5` are both syntax
+errors; every value the engine stores and computes on is a 64-bit integer.
+This is why [`average()` is not supported](#average-is-not-supported).
 
 ---
 

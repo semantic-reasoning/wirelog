@@ -98,6 +98,53 @@ All notable changes to wirelog are documented in this file.
   headline shape of #990; teaching the pass to handle a fused head is separate
   work, but the skip is now visible. Together these counters are the only
   mechanism that can detect a guard silently not being inserted.
+- **`average()` is rejected instead of answering with an arbitrary row**
+  (#978): `average()` was never implemented. `col_op_reduce` seeds each group
+  with the group's first operand, and its update `switch` has arms for
+  `COUNT`/`SUM`/`MIN`/`MAX` and `default: break;` — so `WIRELOG_AGG_AVG` fell
+  through and the seed was returned untouched. The answer followed scan
+  order, not the data: `val(1,9). val(1,5). val(1,2).` gave `t(1, 9)` where
+  the mean is 5, and the same three facts reordered as `val(1,1). val(1,2).
+  val(1,9).` gave `t(1, 1)` where the mean is 4. Both with exit status 0 and
+  no diagnostic. `sum`, `count`, `min` and `max` were and remain correct.
+
+  Rules using `average`/`AVG` are now rejected at plan generation:
+  `wl_plan_from_program()` returns `-1` and `WL_LOG=EVAL:1` names the
+  aggregate and the workaround.
+
+  **Why reject rather than implement.** There is no type to return a mean in.
+  Every value is an `int64_t`; `WIRELOG_TYPE_FLOAT` exists in the public enum
+  but is vestigial, since the lexer has type keywords for
+  `int32`/`int64`/`string`/`symbol` only and no decimal literal — `.decl
+  v(x: float)` and `1.5` are both syntax errors. So the choice was truncating
+  integer division or rejection, and the asymmetry decides it: widening a
+  rejection to a real mean later accepts strictly more programs and rewrites
+  none, whereas replacing truncation with a real mean later would silently
+  change the numbers every existing program prints. Precedent agrees —
+  Soufflé refuses integer operands to `mean()` outright, and PostgreSQL,
+  SQLite, MySQL and cozo all return a wider type rather than truncating. This
+  follows the sequence adopted for #973: reject first, support later.
+
+  The rejection is at lowering, not in the lexer. `average` and `AVG` stay
+  reserved keywords, the AST keeps its `AGGREGATE` node and
+  `WIRELOG_AGG_AVG` stays in the public enum, so no surface syntax has to be
+  un-done if a float type arrives. It deliberately does not add `avg` or
+  `AVERAGE` as keywords, which would take those identifiers away from users
+  and contradict a documented decision.
+
+  **Compatibility:** programs using `average()` now fail to load. They were
+  not producing a mean before — they were producing whichever operand the
+  scan reached first — so nothing correct is lost. No `.dl` file, benchmark
+  workload or example in the tree uses it.
+
+  Two adjacent defects are fixed with it. `wirelog_agg_fn_str()` printed
+  `"avg"` for `WIRELOG_AGG_AVG`, a spelling the lexer refuses, so every AST
+  and IR dump named an aggregate that could not be read back; it now prints
+  `"average"`, and `tests/test_parser.c` asserts the printer/lexer round trip
+  for all five aggregates. And `agg_to_tag()` mapped `WIRELOG_AGG_AVG` to
+  `WL_PLAN_EXPR_AGG_SUM` ("approximate: no AVG tag"), so a serialized plan
+  would have said SUM where the program said `average`; it now fails instead
+  of substituting.
 
 - **Inline facts are validated against their relation's declared arity**
   (#977): `collect_fact` packed `fact_data` using each fact's *own*
