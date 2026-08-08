@@ -48,6 +48,29 @@ struct wirelog_program;
  * @arity_mismatch_skipped: Demands skipped due to adornment count/arity mismatch.
  * @skipped_aggregate:     Aggregate rules skipped because Magic Sets cannot
  *                         safely insert magic guards into them yet.
+ * @skipped_constant_head: Rules left unguarded because every bound head
+ *                         position holds a constant rather than a variable,
+ *                         leaving no join key to guard on.  A *policy* skip:
+ *                         the rule is well-formed and the pass declines.
+ * @skipped_unsupported_head: Rules left unguarded because the head is not a
+ *                         PROJECT the pass can read variable names from --
+ *                         in practice a rule fused to a FLATMAP root (#990).
+ *                         A *capability* gap, not a decision.  An AGGREGATE
+ *                         root cannot reach here: relation_has_aggregate_rule()
+ *                         filters such relations before adornment, in Phase 1
+ *                         and again in the Phase 2 BFS, so they never enter
+ *                         `processed` and the guard loop never sees them.
+ *
+ * Both skip counters describe a rule that is evaluated unrestricted, which is
+ * sound but unoptimized.  They are the only signal that a demand did not reach
+ * it -- but only for a caller that supplies a stats struct.  The library's own
+ * pipeline passes NULL (api_facade.c), so in a shipping build nothing reads
+ * them; they are observability for tests and embedders, not a runtime warning.
+ * They are kept apart because closing the capability gap is work, while
+ * the policy skip is correct as it stands.
+ *
+ * @original_rules_modified counts guards actually inserted.  A rule counted in
+ * either skip counter is not counted there.
  */
 typedef struct {
     uint32_t demand_roots;
@@ -57,6 +80,8 @@ typedef struct {
     uint32_t skipped_all_free;
     uint32_t arity_mismatch_skipped;
     uint32_t skipped_aggregate;
+    uint32_t skipped_constant_head;
+    uint32_t skipped_unsupported_head;
 } wl_magic_sets_stats_t;
 
 /* ======================================================================== */

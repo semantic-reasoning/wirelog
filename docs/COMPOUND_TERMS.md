@@ -336,6 +336,36 @@ destructuring.
 flagged(ID) :- candidate(ID), !event(ID, metadata(_, _, _, 99)).
 ```
 
+### Also not supported: a `side` destructure in a non-first body atom
+
+A positive `side` destructure must be the **first** atom in the body.
+
+```
+.decl event(id: int64, payload: metadata/4 side)
+.decl gate(id: int64)
+.decl hot(id: int64, r: int64)
+
+/* Plan-generation error: the compound atom is not first */
+hot(ID, R) :- gate(ID), event(ID, metadata(_, _, _, R)).
+
+/* Accepted: same rule, compound atom first */
+hot(ID, R) :- event(ID, metadata(_, _, _, R)), gate(ID).
+```
+
+A `side` destructure lowers to a composite `JOIN(scan, side_scan)` subtree.
+When it is not the first atom, that subtree is installed as the right child of
+the body's join chain — and the execution plan cannot represent a composite
+right child, since `wl_plan_op_t.right_relation` is a relation *name*.
+
+Before 0.54.0 this produced no diagnostic: the rule silently matched nothing
+and returned zero rows, while the identical rule with the atoms reordered
+returned the correct answer. It is now a plan-generation error naming the
+cause. Reordering the body is the workaround; conjunction is commutative, so
+the reordered rule is logically identical.
+
+Tracked as issue #994, which proposes flattening the subtree into the left
+spine so that either ordering works.
+
 ### Supported workaround
 
 Extract the compound fields in a **positive** rule first (positive side-compound

@@ -20,14 +20,20 @@
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/subsumption.h"
+#include "../wirelog/ir/ir.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/ir/stratify.h"
+#include "../wirelog/backend.h"
+#include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog-parser.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /* ======================================================================== */
 /* Test Helpers                                                             */
@@ -97,6 +103,217 @@ parse_and_optimize(const char *src)
     wl_jpp_apply(prog, NULL);
     wl_sip_apply(prog, NULL);
     return prog;
+}
+
+/* ======================================================================== */
+/* Helpers: magic guard structure (Issue #989)                             */
+/* ======================================================================== */
+
+/*
+ * The body root of the @nth rule whose head is @head, i.e. child[0] of the
+ * rule's PROJECT.  After Magic Sets this is the guard JOIN.
+ */
+static const wirelog_ir_node_t *
+rule_body_root(const struct wirelog_program *prog, const char *head,
+    uint32_t nth)
+{
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < prog->rule_count; i++) {
+        if (!prog->rules[i].head_relation
+            || strcmp(prog->rules[i].head_relation, head) != 0)
+            continue;
+        if (seen++ != nth)
+            continue;
+        const wirelog_ir_node_t *root = prog->rules[i].ir_root;
+        if (!root || root->child_count == 0)
+            return NULL;
+        return root->children[0];
+    }
+    return NULL;
+}
+
+static const wirelog_ir_node_t *
+rule_ir_root(const struct wirelog_program *prog, const char *head, uint32_t nth)
+{
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < prog->rule_count; i++) {
+        if (!prog->rules[i].head_relation
+            || strcmp(prog->rules[i].head_relation, head) != 0)
+            continue;
+        if (seen++ == nth)
+            return prog->rules[i].ir_root;
+    }
+    return NULL;
+}
+
+static uint32_t
+rule_count_for(const struct wirelog_program *prog, const char *head)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < prog->rule_count; i++) {
+        if (prog->rules[i].head_relation
+            && strcmp(prog->rules[i].head_relation, head) == 0)
+            n++;
+    }
+    return n;
+}
+
+static bool
+ir_contains_type(const wirelog_ir_node_t *node, wirelog_ir_node_type_t type)
+{
+    if (!node)
+        return false;
+    if (node->type == type)
+        return true;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        if (ir_contains_type(node->children[i], type))
+            return true;
+    }
+    return false;
+}
+
+/* ======================================================================== */
+/* Helpers: seeded evaluation (Issue #989)                                 */
+/* ======================================================================== */
+
+/*
+ * Seed a relation's inline facts directly.  This is test-only scaffolding:
+ * the shipped path that seeds a magic demand relation from a bound `.query`
+ * does not exist yet, so the tests below stand in for it in order to reach
+ * the guarded rule bodies at all.
+ */
+static bool
+seed_relation_facts(struct wirelog_program *prog, const char *name,
+    const int64_t *rows, uint32_t row_count, uint32_t ncols)
+{
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        wl_ir_relation_info_t *rel = &prog->relations[i];
+        if (!rel->name || strcmp(rel->name, name) != 0)
+            continue;
+        if (rel->column_count != ncols)
+            return false;
+        size_t total = (size_t)row_count * ncols;
+        free(rel->fact_data);
+        rel->fact_data = (int64_t *)malloc(total * sizeof(int64_t));
+        if (!rel->fact_data)
+            return false;
+        memcpy(rel->fact_data, rows, total * sizeof(int64_t));
+        rel->fact_count = row_count;
+        rel->fact_capacity = (uint32_t)total;
+        return true;
+    }
+    return false;
+}
+
+#define MS_MAX_ROWS 64
+#define MS_MAX_COLS 4
+
+typedef struct {
+    const char *relation;
+    uint32_t ncols;
+    int64_t rows[MS_MAX_ROWS][MS_MAX_COLS];
+    uint32_t count;
+    bool overflow;
+} ms_row_set_t;
+
+static void
+ms_collect_rows(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    ms_row_set_t *set = (ms_row_set_t *)user_data;
+    if (!relation || strcmp(relation, set->relation) != 0)
+        return;
+    if (ncols > MS_MAX_COLS || set->count >= MS_MAX_ROWS) {
+        set->overflow = true;
+        return;
+    }
+    set->ncols = ncols;
+    for (uint32_t i = 0; i < ncols; i++)
+        set->rows[set->count][i] = row[i];
+    set->count++;
+}
+
+static bool
+ms_rows_match(const ms_row_set_t *actual, const int64_t *expected,
+    uint32_t expected_rows, uint32_t ncols)
+{
+    if (actual->overflow || actual->count != expected_rows)
+        return false;
+    if (expected_rows == 0)
+        return true;
+    if (actual->ncols != ncols)
+        return false;
+    for (uint32_t r = 0; r < expected_rows; r++) {
+        bool found = false;
+        for (uint32_t a = 0; a < actual->count && !found; a++) {
+            bool same = true;
+            for (uint32_t c = 0; c < ncols; c++) {
+                if (actual->rows[a][c] != expected[(size_t)r * ncols + c]) {
+                    same = false;
+                    break;
+                }
+            }
+            found = same;
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Parse + optimize @src, apply @demands, re-stratify, and seed @magic_rel
+ * with @seed.  Returns the program ready for plan generation, or NULL.
+ */
+static struct wirelog_program *
+magic_program_with_seed(const char *src, const wl_magic_demand_t *demands,
+    uint32_t demand_count, const char *magic_rel, const int64_t *seed,
+    uint32_t seed_rows, uint32_t seed_cols, wl_magic_sets_stats_t *stats)
+{
+    struct wirelog_program *prog = parse_and_optimize(src);
+    if (!prog)
+        return NULL;
+
+    if (wl_magic_sets_apply_with_demands(prog, demands, demand_count, stats)
+        != 0)
+        goto fail;
+    if (wl_ir_program_rebuild_relation_irs(prog) != 0)
+        goto fail;
+    wl_ir_program_free_strata(prog);
+    if (wl_ir_stratify_program(prog) != 0)
+        goto fail;
+    if (magic_rel
+        && !seed_relation_facts(prog, magic_rel, seed, seed_rows, seed_cols))
+        goto fail;
+    return prog;
+
+fail:
+    wirelog_program_free(prog);
+    return NULL;
+}
+
+static bool
+ms_evaluate(struct wirelog_program *prog, const char *out_rel,
+    uint32_t workers, ms_row_set_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->relation = out_rel;
+
+    wl_plan_t *plan = NULL;
+    if (wl_plan_from_program(prog, &plan) != 0 || !plan)
+        return false;
+
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), plan, workers, &session);
+    if (rc == 0)
+        rc = wl_session_load_facts(session, prog);
+    if (rc == 0)
+        rc = wl_session_snapshot(session, ms_collect_rows, out);
+
+    if (session)
+        wl_session_destroy(session);
+    wl_plan_free(plan);
+    return rc == 0 && !out->overflow;
 }
 
 /* ======================================================================== */
@@ -912,6 +1129,440 @@ test_stratify_no_oob_on_graph_absent_head(void)
 }
 
 /* ======================================================================== */
+/* Issue #989: guard JOIN order                                            */
+/* ======================================================================== */
+
+/* The `.query Path(b, f)` example from docs/SYNTAX.md. */
+static const char *k_syntax_doc_src
+    = ".decl Edge(x: int32, y: int32)\n"
+    ".decl Path(x: int32, y: int32)\n"
+    ".output Path\n"
+    "Edge(1, 2).\n"
+    "Edge(2, 3).\n"
+    "Edge(3, 4).\n"
+    "Path(x, y) :- Edge(x, y).\n"
+    "Path(x, y) :- Edge(x, z), Path(z, y).\n";
+
+/* Non-recursive three-way join: the guarded body is a JOIN chain. */
+static const char *k_three_way_src
+    = ".decl a(x: int32, y: int32)\n"
+    ".decl b(y: int32, z: int32)\n"
+    ".decl c(z: int32, w: int32)\n"
+    ".decl out(x: int32, w: int32)\n"
+    ".output out\n"
+    "a(1, 2).\n"
+    "a(9, 2).\n"
+    "b(2, 3).\n"
+    "c(3, 4).\n"
+    "out(x, w) :- a(x, y), b(y, z), c(z, w).\n";
+
+/*
+ * Test: the guard JOIN's right child must be a relation-bearing node.
+ *
+ * wl_plan_op_t.right_relation is a relation name, not a subtree, so a JOIN
+ * whose right child is itself a JOIN/ANTIJOIN/SEMIJOIN cannot be expressed
+ * in the plan at all: translate_ir_node() emits right_relation = NULL and
+ * the operator matches nothing.
+ */
+static void
+test_guard_join_right_child_is_representable(void)
+{
+    TEST("test_guard_join_right_child_is_representable");
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "Path";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    struct wirelog_program *prog = magic_program_with_seed(k_syntax_doc_src,
+            demands, 1, NULL, NULL, 0, 0, NULL);
+    if (!prog) {
+        FAIL("setup failed");
+        return;
+    }
+
+    uint32_t nrules = rule_count_for(prog, "Path");
+    if (nrules != 2) {
+        wirelog_program_free(prog);
+        FAIL("expected 2 rules for Path");
+        return;
+    }
+
+    for (uint32_t r = 0; r < nrules; r++) {
+        const wirelog_ir_node_t *guard = rule_body_root(prog, "Path", r);
+        if (!guard || guard->type != WIRELOG_IR_JOIN
+            || guard->child_count != 2) {
+            wirelog_program_free(prog);
+            FAIL("guard JOIN missing");
+            return;
+        }
+        const wirelog_ir_node_t *right = guard->children[1];
+        if (!right || !right->relation_name) {
+            wirelog_program_free(prog);
+            FAIL("guard JOIN right child carries no relation name "
+                "(right_relation would be NULL)");
+            return;
+        }
+        if (strncmp(right->relation_name, "$m$", 3) != 0) {
+            wirelog_program_free(prog);
+            FAIL("guard JOIN right child is not the magic demand scan");
+            return;
+        }
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Test: the docs/SYNTAX.md recursive example, with the demand relation
+ * seeded by hand, must produce the full transitive closure reachable from
+ * the seed.  With the guard built right-deep the recursive rule computes
+ * nothing and only the base rule's 3 tuples survive.
+ */
+static void
+test_guard_recursive_eval_exact(void)
+{
+    TEST("test_guard_recursive_eval_exact");
+
+    /* Seed the demand at 2, not at 1.
+     *
+     * Seeding at 1 would expect all six closure tuples -- which is exactly
+     * what an *unguarded* program produces over this graph, since every node
+     * is reachable from 1.  Such a test detects the #989 failure (the guard
+     * rejecting everything) but cannot detect the guard being absent or
+     * over-deriving, because the correct and the broken answers coincide.
+     *
+     * Seeding at 2 makes the expected set a strict subset: the three tuples
+     * rooted at nodes reachable from 2.  A missing or ineffective guard
+     * yields six rows and fails. */
+    static const int64_t seed[] = { 2 };
+    static const int64_t expected[][2] = {
+        { 2, 3 }, { 3, 4 }, { 2, 4 },
+    };
+
+    const uint32_t worker_counts[] = { 1, 4, 8 };
+    for (uint32_t wi = 0; wi < 3; wi++) {
+        wl_magic_demand_t demands[1];
+        demands[0].relation_name = "Path";
+        demands[0].bound_mask = 0x1;
+        demands[0].arity = 2;
+
+        struct wirelog_program *prog
+            = magic_program_with_seed(k_syntax_doc_src, demands, 1,
+                "$m$Path_bf", seed, 1, 1, NULL);
+        if (!prog) {
+            FAIL("setup failed");
+            return;
+        }
+
+        ms_row_set_t rows;
+        if (!ms_evaluate(prog, "Path", worker_counts[wi], &rows)) {
+            wirelog_program_free(prog);
+            FAIL("evaluation failed");
+            return;
+        }
+        if (!ms_rows_match(&rows, &expected[0][0], 3, 2)) {
+            printf(" [workers=%u got %u rows, want 3]", worker_counts[wi],
+                rows.count);
+            wirelog_program_free(prog);
+            FAIL("Path != the demand-restricted closure from seed {2}");
+            return;
+        }
+        wirelog_program_free(prog);
+    }
+
+    PASS();
+}
+
+/*
+ * Test: a non-recursive three-way join under a guard.  The body is a JOIN
+ * chain, so a right-deep guard makes the whole rule produce zero rows.
+ */
+static void
+test_guard_nonrecursive_join_chain_exact(void)
+{
+    TEST("test_guard_nonrecursive_join_chain_exact");
+
+    static const int64_t seed[] = { 1 };
+    static const int64_t expected[][2] = { { 1, 4 } };
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "out";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    struct wirelog_program *prog = magic_program_with_seed(k_three_way_src,
+            demands, 1, "$m$out_bf", seed, 1, 1, NULL);
+    if (!prog) {
+        FAIL("setup failed");
+        return;
+    }
+
+    ms_row_set_t rows;
+    if (!ms_evaluate(prog, "out", 1, &rows)) {
+        wirelog_program_free(prog);
+        FAIL("evaluation failed");
+        return;
+    }
+    if (!ms_rows_match(&rows, &expected[0][0], 1, 2)) {
+        printf(" [got %u rows, want 1]", rows.count);
+        wirelog_program_free(prog);
+        FAIL("out != {(1, 4)}");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Regression: a guarded rule whose body is an ANTIJOIN.  The ANTIJOIN is a
+ * composite node, so it is equally unusable as a JOIN right child.
+ */
+static void
+test_guard_over_antijoin_exact(void)
+{
+    TEST("test_guard_over_antijoin_exact");
+
+    static const char *src = ".decl e(x: int32, y: int32)\n"
+        ".decl s(y: int32)\n"
+        ".decl p(x: int32, y: int32)\n"
+        ".output p\n"
+        "e(1, 2).\n"
+        "e(1, 3).\n"
+        "e(2, 3).\n"
+        "s(3).\n"
+        "p(x, y) :- e(x, y), !s(y).\n";
+
+    static const int64_t seed[] = { 1 };
+    static const int64_t expected[][2] = { { 1, 2 } };
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "p";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    struct wirelog_program *prog = magic_program_with_seed(src, demands, 1,
+            "$m$p_bf", seed, 1, 1, NULL);
+    if (!prog) {
+        FAIL("setup failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *guard = rule_body_root(prog, "p", 0);
+    if (!ir_contains_type(guard, WIRELOG_IR_ANTIJOIN)) {
+        wirelog_program_free(prog);
+        FAIL("expected an ANTIJOIN under the guard");
+        return;
+    }
+
+    ms_row_set_t rows;
+    if (!ms_evaluate(prog, "p", 1, &rows)) {
+        wirelog_program_free(prog);
+        FAIL("evaluation failed");
+        return;
+    }
+    if (!ms_rows_match(&rows, &expected[0][0], 1, 2)) {
+        printf(" [got %u rows, want 1]", rows.count);
+        wirelog_program_free(prog);
+        FAIL("p != {(1, 2)}");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Regression: a guarded rule whose body carries a SIP-inserted SEMIJOIN.
+ */
+static void
+test_guard_over_semijoin_exact(void)
+{
+    TEST("test_guard_over_semijoin_exact");
+
+    static const char *src = ".decl a(x: int32, y: int32)\n"
+        ".decl b(y: int32, z: int32)\n"
+        ".decl c(z: int32, w: int32)\n"
+        ".decl out(x: int32, w: int32)\n"
+        ".output out\n"
+        "a(1, 2).\n"
+        "a(2, 3).\n"
+        "a(3, 4).\n"
+        "b(2, 5).\n"
+        "b(3, 6).\n"
+        "b(4, 7).\n"
+        "c(5, 10).\n"
+        "c(6, 11).\n"
+        "c(7, 12).\n"
+        "out(x, w) :- a(x, y), b(y, z), c(z, w).\n";
+
+    static const int64_t seed[] = { 1 };
+    static const int64_t expected[][2] = { { 1, 10 } };
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "out";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    struct wirelog_program *prog = magic_program_with_seed(src, demands, 1,
+            "$m$out_bf", seed, 1, 1, NULL);
+    if (!prog) {
+        FAIL("setup failed");
+        return;
+    }
+
+    const wirelog_ir_node_t *guard = rule_body_root(prog, "out", 0);
+    if (!ir_contains_type(guard, WIRELOG_IR_SEMIJOIN)) {
+        wirelog_program_free(prog);
+        FAIL("expected a SEMIJOIN under the guard (SIP did not fire)");
+        return;
+    }
+
+    ms_row_set_t rows;
+    if (!ms_evaluate(prog, "out", 1, &rows)) {
+        wirelog_program_free(prog);
+        FAIL("evaluation failed");
+        return;
+    }
+    if (!ms_rows_match(&rows, &expected[0][0], 1, 2)) {
+        printf(" [got %u rows, want 1]", rows.count);
+        wirelog_program_free(prog);
+        FAIL("out != {(1, 10)}");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Test: a constant in the bound head position leaves the rule unguarded, so
+ * it must not be counted as modified.
+ */
+static void
+test_constant_head_position_not_counted(void)
+{
+    TEST("test_constant_head_position_not_counted");
+
+    static const char *src = ".decl edge(x: int32, y: int32)\n"
+        ".decl q(x: int32, y: int32)\n"
+        ".output q\n"
+        "q(1, 1).\n"
+        "q(1, 2).\n"
+        "edge(1, 2).\n"
+        "edge(2, 3).\n"
+        "edge(3, 4).\n"
+        "q(1, y) :- q(1, z), edge(z, y).\n";
+
+    struct wirelog_program *prog = parse_and_optimize(src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "q";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    wl_magic_sets_stats_t stats;
+    if (wl_magic_sets_apply_with_demands(prog, demands, 1, &stats) != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic sets returned error");
+        return;
+    }
+
+    if (stats.original_rules_modified != 0) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("no guard was inserted, yet the rule was counted as modified");
+        return;
+    }
+    if (stats.skipped_constant_head != 1) {
+        printf(" [skipped_constant_head=%u]", stats.skipped_constant_head);
+        wirelog_program_free(prog);
+        FAIL("expected skipped_constant_head == 1");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Test: a rule fused to a non-PROJECT root gets no guard, because
+ * get_head_vars() has no head to read variable names from.  Logic Fusion runs
+ * before Magic Sets in the shipping pipeline and any rule with a filter is a
+ * fusion candidate, so this is the common way for a guard to go missing.  The
+ * pass must say so rather than skip in silence (#990).
+ */
+static void
+test_fused_head_reported_as_unsupported(void)
+{
+    TEST("test_fused_head_reported_as_unsupported");
+
+    static const char *src = ".decl e(x: int32, y: int32)\n"
+        ".decl f(y: int32, z: int32)\n"
+        ".decl hot(x: int32, z: int32)\n"
+        ".output hot\n"
+        "e(1, 2).\n"
+        "f(2, 90).\n"
+        "hot(x, z) :- e(x, y), f(y, z), z > 80.\n";
+
+    struct wirelog_program *prog = parse_and_optimize(src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    /* Guard the guard: if fusion stops producing a non-PROJECT root this
+     * test would otherwise pass for the wrong reason. */
+    const wirelog_ir_node_t *root = rule_ir_root(prog, "hot", 0);
+    if (!root || root->type == WIRELOG_IR_PROJECT) {
+        wirelog_program_free(prog);
+        FAIL("expected fusion to replace the PROJECT root");
+        return;
+    }
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "hot";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    wl_magic_sets_stats_t stats;
+    if (wl_magic_sets_apply_with_demands(prog, demands, 1, &stats) != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic sets returned error");
+        return;
+    }
+
+    if (stats.original_rules_modified != 0) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("no guard was inserted, yet the rule was counted as modified");
+        return;
+    }
+    if (stats.skipped_unsupported_head != 1) {
+        printf(" [skipped_unsupported_head=%u]",
+            stats.skipped_unsupported_head);
+        wirelog_program_free(prog);
+        FAIL("expected skipped_unsupported_head == 1");
+        return;
+    }
+    if (stats.skipped_constant_head != 0) {
+        printf(" [skipped_constant_head=%u]", stats.skipped_constant_head);
+        wirelog_program_free(prog);
+        FAIL("a capability gap must not be reported as a policy skip");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -935,6 +1586,15 @@ main(void)
     test_magic_correctness_noop();
     test_magic_rebuild_and_stratify();
     test_stratify_no_oob_on_graph_absent_head();
+
+    printf("\nGuard Order Tests (Issue #989):\n");
+    test_guard_join_right_child_is_representable();
+    test_guard_recursive_eval_exact();
+    test_guard_nonrecursive_join_chain_exact();
+    test_guard_over_antijoin_exact();
+    test_guard_over_semijoin_exact();
+    test_constant_head_position_not_counted();
+    test_fused_head_reported_as_unsupported();
 
     printf("\n=== Results ===\n");
     printf("Tests run:    %d\n", tests_run);

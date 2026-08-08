@@ -2797,10 +2797,16 @@ test_magic_sets_exe = executable(
   parser_src,
   ir_src,
   optimizer_src,
+  # Issue #989: the guard-order tests evaluate magic-rewritten programs, so
+  # this target needs the plan generator's backend (columnar) and its arena
+  # and work-queue dependencies, not just the IR passes.
+  backend_src,
   io_src,
+  arena_src,
   thread_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  dependencies: [threads_dep],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('magic_sets', test_magic_sets_exe)
