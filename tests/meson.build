@@ -1162,6 +1162,28 @@ test_symbol_aggregates_exe = executable(
 # The whole binary runs in well under a second; the timeout bounds the hang.
 test('symbol_aggregates', test_symbol_aggregates_exe, timeout: 60)
 
+# Issue #978: average() was never implemented -- col_op_reduce() had no AVG
+# arm, so each group kept the first operand the scan happened to reach.  With
+# no float type to return a mean in, it is rejected at lowering instead.
+test_average_rejected_exe = executable(
+  'test_average_rejected',
+  files('test_average_rejected.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+# One case evaluates a recursive stratum; the timeout bounds a non-terminating
+# fixpoint rather than a slow one.
+test('average_rejected', test_average_rejected_exe, timeout: 60)
+
 test('option2_doop', test_option2_doop_exe,
   env: ['DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop'],
 )

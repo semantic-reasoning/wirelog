@@ -627,8 +627,20 @@ cmp_to_tag(wirelog_cmp_op_t op, wl_ir_coltype_t lhs, wl_ir_coltype_t rhs)
     }
 }
 
-/* Map IR agg fn -> plan expr tag */
-static uint8_t
+/*
+ * Map IR agg fn -> plan expr tag, or -1 when the aggregate has no tag.
+ *
+ * WIRELOG_AGG_AVG used to map to WL_PLAN_EXPR_AGG_SUM, commented
+ * "approximate: no AVG tag": the serialized plan said SUM where the program
+ * said average, so a backend reading the plan could not tell the two apart
+ * and no diagnostic was emitted either way.  average() is now refused at the
+ * WIRELOG_IR_AGGREGATE arm below, which is the only route the parser can
+ * take here -- an AGGREGATE node is always a top-level head argument, so
+ * min(average(v)) and the like are parse errors and this expression form
+ * never carries AVG.  Failing rather than substituting keeps that true for
+ * any future caller that builds IR directly (Issue #978).
+ */
+static int
 agg_to_tag(wirelog_agg_fn_t fn)
 {
     switch (fn) {
@@ -641,9 +653,9 @@ agg_to_tag(wirelog_agg_fn_t fn)
     case WIRELOG_AGG_MAX:
         return WL_PLAN_EXPR_AGG_MAX;
     case WIRELOG_AGG_AVG:
-        return WL_PLAN_EXPR_AGG_SUM; /* approximate: no AVG tag */
+        return -1;
     }
-    return WL_PLAN_EXPR_AGG_COUNT; /* fallback */
+    return -1; /* not an aggregate this plan format can encode */
 }
 
 /**
@@ -818,12 +830,16 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         return expr_buf_push_u8(buf, cmp_to_tag(expr->cmp_op, lhs, rhs));
     }
 
-    case WL_IR_EXPR_AGG:
+    case WL_IR_EXPR_AGG: {
         for (uint32_t i = 0; i < expr->child_count; i++) {
             if (serialize_expr(buf, expr->children[i], ctx) != 0)
                 return -1;
         }
-        return expr_buf_push_u8(buf, agg_to_tag(expr->agg_fn));
+        int agg_tag = agg_to_tag(expr->agg_fn);
+        if (agg_tag < 0)
+            return -1;
+        return expr_buf_push_u8(buf, (uint8_t)agg_tag);
+    }
 
     case WL_IR_EXPR_STR_FN:
         /* Serialize arguments first (postfix), then emit the function opcode */
@@ -1476,6 +1492,49 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     }
 
     case WIRELOG_IR_AGGREGATE: {
+        /*
+         * average() is not implemented and is refused here rather than
+         * answered wrongly (Issue #978).
+         *
+         * col_op_reduce() seeds each group with the group's first operand
+         * and its update switch has arms for COUNT/SUM/MIN/MAX only, so
+         * WIRELOG_AGG_AVG fell through `default: break;` and the seed was
+         * returned untouched.  The answer followed scan order rather than
+         * the data -- val(1,9). val(1,5). val(1,2). gave 9, and reordering
+         * the same three facts gave 1 -- with exit status 0 and no
+         * diagnostic.
+         *
+         * Implementing it needs a return type this engine does not have.
+         * Every value is an int64_t (columnar/internal.h), and while
+         * WIRELOG_TYPE_FLOAT exists in the public enum it is vestigial: the
+         * lexer has type keywords for int32/int64/string/symbol only and no
+         * decimal literal, so neither `.decl v(x: float)` nor `1.5` parses.
+         * The only implementable semantics today is truncating integer
+         * division, and that is the one choice that cannot be corrected
+         * later without silently changing existing programs' numbers --
+         * whereas widening a rejection to a real mean accepts strictly more
+         * programs and rewrites none.  Precedent agrees: Soufflé refuses
+         * integer operands to mean() outright, and PostgreSQL, SQLite,
+         * MySQL and cozo all widen the result type rather than truncate.
+         * This follows the sequence adopted for #973: reject first, support
+         * later.
+         *
+         * Placed at lowering, not in the lexer: `average`/`AVG` keep
+         * tokenizing, the AST keeps its AGGREGATE node and the public
+         * WIRELOG_AGG_AVG stays as it is, so nothing about the surface
+         * syntax has to be un-done when float arrives.
+         */
+        if (node->agg_fn == WIRELOG_AGG_AVG) {
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                "'average' is not supported: every value is a 64-bit "
+                "integer, so there is no type to return a mean in. Compute "
+                "it from sum and count instead: "
+                "s(g, sum(v)) :- val(g, v). "
+                "c(g, count(v)) :- val(g, v). "
+                "t(g, x / y) :- s(g, x), c(g, y).");
+            return -1;
+        }
+
         /* Translate child first */
         if (node->child_count > 0) {
             if (translate_ir_node(node->children[0], ops) != 0)
