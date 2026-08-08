@@ -64,7 +64,9 @@ wl_csv_read_file(const char *path, char delimiter, int64_t **data,
  * @delimiter: Field separator character.
  * @col_types: Array of column types (STRING columns are interned).
  * @num_cols:  Number of columns expected (length of @col_types).
- * @values:    Output buffer for parsed int64_t values (length >= @num_cols).
+ * @values:    Output buffer for parsed int64_t values.
+ * @max_cols:  Capacity of @values.  @num_cols > @max_cols is rejected
+ *             rather than written past (#997), as in wl_csv_parse_line().
  * @count:     (out) Number of values parsed.
  * @intern:    Intern table for string columns (must not be NULL if any
  *             column is STRING).
@@ -74,15 +76,18 @@ wl_csv_read_file(const char *path, char delimiter, int64_t **data,
  * stored as int64_t IDs.  Quoted strings (double-quote delimited) are
  * supported; quotes are stripped before interning.
  *
+ * There is no upper bound on @num_cols beyond the buffer the caller
+ * supplies.
+ *
  * Returns:
  *    0: Success.
  *   -1: Invalid arguments or parse error.
- *   -2: Column count mismatch.
+ *   -2: Column count mismatch, or @num_cols exceeds @max_cols.
  */
 int
 wl_csv_parse_line_ex(const char *line, char delimiter,
     const wirelog_column_type_t *col_types, uint32_t num_cols,
-    int64_t *values, uint32_t *count, wl_intern_t *intern);
+    int64_t *values, uint32_t max_cols, uint32_t *count, wl_intern_t *intern);
 
 /**
  * wl_csv_read_file_ex:
@@ -98,6 +103,10 @@ wl_csv_parse_line_ex(const char *line, char delimiter,
  * Read a CSV file with mixed integer and string columns. String columns
  * are interned; integer columns are parsed as int64_t. All non-empty lines
  * must have exactly @num_cols fields.
+ *
+ * @num_cols is not capped: the row buffer is sized from it once per file
+ * (#997).  Contrast wl_csv_read_file(), which auto-detects its width and
+ * therefore still parses into a fixed 256-column frame array.
  *
  * Returns:
  *    0: Success.

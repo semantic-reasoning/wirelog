@@ -4591,6 +4591,33 @@ test_input_arity_exe = executable(
 test('input_arity', test_input_arity_exe)
 
 # ============================================================================
+# Wide-relation CSV Loading Tests (Issue #997)
+# The string-aware CSV parser wrote one int64_t per declared column into a
+# fixed row_values[256] frame buffer with no capacity check, so a relation
+# with 257+ columns and at least one symbol overflowed the caller's stack.
+# Drives the pipeline, wl_csv_read_file_via_ctx(), and the public
+# wirelog_load_facts_from_csv() entry an embedder reaches the parser through.
+# ============================================================================
+
+test_csv_wide_columns_exe = executable(
+  'test_csv_wide_columns',
+  files('test_csv_wide_columns.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  driver_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+test('csv_wide_columns', test_csv_wide_columns_exe)
+
+# ============================================================================
 # Concurrent I/O Adapter Registry Stress Test (#459)
 # Exercises mutex safety under TSan: concurrent find, register/unregister,
 # and mixed readers+writers.  Linux/macOS only (pthreads; skipped on Windows).
