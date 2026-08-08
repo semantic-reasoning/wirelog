@@ -71,6 +71,14 @@ wl_csv_parse_line(const char *line, char delimiter, int64_t *values,
 
 /* Initial capacity for row buffer */
 #define CSV_INITIAL_CAPACITY 64
+/*
+ * Width cap for the integer-only reader below.  wl_csv_read_file()
+ * auto-detects its column count from the file's first line, so it has no
+ * expected width to size a buffer from and parses into a fixed frame
+ * array; wl_csv_parse_line() bounds the writes with -2.  The
+ * string-aware reader is told its width by the caller and sizes its row
+ * buffer from it, so it is not subject to this cap (#997).
+ */
 #define CSV_MAX_COLS 256
 #define CSV_LINE_BUF 4096
 
@@ -156,99 +164,33 @@ wl_csv_read_file(const char *path, char delimiter, int64_t **data,
 }
 
 /* ======================================================================== */
-/* Extended Line Parser (mixed int/string)                                  */
-/* ======================================================================== */
-
-int
-wl_csv_parse_line_ex(const char *line, char delimiter,
-    const wirelog_column_type_t *col_types, uint32_t num_cols,
-    int64_t *values, uint32_t *count, wl_intern_t *intern)
-{
-    if (!line || !col_types || !values || !count || num_cols == 0)
-        return -1;
-
-    *count = 0;
-    const char *p = line;
-
-    for (uint32_t col = 0; col < num_cols; col++) {
-        /* Skip leading whitespace */
-        while (*p && *p != delimiter && *p != '"' && isspace((unsigned char)*p))
-            p++;
-
-        if (*p == '\0' && col < num_cols - 1)
-            return -2; /* too few columns */
-
-        if (col_types[col] == WIRELOG_TYPE_STRING) {
-            /* Parse string field: quoted or unquoted */
-            char strbuf[4096];
-            size_t slen = 0;
-
-            if (*p == '"') {
-                /* Quoted field: read until closing quote */
-                p++; /* skip opening quote */
-                while (*p && *p != '"') {
-                    if (slen < sizeof(strbuf) - 1)
-                        strbuf[slen++] = *p;
-                    p++;
-                }
-                if (*p == '"')
-                    p++; /* skip closing quote */
-            } else {
-                /* Unquoted field: read until delimiter or end */
-                while (*p && *p != delimiter && *p != '\n' && *p != '\r') {
-                    if (slen < sizeof(strbuf) - 1)
-                        strbuf[slen++] = *p;
-                    p++;
-                }
-                /* Trim trailing whitespace */
-                while (slen > 0 && isspace((unsigned char)strbuf[slen - 1]))
-                    slen--;
-            }
-            strbuf[slen] = '\0';
-
-            if (!intern)
-                return -1;
-            values[col] = wl_intern_put(intern, strbuf);
-            if (values[col] < 0)
-                return -1;
-        } else {
-            /* Parse integer field */
-            char *end;
-            values[col] = strtoll(p, &end, 10);
-            if (end == p)
-                return -1; /* not a valid integer */
-            p = end;
-
-            /* Skip trailing whitespace */
-            while (*p && *p != delimiter && isspace((unsigned char)*p))
-                p++;
-        }
-
-        (*count)++;
-
-        /* Skip delimiter between fields */
-        if (col < num_cols - 1) {
-            if (*p == delimiter)
-                p++;
-        }
-    }
-
-    return 0;
-}
-
-/* ======================================================================== */
 /* Callback-based line parser (internal)                                    */
 /* ======================================================================== */
 
+/*
+ * The single implementation of the string-aware line parser.
+ * wl_csv_parse_line_ex() below is a thin wrapper over it; the two used to
+ * be near-identical copies, and the capacity check added for #997 had to
+ * exist in both or neither, so they are now one body.
+ *
+ * @max_cols is the capacity of @values.  Writing @num_cols cells into a
+ * buffer that does not hold them is what #997 was: the caller's declared
+ * width was trusted with no bound, overflowing a fixed 256-entry frame
+ * array.  The bound lives here, at the write site, mirroring
+ * wl_csv_parse_line().
+ */
 static int
 csv_parse_line_via_ctx(const char *line, char delimiter,
     const wirelog_column_type_t *col_types, uint32_t num_cols,
-    int64_t *values, uint32_t *count,
+    int64_t *values, uint32_t max_cols, uint32_t *count,
     int64_t (*intern_cb)(void *opaque, const char *str),
     void *opaque)
 {
     if (!line || !col_types || !values || !count || num_cols == 0 || !intern_cb)
         return -1;
+
+    if (num_cols > max_cols)
+        return -2; /* too many columns for the output buffer */
 
     *count = 0;
     const char *p = line;
@@ -317,6 +259,31 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
     return 0;
 }
 
+/* Adapts the intern-table API to the callback the parser expects. */
+static int64_t
+intern_trampoline(void *opaque, const char *str)
+{
+    return wl_intern_put((wl_intern_t *)opaque, str);
+}
+
+/* ======================================================================== */
+/* Extended Line Parser (mixed int/string)                                  */
+/* ======================================================================== */
+
+int
+wl_csv_parse_line_ex(const char *line, char delimiter,
+    const wirelog_column_type_t *col_types, uint32_t num_cols,
+    int64_t *values, uint32_t max_cols, uint32_t *count, wl_intern_t *intern)
+{
+    /*
+     * A NULL @intern is only an error once a STRING column is actually
+     * reached: wl_intern_put(NULL, ...) returns -1, which the parser
+     * reports as -1.  All-integer column sets stay legal without one.
+     */
+    return csv_parse_line_via_ctx(line, delimiter, col_types, num_cols, values,
+               max_cols, count, intern_trampoline, intern);
+}
+
 /* ======================================================================== */
 /* Callback-based File Reader (#455)                                        */
 /* ======================================================================== */
@@ -353,6 +320,21 @@ wl_csv_read_file_via_ctx(
         return -3;
     }
 
+    /*
+     * One row buffer for the whole file, sized to the caller's real
+     * width.  It used to be a fixed int64_t[256] declared inside the
+     * loop, which the parser wrote past for any relation wider than that
+     * (#997).  Allocating per line instead would be visible on the DOOP
+     * load path, which streams ~760 MB through here.
+     */
+    int64_t *row_values = (int64_t *)malloc((size_t)num_cols
+            * sizeof(int64_t));
+    if (!row_values) {
+        free(buf);
+        fclose(f);
+        return -3;
+    }
+
     char line[CSV_LINE_BUF];
     while (fgets(line, sizeof(line), f)) {
         /* Strip trailing newline */
@@ -364,12 +346,12 @@ wl_csv_read_file_via_ctx(
         if (len == 0)
             continue;
 
-        int64_t row_values[CSV_MAX_COLS];
         uint32_t col_count = 0;
         int rc = csv_parse_line_via_ctx(line, delimiter, col_types, num_cols,
-                row_values, &col_count,
+                row_values, num_cols, &col_count,
                 intern_cb, opaque);
         if (rc != 0 || col_count != num_cols) {
+            free(row_values);
             free(buf);
             fclose(f);
             return -2;
@@ -381,6 +363,7 @@ wl_csv_read_file_via_ctx(
             int64_t *tmp = (int64_t *)realloc(buf, (size_t)capacity * num_cols
                     * sizeof(int64_t));
             if (!tmp) {
+                free(row_values);
                 free(buf);
                 fclose(f);
                 return -3;
@@ -394,6 +377,7 @@ wl_csv_read_file_via_ctx(
         (*out_nrows)++;
     }
 
+    free(row_values);
     fclose(f);
 
     *out_data = buf;
@@ -403,13 +387,6 @@ wl_csv_read_file_via_ctx(
 /* ======================================================================== */
 /* Extended File Reader -- thin wrapper over via_ctx                         */
 /* ======================================================================== */
-
-/* Trampoline for backward compatibility */
-static int64_t
-intern_trampoline(void *opaque, const char *str)
-{
-    return wl_intern_put((wl_intern_t *)opaque, str);
-}
 
 int
 wl_csv_read_file_ex(const char *path, char delimiter,

@@ -422,7 +422,7 @@ test_parse_line_ex_mixed(void)
     int64_t values[3];
     uint32_t count = 0;
     int rc = wl_csv_parse_line_ex("\"Alice\",42,\"Bob\"", ',', types, 3, values,
-            &count, intern);
+            3, &count, intern);
 
     if (rc != 0) {
         FAIL("returned non-zero");
@@ -475,8 +475,8 @@ test_parse_line_ex_unquoted_strings(void)
         = { WIRELOG_TYPE_STRING, WIRELOG_TYPE_STRING };
     int64_t values[2];
     uint32_t count = 0;
-    int rc = wl_csv_parse_line_ex("hello,world", ',', types, 2, values, &count,
-            intern);
+    int rc = wl_csv_parse_line_ex("hello,world", ',', types, 2, values, 2,
+            &count, intern);
 
     if (rc != 0) {
         FAIL("returned non-zero");
@@ -520,8 +520,8 @@ test_parse_line_ex_all_int(void)
     wirelog_column_type_t types[] = { WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT32 };
     int64_t values[2];
     uint32_t count = 0;
-    int rc
-        = wl_csv_parse_line_ex("10,20", ',', types, 2, values, &count, intern);
+    int rc = wl_csv_parse_line_ex("10,20", ',', types, 2, values, 2, &count,
+            intern);
 
     if (rc != 0) {
         FAIL("returned non-zero");
