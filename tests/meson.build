@@ -4619,6 +4619,35 @@ test_input_arity_exe = executable(
 test('input_arity', test_input_arity_exe)
 
 # ============================================================================
+# CSV Reader Line/Field Limit Tests (#953)
+# The reader used to pull lines through a fixed 4096-byte fgets buffer, so a
+# longer physical line was delivered in chunks and every chunk became its own
+# tuple -- truncation that fabricated rows.  #977's width check cannot cover
+# the class because the reader never assembles the whole line.  Drives the
+# full pipeline, plus one direct wl_csv_parse_line_ex() case for the field
+# buffer that is only reachable off the file path, and a >256-column case
+# pinning that #997's row-write capacity bound survives the rewrite.
+# ============================================================================
+
+test_csv_limits_exe = executable(
+  'test_csv_limits',
+  files('test_csv_limits.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  driver_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+test('csv_limits', test_csv_limits_exe)
+
+# ============================================================================
 # Wide-relation CSV Loading Tests (Issue #997)
 # The string-aware CSV parser wrote one int64_t per declared column into a
 # fixed row_values[256] frame buffer with no capacity check, so a relation
