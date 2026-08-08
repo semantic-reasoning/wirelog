@@ -79,10 +79,11 @@ static int tests_failed = 0;
         } while (0)
 
 /*
- * The .decl for a 300-column relation is a few KiB.  The CSV line must
- * also stay under the reader's 4096-byte line buffer -- that truncation
- * limit is #953 and deliberately out of scope here -- so the field
- * values are kept short.
+ * The .decl for a 300-column relation is a few KiB.  The field values
+ * are kept short so both fixtures fit these static buffers; the reader
+ * no longer imposes a line-length limit of its own (#953), and the
+ * interaction between a wide relation and a line long enough to need
+ * the growable buffer is covered in tests/test_csv_limits.c.
  */
 #define WIDE_SRC_BUF 32768
 #define WIDE_CSV_BUF 16384
