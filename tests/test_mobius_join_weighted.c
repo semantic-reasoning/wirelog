@@ -445,9 +445,14 @@ test_wide_relation_join(void)
 int
 main(void)
 {
-    /* Line-buffered: a row-buffer overflow aborts the process, and a fully
-     * buffered stdout would discard the name of the case that crashed. */
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    /* Unbuffered: a row-buffer overflow aborts the process, and a buffered
+     * stdout would discard the name of the case that crashed.  _IONBF is the
+     * only portable spelling: MSVC's UCRT rejects a size of 0 for _IOLBF and
+     * _IOFBF through the invalid-parameter handler, which terminates the
+     * process with 0xC0000409 -- an exit code that reads as a stack-cookie
+     * failure but is not one.  Win32 also maps _IOLBF onto full buffering,
+     * so it would not have flushed per line even where it was accepted. */
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     printf("=== test_mobius_join_weighted (TDD RED PHASE) ===\n\n");
     printf("NOTE: Expected to FAIL at link time until col_op_join_weighted\n");
