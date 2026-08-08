@@ -381,12 +381,74 @@ test_output_multiplicity_is_product(void)
     PASS();
 }
 
+/* ================================================================
+ * Test 4: relations wider than COL_STACK_MAX (Issue #1000)
+ *
+ * col_op_join_weighted copied both the left and the right row into an
+ * int64_t[COL_STACK_MAX] (32) and filled it at the relation's width, so
+ * a join over relations of 33 columns wrote past both buffers.  There is
+ * no .dl program that reaches this function -- it has no caller outside
+ * the test suite -- so the width guard can only be exercised here.
+ *
+ * lhs: 1 row (0, 1, .., 32) mult=2      [33 columns]
+ * rhs: 1 row (0, 100, .., 131) mult=3   [33 columns]
+ * key: column 0 (== 0 in both)
+ *
+ * Expected: one output row of 66 columns, lhs columns then rhs columns,
+ * with multiplicity 6.
+ * ================================================================ */
+#define WIDE_NCOLS 33u
+
+static void
+test_wide_relation_join(void)
+{
+    TEST("33-column JOIN does not overflow the row buffers (#1000)");
+
+    col_rel_t *lhs = test_rel_alloc(WIDE_NCOLS);
+    col_rel_t *rhs = test_rel_alloc(WIDE_NCOLS);
+    col_rel_t *dst = test_rel_alloc(0); /* ncols set by join */
+    ASSERT(lhs && rhs && dst, "test_rel_alloc failed");
+
+    int64_t lrow[WIDE_NCOLS];
+    int64_t rrow[WIDE_NCOLS];
+    for (uint32_t c = 0; c < WIDE_NCOLS; c++) {
+        lrow[c] = (int64_t)c;
+        rrow[c] = (c == 0) ? 0 : (int64_t)(100u + c - 1u);
+    }
+    ASSERT(test_rel_append_row_mult(lhs, lrow, 2) == 0, "append lhs row");
+    ASSERT(test_rel_append_row_mult(rhs, rrow, 3) == 0, "append rhs row");
+
+    int rc = col_op_join_weighted(lhs, rhs, 0, dst);
+
+    ASSERT(rc == 0, "returns 0 on success");
+    ASSERT(dst->ncols == 2u * WIDE_NCOLS, "dst->ncols == 66");
+    ASSERT(dst->nrows == 1, "dst->nrows == 1 (one matching pair)");
+    ASSERT(dst->timestamps != NULL, "dst->timestamps is non-NULL");
+    ASSERT(dst->timestamps[0].multiplicity == 6, "output mult == 6 (2 * 3)");
+
+    for (uint32_t c = 0; c < WIDE_NCOLS; c++) {
+        ASSERT(col_rel_get(dst, 0, c) == lrow[c],
+            "left half of the joined row is intact");
+        ASSERT(col_rel_get(dst, 0, WIDE_NCOLS + c) == rrow[c],
+            "right half of the joined row is intact");
+    }
+
+    test_rel_free(lhs);
+    test_rel_free(rhs);
+    test_rel_free(dst);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
 int
 main(void)
 {
+    /* Line-buffered: a row-buffer overflow aborts the process, and a fully
+     * buffered stdout would discard the name of the case that crashed. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("=== test_mobius_join_weighted (TDD RED PHASE) ===\n\n");
     printf("NOTE: Expected to FAIL at link time until col_op_join_weighted\n");
     printf("      is implemented with extern linkage.\n\n");
@@ -394,6 +456,7 @@ main(void)
     test_simple_join_mult_multiply();
     test_multiple_keys_different_mults();
     test_output_multiplicity_is_product();
+    test_wide_relation_join();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);

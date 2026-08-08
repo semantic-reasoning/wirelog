@@ -4643,7 +4643,33 @@ test_csv_wide_columns_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   install: false,
 )
+
+# ============================================================================
+# Wide-Relation Row Buffer Tests (#1000)
+# Every columnar operator copies rows through an int64_t[COL_STACK_MAX]
+# buffer but fills it at the relation's width, so relations wider than 32
+# columns smash the stack (SIGABRT in release, not just an ASan report).
+# One rule shape per operator kind at widths 32 / 33 / 200.
+# ============================================================================
+
+test_wide_relation_exe = executable(
+  'test_wide_relation',
+  files('test_wide_relation.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  driver_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
 test('csv_wide_columns', test_csv_wide_columns_exe)
+test('wide_relation', test_wide_relation_exe, timeout: 120)
 
 # ============================================================================
 # Concurrent I/O Adapter Registry Stress Test (#459)

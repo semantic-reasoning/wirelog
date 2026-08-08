@@ -406,6 +406,53 @@ col_rel_buf_bytes(const col_rel_t *r, uint32_t row_count)
 }
 
 /* ======================================================================== */
+/* Row Scratch Buffer (Issue #1000)                                         */
+/*                                                                          */
+/* col_rel_row_copy_out() writes r->ncols values, so any buffer handed to   */
+/* it must be at least that wide.  A bare int64_t[COL_STACK_MAX] smashes    */
+/* the stack for relations wider than COL_STACK_MAX columns.  Use this      */
+/* helper instead: it keeps the stack buffer for the common narrow case     */
+/* (no allocation, no free) and spills to the heap only past the bound.     */
+/*                                                                          */
+/*   col_row_buf_t rb;                                                      */
+/*   int64_t *const row = col_row_buf_init(&rb, nc);                        */
+/*   if (!row) { ...ENOMEM... }                                             */
+/*   for (...) { col_rel_row_copy_out(rel, i, row); ... }                   */
+/*   col_row_buf_release(&rb);            (on every exit path)              */
+/*                                                                          */
+/* Two things matter for the hot path.  Hoist the init/release out of       */
+/* per-row loops -- initialising inside a loop would malloc once per row    */
+/* for wide relations.  And read ->ptr once into a local, as above, rather  */
+/* than writing rb.ptr[c] inside the loop: the compiler cannot always prove */
+/* the callee did not change ->ptr, so it reloads it every iteration        */
+/* (worth ~2% on the crdt bench workload when written the naive way).       */
+/* ======================================================================== */
+
+typedef struct {
+    int64_t stack[COL_STACK_MAX];
+    int64_t *ptr; /* == stack, or heap block; NULL on allocation failure */
+} col_row_buf_t;
+
+/** Point @b at a buffer of at least @ncols int64_t.  Returns NULL on OOM. */
+static inline int64_t *
+col_row_buf_init(col_row_buf_t *b, uint32_t ncols)
+{
+    b->ptr = (ncols <= COL_STACK_MAX)
+        ? b->stack
+        : (int64_t *)malloc((size_t)ncols * sizeof(int64_t));
+    return b->ptr;
+}
+
+/** Release @b.  Safe to call on a failed or already-released buffer. */
+static inline void
+col_row_buf_release(col_row_buf_t *b)
+{
+    if (b->ptr && b->ptr != b->stack)
+        free(b->ptr);
+    b->ptr = NULL;
+}
+
+/* ======================================================================== */
 /* Row Comparison (Phase B, Issue #330; optimized Issue #334)                */
 /*                                                                          */
 /* Compare two rows using direct column access for cache efficiency.         */

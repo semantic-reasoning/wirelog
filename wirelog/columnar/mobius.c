@@ -48,16 +48,30 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
     if (!tmp)
         return ENOMEM;
 
+    /* Row scratch for each side (#1000).  col_rel_row_copy_out() writes
+     * ->ncols values, so a bare int64_t[COL_STACK_MAX] overflows for
+     * relations wider than 32 columns.  Both buffers are hoisted out of the
+     * loops: the right-hand buffer is used by the inner loop, so allocating
+     * it there would malloc once per (li, ri) pair. */
+    col_row_buf_t lrb, rrb;
+    int64_t *lptr = col_row_buf_init(&lrb, lhs->ncols);
+    int64_t *rptr = col_row_buf_init(&rrb, rhs->ncols);
+    if (!lptr || !rptr) {
+        col_row_buf_release(&lrb);
+        col_row_buf_release(&rrb);
+        free(tmp);
+        return ENOMEM;
+    }
+
     int rc = 0;
     for (uint32_t li = 0; li < lhs->nrows && rc == 0; li++) {
-        int64_t lrow_buf[COL_STACK_MAX];
-        col_rel_row_copy_out(lhs, li, lrow_buf); const int64_t *lrow = lrow_buf;
+        col_rel_row_copy_out(lhs, li, lptr);
+        const int64_t *lrow = lptr;
         int64_t lmult = lhs->timestamps ? lhs->timestamps[li].multiplicity : 1;
 
         for (uint32_t ri = 0; ri < rhs->nrows && rc == 0; ri++) {
-            int64_t rrow_buf[COL_STACK_MAX];
-            col_rel_row_copy_out(rhs, ri, rrow_buf);
-            const int64_t *rrow = rrow_buf;
+            col_rel_row_copy_out(rhs, ri, rptr);
+            const int64_t *rrow = rptr;
 
             if (lrow[key_col] != rrow[key_col])
                 continue;
@@ -102,6 +116,8 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
         }
     }
 
+    col_row_buf_release(&lrb);
+    col_row_buf_release(&rrb);
     free(tmp);
     return rc;
 }
@@ -138,7 +154,29 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
     uint32_t ncols = prev_collection->ncols;
     out_delta->ncols = ncols;
 
+    /* Row scratch for each collection (#1000).  col_rel_row_copy_out()
+     * writes ->ncols values, so a bare int64_t[COL_STACK_MAX] overflows past
+     * 32 columns.  Both buffers are hoisted to function scope: each pass
+     * scans one collection in its inner loop, so a per-iteration allocation
+     * would malloc once per (ci, pi) pair.  Each buffer always holds a row
+     * of the same collection, in both passes. */
+    col_row_buf_t crb, prb;
+    int64_t *cptr = col_row_buf_init(&crb, curr_collection->ncols);
+    int64_t *pptr = col_row_buf_init(&prb, prev_collection->ncols);
+    if (!cptr || !pptr) {
+        col_row_buf_release(&crb);
+        col_row_buf_release(&prb);
+        return ENOMEM;
+    }
+
     /* Helper lambda (via inline block) to append a row+mult to out_delta. */
+#define DELTA_FAIL()                                                          \
+        do {                                                                      \
+            col_row_buf_release(&crb);                                            \
+            col_row_buf_release(&prb);                                            \
+            return ENOMEM;                                                        \
+        } while (0)
+
 #define DELTA_APPEND(row_ptr, mult_val)                                       \
         do {                                                                      \
             if (out_delta->nrows >= out_delta->capacity) {                        \
@@ -147,17 +185,17 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
                 if (out_delta->columns) {                                         \
                     if (col_columns_realloc(out_delta->columns, ncols,             \
                         new_cap) != 0)                                            \
-                    return ENOMEM;                                            \
+                    DELTA_FAIL();                                             \
                 } else {                                                          \
                     out_delta->columns = col_columns_alloc(ncols, new_cap);        \
                     if (!out_delta->columns)                                       \
-                    return ENOMEM;                                            \
+                    DELTA_FAIL();                                             \
                 }                                                                 \
                 col_delta_timestamp_t *nt = (col_delta_timestamp_t *)realloc(     \
                     out_delta->timestamps,                                        \
                     (size_t)new_cap * sizeof(col_delta_timestamp_t));             \
                 if (!nt)                                                          \
-                return ENOMEM;                                                \
+                DELTA_FAIL();                                                 \
                 out_delta->timestamps = nt;                                       \
                 out_delta->capacity = new_cap;                                    \
             }                                                                     \
@@ -171,9 +209,8 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 
     /* Pass 1: iterate over curr; for each key look up in prev. */
     for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
-        int64_t crow_buf[COL_STACK_MAX];
-        col_rel_row_copy_out(curr_collection, ci, crow_buf);
-        const int64_t *crow = crow_buf;
+        col_rel_row_copy_out(curr_collection, ci, cptr);
+        const int64_t *crow = cptr;
         int64_t cmult = curr_collection->timestamps
                             ? curr_collection->timestamps[ci].multiplicity
                             : 1;
@@ -182,9 +219,8 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
         int64_t pmult = 0;
         bool found_in_prev = false;
         for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
-            int64_t prow_buf[COL_STACK_MAX];
-            col_rel_row_copy_out(prev_collection, pi, prow_buf);
-            const int64_t *prow = prow_buf;
+            col_rel_row_copy_out(prev_collection, pi, pptr);
+            const int64_t *prow = pptr;
             if (prow[0] == crow[0]) {
                 pmult = prev_collection->timestamps
                             ? prev_collection->timestamps[pi].multiplicity
@@ -202,18 +238,16 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 
     /* Pass 2: iterate over prev; emit -prev_mult for keys absent in curr. */
     for (uint32_t pi = 0; pi < prev_collection->nrows; pi++) {
-        int64_t prow_buf[COL_STACK_MAX];
-        col_rel_row_copy_out(prev_collection, pi, prow_buf);
-        const int64_t *prow = prow_buf;
+        col_rel_row_copy_out(prev_collection, pi, pptr);
+        const int64_t *prow = pptr;
         int64_t pmult = prev_collection->timestamps
                             ? prev_collection->timestamps[pi].multiplicity
                             : 1;
 
         bool found_in_curr = false;
         for (uint32_t ci = 0; ci < curr_collection->nrows; ci++) {
-            int64_t crow_buf[COL_STACK_MAX];
-            col_rel_row_copy_out(curr_collection, ci, crow_buf);
-            const int64_t *crow = crow_buf;
+            col_rel_row_copy_out(curr_collection, ci, cptr);
+            const int64_t *crow = cptr;
             if (crow[0] == prow[0]) {
                 found_in_curr = true;
                 break;
@@ -229,6 +263,9 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
     }
 
 #undef DELTA_APPEND
+#undef DELTA_FAIL
 
+    col_row_buf_release(&crb);
+    col_row_buf_release(&prb);
     return 0;
 }
