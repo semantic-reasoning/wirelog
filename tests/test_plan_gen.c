@@ -9,6 +9,7 @@
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/intern.h"
+#include "../wirelog/ir/ir.h"
 #include "../wirelog/ir/program.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -606,6 +607,151 @@ test_semijoin_head_projection_values(void)
 }
 
 /* ----------------------------------------------------------------
+ * Test: a JOIN whose right child is not a relation is rejected
+ *
+ * wl_plan_op_t.right_relation is a relation name, not a subtree.  A JOIN
+ * whose right child is itself a composite node cannot be represented; if
+ * plan generation emits it anyway the operator silently matches nothing
+ * (Issue #989).
+ * ---------------------------------------------------------------- */
+
+static wirelog_ir_node_t *
+find_right_deep_candidate(wirelog_ir_node_t *node)
+{
+    if (!node)
+        return NULL;
+    if (node->type == WIRELOG_IR_JOIN && node->child_count == 2
+        && node->children[0]
+        && node->children[0]->type == WIRELOG_IR_JOIN)
+        return node;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        wirelog_ir_node_t *hit = find_right_deep_candidate(node->children[i]);
+        if (hit)
+            return hit;
+    }
+    return NULL;
+}
+
+static void
+test_join_with_composite_right_child_rejected(void)
+{
+    TEST("JOIN with composite right child is rejected");
+
+    const char *src = ".decl a(x: int32, y: int32)\n"
+        ".decl b(y: int32, z: int32)\n"
+        ".decl c(z: int32, w: int32)\n"
+        ".decl out(x: int32, w: int32)\n"
+        "a(1, 2). b(2, 3). c(3, 4).\n"
+        "out(x, w) :- a(x, y), b(y, z), c(z, w).\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "parse failed");
+
+    /* The parser builds JOIN(JOIN(a, b), c).  Swap the outer JOIN's
+     * children to obtain the right-deep JOIN(c, JOIN(a, b)). */
+    wirelog_ir_node_t *outer = NULL;
+    for (uint32_t r = 0; r < prog->rule_count && !outer; r++) {
+        if (prog->rules[r].head_relation
+            && strcmp(prog->rules[r].head_relation, "out") == 0)
+            outer = find_right_deep_candidate(prog->rules[r].ir_root);
+    }
+    if (!outer) {
+        wirelog_program_free(prog);
+        FAIL("no left-deep JOIN chain to invert");
+        return;
+    }
+
+    wirelog_ir_node_t *tmp = outer->children[0];
+    outer->children[0] = outer->children[1];
+    outer->children[1] = tmp;
+
+    if (wl_ir_program_rebuild_relation_irs(prog) != 0) {
+        wirelog_program_free(prog);
+        FAIL("rebuild_relation_irs failed");
+        return;
+    }
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc == 0) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("plan generation accepted an unrepresentable JOIN right child");
+        return;
+    }
+    ASSERT(plan == NULL, "plan must not be returned on error");
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Issue #994: the same rejection reached from ordinary source, with no IR
+ * surgery and no magic sets.
+ *
+ * build_atom_scan() returns a composite JOIN(scan, side_scan) for a `side`
+ * compound pattern, and convert_rule() installs that whole subtree as the
+ * right child of the outer chain join -- so any body whose *non-first* atom
+ * carries a side compound is right-deep.  That has always been
+ * unrepresentable: before #989 it produced a plan that silently matched
+ * nothing, and the rule returned no rows while the identical rule with the
+ * atoms swapped returned the right answer.
+ *
+ * Pinning the rejection here records that this is a deliberate trade -- a
+ * plan-generation error in place of a silent wrong answer -- and not an
+ * accident.  It is not the fix; #994 tracks flattening the subtree into the
+ * left spine so the rule works in either atom position.
+ */
+static void
+test_side_compound_in_non_first_atom_rejected(void)
+{
+    TEST("side compound in a non-first body atom is rejected (#994)");
+
+    const char *src = ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl gate(id: int64)\n"
+        ".decl hot(id: int64, r: int64)\n"
+        "hot(ID, R) :- gate(ID), event(ID, metadata(_, _, _, R)).\n";
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "parse failed");
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    if (rc == 0) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("side compound in a non-first atom should be rejected");
+        return;
+    }
+    ASSERT(plan == NULL, "plan must not be returned on error");
+    wirelog_program_free(prog);
+
+    /* Control: the same rule with the compound atom first is representable
+     * and must still be accepted -- the rejection is positional, not a ban
+     * on side compounds. */
+    const char *ok_src = ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl gate(id: int64)\n"
+        ".decl hot(id: int64, r: int64)\n"
+        "hot(ID, R) :- event(ID, metadata(_, _, _, R)), gate(ID).\n";
+
+    wirelog_program_t *ok = wirelog_parse_string(ok_src, &err);
+    ASSERT(ok != NULL, "control parse failed");
+
+    wl_plan_t *ok_plan = NULL;
+    if (wl_plan_from_program(ok, &ok_plan) != 0) {
+        wirelog_program_free(ok);
+        FAIL("control: compound-first rule must still lower");
+        return;
+    }
+    wl_plan_free(ok_plan);
+    wirelog_program_free(ok);
+
+    PASS();
+}
+
+/* ----------------------------------------------------------------
  * Test: wl_plan_free NULL-safe
  * ---------------------------------------------------------------- */
 
@@ -648,6 +794,8 @@ main(void)
     test_semijoin_does_not_shift_column_indices();
     test_semijoin_chain_end_to_end();
     test_semijoin_head_projection_values();
+    test_join_with_composite_right_child_rejected();
+    test_side_compound_in_non_first_atom_rejected();
     test_plan_free_null();
     test_load_facts_null_safe();
 

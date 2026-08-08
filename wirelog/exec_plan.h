@@ -416,6 +416,12 @@ typedef struct {
     wl_plan_op_type_t op;
 
     const char *relation_name;
+    /* A relation *name*, not a subplan.  The plan therefore cannot represent
+     * a JOIN/ANTIJOIN/SEMIJOIN whose right child is itself composite: any
+     * such tree must be built left-deep, with the composite side on the left.
+     * translate_ir_node() rejects a JOIN that violates this rather than
+     * emitting NULL here, which used to yield a plan that silently computed
+     * nothing (#989). */
     const char *right_relation;
 
     const char *const *left_keys;

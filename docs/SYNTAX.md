@@ -287,6 +287,15 @@ free (to be computed). This enables the Magic Sets optimization pass to restrict
 evaluation to only the tuples reachable from the query, reducing intermediate
 result sizes for recursive programs.
 
+> **Status (Issue #989): a bound `.query` currently prunes nothing.**
+> The Magic Sets pass builds the magic demand relations and guards the rules
+> with them, but there is no syntax for supplying the bound *values* and
+> nothing seeds the demand relation. The demand relation therefore stays
+> empty, the guards match nothing, and the guarded rules are removed from the
+> result rather than restricted. Adding a bound `.query` to a working program
+> will make it derive fewer tuples, not the same tuples faster. Leave `.query`
+> off, or use all-free adornments, until seeding lands.
+
 ### Syntax
 
 ```
@@ -313,8 +322,14 @@ Path(x, y) :- Edge(x, z), Path(z, y).
 
 Here `.query Path(b, f)` declares that the first argument of `Path` is bound
 (e.g., we only want paths starting from a specific node). The engine generates
-magic demand relations (`$m$Path_bf`) that restrict evaluation to only reachable
-tuples, avoiding full materialization of the transitive closure.
+the magic demand relation `$m$Path_bf` and guards both `Path` rules with it,
+which is *intended* to restrict evaluation to only reachable tuples and avoid
+full materialization of the transitive closure.
+
+As written, this program prints nothing. There is no way to say *which* source
+node is bound, so `$m$Path_bf` is never populated and both guards reject every
+tuple. Deleting the `.query` line prints the full closure. See the status note
+above and Issue #989.
 
 Query with all arguments bound (point query):
 
@@ -334,8 +349,21 @@ Query with a mixed pattern on a ternary relation:
   `.output` relations fully (all-free adornment), which is the default behavior.
 - When `.query` is present, the Magic Sets pass generates demand propagation
   rules that prune the search space based on the bound positions.
+- A `.query` with at least one bound position currently yields an **empty**
+  result for the guarded relation, because nothing seeds the demand relation
+  (Issue #989). Do not use it to speed a program up; it changes the answer.
 - An all-free `.query` (e.g., `.query Path(f, f)`) is equivalent to no `.query`
-  and results in no optimization (the pass is a no-op).
+  and results in no optimization (the pass is a no-op). All-free is the only
+  adornment that is safe today.
+- A rule whose bound head position holds a *constant* rather than a variable
+  (e.g. `q(1, y) :- ...` under `.query q(b, f)`) is left unguarded: there is no
+  variable to key the guard on. Such rules are reported by the pass's
+  `skipped_constant_head` counter.
+- A rule that Logic Fusion has collapsed into a fused root — which includes any
+  rule with a filter — is also left unguarded, because the pass reads head
+  variable names off a `PROJECT` node that no longer exists. Such rules are
+  reported by `skipped_unsupported_head`. Both counters describe a rule that
+  evaluates unrestricted: sound, but not the pruning `.query` asks for.
 - Multiple `.query` directives may appear in a single program for different
   relations.
 

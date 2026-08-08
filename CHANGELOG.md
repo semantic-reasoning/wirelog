@@ -42,6 +42,63 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Magic guards are built left-deep** (#989): `insert_magic_guard` produced
+  `JOIN(magic_scan, body)`. When the body was itself composite -- a JOIN chain,
+  an ANTIJOIN from a negated atom, a SIP-inserted SEMIJOIN -- that is a
+  right-deep JOIN, and a right-deep JOIN is structurally unrepresentable in the
+  execution plan: `wl_plan_op_t.right_relation` is a relation *name*, and
+  `translate_ir_node` collapses `children[1]` to `rn->relation_name`. The
+  operator was emitted with `right_relation = NULL`, matched nothing, and the
+  rule silently derived zero tuples. Measured on the `docs/SYNTAX.md` `.query
+  Path(b, f)` example with the demand relation seeded by hand: 3 of the 6
+  closure tuples, the base rule's only. A non-recursive three-way join under a
+  guard produced zero rows, as did a guarded rule with a negated atom.
+
+  The guard SCAN is now the *right* child, matching the parser's rule chain and
+  jpp's chain rebuild, which already build left-deep. One producer does not:
+  `convert_rule` nests a side-compound atom's `JOIN(scan, side_scan)` subtree
+  on the right whenever that atom is not first in the body, which has always
+  been unrepresentable and has always silently matched nothing. That shape is
+  now a plan-generation error rather than an empty result; it is tracked as
+  #994 and is not fixed here. The swap also inverts which side a bound-variable
+  comparison resolves against: the guard's columns now come last in the layout,
+  and each is named after a body column that resolves first, so the guard's
+  `column_types` (#962) are no longer reachable by name. They are still filled
+  in, since `col_ctx_lookup_type` has a positional `colN` fallback that can
+  land in the guard's range.
+
+  **This does not make a bound `.query` work.** Nothing seeds the demand
+  relation, so the guards still reject everything; see the status note in
+  `docs/SYNTAX.md`. What is fixed is the rewrite itself, which is a
+  prerequisite.
+
+- **Plan generation rejects an unrepresentable JOIN right child** (#989):
+  translating a JOIN whose right child carries no relation name now returns an
+  error instead of emitting `right_relation = NULL`. That NULL was an entire
+  silent-wrong-answer class -- the operator matches nothing and the rule
+  quietly under-derives; it is now a plan-generation failure. No in-tree
+  program, benchmark, or example produces such a JOIN.
+
+- **`original_rules_modified` counts guards actually inserted** (#989):
+  `insert_magic_guard` returns 0 both when it inserts a guard and when it
+  declines to, and the caller incremented the counter unconditionally. A rule
+  whose bound head position holds a constant (`q(1, y) :- ...` under `.query
+  q(b, f)`) gets no guard, because there is no variable to key on -- yet was
+  reported as modified. A program with two real guards reported three. The
+  function now returns a distinguishable outcome, and skipped rules are counted
+  separately.
+
+  Two skip counters are added, kept apart because they mean different things.
+  `skipped_constant_head` is a *policy* skip: the rule is well-formed and the
+  pass declines. `skipped_unsupported_head` is a *capability* gap: the pass
+  reads head variables off a PROJECT root, and a rule fused to a FLATMAP root
+  -- Logic Fusion runs before Magic Sets in the shipping pipeline, and any rule
+  with a filter is a fusion candidate -- has no such root, so it was skipped in
+  total silence. That is the common way for a guard to go missing and the
+  headline shape of #990; teaching the pass to handle a fused head is separate
+  work, but the skip is now visible. Together these counters are the only
+  mechanism that can detect a guard silently not being inserted.
+
 - **Inline facts are validated against their relation's declared arity**
   (#977): `collect_fact` packed `fact_data` using each fact's *own*
   argument count as the row stride, while both readers of that buffer --

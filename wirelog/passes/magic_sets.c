@@ -260,11 +260,19 @@ collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms)
  * The value domain of variable @var as bound somewhere under @node.
  *
  * Used to type the magic guard SCAN, whose columns hold the same values as
- * the body variables they are named after.  The guard SCAN is joined in as
- * the LEFT child, so its columns come first in the rule's column layout and
- * a comparison on a bound variable resolves against them.  Leaving them
- * untyped would silently return string comparisons in magic-set-rewritten
- * rules to comparing intern ids (Issue #962).
+ * the body variables they are named after.
+ *
+ * The guard SCAN is joined in as the RIGHT child (Issue #989), so its
+ * columns come *last* in the rule's column layout, after the body's.  Every
+ * guard column is named after a bound head variable, which by construction
+ * also names an earlier body column, and collect_output_columns() /
+ * serialize_expr() both resolve a name to its first match -- so a comparison
+ * on a bound variable now resolves against the body's column, not the
+ * guard's.  These types are therefore unreachable by name.  They remain
+ * reachable positionally: col_ctx_lookup_type() falls back to parsing "colN"
+ * against the concatenated layout, whose tail is the guard.  Leaving them
+ * untyped would silently return a string comparison landing there to
+ * comparing intern ids (Issue #962), so they are still filled in.
  *
  * First match wins, which is the same rule collect_output_columns() and
  * serialize_expr() use to resolve a name to a column.
@@ -514,32 +522,55 @@ build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
 /* Magic Guard Insertion                                                    */
 /* ======================================================================== */
 
+/* Outcome of insert_magic_guard(); see the counters in magic_sets.h. */
+typedef enum {
+    MS_GUARD_ERROR = -1,
+    MS_GUARD_INSERTED = 0,
+    /* Every bound head position holds a constant, so there is no variable
+     * to key the guard on and the rule is left unrestricted. */
+    MS_GUARD_SKIPPED_CONSTANT_HEAD = 1,
+    /* Malformed input: nothing to attach a guard to. */
+    MS_GUARD_SKIPPED_NO_BODY = 2,
+} ms_guard_result_t;
+
 /*
  * Insert a magic guard JOIN at the top of a rule's body.
  *
  * Transforms:
  *   PROJECT(head) -> body_tree
  * into:
- *   PROJECT(head) -> JOIN(SCAN($magic, [bound_vars]), body_tree)
+ *   PROJECT(head) -> JOIN(body_tree, SCAN($magic, [bound_vars]))
  *
  * The JOIN filters the body to only tuples where the bound variables
  * appear in the magic demand relation.
+ *
+ * The guard SCAN is the RIGHT child, not the left (Issue #989).  A JOIN's
+ * right child is not a subtree in the execution plan: wl_plan_op_t carries
+ * a `right_relation` *name*, and translate_ir_node() collapses children[1]
+ * to its relation_name.  Putting the body on the right therefore produces
+ * right_relation = NULL whenever the body is composite (a JOIN chain, an
+ * ANTIJOIN from a negated atom, a SIP SEMIJOIN), and the rule derives
+ * nothing.  Every other producer of JOIN nodes -- the parser, compound
+ * side-bindings, jpp's chain rebuild -- already builds left-deep; this
+ * keeps that invariant.
  */
-static int
+static ms_guard_result_t
 insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
     const char **bound_vars, uint32_t bound_count)
 {
-    if (!ir_root || !magic_name || bound_count == 0)
-        return 0;
+    if (!ir_root || !magic_name)
+        return MS_GUARD_SKIPPED_NO_BODY;
+    if (bound_count == 0)
+        return MS_GUARD_SKIPPED_CONSTANT_HEAD;
     if (ir_root->child_count == 0)
-        return 0;
+        return MS_GUARD_SKIPPED_NO_BODY;
 
     wirelog_ir_node_t *body = ir_root->children[0];
 
     /* SCAN($m$rel_adorn, column_names = [bound_var_0, ...]) */
     wirelog_ir_node_t *magic_scan = wl_ir_node_create(WIRELOG_IR_SCAN);
     if (!magic_scan)
-        return -1;
+        return MS_GUARD_ERROR;
     wl_ir_node_set_relation(magic_scan, magic_name);
 
     magic_scan->column_names = (char **)calloc(bound_count, sizeof(char *));
@@ -547,7 +578,7 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
         = (wl_ir_coltype_t *)calloc(bound_count, sizeof(wl_ir_coltype_t));
     if (!magic_scan->column_names || !magic_scan->column_types) {
         wl_ir_node_free(magic_scan);
-        return -1;
+        return MS_GUARD_ERROR;
     }
     magic_scan->column_count = bound_count;
     for (uint32_t i = 0; i < bound_count; i++) {
@@ -555,19 +586,20 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
             magic_scan->column_names[i] = strdup_safe(bound_vars[i]);
             /* The magic relation carries the same values as the body
              * variables it is keyed on, so it inherits their types.
-             * Not observable today -- no expression is serialized against
-             * this guard's layout -- but wrong types here would be a
-             * silent mistype if one ever were (Issue #962). */
+             * Unreachable by name now that the guard is the right child --
+             * the body's identically named column resolves first (#989) --
+             * but still reachable through the "colN" positional fallback,
+             * where a wrong type would be a silent mistype (Issue #962). */
             magic_scan->column_types[i]
                 = ms_lookup_var_type(body, bound_vars[i]);
         }
     }
 
-    /* JOIN(magic_scan, body) keyed on bound variables */
+    /* JOIN(body, magic_scan) keyed on bound variables */
     wirelog_ir_node_t *guard_join = wl_ir_node_create(WIRELOG_IR_JOIN);
     if (!guard_join) {
         wl_ir_node_free(magic_scan);
-        return -1;
+        return MS_GUARD_ERROR;
     }
 
     guard_join->join_left_keys = (char **)calloc(bound_count, sizeof(char *));
@@ -575,7 +607,7 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
     if (!guard_join->join_left_keys || !guard_join->join_right_keys) {
         wl_ir_node_free(guard_join);
         wl_ir_node_free(magic_scan);
-        return -1;
+        return MS_GUARD_ERROR;
     }
     guard_join->join_key_count = bound_count;
     for (uint32_t i = 0; i < bound_count; i++) {
@@ -585,12 +617,15 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
         }
     }
 
-    wl_ir_node_add_child(guard_join, magic_scan); /* left: magic demand */
-    wl_ir_node_add_child(guard_join, body);       /* right: original body */
+    /* Left-deep: the composite body stays on the left, where the plan can
+     * express it as a subtree.  The right child must be a single relation
+     * (Issue #989). */
+    wl_ir_node_add_child(guard_join, body);       /* left: original body */
+    wl_ir_node_add_child(guard_join, magic_scan); /* right: magic demand */
 
     /* Replace body in parent */
     ir_root->children[0] = guard_join;
-    return 0;
+    return MS_GUARD_INSERTED;
 }
 
 /* ======================================================================== */
@@ -618,6 +653,8 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
         stats->skipped_all_free = 0;
         stats->arity_mismatch_skipped = 0;
         stats->skipped_aggregate = 0;
+        stats->skipped_constant_head = 0;
+        stats->skipped_unsupported_head = 0;
     }
 
     /* === Phase 1: Seed the worklist from explicit demands === */
@@ -895,8 +932,21 @@ next_4a_atom:
 
             const char *head_vars[64] = { 0 };
             uint32_t head_arity = get_head_vars(ir_root, head_vars, 64);
-            if (head_arity == 0)
+            if (head_arity == 0) {
+                /* No PROJECT head to read variable names from, so the guard
+                 * cannot be keyed and the rule runs unrestricted.  This is a
+                 * capability gap, not a policy decision: a rule fused to a
+                 * FLATMAP root lands here -- Logic Fusion runs before Magic
+                 * Sets in the shipping pipeline and any rule with a filter is
+                 * a candidate.  That is the only shape that reaches this in
+                 * practice; an AGGREGATE root cannot, because
+                 * relation_has_aggregate_rule() filters those relations before
+                 * adornment so they never enter `processed`.  Counting it is
+                 * what makes the omission visible at all (see #990). */
+                if (stats)
+                    stats->skipped_unsupported_head++;
                 continue;
+            }
 
             const char *guard_bvars[64];
             uint32_t guard_bcount = 0;
@@ -905,14 +955,21 @@ next_4a_atom:
                     guard_bvars[guard_bcount++] = head_vars[i];
             }
 
-            int rc = insert_magic_guard(ir_root, guard_magic, guard_bvars,
-                    guard_bcount);
-            if (rc != 0) {
+            ms_guard_result_t gr = insert_magic_guard(ir_root, guard_magic,
+                    guard_bvars, guard_bcount);
+            if (gr == MS_GUARD_ERROR) {
                 free(guard_magic);
                 return -1;
             }
-            if (stats)
-                stats->original_rules_modified++;
+            if (stats) {
+                /* Count guards actually inserted.  A rule whose bound head
+                 * positions are all constants keeps running unrestricted;
+                 * that is what skipped_constant_head records. */
+                if (gr == MS_GUARD_INSERTED)
+                    stats->original_rules_modified++;
+                else if (gr == MS_GUARD_SKIPPED_CONSTANT_HEAD)
+                    stats->skipped_constant_head++;
+            }
         }
 
         free(guard_magic);
