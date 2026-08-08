@@ -377,12 +377,77 @@ test_key_vanishes(void)
     PASS();
 }
 
+/* ================================================================
+ * Test 5: relations wider than COL_STACK_MAX (Issue #1000)
+ *
+ * Both passes of col_compute_delta_mobius copied rows into an
+ * int64_t[COL_STACK_MAX] (32) and filled them at the relation's width, so
+ * a 33-column collection overflowed all four buffers.  The function has
+ * no caller outside the test suite, so no .dl program reaches it and the
+ * width guard can only be exercised here.
+ *
+ * prev: key 1 (mult 2), key 2 (mult 4)     [33 columns]
+ * curr: key 1 (mult 5), key 3 (mult 7)     [33 columns]
+ *
+ * Expected delta, in emission order (pass 1 over curr, then pass 2 over
+ * prev): key 1 -> +3 (5 - 2), key 3 -> +7 (new), key 2 -> -4 (vanished).
+ * ================================================================ */
+#define WIDE_NCOLS 33u
+
+static void
+test_wide_relation_delta(void)
+{
+    TEST("33-column delta does not overflow the row buffers (#1000)");
+
+    col_rel_t *prev = test_rel_alloc(WIDE_NCOLS);
+    col_rel_t *curr = test_rel_alloc(WIDE_NCOLS);
+    col_rel_t *delta = test_rel_alloc(WIDE_NCOLS);
+    ASSERT(prev && curr && delta, "test_rel_alloc failed");
+
+    int64_t rows[3][WIDE_NCOLS];
+    for (uint32_t k = 0; k < 3; k++) {
+        for (uint32_t c = 0; c < WIDE_NCOLS; c++)
+            rows[k][c] = (c == 0) ? (int64_t)(k + 1u)
+                                  : (int64_t)(1000u * (k + 1u) + c);
+    }
+
+    ASSERT(test_rel_append_row_mult(prev, rows[0], 2) == 0, "prev key1 mult=2");
+    ASSERT(test_rel_append_row_mult(prev, rows[1], 4) == 0, "prev key2 mult=4");
+    ASSERT(test_rel_append_row_mult(curr, rows[0], 5) == 0, "curr key1 mult=5");
+    ASSERT(test_rel_append_row_mult(curr, rows[2], 7) == 0, "curr key3 mult=7");
+
+    int rc = col_compute_delta_mobius(prev, curr, delta);
+
+    ASSERT(rc == 0, "returns 0 on success");
+    ASSERT(delta->nrows == 3, "delta->nrows == 3");
+    ASSERT(delta->timestamps != NULL, "delta->timestamps is non-NULL");
+
+    static const int64_t expect_mult[3] = { 3, 7, -4 };
+    static const uint32_t expect_src[3] = { 0u, 2u, 1u };
+    for (uint32_t i = 0; i < 3; i++) {
+        ASSERT(delta->timestamps[i].multiplicity == expect_mult[i],
+            "delta multiplicity matches");
+        for (uint32_t c = 0; c < WIDE_NCOLS; c++)
+            ASSERT(col_rel_get(delta, i, c) == rows[expect_src[i]][c],
+                "every column of the delta row is intact");
+    }
+
+    test_rel_free(prev);
+    test_rel_free(curr);
+    test_rel_free(delta);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
 int
 main(void)
 {
+    /* Line-buffered: a row-buffer overflow aborts the process, and a fully
+     * buffered stdout would discard the name of the case that crashed. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("=== test_mobius_delta_formula (TDD RED PHASE) ===\n\n");
     printf(
         "NOTE: Expected to FAIL at link time until col_compute_delta_mobius\n");
@@ -392,6 +457,7 @@ main(void)
     test_collection_shrinks();
     test_new_key_appears();
     test_key_vanishes();
+    test_wide_relation_delta();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);

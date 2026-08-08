@@ -1544,10 +1544,25 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
     }
 
+    /* Row scratch, hoisted out of the loop: initialising it per row would
+     * malloc once per row for relations wider than COL_STACK_MAX (#1000). */
+    col_row_buf_t row_rb;
+    if (!col_row_buf_init(&row_rb, e.rel->ncols)) {
+        if (ce_map) {
+            for (uint32_t c = 0; c < ce_map_count; c++)
+                col_expr_compiled_free(ce_map[c]);
+            free(ce_map);
+        }
+        free(tmp);
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(e.rel);
+        return ENOMEM;
+    }
+
+    int64_t *const row = row_rb.ptr;
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
-        int64_t row_buf_e[COL_STACK_MAX];
-        col_rel_row_copy_out(e.rel, r, row_buf_e);
-        const int64_t *row = row_buf_e;
+        col_rel_row_copy_out(e.rel, r, row);
         for (uint32_t c = 0; c < pc; c++) {
             if (op->map_exprs && c < op->map_expr_count && op->map_exprs[c].data
                 && op->map_exprs[c].size > 0) {
@@ -1560,6 +1575,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                                 col_expr_compiled_free(ce_map[i]);
                             free(ce_map);
                         }
+                        col_row_buf_release(&row_rb);
                         free(tmp);
                         col_rel_destroy(out);
                         if (e.owned)
@@ -1577,6 +1593,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                                 col_expr_compiled_free(ce_map[i]);
                             free(ce_map);
                         }
+                        col_row_buf_release(&row_rb);
                         free(tmp);
                         col_rel_destroy(out);
                         if (e.owned)
@@ -1597,6 +1614,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     col_expr_compiled_free(ce_map[c]);
                 free(ce_map);
             }
+            col_row_buf_release(&row_rb);
             free(tmp);
             col_rel_destroy(out);
             if (e.owned)
@@ -1610,6 +1628,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             col_expr_compiled_free(ce_map[c]);
         free(ce_map);
     }
+    col_row_buf_release(&row_rb);
     free(tmp);
 
     if (e.owned)
@@ -2359,10 +2378,20 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Slow path: pre-compile expression once, then evaluate per row. */
     col_expr_compiled_t *ce =
         (buf && bsz > 0) ? col_expr_compile(buf, bsz) : NULL;
+
+    /* Row scratch, hoisted out of the loop (#1000). */
+    col_row_buf_t row_rb;
+    if (!col_row_buf_init(&row_rb, e.rel->ncols)) {
+        col_expr_compiled_free(ce);
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(e.rel);
+        return ENOMEM;
+    }
+
+    int64_t *const row = row_rb.ptr;
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
-        int64_t row_buf_e[COL_STACK_MAX];
-        col_rel_row_copy_out(e.rel, r, row_buf_e);
-        const int64_t *row = row_buf_e;
+        col_rel_row_copy_out(e.rel, r, row);
         int pass;
         if (!buf || bsz == 0) {
             pass = 1;
@@ -2378,6 +2407,7 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
         if (pass) {
             int rc = col_rel_append_row(out, row);
             if (rc != 0) {
+                col_row_buf_release(&row_rb);
                 col_expr_compiled_free(ce);
                 col_rel_destroy(out);
                 if (e.owned)
@@ -2386,6 +2416,7 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
             }
         }
     }
+    col_row_buf_release(&row_rb);
     col_expr_compiled_free(ce);
 
     if (e.owned)
@@ -2427,24 +2458,31 @@ static int
 fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
     col_rel_t *out, wl_intern_t *intern)
 {
+    /* Row scratch, hoisted out of both loops below (#1000). */
+    col_row_buf_t rb;
+    if (!col_row_buf_init(&rb, rel->ncols))
+        return ENOMEM;
+    int64_t *row_buf = rb.ptr;
+
     /* Fast path: simple colA CMP CONST or colA CMP colB predicate */
     simple_filter_cmp_t cmp;
     if (filter_is_simple_cmp(buf, bsz, &cmp)) {
         for (uint32_t r = 0; r < rel->nrows; r++) {
-            int64_t row_buf[COL_STACK_MAX];
             col_rel_row_copy_out(rel, r, row_buf);
             if (col_filter_cmp_row(row_buf, rel->ncols, &cmp)) {
-                if (col_rel_append_row(out, row_buf) != 0)
+                if (col_rel_append_row(out, row_buf) != 0) {
+                    col_row_buf_release(&rb);
                     return ENOMEM;
+                }
             }
         }
+        col_row_buf_release(&rb);
         return 0;
     }
 
     /* Slow path: compile once, evaluate per row */
     col_expr_compiled_t *ce = col_expr_compile(buf, bsz);
     for (uint32_t r = 0; r < rel->nrows; r++) {
-        int64_t row_buf[COL_STACK_MAX];
         col_rel_row_copy_out(rel, r, row_buf);
         int pass;
         if (ce) {
@@ -2459,10 +2497,12 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
             pass = (err == 0) ? (val != 0 ? 1 : 0) : 0; /* fail-closed */
         }
         if (pass && col_rel_append_row(out, row_buf) != 0) {
+            col_row_buf_release(&rb);
             col_expr_compiled_free(ce);
             return ENOMEM;
         }
     }
+    col_row_buf_release(&rb);
     col_expr_compiled_free(ce);
     return 0;
 }
@@ -5217,16 +5257,16 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     if (fast_path) {
         /* All d_unique rows are novel. Emit to delta_out and append as run. */
         if (delta_out) {
-            int64_t _drb[COL_STACK_MAX];
-            int64_t *dr = nc <= COL_STACK_MAX ? _drb
-                : (int64_t *)malloc((size_t)nc * sizeof(int64_t));
+            col_row_buf_t drb;
+            int64_t *const dr = col_row_buf_init(&drb, nc);
+            if (!dr)
+                return ENOMEM;
             for (uint32_t k = 0; k < d_unique; k++) {
                 for (uint32_t c = 0; c < nc; c++)
                     dr[c] = rel->columns[c][old_nrows + k];
                 col_rel_append_row(delta_out, dr);
             }
-            if (dr != _drb)
-                free(dr);
+            col_row_buf_release(&drb);
         }
         rel->nrows = old_nrows + d_unique;
         rel->sorted_nrows = rel->nrows;
@@ -5276,14 +5316,29 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                 if (novel_count != i)
                     col_rel_row_move(rel, old_nrows + novel_count, row_idx);
                 if (delta_out) {
-                    int64_t _drb[COL_STACK_MAX];
-                    int64_t *dr = nc <= COL_STACK_MAX ? _drb
-                        : (int64_t *)malloc((size_t)nc * sizeof(int64_t));
+                    /* Issue #1000: the one converted site that is NOT
+                     * covered by a test, and the one that inits inside a
+                     * per-row loop rather than above it.
+                     *
+                     * Reaching it needs a >32-column relation *and*
+                     * d_unique <= old_nrows/16 && rel->run_count > 0, i.e.
+                     * the binary-search dedup branch on a large existing
+                     * relation with few novel rows.  Mutating this guard to
+                     * the old fixed width survives the whole suite, so the
+                     * bound here rests on inspection, not on a test.
+                     *
+                     * The per-row init is the pre-existing shape and is not
+                     * a regression -- the base code allocated here too --
+                     * but it does contradict the hoisting rule this helper
+                     * documents.  Both are tracked in #1003. */
+                    col_row_buf_t drb;
+                    int64_t *const dr = col_row_buf_init(&drb, nc);
+                    if (!dr)
+                        return ENOMEM;
                     for (uint32_t c = 0; c < nc; c++)
                         dr[c] = rel->columns[c][old_nrows + novel_count];
                     col_rel_append_row(delta_out, dr);
-                    if (dr != _drb)
-                        free(dr);
+                    col_row_buf_release(&drb);
                 }
                 novel_count++;
             }
@@ -5347,9 +5402,10 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     }
     int64_t **merged_cols = rel->merge_columns;
 
-    int64_t _delta_row_buf[COL_STACK_MAX];
-    int64_t *delta_row = nc <= COL_STACK_MAX ? _delta_row_buf
-        : (int64_t *)malloc((size_t)nc * sizeof(int64_t));
+    col_row_buf_t delta_rb;
+    if (!col_row_buf_init(&delta_rb, nc))
+        return ENOMEM;
+    int64_t *delta_row = delta_rb.ptr;
 
     /* For fallback merge, we need a single sorted prefix.
      * If multiple runs exist, compact first (#377 fix).
@@ -5360,8 +5416,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         uint32_t delta_phys = old_nrows; /* physical location of delta */
         int rc = col_rel_compact_runs(rel);
         if (rc != 0) {
-            if (delta_row != _delta_row_buf)
-                free(delta_row);
+            col_row_buf_release(&delta_rb);
             return rc;
         }
         uint32_t compacted = rel->nrows;
@@ -5413,8 +5468,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         out++;
     }
 
-    if (delta_row != _delta_row_buf)
-        free(delta_row);
+    col_row_buf_release(&delta_rb);
 
     /* Swap merge_columns and columns to avoid O(N) memcpy (issue #218). */
     {
@@ -5501,39 +5555,55 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
     if (!out)
         return NULL;
 
+    /* Per-block scratch (#1000): both the staging row and the dedup key must
+     * be nc wide, not COL_STACK_MAX wide.  MERGE_K_SETUP declares and
+     * allocates them once per merge block -- allocating inside
+     * MERGE_K_APPEND would malloc once per row for wide relations. */
+#define MERGE_K_SETUP()                                                      \
+        col_row_buf_t _rowbuf, _lastbuf;                                         \
+        int64_t *_rb, *last_row_buf;                                             \
+        const int64_t *last_row = NULL;                                          \
+        _rb = col_row_buf_init(&_rowbuf, nc);                                    \
+        last_row_buf = col_row_buf_init(&_lastbuf, nc);                          \
+        if (!_rb || !last_row_buf) {                                             \
+            col_row_buf_release(&_rowbuf);                                       \
+            col_row_buf_release(&_lastbuf);                                      \
+            col_rel_destroy(out);                                                \
+            return NULL;                                                         \
+        }
+
+#define MERGE_K_RELEASE()                                                    \
+        do {                                                                     \
+            col_row_buf_release(&_rowbuf);                                       \
+            col_row_buf_release(&_lastbuf);                                      \
+        } while (0)
+
     /* Helper: copy row from relation into temp buf, append to out, dedup
-     * against last_row in out. Returns 0 on success, -1 on failure. */
+     * against last_row in out.  Bails out of the enclosing function on
+     * failure (after releasing the block scratch). */
 #define MERGE_K_APPEND(rel_ptr, row_idx)                                     \
         do {                                                                     \
-            int64_t _rbuf[COL_STACK_MAX];                                        \
-            int64_t *_rb = nc <= COL_STACK_MAX ? _rbuf                           \
-            : (int64_t *)malloc((size_t)nc * sizeof(int64_t));               \
-            if (!_rb) {                                                          \
-                col_rel_destroy(out);                                            \
-                return NULL;                                                     \
-            }                                                                    \
             col_rel_row_copy_out((rel_ptr), (row_idx), _rb);                     \
             if (last_row == NULL                                                 \
                 || row_cmp_dispatch(last_row, _rb, nc) != 0) {                   \
                 if (col_rel_append_row(out, _rb) != 0) {                         \
-                    if (_rb != _rbuf) free(_rb);                                 \
+                    MERGE_K_RELEASE();                                           \
                     col_rel_destroy(out);                                        \
                     return NULL;                                                 \
                 }                                                                \
                 col_rel_row_copy_out(out, out->nrows - 1, last_row_buf);         \
                 last_row = last_row_buf;                                         \
             }                                                                    \
-            if (_rb != _rbuf) free(_rb);                                         \
         } while (0)
 
     /* K=1: Copy with dedup using append (handles dynamic growth) */
     if (k == 1) {
         col_rel_t *src = relations[0];
-        int64_t last_row_buf[COL_STACK_MAX];
-        const int64_t *last_row = NULL;
+        MERGE_K_SETUP();
         for (uint32_t r = 0; r < src->nrows; r++) {
             MERGE_K_APPEND(src, r);
         }
+        MERGE_K_RELEASE();
         return out;
     }
 
@@ -5542,8 +5612,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         col_rel_t *left = relations[0];
         col_rel_t *right = relations[1];
         uint32_t li = 0, ri = 0;
-        int64_t last_row_buf[COL_STACK_MAX];
-        const int64_t *last_row = NULL;
+        MERGE_K_SETUP();
 
         while (li < left->nrows && ri < right->nrows) {
             int cmp = col_rel_row_cmp2(left, li, right, ri);
@@ -5574,6 +5643,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
             ri++;
         }
 
+        MERGE_K_RELEASE();
         return out;
     }
 
@@ -5595,15 +5665,17 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
 
     /* Move final result into output using append */
     {
-        int64_t last_row_buf[COL_STACK_MAX];
-        const int64_t *last_row = NULL;
+        MERGE_K_SETUP();
         for (uint32_t r = 0; r < temp->nrows; r++) {
             MERGE_K_APPEND(temp, r);
         }
+        MERGE_K_RELEASE();
         col_rel_destroy(temp);
     }
 
 #undef MERGE_K_APPEND
+#undef MERGE_K_RELEASE
+#undef MERGE_K_SETUP
     return out;
 }
 
@@ -6602,11 +6674,22 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     if (op->agg_expr.data && op->agg_expr.size > 0)
         agg_ce = col_expr_compile(op->agg_expr.data, op->agg_expr.size);
 
+    /* Row scratch, hoisted out of the loop (#1000). */
+    col_row_buf_t row_rb;
+    if (!col_row_buf_init(&row_rb, in->ncols)) {
+        col_expr_compiled_free(agg_ce);
+        free(tmp);
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(in);
+        return ENOMEM;
+    }
+
     /* Sort by group key for group-by */
     /* (Simple O(n^2) implementation; sufficient for Phase 2A) */
+    int64_t *const row = row_rb.ptr;
     for (uint32_t r = 0; r < in->nrows; r++) {
-        int64_t row_buf[COL_STACK_MAX]; col_rel_row_copy_out(in, r, row_buf);
-        const int64_t *row = row_buf;
+        col_rel_row_copy_out(in, r, row);
         int64_t agg_val = (in->ncols > gc) ? row[gc] : 1;
         if (op->agg_fn != WIRELOG_AGG_COUNT
             && op->agg_expr.data && op->agg_expr.size > 0) {
@@ -6615,6 +6698,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (col_eval_expr_compiled(agg_ce, row, in->ncols, &val) == 0)
                     agg_val = val;
                 else {
+                    col_row_buf_release(&row_rb);
                     col_expr_compiled_free(agg_ce);
                     free(tmp);
                     col_rel_destroy(out);
@@ -6628,6 +6712,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     row, in->ncols, &val, sess->intern) == 0) {
                     agg_val = val;
                 } else {
+                    col_row_buf_release(&row_rb);
                     col_expr_compiled_free(agg_ce);
                     free(tmp);
                     col_rel_destroy(out);
@@ -6660,6 +6745,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     int64_t next;
                     if (wl_columnar_ops_checked_add_int64(cur, agg_val,
                         &next) != 0) {
+                        col_row_buf_release(&row_rb);
                         col_expr_compiled_free(agg_ce);
                         free(tmp);
                         col_rel_destroy(out);
@@ -6695,6 +6781,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             tmp[gc] = (op->agg_fn == WIRELOG_AGG_COUNT) ? 1 : agg_val;
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
+                col_row_buf_release(&row_rb);
                 col_expr_compiled_free(agg_ce);
                 free(tmp);
                 col_rel_destroy(out);
@@ -6705,6 +6792,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
+    col_row_buf_release(&row_rb);
     col_expr_compiled_free(agg_ce);
     free(tmp);
     if (e.owned)
