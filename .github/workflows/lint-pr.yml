@@ -135,6 +135,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Install LLVM 22
         run: |
@@ -156,8 +158,24 @@ jobs:
       - name: Run clang-tidy (hard gate)
         run: |
           set -o pipefail
+          BASE_REF="${{ inputs.base-ref }}"
+          git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+          mapfile -t tidy_files < <(
+            git diff "origin/${BASE_REF}...HEAD" --name-only \
+              --diff-filter=ACM | grep -E '^(wirelog|tests)/.*\.(c|h)$' || true
+          )
+
+          : > tidy-results.txt
+          if [ "${#tidy_files[@]}" -eq 0 ]; then
+            echo "No changed C/H files selected for clang-tidy."
+            exit 0
+          fi
+
+          echo "clang-tidy selected ${#tidy_files[@]} changed files:"
+          printf '%s\n' "${tidy_files[@]}"
           run-clang-tidy-22 -p builddir-tidy \
-            "^\\.\\./wirelog/.*\\.(c|h)$" \
+            "${tidy_files[@]}" \
             2>&1 | tee tidy-results.txt
           if grep -qE '^.*\.(c|h):[0-9]+:[0-9]+: (warning|error):' tidy-results.txt; then
             echo "clang-tidy found issues. PR blocked."
