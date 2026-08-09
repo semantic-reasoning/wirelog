@@ -3467,7 +3467,11 @@ col_op_join(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+    /* Materialized results outlive the current delta-pool reset while they
+     * remain in mat_cache, so cache-owned joins must be heap allocated. */
+    col_rel_t *out = (op->materialized && !projected_join)
+        ? col_rel_new_auto("$join", ocols)
+        : col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$join", ocols);
     if (!out) {
         free(lk);
@@ -7247,7 +7251,11 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);
-    col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
+    /* Materialized results outlive the current delta-pool reset while they
+     * remain in mat_cache, so cache-owned joins must be heap allocated. */
+    col_rel_t *out = (op->materialized && !projected_join)
+        ? col_rel_new_auto("$join_diff", ocols)
+        : col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$join_diff", ocols);
     if (!out) {
         free(lk);
