@@ -1031,6 +1031,20 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 }
             }
 
+            /* Issue #176: Per-sub-pass cache eviction for recursive strata.
+             * Materialized join results may live in delta_pool, so release
+             * them before resetting the pool.  Resetting first clears the
+             * pool-owned marker and leaves the cache holding stale pointers.
+             * Use configurable eviction threshold (cache_evict_threshold):
+             * - If 0: clear entire cache each sub-pass (backward compatible)
+             * - If > 0: evict LRU entries when cache exceeds threshold */
+            if (sess->cache_evict_threshold == 0) {
+                col_mat_cache_clear(&sess->mat_cache);
+            } else {
+                col_mat_cache_evict_until(&sess->mat_cache,
+                    sess->cache_evict_threshold);
+            }
+
             delta_pool_reset(sess->delta_pool);
             sess->rotation_ops->rotate_eval_arena(sess);
             /* Issue #560: Advance the compound-arena epoch frontier at the
@@ -1047,17 +1061,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 && sess->rotation_ops->gc_epoch_boundary) {
                 sess->rotation_ops->gc_epoch_boundary(sess);
             }
-            /* Issue #176: Per-sub-pass cache eviction for recursive strata.
-             * Use configurable eviction threshold (cache_evict_threshold):
-             * - If 0: clear entire cache each sub-pass (backward compatible)
-             * - If > 0: evict LRU entries when cache exceeds threshold */
-            if (sess->cache_evict_threshold == 0) {
-                col_mat_cache_clear(&sess->mat_cache);
-            } else {
-                col_mat_cache_evict_until(&sess->mat_cache,
-                    sess->cache_evict_threshold);
-            }
-
             if (!any_new) {
                 /* Fixed point reached: no new tuples in this sub-pass. */
                 converged = true;

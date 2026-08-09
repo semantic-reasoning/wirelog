@@ -40,29 +40,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Tuple counting callback
@@ -76,7 +76,7 @@ struct result_ctx {
 
 static void
 count_tuples_cb(const char *relation, const int64_t *row, uint32_t ncols,
-                void *user_data)
+    void *user_data)
 {
     struct result_ctx *ctx = (struct result_ctx *)user_data;
     ctx->total++;
@@ -92,7 +92,7 @@ count_tuples_cb(const char *relation, const int64_t *row, uint32_t ncols,
 
 static int
 run_program_workers(const char *src, const char *tracked_rel, uint32_t nworkers,
-                    int64_t *out_count, uint32_t *out_iters)
+    int64_t *out_count, uint32_t *out_iters)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
@@ -160,14 +160,14 @@ test_k2_memory_opt_correctness(void)
     TEST("K=2 memory-optimised workers produce correct 6-tuple closure");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 3). r(3, 4).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 3). r(3, 4).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program_workers(src, "r", 1, &count, NULL);
     ASSERT(rc == 0, "K=2 memory-opt program execution failed");
     ASSERT(count == 6,
-           "K=2 memory-opt: expected 6 tuples from 3-edge chain closure");
+        "K=2 memory-opt: expected 6 tuples from 3-edge chain closure");
 
     PASS();
 }
@@ -184,8 +184,8 @@ test_k4_matches_k2(void)
     TEST("K=4 multi-worker matches K=2 result (parity)");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 3). r(3, 4).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 3). r(3, 4).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count_k2 = 0, count_k4 = 0;
     int rc2 = run_program_workers(src, "r", 1, &count_k2, NULL);
@@ -212,10 +212,10 @@ test_k2_isolation_5node_chain(void)
     TEST("K=2 per-worker isolation: 5-node chain produces 10 tuples");
 
     const char *src = ".decl e(x: int32, y: int32)\n"
-                      "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
-                      ".decl reach(x: int32, y: int32)\n"
-                      "reach(x, y) :- e(x, y).\n"
-                      "reach(x, z) :- reach(x, y), reach(y, z).\n";
+        "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- e(x, y).\n"
+        "reach(x, z) :- reach(x, y), reach(y, z).\n";
 
     int64_t count = 0;
     int rc = run_program_workers(src, "reach", 1, &count, NULL);
@@ -237,8 +237,8 @@ test_k2_empty_mat_cache_correctness(void)
     TEST("K=2 empty mat_cache: 2-cycle converges to 4 tuples");
 
     const char *src = ".decl r(x: int32, y: int32)\n"
-                      "r(1, 2). r(2, 1).\n"
-                      "r(x, z) :- r(x, y), r(y, z).\n";
+        "r(1, 2). r(2, 1).\n"
+        "r(x, z) :- r(x, y), r(y, z).\n";
 
     int64_t count = 0;
     uint32_t iters = 0;
@@ -246,6 +246,37 @@ test_k2_empty_mat_cache_correctness(void)
     ASSERT(rc == 0, "2-cycle K=2 program failed");
     ASSERT(count == 4, "2-cycle K=2 should produce 4 tuples");
     ASSERT(iters <= 3, "2-cycle should converge within 3 iterations");
+
+    PASS();
+}
+
+/* ================================================================
+ * Test 5: Non-fused recursive materialization is cleaned before pool reset
+ *
+ * Issue #1020: with K-Fusion disabled, recursive materialized joins may
+ * leave pool-owned results in mat_cache across a sub-pass boundary.  The
+ * cache must release those results before delta_pool_reset clears the pool
+ * slot metadata.
+ * ================================================================ */
+static void
+test_nonfused_materialized_join_cleanup(void)
+{
+    TEST("non-fused recursive materialized join cleanup");
+
+    const char *src = ".decl Edge(x: int64, y: int64)\n"
+        ".decl Label(x: int64, l: int64)\n"
+        ".output Label\n"
+        "Edge(1,2). Edge(2,3). Edge(3,4).\n"
+        "Label(x, min(x)) :- Edge(x, y).\n"
+        "Label(y, min(y)) :- Edge(x, y).\n"
+        "Label(x, min(l)) :- Label(y, l), Edge(y, x).\n"
+        "Label(x, min(l)) :- Label(y, l), Label(y, m), Edge(y, x).\n";
+
+    int64_t count = 0;
+    int rc = run_program_workers(src, "Label", 1, &count, NULL);
+    ASSERT(rc == 0, "non-fused materialized recursive program failed");
+    ASSERT(count == 4,
+        "non-fused materialized recursive program should produce 4 rows");
 
     PASS();
 }
@@ -263,6 +294,7 @@ main(void)
     test_k4_matches_k2();
     test_k2_isolation_5node_chain();
     test_k2_empty_mat_cache_correctness();
+    test_nonfused_materialized_join_cleanup();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
