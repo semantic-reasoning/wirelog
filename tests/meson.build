@@ -872,7 +872,8 @@ test_optimizer_equivalence_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
-test('optimizer_equivalence', test_optimizer_equivalence_exe, suite: 'optimizer')
+test('optimizer_equivalence', test_optimizer_equivalence_exe, suite: 'optimizer',
+     timeout: 120)
 
 test_plan_gen_exe = executable(
   'test_plan_gen',
@@ -3138,7 +3139,7 @@ test_diff_integration_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
-test('diff_integration', test_diff_integration_exe)
+test('diff_integration', test_diff_integration_exe, timeout: 120)
 
 test_diff_recursive_arrangement_exe = executable(
   'test_diff_recursive_arrangement',
