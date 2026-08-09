@@ -1562,6 +1562,45 @@ test_fused_head_reported_as_unsupported(void)
     PASS();
 }
 
+static void
+test_body_atom_limit_is_reported(void)
+{
+    TEST("body atom limit is reported");
+
+    char src[32768];
+    size_t used = 0;
+    used += (size_t)snprintf(src + used, sizeof(src) - used,
+            ".decl out(x: int32)\n.output out\n.query out(b) .\n");
+    for (uint32_t i = 0; i < 65; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used,
+                ".decl r%u(x: int32)\n", i);
+    }
+    used += (size_t)snprintf(src + used, sizeof(src) - used,
+            "out(x) :- ");
+    for (uint32_t i = 0; i < 65; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used,
+                "%sr%u(x)", i == 0 ? "" : ", ", i);
+    }
+    snprintf(src + used, sizeof(src) - used, ".\n");
+
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog) {
+        FAIL("failed to parse over-limit rule");
+        return;
+    }
+
+    wl_magic_demand_t demand = { "out", 1, 1 };
+    int rc = wl_magic_sets_apply_with_demands(prog, &demand, 1, NULL);
+    bool rejected = rc != 0 && !prog->magic_sets_applied;
+    wirelog_program_free(prog);
+    if (!rejected) {
+        FAIL("over-limit rule was silently rewritten");
+        return;
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1595,6 +1634,7 @@ main(void)
     test_guard_over_semijoin_exact();
     test_constant_head_position_not_counted();
     test_fused_head_reported_as_unsupported();
+    test_body_atom_limit_is_reported();
 
     printf("\n=== Results ===\n");
     printf("Tests run:    %d\n", tests_run);
