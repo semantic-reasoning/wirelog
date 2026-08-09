@@ -24,10 +24,21 @@ main(void)
         fprintf(stderr, "cannot create watch input file\n");
         return 1;
     }
-    fprintf(in, "person \"Alice\"\n");
+    const size_t value_len = 5000;
+    char *value = (char *)malloc(value_len + 1);
+    if (!value) {
+        fclose(in);
+        remove(inpath);
+        fprintf(stderr, "cannot allocate watch value\n");
+        return 1;
+    }
+    memset(value, 'A', value_len);
+    value[value_len] = '\0';
+    fprintf(in, "person \"%s\"\n", value);
     fclose(in);
 
     if (!freopen(inpath, "r", stdin)) {
+        free(value);
         remove(inpath);
         fprintf(stderr, "cannot redirect stdin\n");
         return 1;
@@ -37,6 +48,7 @@ main(void)
     test_tmppath(outpath, sizeof(outpath), "wirelog_test_watch_string.out");
     FILE *out = fopen(outpath, "w");
     if (!out) {
+        free(value);
         remove(inpath);
         fprintf(stderr, "cannot create output file\n");
         return 1;
@@ -49,6 +61,7 @@ main(void)
     int rc = wl_run_pipeline(src, 1, false, true, 0, out);
     fclose(out);
     if (rc != 0) {
+        free(value);
         remove(inpath);
         remove(outpath);
         fprintf(stderr, "wl_run_pipeline returned %d\n", rc);
@@ -57,17 +70,22 @@ main(void)
 
     char *output = wl_read_file(outpath);
     if (!output) {
+        free(value);
         remove(inpath);
         remove(outpath);
         fprintf(stderr, "cannot read output file\n");
         return 1;
     }
 
-    int ok = strstr(output, "\"Alice\"") != NULL;
+    int ok = strstr(output, value) != NULL;
+    char *first = strstr(output, "seen(");
+    if (first && strstr(first + 5, "seen(") != NULL)
+        ok = 0;
     if (!ok)
-        fprintf(stderr, "expected watch output to contain Alice: %s\n", output);
+        fprintf(stderr, "expected one complete wide watch tuple\n");
 
     free(output);
+    free(value);
     remove(inpath);
     remove(outpath);
     return ok ? 0 : 1;

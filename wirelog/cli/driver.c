@@ -21,6 +21,7 @@
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,6 +29,40 @@
 #define WL_WATCH_MAX_COLS 64
 /* Maximum length of a relation name in watch-mode input lines */
 #define WL_WATCH_MAX_RELATION 256
+
+/* Read one complete watch-mode record without fabricating records at a
+ * fixed-buffer boundary.  The returned line is NUL-terminated and owned by
+ * the caller; the buffer is retained for reuse by the next call. */
+static int
+read_watch_line(FILE *in, char **line, size_t *capacity)
+{
+    if (!in || !line || !capacity)
+        return -1;
+
+    size_t length = 0;
+    int ch;
+    while ((ch = fgetc(in)) != EOF) {
+        if (length + 1 >= *capacity) {
+            size_t new_capacity = *capacity ? *capacity * 2 : 4096;
+            if (new_capacity <= *capacity)
+                return -1;
+            char *grown = (char *)realloc(*line, new_capacity);
+            if (!grown)
+                return -1;
+            *line = grown;
+            *capacity = new_capacity;
+        }
+        (*line)[length++] = (char)ch;
+        if (ch == '\n')
+            break;
+    }
+
+    if (ferror(in) || (ch == EOF && length == 0))
+        return ferror(in) ? -1 : 0;
+
+    (*line)[length] = '\0';
+    return 1;
+}
 
 char *
 wl_read_file(const char *path)
@@ -475,11 +510,13 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
         (void)watch_interval_ms; /* reserved for future polling interval use */
         fprintf(stderr, "Watch mode: reading from stdin...\n");
 
-        char line[4096];
+        char *line = NULL;
+        size_t line_capacity = 0;
         char relation[WL_WATCH_MAX_RELATION] = { 0 };
         int64_t values[WL_WATCH_MAX_COLS];
+        int read_rc;
 
-        while (fgets(line, (int)sizeof(line), stdin)) {
+        while ((read_rc = read_watch_line(stdin, &line, &line_capacity)) > 0) {
             uint32_t ncols = 0;
 
             if (parse_watch_line(line, relation, sizeof(relation), values,
@@ -501,9 +538,15 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
             }
         }
 
-        /* Treat normal EOF as success */
-        if (feof(stdin))
+        free(line);
+
+        if (read_rc < 0) {
+            fprintf(stderr, "error: failed to read watch input\n");
+            rc = -1;
+        } else if (feof(stdin)) {
+            /* Treat normal EOF as success */
             rc = 0;
+        }
     }
 
     /* 7. Close per-relation output files */
