@@ -33,7 +33,7 @@ side_rel_set_schema(col_rel_t *rel, uint32_t arity)
     char *names_buf
         = (char *)malloc((size_t)ncols * WL_COMPOUND_SIDE_COLNAME_MAX);
     if (!names_buf) {
-        free(names_owned);
+        free((void *)names_owned);
         return ENOMEM;
     }
 
@@ -47,7 +47,7 @@ side_rel_set_schema(col_rel_t *rel, uint32_t arity)
     }
 
     int rc = col_rel_set_schema(rel, ncols, (const char *const *)names_owned);
-    free(names_owned);
+    free((void *)names_owned);
     free(names_buf);
     return rc;
 }
