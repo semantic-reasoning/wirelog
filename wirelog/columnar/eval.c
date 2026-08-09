@@ -411,6 +411,22 @@ col_reduce_output_group_equal(const col_rel_t *rel, uint32_t a, uint32_t b,
     return true;
 }
 
+typedef struct {
+    uint64_t hash;
+    uint32_t row;
+} col_group_slot_t;
+
+static uint64_t
+col_group_hash(const col_rel_t *rel, uint32_t row, uint32_t group_by_count)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint32_t c = 0; c < group_by_count; c++) {
+        hash ^= (uint64_t)col_rel_get(rel, row, c);
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash ? hash : 1;
+}
+
 static int
 col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
     const wl_plan_agg_spec_t *spec, const wl_intern_t *intern)
@@ -423,13 +439,29 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
         return EINVAL;
 
     uint32_t out = 0;
+    uint32_t map_cap = 1;
+    uint64_t desired = (uint64_t)rel->nrows * 2U;
+    while ((uint64_t)map_cap < desired && map_cap <= UINT32_MAX / 2U)
+        map_cap <<= 1;
+    if ((uint64_t)map_cap < desired)
+        return ENOMEM;
+    col_group_slot_t *groups = (col_group_slot_t *)calloc(map_cap,
+            sizeof(*groups));
+    if (!groups)
+        return ENOMEM;
+    uint32_t map_mask = map_cap - 1;
     for (uint32_t row = 0; row < rel->nrows; row++) {
         uint32_t found = UINT32_MAX;
-        for (uint32_t keep = 0; keep < out; keep++) {
-            if (col_reduce_output_group_equal(rel, keep, row, gc)) {
+        uint64_t hash = col_group_hash(rel, row, gc);
+        uint32_t slot = (uint32_t)hash & map_mask;
+        while (groups[slot].hash != 0) {
+            uint32_t keep = groups[slot].row;
+            if (groups[slot].hash == hash
+                && col_reduce_output_group_equal(rel, keep, row, gc)) {
                 found = keep;
                 break;
             }
+            slot = (slot + 1) & map_mask;
         }
 
         if (found != UINT32_MAX) {
@@ -454,6 +486,8 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
             if (rel->timestamps)
                 rel->timestamps[out] = rel->timestamps[row];
         }
+        groups[slot].hash = hash;
+        groups[slot].row = out;
         out++;
     }
 
@@ -465,6 +499,8 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
         rel->dedup_count = 0;
         memset(rel->run_ends, 0, sizeof(rel->run_ends));
     }
+
+    free(groups);
 
     return 0;
 }
