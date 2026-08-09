@@ -25,7 +25,7 @@
 #include <string.h>
 
 #define MAX_ROWS 128
-#define MAX_COLS 4
+#define MAX_COLS 6
 
 typedef struct {
     const char *relation;
@@ -490,6 +490,20 @@ main(void)
         "c(6, 11).\n"
         "c(7, 12).\n"
         "out(x, w) :- a(x, y), b(y, z), c(z, w).\n";
+    static const char *wide_chain_src =
+        ".decl a(x: int32, y: int32)\n"
+        ".decl b(y: int32, z: int32)\n"
+        ".decl c(z: int32, u: int32)\n"
+        ".decl d(u: int32, v: int32)\n"
+        ".decl e(v: int32, w: int32)\n"
+        ".decl chain(x: int32, y: int32, z: int32, u: int32, v: int32, w: int32)\n"
+        ".output chain\n"
+        "a(1, 2).\n"
+        "b(2, 3).\n"
+        "c(3, 4).\n"
+        "d(4, 5).\n"
+        "e(5, 6).\n"
+        "chain(x, y, z, u, v, w) :- a(x, y), b(y, z), c(z, u), d(u, v), e(v, w).\n";
     static const char *jpp_src =
         ".decl a(x: int32, y: int32)\n"
         ".decl b(y: int32, z: int32)\n"
@@ -547,6 +561,8 @@ main(void)
             expect_fusion);
     failed += check_matrix_case("optimizer matrix: sip", sip_src, "out",
             expect_sip);
+    failed += check_matrix_case("optimizer matrix: wide chain", wide_chain_src,
+            "chain", expect_none);
     failed += check_matrix_case("optimizer matrix: jpp", jpp_src, "out",
             expect_jpp);
     failed += check_matrix_case("optimizer matrix: bounded magic",
