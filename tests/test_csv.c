@@ -538,6 +538,68 @@ test_parse_line_ex_all_int(void)
     PASS();
 }
 
+static void
+test_parse_line_rejects_erange(void)
+{
+    TEST("parse_line: rejects integer overflow");
+
+    int64_t values[1];
+    uint32_t count = 0;
+    int rc = wl_csv_parse_line("999999999999999999999999", ',', values, 1,
+            &count);
+    if (rc == 0) {
+        FAIL("out-of-range integer was accepted");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_parse_line_ex_rejects_malformed_fields(void)
+{
+    TEST("parse_line_ex: rejects malformed fields and preserves empty final");
+
+    wl_intern_t *intern = wl_intern_create();
+    if (!intern) {
+        FAIL("intern create failed");
+        return;
+    }
+
+    wirelog_column_type_t types[]
+        = { WIRELOG_TYPE_STRING, WIRELOG_TYPE_STRING,
+            WIRELOG_TYPE_STRING };
+    int64_t values[3];
+    uint32_t count = 0;
+
+    int rc = wl_csv_parse_line_ex("\"unterminated", ',', types, 3, values,
+            3, &count, intern);
+    if (rc == 0) {
+        FAIL("unterminated quote was accepted");
+        wl_intern_free(intern);
+        return;
+    }
+    rc = wl_csv_parse_line_ex("\"ok\"junk,x,y", ',', types, 3, values,
+            3, &count, intern);
+    if (rc == 0) {
+        FAIL("junk after quote was accepted");
+        wl_intern_free(intern);
+        return;
+    }
+    rc = wl_csv_parse_line_ex("a,b,", ',', types, 3, values, 3, &count,
+            intern);
+    const char *empty = (rc == 0 && count == 3)
+        ? wl_intern_reverse(intern, values[2]) : NULL;
+    if (rc != 0 || count != 3
+        || !empty || strcmp(empty, "") != 0) {
+        FAIL("trailing delimiter did not preserve empty final field");
+        wl_intern_free(intern);
+        return;
+    }
+
+    wl_intern_free(intern);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Test: wl_csv_read_file_via_ctx (callback-based, #455)                    */
 /* ======================================================================== */
@@ -637,6 +699,8 @@ main(void)
     test_parse_line_ex_mixed();
     test_parse_line_ex_unquoted_strings();
     test_parse_line_ex_all_int();
+    test_parse_line_rejects_erange();
+    test_parse_line_ex_rejects_malformed_fields();
 
     printf("\n--- File Reading ---\n");
     test_read_file_basic();

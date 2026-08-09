@@ -11,6 +11,7 @@
 #include "csv_reader.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,17 +39,23 @@ wl_csv_parse_line(const char *line, char delimiter, int64_t *values,
         while (*p && *p != delimiter && isspace((unsigned char)*p))
             p++;
 
-        if (*p == '\0')
-            break;
+        if (*p == '\0') {
+            if (*count == 0)
+                break;
+            return -1; /* trailing delimiter or empty integer field */
+        }
 
         if (*count >= max_cols)
             return -2;
 
         char *end;
+        errno = 0;
         int64_t val = strtoll(p, &end, 10);
 
         if (end == p)
             return -1; /* not a valid integer */
+        if (errno == ERANGE)
+            return -1; /* do not silently clamp out-of-range values */
 
         values[*count] = val;
         (*count)++;
@@ -470,8 +477,18 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
         while (*p && *p != delimiter && *p != '"' && isspace((unsigned char)*p))
             p++;
 
-        if (*p == '\0' && col < num_cols - 1)
+        if (*p == '\0') {
+            /* A trailing delimiter denotes an empty final string field. */
+            if (col == num_cols - 1 && col > 0 && p[-1] == delimiter
+                && col_types[col] == WIRELOG_TYPE_STRING) {
+                values[col] = intern_cb(opaque, "");
+                if (values[col] < 0)
+                    return -1;
+                (*count)++;
+                break;
+            }
             return -2; /* too few columns */
+        }
 
         if (col_types[col] == WIRELOG_TYPE_STRING) {
             /* Parse string field: quoted or unquoted */
@@ -484,9 +501,15 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
                 start = p;
                 while (*p && *p != '"')
                     p++;
+                if (*p != '"')
+                    return -1; /* unterminated quoted field */
                 slen = (size_t)(p - start);
-                if (*p == '"')
-                    p++; /* skip closing quote */
+                p++; /* skip closing quote */
+                while (*p && *p != delimiter && *p != '\n' && *p != '\r'
+                    && isspace((unsigned char)*p))
+                    p++;
+                if (*p && *p != delimiter && *p != '\n' && *p != '\r')
+                    return -1; /* junk after closing quote */
             } else {
                 /* Unquoted field: read until delimiter or end */
                 start = p;
@@ -510,9 +533,12 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
         } else {
             /* Parse integer field */
             char *end;
+            errno = 0;
             values[col] = strtoll(p, &end, 10);
             if (end == p)
                 return -1; /* not a valid integer */
+            if (errno == ERANGE)
+                return -1; /* do not silently clamp out-of-range values */
             p = end;
 
             /* Skip trailing whitespace */
@@ -526,6 +552,14 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
         if (col < num_cols - 1) {
             if (*p == delimiter)
                 p++;
+            else
+                return -2; /* missing field separator */
+        } else {
+            while (*p && (*p == '\n' || *p == '\r'
+                || isspace((unsigned char)*p)))
+                p++;
+            if (*p != '\0')
+                return -2; /* extra field after the declared width */
         }
     }
 
