@@ -12,8 +12,10 @@
 #include "jpp.h"
 #include "../ir/ir.h"
 #include "../ir/program.h"
+#include "../util/log.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -73,6 +75,58 @@ scan_vars(const wirelog_ir_node_t *scan, uint32_t *count)
     }
     *count = scan->column_count;
     return scan->column_names;
+}
+
+/* Largest element count a char *[] allocation can express. */
+#define JPP_PTR_ARRAY_MAX ((uint64_t)(SIZE_MAX / sizeof(char *)))
+
+/*
+ * Total number of scan columns in a chain, for sizing the scratch arrays.
+ *
+ * The count MUST come from scan_vars(), not from scans[i]->column_count: a
+ * leaf may be a FILTER wrapping the SCAN (program.c wraps an atom that
+ * repeats a variable), and such a leaf carries column_count == 0 while the
+ * inner SCAN holds the real width.
+ *
+ * Returns false only when the element count would exceed what a char *[]
+ * allocation can express; that is the one case a caller must treat as "give
+ * up".  On success *out is at least 1.
+ *
+ * A total of 0 is reachable and is NOT a failure: `.decl p()` is legal and
+ * leaves column_count == 0 (see wirelog/ir/program.h), so a chain of nullary
+ * atoms totals 0 while still being a chain the pass should optimize.  *out is
+ * clamped to 1 there rather than reported as failure, because calloc(0, ..)
+ * may return NULL and a caller cannot tell that apart from OOM.
+ *
+ * The clamp is safe for the two arrays sized directly from this value --
+ * acc[] and phys_names[] -- because every write into those is bounded by some
+ * scan's own column count, so a chain totalling 0 columns performs no writes
+ * at all.  It is NOT the whole story for needed[], which also receives the
+ * head variables and so can take a write even when this returns 0-clamped-to-1
+ * (`o(x) :- a(), b(), e().` over nullary a/b/e reaches exactly that).  That
+ * array is sized head_var_count + this value; see needed_cap in
+ * insert_projections().
+ */
+static bool
+scan_columns_total(wirelog_ir_node_t **scans, uint32_t nscan, size_t *out)
+{
+    uint64_t total = 0;
+
+    for (uint32_t i = 0; i < nscan; i++) {
+        uint32_t count = 0;
+        (void)scan_vars(scans[i], &count);
+        total += count;
+        if (total > JPP_PTR_ARRAY_MAX) {
+            WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+                "jpp: join chain of %u scans exceeds %llu columns; scratch "
+                "arrays cannot be sized, leaving the chain unoptimized",
+                nscan, (unsigned long long)JPP_PTR_ARRAY_MAX);
+            return false;
+        }
+    }
+
+    *out = total > 0 ? (size_t)total : (size_t)1;
+    return true;
 }
 
 /*
@@ -286,8 +340,22 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order,
     /* Accumulated variable set */
     uint32_t acc_count;
     char **acc_vars = scan_vars(scans[0], &acc_count);
-    /* We need a mutable copy for merging */
-    char **acc = (char **)calloc(acc_count + nscan * 16, sizeof(char *));
+    /* We need a mutable copy for merging.  The chain's total column count is
+     * an exact upper bound -- but note the bound is TOTAL columns, not
+     * DISTINCT ones, and it has to be.  acc[] is seeded with scans[0]'s
+     * columns verbatim, duplicates and NULLs included (an atom that repeats a
+     * variable, r0(p, p, q), carries cols=3 [p,p,q]); only the columns merged
+     * from later scans are deduplicated.  Do not tighten this to a distinct
+     * count -- that reintroduces the overflow this pass was fixed for. */
+    size_t acc_cap;
+    if (!scan_columns_total(scans, nscan, &acc_cap)) {
+        free(is_idb);
+        free(used);
+        for (uint32_t i = 0; i < nscan; i++)
+            order[i] = i;
+        return false;
+    }
+    char **acc = (char **)calloc(acc_cap, sizeof(char *));
     if (!acc) {
         free(is_idb);
         free(used);
@@ -445,6 +513,16 @@ collect_joins(wirelog_ir_node_t *node, wirelog_ir_node_t **out, uint32_t max)
  * Walk from the IR root through wrapper nodes to collect all variable
  * names that are referenced by the head projection or filter expressions.
  * This tells us which variables must survive to the top of the join chain.
+ *
+ * DO NOT REMOVE the `max` checks here (the `*count >= max` guard below and
+ * the `count < max` guard in collect_head_vars()'s ANTIJOIN arm).  The caller
+ * sizes `out` from count_head_vars(), which is intended to be an exact upper
+ * bound, so the checks look redundant -- and they are, as long as that
+ * function stays in step with this one.  The two walk the same node types by
+ * hand, in two places; if they ever diverge and count_head_vars() undercounts,
+ * these checks are the only thing that makes the consequence a truncated head
+ * set (a wrong plan) instead of a heap-buffer-overflow WRITE.  That is the
+ * failure mode issue #1002 was filed for.
  */
 static void
 collect_head_vars_from_expr(const wl_ir_expr_t *expr, char **out,
@@ -519,6 +597,75 @@ collect_head_vars(wirelog_ir_node_t *ir, char **out, uint32_t max)
     return count;
 }
 
+static uint64_t
+count_head_vars_in_expr(const wl_ir_expr_t *expr)
+{
+    if (!expr)
+        return 0;
+    uint64_t count
+        = (expr->type == WL_IR_EXPR_VAR && expr->var_name) ? 1u : 0u;
+    for (uint32_t i = 0; i < expr->child_count; i++)
+        count += count_head_vars_in_expr(expr->children[i]);
+    return count;
+}
+
+/*
+ * Upper bound on what collect_head_vars() will return.
+ *
+ * Walks exactly the same wrapper chain and counts every VAR leaf plus every
+ * ANTIJOIN join key, without collect_head_vars()'s deduplication, so the
+ * result is always >= the deduplicated count.  Used to size the output array
+ * up front: a fixed cap silently truncates, and a dropped head variable that
+ * does not also appear in a later scan of the chain -- the "needed" loop in
+ * insert_projections() re-adds the ones that do -- is projected away, which
+ * yields wrong column values with a zero exit status and no diagnostic.
+ *
+ * Accumulates in uint64_t and saturates at UINT32_MAX.  Saturation needs more
+ * than 2^32 VAR nodes in one rule and so is unreachable in practice; it is
+ * here so that the bound can never wrap to a small number, which would put us
+ * straight back into the undersized-array failure this pass exists to avoid.
+ * A saturated count is still a valid upper bound, so it is safe either way:
+ * the calloc() in optimize_tree() will usually fail at that size and leave the
+ * chain unoptimized, but it may also succeed under Linux overcommit, and a
+ * 2^32-entry array is not too small.
+ */
+static uint32_t
+count_head_vars(const wirelog_ir_node_t *ir)
+{
+    uint64_t count = 0;
+    const wirelog_ir_node_t *node = ir;
+
+    while (node) {
+        if (node->type == WIRELOG_IR_PROJECT) {
+            if (node->project_exprs) {
+                for (uint32_t i = 0; i < node->project_count; i++)
+                    count += count_head_vars_in_expr(node->project_exprs[i]);
+            }
+        } else if (node->type == WIRELOG_IR_FLATMAP) {
+            if (node->project_exprs) {
+                for (uint32_t i = 0; i < node->project_count; i++)
+                    count += count_head_vars_in_expr(node->project_exprs[i]);
+            }
+            if (node->filter_expr)
+                count += count_head_vars_in_expr(node->filter_expr);
+        } else if (node->type == WIRELOG_IR_FILTER) {
+            if (node->filter_expr)
+                count += count_head_vars_in_expr(node->filter_expr);
+        } else if (node->type == WIRELOG_IR_ANTIJOIN) {
+            count += node->join_key_count;
+        } else {
+            break;
+        }
+
+        if (node->child_count > 0)
+            node = node->children[0];
+        else
+            break;
+    }
+
+    return count > UINT32_MAX ? UINT32_MAX : (uint32_t)count;
+}
+
 /* ======================================================================== */
 /* Internal: insert intermediate projections in a join chain                */
 /* ======================================================================== */
@@ -565,12 +712,23 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
 
     uint32_t projections = 0;
 
+    /* Bound for acc[] and phys_names[] below: neither ever holds more than
+     * one alias per scan column in the chain.  needed[] is sized separately
+     * -- it holds the head variables as well, so its bound adds
+     * head_var_count on top of this. */
+    size_t total_cols;
+    if (!scan_columns_total(scans, nscan, &total_cols)) {
+        free(scans);
+        free(joins);
+        return 0;
+    }
+
     /* For each intermediate join (all except the outermost = joins[depth-1]),
      * check if we can project away variables. */
     uint32_t acc_count;
     char **acc_vars = scan_vars(scans[0], &acc_count);
     /* Build mutable accumulated set */
-    char **acc = (char **)calloc(nscan * 16, sizeof(char *));
+    char **acc = (char **)calloc(total_cols, sizeof(char *));
     if (!acc) {
         free(scans);
         free(joins);
@@ -597,7 +755,7 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
      * appearing in both children.  When a PROJECT is inserted it shrinks the
      * layout; subsequent scans are appended on top.  This is the layout that
      * project_indices must reference. */
-    char **phys_names = (char **)calloc(nscan * 32, sizeof(char *));
+    char **phys_names = (char **)calloc(total_cols, sizeof(char *));
     uint32_t phys_count = 0;
     if (!phys_names) {
         free(acc);
@@ -624,10 +782,27 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
      *     and head_vars
      *   - If any are dead, insert a PROJECT
      */
+    /* The needed set holds at most every head variable plus every scan
+     * column, deduplicated.  0 means only that the size would overflow;
+     * total_cols is already at least 1, so 0 is never a legitimate bound. */
+    uint64_t needed_total = (uint64_t)head_var_count + (uint64_t)total_cols;
+    size_t needed_cap = 0;
+    if (needed_total > JPP_PTR_ARRAY_MAX) {
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+            "jpp: %u head variables plus %zu scan columns exceed %llu; the "
+            "needed set cannot be sized, leaving the chain unoptimized",
+            head_var_count, total_cols,
+            (unsigned long long)JPP_PTR_ARRAY_MAX);
+    } else {
+        needed_cap = (size_t)needed_total;
+    }
+
     for (uint32_t i = 0; i < depth - 1; i++) {
         /* Compute "needed" vars: head_vars + vars in future scans */
         /* Build needed set */
-        char **needed = (char **)calloc(nscan * 16, sizeof(char *));
+        char **needed = needed_cap > 0
+            ? (char **)calloc(needed_cap, sizeof(char *))
+            : NULL;
         uint32_t needed_count = 0;
         if (!needed)
             break;
@@ -897,12 +1072,26 @@ optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
 
     (*chains_examined)++;
 
-    /* Collect head variables from wrapper nodes */
-    char *head_vars[64];
-    uint32_t head_var_count = collect_head_vars(ir, head_vars, 64);
+    /* Collect head variables from wrapper nodes, into an array sized by a
+     * counting pre-pass so that none is dropped. */
+    uint32_t head_var_max = count_head_vars(ir);
+    char **head_vars = NULL;
+    if (head_var_max > 0) {
+        head_vars = (char **)calloc(head_var_max, sizeof(char *));
+        if (!head_vars) {
+            /* Without the head variables every accumulated variable looks
+             * dead, which would project away live columns.  Leave this tree
+             * unoptimized instead. */
+            return;
+        }
+    }
+    uint32_t head_var_count
+        = head_vars ? collect_head_vars(ir, head_vars, head_var_max) : 0;
 
     jpp_chain_result_t result
         = optimize_chain(root, head_vars, head_var_count, idb_names, idb_count);
+
+    free(head_vars);
 
     if (result.reordered)
         (*joins_reordered)++;
