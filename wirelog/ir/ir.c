@@ -11,6 +11,7 @@
 
 #include "ir.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -322,63 +323,92 @@ ir_node_type_str(wirelog_ir_node_type_t type)
 }
 
 static void
+ir_buf_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
+{
+    if (!buf || !pos || bufsize == 0)
+        return;
+
+    if (*pos >= bufsize - 1) {
+        *pos = bufsize - 1;
+        buf[*pos] = '\0';
+        return;
+    }
+
+    size_t remaining = bufsize - *pos;
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + *pos, remaining, fmt, args);
+    va_end(args);
+
+    if (written < 0)
+        return;
+
+    size_t available = remaining - 1;
+    if ((size_t)written > available)
+        *pos += available;
+    else
+        *pos += (size_t)written;
+    buf[*pos] = '\0';
+}
+
+static void
 ir_expr_to_buf(const wl_ir_expr_t *expr, char *buf, size_t bufsize, size_t *pos)
 {
-    if (!expr || *pos >= bufsize - 1)
+    if (!expr || !pos || bufsize == 0)
         return;
 
     switch (expr->type) {
     case WL_IR_EXPR_VAR:
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "%s",
-                expr->var_name ? expr->var_name : "?");
+        ir_buf_append(buf, bufsize, pos, "%s",
+            expr->var_name ? expr->var_name : "?");
         break;
     case WL_IR_EXPR_CONST_INT:
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "%lld",
-                (long long)expr->int_value);
+        ir_buf_append(buf, bufsize, pos, "%lld",
+            (long long)expr->int_value);
         break;
     case WL_IR_EXPR_CONST_STR:
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "\"%s\"",
-                expr->str_value ? expr->str_value : "");
+        ir_buf_append(buf, bufsize, pos, "\"%s\"",
+            expr->str_value ? expr->str_value : "");
         break;
     case WL_IR_EXPR_ARITH:
         if (expr->child_count >= 2) {
-            *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "(");
+            ir_buf_append(buf, bufsize, pos, "(");
             ir_expr_to_buf(expr->children[0], buf, bufsize, pos);
-            *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " %s ",
-                    wirelog_arith_op_str(expr->arith_op));
+            ir_buf_append(buf, bufsize, pos, " %s ",
+                wirelog_arith_op_str(expr->arith_op));
             ir_expr_to_buf(expr->children[1], buf, bufsize, pos);
-            *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ")");
+            ir_buf_append(buf, bufsize, pos, ")");
         }
         break;
     case WL_IR_EXPR_CMP:
         if (expr->child_count >= 2) {
             ir_expr_to_buf(expr->children[0], buf, bufsize, pos);
-            *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " %s ",
-                    wirelog_cmp_op_str(expr->cmp_op));
+            ir_buf_append(buf, bufsize, pos, " %s ",
+                wirelog_cmp_op_str(expr->cmp_op));
             ir_expr_to_buf(expr->children[1], buf, bufsize, pos);
         }
         break;
     case WL_IR_EXPR_AGG:
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "%s(",
-                wirelog_agg_fn_str(expr->agg_fn));
+        ir_buf_append(buf, bufsize, pos, "%s(",
+            wirelog_agg_fn_str(expr->agg_fn));
         if (expr->child_count >= 1) {
             ir_expr_to_buf(expr->children[0], buf, bufsize, pos);
         }
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ")");
+        ir_buf_append(buf, bufsize, pos, ")");
         break;
     case WL_IR_EXPR_BOOL:
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "%s",
-                expr->bool_value ? "true" : "false");
+        ir_buf_append(buf, bufsize, pos, "%s",
+            expr->bool_value ? "true" : "false");
         break;
     case WL_IR_EXPR_STR_FN:
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "str_fn_%d(",
-                (int)expr->str_fn);
+        ir_buf_append(buf, bufsize, pos, "str_fn_%d(",
+            (int)expr->str_fn);
         for (uint32_t ci = 0; ci < expr->child_count; ci++) {
             if (ci > 0)
-                *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ", ");
+                ir_buf_append(buf, bufsize, pos, ", ");
             ir_expr_to_buf(expr->children[ci], buf, bufsize, pos);
         }
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ")");
+        ir_buf_append(buf, bufsize, pos, ")");
         break;
     }
 }
@@ -387,64 +417,64 @@ static void
 ir_node_to_buf(const wirelog_ir_node_t *node, char *buf, size_t bufsize,
     size_t *pos, uint32_t indent)
 {
-    if (!node || *pos >= bufsize - 1)
+    if (!node || !pos || bufsize == 0)
         return;
 
     /* Indentation */
     for (uint32_t i = 0; i < indent; i++) {
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "  ");
+        ir_buf_append(buf, bufsize, pos, "  ");
     }
 
     /* Node type */
-    *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "%s",
-            ir_node_type_str(node->type));
+    ir_buf_append(buf, bufsize, pos, "%s",
+        ir_node_type_str(node->type));
 
     /* Relation name */
     if (node->relation_name) {
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " \"%s\"",
-                node->relation_name);
+        ir_buf_append(buf, bufsize, pos, " \"%s\"",
+            node->relation_name);
     }
 
     /* SCAN columns */
     if (node->type == WIRELOG_IR_SCAN && node->column_names) {
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " [");
+        ir_buf_append(buf, bufsize, pos, " [");
         for (uint32_t i = 0; i < node->column_count; i++) {
             if (i > 0)
-                *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ", ");
+                ir_buf_append(buf, bufsize, pos, ", ");
             if (node->column_names[i]) {
-                *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "%s",
-                        node->column_names[i]);
+                ir_buf_append(buf, bufsize, pos, "%s",
+                    node->column_names[i]);
             } else {
-                *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "_");
+                ir_buf_append(buf, bufsize, pos, "_");
             }
         }
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "]");
+        ir_buf_append(buf, bufsize, pos, "]");
     }
 
     /* JOIN keys */
     if (node->type == WIRELOG_IR_JOIN && node->join_left_keys) {
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " (key:");
+        ir_buf_append(buf, bufsize, pos, " (key:");
         for (uint32_t i = 0; i < node->join_key_count; i++) {
-            *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " %s",
-                    node->join_left_keys[i]);
+            ir_buf_append(buf, bufsize, pos, " %s",
+                node->join_left_keys[i]);
         }
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ")");
+        ir_buf_append(buf, bufsize, pos, ")");
     }
 
     /* FILTER expression */
     if (node->type == WIRELOG_IR_FILTER && node->filter_expr) {
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " (");
+        ir_buf_append(buf, bufsize, pos, " (");
         ir_expr_to_buf(node->filter_expr, buf, bufsize, pos);
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, ")");
+        ir_buf_append(buf, bufsize, pos, ")");
     }
 
     /* AGGREGATE */
     if (node->type == WIRELOG_IR_AGGREGATE && node->agg_expr) {
-        *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, " ");
+        ir_buf_append(buf, bufsize, pos, " ");
         ir_expr_to_buf(node->agg_expr, buf, bufsize, pos);
     }
 
-    *pos += (size_t)snprintf(buf + *pos, bufsize - *pos, "\n");
+    ir_buf_append(buf, bufsize, pos, "\n");
 
     /* Children */
     for (uint32_t i = 0; i < node->child_count; i++) {

@@ -609,6 +609,61 @@ test_ir_node_to_string_tree(void)
 }
 
 static void
+test_ir_node_to_string_wide_scan(void)
+{
+    TEST("IR node to_string truncates wide output safely");
+
+    wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
+    if (!scan) {
+        FAIL("node is NULL");
+        return;
+    }
+
+    const uint32_t column_count = 512;
+    scan->column_count = column_count;
+    scan->column_names = (char **)calloc(column_count, sizeof(char *));
+    if (!scan->column_names) {
+        wl_ir_node_free(scan);
+        FAIL("column allocation failed");
+        return;
+    }
+    for (uint32_t i = 0; i < column_count; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "column_%03u", i);
+        scan->column_names[i] = strdup_safe(name);
+        if (!scan->column_names[i]) {
+            wl_ir_node_free(scan);
+            FAIL("column name allocation failed");
+            return;
+        }
+    }
+
+    char *str = wirelog_ir_node_to_string(scan);
+    if (!str) {
+        wl_ir_node_free(scan);
+        FAIL("to_string returned NULL");
+        return;
+    }
+
+    if (strlen(str) >= 4096 || str[4095] != '\0') {
+        free(str);
+        wl_ir_node_free(scan);
+        FAIL("wide output should be truncated and NUL-terminated");
+        return;
+    }
+    if (!strstr(str, "column_000")) {
+        free(str);
+        wl_ir_node_free(scan);
+        FAIL("wide output should contain the first column");
+        return;
+    }
+
+    free(str);
+    wl_ir_node_free(scan);
+    PASS();
+}
+
+static void
 test_ir_node_print(void)
 {
     TEST("IR node print output (smoke test)");
@@ -915,6 +970,7 @@ main(void)
     test_get_child_out_of_bounds();
     test_ir_node_to_string();
     test_ir_node_to_string_tree();
+    test_ir_node_to_string_wide_scan();
     test_ir_node_print();
     test_ir_node_free_null();
     test_ir_node_get_type_all();
