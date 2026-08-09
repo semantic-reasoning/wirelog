@@ -48,12 +48,14 @@
 typedef struct {
     const char *vars[MS_MAX_VARS]; /* borrowed pointers from IR nodes */
     uint32_t count;
+    bool overflow;
 } ms_varset_t;
 
 static void
 varset_clear(ms_varset_t *vs)
 {
     vs->count = 0;
+    vs->overflow = false;
 }
 
 static bool
@@ -71,10 +73,13 @@ varset_contains(const ms_varset_t *vs, const char *var)
 static void
 varset_add(ms_varset_t *vs, const char *var)
 {
-    if (!var || vs->count >= MS_MAX_VARS)
+    if (!var || varset_contains(vs, var))
         return;
-    if (!varset_contains(vs, var))
-        vs->vars[vs->count++] = var;
+    if (vs->count >= MS_MAX_VARS) {
+        vs->overflow = true;
+        return;
+    }
+    vs->vars[vs->count++] = var;
 }
 
 /* ======================================================================== */
@@ -92,15 +97,32 @@ typedef struct {
 /* ======================================================================== */
 
 typedef struct {
-    char rel_name[128];
+    const char *rel_name; /* borrowed from the program IR */
     uint64_t bound_mask;
     uint32_t arity;
 } ms_adorned_t;
 
 typedef struct {
-    ms_adorned_t items[MS_MAX_ADORNED];
+    ms_adorned_t *items;
     uint32_t count;
+    bool overflow;
 } ms_adorned_set_t;
+
+static bool
+adorned_set_init(ms_adorned_set_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->items = (ms_adorned_t *)calloc(MS_MAX_ADORNED, sizeof(*s->items));
+    return s->items != NULL;
+}
+
+static void
+adorned_set_free(ms_adorned_set_t *s)
+{
+    free(s->items);
+    s->items = NULL;
+    s->count = 0;
+}
 
 static bool
 adorned_contains(const ms_adorned_set_t *s, const char *name, uint64_t mask)
@@ -120,10 +142,11 @@ adorned_add(ms_adorned_set_t *s, const char *name, uint64_t mask,
 {
     if (adorned_contains(s, name, mask))
         return false;
-    if (s->count >= MS_MAX_ADORNED)
+    if (s->count >= MS_MAX_ADORNED) {
+        s->overflow = true;
         return false;
-    snprintf(s->items[s->count].rel_name, sizeof(s->items[s->count].rel_name),
-        "%s", name);
+    }
+    s->items[s->count].rel_name = name;
     s->items[s->count].bound_mask = mask;
     s->items[s->count].arity = arity;
     s->count++;
@@ -207,10 +230,14 @@ get_arity(const struct wirelog_program *prog, const char *rel_name)
 
 static void
 collect_scans_r(const wirelog_ir_node_t *node, ms_atom_t *atoms,
-    uint32_t *count)
+    uint32_t *count, bool *overflow)
 {
-    if (!node || *count >= MS_MAX_ATOMS)
+    if (!node)
         return;
+    if (*count >= MS_MAX_ATOMS) {
+        *overflow = true;
+        return;
+    }
 
     switch (node->type) {
     case WIRELOG_IR_SCAN:
@@ -231,12 +258,12 @@ collect_scans_r(const wirelog_ir_node_t *node, ms_atom_t *atoms,
          *           filtering only, not a real body atom.
          */
         if (node->child_count > 0)
-            collect_scans_r(node->children[0], atoms, count);
+            collect_scans_r(node->children[0], atoms, count, overflow);
         break;
 
     default:
         for (uint32_t i = 0; i < node->child_count; i++)
-            collect_scans_r(node->children[i], atoms, count);
+            collect_scans_r(node->children[i], atoms, count, overflow);
         break;
     }
 }
@@ -247,12 +274,13 @@ collect_scans_r(const wirelog_ir_node_t *node, ms_atom_t *atoms,
  * Returns the number of atoms collected.
  */
 static uint32_t
-collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms)
+collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms,
+    bool *overflow)
 {
     if (!ir_root || ir_root->child_count == 0)
         return 0;
     uint32_t count = 0;
-    collect_scans_r(ir_root->children[0], atoms, &count);
+    collect_scans_r(ir_root->children[0], atoms, &count, overflow);
     return count;
 }
 
@@ -316,6 +344,13 @@ get_head_vars(const wirelog_ir_node_t *ir_root, const char **vars,
         return 0;
 
     if (ir_root->type == WIRELOG_IR_PROJECT) {
+        if (ir_root->project_count > max_vars) {
+            fprintf(stderr,
+                "warning: magic sets skipped rule with %u head columns; "
+                "the 64-bit adornment mask supports at most %u\n",
+                ir_root->project_count, max_vars);
+            return 0;
+        }
         uint32_t n = (ir_root->project_count < max_vars)
                          ? ir_root->project_count
                          : max_vars;
@@ -660,7 +695,8 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
     /* === Phase 1: Seed the worklist from explicit demands === */
 
     ms_adorned_set_t processed;
-    memset(&processed, 0, sizeof(processed));
+    if (!adorned_set_init(&processed))
+        return -1;
 
     /* Simple queue over processed items (indices 0..count-1) */
     uint32_t wl_head = 0; /* index of next item to process */
@@ -702,6 +738,13 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
         }
 
         adorned_add(&processed, d->relation_name, d->bound_mask, arity);
+        if (processed.overflow) {
+            fprintf(stderr,
+                "warning: magic sets skipped program with more than %u "
+                "adorned predicates\n", MS_MAX_ADORNED);
+            adorned_set_free(&processed);
+            return -1;
+        }
     }
 
     /* === Phase 2: BFS adorned program === */
@@ -735,7 +778,16 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
 
             /* Collect body atoms in join order */
             ms_atom_t atoms[MS_MAX_ATOMS];
-            uint32_t atom_count = collect_body_atoms(ir_root, atoms);
+            bool atom_overflow = false;
+            uint32_t atom_count = collect_body_atoms(ir_root, atoms,
+                    &atom_overflow);
+            if (atom_overflow) {
+                fprintf(stderr,
+                    "warning: magic sets skipped rule with more than %u "
+                    "body atoms\n", MS_MAX_ATOMS);
+                adorned_set_free(&processed);
+                return -1;
+            }
 
             for (uint32_t ai = 0; ai < atom_count; ai++) {
                 const ms_atom_t *atom = &atoms[ai];
@@ -761,6 +813,14 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                     if (atom_mask != 0) {
                         adorned_add(&processed, atom->rel_name, atom_mask,
                             atom->col_count);
+                        if (processed.overflow) {
+                            fprintf(stderr,
+                                "warning: magic sets skipped program with "
+                                "more than %u adorned predicates\n",
+                                MS_MAX_ADORNED);
+                            adorned_set_free(&processed);
+                            return -1;
+                        }
                     } else {
                         if (stats)
                             stats->skipped_all_free++;
@@ -773,6 +833,13 @@ next_atom:
                     if (atom->col_names && atom->col_names[ci])
                         varset_add(&bound, atom->col_names[ci]);
                 }
+                if (bound.overflow) {
+                    fprintf(stderr,
+                        "warning: magic sets skipped rule with more than "
+                        "%u variables\n", MS_MAX_VARS);
+                    adorned_set_free(&processed);
+                    return -1;
+                }
             }
         }
     }
@@ -780,8 +847,10 @@ next_atom:
     if (stats)
         stats->adorned_predicates = processed.count;
 
-    if (processed.count == 0)
+    if (processed.count == 0){
+        adorned_set_free(&processed);
         return 0; /* Nothing to do */
+    }
 
     /* === Phase 3: Create magic relations === */
 
@@ -843,7 +912,16 @@ next_atom:
             }
 
             ms_atom_t atoms[MS_MAX_ATOMS];
-            uint32_t atom_count = collect_body_atoms(ir_root, atoms);
+            bool atom_overflow = false;
+            uint32_t atom_count = collect_body_atoms(ir_root, atoms,
+                    &atom_overflow);
+            if (atom_overflow) {
+                fprintf(stderr,
+                    "warning: magic sets skipped rule with more than %u "
+                    "body atoms\n", MS_MAX_ATOMS);
+                adorned_set_free(&processed);
+                return -1;
+            }
 
             ms_varset_t bound;
             varset_clear(&bound);
@@ -898,6 +976,13 @@ next_4a_atom:
                 for (uint32_t ci = 0; ci < atom->col_count; ci++) {
                     if (atom->col_names && atom->col_names[ci])
                         varset_add(&bound, atom->col_names[ci]);
+                }
+                if (bound.overflow) {
+                    fprintf(stderr,
+                        "warning: magic sets skipped rule with more than "
+                        "%u variables\n", MS_MAX_VARS);
+                    adorned_set_free(&processed);
+                    return -1;
                 }
             }
         }
@@ -976,6 +1061,7 @@ next_4a_atom:
     }
 
     prog->magic_sets_applied = true;
+    adorned_set_free(&processed);
     return 0;
 }
 
