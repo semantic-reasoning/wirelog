@@ -1464,6 +1464,18 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             continue;
 
         uint32_t ncols = r->ncols;
+        int64_t row_stack[COL_STACK_MAX];
+        int64_t *src_buf = row_stack;
+        if (ncols > COL_STACK_MAX) {
+            src_buf = (int64_t *)malloc(ncols * sizeof(int64_t));
+            if (!src_buf) {
+                for (uint32_t i = 0; i < rc_cnt; i++)
+                    free(retract_data[i]);
+                free(retract_data);
+                free(retract_nrows);
+                return ENOMEM;
+            }
+        }
 
         for (uint32_t del_idx = 0; del_idx < retract_nrows[ri]; del_idx++) {
             const int64_t *to_remove
@@ -1473,15 +1485,9 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             uint32_t out_r = 0;
             bool found = false;
             for (uint32_t src_idx = 0; src_idx < r->nrows; src_idx++) {
-                int64_t sbuf[COL_STACK_MAX];
-                int64_t *src_buf = sbuf;
-                if (ncols > COL_STACK_MAX)
-                    src_buf = (int64_t *)malloc(ncols * sizeof(int64_t));
                 col_rel_row_copy_out(r, src_idx, src_buf);
                 if (memcmp(src_buf, to_remove, sizeof(int64_t) * ncols)
                     == 0) {
-                    if (src_buf != sbuf)
-                        free(src_buf);
                     /* Found matching row; skip it (removal) */
                     found = true;
                     /* Copy remaining rows forward */
@@ -1497,8 +1503,6 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                     if (out_r != src_idx)
                         col_rel_row_copy_in(r, out_r, src_buf);
                     out_r++;
-                    if (src_buf != sbuf)
-                        free(src_buf);
                 }
             }
 
@@ -1508,6 +1512,8 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                     sess->delta_data);
             }
         }
+        if (src_buf != row_stack)
+            free(src_buf);
     }
 
     /* Cleanup: free stolen retraction buffers */
