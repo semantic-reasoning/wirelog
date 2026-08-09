@@ -664,28 +664,6 @@ test_recursive_selfjoin_wide(void)
                 atoms, n);
             TEST(name);
 
-            /*
-             * Three or more body atoms reach col_rel_merge_k's k >= 3 branch,
-             * but they cannot be evaluated at any of these widths yet: the
-             * join-project-plan pass sizes three scratch arrays as
-             * `nscan * 16` (wirelog/passes/jpp.c:290, :589, :646) and then
-             * fills them with one entry per column per scan, so a 3-atom
-             * join over relations wider than 16 columns writes out of
-             * bounds inside wl_jpp_apply -- before evaluation begins.
-             *
-             * That is a separate defect in a different module (a sizing
-             * guess in the optimizer, not a COL_STACK_MAX row buffer), with
-             * its own reproducer and its own fix; it is deliberately not
-             * addressed here.  The k >= 3 branch shares the MERGE_K_SETUP /
-             * MERGE_K_APPEND macros with the k == 2 branch that the
-             * 2-atom cases above do cover at 33 and 200 columns.
-             */
-            if (atoms == 3) {
-                SKIP("blocked by jpp.c nscan*16 sizing overflow "
-                    "(separate defect; see comment)");
-                continue;
-            }
-
             sbuf_t s;
             sb_init(&s);
             build_tc_src(&s, n, atoms);
