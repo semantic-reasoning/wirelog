@@ -5867,6 +5867,7 @@ col_op_k_fusion_serial(const wl_plan_op_t *op, eval_stack_t *stack,
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < k; d++) {
         wl_plan_relation_t plan_data;
+        memset(&plan_data, 0, sizeof(plan_data));
         plan_data.name = "<k_fusion_copy>";
         plan_data.delta_name = NULL;
         plan_data.ops = meta->k_ops[d];
@@ -6037,6 +6038,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t live_count = 0;
     for (uint32_t d = 0; d < k; d++) {
         wl_plan_relation_t plan_data;
+        memset(&plan_data, 0, sizeof(plan_data));
         plan_data.name = "<k_fusion_copy>";
         plan_data.delta_name = NULL;
         plan_data.ops = meta->k_ops[d];

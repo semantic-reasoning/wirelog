@@ -1163,6 +1163,32 @@ test_symbol_aggregates_exe = executable(
 # The whole binary runs in well under a second; the timeout bounds the hang.
 test('symbol_aggregates', test_symbol_aggregates_exe, timeout: 60)
 
+# Issue #975: recursive min()/max() canonicalisation never ran on a relation
+# rewrite_multiway_delta() had fused, because the decision to run was taken
+# by scanning the relation's operator list for a REDUCE and the rewrite had
+# moved it into the K_FUSION operator's opaque_data.  Adding a rule that
+# derives nothing changed the answer.
+test_recursive_agg_kfusion_exe = executable(
+  'test_recursive_agg_kfusion',
+  files('test_recursive_agg_kfusion.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+# Every case runs at W = 1, 4, 8 and 16; the 16-worker recursive cases are
+# the slow ones.  The timeout also bounds the failure mode where a relation
+# reduced under a comparator that is not a total order never converges.
+test('recursive_agg_kfusion', test_recursive_agg_kfusion_exe,
+     suite: 'semantics', timeout: 120)
+
 # Issue #978: average() was never implemented -- col_op_reduce() had no AVG
 # arm, so each group kept the first operand the scan happened to reach.  With
 # no float type to return a mean in, it is rejected at lowering instead.
