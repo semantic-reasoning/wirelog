@@ -1795,25 +1795,25 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (r->ncols != num_cols)
         return EINVAL;
 
+    int64_t row_stack[COL_STACK_MAX];
+    int64_t *row_buf = row_stack;
+    if (num_cols > COL_STACK_MAX) {
+        row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
+        if (!row_buf)
+            return ENOMEM;
+    }
+
     /* Compact: remove matching rows */
     for (uint32_t di = 0; di < num_rows; di++) {
         const int64_t *del = data + (size_t)di * num_cols;
         uint32_t out_r = 0;
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            int64_t rbuf[COL_STACK_MAX];
-            int64_t *row_buf = rbuf;
-            if (num_cols > COL_STACK_MAX)
-                row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
             col_rel_row_copy_out(r, ri, row_buf);
             if (memcmp(row_buf, del, sizeof(int64_t) * num_cols) != 0) {
                 if (out_r != ri)
                     col_rel_row_copy_in(r, out_r, row_buf);
                 out_r++;
-                if (row_buf != rbuf)
-                    free(row_buf);
             } else {
-                if (row_buf != rbuf)
-                    free(row_buf);
                 /* Remove first matching row only */
                 di = num_rows; /* break outer loop after this one */
                 for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
@@ -1825,6 +1825,8 @@ col_session_remove(wl_session_t *session, const char *relation,
         r->nrows = out_r;
 next_del:;
     }
+    if (row_buf != row_stack)
+        free(row_buf);
     session_invalidate_relation_caches(sess, r->name);
     sess->pending_input_change = true;
     sess->snapshot_stable_valid = false;
@@ -1900,25 +1902,25 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         return rc;
     }
 
+    int64_t row_stack[COL_STACK_MAX];
+    int64_t *row_buf = row_stack;
+    if (num_cols > COL_STACK_MAX) {
+        row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
+        if (!row_buf)
+            return ENOMEM;
+    }
+
     /* Remove rows from the EDB using existing compact logic */
     for (uint32_t di = 0; di < num_rows; di++) {
         const int64_t *del = data + (size_t)di * num_cols;
         uint32_t out_r = 0;
         for (uint32_t ri = 0; ri < r->nrows; ri++) {
-            int64_t rbuf[COL_STACK_MAX];
-            int64_t *row_buf = rbuf;
-            if (num_cols > COL_STACK_MAX)
-                row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
             col_rel_row_copy_out(r, ri, row_buf);
             if (memcmp(row_buf, del, sizeof(int64_t) * num_cols) != 0) {
                 if (out_r != ri)
                     col_rel_row_copy_in(r, out_r, row_buf);
                 out_r++;
-                if (row_buf != rbuf)
-                    free(row_buf);
             } else {
-                if (row_buf != rbuf)
-                    free(row_buf);
                 /* Remove first matching row only */
                 di = num_rows; /* break outer loop after this one */
                 for (uint32_t rest = ri + 1; rest < r->nrows; rest++, out_r++)
@@ -1930,6 +1932,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         r->nrows = out_r;
 next_del_incr:;
     }
+    if (row_buf != row_stack)
+        free(row_buf);
 
     /* Clamp base_nrows to current row count */
     if (r->base_nrows > r->nrows)
