@@ -3291,6 +3291,11 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         wl_plan_free(plan);
         return -1;
     }
+    /* Transfer ownership before building the first stratum so every failure
+     * path can release already-completed nested allocations through
+     * wl_plan_free(). */
+    plan->strata = strata;
+    plan->stratum_count = stratum_count;
 
     for (uint32_t s = 0; s < prog->stratum_count; s++) {
         const wirelog_stratum_t *src = &prog->strata[s];
@@ -3318,7 +3323,6 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         uint32_t max_rels = src->rule_count;
         char **unique_names = (char **)calloc(max_rels, sizeof(char *));
         if (!unique_names) {
-            free(strata);
             wl_plan_free(plan);
             return -1;
         }
@@ -3343,7 +3347,6 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
             unique_count, sizeof(wl_plan_relation_t));
         if (!rels) {
             free((void *)unique_names);
-            free(strata);
             wl_plan_free(plan);
             return -1;
         }
@@ -3378,7 +3381,6 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                 free((void *)rels[u].name);
                 free(rels[u].delta_name);
                 free(rels);
-                free(strata);
                 wl_plan_free(plan);
                 return -1;
             }
@@ -3400,7 +3402,6 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     free((void *)rels[u].name);
                     free(rels[u].delta_name);
                     free(rels);
-                    free(strata);
                     wl_plan_free(plan);
                     return -1;
                 }
@@ -3424,7 +3425,6 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     free((void *)rels[u].name);
                     free(rels[u].delta_name);
                     free(rels);
-                    free(strata);
                     wl_plan_free(plan);
                     return -1;
                 }
@@ -3441,9 +3441,6 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         dst->relations = rels;
         dst->relation_count = unique_count;
     }
-
-    plan->strata = strata;
-    plan->stratum_count = stratum_count;
 
     /* Rewrite K-atom recursive rules for complete semi-naive evaluation.
      * For rules with K >= 2 IDB body atoms, emit K copies with CSE
