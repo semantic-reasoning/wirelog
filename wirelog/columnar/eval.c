@@ -319,6 +319,40 @@ retraction_rel_name(const char *rel, char *buf, size_t sz)
  *
  * Issue #158 extension: When retraction_seeded and iteration == 0, check
  * $r$<name> relations instead of $d$<name>.
+ *
+ * Issue #1019: this scan is blinded by the same plan rewrites that blinded
+ * col_compute_affected_strata(). On a fused relation rp->ops is
+ * [K_FUSION, EXCHANGE], both zero-initialised, so delta_mode is never
+ * WL_DELTA_FORCE_DELTA and this returns false unconditionally.
+ *
+ * FOUR of the eight call sites are blinded, not two.  All four pass a
+ * top-level wl_plan_stratum_t relation plan (&sp->relations[ri]), which is
+ * exactly what the rewrite replaced:
+ *   - col_eval_stratum(): the whole-stratum early exit (break the sub-pass
+ *     when EVERY rule answers true) and the per-rule pre-scan below it;
+ *   - tdd_worker_subpass_fn(): the same pair again on the TDD worker path
+ *     -- an all-rules early exit that sets ctx->all_empty_delta, and a
+ *     per-rule pre-scan in its relation loop.
+ * The other FOUR are not blinded, because they pass an inner operator list
+ * that still carries the FORCE_DELTA ops the rewrite hid:
+ *   - tdd_worker_eval_rule_slices() and tdd_coord_eval_fallback_rule_slices()
+ *     (this file) evaluate a wl_tdd_rule_slice_t; on a fused relation
+ *     tdd_build_rule_slices() takes those ops from
+ *     wl_plan_op_k_fusion_t.k_ops[], i.e. from inside the opaque_data;
+ *   - col_op_k_fusion_serial() and col_op_k_fusion() (columnar/ops.c)
+ *     evaluate meta->k_ops[d] directly.
+ * Call sites are named by function on purpose: line numbers drift.
+ *
+ * The blinding costs iterations, never correctness, so it is deliberately
+ * NOT fixed the way #1019 fixed the frontier: the answer depends on live
+ * per-iteration session state ($d$/$r$ relation contents, delta_seeded,
+ * retraction_seeded), which does not exist at plan-lowering time and so
+ * cannot be recorded on the plan. The two unblinded in-kernel checks are
+ * not a substitute either, and they differ from each other:
+ * col_op_k_fusion_serial() skips one fused branch with a continue, while
+ * col_op_k_fusion() builds a live_indices[] list and short-circuits the
+ * WHOLE K_FUSION op to an empty relation when live_count == 0. Neither can
+ * reproduce the whole-sub-pass break this function enables.
  */
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,

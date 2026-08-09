@@ -543,6 +543,21 @@ typedef struct {
 /* ======================================================================== */
 
 /**
+ * wl_plan_refset_t:
+ *
+ * De-duplicated set of relation names read by one relation's operator
+ * sequence (Issue #1019).
+ *
+ * @names: Owned array of @count owned, null-terminated names.  NULL when
+ *         @count is 0 and the relation had no operators.
+ * @count: Number of names.
+ */
+typedef struct {
+    char **names;
+    uint32_t count;
+} wl_plan_refset_t;
+
+/**
  * wl_plan_stratum_t:
  *
  * Execution plan for a single stratum.
@@ -554,6 +569,39 @@ typedef struct {
  *                  Used for DRedL-style deletion phase optimization.
  * @relations:      Array of per-relation plans (caller-owned).
  * @relation_count: Number of relations in this stratum.
+ * @rule_refs:      Issue #1019.  @relation_count entries, owned, parallel to
+ *                  @relations: the relations each rule reads, recorded at IR
+ *                  lowering before any plan rewrite runs.  Two rewrites erase
+ *                  those names from @relations[i].ops, by different means:
+ *                  rewrite_multiway_delta() really does move the naming
+ *                  operators out of reach, into
+ *                  wl_plan_op_k_fusion_t.k_ops[] behind
+ *                  wl_plan_op_t.opaque_data; rewrite_lftj_chains() moves no
+ *                  operators at all -- build_lftj_op() copies only
+ *                  rel_names[]/key_cols[] into wl_plan_op_lftj_t and then
+ *                  free_op()s the originals, so the operators are gone
+ *                  rather than hidden.  Either way a consumer scanning
+ *                  @relations[i].ops no longer sees the names.  NULL
+ *                  means "not recorded" -- consumers must fall back to scanning
+ *                  the operator list.  Held on the stratum rather than on
+ *                  wl_plan_relation_t because relation structs get rebuilt
+ *                  field by field in several places -- col_plan_split_at_exchange()
+ *                  and the two designated initialisers in columnar/eval.c that
+ *                  wrap a child op list -- so a new relation field is silently
+ *                  dropped rather than carried.
+ *
+ *                  Invariant to preserve when adding a construction site:
+ *                  every site must zero-initialise the stratum before
+ *                  filling it, so an unrecorded @rule_refs reads as NULL and
+ *                  consumers take the fallback path instead of dereferencing
+ *                  garbage.  wl_plan_from_program() gets that from calloc();
+ *                  the stack-declared wl_plan_stratum_t arrays in
+ *                  tests/test_affected_strata.c, tests/test_affected_rules.c
+ *                  and tests/test_rule_level_frontier.c (18 arrays at the
+ *                  time of writing) each memset() the struct first.  This
+ *                  type is deliberately NOT private to wl_plan_t: hand-built
+ *                  strata passed straight to the columnar frontier helpers
+ *                  are an established pattern in those three files.
  */
 typedef struct {
     uint32_t stratum_id;
@@ -561,6 +609,7 @@ typedef struct {
     bool is_monotone;
     const wl_plan_relation_t *relations;
     uint32_t relation_count;
+    wl_plan_refset_t *rule_refs;
 } wl_plan_stratum_t;
 
 /* ======================================================================== */
