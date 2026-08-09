@@ -481,6 +481,12 @@ build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
         for (uint32_t i = 0; i < guard_bound_count; i++) {
             if (guard_bound_vars[i])
                 current->column_names[i] = strdup_safe(guard_bound_vars[i]);
+            else {
+                char constant_name[32];
+                snprintf(constant_name, sizeof(constant_name),
+                    "$magic_const_%u", i);
+                current->column_names[i] = strdup_safe(constant_name);
+            }
         }
     }
 
@@ -623,7 +629,7 @@ typedef enum {
  * Transforms:
  *   PROJECT(head) -> body_tree
  * into:
- *   PROJECT(head) -> JOIN(body_tree, SCAN($magic, [bound_vars]))
+ *   PROJECT(head) -> JOIN(body_tree, SCAN($magic, [bound_positions]))
  *
  * The JOIN filters the body to only tuples where the bound variables
  * appear in the magic demand relation.
@@ -644,10 +650,16 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
 {
     if (!ir_root || !magic_name)
         return MS_GUARD_SKIPPED_NO_BODY;
-    if (bound_count == 0)
-        return MS_GUARD_SKIPPED_CONSTANT_HEAD;
     if (ir_root->child_count == 0)
         return MS_GUARD_SKIPPED_NO_BODY;
+
+    uint32_t variable_count = 0;
+    for (uint32_t i = 0; i < bound_count; i++) {
+        if (bound_vars[i])
+            variable_count++;
+    }
+    if (variable_count == 0)
+        return MS_GUARD_SKIPPED_CONSTANT_HEAD;
 
     wirelog_ir_node_t *body = ir_root->children[0];
 
@@ -676,6 +688,11 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
              * where a wrong type would be a silent mistype (Issue #962). */
             magic_scan->column_types[i]
                 = ms_lookup_var_type(body, bound_vars[i]);
+        } else {
+            char constant_name[32];
+            snprintf(constant_name, sizeof(constant_name),
+                "$magic_const_%u", i);
+            magic_scan->column_names[i] = strdup_safe(constant_name);
         }
     }
 
@@ -686,18 +703,22 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
         return MS_GUARD_ERROR;
     }
 
-    guard_join->join_left_keys = (char **)calloc(bound_count, sizeof(char *));
-    guard_join->join_right_keys = (char **)calloc(bound_count, sizeof(char *));
+    guard_join->join_left_keys
+        = (char **)calloc(variable_count, sizeof(char *));
+    guard_join->join_right_keys
+        = (char **)calloc(variable_count, sizeof(char *));
     if (!guard_join->join_left_keys || !guard_join->join_right_keys) {
         wl_ir_node_free(guard_join);
         wl_ir_node_free(magic_scan);
         return MS_GUARD_ERROR;
     }
-    guard_join->join_key_count = bound_count;
+    guard_join->join_key_count = variable_count;
+    uint32_t key = 0;
     for (uint32_t i = 0; i < bound_count; i++) {
         if (bound_vars[i]) {
-            guard_join->join_left_keys[i] = strdup_safe(bound_vars[i]);
-            guard_join->join_right_keys[i] = strdup_safe(bound_vars[i]);
+            guard_join->join_left_keys[key] = strdup_safe(bound_vars[i]);
+            guard_join->join_right_keys[key] = strdup_safe(bound_vars[i]);
+            key++;
         }
     }
 
@@ -959,10 +980,10 @@ next_atom:
             if (head_arity == 0)
                 continue;
 
-            const char *guard_bvars[64];
+            const char *guard_bvars[64] = { 0 };
             uint32_t guard_bcount = 0;
             for (uint32_t i = 0; i < head_arity && i < 64; i++) {
-                if ((ap->bound_mask & (1ULL << i)) && head_vars[i])
+                if (ap->bound_mask & (1ULL << i))
                     guard_bvars[guard_bcount++] = head_vars[i];
             }
 
@@ -1110,10 +1131,10 @@ next_4a_atom:
                 continue;
             }
 
-            const char *guard_bvars[64];
+            const char *guard_bvars[64] = { 0 };
             uint32_t guard_bcount = 0;
             for (uint32_t i = 0; i < head_arity && i < 64; i++) {
-                if ((ap->bound_mask & (1ULL << i)) && head_vars[i])
+                if (ap->bound_mask & (1ULL << i))
                     guard_bvars[guard_bcount++] = head_vars[i];
             }
 
