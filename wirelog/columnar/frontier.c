@@ -76,8 +76,8 @@ stratum_references_relation(const wl_plan_stratum_t *sp, const char *rel)
                 return true;
             }
             if ((pr->ops[oi].op == WL_PLAN_OP_JOIN
-                 || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
-                 || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
+                || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
+                || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
                 && pr->ops[oi].right_relation != NULL
                 && strcmp(pr->ops[oi].right_relation, rel) == 0) {
                 return true;
@@ -117,7 +117,7 @@ stratum_references_relation(const wl_plan_stratum_t *sp, const char *rel)
  */
 uint64_t
 col_compute_affected_strata(wl_session_t *session,
-                            const char *inserted_relation)
+    const char *inserted_relation)
 {
     if (!session || !inserted_relation)
         return 0;
@@ -180,7 +180,7 @@ col_compute_affected_strata(wl_session_t *session,
                     if (affected & ((uint64_t)1 << sj))
                         continue; /* already marked */
                     if (stratum_references_relation(&plan->strata[sj],
-                                                    produced)) {
+                        produced)) {
                         affected = bitmask_or_simd(affected, (uint64_t)1 << sj);
                     }
                 }
@@ -211,8 +211,8 @@ rule_references_relation(const wl_plan_relation_t *pr, const char *rel)
         }
         /* Check JOIN/ANTIJOIN/SEMIJOIN right_relation (right child of joins) */
         if ((pr->ops[oi].op == WL_PLAN_OP_JOIN
-             || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
-             || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
+            || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
+            || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
             && pr->ops[oi].right_relation != NULL
             && strcmp(pr->ops[oi].right_relation, rel) == 0) {
             return true;
@@ -262,7 +262,7 @@ col_compute_affected_rules(wl_session_t *session, const char *inserted_relation)
      */
     uint32_t nrules = 0;
     for (uint32_t si = 0; si < plan->stratum_count && nrules < MAX_RULES;
-         si++) {
+        si++) {
         uint32_t rc = plan->strata[si].relation_count;
         if (nrules + rc > MAX_RULES)
             rc = MAX_RULES - nrules;
@@ -281,10 +281,10 @@ col_compute_affected_rules(wl_session_t *session, const char *inserted_relation)
     {
         uint32_t idx = 0;
         for (uint32_t si = 0; si < plan->stratum_count && idx < MAX_RULES;
-             si++) {
+            si++) {
             for (uint32_t ri = 0;
-                 ri < plan->strata[si].relation_count && idx < MAX_RULES;
-                 ri++) {
+                ri < plan->strata[si].relation_count && idx < MAX_RULES;
+                ri++) {
                 rule_si[idx] = si;
                 rule_ri[idx] = ri;
                 idx++;
