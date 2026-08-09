@@ -26,6 +26,7 @@
 #include "magic_sets.h"
 #include "../ir/ir.h"
 #include "../ir/program.h"
+#include "../util/log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,6 +196,19 @@ is_idb(const struct wirelog_program *prog, const char *rel_name)
     return false;
 }
 
+/*
+ * Whether any rule defining @rel_name has an AGGREGATE root.
+ *
+ * The type test is the right one here and must stay: this asks what kind of
+ * rule it is, not what the root's payload holds.  It is also load-bearing in a
+ * way that is not local -- since #990, get_head_vars() no longer names
+ * AGGREGATE, and returns 0 for such a root only because an AGGREGATE root
+ * carries no project_exprs.  This function is therefore the sole thing keeping
+ * aggregate rules out of the guard loop; it is called before adornment in
+ * Phase 1 and again in the Phase 2 BFS, so such relations never enter
+ * `processed`.  Widening AGGREGATE to carry a head projection would need this
+ * to still hold.
+ */
 static bool
 relation_has_aggregate_rule(const struct wirelog_program *prog,
     const char *rel_name)
@@ -331,10 +345,20 @@ ms_lookup_var_type(const wirelog_ir_node_t *node, const char *var)
 /* ======================================================================== */
 
 /*
- * Extract variable names from the rule's PROJECT head.
+ * Extract variable names from the rule's head projection.
  * vars[i] = variable name at head position i, or NULL for constants/wildcards.
  * Returns the head arity (number of head arguments).
- * Returns 0 for AGGREGATE rules (not currently supported for magic guards).
+ *
+ * Returns 0 for AGGREGATE rules, but only as a consequence of the test below:
+ * an AGGREGATE root carries project_count == 0 and project_exprs == NULL, so
+ * it has no head projection to read.  Nothing here names the type.  If an
+ * AGGREGATE root ever grows project_exprs, this returns its head variables
+ * and the pass will guard aggregate rules -- see the note on
+ * relation_has_aggregate_rule(), which is what actually keeps them out.
+ *
+ * Also returns 0 for a head wider than @max_vars, which is a different thing:
+ * there the head projection is present and readable, and the pass declines it
+ * because the adornment mask is 64 bits wide.  Callers see one 0 for both.
  */
 static uint32_t
 get_head_vars(const wirelog_ir_node_t *ir_root, const char **vars,
@@ -343,7 +367,27 @@ get_head_vars(const wirelog_ir_node_t *ir_root, const char **vars,
     if (!ir_root)
         return 0;
 
-    if (ir_root->type == WIRELOG_IR_PROJECT) {
+    /*
+     * Key off the head projection payload, not the node type (Issue #990).
+     *
+     * A rule root does not keep the type it was parsed with.  Logic Fusion
+     * rewrites PROJECT -> FLATMAP in place (fusion.c), leaving project_exprs /
+     * project_count untouched, and it runs before Magic Sets in the shipping
+     * pipeline -- so testing for WIRELOG_IR_PROJECT silently skipped every
+     * filtered rule, losing answers.  Nor is fusion the only rewriter:
+     * program.c re-types SCAN -> COMPOUND_INLINE/_SIDE the same way.
+     * Enumerating root types is a losing game; the payload is what this
+     * function actually needs.
+     *
+     * This is the existing convention, not a new one: exec_plan_gen.c decides
+     * a node projects with literally `node->project_exprs &&
+     * node->project_count > 0`, keying off the pointer rather than the type.
+     *
+     * Safe against the one PROJECT built without project_exprs -- jpp.c's
+     * dead-variable projection -- because that one is spliced strictly
+     * between JOINs in a chain and never becomes a rule root.
+     */
+    if (ir_root->project_exprs && ir_root->project_count > 0) {
         if (ir_root->project_count > max_vars) {
             fprintf(stderr,
                 "warning: magic sets skipped rule with %u head columns; "
@@ -364,7 +408,12 @@ get_head_vars(const wirelog_ir_node_t *ir_root, const char **vars,
         return n;
     }
 
-    /* AGGREGATE rules: skip magic guard insertion for now */
+    /* No head projection to read variable names from.  Two shapes reach here:
+     * an AGGREGATE root, excluded upstream by relation_has_aggregate_rule(),
+     * and a zero-arity head (`.decl p()`), which parses to a PROJECT with
+     * project_count == 0 and has no position a demand could bind.  The
+     * over-wide head above returns 0 without reaching this line, so a 0
+     * return does not imply this path. */
     return 0;
 }
 
@@ -762,7 +811,8 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
             if (!ir_root)
                 continue;
 
-            /* Get head variable names (PROJECT only) */
+            /* Head variable names, read off whatever head projection the root
+             * carries -- not off its node type (#990). */
             const char *head_vars[64] = { 0 };
             uint32_t head_arity = get_head_vars(ir_root, head_vars, 64);
             if (head_arity == 0)
@@ -994,8 +1044,10 @@ next_4a_atom:
      * === Phase 4b: Insert magic guards into original rules (MUTATING) ===
      *
      * Now that all demand propagation rules have been generated from the
-     * original (unmodified) IR, we can safely mutate the original rule
-     * bodies by prepending JOIN(SCAN($m$rel), body).
+     * original (unmodified) IR, we can safely mutate the original rule bodies
+     * by splicing in JOIN(body, SCAN($m$rel)).  The guard SCAN is the right
+     * child and the body stays on the left; see insert_magic_guard() for why
+     * the other order does not survive plan translation (#989).
      */
 
     for (uint32_t pi = 0; pi < processed.count; pi++) {
@@ -1018,18 +1070,32 @@ next_4a_atom:
             const char *head_vars[64] = { 0 };
             uint32_t head_arity = get_head_vars(ir_root, head_vars, 64);
             if (head_arity == 0) {
-                /* No PROJECT head to read variable names from, so the guard
-                 * cannot be keyed and the rule runs unrestricted.  This is a
-                 * capability gap, not a policy decision: a rule fused to a
-                 * FLATMAP root lands here -- Logic Fusion runs before Magic
-                 * Sets in the shipping pipeline and any rule with a filter is
-                 * a candidate.  That is the only shape that reaches this in
-                 * practice; an AGGREGATE root cannot, because
-                 * relation_has_aggregate_rule() filters those relations before
-                 * adornment so they never enter `processed`.  Counting it is
-                 * what makes the omission visible at all (see #990). */
+                /* No head variable names the guard could be keyed on, so the
+                 * rule runs unrestricted -- sound but unoptimized.  A
+                 * capability gap, not a policy decision.
+                 *
+                 * Reachable.  get_head_vars() also returns 0 for a head wider
+                 * than the 64-bit adornment mask, and that path needs only a
+                 * bound demand on a relation with more than 64 columns; it is
+                 * pinned by test_wide_head_is_an_unsupported_head().  What
+                 * #990 changed is that a rule fused to a FLATMAP root no
+                 * longer lands here: it keeps its project_exprs and is guarded
+                 * normally.  An AGGREGATE root cannot reach here either --
+                 * relation_has_aggregate_rule() excludes those relations
+                 * before they can enter `processed`.
+                 *
+                 * Guarding a rule is not on its own enough to make the demand
+                 * correct: the guard prunes only what the demand relation was
+                 * actually populated with, so a rule guarded on a demand that
+                 * no propagation rule ever fills loses answers rather than
+                 * saving work.  See #1027; nothing seeds $m$ today, so it is
+                 * not a shipping regression. */
                 if (stats)
                     stats->skipped_unsupported_head++;
+                WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_WARN,
+                    "magic sets left rule for '%s' unguarded: its head has no "
+                    "variable names the demand relation '%s' can be keyed on",
+                    ap->rel_name, guard_magic);
                 continue;
             }
 

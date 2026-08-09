@@ -371,11 +371,12 @@ entry-point symbols are:
 
 An adornment is "all-free" when `bound_mask == 0`: every argument position
 of the adorned predicate is free at the Magic Sets demand site. The Magic
-Sets pass handles this at `wirelog/passes/magic_sets.c:571-575` by taking
-a skip path — no demand propagation is emitted because there are no bound
-columns to propagate. The other three passes (SIP, Logic Fusion, JPP) have
-no equivalent adornment concept and therefore no analogous counter or skip
-path.
+Sets pass handles this at `wirelog/passes/magic_sets.c:761-765` (a demand
+root) and `wirelog/passes/magic_sets.c:874-877` (an IDB body atom in the
+Phase 2 BFS) by taking a skip path — no demand propagation is emitted
+because there are no bound columns to propagate. The other three passes
+(SIP, Logic Fusion, JPP) have no equivalent adornment concept and therefore
+no analogous counter or skip path.
 
 ### Definition of "aggregate-skip"
 
@@ -397,7 +398,12 @@ testing the actual optimizer pipeline.
 - `wirelog/wirelog-optimizer.h:57-64` — `wirelog_opt_pass_t` enum.
 - `wirelog/wirelog-optimizer.h:71-79` — `wirelog_opt_config_t` struct.
 - `wirelog/wirelog-optimizer.h:134-137` — `wirelog_optimize_with_config` declaration.
-- `wirelog/passes/magic_sets.c:251-275` — aggregate-skip in Magic Sets head extraction.
-- `wirelog/passes/magic_sets.c:571-575` — all-free adornment skip path.
+- `wirelog/passes/magic_sets.c:212-226` — `relation_has_aggregate_rule()`, the
+  aggregate-skip predicate. It is what excludes aggregate rules, not head
+  extraction: since Issue #990 `get_head_vars()` no longer names AGGREGATE and
+  returns 0 for such a root only because it carries no head projection. Applied
+  at `:767-771` (demand root) and `:848-852` (Phase 2 BFS body atom).
+- `wirelog/passes/magic_sets.c:761-765`, `:874-877` — all-free adornment skip
+  paths.
 - `tests/test_optimizer_equivalence.c` — 16-combination equivalence matrix.
 - `stable-release-plan.md` — v0.43 milestone scope.

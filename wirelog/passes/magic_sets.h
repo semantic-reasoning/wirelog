@@ -48,26 +48,53 @@ struct wirelog_program;
  * @arity_mismatch_skipped: Demands skipped due to adornment count/arity mismatch.
  * @skipped_aggregate:     Aggregate rules skipped because Magic Sets cannot
  *                         safely insert magic guards into them yet.
- * @skipped_constant_head: Rules left unguarded because every bound head
- *                         position holds a constant rather than a variable,
- *                         leaving no join key to guard on.  A *policy* skip:
- *                         the rule is well-formed and the pass declines.
- * @skipped_unsupported_head: Rules left unguarded because the head is not a
- *                         PROJECT the pass can read variable names from --
- *                         in practice a rule fused to a FLATMAP root (#990).
- *                         A *capability* gap, not a decision.  An AGGREGATE
- *                         root cannot reach here: relation_has_aggregate_rule()
- *                         filters such relations before adornment, in Phase 1
- *                         and again in the Phase 2 BFS, so they never enter
- *                         `processed` and the guard loop never sees them.
+ * @skipped_constant_head: Rules left unguarded because no bound head position
+ *                         holds a variable the guard could be keyed on.
+ *                         Read the name loosely.  A literal constant in the
+ *                         bound position is the common case and is a genuine
+ *                         policy skip -- the rule is well-formed and the pass
+ *                         declines.  But an arithmetic head expression in the
+ *                         bound position (`p(x + 1, y) :- ...` under
+ *                         `.query p(b, f)`) also lands here, and that is
+ *                         neither a constant nor a decision: the pass simply
+ *                         cannot key a guard on a computed head column yet.
+ *                         The counter conflates the two.  Only the *bound*
+ *                         positions are read, so `p(x, y + 1)` under the same
+ *                         query is guarded normally -- position 0 is the plain
+ *                         variable x.  Before #990 an arithmetic head in a
+ *                         bound position reached this only when unfused, and
+ *                         counted as an unsupported head when fused; now it
+ *                         counts here either way, which is at least
+ *                         consistent, but still mislabeled.
+ * @skipped_unsupported_head: Rules left unguarded because the pass found no
+ *                         head variable names to key the guard on.  A
+ *                         *capability* gap.  Two shapes reach it, and the
+ *                         counter does not separate them: a head wider than
+ *                         the 64-bit adornment mask (more than 64 columns),
+ *                         and a root carrying no head projection at all.
+ *                         Since #990 a rule fused to a FLATMAP root -- once
+ *                         the common way to get here -- keeps its
+ *                         project_exprs and is guarded normally.  An AGGREGATE
+ *                         root cannot reach here either:
+ *                         relation_has_aggregate_rule() filters such relations
+ *                         before adornment, in Phase 1 and again in the Phase
+ *                         2 BFS, so they never enter `processed` and the guard
+ *                         loop never sees them.  The wide head is what remains
+ *                         reachable in practice.
  *
  * Both skip counters describe a rule that is evaluated unrestricted, which is
  * sound but unoptimized.  They are the only signal that a demand did not reach
  * it -- but only for a caller that supplies a stats struct.  The library's own
  * pipeline passes NULL (api_facade.c), so in a shipping build nothing reads
  * them; they are observability for tests and embedders, not a runtime warning.
- * They are kept apart because closing the capability gap is work, while
- * the policy skip is correct as it stands.
+ * A rule missing from both counters is guarded, which is not the same as
+ * correctly restricted: a guard prunes only what its demand relation was
+ * populated with, so a rule guarded on a demand no propagation rule ever fills
+ * loses answers instead of saving work (#1027).  Guarding is complete only
+ * when the demand actually propagates; these counters measure the first half.
+ * They are kept apart because they are reported at different points, not
+ * because the split is clean: as noted above, one capability gap is currently
+ * counted on the policy side.
  *
  * @original_rules_modified counts guards actually inserted.  A rule counted in
  * either skip counter is not counted there.

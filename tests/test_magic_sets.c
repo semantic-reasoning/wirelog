@@ -1492,24 +1492,341 @@ test_constant_head_position_not_counted(void)
 }
 
 /*
- * Test: a rule fused to a non-PROJECT root gets no guard, because
- * get_head_vars() has no head to read variable names from.  Logic Fusion runs
- * before Magic Sets in the shipping pipeline and any rule with a filter is a
- * fusion candidate, so this is the common way for a guard to go missing.  The
- * pass must say so rather than skip in silence (#990).
+ * Source shared by the two fused-head tests (#990).
+ *
+ * p's second rule is the fusion candidate: PROJECT(FILTER(JOIN(...)))
+ * collapses to a FLATMAP root carrying the `y < 4` filter.  Logic Fusion runs
+ * before Magic Sets in the shipping pipeline, so this is the ordinary shape a
+ * filtered rule reaches the pass in.  p also has a PROJECT-rooted sibling
+ * rule, so the two roots must both plan under the same UNION.
+ *
+ * With no magic sets the program yields five tuples:
+ *
+ *     (1,2) (1,3) (1,9) (2,3) (9,5)
+ *
+ * Seeded at $m$p_bf = {1} the answer is the three with x = 1: (1,2), (1,3),
+ * (1,9).  (2,3) and (9,5) are exactly what the demand prunes, so the seeded
+ * answer is *not* the unrestricted one -- a test that got all five back would
+ * mean the guards matched everything.
+ *
+ * Two tuples carry the load.  p(1,3) comes only from the fused rule
+ * (edge(1,2), b(2,3)), so it is lost outright when the fused rule's demand
+ * propagation rule is not generated.  p(1,5) -- edge(1,9), b(9,5) -- is the
+ * one the `y < 4` filter rejects, so it appears if guard insertion splices
+ * over the FLATMAP instead of under it and drops the filter.  The filter is
+ * therefore load-bearing on the answer, not only on the tree shape.
+ */
+static const char *k_fused_head_src = ".decl edge(x: int32, y: int32)\n"
+    ".decl b(x: int32, y: int32)\n"
+    ".decl p(x: int32, y: int32)\n"
+    ".output p\n"
+    "edge(1, 2).\n"
+    "edge(2, 3).\n"
+    "edge(1, 9).\n"
+    "edge(9, 5).\n"
+    "b(x, y) :- edge(x, y).\n"
+    "p(x, y) :- b(x, y).\n"
+    "p(x, y) :- edge(x, z), b(z, y), y < 4.\n";
+
+/*
+ * Test: a rule fused to a FLATMAP root still gets its magic guard, and the
+ * demand it propagates still reaches the IDB it reads.
+ *
+ * This is the answer test.  get_head_vars() used to key off the root's node
+ * type, which fusion rewrites in place, so a fused rule was skipped in all
+ * three phases.  The Phase 4a skip is the one that loses tuples: no demand
+ * propagation rule is generated for the fused rule, so b is under-populated
+ * and p(1, 3) never derives.
+ *
+ * magic_rules_generated is the assertion that pins Phase 4a.  A shape-only
+ * assertion passes with Phase 4a still broken, because Phase 4b inserts the
+ * guard from the same head variables independently.
  */
 static void
-test_fused_head_reported_as_unsupported(void)
+test_fused_head_guard_answers_exact(void)
 {
-    TEST("test_fused_head_reported_as_unsupported");
+    TEST("test_fused_head_guard_answers_exact");
 
-    static const char *src = ".decl e(x: int32, y: int32)\n"
-        ".decl f(y: int32, z: int32)\n"
-        ".decl hot(x: int32, z: int32)\n"
-        ".output hot\n"
-        "e(1, 2).\n"
-        "f(2, 90).\n"
-        "hot(x, z) :- e(x, y), f(y, z), z > 80.\n";
+    static const int64_t seed[] = { 1 };
+    static const int64_t expected[][2] = { { 1, 2 }, { 1, 3 }, { 1, 9 } };
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "p";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    wl_magic_sets_stats_t stats;
+    struct wirelog_program *prog = magic_program_with_seed(k_fused_head_src,
+            demands, 1, "$m$p_bf", seed, 1, 1, &stats);
+    if (!prog) {
+        FAIL("setup failed");
+        return;
+    }
+
+    /* Three guards: both rules of p, plus the single rule of b, which is
+     * adorned in turn as p's body atom.  Only 2 of the 3 land without the
+     * fix, because the fused rule of p is skipped. */
+    if (stats.original_rules_modified != 3) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("expected both rules of p to be guarded");
+        return;
+    }
+    if (stats.skipped_unsupported_head != 0) {
+        printf(" [skipped_unsupported_head=%u]",
+            stats.skipped_unsupported_head);
+        wirelog_program_free(prog);
+        FAIL("the fused rule must not be skipped as an unsupported head");
+        return;
+    }
+
+    /* Phase 4a: one demand propagation rule per rule of p that reads an IDB.
+     * With the fused rule skipped this is 1, and b loses its demand. */
+    if (stats.magic_rules_generated != 2) {
+        printf(" [magic_rules_generated=%u]", stats.magic_rules_generated);
+        wirelog_program_free(prog);
+        FAIL("the fused rule generated no demand propagation rule");
+        return;
+    }
+
+    ms_row_set_t rows;
+    if (!ms_evaluate(prog, "p", 1, &rows)) {
+        wirelog_program_free(prog);
+        FAIL("evaluation failed");
+        return;
+    }
+    if (!ms_rows_match(&rows, &expected[0][0], 3, 2)) {
+        printf(" [got %u rows, want 3]", rows.count);
+        wirelog_program_free(prog);
+        FAIL("p != {(1, 2), (1, 3), (1, 9)}");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Test: the guard inserted into a fused rule has the same shape as the guard
+ * inserted into a PROJECT-rooted one -- a JOIN whose right child is the magic
+ * demand SCAN (#989).
+ *
+ * Asserted per rule over every rule of p, including the fused one.  A bare
+ * count of $m$ SCANs would not do: a right-deep guard still contains exactly
+ * one, so it cannot tell #989's bug from a correct guard.
+ */
+static void
+test_fused_head_guard_shape(void)
+{
+    TEST("test_fused_head_guard_shape");
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "p";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    struct wirelog_program *prog = parse_and_optimize(k_fused_head_src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    /* Precondition: fusion must actually have replaced a PROJECT root.  If it
+     * stops firing this test would otherwise pass for the wrong reason. */
+    uint32_t nrules = rule_count_for(prog, "p");
+    bool saw_fused = false;
+    for (uint32_t r = 0; r < nrules; r++) {
+        const wirelog_ir_node_t *root = rule_ir_root(prog, "p", r);
+        if (root && root->type == WIRELOG_IR_FLATMAP)
+            saw_fused = true;
+    }
+    if (nrules != 2 || !saw_fused) {
+        wirelog_program_free(prog);
+        FAIL("expected fusion to replace the PROJECT root of one rule of p");
+        return;
+    }
+
+    wl_magic_sets_stats_t stats;
+    if (wl_magic_sets_apply_with_demands(prog, demands, 1, &stats) != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic sets returned error");
+        return;
+    }
+
+    for (uint32_t r = 0; r < nrules; r++) {
+        const wirelog_ir_node_t *root = rule_ir_root(prog, "p", r);
+        const wirelog_ir_node_t *guard = rule_body_root(prog, "p", r);
+        if (!guard || guard->type != WIRELOG_IR_JOIN
+            || guard->child_count != 2) {
+            printf(" [rule %u]", r);
+            wirelog_program_free(prog);
+            FAIL("guard JOIN missing");
+            return;
+        }
+        const wirelog_ir_node_t *right = guard->children[1];
+        if (!right || !right->relation_name
+            || strncmp(right->relation_name, "$m$", 3) != 0) {
+            printf(" [rule %u]", r);
+            wirelog_program_free(prog);
+            FAIL("guard JOIN right child is not the magic demand scan");
+            return;
+        }
+        /* The fused rule keeps its filter: the guard is spliced under the
+         * FLATMAP, not in place of it. */
+        if (root && root->type == WIRELOG_IR_FLATMAP && !root->filter_expr) {
+            wirelog_program_free(prog);
+            FAIL("guard insertion dropped the fused rule's filter");
+            return;
+        }
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Test: Phase 2's own call to get_head_vars() reads the fused root.
+ *
+ * The BFS in Phase 2 is what turns a demand on p into an adornment on p's
+ * body atoms; a rule it cannot read the head of contributes no adorned
+ * predicates.  k_fused_head_src does not test that call site: p there also has
+ * a PROJECT-rooted sibling rule, which adorns b on its own, so gating Phase 2
+ * alone changes nothing observable.  Here the fused rule is p's *only* rule,
+ * so it is the only path from the demand on p to b, and $m$b_bf exists only if
+ * Phase 2 read the FLATMAP root's head projection.
+ *
+ * original_rules_modified == 2 is the same statement counted: p's one rule
+ * plus b's one rule.  b is guarded only because it was adorned.
+ */
+static void
+test_fused_head_is_the_only_path_to_the_idb(void)
+{
+    TEST("test_fused_head_is_the_only_path_to_the_idb");
+
+    static const char *src = ".decl edge(x: int32, y: int32)\n"
+        ".decl b(x: int32, y: int32)\n"
+        ".decl p(x: int32, y: int32)\n"
+        ".output p\n"
+        "edge(1, 2).\n"
+        "edge(2, 3).\n"
+        "edge(1, 9).\n"
+        "edge(9, 5).\n"
+        "b(x, y) :- edge(x, y).\n"
+        "p(x, y) :- edge(x, z), b(z, y), y < 4.\n";
+
+    static const int64_t seed[] = { 1 };
+    static const int64_t expected[][2] = { { 1, 3 } };
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "p";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    /* Precondition: p's single rule must really be fused, or the test proves
+     * nothing about a FLATMAP root. */
+    struct wirelog_program *shape = parse_and_optimize(src);
+    if (!shape) {
+        FAIL("parse failed");
+        return;
+    }
+    const wirelog_ir_node_t *root = rule_ir_root(shape, "p", 0);
+    bool fused = rule_count_for(shape, "p") == 1 && root
+        && root->type == WIRELOG_IR_FLATMAP;
+    wirelog_program_free(shape);
+    if (!fused) {
+        FAIL("expected p to have exactly one rule, fused to a FLATMAP root");
+        return;
+    }
+
+    wl_magic_sets_stats_t stats;
+    struct wirelog_program *prog = magic_program_with_seed(src, demands, 1,
+            "$m$p_bf", seed, 1, 1, &stats);
+    if (!prog) {
+        FAIL("setup failed");
+        return;
+    }
+
+    /* Phase 2: the adornment reached b through the fused rule.  Without it the
+     * BFS never leaves p and no magic relation for b is created. */
+    if (!has_relation(prog, "$m$b_bf")) {
+        wirelog_program_free(prog);
+        FAIL("no $m$b_bf: the demand did not propagate through the fused rule");
+        return;
+    }
+    if (stats.original_rules_modified != 2) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("expected p's fused rule and b's rule to be guarded");
+        return;
+    }
+    if (stats.skipped_unsupported_head != 0) {
+        printf(" [skipped_unsupported_head=%u]",
+            stats.skipped_unsupported_head);
+        wirelog_program_free(prog);
+        FAIL("the fused rule must not be skipped as an unsupported head");
+        return;
+    }
+
+    /* p(1, 3) needs b(2, 3), which exists only if b's guard saw the demand the
+     * fused rule propagated. */
+    ms_row_set_t rows;
+    if (!ms_evaluate(prog, "p", 1, &rows)) {
+        wirelog_program_free(prog);
+        FAIL("evaluation failed");
+        return;
+    }
+    if (!ms_rows_match(&rows, &expected[0][0], 1, 2)) {
+        printf(" [got %u rows, want 1]", rows.count);
+        wirelog_program_free(prog);
+        FAIL("p != {(1, 3)}");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Test: a head wider than the 64-bit adornment mask is reported as an
+ * unsupported head.
+ *
+ * This is what keeps skipped_unsupported_head reachable after #990.
+ * get_head_vars() returns 0 for such a head even though the root's
+ * project_exprs are present and readable -- the pass declines because it has
+ * no adornment bit for column 64 and beyond -- and Phase 4b counts the rule
+ * rather than guarding it.  Nothing else covered this counter.
+ */
+static void
+test_wide_head_is_an_unsupported_head(void)
+{
+    TEST("test_wide_head_is_an_unsupported_head");
+
+    /* 65 columns: one past the mask.  Same generator idea as
+     * test_body_atom_limit_is_reported(). */
+    char src[32768];
+    size_t used = 0;
+    used += (size_t)snprintf(src + used, sizeof(src) - used, ".decl src(");
+    for (uint32_t i = 0; i < 65; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used,
+                "%sc%u: int32", i == 0 ? "" : ", ", i);
+    }
+    used += (size_t)snprintf(src + used, sizeof(src) - used, ")\n.decl wide(");
+    for (uint32_t i = 0; i < 65; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used,
+                "%sc%u: int32", i == 0 ? "" : ", ", i);
+    }
+    used += (size_t)snprintf(src + used, sizeof(src) - used,
+            ")\n.output wide\nwide(");
+    for (uint32_t i = 0; i < 65; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used,
+                "%sv%u", i == 0 ? "" : ", ", i);
+    }
+    used += (size_t)snprintf(src + used, sizeof(src) - used, ") :- src(");
+    for (uint32_t i = 0; i < 65; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used,
+                "%sv%u", i == 0 ? "" : ", ", i);
+    }
+    snprintf(src + used, sizeof(src) - used, ").\n");
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -1517,10 +1834,72 @@ test_fused_head_reported_as_unsupported(void)
         return;
     }
 
-    /* Guard the guard: if fusion stops producing a non-PROJECT root this
-     * test would otherwise pass for the wrong reason. */
+    /* The head projection is present -- this is not the AGGREGATE shape. */
+    const wirelog_ir_node_t *root = rule_ir_root(prog, "wide", 0);
+    if (!root || !root->project_exprs || root->project_count != 65) {
+        wirelog_program_free(prog);
+        FAIL("expected a 65-column head projection on the rule root");
+        return;
+    }
+
+    wl_magic_demand_t demand = { "wide", 0x1, 65 };
+    wl_magic_sets_stats_t stats;
+    if (wl_magic_sets_apply_with_demands(prog, &demand, 1, &stats) != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic sets returned error");
+        return;
+    }
+
+    if (stats.skipped_unsupported_head != 1) {
+        printf(" [skipped_unsupported_head=%u]",
+            stats.skipped_unsupported_head);
+        wirelog_program_free(prog);
+        FAIL("expected skipped_unsupported_head == 1");
+        return;
+    }
+    if (stats.original_rules_modified != 0) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("an over-wide head must not be guarded");
+        return;
+    }
+    if (stats.skipped_constant_head != 0) {
+        printf(" [skipped_constant_head=%u]", stats.skipped_constant_head);
+        wirelog_program_free(prog);
+        FAIL("a capability gap must not be reported as a policy skip");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Test: a constant in the bound head position of a *fused* rule is a policy
+ * skip, not a capability gap.  Before #990 the fused root made
+ * get_head_vars() return 0 and the rule was misreported as an unsupported
+ * head; reading project_exprs instead sees the constant for what it is.
+ */
+static void
+test_fused_constant_head_is_a_policy_skip(void)
+{
+    TEST("test_fused_constant_head_is_a_policy_skip");
+
+    static const char *src = ".decl e(x: int32, y: int32)\n"
+        ".decl hot(x: int32, y: int32)\n"
+        ".output hot\n"
+        "e(1, 2).\n"
+        "e(2, 3).\n"
+        "hot(1, y) :- e(x, y), y > 1.\n";
+
+    struct wirelog_program *prog = parse_and_optimize(src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
     const wirelog_ir_node_t *root = rule_ir_root(prog, "hot", 0);
-    if (!root || root->type == WIRELOG_IR_PROJECT) {
+    if (!root || root->type != WIRELOG_IR_FLATMAP) {
         wirelog_program_free(prog);
         FAIL("expected fusion to replace the PROJECT root");
         return;
@@ -1544,17 +1923,17 @@ test_fused_head_reported_as_unsupported(void)
         FAIL("no guard was inserted, yet the rule was counted as modified");
         return;
     }
-    if (stats.skipped_unsupported_head != 1) {
+    if (stats.skipped_constant_head != 1) {
+        printf(" [skipped_constant_head=%u]", stats.skipped_constant_head);
+        wirelog_program_free(prog);
+        FAIL("expected skipped_constant_head == 1");
+        return;
+    }
+    if (stats.skipped_unsupported_head != 0) {
         printf(" [skipped_unsupported_head=%u]",
             stats.skipped_unsupported_head);
         wirelog_program_free(prog);
-        FAIL("expected skipped_unsupported_head == 1");
-        return;
-    }
-    if (stats.skipped_constant_head != 0) {
-        printf(" [skipped_constant_head=%u]", stats.skipped_constant_head);
-        wirelog_program_free(prog);
-        FAIL("a capability gap must not be reported as a policy skip");
+        FAIL("a constant head must not be reported as an unsupported head");
         return;
     }
 
@@ -1633,7 +2012,11 @@ main(void)
     test_guard_over_antijoin_exact();
     test_guard_over_semijoin_exact();
     test_constant_head_position_not_counted();
-    test_fused_head_reported_as_unsupported();
+    test_fused_head_guard_answers_exact();
+    test_fused_head_guard_shape();
+    test_fused_head_is_the_only_path_to_the_idb();
+    test_wide_head_is_an_unsupported_head();
+    test_fused_constant_head_is_a_policy_skip();
     test_body_atom_limit_is_reported();
 
     printf("\n=== Results ===\n");
