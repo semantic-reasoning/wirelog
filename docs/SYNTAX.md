@@ -385,6 +385,12 @@ result sizes for recursive programs.
 > result rather than restricted. Adding a bound `.query` to a working program
 > will make it derive fewer tuples, not the same tuples faster. Leave `.query`
 > off, or use all-free adornments, until seeding lands.
+>
+> Seeding alone will not be enough. Issue #1027 tracks two further defects that
+> only become observable once the demand relation is populated: a rule can be
+> guarded on a demand no propagation rule ever generates, and two adornments of
+> one relation conjoin into a single rule body rather than forming separate
+> adorned predicates. Both lose answers.
 
 ### Syntax
 
@@ -449,11 +455,19 @@ Query with a mixed pattern on a ternary relation:
   (e.g. `q(1, y) :- ...` under `.query q(b, f)`) is left unguarded: there is no
   variable to key the guard on. Such rules are reported by the pass's
   `skipped_constant_head` counter.
+- A rule whose head is wider than 64 columns is left unguarded: the adornment
+  is carried in a 64-bit mask, so there is no bit for the remaining positions.
+  Such rules are reported by the `skipped_unsupported_head` counter.
 - A rule that Logic Fusion has collapsed into a fused root — which includes any
-  rule with a filter — is also left unguarded, because the pass reads head
-  variable names off a `PROJECT` node that no longer exists. Such rules are
-  reported by `skipped_unsupported_head`. Both counters describe a rule that
-  evaluates unrestricted: sound, but not the pruning `.query` asks for.
+  rule with a filter — **is** guarded, as of Issue #990. It reads its head
+  variable names off the head projection the root still carries, not off the
+  root's node type, so the rewrite fusion performs does not hide the head. Such
+  rules were previously reported by `skipped_unsupported_head`; they are now
+  counted in `original_rules_modified` like any other guarded rule.
+- Both skip counters describe a rule that evaluates unrestricted: sound, but
+  not the pruning `.query` asks for. Absence from both means the rule was
+  guarded, which is a weaker statement than "correctly restricted" — see the
+  status note above and Issue #1027.
 - Multiple `.query` directives may appear in a single program for different
   relations.
 
