@@ -710,7 +710,7 @@ atom_physical_column_count(const wl_parser_ast_node_t *atom,
  * row stride, but both readers of that buffer -- wl_session_load_facts()
  * (session_facts.c) and the public wirelog_program_get_facts() (ir/api.c),
  * the latter reachable by an embedder with no session at all -- stride by
- * the *declared* rel->column_count.  (exec_plan_gen.c only tests
+ * the relation's PHYSICAL width.  (exec_plan_gen.c only tests
  * fact_data != NULL; it never reads the contents.)  Nothing reconciled the
  * two, so a mismatch produced, depending on direction:
  *
@@ -734,7 +734,30 @@ atom_physical_column_count(const wl_parser_ast_node_t *atom,
  * because column_count is 0; that is a separate defect and is deliberately
  * left unchanged here.  The guard keys off has_decl rather than
  * `column_count > 0` because `.decl p()` parses and leaves column_count
- * == 0, and those relations must be checked, not skipped. */
+ * == 0, and those relations must be checked, not skipped.
+ *
+ * PHYSICAL width, not logical (#985).  A fact is a row of the relation's
+ * storage, so its argument count is a stride, and the stride an `inline`
+ * compound column contributes is its full arity.  This used to compare
+ * against the logical rel->column_count, on the reasoning that the readers
+ * strided by column_count too -- but that was the defect, not a constraint:
+ * both readers now stride physically, and while they did not, the accepted
+ * `pred(1, 99).` against `.decl pred(id: int64, payload: f/2 inline)` left
+ * the second inline slot never written, and a body pattern that
+ * destructures the column read it regardless.
+ * `outr(id, p, q) :- pred(id, f(p, q)).` evaluated to outr(1, 99, 0) with
+ * exit 0 and ASAN silent -- a fabricated value in no source data.
+ *
+ * Nothing is taken away by tightening.  The flat spelling `pred(1,10,20).`
+ * is the redirect, and it is the *only* spelling that ever worked: the fact
+ * grammar admits integer and string constants only, so `pred(1, f(10,20)).`
+ * and `pred(1, [10,20]).` are parse errors, and the head grammar likewise
+ * has no compound-term production.  Before this change the flat spelling was
+ * rejected and the broken one accepted, which is to say the relation had no
+ * working fact syntax at all.  Rejecting a wrong-width fact rather than
+ * zero-filling is forced: 0 is a valid int64 and a valid intern id, so there
+ * is no value that could stand for "not written", and the rule-head
+ * analogue is already rejected by validate_head_arities() below. */
 static int
 validate_fact_arities(const struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
@@ -755,58 +778,26 @@ validate_fact_arities(const struct wirelog_program *program,
         if (!rel || !rel->has_decl)
             continue;
 
-        if (node->child_count != rel->column_count) {
-            WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
-                "fact for relation '%s' has %u argument(s) but '%s' is"
-                " declared with %u column(s) (line %u)",
-                rel->name, node->child_count, rel->name, rel->column_count,
-                node->line);
+        uint32_t declared = wl_ir_relation_physical_width(rel);
+        if (node->child_count != declared) {
+            if (declared != rel->column_count)
+                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                    "fact for relation '%s' has %u argument(s) but '%s'"
+                    " occupies %u column(s) (%u declared, inline compound"
+                    " column(s) expanded to their slots) (line %u)",
+                    rel->name, node->child_count, rel->name, declared,
+                    rel->column_count, node->line);
+            else
+                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                    "fact for relation '%s' has %u argument(s) but '%s' is"
+                    " declared with %u column(s) (line %u)",
+                    rel->name, node->child_count, rel->name, declared,
+                    node->line);
             return -1;
         }
     }
 
     return 0;
-}
-
-/* The number of PHYSICAL columns a relation's `.decl` describes.
- *
- * An `inline` compound column is stored as `compound_arity` contiguous
- * physical slots; a `side` compound is a single handle slot, and so is every
- * scalar.  This is the same walk collect_decl() runs to assign
- * compound_inline_col_offset -- for every declaration the parser can
- * produce, the prefix sum there ends at exactly this value -- and the same
- * layout col_rel_t records in compound_arity_map.
- *
- * The INLINE arm deliberately adds compound_arity unguarded, mirroring
- * collect_decl() exactly rather than defending against a zero arity.  A
- * guard such as `compound_arity > 0 ? compound_arity : 1` would look safer
- * but is the opposite: it is the only construct that could make the two
- * walks disagree (1 here against 0 there), turning an invariant violation
- * into a silent width mismatch instead of an obvious one.
- *
- * The invariant holds regardless: parse_compound_metadata() resets the whole
- * metadata struct -- kind included -- on every failure path, returning
- * kind = NONE for a non-positive arity and for an inline arity above
- * WL_IR_COMPOUND_INLINE_MAX_ARITY, and program.c's collect_decl() is the
- * only writer of columns[].compound_kind.  So INLINE implies
- * 1 <= compound_arity <= WL_IR_COMPOUND_INLINE_MAX_ARITY. */
-static uint32_t
-declared_physical_column_count(const wl_ir_relation_info_t *rel)
-{
-    uint32_t phys = 0;
-
-    if (!rel)
-        return 0;
-    if (!rel->columns)
-        return rel->column_count;
-
-    for (uint32_t i = 0; i < rel->column_count; i++) {
-        const wirelog_column_t *col = &rel->columns[i];
-        phys += (col->compound_kind == WIRELOG_COMPOUND_KIND_INLINE)
-            ? col->compound_arity
-            : 1u;
-    }
-    return phys;
 }
 
 /* Issue #977: validate every rule head against its relation's declared
@@ -839,14 +830,14 @@ declared_physical_column_count(const wl_ir_relation_info_t *rel)
  * against `.decl t/2`.
  *
  * PHYSICAL width, not logical -- this is the one thing that must not be
- * "simplified".  Unit 2 compares facts LOGICALLY, and deliberately so:
- * collect_fact() packs one slot per written argument and both readers
- * (wl_session_load_facts, wirelog_program_get_facts) stride by the logical
- * rel->column_count.  A rule head is the opposite.  The head grammar has no
- * compound-term production at all -- parse_head_arg() (parser/parser.c)
- * dispatches only to aggregate and arithmetic expressions, so
- * `pred(x, f(y, z))` is a parse error -- which leaves the flattened spelling
- * as the only way to write an inline-compound relation from a rule:
+ * "simplified".  Since #985 the fact pass above measures physically too, so
+ * the two agree; before it the fact pass compared logically and this comment
+ * had to argue the divergence was intentional.  It was not a divergence
+ * worth keeping: the head grammar has no compound-term production at all --
+ * parse_head_arg() (parser/parser.c) dispatches only to aggregate and
+ * arithmetic expressions, so `pred(x, f(y, z))` is a parse error -- which
+ * leaves the flattened spelling as the only way to write an inline-compound
+ * relation from a rule:
  *
  *   .decl pred(id: int64, payload: f/2 inline)
  *   pred(x, y, z) :- src(x, y, z).              -> pred(1, 10, 20)
@@ -864,14 +855,13 @@ declared_physical_column_count(const wl_ir_relation_info_t *rel)
  * compound support, instead of two that can drift apart.
  *
  * The two-argument handle form -- `pred(x, y)` against the same .decl -- is
- * rejected, even though the corresponding *fact* `pred(1, 99).` is accepted
- * by the logical fact rule.  The asymmetry is deliberate: the head leaves
- * the second inline slot never written, and a body pattern that destructures
- * the column reads it regardless, so
- * `outr(id, p, q) :- pred(id, f(p, q)).` evaluated to outr(1, 99, 0) with
- * exit 0 and ASAN silent -- a fabricated value, the failure mode this issue
- * exists to remove.  The three-argument spelling of the same program yields
- * outr(1, 10, 20), which is correct.
+ * rejected, and since #985 so is the corresponding *fact* `pred(1, 99).`.
+ * The reason is the same for both: the handle form leaves the second inline
+ * slot never written, and a body pattern that destructures the column reads
+ * it regardless, so `outr(id, p, q) :- pred(id, f(p, q)).` evaluated to
+ * outr(1, 99, 0) with exit 0 and ASAN silent -- a fabricated value, the
+ * failure mode this issue exists to remove.  The three-argument spelling of
+ * the same program yields outr(1, 10, 20), which is correct.
  *
  * Aggregate heads need no special case.  parse_aggregate_expr() has exactly
  * one caller, parse_head_arg(), so an AGGREGATE node is always a direct
@@ -904,12 +894,20 @@ validate_head_arities(const struct wirelog_program *program,
             continue;
 
         uint32_t emitted = atom_physical_column_count(head, rel, program);
-        uint32_t declared = declared_physical_column_count(rel);
+        uint32_t declared = wl_ir_relation_physical_width(rel);
         if (emitted != declared) {
-            WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
-                "rule head for relation '%s' emits %u column(s) but '%s' is"
-                " declared with %u column(s) (line %u)",
-                rel->name, emitted, rel->name, declared, head->line);
+            if (declared != rel->column_count)
+                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                    "rule head for relation '%s' emits %u column(s) but '%s'"
+                    " occupies %u column(s) (%u declared, inline compound"
+                    " column(s) expanded to their slots) (line %u)",
+                    rel->name, emitted, rel->name, declared,
+                    rel->column_count, head->line);
+            else
+                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                    "rule head for relation '%s' emits %u column(s) but '%s'"
+                    " is declared with %u column(s) (line %u)",
+                    rel->name, emitted, rel->name, declared, head->line);
             return -1;
         }
     }

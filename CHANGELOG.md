@@ -19,6 +19,52 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **`wirelog_program_get_facts` reports the physical row stride** (#985): its
+  `num_cols` output is the number of `int64_t` slots each returned tuple
+  occupies -- which is what an embedder must index the buffer by -- and it is
+  no longer necessarily equal to the `column_count` of
+  `wirelog_program_get_schema`. The two agree for every relation that
+  declares no `inline` compound column; where one is declared they can
+  differ, as in `.decl pred(id: int64, payload: f/2 inline)`, which reports
+  `column_count` 2 and `num_cols` 3. (They still agree at `inline` arity 1 --
+  one declared column, one slot -- so an inline compound column is a
+  necessary but not a sufficient condition.) Logical width stays
+  authoritative for every declaration question (`wirelog_schema_t`,
+  `wirelog_program_get_schema`); physical width is authoritative for every
+  storage question.
+
+  The signature is unchanged and there is no ABI break, but this is a
+  semantic change for embedders. It affects no relation without an inline
+  compound column, which is every relation this API could previously return
+  facts for at all -- the fact syntax for an inline-compound relation did not
+  work before this release (see the `Fixed` entry below).
+
+- **`wirelog_io_ctx_num_cols` and `wirelog_io_ctx_col_type` are physical**
+  (#985): the same width change, on the installed I/O adapter contract. Third
+  parties implement `read()` against these two accessors, so the change is
+  called out separately from `wirelog_program_get_facts` above.
+
+  `wirelog_io_ctx_num_cols(ctx)` is now the physical row stride -- the
+  `int64_t` slots one tuple occupies, which is what `docs/io-adapters.md` has
+  always required `read()` to size its buffer by and the width wirelog
+  inserts that buffer at. It previously reported the declared column count,
+  which for a relation with an `inline` compound column names a stride the
+  storage does not use. `wirelog_io_ctx_col_type(ctx, i)` is indexed by the
+  same physical position, and each slot of an inline compound now reports
+  `WIRELOG_TYPE_INT64` rather than the compound column's declared type: the
+  slots carry raw `int64` payload. For
+  `.decl inp(id: int64, p: pair/2 inline, s: symbol)` an adapter is now told
+  4 columns of `INT64, INT64, INT64, STRING`, against 3 of
+  `INT64, <p's declared type>, STRING` before.
+
+  `WIRELOG_IO_ABI_VERSION` is unchanged and no signature moved; only the
+  values differ, and only for a relation declaring an `inline` compound
+  column. An adapter that already sizes its output from `num_cols` needs no
+  change -- the built-in CSV adapter did and does. One that reconstructs the
+  stride from a schema of its own will now disagree with wirelog for those
+  relations. See the accessor block in `wirelog/io/io_adapter.h` and
+  [docs/io-adapters.md](docs/io-adapters.md).
+
 - **Warning-clean library build** (#940): the last three `-Wunused-function`
   warnings in library code are gone. `expand_multiway_delta` is now compiled only under
   `#if !ENABLE_K_FUSION`, the configuration that actually calls it (used by
@@ -41,6 +87,73 @@ All notable changes to wirelog are documented in this file.
   callers anywhere and is removed.
 
 ### Fixed
+
+- **A relation with an `inline` compound column has a working fact and
+  `.input` syntax** (#985): such a relation has a *logical* width (its
+  declared columns) and a *physical* width (inline slots expanded), and no
+  component agreed which was authoritative. The fact path, the `.input`
+  path, and `wirelog_program_get_facts` strided by the logical width while
+  the storage was laid out physically, so:
+
+  ```
+  .decl src(a: int64, b: int64, c: int64)
+  .decl pred(id: int64, payload: f/2 inline)
+  src(1,10,20).  pred(7,99).  pred(x,y,z) :- src(x,y,z).
+  ```
+
+  emitted `pred(7, 99)` and `pred(1, 10)`, dropping the 20: the two-argument
+  fact fixed the relation's runtime width at 2 and the rule's third column
+  was truncated away by `col_rel_append_all` (`columnar/relation.c`), which
+  copies `dst->ncols` columns with no clamp against `src->ncols`. In the
+  other direction a body pattern that destructured the column read the
+  inline slot the fact never wrote --
+  `outr(id, p, q) :- pred(id, f(p, q)).` produced `outr(1, 99, 0)`, exit 0,
+  AddressSanitizer silent -- the `0` coming from
+  `tmp[c] = (src < e.rel->ncols) ? row[src] : 0;` in `columnar/ops.c`. An
+  `.input` file was mis-read the same way: a four-field file for
+  `.decl inp(id: int64, p: pair/2 inline, s: symbol)` loaded three fields
+  under the wrong types and evaluated to `outr(1, 7, 1, "pair")`, four
+  values of which none were the file's.
+
+  Physical width is now authoritative for every storage question -- the
+  inline-fact insert stride, the `.input` insert stride,
+  `wirelog_io_ctx_num_cols` and its `col_types` (an inline compound's slots
+  are raw `int64` payload), the CSV stride in
+  `wirelog_load_facts_from_csv`, and `wirelog_program_get_facts`. It is
+  derived from `columns[]` on demand by `wl_ir_relation_physical_width()`
+  rather than stored, because `column_count` has more than one writer and a
+  cached copy could go stale. Logical width remains authoritative for every
+  declaration question.
+
+  **Compatibility:** a fact whose argument count is not the relation's
+  physical width is now rejected at load with `WIRELOG_ERR_PARSE`, reported
+  through `WL_LOG=PARSER:1`. For an inline-compound relation the diagnostic
+  names both widths, since "2 arguments but 2 columns" would otherwise read
+  as a contradiction. Nothing expressible is taken away: `pred(1,99).` was
+  the only spelling that parsed, and it was the broken one, while the
+  correct flat spelling `pred(1,10,20).` was *rejected*. There is no
+  compound fact notation to redirect to either -- `pred(1, f(10,20)).` and
+  `pred(1, [10,20]).` are parse errors, as is `pred(x, f(y,z))` in a rule
+  head. Filling the unwritten slot instead of rejecting is not available:
+  `0` is a valid `int64` and a valid intern id alike. The rule-head analogue
+  was already rejected under #977; this makes facts agree with it. No
+  benchmark, example or `.dl` workload in the tree declares an inline
+  compound column at all. Around a dozen test files do -- `test_program`,
+  `test_parser`, `test_wirelog_easy`, `test_wirelog_advanced`,
+  `test_symbol_ordering`, `test_symbol_aggregates`, `test_symbol_digests`
+  and more; the set moves with the suite, so read that as a sample and not
+  as a closed list -- and each of them seeds such a relation through the API
+  at the physical width rather than through an inline fact, so none changes
+  behaviour. The passing suite is the evidence for that, not the
+  enumeration.
+
+  **A bound `.query` on such a relation is still not fixed.** `.query`
+  arity flows through `passes/magic_sets.c`, which is deliberately left
+  logical here: with #989 open the demand relation is never seeded, so the
+  arity-mismatch warning is currently what routes the inline-compound case
+  onto the skip path and lets it produce rows at all. Making that arity
+  physical today converts a warning plus correct output into silence plus
+  zero rows. It is blocked on #989, not overlooked.
 
 - **Magic guards are built left-deep** (#989): `insert_magic_guard` produced
   `JOIN(magic_scan, body)`. When the body was itself composite -- a JOIN chain,
@@ -150,8 +263,11 @@ All notable changes to wirelog are documented in this file.
   (#977): `collect_fact` packed `fact_data` using each fact's *own*
   argument count as the row stride, while both readers of that buffer --
   `wl_session_load_facts` and the public `wirelog_program_get_facts`, the
-  latter reachable by an embedder with no session at all -- strided by the
-  *declared* `column_count`. Nothing reconciled the two. Depending on which
+  latter reachable by an embedder with no session at all -- strided by a
+  single fixed width taken from the `.decl` (the *declared* `column_count`
+  at the time; #985 above moves both readers to the physical width, which is
+  the same number for every relation that declares no `inline` compound
+  column). Nothing reconciled the two. Depending on which
   side was wider this produced a heap over-read, an uninitialised read
   *inside* the allocation that AddressSanitizer cannot see (exit status 0,
   emitting heap bytes as query answers), or a fabricated tuple: `val(1,5,7).
@@ -170,12 +286,23 @@ All notable changes to wirelog are documented in this file.
 
   **Compatibility:** programs that previously loaded now fail to load. Every
   rejected shape was already producing a crash, uninitialised heap, or a
-  fabricated tuple, so nothing correct is lost. One shape worth naming:
-  flattened facts against an inline-compound column -- `p(1,2,3).` against
-  `.decl p(id: int64, lbl: pair/2 inline)` -- were accepted and silently
-  dropped the third value; they are now rejected. Verified across every
-  Datalog program in the tree, including those the benchmarks generate from
-  CSV at runtime: no in-tree program changes behaviour.
+  fabricated tuple, so nothing correct is lost. Verified across every Datalog
+  program in the tree, including those the benchmarks generate from CSV at
+  runtime: no in-tree program changes behaviour.
+
+  **One half of this check is superseded later in this same release.** As
+  landed, the comparison was against the *logical* `column_count`, which for
+  a relation with an `inline` compound column is not the width its storage
+  uses. That rejected the flattened spelling -- `p(1,2,3).` against
+  `.decl p(id: int64, lbl: pair/2 inline)`, previously accepted while
+  silently dropping the third value -- and went on accepting the
+  two-argument `p(1,2).`, which leaves the second inline slot never written.
+  #985 (see its `Fixed` entry above) moves the comparison to the physical
+  width, so in the released build `p(1,2,3).` is **accepted** and stored as
+  three slots, and `p(1,2).` is the rejected spelling. Read the two entries
+  together: the *existence* of a fact arity check is #977, the width it
+  compares against is #985. Nothing here changes for a relation without an
+  `inline` compound column, which is every relation in the tree.
 
   This covers the inline-fact half of #977. Rule bodies and facts on
   undeclared relations remain unvalidated; rule heads are covered by the
@@ -210,12 +337,14 @@ All notable changes to wirelog are documented in this file.
 
   Heads are compared against the declared **physical** width, where an
   `inline` compound column counts as its full arity and a `side` compound as
-  one handle column -- deliberately unlike the fact check above, which
-  compares logically. The head grammar has no compound-term production
+  one handle column. The head grammar has no compound-term production
   (`pred(x, f(y, z))` is a parse error), so the flattened spelling
   `pred(x, y, z) :- src(x, y, z).` is the only way to write an
   inline-compound relation from a rule, and a logical comparison would reject
-  it.
+  it. When this landed the fact check above compared logically instead, an
+  asymmetry documented here as deliberate; #985 removed it by moving the fact
+  check to the physical width too, so in the released build both compare
+  physically.
 
   **Compatibility:** programs that previously loaded now fail to load. Every
   rejected shape was already a crash or a wrong answer. One shape worth

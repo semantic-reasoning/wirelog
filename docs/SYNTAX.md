@@ -226,17 +226,52 @@ query answers with exit status 0, or a tuple assembled from two different
 facts. Loading fails with `WIRELOG_ERR_PARSE`; run with `WL_LOG=PARSER:1` to
 see which relation and which arities.
 
-Facts are compared against the declared **logical** width — one argument per
-declared column. For a relation with an `inline` compound column that has an
-awkward consequence: `p(1,2,3).` against `.decl p(id: int64, lbl: pair/2
-inline)` is rejected as three arguments against two columns, while `p(1,2).`
-is accepted and writes only the first of the two inline slots.
+Facts are compared against the declared **physical** width (#985), exactly as
+rule heads are: an `inline` compound column counts as its full arity, a `side`
+compound as the one handle column it is stored in. A fact is a row of the
+relation's storage, and that is the stride the storage uses.
 
-There is no compound spelling to reach for instead — `p(1, pair(2,3)).` is a
-parse error, because facts admit only integer and string constants. So an
-inline-compound relation currently cannot be populated correctly by an inline
-fact at all: the accepted form leaves a slot unwritten and produces no output.
-Use `.input` or derive the relation from a rule. Tracked as #985.
+```
+.decl p(id: int64, lbl: pair/2 inline)
+p(1, 2, 3).         /* accepted: 3 physical columns, written flat */
+p(1, 2).            /* rejected: 2, and leaves the second slot unwritten */
+
+.decl q(a: int64, m: m/4 side)
+q(1, 2).            /* accepted: a side compound is one handle column */
+```
+
+The flat spelling is the only spelling. `p(1, pair(2,3)).` and `p(1, [2,3]).`
+are parse errors — facts admit integer and string constants only — and the
+head grammar has no compound-term production either, so `p(x, pair(y,z))` in a
+rule head is a parse error as well. Flat is what a rule writes
+(`p(x, y, z) :- src(x, y, z).`) and flat is what an `.input` file carries: one
+field per physical column, four fields for
+`.decl inp(id: int64, p: pair/2 inline, s: symbol)`.
+
+Until #985 this comparison was logical, which rejected `p(1, 2, 3).` and
+accepted `p(1, 2).` — that is, it rejected the working spelling and accepted
+the broken one, leaving such a relation with no usable fact syntax at all. The
+accepted form left the second inline slot never written, and a body pattern
+that destructures the column read it regardless:
+`outr(id, x, y) :- p(id, pair(x, y)).` produced a `0` present in no source
+data. Rejecting is forced rather than chosen — `0` is a valid `int64` and a
+valid intern id, so no filler value could mean "not written".
+
+One thing a fact can do that an `.input` file cannot: put a **symbol** in an
+inline compound slot. `p(1, "aa", "bb").` against
+`.decl p(id: int64, lbl: pair/2 inline)` works, and
+`o(a, b, c) :- p(a, pair(b, c)).` gives `o(1, "aa", "bb")`. The same three
+values in a CSV file fail the load, because the `.decl` grammar records one
+type per declared column and has no way to say that slot 1 of `lbl` is a
+symbol — so the loader types every inline slot as `int64` and the reader
+cannot parse `aa`. This is a gap in the `.input` path, not a property of the
+storage; the slots are ordinary `int64` cells and hold interned ids fine.
+
+The physical width is also the row stride reported by
+`wirelog_program_get_facts`. It agrees with the `column_count` of
+`wirelog_program_get_schema` for every relation that declares no `inline`
+compound column, and can exceed it where one is declared. See the note on
+that function in `wirelog/wirelog.h`.
 
 Facts on a relation with **no** `.decl` at all are unaffected by this check
 and continue to fail later, during loading, with a less specific message.
@@ -276,12 +311,12 @@ answer instead.
 Loading fails with `WIRELOG_ERR_PARSE`; run with `WL_LOG=PARSER:1` to see
 which relation and which arities.
 
-Unlike the fact check, heads are compared against the declared **physical**
-width — an `inline` compound column counts as its full arity, a `side`
-compound as the single handle column it is stored in. The reason is that the
-head grammar has no compound-term production (`pred(x, f(y, z))` is a parse
-error), so the flattened spelling is the only way to write an
-inline-compound relation from a rule:
+Heads are compared against the declared **physical** width — an `inline`
+compound column counts as its full arity, a `side` compound as the single
+handle column it is stored in. The reason is that the head grammar has no
+compound-term production (`pred(x, f(y, z))` is a parse error), so the
+flattened spelling is the only way to write an inline-compound relation from
+a rule:
 
 ```
 .decl src(a: int64, b: int64, c: int64)
@@ -301,11 +336,10 @@ that destructures the column reads it anyway — `outr(id, p, q) :- pred(id,
 f(p, q)).` produced `outr(1, 99, 0)`, a value present in no source data,
 where the three-argument spelling correctly produces `outr(1, 10, 20)`.
 
-The corresponding *fact* `pred(1, 99).` is accepted, because facts must be
-compared logically (see [Inline facts must match their declared
-arity](#inline-facts-must-match-their-declared-arity) above) and so cannot be
-held to the physical width. That asymmetry is real and is tracked as #985 —
-it is a limitation of the width model, not of this check.
+The corresponding *fact* `pred(1, 99).` is rejected for the same reason, and
+by the same physical comparison (see [Inline facts must match their declared
+arity](#inline-facts-must-match-their-declared-arity) above). It was accepted
+until #985, which is where the `outr(1, 99, 0)` above was observed.
 
 Rule **bodies** are still not validated against their `.decl`.
 

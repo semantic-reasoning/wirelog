@@ -64,6 +64,77 @@ typedef struct {
     uint32_t graph_column_index;  /* valid only when has_graph_column == true */
 } wl_ir_relation_info_t;
 
+/* The number of PHYSICAL columns a relation's `.decl` describes -- the row
+ * stride of every buffer that stores or transports its tuples.
+ *
+ * An `inline` compound column is stored as `compound_arity` contiguous
+ * physical slots; a `side` compound is a single handle slot, and so is every
+ * scalar.  This is the same walk collect_decl() (ir/program.c) runs to assign
+ * compound_inline_col_offset -- for every declaration the parser can
+ * produce, the prefix sum there ends at exactly this value -- and the same
+ * layout col_rel_t records in compound_arity_map.
+ *
+ * Physical width is authoritative for every storage question: fact-buffer
+ * and `.input` row strides, the `num_cols` a reader is handed, the width a
+ * relation is materialised at.  The *logical* column_count stays
+ * authoritative for every declaration question: columns[], wirelog_schema_t,
+ * wirelog_program_get_schema().  Issue #985 is what happened while the two
+ * were confused for each other.
+ *
+ * Derived on demand rather than stored, because column_count has more than
+ * one writer -- collect_decl(), which is re-entrant for a repeated `.decl`
+ * (#724), and wl_ir_program_add_magic_relation(), which calloc()s columns[]
+ * and never runs the offset loop at all.  A cached field would have to be
+ * refreshed by both; a derivation cannot go stale.  The calloc'd case is
+ * exact rather than merely safe: WIRELOG_COMPOUND_KIND_NONE is 0, so every
+ * zeroed column contributes 1 and the sum is column_count.
+ *
+ * The `!rel->columns` early return is unreachable for a nonzero
+ * column_count and is not covered by a test on purpose -- there is no
+ * observable behaviour to pin.  Both writers named above allocate
+ * columns[] before assigning column_count and bail out on allocation
+ * failure without assigning it, so `column_count > 0 && columns == NULL`
+ * cannot be constructed; the branch exists so that the zero case reads as
+ * a deliberate 0 rather than as a loop that happens not to run.  A mutant
+ * that changes it to `return 0` is an equivalent mutant, not a coverage
+ * gap.
+ *
+ * The INLINE arm deliberately adds compound_arity unguarded, mirroring
+ * collect_decl() exactly rather than defending against a zero arity.  A
+ * guard such as `compound_arity > 0 ? compound_arity : 1` would look safer
+ * but is the opposite: it is the only construct that could make the two
+ * walks disagree (1 here against 0 there), turning an invariant violation
+ * into a silent width mismatch instead of an obvious one.
+ *
+ * The invariant holds regardless: parse_compound_metadata() resets the whole
+ * metadata struct -- kind included -- on every failure path, returning
+ * kind = NONE for a non-positive arity and for an inline arity above
+ * WL_IR_COMPOUND_INLINE_MAX_ARITY, and program.c's collect_decl() is the
+ * only writer of columns[].compound_kind.  So INLINE implies
+ * 1 <= compound_arity <= WL_IR_COMPOUND_INLINE_MAX_ARITY.
+ *
+ * static inline in the header rather than a function in program.c because
+ * tests/test_io_ctx links only io/io_ctx.c plus intern, and
+ * io/io_ctx_internal.h already includes this header. */
+static inline uint32_t
+wl_ir_relation_physical_width(const wl_ir_relation_info_t *rel)
+{
+    uint32_t phys = 0;
+
+    if (!rel)
+        return 0;
+    if (!rel->columns)
+        return rel->column_count;
+
+    for (uint32_t i = 0; i < rel->column_count; i++) {
+        const wirelog_column_t *col = &rel->columns[i];
+        phys += (col->compound_kind == WIRELOG_COMPOUND_KIND_INLINE)
+            ? col->compound_arity
+            : 1u;
+    }
+    return phys;
+}
+
 /* ======================================================================== */
 /* Rule IR                                                                  */
 /* ======================================================================== */

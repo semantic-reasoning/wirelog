@@ -260,6 +260,143 @@ test_inline_compound_head_evaluates_exactly(void)
     return rc;
 }
 
+static int
+has_triple(const struct triple_state *st, int64_t a, int64_t b, int64_t c)
+{
+    for (uint32_t i = 0; i < st->rows; i++) {
+        if (st->seen[i][0] == a && st->seen[i][1] == b
+            && st->seen[i][2] == c)
+            return 1;
+    }
+    return 0;
+}
+
+/* T5 (issue #985): a flat inline-compound *fact* must be accepted and must
+ *     coexist with the flattened rule-head spelling at the same width.
+ *
+ *     Pre-fix `pred(7, 98, 99).` was rejected outright (three arguments
+ *     against a two-column .decl, compared logically) while the broken
+ *     two-argument `pred(7, 99).` was accepted -- so the relation had no
+ *     working fact syntax at all.  Worse, the accepted form fixed the
+ *     relation's runtime width at 2, so the rule's three columns were then
+ *     truncated: the issue's own reproducer emitted pred(7, 99) and
+ *     pred(1, 10), dropping the 20.
+ *
+ *     ncols is asserted inside the callback, which is where the truncation
+ *     is visible; collect_triples() poisons st->rows if it is not 3.  Both
+ *     rows are asserted by value and order-insensitively, because the row
+ *     *count* is 2 either way -- a count-only assertion passes on the bug. */
+static int
+test_inline_compound_flat_fact_evaluates_exactly(void)
+{
+    static const char *src = ".decl src(a: int64, b: int64, c: int64)\n"
+        ".decl pred(id: int64, payload: f/2 inline)\n"
+        "src(1, 10, 20).\n"
+        "pred(7, 98, 99).\n"
+        "pred(x, y, z) :- src(x, y, z).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(src, &s);
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T5 open err=%d (flat inline-compound fact must be "
+            "accepted; a logical arity check rejects it)\n", err);
+        return 1;
+    }
+
+    struct triple_state st = { 0, { { 0, 0, 0 } } };
+    err = wirelog_easy_snapshot(s, "pred", collect_triples, &st);
+    int rc = 0;
+    if (err != WIRELOG_OK) {
+        fprintf(stderr, "T5 snapshot err=%d\n", err);
+        rc = 1;
+    } else if (st.rows != 2) {
+        fprintf(stderr, "T5: expected 2 pred rows at ncols 3, got %u\n",
+            st.rows);
+        rc = 1;
+    } else if (!has_triple(&st, 7, 98, 99) || !has_triple(&st, 1, 10, 20)) {
+        fprintf(stderr, "T5: expected pred(7,98,99) and pred(1,10,20), got "
+            "pred(%lld,%lld,%lld) and pred(%lld,%lld,%lld)\n",
+            (long long)st.seen[0][0], (long long)st.seen[0][1],
+            (long long)st.seen[0][2], (long long)st.seen[1][0],
+            (long long)st.seen[1][1], (long long)st.seen[1][2]);
+        rc = 1;
+    }
+    wirelog_easy_close(s);
+    return rc;
+}
+
+/* T6 (issue #985): the handle-form fact must fail to open.
+ *
+ *     `pred(1, 99).` leaves the second inline slot never written, and
+ *     `outr(id, p, q) :- pred(id, f(p, q)).` destructures the column and
+ *     reads it regardless -- outr(1, 99, 0) pre-fix, exit 0, ASAN silent.
+ *     The 0 is present in no source data and there is no honest default to
+ *     put there, so the program is rejected at load.
+ *
+ *     T7 is this test's positive control and is not optional: without it a
+ *     change that rejected *everything* would leave T6 green. */
+static int
+test_inline_compound_handle_fact_rejected(void)
+{
+    static const char *src = ".decl pred(id: int64, payload: f/2 inline)\n"
+        ".decl outr(id: int64, p: int64, q: int64)\n"
+        "pred(1, 99).\n"
+        "outr(id, p, q) :- pred(id, f(p, q)).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(src, &s);
+    if (err == WIRELOG_OK) {
+        fprintf(stderr, "T6: pred(1,99). against an f/2 inline .decl must "
+            "not open (it fabricates outr(1,99,0))\n");
+        wirelog_easy_close(s);
+        return 1;
+    }
+    return 0;
+}
+
+/* T7 (issue #985): positive control for T6, and the assertion that the
+ *     fabricated 0 is gone.
+ *
+ *     Same destructuring rule, the fact written flat.  The second inline
+ *     slot is now written, so the body pattern reads real data and outr
+ *     carries the source values instead of a slot nobody filled in. */
+static int
+test_inline_compound_flat_fact_destructures_exactly(void)
+{
+    static const char *src = ".decl pred(id: int64, payload: f/2 inline)\n"
+        ".decl outr(id: int64, p: int64, q: int64)\n"
+        "pred(1, 98, 99).\n"
+        "outr(id, p, q) :- pred(id, f(p, q)).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(src, &s);
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T7 open err=%d\n", err);
+        return 1;
+    }
+
+    struct triple_state st = { 0, { { 0, 0, 0 } } };
+    err = wirelog_easy_snapshot(s, "outr", collect_triples, &st);
+    int rc = 0;
+    if (err != WIRELOG_OK) {
+        fprintf(stderr, "T7 snapshot err=%d\n", err);
+        rc = 1;
+    } else if (st.rows != 1) {
+        fprintf(stderr, "T7: expected 1 outr row at ncols 3, got %u\n",
+            st.rows);
+        rc = 1;
+    } else if (st.seen[0][0] != 1 || st.seen[0][1] != 98
+        || st.seen[0][2] != 99) {
+        fprintf(stderr,
+            "T7: expected outr(1,98,99), got outr(%lld,%lld,%lld)\n",
+            (long long)st.seen[0][0], (long long)st.seen[0][1],
+            (long long)st.seen[0][2]);
+        rc = 1;
+    }
+    wirelog_easy_close(s);
+    return rc;
+}
+
 int
 main(void)
 {
@@ -268,6 +405,9 @@ main(void)
     failures += test_static_fact_joins_with_host_insert();
     failures += test_matching_arity_facts_evaluate_exactly();
     failures += test_inline_compound_head_evaluates_exactly();
+    failures += test_inline_compound_flat_fact_evaluates_exactly();
+    failures += test_inline_compound_handle_fact_rejected();
+    failures += test_inline_compound_flat_fact_destructures_exactly();
     if (failures == 0)
         printf("test_wl_easy_inline_facts: OK\n");
     else

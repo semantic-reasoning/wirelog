@@ -34,8 +34,13 @@ wl_session_load_facts(wl_session_t *sess, const struct wirelog_program *prog)
         if (!rel->name || rel->fact_count == 0 || !rel->fact_data)
             continue;
 
+        /* Physical width, not rel->column_count (#985): fact_data is packed
+         * one slot per written argument, and validate_fact_arities() has
+         * already required that count to be the physical width.  An inline
+         * compound column occupies compound_arity slots, so the logical
+         * count would insert at a shorter stride than the buffer holds. */
         int rc = wl_session_insert(sess, rel->name, rel->fact_data,
-                rel->fact_count, rel->column_count);
+                rel->fact_count, wl_ir_relation_physical_width(rel));
         if (rc != 0) {
             fprintf(stderr, "error: failed to load facts for '%s'\n",
                 rel->name);
@@ -111,8 +116,12 @@ wl_session_load_input_files(wl_session_t *sess,
         }
 
         if (nrows > 0 && data) {
+            /* Physical width, matching wirelog_io_ctx_num_cols() (#985):
+             * the adapter contract sizes this buffer at
+             * nrows * wirelog_io_ctx_num_cols(ctx), and io_ctx.c sets that
+             * from the physical width. */
             rc = wl_session_insert(sess, rel->name, data, nrows,
-                    rel->column_count);
+                    wl_ir_relation_physical_width(rel));
             free(data);
             if (rc != 0) {
                 fprintf(stderr,

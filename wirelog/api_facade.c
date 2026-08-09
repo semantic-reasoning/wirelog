@@ -494,18 +494,32 @@ wirelog_load_facts_from_csv(wirelog_executor_t *executor,
     uint32_t nrows = 0;
     uint32_t ncols = 0;
     wirelog_column_type_t *types = NULL;
-    if (rel->column_count > 0) {
+    /* Physical width (#985), and physical-indexed types to match: this is
+     * the CSV row stride and the stride the rows are inserted at, so an
+     * inline compound column contributes compound_arity int64 slots rather
+     * than one column of its declared type.  Same expansion as
+     * wirelog_io_ctx_create_for_relation() (io/io_ctx.c). */
+    uint32_t phys = wl_ir_relation_physical_width(rel);
+    if (phys > 0 && rel->columns) {
         types = (wirelog_column_type_t *)malloc(
-            rel->column_count * sizeof(wirelog_column_type_t));
+            phys * sizeof(wirelog_column_type_t));
         if (!types) {
             set_error(error, WIRELOG_ERR_MEMORY);
             return false;
         }
-        for (uint32_t i = 0; i < rel->column_count; i++)
-            types[i] = rel->columns[i].type;
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < rel->column_count; i++) {
+            if (rel->columns[i].compound_kind
+                == WIRELOG_COMPOUND_KIND_INLINE) {
+                for (uint32_t j = 0; j < rel->columns[i].compound_arity; j++)
+                    types[k++] = WIRELOG_TYPE_INT64;
+            } else {
+                types[k++] = rel->columns[i].type;
+            }
+        }
     }
 
-    int rc = wl_csv_read_file_ex(csv_file, ',', types, rel->column_count,
+    int rc = wl_csv_read_file_ex(csv_file, ',', types, phys,
             &data, &nrows, &ncols, executor->program->intern);
     free(types);
     if (rc != 0) {
