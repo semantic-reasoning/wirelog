@@ -1491,6 +1491,51 @@ test_constant_head_position_not_counted(void)
     PASS();
 }
 
+/* A mixed constant/variable adornment keeps both physical magic columns, but
+ * only the variable column participates in the guard key. */
+static void
+test_mixed_constant_variable_guard_positions(void)
+{
+    TEST("test_mixed_constant_variable_guard_positions");
+
+    static const char *src = ".decl mid(x: int32, y: int32)\n"
+        ".decl q(a: int32, b: int32)\n"
+        ".output q\n"
+        "mid(1, 2).\n"
+        "q(1, y) :- mid(x, y).\n";
+    struct wirelog_program *prog = parse_and_optimize(src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_magic_demand_t demand = { "q", 0x3, 2 };
+    wl_magic_sets_stats_t stats;
+    if (wl_magic_sets_apply_with_demands(prog, &demand, 1, &stats) != 0
+        || stats.original_rules_modified != 1) {
+        wirelog_program_free(prog);
+        FAIL("mixed bound positions were not guarded");
+        return;
+    }
+
+    const wirelog_ir_node_t *guard = rule_body_root(prog, "q", 0);
+    const wirelog_ir_node_t *scan = guard && guard->child_count == 2
+        ? guard->children[1] : NULL;
+    if (!scan || scan->type != WIRELOG_IR_SCAN || scan->column_count != 2
+        || !scan->column_names[0] || !scan->column_names[1]
+        || strcmp(scan->column_names[1], "y") != 0
+        || guard->join_key_count != 1
+        || strcmp(guard->join_left_keys[0], "y") != 0
+        || strcmp(guard->join_right_keys[0], "y") != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic guard columns and keys are positionally misaligned");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
 /*
  * Source shared by the two fused-head tests (#990).
  *
@@ -2012,6 +2057,7 @@ main(void)
     test_guard_over_antijoin_exact();
     test_guard_over_semijoin_exact();
     test_constant_head_position_not_counted();
+    test_mixed_constant_variable_guard_positions();
     test_fused_head_guard_answers_exact();
     test_fused_head_guard_shape();
     test_fused_head_is_the_only_path_to_the_idb();
