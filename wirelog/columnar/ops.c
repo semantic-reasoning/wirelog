@@ -6691,8 +6691,38 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
-    /* Sort by group key for group-by */
-    /* (Simple O(n^2) implementation; sufficient for Phase 2A) */
+    typedef struct {
+        uint64_t hash;
+        uint32_t row;
+    } reduce_group_slot_t;
+    uint32_t map_cap = 1;
+    uint64_t desired = (uint64_t)(in->nrows ? in->nrows : 1) * 2U;
+    while ((uint64_t)map_cap < desired && map_cap <= UINT32_MAX / 2U)
+        map_cap <<= 1;
+    if ((uint64_t)map_cap < desired) {
+        col_row_buf_release(&row_rb);
+        col_expr_compiled_free(agg_ce);
+        free(tmp);
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(in);
+        return ENOMEM;
+    }
+    reduce_group_slot_t *groups = (reduce_group_slot_t *)calloc(map_cap,
+            sizeof(*groups));
+    if (!groups) {
+        col_row_buf_release(&row_rb);
+        col_expr_compiled_free(agg_ce);
+        free(tmp);
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(in);
+        return ENOMEM;
+    }
+    uint32_t map_mask = map_cap - 1;
+
+    /* Index groups by their key so reduction remains linear in the number of
+     * input rows rather than scanning every output group. */
     int64_t *const row = row_rb.ptr;
     for (uint32_t r = 0; r < in->nrows; r++) {
         col_rel_row_copy_out(in, r, row);
@@ -6706,6 +6736,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 else {
                     col_row_buf_release(&row_rb);
                     col_expr_compiled_free(agg_ce);
+                    free(groups);
                     free(tmp);
                     col_rel_destroy(out);
                     if (e.owned)
@@ -6720,6 +6751,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 } else {
                     col_row_buf_release(&row_rb);
                     col_expr_compiled_free(agg_ce);
+                    free(groups);
                     free(tmp);
                     col_rel_destroy(out);
                     if (e.owned)
@@ -6729,52 +6761,68 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             }
         }
 
-        /* Check if this group key already exists in output */
+        /* Use an open-addressed key index instead of scanning all output
+         * groups for every input row. */
+        uint64_t hash = UINT64_C(1469598103934665603);
+        for (uint32_t k = 0; k < gc; k++) {
+            uint32_t gi = op->group_by_indices ? op->group_by_indices[k] : k;
+            hash ^= (uint64_t)row[gi < in->ncols ? gi : 0];
+            hash *= UINT64_C(1099511628211);
+        }
+        if (!hash)
+            hash = 1;
+        uint32_t slot = (uint32_t)hash & map_mask;
         bool found = false;
-        for (uint32_t o = 0; o < out->nrows; o++) {
-            bool match = true;
+        uint32_t group_row = UINT32_MAX;
+        while (groups[slot].hash != 0) {
+            bool match = groups[slot].hash == hash;
             for (uint32_t k = 0; k < gc && match; k++) {
                 uint32_t gi
                     = op->group_by_indices ? op->group_by_indices[k] : k;
-                match = (row[gi < in->ncols ? gi : 0]
-                    == col_rel_get(out, o, k));
+                match = row[gi < in->ncols ? gi : 0]
+                    == col_rel_get(out, groups[slot].row, k);
             }
             if (match) {
-                /* Update aggregate */
-                int64_t cur = col_rel_get(out, o, gc);
-                switch (op->agg_fn) {
-                case WIRELOG_AGG_COUNT:
-                    col_rel_set(out, o, gc, cur + 1);
-                    break;
-                case WIRELOG_AGG_SUM:
-                {
-                    int64_t next;
-                    if (wl_columnar_ops_checked_add_int64(cur, agg_val,
-                        &next) != 0) {
-                        col_row_buf_release(&row_rb);
-                        col_expr_compiled_free(agg_ce);
-                        free(tmp);
-                        col_rel_destroy(out);
-                        if (e.owned)
-                            col_rel_destroy(in);
-                        return ERANGE;
-                    }
-                    col_rel_set(out, o, gc, next);
-                }
-                break;
-                case WIRELOG_AGG_MIN:
-                case WIRELOG_AGG_MAX:
-                    /* Ordered by the operand's declared domain, not by the
-                     * raw int64 -- for a symbol column that int64 is an
-                     * intern id (Issue #965). */
-                    if (col_agg_better(op->agg_fn, op->agg_operand_type,
-                        sess->intern, agg_val, cur))
-                        col_rel_set(out, o, gc, agg_val);
-                    break;
-                default:
-                    break;
-                }
                 found = true;
+                group_row = groups[slot].row;
+                break;
+            }
+            slot = (slot + 1) & map_mask;
+        }
+        if (found) {
+            /* Update aggregate */
+            int64_t cur = col_rel_get(out, group_row, gc);
+            switch (op->agg_fn) {
+            case WIRELOG_AGG_COUNT:
+                col_rel_set(out, group_row, gc, cur + 1);
+                break;
+            case WIRELOG_AGG_SUM:
+            {
+                int64_t next;
+                if (wl_columnar_ops_checked_add_int64(cur, agg_val,
+                    &next) != 0) {
+                    col_row_buf_release(&row_rb);
+                    col_expr_compiled_free(agg_ce);
+                    free(groups);
+                    free(tmp);
+                    col_rel_destroy(out);
+                    if (e.owned)
+                        col_rel_destroy(in);
+                    return ERANGE;
+                }
+                col_rel_set(out, group_row, gc, next);
+            }
+            break;
+            case WIRELOG_AGG_MIN:
+            case WIRELOG_AGG_MAX:
+                /* Ordered by the operand's declared domain, not by the
+                 * raw int64 -- for a symbol column that int64 is an
+                 * intern id (Issue #965). */
+                if (col_agg_better(op->agg_fn, op->agg_operand_type,
+                    sess->intern, agg_val, cur))
+                    col_rel_set(out, group_row, gc, agg_val);
+                break;
+            default:
                 break;
             }
         }
@@ -6789,17 +6837,21 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
                 col_expr_compiled_free(agg_ce);
+                free(groups);
                 free(tmp);
                 col_rel_destroy(out);
                 if (e.owned)
                     col_rel_destroy(in);
                 return rc;
             }
+            groups[slot].hash = hash;
+            groups[slot].row = out->nrows - 1;
         }
     }
 
     col_row_buf_release(&row_rb);
     col_expr_compiled_free(agg_ce);
+    free(groups);
     free(tmp);
     if (e.owned)
         col_rel_destroy(in);
