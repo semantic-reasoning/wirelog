@@ -377,36 +377,14 @@ col_reduce_output_group_equal(const col_rel_t *rel, uint32_t a, uint32_t b,
     return true;
 }
 
-static const wl_plan_op_t *
-col_relation_recursive_reduce_op(const wl_plan_relation_t *rp)
-{
-    const wl_plan_op_t *reduce_op = NULL;
-
-    for (uint32_t oi = 0; oi < rp->op_count; oi++) {
-        const wl_plan_op_t *op = &rp->ops[oi];
-        if (op->op != WL_PLAN_OP_REDUCE)
-            continue;
-        if (op->agg_fn != WIRELOG_AGG_MIN && op->agg_fn != WIRELOG_AGG_MAX)
-            return NULL;
-        if (reduce_op
-            && (reduce_op->agg_fn != op->agg_fn
-            || reduce_op->group_by_count != op->group_by_count)) {
-            return NULL;
-        }
-        reduce_op = op;
-    }
-
-    return reduce_op;
-}
-
 static int
 col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
-    const wl_plan_op_t *reduce_op, const wl_intern_t *intern)
+    const wl_plan_agg_spec_t *spec, const wl_intern_t *intern)
 {
-    if (!rel || !reduce_op || rel->nrows < 2)
+    if (!rel || !spec || !spec->has_spec || rel->nrows < 2)
         return 0;
 
-    uint32_t gc = reduce_op->group_by_count;
+    uint32_t gc = spec->group_by_count;
     if (rel->ncols <= gc)
         return EINVAL;
 
@@ -426,8 +404,8 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
             /* Same comparator as col_op_reduce(): a fixpoint that ordered
              * lexicographically within an iteration and by intern id across
              * iterations would be worse than the original bug (#965). */
-            bool better = col_agg_better(reduce_op->agg_fn,
-                    reduce_op->agg_operand_type, intern, val, cur);
+            bool better = col_agg_better(spec->fn, spec->operand_type,
+                    intern, val, cur);
             if (better) {
                 col_rel_set(rel, found, gc, val);
                 if (rel->timestamps)
@@ -461,14 +439,29 @@ static int
 col_canonicalize_recursive_aggregates(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess)
 {
+    /*
+     * Reading the recorded specification rather than looking for a REDUCE in
+     * rp->ops is the whole of #975: rewrite_multiway_delta() replaces a fused
+     * relation's operators with a single K_FUSION and moves the originals into
+     * its opaque_data, so the operator was not there to be found and this ran
+     * on every recursive aggregate relation *except* the ones fusion applies
+     * to.  wl_plan_relation_t.recursive_agg is filled at IR lowering, before
+     * any rewrite runs.
+     *
+     * Timing is unchanged: this is the fixpoint, not per-iteration
+     * consolidation.  A same-stratum consumer can therefore hold rows derived
+     * from labels this reduction then dominates away, leaving output that
+     * contradicts itself.  Moving it into consolidation needs
+     * wl_plan_stratum_t.is_monotone, which is hardcoded false and never
+     * computed -- that is issue #1021, not this one.
+     */
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         const wl_plan_relation_t *rp = &sp->relations[ri];
-        const wl_plan_op_t *reduce_op = col_relation_recursive_reduce_op(rp);
-        if (!reduce_op)
+        if (!rp->recursive_agg.has_spec)
             continue;
         col_rel_t *rel = session_find_rel(sess, rp->name);
-        int rc = col_canonicalize_recursive_aggregate_relation(rel, reduce_op,
-                sess->intern);
+        int rc = col_canonicalize_recursive_aggregate_relation(rel,
+                &rp->recursive_agg, sess->intern);
         if (rc != 0)
             return rc;
         col_session_invalidate_arrangements(&sess->base, rp->name);

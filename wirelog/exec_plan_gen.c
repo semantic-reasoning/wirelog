@@ -891,6 +891,11 @@ typedef struct {
     wl_plan_op_t *ops;
     uint32_t count;
     uint32_t capacity;
+
+    /* The whole-relation reduction this operator list admits, accumulated as
+     * the REDUCEs are emitted (Issue #975).  See agg_spec_observe(). */
+    wl_plan_agg_spec_t agg;
+    bool agg_vetoed;
 } op_list_t;
 
 static int
@@ -898,8 +903,69 @@ op_list_init(op_list_t *list)
 {
     list->capacity = 8;
     list->count = 0;
+    memset(&list->agg, 0, sizeof(list->agg));
+    list->agg_vetoed = false;
     list->ops = (wl_plan_op_t *)calloc(list->capacity, sizeof(wl_plan_op_t));
     return list->ops ? 0 : -1;
+}
+
+/*
+ * Fold one emitted REDUCE into the relation's whole-relation reduction
+ * specification (Issue #975).
+ *
+ * This reproduces, exactly, the admission rules the columnar backend used to
+ * rediscover by scanning the finished operator list -- the scan #975 deleted,
+ * because a fused relation has no REDUCE left to find.  The rules are:
+ *
+ *   - an aggregate other than MIN or MAX has no domination order, so the
+ *     relation is refused outright;
+ *   - two rules of one head that disagree on the aggregate, or on the number
+ *     of grouping columns, leave no single order to reduce under, so the
+ *     relation is refused as well.
+ *
+ * Both refusals are *sticky*: agg_vetoed latches, so a later agreeing REDUCE
+ * cannot resurrect a specification an earlier conflict rejected.  Overwriting
+ * per REDUCE instead of vetoing would be a behaviour change in the wrong
+ * direction -- it would start collapsing relations that are correctly left
+ * alone today, under an order only one of their rules asked for.
+ *
+ * The operand's domain is the one field NOT compared: where several REDUCEs
+ * agree on the aggregate and the group width, the last one's domain decides,
+ * which is what the deleted scan did (it kept the last operator it saw and
+ * never looked at agg_operand_type).  Reproduced deliberately so that no
+ * program's answer moves with this change, but it is a latent variant of
+ * #965: WL_PLAN_AGG_OPERAND_UNKNOWN and _STRING can coexist across two rules
+ * of one head -- a declared `symbol` column in one and an undeclared
+ * relation in the other -- and then rule order, not the data, decides whether
+ * min() orders by string or by interned id.  Deciding what genuinely
+ * disagreeing rules should do is a separate question from where the
+ * specification is stored, and is not settled here.
+ */
+static void
+agg_spec_observe(op_list_t *list, const wl_plan_op_t *reduce)
+{
+    if (list->agg_vetoed)
+        return;
+
+    if (reduce->agg_fn != WIRELOG_AGG_MIN
+        && reduce->agg_fn != WIRELOG_AGG_MAX) {
+        list->agg_vetoed = true;
+        memset(&list->agg, 0, sizeof(list->agg));
+        return;
+    }
+
+    if (list->agg.has_spec
+        && (list->agg.fn != reduce->agg_fn
+        || list->agg.group_by_count != reduce->group_by_count)) {
+        list->agg_vetoed = true;
+        memset(&list->agg, 0, sizeof(list->agg));
+        return;
+    }
+
+    list->agg.has_spec = true;
+    list->agg.fn = reduce->agg_fn;
+    list->agg.group_by_count = reduce->group_by_count;
+    list->agg.operand_type = reduce->agg_operand_type;
 }
 
 static wl_plan_op_t *
@@ -1615,6 +1681,12 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                 "(.decl R(c: symbol)) if the column holds symbols",
                 op->agg_fn == WIRELOG_AGG_MIN ? "min" : "max");
         }
+
+        /* Record whether the relation as a whole may be reduced under this
+         * aggregate, while the operator is still an operator (Issue #975).
+         * Last statement of the arm: nothing below pushes, so @op is still
+         * the operator just emitted. */
+        agg_spec_observe(ops, op);
         return 0;
     }
 
@@ -3431,6 +3503,12 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
 
                 rels[u].ops = ol.ops;
                 rels[u].op_count = ol.count;
+                /* Issue #975: recorded here, before rewrite_lftj_chains(),
+                 * rewrite_multiway_delta(), rewrite_join_project_fusion() and
+                 * rewrite_insert_exchanges() run below.  Those reshape and in
+                 * the fusion case hide @ops entirely; none of them can reach a
+                 * field that is not an operator. */
+                rels[u].recursive_agg = ol.agg;
             } else {
                 rels[u].ops = NULL;
                 rels[u].op_count = 0;
@@ -3504,6 +3582,9 @@ col_plan_split_at_exchange(const wl_plan_relation_t *rplan)
             result.segments[seg].name = rplan->name;
             result.segments[seg].ops = rplan->ops + seg_start;
             result.segments[seg].op_count = i - seg_start;
+            /* Carried, not recomputed: it is a property of the relation, and
+             * every segment is a view of the same relation (Issue #975). */
+            result.segments[seg].recursive_agg = rplan->recursive_agg;
             seg++;
             seg_start = i + 1; /* skip the EXCHANGE op */
         }

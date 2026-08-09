@@ -301,6 +301,49 @@ typedef enum {
     WL_PLAN_AGG_OPERAND_STRING = 2,
 } wl_plan_agg_operand_t;
 
+/**
+ * wl_plan_agg_spec_t:
+ *
+ * The order a recursive relation's rows may be reduced under as a whole
+ * (Issue #975).
+ *
+ * A relation whose every rule reduces by the same ordering aggregate over
+ * the same grouping columns has one row per group at the fixpoint, not one
+ * row per group per rule: each rule computes a partial minimum (or maximum)
+ * and the union of those partials still has to be reduced once more.  This
+ * records that the relation admits that final reduction, and under which
+ * order.
+ *
+ * It is a property of the relation, established at IR lowering, and NOT
+ * something to be recovered by scanning the operator list.  The scan is what
+ * #975 was: rewrite_multiway_delta() (exec_plan_gen.c) replaces a fused
+ * relation's operators with a single K_FUSION and moves the originals into
+ * its opaque_data, so a REDUCE lookup over ops found nothing and the final
+ * reduction was skipped -- silently, on exactly the relations fusion exists
+ * to accelerate.  Recorded before any rewrite runs, a rewrite cannot delete
+ * a field that is not an operator.
+ *
+ * has_spec == false is the zero value, matching the discipline documented
+ * for wl_plan_agg_operand_t above: a relation nobody typed is structurally
+ * distinguishable from one deliberately admitted.  It is also the answer for
+ * every relation the final reduction must refuse -- see the accumulator in
+ * exec_plan_gen.c for the conflicts that clear it.
+ *
+ * @has_spec:       True when the relation admits whole-relation reduction.
+ * @fn:             The aggregate every rule of the relation agreed on.
+ *                  Only WIRELOG_AGG_MIN and WIRELOG_AGG_MAX are admitted.
+ * @operand_type:   The aggregated operand's domain, which decides whether
+ *                  the order is numeric or lexicographic (Issue #965).
+ * @group_by_count: Number of leading grouping columns; the aggregated
+ *                  value sits at column @group_by_count.
+ */
+typedef struct {
+    bool has_spec;
+    wirelog_agg_fn_t fn;
+    wl_plan_agg_operand_t operand_type;
+    uint32_t group_by_count;
+} wl_plan_agg_spec_t;
+
 /* ======================================================================== */
 /* Operator Types                                                           */
 /* ======================================================================== */
@@ -484,6 +527,15 @@ typedef struct {
     char *delta_name;
     const wl_plan_op_t *ops;
     uint32_t op_count;
+
+    /* Whether this relation's rows may be reduced as a whole at the
+     * fixpoint, and under which order (Issue #975).  Established at IR
+     * lowering, before any plan rewrite runs, precisely so that a rewrite
+     * which reshapes @ops cannot take it away.  Appended at the end so no
+     * existing field shifts, matching the discipline wl_plan_op_t follows
+     * above.  Zeroed (has_spec == false) on every relation that is not a
+     * recursive ordering aggregate. */
+    wl_plan_agg_spec_t recursive_agg;
 } wl_plan_relation_t;
 
 /* ======================================================================== */

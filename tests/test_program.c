@@ -1035,8 +1035,11 @@ test_aggregation_multi_head_rejected(void)
     }
 
     /* Negative: same agg_fn twice.  This one passes the downstream
-     * col_relation_recursive_reduce_op() mixed-agg_fn guard (#692 B5) and
-     * would canonicalise only one column, so it must be caught here. */
+     * mixed-agg_fn guard (#692 B5) -- since #975 that guard lives in
+     * agg_spec_observe() (exec_plan_gen.c), which records the relation's
+     * whole-relation reduction at lowering rather than rediscovering it by
+     * scanning ops -- and would canonicalise only one column, so it must be
+     * caught here. */
     bad = make_program_with_rules(".decl val(g: int32, v: int32)\n"
             ".decl t(g: int32, a: int32, b: int32)\n"
             "t(g, min(v), min(v)) :- val(g, v).\n");
