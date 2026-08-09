@@ -30,6 +30,15 @@
 #include <windows.h>
 #endif
 
+/* A uint64_t dependency mask cannot represent indices above 63.  Treat an
+ * unrepresentable index as affected so a wide plan is evaluated conservatively
+ * instead of invoking undefined behaviour or silently skipping work. */
+static bool
+col_affected_mask_contains(uint64_t mask, uint32_t index)
+{
+    return index >= 64 || (mask & (UINT64_C(1) << index)) != 0;
+}
+
 /* Relation storage and cache functions moved to columnar/relation.c and
  * columnar/cache.c; declarations in columnar/internal.h. */
 
@@ -2061,7 +2070,7 @@ col_session_step(wl_session_t *session)
         /* Incremental (delta callback mode): reset affected rules to (current_epoch, UINT32_MAX).
          * No pre-seeded deltas in this path, so reset unconditionally. */
         for (uint32_t si = 0; si < plan->stratum_count; si++) {
-            if ((affected_mask & ((uint64_t)1 << si)) != 0) {
+            if (col_affected_mask_contains(affected_mask, si)) {
                 uint32_t rule_base = 0;
                 for (uint32_t j = 0; j < si; j++)
                     rule_base += plan->strata[j].relation_count;
@@ -2079,7 +2088,7 @@ col_session_step(wl_session_t *session)
 
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         /* Skip strata not affected by the last incremental insertion */
-        if ((affected_mask & ((uint64_t)1 << si)) == 0)
+        if (!col_affected_mask_contains(affected_mask, si))
             continue;
 
         const wl_plan_stratum_t *sp = &plan->strata[si];
@@ -2337,7 +2346,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     if (affected_mask != UINT64_MAX) {
         for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
             si++) {
-            if ((affected_mask & ((uint64_t)1 << si)) != 0) {
+            if (col_affected_mask_contains(affected_mask, si)) {
                 /* Issue #107: Selective rule frontier reset based on pre-seeded delta presence.
                  * Reset frontier for strata that have pre-seeded EDB deltas.
                  * Preserve frontier for transitively-affected strata (no direct EDB delta).
@@ -2379,12 +2388,12 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         uint64_t affected_rules
             = col_compute_affected_rules(session, sess->last_inserted_relation);
         for (uint32_t ri = 0; ri < MAX_RULES; ri++) {
-            if ((affected_rules & ((uint64_t)1 << ri)) == 0)
+            if (!col_affected_mask_contains(affected_rules, ri))
                 continue;
             uint32_t si = rule_index_to_stratum_index(plan, ri);
             if (si == UINT32_MAX)
                 continue;
-            if ((affected_mask & ((uint64_t)1 << si)) == 0)
+            if (!col_affected_mask_contains(affected_mask, si))
                 continue;
             if (stratum_has_preseeded_delta(&plan->strata[si], sess)) {
                 sess->frontier_ops->reset_rule_frontier(sess, ri,
@@ -2419,7 +2428,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         || !sess->has_evaluated));
     sess->tdd_decision_tracking_active = true;
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
-        if ((affected_mask & ((uint64_t)1 << si)) == 0)
+        if (!col_affected_mask_contains(affected_mask, si))
             continue;
         wl_columnar_session_tdd_decision_t tdd_decision =
             wl_columnar_session_tdd_plan_stratum(&plan->strata[si], sess,
