@@ -9,8 +9,21 @@
  */
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>
+#define close _close
+#define dup _dup
+#define dup2 _dup2
+#define fileno _fileno
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+#else
+#include <unistd.h>
+#endif
 
 #include "../wirelog/wirelog-ir.h"
 #include "../wirelog/ir/ir.h"
@@ -679,6 +692,66 @@ test_ir_node_print(void)
 }
 
 static void
+test_ir_node_print_wide_scan(void)
+{
+    TEST("IR node print truncates wide output safely");
+
+    wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
+    if (!scan) {
+        FAIL("node is NULL");
+        return;
+    }
+
+    const uint32_t column_count = 1200;
+    scan->column_count = column_count;
+    scan->column_names = (char **)calloc(column_count, sizeof(char *));
+    if (!scan->column_names) {
+        wl_ir_node_free(scan);
+        FAIL("column allocation failed");
+        return;
+    }
+    for (uint32_t i = 0; i < column_count; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "column_%04u", i);
+        scan->column_names[i] = strdup_safe(name);
+        if (!scan->column_names[i]) {
+            wl_ir_node_free(scan);
+            FAIL("column name allocation failed");
+            return;
+        }
+    }
+
+    /* The print API uses the stack-backed rendering path.  Keep its output
+    * out of the test log; under ASan this call is the regression assertion
+    * because the pre-fix implementation overflows its 4096-byte buffer. */
+    int saved_stderr = dup(STDERR_FILENO);
+    FILE *sink = tmpfile();
+    if (saved_stderr < 0 || !sink
+        || dup2(fileno(sink), STDERR_FILENO) < 0) {
+        if (sink)
+            fclose(sink);
+        if (saved_stderr >= 0)
+            close(saved_stderr);
+        wl_ir_node_free(scan);
+        FAIL("stderr capture setup failed");
+        return;
+    }
+
+    wirelog_ir_node_print(scan, 0);
+    fflush(stderr);
+    bool restored = dup2(saved_stderr, STDERR_FILENO) >= 0;
+    close(saved_stderr);
+    fclose(sink);
+    wl_ir_node_free(scan);
+
+    if (!restored) {
+        FAIL("stderr restore failed");
+        return;
+    }
+    PASS();
+}
+
+static void
 test_ir_node_free_null(void)
 {
     TEST("IR node free handles NULL safely");
@@ -972,6 +1045,7 @@ main(void)
     test_ir_node_to_string_tree();
     test_ir_node_to_string_wide_scan();
     test_ir_node_print();
+    test_ir_node_print_wide_scan();
     test_ir_node_free_null();
     test_ir_node_get_type_all();
 
