@@ -142,9 +142,17 @@ csv_read(wirelog_io_ctx_t *ctx, int64_t **out_data,
      * The invariant being restored is the adapter contract itself:
      * docs/io-adapters.md requires read() to produce a buffer of
      * *out_nrows * wirelog_io_ctx_num_cols(ctx) elements, and
-     * wirelog_io_ctx_num_cols() is set from rel->column_count
+     * wirelog_io_ctx_num_cols() is the relation's PHYSICAL width
      * (io/io_ctx.c) -- the very stride wl_session_load_input_files()
      * inserts at.  This branch was violating the contract it publishes.
+     *
+     * Physical, not the declared rel->column_count: an `inline` compound
+     * column occupies compound_arity slots, so a file for
+     * `.decl inp(id: int64, p: pair/2 inline, s: symbol)` carries four
+     * fields against three declared columns (#985).  This branch needs no
+     * special case for that -- it compares the detected width against
+     * num_cols and never sees column_count -- but the number it is
+     * comparing against is no longer the declared one.
      *
      * -2 is the code wl_csv_read_file_via_ctx() uses for a width
      * mismatch, reused for consistency of the return value only.  Note

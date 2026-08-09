@@ -377,7 +377,23 @@ wirelog_easy_print_delta(const char *relation, const int64_t *row,
      * warrant to treat an integer id as a pointer into the intern table.
      * In the schema-unavailable branch, default to integer rendering so a
      * synthetic delta call (or a schema-less relation) does not trip the
-     * abort. */
+     * abort.
+     *
+     * The ncols equality is a *logical* schema against a *physical* row
+     * width.  The two agree for every relation that declares no `inline`
+     * compound column; where one is declared they can differ, and then the
+     * equality fails: `.decl pred(id: int64, payload: f/2 inline)` reports
+     * column_count 2 while the row carries 3 slots (#985).  (An `inline`
+     * compound of arity 1 is one declared column and one slot, so the
+     * equality still holds there -- an inline compound column is necessary
+     * for the mismatch, not sufficient.)  A relation whose widths do differ
+     * therefore always renders as raw integers here, including any genuine
+     * `symbol` column beside the compound.  That is the safe direction of
+     * the degradation -- no abort, no id misread as a pointer -- and it is
+     * left deliberate rather than accidental: rendering per column would
+     * need the logical-to-physical slot map, which this printer does not
+     * have.  Not to be "fixed" by comparing against a physical width; that
+     * would index schema->columns[] physically, which is wrong. */
     const wirelog_schema_t *schema
         = wirelog_program_get_schema(s->prog, relation);
     bool have_schema = (schema != NULL && schema->columns != NULL

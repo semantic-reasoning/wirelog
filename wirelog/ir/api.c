@@ -251,7 +251,12 @@ wirelog_program_get_facts(const wirelog_program_t *prog, const char *relation,
             if (rel->fact_count == 0)
                 return 1;
 
-            uint32_t ncols = rel->column_count;
+            /* Physical width (#985).  *num_cols is the caller's row stride
+             * into *data, not a declaration; an inline compound column
+             * occupies compound_arity slots there.  It can therefore exceed
+             * wirelog_program_get_schema()'s column_count -- see the note on
+             * this function in wirelog.h. */
+            uint32_t ncols = wl_ir_relation_physical_width(rel);
             uint32_t total = rel->fact_count * ncols;
             int64_t *copy = (int64_t *)malloc(total * sizeof(int64_t));
             if (!copy)

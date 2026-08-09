@@ -59,8 +59,8 @@ internals:
 | Accessor | Description |
 |----------|-------------|
 | `wirelog_io_ctx_relation_name(ctx)` | Name of the target relation |
-| `wirelog_io_ctx_num_cols(ctx)` | Column count |
-| `wirelog_io_ctx_col_type(ctx, i)` | Column type (`WIRELOG_TYPE_INT64`, `WIRELOG_TYPE_STRING`, ...) |
+| `wirelog_io_ctx_num_cols(ctx)` | Physical row stride: `int64_t` slots per tuple (see below) |
+| `wirelog_io_ctx_col_type(ctx, i)` | Type of physical slot `i` (`WIRELOG_TYPE_INT64`, `WIRELOG_TYPE_STRING`, ...) |
 | `wirelog_io_ctx_param(ctx, key)` | `.input` parameter lookup (e.g. `"filename"`, `"delimiter"`) |
 | `wirelog_io_ctx_intern_string(ctx, utf8)` | Intern a string, returns `int64_t` id for `WIRELOG_TYPE_STRING` columns |
 | `wirelog_io_ctx_platform(ctx)` | Platform context pointer (e.g. `JavaVM *` on Android) |
@@ -69,6 +69,39 @@ internals:
 Adapters never see `wl_intern_t`, `wl_ir_relation_info_t`, or any other
 internal type. This is the ABI firewall -- the context struct is opaque and
 its layout is private.
+
+#### `num_cols` is physical, not declared (#985)
+
+`wirelog_io_ctx_num_cols(ctx)` is the **physical row stride**: the number of
+`int64_t` slots one tuple of the relation occupies. That is the number of
+fields your `read()` must produce per row, and the width wirelog inserts the
+returned buffer at. It is not the relation's declared column count.
+
+A column declared as an `inline` compound occupies its full arity of
+consecutive slots:
+
+```
+.decl inp(id: int64, p: pair/2 inline, s: symbol)
+```
+
+is three declared columns but `num_cols` 4, and its `.input` file carries
+four fields. A `side` compound is a single handle slot, and so is every
+scalar, so the two numbers agree for every relation that declares no inline
+compound column.
+
+`wirelog_io_ctx_col_type(ctx, i)` is indexed by the same physical position:
+`i` runs over slots, not over declared columns. Each slot of an inline
+compound reports `WIRELOG_TYPE_INT64`, because the slots carry raw `int64`
+payload and the declared type of the compound column does not describe them.
+For the relation above the types are `INT64, INT64, INT64, STRING`.
+
+Before #985 both accessors reported the *declared* column count and the
+declared per-column types, which named a stride the storage does not use. The
+signatures and `WIRELOG_IO_ABI_VERSION` are unchanged; what changed is the
+value for a relation with an inline compound column. An adapter that already
+sizes its output from `num_cols` -- which this contract has always required
+-- needs no change. One that reconstructs the stride from a schema of its own
+will now disagree with wirelog for those relations.
 
 ---
 

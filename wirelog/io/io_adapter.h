@@ -67,6 +67,34 @@ typedef struct wirelog_io_ctx wirelog_io_ctx_t;
 /* Context Accessors (implemented in #453)                                  */
 /* ======================================================================== */
 
+/*
+ * wirelog_io_ctx_num_cols() is the PHYSICAL row stride of the relation --
+ * the number of int64_t slots one tuple occupies, which is the number of
+ * fields read() must produce per row and the width wirelog inserts the
+ * returned buffer at.  It is NOT the relation's declared column count.
+ *
+ * A column declared as an `inline` compound occupies its full arity of
+ * consecutive slots: `.decl inp(id: int64, p: pair/2 inline, s: symbol)` is
+ * three declared columns but num_cols 4, and its `.input` file carries four
+ * fields.  A `side` compound is one handle slot, and so is every scalar, so
+ * the two numbers agree for every relation that declares no inline compound
+ * column.
+ *
+ * wirelog_io_ctx_col_type(ctx, i) is indexed by the same physical position,
+ * so `i` runs over slots and not over declared columns.  Each slot of an
+ * inline compound reports WIRELOG_TYPE_INT64 -- the slots carry raw int64
+ * payload, and the declared type of a compound column does not describe
+ * them.  In the example above the types are INT64, INT64, INT64, STRING.
+ *
+ * Before #985 both accessors reported the declared column count and the
+ * declared per-column types, which named a stride the storage does not use;
+ * an adapter for such a relation was handed the wrong width and the wrong
+ * types.  The signatures are unchanged and WIRELOG_IO_ABI_VERSION is
+ * unchanged, but an adapter that reconstructed the stride from a schema of
+ * its own -- rather than from num_cols, as the contract in
+ * docs/io-adapters.md requires -- will now disagree with wirelog for a
+ * relation with an inline compound column.  Index by num_cols.
+ */
 WIRELOG_API const char *
 wirelog_io_ctx_relation_name(const wirelog_io_ctx_t *ctx);
 WIRELOG_API uint32_t

@@ -2957,26 +2957,113 @@ test_fact_arity_wider_than_decl_rejected(void)
 
     /* Inline-compound columns.  `.decl p(id, lbl: pair/2 inline)` has a
      * *logical* width of 2 and a *physical* width of 3, and this fact is
-     * written flat.  It is rejected, because facts are compared logically:
-     * collect_fact packs one slot per written argument and both readers
-     * stride by rel->column_count, which is the logical width.
+     * written flat.  It is ACCEPTED (#985): facts are compared against the
+     * physical width, because a fact is a row of the relation's storage and
+     * an inline compound occupies its full arity of slots there.
      *
-     * Pre-fix this was accepted and silently dropped the third value.
-     * Note this is the one place where the fact rule and the rule-head rule
-     * diverge: validate_head_arities() (#977 unit 3) compares *physical*
-     * width via atom_physical_column_count(), so the head spelling of this
-     * same shape -- pred(x,y,z) against .decl pred(id, payload: f/2 inline)
-     * -- is accepted, and is pinned by
-     * test_head_arity_inline_compound_accepted().  The divergence is not an
-     * oversight: the head grammar has no compound-term production, so the
-     * flattened spelling is the only one available to a rule, while facts
-     * are packed and read back at the logical width.  If compound terms ever
-     * become expressible in facts, this comparison has to move with it. */
-    bad = make_program(".decl p(id: int64, lbl: pair/2 inline)\n"
+     * This half used to assert the opposite, under a logical comparison.
+     * That was the defect: it rejected the only spelling that works and
+     * accepted `p(1, 2).`, which left the second inline slot never written
+     * for a body pattern to read back as a fabricated 0.
+     *
+     * The contents are asserted, not merely non-NULL: a check deleted rather
+     * than corrected would still leave fact_data non-NULL, so only the
+     * values distinguish "accepted" from "accepted and stored correctly". */
+    struct wirelog_program *ok
+        = make_program(".decl p(id: int64, lbl: pair/2 inline)\n"
             "p(1, 2, 3).\n");
+    if (!ok) {
+        FAIL("flat p(1,2,3). against inline-compound .decl p/2 accepted");
+        return;
+    }
+    if (ok->relation_count != 1 || ok->relations[0].fact_count != 1
+        || !ok->relations[0].fact_data) {
+        wl_ir_program_free(ok);
+        FAIL("p(1,2,3). should store exactly one fact row");
+        return;
+    }
+    if (ok->relations[0].fact_data[0] != 1
+        || ok->relations[0].fact_data[1] != 2
+        || ok->relations[0].fact_data[2] != 3) {
+        wl_ir_program_free(ok);
+        FAIL("p(1,2,3). should store the slots 1,2,3");
+        return;
+    }
+    wl_ir_program_free(ok);
+
+    PASS();
+}
+
+static void
+test_fact_arity_compound_handle_form_rejected(void)
+{
+    TEST("Fact arity: handle-form fact into a compound relation is rejected");
+
+    /* The mutation-resistant half of #985, and the whole of its defect B.
+     * `.decl p(id, lbl: pair/2 inline)` is two logical columns and three
+     * physical ones, so the two-argument fact writes one slot fewer than the
+     * relation occupies.
+     *
+     * Pre-fix this was accepted -- 2 == column_count -- and left the second
+     * inline slot never written; a body pattern that destructures the column
+     * read it anyway and produced a fabricated 0
+     * (`outr(id, x, y) :- p(id, pair(x, y)).` -> outr(1, 99, 0), exit 0,
+     * ASAN silent).  There is no honest default to fill the slot with: 0 is
+     * a valid int64 and a valid intern id alike.
+     *
+     * If anyone "simplifies" the fact comparison back to the logical
+     * rel->column_count, this is the test that fails.  The accepting half in
+     * test_fact_arity_wider_than_decl_rejected() alone would not catch it --
+     * a blanket accept passes that one. */
+    struct wirelog_program *bad
+        = make_program(".decl p(id: int64, lbl: pair/2 inline)\n"
+            "p(1, 2).\n");
     if (bad) {
         wl_ir_program_free(bad);
-        FAIL("flat p(1,2,3). against inline-compound .decl p/2 rejected");
+        FAIL("handle-form p(1,2). against inline-compound .decl p/2 rejected");
+        return;
+    }
+
+    PASS();
+}
+
+static void
+test_fact_arity_side_compound_is_one_column(void)
+{
+    TEST("Fact arity: a side compound occupies exactly one column");
+
+    /* A `side` compound is stored as a single handle slot, not
+     * compound_arity of them, so the handle form is the *only* form and
+     * `q(1, 2).` must be accepted against `.decl q(a: int64, m: m/4 side)`.
+     * Without this the physical-width sum could be written as a blanket
+     * `+= compound_arity` and every other test in the file would still
+     * pass.  It is the fact-side twin of the SIDE half of
+     * test_head_arity_compound_handle_form_rejected(). */
+    struct wirelog_program *ok
+        = make_program(".decl q(a: int64, m: m/4 side)\n"
+            "q(1, 2).\n");
+    if (!ok) {
+        FAIL("q(1,2). against side-compound .decl q/2 should be accepted");
+        return;
+    }
+    if (ok->relation_count != 1 || ok->relations[0].fact_count != 1
+        || !ok->relations[0].fact_data
+        || ok->relations[0].fact_data[0] != 1
+        || ok->relations[0].fact_data[1] != 2) {
+        wl_ir_program_free(ok);
+        FAIL("q(1,2). should store the slots 1,2");
+        return;
+    }
+    wl_ir_program_free(ok);
+
+    /* Widening to the side compound's arity is a mismatch, not an
+     * alternative spelling. */
+    struct wirelog_program *bad
+        = make_program(".decl q(a: int64, m: m/4 side)\n"
+            "q(1, 2, 3).\n");
+    if (bad) {
+        wl_ir_program_free(bad);
+        FAIL("q(1,2,3). against side-compound .decl q/2 should be rejected");
         return;
     }
 
@@ -3345,12 +3432,13 @@ test_head_arity_compound_handle_form_rejected(void)
 {
     TEST("Head arity: handle-form head into a compound relation is rejected");
 
-    /* The open question this unit had to settle.  `pred(1, 99).` is a legal
-     * *fact* -- unit 2 compares facts logically, and 2 == 2 -- so it is not
-     * obvious that the head analogue `pred(x, y) :- src(x, y).` should be
-     * illegal.  It is, and the reason is not symmetry but a fabricated
-     * value: the head leaves the second inline slot never written, and a
-     * body pattern that destructures the column reads it anyway.
+    /* The open question this unit had to settle.  `pred(1, 99).` used to be
+     * a legal *fact* -- unit 2 compared facts logically, and 2 == 2 -- so it
+     * was not obvious that the head analogue `pred(x, y) :- src(x, y).`
+     * should be illegal.  It is, and the reason is not symmetry but a
+     * fabricated value: the head leaves the second inline slot never
+     * written, and a body pattern that destructures the column reads it
+     * anyway.
      *
      *   .decl src(a: int64, b: int64)
      *   .decl pred(id: int64, payload: f/2 inline)
@@ -3366,12 +3454,12 @@ test_head_arity_compound_handle_form_rejected(void)
      * one the relation must be written at, and this shape is rejected.
      *
      * (The identical defect via the *fact* form -- `pred(1, 99).` plus the
-     * same destructuring rule, also outr(1, 99, 0) -- is still accepted,
-     * because unit 2 must compare facts logically: wl_session_load_facts()
-     * and wirelog_program_get_facts() both stride by column_count.  That
-     * asymmetry is real and is not resolved here -- issue #985 tracks it,
-     * along with the fact that an inline-compound relation cannot be
-     * populated correctly by an inline fact at all.) */
+     * same destructuring rule, also outr(1, 99, 0) -- was accepted when this
+     * unit landed, because unit 2 then compared facts logically.  #985
+     * closed that: wl_session_load_facts() and wirelog_program_get_facts()
+     * now stride physically and the fact pass compares physically, so
+     * `pred(1, 99).` is rejected too.  See
+     * test_fact_arity_compound_handle_form_rejected().) */
     struct wirelog_program *bad
         = make_program(".decl src(a: int64, b: int64)\n"
             ".decl pred(id: int64, payload: f/2 inline)\n"
@@ -3580,6 +3668,84 @@ test_api_get_facts(void)
         free(data);
         wirelog_program_free(prog);
         FAIL("fact data mismatch");
+        return;
+    }
+
+    free(data);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * The same public reader against a relation with an `inline` compound
+ * column -- the case the other three get_facts tests cannot reach, because
+ * every one of them declares a plain relation where the logical and
+ * physical widths are the same number.
+ *
+ * `.decl pred(id: int64, payload: f/2 inline)` is two declared columns and
+ * three physical slots.  *num_cols is the caller's row stride into *data,
+ * so it must be 3; wirelog.h documents exactly that as the public contract
+ * and the CHANGELOG leads its `Changed` section with it.  Reverting
+ * ir/api.c to `rel->column_count` returns 2 here, and an embedder indexing
+ * the buffer by it reads pred(1, 98) followed by whatever tuple 99 begins.
+ *
+ * The slot values are asserted, not just the count: rel->fact_data already
+ * holds three slots (collect_fact packs one per written argument), so a
+ * stride of 2 still yields a non-NULL buffer of plausible-looking numbers.
+ * Only the contents distinguish "the whole row" from "the row's prefix".
+ */
+static void
+test_api_get_facts_inline_compound_physical_width(void)
+{
+    TEST("wirelog_program_get_facts reports the physical stride");
+
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl pred(id: int64, payload: f/2 inline)\n"
+            "pred(1, 98, 99).\n",
+            NULL);
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    /* The declaration side stays logical: 2 columns, not 3. */
+    const wirelog_schema_t *schema = wirelog_program_get_schema(prog, "pred");
+    if (!schema || schema->column_count != 2) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "expected schema column_count 2, got %u",
+            schema ? schema->column_count : 0u);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    int64_t *data = NULL;
+    uint32_t num_rows = 0, num_cols = 0;
+    int rc
+        = wirelog_program_get_facts(prog, "pred", &data, &num_rows, &num_cols);
+    if (rc != 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "get_facts should return 0, got %d", rc);
+        free(data);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (num_rows != 1 || num_cols != 3) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+            "expected 1x3 (physical), got %ux%u", num_rows, num_cols);
+        free(data);
+        wirelog_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (!data || data[0] != 1 || data[1] != 98 || data[2] != 99) {
+        free(data);
+        wirelog_program_free(prog);
+        FAIL("expected the slots {1,98,99}");
         return;
     }
 
@@ -3978,6 +4144,8 @@ main(void)
     test_fact_arity_narrower_than_decl_rejected();
     test_fact_arity_decl_after_facts_rejected();
     test_fact_arity_wider_than_decl_rejected();
+    test_fact_arity_compound_handle_form_rejected();
+    test_fact_arity_side_compound_is_one_column();
     test_fact_arity_mixed_across_facts_rejected();
     test_fact_arity_zero_param_decl_rejected();
     test_fact_arity_matching_accepted();
@@ -3996,6 +4164,7 @@ main(void)
 
     /* Fact extraction API */
     test_api_get_facts();
+    test_api_get_facts_inline_compound_physical_width();
     test_api_get_facts_no_facts();
     test_api_get_facts_unknown_relation();
 

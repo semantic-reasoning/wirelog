@@ -186,11 +186,22 @@ wirelog_program_get_intern(const wirelog_program_t *prog);
  * Returns a flat row-major int64_t array of all facts declared for
  * the given relation.  Caller must free the returned array.
  *
+ * @p num_cols is the PHYSICAL row stride of @p data -- the number of
+ * int64_t slots each tuple occupies -- and it is what you must index by.
+ * It is not necessarily the declared column count reported by
+ * wirelog_program_get_schema(): a column declared as an `inline` compound
+ * (`.decl pred(id: int64, payload: f/2 inline)`) is one schema column but
+ * occupies its full arity of consecutive slots here, so that relation
+ * reports column_count 2 and num_cols 3.  The two agree for every relation
+ * that declares no inline compound column.  The signature is unchanged and
+ * no ABI break is involved, but this is a semantic change for an embedder
+ * that had treated the two as interchangeable: index by @p num_cols (#985).
+ *
  * @param prog       Compiled program
  * @param relation   Relation name (e.g., "edge")
  * @param data       Output: allocated array of int64_t values (caller frees)
  * @param num_rows   Output: number of fact tuples
- * @param num_cols   Output: number of columns per tuple
+ * @param num_cols   Output: physical slots per tuple (the row stride)
  * @return 0 on success, -1 on error (unknown relation), 1 if no facts
  */
 WIRELOG_API int
