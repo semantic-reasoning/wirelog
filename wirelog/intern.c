@@ -363,12 +363,23 @@ wl_intern_put(wl_intern_t *intern, const char *str)
     if (!intern || !str)
         return -1;
 
+    /* Prepare the owned copy before taking the writer lock.  strlen/malloc/
+     * memcpy are independent of the table and used to make every worker wait
+     * behind the lock while doing allocation and copying (#961).  A duplicate
+     * discovered below simply releases this speculative copy. */
+    size_t slen = strlen(str);
+    char *copy = (char *)malloc(slen + 1);
+    if (!copy)
+        return -1;
+    memcpy(copy, str, slen + 1);
+
     mutex_lock(&intern->lock);
 
     /* Check if already interned */
     uint32_t h = 0;
     int64_t existing = intern_lookup_locked(intern, str, &h);
     if (existing >= 0) {
+        free(copy);
         mutex_unlock(&intern->lock);
         return existing;
     }
@@ -377,17 +388,10 @@ wl_intern_put(wl_intern_t *intern, const char *str)
     uint32_t new_id = WL_INTERN_LOAD_RELAXED(&intern->count);
     if (new_id >= INTERN_MAX_STRINGS
         || intern_seg_ensure(intern, new_id) != 0) {
+        free(copy);
         mutex_unlock(&intern->lock);
         return -1;
     }
-
-    size_t slen = strlen(str);
-    char *copy = (char *)malloc(slen + 1);
-    if (!copy) {
-        mutex_unlock(&intern->lock);
-        return -1;
-    }
-    memcpy(copy, str, slen + 1);
 
     /* Resize hash table before insertion if the new entry would exceed the load factor. */
     if ((uint64_t)(new_id + 1U) * INTERN_LOAD_FACTOR_DEN
