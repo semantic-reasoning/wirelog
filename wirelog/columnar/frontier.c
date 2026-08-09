@@ -60,29 +60,99 @@ bitmask_or_simd(uint64_t dst, uint64_t src)
 }
 
 /*
- * stratum_references_relation - Return true if any VARIABLE op in stratum sp
+ * refset_names_relation - Return true if the reference set recorded at plan
+ * lowering (Issue #1019) names `rel`.
+ */
+static bool
+refset_names_relation(const wl_plan_refset_t *rs, const char *rel)
+{
+    for (uint32_t i = 0; i < rs->count; i++) {
+        if (rs->names[i] != NULL && strcmp(rs->names[i], rel) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * ops_reference_relation - Return true if any VARIABLE op in relation pr
  * references the relation named `rel`, or if any JOIN/ANTIJOIN/SEMIJOIN op
  * has right_relation matching `rel`.
+ *
+ * This sees only what survives in pr->ops, and two rewrites take the naming
+ * operators out of it by different means:
+ *   - rewrite_multiway_delta() moves them into wl_plan_op_k_fusion_t.k_ops[]
+ *     behind the K_FUSION op's opaque_data -- hidden, but still there;
+ *   - rewrite_lftj_chains() moves nothing.  build_lftj_op() copies only
+ *     rel_names[]/key_cols[] into wl_plan_op_lftj_t, and the caller then
+ *     free_op()s the original operators outright.
+ * Either way this returns false on a rewritten relation however many
+ * relations the rule really reads.
+ */
+static bool
+ops_reference_relation(const wl_plan_relation_t *pr, const char *rel)
+{
+    for (uint32_t oi = 0; oi < pr->op_count; oi++) {
+        if (pr->ops[oi].op == WL_PLAN_OP_VARIABLE
+            && pr->ops[oi].relation_name != NULL
+            && strcmp(pr->ops[oi].relation_name, rel) == 0) {
+            return true;
+        }
+        if ((pr->ops[oi].op == WL_PLAN_OP_JOIN
+            || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
+            || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
+            && pr->ops[oi].right_relation != NULL
+            && strcmp(pr->ops[oi].right_relation, rel) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * rule_references_relation - Return true if rule `ri` of stratum `sp` reads
+ * the relation named `rel`.
+ *
+ * Prefers the set recorded before any plan rewrite ran (Issue #1019), and
+ * falls back to the operator scan when that set does not answer yes.  The two
+ * arms are not equally load-bearing:
+ *
+ *   - The fallback IS load-bearing for hand-built plans.  Strata declared on
+ *     the stack in tests/test_affected_strata.c, tests/test_affected_rules.c
+ *     and tests/test_rule_level_frontier.c never run through
+ *     wl_plan_from_program(), so their rule_refs is NULL and the scan is the
+ *     only answer they have.  Those tests are the whole population: exec_plan.h
+ *     is not in wirelog_public_headers, so it is never installed, and
+ *     scripts/ci/check-advanced-header.sh allowlists what wirelog-advanced.h
+ *     may include -- exec_plan*.h is not on the list.  No installed header
+ *     exposes wl_plan_stratum_t, so a third-party embedder cannot fill one.
+ *
+ *   - The union is otherwise defensive only.  Instrumenting this function
+ *     over the full test suite measured ZERO cases where a recorded refset
+ *     said no and the operator scan said yes, so on today's repo the
+ *     exclusive form -- refset when present, scan otherwise -- would give
+ *     identical answers.  The scan arm is kept in case a future rewrite
+ *     introduces a name that lowering did not record; nothing exercises that
+ *     path today.
+ */
+static bool
+rule_references_relation(const wl_plan_stratum_t *sp, uint32_t ri,
+    const char *rel)
+{
+    if (sp->rule_refs != NULL && refset_names_relation(&sp->rule_refs[ri], rel))
+        return true;
+    return ops_reference_relation(&sp->relations[ri], rel);
+}
+
+/*
+ * stratum_references_relation - Return true if any rule of stratum sp reads
+ * the relation named `rel`.
  */
 static bool
 stratum_references_relation(const wl_plan_stratum_t *sp, const char *rel)
 {
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        const wl_plan_relation_t *pr = &sp->relations[ri];
-        for (uint32_t oi = 0; oi < pr->op_count; oi++) {
-            if (pr->ops[oi].op == WL_PLAN_OP_VARIABLE
-                && pr->ops[oi].relation_name != NULL
-                && strcmp(pr->ops[oi].relation_name, rel) == 0) {
-                return true;
-            }
-            if ((pr->ops[oi].op == WL_PLAN_OP_JOIN
-                || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
-                || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
-                && pr->ops[oi].right_relation != NULL
-                && strcmp(pr->ops[oi].right_relation, rel) == 0) {
-                return true;
-            }
-        }
+        if (rule_references_relation(sp, ri, rel))
+            return true;
     }
     return false;
 }
@@ -106,10 +176,18 @@ stratum_references_relation(const wl_plan_stratum_t *sp, const char *rel)
  * vorrq_u64 (NEON) or _mm_or_si128 (SSE2) instruction when those ISAs are
  * available. The scalar path is a plain | operator.
  *
- * Supports up to 64 strata (one uint64_t bitmask). Plans with more strata
- * will have bits beyond 63 silently ignored (conservative: returns 0 for
- * those strata, which causes them to be re-evaluated unconditionally by the
- * caller's fallback).
+ * Supports up to 64 strata (one uint64_t bitmask); strata 64 and above are
+ * clamped away below and never marked. There is no caller-side fallback that
+ * rescues them. The *evaluation* gates in col_session_step() and
+ * col_session_snapshot() test `affected_mask & ((uint64_t)1 << si)` with si
+ * bounded only by plan->stratum_count, so for si >= 64 the shift is undefined
+ * behaviour (C11 6.5.7p3), not a re-evaluation. The *frontier-reset* loops in
+ * col_session_snapshot() are the exception: they carry an explicit
+ * `&& si < MAX_STRATA` and so stop early rather than shifting out of range.
+ * Independently, MAX_STRATA (columnar/internal.h) caps the session's
+ * per-stratum frontier arrays at 32 while this mask is 64 wide, so strata
+ * 32..63 already run without per-stratum frontier tracking. Neither limit is
+ * enforced at plan construction; both need their own fix.
  *
  * @param session          Active session (must have a plan attached).
  * @param inserted_relation Name of the EDB relation receiving new facts.
@@ -196,32 +274,6 @@ col_compute_affected_strata(wl_session_t *session,
 /* ======================================================================== */
 
 /*
- * rule_references_relation - Return true if any VARIABLE op in relation pr
- * references the relation named `rel`.
- */
-static bool
-rule_references_relation(const wl_plan_relation_t *pr, const char *rel)
-{
-    for (uint32_t oi = 0; oi < pr->op_count; oi++) {
-        /* Check VARIABLE ops (left child of joins) */
-        if (pr->ops[oi].op == WL_PLAN_OP_VARIABLE
-            && pr->ops[oi].relation_name != NULL
-            && strcmp(pr->ops[oi].relation_name, rel) == 0) {
-            return true;
-        }
-        /* Check JOIN/ANTIJOIN/SEMIJOIN right_relation (right child of joins) */
-        if ((pr->ops[oi].op == WL_PLAN_OP_JOIN
-            || pr->ops[oi].op == WL_PLAN_OP_ANTIJOIN
-            || pr->ops[oi].op == WL_PLAN_OP_SEMIJOIN)
-            && pr->ops[oi].right_relation != NULL
-            && strcmp(pr->ops[oi].right_relation, rel) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
  * col_compute_affected_rules - Identify rules needing re-evaluation.
  *
  * Rules are enumerated globally across all strata in declaration order:
@@ -236,9 +288,11 @@ rule_references_relation(const wl_plan_relation_t *pr, const char *rel)
  *
  * SIMD: bitmask union uses bitmask_or_simd() (same helper as strata version).
  *
- * Supports up to 64 rules (one uint64_t bitmask). Plans with more rules will
- * have bits beyond 63 silently ignored (conservative: those rules are always
- * re-evaluated by the caller's fallback via UINT64_MAX mask).
+ * Supports up to 64 rules (one uint64_t bitmask, MAX_RULES). Rules past that
+ * are never enumerated and never marked. This is not conservative: the only
+ * caller (col_session_snapshot) uses the mask to decide which rule frontiers
+ * to reset, and an unmarked rule keeps the frontier it had, so an unreachable
+ * rule index is a skipped reset rather than a forced re-evaluation.
  *
  * @param session           Active session (must have a plan attached).
  * @param inserted_relation Name of the EDB relation receiving new facts.
@@ -296,9 +350,8 @@ col_compute_affected_rules(wl_session_t *session, const char *inserted_relation)
 
     /* --- Pass 1: seed rules that directly reference inserted_relation --- */
     for (uint32_t i = 0; i < nrules; i++) {
-        const wl_plan_relation_t *pr
-            = &plan->strata[rule_si[i]].relations[rule_ri[i]];
-        if (rule_references_relation(pr, inserted_relation)) {
+        if (rule_references_relation(&plan->strata[rule_si[i]], rule_ri[i],
+            inserted_relation)) {
             affected = bitmask_or_simd(affected, (uint64_t)1 << i);
         }
     }
@@ -329,9 +382,8 @@ col_compute_affected_rules(wl_session_t *session, const char *inserted_relation)
             for (uint32_t j = 0; j < nrules; j++) {
                 if (affected & ((uint64_t)1 << j))
                     continue; /* already marked */
-                const wl_plan_relation_t *pr
-                    = &plan->strata[rule_si[j]].relations[rule_ri[j]];
-                if (rule_references_relation(pr, head)) {
+                if (rule_references_relation(&plan->strata[rule_si[j]],
+                    rule_ri[j], head)) {
                     affected = bitmask_or_simd(affected, (uint64_t)1 << j);
                 }
             }

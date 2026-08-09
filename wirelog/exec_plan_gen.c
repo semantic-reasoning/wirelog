@@ -3160,6 +3160,113 @@ rewrite_lftj_chains(wl_plan_t *plan)
 }
 
 /* ======================================================================== */
+/* Referenced-relation sets (Issue #1019)                                   */
+/* ======================================================================== */
+
+/*
+ * plan_refsets_free - Release a wl_plan_stratum_t.rule_refs array of @count
+ * entries.  NULL-safe; entries with a NULL names array are skipped.
+ */
+static void
+plan_refsets_free(wl_plan_refset_t *refs, uint32_t count)
+{
+    if (!refs)
+        return;
+    for (uint32_t r = 0; r < count; r++) {
+        for (uint32_t i = 0; i < refs[r].count; i++)
+            free(refs[r].names[i]);
+        free(refs[r].names);
+    }
+    free(refs);
+}
+
+/*
+ * plan_op_referenced_relation - Name of the relation read by @op, using
+ * exactly the predicate the frontier scan in columnar/frontier.c applies:
+ * WL_PLAN_OP_VARIABLE contributes relation_name, JOIN/ANTIJOIN/SEMIJOIN
+ * contribute right_relation.  Every other operator contributes nothing.
+ * Returns NULL when the operator names no relation.
+ */
+static const char *
+plan_op_referenced_relation(const wl_plan_op_t *op)
+{
+    if (op->op == WL_PLAN_OP_VARIABLE)
+        return op->relation_name;
+    if (op->op == WL_PLAN_OP_JOIN || op->op == WL_PLAN_OP_ANTIJOIN
+        || op->op == WL_PLAN_OP_SEMIJOIN)
+        return op->right_relation;
+    return NULL;
+}
+
+/*
+ * plan_stratum_record_refs - Record, per relation of @st, the de-duplicated
+ * set of relation names its operators read (Issue #1019).
+ *
+ * Must be called while @st->relations still holds the operator list produced
+ * by IR lowering.  Two rewrites destroy that list, by different means:
+ * rewrite_multiway_delta() replaces it with a K_FUSION operator that holds the
+ * real operators in opaque_data (wl_plan_op_k_fusion_t.k_ops[]), whereas
+ * rewrite_lftj_chains() replaces the chain with an LFTJ operator whose
+ * opaque_data holds only wl_plan_op_lftj_t.rel_names[]/key_cols[] -- the
+ * original operators are free_op()d, not carried.  After either rewrite no
+ * scan of @st->relations[i].ops can recover the names, and
+ * col_compute_affected_strata() concludes that the stratum reads nothing.
+ *
+ * Returns 0 on success, -1 on allocation failure with @st->rule_refs left NULL
+ * (consumers then fall back to the operator scan).
+ */
+static int
+plan_stratum_record_refs(wl_plan_stratum_t *st)
+{
+    if (st->relation_count == 0 || !st->relations)
+        return 0;
+
+    wl_plan_refset_t *refs = (wl_plan_refset_t *)calloc(
+        st->relation_count, sizeof(wl_plan_refset_t));
+    if (!refs)
+        return -1;
+
+    for (uint32_t r = 0; r < st->relation_count; r++) {
+        const wl_plan_relation_t *rel = &st->relations[r];
+        if (rel->op_count == 0 || !rel->ops)
+            continue;
+
+        /* Each operator contributes at most one name, so op_count is a
+         * sufficient upper bound before de-duplication. */
+        char **names = (char **)calloc(rel->op_count, sizeof(char *));
+        if (!names) {
+            plan_refsets_free(refs, st->relation_count);
+            return -1;
+        }
+        refs[r].names = names;
+
+        for (uint32_t o = 0; o < rel->op_count; o++) {
+            const char *name = plan_op_referenced_relation(&rel->ops[o]);
+            if (!name)
+                continue;
+
+            bool seen = false;
+            for (uint32_t i = 0; i < refs[r].count && !seen; i++) {
+                if (strcmp(names[i], name) == 0)
+                    seen = true;
+            }
+            if (seen)
+                continue;
+
+            names[refs[r].count] = dup_str(name);
+            if (!names[refs[r].count]) {
+                plan_refsets_free(refs, st->relation_count);
+                return -1;
+            }
+            refs[r].count++;
+        }
+    }
+
+    st->rule_refs = refs;
+    return 0;
+}
+
+/* ======================================================================== */
 /* Public API                                                               */
 /* ======================================================================== */
 
@@ -3186,6 +3293,9 @@ wl_plan_free(wl_plan_t *plan)
                 }
                 free((void *)st->relations);
             }
+            /* Issue #1019: parallel to st->relations, so freed with the same
+             * count.  relation_count is 0 whenever relations is NULL. */
+            plan_refsets_free(st->rule_refs, st->relation_count);
         }
         free((void *)plan->strata);
     }
@@ -3518,6 +3628,17 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         free((void *)unique_names);
         dst->relations = rels;
         dst->relation_count = unique_count;
+
+        /* Issue #1019: record what each relation reads while @ops is still the
+         * lowered operator list.  Deliberately placed after the ownership
+         * transfer above, not next to the rels[u].ops assignment: from here on
+         * wl_plan_free() reaches every allocation made so far, so the failure
+         * path does not have to unwind rels[] by hand.  Still ahead of all four
+         * rewrites below, which is what the record is for. */
+        if (plan_stratum_record_refs(dst) != 0) {
+            wl_plan_free(plan);
+            return -1;
+        }
     }
 
     /* Rewrite K-atom recursive rules for complete semi-naive evaluation.

@@ -2403,6 +2403,38 @@ test_cli_watch_exe = executable(
 
 test('cli_watch', test_cli_watch_exe)
 
+# ============================================================================
+# Affected Strata Across Plan Rewrites (Issue #1019)
+# ============================================================================
+
+test_affected_strata_rewrites_exe = executable(
+  'test_affected_strata_rewrites',
+  files('test_affected_strata_rewrites.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  driver_src,
+  '../wirelog/wirelog-easy.c',
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+# Issue #1019: allocation-heavy -- ten plan builds plus four end-to-end
+# incremental runs at W in {1,2,4,8}, each stepping the session once per
+# inserted edge.  Measured under `meson test` on the dev host at 1.67s
+# (release) and 0.33s (address,undefined); the release figure is dominated by
+# MALLOC_PERTURB_, which meson sets for every test and which makes glibc
+# scrub every one of those allocations.  That leaves little margin on a
+# loaded or slower CI runner, so take the same explicit override the other
+# allocation-heavy cases here use rather than riding the 30s default.
+test('affected_strata_rewrites', test_affected_strata_rewrites_exe,
+     timeout: 120)
+
 test_cli_delta_exe = executable(
   'test_cli_delta',
   files('test_cli_delta.c'),
