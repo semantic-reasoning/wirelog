@@ -7,9 +7,9 @@
  * single LFTJ op.  Both move the operators that name the relations being read
  * into wl_plan_op_t.opaque_data, where col_compute_affected_strata()'s
  * operator scan cannot see them.  The stratum then looks like it reads
- * nothing: incremental inserts derive no tuples and, because
- * col_session_step() intersects the removal mask into UINT64_MAX, retracted
- * tuples are retained.
+ * nothing: incremental inserts derive no tuples and, because a removal-only
+ * step takes the removal's mask as its whole affected-strata mask, a blinded
+ * 0 leaves no stratum to run and retracted tuples are retained.
  *
  * Every case here builds a REAL plan through wl_plan_from_program() and
  * asserts its own premise -- that the blinding operator it targets is
@@ -892,9 +892,16 @@ test_incremental_matches_full_eval(void)
 /* ======================================================================== */
 
 /*
- * col_session_step() starts from UINT64_MAX and *intersects* the removal
- * mask, so a blinded 0 zeroes the whole mask and every retracted tuple is
- * retained.  This is the only case that exercises that line.
+ * col_session_step() unions the removal mask into a 0-seeded affected-strata
+ * mask (Issue #1031), so on this removal-only step the removal mask IS the
+ * whole mask: a blinded 0 skips every stratum and every retracted tuple is
+ * retained.
+ *
+ * The retraction step is not unique to this case -- incremental_paths() also
+ * runs it from test_incremental_matches_full_eval() above, once per worker
+ * count.  What is unique here is the assertion: those cases compare only the
+ * final tuple set, while this one pins the exact set of tuples the retraction
+ * had to remove.
  */
 static void
 test_retraction_emits_exact_negative_deltas(void)

@@ -2002,22 +2002,34 @@ col_session_step(wl_session_t *session)
         return 0;
 
     /* Compute affected strata bitmask (Phase 4 incremental skip).
-     * When last_inserted_relation is set (incremental path), only evaluate
-     * strata that transitively depend on the inserted relation.  When NULL
-     * (regular step), UINT64_MAX means all strata are evaluated. */
+     * A step may carry both an insertion and a removal, and the two
+     * relations need not share a stratum, so the mask is the UNION of the
+     * strata reachable from each -- seeded at 0 so a single-source step
+     * still narrows to just that source's strata (Issue #1031).  When
+     * neither pointer is set (regular step) UINT64_MAX means all strata are
+     * evaluated, and pending_full_input_eval ("this step cannot be
+     * incremental") keeps that default no matter what is pending. */
     uint64_t affected_mask = UINT64_MAX;
-    if (!sess->pending_full_input_eval &&
-        sess->last_inserted_relation != NULL) {
-        affected_mask = col_compute_affected_strata(
-            session, sess->last_inserted_relation);
+    if (!sess->pending_full_input_eval
+        && (sess->last_inserted_relation != NULL
+        || sess->last_removed_relation != NULL)) {
+        affected_mask = 0;
+        if (sess->last_inserted_relation != NULL) {
+            affected_mask |= col_compute_affected_strata(
+                session, sess->last_inserted_relation);
+        }
+        if (sess->last_removed_relation != NULL) {
+            affected_mask |= col_compute_affected_strata(
+                session, sess->last_removed_relation);
+        }
     }
 
-    /* Issue #158: Pre-seed retraction deltas for affected strata.
-     * If last_removed_relation is set (removal via col_session_remove_incremental),
-     * check if $r$<name> exists for retractions, and set retraction_seeded. */
+    /* Issue #158: Pre-seed retraction deltas.  If last_removed_relation is
+     * set (removal via col_session_remove_incremental), check if $r$<name>
+     * exists for retractions, and set retraction_seeded.  This block does
+     * not narrow affected_mask; the removal's contribution to it is unioned
+     * in above (Issue #1031). */
     if (sess->last_removed_relation != NULL) {
-        affected_mask &= col_compute_affected_strata(
-            session, sess->last_removed_relation);
         char rname[256];
         if (retraction_rel_name(sess->last_removed_relation, rname,
             sizeof(rname))
