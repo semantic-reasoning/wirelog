@@ -188,8 +188,8 @@ relation_info_free(wl_ir_relation_info_t *info)
             free(info->input_param_names[i]);
             free(info->input_param_values[i]);
         }
-        free(info->input_param_names);
-        free(info->input_param_values);
+        free((void *)info->input_param_names);
+        free((void *)info->input_param_values);
     }
     free(info->input_io_scheme);
     free(info->output_file);
@@ -238,14 +238,14 @@ wl_ir_program_free(struct wirelog_program *program)
             if (program->relation_irs[i]
                 && program->relation_irs[i]->type == WIRELOG_IR_UNION) {
                 /* Detach children (rule ir_roots) so they aren't freed here */
-                free(program->relation_irs[i]->children);
+                free((void *)program->relation_irs[i]->children);
                 program->relation_irs[i]->children = NULL;
                 program->relation_irs[i]->child_count = 0;
                 wl_ir_node_free(program->relation_irs[i]);
             }
             /* Non-UNION entries are aliases to rule ir_roots, freed below */
         }
-        free(program->relation_irs);
+        free((void *)program->relation_irs);
     }
 
     /* Free rules (owns ir_root nodes) */
@@ -494,8 +494,8 @@ collect_input(struct wirelog_program *prog,
             free(rel->input_param_names[i]);
             free(rel->input_param_values[i]);
         }
-        free(rel->input_param_names);
-        free(rel->input_param_values);
+        free((void *)rel->input_param_names);
+        free((void *)rel->input_param_values);
         rel->input_param_names = NULL;
         rel->input_param_values = NULL;
         rel->input_param_count = 0;
@@ -508,7 +508,7 @@ collect_input(struct wirelog_program *prog,
     for (uint32_t i = 0; i < input_node->child_count; i++) {
         if (input_node->children[i]->type == WL_PARSER_AST_NODE_INPUT_PARAM) {
             if (input_node->children[i]->name
-                && strncmp("io", input_node->children[i]->name, 3) == 0) {
+                && strcmp(input_node->children[i]->name, "io") == 0) {
                 rel->input_io_scheme
                     = strdup_safe(input_node->children[i]->str_value);
             } else {
@@ -528,8 +528,14 @@ collect_input(struct wirelog_program *prog,
         for (uint32_t i = 0; i < input_node->child_count; i++) {
             const wl_parser_ast_node_t *param = input_node->children[i];
             if (param->type == WL_PARSER_AST_NODE_INPUT_PARAM) {
-                if (param->name && strncmp(param->name, "io", 3) == 0)
+                if (param->name && strcmp(param->name, "io") == 0)
                     continue;
+                /* idx < param_count: this loop walks the same children with
+                 * the same "io" predicate the counting loop above used, so
+                 * it writes exactly param_count entries.  The analyzer
+                 * models each strcmp() call site as an independent opaque
+                 * value and so cannot relate the two tallies. */
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                 rel->input_param_names[idx] = strdup_safe(param->name);
                 rel->input_param_values[idx] = strdup_safe(param->str_value);
                 idx++;
@@ -1147,7 +1153,7 @@ free_var_names(char **names, uint32_t count)
     for (uint32_t i = 0; i < count; i++) {
         free(names[i]);
     }
-    free(names);
+    free((void *)names);
 }
 
 static char **
@@ -1167,6 +1173,12 @@ merge_var_names(char **left, uint32_t left_count, char **right,
     }
 
     for (uint32_t i = 0; i < right_count; i++) {
+        /* left_count + i < max_count by construction.  The analyzer reaches
+         * this store only along a path where max_count == 0 while
+         * left_count > 0, i.e. where the uint32_t sum above wrapped; that
+         * needs ~2^32 variable slots, each already backed by a char * in
+         * these arrays and by a parsed token upstream. */
+        // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
         merged[left_count + i] = right[i] ? strdup_safe(right[i]) : NULL;
     }
 
@@ -1230,6 +1242,12 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
             if (!right_vars[j])
                 continue;
             if (strcmp(left_vars[i], right_vars[j]) == 0) {
+                /* k < key_count: this loop is the counting loop above run
+                 * again over the same arrays with the same predicate, so it
+                 * takes this branch exactly key_count times.  The analyzer
+                 * models each strcmp() call site as an independent opaque
+                 * value and so cannot relate the two tallies. */
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                 join->join_left_keys[k] = strdup_safe(left_vars[i]);
                 join->join_right_keys[k] = strdup_safe(right_vars[j]);
                 k++;
@@ -1652,8 +1670,8 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     if (!scan->column_names || !scan->column_types || !var_names
         || !physical_args || !side_bindings) {
         free(side_bindings);
-        free(physical_args);
-        free(var_names);
+        free((void *)physical_args);
+        free((void *)var_names);
         wl_ir_node_free(scan);
         return NULL;
     }
@@ -1671,12 +1689,27 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
      * last one, and the resulting mistype is silent: a physical integer
      * column that inherits `string` makes wl_intern_reverse return NULL, and
      * WL_PLAN_EXPR_CMP_STR_LT then drops every row (Issue #962).
+     *
+     * phys_idx stays below physical_count, and reaches exactly it, because
+     * atom_physical_column_count() runs this same walk: it starts at
+     * arg_count and adds compound_arity - 1 for precisely the arguments the
+     * INLINE arm below expands, and compound_arg_matches_decl() has already
+     * established arg->child_count == compound_arity for those.  Every other
+     * arm advances by one, matching the one slot the count started with.
+     * The `compound_arity > 0` guard the count walk carries and this one does
+     * not is not a divergence: INLINE implies compound_arity >= 1, for the
+     * reason declared_physical_column_count() sets out above.
+     * The four stores below therefore cannot run off physical_args; the
+     * NOLINTs are there because the analyzer does not inline
+     * atom_physical_column_count() and so explores paths where its result is
+     * unrelated to arg_count (physical_count == 0 with arg_count > 0).
      */
     uint32_t phys_idx = 0;
     uint32_t side_binding_count = 0;
     for (uint32_t i = 0; i < arg_count; i++) {
         const wl_parser_ast_node_t *arg = atom->children[i];
         if (arg->type == WL_PARSER_AST_NODE_VARIABLE) {
+            // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             physical_args[phys_idx] = arg;
             scan->column_names[phys_idx] = strdup_safe(arg->name);
             scan->column_types[phys_idx] = declared_coltype(rel_info, i);
@@ -1688,6 +1721,7 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             && compound_arg_functor_matches(arg, &rel_info->columns[i], prog)) {
             for (uint32_t c = 0; c < arg->child_count; c++) {
                 const wl_parser_ast_node_t *child = arg->children[c];
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                 physical_args[phys_idx] = child;
                 if (child->type == WL_PARSER_AST_NODE_VARIABLE) {
                     scan->column_names[phys_idx] = strdup_safe(child->name);
@@ -1707,6 +1741,7 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             == WIRELOG_COMPOUND_KIND_SIDE
             && compound_arg_functor_matches(arg, &rel_info->columns[i], prog)) {
             char *handle_var = make_side_handle_var(atom, i);
+            // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             physical_args[phys_idx] = arg;
             if (handle_var) {
                 scan->column_names[phys_idx] = strdup_safe(handle_var);
@@ -1720,6 +1755,7 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             phys_idx++;
         } else {
             /* Wildcard, integer, string -> NULL (anonymous position) */
+            // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             physical_args[phys_idx] = arg;
             scan->column_names[phys_idx] = NULL;
             scan->column_types[phys_idx] = declared_coltype(rel_info, i);
@@ -1829,6 +1865,12 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     /* Step 1b: Intra-atom FILTER for constants */
     for (uint32_t i = 0; i < physical_count; i++) {
         const wl_parser_ast_node_t *arg = physical_args[i];
+        /* Every slot below physical_count was written by the mapping loop
+         * above -- see the note on physical_count there -- so no calloc'd
+         * NULL survives.  The analyzer does not inline
+         * atom_physical_column_count(), so it explores the infeasible
+         * physical_count > 0 with arg_count == 0. */
+        // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
         if (arg->type == WL_PARSER_AST_NODE_INTEGER) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_INT);
             if (rhs) {
@@ -1887,7 +1929,7 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     for (uint32_t i = 0; i < side_binding_count; i++)
         free(side_bindings[i].handle_var);
     free(side_bindings);
-    free(physical_args);
+    free((void *)physical_args);
     *out_var_names = result_vars;
     *out_var_count = result_vcount;
     return result;
@@ -2070,8 +2112,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     char ***scan_vars = (char ***)calloc(scan_cap, sizeof(char **));
     uint32_t *scan_vcounts = (uint32_t *)calloc(scan_cap, sizeof(uint32_t));
     if (!scans || !scan_vars || !scan_vcounts) {
-        free(scans);
-        free(scan_vars);
+        free((void *)scans);
+        free((void *)scan_vars);
         free(scan_vcounts);
         return NULL;
     }
@@ -2145,6 +2187,13 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
 
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
+        /* children[0 .. child_count) is never NULL:
+         * wl_parser_ast_node_add_child() (parser/ast.c) returns without
+         * storing anything when child is NULL, so a NULL child never
+         * consumes a slot and never bumps child_count.  The analyzer infers
+         * nullability here only from the belt-and-braces `if (!b) continue;`
+         * in the Step 1 loop above, which is defensive, not a live case. */
+        // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
         if (b->type == WL_PARSER_AST_NODE_COMPARISON && current) {
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
             if (!f)
@@ -2198,8 +2247,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 if (cur_vars_is_merged)
                     free_var_names(cur_vars, cur_vcount);
                 wl_ir_node_free(current);
-                free(scans);
-                free(scan_vars);
+                free((void *)scans);
+                free((void *)scan_vars);
                 free(scan_vcounts);
                 return NULL;
             }
@@ -2243,8 +2292,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 if (cur_vars_is_merged)
                     free_var_names(cur_vars, cur_vcount);
                 wl_ir_node_free(current);
-                free(scans);
-                free(scan_vars);
+                free((void *)scans);
+                free((void *)scan_vars);
                 free(scan_vcounts);
                 return NULL;
             }
@@ -2367,8 +2416,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         free_var_names(cur_vars, cur_vcount);
     }
 
-    free(scans);
-    free(scan_vars);
+    free((void *)scans);
+    free((void *)scan_vars);
     free(scan_vcounts);
 
     return root;
@@ -2555,13 +2604,13 @@ wl_ir_program_rebuild_relation_irs(struct wirelog_program *prog)
         for (uint32_t i = 0; i < prog->relation_count; i++) {
             if (prog->relation_irs[i]
                 && prog->relation_irs[i]->type == WIRELOG_IR_UNION) {
-                free(prog->relation_irs[i]->children);
+                free((void *)prog->relation_irs[i]->children);
                 prog->relation_irs[i]->children = NULL;
                 prog->relation_irs[i]->child_count = 0;
                 wl_ir_node_free(prog->relation_irs[i]);
             }
         }
-        free(prog->relation_irs);
+        free((void *)prog->relation_irs);
         prog->relation_irs = NULL;
     }
 
