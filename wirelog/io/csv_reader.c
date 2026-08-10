@@ -239,6 +239,10 @@ csv_next_line(csv_line_reader_t *r, char **out_line, size_t *out_len)
                 break;
             r->chunk_len = fread(r->chunk, 1, WL_CSV_READ_CHUNK, r->f);
             r->chunk_pos = 0;
+            if (ferror(r->f))
+                return WL_CSV_ERR_ARGS;
+            /* A short read on a regular file means the next refill is EOF. */
+            r->eof = r->chunk_len < WL_CSV_READ_CHUNK;
             if (r->chunk_len == 0) {
                 /*
                  * fgets() reported EOF and a read error the same way, so
@@ -247,14 +251,11 @@ csv_next_line(csv_line_reader_t *r, char **out_line, size_t *out_len)
                  * prefix of a file is the same failure mode as silently
                  * keeping a prefix of a line; report it instead.
                  */
-                if (ferror(r->f))
-                    return WL_CSV_ERR_ARGS;
-                r->eof = 1;
                 break;
             }
         }
 
-        char *base = r->chunk + r->chunk_pos;
+        const char *base = r->chunk + r->chunk_pos;
         size_t avail = r->chunk_len - r->chunk_pos;
         char *nl = (char *)memchr(base, '\n', avail);
 
@@ -266,18 +267,22 @@ csv_next_line(csv_line_reader_t *r, char **out_line, size_t *out_len)
              */
             size_t n = (size_t)(nl - base) + 1;
             r->chunk_pos += n;
-            int rc = csv_finish_line(base, &n);
+            int rc = csv_finish_line((char *)base, &n);
             if (rc != WL_CSV_OK)
                 return rc;
-            *out_line = base;
+            *out_line = (char *)base;
             *out_len = n;
             return 1;
         }
 
         size_t take = nl ? (size_t)(nl - base) + 1 : avail;
+        /* base aliases r->chunk; csv_reader_dispose owns its lifetime. */
+        // NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
         int rc = csv_line_append(r, base, take);
-        if (rc != WL_CSV_OK)
+        if (rc != WL_CSV_OK) {
+            csv_reader_dispose(r);
             return rc;
+        }
         spilled = 1;
         r->chunk_pos += take;
         if (nl)

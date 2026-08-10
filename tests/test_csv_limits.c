@@ -627,7 +627,7 @@ test_line_ceiling_enforced(void)
     test_tmppath(out_path, sizeof(out_path), "wl_csv953_ceiling_out.txt");
 
     const size_t n = (size_t)20 * 1024 * 1024;
-    const size_t block = 64 * 1024;
+    const size_t block = (size_t)64 * 1024;
     char *buf = (char *)malloc(block);
     if (!buf) {
         FAIL("out of memory building fixture");
