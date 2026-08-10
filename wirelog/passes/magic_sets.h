@@ -41,10 +41,23 @@ struct wirelog_program;
  * Statistics from a single Magic Sets pass invocation.
  *
  * @demand_roots:           Relations identified as demand roots.
- * @adorned_predicates:     Unique (relation, adornment) pairs with bound_mask != 0.
+ * @adorned_predicates:     Unique (relation, adornment) pairs with bound_mask
+ *                         != 0 that survived the guard-viability closure --
+ *                         that is, the ones a magic relation was created for.
+ *                         A pair the closure dropped is counted only by
+ *                         @unrestrictable_relations (#1027).
  * @magic_rules_generated:  Magic demand propagation rules added.
  * @original_rules_modified: Original rules with magic guards inserted.
- * @skipped_all_free:       Adorned predicates skipped (all-free adornment).
+ * @skipped_all_free:       Demand *roots* skipped because the demand itself is
+ *                         all-free (bound_mask == 0), the default for a
+ *                         .output relation with no bound .query.  A Phase 1
+ *                         event and a genuine optimisation skip: there is no
+ *                         restriction to propagate, so the pass declines and
+ *                         the program is left as written.  Nothing is lost.
+ *                         An all-free IDB *body occurrence* is a different
+ *                         event and is counted by @unrestrictable_relations
+ *                         below; it used to share this counter, which
+ *                         conflated a no-op with a correctness constraint.
  * @arity_mismatch_skipped: Demands skipped due to adornment count/arity mismatch.
  * @skipped_aggregate:     Aggregate rules skipped because Magic Sets cannot
  *                         safely insert magic guards into them yet.
@@ -81,23 +94,106 @@ struct wirelog_program;
  *                         2 BFS, so they never enter `processed` and the guard
  *                         loop never sees them.  The wide head is what remains
  *                         reachable in practice.
+ * @unrestrictable_relations: Relations excluded from the transformation
+ *                         entirely by the guard-viability closure (#1027).
+ *                         Seeded by an IDB body occurrence that binds nothing
+ *                         -- such an occurrence needs every tuple of the
+ *                         relation, and this pass cannot hand one occurrence
+ *                         an unguarded copy, because insert_magic_guard()
+ *                         rewrites the rule root in place and one set of rules
+ *                         serves every adornment.  Closed under "R unguarded
+ *                         implies every IDB R reads is unguarded", since an
+ *                         unguarded R evaluated against a guarded child has
+ *                         its own fixpoint cut.  Every member gets no magic
+ *                         relation, no demand rule and no guard.
+ *                         This is an over-approximation, not a lost-answers
+ *                         count.  It is seeded from an occurrence's binding
+ *                         pattern alone, and a binding pattern does not decide
+ *                         whether the occurrence contributes anything for the
+ *                         seeded demand -- a rule whose body is empty for that
+ *                         demand is guarded soundly and completely despite
+ *                         reading its relation all-free.  The closure has no
+ *                         way to tell those apart, so it excludes both.  What
+ *                         the counter reports is how much of the program the
+ *                         pass declined to optimise in order to stay correct.
  *
- * Both skip counters describe a rule that is evaluated unrestricted, which is
- * sound but unoptimized.  They are the only signal that a demand did not reach
- * it -- but only for a caller that supplies a stats struct.  The library's own
- * pipeline passes NULL (api_facade.c), so in a shipping build nothing reads
- * them; they are observability for tests and embedders, not a runtime warning.
- * A rule missing from both counters is guarded, which is not the same as
- * correctly restricted: a guard prunes only what its demand relation was
- * populated with, so a rule guarded on a demand no propagation rule ever fills
- * loses answers instead of saving work (#1027).  Guarding is complete only
- * when the demand actually propagates; these counters measure the first half.
- * They are kept apart because they are reported at different points, not
- * because the split is clean: as noted above, one capability gap is currently
- * counted on the policy side.
+ *                         That cost is not small, and its dominant trigger has
+ *                         a name: a rule with a constant in the bound head
+ *                         position, `X(1, y) :- ...` under `.query X(b, f)`.
+ *                         get_head_vars() yields no variable for a constant
+ *                         position, so Phase 2's `bound` set starts empty,
+ *                         so *every* IDB in that rule's body binds nothing and
+ *                         seeds the closure, and the transitive step unguards
+ *                         the whole subprogram reachable from there.  One
+ *                         character does it: changing `X(a, b) :- p(a, b),
+ *                         q(a, b).` to `X(1, b) :- p(a, b), q(a, b).` takes
+ *                         the same program from 4 adorned predicates and 4
+ *                         guards to 2 and 1.
+ *
+ *                         Measured over a 342-program census on which the pass
+ *                         with and without this closure are both sound and
+ *                         query-complete: the unguarded oracle derives 1785
+ *                         rows, the pass without the closure 820, and with it
+ *                         1085 -- so about a third of the pruning is given
+ *                         back.  It derives more than the pass without it on
+ *                         94 of the 342, roughly one program in five, which is
+ *                         not a corner case.  A separate sample found the
+ *                         constant-in-bound-head shape in almost every program
+ *                         the closure made lossier; that sample and the 342
+ *                         census are different runs and their counts do not
+ *                         combine, so take the shape as the dominant trigger
+ *                         and the 94 as the rate.
+ *
+ *                         Does not reach a relation read under negation
+ *                         (#1047), which is invisible to the walk this closure
+ *                         uses, or one defined by an aggregate rule (#1048),
+ *                         which the walk tests for and steps over.  Neither is
+ *                         left unaffected, though.  Under negation the closure
+ *                         can leave R unguarded while a relation R reads
+ *                         negatively stays guarded, i.e. partial -- measured,
+ *                         that turns #1047's pre-existing defect from lost
+ *                         answers into unsound ones.  See close_unrestrictable()
+ *                         in magic_sets.c for the program and the row counts.
+ *
+ * The two skip counters describe a rule the pass declined to guard.  That is
+ * sound *in isolation* but is not a "sound but unoptimized" outcome in
+ * general: an unrestricted rule that reads a relation the pass did guard is
+ * reading a partial relation, which is unsound under negation (#1047) and
+ * wrong-valued under aggregation (#1048).  Correctness comes from the whole
+ * assignment of guards being consistent, not from any one rule's skip; the
+ * guard-viability closure above is what enforces that for the shapes it can
+ * see, and the two issues named are the shapes it cannot.
+ *
+ * They are the only signal that a demand did not reach a rule -- but only for
+ * a caller that supplies a stats struct.  The library's own pipeline passes
+ * NULL (api_facade.c), so in a shipping build nothing reads them; they are
+ * observability for tests and embedders, not a runtime warning.  A rule
+ * missing from both counters is not necessarily guarded either: a rule of a
+ * relation in @unrestrictable_relations is unguarded and is counted by none of
+ * the three, because Phase 4b never walks it.  Being guarded is in turn not
+ * the same as being correctly restricted: a guard prunes only what its demand
+ * relation was populated with, so a rule guarded on a demand no propagation
+ * rule ever fills loses answers instead of saving work.  That is exactly the
+ * failure #1027 fixed, and the closure now removes the relation from the
+ * transformation rather than guarding it on a demand that stays empty.  The
+ * two skip counters are kept apart because they are reported at different
+ * points, not because the split is clean: as noted above, one capability gap
+ * is currently counted on the policy side.
  *
  * @original_rules_modified counts guards actually inserted.  A rule counted in
- * either skip counter is not counted there.
+ * either skip counter is not counted there, and neither is a rule of a
+ * relation in @unrestrictable_relations -- Phase 4b never reaches it.
+ *
+ * The pass can also decline outright, leaving the program exactly as written:
+ * that happens when the guard-viability closure cannot be completed, which
+ * today means a rule with more than MS_MAX_ATOMS body atoms somewhere under an
+ * unguardable relation.  It returns 0 with `magic_sets_applied` still false and
+ * both @adorned_predicates and @unrestrictable_relations at 0, and warns on
+ * stderr.  Declining is deliberate: the closure walks rules Phase 2 never
+ * reached, so it is the first thing in the pass able to trip over such a rule
+ * in a subprogram the demand never touched, and returning an error there would
+ * surface through api_facade.c as WIRELOG_ERR_MEMORY and fail
+ * wirelog_optimize() for a program that optimized before.
  */
 typedef struct {
     uint32_t demand_roots;
@@ -109,6 +205,7 @@ typedef struct {
     uint32_t skipped_aggregate;
     uint32_t skipped_constant_head;
     uint32_t skipped_unsupported_head;
+    uint32_t unrestrictable_relations;
 } wl_magic_sets_stats_t;
 
 /* ======================================================================== */

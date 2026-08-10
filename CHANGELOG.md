@@ -155,6 +155,78 @@ All notable changes to wirelog are documented in this file.
   physical today converts a warning plus correct output into silence plus
   zero rows. It is blocked on #989, not overlooked.
 
+- **Magic Sets no longer guards a relation it never generates a demand for**
+  (#1027): when an IDB body occurrence binds none of its columns, Phase 2 adds
+  no adorned predicate for that relation and Phase 4a generates no demand rule
+  -- but Phase 4b guarded its rules anyway. The relation was then restricted to
+  a demand relation nothing ever populates, while its own body needed it
+  unrestricted, so the recursion was cut. Left-recursive `p` under
+  `.query p(f, b)` over `e = {(1,2), (2,3), (3,4)}`, demand seeded at `y = 4`,
+  answered with one tuple against a six-tuple closure, losing two of the three
+  the query asked for. Measured identically with Logic Fusion on and off, and
+  with and without a filter on the rules, so this is not a #990 artifact.
+
+  A guard-viability closure now runs between Phase 2 and Phase 3. It is seeded
+  with every relation such an occurrence reads and closed under "R unguarded
+  implies every IDB R reads is unguarded" -- an unguarded relation is evaluated
+  in full, so a guarded child would cut its fixpoint one level down instead.
+  Every relation in the closure is dropped from the transformation entirely: no
+  magic relation, no demand rule (including demand rules that other, guarded
+  relations would otherwise key on it), no guard. Rules outside the closure are
+  guarded and pruned exactly as before. The correct fix is predicate splitting,
+  which this pass cannot do -- `insert_magic_guard` rewrites the rule root in
+  place, so one set of rules serves every adornment of a relation.
+
+  The Phase 2 event has its own statistic, `unrestrictable_relations`, instead
+  of sharing `skipped_all_free` with the unrelated Phase 1 event (a demand root
+  adorned all-free, which is a genuine no-op). Read it as "how much of the
+  program the pass declined to optimise in order to stay correct", not as "how
+  many answers were lost": it is seeded from a binding pattern, which does not
+  decide whether the occurrence contributes anything for the demand actually
+  seeded.
+
+  **The pruning this costs is not marginal.** Its dominant trigger is a rule
+  with a constant in the bound head position, `X(1, y) :- ...` under
+  `.query X(b, f)`: a constant yields no head variable, so Phase 2's bound set
+  starts empty, every IDB in that body binds nothing and seeds the closure, and
+  the transitive step unguards the subprogram below. Changing one character in
+  `X(a, b) :- p(a, b), q(a, b).` to `X(1, b) :- ...` takes the same program
+  from 4 adorned predicates and 4 guards to 2 and 1. Over a 342-program census
+  on which the pass is sound and query-complete both with and without the
+  closure, the unguarded oracle derives 1785 rows, the pass without the closure
+  820, and with it 1085; it derives more than before on 94 of the 342, roughly
+  one program in five. A separate sample found the constant-in-bound-head shape
+  in almost every program the closure made lossier -- that sample and the 342
+  census are different runs, so read the shape as the dominant trigger and the
+  94 as the rate, not as two views of one population.
+
+  Two shapes are out of the closure's reach and tracked separately: a relation
+  read under negation (#1047), which the walk never sees because it descends
+  only the positive child of an `ANTIJOIN`, and one defined by an aggregate
+  rule (#1048), which the walk now tests for and steps over -- Phase 2's
+  aggregate check guards only the seed site, and without the same check on the
+  transitive step the closure reached aggregate relations and everything below
+  them.
+
+  Neither is left unaffected, and for negation the change is a regression in
+  kind. The closure can leave `u` unguarded while a relation `u` reads under
+  negation stays guarded, and a guarded relation is a partial one. On
+  `u(x, y) :- u(x, z), e(z, y), !g(x, y).` with `g` guarded and seeded at
+  `x = 2` and `u` demanded free-bound, the pass without the closure guarded `u`
+  on an empty demand and derived 0 rows against a 3-row oracle -- lossy, but a
+  subset; with the closure `u` runs in full against a partially evaluated `g`
+  and derives 5 rows, two of which are not oracle answers at all. #1047's
+  defect was already present and already wrong there; it now presents as
+  unsound answers rather than as lost ones. Fixing it needs the walker #1047
+  tracks.
+
+  One new decline path: the closure walks rules of relations Phase 2 never
+  touched, so it is the first thing in the pass that can meet a rule with more
+  than `MS_MAX_ATOMS` body atoms in a subprogram the demand never reached.
+  Rather than fail -- which `api_facade.c` would report as
+  `WIRELOG_ERR_MEMORY`, failing `wirelog_optimize()` for a program that
+  optimized before -- the pass warns and leaves the program as written.
+
 - **Magic guards are built left-deep** (#989): `insert_magic_guard` produced
   `JOIN(magic_scan, body)`. When the body was itself composite -- a JOIN chain,
   an ANTIJOIN from a negated atom, a SIP-inserted SEMIJOIN -- that is a
@@ -204,13 +276,14 @@ All notable changes to wirelog are documented in this file.
   Two skip counters are added, kept apart because they mean different things.
   `skipped_constant_head` is a *policy* skip: the rule is well-formed and the
   pass declines. `skipped_unsupported_head` is a *capability* gap: the pass
-  reads head variables off a PROJECT root, and a rule fused to a FLATMAP root
-  -- Logic Fusion runs before Magic Sets in the shipping pipeline, and any rule
-  with a filter is a fusion candidate -- has no such root, so it was skipped in
-  total silence. That is the common way for a guard to go missing and the
-  headline shape of #990; teaching the pass to handle a fused head is separate
-  work, but the skip is now visible. Together these counters are the only
-  mechanism that can detect a guard silently not being inserted.
+  found no head variable names to key the guard on. The shape that used to
+  dominate it -- a rule fused to a `FLATMAP` root, which any rule with a filter
+  becomes, since Logic Fusion runs before Magic Sets -- no longer reaches it:
+  #990 made `get_head_vars` read the root's `project_exprs` rather than test
+  its node type, and fusion leaves `project_exprs` in place. What remains
+  reachable is a head wider than the 64-bit adornment mask. Together these
+  counters are the only mechanism that can detect a guard silently not being
+  inserted.
 - **`average()` is rejected instead of answering with an arbitrary row**
   (#978): `average()` was never implemented. `col_op_reduce` seeds each group
   with the group's first operand, and its update `switch` has arms for

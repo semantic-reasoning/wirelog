@@ -91,18 +91,33 @@ has_rule_for(const struct wirelog_program *prog, const char *head_name)
 /* Helper: parse a program with standard optimizer passes applied          */
 /* ======================================================================== */
 
+/*
+ * @fusion toggles Logic Fusion; the rest of the pipeline is fixed.
+ *
+ * Fusion is the one pass that rewrites a rule root in place, so it is also the
+ * one that has historically changed which shapes Magic Sets can read (#990).
+ * A case that runs both ways and agrees is evidence the behaviour under test
+ * is not a fusion artifact (#1027).
+ */
 static struct wirelog_program *
-parse_and_optimize(const char *src)
+parse_and_optimize_ex(const char *src, bool fusion)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
     if (!prog)
         return NULL;
     wl_subsumption_apply(prog, NULL);
-    wl_fusion_apply(prog, NULL);
+    if (fusion)
+        wl_fusion_apply(prog, NULL);
     wl_jpp_apply(prog, NULL);
     wl_sip_apply(prog, NULL);
     return prog;
+}
+
+static struct wirelog_program *
+parse_and_optimize(const char *src)
+{
+    return parse_and_optimize_ex(src, true);
 }
 
 /* ======================================================================== */
@@ -314,6 +329,144 @@ ms_evaluate(struct wirelog_program *prog, const char *out_rel,
         wl_session_destroy(session);
     wl_plan_free(plan);
     return rc == 0 && !out->overflow;
+}
+
+/* ======================================================================== */
+/* Helpers: oracle comparison (Issue #1027)                                */
+/* ======================================================================== */
+
+/* Whether the @ncols-wide @row appears in @set. */
+static bool
+ms_row_in_set(const ms_row_set_t *set, const int64_t *row, uint32_t ncols)
+{
+    if (set->ncols != ncols)
+        return false;
+    for (uint32_t i = 0; i < set->count; i++) {
+        bool same = true;
+        for (uint32_t c = 0; c < ncols; c++) {
+            if (set->rows[i][c] != row[c]) {
+                same = false;
+                break;
+            }
+        }
+        if (same)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Soundness: every tuple the transformed program derives is derived by the
+ * untransformed one too.
+ *
+ * A subset test, deliberately not an equality test.  Magic Sets exists to
+ * derive *fewer* tuples, so equality with the magic-off oracle would score
+ * correct pruning as a failure.
+ */
+static bool
+ms_rows_subset(const ms_row_set_t *sub, const ms_row_set_t *super)
+{
+    if (sub->overflow || super->overflow)
+        return false;
+    for (uint32_t i = 0; i < sub->count; i++) {
+        if (!ms_row_in_set(super, sub->rows[i], sub->ncols))
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Query-completeness: every oracle tuple the query actually asked for
+ * survives.
+ *
+ * @bound_mask selects the demanded columns, low bit first; @seed holds one
+ * row of @seed_cols values per demanded binding, in the same order the magic
+ * relation stores them.  An oracle tuple whose bound columns match a seed row
+ * is in the answer to the query and must appear in @magic; everything else is
+ * what the demand is allowed to prune.
+ */
+static bool
+ms_query_complete(const ms_row_set_t *magic, const ms_row_set_t *oracle,
+    uint64_t bound_mask, const int64_t *seed, uint32_t seed_rows,
+    uint32_t seed_cols)
+{
+    if (magic->overflow || oracle->overflow)
+        return false;
+    for (uint32_t i = 0; i < oracle->count; i++) {
+        int64_t key[MS_MAX_COLS];
+        uint32_t nkey = 0;
+        for (uint32_t c = 0; c < oracle->ncols && nkey < MS_MAX_COLS; c++) {
+            if (bound_mask & (1ULL << c))
+                key[nkey++] = oracle->rows[i][c];
+        }
+        if (nkey != seed_cols)
+            return false;
+
+        bool demanded = false;
+        for (uint32_t s = 0; s < seed_rows && !demanded; s++) {
+            bool same = true;
+            for (uint32_t c = 0; c < seed_cols; c++) {
+                if (seed[(size_t)s * seed_cols + c] != key[c]) {
+                    same = false;
+                    break;
+                }
+            }
+            demanded = same;
+        }
+        if (demanded && !ms_row_in_set(magic, oracle->rows[i], oracle->ncols))
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Parse, optimize, optionally apply @demands, and evaluate @out_rel.
+ *
+ * With @magic false this is the oracle: the same program with Magic Sets off.
+ *
+ * @magic_rel is seeded only when it exists.  A demand relation the
+ * guard-viability closure declined to create is not a setup failure -- it is
+ * the outcome under test (#1027), and the program is then evaluated
+ * unrestricted, which is what a relation in the closure requires.
+ *
+ * Rebuild and re-stratification are gated on magic_sets_applied, matching the
+ * shipping pipeline (api_facade.c rebuild_after_magic_sets()).
+ */
+static bool
+ms_run(const char *src, bool fusion, bool magic,
+    const wl_magic_demand_t *demands, uint32_t demand_count,
+    const char *magic_rel, const int64_t *seed, uint32_t seed_rows,
+    uint32_t seed_cols, const char *out_rel, ms_row_set_t *out,
+    wl_magic_sets_stats_t *stats)
+{
+    struct wirelog_program *prog = parse_and_optimize_ex(src, fusion);
+    if (!prog)
+        return false;
+
+    if (magic) {
+        if (wl_magic_sets_apply_with_demands(prog, demands, demand_count,
+            stats) != 0)
+            goto fail;
+        if (prog->magic_sets_applied) {
+            if (wl_ir_program_rebuild_relation_irs(prog) != 0)
+                goto fail;
+            wl_ir_program_free_strata(prog);
+            if (wl_ir_stratify_program(prog) != 0)
+                goto fail;
+        }
+        if (magic_rel && has_relation(prog, magic_rel)
+            && !seed_relation_facts(prog, magic_rel, seed, seed_rows,
+            seed_cols))
+            goto fail;
+    }
+
+    bool ok = ms_evaluate(prog, out_rel, 1, out);
+    wirelog_program_free(prog);
+    return ok;
+
+fail:
+    wirelog_program_free(prog);
+    return false;
 }
 
 /* ======================================================================== */
@@ -1440,6 +1593,24 @@ test_guard_over_semijoin_exact(void)
 /*
  * Test: a constant in the bound head position leaves the rule unguarded, so
  * it must not be counted as modified.
+ *
+ * Two programs, because the original one no longer reaches the counter.
+ *
+ * Part A is what this test used to assert on its own:
+ * `q(1, y) :- q(1, z), edge(z, y).` under `.query q(b, f)`.  The bound head
+ * position holds a constant, so the rule's bound set is empty and the
+ * recursive q(1, z) binds nothing.  q is therefore unrestrictable (#1027) and
+ * the guard-viability closure drops every adornment of it before Phase 4b runs
+ * -- so the rule is never reached, and skipped_constant_head is 0 where this
+ * test used to assert 1.  The old assertion pinned pre-fix behaviour: the
+ * counter only fired because Phase 4b was walking a relation it should not
+ * have been guarding at all.
+ *
+ * Part B keeps the counter itself pinned, on a rule that genuinely is a policy
+ * skip: the same constant head position, but no IDB body atom, so nothing
+ * makes the relation unrestrictable and Phase 4b really does decline the rule.
+ * Without Part B this test would pass against a pass that had simply stopped
+ * counting constant heads.
  */
 static void
 test_constant_head_position_not_counted(void)
@@ -1456,6 +1627,7 @@ test_constant_head_position_not_counted(void)
         "edge(3, 4).\n"
         "q(1, y) :- q(1, z), edge(z, y).\n";
 
+    /* Part A: unrestrictable, so the rule never reaches Phase 4b. */
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
         FAIL("parse failed");
@@ -1480,10 +1652,71 @@ test_constant_head_position_not_counted(void)
         FAIL("no guard was inserted, yet the rule was counted as modified");
         return;
     }
+    if (stats.unrestrictable_relations != 1) {
+        printf(" [unrestrictable_relations=%u]",
+            stats.unrestrictable_relations);
+        wirelog_program_free(prog);
+        FAIL("expected q to be the one unrestrictable relation");
+        return;
+    }
+    if (stats.skipped_constant_head != 0) {
+        printf(" [skipped_constant_head=%u]", stats.skipped_constant_head);
+        wirelog_program_free(prog);
+        FAIL("an unrestrictable relation must not reach the guard loop");
+        return;
+    }
+    if (has_relation(prog, "$m$q_bf")) {
+        wirelog_program_free(prog);
+        FAIL("an unrestrictable relation must not get a magic relation");
+        return;
+    }
+    if (prog->magic_sets_applied) {
+        wirelog_program_free(prog);
+        FAIL("nothing was adorned, so the program must be left untransformed");
+        return;
+    }
+    wirelog_program_free(prog);
+
+    /* Part B: a constant bound head position with no IDB body atom.  Nothing
+     * seeds the closure, the relation is adorned normally, and Phase 4b
+     * declines the rule -- the policy skip this counter names. */
+    static const char *policy_src = ".decl base(x: int32, y: int32)\n"
+        ".decl h(x: int32, y: int32)\n"
+        ".output h\n"
+        "base(1, 2).\n"
+        "base(2, 3).\n"
+        "h(1, y) :- base(x, y).\n";
+
+    prog = parse_and_optimize(policy_src);
+    if (!prog) {
+        FAIL("parse failed (policy program)");
+        return;
+    }
+
+    demands[0].relation_name = "h";
+    if (wl_magic_sets_apply_with_demands(prog, demands, 1, &stats) != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic sets returned error (policy program)");
+        return;
+    }
+
+    if (stats.unrestrictable_relations != 0) {
+        printf(" [unrestrictable_relations=%u]",
+            stats.unrestrictable_relations);
+        wirelog_program_free(prog);
+        FAIL("no body atom binds nothing here; the closure must stay empty");
+        return;
+    }
     if (stats.skipped_constant_head != 1) {
         printf(" [skipped_constant_head=%u]", stats.skipped_constant_head);
         wirelog_program_free(prog);
         FAIL("expected skipped_constant_head == 1");
+        return;
+    }
+    if (stats.original_rules_modified != 0) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("no guard was inserted, yet the rule was counted as modified");
         return;
     }
 
@@ -1941,6 +2174,610 @@ test_fused_constant_head_is_a_policy_skip(void)
     PASS();
 }
 
+/* ======================================================================== */
+/* Issue #1027: guard-viability closure                                    */
+/* ======================================================================== */
+
+/*
+ * Left-recursive p demanded p(f, b).  The recursive body atom p(x, z) binds
+ * neither of its columns -- the demand binds y, and y appears nowhere in it --
+ * so Phase 2 adds no adorned predicate for it and Phase 4a generates no demand
+ * rule.  Phase 4b used to guard p's rules regardless, restricting p to a
+ * demand relation nothing populates while p's own body needs it unrestricted.
+ *
+ * Over e = {(1,2), (2,3), (3,4)} the closure is six tuples.  Seeded at y = 4
+ * the answer used to be one, (3, 4): the base rule matched the seed directly
+ * and the recursive rule could then find nothing, losing (2, 4) and (1, 4).
+ */
+static const char *k_unrestrictable_filtered_src
+    = ".decl e(x: int32, y: int32)\n"
+    ".decl p(x: int32, y: int32)\n"
+    ".output p\n"
+    "e(1, 2).\n"
+    "e(2, 3).\n"
+    "e(3, 4).\n"
+    "p(x, y) :- e(x, y), y > 0.\n"
+    "p(x, y) :- p(x, z), e(z, y), y > 0.\n";
+
+/*
+ * The same program with no filter at all.
+ *
+ * The carrier of the claim that this is not a Logic Fusion artifact.  With no
+ * filter there is nothing for fusion to fold into a FLATMAP root, so both
+ * rules stay PROJECT-rooted whichever way the pipeline is run, and the answers
+ * were lost just the same.
+ */
+static const char *k_unrestrictable_plain_src
+    = ".decl e(x: int32, y: int32)\n"
+    ".decl p(x: int32, y: int32)\n"
+    ".output p\n"
+    "e(1, 2).\n"
+    "e(2, 3).\n"
+    "e(3, 4).\n"
+    "p(x, y) :- e(x, y).\n"
+    "p(x, y) :- p(x, z), e(z, y).\n";
+
+/*
+ * Mutual recursion: the relation that binds nothing is q, but the relation
+ * that gets guarded is p.
+ *
+ * This is what pins the *closure* rather than the direct case.  q(x, z) binds
+ * nothing under p(f, b), so q seeds the set; q's own body reads p, so p joins
+ * it.  A fix that only unguards the relation named at the seed site leaves p
+ * guarded, and p's fixpoint is still cut -- one row instead of six.
+ */
+static const char *k_unrestrictable_mutual_src
+    = ".decl e(x: int32, y: int32)\n"
+    ".decl p(x: int32, y: int32)\n"
+    ".decl q(x: int32, y: int32)\n"
+    ".output p\n"
+    "e(1, 2).\n"
+    "e(2, 3).\n"
+    "e(3, 4).\n"
+    "p(x, y) :- e(x, y), y > 0.\n"
+    "p(x, y) :- q(x, z), e(z, y), y > 0.\n"
+    "q(x, y) :- p(x, y), y > 0.\n";
+
+/*
+ * Test: a relation the pass cannot restrict keeps its answers.
+ *
+ * Asserted against the magic-off oracle as two set relations, not as equality:
+ *
+ *   soundness          -- magic is a subset of the oracle
+ *   query-completeness -- every oracle tuple whose bound columns are in the
+ *                         seed appears in magic
+ *
+ * Equality would be the wrong test: Magic Sets is meant to return fewer rows,
+ * and test_guarded_relation_still_prunes() below asserts that it does.  These
+ * two on their own are satisfied by a pass that inserts no guards anywhere,
+ * which is why that test is a required companion to this one.
+ *
+ * Every case runs with fusion on and off and the two must agree.
+ */
+static void
+test_unrestrictable_recursion_keeps_answers(void)
+{
+    TEST("test_unrestrictable_recursion_keeps_answers");
+
+    static const int64_t seed[] = { 4 };
+    const char *srcs[] = {
+        k_unrestrictable_filtered_src,
+        k_unrestrictable_plain_src,
+        k_unrestrictable_mutual_src,
+    };
+    const char *names[] = { "filtered", "unfiltered", "mutual" };
+
+    /* Every case is reported before the first failure aborts the test, so a
+     * red run says which of the six configurations lost answers rather than
+     * only the first. */
+    uint32_t failures = 0;
+
+    for (size_t si = 0; si < sizeof(srcs) / sizeof(srcs[0]); si++) {
+        ms_row_set_t reference;
+        bool have_reference = false;
+
+        for (uint32_t f = 0; f < 2; f++) {
+            bool fusion = f != 0;
+
+            wl_magic_demand_t demands[1];
+            demands[0].relation_name = "p";
+            demands[0].bound_mask = 0x2; /* p(f, b) */
+            demands[0].arity = 2;
+
+            ms_row_set_t oracle;
+            ms_row_set_t magic;
+            if (!ms_run(srcs[si], fusion, false, NULL, 0, NULL, NULL, 0, 0,
+                "p", &oracle, NULL)
+                || !ms_run(srcs[si], fusion, true, demands, 1, "$m$p_fb", seed,
+                1, 1, "p", &magic, NULL)) {
+                printf(" [%s fusion=%d: evaluation failed]", names[si],
+                    (int)fusion);
+                failures++;
+                continue;
+            }
+
+            if (!ms_rows_subset(&magic, &oracle)) {
+                printf(" [%s fusion=%d unsound magic=%u oracle=%u]", names[si],
+                    (int)fusion, magic.count, oracle.count);
+                failures++;
+            } else if (!ms_query_complete(&magic, &oracle,
+                demands[0].bound_mask, seed, 1, 1)) {
+                printf(" [%s fusion=%d lost magic=%u oracle=%u]", names[si],
+                    (int)fusion, magic.count, oracle.count);
+                failures++;
+            }
+
+            /* The two pipeline configurations must agree.  A difference here
+             * would mean the behaviour is a fusion artifact after all. */
+            if (!have_reference) {
+                reference = magic;
+                have_reference = true;
+            } else if (!ms_rows_subset(&magic, &reference)
+                || !ms_rows_subset(&reference, &magic)) {
+                printf(" [%s: fusion on and off disagree]", names[si]);
+                failures++;
+            }
+        }
+    }
+
+    if (failures > 0) {
+        FAIL("magic sets lost answers a demanded query needs");
+        return;
+    }
+    PASS();
+}
+
+/*
+ * Test: the Phase 2 signal has its own counter.
+ *
+ * skipped_all_free is incremented at two sites that mean different things: a
+ * demand root adorned all-free (Phase 1, a harmless optimisation skip) and an
+ * IDB body occurrence that binds nothing (Phase 2, the guard-viability
+ * signal).  Only the second one drives the closure, so it gets its own
+ * counter.  Asserting that skipped_all_free is 0 here is what makes this a
+ * split rather than a rename.
+ */
+static void
+test_unrestrictable_counter_is_split_from_all_free(void)
+{
+    TEST("test_unrestrictable_counter_is_split_from_all_free");
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "p";
+    demands[0].bound_mask = 0x2;
+    demands[0].arity = 2;
+
+    struct wirelog_program *prog
+        = parse_and_optimize(k_unrestrictable_filtered_src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_magic_sets_stats_t stats;
+    if (wl_magic_sets_apply_with_demands(prog, demands, 1, &stats) != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic sets returned error");
+        return;
+    }
+
+    if (stats.unrestrictable_relations == 0) {
+        wirelog_program_free(prog);
+        FAIL("expected unrestrictable_relations > 0");
+        return;
+    }
+    if (stats.skipped_all_free != 0) {
+        printf(" [skipped_all_free=%u]", stats.skipped_all_free);
+        wirelog_program_free(prog);
+        FAIL("the Phase 2 site must no longer report as an all-free skip");
+        return;
+    }
+    if (stats.demand_roots != 1) {
+        printf(" [demand_roots=%u]", stats.demand_roots);
+        wirelog_program_free(prog);
+        FAIL("expected exactly one demand root");
+        return;
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+/*
+ * Negative control: a relation the closure does *not* reach must still be
+ * guarded, and the guard must still prune.
+ *
+ * Without this, "delete every guard insertion" satisfies every other test in
+ * this group.  Same shape as test_guard_recursive_eval_exact(): the demand is
+ * on the first column, the recursive atom Path(z, y) binds z, so nothing is
+ * unrestrictable and seed {2} must yield a strict subset of the six-tuple
+ * closure.  Run both ways round the fusion axis.
+ */
+static void
+test_guarded_relation_still_prunes(void)
+{
+    TEST("test_guarded_relation_still_prunes");
+
+    static const int64_t seed[] = { 2 };
+
+    for (uint32_t f = 0; f < 2; f++) {
+        bool fusion = f != 0;
+
+        wl_magic_demand_t demands[1];
+        demands[0].relation_name = "Path";
+        demands[0].bound_mask = 0x1; /* Path(b, f) */
+        demands[0].arity = 2;
+
+        ms_row_set_t oracle;
+        if (!ms_run(k_syntax_doc_src, fusion, false, NULL, 0, NULL, NULL, 0, 0,
+            "Path", &oracle, NULL)) {
+            printf(" [fusion=%d]", (int)fusion);
+            FAIL("oracle evaluation failed");
+            return;
+        }
+
+        wl_magic_sets_stats_t stats;
+        ms_row_set_t magic;
+        if (!ms_run(k_syntax_doc_src, fusion, true, demands, 1, "$m$Path_bf",
+            seed, 1, 1, "Path", &magic, &stats)) {
+            printf(" [fusion=%d]", (int)fusion);
+            FAIL("magic evaluation failed");
+            return;
+        }
+
+        if (stats.unrestrictable_relations != 0) {
+            printf(" [fusion=%d unrestrictable_relations=%u]", (int)fusion,
+                stats.unrestrictable_relations);
+            FAIL("nothing in this program binds nothing");
+            return;
+        }
+        if (stats.original_rules_modified != 2) {
+            printf(" [fusion=%d original_rules_modified=%u]", (int)fusion,
+                stats.original_rules_modified);
+            FAIL("both rules of Path must still be guarded");
+            return;
+        }
+        if (!ms_rows_subset(&magic, &oracle)) {
+            printf(" [fusion=%d]", (int)fusion);
+            FAIL("unsound: magic derived a tuple the oracle does not");
+            return;
+        }
+        if (magic.count != 3 || oracle.count != 6) {
+            printf(" [fusion=%d magic=%u oracle=%u]", (int)fusion, magic.count,
+                oracle.count);
+            FAIL("the guard must prune the closure to the tuples from seed 2");
+            return;
+        }
+    }
+
+    PASS();
+}
+
+/*
+ * Test: an unrestrictable relation does not drag its neighbours out of the
+ * transformation, and no demand rule is generated for it.
+ *
+ * q is unrestrictable: its bound head position is the constant 1, so the
+ * recursive q(1, z) binds nothing.  r is not -- r(z, y) binds z through
+ * edge(x, z) -- so r keeps its magic relation, its guards and its pruning.
+ *
+ * The demand rule is the part that is easy to get wrong.  Phase 4a walks the
+ * rules of r and finds the body atom q(x, y) adorned bf, which would key a
+ * demand rule on $m$q_bf -- a relation Phase 3 declined to create.  Such a
+ * rule is silently dropped later (wl_ir_program_rebuild_relation_irs()
+ * iterates relations, not rules), so nothing downstream complains; the
+ * assertion has to be made here.
+ */
+static void
+test_unrestrictable_neighbour_stays_guarded(void)
+{
+    TEST("test_unrestrictable_neighbour_stays_guarded");
+
+    static const char *src = ".decl edge(x: int32, y: int32)\n"
+        ".decl q(x: int32, y: int32)\n"
+        ".decl r(x: int32, y: int32)\n"
+        ".output q\n"
+        ".output r\n"
+        "q(1, 1).\n"
+        "q(1, 2).\n"
+        "edge(0, 1).\n"
+        "edge(1, 2).\n"
+        "edge(2, 3).\n"
+        "edge(3, 4).\n"
+        "q(1, y) :- q(1, z), edge(z, y).\n"
+        "r(x, y) :- q(x, y).\n"
+        "r(x, y) :- edge(x, z), r(z, y).\n";
+
+    static const int64_t seed[] = { 1 };
+
+    wl_magic_demand_t demands[2];
+    demands[0].relation_name = "q";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+    demands[1].relation_name = "r";
+    demands[1].bound_mask = 0x1;
+    demands[1].arity = 2;
+
+    struct wirelog_program *prog = parse_and_optimize(src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_magic_sets_stats_t stats;
+    if (wl_magic_sets_apply_with_demands(prog, demands, 2, &stats) != 0) {
+        wirelog_program_free(prog);
+        FAIL("magic sets returned error");
+        return;
+    }
+
+    if (has_relation(prog, "$m$q_bf")) {
+        wirelog_program_free(prog);
+        FAIL("q is unrestrictable: $m$q_bf must not be created");
+        return;
+    }
+    if (has_rule_for(prog, "$m$q_bf")) {
+        wirelog_program_free(prog);
+        FAIL("a demand rule was generated for a relation Phase 3 declined");
+        return;
+    }
+    if (!has_relation(prog, "$m$r_bf")) {
+        wirelog_program_free(prog);
+        FAIL("r is restrictable: $m$r_bf must still be created");
+        return;
+    }
+    if (stats.unrestrictable_relations != 1) {
+        printf(" [unrestrictable_relations=%u]",
+            stats.unrestrictable_relations);
+        wirelog_program_free(prog);
+        FAIL("expected q and only q to be unrestrictable");
+        return;
+    }
+    if (stats.adorned_predicates != 1) {
+        printf(" [adorned_predicates=%u]", stats.adorned_predicates);
+        wirelog_program_free(prog);
+        FAIL("expected r_bf to be the one surviving adorned predicate");
+        return;
+    }
+    if (stats.original_rules_modified != 2) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("both rules of r must be guarded");
+        return;
+    }
+    if (stats.magic_rules_generated != 1) {
+        printf(" [magic_rules_generated=%u]", stats.magic_rules_generated);
+        wirelog_program_free(prog);
+        FAIL("expected exactly the $m$r_bf demand rule");
+        return;
+    }
+    wirelog_program_free(prog);
+
+    /* Answers: q is complete, r is pruned to the seed. */
+    ms_row_set_t oracle_q;
+    ms_row_set_t oracle_r;
+    ms_row_set_t magic_q;
+    ms_row_set_t magic_r;
+    if (!ms_run(src, true, false, NULL, 0, NULL, NULL, 0, 0, "q", &oracle_q,
+        NULL)
+        || !ms_run(src, true, false, NULL, 0, NULL, NULL, 0, 0, "r", &oracle_r,
+        NULL)
+        || !ms_run(src, true, true, demands, 2, "$m$r_bf", seed, 1, 1, "q",
+        &magic_q, NULL)
+        || !ms_run(src, true, true, demands, 2, "$m$r_bf", seed, 1, 1, "r",
+        &magic_r, NULL)) {
+        FAIL("evaluation failed");
+        return;
+    }
+
+    if (!ms_rows_subset(&magic_q, &oracle_q)
+        || !ms_rows_subset(&oracle_q, &magic_q)) {
+        printf(" [q magic=%u oracle=%u]", magic_q.count, oracle_q.count);
+        FAIL("q is unrestrictable, so it must be evaluated in full");
+        return;
+    }
+    if (!ms_rows_subset(&magic_r, &oracle_r)) {
+        FAIL("unsound: r derived a tuple the oracle does not");
+        return;
+    }
+    if (!ms_query_complete(&magic_r, &oracle_r, 0x1, seed, 1, 1)) {
+        FAIL("query-incomplete: r lost a demanded tuple");
+        return;
+    }
+    if (magic_r.count >= oracle_r.count) {
+        printf(" [r magic=%u oracle=%u]", magic_r.count, oracle_r.count);
+        FAIL("r's guard must still prune");
+        return;
+    }
+
+    PASS();
+}
+
+/*
+ * Test: the closure stops at an aggregate relation.
+ *
+ * Two programs differing in one character -- the body of G's aggregate rule
+ * reads the EDB e in one and the IDB S in the other.  Neither difference is
+ * reachable from the demand: X is unrestrictable (d reads it binding nothing),
+ * so the closure walks X's body, finds G, and would walk G's body next.
+ *
+ * relation_has_aggregate_rule() keeps aggregate relations out of Phase 2, but
+ * that guards the *seed* site only; the closure reaches G through X's body,
+ * where Phase 2 never looked.  Without the same test on the transitive step
+ * the second program pulled S out of the transformation and the pair measured
+ * differently -- adorned 2 vs 1, magic rules 2 vs 0 -- for a change that the
+ * pass is supposed not to see at all.  #1048 owns aggregates; this test is
+ * what keeps them out of #1027's closure.
+ */
+static void
+test_closure_stops_at_aggregate(void)
+{
+    TEST("test_closure_stops_at_aggregate");
+
+    static const char *agg_on_edb = ".decl e(x: int32, y: int32)\n"
+        ".decl S(x: int32, y: int32)\n"
+        ".decl G(g: int32, c: int32)\n"
+        ".decl X(a: int32, b: int32)\n"
+        ".decl d(p: int32, q: int32)\n"
+        ".output d\n"
+        "S(x, y) :- e(x, y).\n"
+        "S(x, y) :- e(x, z), S(z, y).\n"
+        "G(g, count(v)) :- e(g, v).\n"
+        "X(a, b) :- G(a, b).\n"
+        "d(p, q) :- S(p, q), X(u, v).\n";
+
+    static const char *agg_on_idb = ".decl e(x: int32, y: int32)\n"
+        ".decl S(x: int32, y: int32)\n"
+        ".decl G(g: int32, c: int32)\n"
+        ".decl X(a: int32, b: int32)\n"
+        ".decl d(p: int32, q: int32)\n"
+        ".output d\n"
+        "S(x, y) :- e(x, y).\n"
+        "S(x, y) :- e(x, z), S(z, y).\n"
+        "G(g, count(v)) :- S(g, v).\n"
+        "X(a, b) :- G(a, b).\n"
+        "d(p, q) :- S(p, q), X(u, v).\n";
+
+    const char *srcs[] = { agg_on_edb, agg_on_idb };
+    const char *names[] = { "aggregate over EDB", "aggregate over IDB" };
+    wl_magic_sets_stats_t seen[2];
+    uint32_t failures = 0;
+
+    for (size_t si = 0; si < 2; si++) {
+        for (uint32_t f = 0; f < 2; f++) {
+            struct wirelog_program *prog
+                = parse_and_optimize_ex(srcs[si], f != 0);
+            if (!prog) {
+                printf(" [%s fusion=%u: parse failed]", names[si], f);
+                failures++;
+                continue;
+            }
+
+            wl_magic_demand_t demands[1];
+            demands[0].relation_name = "d";
+            demands[0].bound_mask = 0x1; /* d(b, f) */
+            demands[0].arity = 2;
+
+            wl_magic_sets_stats_t stats;
+            if (wl_magic_sets_apply_with_demands(prog, demands, 1, &stats)
+                != 0) {
+                printf(" [%s fusion=%u: magic sets returned error]", names[si],
+                    f);
+                wirelog_program_free(prog);
+                failures++;
+                continue;
+            }
+
+            /* S is reachable only through the aggregate.  It must keep its
+             * magic relation whichever way G's rule is written. */
+            if (!has_relation(prog, "$m$S_bf")) {
+                printf(" [%s fusion=%u: S lost its magic relation]", names[si],
+                    f);
+                failures++;
+            }
+            if (stats.unrestrictable_relations != 1) {
+                printf(" [%s fusion=%u: unrestrictable_relations=%u]",
+                    names[si], f, stats.unrestrictable_relations);
+                failures++;
+            }
+            if (f == 0)
+                seen[si] = stats;
+            else if (memcmp(&seen[si], &stats, sizeof(stats)) != 0) {
+                printf(" [%s: fusion changed the outcome]", names[si]);
+                failures++;
+            }
+            wirelog_program_free(prog);
+        }
+    }
+
+    if (failures == 0 && memcmp(&seen[0], &seen[1], sizeof(seen[0])) != 0) {
+        printf(" [adorned %u vs %u, magic rules %u vs %u]",
+            seen[0].adorned_predicates, seen[1].adorned_predicates,
+            seen[0].magic_rules_generated, seen[1].magic_rules_generated);
+        failures++;
+    }
+
+    if (failures > 0) {
+        FAIL("the closure crossed into an aggregate relation");
+        return;
+    }
+    PASS();
+}
+
+/*
+ * Test: an over-long rule the closure reaches makes the pass decline, not
+ * fail.
+ *
+ * r is unrestrictable, and r's second rule has more than MS_MAX_ATOMS body
+ * atoms.  Phase 2 never walks r's rules -- no adorned predicate is ever
+ * created for r -- so the closure is the only thing that gets there.  Before
+ * the closure existed this program optimized; a -1 here would reach the caller
+ * through api_facade.c as WIRELOG_ERR_MEMORY and fail wirelog_optimize()
+ * outright, blaming allocation for a body-atom limit.
+ *
+ * The contract is rc == 0 with the program left exactly as written.
+ */
+static void
+test_over_long_rule_under_unrestrictable_declines(void)
+{
+    TEST("test_over_long_rule_under_unrestrictable_declines");
+
+    char src[65536];
+    size_t used = 0;
+    used += (size_t)snprintf(src + used, sizeof(src) - used,
+            ".decl e(x: int32, y: int32)\n"
+            ".decl r(x: int32, y: int32)\n"
+            ".decl s(x: int32, y: int32)\n"
+            ".decl d(p: int32, q: int32)\n"
+            ".output d\n"
+            "s(x, y) :- e(x, y).\n"
+            "r(x, y) :- e(x, y).\n"
+            "r(x, y) :- ");
+    for (uint32_t i = 0; i < 70; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used,
+                "e(v%u, v%u), ", i, i + 1);
+    }
+    snprintf(src + used, sizeof(src) - used,
+        "e(x, y).\n"
+        "d(p, q) :- s(p, q), r(u, v).\n");
+
+    struct wirelog_program *prog = parse_and_optimize(src);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    uint32_t rules_before = prog->rule_count;
+    uint32_t relations_before = prog->relation_count;
+
+    wl_magic_demand_t demands[1];
+    demands[0].relation_name = "d";
+    demands[0].bound_mask = 0x1;
+    demands[0].arity = 2;
+
+    wl_magic_sets_stats_t stats;
+    int rc = wl_magic_sets_apply_with_demands(prog, demands, 1, &stats);
+
+    bool declined = rc == 0 && !prog->magic_sets_applied
+        && prog->rule_count == rules_before
+        && prog->relation_count == relations_before
+        && stats.adorned_predicates == 0
+        && stats.unrestrictable_relations == 0
+        && stats.original_rules_modified == 0;
+
+    if (!declined)
+        printf(" [rc=%d applied=%d rules %u->%u relations %u->%u]", rc,
+            (int)prog->magic_sets_applied, rules_before, prog->rule_count,
+            relations_before, prog->relation_count);
+    wirelog_program_free(prog);
+
+    if (!declined) {
+        FAIL("an over-long rule under the closure must decline, not fail");
+        return;
+    }
+    PASS();
+}
+
 static void
 test_body_atom_limit_is_reported(void)
 {
@@ -2018,6 +2855,14 @@ main(void)
     test_wide_head_is_an_unsupported_head();
     test_fused_constant_head_is_a_policy_skip();
     test_body_atom_limit_is_reported();
+
+    printf("\nGuard Viability Tests (Issue #1027):\n");
+    test_unrestrictable_recursion_keeps_answers();
+    test_unrestrictable_counter_is_split_from_all_free();
+    test_guarded_relation_still_prunes();
+    test_unrestrictable_neighbour_stays_guarded();
+    test_closure_stops_at_aggregate();
+    test_over_long_rule_under_unrestrictable_declines();
 
     printf("\n=== Results ===\n");
     printf("Tests run:    %d\n", tests_run);
