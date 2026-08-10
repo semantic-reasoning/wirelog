@@ -2435,6 +2435,29 @@ test_affected_strata_rewrites_exe = executable(
 test('affected_strata_rewrites', test_affected_strata_rewrites_exe,
      timeout: 120)
 
+# ============================================================================
+# Mixed insert/remove affected-strata mask (Issue #1031)
+# ============================================================================
+
+test_mixed_insert_remove_mask_exe = executable(
+  'test_mixed_insert_remove_mask',
+  files('test_mixed_insert_remove_mask.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  '../wirelog/wirelog-easy.c',
+  '../wirelog/api_facade.c',
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('mixed_insert_remove_mask', test_mixed_insert_remove_mask_exe)
+
 test_cli_delta_exe = executable(
   'test_cli_delta',
   files('test_cli_delta.c'),

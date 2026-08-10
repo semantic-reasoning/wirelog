@@ -154,6 +154,27 @@ All notable changes to wirelog are documented in this file.
   onto the skip path and lets it produce rows at all. Making that arity
   physical today converts a warning plus correct output into silence plus
   zero rows. It is blocked on #989, not overlooked.
+- **Mixed insert/remove steps evaluate the union of their strata** (#1031):
+  `col_session_step` assigned the affected-strata mask from the inserted
+  relation and then *intersected* the removed relation's mask into it. A step
+  that inserted into one relation and removed from another therefore evaluated
+  the intersection of two sets that need not overlap, and when they did not,
+  no stratum ran and the step emitted nothing. Neither effect is lost: the
+  removed row has already been compacted out of the EDB and the inserted row
+  is already in it, so each one surfaces on the next step whose own mask
+  happens to cover the stratum that derives it -- separately, on steps whose
+  inputs have nothing to do with either, arbitrarily far apart and arbitrarily
+  far in the future. Until then the session reports a state its inputs no
+  longer describe, and an intervening step with no input change reports
+  nothing at all, because the delta path returns early once a delta callback
+  is installed, no input change is pending, and both relation pointers are
+  clear. The same `&=` also defeated `pending_full_input_eval` -- the "this
+  step cannot be incremental" safety valve -- narrowing a full evaluation down
+  to the removal's strata whenever a removal was pending. The mask is now a
+  union seeded at 0, guarded so a step with only an insertion, only a removal,
+  or neither keeps exactly the mask it had before; seeding the union at
+  `UINT64_MAX` instead would have widened every case to full evaluation, the
+  mixed one this fix exists to narrow included.
 
 - **Magic guards are built left-deep** (#989): `insert_magic_guard` produced
   `JOIN(magic_scan, body)`. When the body was itself composite -- a JOIN chain,
