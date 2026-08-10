@@ -909,12 +909,15 @@ next_atom:
         uint32_t bound_count = popcount64(ap->bound_mask);
 
         char *mname = make_magic_name(ap->rel_name, ap->bound_mask, ap->arity);
-        if (!mname)
+        if (!mname) {
+            adorned_set_free(&processed);
             return -1;
+        }
 
         int rc = wl_ir_program_add_magic_relation(prog, mname, bound_count);
         if (rc != 0) {
             free(mname);
+            adorned_set_free(&processed);
             return -1;
         }
         free(mname);
@@ -937,8 +940,10 @@ next_atom:
 
         char *guard_magic
             = make_magic_name(ap->rel_name, ap->bound_mask, ap->arity);
-        if (!guard_magic)
+        if (!guard_magic) {
+            adorned_set_free(&processed);
             return -1;
+        }
 
         for (uint32_t ri = 0; ri < orig_rule_count; ri++) {
             if (!prog->rules[ri].head_relation
@@ -969,6 +974,7 @@ next_atom:
                 fprintf(stderr,
                     "warning: magic sets skipped rule with more than %u "
                     "body atoms\n", MS_MAX_ATOMS);
+                free(guard_magic);
                 adorned_set_free(&processed);
                 return -1;
             }
@@ -999,6 +1005,7 @@ next_atom:
                             atom->rel_name, atom_mask, atom->col_count);
                         if (!body_magic) {
                             free(guard_magic);
+                            adorned_set_free(&processed);
                             return -1;
                         }
 
@@ -1013,6 +1020,7 @@ next_atom:
                                 free(body_magic);
                                 free(guard_magic);
                                 wl_ir_node_free(demand_ir);
+                                adorned_set_free(&processed);
                                 return -1;
                             }
                             if (stats)
@@ -1031,6 +1039,7 @@ next_4a_atom:
                     fprintf(stderr,
                         "warning: magic sets skipped rule with more than "
                         "%u variables\n", MS_MAX_VARS);
+                    free(guard_magic);
                     adorned_set_free(&processed);
                     return -1;
                 }
@@ -1055,8 +1064,10 @@ next_4a_atom:
 
         char *guard_magic
             = make_magic_name(ap->rel_name, ap->bound_mask, ap->arity);
-        if (!guard_magic)
+        if (!guard_magic) {
+            adorned_set_free(&processed);
             return -1;
+        }
 
         for (uint32_t ri = 0; ri < orig_rule_count; ri++) {
             if (!prog->rules[ri].head_relation
@@ -1110,6 +1121,7 @@ next_4a_atom:
                     guard_bvars, guard_bcount);
             if (gr == MS_GUARD_ERROR) {
                 free(guard_magic);
+                adorned_set_free(&processed);
                 return -1;
             }
             if (stats) {
