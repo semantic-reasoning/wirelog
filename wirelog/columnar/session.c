@@ -162,7 +162,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
         for (uint32_t c = 0; c < r->ncols; c++)
             memcpy(heap_cols[c], r->columns[c],
                 sizeof(int64_t) * r->capacity);
-        free(r->columns); /* free old columns array (arena owns buffers) */
+        /* free old columns array (arena owns buffers) */
+        free((void *)r->columns);
         r->columns = heap_cols;
         r->arena_owned = false;
     }
@@ -191,8 +192,8 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 
     if (sess->nrels >= sess->rel_cap) {
         uint32_t nc = sess->rel_cap ? sess->rel_cap * 2 : 16;
-        col_rel_t **nr
-            = (col_rel_t **)realloc(sess->rels, sizeof(col_rel_t *) * nc);
+        col_rel_t **nr = (col_rel_t **)realloc(
+            (void *)sess->rels, sizeof(col_rel_t *) * nc);
         if (!nr)
             return ENOMEM;
         sess->rels = nr;
@@ -964,7 +965,8 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
                  * narrow-join workloads that dominate the v0.43 portfolio. */
                 sess->join_output_limit = (phys / 4) / 24ULL;
             } else {
-                sess->join_output_limit = COL_JOIN_OUTPUT_LIMIT_DEFAULT;
+                sess->join_output_limit
+                    = (uint64_t)COL_JOIN_OUTPUT_LIMIT_DEFAULT;
             }
         }
         /* Clamp to UINT32_MAX since nrows is uint32_t */
@@ -988,7 +990,7 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
      * Slab: 256 relations (cover ~20 rules x 5 ops + headroom)
      * Arena: 64MB initial (for row data buffers) */
     sess->delta_pool
-        = delta_pool_create(256, sizeof(col_rel_t), 64 * 1024 * 1024);
+        = delta_pool_create(256, sizeof(col_rel_t), 64UL * 1024 * 1024);
     if (!sess->delta_pool) {
         /* Non-fatal: pool allocation failed, fall back to malloc */
     }
@@ -998,7 +1000,7 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
      * (COL_REL_INIT_CAP * ncols * sizeof(int64_t) per operator).
      * Reset at each iteration boundary alongside delta_pool_reset.
      * NULL arena is handled gracefully: operators fall back to malloc. */
-    sess->eval_arena = wl_arena_create(64 * 1024 * 1024);
+    sess->eval_arena = wl_arena_create(64UL * 1024 * 1024);
     /* Non-fatal if NULL: col_rel_pool_new_auto falls back to malloc */
 
     /* Issue #224: Initialize memory accounting ledger.
@@ -1211,7 +1213,7 @@ oom:
         col_rel_free_contents(sess->rels[i]);
         free(sess->rels[i]);
     }
-    free(sess->rels);
+    free((void *)sess->rels);
     wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
     wl_compound_arena_free(sess->compound_arena); /* NULL-safe (Issue #559) */
@@ -1243,7 +1245,7 @@ col_session_destroy(wl_session_t *session)
         col_rel_free_contents(sess->rels[i]);
         free(sess->rels[i]);
     }
-    free(sess->rels);
+    free((void *)sess->rels);
     /* Free relation name hash table (Issue #281) */
     session_rel_free_hash(sess);
     col_mat_cache_clear(&sess->mat_cache);
@@ -1280,10 +1282,10 @@ col_session_destroy(wl_session_t *session)
             if (sess->exchange_bufs[src]) {
                 for (uint32_t dst = 0; dst < sess->exchange_num_workers; dst++)
                     col_rel_destroy(sess->exchange_bufs[src][dst]);
-                free(sess->exchange_bufs[src]);
+                free((void *)sess->exchange_bufs[src]);
             }
         }
-        free(sess->exchange_bufs);
+        free((void *)sess->exchange_bufs);
     }
     /* Issue #317: Free per-worker frontier progress tracker.
      * Worker sessions have progress.entries == NULL (set in col_worker_session_create)
@@ -1541,7 +1543,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
             free(worker->rels[i]);
         }
     }
-    free(worker->rels);
+    free((void *)worker->rels);
 
     /* Free hash table (may have been lazily built) */
     session_rel_free_hash(worker);
@@ -2547,12 +2549,12 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
                 }
             }
             free(tdd_counts);
-            free(tdd_saved);
+            free((void *)tdd_saved);
         }
         if (pre_saved) {
             for (uint32_t ri = 0; ri < cnrels; ri++)
                 col_rel_destroy(pre_saved[ri]);
-            free(pre_saved);
+            free((void *)pre_saved);
         }
 
         if (rc != 0) {
