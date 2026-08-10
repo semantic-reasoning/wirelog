@@ -418,11 +418,33 @@ result sizes for recursive programs.
 > preserves the complete result until a query API with seed values is added;
 > all-free adornments remain a no-op as before.
 >
-> Seeding alone will not be enough. Issue #1027 tracks two further defects that
-> only become observable once the demand relation is populated: a rule can be
-> guarded on a demand no propagation rule ever generates, and two adornments of
-> one relation conjoin into a single rule body rather than forming separate
-> adorned predicates. Both lose answers.
+> **Not every relation is guarded.** Since Issue #1027 the pass excludes a
+> relation from the transformation altogether when some occurrence of it needs
+> to be read unrestricted -- when a rule body reads it without binding any of
+> its columns -- along with everything such a relation transitively reads. An
+> excluded relation is evaluated in full and yields its complete result, empty
+> demand relation or not. The same goes for a rule the pass declines to guard
+> for other reasons, such as a constant in the bound head position.
+>
+> So a bound `.query` splits the program in two: the part the pass left
+> unguarded still computes its full result, and the part it guarded computes
+> nothing. Only the second changes when seeding lands.
+>
+> **Do not read that as "the answer is either complete or empty."** Those two
+> parts interact, and where they do the output can be neither. If an unguarded
+> rule reads a *guarded* relation, it reads a partial relation and can derive
+> tuples the unoptimized program never derives -- under negation, because a
+> tuple missing from the guarded relation makes a `!` test pass that should
+> have failed (#1047); under aggregation, because the aggregate is computed
+> over a subset (#1048). A measured case derives 5 rows against a 3-row
+> oracle, 2 of which are not oracle answers. Until seeding lands, treat any
+> output from a program that mixes a bound `.query` with negation or
+> aggregation as unreliable rather than merely incomplete.
+>
+> Seeding alone will still not be enough. Issue #995 tracks a further defect
+> that becomes observable once the demand relation is populated: two
+> adornments of one relation conjoin into a single rule body rather than
+> forming separate adorned predicates, which loses answers.
 
 ### Syntax
 
@@ -458,6 +480,13 @@ As written, this program prints the full closure. There is no way to say
 *which* source node is bound, so the public optimizer conservatively leaves the
 query unoptimized. A future query API can seed `$m$Path_bf` and enable the
 intended restriction without changing this source syntax.
+
+`Path` is guarded here because the recursive atom `Path(z, y)` binds `z`
+through `Edge(x, z)`. Written left-recursively instead --
+`Path(x, y) :- Path(x, z), Edge(z, y).` under `.query Path(f, b)` -- the
+recursive atom binds neither column, so the pass excludes `Path` from the
+transformation and that program prints the full closure rather than nothing.
+See the status note above and Issue #1027.
 
 Query with all arguments bound (point query):
 

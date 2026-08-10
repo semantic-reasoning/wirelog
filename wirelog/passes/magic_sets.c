@@ -10,6 +10,8 @@
  * Algorithm overview:
  *  Phase 1: Identify demand roots (from explicit demands or .output relations).
  *  Phase 2: BFS to compute adorned program (which relations need magic guards).
+ *  Phase 2b: Guard-viability closure -- drop the relations that must stay
+ *            unguarded, and everything they read (#1027).
  *  Phase 3: Create magic relations ($m$<name>_<adornment>).
  *  Phase 4: Generate demand propagation rules and insert magic guards.
  *
@@ -155,6 +157,87 @@ adorned_add(ms_adorned_set_t *s, const char *name, uint64_t mask,
 }
 
 /* ======================================================================== */
+/* Unrestrictable Relation Set (Issue #1027)                                */
+/* ======================================================================== */
+
+/*
+ * Relations this pass must leave entirely unguarded.
+ *
+ * Textbook Magic Sets answers "one occurrence needs all of R, another needs
+ * only the demanded part" by splitting R into separate adorned predicates.
+ * This pass does not split: insert_magic_guard() mutates the rule root in
+ * place, so one set of rules serves every adornment of R.  Under that
+ * architecture the requirement collapses to all-or-nothing -- if any
+ * occurrence needs R unrestricted, R must not be guarded at all.
+ *
+ * Membership is by name.  Both sites that add to the set do so only under
+ * is_idb(), so every member is the head relation of some rule, and the set can
+ * therefore never hold more distinct names than the program has rules.  That
+ * bound is an invariant of this file -- it holds because of the two is_idb()
+ * guards a few lines away -- which is why the capacity is sized from
+ * prog->rule_count rather than from prog->relation_count.  Sizing it from the
+ * relation table would instead rest on what the parser chooses to put there,
+ * which is not this pass's to promise.
+ */
+typedef struct {
+    const char **names; /* borrowed from the program IR */
+    uint32_t count;
+    uint32_t capacity;
+} ms_relset_t;
+
+static bool
+relset_init(ms_relset_t *s, uint32_t capacity)
+{
+    memset(s, 0, sizeof(*s));
+    s->capacity = (capacity > 0) ? capacity : 1;
+    s->names = (const char **)calloc(s->capacity, sizeof(*s->names));
+    return s->names != NULL;
+}
+
+static void
+relset_free(ms_relset_t *s)
+{
+    /* Explicit cast: the array holds `const char *` elements, and an implicit
+     * `const char ** -> void *` conversion is a clang-tidy finding
+     * (bugprone-multi-level-implicit-pointer-conversion).  Same convention as
+     * exec_plan_gen.c's free() calls on borrowed-name arrays. */
+    free((void *)s->names);
+    s->names = NULL;
+    s->count = 0;
+    s->capacity = 0;
+}
+
+static bool
+relset_contains(const ms_relset_t *s, const char *name)
+{
+    if (!name)
+        return false;
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (s->names[i] && strcmp(s->names[i], name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Returns false only if the set is full, which the capacity bound above makes
+ * unreachable: the caller sizes it at prog->rule_count + 1 and every name
+ * added is a rule head.  The branch is kept rather than asserted because the
+ * consequence of a silent drop would be a relation guarded that must not be,
+ * i.e. lost answers; callers turn a false return into a declined pass.
+ */
+static bool
+relset_add(ms_relset_t *s, const char *name)
+{
+    if (!name || relset_contains(s, name))
+        return true;
+    if (s->count >= s->capacity)
+        return false;
+    s->names[s->count++] = name;
+    return true;
+}
+
+/* ======================================================================== */
 /* Magic Relation Name                                                      */
 /* ======================================================================== */
 
@@ -296,6 +379,102 @@ collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms,
     uint32_t count = 0;
     collect_scans_r(ir_root->children[0], atoms, &count, overflow);
     return count;
+}
+
+/*
+ * Close @u under "R unguarded implies every IDB R reads is unguarded".
+ *
+ * @u arrives seeded with every relation whose IDB body occurrence bound
+ * nothing at the Phase 2 site.  Such an occurrence needs the whole relation,
+ * and the pass cannot give it an unguarded copy, so the relation must be left
+ * unguarded outright (see ms_relset_t).
+ *
+ * Being unguarded is contagious.  An unguarded R is evaluated in full, so
+ * every IDB in R's rule bodies must be evaluated in full too -- otherwise R's
+ * own fixpoint is cut through the guarded child and the answers are lost one
+ * level down instead of at R.  Hence the closure.
+ *
+ * The walk uses collect_body_atoms(), the same one Phase 2 uses, so it shares
+ * Phase 2's blind spot for negation, and it needs its own aggregate test:
+ *
+ *   - collect_scans_r() descends only into children[0] of an ANTIJOIN, so an
+ *     IDB read under negation is never an atom this loop sees (#1047).
+ *   - relation_has_aggregate_rule() keeps aggregate relations out of Phase 2
+ *     before the seed site can fire, but that covers the seed only.  This loop
+ *     reaches a relation through *another* relation's body, where Phase 2
+ *     never looked, so without the explicit test below an aggregate relation
+ *     -- and every relation it reads -- would enter @u after all.  Measured
+ *     on two programs differing in one character: without the test, both
+ *     `G(g, count(v)) :- e(g, v).` and `G(g, count(v)) :- S(g, v).` put G in
+ *     @u, and the second then walked G's body and unguarded S as well, giving
+ *     the pair different results -- 2 adorned predicates and 2 demand rules
+ *     against 1 and 0 -- for a difference the pass is supposed not to see.
+ *     The test is therefore repeated here and #1048 stays out of scope.
+ *
+ * Neither shape can be handled from inside this closure; both need a different
+ * walker and are tracked separately.  They are not, however, untouched by it.
+ * For negation specifically the change is real and measured, and it is not an
+ * improvement: the closure can leave R unguarded while a relation R reads
+ * under negation stays guarded, and a guarded relation is a partial relation.
+ * On
+ *
+ *     u(x, y) :- e(x, y).
+ *     u(x, y) :- u(x, z), e(z, y), !g(x, y).
+ *
+ * with e = {(1,2), (2,3), (3,4)}, g guarded and its demand seeded at x = 2,
+ * and u demanded free-bound: before this closure u was guarded on a demand
+ * nothing fills and derived 0 rows against a 3-row oracle -- lossy, but a
+ * subset.  After it u is unrestrictable, runs in full against a partially
+ * evaluated g, and derives 5 rows, of which (1,3) and (1,4) are not oracle
+ * answers at all.  Both fusion settings.  So #1047's defect, which was already
+ * present and already wrong here, changes register: it presented as lost
+ * answers and now presents as unsound ones.  Fixing that needs the walker
+ * #1047 tracks.
+ *
+ * Terminates: the bound is re-read each iteration but relset_add() appends a
+ * name at most once, so each relation is dequeued exactly once.
+ *
+ * Returns false if the closure could not be completed -- a rule with more than
+ * MS_MAX_ATOMS body atoms, or a full @u -- in which case the caller must not
+ * rely on @u and declines the transformation.
+ */
+static bool
+close_unrestrictable(const struct wirelog_program *prog, ms_relset_t *u)
+{
+    for (uint32_t ui = 0; ui < u->count; ui++) {
+        const char *rel = u->names[ui];
+
+        for (uint32_t ri = 0; ri < prog->rule_count; ri++) {
+            if (!prog->rules[ri].head_relation
+                || strcmp(prog->rules[ri].head_relation, rel) != 0)
+                continue;
+
+            const wirelog_ir_node_t *ir_root = prog->rules[ri].ir_root;
+            if (!ir_root)
+                continue;
+
+            ms_atom_t atoms[MS_MAX_ATOMS];
+            bool atom_overflow = false;
+            uint32_t atom_count = collect_body_atoms(ir_root, atoms,
+                    &atom_overflow);
+            if (atom_overflow) {
+                fprintf(stderr,
+                    "warning: magic sets declined: a rule with more than %u "
+                    "body atoms is reachable from an unguardable relation\n",
+                    MS_MAX_ATOMS);
+                return false;
+            }
+
+            for (uint32_t ai = 0; ai < atom_count; ai++) {
+                if (!atoms[ai].rel_name || !is_idb(prog, atoms[ai].rel_name)
+                    || relation_has_aggregate_rule(prog, atoms[ai].rel_name))
+                    continue;
+                if (!relset_add(u, atoms[ai].rel_name))
+                    return false;
+            }
+        }
+    }
+    return true;
 }
 
 /*
@@ -760,6 +939,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
         stats->skipped_aggregate = 0;
         stats->skipped_constant_head = 0;
         stats->skipped_unsupported_head = 0;
+        stats->unrestrictable_relations = 0;
     }
 
     /* === Phase 1: Seed the worklist from explicit demands === */
@@ -767,6 +947,18 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
     ms_adorned_set_t processed;
     if (!adorned_set_init(&processed))
         return -1;
+
+    /* Relations that must not be guarded at all (#1027).  Seeded in Phase 2,
+     * closed before Phase 3.  Every member is an IDB, so the distinct names
+     * cannot outnumber the program's rules; +1 keeps the allocation non-zero
+     * for a program with none.  See ms_relset_t for why the bound is taken
+     * from the rule table and not the relation table. */
+    ms_relset_t unrestrictable;
+    if (!relset_init(&unrestrictable, prog->rule_count + 1)) {
+        adorned_set_free(&processed);
+        return -1;
+    }
+    bool closure_incomplete = false;
 
     /* Simple queue over processed items (indices 0..count-1) */
     uint32_t wl_head = 0; /* index of next item to process */
@@ -813,6 +1005,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                 "warning: magic sets skipped program with more than %u "
                 "adorned predicates\n", MS_MAX_ADORNED);
             adorned_set_free(&processed);
+            relset_free(&unrestrictable);
             return -1;
         }
     }
@@ -857,6 +1050,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                     "warning: magic sets skipped rule with more than %u "
                     "body atoms\n", MS_MAX_ATOMS);
                 adorned_set_free(&processed);
+                relset_free(&unrestrictable);
                 return -1;
             }
 
@@ -890,11 +1084,25 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
                                 "more than %u adorned predicates\n",
                                 MS_MAX_ADORNED);
                             adorned_set_free(&processed);
+                            relset_free(&unrestrictable);
                             return -1;
                         }
                     } else {
-                        if (stats)
-                            stats->skipped_all_free++;
+                        /* This occurrence binds nothing, so it needs every
+                         * tuple of the relation.  No adorned predicate is
+                         * added, so Phase 3 creates no demand relation and
+                         * Phase 4a generates no rule to fill one -- and a
+                         * guard over a demand nothing populates does not
+                         * prune, it cuts the recursion (#1027).  Seed the
+                         * guard-viability closure with the relation instead;
+                         * it will be excluded from guarding altogether.
+                         *
+                         * Not counted as skipped_all_free.  That counter names
+                         * the Phase 1 event -- a demand root adorned all-free,
+                         * a genuine optimisation skip -- and this is a
+                         * different thing entirely. */
+                        if (!relset_add(&unrestrictable, atom->rel_name))
+                            closure_incomplete = true;
                     }
                 }
 
@@ -909,10 +1117,68 @@ next_atom:
                         "warning: magic sets skipped rule with more than "
                         "%u variables\n", MS_MAX_VARS);
                     adorned_set_free(&processed);
+                    relset_free(&unrestrictable);
                     return -1;
                 }
             }
         }
+    }
+
+    /*
+     * === Guard-viability closure (Issue #1027) ===
+     *
+     * Between the BFS and any mutation.  Phase 2 seeded `unrestrictable` with
+     * the relations some occurrence needs whole; close it so that everything
+     * they read is unguarded too, then drop every adornment of every member.
+     *
+     * Dropping them here is the single point that skips all three of the
+     * things the pass would otherwise do with an adorned predicate: Phase 3
+     * creates no magic relation for it, Phase 4a generates no demand rule
+     * keyed on it, and Phase 4b inserts no guard into its rules.  All three
+     * iterate `processed`.  The one site that does not is the Phase 4a
+     * *target*, which keys off the body atom it is looking at rather than off
+     * `processed`; that one is skipped explicitly below.
+     *
+     * If the closure cannot be completed the pass declines rather than
+     * failing.  This walk reaches rules of relations Phase 2 never touched, so
+     * it is the first thing in the pass that can trip over a rule with more
+     * than MS_MAX_ATOMS body atoms in a subprogram the demand never reached.
+     * Returning -1 there would surface through api_facade.c as
+     * WIRELOG_ERR_MEMORY and fail wirelog_optimize() outright for a program
+     * that optimized before, naming a cause that is not the real one.  An
+     * incomplete closure is not an error, it just means no assignment of
+     * guards can be shown consistent -- so leave the program as written.
+     * Nothing has been mutated at this point: Phase 3 is the first writer.
+     */
+
+    if (!close_unrestrictable(prog, &unrestrictable))
+        closure_incomplete = true;
+
+    if (closure_incomplete) {
+        /*
+         * Declined: `magic_sets_applied` stays false and the IR is untouched.
+         * Both closure-derived counters are zeroed because neither describes
+         * anything that happened -- `unrestrictable` is a partial set here.
+         */
+        if (stats) {
+            stats->adorned_predicates = 0;
+            stats->unrestrictable_relations = 0;
+        }
+        adorned_set_free(&processed);
+        relset_free(&unrestrictable);
+        return 0;
+    }
+    if (stats)
+        stats->unrestrictable_relations = unrestrictable.count;
+
+    if (unrestrictable.count > 0) {
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < processed.count; i++) {
+            if (relset_contains(&unrestrictable, processed.items[i].rel_name))
+                continue;
+            processed.items[kept++] = processed.items[i];
+        }
+        processed.count = kept;
     }
 
     if (stats)
@@ -920,6 +1186,7 @@ next_atom:
 
     if (processed.count == 0){
         adorned_set_free(&processed);
+        relset_free(&unrestrictable);
         return 0; /* Nothing to do */
     }
 
@@ -932,6 +1199,7 @@ next_atom:
         char *mname = make_magic_name(ap->rel_name, ap->bound_mask, ap->arity);
         if (!mname) {
             adorned_set_free(&processed);
+            relset_free(&unrestrictable);
             return -1;
         }
 
@@ -939,6 +1207,7 @@ next_atom:
         if (rc != 0) {
             free(mname);
             adorned_set_free(&processed);
+            relset_free(&unrestrictable);
             return -1;
         }
         free(mname);
@@ -963,6 +1232,7 @@ next_atom:
             = make_magic_name(ap->rel_name, ap->bound_mask, ap->arity);
         if (!guard_magic) {
             adorned_set_free(&processed);
+            relset_free(&unrestrictable);
             return -1;
         }
 
@@ -997,6 +1267,7 @@ next_atom:
                     "body atoms\n", MS_MAX_ATOMS);
                 free(guard_magic);
                 adorned_set_free(&processed);
+                relset_free(&unrestrictable);
                 return -1;
             }
 
@@ -1012,7 +1283,32 @@ next_atom:
                 if (!atom->rel_name)
                     goto next_4a_atom;
 
-                if (is_idb(prog, atom->rel_name)) {
+                /*
+                 * The guard-viability skip has to be applied here as well as
+                 * on `ap` (Issue #1027).  This loop is keyed on the *body
+                 * atom's* relation while `ap` names the *head's*, so an
+                 * unrestrictable body atom under a perfectly restrictable head
+                 * would otherwise still get a demand rule -- one whose head
+                 * names a magic relation Phase 3 declined to create.  Nothing
+                 * downstream reports that: wl_ir_program_rebuild_relation_irs()
+                 * iterates relations, so a rule with no declared head relation
+                 * is silently dropped.
+                 *
+                 * There is no demand to propagate to an unguarded relation in
+                 * any case; it is evaluated in full.
+                 *
+                 * This is not the last site with that hazard.  An *aggregate*
+                 * body atom reaches the same branch: Phase 2 skips it, so
+                 * Phase 3 creates no magic relation, but this condition does
+                 * not test for it and a `$m$` demand rule is built anyway.
+                 * Measured byte-identical before and after the closure, with
+                 * magic_rules_generated counting a rule that is then dropped.
+                 * That belongs to #1048 and is a one-line addition to this
+                 * same condition; it is left out here so the closure change
+                 * stays scoped.
+                 */
+                if (is_idb(prog, atom->rel_name)
+                    && !relset_contains(&unrestrictable, atom->rel_name)) {
                     uint64_t atom_mask = 0;
                     for (uint32_t ci = 0; ci < atom->col_count && ci < 64;
                         ci++) {
@@ -1027,6 +1323,7 @@ next_atom:
                         if (!body_magic) {
                             free(guard_magic);
                             adorned_set_free(&processed);
+                            relset_free(&unrestrictable);
                             return -1;
                         }
 
@@ -1042,6 +1339,7 @@ next_atom:
                                 free(guard_magic);
                                 wl_ir_node_free(demand_ir);
                                 adorned_set_free(&processed);
+                                relset_free(&unrestrictable);
                                 return -1;
                             }
                             if (stats)
@@ -1062,6 +1360,7 @@ next_4a_atom:
                         "%u variables\n", MS_MAX_VARS);
                     free(guard_magic);
                     adorned_set_free(&processed);
+                    relset_free(&unrestrictable);
                     return -1;
                 }
             }
@@ -1078,6 +1377,14 @@ next_4a_atom:
      * by splicing in JOIN(body, SCAN($m$rel)).  The guard SCAN is the right
      * child and the body stays on the left; see insert_magic_guard() for why
      * the other order does not survive plan translation (#989).
+     *
+     * Every adornment left in `processed` is one Phase 3 created a relation
+     * for and Phase 4a can propagate a demand into -- except the demand roots
+     * themselves, which by construction no propagation rule fills, because
+     * nothing above them demands anything.  Seeding those is #989.  For every
+     * other member the guard-viability closure removed the ones whose demand
+     * could not be filled before Phase 3 ran, so this loop no longer guards a
+     * rule on a demand nothing fills (#1027).
      */
 
     for (uint32_t pi = 0; pi < processed.count; pi++) {
@@ -1087,6 +1394,7 @@ next_4a_atom:
             = make_magic_name(ap->rel_name, ap->bound_mask, ap->arity);
         if (!guard_magic) {
             adorned_set_free(&processed);
+            relset_free(&unrestrictable);
             return -1;
         }
 
@@ -1103,8 +1411,8 @@ next_4a_atom:
             uint32_t head_arity = get_head_vars(ir_root, head_vars, 64);
             if (head_arity == 0) {
                 /* No head variable names the guard could be keyed on, so the
-                 * rule runs unrestricted -- sound but unoptimized.  A
-                 * capability gap, not a policy decision.
+                 * rule runs unrestricted.  A capability gap, not a policy
+                 * decision.
                  *
                  * Reachable.  get_head_vars() also returns 0 for a head wider
                  * than the 64-bit adornment mask, and that path needs only a
@@ -1116,12 +1424,15 @@ next_4a_atom:
                  * relation_has_aggregate_rule() excludes those relations
                  * before they can enter `processed`.
                  *
-                 * Guarding a rule is not on its own enough to make the demand
-                 * correct: the guard prunes only what the demand relation was
-                 * actually populated with, so a rule guarded on a demand that
-                 * no propagation rule ever fills loses answers rather than
-                 * saving work.  See #1027; nothing seeds $m$ today, so it is
-                 * not a shipping regression. */
+                 * Leaving one rule of a guarded relation unrestricted is not
+                 * automatically sound.  The rule still reads whatever its body
+                 * names, and a body atom on a *guarded* relation reads a
+                 * partial relation -- which is unsound under negation (#1047)
+                 * and wrong-valued under aggregation (#1048).  The
+                 * guard-viability closure (#1027) is what keeps the assignment
+                 * of guards consistent for the shapes it can see; this skip is
+                 * outside it, and the head arity that lands here is the one
+                 * shape where the pass has no guard to offer either way. */
                 if (stats)
                     stats->skipped_unsupported_head++;
                 WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_WARN,
@@ -1143,6 +1454,7 @@ next_4a_atom:
             if (gr == MS_GUARD_ERROR) {
                 free(guard_magic);
                 adorned_set_free(&processed);
+                relset_free(&unrestrictable);
                 return -1;
             }
             if (stats) {
@@ -1161,6 +1473,7 @@ next_4a_atom:
 
     prog->magic_sets_applied = true;
     adorned_set_free(&processed);
+    relset_free(&unrestrictable);
     return 0;
 }
 
