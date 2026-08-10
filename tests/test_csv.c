@@ -596,6 +596,22 @@ test_parse_line_ex_rejects_malformed_fields(void)
         return;
     }
 
+    rc = wl_csv_parse_line_ex("a,b", ',', types, 3, values, 3, &count,
+            intern);
+    if (rc == 0) {
+        FAIL("missing final string field was accepted");
+        wl_intern_free(intern);
+        return;
+    }
+
+    rc = wl_csv_parse_line_ex("a,b,c,d", ',', types, 3, values, 3, &count,
+            intern);
+    if (rc == 0) {
+        FAIL("extra string fields were accepted");
+        wl_intern_free(intern);
+        return;
+    }
+
     wl_intern_free(intern);
     PASS();
 }

@@ -337,17 +337,16 @@ test_split_line_int_true_values(void)
 /* ======================================================================== */
 
 /*
- * The string reader parses exactly the declared number of fields and
- * ignores any trailing ones (#982, out of scope here), so the same
- * 8000-byte line at arity 2 must produce exactly one row whose two
- * fields are the true 2000-byte and 3999-byte prefixes of the line.
+ * The string reader must reject fields beyond the declared width (#982),
+ * so the same 8000-byte line at arity 2 must fail instead of silently
+ * dropping its third field.
  *
  * Before the fix: two rows, from the two chunks, exit 0.
  */
 static void
 test_split_line_str_not_fabricated(void)
 {
-    TEST("8000-byte line split across chunks fabricates no string rows");
+    TEST("string input rejects fields beyond declared width");
 
     char csv_path[512];
     char out_path[512];
@@ -378,30 +377,10 @@ test_split_line_str_not_fabricated(void)
     remove(csv_path);
     remove(out_path);
 
-    if (rc != 0 || !output) {
+    if (rc == 0) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "wl_run_pipeline returned %d", rc);
-        free(output);
-        FAIL(msg);
-        return;
-    }
-
-    int rows = count_lines(output);
-    if (rows != 1) {
-        char msg[256];
         snprintf(msg, sizeof(msg),
-            "expected exactly 1 row, got %d (chunk rows fabricated)", rows);
-        free(output);
-        FAIL(msg);
-        return;
-    }
-
-    size_t f0 = quoted_field_len(output, 0);
-    size_t f1 = quoted_field_len(output, 1);
-    if (f0 != 2000 || f1 != 3999) {
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-            "expected field lengths 2000/3999, got %zu/%zu", f0, f1);
+            "wl_run_pipeline accepted an extra string field (rc=%d)", rc);
         free(output);
         FAIL(msg);
         return;

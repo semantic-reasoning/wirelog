@@ -554,9 +554,8 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
                 p++;
             else
                 return -2; /* missing field separator */
-        } else if (col_types[col] != WIRELOG_TYPE_STRING) {
-            /* The string reader historically ignores fields beyond the
-            * declared width; preserve that adapter behavior (#982). */
+        } else {
+            /* Reject fields beyond the declared width for every column type. */
             while (*p && (*p == '\n' || *p == '\r'
                 || isspace((unsigned char)*p)))
                 p++;
