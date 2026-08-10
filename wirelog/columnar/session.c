@@ -142,6 +142,7 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 {
     /* Pool-owned structs must be promoted to heap before storing in the
      * session, because col_session_destroy calls free() on each entry. */
+    col_rel_t *pool_src = NULL;
     if (r->pool_owned) {
         col_rel_t *heap = (col_rel_t *)calloc(1, sizeof(col_rel_t));
         if (!heap)
@@ -150,6 +151,7 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
         heap->pool_owned = false;
         /* Zero out source slot so pool_reset doesn't double-free contents */
         memset(r, 0, sizeof(*r));
+        pool_src = r;
         r = heap;
     }
     /* Arena-owned data must be promoted to heap before storing in the
@@ -158,7 +160,7 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
         /* Promote arena columns to heap: per-column malloc + memcpy */
         int64_t **heap_cols = col_columns_alloc(r->ncols, r->capacity);
         if (!heap_cols)
-            return ENOMEM;
+            goto oom;
         for (uint32_t c = 0; c < r->ncols; c++)
             memcpy(heap_cols[c], r->columns[c],
                 sizeof(int64_t) * r->capacity);
@@ -195,7 +197,7 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
         col_rel_t **nr = (col_rel_t **)realloc(
             (void *)sess->rels, sizeof(col_rel_t *) * nc);
         if (!nr)
-            return ENOMEM;
+            goto oom;
         sess->rels = nr;
         sess->rel_cap = nc;
     }
@@ -212,6 +214,24 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
      * session_find_rel. Continue adding relation. */
 
     return 0;
+
+oom:
+    /* Undo the pool-to-heap promotion.  A failed session_add_rel leaves the
+     * relation with the caller, which destroys it via col_rel_destroy(), so
+     * the promoted copy has to go back into the pool slot before returning.
+     * Without this the copy -- and the name, col_names[] and compound
+     * metadata it is now the only pointer to -- leaks, and the caller's
+     * col_rel_destroy() sees the zeroed slot with pool_owned cleared by the
+     * memset above and calls free() on an interior pointer into the
+     * delta_pool slab.  Both promotions run on relations from
+     * col_rel_pool_new_auto(), which sets pool_owned and arena_owned
+     * together. */
+    if (pool_src) {
+        *pool_src = *r;
+        pool_src->pool_owned = true;
+        free(r);
+    }
+    return ENOMEM;
 }
 
 void
