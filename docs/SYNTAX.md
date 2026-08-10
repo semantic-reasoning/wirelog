@@ -411,14 +411,12 @@ free (to be computed). This enables the Magic Sets optimization pass to restrict
 evaluation to only the tuples reachable from the query, reducing intermediate
 result sizes for recursive programs.
 
-> **Status (Issue #989): a bound `.query` currently prunes nothing.**
-> The Magic Sets pass builds the magic demand relations and guards the rules
-> with them, but there is no syntax for supplying the bound *values* and
-> nothing seeds the demand relation. The demand relation therefore stays
-> empty, the guards match nothing, and the guarded rules are removed from the
-> result rather than restricted. Adding a bound `.query` to a working program
-> will make it derive fewer tuples, not the same tuples faster. Leave `.query`
-> off, or use all-free adornments, until seeding lands.
+> **Status (Issue #989): bound `.query` is accepted conservatively.**
+> The directive currently carries only an adornment (`b`/`f`), not the bound
+> values needed to seed a magic demand relation. The public optimizer therefore
+> leaves a bound query unoptimized instead of installing an empty guard. This
+> preserves the complete result until a query API with seed values is added;
+> all-free adornments remain a no-op as before.
 >
 > Seeding alone will not be enough. Issue #1027 tracks two further defects that
 > only become observable once the demand relation is populated: a rule can be
@@ -456,10 +454,10 @@ the magic demand relation `$m$Path_bf` and guards both `Path` rules with it,
 which is *intended* to restrict evaluation to only reachable tuples and avoid
 full materialization of the transitive closure.
 
-As written, this program prints nothing. There is no way to say *which* source
-node is bound, so `$m$Path_bf` is never populated and both guards reject every
-tuple. Deleting the `.query` line prints the full closure. See the status note
-above and Issue #989.
+As written, this program prints the full closure. There is no way to say
+*which* source node is bound, so the public optimizer conservatively leaves the
+query unoptimized. A future query API can seed `$m$Path_bf` and enable the
+intended restriction without changing this source syntax.
 
 Query with all arguments bound (point query):
 

@@ -145,8 +145,9 @@ typedef struct {
  *
  * With all-free adornment (the default), the all-free optimization
  * skips magic relation generation entirely, making this a no-op.
- * Magic Sets only activates when explicit .query directives specify
- * bound positions (future: parser support for .query).
+ * The public optimizer defers parsed bound `.query` directives until their
+ * seed values can be supplied.  Explicit callers may use this lower-level
+ * entry point and populate the generated demand relations themselves.
  *
  * Must be called AFTER: fusion, JPP, SIP.
  * Caller must call wl_ir_program_rebuild_relation_irs() and
@@ -170,7 +171,7 @@ wl_magic_sets_apply(struct wirelog_program *prog, wl_magic_sets_stats_t *stats);
  * Apply Magic Sets transformation with explicit demand specifications.
  * Demands with bound_mask == 0 are skipped (all-free optimization).
  *
- * Used for testing and for future .query directive support.
+ * Used for testing and for explicit callers that provide demand seeds.
  *
  * Returns:
  *    0: Success.

@@ -265,6 +265,27 @@ wirelog_optimizer_get_default_config(void)
     };
 }
 
+/*
+ * A parsed `.query` currently carries only an adornment (b/f), not the
+ * values that seed the corresponding magic relation.  Applying Magic Sets
+ * to such a demand creates an empty guard and silently drops every answer.
+ * Keep the public optimizer sound until the query API can provide those
+ * seed values.  Callers of wl_magic_sets_apply_with_demands() may still
+ * supply and seed explicit demands themselves.
+ */
+static bool
+has_unseeded_bound_query(const wirelog_program_t *program)
+{
+    if (!program)
+        return false;
+
+    for (uint32_t i = 0; i < program->demand_count; i++) {
+        if (program->demands[i].bound_mask != 0)
+            return true;
+    }
+    return false;
+}
+
 bool
 wirelog_optimize_with_config(wirelog_program_t *program,
     const wirelog_opt_config_t *config, wirelog_error_t *error)
@@ -312,15 +333,17 @@ wirelog_optimize_with_config(wirelog_program_t *program,
         &applied, &stats))
         return false;
 
-    rc = wl_magic_sets_apply_with_demands(
-        program, program->demands, program->demand_count, NULL);
-    if (rc != 0) {
-        set_error(error,
-            rc == -1 ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_INVALID_IR);
-        return false;
+    if (!has_unseeded_bound_query(program)) {
+        rc = wl_magic_sets_apply_with_demands(
+            program, program->demands, program->demand_count, NULL);
+        if (rc != 0) {
+            set_error(error,
+                rc == -1 ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_INVALID_IR);
+            return false;
+        }
+        if (!rebuild_after_magic_sets(program, error))
+            return false;
     }
-    if (!rebuild_after_magic_sets(program, error))
-        return false;
 
     stats.passes_applied = applied;
     stats.optimized_node_count = count_ir_nodes(program);

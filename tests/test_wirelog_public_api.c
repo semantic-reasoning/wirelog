@@ -120,6 +120,58 @@ test_optimizer_config_disable_passes(void)
 }
 
 static int
+test_bound_query_without_seed_preserves_answers(void)
+{
+    const char *src =
+        ".decl edge(x:int32,y:int32)\n"
+        ".decl path(x:int32,y:int32)\n"
+        ".output path\n"
+        ".query path(b,f) .\n"
+        "edge(1,2).\n"
+        "edge(2,3).\n"
+        "edge(3,4).\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,y) :- edge(x,z), path(z,y).\n";
+    wirelog_error_t err = WIRELOG_ERR_UNKNOWN;
+    wirelog_program_t *program = wirelog_parse_string(src, &err);
+    if (!program || err != WIRELOG_OK) {
+        fprintf(stderr, "bound query parse failed err=%d\n", err);
+        return 1;
+    }
+
+    if (!wirelog_optimize(program, &err) || err != WIRELOG_OK) {
+        fprintf(stderr, "bound query optimize failed err=%d\n", err);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_executor_t *executor = wirelog_executor_create(program, &err);
+    if (!executor || err != WIRELOG_OK) {
+        fprintf(stderr, "bound query executor create failed err=%d\n", err);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_result_t *result = wirelog_evaluate(executor, &err);
+    uint64_t rows = result
+        ? wirelog_result_relation_cardinality(result, "path") : 0;
+    if (!result || err != WIRELOG_OK || rows != 6) {
+        fprintf(stderr,
+            "bound query changed unseeded result: rows=%" PRIu64 " err=%d\n",
+            rows, err);
+        wirelog_result_free(result);
+        wirelog_executor_free(executor);
+        wirelog_program_free(program);
+        return 1;
+    }
+
+    wirelog_result_free(result);
+    wirelog_executor_free(executor);
+    wirelog_program_free(program);
+    return 0;
+}
+
+static int
 test_executor_result_api(void)
 {
     const char *src =
@@ -180,6 +232,7 @@ main(void)
     failures += test_utility_api();
     failures += test_optimizer_api();
     failures += test_optimizer_config_disable_passes();
+    failures += test_bound_query_without_seed_preserves_answers();
     failures += test_executor_result_api();
     if (failures == 0)
         printf("test_wirelog_public_api: OK\n");
