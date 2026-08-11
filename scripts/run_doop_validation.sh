@@ -51,9 +51,12 @@
 #   baseline captured at a different width is the caller's call, and the
 #   run warns rather than refusing.
 #
-#   The oracle is a FINGERPRINT of current code, not a statement about
-#   what DOOP should compute.  #957 still passes through it: the total
-#   counts duplicate rows, so it is a row count and not a tuple count.
+#   The default tuple oracle is a post-#957 FINGERPRINT of current code,
+#   not a statement about what DOOP should compute.  The current evaluator
+#   uses set semantics for single-rule IDBs, so duplicate derivations are
+#   consolidated and this total represents distinct tuples.  Historical
+#   pre-#957 measurements counted duplicate rows; do not compare those row
+#   counts with this set-semantic oracle.
 #   It is W=1-only because W>1 does not complete -- the per-worker
 #   join-output cap is the session cap divided by the worker count
 #   (#959) -- and because W>1 totals varied run to run when they did
