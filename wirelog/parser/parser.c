@@ -174,18 +174,60 @@ parse_declaration_type(wl_parser_t *parser)
     if (!functor)
         return NULL;
 
-    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_SLASH,
-        "expected '/' in compound type")) {
-        free(functor);
-        return NULL;
-    }
-    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_INTEGER,
-        "expected compound arity after '/'")) {
-        free(functor);
-        return NULL;
-    }
+    /* Issue #1037: `f(t1, t2)` names each slot's type; `f/2` keeps meaning
+     * "every slot is int64".  No lexer change -- '(' ',' ')' are already
+     * tokens, and this function has always built the type string from
+     * separately lexed pieces rather than lexing one. */
+    char slot_types[4][8];
+    uint32_t slot_count = 0;
+    int64_t arity_value;
 
-    int64_t arity_value = parser->previous.int_value;
+    if (parser_match(parser, WL_PARSER_LEXER_TOK_LPAREN)) {
+        do {
+            const char *t = NULL;
+            if (parser_match(parser, WL_PARSER_LEXER_TOK_INT32)) t = "int32";
+            else if (parser_match(parser,
+                WL_PARSER_LEXER_TOK_INT64)) t = "int64";
+            else if (parser_match(parser,
+                WL_PARSER_LEXER_TOK_STRING_TYPE)) t = "string";
+            else if (parser_match(parser,
+                WL_PARSER_LEXER_TOK_SYMBOL_TYPE)) t = "symbol";
+            else {
+                parser_error(parser, "expected a slot type (int32, int64, "
+                    "string, symbol) in a compound type list");
+                free(functor);
+                return NULL;
+            }
+            /* Bounded before the write: the `/arity` spelling checks its
+            * bound after parsing an integer, which does not transfer. */
+            if (slot_count >= 4) {
+                parser_error(parser,
+                    "compound type list exceeds maximum arity 4");
+                free(functor);
+                return NULL;
+            }
+            snprintf(slot_types[slot_count], sizeof(slot_types[0]), "%s", t);
+            slot_count++;
+        } while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA));
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+            "expected ')' after compound type list")) {
+            free(functor);
+            return NULL;
+        }
+        arity_value = (int64_t)slot_count;
+    } else {
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_SLASH,
+            "expected '/' or '(' in compound type")) {
+            free(functor);
+            return NULL;
+        }
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_INTEGER,
+            "expected compound arity after '/'")) {
+            free(functor);
+            return NULL;
+        }
+        arity_value = parser->previous.int_value;
+    }
     if (arity_value <= 0 || arity_value > UINT32_MAX) {
         parser_error(parser, "compound arity must be a positive uint32");
         free(functor);
@@ -224,15 +266,28 @@ parse_declaration_type(wl_parser_t *parser)
     char arity_buf[32];
     snprintf(arity_buf, sizeof(arity_buf), "%u", (uint32_t)arity_value);
 
-    size_t len = strlen(functor) + 1 + strlen(arity_buf)
+    /* Slot types ride in the synthetic name as <t1,t2> so
+     * parse_compound_metadata() stays the single decoder. */
+    char slots_buf[96];
+    slots_buf[0] = '\0';
+    if (slot_count > 0) {
+        size_t off = (size_t)snprintf(slots_buf, sizeof(slots_buf), "<");
+        for (uint32_t i = 0; i < slot_count && off < sizeof(slots_buf); i++)
+            off += (size_t)snprintf(slots_buf + off, sizeof(slots_buf) - off,
+                    "%s%s", i ? "," : "", slot_types[i]);
+        if (off < sizeof(slots_buf))
+            snprintf(slots_buf + off, sizeof(slots_buf) - off, ">");
+    }
+
+    size_t len = strlen(functor) + 1 + strlen(arity_buf) + strlen(slots_buf)
         + (modifier ? 1 + strlen(modifier) : 0);
     char *type_name = (char *)malloc(len + 1);
     if (!type_name) {
         free(functor);
         return NULL;
     }
-    snprintf(type_name, len + 1, "%s/%s%s%s", functor, arity_buf,
-        modifier ? " " : "", modifier ? modifier : "");
+    snprintf(type_name, len + 1, "%s/%s%s%s%s", functor, arity_buf,
+        slots_buf, modifier ? " " : "", modifier ? modifier : "");
     free(functor);
     return type_name;
 }

@@ -4672,6 +4672,16 @@ if not is_android
     suite: 'cli',
   )
 
+  test('inline_slot_types',
+    baseline_py3,
+    args: [
+      files('test_inline_slot_types.py')[0],
+      wirelog_cli.full_path(),
+    ],
+    depends: wirelog_cli,
+    suite: 'cli',
+  )
+
   test('cli_version',
     baseline_py3,
     args: [
