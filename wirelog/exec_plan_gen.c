@@ -931,17 +931,33 @@ op_list_init(op_list_t *list)
  * direction -- it would start collapsing relations that are correctly left
  * alone today, under an order only one of their rules asked for.
  *
- * The operand's domain is the one field NOT compared: where several REDUCEs
- * agree on the aggregate and the group width, the last one's domain decides,
- * which is what the deleted scan did (it kept the last operator it saw and
- * never looked at agg_operand_type).  Reproduced deliberately so that no
- * program's answer moves with this change, but it is a latent variant of
- * #965: WL_PLAN_AGG_OPERAND_UNKNOWN and _STRING can coexist across two rules
- * of one head -- a declared `symbol` column in one and an undeclared
- * relation in the other -- and then rule order, not the data, decides whether
- * min() orders by string or by interned id.  Deciding what genuinely
- * disagreeing rules should do is a separate question from where the
- * specification is stored, and is not settled here.
+ * The operand's domain is reconciled rather than overwritten (Issue #1024).
+ * It used to be the one field not compared -- the last REDUCE's domain won,
+ * reproducing what the scan #975 deleted had done -- so for a head whose
+ * rules agreed on the aggregate and the group width but disagreed on the
+ * domain, *rule order* decided whether min() ordered a symbol column
+ * lexicographically or by interned id.  That is a latent variant of #965,
+ * whose whole point was that ordering symbols by id makes the answer depend
+ * on which unrelated facts were parsed first.
+ *
+ * Two disagreements are not the same thing and are not treated the same:
+ *
+ *   UNKNOWN against a known domain is not a conflict.  UNKNOWN means no
+ *   producer typed the operand -- an undeclared relation -- not that it is
+ *   numeric.  The rule that does know wins, in either direction, so the
+ *   answer no longer depends on which rule came last.
+ *
+ *   SCALAR against STRING is a real conflict: one rule's `.decl` says the
+ *   column holds numbers and another's says it holds symbols.  There is no
+ *   widening that is right for both -- ordering the numeric rule's values
+ *   lexicographically would reverse-intern values that are not ids -- so the
+ *   relation is vetoed, exactly as it already is when the rules disagree on
+ *   the aggregate function or the grouping width.  This is the issue's
+ *   option 1 for the case that genuinely needs it and its option 2 for the
+ *   case that does not; a blanket "any STRING wins" would silently reorder a
+ *   numeric column.
+ *
+ * The veto is sticky like the others.
  */
 static void
 agg_spec_observe(op_list_t *list, const wl_plan_op_t *reduce)
@@ -965,11 +981,25 @@ agg_spec_observe(op_list_t *list, const wl_plan_op_t *reduce)
         return;
     }
 
+    /* Issue #1024: reconcile the domain instead of letting the last rule win. */
+    if (list->agg.has_spec
+        && list->agg.operand_type != reduce->agg_operand_type
+        && list->agg.operand_type != WL_PLAN_AGG_OPERAND_UNKNOWN
+        && reduce->agg_operand_type != WL_PLAN_AGG_OPERAND_UNKNOWN) {
+        list->agg_vetoed = true;
+        memset(&list->agg, 0, sizeof(list->agg));
+        return;
+    }
+
+    wl_plan_agg_operand_t domain = reduce->agg_operand_type;
+    if (domain == WL_PLAN_AGG_OPERAND_UNKNOWN && list->agg.has_spec)
+        domain = list->agg.operand_type;
+
     list->agg.has_spec = true;
     list->agg.fn = reduce->agg_fn;
     list->agg.group_by_count = reduce->group_by_count;
     list->agg.aggregate_index = reduce->aggregate_index;
-    list->agg.operand_type = reduce->agg_operand_type;
+    list->agg.operand_type = domain;
 }
 
 static wl_plan_op_t *

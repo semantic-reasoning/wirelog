@@ -672,27 +672,27 @@ test_mixed_min_max_not_canonicalized(void)
 /* ---------------------------------------------------------------------- */
 
 /*
- * Records current behaviour; it is not a statement that this behaviour is
- * right.
+ * Issue #1024: the operand's domain is reconciled across a head's rules, so
+ * rule order no longer decides how min() orders a symbol column.
  *
- * Where two rules of one head agree on the aggregate function and the number
- * of grouping columns but disagree on the operand's domain -- here a
+ * Two rules of one head can agree on the aggregate function and the number
+ * of grouping columns and still disagree on the operand's domain -- here a
  * declared `symbol` column against an undeclared relation, which has no
- * column types at all -- the relation is canonicalised under whichever
- * domain the *last* rule established.  The two programs below differ only in
- * the order of their last two rules and answer differently: with the
- * undeclared rule last the whole relation is reduced by intern id and
- * answers "zz", and with the declared rule last it is reduced
- * lexicographically and answers "aa".
+ * column types at all.  The domain used to be the one field agg_spec_observe
+ * did not compare, so whichever rule was written *last* established it: with
+ * the undeclared rule last the relation reduced by intern id and answered
+ * "zz", and with the declared rule last it reduced lexicographically and
+ * answered "aa".  Same data, same rules, different order, different answer.
  *
- * That is what the pre-fix scan did (it compared the aggregate function and
- * the group width across REDUCEs but never the operand domain, and kept the
- * last operator it saw), and it is reproduced deliberately so the fix does
- * not change any program's answer.  It is a latent variant of #965: plan
- * order, not the data, decides whether min() orders by string or by intern
- * id.  Fixing it means deciding what a relation whose rules genuinely
- * disagree should do, which is a separate question from where the
- * specification is stored.
+ * That was a latent variant of #965, whose point was that intern ids are
+ * assigned in first-appearance order, so ordering symbols by id makes the
+ * result depend on which unrelated facts were parsed first.
+ *
+ * UNKNOWN is not a third domain to negotiate with: it means no producer
+ * typed the operand, not that it is numeric.  So the rule that does know
+ * wins in either direction and both programs below must now answer "aa".
+ * The two orderings are the whole point -- one of them passed before the
+ * fix, so a test that ran only one would not have moved.
  */
 #define LASTWINS_FACTS                                                  \
         ".decl Edge(x: int64, y: int64)\n"                              \
@@ -704,32 +704,80 @@ test_mixed_min_max_not_canonicalized(void)
         "Label(x, min(v)) :- Label(y, v), Edge(y, x).\n"
 
 static void
-test_operand_type_last_rule_wins(void)
+test_operand_type_is_order_independent(void)
 {
-    TEST("operand domain: the last rule of the head decides (recorded)");
+    TEST("operand domain: rule order no longer decides the ordering");
 
-    /* Untyped rule last: the whole relation reduces by intern id. */
     static const char *untyped_last = LASTWINS_FACTS
         "Label(x, min(v)) :- Sym(x, v).\n"
         "Label(x, min(v)) :- M(x, v).\n";
-    /* Typed rule last: the whole relation reduces lexicographically. */
     static const char *typed_last = LASTWINS_FACTS
         "Label(x, min(v)) :- M(x, v).\n"
         "Label(x, min(v)) :- Sym(x, v).\n";
-    static const char *const want_untyped[] = { "1|zz", "2|zz", NULL };
-    static const char *const want_typed[] = { "1|aa", "2|aa", NULL };
+    /* Lexicographic in both orders.  Pre-fix, untyped_last answered zz. */
+    static const char *const want[] = { "1|aa", "2|aa", NULL };
 
     for (size_t w = 0; w < N_WORKER_COUNTS; w++) {
         collect_t c;
         ASSERT(eval_relation_at(untyped_last, "Label",
             k_worker_counts[w], 1, &c) == 0, "evaluation failed");
-        ASSERT(saw_exactly(&c, want_untyped),
-            "untyped-last no longer reduces by intern id");
+        ASSERT(saw_exactly(&c, want),
+            "untyped-last must still order lexicographically");
 
         ASSERT(eval_relation_at(typed_last, "Label",
             k_worker_counts[w], 1, &c) == 0, "evaluation failed");
-        ASSERT(saw_exactly(&c, want_typed),
-            "typed-last no longer reduces lexicographically");
+        ASSERT(saw_exactly(&c, want),
+            "typed-last must still order lexicographically");
+    }
+    PASS();
+}
+
+/*
+ * The other half of #1024: a domain disagreement that is real.
+ *
+ * UNKNOWN against a known domain is not a conflict and is reconciled above.
+ * SCALAR against STRING is: one rule's `.decl` says the aggregated column
+ * holds numbers, another's says it holds symbols, and there is no widening
+ * that is right for both -- ordering the numeric rule's values
+ * lexicographically would reverse-intern values that are not intern ids.
+ * So the relation is vetoed and left un-canonicalised, exactly as it already
+ * is when the rules disagree on the aggregate function (TEST 8) or the
+ * grouping width.
+ *
+ * Group 1 keeping two rows is the whole assertion: it is what "not
+ * canonicalised" looks like.  Without this case the veto branch is dead
+ * code -- confirmed by mutation, deleting it left the other nine cases
+ * green.
+ *
+ * The mixed output itself is not pretty, and is not made prettier here: a
+ * column declared `symbol` shows a raw 5 because the numeric rule wrote one.
+ * That is the pre-existing consequence of a program whose rules disagree
+ * about what the column holds, and diagnosing it is #979's channel, not this
+ * change's business.
+ */
+static void
+test_operand_domain_conflict_is_vetoed(void)
+{
+    TEST("operand domain: a real SCALAR/STRING conflict is not reduced");
+
+    static const char *src =
+        ".decl Edge(x: int64, y: int64)\n"
+        ".decl Sym(x: int64, v: symbol)\n"
+        ".decl Num(x: int64, v: int64)\n"
+        ".decl Label(x: int64, l: symbol)\n"
+        "Sym(1,\"zz\"). Sym(1,\"aa\"). Num(1, 5). Num(1, 9).\n"
+        "Edge(1,2).\n"
+        "Label(x, min(v)) :- Sym(x, v).\n"
+        "Label(x, min(v)) :- Num(x, v).\n"
+        "Label(x, min(v)) :- Label(y, v), Edge(y, x).\n";
+    static const char *const want[] = { "1|5", "1|aa", "2|aa", NULL };
+
+    for (size_t w = 0; w < N_WORKER_COUNTS; w++) {
+        collect_t c;
+        ASSERT(eval_relation_at(src, "Label", k_worker_counts[w], 1, &c) == 0,
+            "evaluation failed");
+        ASSERT(saw_exactly(&c, want),
+            "a conflicting-domain relation must be left un-canonicalised");
     }
     PASS();
 }
@@ -749,7 +797,8 @@ main(void)
     test_group_by_two_columns();
     test_count_not_canonicalized();
     test_mixed_min_max_not_canonicalized();
-    test_operand_type_last_rule_wins();
+    test_operand_type_is_order_independent();
+    test_operand_domain_conflict_is_vetoed();
 
     printf("\n=== %d/%d passed, %d failed ===\n", pass_count, test_count,
         fail_count);
