@@ -98,9 +98,9 @@ block below runs them separately for the same reason.
     parallelism currently lowers the capacity of the run. W=1 is
     deterministic; the W>1 tuple counts recorded in an earlier revision of
     this table came from runs that varied between invocations (#958).
-    The total counts duplicate rows rather than distinct tuples (#957), so
-    treat it as a fingerprint of current code rather than a statement
-    about what DOOP should compute.
+    Older, pre-#957 measurements counted duplicate rows rather than distinct
+    tuples. The 14,096,448 total shown here is from the post-#957 set-semantic
+    evaluator; no separate distinct-tuple benchmark number is claimed here.
 
 Numbers are 5-trial medians (`--repeat 5`) on a single dev host with
 cpufreq governor `schedutil`; treat them as descriptive, not gated.
