@@ -22,7 +22,7 @@ Both paths use the same adapter interface defined in
 #include <wirelog/io/io_adapter.h>
 
 typedef struct wirelog_io_adapter {
-    uint32_t    abi_version;   /* must equal WIRELOG_IO_ABI_VERSION (currently 1) */
+    uint32_t    abi_version;   /* must equal WIRELOG_IO_ABI_VERSION (currently 2) */
     const char *scheme;        /* e.g. "csv", "pcap"                        */
     const char *description;   /* human-readable, for diagnostics           */
 
@@ -311,7 +311,9 @@ The ownership contract is simple:
 
 ## 6. ABI versioning policy
 
-- `WIRELOG_IO_ABI_VERSION` starts at `1`.
+- The initial I/O adapter ABI version was `1` (the v0.30.0 interface). The
+  current `WIRELOG_IO_ABI_VERSION` is `2`; it was introduced when the public
+  adapter symbols were renamed for v0.40+.
 - The registry rejects adapters with a mismatched version at registration time.
 - A version bump is required when:
   - A field is added to or removed from `wirelog_io_adapter_t`.

@@ -9,8 +9,10 @@ steps for each significant Wirelog release. Entries are ordered newest first.
 
 ## 0.53 -> 0.54
 
-Version `0.54.0` is a correctness-focused release. It does not change the
-public API, ABI, or source compatibility.
+Version `0.54.0` is a correctness-focused release. C source compatibility is
+preserved, and the public API and ABI are unchanged. Datalog input
+compatibility has one documented restriction: inline-compound facts must use
+their physical arity, so the shorter declared-arity form is rejected.
 
 - **SEMIJOIN and ANTIJOIN plan layouts are now correct** (#955): these
   filtering operators no longer include the right-hand relation in their
@@ -19,7 +21,10 @@ public API, ABI, or source compatibility.
 - **Inline compound storage width is consistent** (#985): facts, inputs,
   I/O adapters, and fact enumeration now use physical row width where
   storage is concerned. Applications using inline compound columns should
-  provide and consume their expanded physical rows.
+  provide and consume their expanded physical rows. Datalog facts for these
+  relations likewise need the expanded physical arity; the shorter
+  declared-arity spelling is rejected rather than leaving an inline slot
+  unwritten.
 - **Magic Sets keeps output, negation, and aggregate inputs complete** (#1046,
   #1047, #1048): guarded producers are no longer exposed as partial relations
   to unguarded output consumers, negated reads, or aggregate inputs. This
