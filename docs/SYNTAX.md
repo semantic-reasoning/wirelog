@@ -426,26 +426,23 @@ result sizes for recursive programs.
 > demand relation or not. The same goes for a rule the pass declines to guard
 > for other reasons, such as a constant in the bound head position.
 >
-> So a bound `.query` splits the program in two: the part the pass left
-> unguarded still computes its full result, and the part it guarded computes
-> nothing. Only the second changes when seeding lands.
+> The guard-viability closure also protects consumers that require complete
+> inputs. It keeps IDBs read by unrestricted `.output`/`.printsize` consumers,
+> under negation (#1047), or by aggregate rules (#1048) unrestricted, together
+> with their positive IDB dependencies. Those fixes prevent a partial guarded
+> relation from making negation derive false positives, an aggregate compute
+> the wrong value, or an output consumer report incomplete results. The
+> closure is conservative: affected relations may be evaluated in full, so
+> this can give back some pruning, but it does not change the answer.
 >
-> **Do not read that as "the answer is either complete or empty."** Those two
-> parts interact, and where they do the output can be neither. If an unguarded
-> rule reads a *guarded* relation, it reads a partial relation and can derive
-> tuples the unoptimized program never derives -- under negation, because a
-> tuple missing from the guarded relation makes a `!` test pass that should
-> have failed (#1047); under aggregation, because the aggregate is computed
-> over a subset (#1048). A measured case derives 5 rows against a 3-row
-> oracle, 2 of which are not oracle answers. Until seeding lands, treat any
-> output from a program that mixes a bound `.query` with negation or
-> aggregation as unreliable rather than merely incomplete.
+> The remaining bound-query limitation is seeding. The syntax supplies only
+> the `b`/`f` pattern, not the bound values, so the public optimizer leaves a
+> bound query unoptimized and preserves the complete result. An explicit
+> caller that supplies demand seeds can use the lower-level API to obtain the
+> intended restriction. Issue #995 remains: once multiple adornments of one
+> relation are seeded, they conjoin into one rule body instead of forming
+> separate adorned predicates, which can lose answers.
 >
-> Seeding alone will still not be enough. Issue #995 tracks a further defect
-> that becomes observable once the demand relation is populated: two
-> adornments of one relation conjoin into a single rule body rather than
-> forming separate adorned predicates, which loses answers.
-
 ### Syntax
 
 ```
@@ -506,9 +503,10 @@ Query with a mixed pattern on a ternary relation:
   `.output` relations fully (all-free adornment), which is the default behavior.
 - When `.query` is present, the Magic Sets pass generates demand propagation
   rules that prune the search space based on the bound positions.
-- A `.query` with at least one bound position currently yields an **empty**
-  result for the guarded relation, because nothing seeds the demand relation
-  (Issue #989). Do not use it to speed a program up; it changes the answer.
+- A parsed `.query` with at least one bound position currently remains
+  unoptimized because the syntax supplies no seed values (Issue #989). It
+  preserves the complete result; explicit callers that provide demand seeds
+  can use the lower-level API for the intended restriction.
 - An all-free `.query` (e.g., `.query Path(f, f)`) is equivalent to no `.query`
   and results in no optimization (the pass is a no-op). All-free is the only
   adornment that is safe today.
