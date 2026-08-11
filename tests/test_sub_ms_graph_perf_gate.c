@@ -520,22 +520,43 @@ main(void)
         return SKIP_EXIT;
     }
 
+    /* Issue #948: a trace ceiling no longer skips this gate.
+     *
+     * The requirement existed so inner-loop WL_LOG sites are stripped at
+     * compile time before anything is timed.  Measured on this workload it
+     * makes no difference: two release builds of the same tree, best of
+     * three, gave 13417 ms at -Dwirelog_log_max_level=error against
+     * 13312 ms at =trace -- 0.8% apart, with the trace build marginally
+     * *faster*.  That is noise, not a reason to refuse to measure.
+     *
+     * It was also not merely a lost gate.  Both perf workflows configure
+     * -Dwirelog_log_max_level=trace so that log_perf_gate (which requires
+     * the opposite, >= TRACE) can run, and one suite invocation means one
+     * build directory -- so this arm skipped on every perf run there has
+     * ever been, and perf-nightly being green meant these three gates did
+     * not execute.
+     *
+     * The ceiling is still reported, because if a target is ever missed on
+     * a trace build it is the first thing worth ruling out, and
+     * WIRELOG_PERF_REQUIRE still makes it fatal for anyone who wants the
+     * strict measurement build. */
     if (!correctness_only && WL_LOG_COMPILE_MAX_LEVEL > WL_LOG_ERROR) {
         if (parse_bool_env_("WIRELOG_PERF_REQUIRE", 0)) {
             fprintf(stderr,
-                "test_sub_ms_graph_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 "
-                "but WL_LOG_COMPILE_MAX_LEVEL=%d > ERROR.  Reconfigure with "
-                "-Dwirelog_log_max_level=error for the perf measurement "
-                "build.\n",
+                "test_sub_ms_graph_perf_gate: FAIL: WIRELOG_PERF_REQUIRE=1 but "
+                "WL_LOG_COMPILE_MAX_LEVEL=%d > ERROR.  The build is not the "
+                "perf-gate measurement build (reconfigure with "
+                "-Dwirelog_log_max_level=error so inner-loop log sites "
+                "are stripped).\n",
                 (int)WL_LOG_COMPILE_MAX_LEVEL);
             return 1;
         }
         fprintf(stderr,
-            "test_sub_ms_graph_perf_gate: SKIP: WL_LOG_COMPILE_MAX_LEVEL=%d "
-            "> ERROR; build with -Dwirelog_log_max_level=error so inner-loop "
-            "log sites are stripped at compile time\n",
+            "test_sub_ms_graph_perf_gate: NOTE: WL_LOG_COMPILE_MAX_LEVEL=%d > ERROR; inner-loop log "
+            "sites are not stripped.  Measured at under 1%% on this "
+            "workload (#948), so the gate runs anyway; rule this out first "
+            "if a target is missed.\n",
             (int)WL_LOG_COMPILE_MAX_LEVEL);
-        return SKIP_EXIT;
     }
 
     if (!correctness_only && !wl_perf_stability_env_ok()) {
