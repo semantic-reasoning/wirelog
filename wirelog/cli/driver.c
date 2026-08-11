@@ -418,9 +418,19 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
 
     /* 1. Parse */
     wirelog_error_t err;
-    wirelog_program_t *prog = wirelog_parse_string(source, &err);
+    /* Issue #979: the reason a program was rejected used to be composed and
+     * then dropped -- the parser's "line %u, col %u: ..." went out of scope
+     * unread, and the semantic stages could only reach a logger whose
+     * default threshold discards WL_LOG_ERROR.  A user got these two words
+     * and nothing else. */
+    char parse_err[512] = { 0 };
+    wirelog_program_t *prog
+        = wl_ir_parse_string_err(source, &err, parse_err, sizeof(parse_err));
     if (!prog) {
-        fprintf(stderr, "Parse error\n");
+        if (parse_err[0] != '\0')
+            fprintf(stderr, "Parse error: %s\n", parse_err);
+        else
+            fprintf(stderr, "Parse error\n");
         return -1;
     }
 
