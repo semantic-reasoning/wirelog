@@ -1,9 +1,25 @@
 # Migration Guide
 
-**Last Updated:** 2026-07-31
+**Last Updated:** 2026-08-11
 
 This document describes breaking changes, opt-in features, and migration
 steps for each significant Wirelog release. Entries are ordered newest first.
+
+---
+
+## 0.53 -> 0.54
+
+Version `0.54.0` is a correctness-focused release. It does not change the
+public API, ABI, or source compatibility.
+
+- **SEMIJOIN and ANTIJOIN plan layouts are now correct** (#955): these
+  filtering operators no longer include the right-hand relation in their
+  reported output layout, so SIP-inserted semijoins no longer shift join
+  keys and projections or silently drop derived results.
+- **Inline compound storage width is consistent** (#985): facts, inputs,
+  I/O adapters, and fact enumeration now use physical row width where
+  storage is concerned. Applications using inline compound columns should
+  provide and consume their expanded physical rows.
 
 ---
 
