@@ -134,6 +134,20 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Magic Sets keeps unsafe consumers complete** (#1046, #1047, #1048): the
+  guard-viability closure now propagates through output consumers, negated
+  reads, and aggregate inputs. A guarded producer is therefore never read as
+  a partial relation by an unguarded consumer, which fixes lost output rows,
+  answers invented through negation, and aggregate values computed from a
+  subset. These fixes are included in 0.54.0; the design history and the
+  original failure shapes remain documented in the #1027 entry below.
+- **Single-rule IDB snapshots are set-valued** (#957): snapshot evaluation
+  consolidates single-rule IDBs before downstream joins, so duplicate
+  derivations no longer multiply snapshot rows or join results.
+- **0.54.0 includes the SEMIJOIN layout fix** (#974): this is the first tagged
+  release intended to carry #955, closing the release-availability gap that
+  previously required downstream users to pin an untagged commit.
+
 - **A relation with an `inline` compound column has a working fact and
   `.input` syntax** (#985): such a relation has a *logical* width (its
   declared columns) and a *physical* width (inline slots expanded), and no
@@ -267,25 +281,14 @@ All notable changes to wirelog are documented in this file.
   census are different runs, so read the shape as the dominant trigger and the
   94 as the rate, not as two views of one population.
 
-  Two shapes are out of the closure's reach and tracked separately: a relation
-  read under negation (#1047), which the walk never sees because it descends
-  only the positive child of an `ANTIJOIN`, and one defined by an aggregate
-  rule (#1048), which the walk now tests for and steps over -- Phase 2's
-  aggregate check guards only the seed site, and without the same check on the
-  transitive step the closure reached aggregate relations and everything below
-  them.
-
-  Neither is left unaffected, and for negation the change is a regression in
-  kind. The closure can leave `u` unguarded while a relation `u` reads under
-  negation stays guarded, and a guarded relation is a partial one. On
-  `u(x, y) :- u(x, z), e(z, y), !g(x, y).` with `g` guarded and seeded at
-  `x = 2` and `u` demanded free-bound, the pass without the closure guarded `u`
-  on an empty demand and derived 0 rows against a 3-row oracle -- lossy, but a
-  subset; with the closure `u` runs in full against a partially evaluated `g`
-  and derives 5 rows, two of which are not oracle answers at all. #1047's
-  defect was already present and already wrong there; it now presents as
-  unsound answers rather than as lost ones. Fixing it needs the walker #1047
-  tracks.
+  The closure now covers the unsafe-consumer cases that were tracked
+  separately: an output consumer (#1046), a relation read under negation
+  (#1047), and a relation defined by an aggregate rule (#1048). The old
+  failure mode was that an unguarded relation could read a guarded, partial
+  producer, losing output rows or deriving answers that were not in the
+  oracle; aggregate values could likewise be computed from only a subset.
+  The 0.54.0 closure propagates viability through each of these consumers,
+  and the focused tests for all three cases are included in this release.
 
   One new decline path: the closure walks rules of relations Phase 2 never
   touched, so it is the first thing in the pass that can meet a rule with more
