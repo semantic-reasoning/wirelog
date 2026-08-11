@@ -1112,6 +1112,12 @@ typedef struct {
 typedef struct {
     col_expr_instr_t *instrs;
     uint32_t ninstr;
+    /* Issue #966: fixed for the whole expression, so it is resolved once here
+     * rather than passed to the per-row evaluator.  Borrowed -- wl_plan_t
+     * documents its intern as outliving the plan, which outlives any compiled
+     * expression.  NULL is legal and matches the interpreter's own NULL-intern
+     * fallbacks. */
+    const wl_intern_t *intern;
 } col_expr_compiled_t;
 
 static void
@@ -1134,7 +1140,7 @@ col_expr_compiled_free(col_expr_compiled_t *c)
  * col_eval_expr_run in that case.
  */
 static col_expr_compiled_t *
-col_expr_compile(const uint8_t *buf, uint32_t size)
+col_expr_compile(const uint8_t *buf, uint32_t size, const wl_intern_t *intern)
 {
     if (!buf || size == 0)
         return NULL;
@@ -1186,6 +1192,18 @@ col_expr_compile(const uint8_t *buf, uint32_t size)
         case WL_PLAN_EXPR_CMP_GT:
         case WL_PLAN_EXPR_CMP_LTE:
         case WL_PLAN_EXPR_CMP_GTE:
+        /* Issue #966: string-ordering comparisons (no payload).  #962 made
+         * these correct by emitting them; they were absent here, so any
+         * predicate containing one fell to `default: return NULL` and the
+         * whole expression was demoted to the interpreter.  Measured at
+         * ~66 ns/cmp of the ~77 ns regression -- the demotion, not the
+         * strcmp. */
+        case WL_PLAN_EXPR_CMP_STR_EQ:
+        case WL_PLAN_EXPR_CMP_STR_NEQ:
+        case WL_PLAN_EXPR_CMP_STR_LT:
+        case WL_PLAN_EXPR_CMP_STR_GT:
+        case WL_PLAN_EXPR_CMP_STR_LTE:
+        case WL_PLAN_EXPR_CMP_STR_GTE:
         /* Aggregate operators (no payload) */
         case WL_PLAN_EXPR_AGG_COUNT:
         case WL_PLAN_EXPR_AGG_SUM:
@@ -1213,6 +1231,7 @@ col_expr_compile(const uint8_t *buf, uint32_t size)
         return NULL;
     }
     c->ninstr = ninstr;
+    c->intern = intern;
 
     /* Pass 2: fill instruction array. */
     uint32_t j = 0;
@@ -1252,10 +1271,22 @@ col_expr_compile(const uint8_t *buf, uint32_t size)
  * VAR instructions use pre-parsed column indices — no strtol per row.
  * Returns 0 on success with result in *out_val, non-zero on error.
  */
+/*
+ * Issue #966: string comparison on the compiled path.
+ *
+ * The six CMP_STR arms below are transcribed from the interpreter's block in
+ * col_eval_expr rather than paraphrased, because their fallbacks are NOT
+ * symmetric and the asymmetry is load-bearing: when either reverse lookup
+ * fails, EQ/NEQ fall back to comparing the raw ids, while LT/GT/LTE/GTE
+ * yield false.  Collapsing the two families into one shape would be a silent
+ * wrong-answer change, and #962's sweep found no program in this tree that
+ * compares symbols -- nothing existing would catch it.
+ */
 static int
 col_eval_expr_compiled(const col_expr_compiled_t *c, const int64_t *row,
     uint32_t ncols, int64_t *out_val)
 {
+    const wl_intern_t *intern = c->intern;
     filt_stack_t s;
     s.top = 0;
     for (uint32_t k = 0; k < c->ninstr; k++) {
@@ -1264,6 +1295,50 @@ col_eval_expr_compiled(const col_expr_compiled_t *c, const int64_t *row,
         case WL_PLAN_EXPR_VAR:
             filt_push(&s, (in->iarg < ncols) ? row[in->iarg] : 0);
             break;
+        case WL_PLAN_EXPR_CMP_STR_EQ: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s,
+                (sa && sb) ? (strcmp(sa, sb) == 0 ? 1 : 0) : (a == b ? 1 : 0));
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_NEQ: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s,
+                (sa && sb) ? (strcmp(sa, sb) != 0 ? 1 : 0) : (a != b ? 1 : 0));
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_LT: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) < 0 ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_GT: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) > 0 ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_LTE: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) <= 0 ? 1 : 0) : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_STR_GTE: {
+            int64_t b = filt_pop(&s), a = filt_pop(&s);
+            const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
+            const char *sb = intern ? wl_intern_reverse(intern, b) : NULL;
+            filt_push(&s, (sa && sb) ? (strcmp(sa, sb) >= 0 ? 1 : 0) : 0);
+            break;
+        }
         case WL_PLAN_EXPR_CONST_INT:
         case WL_PLAN_EXPR_BOOL:
             filt_push(&s, in->larg);
@@ -1625,7 +1700,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             for (uint32_t c = 0; c < ce_map_count; c++) {
                 if (op->map_exprs[c].data && op->map_exprs[c].size > 0)
                     ce_map[c] = col_expr_compile(op->map_exprs[c].data,
-                            op->map_exprs[c].size);
+                            op->map_exprs[c].size,
+                            sess ? sess->intern : NULL);
             }
         }
     }
@@ -2463,7 +2539,9 @@ col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
 
     /* Slow path: pre-compile expression once, then evaluate per row. */
     col_expr_compiled_t *ce =
-        (buf && bsz > 0) ? col_expr_compile(buf, bsz) : NULL;
+        (buf && bsz > 0)
+        ? col_expr_compile(buf, bsz, sess ? sess->intern : NULL)
+        : NULL;
 
     /* Row scratch, hoisted out of the loop (#1000). */
     col_row_buf_t row_rb;
@@ -2567,7 +2645,7 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
     }
 
     /* Slow path: compile once, evaluate per row */
-    col_expr_compiled_t *ce = col_expr_compile(buf, bsz);
+    col_expr_compiled_t *ce = col_expr_compile(buf, bsz, intern);
     for (uint32_t r = 0; r < rel->nrows; r++) {
         col_rel_row_copy_out(rel, r, row_buf);
         int pass;
@@ -6772,7 +6850,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
 
     col_expr_compiled_t *agg_ce = NULL;
     if (op->agg_expr.data && op->agg_expr.size > 0)
-        agg_ce = col_expr_compile(op->agg_expr.data, op->agg_expr.size);
+        agg_ce = col_expr_compile(op->agg_expr.data, op->agg_expr.size,
+                sess ? sess->intern : NULL);
 
     /* Row scratch, hoisted out of the loop (#1000). */
     col_row_buf_t row_rb;

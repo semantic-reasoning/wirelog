@@ -4662,6 +4662,16 @@ if not is_android
     suite: 'cli',
   )
 
+  test('string_compare_ops',
+    baseline_py3,
+    args: [
+      files('test_string_compare_ops.py')[0],
+      wirelog_cli.full_path(),
+    ],
+    depends: wirelog_cli,
+    suite: 'cli',
+  )
+
   test('cli_version',
     baseline_py3,
     args: [
