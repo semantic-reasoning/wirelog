@@ -1847,6 +1847,71 @@ test_delta_cb_multi_round_recursive_insert(void)
     PASS();
 }
 
+static void
+test_delta_cb_snapshot_recomputes_fused_recursive_relation(void)
+{
+    TEST("delta_cb snapshot recomputes a fused recursive relation");
+
+    static const char *src
+        = ".decl edge(a: int64, b: int64)\n"
+        ".decl path(a: int64, b: int64)\n"
+        "path(A, B) :- edge(A, B).\n"
+        "path(A, C) :- path(A, B), path(B, C).\n";
+    wirelog_easy_session_t *s = NULL;
+    if (wirelog_easy_open(src, &s) != WIRELOG_OK || !s) {
+        FAIL("open failed");
+        return;
+    }
+
+    delta_collector_t deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    if (wirelog_easy_set_delta_cb(s, collect_delta, &deltas) != WIRELOG_OK) {
+        FAIL("set_delta_cb failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t first[] = { 1, 2 };
+    if (wirelog_easy_insert(s, "edge", first, 2) != WIRELOG_OK
+        || wirelog_easy_step(s) != WIRELOG_OK) {
+        FAIL("initial insert/step failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t second[] = { 2, 3 };
+    if (wirelog_easy_insert(s, "edge", second, 2) != WIRELOG_OK) {
+        FAIL("second insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    tuple_collector_t tuples;
+    memset(&tuples, 0, sizeof(tuples));
+    if (wirelog_easy_snapshot(s, "path", collect_tuple, &tuples)
+        != WIRELOG_OK) {
+        FAIL("snapshot failed");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    bool found = false;
+    for (int i = 0; i < tuples.count; i++) {
+        if (strcmp(tuples.relations[i], "path") == 0
+            && tuples.ncols[i] == 2 && tuples.rows[i][0] == 1
+            && tuples.rows[i][1] == 3) {
+            found = true;
+            break;
+        }
+    }
+    wirelog_easy_close(s);
+    if (!found) {
+        FAIL("snapshot missed path(1,3) after the second insert");
+        return;
+    }
+    PASS();
+}
+
 /* Issue #665: a 5-relation conjunctive rule was reported to surface
 * WIRELOG_ERR_EXEC from wirelog_easy_step when the EDB prerequisites were
 * inserted across separate epochs and only some were present at step time.
@@ -2153,6 +2218,7 @@ main(void)
     test_cleanup_order_no_use_after_free();
     test_intern_after_step_succeeds();
     test_delta_cb_multi_round_recursive_insert();
+    test_delta_cb_snapshot_recomputes_fused_recursive_relation();
     test_issue_665_partial_conjunction_default_workers();
     test_issue_665_partial_conjunction_multi_worker();
     test_snapshot_rebuilds_idb_after_query_mode_input_changes();
