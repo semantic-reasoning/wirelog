@@ -75,7 +75,7 @@ assert_parse_fails(const char *test_name, const char *src)
 }
 
 /* ======================================================================== */
-/* Valid Syntax: All 13 String Functions                                   */
+/* Valid Syntax: All 14 String Functions                                   */
 /* ======================================================================== */
 
 static void
@@ -209,6 +209,16 @@ test_parse_to_number(void)
     assert_parses("to_number(x) parses successfully", src);
 }
 
+static void
+test_parse_uuid5_rfc(void)
+{
+    const char *src =
+        ".decl a(ns: symbol, name: symbol)\n"
+        ".decl r(uuid: symbol)\n"
+        "r(uuid5_rfc(ns, name)) :- a(ns, name).\n";
+    assert_parses("uuid5_rfc(namespace, name) parses successfully", src);
+}
+
 /* ======================================================================== */
 /* Nested and Complex Expressions                                           */
 /* ======================================================================== */
@@ -320,6 +330,7 @@ main(void)
     test_parse_trim();
     test_parse_to_string();
     test_parse_to_number();
+    test_parse_uuid5_rfc();
 
     printf("\n--- Nested and Complex Expressions ---\n");
     test_parse_nested_cat_substr();

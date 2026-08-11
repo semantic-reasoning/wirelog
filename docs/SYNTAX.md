@@ -651,10 +651,11 @@ frame-integrity validation example.
 
 ### UUID Functions
 
-`uuid4()`, `uuid5(namespace, name)`
+`uuid4()`, `uuid5(namespace, name)`, `uuid5_rfc(namespace_uuid, name)`
 
-The UUID built-ins require mbedTLS for non-zero runtime output and
-return the first 8 UUID bytes as an `int64`, not formatted text.
+The legacy `uuid4()` and `uuid5()` built-ins require mbedTLS for non-zero
+runtime output and return the first 8 UUID bytes as an `int64`, not formatted
+text. `uuid5_rfc()` returns a formatted symbol as described below.
 Disabled UUID calls follow the same fail-closed behavior described for
 crypto hash functions.
 
@@ -706,6 +707,13 @@ it so. RFC 4122 requires the namespace to *be* a 16-byte UUID and defines
 a 128-bit result; wirelog accepts whatever bytes the operand carries and
 returns only the first 8 of the 16 digest bytes. Treat the result as a
 namespaced fingerprint, not as a UUID.
+
+`uuid5_rfc(namespace_uuid, name)` is the standards-compliant string-returning
+variant. `namespace_uuid` must be a canonical 36-character UUID string; it is
+decoded to its 16 raw bytes before SHA-1 hashing. The name is arbitrary symbol
+text. The result is the full canonical lowercase UUID string with version 5 and
+the RFC variant bits set. A malformed namespace, or a call without mbedTLS,
+rejects the row.
 
 ### Comparison Operators
 

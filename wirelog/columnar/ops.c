@@ -187,6 +187,58 @@ out:
     return ret;
 }
 
+#ifdef WL_MBEDTLS_ENABLED
+static int
+wl_columnar_ops_parse_uuid(const char *text, unsigned char uuid[16])
+{
+    static const unsigned char hyphen[4] = { 8, 13, 18, 23 };
+    size_t pos = 0;
+
+    if (!text || strlen(text) != 36)
+        return -1;
+    for (size_t i = 0; i < 36; i++) {
+        if (i == hyphen[0] || i == hyphen[1]
+            || i == hyphen[2] || i == hyphen[3]) {
+            if (text[i] != '-')
+                return -1;
+            continue;
+        }
+        unsigned char c = (unsigned char)text[i];
+        unsigned char nibble;
+        if (c >= '0' && c <= '9')
+            nibble = (unsigned char)(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            nibble = (unsigned char)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F')
+            nibble = (unsigned char)(c - 'A' + 10);
+        else
+            return -1;
+        if ((pos & 1u) == 0)
+            uuid[pos / 2] = (unsigned char)(nibble << 4);
+        else
+            uuid[pos / 2] |= nibble;
+        pos++;
+    }
+    return pos == 32 ? 0 : -1;
+}
+
+static int64_t
+wl_columnar_ops_format_uuid(const unsigned char uuid[16], wl_intern_t *intern)
+{
+    static const char hex[] = "0123456789abcdef";
+    char text[37];
+    size_t out = 0;
+    for (size_t i = 0; i < 16; i++) {
+        text[out++] = hex[uuid[i] >> 4];
+        text[out++] = hex[uuid[i] & 0x0f];
+        if (i == 3 || i == 5 || i == 7 || i == 9)
+            text[out++] = '-';
+    }
+    text[out] = '\0';
+    return wl_intern_put(intern, text);
+}
+#endif
+
 static int
 wl_columnar_ops_psa_hmac_sha256(const void *msg, size_t msg_len,
     const void *key, size_t key_len, unsigned char *digest, size_t digest_len)
@@ -912,6 +964,40 @@ col_eval_expr_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             if (!intern || wl_string_ops_to_number_checked(a, intern, &v) != 0)
                 goto bad;
             filt_push(&s, v);
+            break;
+        }
+        case WL_PLAN_EXPR_STR_FN_UUID5_RFC: {
+#ifdef WL_MBEDTLS_ENABLED
+            int64_t name_id = filt_pop(&s);
+            int64_t namespace_id = filt_pop(&s);
+            const char *namespace_text = intern
+                ? wl_intern_reverse(intern, namespace_id) : NULL;
+            const char *name = intern
+                ? wl_intern_reverse(intern, name_id) : NULL;
+            unsigned char namespace_uuid[16];
+            unsigned char digest[20];
+
+            /* RFC 4122 requires the namespace operand to be a canonical
+             * UUID string, but the name is an arbitrary string. */
+            if (!intern || !name
+                || wl_columnar_ops_parse_uuid(namespace_text,
+                namespace_uuid) != 0
+                || wl_columnar_ops_psa_hash_pair(PSA_ALG_SHA_1, false,
+                0, namespace_uuid, sizeof(namespace_uuid), 0,
+                name, strlen(name), digest, sizeof(digest)) != 0)
+                goto bad;
+            /* RFC 4122 v5: version 5 and the RFC variant. */
+            digest[6] = (digest[6] & 0x0F) | 0x50;
+            digest[8] = (digest[8] & 0x3F) | 0x80;
+            int64_t result = wl_columnar_ops_format_uuid(digest, intern);
+            if (result < 0)
+                goto bad;
+            filt_push(&s, result);
+#else
+            (void)filt_pop(&s);
+            (void)filt_pop(&s);
+            goto bad; /* uuid5_rfc requires mbedTLS */
+#endif
             break;
         }
 

@@ -296,6 +296,8 @@ identifier_type(const char *start, uint32_t length)
         return WL_PARSER_LEXER_TOK_TO_STRING;
     if (IS_KW("to_number"))
         return WL_PARSER_LEXER_TOK_TO_NUMBER;
+    if (IS_KW("uuid5_rfc"))
+        return WL_PARSER_LEXER_TOK_UUID5_RFC;
 
     return WL_PARSER_LEXER_TOK_IDENT;
 }
@@ -601,6 +603,8 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "UUID4";
     case WL_PARSER_LEXER_TOK_UUID5:
         return "UUID5";
+    case WL_PARSER_LEXER_TOK_UUID5_RFC:
+        return "UUID5_RFC";
     case WL_PARSER_LEXER_TOK_CRC32_ETH:
         return "CRC32_ETHERNET";
     case WL_PARSER_LEXER_TOK_CRC32_CAST:

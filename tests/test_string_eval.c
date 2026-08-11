@@ -138,6 +138,28 @@ run_string_program(const char *src, int64_t *out_values, int max_values)
     return n;
 }
 
+#ifdef WL_MBEDTLS_ENABLED
+static void
+test_eval_uuid5_rfc_known_vector(void)
+{
+    TEST("uuid5_rfc matches RFC 4122 known vector");
+
+    const char *src =
+        ".decl a(ns: symbol, name: symbol)\n"
+        "a(\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\", \"python.org\").\n"
+        ".decl r(ok: int64)\n"
+        "r(1) :- a(ns, name), uuid5_rfc(ns, name) = "
+        "\"886313e1-3b8a-5372-9b90-0c9aee199e5d\".\n";
+    int64_t values[2];
+    int n = run_string_program(src, values, 2);
+    if (n != 1 || values[0] != 1) {
+        FAIL("RFC 4122 UUID v5 known vector did not match");
+        return;
+    }
+    PASS();
+}
+#endif
+
 /* ======================================================================== */
 /* strlen tests                                                             */
 /* ======================================================================== */
@@ -725,6 +747,11 @@ main(void)
 
     printf("\n--- multiple input tuples ---\n");
     test_eval_strlen_multiple_inputs();
+
+#ifdef WL_MBEDTLS_ENABLED
+    printf("\n--- uuid5_rfc ---\n");
+    test_eval_uuid5_rfc_known_vector();
+#endif
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);
