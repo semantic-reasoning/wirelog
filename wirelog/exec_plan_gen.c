@@ -3566,12 +3566,10 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         dst->stratum_id = src->stratum_id;
         dst->is_recursive = src->is_recursive;
 
-        /* Issue #105: Determine if stratum is monotone (derives facts only,
-         * no deletion via negation/antijoin). Conservative default: false.
-         * Future: analyze operator trees for antijoin/semijoin/subtract operations
-         * to set is_monotone = true when no negation is present. For now, we
-         * mark only strata with zero negation rules. */
-        dst->is_monotone = false; /* Conservative: requires operator analysis */
+        /* Issue #105 / #1021: computed below, once this stratum's relations
+         * exist.  Seeded false so every early-exit path leaves the
+         * conservative value. */
+        dst->is_monotone = false;
 
         /* Count unique relations in this stratum */
         /* Build per-relation plan from relation_irs[] */
@@ -3739,6 +3737,49 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         free((void *)unique_names);
         dst->relations = rels;
         dst->relation_count = unique_count;
+
+        /* Issue #1021: compute is_monotone, which #105 declared and left
+         * hardcoded false.
+         *
+         * Scanned here deliberately, not later: the rewrites run at the end
+         * of this function, and rewrite_multiway_delta() moves a fused
+         * relation's operators into K_FUSION's opaque_data while
+         * rewrite_lftj_chains() frees them outright, keeping only
+         * rel_names[].  A scan after either one sees a rule that appears to
+         * contain no antijoin.  That is the same blinding as #1019, and the
+         * fix is the same: look before the rewrites, where the operators are
+         * still all present.
+         *
+         * Scope, stated because the field's name promises more than this
+         * computes.  What is decided here is exactly "does this stratum
+         * retract through negation".  The other half of the monotonicity
+         * question -- whether a same-stratum rule reads an aggregate column
+         * non-monotonically, which is what gates eager aggregate domination
+         * -- is NOT decided, and a true value here must not be read as
+         * clearance for that.  #1021's remaining work is that analysis plus
+         * moving domination into consolidation across all three call sites.
+         *
+         * Nothing reads this today: stratum_is_monotone[] is written in
+         * session.c and has no consumer, so the "deletion phase skip
+         * optimization" its comment describes does not exist.  Computing it
+         * therefore cannot change any answer; it is the prerequisite the
+         * issue asks for, made observable so the next step can be tested. */
+        bool has_negation = false;
+        for (uint32_t v = 0; v < unique_count && !has_negation; v++) {
+            for (uint32_t o = 0; o < rels[v].op_count; o++) {
+                if (rels[v].ops[o].op == WL_PLAN_OP_ANTIJOIN) {
+                    has_negation = true;
+                    break;
+                }
+            }
+        }
+        dst->is_monotone = !has_negation;
+
+        WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_DEBUG,
+            "stratum %u is_monotone=%d (negation=%d, relations=%u); "
+            "negation only -- aggregate reads not analysed (#1021)",
+            dst->stratum_id, (int)dst->is_monotone, (int)has_negation,
+            unique_count);
 
         /* Issue #1019: record what each relation reads while @ops is still the
          * lowered operator list.  Deliberately placed after the ownership
