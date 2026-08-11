@@ -1050,6 +1050,11 @@ typedef struct wl_col_session_t {
      * based on available physical memory, num_workers, and estimated row width.
      * 0 = disabled (no limit). Overridable via WIRELOG_JOIN_OUTPUT_LIMIT env var. */
     uint64_t join_output_limit;
+    /* Issue #959: high-water mark of a single join's output, per session.
+     * Workers are separate sessions, so each carries its own -- which is the
+     * number needed to decide whether dividing the row cap by W is right:
+     * compare a worker's peak against single_threaded_peak / W. */
+    uint64_t join_output_peak;
     /* Shared join-output counter for relation-level TDD workers. Borrowed from
      * the coordinator while a single non-recursive relation plan is running;
      * NULL uses the session-local join_output_limit semantics. */
