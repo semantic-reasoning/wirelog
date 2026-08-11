@@ -381,6 +381,123 @@ collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms,
     return count;
 }
 
+/* Collect every relation scan, including scans below an anti-join.  This is
+ * deliberately separate from collect_scans_r(): demand propagation must not
+ * cross negation, while guard viability must see the complete relation a
+ * negated or aggregate consumer reads. */
+static void
+collect_all_scans_r(const wirelog_ir_node_t *node, ms_atom_t *atoms,
+    uint32_t *count, bool *overflow)
+{
+    if (!node)
+        return;
+    if (*count >= MS_MAX_ATOMS) {
+        *overflow = true;
+        return;
+    }
+
+    if (node->type == WIRELOG_IR_SCAN
+        || node->type == WIRELOG_IR_COMPOUND_INLINE
+        || node->type == WIRELOG_IR_COMPOUND_SIDE) {
+        atoms[*count].rel_name = node->relation_name;
+        atoms[*count].col_names = (const char **)node->column_names;
+        atoms[*count].col_count = node->column_count;
+        (*count)++;
+        return;
+    }
+
+    for (uint32_t i = 0; i < node->child_count; i++)
+        collect_all_scans_r(node->children[i], atoms, count, overflow);
+}
+
+/* Find scans used as the right-hand side of any anti-join.  The left side is
+ * still traversed because it can contain another nested anti-join. */
+static void
+collect_negated_scans_r(const wirelog_ir_node_t *node, ms_atom_t *atoms,
+    uint32_t *count, bool *overflow)
+{
+    if (!node)
+        return;
+
+    if (node->type == WIRELOG_IR_ANTIJOIN) {
+        if (node->child_count > 0)
+            collect_negated_scans_r(node->children[0], atoms, count,
+                overflow);
+        if (node->child_count > 1)
+            collect_all_scans_r(node->children[1], atoms, count, overflow);
+        return;
+    }
+
+    for (uint32_t i = 0; i < node->child_count; i++)
+        collect_negated_scans_r(node->children[i], atoms, count, overflow);
+}
+
+static bool
+seed_unrestrictable_scans(const struct wirelog_program *prog,
+    const wirelog_ir_node_t *root, bool all_scans, ms_relset_t *u)
+{
+    if (!root || root->child_count == 0)
+        return true;
+
+    ms_atom_t atoms[MS_MAX_ATOMS];
+    uint32_t count = 0;
+    bool overflow = false;
+    if (all_scans)
+        collect_all_scans_r(root->children[0], atoms, &count, &overflow);
+    else
+        collect_negated_scans_r(root->children[0], atoms, &count, &overflow);
+    if (overflow)
+        return false;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (atoms[i].rel_name && is_idb(prog, atoms[i].rel_name)
+            && !relset_add(u, atoms[i].rel_name))
+            return false;
+    }
+    return true;
+}
+
+/* Seed consumers whose semantics require a complete producer relation. */
+static bool
+seed_guard_viability_roots(const struct wirelog_program *prog,
+    const wl_magic_demand_t *demands, uint32_t demand_count, ms_relset_t *u)
+{
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        const wl_ir_relation_info_t *rel = &prog->relations[i];
+        bool explicitly_restricted = false;
+        for (uint32_t di = 0; di < demand_count; di++) {
+            if (demands[di].relation_name
+                && strcmp(demands[di].relation_name, rel->name) == 0
+                && demands[di].bound_mask != 0) {
+                explicitly_restricted = true;
+                break;
+            }
+        }
+        if ((rel->has_output || rel->has_printsize)
+            && !explicitly_restricted && is_idb(prog, rel->name)
+            && !relset_add(u, rel->name))
+            return false;
+    }
+
+    for (uint32_t i = 0; i < prog->rule_count; i++) {
+        const wirelog_ir_node_t *root = prog->rules[i].ir_root;
+        if (!root)
+            continue;
+
+        /* A negated relation must be complete before anti-join evaluation. */
+        if (!seed_unrestrictable_scans(prog, root, false, u))
+            return false;
+
+        /* Aggregate heads are intentionally not adorned.  Their inputs must
+         * nevertheless be complete or the aggregate value is computed over a
+         * demand-restricted subset. */
+        if (root->type == WIRELOG_IR_AGGREGATE
+            && !seed_unrestrictable_scans(prog, root, true, u))
+            return false;
+    }
+    return true;
+}
+
 /*
  * Close @u under "R unguarded implies every IDB R reads is unguarded".
  *
@@ -394,42 +511,13 @@ collect_body_atoms(const wirelog_ir_node_t *ir_root, ms_atom_t *atoms,
  * own fixpoint is cut through the guarded child and the answers are lost one
  * level down instead of at R.  Hence the closure.
  *
- * The walk uses collect_body_atoms(), the same one Phase 2 uses, so it shares
- * Phase 2's blind spot for negation, and it needs its own aggregate test:
- *
- *   - collect_scans_r() descends only into children[0] of an ANTIJOIN, so an
- *     IDB read under negation is never an atom this loop sees (#1047).
- *   - relation_has_aggregate_rule() keeps aggregate relations out of Phase 2
- *     before the seed site can fire, but that covers the seed only.  This loop
- *     reaches a relation through *another* relation's body, where Phase 2
- *     never looked, so without the explicit test below an aggregate relation
- *     -- and every relation it reads -- would enter @u after all.  Measured
- *     on two programs differing in one character: without the test, both
- *     `G(g, count(v)) :- e(g, v).` and `G(g, count(v)) :- S(g, v).` put G in
- *     @u, and the second then walked G's body and unguarded S as well, giving
- *     the pair different results -- 2 adorned predicates and 2 demand rules
- *     against 1 and 0 -- for a difference the pass is supposed not to see.
- *     The test is therefore repeated here and #1048 stays out of scope.
- *
- * Neither shape can be handled from inside this closure; both need a different
- * walker and are tracked separately.  They are not, however, untouched by it.
- * For negation specifically the change is real and measured, and it is not an
- * improvement: the closure can leave R unguarded while a relation R reads
- * under negation stays guarded, and a guarded relation is a partial relation.
- * On
- *
- *     u(x, y) :- e(x, y).
- *     u(x, y) :- u(x, z), e(z, y), !g(x, y).
- *
- * with e = {(1,2), (2,3), (3,4)}, g guarded and its demand seeded at x = 2,
- * and u demanded free-bound: before this closure u was guarded on a demand
- * nothing fills and derived 0 rows against a 3-row oracle -- lossy, but a
- * subset.  After it u is unrestrictable, runs in full against a partially
- * evaluated g, and derives 5 rows, of which (1,3) and (1,4) are not oracle
- * answers at all.  Both fusion settings.  So #1047's defect, which was already
- * present and already wrong here, changes register: it presented as lost
- * answers and now presents as unsound ones.  Fixing that needs the walker
- * #1047 tracks.
+ * The separate seed walker above handles negated and aggregate consumers
+ * before this transitive pass runs.  Consequently this function only needs
+ * to follow ordinary positive IDB dependencies from each already-unsafe
+ * relation; demand propagation continues to use collect_body_atoms().
+ * Keeping those walkers separate is important: a negated relation must be
+ * complete for soundness, but no demand may propagate through the negated
+ * atom.
  *
  * Terminates: the bound is re-read each iteration but relset_add() appends a
  * name at most once, so each relation is dequeued exactly once.
@@ -960,6 +1048,15 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
     }
     bool closure_incomplete = false;
 
+    /* These consumers are unrestricted by construction.  Seed their IDB
+     * inputs before the adorned BFS so the same closure also removes any
+     * guards that would make their results incomplete, unsound, or wrong.
+     * This walker is intentionally separate from Phase 2's demand walker:
+     * negation must not propagate demand, but it must constrain viability. */
+    if (!seed_guard_viability_roots(prog, demands, demand_count,
+        &unrestrictable))
+        closure_incomplete = true;
+
     /* Simple queue over processed items (indices 0..count-1) */
     uint32_t wl_head = 0; /* index of next item to process */
 
@@ -1297,18 +1394,14 @@ next_atom:
                  * There is no demand to propagate to an unguarded relation in
                  * any case; it is evaluated in full.
                  *
-                 * This is not the last site with that hazard.  An *aggregate*
-                 * body atom reaches the same branch: Phase 2 skips it, so
-                 * Phase 3 creates no magic relation, but this condition does
-                 * not test for it and a `$m$` demand rule is built anyway.
-                 * Measured byte-identical before and after the closure, with
-                 * magic_rules_generated counting a rule that is then dropped.
-                 * That belongs to #1048 and is a one-line addition to this
-                 * same condition; it is left out here so the closure change
-                 * stays scoped.
+                 * Aggregate body atoms use the same exclusion: Phase 2 skips
+                 * aggregate relations, so Phase 3 creates no magic relation
+                 * for them.  Keep Phase 4a in agreement or it emits an orphan
+                 * demand rule that is silently dropped during IR rebuild.
                  */
                 if (is_idb(prog, atom->rel_name)
-                    && !relset_contains(&unrestrictable, atom->rel_name)) {
+                    && !relset_contains(&unrestrictable, atom->rel_name)
+                    && !relation_has_aggregate_rule(prog, atom->rel_name)) {
                     uint64_t atom_mask = 0;
                     for (uint32_t ci = 0; ci < atom->col_count && ci < 64;
                         ci++) {
