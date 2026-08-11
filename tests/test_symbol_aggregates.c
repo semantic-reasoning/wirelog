@@ -608,6 +608,34 @@ test_mistyped_symbol_column_recursive(void)
 }
 
 static void
+test_aggregate_preserves_head_position(void)
+{
+    TEST("aggregate value stays at its declared head position");
+
+    static const char *src =
+        ".decl val(g: int64, v: int64)\n"
+        ".decl t(a: int64, g: int64)\n"
+        ".output t\n"
+        "val(7, 100). val(7, 50). val(4, 200).\n"
+        "t(min(v), g) :- val(g, v).\n";
+    collect_t c;
+    ASSERT(eval_relation(src, "t", &c) == 0, "aggregate evaluation failed");
+    bool saw_7 = false;
+    bool saw_4 = false;
+    for (uint32_t i = 0; i < c.count && i < MAX_SEEN; i++) {
+        if (c.ncols != 2)
+            continue;
+        if (c.raw[i][0] == 50 && c.raw[i][1] == 7)
+            saw_7 = true;
+        if (c.raw[i][0] == 200 && c.raw[i][1] == 4)
+            saw_4 = true;
+    }
+    ASSERT(saw_7 && saw_4,
+        "aggregate output was not restored to head order");
+    PASS();
+}
+
+static void
 test_mixed_interned_and_uninterned_group(void)
 {
     TEST("a group mixing interned and un-interned values prefers the strings");
@@ -826,6 +854,7 @@ main(void)
     test_join_chain_aggregate();
     test_min_of_to_upper();
     test_integer_aggregates_unchanged();
+    test_aggregate_preserves_head_position();
     test_mistyped_symbol_column_recursive();
     test_mixed_interned_and_uninterned_group();
     test_undeclared_relation();

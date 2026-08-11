@@ -6744,8 +6744,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     col_rel_t *in = e.rel;
     uint32_t gc = op->group_by_count;
 
-    /* Output: group_by columns + 1 aggregate column */
+    /* Output: the group columns and aggregate retain the rule-head order. */
     uint32_t ocols = gc + 1;
+    uint32_t agg_index = op->aggregate_index < ocols
+        ? op->aggregate_index : gc;
     col_rel_t *out = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$reduce", ocols);
     if (!out) {
@@ -6865,8 +6867,9 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             for (uint32_t k = 0; k < gc && match; k++) {
                 uint32_t gi
                     = op->group_by_indices ? op->group_by_indices[k] : k;
+                uint32_t out_col = k >= agg_index ? k + 1 : k;
                 match = row[gi < in->ncols ? gi : 0]
-                    == col_rel_get(out, groups[slot].row, k);
+                    == col_rel_get(out, groups[slot].row, out_col);
             }
             if (match) {
                 found = true;
@@ -6877,10 +6880,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         }
         if (found) {
             /* Update aggregate */
-            int64_t cur = col_rel_get(out, group_row, gc);
+            int64_t cur = col_rel_get(out, group_row, agg_index);
             switch (op->agg_fn) {
             case WIRELOG_AGG_COUNT:
-                col_rel_set(out, group_row, gc, cur + 1);
+                col_rel_set(out, group_row, agg_index, cur + 1);
                 break;
             case WIRELOG_AGG_SUM:
             {
@@ -6896,7 +6899,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                         col_rel_destroy(in);
                     return ERANGE;
                 }
-                col_rel_set(out, group_row, gc, next);
+                col_rel_set(out, group_row, agg_index, next);
             }
             break;
             case WIRELOG_AGG_MIN:
@@ -6906,7 +6909,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                  * intern id (Issue #965). */
                 if (col_agg_better(op->agg_fn, op->agg_operand_type,
                     sess->intern, agg_val, cur))
-                    col_rel_set(out, group_row, gc, agg_val);
+                    col_rel_set(out, group_row, agg_index, agg_val);
                 break;
             default:
                 break;
@@ -6916,9 +6919,10 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             for (uint32_t k = 0; k < gc; k++) {
                 uint32_t gi
                     = op->group_by_indices ? op->group_by_indices[k] : k;
-                tmp[k] = row[gi < in->ncols ? gi : 0];
+                uint32_t out_col = k >= agg_index ? k + 1 : k;
+                tmp[out_col] = row[gi < in->ncols ? gi : 0];
             }
-            tmp[gc] = (op->agg_fn == WIRELOG_AGG_COUNT) ? 1 : agg_val;
+            tmp[agg_index] = (op->agg_fn == WIRELOG_AGG_COUNT) ? 1 : agg_val;
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
