@@ -248,7 +248,7 @@ done
 ```bash
 meson setup build
 meson compile -C build
-meson test -C build --print-errorlogs    # 268 tests
+meson test -C build --print-errorlogs    # 284 tests
 
 # Sanitizer build (optional)
 meson setup build-san -Db_sanitize=address,undefined
