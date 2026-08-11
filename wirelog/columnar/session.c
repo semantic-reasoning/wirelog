@@ -1168,6 +1168,13 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
             r->has_graph_column = true;
             r->graph_col_idx = plan->edb_graph_col_index[i];
         }
+        /* Issue #1038: carry the declared physical width so the first insert
+         * is checked against the `.decl` rather than defining it.  Guarded on
+         * non-NULL for callers that build a plan by hand and never populate
+         * the array; they keep the old first-producer-wins behaviour. */
+        if (plan->edb_declared_width != NULL
+            && plan->edb_declared_width[i] != WL_PLAN_WIDTH_UNDECLARED)
+            r->declared_ncols = plan->edb_declared_width[i];
         rc = session_add_rel(sess, r);
         if (rc != 0) {
             col_rel_destroy(r);
@@ -1633,8 +1640,13 @@ col_session_insert(wl_session_t *session, const char *relation,
     if (!r)
         return ENOENT;
 
-    /* Lazy schema initialisation on first insert */
+    /* Lazy schema initialisation on first insert.  Issue #1038: the first
+     * insert used to *define* the width; it is now checked against the
+     * declared physical width when the program declared one, so a host
+     * cannot establish a relation at a shape its own `.decl` contradicts. */
     if (r->ncols == 0) {
+        if (r->declared_ncols != 0 && num_cols != r->declared_ncols)
+            return EINVAL;
         int rc = col_rel_set_schema(r, num_cols, NULL);
         if (rc != 0)
             return rc;
@@ -1779,8 +1791,13 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
     if (!r)
         return ENOENT;
 
-    /* Lazy schema initialisation on first insert */
+    /* Lazy schema initialisation on first insert.  Issue #1038: the first
+     * insert used to *define* the width; it is now checked against the
+     * declared physical width when the program declared one, so a host
+     * cannot establish a relation at a shape its own `.decl` contradicts. */
     if (r->ncols == 0) {
+        if (r->declared_ncols != 0 && num_cols != r->declared_ncols)
+            return EINVAL;
         int rc = col_rel_set_schema(r, num_cols, NULL);
         if (rc != 0)
             return rc;

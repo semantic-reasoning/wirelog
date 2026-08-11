@@ -4544,6 +4544,25 @@ test_wirelog_easy_inline_facts_exe = executable(
 
 test('wirelog_easy_inline_facts', test_wirelog_easy_inline_facts_exe)
 
+test_host_insert_width_exe = executable(
+  'test_host_insert_width',
+  files('test_host_insert_width.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  '../wirelog/wirelog-easy.c',
+  '../wirelog/api_facade.c',
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('host_insert_width', test_host_insert_width_exe)
+
 # Issue #717 / #703: behavioral-parity test for the advanced session API.
 test_wirelog_advanced_exe = executable(
   'test_wirelog_advanced',

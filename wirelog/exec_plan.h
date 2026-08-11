@@ -637,7 +637,18 @@ typedef struct {
  * @edb_graph_col_index:   Parallel array (length edb_count); column index of
  *                         __graph_id (valid only when edb_has_graph_column[i]).
  *                         Issue #535: RDF named-graph support.
+ * @edb_declared_width:    Parallel array (length edb_count); the relation's
+ *                         declared *physical* width, or
+ *                         WL_PLAN_WIDTH_UNDECLARED when it has no `.decl`.
+ *                         Issue #1038: without this the first host insert
+ *                         defines the width and a later destructuring rule
+ *                         can read a slot nobody wrote.
  */
+/* Issue #1038: sentinel for edb_declared_width[i] when the relation carries
+ * no `.decl`.  Distinct from 0, which is the honest physical width of a
+ * zero-arity declaration such as `.decl p()`. */
+#define WL_PLAN_WIDTH_UNDECLARED UINT32_MAX
+
 typedef struct {
     const wl_plan_stratum_t *strata;
     uint32_t stratum_count;
@@ -649,6 +660,10 @@ typedef struct {
      * Allocated with edb_relations; freed in wl_plan_free. */
     const bool *edb_has_graph_column;
     const uint32_t *edb_graph_col_index;
+    /* Issue #1038: declared physical width per EDB relation, or
+     * WL_PLAN_WIDTH_UNDECLARED.  Allocated with edb_relations; freed in
+     * wl_plan_free. */
+    const uint32_t *edb_declared_width;
     struct wl_intern *intern; /* borrowed from program; lifetime >= plan */
 } wl_plan_t;
 

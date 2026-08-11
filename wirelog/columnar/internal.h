@@ -340,6 +340,22 @@ typedef struct {
     uint32_t compound_count;
     uint32_t *compound_arity_map;
     uint32_t inline_physical_offset;
+
+    /* Issue #1038: the relation's declared *physical* width, propagated from
+     * the plan at session creation, or 0 when there is nothing to enforce.
+     *
+     * Without it a relation's width was whatever its first producer supplied
+     * -- col_session_insert() set the schema lazily from the caller's ncols
+     * and nothing compared that against the `.decl`.  A host inserting an
+     * inline-compound relation at its *logical* width established it too
+     * narrow, and a destructuring rule then read a slot nobody wrote.
+     *
+     * 0 covers two cases that are both correctly unenforced: a relation with
+     * no `.decl` (legitimate and caller-defined), and the degenerate
+     * zero-arity `.decl p()`, which carries no data for a width check to
+     * protect.  Using 0 rather than a sentinel keeps every calloc()
+     * allocation path correct by default, as the block above requires. */
+    uint32_t declared_ncols;
 } col_rel_t;
 
 /* ======================================================================== */

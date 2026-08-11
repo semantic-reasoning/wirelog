@@ -3315,6 +3315,7 @@ wl_plan_free(wl_plan_t *plan)
     /* Issue #535: free per-EDB graph-column metadata arrays. */
     free((void *)plan->edb_has_graph_column);
     free((void *)plan->edb_graph_col_index);
+    free((void *)plan->edb_declared_width);
 
     free(plan);
 }
@@ -3377,7 +3378,13 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
     /* Issue #535: parallel arrays for per-EDB graph-column metadata. */
     bool *edb_has_graph = (bool *)calloc(edb_cap, sizeof(bool));
     uint32_t *edb_graph_idx = (uint32_t *)calloc(edb_cap, sizeof(uint32_t));
-    if (!edb_has_graph || !edb_graph_idx) {
+    /* Issue #1038: the declared physical width, so the session can reject a
+     * first host insert that disagrees with the `.decl` instead of letting
+     * it define the relation.  WL_PLAN_WIDTH_UNDECLARED for a relation with
+     * no `.decl` -- those are legitimate and stay caller-defined. */
+    uint32_t *edb_decl_w = (uint32_t *)malloc(edb_cap * sizeof(uint32_t));
+    if (!edb_has_graph || !edb_graph_idx || !edb_decl_w) {
+        free(edb_decl_w);
         free(edb_graph_idx);
         free(edb_has_graph);
         free(edb_rels);
@@ -3415,6 +3422,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     free((void *)edb_rels);
                     free(edb_has_graph);
                     free(edb_graph_idx);
+                    free(edb_decl_w);
                     free(plan);
                     return -1;
                 }
@@ -3427,6 +3435,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     free((void *)edb_rels);
                     free(edb_has_graph);
                     free(edb_graph_idx);
+                    free(edb_decl_w);
                     free(plan);
                     return -1;
                 }
@@ -3439,10 +3448,24 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     free((void *)edb_rels);
                     free(edb_has_graph);
                     free(edb_graph_idx);
+                    free(edb_decl_w);
                     free(plan);
                     return -1;
                 }
                 edb_graph_idx = itmp;
+                uint32_t *wtmp = (uint32_t *)realloc(edb_decl_w,
+                        edb_cap * sizeof(uint32_t));
+                if (!wtmp) {
+                    for (uint32_t j = 0; j < edb_count; j++)
+                        free(edb_rels[j]);
+                    free((void *)edb_rels);
+                    free(edb_has_graph);
+                    free(edb_graph_idx);
+                    free(edb_decl_w);
+                    free(plan);
+                    return -1;
+                }
+                edb_decl_w = wtmp;
             }
             edb_rels[edb_count] = dup_str(rel->name);
             if (!edb_rels[edb_count]) {
@@ -3451,12 +3474,19 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                 free((void *)edb_rels);
                 free(edb_has_graph);
                 free(edb_graph_idx);
+                free(edb_decl_w);
                 free(plan);
                 return -1;
             }
             /* Issue #535: propagate graph-column metadata from IR. */
             edb_has_graph[edb_count] = rel->has_graph_column;
             edb_graph_idx[edb_count] = rel->graph_column_index;
+            /* Issue #1038: physical, not logical -- an inline compound
+             * column occupies compound_arity slots, and the physical count
+             * is what a host insert has to match. */
+            edb_decl_w[edb_count] = rel->has_decl
+                ? wl_ir_relation_physical_width(rel)
+                : WL_PLAN_WIDTH_UNDECLARED;
             edb_count++;
         }
     }
@@ -3465,6 +3495,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
     plan->edb_count = edb_count;
     plan->edb_has_graph_column = (const bool *)edb_has_graph;
     plan->edb_graph_col_index = (const uint32_t *)edb_graph_idx;
+    plan->edb_declared_width = (const uint32_t *)edb_decl_w;
 
     /* ----------------------------------------------------------------
      * Build strata

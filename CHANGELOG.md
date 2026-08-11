@@ -44,6 +44,34 @@ All notable changes to wirelog are documented in this file.
   parties implement `read()` against these two accessors, so the change is
   called out separately from `wirelog_program_get_facts` above.
 
+- **A host insert must match the declared physical width** (#1038): the
+  `ncols` passed to `wirelog_easy_insert` is now checked against the
+  relation's `.decl` on the *first* insert as well as every later one, and a
+  mismatch returns an error instead of succeeding. Both the direct and the
+  incremental (delta-callback) insert paths enforce it. Removal is unchanged:
+  a remove against a relation with no established width is still the no-op it
+  always was, because there is nothing to remove.
+
+  This is the third embedder-visible consequence of #985 and the one that
+  was missing from the two entries above: for a relation declaring an
+  `inline` compound column, the width a host must insert at moved from the
+  logical count to the physical one. A host that inserted
+  `.decl p(id: int64, lbl: pair/2 inline)` at 2 and matched the old fact
+  path must now insert at 3.
+
+  Previously a relation's width was whatever its first producer happened to
+  supply -- the schema was set lazily from the caller's `ncols` and nothing
+  compared it against the declaration, so the check that already rejected
+  every *subsequent* mismatch was working from an accidental baseline. Both
+  directions were silent: too narrow fabricated a slot no source ever wrote
+  (`insert(p, {5, 55}, ncols=2)` derived `outr(5, 55, 0)`), and too wide
+  dropped the surplus without a word, which needed no compound at all --
+  a two-column `.decl` accepted a first insert of three.
+
+  Relations with no `.decl` are unaffected and stay caller-defined, as does
+  the degenerate zero-arity `.decl p()`, which carries no data for a width
+  check to protect.
+
   `wirelog_io_ctx_num_cols(ctx)` is now the physical row stride -- the
   `int64_t` slots one tuple occupies, which is what `docs/io-adapters.md` has
   always required `read()` to size its buffer by and the width wirelog
