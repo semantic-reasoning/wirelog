@@ -163,6 +163,8 @@ wl_ir_node_create(wirelog_ir_node_type_t type)
     if (!node)
         return NULL;
     node->type = type;
+    if (type == WIRELOG_IR_AGGREGATE)
+        node->aggregate_index = WL_IR_AGGREGATE_INDEX_UNSET;
     return node;
 }
 

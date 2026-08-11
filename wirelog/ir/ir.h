@@ -19,6 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A zero aggregate_index is a valid head position.  Keep legacy/internal
+ * callers that do not specify one distinguishable from that position. */
+#define WL_IR_AGGREGATE_INDEX_UNSET UINT32_MAX
+
 /* ======================================================================== */
 /* Expression Representation                                                */
 /* ======================================================================== */
@@ -128,7 +132,7 @@ struct wirelog_ir_node {
     wl_ir_expr_t *agg_expr;     /* AGGREGATE: expression to aggregate */
     uint32_t *group_by_indices; /* AGGREGATE: grouping column indices */
     uint32_t group_by_count;    /* AGGREGATE: number of grouping columns */
-    uint32_t aggregate_index;   /* AGGREGATE: output position of aggregate */
+    uint32_t aggregate_index;   /* AGGREGATE: output position, or UNSET */
 
     /* Compound column IR (Issue #531) */
     struct {
