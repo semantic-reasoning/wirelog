@@ -58,7 +58,9 @@ def collect_test_names(path: pathlib.Path) -> dict[str, int]:
     reject them anyway, but the lint catches them earlier with a
     clearer diagnostic)."""
     out: dict[str, int] = {}
-    for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+    for lineno, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         m = NAME_RE.match(line)
         if m:
             name = f"test_{m.group(1)}"
@@ -87,7 +89,7 @@ def main() -> int:
 
     easy_names = collect_test_names(EASY)
     advanced_names = set(collect_test_names(ADVANCED).keys())
-    easy_lines = EASY.read_text().splitlines()
+    easy_lines = EASY.read_text(encoding="utf-8").splitlines()
 
     missing: list[tuple[str, int]] = []
     for name, lineno in easy_names.items():
