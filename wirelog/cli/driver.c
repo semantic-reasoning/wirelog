@@ -151,6 +151,43 @@ find_relation(const wirelog_program_t *prog, const char *name)
     return NULL;
 }
 
+/*
+ * Type of the physical column at index @phys, or INT64 when it cannot be
+ * named.
+ *
+ * A relation's columns[] is its *declared* list; a row is laid out
+ * physically, and an inline compound column occupies compound_arity slots
+ * rather than one.  Indexing columns[] with a physical position therefore
+ * shifts every type after the first inline compound and runs off the end on
+ * the last one -- the mistake build_atom_scan() in ir/program.c warns about
+ * by name, and that #962 fixed there.  Every renderer below goes through
+ * this instead (#1036).
+ *
+ * An inline compound's slots are raw int64 payload, not the declared type of
+ * the compound as a whole, which is the same expansion io_ctx.c applies to
+ * the .input column types.  A physical index past the declared width has no
+ * declared type at all; INT64 renders it verbatim rather than reverse-
+ * interning a value that is not an intern id.
+ */
+static wirelog_column_type_t
+physical_column_type(const wl_ir_relation_info_t *rel, uint32_t phys)
+{
+    if (!rel)
+        return WIRELOG_TYPE_INT64;
+
+    uint32_t at = 0;
+    for (uint32_t c = 0; c < rel->column_count; c++) {
+        bool inl = (rel->columns[c].compound_kind
+            == WIRELOG_COMPOUND_KIND_INLINE);
+        uint32_t width = inl ? rel->columns[c].compound_arity : 1;
+
+        if (phys < at + width)
+            return inl ? WIRELOG_TYPE_INT64 : rel->columns[c].type;
+        at += width;
+    }
+    return WIRELOG_TYPE_INT64;
+}
+
 /* Write a single tuple as a CSV row to the given file */
 static void
 write_tuple_csv(FILE *f, const wl_ir_relation_info_t *rel,
@@ -160,8 +197,7 @@ write_tuple_csv(FILE *f, const wl_ir_relation_info_t *rel,
         if (i > 0)
             fprintf(f, ",");
 
-        if (rel && i < rel->column_count
-            && rel->columns[i].type == WIRELOG_TYPE_STRING && intern) {
+        if (physical_column_type(rel, i) == WIRELOG_TYPE_STRING && intern) {
             const char *str = wl_intern_reverse(intern, row[i]);
             if (str)
                 fprintf(f, "%s", str);
@@ -209,8 +245,8 @@ print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
         if (i > 0)
             fprintf(ctx->out, ", ");
 
-        if (rel && i < rel->column_count
-            && rel->columns[i].type == WIRELOG_TYPE_STRING && ctx->intern) {
+        if (physical_column_type(rel, i) == WIRELOG_TYPE_STRING
+            && ctx->intern) {
             const char *str = wl_intern_reverse(ctx->intern, row[i]);
             if (str)
                 fprintf(ctx->out, "\"%s\"", str);
@@ -313,8 +349,7 @@ parse_watch_line(char *line, char *relation_out, size_t rel_buf_size,
 
         /* Type-aware parsing: intern strings when schema is known */
         bool is_string = false;
-        if (rel_info && col < rel_info->column_count
-            && rel_info->columns[col].type == WIRELOG_TYPE_STRING)
+        if (physical_column_type(rel_info, col) == WIRELOG_TYPE_STRING)
             is_string = true;
 
         if (is_string && intern) {
@@ -360,8 +395,8 @@ delta_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
         if (i > 0)
             fprintf(ctx->out, ", ");
 
-        if (rel && i < rel->column_count
-            && rel->columns[i].type == WIRELOG_TYPE_STRING && ctx->intern) {
+        if (physical_column_type(rel, i) == WIRELOG_TYPE_STRING
+            && ctx->intern) {
             const char *str = wl_intern_reverse(ctx->intern, row[i]);
             if (str)
                 fprintf(ctx->out, "\"%s\"", str);
