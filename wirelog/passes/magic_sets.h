@@ -144,16 +144,12 @@ struct wirelog_program;
  *                         combine, so take the shape as the dominant trigger
  *                         and the 94 as the rate.
  *
- *                         Does not reach a relation read under negation
- *                         (#1047), which is invisible to the walk this closure
- *                         uses, or one defined by an aggregate rule (#1048),
- *                         which the walk tests for and steps over.  Neither is
- *                         left unaffected, though.  Under negation the closure
- *                         can leave R unguarded while a relation R reads
- *                         negatively stays guarded, i.e. partial -- measured,
- *                         that turns #1047's pre-existing defect from lost
- *                         answers into unsound ones.  See close_unrestrictable()
- *                         in magic_sets.c for the program and the row counts.
+ *                         Seeds also cover IDBs behind unguarded
+ *                         .output/.printsize consumers, IDBs under negation
+ *                         (#1047), and IDBs feeding aggregate rules (#1048).
+ *                         The closure is conservative: every such relation
+ *                         and every positive IDB dependency it reads is left
+ *                         unrestricted.
  *
  * The two skip counters describe a rule the pass declined to guard.  That is
  * sound *in isolation* but is not a "sound but unoptimized" outcome in

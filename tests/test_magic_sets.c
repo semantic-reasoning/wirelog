@@ -2639,25 +2639,22 @@ test_unrestrictable_neighbour_stays_guarded(void)
 }
 
 /*
- * Test: the closure stops at an aggregate relation.
+ * Test: aggregate inputs are complete without making the aggregate head
+ * itself a magic predicate.
  *
  * Two programs differing in one character -- the body of G's aggregate rule
  * reads the EDB e in one and the IDB S in the other.  Neither difference is
  * reachable from the demand: X is unrestrictable (d reads it binding nothing),
  * so the closure walks X's body, finds G, and would walk G's body next.
  *
- * relation_has_aggregate_rule() keeps aggregate relations out of Phase 2, but
- * that guards the *seed* site only; the closure reaches G through X's body,
- * where Phase 2 never looked.  Without the same test on the transitive step
- * the second program pulled S out of the transformation and the pair measured
- * differently -- adorned 2 vs 1, magic rules 2 vs 0 -- for a change that the
- * pass is supposed not to see at all.  #1048 owns aggregates; this test is
- * what keeps them out of #1027's closure.
+ * relation_has_aggregate_rule() keeps aggregate heads out of Phase 2, but
+ * their IDB inputs must still be complete.  Thus S remains restrictable when
+ * G reads EDB e, while S becomes unrestrictable when G reads S.
  */
 static void
-test_closure_stops_at_aggregate(void)
+test_aggregate_input_closure(void)
 {
-    TEST("test_closure_stops_at_aggregate");
+    TEST("test_aggregate_input_closure");
 
     static const char *agg_on_edb = ".decl e(x: int32, y: int32)\n"
         ".decl S(x: int32, y: int32)\n"
@@ -2713,14 +2710,14 @@ test_closure_stops_at_aggregate(void)
                 continue;
             }
 
-            /* S is reachable only through the aggregate.  It must keep its
-             * magic relation whichever way G's rule is written. */
-            if (!has_relation(prog, "$m$S_bf")) {
-                printf(" [%s fusion=%u: S lost its magic relation]", names[si],
-                    f);
+            bool aggregate_reads_idb = si == 1;
+            if (has_relation(prog, "$m$S_bf") == aggregate_reads_idb) {
+                printf(" [%s fusion=%u: unexpected S magic relation]",
+                    names[si], f);
                 failures++;
             }
-            if (stats.unrestrictable_relations != 1) {
+            uint32_t expected_unrestrictable = aggregate_reads_idb ? 2 : 1;
+            if (stats.unrestrictable_relations != expected_unrestrictable) {
                 printf(" [%s fusion=%u: unrestrictable_relations=%u]",
                     names[si], f, stats.unrestrictable_relations);
                 failures++;
@@ -2735,15 +2732,8 @@ test_closure_stops_at_aggregate(void)
         }
     }
 
-    if (failures == 0 && memcmp(&seen[0], &seen[1], sizeof(seen[0])) != 0) {
-        printf(" [adorned %u vs %u, magic rules %u vs %u]",
-            seen[0].adorned_predicates, seen[1].adorned_predicates,
-            seen[0].magic_rules_generated, seen[1].magic_rules_generated);
-        failures++;
-    }
-
     if (failures > 0) {
-        FAIL("the closure crossed into an aggregate relation");
+        FAIL("aggregate inputs were not assigned a viable guard policy");
         return;
     }
     PASS();
@@ -2762,6 +2752,90 @@ test_closure_stops_at_aggregate(void)
  *
  * The contract is rc == 0 with the program left exactly as written.
  */
+static void
+test_issue_1046_output_consumer_closure(void)
+{
+    TEST("issue #1046: output consumers see complete producers");
+
+    static const char *src = ".decl e(x: int64, y: int64)\n"
+        ".decl p(x: int64, y: int64)\n"
+        ".decl outr(x: int64, y: int64)\n"
+        ".output outr\n"
+        "e(1, 2).\n e(2, 3).\n e(3, 4).\n"
+        "p(x, y) :- e(x, y).\n"
+        "p(x, y) :- e(x, z), p(z, y).\n"
+        "outr(x, y) :- p(x, y).\n";
+    static const int64_t seed[] = { 2 };
+    wl_magic_demand_t demand = { "p", 0x1, 2 };
+    ms_row_set_t oracle, magic;
+
+    if (!ms_run(src, true, false, NULL, 0, NULL, NULL, 0, 0, "outr",
+        &oracle, NULL)
+        || !ms_run(src, true, true, &demand, 1, "$m$p_bf", seed, 1, 1,
+        "outr", &magic, NULL)
+        || !ms_rows_subset(&magic, &oracle)
+        || !ms_query_complete(&magic, &oracle, demand.bound_mask, seed, 1, 1)) {
+        FAIL("unguarded output lost tuples from its guarded producer");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_issue_1047_negated_relation_is_complete(void)
+{
+    TEST("issue #1047: negation never reads a partial relation");
+
+    static const char *src = ".decl e(x: int64, y: int64)\n"
+        ".decl p(x: int64, y: int64)\n"
+        ".decl outr(x: int64, y: int64)\n"
+        ".output outr\n"
+        "e(1, 2).\n e(2, 3).\n"
+        "p(x, y) :- e(x, y).\n"
+        "p(x, y) :- e(x, z), p(z, y).\n"
+        "outr(x, y) :- e(x, y), !p(x, y).\n";
+    static const int64_t seed[] = { 2 };
+    wl_magic_demand_t demand = { "p", 0x1, 2 };
+    ms_row_set_t oracle, magic;
+
+    if (!ms_run(src, true, false, NULL, 0, NULL, NULL, 0, 0, "outr",
+        &oracle, NULL)
+        || !ms_run(src, true, true, &demand, 1, "$m$p_bf", seed, 1, 1,
+        "outr", &magic, NULL)
+        || oracle.count != 0 || magic.count != 0) {
+        FAIL("negation invented an answer from a restricted producer");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_issue_1048_aggregate_input_is_complete(void)
+{
+    TEST("issue #1048: aggregates read complete inputs");
+
+    static const char *src = ".decl e(x: int64, y: int64)\n"
+        ".decl p(x: int64, y: int64)\n"
+        ".decl c(y: int64, n: int64)\n"
+        ".output c\n"
+        "e(1, 2).\n e(2, 3).\n e(3, 4).\n"
+        "p(x, y) :- e(x, y).\n"
+        "p(x, y) :- e(x, z), p(z, y).\n"
+        "c(y, count(x)) :- p(x, y).\n";
+    static const int64_t seed[] = { 2 };
+    static const int64_t expected[] = { 2, 1, 3, 2, 4, 3 };
+    wl_magic_demand_t demand = { "p", 0x1, 2 };
+    ms_row_set_t magic;
+
+    if (!ms_run(src, true, true, &demand, 1, "$m$p_bf", seed, 1, 1,
+        "c", &magic, NULL)
+        || !ms_rows_match(&magic, expected, 3, 2)) {
+        FAIL("aggregate values were computed from a restricted input");
+        return;
+    }
+    PASS();
+}
+
 static void
 test_over_long_rule_under_unrestrictable_declines(void)
 {
@@ -2907,7 +2981,10 @@ main(void)
     test_unrestrictable_counter_is_split_from_all_free();
     test_guarded_relation_still_prunes();
     test_unrestrictable_neighbour_stays_guarded();
-    test_closure_stops_at_aggregate();
+    test_aggregate_input_closure();
+    test_issue_1046_output_consumer_closure();
+    test_issue_1047_negated_relation_is_complete();
+    test_issue_1048_aggregate_input_is_complete();
     test_over_long_rule_under_unrestrictable_declines();
 
     printf("\n=== Results ===\n");
