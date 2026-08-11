@@ -100,11 +100,11 @@ sensor_4, 1700000500
 Expected `latest` output (sensor_4 has a tie):
 
 ```
-sensor_1, 1700000300, 24.1
-sensor_2, 1700000400, 46.0
-sensor_3, 1700000350, 13.5
-sensor_4, 1700000500, 98.5
-sensor_4, 1700000500, 99.0
+sensor_1,1700000300,24.1
+sensor_2,1700000400,46.0
+sensor_3,1700000350,13.5
+sensor_4,1700000500,99.0
+sensor_4,1700000500,98.5
 ```
 
 ## Running the Example
