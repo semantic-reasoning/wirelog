@@ -265,6 +265,7 @@ token_to_str_fn(wl_parser_lexer_token_type_t type)
     case WL_PARSER_LEXER_TOK_TRIM:        return WIRELOG_STR_FN_TRIM;
     case WL_PARSER_LEXER_TOK_TO_STRING:   return WIRELOG_STR_FN_TO_STRING;
     case WL_PARSER_LEXER_TOK_TO_NUMBER:   return WIRELOG_STR_FN_TO_NUMBER;
+    case WL_PARSER_LEXER_TOK_UUID5_RFC:   return WIRELOG_STR_FN_UUID5_RFC;
     default:                               return WIRELOG_STR_FN_STRLEN;
     }
 }
@@ -284,7 +285,8 @@ is_string_fn_token(wl_parser_lexer_token_type_t type)
            || type == WL_PARSER_LEXER_TOK_STR_REPLACE
            || type == WL_PARSER_LEXER_TOK_TRIM
            || type == WL_PARSER_LEXER_TOK_TO_STRING
-           || type == WL_PARSER_LEXER_TOK_TO_NUMBER;
+           || type == WL_PARSER_LEXER_TOK_TO_NUMBER
+           || type == WL_PARSER_LEXER_TOK_UUID5_RFC;
 }
 
 /* Parse a string function call: fn(arg [, arg]*) */
@@ -327,6 +329,12 @@ parse_string_fn_expr(wl_parser_t *parser)
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
         "expected ')' after string function arguments")) {
+        wl_parser_ast_node_free(node);
+        return NULL;
+    }
+
+    if (fn == WIRELOG_STR_FN_UUID5_RFC && node->child_count != 2) {
+        parser_error(parser, "uuid5_rfc expects namespace and name");
         wl_parser_ast_node_free(node);
         return NULL;
     }

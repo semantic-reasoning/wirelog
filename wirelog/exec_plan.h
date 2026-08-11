@@ -157,6 +157,7 @@ typedef enum {
     WL_PLAN_EXPR_STR_FN_TRIM       = 0x4A, /* unary:   pop 1 push 1 */
     WL_PLAN_EXPR_STR_FN_TO_STRING  = 0x4B, /* unary:   pop 1 push 1 */
     WL_PLAN_EXPR_STR_FN_TO_NUMBER  = 0x4C, /* unary:   pop 1 push 1 */
+    WL_PLAN_EXPR_STR_FN_UUID5_RFC  = 0x4D, /* binary: pop 2 push 1 */
 
     /* String comparison operators (intern IDs → bool, via strcmp) */
     WL_PLAN_EXPR_CMP_STR_EQ  = 0x50, /* binary: pop 2 push bool */

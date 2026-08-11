@@ -98,6 +98,7 @@ typedef enum {
     /* UUID function keywords (mbedTLS) */
     WL_PARSER_LEXER_TOK_UUID4, /* uuid4 */
     WL_PARSER_LEXER_TOK_UUID5, /* uuid5 */
+    WL_PARSER_LEXER_TOK_UUID5_RFC, /* uuid5_rfc */
 
     /* CRC-32 function keywords (Issue #884) */
     WL_PARSER_LEXER_TOK_CRC32_ETH,  /* crc32_ethernet */

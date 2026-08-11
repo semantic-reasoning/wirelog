@@ -117,6 +117,7 @@ typedef enum {
     WIRELOG_STR_FN_TRIM,        /* trim(s) - strip leading/trailing whitespace */
     WIRELOG_STR_FN_TO_STRING,   /* to_string(x) - numeric to string */
     WIRELOG_STR_FN_TO_NUMBER,   /* to_number(s) - string to numeric */
+    WIRELOG_STR_FN_UUID5_RFC,   /* uuid5_rfc(namespace_uuid, name) */
 } wirelog_str_fn_t;
 
 /* ======================================================================== */

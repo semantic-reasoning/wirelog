@@ -523,6 +523,7 @@ str_fn_to_tag(wirelog_str_fn_t fn)
     case WIRELOG_STR_FN_TRIM:        return WL_PLAN_EXPR_STR_FN_TRIM;
     case WIRELOG_STR_FN_TO_STRING:   return WL_PLAN_EXPR_STR_FN_TO_STRING;
     case WIRELOG_STR_FN_TO_NUMBER:   return WL_PLAN_EXPR_STR_FN_TO_NUMBER;
+    case WIRELOG_STR_FN_UUID5_RFC:   return WL_PLAN_EXPR_STR_FN_UUID5_RFC;
     }
     return WL_PLAN_EXPR_STR_FN_STRLEN; /* fallback */
 }
@@ -697,6 +698,7 @@ expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
         case WIRELOG_STR_FN_STR_REPLACE:
         case WIRELOG_STR_FN_TRIM:
         case WIRELOG_STR_FN_TO_STRING:
+        case WIRELOG_STR_FN_UUID5_RFC:
             return WL_IR_COLTYPE_STRING;
         /* Produce a length, a code point, a boolean or a number. */
         case WIRELOG_STR_FN_STRLEN:
