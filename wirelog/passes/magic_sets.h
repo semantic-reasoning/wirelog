@@ -157,8 +157,10 @@ struct wirelog_program;
  * reading a partial relation, which is unsound under negation (#1047) and
  * wrong-valued under aggregation (#1048).  Correctness comes from the whole
  * assignment of guards being consistent, not from any one rule's skip; the
- * guard-viability closure above is what enforces that for the shapes it can
- * see, and the two issues named are the shapes it cannot.
+ * guard-viability closure above is what enforces that across the consumer
+ * shapes it seeds, including output, negation and aggregate consumers.  The
+ * remaining limitations are conservative over-approximation and the separate
+ * multiple-adornment issue (#995), not unseen #1047/#1048 shapes.
  *
  * They are the only signal that a demand did not reach a rule -- but only for
  * a caller that supplies a stats struct.  The library's own pipeline passes
