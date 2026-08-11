@@ -20,6 +20,14 @@ public API, ABI, or source compatibility.
   I/O adapters, and fact enumeration now use physical row width where
   storage is concerned. Applications using inline compound columns should
   provide and consume their expanded physical rows.
+- **Magic Sets keeps output, negation, and aggregate inputs complete** (#1046,
+  #1047, #1048): guarded producers are no longer exposed as partial relations
+  to unguarded output consumers, negated reads, or aggregate inputs. This
+  prevents lost output rows, answers invented through negation, and aggregate
+  values computed from only a subset.
+- **Single-rule IDBs use set semantics** (#957): single-rule IDB snapshots are
+  consolidated before downstream joins, preventing duplicate derivations from
+  multiplying downstream rows or join results.
 
 ---
 
