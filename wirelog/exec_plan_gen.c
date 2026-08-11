@@ -3136,6 +3136,19 @@ rewrite_lftj_chains(wl_plan_t *plan)
                         ok = false;
                         break;
                     }
+                    /* Issue #1032: the only externally observable evidence
+                     * that an LFTJ was produced.  build_lftj_op() frees the
+                     * chain's operators and keeps only rel_names[], so any
+                     * consumer that does not descend into it sees a rule that
+                     * reads nothing -- and without this line "the rewrite fired
+                     * and the consumer coped" is indistinguishable from "the
+                     * rewrite never fired", which is what made the blindness
+                     * untestable.  TRACE, so release builds strip it. */
+                    WL_LOG(WL_LOG_SEC_ARRANGEMENT, WL_LOG_TRACE,
+                        "lftj rewrite relation=%s chain_at=%u k=%u "
+                        "left_key=%s right_key=%s",
+                        rel->name ? rel->name : "?", i, clen,
+                        lk0 ? lk0 : "-", rk0 ? rk0 : "-");
                     ni++;
                     i += clen;
                 } else {
