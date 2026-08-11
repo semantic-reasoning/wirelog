@@ -2796,6 +2796,12 @@ col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
         return false;
     uint64_t limit = sess->join_output_shared_count
         ? sess->join_output_shared_limit : sess->join_output_limit;
+    /* Issue #959: record the high-water mark even when no cap is set, so a
+     * run that completes still reports what it needed.  Cheap: this helper
+     * is already called once per output-size check, and it is a compare and
+     * a store on a session-local field. */
+    if (out && out->nrows > sess->join_output_peak)
+        sess->join_output_peak = out->nrows;
     if (limit == 0)
         return false;
     if (sess->join_output_shared_count) {

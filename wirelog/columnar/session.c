@@ -1272,6 +1272,36 @@ col_session_destroy(wl_session_t *session)
     if (!session)
         return;
     wl_col_session_t *sess = COL_SESSION(session);
+
+    /* Issue #959: report the join-output high-water mark before teardown.
+     *
+     * The open question is whether dividing the row cap by W is right --
+     * col_session_worker_init() gives each worker join_output_limit / W,
+     * which assumes a worker's largest intermediate is 1/W of the
+     * single-threaded one.  Workers are separate sessions, so each prints
+     * its own line and the ratio is readable directly:
+     *
+     *     WL_LOG=SESSION:4 ... 2>&1 | grep join_output_peak
+     *
+     * A worker peak near single_threaded_peak / W means the division is
+     * sound for that workload; a much larger one is the reproduction #959
+     * has been missing, and also sizes the fix.  DEBUG rather than INFO so
+     * it does not appear in ordinary runs.
+     *
+     * Known gap, stated rather than left to be discovered: only the
+     * coordinator reaches here.  Worker sessions are bitwise copies torn
+     * down on their own path and never call col_session_destroy, so at W=8
+     * this still prints exactly one line.  What it gives today is the
+     * single-threaded reference number -- the denominator of the ratio --
+     * and confirmation that it does not change with W.  Capturing the
+     * numerator needs the same emit on the worker teardown path, which is
+     * the next step for #959 and is deliberately not guessed at here. */
+    WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_DEBUG,
+        "join_output_peak rows=%llu limit=%llu workers=%u",
+        (unsigned long long)sess->join_output_peak,
+        (unsigned long long)sess->join_output_limit,
+        sess->num_workers);
+
     /* Issue #600: tear down rotation strategy first so the destroy hook
      * still sees a fully-populated session (eval_arena, compound_arena,
      * etc.) before any of the other teardown frees them. NULL-safe. */
