@@ -1,3 +1,5 @@
+./.github/workflows/lint-main.yml@UNKNOWN:NOASSERTION
+./.github/workflows/lint-pr.yml@UNKNOWN:NOASSERTION
 actions/cache@v4:NOASSERTION
 actions/cache@v5:NOASSERTION
 actions/cache@v5:NOASSERTION
@@ -61,11 +63,9 @@ docker/setup-buildx-action@v4.0.0:NOASSERTION
 docker/setup-qemu-action@v4.0.0:NOASSERTION
 docker/setup-qemu-action@v4.0.0:NOASSERTION
 github/codeql-action/upload-sarif@v2.14.5:NOASSERTION
-./.github/workflows/lint-main.yml@UNKNOWN:NOASSERTION
-./.github/workflows/lint-pr.yml@UNKNOWN:NOASSERTION
 ilammy/msvc-dev-cmd@v1:NOASSERTION
 mozilla-actions/sccache-action@v0.0.10:NOASSERTION
-msys2/setup-msys2@7efe20baefed56359985e327d329042cde2434ff:NOASSERTION
+msys2/setup-msys2@v2:NOASSERTION
 mymindstorm/setup-emsdk@v14:NOASSERTION
 nanoarrow@0.8.0.9000:Apache
 nttld/setup-ndk@v1:NOASSERTION
@@ -78,4 +78,4 @@ r-lib/actions/setup-r-dependencies@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-tinytex@v2:NOASSERTION
-# nanoarrow-resolved-sha: 8dcb55e735354ece7e1776d2d9577806cda3ee00
+# nanoarrow-resolved-sha: 65ab7e9f29244589ccbe7f95900c1295633baf42

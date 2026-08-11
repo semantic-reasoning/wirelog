@@ -289,9 +289,9 @@ const wirelog_io_adapter_t *const *wirelog_io_plugin_entry(uint32_t *n_out, uint
 The CLI calls `dlopen` + `dlsym("wirelog_io_plugin_entry")`, validates the ABI
 version, and bulk-registers all returned adapters.
 
-> **Note**: The symbols above (`WIRELOG_IO_PLUGIN_EXPORT`, `wirelog_io_plugin_entry`)
-> are the proposed contract and are not yet defined in the header. They will
-> be introduced in #461.
+The export macro and `wirelog_io_plugin_entry` declaration are defined in
+`<wirelog/io/io_adapter.h>`. Plugins must compile against the ABI-2 header
+(`WIRELOG_IO_ABI_VERSION == 2u`) and export the entry symbol shown above.
 
 ---
 
