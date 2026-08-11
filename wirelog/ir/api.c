@@ -24,6 +24,7 @@
 #include "../util/log.h"
 #include "../wirelog-parser.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,8 +32,26 @@
 /* Parsing                                                                  */
 /* ======================================================================== */
 
+/* Copy a rejection reason into the caller's buffer, if it wants one and
+ * there is one to give.  A NULL or zero-capacity buffer is the normal case
+ * -- it is what wirelog_parse_string() passes -- so this is not an error. */
+static void
+copy_err(char *errbuf, size_t errcap, const char *msg)
+{
+    if (!errbuf || errcap == 0 || !msg || msg[0] == '\0')
+        return;
+    snprintf(errbuf, errcap, "%s", msg);
+}
+
 wirelog_program_t *
 wirelog_parse_string(const char *program_text, wirelog_error_t *error)
+{
+    return wl_ir_parse_string_err(program_text, error, NULL, 0);
+}
+
+wirelog_program_t *
+wl_ir_parse_string_err(const char *program_text, wirelog_error_t *error,
+    char *errbuf, size_t errcap)
 {
     /* Issue #973: the post-parse stages below reject some programs and explain
      * why through WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR, ...) -- the
@@ -44,11 +63,14 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
      * so the process returned before the logger existed and no WL_LOG value
      * could help.  Initializing here makes WL_LOG=PARSER:1 actually work.
      *
-     * This does not change default output -- the gate is LVL <= threshold and
-     * the default WL_LOG_NONE (0) still suppresses WL_LOG_ERROR (1).  A user
-     * who sets nothing still sees only "Parse error" from cli/driver.c; giving
-     * them a message by default requires surfacing the errbuf below, which is
-     * issue #979.  This is the opt-in half of that.
+     * That did not change default output -- the gate is LVL <= threshold and
+     * the default WL_LOG_NONE (0) still suppresses WL_LOG_ERROR (1) -- so it
+     * was only the opt-in half.  The default-visible half is issue #979,
+     * which is now this function: the stages record their reason on the
+     * program via wl_ir_program_set_error() and it is copied into @errbuf
+     * below, independently of any threshold.  WL_LOG remains the way to see
+     * these when parsing through the public wirelog_parse_string(), which
+     * passes no buffer.
      *
      * Thread-safety caveat, and note this is a *new* exposure rather than
      * purely an inherited one.  wl_log_init() fcloses the old sink, NULLs it
@@ -63,6 +85,9 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
      * Cost: with WL_LOG_FILE set this reopens the sink on every call, so a
      * caller parsing many programs in a loop pays an fopen+fclose each time.
      * Unset -- the default -- it is just a threshold recompute. */
+    if (errbuf && errcap > 0)
+        errbuf[0] = '\0';
+
     if (!program_text) {
         if (error)
             *error = WIRELOG_ERR_PARSE;
@@ -71,10 +96,15 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
 
     wl_log_init();
 
-    char errbuf[512] = { 0 };
+    /* Named apart from the @errbuf parameter deliberately: this one is the
+     * parser's own scratch, sized by parser.c's error_msg[512]. */
+    char syntax_err[512] = { 0 };
     wl_parser_ast_node_t *ast
-        = wl_parser_parse_string(program_text, errbuf, sizeof(errbuf));
+        = wl_parser_parse_string(program_text, syntax_err, sizeof(syntax_err));
     if (!ast) {
+        /* Issue #979 gap 1: this text was composed and then discarded when
+         * the buffer went out of scope one line later. */
+        copy_err(errbuf, errcap, syntax_err);
         if (error)
             *error = WIRELOG_ERR_PARSE;
         return NULL;
@@ -90,7 +120,12 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
 
     prog->ast = ast;
 
+    /* Issue #979 gap 2: each stage records its reason on the program, which
+     * wl_ir_program_free() is about to destroy -- so copy it out first.  Doing
+     * the free first and the copy second reads identically and yields a
+     * use-after-free; the ordering here is load-bearing, not stylistic. */
     if (wl_ir_program_collect_metadata(prog, ast) != 0) {
+        copy_err(errbuf, errcap, prog->parse_error);
         wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_PARSE;
@@ -98,6 +133,7 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
     }
 
     if (wl_ir_program_convert_rules(prog, ast) != 0) {
+        copy_err(errbuf, errcap, prog->parse_error);
         wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_PARSE;
@@ -105,6 +141,7 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
     }
 
     if (wl_ir_program_merge_unions(prog) != 0) {
+        copy_err(errbuf, errcap, prog->parse_error);
         wl_ir_program_free(prog);
         if (error)
             *error = WIRELOG_ERR_MEMORY;

@@ -14,6 +14,8 @@
 
 #include "ir.h"
 #include "../intern.h"
+/* wirelog_error_t, for wl_ir_parse_string_err() below (#979). */
+#include "../wirelog.h"
 #include "../wirelog-types.h"
 #include "../passes/magic_sets.h"
 
@@ -175,6 +177,12 @@ struct wirelog_program {
     /* Source AST (retained for debugging, freed on program_free) */
     wl_parser_ast_node_t *ast;
 
+    /* Why the lowering stages rejected this program, if they did (#979).
+     * First writer wins -- see wl_ir_program_set_error().  Empty until a
+     * rejection, and read by wl_ir_parse_string_err() *before* it frees the
+     * program on the failure path, since this dies with the struct. */
+    char parse_error[512];
+
     /* Symbol intern table (string -> int64 mapping) */
     wl_intern_t *intern;
 
@@ -206,6 +214,40 @@ wl_ir_program_create(void);
 void
 wl_ir_program_free(struct wirelog_program *program);
 
+/**
+ * wl_ir_parse_string_err:
+ * @program_text: Datalog source
+ * @error: (out) (nullable): coarse error code, as wirelog_parse_string()
+ * @errbuf: (out) (nullable): buffer for the human-readable rejection reason
+ * @errcap: size of @errbuf in bytes
+ *
+ * wirelog_parse_string() with somewhere for the reason to go (issue #979).
+ *
+ * The public entry point's signature is ABI-frozen and has no message
+ * parameter, so it forwards here with (NULL, 0) and behaves exactly as
+ * before.  This variant is deliberately internal rather than a new
+ * `wirelog_parse_string_ex()` export: the only consumer that needs it is the
+ * CLI, which compiles wirelog_sources directly into its executable rather
+ * than linking libwirelog, so it reaches internal symbols without a new
+ * public one.  Adding a public symbol would mean updating three per-platform
+ * lists under abi/ plus the abidiff baseline, and committing to the surface
+ * forever -- a decision worth making on its own evidence rather than as a
+ * side effect of a diagnostics fix.  See #1024, which wants to know whether
+ * such rejections should be load-time errors at all.
+ *
+ * On failure @errbuf receives the reason when one is available: the parser's
+ * "line %u, col %u: ..." text for a syntax error, or the rejecting stage's
+ * message for a semantic one.  It is set to the empty string on entry, so an
+ * empty buffer after a NULL return means the failure had no message, not
+ * that the caller forgot to look.  @errbuf is caller-owned; nothing retains
+ * a pointer to it.
+ *
+ * Returns: the program, or NULL on failure.
+ */
+struct wirelog_program *
+wl_ir_parse_string_err(const char *program_text, wirelog_error_t *error,
+    char *errbuf, size_t errcap);
+
 int
 wl_ir_program_collect_metadata(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast);
@@ -216,6 +258,33 @@ wl_ir_program_convert_rules(struct wirelog_program *program,
 
 int
 wl_ir_program_merge_unions(struct wirelog_program *program);
+
+/**
+ * wl_ir_program_set_error:
+ * @program: (nullable): the program being lowered
+ * @fmt: printf-style format for the rejection reason
+ *
+ * Record why lowering rejected @program, and log it (issue #979).
+ *
+ * Replaces the bare WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR, ...) that each
+ * rejection site used to call.  Those messages were already well composed --
+ * they name the relation, the counts and the source line -- but WL_LOG could
+ * not deliver them: wl_log_thresholds defaults to WL_LOG_NONE (0), the gate
+ * is (LVL) <= threshold, and WL_LOG_ERROR is 1.  Formatting once here and
+ * both storing and logging keeps a single format string per rejection, so
+ * the stored text and the logged text cannot drift apart.
+ *
+ * First writer wins.  Each stage returns non-zero as soon as it rejects, so
+ * in practice only one call fires per parse; keeping the first rather than
+ * the last means that if that ever stops holding, the user sees the root
+ * cause instead of whatever happened to run last.
+ */
+void
+wl_ir_program_set_error(struct wirelog_program *program, const char *fmt, ...)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 2, 3)))
+#endif
+;
 
 void
 wl_ir_program_build_schemas(struct wirelog_program *program);

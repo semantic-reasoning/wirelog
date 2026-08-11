@@ -4633,6 +4633,16 @@ if not is_android
   # Reuses baseline_py3 (already resolved above) to invoke the executable.
   # ============================================================================
 
+  test('cli_parse_diagnostics',
+    baseline_py3,
+    args: [
+      files('test_cli_parse_diagnostics.py')[0],
+      wirelog_cli.full_path(),
+    ],
+    depends: wirelog_cli,
+    suite: 'cli',
+  )
+
   test('cli_version',
     baseline_py3,
     args: [

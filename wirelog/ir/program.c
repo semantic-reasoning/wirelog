@@ -16,6 +16,7 @@
 #include "../util/log.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,6 +154,34 @@ parse_compound_metadata(const char *type_name, wl_intern_t *intern)
 /* ======================================================================== */
 /* Program Create / Free                                                    */
 /* ======================================================================== */
+
+void
+wl_ir_program_set_error(struct wirelog_program *program, const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (n < 0)
+        return;
+
+    /* Log unconditionally, exactly as the open-coded WL_LOG at each site did,
+    * so WL_LOG=PARSER:1 keeps behaving as before for anyone relying on it. */
+    WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR, "%s", buf);
+
+    /* Defensive only -- all seven current call sites pass a live program.
+     * The log line above has already been emitted either way, so a future
+     * site that has a message but no program still gets WL_LOG behaviour
+     * identical to the open-coded call it replaced. */
+    if (!program)
+        return;
+    if (program->parse_error[0] != '\0')
+        return; /* first writer wins */
+    snprintf(program->parse_error, sizeof(program->parse_error), "%s", buf);
+}
 
 struct wirelog_program *
 wl_ir_program_create(void)
@@ -364,7 +393,7 @@ collect_decl(struct wirelog_program *prog,
                 typed_count++;
         }
         if (typed_count != 6) {
-            WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+            wl_ir_program_set_error(prog,
                 "'__graph_metadata' is reserved and must have exactly 6"
                 " columns (graph_id, tenant, timestamp, location, risk,"
                 " description); got %u",
@@ -759,7 +788,7 @@ atom_physical_column_count(const wl_parser_ast_node_t *atom,
  * is no value that could stand for "not written", and the rule-head
  * analogue is already rejected by validate_head_arities() below. */
 static int
-validate_fact_arities(const struct wirelog_program *program,
+validate_fact_arities(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
 {
     for (uint32_t i = 0; i < ast->child_count; i++) {
@@ -781,14 +810,14 @@ validate_fact_arities(const struct wirelog_program *program,
         uint32_t declared = wl_ir_relation_physical_width(rel);
         if (node->child_count != declared) {
             if (declared != rel->column_count)
-                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                wl_ir_program_set_error(program,
                     "fact for relation '%s' has %u argument(s) but '%s'"
                     " occupies %u column(s) (%u declared, inline compound"
                     " column(s) expanded to their slots) (line %u)",
                     rel->name, node->child_count, rel->name, declared,
                     rel->column_count, node->line);
             else
-                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                wl_ir_program_set_error(program,
                     "fact for relation '%s' has %u argument(s) but '%s' is"
                     " declared with %u column(s) (line %u)",
                     rel->name, node->child_count, rel->name, declared,
@@ -876,7 +905,7 @@ validate_fact_arities(const struct wirelog_program *program,
  * Undeclared heads are skipped: they are widespread and legitimate
  * (bench/workloads/doop.dl has ~90). */
 static int
-validate_head_arities(const struct wirelog_program *program,
+validate_head_arities(struct wirelog_program *program,
     const wl_parser_ast_node_t *ast)
 {
     for (uint32_t i = 0; i < ast->child_count; i++) {
@@ -897,14 +926,14 @@ validate_head_arities(const struct wirelog_program *program,
         uint32_t declared = wl_ir_relation_physical_width(rel);
         if (emitted != declared) {
             if (declared != rel->column_count)
-                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                wl_ir_program_set_error(program,
                     "rule head for relation '%s' emits %u column(s) but '%s'"
                     " occupies %u column(s) (%u declared, inline compound"
                     " column(s) expanded to their slots) (line %u)",
                     rel->name, emitted, rel->name, declared,
                     rel->column_count, head->line);
             else
-                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                wl_ir_program_set_error(program,
                     "rule head for relation '%s' emits %u column(s) but '%s'"
                     " is declared with %u column(s) (line %u)",
                     rel->name, emitted, rel->name, declared, head->line);
@@ -2036,7 +2065,7 @@ wl_ir_program_push_constant_filters(const wl_parser_ast_node_t *rule_node,
 
 static wirelog_ir_node_t *
 convert_rule(const wl_parser_ast_node_t *rule_node,
-    const struct wirelog_program *prog)
+    struct wirelog_program *prog)
 {
     if (!rule_node || rule_node->child_count < 1)
         return NULL;
@@ -2090,7 +2119,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             head_agg_count++;
     }
     if (head_agg_count > 1) {
-        WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+        wl_ir_program_set_error(prog,
             "relation '%s' has %u aggregates in one rule head; at most one is "
             "supported. Derive each aggregate in its own rule and join the "
             "results (e.g. tmin(g, min(v)) :- val(g, v); "
@@ -2276,7 +2305,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 if (bound)
                     continue;
 
-                WL_LOG(WL_LOG_SEC_PARSER, WL_LOG_ERROR,
+                wl_ir_program_set_error(prog,
                     "unsafe variable '%s' appears only in negated atom '%s'; "
                     "bind it in a positive body atom (e.g. project the negated "
                     "relation first: key(...) :- %s(...); "
