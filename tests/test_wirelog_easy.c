@@ -1847,6 +1847,7 @@ test_delta_cb_multi_round_recursive_insert(void)
     PASS();
 }
 
+/* PARITY: facade-only -- this regression uses the easy snapshot callback API. */
 static void
 test_delta_cb_snapshot_recomputes_fused_recursive_relation(void)
 {
@@ -1889,26 +1890,57 @@ test_delta_cb_snapshot_recomputes_fused_recursive_relation(void)
     tuple_collector_t tuples;
     memset(&tuples, 0, sizeof(tuples));
     if (wirelog_easy_snapshot(s, "path", collect_tuple, &tuples)
-        != WIRELOG_OK) {
-        FAIL("snapshot failed");
+        != WIRELOG_OK || tuples.count != 3) {
+        FAIL("snapshot after the second insert must contain the full closure");
         wirelog_easy_close(s);
         return;
     }
 
     bool found = false;
     for (int i = 0; i < tuples.count; i++) {
-        if (strcmp(tuples.relations[i], "path") == 0
-            && tuples.ncols[i] == 2 && tuples.rows[i][0] == 1
-            && tuples.rows[i][1] == 3) {
+        if (tuples.rows[i][0] == 1 && tuples.rows[i][1] == 3) {
             found = true;
             break;
         }
     }
-    wirelog_easy_close(s);
     if (!found) {
         FAIL("snapshot missed path(1,3) after the second insert");
+        wirelog_easy_close(s);
         return;
     }
+
+    /* A clean repeated snapshot must expose the same complete fused state,
+     * not a partially cached K-fusion result. */
+    memset(&tuples, 0, sizeof(tuples));
+    if (wirelog_easy_snapshot(s, "path", collect_tuple, &tuples)
+        != WIRELOG_OK || tuples.count != 3) {
+        FAIL("repeated snapshot must preserve the complete closure");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    int64_t third[] = { 3, 4 };
+    if (wirelog_easy_insert(s, "edge", third, 2) != WIRELOG_OK) {
+        FAIL("third insert failed");
+        wirelog_easy_close(s);
+        return;
+    }
+    memset(&tuples, 0, sizeof(tuples));
+    if (wirelog_easy_snapshot(s, "path", collect_tuple, &tuples)
+        != WIRELOG_OK || tuples.count != 6) {
+        FAIL("snapshot after a later insert must recompute the full closure");
+        wirelog_easy_close(s);
+        return;
+    }
+
+    memset(&tuples, 0, sizeof(tuples));
+    if (wirelog_easy_snapshot(s, "path", collect_tuple, &tuples)
+        != WIRELOG_OK || tuples.count != 6) {
+        FAIL("repeated later snapshot must remain complete");
+        wirelog_easy_close(s);
+        return;
+    }
+    wirelog_easy_close(s);
     PASS();
 }
 
