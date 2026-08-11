@@ -30,6 +30,16 @@ typedef struct wl_parser_ast_node wl_parser_ast_node_t;
 typedef struct {
     char *name;
     wirelog_column_t *columns;
+    /* Issue #1037: per-slot types for inline compound columns, stride
+     * col*4+slot, or NULL when no column names its slot types.
+     *
+     * Deliberately NOT a field on wirelog_column_t: that struct is public
+     * (wirelog-types.h) and travels by value inside wirelog_schema_t, which
+     * wirelog_program_get_schema() hands to embedders, so widening it is a
+     * layout break rather than a manifest update.  A side array keeps the
+     * ABI still, the same shape as plan->edb_declared_width (#1038). */
+    wirelog_column_type_t *slot_types;
+    uint32_t slot_type_count;
     uint32_t column_count;
     /* Issue #977: true once a `.decl` for this relation has been collected.
      * Distinguishes "declared with zero columns" (`.decl p()`, which parses

@@ -67,6 +67,10 @@ typedef struct {
     wirelog_compound_kind_t kind;
     uint32_t functor_id;
     uint32_t arity;
+    /* Issue #1037: set only for the f(t1, t2) spelling; false means f/arity,
+     * which continues to mean every slot is int64. */
+    bool has_slot_types;
+    wirelog_column_type_t slot_types[4];
 } compound_metadata_t;
 
 /**
@@ -114,8 +118,50 @@ parse_compound_metadata(const char *type_name, wl_intern_t *intern)
         return result; /* Invalid arity */
     }
 
-    /* Check for kind modifier (inline/side) after arity */
+    /* Issue #1037: decode an optional <t1,t2> between the arity and the
+     * modifier.  strtol above already stops at '<', so the arity is right
+     * either way; without this the modifier compare below sees "<...> inline"
+     * and fails, leaving compound_kind NONE. */
     char *kind_str = arity_end;
+    if (*kind_str == '<') {
+        char *q = kind_str + 1;
+        uint32_t n = 0;
+        while (*q && *q != '>') {
+            const char *tok = q;
+            while (*q && *q != ',' && *q != '>')
+                q++;
+            size_t tlen = (size_t)(q - tok);
+            wirelog_column_type_t ty;
+            /* `symbol` -> STRING exactly as type_name_to_column_type() does
+             * for a whole column; csv_reader.c already interns STRING
+             * columns, which is why no new public enum value is needed. */
+            if (tlen == 5 && strncmp(tok, "int32",
+                5) == 0) ty = WIRELOG_TYPE_INT32;
+            else if (tlen == 5 && strncmp(tok, "int64",
+                5) == 0) ty = WIRELOG_TYPE_INT64;
+            else if (tlen == 6 && strncmp(tok, "string",
+                6) == 0) ty = WIRELOG_TYPE_STRING;
+            else if (tlen == 6 && strncmp(tok, "symbol",
+                6) == 0) ty = WIRELOG_TYPE_STRING;
+            else {
+                free(functor_name); return result;
+            }
+            if (n >= 4) {
+                free(functor_name); return result;
+            }
+            result.slot_types[n++] = ty;
+            if (*q == ',') q++;
+        }
+        /* List length and arity validated equal rather than either being
+         * trusted: wl_ir_relation_physical_width() (#985) derives the
+         * physical width from compound_arity. */
+        if (*q != '>' || n == 0 || (uint32_t)arity_val != n) {
+            free(functor_name);
+            return result;
+        }
+        result.has_slot_types = true;
+        kind_str = q + 1;
+    }
     while (*kind_str && isspace((unsigned char)*kind_str))
         kind_str++;
 
@@ -212,6 +258,7 @@ relation_info_free(wl_ir_relation_info_t *info)
         }
         free(info->columns);
     }
+    free(info->slot_types); /* Issue #1037 */
     if (info->input_param_names) {
         for (uint32_t i = 0; i < info->input_param_count; i++) {
             free(info->input_param_names[i]);
@@ -462,6 +509,30 @@ collect_decl(struct wirelog_program *prog,
                 rel->columns[idx].compound_functor_id = meta.functor_id;
                 rel->columns[idx].compound_arity = meta.arity;
                 rel->columns[idx].compound_inline_col_offset = 0;
+
+                /* Issue #1037: fixed stride col*4+slot.  A physically packed
+                 * array would have to be built in column order and misaligns
+                 * if a scalar column precedes the compound.  Seeded INT64
+                 * rather than left at calloc's zero because
+                 * WIRELOG_TYPE_INT32 == 0, so a zero cell is otherwise
+                 * indistinguishable from an unwritten one. */
+                if (meta.has_slot_types
+                    && meta.kind == WIRELOG_COMPOUND_KIND_INLINE) {
+                    if (!rel->slot_types) {
+                        rel->slot_types = (wirelog_column_type_t *)calloc(
+                            (size_t)rel->column_count * 4,
+                            sizeof(wirelog_column_type_t));
+                        rel->slot_type_count = rel->slot_types
+                            ? rel->column_count * 4 : 0;
+                        for (uint32_t z = 0; z < rel->slot_type_count; z++)
+                            rel->slot_types[z] = WIRELOG_TYPE_INT64;
+                    }
+                    if (rel->slot_types
+                        && (idx * 4 + meta.arity) <= rel->slot_type_count) {
+                        for (uint32_t si = 0; si < meta.arity; si++)
+                            rel->slot_types[idx * 4 + si] = meta.slot_types[si];
+                    }
+                }
 
                 /* Issue #535: RDF named-graph support */
                 if (strcmp(param->name, "__graph_id") == 0) {

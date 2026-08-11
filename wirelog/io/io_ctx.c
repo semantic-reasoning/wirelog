@@ -86,8 +86,18 @@ wirelog_io_ctx_create_for_relation(const wl_ir_relation_info_t *rel,
         for (uint32_t i = 0; i < rel->column_count; i++) {
             if (rel->columns[i].compound_kind
                 == WIRELOG_COMPOUND_KIND_INLINE) {
-                for (uint32_t j = 0; j < rel->columns[i].compound_arity; j++)
-                    ctx->col_types[k++] = WIRELOG_TYPE_INT64;
+                /* Issue #1037: a `.decl` may name each slot's type as
+                 * `f(symbol, int64) inline`.  When it does, the side array
+                 * carries them at col*4+slot; a symbol slot reads as
+                 * WIRELOG_TYPE_STRING, which csv_reader.c already interns.
+                 * `f/arity` leaves slot_types NULL and keeps meaning
+                 * all-int64, so nothing that parses today moves. */
+                for (uint32_t j = 0; j < rel->columns[i].compound_arity; j++) {
+                    wirelog_column_type_t st = WIRELOG_TYPE_INT64;
+                    if (rel->slot_types && (i * 4 + j) < rel->slot_type_count)
+                        st = rel->slot_types[i * 4 + j];
+                    ctx->col_types[k++] = st;
+                }
             } else {
                 ctx->col_types[k++] = rel->columns[i].type;
             }
