@@ -501,8 +501,10 @@ Query with a mixed pattern on a ternary relation:
 
 - `.query` is **optional**. Programs without `.query` directives evaluate all
   `.output` relations fully (all-free adornment), which is the default behavior.
-- When `.query` is present, the Magic Sets pass generates demand propagation
-  rules that prune the search space based on the bound positions.
+- The lower-level Magic Sets API can prune the search space when callers
+  explicitly seed demand relations for bound positions; the public parsed
+  `.query` path currently supplies no seed values, remains unoptimized, and
+  preserves the complete result.
 - A parsed `.query` with at least one bound position currently remains
   unoptimized because the syntax supplies no seed values (Issue #989). It
   preserves the complete result; explicit callers that provide demand seeds
