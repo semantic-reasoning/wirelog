@@ -4719,6 +4719,27 @@ test_input_arity_exe = executable(
 test('input_arity', test_input_arity_exe)
 
 # ============================================================================
+# Single-rule relations are sets (#957)
+# ============================================================================
+test_single_rule_dedup_exe = executable(
+  'test_single_rule_dedup',
+  files('test_single_rule_dedup.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  driver_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+test('single_rule_dedup', test_single_rule_dedup_exe)
+
+# ============================================================================
 # CSV Reader Line/Field Limit Tests (#953)
 # The reader used to pull lines through a fixed 4096-byte fgets buffer, so a
 # longer physical line was delivered in chunks and every chunk became its own

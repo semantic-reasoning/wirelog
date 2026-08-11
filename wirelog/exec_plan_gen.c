@@ -3595,6 +3595,32 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                 }
 
                 int rc = translate_ir_node(ir_root, &ol);
+
+                /*
+                 * Issue #957: the WIRELOG_IR_UNION arm ends its op sequence
+                 * with CONSOLIDATE, so a relation defined by two or more
+                 * rules is deduplicated.  A relation defined by a single
+                 * rule has no UNION wrapper and so got no CONSOLIDATE, and
+                 * a rule whose head projects away a body variable then
+                 * derived one row per derivation rather than one per
+                 * distinct tuple.
+                 *
+                 * Those duplicates were not confined to the relation's own
+                 * row count.  They are read by every join over the relation
+                 * and multiply there: with p(x) :- e(x, y). over three e
+                 * rows sharing an x, q(x) :- p(x), p(x). produced nine rows
+                 * and a third relation reading both produced twenty-seven.
+                 * Datalog is set-valued, so the single-rule path was the
+                 * unsound one; this makes the two agree.
+                 */
+                if (rc == 0 && ir_root->type != WIRELOG_IR_UNION) {
+                    wl_plan_op_t *consol = op_list_push(&ol);
+                    if (!consol)
+                        rc = -1;
+                    else
+                        consol->op = WL_PLAN_OP_CONSOLIDATE;
+                }
+
                 if (rc != 0) {
                     /* Clean up ops */
                     for (uint32_t o = 0; o < ol.count; o++)
