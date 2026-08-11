@@ -335,14 +335,15 @@ typedef enum {
  *                  Only WIRELOG_AGG_MIN and WIRELOG_AGG_MAX are admitted.
  * @operand_type:   The aggregated operand's domain, which decides whether
  *                  the order is numeric or lexicographic (Issue #965).
- * @group_by_count: Number of leading grouping columns; the aggregated
- *                  value sits at column @group_by_count.
+ * @group_by_count: Number of grouping columns.
+ * @aggregate_index: Output column containing the aggregated value.
  */
 typedef struct {
     bool has_spec;
     wirelog_agg_fn_t fn;
     wl_plan_agg_operand_t operand_type;
     uint32_t group_by_count;
+    uint32_t aggregate_index;
 } wl_plan_agg_spec_t;
 
 /* ======================================================================== */
@@ -481,6 +482,7 @@ typedef struct {
     wl_plan_expr_buffer_t agg_expr;
     const uint32_t *group_by_indices;
     uint32_t group_by_count;
+    uint32_t aggregate_index;
 
     wl_plan_expr_buffer_t *map_exprs;
     uint32_t map_expr_count;

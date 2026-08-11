@@ -958,7 +958,8 @@ agg_spec_observe(op_list_t *list, const wl_plan_op_t *reduce)
 
     if (list->agg.has_spec
         && (list->agg.fn != reduce->agg_fn
-        || list->agg.group_by_count != reduce->group_by_count)) {
+        || list->agg.group_by_count != reduce->group_by_count
+        || list->agg.aggregate_index != reduce->aggregate_index)) {
         list->agg_vetoed = true;
         memset(&list->agg, 0, sizeof(list->agg));
         return;
@@ -967,6 +968,7 @@ agg_spec_observe(op_list_t *list, const wl_plan_op_t *reduce)
     list->agg.has_spec = true;
     list->agg.fn = reduce->agg_fn;
     list->agg.group_by_count = reduce->group_by_count;
+    list->agg.aggregate_index = reduce->aggregate_index;
     list->agg.operand_type = reduce->agg_operand_type;
 }
 
@@ -1616,6 +1618,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
         op->group_by_indices
             = dup_indices(node->group_by_indices, node->group_by_count);
         op->group_by_count = node->group_by_count;
+        op->aggregate_index = node->aggregate_index;
         if (node->agg_expr) {
             const wirelog_ir_node_t *child0
                 = (node->child_count > 0) ? node->children[0] : NULL;
@@ -2133,6 +2136,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
     dst->key_count = src->key_count;
     dst->project_count = src->project_count;
     dst->group_by_count = src->group_by_count;
+    dst->aggregate_index = src->aggregate_index;
     dst->map_expr_count = src->map_expr_count;
 
     if (src->relation_name) {

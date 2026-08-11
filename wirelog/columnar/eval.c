@@ -402,10 +402,12 @@ col_canonicalize_recursive_aggregates(const wl_plan_stratum_t *sp,
 
 static bool
 col_reduce_output_group_equal(const col_rel_t *rel, uint32_t a, uint32_t b,
-    uint32_t group_by_count)
+    uint32_t group_by_count, uint32_t aggregate_index)
 {
     for (uint32_t c = 0; c < group_by_count; c++) {
-        if (col_rel_get(rel, a, c) != col_rel_get(rel, b, c))
+        uint32_t out_col = c >= aggregate_index ? c + 1 : c;
+        if (col_rel_get(rel, a, out_col)
+            != col_rel_get(rel, b, out_col))
             return false;
     }
     return true;
@@ -417,11 +419,13 @@ typedef struct {
 } col_group_slot_t;
 
 static uint64_t
-col_group_hash(const col_rel_t *rel, uint32_t row, uint32_t group_by_count)
+col_group_hash(const col_rel_t *rel, uint32_t row, uint32_t group_by_count,
+    uint32_t aggregate_index)
 {
     uint64_t hash = UINT64_C(1469598103934665603);
     for (uint32_t c = 0; c < group_by_count; c++) {
-        hash ^= (uint64_t)col_rel_get(rel, row, c);
+        uint32_t out_col = c >= aggregate_index ? c + 1 : c;
+        hash ^= (uint64_t)col_rel_get(rel, row, out_col);
         hash *= UINT64_C(1099511628211);
     }
     return hash ? hash : 1;
@@ -435,6 +439,8 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
         return 0;
 
     uint32_t gc = spec->group_by_count;
+    uint32_t agg_index = spec->aggregate_index < rel->ncols
+        ? spec->aggregate_index : gc;
     if (rel->ncols <= gc)
         return EINVAL;
 
@@ -452,12 +458,13 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
     uint32_t map_mask = map_cap - 1;
     for (uint32_t row = 0; row < rel->nrows; row++) {
         uint32_t found = UINT32_MAX;
-        uint64_t hash = col_group_hash(rel, row, gc);
+        uint64_t hash = col_group_hash(rel, row, gc, agg_index);
         uint32_t slot = (uint32_t)hash & map_mask;
         while (groups[slot].hash != 0) {
             uint32_t keep = groups[slot].row;
             if (groups[slot].hash == hash
-                && col_reduce_output_group_equal(rel, keep, row, gc)) {
+                && col_reduce_output_group_equal(rel, keep, row, gc,
+                agg_index)) {
                 found = keep;
                 break;
             }
@@ -465,15 +472,15 @@ col_canonicalize_recursive_aggregate_relation(col_rel_t *rel,
         }
 
         if (found != UINT32_MAX) {
-            int64_t cur = col_rel_get(rel, found, gc);
-            int64_t val = col_rel_get(rel, row, gc);
+            int64_t cur = col_rel_get(rel, found, agg_index);
+            int64_t val = col_rel_get(rel, row, agg_index);
             /* Same comparator as col_op_reduce(): a fixpoint that ordered
              * lexicographically within an iteration and by intern id across
              * iterations would be worse than the original bug (#965). */
             bool better = col_agg_better(spec->fn, spec->operand_type,
                     intern, val, cur);
             if (better) {
-                col_rel_set(rel, found, gc, val);
+                col_rel_set(rel, found, agg_index, val);
                 if (rel->timestamps)
                     rel->timestamps[found] = rel->timestamps[row];
             }

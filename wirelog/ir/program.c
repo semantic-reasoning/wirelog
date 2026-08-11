@@ -2335,6 +2335,12 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         if (root) {
             wl_ir_node_set_relation(root, head->name);
             root->agg_fn = agg_node->agg_fn;
+            for (uint32_t i = 0; i < head->child_count; i++) {
+                if (head->children[i]->type == WL_PARSER_AST_NODE_AGGREGATE) {
+                    root->aggregate_index = i;
+                    break;
+                }
+            }
 
             if (agg_node->child_count >= 1) {
                 root->agg_expr = convert_expr(agg_node->children[0]);

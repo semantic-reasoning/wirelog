@@ -128,6 +128,7 @@ struct wirelog_ir_node {
     wl_ir_expr_t *agg_expr;     /* AGGREGATE: expression to aggregate */
     uint32_t *group_by_indices; /* AGGREGATE: grouping column indices */
     uint32_t group_by_count;    /* AGGREGATE: number of grouping columns */
+    uint32_t aggregate_index;   /* AGGREGATE: output position of aggregate */
 
     /* Compound column IR (Issue #531) */
     struct {
