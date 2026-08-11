@@ -996,7 +996,8 @@ test_aggregation_multi_head_rejected(void)
     }
     if (ok->rules[0].ir_root->type != WIRELOG_IR_AGGREGATE
         || ok->rules[0].ir_root->agg_fn != WIRELOG_AGG_MIN
-        || ok->rules[0].ir_root->group_by_count != 1) {
+        || ok->rules[0].ir_root->group_by_count != 1
+        || ok->rules[0].ir_root->aggregate_index != 1) {
         wl_ir_program_free(ok);
         FAIL("control: expected AGGREGATE/MIN/group_by_count==1");
         return;

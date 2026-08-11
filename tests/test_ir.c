@@ -258,6 +258,12 @@ test_create_aggregate_node(void)
         return;
     }
 
+    if (agg->aggregate_index != WL_IR_AGGREGATE_INDEX_UNSET) {
+        wl_ir_node_free(agg);
+        FAIL("unspecified aggregate position should retain legacy default");
+        return;
+    }
+
     if (!agg->agg_expr || agg->agg_expr->type != WL_IR_EXPR_VAR) {
         wl_ir_node_free(agg);
         FAIL("agg_expr mismatch");
