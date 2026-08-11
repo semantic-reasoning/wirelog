@@ -2266,6 +2266,16 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     wl_col_session_t *sess = COL_SESSION(session);
     const wl_plan_t *plan = sess->plan;
 
+    /* K-fusion's pre-seeded delta expansion is designed for step-style
+     * outbound evaluation.  On the snapshot route it can suppress the EDB
+     * base segment before the newly inserted delta reaches a fused recursive
+     * relation (#1030).  A delta callback makes inserts incremental, but a
+     * snapshot still promises the complete current model; fall back to the
+     * already-correct full evaluation path for that combination. */
+    if (sess->delta_cb != NULL && sess->last_inserted_relation != NULL
+        && sess->has_evaluated)
+        sess->pending_full_input_eval = true;
+
     /* Reset profiling counters for this evaluation pass */
     col_session_reset_snapshot_profile(sess);
 
