@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.54.0] - 2026-08-11
+
+### Added
+
 - **DOOP fact-catalogue drift gate** (#952): the set of DOOP `.facts` files is
   written down in four places -- `download.sh`, `doop_edbs[]`,
   `doop_fact_files[]`, and the file count in `run_doop_validation.sh`. They
