@@ -397,6 +397,48 @@ test_inline_compound_flat_fact_destructures_exactly(void)
     return rc;
 }
 
+/* T8 (issue #957): a single-rule IDB is set-valued, and duplicate rows must
+ * not multiply a downstream join.  The two source facts project to one
+ * `projected` tuple; joining that IDB back to source therefore yields the
+ * two distinct source pairs, not four raw join products. */
+static int
+test_single_rule_idb_is_set_valued(void)
+{
+    static const char *src =
+        ".decl source(x: int32, y: int32)\n"
+        ".decl projected(x: int32)\n"
+        ".decl downstream(x: int32, y: int32)\n"
+        "source(1, 10).\n"
+        "source(1, 20).\n"
+        "projected(X) :- source(X, Y).\n"
+        "downstream(X, Y) :- projected(X), source(X, Y).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(src, &s);
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T8 open err=%d\n", err);
+        return 1;
+    }
+
+    struct count_state projected = { 0 };
+    struct count_state downstream = { 0 };
+    err = wirelog_easy_snapshot(s, "projected", count_rows, &projected);
+    if (err == WIRELOG_OK)
+        err = wirelog_easy_snapshot(s, "downstream", count_rows, &downstream);
+
+    int rc = 0;
+    if (err != WIRELOG_OK) {
+        fprintf(stderr, "T8 snapshot err=%d\n", err);
+        rc = 1;
+    } else if (projected.rows != 1 || downstream.rows != 2) {
+        fprintf(stderr, "T8: expected projected=1 downstream=2, got "
+            "%u and %u\n", projected.rows, downstream.rows);
+        rc = 1;
+    }
+    wirelog_easy_close(s);
+    return rc;
+}
+
 int
 main(void)
 {
@@ -408,6 +450,7 @@ main(void)
     failures += test_inline_compound_flat_fact_evaluates_exactly();
     failures += test_inline_compound_handle_fact_rejected();
     failures += test_inline_compound_flat_fact_destructures_exactly();
+    failures += test_single_rule_idb_is_set_valued();
     if (failures == 0)
         printf("test_wl_easy_inline_facts: OK\n");
     else

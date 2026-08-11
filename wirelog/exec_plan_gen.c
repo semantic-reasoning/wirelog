@@ -3691,6 +3691,37 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
                     return -1;
                 }
 
+                /* Every IDB relation is set-valued.  A relation with one
+                 * defining rule has no IR UNION node, so it otherwise skips
+                 * the CONSOLIDATE emitted by the union lowering.  Leaving
+                 * that path unconsolidated makes duplicate EDB rows visible
+                 * in snapshots and lets them multiply downstream joins. */
+                if (ol.count == 0
+                    || ol.ops[ol.count - 1].op != WL_PLAN_OP_CONSOLIDATE) {
+                    wl_plan_op_t *consol = op_list_push(&ol);
+                    if (!consol) {
+                        for (uint32_t o = 0; o < ol.count; o++)
+                            free_op(&ol.ops[o]);
+                        free(ol.ops);
+                        free((void *)unique_names);
+                        for (uint32_t v = 0; v < u; v++) {
+                            free((void *)rels[v].name);
+                            free(rels[v].delta_name);
+                            if (rels[v].ops) {
+                                for (uint32_t o = 0; o < rels[v].op_count; o++)
+                                    free_op((wl_plan_op_t *)&rels[v].ops[o]);
+                                free((void *)rels[v].ops);
+                            }
+                        }
+                        free((void *)rels[u].name);
+                        free(rels[u].delta_name);
+                        free(rels);
+                        wl_plan_free(plan);
+                        return -1;
+                    }
+                    consol->op = WL_PLAN_OP_CONSOLIDATE;
+                }
+
                 rels[u].ops = ol.ops;
                 rels[u].op_count = ol.count;
                 /* Issue #975: recorded here, before rewrite_lftj_chains(),
