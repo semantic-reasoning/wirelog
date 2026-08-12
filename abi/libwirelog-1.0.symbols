@@ -62,6 +62,7 @@ wirelog_program_get_schema
 wirelog_program_get_stratum
 wirelog_program_get_stratum_count
 wirelog_program_is_stratified
+wirelog_program_relation_has_input
 wirelog_result_free
 wirelog_result_get_relation
 wirelog_result_relation_cardinality

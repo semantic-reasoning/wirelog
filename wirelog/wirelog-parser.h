@@ -127,6 +127,25 @@ wirelog_program_get_schema(const wirelog_program_t *program,
     const char *relation_name);
 
 /**
+ * wirelog_program_relation_has_input:
+ * @program: Parsed program
+ * @relation_name: Relation to query
+ *
+ * Check whether the parsed program contains an `.input` directive for a
+ * relation.  This queries parser metadata only; it does not open a file,
+ * resolve an adapter, or perform custom I/O.
+ *
+ * Relation names are compared exactly and case-sensitively.  An unknown
+ * relation, a NULL argument, or a relation without `.input` returns false.
+ * Duplicate directives and directives for undeclared relations return true.
+ *
+ * Returns: true if the relation has a parsed `.input` directive
+ */
+WIRELOG_API bool
+wirelog_program_relation_has_input(const wirelog_program_t *program,
+    const char *relation_name);
+
+/**
  * wirelog_program_is_stratified:
  * @program: Parsed program
  *

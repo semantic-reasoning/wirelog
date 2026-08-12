@@ -221,6 +221,22 @@ wirelog_program_get_schema(const wirelog_program_t *program,
     return NULL;
 }
 
+bool
+wirelog_program_relation_has_input(const wirelog_program_t *program,
+    const char *relation_name)
+{
+    if (!program || !relation_name || !program->relations)
+        return false;
+
+    for (uint32_t i = 0; i < program->relation_count; i++) {
+        const wl_ir_relation_info_t *rel = &program->relations[i];
+        if (rel->name && strcmp(rel->name, relation_name) == 0)
+            return rel->has_input;
+    }
+
+    return false;
+}
+
 uint32_t
 wirelog_program_get_stratum_count(const wirelog_program_t *program)
 {

@@ -7,6 +7,17 @@ steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
 
+## 0.54 -> 0.60
+
+Version `0.60.0` adds a public parser-metadata query for hosts that need to
+make admission decisions before loading external sources:
+
+- `wirelog_program_relation_has_input()` reports whether a parsed relation has
+  an `.input` directive without opening a file or invoking an I/O adapter.
+  Matching is exact and case-sensitive; duplicate and undeclared-relation
+  directives are included.  Unknown relations and NULL arguments return
+  `false`.
+
 ## 0.53 -> 0.54
 
 Version `0.54.0` is a correctness-focused release. C source compatibility is
