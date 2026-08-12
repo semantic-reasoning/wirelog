@@ -290,7 +290,7 @@ atomic APIs (`atomic_load`/`atomic_store`); they default to
 `memory_order_seq_cst`, which is acceptable here because init runs
 once and the surrounding overhead dominates.
 
-### 5.4 `wirelog/columnar/ops.c` — K-fusion cancel/budget (10 rows)
+### 5.4 `wirelog/columnar/ops.c` — K-fusion cancel/budget (11 rows)
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -302,6 +302,7 @@ once and the surrounding overhead dominates.
 | `ops.c:2420` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
 | `ops.c:2423` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see :2410 note) |
 | `ops.c:6750` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
+| `ops.c:6299` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before the branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:1875`, which resets the TDD counter before `thread_create()` |
 | `ops.c:6771` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 | `ops.c:6773` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll |
 
