@@ -75,32 +75,39 @@ block below runs them separately for the same reason.
 
 | Category | Workload | W=1 median | W=8 median | W=16 median | Tuples | Iterations | Peak RSS (W=1 / W=8 / W=16) |
 |----------|----------|------------|------------|-------------|--------|------------|-------------------------------|
-| Graph | TC (Transitive Closure) | 6.1ms | 6.0ms | 7.6ms | 4,950 | 98 | 3.2MB / 3.5MB / 3.4MB |
-| Graph | Reach | 0.6ms | 0.6ms | 0.4ms | 100 | 98 | 2.9MB / 2.9MB / 2.9MB |
-| Graph | CC (Connected Components) | 8.7ms | 8.4ms | 12.7ms | 100 | 99 | 3.2MB / 3.1MB / 3.2MB |
-| Graph | SSSP (Shortest Path) | 0.8ms | 0.6ms | 0.8ms | 100 | 98 | 2.8MB / 2.8MB / 2.8MB |
-| Graph | SG (Subgraph) | 0.5ms | 0.4ms | 0.5ms | 0 | 0 | 2.8MB / 2.9MB / 2.8MB |
-| Graph | Bipartite | 0.9ms | 0.7ms | 0.8ms | 100 | 73 | 3.0MB / 2.9MB / 2.9MB |
-| Pointer Analysis | Andersen | 2.4ms | 3.1ms | 3.2ms | 155 | 8 | 3.1MB / 3.4MB / 3.5MB |
-| Pointer Analysis | Dyck-2 | 10.2ms | 10.3ms | 9.5ms | 2,120 | 8 | 3.5MB / 7.2MB / 7.3MB |
-| Pointer Analysis | CSPA | 1.32s | 716.9ms | 695.9ms | 20,381 | 6 | 325MB / 459MB / 453MB |
-| Data Flow | CSDA | 2.7ms | 2.3ms | 2.3ms | 2,986 | 29 | 3.2MB / 3.4MB / 3.3MB |
-| Ontology | Galen | 21.1ms | 31.0ms | 33.9ms | 5,568 | 23 | 4.2MB / 8.8MB / 9.0MB |
-| Borrow Check | Polonius | 4.4ms | 3.8ms | 3.6ms | 1,999 | 23 / 25 / 25 | 3.5MB / 3.4MB / 3.5MB |
-| Disassembly | DDISASM | 2.4ms | 3.8ms | 3.3ms | 900 | 0 / 19 / 19 | 3.5MB / 3.7MB / 3.7MB |
-| CRDT | CRDT | 23.36s | 24.01s | 23.65s | 2,156,530 | 14,148 | 108MB / 345MB / 462MB |
-| Program Analysis | DOOP (zxing) | 1368.4s | FAIL | FAIL | 14,096,448 [^doop] | 153 | 39.1GB / -- / -- |
+| Graph | TC (Transitive Closure) | 6.3ms | 8.0ms | 8.0ms | 4,950 | 98 | 3.0MB / 3.3MB / 3.3MB |
+| Graph | Reach | 0.6ms | 0.6ms | 0.4ms | 100 | 98 | 2.8MB / 2.9MB / 2.9MB |
+| Graph | CC (Connected Components) | 7.7ms | 7.4ms | 9.9ms | 100 | 99 | 3.0MB / 3.2MB / 3.4MB |
+| Graph | SSSP (Shortest Path) | 0.8ms | 0.8ms | 0.8ms | 100 | 98 | 2.9MB / 2.9MB / 2.9MB |
+| Graph | SG (Subgraph) | 0.4ms | 0.5ms | 0.5ms | 0 | 0 | 2.9MB / 2.9MB / 2.9MB |
+| Graph | Bipartite | 1.0ms | 1.0ms | 1.0ms | 100 | 73 | 3.0MB / 3.0MB / 2.9MB |
+| Pointer Analysis | Andersen | 2.2ms | 3.8ms | 3.3ms | 155 | 8 | 3.1MB / 3.5MB / 3.6MB |
+| Pointer Analysis | Dyck-2 | 11.9ms | 13.7ms | 13.4ms | 2,120 | 8 | 3.5MB / 7.2MB / 7.0MB |
+| Pointer Analysis | CSPA | 1.59s | 1.41s | 1.43s | 20,381 | 6 | 330.4MB / 442.4MB / 419.1MB |
+| Data Flow | CSDA | 2.8ms | 2.8ms | 2.4ms | 2,986 | 29 | 3.2MB / 3.2MB / 3.1MB |
+| Ontology | Galen | 23.1ms | 29.2ms | 32.1ms | 5,568 | 23 | 4.2MB / 8.6MB / 8.1MB |
+| Borrow Check | Polonius | 4.7ms | 3.4ms | 4.6ms | 1,983 | 23 / 25 / 25 | 3.5MB / 3.5MB / 3.5MB |
+| Disassembly | DDISASM | 2.9ms | 3.4ms | 3.4ms | 704 | 0 / 19 / 19 | 3.5MB / 3.6MB / 3.7MB |
+| CRDT | CRDT | 24.95s | 24.90s | 24.06s | 2,152,328 | 14,148 | 113.6MB / 377.7MB / 451.1MB |
+| Program Analysis | DOOP (zxing) | 1399.2s | 1169.2s | 1134.7s | 13,828,835 [^doop] | 153 | 39.1GB / 40.9GB / 41.0GB |
 
 [^doop]: DOOP is the one row measured with `--repeat 1`, not a 5-trial
     median: at 23 minutes a run, three widths at `--repeat 5` is six hours.
-    **W=8 and W=16 do not complete** -- they hit the per-worker join-output
-    cap, which is the session cap divided by the worker count (#959), so
-    parallelism currently lowers the capacity of the run. W=1 is
-    deterministic; the W>1 tuple counts recorded in an earlier revision of
-    this table came from runs that varied between invocations (#958).
-    Older, pre-#957 measurements counted duplicate rows rather than distinct
-    tuples. The 14,096,448 total shown here is from the post-#957 set-semantic
-    evaluator; no separate distinct-tuple benchmark number is claimed here.
+    All three widths complete and agree: 13,828,835 tuples and 153
+    iterations at W=1, W=8 and W=16 alike. Until #959 they did not -- W=8
+    and W=16 died on a join-output cap of 74,026,332. The earlier revision
+    of this footnote attributed that to the session cap being divided by the
+    worker count; that was wrong. The divisor was the K-fusion *branch*
+    count (19 for this workload), applied to the whole session budget, so
+    the cap shrank as the fan grew rather than as the width grew. W>1
+    depends on the branch dispatch having a work queue, which is why W=1 was
+    never affected.
+
+    Parallel scaling is weak -- 1.20x at W=8 and 1.23x at W=16 -- and
+    nothing here claims otherwise; #959 removed a hard failure, not a
+    bottleneck. The W>1 tuple counts recorded two revisions ago came from
+    runs that varied between invocations (#958); the agreement across widths
+    above is the check that this is no longer true.
 
 Numbers are 5-trial medians (`--repeat 5`) on a single dev host with
 cpufreq governor `schedutil`; treat them as descriptive, not gated.
@@ -118,6 +125,25 @@ Historic single-trial numbers from pre-2026-05-09 README revisions
 comparable to the current 5-trial medians. Wall-clock deltas between
 successive refreshes on this host are descriptive and should not be read
 as isolated algorithmic speedups or regressions.
+
+**Tuple counts fell for four workloads in 0.54.0, and the new numbers are
+the correct ones.** DDISASM 900 -> 704, Polonius 1,999 -> 1,983, CRDT
+2,156,530 -> 2,152,328, DOOP 14,096,448 -> 13,828,835. Iteration counts are
+unchanged in every case.
+
+The cause is `059e410` (#957): a relation defined by a single rule was not
+deduplicated, so a head that projected away a body variable derived one row
+per derivation rather than one per distinct tuple. Datalog is set-valued,
+so the earlier totals were counting duplicates. Confirmed by building both
+sides of that commit on this host: `059e410^` reproduces the previous
+table's DDISASM 900, Polonius 1,999 and CRDT 2,156,530 exactly, and
+`059e410` reproduces the three values above exactly.
+
+DOOP was not bisected the same way -- 23 minutes a run makes a two-sided
+build expensive -- so its attribution to #957 is by consistency with the
+other three rather than by direct measurement. Note that the previous
+footnote claimed 14,096,448 was already a post-#957 figure; that claim does
+not survive re-measurement and was wrong.
 
 **Output changed for four workloads since the 2026-05-24 revision.** These
 are result-set changes, not timing noise, and they have separate causes:
@@ -163,7 +189,7 @@ Running today's engine against both archives separates the two causes:
 |---|---|---|
 | `70f4d84` engine, old archive (the old row) | 6,276,657 | 28 |
 | today's engine, old archive | 14,470,301 | 160 |
-| today's engine, current archive | 14,096,448 | 153 |
+| today's engine, current archive | 13,828,835 | 153 |
 
 **The engine change dominates.** #955 -- a plan-generation defect that
 shifted join keys past a semijoin and silently resolved them to column 0 --
