@@ -64,6 +64,7 @@
     <elf-symbol name='wirelog_program_get_stratum' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_program_get_stratum_count' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_program_is_stratified' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='wirelog_program_relation_has_input' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_result_free' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_result_get_relation' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_result_relation_cardinality' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>

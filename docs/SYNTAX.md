@@ -384,6 +384,14 @@ Load relation data from external files:
 .input Edge(IO="file", filename="edge.csv", delimiter=",")
 ```
 
+Hosts that need to inspect source-admission policy can call
+`wirelog_program_relation_has_input()` after parsing.  The query reads parser
+metadata only: it does not open the declared path, resolve the adapter, or
+perform custom I/O.  Relation names are matched exactly and
+case-sensitively; duplicate `.input` directives and `.input` directives for
+undeclared relations still report `true`, while unknown relations and NULL
+arguments report `false`.
+
 ### .output
 
 Write computed relation to stdout or a file:

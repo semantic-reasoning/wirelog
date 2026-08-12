@@ -10,6 +10,21 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+
+static int metadata_probe_reads;
+
+static int
+metadata_probe_read(wirelog_io_ctx_t *ctx, int64_t **out_data,
+    uint32_t *out_nrows, void *user_data)
+{
+    (void)ctx;
+    (void)out_data;
+    (void)out_nrows;
+    (void)user_data;
+    metadata_probe_reads++;
+    return -1;
+}
 
 static int
 test_utility_api(void)
@@ -30,6 +45,89 @@ test_utility_api(void)
     (void)wirelog_config_embedded();
     (void)wirelog_config_ipc();
     return 0;
+}
+
+static int
+test_program_input_metadata_api(void)
+{
+    static const char source[] =
+        "# .input Commented(filename=\"ignored.csv\")\n"
+        ".decl NoInput(x: int32)\n"
+        ".decl Text(s: string)\n"
+        "Text(\".input Fake(...)\").\n"
+        ".input Declared(IO=\"file\", filename=\"/definitely/missing/.input\")\n"
+        ".input Declared(IO=\"metadata_probe\", filename=\"relative.csv\")\n"
+        ".input Undeclared(IO=\"metadata_probe\", filename=\"/definitely/missing/undeclared.csv\")\n"
+        ".input session_state(IO=\"metadata_probe\", filename=\"/definitely/missing/session.csv\")\n"
+        ".input session_state(IO=\"metadata_probe\", filename=\"/definitely/missing/session2.csv\")\n"
+        ".input CamelCase(IO=\"metadata_probe\", filename=\"camel.csv\")\n"
+        ".input camelcase(IO=\"metadata_probe\", filename=\"lower.csv\")\n";
+    wirelog_io_adapter_t adapter = {
+        .abi_version = WIRELOG_IO_ABI_VERSION,
+        .scheme = "metadata_probe",
+        .read = metadata_probe_read,
+    };
+
+    if (wirelog_io_register_adapter(&adapter) != 0) {
+        fprintf(stderr, "metadata probe adapter registration failed: %s\n",
+            wirelog_io_last_error());
+        return 1;
+    }
+
+    wirelog_error_t err = WIRELOG_ERR_UNKNOWN;
+    wirelog_program_t *program = wirelog_parse_string(source, &err);
+    int failures = 0;
+    if (!program || err != WIRELOG_OK) {
+        fprintf(stderr, "input metadata parse failed err=%d\n", err);
+        failures = 1;
+        goto cleanup;
+    }
+
+    const struct {
+        const char *name;
+        bool expected;
+    } cases[] = {
+        { "Declared", true },
+        { "Undeclared", true },
+        { "session_state", true },
+        { "CamelCase", true },
+        { "camelcase", true },
+        { "CAMELCASE", false },
+        { "Commented", false },
+        { "literal .input", false },
+        { "Fake", false },
+        { "Unknown", false },
+        { "NoInput", false },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (wirelog_program_relation_has_input(program, cases[i].name)
+            != cases[i].expected) {
+            fprintf(stderr, "unexpected .input metadata for '%s'\n",
+                cases[i].name);
+            failures = 1;
+        }
+    }
+    if (wirelog_program_relation_has_input(program, NULL)) {
+        fprintf(stderr, "NULL relation name should return false\n");
+        failures = 1;
+    }
+    if (wirelog_program_relation_has_input(NULL, "Declared")) {
+        fprintf(stderr, "NULL program should return false\n");
+        failures = 1;
+    }
+    if (metadata_probe_reads != 0) {
+        fprintf(stderr, "metadata query opened an adapter (%d reads)\n",
+            metadata_probe_reads);
+        failures = 1;
+    }
+
+cleanup:
+    wirelog_program_free(program);
+    if (wirelog_io_unregister_adapter("metadata_probe") != 0) {
+        fprintf(stderr, "metadata probe adapter unregister failed\n");
+        failures = 1;
+    }
+    return failures;
 }
 
 static int
@@ -230,6 +328,7 @@ main(void)
 {
     int failures = 0;
     failures += test_utility_api();
+    failures += test_program_input_metadata_api();
     failures += test_optimizer_api();
     failures += test_optimizer_config_disable_passes();
     failures += test_bound_query_without_seed_preserves_answers();
