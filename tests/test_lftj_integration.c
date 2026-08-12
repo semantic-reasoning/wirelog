@@ -535,6 +535,8 @@ test_tdd_lftj_metadata_is_conservative(void)
     fusion_op->opaque_data = &fusion_clone;
     ASSERT(tdd_stratum_has_unsupported_lftj(fusion_stratum),
         "NULL K_FUSION child was accepted");
+    ASSERT(tdd_stratum_has_idb_self_join(fusion_stratum),
+        "NULL K_FUSION child broke self-join diagnostics");
     fusion_op->opaque_data = fusion;
     free(fusion_clone.k_ops);
     free(fusion_clone.k_op_counts);

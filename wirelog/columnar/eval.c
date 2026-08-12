@@ -4386,6 +4386,9 @@ static bool
 ops_have_idb_idb_join(const wl_plan_op_t *ops, uint32_t op_count,
     const wl_plan_stratum_t *sp)
 {
+    if (!ops)
+        return op_count != 0;
+
     bool stack_has_idb = false;
     for (uint32_t oi = 0; oi < op_count; oi++) {
         const wl_plan_op_t *op = &ops[oi];
