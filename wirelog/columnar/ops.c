@@ -6277,6 +6277,27 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
 
     int rc = 0;
 
+    /* Issue #959: one shared counter for the whole fused branch set, rather
+     * than giving each branch join_output_limit / live_count.
+     *
+     * A branch's join output is not 1/live_count of what the relation would
+     * produce -- each branch materialises its own -- so dividing made the
+     * effective capacity of a run *shrink* as the fan grew.  Measured on
+     * DOOP: a 19-branch fusion cut the cap from 1,406,500,309 to 74,026,332,
+     * against a single-threaded peak of 641,550,746 for the same workload.
+     * Even a perfectly even split needs 80,193,843 per branch, so the run
+     * could not fit its own ideal case; it failed at W=8 and completed at
+     * W=1, which is exactly what #959 reported.
+     *
+     * col_join_output_limit_reached() already implements this shape: when
+     * join_output_shared_count is set it accumulates atomically against
+     * join_output_shared_limit instead of testing one relation's row count.
+     * The TDD worker path (eval.c) has used it since #426; this is the same
+     * treatment on the K-fusion branch path, so the cap bounds the aggregate
+     * across branches -- which is what a global row budget means. */
+    atomic_uint_fast64_t shared_join_count;
+    atomic_store_explicit(&shared_join_count, 0, memory_order_relaxed);
+
     /* Issue #196: Workers start with zeroed mat_cache (no shared entries).
      * All worker cache entries are worker-owned; cleanup frees all of them
      * starting from index 0, so no base_count snapshot is needed. */
@@ -6299,10 +6320,10 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].tdd_workers_cap = 0;
         worker_sess[d].tdd_workers_count = 0;
         if (worker_sess[d].join_output_limit > 0 && live_count > 1) {
-            uint64_t per_branch =
-                worker_sess[d].join_output_limit / live_count;
-            worker_sess[d].join_output_limit =
-                per_branch > 0 ? per_branch : 1;
+            /* Issue #959: share one budget instead of splitting it. */
+            worker_sess[d].join_output_shared_count = &shared_join_count;
+            worker_sess[d].join_output_shared_limit =
+                worker_sess[d].join_output_limit;
         }
         /* NULL out owned resources before allocation so cleanup_wq is safe
          * even if we abort early (e.g. clone failure).  Each owned pointer
