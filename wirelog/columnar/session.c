@@ -302,6 +302,9 @@ static bool
 wl_columnar_session_tdd_stratum_is_safe(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess)
 {
+    if (tdd_stratum_has_unsupported_lftj(sp))
+        return false;
+
     /* TDD is only beneficial for recursive strata when there is no
      * IDB self-join OR the IDB self-join is exchange-aligned.  A
      * non-aligned self-join forces replicate_mode (all W workers do
@@ -376,6 +379,13 @@ wl_columnar_session_tdd_plan_stratum(const wl_plan_stratum_t *sp,
     if (!sp->is_recursive) {
         decision.fallback_reason =
             WL_COLUMNAR_INTERNAL_TDD_FALLBACK_NON_RECURSIVE;
+        wl_columnar_session_tdd_debug_decision(sp, sess,
+            snapshot_tdd_eligible, decision);
+        return decision;
+    }
+    if (tdd_stratum_has_unsupported_lftj(sp)) {
+        decision.fallback_reason =
+            WL_COLUMNAR_INTERNAL_TDD_FALLBACK_UNSAFE_PLAN;
         wl_columnar_session_tdd_debug_decision(sp, sess,
             snapshot_tdd_eligible, decision);
         return decision;

@@ -4300,6 +4300,83 @@ is_stratum_idb(const wl_plan_stratum_t *sp, const char *name)
 }
 
 /*
+ * LFTJ plans currently contain only EDB operands.  Keep that invariant
+ * explicit at the TDD boundary: a hand-built or future plan with an IDB
+ * operand must take the conservative path rather than being treated as an
+ * EDB-only operator by the linear TDD scans.
+ */
+static bool
+tdd_lftj_meta_valid(const wl_plan_op_lftj_t *meta)
+{
+    if (!meta || meta->k < 3 || !meta->rel_names || !meta->key_cols)
+        return false;
+    for (uint32_t i = 0; i < meta->k; i++) {
+        if (!meta->rel_names[i])
+            return false;
+    }
+    return true;
+}
+
+static uint32_t
+tdd_lftj_idb_count(const wl_plan_op_lftj_t *meta,
+    const wl_plan_stratum_t *sp)
+{
+    if (!tdd_lftj_meta_valid(meta))
+        return UINT32_MAX;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < meta->k; i++) {
+        if (is_stratum_idb(sp, meta->rel_names[i]))
+            count++;
+    }
+    return count;
+}
+
+static bool
+tdd_ops_have_unsupported_lftj(const wl_plan_op_t *ops, uint32_t op_count,
+    const wl_plan_stratum_t *sp)
+{
+    if (!ops)
+        return false;
+    for (uint32_t i = 0; i < op_count; i++) {
+        const wl_plan_op_t *op = &ops[i];
+        if (op->op == WL_PLAN_OP_LFTJ) {
+            const wl_plan_op_lftj_t *meta =
+                (const wl_plan_op_lftj_t *)op->opaque_data;
+            if (tdd_lftj_idb_count(meta, sp) != 0)
+                return true;
+        } else if (op->op == WL_PLAN_OP_K_FUSION) {
+            if (!op->opaque_data)
+                return true;
+            const wl_plan_op_k_fusion_t *kf =
+                (const wl_plan_op_k_fusion_t *)op->opaque_data;
+            if (kf->k == 0 || !kf->k_ops || !kf->k_op_counts)
+                return true;
+            for (uint32_t k = 0; k < kf->k; k++) {
+                if (kf->k_op_counts[k] > 0 && !kf->k_ops[k])
+                    return true;
+                if (tdd_ops_have_unsupported_lftj(kf->k_ops[k],
+                    kf->k_op_counts[k], sp))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool
+tdd_stratum_has_unsupported_lftj(const wl_plan_stratum_t *sp)
+{
+    if (!sp)
+        return true;
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        if (tdd_ops_have_unsupported_lftj(sp->relations[ri].ops,
+            sp->relations[ri].op_count, sp))
+            return true;
+    }
+    return false;
+}
+
+/*
  * ops_have_idb_idb_join:
  * Walk an op sequence tracking whether the eval stack top derives from IDB.
  * Returns true if any JOIN has BOTH IDB-derived left input AND IDB right.
@@ -4319,6 +4396,14 @@ ops_have_idb_idb_join(const wl_plan_op_t *ops, uint32_t op_count,
             if (right_idb && stack_has_idb)
                 return true;
             if (right_idb)
+                stack_has_idb = true;
+        } else if (op->op == WL_PLAN_OP_LFTJ) {
+            const wl_plan_op_lftj_t *meta =
+                (const wl_plan_op_lftj_t *)op->opaque_data;
+            uint32_t idb_count = tdd_lftj_idb_count(meta, sp);
+            if (idb_count == UINT32_MAX || idb_count >= 2)
+                return true;
+            if (idb_count == 1)
                 stack_has_idb = true;
         }
     }
@@ -4345,8 +4430,18 @@ ops_max_idb_segment_body_atoms(const wl_plan_op_t *ops, uint32_t op_count,
             segment_count = 0;
         }
 
-        if (op_references_stratum_idb(op, sp))
+        if (op->op == WL_PLAN_OP_LFTJ) {
+            const wl_plan_op_lftj_t *meta =
+                (const wl_plan_op_lftj_t *)op->opaque_data;
+            uint32_t idb_count = tdd_lftj_idb_count(meta, sp);
+            if (idb_count == UINT32_MAX
+                || UINT32_MAX - segment_count < idb_count)
+                segment_count = UINT32_MAX;
+            else
+                segment_count += idb_count;
+        } else if (op_references_stratum_idb(op, sp)) {
             segment_count++;
+        }
 
         if (op->op == WL_PLAN_OP_VARIABLE) {
             depth++;
@@ -4409,6 +4504,11 @@ op_references_stratum_idb(const wl_plan_op_t *op,
         || op->op == WL_PLAN_OP_ANTIJOIN)
         && op->right_relation)
         return is_stratum_idb(sp, op->right_relation);
+    if (op->op == WL_PLAN_OP_LFTJ) {
+        const wl_plan_op_lftj_t *meta =
+            (const wl_plan_op_lftj_t *)op->opaque_data;
+        return tdd_lftj_idb_count(meta, sp) != 0;
+    }
     return false;
 }
 
@@ -4440,6 +4540,16 @@ ops_max_idb_segment_join_like(const wl_plan_op_t *ops, uint32_t op_count,
         case WL_PLAN_OP_ANTIJOIN:
             segment_count++;
             break;
+        case WL_PLAN_OP_LFTJ: {
+            const wl_plan_op_lftj_t *meta =
+                (const wl_plan_op_lftj_t *)op->opaque_data;
+            uint32_t idb_count = tdd_lftj_idb_count(meta, sp);
+            if (idb_count == UINT32_MAX)
+                return UINT32_MAX;
+            if (idb_count > 0 && meta->k > 1)
+                segment_count += meta->k - 1;
+            break;
+        }
         default:
             break;
         }
@@ -4528,6 +4638,18 @@ tdd_record_segment_stats(const wl_plan_op_t *ops, uint32_t op_count,
             join_like++;
             has_antijoin = true;
             break;
+        case WL_PLAN_OP_LFTJ: {
+            const wl_plan_op_lftj_t *meta =
+                (const wl_plan_op_lftj_t *)op->opaque_data;
+            uint32_t idb_count = tdd_lftj_idb_count(meta, sp);
+            if (idb_count == UINT32_MAX) {
+                stats->unsafe_segments++;
+                return;
+            }
+            if (meta->k > 1)
+                join_like += meta->k - 1;
+            break;
+        }
         default:
             break;
         }
@@ -4599,6 +4721,9 @@ tdd_rule_slice_global_read_safe(const wl_plan_op_t *ops, uint32_t op_count,
     if (!relation_has_exchange || !ops || op_count == 0)
         return false;
 
+    if (tdd_ops_have_unsupported_lftj(ops, op_count, sp))
+        return false;
+
     for (uint32_t oi = 0; oi < op_count; oi++) {
         const wl_plan_op_t *op = &ops[oi];
         if (op->delta_mode == WL_DELTA_FORCE_EMPTY)
@@ -4619,6 +4744,13 @@ tdd_rule_slice_global_read_safe(const wl_plan_op_t *ops, uint32_t op_count,
             join_like++;
             has_antijoin = true;
             break;
+        case WL_PLAN_OP_LFTJ: {
+            const wl_plan_op_lftj_t *meta =
+                (const wl_plan_op_lftj_t *)op->opaque_data;
+            if (meta->k > 1)
+                join_like += meta->k - 1;
+            break;
+        }
         default:
             break;
         }
@@ -4636,6 +4768,9 @@ tdd_child_plan_global_read_safe(const wl_plan_op_t *ops, uint32_t op_count,
     const wl_plan_stratum_t *sp, bool relation_has_exchange)
 {
     if (!ops || op_count == 0)
+        return false;
+
+    if (tdd_ops_have_unsupported_lftj(ops, op_count, sp))
         return false;
 
     uint32_t idb_segments = 0;
@@ -4821,6 +4956,8 @@ tdd_stratum_global_read_candidate(const wl_plan_stratum_t *sp)
 {
     if (!sp)
         return false;
+    if (tdd_stratum_has_unsupported_lftj(sp))
+        return false;
     if (tdd_stratum_has_idb_self_join(sp))
         return false;
     uint32_t max_idb_atoms = tdd_stratum_global_read_max_idb_atoms(sp);
@@ -4924,6 +5061,13 @@ tdd_ops_single_idb_keys_exchange_aligned(const wl_plan_op_t *ops,
 
     for (uint32_t oi = 0; oi < op_count; oi++) {
         const wl_plan_op_t *op = &ops[oi];
+        if (op->op == WL_PLAN_OP_LFTJ) {
+            const wl_plan_op_lftj_t *meta =
+                (const wl_plan_op_lftj_t *)op->opaque_data;
+            if (tdd_lftj_idb_count(meta, sp) != 0)
+                return false;
+            continue;
+        }
         if (op->op == WL_PLAN_OP_VARIABLE) {
             if (is_stratum_idb(sp, op->relation_name)) {
                 stack_has_idb = true;
@@ -7571,6 +7715,9 @@ col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
 {
     if (!sp || !coord)
         return EINVAL;
+
+    if (tdd_stratum_has_unsupported_lftj(sp))
+        return col_eval_stratum(sp, coord, stratum_idx);
 
     /* Single-worker fast path: zero overhead delegation */
     if (coord->num_workers <= 1)

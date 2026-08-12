@@ -1694,6 +1694,8 @@ wl_columnar_session_ensure_tdd_worker_slots(wl_col_session_t *sess,
     uint32_t active_workers);
 bool
 tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp);
+bool
+tdd_stratum_has_unsupported_lftj(const wl_plan_stratum_t *sp);
 uint32_t
 stratum_max_idb_body_atoms(const wl_plan_stratum_t *sp);
 bool
