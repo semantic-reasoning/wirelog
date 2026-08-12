@@ -239,14 +239,17 @@ main(void)
 
     int verdict = 0;
 
-    /* ASan compile-time skip of the RSS portion (mirror daemon-soak's
-    * pattern from test_stress_harness.c).  Ledger and rotation
-    * assertions still run under ASan -- the ledger contract is not
-    * confounded by ASan instrumentation, only the VmRSS signal is. */
-#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+    /* Sanitizer compile-time skip of the RSS portion (mirror
+     * daemon-soak's pattern from test_stress_harness.c).  Ledger and
+     * rotation assertions still run under sanitizers -- the ledger
+     * contract is not confounded by instrumentation, only the VmRSS
+     * signal is.  In particular, TSan shadow state and allocator
+     * bookkeeping make the process RSS unsuitable as a hard gate. */
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer) \
+    || defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
     int rss_skipped = 1;
-    printf("  [rss-bounded skipped: AddressSanitizer instrumentation "
-        "confounds VmRSS signal]\n");
+    printf("  [rss-bounded skipped: sanitizer instrumentation confounds "
+        "VmRSS signal]\n");
 #else
     int rss_skipped = 0;
 #endif
