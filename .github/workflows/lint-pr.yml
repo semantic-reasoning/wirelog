@@ -123,15 +123,12 @@ jobs:
           fi
 
   # ==========================================================================
-  # Phase 1c: clang-tidy 22 check (temporarily disabled)
-  # Temporary release unblock: restore the job condition before re-enabling
-  # this advisory check.
+  # Phase 1c: clang-tidy 22 check (hard gate)
   # Excludes: subprojects/**, build/**
   # Runs only after uncrustify passes.
   # ==========================================================================
   clang-tidy-check:
-    name: clang-tidy 22 check (temporarily disabled)
-    if: ${{ false }}
+    name: clang-tidy 22 check
     runs-on: ubuntu-latest
     needs: [uncrustify-check]
     timeout-minutes: 30
