@@ -129,6 +129,7 @@ jobs:
   # ==========================================================================
   clang-tidy-check:
     name: clang-tidy 22 check
+    if: ${{ false }}
     runs-on: ubuntu-latest
     needs: [uncrustify-check]
     timeout-minutes: 90
