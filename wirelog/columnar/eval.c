@@ -333,12 +333,8 @@ retraction_rel_name(const char *rel, char *buf, size_t sz)
  *   - tdd_worker_subpass_fn(): the same pair again on the TDD worker path
  *     -- an all-rules early exit that sets ctx->all_empty_delta, and a
  *     per-rule pre-scan in its relation loop.
- * The other FOUR are not blinded, because they pass an inner operator list
+ * The other two are not blinded, because they pass an inner operator list
  * that still carries the FORCE_DELTA ops the rewrite hid:
- *   - tdd_worker_eval_rule_slices() and tdd_coord_eval_fallback_rule_slices()
- *     (this file) evaluate a wl_tdd_rule_slice_t; on a fused relation
- *     tdd_build_rule_slices() takes those ops from
- *     wl_plan_op_k_fusion_t.k_ops[], i.e. from inside the opaque_data;
  *   - col_op_k_fusion_serial() and col_op_k_fusion() (columnar/ops.c)
  *     evaluate meta->k_ops[d] directly.
  * Call sites are named by function on purpose: line numbers drift.
@@ -2734,257 +2730,6 @@ tdd_install_empty_delta_on_workers(wl_col_session_t *coord,
     return 0;
 }
 
-static int
-tdd_worker_eval_rule_slices(col_eval_tdd_worker_ctx_t *ctx,
-    wl_col_session_t *sess, uint32_t eff_iter, bool *out_any_new)
-{
-    const wl_plan_stratum_t *sp = ctx->sp;
-    uint32_t nrels = sp->relation_count;
-    col_rel_t **deltas = (col_rel_t **)calloc(nrels, sizeof(col_rel_t *));
-    if (!deltas)
-        return ENOMEM;
-
-    int rc = 0;
-    for (uint32_t si = 0; si < ctx->rule_slice_count; si++) {
-        const wl_tdd_rule_slice_t *slice = &ctx->rule_slices[si];
-        if (!slice->tdd_safe || slice->relation_index >= nrels)
-            continue;
-
-        const wl_plan_relation_t *target_plan =
-            &sp->relations[slice->relation_index];
-        wl_plan_relation_t tmp = {
-            .name = target_plan->name,
-            .delta_name = target_plan->delta_name,
-            .ops = slice->ops,
-            .op_count = slice->op_count,
-        };
-        if (has_empty_forced_delta(&tmp, sess, eff_iter))
-            continue;
-
-        eval_stack_t stack;
-        eval_stack_init(&stack);
-        rc = col_eval_relation_plan(&tmp, &stack, sess);
-        if (rc != 0) {
-            eval_stack_drain(&stack);
-            break;
-        }
-        if (stack.top == 0)
-            continue;
-
-        eval_entry_t result = eval_stack_pop(&stack);
-        eval_stack_drain(&stack);
-        if (!result.rel || result.rel->nrows == 0) {
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            continue;
-        }
-
-        col_rel_t *target = session_find_rel(sess, target_plan->name);
-        if (target && target->ncols > 0 && result.rel->ncols != target->ncols) {
-            if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG")) {
-                fprintf(stderr,
-                    "TDD worker slice schema mismatch rel=%s worker=%u "
-                    "slice=%u result_cols=%u target_cols=%u\n",
-                    target_plan->name, sess->worker_id, si,
-                    result.rel->ncols, target->ncols);
-            }
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            rc = EINVAL;
-            break;
-        }
-
-        col_rel_t *delta = deltas[slice->relation_index];
-        if (delta && delta->ncols != result.rel->ncols) {
-            if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG")) {
-                fprintf(stderr,
-                    "TDD worker slice delta schema mismatch rel=%s worker=%u "
-                    "slice=%u delta_cols=%u result_cols=%u\n",
-                    target_plan->name, sess->worker_id, si,
-                    delta->ncols, result.rel->ncols);
-            }
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            rc = EINVAL;
-            break;
-        }
-        if (!delta) {
-            delta = col_rel_new_like(target_plan->delta_name, result.rel);
-            if (!delta) {
-                if (result.owned)
-                    col_rel_destroy(result.rel);
-                rc = ENOMEM;
-                break;
-            }
-            deltas[slice->relation_index] = delta;
-        }
-        rc = col_rel_append_all(delta, result.rel, sess->eval_arena);
-        if (result.owned)
-            col_rel_destroy(result.rel);
-        if (rc != 0)
-            break;
-    }
-
-    if (rc == 0) {
-        for (uint32_t ri = 0; ri < nrels; ri++) {
-            col_rel_t *delta = deltas[ri];
-            deltas[ri] = NULL;
-            if (!delta)
-                continue;
-
-            col_rel_t *target = session_find_rel(sess, sp->relations[ri].name);
-            if (target && target->nrows > 0) {
-                rc = bdx_hash_diff(delta, target);
-                if (rc != 0) {
-                    col_rel_destroy(delta);
-                    break;
-                }
-            }
-            if (sess->coordinator && delta->nrows > 0) {
-                col_rel_t *coord_target = session_find_rel(
-                    sess->coordinator, sp->relations[ri].name);
-                if (coord_target && coord_target->nrows > 0) {
-                    rc = tdd_hashset_diff(delta, coord_target);
-                    if (rc != 0) {
-                        col_rel_destroy(delta);
-                        break;
-                    }
-                }
-            }
-            if (delta->nrows > 1)
-                tdd_dedup_rel(delta);
-            bool produced = delta->nrows > 0;
-            rc = tdd_worker_publish_delta(ctx, sess, delta, ri, eff_iter);
-            if (rc != 0)
-                break;
-            if (produced && out_any_new)
-                *out_any_new = true;
-        }
-    }
-
-    for (uint32_t ri = 0; ri < nrels; ri++)
-        col_rel_destroy(deltas[ri]);
-    free(deltas);
-    return rc;
-}
-
-static int
-tdd_coord_append_delta(col_eval_tdd_worker_ctx_t *ctx, uint32_t rel_idx,
-    col_rel_t *delta)
-{
-    if (!delta || delta->nrows == 0) {
-        col_rel_destroy(delta);
-        return 0;
-    }
-    col_rel_t *existing = ctx->delta_rels[rel_idx];
-    if (!existing) {
-        ctx->delta_rels[rel_idx] = delta;
-        return 0;
-    }
-    if (existing->ncols != delta->ncols) {
-        col_rel_destroy(delta);
-        return EINVAL;
-    }
-    int rc = col_rel_append_all(existing, delta, NULL);
-    col_rel_destroy(delta);
-    return rc;
-}
-
-static int
-tdd_coord_eval_fallback_rule_slices(const wl_plan_stratum_t *sp,
-    wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctx,
-    const wl_tdd_rule_slice_t *slices, uint32_t slice_count,
-    uint32_t eff_iter, bool *out_any_new)
-{
-    int rc = 0;
-    bool saved_diff = coord->diff_operators_active;
-    coord->diff_operators_active = coord->diff_enabled && eff_iter > 0;
-    coord->current_iteration = eff_iter;
-
-    for (uint32_t si = 0; si < slice_count; si++) {
-        const wl_tdd_rule_slice_t *slice = &slices[si];
-        if (slice->tdd_safe || slice->relation_index >= sp->relation_count)
-            continue;
-
-        const wl_plan_relation_t *target_plan =
-            &sp->relations[slice->relation_index];
-        wl_plan_relation_t tmp = {
-            .name = target_plan->name,
-            .delta_name = target_plan->delta_name,
-            .ops = slice->ops,
-            .op_count = slice->op_count,
-        };
-        if (has_empty_forced_delta(&tmp, coord, eff_iter))
-            continue;
-
-        eval_stack_t stack;
-        eval_stack_init(&stack);
-        rc = col_eval_relation_plan(&tmp, &stack, coord);
-        if (rc != 0) {
-            eval_stack_drain(&stack);
-            break;
-        }
-        if (stack.top == 0)
-            continue;
-
-        eval_entry_t result = eval_stack_pop(&stack);
-        eval_stack_drain(&stack);
-        if (!result.rel || result.rel->nrows == 0) {
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            continue;
-        }
-
-        col_rel_t *target = session_find_rel(coord, target_plan->name);
-        if (target && target->ncols > 0 && result.rel->ncols != target->ncols) {
-            if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG")) {
-                fprintf(stderr,
-                    "TDD fallback slice schema mismatch rel=%s slice=%u "
-                    "result_cols=%u target_cols=%u\n",
-                    target_plan->name, si, result.rel->ncols, target->ncols);
-            }
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            rc = EINVAL;
-            break;
-        }
-
-        col_rel_t *delta = col_rel_new_like(target_plan->delta_name,
-                result.rel);
-        if (!delta) {
-            if (result.owned)
-                col_rel_destroy(result.rel);
-            rc = ENOMEM;
-            break;
-        }
-        rc = col_rel_append_all(delta, result.rel, coord->eval_arena);
-        if (result.owned)
-            col_rel_destroy(result.rel);
-        if (rc != 0) {
-            col_rel_destroy(delta);
-            break;
-        }
-
-        if (target && target->nrows > 0) {
-            rc = tdd_hashset_diff(delta, target);
-            if (rc != 0) {
-                col_rel_destroy(delta);
-                break;
-            }
-        }
-        if (delta->nrows > 1)
-            tdd_dedup_rel(delta);
-        if (delta->nrows > 0 && out_any_new)
-            *out_any_new = true;
-        rc = tdd_coord_append_delta(ctx, slice->relation_index, delta);
-        if (rc != 0)
-            break;
-    }
-
-    coord->diff_operators_active = saved_diff;
-    return rc;
-}
-
 static void
 tdd_worker_subpass_fn(void *arg)
 {
@@ -3061,33 +2806,6 @@ tdd_worker_subpass_fn(void *arg)
     }
 
     bool any_new = false;
-
-    if (ctx->rule_slices && ctx->rule_slice_count > 0) {
-        int slice_rc = tdd_worker_eval_rule_slices(ctx, sess, eff_iter,
-                &any_new);
-        free(snap);
-        if (slice_rc != 0) {
-            ctx->rc = slice_rc;
-            sess->tdd_subpass_active = saved_tdd_subpass;
-            sess->tdd_outbound_only_active = saved_outbound_only;
-            sess->diff_operators_active = saved_diff;
-            TDD_WORKER_RETURN();
-        }
-        delta_pool_reset(sess->delta_pool);
-        sess->rotation_ops->rotate_eval_arena(sess);
-        if (sess->cache_evict_threshold == 0) {
-            col_mat_cache_clear(&sess->mat_cache);
-        } else {
-            col_mat_cache_evict_until(&sess->mat_cache,
-                sess->cache_evict_threshold);
-        }
-        ctx->any_new = any_new;
-        sess->tdd_subpass_active = saved_tdd_subpass;
-        sess->tdd_outbound_only_active = saved_outbound_only;
-        sess->diff_operators_active = saved_diff;
-        ctx->runtime_ns = now_ns() - worker_t0;
-        TDD_WORKER_RETURN();
-    }
 
     /* Evaluate all relation plans (eval.c:505-604) */
     for (uint32_t ri = 0; ri < nrels; ri++) {
@@ -6606,8 +6324,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
 static int
 tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
-    bool *out_any_accepted, uint32_t *out_accepted_rows,
-    bool install_coord_delta)
+    bool *out_any_accepted, uint32_t *out_accepted_rows)
 {
     uint32_t nrels = sp->relation_count;
     int rc = 0;
@@ -6620,8 +6337,6 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
         const char *dname = sp->relations[ri].delta_name;
         const char *rel_name = sp->relations[ri].name;
 
-        if (install_coord_delta)
-            session_remove_rel(coord, dname);
         for (uint32_t w = 0; w < W; w++)
             session_remove_rel(&coord->tdd_workers[w], dname);
 
@@ -6682,22 +6397,6 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             *out_any_accepted = true;
         if (out_accepted_rows)
             *out_accepted_rows += combined->nrows;
-
-        if (install_coord_delta) {
-            col_rel_t *coord_delta = col_rel_new_like(dname, combined);
-            if (!coord_delta) {
-                col_rel_destroy(combined);
-                return ENOMEM;
-            }
-            rc = col_rel_append_all(coord_delta, combined, NULL);
-            if (rc == 0)
-                rc = session_add_rel(coord, coord_delta);
-            if (rc != 0) {
-                col_rel_destroy(coord_delta);
-                col_rel_destroy(combined);
-                return rc;
-            }
-        }
 
         if (coord_idb) {
             if (coord_idb->ncols == 0 && combined->ncols > 0) {
@@ -6900,32 +6599,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         && stratum_max_idb_body_atoms(sp) <= 1
         && tdd_stratum_single_idb_join_keys_exchange_aligned(sp);
     bool bdx_mode = has_idb_self_join && !self_join_mode;
-    wl_tdd_rule_slice_t *mixed_slices = NULL;
-    uint32_t mixed_slice_count = 0;
-    uint32_t mixed_safe_count = 0;
-    bool mixed_slice_mode = false;
-    const char *mixed_env = getenv("WIRELOG_TDD_MIXED_SLICES");
-    if (mixed_env && mixed_env[0] == '1') {
-        rc = tdd_build_rule_slices(sp, &mixed_slices, &mixed_slice_count,
-                &mixed_safe_count);
-        if (rc != 0) {
-            coord->tdd_total_ns += now_ns() - tdd_total_t0;
-            return rc;
-        }
-        mixed_slice_mode = mixed_safe_count > 0
-            && mixed_safe_count < mixed_slice_count;
-    }
     const char *global_read_env = getenv("WIRELOG_TDD_GLOBAL_READ");
     bool global_read_mode = !(global_read_env && global_read_env[0] == '0'
         && global_read_env[1] == '\0')
         && !owner_exchange_mode && !self_join_mode && !bdx_mode
         && tdd_stratum_global_read_candidate(sp);
-    if (mixed_slice_mode) {
-        owner_exchange_mode = false;
-        self_join_mode = false;
-        bdx_mode = false;
-        global_read_mode = true;
-    }
     bool replicate_mode = !owner_exchange_mode
         && !global_read_mode
         && ((coord->last_inserted_relation == NULL)
@@ -6957,7 +6635,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         int seq_rc = col_eval_stratum(sp, coord, stratum_idx);
         if (seq_rc == 0 && saved_total_iterations > 0)
             coord->total_iterations += saved_total_iterations;
-        free(mixed_slices);
         return seq_rc;
     }
 
@@ -6968,14 +6645,12 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         owner_fallback_saved = tdd_save_coord_idb(sp, coord);
         if (!owner_fallback_saved) {
             coord->tdd_total_ns += now_ns() - tdd_total_t0;
-            free(mixed_slices);
             return ENOMEM;
         }
     } else if (global_read_mode) {
         global_read_saved = tdd_save_coord_idb(sp, coord);
         if (!global_read_saved) {
             coord->tdd_total_ns += now_ns() - tdd_total_t0;
-            free(mixed_slices);
             return ENOMEM;
         }
     }
@@ -6990,7 +6665,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);
         tdd_free_saved_coord_idb(sp, global_read_saved);
         coord->tdd_total_ns += now_ns() - tdd_total_t0;
-        free(mixed_slices);
         return rc;
     }
 
@@ -7004,7 +6678,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                     tdd_free_saved_coord_idb(sp, global_read_saved);
                     coord->tdd_total_ns += now_ns() - tdd_total_t0;
-                    free(mixed_slices);
                     return rc;
                 }
             }
@@ -7018,7 +6691,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);
         tdd_free_saved_coord_idb(sp, global_read_saved);
         coord->tdd_total_ns += now_ns() - tdd_total_t0;
-        free(mixed_slices);
         return rc;
     }
 
@@ -7048,7 +6720,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                 tdd_free_saved_coord_idb(sp, global_read_saved);
                 coord->tdd_total_ns += now_ns() - tdd_total_t0;
-                free(mixed_slices);
                 return ENOMEM;
             }
             rc = session_add_rel(&coord->tdd_workers[w], slot);
@@ -7058,7 +6729,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                 tdd_free_saved_coord_idb(sp, global_read_saved);
                 coord->tdd_total_ns += now_ns() - tdd_total_t0;
-                free(mixed_slices);
                 return rc;
             }
         }
@@ -7273,9 +6943,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 memset(ctxs[w].delta_rels, 0, nrels * sizeof(col_rel_t *));
                 ctxs[w].sp = sp;
                 ctxs[w].worker_sess = &coord->tdd_workers[w];
-                ctxs[w].rule_slices = mixed_slice_mode ? mixed_slices : NULL;
-                ctxs[w].rule_slice_count =
-                    mixed_slice_mode ? mixed_slice_count : 0;
                 ctxs[w].stratum_idx = stratum_idx;
                 ctxs[w].eff_iter = eff_iter;
                 ctxs[w].any_new = false;
@@ -7368,23 +7035,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 coord->tdd_queue_drain_ns += now_ns() - queue_t0;
             }
 
-            bool mixed_fallback_any_new = false;
-            if (mixed_slice_mode) {
-                rc = tdd_coord_eval_fallback_rule_slices(sp, coord,
-                        &ctxs[0], mixed_slices, mixed_slice_count,
-                        eff_iter, &mixed_fallback_any_new);
-                if (rc != 0) {
-                    for (uint32_t w = 0; w < W; w++)
-                        for (uint32_t ri = 0; ri < nrels; ri++) {
-                            col_rel_destroy(ctxs[w].delta_rels[ri]);
-                            ctxs[w].delta_rels[ri] = NULL;
-                        }
-                    goto done;
-                }
-                if (mixed_fallback_any_new)
-                    ctxs[0].any_new = true;
-            }
-
             uint64_t convergence_t0 = now_ns();
 
             /* Stratum-level early exit: all workers have all_empty_delta */
@@ -7395,7 +7045,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     break;
                 }
             }
-            if (all_workers_empty && !mixed_slice_mode) {
+            if (all_workers_empty) {
                 coord->tdd_convergence_ns += now_ns() - convergence_t0;
                 for (uint32_t w = 0; w < W; w++)
                     for (uint32_t ri = 0; ri < nrels; ri++)
@@ -7444,8 +7094,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                             &owner_any_accepted, &owner_accepted_rows);
                 else if (global_read_mode)
                     brc = tdd_global_read_exchange_deltas(sp, coord, ctxs, W,
-                            &owner_any_accepted, &owner_accepted_rows,
-                            mixed_slice_mode);
+                            &owner_any_accepted, &owner_accepted_rows);
                 else if (bdx_mode)
                     brc = tdd_bdx_exchange_deltas(sp, coord, ctxs, W,
                             bdx_snap);
@@ -7461,10 +7110,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 if (getenv("WIRELOG_TDD_GLOBAL_READ_DEBUG"))
                     fprintf(stderr,
                         "TDD exchange error stratum=%u iter=%u rc=%d "
-                        "owner=%d global=%d bdx=%d mixed=%d replicate=%d\n",
+                        "owner=%d global=%d bdx=%d replicate=%d\n",
                         stratum_idx, eff_iter, brc, owner_exchange_mode,
-                        global_read_mode, bdx_mode, mixed_slice_mode,
-                        replicate_mode);
+                        global_read_mode, bdx_mode, replicate_mode);
                 rc = brc;
                 goto done;
             }
@@ -7516,7 +7164,6 @@ done:
         free(ctxs);
     }
     free(bdx_snap);
-    free(mixed_slices);
     coord->diff_operators_active = saved_diff;
 
     if (owner_adaptive_fallback && rc == 0) {
