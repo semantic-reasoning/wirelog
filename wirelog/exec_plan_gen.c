@@ -1515,7 +1515,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
              * child (JOIN/ANTIJOIN/SEMIJOIN/...) cannot be represented at
              * all.  Emitting NULL here yields an operator that matches
              * nothing and a silently empty result -- fail the plan instead
-             * (Issue #989). */
+             * (Issue #989/#993). */
             if (!rn || !rn->relation_name) {
                 WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
                     "JOIN right child (IR node type %d) carries no relation "
@@ -1550,7 +1550,20 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             const wirelog_ir_node_t *rn
                 = unwrap_filters_collect(node->children[1],
                     &op->right_filter_expr);
+            if (!rn || !rn->relation_name) {
+                WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                    "ANTIJOIN right child (IR node type %d) carries no "
+                    "relation name: the plan cannot represent a "
+                    "right-deep join",
+                    (int)(rn ? rn->type : node->children[1]->type));
+                return -1;
+            }
             op->right_relation = dup_str(rn ? rn->relation_name : NULL);
+        } else {
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                "ANTIJOIN right child is missing: the plan cannot "
+                "represent a right-deep join");
+            return -1;
         }
         op->left_keys = (const char *const *)resolve_keys_to_colN(
             node->join_left_keys, node->join_key_count,
@@ -1576,7 +1589,20 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             const wirelog_ir_node_t *rn
                 = unwrap_filters_collect(node->children[1],
                     &op->right_filter_expr);
+            if (!rn || !rn->relation_name) {
+                WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                    "SEMIJOIN right child (IR node type %d) carries no "
+                    "relation name: the plan cannot represent a "
+                    "right-deep join",
+                    (int)(rn ? rn->type : node->children[1]->type));
+                return -1;
+            }
             op->right_relation = dup_str(rn ? rn->relation_name : NULL);
+        } else {
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                "SEMIJOIN right child is missing: the plan cannot "
+                "represent a right-deep join");
+            return -1;
         }
         op->left_keys = (const char *const *)resolve_keys_to_colN(
             node->join_left_keys, node->join_key_count,

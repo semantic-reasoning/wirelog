@@ -632,6 +632,26 @@ find_right_deep_candidate(wirelog_ir_node_t *node)
     return NULL;
 }
 
+static wirelog_ir_node_t *
+find_composite_left_joinlike(wirelog_ir_node_t *node,
+    wirelog_ir_node_type_t type)
+{
+    if (!node)
+        return NULL;
+    if (node->type == type && node->child_count == 2
+        && node->children[0]
+        && node->children[0]->type == WIRELOG_IR_JOIN
+        && node->children[1] && node->children[1]->relation_name)
+        return node;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        wirelog_ir_node_t *hit
+            = find_composite_left_joinlike(node->children[i], type);
+        if (hit)
+            return hit;
+    }
+    return NULL;
+}
+
 static void
 test_join_with_composite_right_child_rejected(void)
 {
@@ -682,6 +702,100 @@ test_join_with_composite_right_child_rejected(void)
     }
     ASSERT(plan == NULL, "plan must not be returned on error");
 
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_antijoin_with_composite_right_child_rejected(void)
+{
+    TEST("ANTIJOIN with composite right child is rejected (#993)");
+
+    const char *src = ".decl a(x: int32, y: int32)\n"
+        ".decl b(y: int32, z: int32)\n"
+        ".decl blocked(z: int32)\n"
+        ".decl out(x: int32)\n"
+        "out(x) :- a(x, y), b(y, z), !blocked(z).\n";
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "parse failed");
+
+    wl_plan_t *control = NULL;
+    int rc = wl_plan_from_program(prog, &control);
+    ASSERT(rc == 0 && control != NULL,
+        "unmodified ANTIJOIN plan should be valid");
+    wl_plan_free(control);
+
+    wirelog_ir_node_t *anti = NULL;
+    for (uint32_t r = 0; r < prog->rule_count && !anti; r++) {
+        if (prog->rules[r].head_relation
+            && strcmp(prog->rules[r].head_relation, "out") == 0)
+            anti = find_composite_left_joinlike(prog->rules[r].ir_root,
+                    WIRELOG_IR_ANTIJOIN);
+    }
+    ASSERT(anti != NULL, "no composite-left ANTIJOIN candidate found");
+
+    uint32_t saved_child_count = anti->child_count;
+    anti->child_count = 1;
+    ASSERT(wl_ir_program_rebuild_relation_irs(prog) == 0,
+        "rebuild_relation_irs failed for missing child");
+    wl_plan_t *missing_plan = NULL;
+    rc = wl_plan_from_program(prog, &missing_plan);
+    ASSERT(rc != 0 && missing_plan == NULL,
+        "plan generation accepted a missing ANTIJOIN child");
+    anti->child_count = saved_child_count;
+
+    wirelog_ir_node_t *tmp = anti->children[0];
+    anti->children[0] = anti->children[1];
+    anti->children[1] = tmp;
+    ASSERT(wl_ir_program_rebuild_relation_irs(prog) == 0,
+        "rebuild_relation_irs failed");
+
+    wl_plan_t *plan = NULL;
+    rc = wl_plan_from_program(prog, &plan);
+    ASSERT(rc != 0 && plan == NULL,
+        "plan generation accepted an unrepresentable ANTIJOIN");
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_semijoin_with_composite_right_child_rejected(void)
+{
+    TEST("SEMIJOIN with composite right child is rejected (#993)");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(k_semijoin_chain_src, &err);
+    ASSERT(prog != NULL, "parse failed");
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+
+    wl_plan_t *control = NULL;
+    int rc = wl_plan_from_program(prog, &control);
+    ASSERT(rc == 0 && control != NULL,
+        "unmodified SEMIJOIN plan should be valid");
+    wl_plan_free(control);
+
+    wirelog_ir_node_t *semi = NULL;
+    for (uint32_t r = 0; r < prog->rule_count && !semi; r++) {
+        if (prog->rules[r].head_relation
+            && strcmp(prog->rules[r].head_relation, "chain") == 0)
+            semi = find_composite_left_joinlike(prog->rules[r].ir_root,
+                    WIRELOG_IR_SEMIJOIN);
+    }
+    ASSERT(semi != NULL, "no composite-left SEMIJOIN candidate found");
+
+    wirelog_ir_node_t *tmp = semi->children[0];
+    semi->children[0] = semi->children[1];
+    semi->children[1] = tmp;
+    ASSERT(wl_ir_program_rebuild_relation_irs(prog) == 0,
+        "rebuild_relation_irs failed");
+
+    wl_plan_t *plan = NULL;
+    rc = wl_plan_from_program(prog, &plan);
+    ASSERT(rc != 0 && plan == NULL,
+        "plan generation accepted an unrepresentable SEMIJOIN");
     wirelog_program_free(prog);
     PASS();
 }
@@ -795,6 +909,8 @@ main(void)
     test_semijoin_chain_end_to_end();
     test_semijoin_head_projection_values();
     test_join_with_composite_right_child_rejected();
+    test_antijoin_with_composite_right_child_rejected();
+    test_semijoin_with_composite_right_child_rejected();
     test_side_compound_in_non_first_atom_rejected();
     test_plan_free_null();
     test_load_facts_null_safe();
