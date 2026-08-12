@@ -461,7 +461,7 @@ jobs:
   # ==========================================================================
   # Phase: Sanitizer Matrix (starts after lint, parallel with build-primary)
   # ASan + UBSan validation; runs in parallel with build-matrix.
-  # Linux: GCC + Clang; macOS: Clang
+  # Linux: GCC + Clang + ARM64 GCC; macOS: Clang
   # ==========================================================================
   sanitizer-matrix:
     name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
@@ -481,6 +481,11 @@ jobs:
           - os: ubuntu-latest
             compiler: clang
             cc: clang
+
+          # Linux ARM64 - GCC
+          - os: ubuntu-24.04-arm
+            compiler: gcc
+            cc: gcc
 
           # macOS - Clang
           - os: macos-latest
