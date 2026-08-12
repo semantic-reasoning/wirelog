@@ -413,14 +413,6 @@ wl_columnar_session_tdd_plan_stratum(const wl_plan_stratum_t *sp,
                 snapshot_tdd_eligible, decision);
             return decision;
         }
-        const char *mixed_env = getenv("WIRELOG_TDD_MIXED_SLICES");
-        if (mixed_env && mixed_env[0] == '1'
-            && tdd_stratum_mixed_slice_candidate(sp)) {
-            decision.use_tdd = true;
-            wl_columnar_session_tdd_debug_decision(sp, sess,
-                snapshot_tdd_eligible, decision);
-            return decision;
-        }
         decision.fallback_reason =
             WL_COLUMNAR_INTERNAL_TDD_FALLBACK_UNSAFE_PLAN;
         wl_columnar_session_tdd_debug_decision(sp, sess,
