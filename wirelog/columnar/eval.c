@@ -4724,9 +4724,6 @@ tdd_rule_slice_global_read_safe(const wl_plan_op_t *ops, uint32_t op_count,
     if (!relation_has_exchange || !ops || op_count == 0)
         return false;
 
-    if (tdd_ops_have_unsupported_lftj(ops, op_count, sp))
-        return false;
-
     for (uint32_t oi = 0; oi < op_count; oi++) {
         const wl_plan_op_t *op = &ops[oi];
         if (op->delta_mode == WL_DELTA_FORCE_EMPTY)
@@ -4747,13 +4744,6 @@ tdd_rule_slice_global_read_safe(const wl_plan_op_t *ops, uint32_t op_count,
             join_like++;
             has_antijoin = true;
             break;
-        case WL_PLAN_OP_LFTJ: {
-            const wl_plan_op_lftj_t *meta =
-                (const wl_plan_op_lftj_t *)op->opaque_data;
-            if (meta->k > 1)
-                join_like += meta->k - 1;
-            break;
-        }
         default:
             break;
         }
@@ -4771,9 +4761,6 @@ tdd_child_plan_global_read_safe(const wl_plan_op_t *ops, uint32_t op_count,
     const wl_plan_stratum_t *sp, bool relation_has_exchange)
 {
     if (!ops || op_count == 0)
-        return false;
-
-    if (tdd_ops_have_unsupported_lftj(ops, op_count, sp))
         return false;
 
     uint32_t idb_segments = 0;
@@ -4911,6 +4898,8 @@ tdd_build_rule_slices(const wl_plan_stratum_t *sp,
 bool
 tdd_stratum_mixed_slice_candidate(const wl_plan_stratum_t *sp)
 {
+    if (tdd_stratum_has_unsupported_lftj(sp))
+        return false;
     wl_tdd_rule_slice_t *slices = NULL;
     uint32_t count = 0;
     uint32_t safe_count = 0;
@@ -5064,13 +5053,6 @@ tdd_ops_single_idb_keys_exchange_aligned(const wl_plan_op_t *ops,
 
     for (uint32_t oi = 0; oi < op_count; oi++) {
         const wl_plan_op_t *op = &ops[oi];
-        if (op->op == WL_PLAN_OP_LFTJ) {
-            const wl_plan_op_lftj_t *meta =
-                (const wl_plan_op_lftj_t *)op->opaque_data;
-            if (tdd_lftj_idb_count(meta, sp) != 0)
-                return false;
-            continue;
-        }
         if (op->op == WL_PLAN_OP_VARIABLE) {
             if (is_stratum_idb(sp, op->relation_name)) {
                 stack_has_idb = true;
@@ -5112,6 +5094,8 @@ bool
 tdd_stratum_single_idb_join_keys_exchange_aligned(
     const wl_plan_stratum_t *sp)
 {
+    if (tdd_stratum_has_unsupported_lftj(sp))
+        return false;
     if (tdd_stratum_has_idb_self_join(sp))
         return false;
 
