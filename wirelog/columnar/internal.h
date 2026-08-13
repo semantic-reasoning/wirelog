@@ -1597,7 +1597,7 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
     col_rel_t *out_delta);
 
 /* ======================================================================== */
-/* Eval Stack & Operators (columnar/ops.c)                                  */
+/* Eval Stack (columnar/eval_stack.c) and operators (columnar/ops.c)         */
 /* ======================================================================== */
 
 void
