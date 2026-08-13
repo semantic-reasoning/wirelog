@@ -1,7 +1,7 @@
 name: Lint PR
 
 # PR-specific lint workflow with hard-gate semantics.
-# Runs 3 sequential checks: editorconfig -> uncrustify -> clang-tidy
+# Runs 2 sequential checks: editorconfig -> uncrustify
 # Each check must pass before the next runs (fail-fast).
 # This workflow is imported by ci-pr.yml as Phase 1.
 
@@ -121,83 +121,3 @@ jobs:
           else
             echo 'No formatting issues found.' >> "$GITHUB_STEP_SUMMARY"
           fi
-
-  # ==========================================================================
-  # Phase 1c: clang-tidy 22 check (hard gate)
-  # Excludes: subprojects/**, build/**
-  # Runs only after uncrustify passes.
-  # ==========================================================================
-  clang-tidy-check:
-    name: clang-tidy 22 check
-    if: ${{ false }}
-    runs-on: ubuntu-latest
-    needs: [uncrustify-check]
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Install LLVM 22
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
-          sudo apt-get update
-          sudo apt-get install -y clang-tidy-22 clang-tools-22
-
-      - name: Verify tool version
-        run: clang-tidy-22 --version
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get install -y meson ninja-build
-
-      - name: Configure build (for compile_commands.json)
-        run: meson setup builddir-tidy -Dtests=true
-
-      - name: Run clang-tidy (hard gate)
-        run: |
-          set -o pipefail
-          BASE_REF="${{ inputs.base-ref }}"
-          git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-
-          mapfile -t tidy_files < <(
-            git diff "origin/${BASE_REF}...HEAD" --name-only \
-              --diff-filter=ACM | grep -E '^(wirelog|tests)/.*\.(c|h)$' || true
-          )
-
-          : > tidy-results.txt
-          if [ "${#tidy_files[@]}" -eq 0 ]; then
-            echo "No changed C/H files selected for clang-tidy."
-            exit 0
-          fi
-
-          echo "clang-tidy selected ${#tidy_files[@]} changed files:"
-          printf '%s\n' "${tidy_files[@]}"
-          run-clang-tidy-22 -p builddir-tidy \
-            "${tidy_files[@]}" \
-            2>&1 | tee tidy-results.txt
-          if grep -qE '^.*\.(c|h):[0-9]+:[0-9]+: (warning|error):' tidy-results.txt; then
-            echo "clang-tidy found issues. PR blocked."
-            exit 1
-          fi
-
-      - name: Publish results
-        if: always()
-        run: |
-          echo '## clang-tidy Results' >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          if [ -s tidy-results.txt ]; then
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            tail -50 tidy-results.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo 'No issues found.' >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Upload tidy results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: tidy-results-pr
-          path: tidy-results.txt

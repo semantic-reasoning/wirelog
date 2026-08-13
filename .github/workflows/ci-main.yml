@@ -22,7 +22,7 @@ permissions:
 jobs:
   # ==========================================================================
   # Phase 1: Lint monitoring (import lint-main.yml)
-  # editorconfig, uncrustify, clang-tidy 22 — all parallel, non-blocking
+  # editorconfig and uncrustify — parallel, non-blocking
   # ==========================================================================
   lint:
     uses: ./.github/workflows/lint-main.yml

@@ -284,7 +284,7 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
     path-filtered contexts for branch protection.
   - Currently known concrete PR contexts to require at cutover (unless
     replaced by a later policy-consolidation change): `lint / EditorConfig check`,
-    `lint / uncrustify check`, `lint / clang-tidy 22 check`,
+    `lint / uncrustify check`,
     `Build / ubuntu-latest / gcc`, `Build / ubuntu-24.04-arm / gcc`,
     `RC changelog freeze gate`, `CLA signoff gate`,
     `mbedtls-enabled / ubuntu-latest / gcc`,
