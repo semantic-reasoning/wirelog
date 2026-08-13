@@ -30,6 +30,55 @@ env:
 
 jobs:
   # ==========================================================================
+  # Build scope gate
+  # Keep lint/policy checks active for every PR, but avoid the expensive build
+  # and sanitizer matrix when a PR only changes documentation or metadata.
+  # ==========================================================================
+  build-scope:
+    name: Detect build-triggering changes
+    runs-on: ubuntu-latest
+    outputs:
+      build-required: ${{ steps.scope.outputs.build-required }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect source and build-definition changes
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if ! changed_files="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")"; then
+            echo "Unable to determine the PR diff; running the full build as a safe fallback."
+            echo "build-required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "$changed_files"
+
+          build_required=false
+          while IFS= read -r path; do
+            case "$path" in
+              *.md|*.markdown|*.rst)
+                continue
+                ;;
+              *.c|*.h|*.in|wirelog/*|tests/*|examples/*|bench/*|fuzz/*|scripts/*|subprojects/*|cross/*|abi/*|sbom/*|.github/workflows/*|meson.build|meson_options.txt|uncrustify.cfg|.clang-tidy)
+                build_required=true
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          if [ "$build_required" = true ]; then
+            echo "build-required=true" >> "$GITHUB_OUTPUT"
+            echo "Build-triggering source or build-definition changes detected."
+          else
+            echo "build-required=false" >> "$GITHUB_OUTPUT"
+            echo "No source or build-definition changes detected; build matrix will be skipped."
+          fi
+
+  # ==========================================================================
   # Issue #747 B18: RC changelog freeze gate (stable always-emitting context)
   # Enforces only for PRs whose base branch is `1.0`; non-1.0 PRs SKIP/pass.
   # ==========================================================================
@@ -63,7 +112,8 @@ jobs:
   # ==========================================================================
   build-primary:
     name: Build / ubuntu-latest / gcc
-    needs: [lint]
+    needs: [lint, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -139,7 +189,8 @@ jobs:
   # ==========================================================================
   build-arm:
     name: Build / ubuntu-24.04-arm / gcc
-    needs: [build-primary]
+    needs: [build-primary, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
@@ -173,7 +224,8 @@ jobs:
   # ==========================================================================
   build-matrix:
     name: Build / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [build-arm, build-mbedtls]
+    needs: [build-arm, build-mbedtls, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -306,7 +358,8 @@ jobs:
   # ==========================================================================
   build-mbedtls:
     name: mbedtls-enabled / ubuntu-latest / gcc
-    needs: [build-primary]
+    needs: [build-primary, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -345,7 +398,8 @@ jobs:
   # ==========================================================================
   sanitizer-matrix:
     name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [lint]
+    needs: [lint, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -415,7 +469,8 @@ jobs:
   # ==========================================================================
   tsan:
     name: TSan / ubuntu-latest / gcc
-    needs: [sanitizer-matrix]
+    needs: [sanitizer-matrix, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -477,7 +532,8 @@ jobs:
   # ==========================================================================
   tsan-native:
     name: TSan-native / ubuntu-latest / gcc
-    needs: [sanitizer-matrix]
+    needs: [sanitizer-matrix, build-scope]
+    if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-latest
 
     steps:
