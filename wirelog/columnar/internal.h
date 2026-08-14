@@ -1601,6 +1601,20 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 /* ======================================================================== */
 
 /* Checked expression arithmetic (columnar/arithmetic.c). */
+typedef struct wl_columnar_expr_compiled wl_columnar_expr_compiled_t;
+
+wl_columnar_expr_compiled_t *
+wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
+    const wl_intern_t *intern);
+void
+wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c);
+int
+wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
+    const int64_t *row, uint32_t ncols, int64_t *out_val);
+bool
+wl_columnar_expr_parse_var_col(const uint8_t *buf, uint32_t size,
+    uint32_t *pos, uint32_t *col_out);
+
 int
 wl_columnar_arithmetic_checked_add_int64(int64_t a, int64_t b, int64_t *out);
 int
