@@ -608,9 +608,9 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         return rc;
     }
 
-    /* The placeholder $join relation was allocated before this fast path was
-     * selected and its initial capacity was never charged to the ledger. */
-    (*outp)->mem_ledger = NULL;
+    /* The placeholder was ledger-accounted before selecting this fast path;
+     * retain its ledger while destroying it so the initial allocation is
+     * released. */
     col_rel_destroy(*outp);
     *outp = out;
     return 0;
