@@ -1664,6 +1664,8 @@ eval_stack_drain(eval_stack_t *s);
 int
 col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess);
 int
+row_cmp_dispatch(const int64_t *a, const int64_t *b, uint32_t ncols);
+int
 col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     uint32_t seg_count);
 int
