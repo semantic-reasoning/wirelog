@@ -246,7 +246,7 @@ normal_eval:
             rc = col_op_map(op, stack, sess);
             break;
         case WL_PLAN_OP_FILTER:
-            rc = col_op_filter(op, stack, sess);
+            rc = wl_columnar_filter_op(op, stack, sess);
             break;
         case WL_PLAN_OP_JOIN:
             rc = sess->diff_operators_active

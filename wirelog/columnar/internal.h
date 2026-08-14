@@ -1640,6 +1640,16 @@ int
 wl_columnar_arithmetic_checked_shl_int64(int64_t a, int64_t b, int64_t *out);
 int
 wl_columnar_arithmetic_checked_shr_int64(int64_t a, int64_t b, int64_t *out);
+uint32_t
+wl_columnar_filter_next_pow2(uint32_t n);
+col_rel_t *
+wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
+    col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern);
+uint64_t
+wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len);
+col_rel_t *
+wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
+    const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel);
 
 void
 eval_stack_init(eval_stack_t *s);
@@ -1672,7 +1682,7 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess);
 int
-col_op_filter(const wl_plan_op_t *op, eval_stack_t *stack,
+wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int
 col_op_join(const wl_plan_op_t *op, eval_stack_t *stack,
