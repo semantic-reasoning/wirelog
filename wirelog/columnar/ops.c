@@ -219,7 +219,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         if (ce_map) {
             for (uint32_t c = 0; c < ce_map_count; c++)
                 wl_columnar_expr_compiled_free(ce_map[c]);
-            free(ce_map);
+            free((void *)ce_map);
         }
         free(tmp);
         col_rel_destroy(out);
@@ -242,7 +242,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         if (ce_map) {
                             for (uint32_t i = 0; i < ce_map_count; i++)
                                 wl_columnar_expr_compiled_free(ce_map[i]);
-                            free(ce_map);
+                            free((void *)ce_map);
                         }
                         col_row_buf_release(&row_rb);
                         free(tmp);
@@ -260,7 +260,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         if (ce_map) {
                             for (uint32_t i = 0; i < ce_map_count; i++)
                                 wl_columnar_expr_compiled_free(ce_map[i]);
-                            free(ce_map);
+                            free((void *)ce_map);
                         }
                         col_row_buf_release(&row_rb);
                         free(tmp);
@@ -281,7 +281,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             if (ce_map) {
                 for (uint32_t c = 0; c < ce_map_count; c++)
                     wl_columnar_expr_compiled_free(ce_map[c]);
-                free(ce_map);
+                free((void *)ce_map);
             }
             col_row_buf_release(&row_rb);
             free(tmp);
@@ -295,7 +295,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     if (ce_map) {
         for (uint32_t c = 0; c < ce_map_count; c++)
             wl_columnar_expr_compiled_free(ce_map[c]);
-        free(ce_map);
+        free((void *)ce_map);
     }
     col_row_buf_release(&row_rb);
     free(tmp);
