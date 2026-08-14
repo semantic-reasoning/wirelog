@@ -1611,6 +1611,17 @@ wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c);
 int
 wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
     const int64_t *row, uint32_t ncols, int64_t *out_val);
+int
+wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, int64_t *out_val,
+    wl_intern_t *intern);
+int
+wl_columnar_expr_filter_row(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, wl_intern_t *intern);
+int
+wl_columnar_expr_eval_i64(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, int64_t *out_val,
+    wl_intern_t *intern);
 bool
 wl_columnar_expr_parse_var_col(const uint8_t *buf, uint32_t size,
     uint32_t *pos, uint32_t *col_out);
