@@ -724,8 +724,10 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         if (!(prev_sarr
                             && prev_sarr->indexed_rows
                             == inputs[j].nrows
-                            && prev_sarr->nrows > 0))
+                            && prev_sarr->nrows > 0)) {
                             free((void *)inputs[j].data);
+                            inputs[j].data = NULL;
+                        }
                     }
                 }
                 rc = ENOMEM;
