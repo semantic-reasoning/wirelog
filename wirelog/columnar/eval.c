@@ -250,11 +250,11 @@ normal_eval:
             break;
         case WL_PLAN_OP_JOIN:
             rc = sess->diff_operators_active
-                ? col_op_join_diff(op, stack, sess)
-                : col_op_join(op, stack, sess);
+                ? wl_columnar_join_diff_op(op, stack, sess)
+                : wl_columnar_join_op(op, stack, sess);
             break;
         case WL_PLAN_OP_ANTIJOIN:
-            rc = col_op_antijoin(op, stack, sess);
+            rc = wl_columnar_antijoin_op(op, stack, sess);
             break;
         case WL_PLAN_OP_CONCAT:
             rc = col_op_concat(stack, sess);
@@ -268,7 +268,7 @@ normal_eval:
             rc = col_op_reduce(op, stack, sess);
             break;
         case WL_PLAN_OP_SEMIJOIN:
-            rc = col_op_semijoin(op, stack, sess);
+            rc = wl_columnar_semijoin_op(op, stack, sess);
             break;
         case WL_PLAN_OP_K_FUSION: {
             uint64_t t0 = now_ns();

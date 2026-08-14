@@ -1685,15 +1685,15 @@ int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int
-col_op_join(const wl_plan_op_t *op, eval_stack_t *stack,
+wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int
-col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
+wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int
 col_op_concat(eval_stack_t *stack, wl_col_session_t *sess);
 int
-col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
+wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int
 col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
@@ -1709,6 +1709,18 @@ col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 
 /* Differential operator variants (Issue #263) */
+int
+wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_join(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
 int
 col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
