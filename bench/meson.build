@@ -34,6 +34,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/filter.c',
   subdir_wirelog / 'columnar/join.c',
   subdir_wirelog / 'columnar/merge.c',
+  subdir_wirelog / 'columnar/kfusion.c',
   subdir_wirelog / 'columnar/eval_stack.c',
   subdir_wirelog / 'columnar/eval.c',
   subdir_wirelog / 'columnar/arrangement.c',
