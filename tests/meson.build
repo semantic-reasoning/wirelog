@@ -821,6 +821,7 @@ backend_src = files(
   '../wirelog/columnar/join.c',
   '../wirelog/columnar/merge.c',
   '../wirelog/columnar/kfusion.c',
+  '../wirelog/columnar/diff.c',
   '../wirelog/columnar/eval_stack.c',
   '../wirelog/columnar/eval.c',
   '../wirelog/columnar/arrangement.c',
