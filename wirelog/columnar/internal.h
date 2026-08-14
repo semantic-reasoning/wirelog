@@ -1600,6 +1600,22 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 /* Eval Stack (columnar/eval_stack.c) and operators (columnar/ops.c)         */
 /* ======================================================================== */
 
+/* Checked expression arithmetic (columnar/arithmetic.c). */
+int
+wl_columnar_arithmetic_checked_add_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_sub_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_mul_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_div_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_mod_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_shl_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_shr_int64(int64_t a, int64_t b, int64_t *out);
+
 void
 eval_stack_init(eval_stack_t *s);
 int

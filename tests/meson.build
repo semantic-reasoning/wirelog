@@ -815,6 +815,7 @@ backend_src = files(
   '../wirelog/columnar/relation.c',
   '../wirelog/columnar/cache.c',
   '../wirelog/columnar/ops.c',
+  '../wirelog/columnar/arithmetic.c',
   '../wirelog/columnar/eval_stack.c',
   '../wirelog/columnar/eval.c',
   '../wirelog/columnar/arrangement.c',
