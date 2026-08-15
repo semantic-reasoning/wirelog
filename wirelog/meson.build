@@ -90,7 +90,7 @@ wirelog_lockfree_queue_src = files('util/lockfree_queue.c', )
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_backend_src = files('columnar/relation.c', 'columnar/cache.c',
-                           'columnar/ops.c', 'columnar/arithmetic.c', 'columnar/expr.c', 'columnar/filter.c', 'columnar/join.c', 'columnar/merge.c', 'columnar/kfusion.c', 'columnar/diff.c', 'columnar/inline.c', 'columnar/eval_dedup.c', 'columnar/eval_plan.c', 'columnar/eval_stack.c', 'columnar/eval.c',
+                           'columnar/ops.c', 'columnar/arithmetic.c', 'columnar/expr.c', 'columnar/filter.c', 'columnar/join.c', 'columnar/merge.c', 'columnar/kfusion.c', 'columnar/diff.c', 'columnar/inline.c', 'columnar/eval_dedup.c', 'columnar/eval_delta.c', 'columnar/eval_plan.c', 'columnar/eval_stack.c', 'columnar/eval.c',
                            'columnar/arrangement.c', 'columnar/frontier.c', 'columnar/frontier_epoch.c',
                            'columnar/mobius.c', 'columnar/session.c', 'columnar/session_hash.c',
                            'columnar/delta_pool.c', 'columnar/lftj.c',
