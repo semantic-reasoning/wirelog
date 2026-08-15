@@ -1730,6 +1730,19 @@ int
 col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess);
 
 /* ======================================================================== */
+/* Evaluator deduplication (columnar/eval_dedup.c)                           */
+/* ======================================================================== */
+
+uint64_t
+wl_columnar_eval_dedup_row_hash(const col_rel_t *r, uint32_t row);
+bool
+wl_columnar_eval_dedup_set_insert(col_rel_t *r, uint64_t h);
+bool
+wl_columnar_eval_dedup_set_contains(const col_rel_t *r, uint64_t h);
+int
+wl_columnar_eval_dedup_set_init_from_rel(col_rel_t *r);
+
+/* ======================================================================== */
 /* Evaluator (columnar/eval.c)                                              */
 /* ======================================================================== */
 
