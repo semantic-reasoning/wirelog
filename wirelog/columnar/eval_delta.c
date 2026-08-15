@@ -67,7 +67,7 @@ col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
 /*
  * col_stratum_step_with_delta: Evaluate one stratum and fire delta callbacks.
  *
- * Phase 2A algorithm (full re-eval + set diff):
+ * Full re-evaluation and set-difference algorithm:
  *   1. Snapshot each IDB relation's current sorted rows (prev state)
  *   2. Run col_eval_stratum (appends newly derived rows)
  *   3. Consolidate each IDB relation (sort + dedup)
