@@ -823,6 +823,7 @@ backend_src = files(
   '../wirelog/columnar/kfusion.c',
   '../wirelog/columnar/diff.c',
   '../wirelog/columnar/inline.c',
+  '../wirelog/columnar/eval_dedup.c',
   '../wirelog/columnar/eval_plan.c',
   '../wirelog/columnar/eval_stack.c',
   '../wirelog/columnar/eval.c',
