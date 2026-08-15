@@ -26,10 +26,11 @@
 #define TDD_OWNER_FALLBACK_MIN_ITER 31u
 #define TDD_OWNER_FALLBACK_DELTA_ROWS 512u
 
-#define dedup_row_hash wl_columnar_eval_dedup_row_hash
-#define dedup_set_insert wl_columnar_eval_dedup_set_insert
-#define dedup_set_contains wl_columnar_eval_dedup_set_contains
-#define dedup_set_init_from_rel wl_columnar_eval_dedup_set_init_from_rel
+#define WL_COLUMNAR_EVAL_DEDUP_ROW_HASH wl_columnar_eval_dedup_row_hash
+#define WL_COLUMNAR_EVAL_DEDUP_SET_INSERT wl_columnar_eval_dedup_set_insert
+#define WL_COLUMNAR_EVAL_DEDUP_SET_CONTAINS wl_columnar_eval_dedup_set_contains
+#define WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL \
+        wl_columnar_eval_dedup_set_init_from_rel
 
 /* Relation-plan dispatch is implemented in columnar/eval_plan.c. */
 static col_frontier_t
@@ -2704,8 +2705,8 @@ tdd_worker_subpass_fn(void *arg)
             }
             uint32_t keep = snap[ri];
             for (uint32_t i = snap[ri]; i < r->nrows; i++) {
-                uint64_t h = dedup_row_hash(r, i);
-                if (dedup_set_insert(r, h)) {
+                uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(r, i);
+                if (WL_COLUMNAR_EVAL_DEDUP_SET_INSERT(r, h)) {
                     /* New row: compact into [keep] and emit to delta. */
                     if (keep != i)
                         col_rel_row_move(r, keep, i);
@@ -4884,7 +4885,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                             rc = ENOMEM;
                         } else {
                             /* Init hash-set dedup for O(1) consolidation. */
-                            dedup_set_init_from_rel(parts[w]);
+                            WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(parts[w]);
                             worker_rels[w][rels_built] = parts[w];
                             parts[w] = NULL;
                         }
@@ -4964,7 +4965,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                 /* Init hash-set dedup for empty IDB workers so
                  * consolidation uses O(D) instead of O(N) merge. */
                 if (is_idb && rel->nrows == 0)
-                    dedup_set_init_from_rel(view);
+                    WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(view);
                 worker_rels[w][rels_built] = view;
             }
         }
@@ -5389,7 +5390,7 @@ bdx_hash_diff(col_rel_t *delta, const col_rel_t *base)
 
     uint32_t ncols = base->ncols;
     for (uint32_t i = 0; i < base->nrows; i++) {
-        uint64_t h = dedup_row_hash(base, i);
+        uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(base, i);
         uint32_t slot = (uint32_t)(h & mask);
         while (slots[slot] != 0)
             slot = (slot + 1) & mask;
@@ -5398,7 +5399,7 @@ bdx_hash_diff(col_rel_t *delta, const col_rel_t *base)
 
     uint32_t wr = 0;
     for (uint32_t di = 0; di < delta->nrows; di++) {
-        uint64_t h = dedup_row_hash(delta, di);
+        uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(delta, di);
         uint32_t slot = (uint32_t)(h & mask);
         bool found = false;
         while (slots[slot] != 0) {
@@ -5444,8 +5445,8 @@ tdd_hashset_diff(col_rel_t *delta, const col_rel_t *base)
 
     uint32_t wr = 0;
     for (uint32_t di = 0; di < delta->nrows; di++) {
-        uint64_t h = dedup_row_hash(delta, di);
-        if (dedup_set_contains(base, h))
+        uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(delta, di);
+        if (WL_COLUMNAR_EVAL_DEDUP_SET_CONTAINS(base, h))
             continue;
         if (wr != di) {
             col_columns_copy_row(delta->columns, wr,
@@ -5465,8 +5466,8 @@ tdd_dedup_set_insert_rel(col_rel_t *target, const col_rel_t *rows)
     if (!target || !target->dedup_slots || !rows)
         return;
     for (uint32_t row = 0; row < rows->nrows; row++) {
-        uint64_t h = dedup_row_hash(rows, row);
-        dedup_set_insert(target, h);
+        uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(rows, row);
+        WL_COLUMNAR_EVAL_DEDUP_SET_INSERT(target, h);
     }
 }
 
@@ -5727,8 +5728,9 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
                     if (rc == 0) {
                         for (uint32_t row = 0; row < parts[w]->nrows;
                             row++) {
-                            uint64_t h = dedup_row_hash(parts[w], row);
-                            dedup_set_insert(widb, h);
+                            uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(
+                                parts[w], row);
+                            WL_COLUMNAR_EVAL_DEDUP_SET_INSERT(widb, h);
                         }
                     }
                 }
@@ -5933,8 +5935,9 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
                 }
                 if (widb->dedup_slots) {
                     for (uint32_t row = 0; row < part->nrows; row++) {
-                        uint64_t h = dedup_row_hash(part, row);
-                        dedup_set_insert(widb, h);
+                        uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(
+                            part, row);
+                        WL_COLUMNAR_EVAL_DEDUP_SET_INSERT(widb, h);
                     }
                 }
                 col_session_invalidate_arrangements(
@@ -6317,7 +6320,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
             if (r && !r->dedup_slots) {
-                rc = dedup_set_init_from_rel(r);
+                rc = WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL(r);
                 if (rc != 0) {
                     tdd_cleanup_workers(coord);
                     tdd_free_saved_coord_idb(sp, owner_fallback_saved);
