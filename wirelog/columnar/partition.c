@@ -172,6 +172,13 @@ col_rel_partition_by_key(const col_rel_t *src,
         memset(offsets, 0, num_workers * sizeof(uint32_t));
         for (uint32_t i = 0; i < nrows; i++) {
             uint32_t p = part_idx[i];
+            /* out_parts[p]->columns is NULL only for counts[p] == 0,
+             * where the default allocation was freed above.  part_idx[i]
+             * comes from the same pure row_partition_colmajor() computation
+             * that incremented counts[p] in pass 1, so every p reached here has
+             * counts[p] > 0 and a live columns array.  The analyzer cannot
+             * relate the counts array to part_idx across the two passes. */
+            // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
             out_parts[p]->columns[c][offsets[p]] = src->columns[c][i];
             offsets[p]++;
         }
@@ -286,7 +293,12 @@ col_rel_merge_partitions(col_rel_t **parts, uint32_t num_workers,
     /* Copy partition data contiguously per column */
     uint32_t row_offset = 0;
     for (uint32_t w = 0; w < num_workers; w++) {
-        if (parts[w]->nrows > 0) {
+        /* merged->columns is NULL only for total_rows == 0, which implies
+         * every parts[w]->nrows == 0 because total_rows is their exact
+         * sum.  The analyzer cannot derive "sum == 0 => each term == 0",
+         * so the total_rows guard is spelled out.  It costs nothing:
+         * merged->nrows is set to total_rows == 0 either way. */
+        if (total_rows > 0 && parts[w]->nrows > 0) {
             for (uint32_t c = 0; c < ncols; c++)
                 memcpy(merged->columns[c] + row_offset,
                     parts[w]->columns[c],

@@ -579,6 +579,85 @@ test_merge_roundtrip(void)
     return 0;
 }
 
+/*
+ * Regression test (Issue #1078): pins the empty-output representation that
+ * both partition.c null-dereference invariants rely on.  This is a property
+ * of partition/merge OUTPUTS only, not of 0-row relations in general: a
+ * freshly built col_rel_new_auto() source has nrows == 0 but columns
+ * != NULL, because col_rel_set_schema() allocates COL_REL_INIT_CAP.  The
+ * two output paths deliberately drop that allocation instead --
+ * col_rel_partition_by_key() frees it for every partition with
+ * counts[w] == 0 (partition.c:148-152), and col_rel_merge_partitions()
+ * frees it when total_rows == 0 (partition.c:287-291) -- so both keep the
+ * schema (ncols) while carrying columns == NULL.
+ *
+ * Characterization test, not TDD: it passes before and after the change,
+ * because #1078 fixed only false-positive analyzer diagnostics and altered
+ * no behavior.  Its job is to fail loudly if either output representation
+ * is ever changed, which would invalidate the recorded invariants.
+ */
+static int
+test_merge_all_empty_partitions(void)
+{
+    TEST("merge of all-empty partitions yields empty relation");
+
+    col_rel_t *src = col_rel_new_auto("empty", 3);
+    if (!src) {
+        FAIL("alloc");
+        return 1;
+    }
+
+    col_rel_t *parts[4] = { NULL };
+    uint32_t key_cols[] = { 0 };
+    int rc = col_rel_partition_by_key(src, key_cols, 1, 4, parts);
+    if (rc != 0) {
+        FAIL("partition returned error");
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    /* Site 1 invariant: every empty partition drops its columns array. */
+    for (uint32_t w = 0; w < 4; w++) {
+        if (parts[w]->nrows != 0 || parts[w]->columns != NULL) {
+            FAIL("empty partition did not free its columns allocation");
+            destroy_parts(parts, 4);
+            col_rel_destroy(src);
+            return 1;
+        }
+    }
+
+    col_rel_t *merged = NULL;
+    rc = col_rel_merge_partitions(parts, 4, &merged);
+    if (rc != 0) {
+        FAIL("merge returned error");
+        destroy_parts(parts, 4);
+        col_rel_destroy(src);
+        return 1;
+    }
+
+    /* Site 2 invariant: the merged output likewise carries columns == NULL. */
+    const char *err = NULL;
+    if (!merged)
+        err = "merge produced NULL relation";
+    else if (merged->nrows != 0)
+        err = "merged nrows != 0";
+    else if (merged->ncols != 3)
+        err = "merged ncols != 3";
+    else if (merged->columns != NULL)
+        err = "empty merged relation kept a columns allocation";
+
+    col_rel_destroy(merged);
+    destroy_parts(parts, 4);
+    col_rel_destroy(src);
+
+    if (err) {
+        FAIL(err);
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 static int
 test_partition_balance(void)
 {
@@ -1283,6 +1362,7 @@ main(void)
     test_schema_propagation();
     test_multi_column_key();
     test_merge_roundtrip();
+    test_merge_all_empty_partitions();
     test_partition_balance();
     test_skewed_keys();
     test_preserves_all_columns();
