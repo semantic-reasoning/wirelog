@@ -69,7 +69,11 @@ make_delta_name(const char *name)
     char *d = (char *)malloc(len + 4); /* "$d$" (3) + name + NUL */
     if (!d)
         return NULL;
-    memcpy(d, "$d$", 3);
+    /* Copy the literal's NUL too: after this memcpy the buffer must be
+     * NUL-terminated (bugprone-not-null-terminated-result).  Do not write
+     * sizeof("$d$") - 1 -- that silences the check without terminating.
+     * d[3] is overwritten by the next memcpy. */
+    memcpy(d, "$d$", sizeof("$d$"));
     memcpy(d + 3, name, len + 1);
     return d;
 }
@@ -2101,7 +2105,7 @@ clone_lftj_opaque(const wl_plan_op_t *src, wl_plan_op_t *dst)
     dm->rel_names = (char **)malloc(sm->k * sizeof(char *));
     dm->key_cols = (uint32_t *)malloc(sm->k * sizeof(uint32_t));
     if (!dm->rel_names || !dm->key_cols) {
-        free(dm->rel_names);
+        free((void *)dm->rel_names);
         free(dm->key_cols);
         free(dm);
         return -1;
@@ -2112,7 +2116,7 @@ clone_lftj_opaque(const wl_plan_op_t *src, wl_plan_op_t *dst)
         if (!dm->rel_names[i]) {
             for (uint32_t j = 0; j < i; j++)
                 free(dm->rel_names[j]);
-            free(dm->rel_names);
+            free((void *)dm->rel_names);
             free(dm->key_cols);
             free(dm);
             return -1;
@@ -2214,7 +2218,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
             if (!lk[i]) {
                 for (uint32_t j = 0; j < i; j++)
                     free(lk[j]);
-                free(lk);
+                free((void *)lk);
                 return -1;
             }
         }
@@ -2229,7 +2233,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
             if (!rk[i]) {
                 for (uint32_t j = 0; j < i; j++)
                     free(rk[j]);
-                free(rk);
+                free((void *)rk);
                 return -1;
             }
         }
@@ -2454,7 +2458,7 @@ free_k_fusion_opaque(wl_plan_op_t *op)
                 free(meta->k_ops[d]);
             }
         }
-        free(meta->k_ops);
+        free((void *)meta->k_ops);
     }
     free(meta->k_op_counts);
     free(meta);
@@ -2474,7 +2478,7 @@ free_lftj_opaque(wl_plan_op_t *op)
     if (meta->rel_names) {
         for (uint32_t i = 0; i < meta->k; i++)
             free(meta->rel_names[i]);
-        free(meta->rel_names);
+        free((void *)meta->rel_names);
     }
     free(meta->key_cols);
     free(meta);
@@ -2532,7 +2536,7 @@ expand_multiway_k_fusion(const wl_plan_op_t *ops, uint32_t op_count,
     meta->k_ops = (wl_plan_op_t **)calloc(k, sizeof(wl_plan_op_t *));
     meta->k_op_counts = (uint32_t *)calloc(k, sizeof(uint32_t));
     if (!meta->k_ops || !meta->k_op_counts) {
-        free(meta->k_ops);
+        free((void *)meta->k_ops);
         free(meta->k_op_counts);
         free(meta);
         free(result);
@@ -2669,7 +2673,7 @@ fail:
             free(meta->k_ops[d]);
         }
     }
-    free(meta->k_ops);
+    free((void *)meta->k_ops);
     free(meta->k_op_counts);
     free(meta);
     free(result);
@@ -2730,7 +2734,7 @@ rewrite_multiway_delta(wl_plan_t *plan)
             }
             free(dpos);
         }
-        free(idb_names);
+        free((void *)idb_names);
     }
 }
 
@@ -2812,7 +2816,7 @@ build_lftj_op(const wl_plan_op_t *ops, uint32_t start, uint32_t len,
     meta->rel_names = (char **)malloc(k * sizeof(char *));
     meta->key_cols = (uint32_t *)malloc(k * sizeof(uint32_t));
     if (!meta->rel_names || !meta->key_cols) {
-        free(meta->rel_names);
+        free((void *)meta->rel_names);
         free(meta->key_cols);
         free(meta);
         return -1;
@@ -2821,7 +2825,7 @@ build_lftj_op(const wl_plan_op_t *ops, uint32_t start, uint32_t len,
     /* Validate "colN" format before parsing */
     if (strncmp(lk0, "col", 3) != 0 || !isdigit((unsigned char)lk0[3])
         || strncmp(rk0, "col", 3) != 0 || !isdigit((unsigned char)rk0[3])) {
-        free(meta->rel_names);
+        free((void *)meta->rel_names);
         free(meta->key_cols);
         free(meta);
         return -1;
@@ -2842,7 +2846,7 @@ build_lftj_op(const wl_plan_op_t *ops, uint32_t start, uint32_t len,
         if (!meta->rel_names[q]) {
             for (uint32_t p = 0; p < k; p++)
                 free(meta->rel_names[p]);
-            free(meta->rel_names);
+            free((void *)meta->rel_names);
             free(meta->key_cols);
             free(meta);
             return -1;
@@ -3250,7 +3254,7 @@ plan_refsets_free(wl_plan_refset_t *refs, uint32_t count)
     for (uint32_t r = 0; r < count; r++) {
         for (uint32_t i = 0; i < refs[r].count; i++)
             free(refs[r].names[i]);
-        free(refs[r].names);
+        free((void *)refs[r].names);
     }
     free(refs);
 }
@@ -3456,7 +3460,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         free(edb_decl_w);
         free(edb_graph_idx);
         free(edb_has_graph);
-        free(edb_rels);
+        free((void *)edb_rels);
         free(plan);
         return -1;
     }
@@ -3483,8 +3487,8 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
         if (!is_idb || has_facts) {
             if (edb_count >= edb_cap) {
                 edb_cap *= 2;
-                char **tmp
-                    = (char **)realloc(edb_rels, edb_cap * sizeof(char *));
+                char **tmp = (char **)realloc((void *)edb_rels,
+                        edb_cap * sizeof(char *));
                 if (!tmp) {
                     for (uint32_t j = 0; j < edb_count; j++)
                         free(edb_rels[j]);
