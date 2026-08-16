@@ -124,13 +124,13 @@ col_rel_free_contents(col_rel_t *r)
                 if (!r->col_shared[c])
                     free(r->columns[c]);
             }
-            free(r->columns);
+            free((void *)r->columns);
         } else {
             col_columns_free(r->columns, r->ncols);
         }
     } else {
         /* Arena owns column buffers; only free the columns array itself */
-        free(r->columns);
+        free((void *)r->columns);
     }
     free(r->col_shared);
     col_columns_free(r->retract_backup_columns, r->ncols);
@@ -140,7 +140,7 @@ col_rel_free_contents(col_rel_t *r)
     if (r->col_names) {
         for (uint32_t i = 0; i < r->ncols; i++)
             free(r->col_names[i]);
-        free(r->col_names);
+        free((void *)r->col_names);
     }
     free(r->dedup_slots);
     free(r->compound_arity_map);
@@ -204,7 +204,7 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
             if (!r->col_names[i]) {
                 for (uint32_t j = 0; j < i; j++)
                     free(r->col_names[j]);
-                free(r->col_names);
+                free((void *)r->col_names);
                 col_columns_free(r->columns, ncols);
                 r->col_names = NULL;
                 r->columns = NULL;
@@ -458,7 +458,7 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
                 memcpy(new_cols[c], r->columns[c],
                     sizeof(int64_t) * r->nrows);
             /* Don't free arena columns; just free the columns array */
-            free(r->columns);
+            free((void *)r->columns);
             r->columns = new_cols;
             r->arena_owned = false;
         } else if (r->columns) {
@@ -544,10 +544,10 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                 }
                 if (!ok) {
                     /* Arena alloc failed; don't free arena columns */
-                    free(new_cols);
+                    free((void *)new_cols);
                     return ENOMEM;
                 }
-                free(dst->columns); /* free old columns array only */
+                free((void *)dst->columns); /* free old columns array only */
                 dst->columns = new_cols;
             } else {
                 /* Fallback to heap if arena unavailable */
@@ -558,7 +558,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                 for (uint32_t c = 0; c < dst->ncols; c++)
                     memcpy(new_cols[c], dst->columns[c],
                         sizeof(int64_t) * dst->nrows);
-                free(dst->columns);
+                free((void *)dst->columns);
                 dst->columns = new_cols;
                 dst->arena_owned = false;
             }
@@ -624,14 +624,14 @@ col_rel_compact(col_rel_t *r)
                     if (!r->col_shared[c])
                         free(r->columns[c]);
                 }
-                free(r->columns);
+                free((void *)r->columns);
                 free(r->col_shared);
                 r->col_shared = NULL;
             } else {
                 col_columns_free(r->columns, r->ncols);
             }
         } else {
-            free(r->columns);
+            free((void *)r->columns);
         }
         r->columns = NULL;
         r->capacity = 0;
@@ -672,7 +672,7 @@ col_rel_compact(col_rel_t *r)
             for (uint32_t c = 0; c < r->ncols; c++)
                 memcpy(new_cols[c], r->columns[c],
                     (size_t)r->nrows * sizeof(int64_t));
-            free(r->columns);
+            free((void *)r->columns);
             r->columns = new_cols;
             r->arena_owned = false;
         } else {
@@ -976,7 +976,7 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
                     r->arena_owned = true;
                 } else {
                     /* Arena alloc failed for some columns; free and retry */
-                    free(r->columns);
+                    free((void *)r->columns);
                     r->columns = NULL;
                 }
             }
