@@ -946,46 +946,6 @@ rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id)
 /* ======================================================================== */
 
 /*
- * tdd_reconstruct_delta_matrix:
- * See declaration in columnar/internal.h for full contract.
- */
-void
-tdd_reconstruct_delta_matrix(col_eval_tdd_worker_ctx_t *ctxs,
-    const wl_delta_msg_t *msgs, uint32_t count,
-    uint32_t num_workers, uint32_t nrels)
-{
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t w = msgs[i].worker_id;
-        uint32_t ri = msgs[i].rel_idx;
-
-        if (w >= num_workers || ri >= nrels) {
-            col_rel_destroy((col_rel_t *)msgs[i].delta);
-            continue;
-        }
-
-        ctxs[w].delta_rels[ri] = (col_rel_t *)msgs[i].delta;
-    }
-}
-
-static void
-tdd_discard_delta_queue(wl_mpsc_queue_t *queue, uint32_t W, uint32_t nrels)
-{
-    if (!queue)
-        return;
-    uint32_t max_msgs = W * nrels;
-    if (max_msgs == 0)
-        max_msgs = 1;
-    wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(max_msgs,
-            sizeof(wl_delta_msg_t));
-    if (!msgs)
-        return;
-    uint32_t msg_count = wl_mpsc_dequeue_all(queue, msgs, max_msgs);
-    for (uint32_t i = 0; i < msg_count; i++)
-        col_rel_destroy((col_rel_t *)msgs[i].delta);
-    free(msgs);
-}
-
-/*
  * tdd_cleanup_workers:
  * Destroy and zero all initialized TDD worker sessions.
  * Safe to call on a coordinator with no workers (tdd_workers_count == 0).
@@ -1849,11 +1809,6 @@ static void tdd_dedup_rel(col_rel_t *r);
 static int bdx_hash_diff(col_rel_t *delta, const col_rel_t *base);
 static int tdd_hashset_diff(col_rel_t *delta, const col_rel_t *base);
 static int
-tdd_worker_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
-    wl_col_session_t *sess, col_rel_t *delta, uint32_t rel_idx,
-    uint32_t eff_iter);
-
-static int
 tdd_install_empty_delta_on_workers(wl_col_session_t *coord,
     const char *dname, uint32_t ncols, uint32_t W)
 {
@@ -2061,7 +2016,8 @@ tdd_worker_subpass_fn(void *arg)
             if (delta->nrows > 1)
                 tdd_dedup_rel(delta);
             bool produced = delta->nrows > 0;
-            rc = tdd_worker_publish_delta(ctx, sess, delta, ri, eff_iter);
+            rc = wl_columnar_eval_tdd_queue_publish_delta(ctx, sess, delta,
+                    ri, eff_iter);
             if (rc != 0) {
                 ctx->rc = rc;
                 free(snap);
@@ -2281,7 +2237,8 @@ tdd_worker_subpass_fn(void *arg)
 
             /* Issue #410, Commit 5: Queue-only transport.
              * delta ownership transfers to queue; coordinator reconstructs
-             * ctxs via tdd_reconstruct_delta_matrix after barrier.
+             * ctxs via wl_columnar_eval_tdd_queue_reconstruct_delta_matrix
+             * after barrier.
              * Fallback to ctx write when queue unavailable (alloc failure). */
             if (sess->coordinator && sess->coordinator->delta_queue) {
                 int enq_rc = wl_mpsc_enqueue(
@@ -2665,42 +2622,6 @@ static int tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W);
 static void tdd_dedup_rel(col_rel_t *r);
 static int bdx_hash_diff(col_rel_t *delta, const col_rel_t *base);
-
-static int
-tdd_worker_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
-    wl_col_session_t *sess, col_rel_t *delta, uint32_t rel_idx,
-    uint32_t eff_iter)
-{
-    if (delta->nrows == 0) {
-        col_rel_destroy(delta);
-        return 0;
-    }
-
-    delta->timestamps = (col_delta_timestamp_t *)calloc(
-        delta->nrows, sizeof(col_delta_timestamp_t));
-    if (!delta->timestamps) {
-        col_rel_destroy(delta);
-        return ENOMEM;
-    }
-    for (uint32_t ti = 0; ti < delta->nrows; ti++) {
-        delta->timestamps[ti].iteration = eff_iter;
-        delta->timestamps[ti].stratum = ctx->stratum_idx;
-        delta->timestamps[ti].worker = (uint16_t)sess->worker_id;
-        delta->timestamps[ti].multiplicity = 1;
-    }
-
-    if (sess->coordinator && sess->coordinator->delta_queue) {
-        int rc = wl_mpsc_enqueue(sess->coordinator->delta_queue,
-                sess->worker_id, delta, ctx->stratum_idx, rel_idx);
-        if (rc != 0) {
-            col_rel_destroy(delta);
-            return ENOMEM;
-        }
-    } else {
-        ctx->delta_rels[rel_idx] = delta;
-    }
-    return 0;
-}
 
 /*
  * tdd_broadcast_relation_delta:
@@ -6115,7 +6036,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             coord->tdd_submit_loop_ns += submit_ns;
 
             if (!submit_ok) {
-                tdd_discard_delta_queue(coord->delta_queue, W, nrels);
+                wl_columnar_eval_tdd_queue_discard_delta_queue(
+                    coord->delta_queue, W, nrels);
                 for (uint32_t w = 0; w < W; w++)
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
@@ -6152,7 +6074,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     fprintf(stderr,
                         "TDD worker error stratum=%u iter=%u rc=%d\n",
                         stratum_idx, eff_iter, rc);
-                tdd_discard_delta_queue(coord->delta_queue, W, nrels);
+                wl_columnar_eval_tdd_queue_discard_delta_queue(
+                    coord->delta_queue, W, nrels);
                 for (uint32_t w = 0; w < W; w++)
                     for (uint32_t ri = 0; ri < nrels; ri++)
                         col_rel_destroy(ctxs[w].delta_rels[ri]);
@@ -6175,8 +6098,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     for (uint32_t w = 0; w < W; w++)
                         memset(ctxs[w].delta_rels, 0,
                             nrels * sizeof(col_rel_t *));
-                    tdd_reconstruct_delta_matrix(ctxs, msgs, msg_count,
-                        W, nrels);
+                    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
+                        ctxs, msgs, msg_count, W, nrels);
                     free(msgs);
                 }
                 coord->tdd_queue_drain_ns += now_ns() - queue_t0;

@@ -380,7 +380,8 @@ test_reconstruct_empty(void)
     ctxs[0].delta_rels = dr0;
     ctxs[1].delta_rels = dr1;
 
-    tdd_reconstruct_delta_matrix(ctxs, NULL, 0, W, nrels);
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(ctxs, NULL, 0, W,
+        nrels);
 
     for (uint32_t w = 0; w < W; w++)
         for (uint32_t ri = 0; ri < nrels; ri++)
@@ -412,7 +413,8 @@ test_reconstruct_single(void)
     msg.worker_id = 2;
     msg.rel_idx = 3;
 
-    tdd_reconstruct_delta_matrix(ctxs, &msg, 1, W, nrels);
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(ctxs, &msg, 1, W,
+        nrels);
 
     if (ctxs[2].delta_rels[3] != sentinel) {
         FAIL("slot [2][3] not set to sentinel");
@@ -461,7 +463,8 @@ test_reconstruct_full_matrix(void)
         }
     }
 
-    tdd_reconstruct_delta_matrix(ctxs, msgs, 12, W, nrels);
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(ctxs, msgs, 12, W,
+        nrels);
 
     int ok = 1;
     for (uint32_t w = 0; w < W; w++)
@@ -508,7 +511,8 @@ test_reconstruct_sparse(void)
          .rel_idx = 2},
     };
 
-    tdd_reconstruct_delta_matrix(ctxs, msgs, 5, W, nrels);
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(ctxs, msgs, 5, W,
+        nrels);
 
     int ok = 1;
     /* filled slots */
@@ -555,7 +559,7 @@ test_reconstruct_duplicate(void)
         {.delta = second, .worker_id = 0, .rel_idx = 1},
     };
 
-    tdd_reconstruct_delta_matrix(ctxs, msgs, 2, 1, 4);
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(ctxs, msgs, 2, 1, 4);
 
     if (ctxs[0].delta_rels[1] != second) {
         FAIL("last write did not win for duplicate pair");
