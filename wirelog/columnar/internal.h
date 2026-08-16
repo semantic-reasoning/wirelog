@@ -1968,7 +1968,7 @@ typedef struct {
 } col_eval_tdd_worker_ctx_t;
 
 /*
- * tdd_reconstruct_delta_matrix:
+ * wl_columnar_eval_tdd_queue_reconstruct_delta_matrix:
  * Convert flat delta message buffer from MPSC queue drain into the
  * ctxs[w].delta_rels[ri] matrix used by existing exchange functions.
  *
@@ -1982,9 +1982,18 @@ typedef struct {
  * Pure: no allocations, no side effects, no atomics.  O(count) time, O(1) space.
  */
 void
-tdd_reconstruct_delta_matrix(col_eval_tdd_worker_ctx_t *ctxs,
-    const wl_delta_msg_t *msgs, uint32_t count,
-    uint32_t num_workers, uint32_t nrels);
+wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
+    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
+    uint32_t count, uint32_t num_workers, uint32_t nrels);
+
+void
+wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
+    uint32_t W, uint32_t nrels);
+
+int
+wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
+    wl_col_session_t *sess, col_rel_t *delta, uint32_t rel_idx,
+    uint32_t eff_iter);
 
 /*
  * COL_FILTER_SEL_SLACK:
