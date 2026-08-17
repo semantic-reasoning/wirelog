@@ -4795,6 +4795,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     /* Issue #361: Pre-allocate worker contexts and delta_rels arrays once.
      * Reuse across iterations to avoid calloc/free overhead per sub-pass
      * (~14k iterations for CRDT). */
+    /* Keep this initialized before any goto done path. */
+    uint32_t *bdx_snap = NULL;
     col_eval_tdd_worker_ctx_t *ctxs
         = (col_eval_tdd_worker_ctx_t *)calloc(
             W, sizeof(col_eval_tdd_worker_ctx_t));
@@ -4823,7 +4825,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     /* Issue #390: BDX snap array — pre-subpass IDB sizes per worker/relation.
      * Used to truncate worker IDB back to clean partition state after each
      * sub-pass (removes cross-partition pollution from join output). */
-    uint32_t *bdx_snap = NULL;
     if (bdx_mode) {
         bdx_snap = (uint32_t *)calloc(
             (size_t)W * nrels, sizeof(uint32_t));
