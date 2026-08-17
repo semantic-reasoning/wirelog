@@ -14,10 +14,8 @@ build's `compile_commands.json`:
     fails the build.
   - `scripts/ci/clang-tidy-backlog.txt` lists the files that are not clean
     yet.  They are not analysed.  The backlog carries no diagnostic counts:
-    counts are toolchain-version-dependent (LLVM 22 renamed the
-    `clang-analyzer-valist.*` checks out from under `.clang-tidy`; see
-    #1114), so a count would turn a toolchain bump into a spurious
-    failure.
+    counts are toolchain-version-dependent, so a count would turn a
+    toolchain bump into a spurious failure.
   - The two lists must partition the selected translation units exactly.
     That assertion is what stops a regression being made to disappear by
     deleting the allowlist line.  Demotion -- moving a line from the

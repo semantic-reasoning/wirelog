@@ -5,10 +5,9 @@
 # on any other major; .github/workflows/ci-pr.yml installs the first entry.
 #
 # Why a pin at all: 9 of the 13 backlog diagnostics are path-sensitive
-# clang-analyzer results that move between LLVM releases, and LLVM 22
-# renamed the clang-analyzer-valist.* checks out from under .clang-tidy
-# entirely (see #1114).  An unpinned gate would fail, or silently stop
-# covering checks, on the first toolchain bump.
+# clang-analyzer results that move between LLVM releases, and check names
+# can change between LLVM releases (see #1114).  An unpinned gate would
+# fail, or silently stop covering checks, on the first toolchain bump.
 #
 # To adopt a new major: run
 #   scripts/ci/check-clang-tidy-ratchet.py --build-dir build --mode regenerate
