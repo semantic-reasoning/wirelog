@@ -796,6 +796,11 @@ stride_error:
         if (outer_rc != 0) {
             /* Issue #282: Restore diff_operators_active on error path */
             sess->diff_operators_active = saved_diff_operators_active;
+            for (uint32_t ri = 0; ri < nrels; ri++) {
+                session_remove_rel(sess, sp->relations[ri].delta_name);
+                if (delta_rels[ri])
+                    col_rel_destroy(delta_rels[ri]);
+            }
             free(snap);
             free((void *)delta_rels);
             return outer_rc;
