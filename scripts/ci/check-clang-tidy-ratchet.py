@@ -56,31 +56,12 @@ Environment:
   WIRELOG_TIDY_JOBS=N      override the parallelism (default min(8, ncpu))
   CLANG_TIDY               override the clang-tidy executable
 
-KNOWN LIMITATION -- single preprocessor configuration.  Each file is
-analysed exactly once, under the one command line meson recorded for it.
-Code behind non-default preprocessor conditionals is therefore never seen,
-even for allowlisted files:
-
-  - `wirelog/exec_plan_gen.c` is only ever analysed with `ENABLE_K_FUSION`
-    at the value 1, which the `#ifndef` default at `:43-44` supplies
-    because the database entry carries no `-DENABLE_K_FUSION`.  Every
-    `#if ENABLE_K_FUSION` guard in the file (e.g. `:1866`) therefore has
-    one arm that is never seen, and the `ENABLE_K_FUSION=0` variant that
-    `bench_flowlog_seq` builds (`bench/meson.build:126`) is never analysed
-    at all.
-  - `wirelog/columnar/relation.c` is only ever analysed with
-    `WL_RADIX_BENCH` undefined, so every `#ifdef WL_RADIX_BENCH` region in
-    the file (e.g. `:56`) is invisible to the gate.  The macro is set only
-    by `bench/meson.build:109`.
-
-Those line references are single examples, not an enumeration -- both files
-carry several such guards, and the limitation is a property of the scan, not
-of any particular guard.  Do not turn this into an exhaustive list: it would
-go stale on the next edit to either file without anything failing.
-
-Both files are on the allowlist, so the ratchet asserts "clean" over code
-it has not looked at.  Covering both configurations needs a second scan
-pass and is tracked as #1115.
+The ratchet also scans the alternate preprocessor configurations used by the
+bench targets for the two allowlisted sources that have configuration-gated
+code.  These scans are synthesized from the canonical `libwirelog.so`
+commands, not copied from arbitrary bench or test targets, so the allowlist
+continues to describe one source-level verdict.  A diagnostic in either
+configuration fails that source and is reported with its configuration label.
 
 Exit codes:
    0 - every allowlisted file is clean
@@ -326,12 +307,14 @@ def check_configuration(entries: list[dict]) -> None:
 
 class Result:
     def __init__(self, source: pathlib.Path, returncode: int,
-                 stdout: str, stderr: str, diagnostics: list[str]):
+                 stdout: str, stderr: str, diagnostics: list[str],
+                 configuration: str = "default"):
         self.source = source
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
         self.diagnostics = diagnostics
+        self.configuration = configuration
 
 
 def parse_diagnostics(stdout: str, cwd: pathlib.Path) -> list[str]:
@@ -363,7 +346,8 @@ def parse_diagnostics(stdout: str, cwd: pathlib.Path) -> list[str]:
     return kept
 
 
-def run_clang_tidy(exe: str, db_dir: pathlib.Path, entry: dict) -> Result:
+def run_clang_tidy(exe: str, db_dir: pathlib.Path, entry: dict,
+                   configuration: str = "default") -> Result:
     source = entry_source(entry)
     cwd = pathlib.Path(entry["directory"])
     argv = [exe, f"--config-file={CONFIG_FILE}", "-p", str(db_dir),
@@ -371,7 +355,7 @@ def run_clang_tidy(exe: str, db_dir: pathlib.Path, entry: dict) -> Result:
     proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
                           check=False)
     return Result(source, proc.returncode, proc.stdout, proc.stderr,
-                  parse_diagnostics(proc.stdout, cwd))
+                  parse_diagnostics(proc.stdout, cwd), configuration)
 
 
 def job_count() -> int:
@@ -397,6 +381,81 @@ def run_all(exe: str, db_dir: pathlib.Path,
         return [future.result() for future in futures]
 
 
+ALTERNATE_CONFIGS = {
+    "wirelog/exec_plan_gen.c":
+        ("ENABLE_K_FUSION=0", "ENABLE_K_FUSION", "0"),
+    "wirelog/columnar/relation.c":
+        ("WL_RADIX_BENCH=1", "WL_RADIX_BENCH", "1"),
+}
+
+
+def replace_macro(tokens: list[str], macro: str, value: str) -> list[str]:
+    """Replace all command-line definitions of *macro* with one value."""
+    result: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("-D", "-U") and index + 1 < len(tokens):
+            definition = tokens[index + 1]
+            if definition.split("=", 1)[0] == macro:
+                index += 2
+                continue
+        if token.startswith(("-D", "-U")):
+            definition = token[2:]
+            if definition.split("=", 1)[0] == macro:
+                index += 1
+                continue
+        result.append(token)
+        index += 1
+    result.append(f"-D{macro}={value}")
+    return result
+
+
+def alternate_entry(entry: dict, macro: str, value: str,
+                    stem: str) -> dict:
+    """Clone one canonical entry for one isolated alternate scan."""
+    tokens = replace_macro(entry_command(entry), macro, value)
+    output: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("-o", "-MQ", "-MF") and index + 1 < len(tokens):
+            output.extend((token, stem + (".d" if token == "-MF" else ".o")))
+            index += 2
+            continue
+        output.append(token)
+        index += 1
+    return {
+        "directory": entry["directory"],
+        "command": shlex.join(output),
+        "file": entry["file"],
+        "output": stem + ".o",
+    }
+
+
+def run_alternate_configs(exe: str, entries: list[dict],
+                          allowed: set[str] | None = None) -> list[Result]:
+    """Run only required alternate configs from canonical entries."""
+    by_source = {rel_to_repo(entry_source(entry)): entry for entry in entries}
+    specs = []
+    for source, (label, macro, value) in ALTERNATE_CONFIGS.items():
+        if source in by_source and (allowed is None or source in allowed):
+            specs.append((source, label, macro, value, by_source[source]))
+
+    def run(spec: tuple) -> Result:
+        source, label, macro, value, entry = spec
+        with tempfile.TemporaryDirectory(prefix="wl-tidy-alt-") as tmp:
+            workdir = pathlib.Path(tmp)
+            synthetic = alternate_entry(
+                entry, macro, value, "wl_tidy_alt_" + source.replace("/", "_"))
+            prune_db([synthetic], workdir)
+            return run_clang_tidy(exe, workdir, synthetic, label)
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(specs), job_count()) or 1) as pool:
+        return list(pool.map(run, specs))
+
+
 def report_failures(results: list[Result]) -> int:
     """Print the failures; return the process exit code."""
     dirty = [r for r in results if r.diagnostics]
@@ -408,7 +467,9 @@ def report_failures(results: list[Result]) -> int:
         print("check-clang-tidy-ratchet: FAIL: clang-tidy failed to run "
               "cleanly (harness error, not a lint result):", file=sys.stderr)
         for result in broken:
-            print(f"  {rel_to_repo(result.source)}: "
+            label = (f" [{result.configuration}]"
+                     if result.configuration != "default" else "")
+            print(f"  {rel_to_repo(result.source)}{label}: "
                   f"exit {result.returncode}", file=sys.stderr)
             for line in result.stderr.splitlines():
                 print(f"    {line}", file=sys.stderr)
@@ -421,7 +482,9 @@ def report_failures(results: list[Result]) -> int:
           "longer clang-tidy clean:", file=sys.stderr)
     print("", file=sys.stderr)
     for result in dirty:
-        print(f"  {rel_to_repo(result.source)}", file=sys.stderr)
+        label = (f" [{result.configuration}]"
+                 if result.configuration != "default" else "")
+        print(f"  {rel_to_repo(result.source)}{label}", file=sys.stderr)
         for diagnostic in result.diagnostics:
             print(f"    {diagnostic}", file=sys.stderr)
         if result.stderr.strip():
@@ -480,11 +543,13 @@ def mode_ratchet(exe: str, entries: list[dict]) -> int:
         workdir = pathlib.Path(tmp)
         prune_db([selected[p] for p in sorted(selected)], workdir)
         results = run_all(exe, workdir, targets)
+    results += run_alternate_configs(exe, entries, set(allow))
 
     rc = report_failures(results)
     if rc == 0:
         print(f"check-clang-tidy-ratchet: OK; {len(allow)} file(s) clean, "
-              f"{len(backlog)} in backlog")
+              f"{len(backlog)} in backlog, "
+              f"{len(ALTERNATE_CONFIGS)} alternate configuration(s) checked")
     return rc
 
 
@@ -608,10 +673,11 @@ def mode_regenerate(exe: str, entries: list[dict]) -> int:
         workdir = pathlib.Path(tmp)
         prune_db(entries, workdir)
         results = run_all(exe, workdir, entries)
+    results += run_alternate_configs(exe, entries)
     for result in sorted(results, key=lambda r: r.source):
         state = "DIRTY" if result.diagnostics else "clean"
         print(f"{state} {rel_to_repo(result.source)} "
-              f"({len(result.diagnostics)})")
+              f"[{result.configuration}] ({len(result.diagnostics)})")
     return 0
 
 

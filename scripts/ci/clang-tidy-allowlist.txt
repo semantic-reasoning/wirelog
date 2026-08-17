@@ -24,30 +24,18 @@
 # the LLVM major in clang-tidy-supported-majors.txt, and nothing else.  The
 # gate SKIPs elsewhere rather than reporting an uncalibrated verdict.
 #
-# LIMITATION -- one preprocessor configuration only.  Each file is analysed
-# under the single command line meson recorded for it, so code behind
-# non-default conditionals is never seen even though the file is listed as
-# clean here:
+# CONFIGURATION COVERAGE.  Most files use the canonical libwirelog.so
+# command line.  The ratchet also synthesizes alternate scans for the two
+# allowlisted sources whose bench targets select a different preprocessor
+# configuration:
 #
-#   wirelog/exec_plan_gen.c   analysed only with ENABLE_K_FUSION at 1, the
-#                             #ifndef default at :43-44, because the
-#                             database entry carries no -DENABLE_K_FUSION.
-#                             Every #if ENABLE_K_FUSION guard in the file
-#                             (e.g. :1866) has an arm that is never seen,
-#                             and the ENABLE_K_FUSION=0 variant that
-#                             bench_flowlog_seq builds
-#                             (bench/meson.build:126) is never analysed.
+#   wirelog/exec_plan_gen.c   additionally scanned with ENABLE_K_FUSION=0.
 #   wirelog/columnar/relation.c
-#                             analysed only with WL_RADIX_BENCH undefined,
-#                             so every #ifdef WL_RADIX_BENCH region in the
-#                             file (e.g. :56) is invisible here.  The macro
-#                             is set only by bench/meson.build:109.
+#                             additionally scanned with WL_RADIX_BENCH=1.
 #
-# The line references above are examples, NOT an enumeration -- both files
-# carry several such guards.  Please keep it that way: an exhaustive list
-# would go stale on the next edit to either file with nothing to catch it.
-#
-# Covering both configurations needs a second scan pass; tracked as #1115.
+# The alternate entries are synthesized from the canonical library command;
+# bench/test compile database entries are intentionally not folded into the
+# source partition.
 wirelog/api_facade.c
 wirelog/arena/arena.c
 wirelog/arena/compound_arena.c

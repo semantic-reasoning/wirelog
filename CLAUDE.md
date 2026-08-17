@@ -110,10 +110,9 @@ After a toolchain bump, re-derive the lists with:
 scripts/ci/check-clang-tidy-ratchet.py --build-dir build --mode regenerate
 ```
 
-Two limitations are known and deliberate. Each file is analysed under the
-single command line meson recorded for it, so `exec_plan_gen.c` is only
-ever scanned with `ENABLE_K_FUSION` at its `#ifndef` default of 1 — the
-`ENABLE_K_FUSION=0` variant `bench_flowlog_seq` builds is never seen — and
-`relation.c`'s `#ifdef WL_RADIX_BENCH` regions are never scanned at all,
-even though both files are allowlisted (#1115). And the backlog carries no
-diagnostic counts, because counts are toolchain-version-dependent (#1114).
+The two configuration-gated sources receive an additional scan using the
+alternate macros used by the bench targets: `ENABLE_K_FUSION=0` for
+`exec_plan_gen.c` and `WL_RADIX_BENCH=1` for `relation.c`. The scans are
+derived from the canonical library compile commands and report one
+source-level verdict. The backlog carries no diagnostic counts because
+counts are toolchain-version-dependent.
