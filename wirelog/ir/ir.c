@@ -70,11 +70,11 @@ wl_ir_expr_create(wl_ir_expr_type_t type)
     return expr;
 }
 
-void
+int
 wl_ir_expr_add_child(wl_ir_expr_t *parent, wl_ir_expr_t *child)
 {
     if (!parent || !child)
-        return;
+        return -1;
 
     if (parent->child_count >= parent->child_capacity) {
         uint32_t new_cap = parent->child_capacity == 0
@@ -83,12 +83,13 @@ wl_ir_expr_add_child(wl_ir_expr_t *parent, wl_ir_expr_t *child)
         wl_ir_expr_t **new_children = (wl_ir_expr_t **)realloc(
             parent->children, new_cap * sizeof(wl_ir_expr_t *));
         if (!new_children)
-            return;
+            return -1;
         parent->children = new_children;
         parent->child_capacity = new_cap;
     }
 
     parent->children[parent->child_count++] = child;
+    return 0;
 }
 
 void
@@ -145,7 +146,11 @@ wl_ir_expr_clone(const wl_ir_expr_t *expr)
             wl_ir_expr_free(clone);
             return NULL;
         }
-        wl_ir_expr_add_child(clone, child_clone);
+        if (wl_ir_expr_add_child(clone, child_clone) != 0) {
+            wl_ir_expr_free(child_clone);
+            wl_ir_expr_free(clone);
+            return NULL;
+        }
     }
 
     return clone;
@@ -177,11 +182,11 @@ wl_ir_node_set_relation(wirelog_ir_node_t *node, const char *name)
     node->relation_name = strdup_safe(name);
 }
 
-void
+int
 wl_ir_node_add_child(wirelog_ir_node_t *node, wirelog_ir_node_t *child)
 {
     if (!node || !child)
-        return;
+        return -1;
 
     if (node->child_count >= node->child_capacity) {
         uint32_t new_cap = node->child_capacity == 0 ? INITIAL_CHILD_CAPACITY
@@ -189,12 +194,13 @@ wl_ir_node_add_child(wirelog_ir_node_t *node, wirelog_ir_node_t *child)
         wirelog_ir_node_t **new_children = (wirelog_ir_node_t **)realloc(
             node->children, new_cap * sizeof(wirelog_ir_node_t *));
         if (!new_children)
-            return;
+            return -1;
         node->children = new_children;
         node->child_capacity = new_cap;
     }
 
     node->children[node->child_count++] = child;
+    return 0;
 }
 
 void

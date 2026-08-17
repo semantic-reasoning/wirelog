@@ -1135,6 +1135,15 @@ wl_ir_program_build_default_stratum(struct wirelog_program *program)
 
 /* ---- Expression Conversion (AST expr -> IR expr) ---- */
 
+static bool
+ir_expr_attach(wl_ir_expr_t *parent, wl_ir_expr_t *child)
+{
+    if (wl_ir_expr_add_child(parent, child) == 0)
+        return true;
+    wl_ir_expr_free(child);
+    return false;
+}
+
 static wl_ir_expr_t *
 convert_expr(const wl_parser_ast_node_t *node)
 {
@@ -1165,8 +1174,12 @@ convert_expr(const wl_parser_ast_node_t *node)
         if (!e)
             return NULL;
         e->arith_op = node->arith_op;
-        for (uint32_t ci = 0; ci < node->child_count; ci++)
-            wl_ir_expr_add_child(e, convert_expr(node->children[ci]));
+        for (uint32_t ci = 0; ci < node->child_count; ci++) {
+            if (!ir_expr_attach(e, convert_expr(node->children[ci]))) {
+                wl_ir_expr_free(e);
+                return NULL;
+            }
+        }
         return e;
     }
     case WL_PARSER_AST_NODE_COMPARISON: {
@@ -1175,8 +1188,11 @@ convert_expr(const wl_parser_ast_node_t *node)
             return NULL;
         e->cmp_op = node->cmp_op;
         if (node->child_count >= 2) {
-            wl_ir_expr_add_child(e, convert_expr(node->children[0]));
-            wl_ir_expr_add_child(e, convert_expr(node->children[1]));
+            if (!ir_expr_attach(e, convert_expr(node->children[0]))
+                || !ir_expr_attach(e, convert_expr(node->children[1]))) {
+                wl_ir_expr_free(e);
+                return NULL;
+            }
         }
         return e;
     }
@@ -1186,7 +1202,10 @@ convert_expr(const wl_parser_ast_node_t *node)
             return NULL;
         e->agg_fn = node->agg_fn;
         if (node->child_count >= 1) {
-            wl_ir_expr_add_child(e, convert_expr(node->children[0]));
+            if (!ir_expr_attach(e, convert_expr(node->children[0]))) {
+                wl_ir_expr_free(e);
+                return NULL;
+            }
         }
         return e;
     }
@@ -1206,7 +1225,10 @@ convert_expr(const wl_parser_ast_node_t *node)
             if (!child) {
                 wl_ir_expr_free(e); return NULL;
             }
-            wl_ir_expr_add_child(e, child);
+            if (!ir_expr_attach(e, child)) {
+                wl_ir_expr_free(e);
+                return NULL;
+            }
         }
         return e;
     }
@@ -1448,7 +1470,10 @@ wrap_false_filter(wirelog_ir_node_t *child)
     }
     expr->bool_value = false;
     filter->filter_expr = expr;
-    wl_ir_node_add_child(filter, child);
+    if (wl_ir_node_add_child(filter, child) != 0) {
+        wl_ir_node_free(filter);
+        return child;
+    }
     return filter;
 }
 
@@ -1479,10 +1504,22 @@ wrap_column_cmp_filter(wirelog_ir_node_t *child, uint32_t left_col,
     char col[32];
     snprintf(col, sizeof(col), "col%u", left_col);
     lhs->var_name = strdup_safe(col);
-    wl_ir_expr_add_child(cmp, lhs);
-    wl_ir_expr_add_child(cmp, (wl_ir_expr_t *)right_expr);
+    if (!ir_expr_attach(cmp, lhs)) {
+        wl_ir_expr_free((wl_ir_expr_t *)right_expr);
+        wl_ir_expr_free(cmp);
+        wl_ir_node_free(filter);
+        return child;
+    }
+    if (!ir_expr_attach(cmp, (wl_ir_expr_t *)right_expr)) {
+        wl_ir_expr_free(cmp);
+        wl_ir_node_free(filter);
+        return child;
+    }
     filter->filter_expr = cmp;
-    wl_ir_node_add_child(filter, child);
+    if (wl_ir_node_add_child(filter, child) != 0) {
+        wl_ir_node_free(filter);
+        return child;
+    }
     return filter;
 }
 
@@ -1522,11 +1559,23 @@ wrap_duplicate_var_filters(wirelog_ir_node_t *child, char **var_names,
                     snprintf(col, sizeof(col), "col%u", j);
                     rhs->var_name = strdup_safe(col);
                 }
-                wl_ir_expr_add_child(cmp, lhs);
-                wl_ir_expr_add_child(cmp, rhs);
+                if (!ir_expr_attach(cmp, lhs)) {
+                    wl_ir_expr_free(rhs);
+                    wl_ir_expr_free(cmp);
+                    wl_ir_node_free(f);
+                    continue;
+                }
+                if (!ir_expr_attach(cmp, rhs)) {
+                    wl_ir_expr_free(cmp);
+                    wl_ir_node_free(f);
+                    continue;
+                }
             }
             f->filter_expr = cmp;
-            wl_ir_node_add_child(f, result);
+            if (wl_ir_node_add_child(f, result) != 0) {
+                wl_ir_node_free(f);
+                continue;
+            }
             result = f;
         }
     }
@@ -2003,8 +2052,20 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             continue;
         }
 
-        wl_ir_node_add_child(join, result);
-        wl_ir_node_add_child(join, side_scan);
+        if (wl_ir_node_add_child(join, result) != 0) {
+            wl_ir_node_free(join);
+            wl_ir_node_free(side_scan);
+            free_var_names(side_vars, side_vcount);
+            continue;
+        }
+        if (wl_ir_node_add_child(join, side_scan) != 0) {
+            join->children[0] = NULL;
+            join->child_count = 0;
+            wl_ir_node_free(join);
+            wl_ir_node_free(side_scan);
+            free_var_names(side_vars, side_vcount);
+            continue;
+        }
         result = join;
 
         uint32_t combined_count = 0;
@@ -2258,14 +2319,35 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
 
         for (uint32_t i = 1; i < scan_count; i++) {
             wirelog_ir_node_t *join = wl_ir_node_create(WIRELOG_IR_JOIN);
-            if (!join)
+            if (!join) {
+                for (uint32_t j = i; j < scan_count; j++) {
+                    wl_ir_node_free(scans[j]);
+                    scans[j] = NULL;
+                }
                 break;
+            }
 
             setup_join_keys(cur_vars, cur_vcount, scan_vars[i], scan_vcounts[i],
                 join);
 
-            wl_ir_node_add_child(join, current);
-            wl_ir_node_add_child(join, scans[i]);
+            if (wl_ir_node_add_child(join, current) != 0) {
+                wl_ir_node_free(join);
+                for (uint32_t j = i; j < scan_count; j++) {
+                    wl_ir_node_free(scans[j]);
+                    scans[j] = NULL;
+                }
+                break;
+            }
+            if (wl_ir_node_add_child(join, scans[i]) != 0) {
+                join->children[0] = NULL;
+                join->child_count = 0;
+                wl_ir_node_free(join);
+                for (uint32_t j = i; j < scan_count; j++) {
+                    wl_ir_node_free(scans[j]);
+                    scans[j] = NULL;
+                }
+                break;
+            }
 
             uint32_t merged_count;
             char **merged = merge_var_names(cur_vars, cur_vcount, scan_vars[i],
@@ -2285,20 +2367,20 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
 
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
-        /* children[0 .. child_count) is never NULL:
-         * wl_parser_ast_node_add_child() (parser/ast.c) returns without
-         * storing anything when child is NULL, so a NULL child never
-         * consumes a slot and never bumps child_count.  The analyzer infers
-         * nullability here only from the belt-and-braces `if (!b) continue;`
-         * in the Step 1 loop above, which is defensive, not a live case. */
+        /* Parser child attachment rejects NULL children before they reach the
+         * IR conversion boundary.  Keep this guard for malformed ASTs loaded
+         * by internal callers. */
         // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
         if (b->type == WL_PARSER_AST_NODE_COMPARISON && current) {
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
             if (!f)
                 continue;
             f->filter_expr = convert_expr(b);
-            wl_ir_node_add_child(f, current);
-            current = f;
+            if (!f->filter_expr || wl_ir_node_add_child(f, current) != 0) {
+                wl_ir_node_free(f);
+            } else {
+                current = f;
+            }
         } else if (b->type == WL_PARSER_AST_NODE_BOOLEAN) {
             if (!b->bool_value && current) {
                 wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
@@ -2308,8 +2390,10 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 if (e)
                     e->bool_value = false;
                 f->filter_expr = e;
-                wl_ir_node_add_child(f, current);
-                current = f;
+                if (wl_ir_node_add_child(f, current) != 0)
+                    wl_ir_node_free(f);
+                else
+                    current = f;
             }
             /* Boolean True -> no-op */
         } else if (b->type == WL_PARSER_AST_NODE_STR_FUNCTION && current) {
@@ -2318,8 +2402,11 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             if (!f)
                 continue;
             f->filter_expr = convert_expr(b);
-            wl_ir_node_add_child(f, current);
-            current = f;
+            if (!f->filter_expr || wl_ir_node_add_child(f, current) != 0) {
+                wl_ir_node_free(f);
+            } else {
+                current = f;
+            }
         }
     }
 
@@ -2401,9 +2488,17 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 if (aj) {
                     setup_join_keys(cur_vars, cur_vcount, neg_vars, neg_vcount,
                         aj);
-                    wl_ir_node_add_child(aj, current);
-                    wl_ir_node_add_child(aj, neg_scan);
-                    current = aj;
+                    if (wl_ir_node_add_child(aj, current) != 0) {
+                        wl_ir_node_free(aj);
+                        wl_ir_node_free(neg_scan);
+                    } else if (wl_ir_node_add_child(aj, neg_scan) != 0) {
+                        aj->children[0] = NULL;
+                        aj->child_count = 0;
+                        wl_ir_node_free(aj);
+                        wl_ir_node_free(neg_scan);
+                    } else {
+                        current = aj;
+                    }
                 } else {
                     wl_ir_node_free(neg_scan);
                 }
@@ -2486,8 +2581,11 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 }
             }
 
-            if (current)
-                wl_ir_node_add_child(root, current);
+            if (current && wl_ir_node_add_child(root, current) != 0) {
+                wl_ir_node_free(root);
+                wl_ir_node_free(current);
+                root = NULL;
+            }
         }
     } else {
         root = wl_ir_node_create(WIRELOG_IR_PROJECT);
@@ -2506,8 +2604,11 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 }
             }
 
-            if (current)
-                wl_ir_node_add_child(root, current);
+            if (current && wl_ir_node_add_child(root, current) != 0) {
+                wl_ir_node_free(root);
+                wl_ir_node_free(current);
+                root = NULL;
+            }
         }
     }
 
@@ -2607,7 +2708,12 @@ wl_ir_program_merge_unions(struct wirelog_program *program)
             for (uint32_t i = 0; i < program->rule_count; i++) {
                 if (program->rules[i].head_relation
                     && strcmp(program->rules[i].head_relation, rel_name) == 0) {
-                    wl_ir_node_add_child(u, program->rules[i].ir_root);
+                    if (wl_ir_node_add_child(u,
+                        program->rules[i].ir_root) != 0) {
+                        u->child_count = 0;
+                        wl_ir_node_free(u);
+                        return -1;
+                    }
                 }
             }
 
