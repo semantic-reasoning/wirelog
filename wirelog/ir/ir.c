@@ -81,7 +81,7 @@ wl_ir_expr_add_child(wl_ir_expr_t *parent, wl_ir_expr_t *child)
                                ? INITIAL_CHILD_CAPACITY
                                : parent->child_capacity * 2;
         wl_ir_expr_t **new_children = (wl_ir_expr_t **)realloc(
-            parent->children, new_cap * sizeof(wl_ir_expr_t *));
+            (void *)parent->children, new_cap * sizeof(wl_ir_expr_t *));
         if (!new_children)
             return;
         parent->children = new_children;
@@ -100,7 +100,7 @@ wl_ir_expr_free(wl_ir_expr_t *expr)
     for (uint32_t i = 0; i < expr->child_count; i++) {
         wl_ir_expr_free(expr->children[i]);
     }
-    free(expr->children);
+    free((void *)expr->children);
     free(expr->var_name);
     free(expr->str_value);
     free(expr);
@@ -187,7 +187,7 @@ wl_ir_node_add_child(wirelog_ir_node_t *node, wirelog_ir_node_t *child)
         uint32_t new_cap = node->child_capacity == 0 ? INITIAL_CHILD_CAPACITY
                                                      : node->child_capacity * 2;
         wirelog_ir_node_t **new_children = (wirelog_ir_node_t **)realloc(
-            node->children, new_cap * sizeof(wirelog_ir_node_t *));
+            (void *)node->children, new_cap * sizeof(wirelog_ir_node_t *));
         if (!new_children)
             return;
         node->children = new_children;
@@ -207,7 +207,7 @@ wl_ir_node_free(wirelog_ir_node_t *node)
     for (uint32_t i = 0; i < node->child_count; i++) {
         wl_ir_node_free(node->children[i]);
     }
-    free(node->children);
+    free((void *)node->children);
 
     /* Free relation name */
     free(node->relation_name);
@@ -217,7 +217,7 @@ wl_ir_node_free(wirelog_ir_node_t *node)
         for (uint32_t i = 0; i < node->column_count; i++) {
             free(node->column_names[i]); /* NULL-safe: free(NULL) is no-op */
         }
-        free(node->column_names);
+        free((void *)node->column_names);
     }
     free(node->column_types);
 
@@ -227,7 +227,7 @@ wl_ir_node_free(wirelog_ir_node_t *node)
         for (uint32_t i = 0; i < node->project_count; i++) {
             wl_ir_expr_free(node->project_exprs[i]);
         }
-        free(node->project_exprs);
+        free((void *)node->project_exprs);
     }
 
     /* Free FILTER expression */
@@ -238,13 +238,13 @@ wl_ir_node_free(wirelog_ir_node_t *node)
         for (uint32_t i = 0; i < node->join_key_count; i++) {
             free(node->join_left_keys[i]);
         }
-        free(node->join_left_keys);
+        free((void *)node->join_left_keys);
     }
     if (node->join_right_keys) {
         for (uint32_t i = 0; i < node->join_key_count; i++) {
             free(node->join_right_keys[i]);
         }
-        free(node->join_right_keys);
+        free((void *)node->join_right_keys);
     }
 
     /* Free AGGREGATE data */
