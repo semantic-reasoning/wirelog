@@ -256,8 +256,8 @@ free_join_keys(wirelog_ir_node_t *node)
         free(node->join_left_keys[i]);
         free(node->join_right_keys[i]);
     }
-    free(node->join_left_keys);
-    free(node->join_right_keys);
+    free((void *)node->join_left_keys);
+    free((void *)node->join_right_keys);
     node->join_left_keys = NULL;
     node->join_right_keys = NULL;
     node->join_key_count = 0;
@@ -413,7 +413,7 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order,
         }
     }
 
-    free(acc);
+    free((void *)acc);
     free(is_idb);
     free(used);
 
@@ -479,12 +479,12 @@ rebuild_chain(wirelog_ir_node_t **join_nodes, uint32_t njoin,
         /* Merge into accumulated */
         uint32_t new_count;
         char **new_acc = merge_vars(acc, acc_count, svars, scount, &new_count);
-        free(acc);
+        free((void *)acc);
         acc = new_acc;
         acc_count = new_count;
     }
 
-    free(acc);
+    free((void *)acc);
 }
 
 /* ======================================================================== */
@@ -702,8 +702,8 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
     wirelog_ir_node_t **joins
         = (wirelog_ir_node_t **)calloc(depth, sizeof(wirelog_ir_node_t *));
     if (!scans || !joins) {
-        free(scans);
-        free(joins);
+        free((void *)scans);
+        free((void *)joins);
         return 0;
     }
 
@@ -718,8 +718,8 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
      * head_var_count on top of this. */
     size_t total_cols;
     if (!scan_columns_total(scans, nscan, &total_cols)) {
-        free(scans);
-        free(joins);
+        free((void *)scans);
+        free((void *)joins);
         return 0;
     }
 
@@ -730,8 +730,8 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
     /* Build mutable accumulated set */
     char **acc = (char **)calloc(total_cols, sizeof(char *));
     if (!acc) {
-        free(scans);
-        free(joins);
+        free((void *)scans);
+        free((void *)joins);
         return 0;
     }
     for (uint32_t i = 0; i < acc_count; i++)
@@ -758,9 +758,9 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
     char **phys_names = (char **)calloc(total_cols, sizeof(char *));
     uint32_t phys_count = 0;
     if (!phys_names) {
-        free(acc);
-        free(scans);
-        free(joins);
+        free((void *)acc);
+        free((void *)scans);
+        free((void *)joins);
         return 0;
     }
     /* Initial physical layout: S0 columns || S1 columns (with duplicates) */
@@ -903,7 +903,7 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
             }
         }
 
-        free(needed);
+        free((void *)needed);
 
         /* Merge next scan's vars into acc and physical layout for the next
          * iteration.  phys_names gets ALL scan columns (join-key duplicates
@@ -919,10 +919,10 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
         }
     }
 
-    free(phys_names);
-    free(acc);
-    free(scans);
-    free(joins);
+    free((void *)phys_names);
+    free((void *)acc);
+    free((void *)scans);
+    free((void *)joins);
     return projections;
 }
 
@@ -965,8 +965,8 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
         = (wirelog_ir_node_t **)calloc(depth, sizeof(wirelog_ir_node_t *));
     uint32_t *order = (uint32_t *)calloc(nscan, sizeof(uint32_t));
     if (!scans || !joins || !order) {
-        free(scans);
-        free(joins);
+        free((void *)scans);
+        free((void *)joins);
         free(order);
         return result;
     }
@@ -977,8 +977,8 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
 
     if (actual_scans != nscan) {
         /* Not a clean left-deep chain; skip */
-        free(scans);
-        free(joins);
+        free((void *)scans);
+        free((void *)joins);
         free(order);
         return result;
     }
@@ -994,7 +994,7 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
             for (uint32_t i = 0; i < nscan; i++)
                 ordered[i] = scans[order[i]];
             rebuild_chain(joins, depth, ordered, nscan);
-            free(ordered);
+            free((void *)ordered);
         }
         result.reordered = true;
     }
@@ -1006,8 +1006,8 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
     result.projections_inserted
         = insert_projections(join_root, head_vars, head_var_count);
 
-    free(scans);
-    free(joins);
+    free((void *)scans);
+    free((void *)joins);
     free(order);
 
     return result;
@@ -1091,7 +1091,7 @@ optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
     jpp_chain_result_t result
         = optimize_chain(root, head_vars, head_var_count, idb_names, idb_count);
 
-    free(head_vars);
+    free((void *)head_vars);
 
     if (result.reordered)
         (*joins_reordered)++;
@@ -1171,7 +1171,7 @@ wl_jpp_apply(struct wirelog_program *prog, wl_jpp_stats_t *stats)
             &projections_inserted, idb_names, idb_count);
     }
 
-    free(idb_names);
+    free((void *)idb_names);
 
     if (stats) {
         stats->joins_reordered = joins_reordered;
