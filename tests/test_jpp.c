@@ -60,6 +60,23 @@ static unsigned long jpp_calloc_calls;
 static unsigned long jpp_malloc_calls;
 static unsigned long jpp_realloc_calls;
 
+/*
+ * Issue #1119 item 1: a separate, independently scoped observation.
+ *
+ * C permits calloc(0, n) and calloc(n, 0) to return NULL, and a caller cannot
+ * tell that apart from OOM.  jpp.c must therefore never ASK for zero
+ * elements; scan_columns_total() already clamps to 1 for exactly this reason.
+ * Counting the requests tests the argument jpp.c passes rather than emulating
+ * a hostile allocator that no CI machine runs -- and it also catches a future
+ * zero-size calloc whose NULL return would happen to be benign.
+ *
+ * __wrap_calloc is process-wide, so the watch is scoped to the one
+ * wl_jpp_apply() call under test; a stray zero-size calloc from the parser
+ * must not be attributed to the pass.
+ */
+static bool jpp_zero_calloc_watch;
+static unsigned long jpp_zero_calloc_calls;
+
 void *__real_calloc(size_t nmemb, size_t size);
 void *__real_malloc(size_t size);
 void *__real_realloc(void *ptr, size_t size);
@@ -67,6 +84,8 @@ void *__real_realloc(void *ptr, size_t size);
 void *
 __wrap_calloc(size_t nmemb, size_t size)
 {
+    if (jpp_zero_calloc_watch && (nmemb == 0 || size == 0))
+        jpp_zero_calloc_calls++;
     if (jpp_oom_armed) {
         jpp_calloc_calls++;
         if (jpp_calloc_countdown >= 0 && jpp_calloc_countdown-- == 0)
@@ -121,6 +140,20 @@ jpp_oom_disarm(void)
     jpp_calloc_countdown = -1;
     jpp_malloc_countdown = -1;
     jpp_realloc_countdown = -1;
+}
+
+static void
+jpp_zero_calloc_watch_begin(void)
+{
+    jpp_zero_calloc_calls = 0;
+    jpp_zero_calloc_watch = true;
+}
+
+static unsigned long
+jpp_zero_calloc_watch_end(void)
+{
+    jpp_zero_calloc_watch = false;
+    return jpp_zero_calloc_calls;
 }
 
 #endif /* __linux__ */
@@ -1616,6 +1649,16 @@ test_jpp_nullary_chain(void)
      *
      * Answers are unaffected here (a nullary join is a cross product), so
      * nothing but the plan shows the difference.  Pin the plan.
+     *
+     * The same rule pins the other half of that clamp (issue #1119 item 1):
+     * this chain is where merge_vars() is asked to allocate na + nb == 0
+     * elements.  Nothing here can observe a platform whose calloc(0, n)
+     * returns NULL -- glibc and musl both return non-NULL -- so instead of
+     * emulating one, count the zero-size REQUESTS and require none.  That
+     * tests the argument jpp.c passes rather than the allocator's reply, and
+     * it also catches a future zero-size calloc whose NULL return happens to
+     * be benign today.  Measured before the clamp: 2 such calls, one per
+     * merge_vars() call site.
      */
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(".decl e()\n"
@@ -1634,12 +1677,31 @@ test_jpp_nullary_chain(void)
     }
 
     wl_jpp_stats_t stats = { 0, 0, 0 };
+#ifdef __linux__
+    jpp_zero_calloc_watch_begin();
+#endif
     int rc = wl_jpp_apply(prog, &stats);
+#ifdef __linux__
+    unsigned long zero_callocs = jpp_zero_calloc_watch_end();
+#endif
     if (rc != 0) {
         FAIL("expected 0");
         wirelog_program_free(prog);
         return;
     }
+
+#ifdef __linux__
+    if (zero_callocs != 0) {
+        char zbuf[160];
+        snprintf(zbuf, sizeof(zbuf),
+            "%lu calloc request(s) for zero elements; calloc(0, n) may "
+            "return NULL and would be misread as OOM",
+            zero_callocs);
+        FAIL(zbuf);
+        wirelog_program_free(prog);
+        return;
+    }
+#endif
 
     if (stats.chains_examined != 1 || stats.joins_reordered != 1
         || stats.projections_inserted != 0) {

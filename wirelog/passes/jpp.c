@@ -291,8 +291,21 @@ jpp_build_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
 static char **
 merge_vars(char **a, uint32_t na, char **b, uint32_t nb, uint32_t *out_count)
 {
-    /* Upper bound on merged size */
-    char **merged = (char **)calloc(na + nb, sizeof(char *));
+    /*
+     * Upper bound on merged size, clamped to at least one element.
+     *
+     * na + nb == 0 is reachable and legitimate: `.decl p()` is legal and
+     * leaves column_count == 0, so an all-nullary chain merges two empty
+     * sets.  C permits calloc(0, n) to return NULL and a caller cannot tell
+     * that apart from OOM, which would decline the reorder for a chain that
+     * is perfectly optimizable.  scan_columns_total() above clamps for
+     * exactly this reason; the clamp is safe here for the same reason it is
+     * safe there -- every write into merged[] is bounded by na + nb, so a
+     * zero-total merge performs no writes at all.
+     */
+    size_t merged_cap = (size_t)na + (size_t)nb;
+    char **merged
+        = (char **)calloc(merged_cap > 0 ? merged_cap : 1, sizeof(char *));
     if (!merged) {
         *out_count = 0;
         return NULL;
