@@ -30,13 +30,21 @@
  * as a cross product -- wrong answers, exit status 0.
  *
  * Reaching those paths needs allocator interposition, so tests/meson.build
- * links this binary with --wrap=calloc AND --wrap=malloc.  Both are needed:
- * the key arrays come from calloc, but the key STRINGS come from
- * strdup_safe(), which uses malloc (wirelog/ir/ir.c).  A calloc-only sweep
- * can never exercise the unchecked strdup path, and that path is not merely
- * "a different failure mode": exec_plan_gen.c's resolve_key_to_colN() falls
- * back to column 0 when a key name is NULL, so a NULL key silently produces
- * a WRONG join rather than a cross product.
+ * links this binary with --wrap=calloc, --wrap=malloc AND --wrap=realloc.
+ * All three are needed:
+ *
+ *   calloc  -- the key ARRAYS and every scratch array in the pass.
+ *   malloc  -- the key STRINGS, which come from strdup_safe()
+ *              (wirelog/ir/ir.c).  A calloc-only sweep can never exercise
+ *              the unchecked strdup path, and that path is not merely "a
+ *              different failure mode": exec_plan_gen.c's
+ *              resolve_key_to_colN() falls back to column 0 when a key name
+ *              is NULL, so a NULL key silently produces a WRONG join rather
+ *              than a cross product.
+ *   realloc -- the child-pointer array grown by wl_ir_node_add_child()
+ *              (issue #1119).  This is the only route by which
+ *              insert_projections() can abandon a projection midway, and it
+ *              is reachable from neither of the other two.
  *
  * The wrap must be paired with b_lto=false in tests/meson.build.  Under
  * -flto the wrappers are never reached and no diagnostic is emitted.
@@ -47,11 +55,14 @@
 static bool jpp_oom_armed;
 static long jpp_calloc_countdown = -1; /* < 0: count but never fail */
 static long jpp_malloc_countdown = -1;
+static long jpp_realloc_countdown = -1;
 static unsigned long jpp_calloc_calls;
 static unsigned long jpp_malloc_calls;
+static unsigned long jpp_realloc_calls;
 
 void *__real_calloc(size_t nmemb, size_t size);
 void *__real_malloc(size_t size);
+void *__real_realloc(void *ptr, size_t size);
 
 void *
 __wrap_calloc(size_t nmemb, size_t size)
@@ -75,18 +86,31 @@ __wrap_malloc(size_t size)
     return __real_malloc(size);
 }
 
+void *
+__wrap_realloc(void *ptr, size_t size)
+{
+    if (jpp_oom_armed) {
+        jpp_realloc_calls++;
+        if (jpp_realloc_countdown >= 0 && jpp_realloc_countdown-- == 0)
+            return NULL;
+    }
+    return __real_realloc(ptr, size);
+}
+
 /*
  * Arm the countdowns.  A negative countdown counts calls without failing
  * any.  Arming is scoped to the wl_jpp_apply() call itself so that parsing
  * and program construction never see a failing allocator.
  */
 static void
-jpp_oom_arm(long calloc_nth, long malloc_nth)
+jpp_oom_arm(long calloc_nth, long malloc_nth, long realloc_nth)
 {
     jpp_calloc_countdown = calloc_nth;
     jpp_malloc_countdown = malloc_nth;
+    jpp_realloc_countdown = realloc_nth;
     jpp_calloc_calls = 0;
     jpp_malloc_calls = 0;
+    jpp_realloc_calls = 0;
     jpp_oom_armed = true;
 }
 
@@ -96,6 +120,7 @@ jpp_oom_disarm(void)
     jpp_oom_armed = false;
     jpp_calloc_countdown = -1;
     jpp_malloc_countdown = -1;
+    jpp_realloc_countdown = -1;
 }
 
 #endif /* __linux__ */
@@ -1984,12 +2009,13 @@ joins_children_unchanged(const wirelog_ir_node_t *ir,
 
 /*
  * One sweep step.  Returns NULL when the invariants hold, otherwise a static
- * description of the violation.  @fail_calloc / @fail_malloc select which
- * allocation inside wl_jpp_apply() returns NULL (< 0 fails none).
+ * description of the violation.  @fail_calloc / @fail_malloc / @fail_realloc
+ * select which allocation inside wl_jpp_apply() returns NULL (< 0 fails
+ * none).
  */
 static const char *
 jpp_oom_step(const char *src, const char *relation, long fail_calloc,
-    long fail_malloc, wl_jpp_stats_t *out_stats)
+    long fail_malloc, long fail_realloc, wl_jpp_stats_t *out_stats)
 {
     static char detail[192];
     wirelog_error_t err;
@@ -2011,7 +2037,7 @@ jpp_oom_step(const char *src, const char *relation, long fail_calloc,
     }
 
     wl_jpp_stats_t stats = { 0, 0, 0, 0 };
-    jpp_oom_arm(fail_calloc, fail_malloc);
+    jpp_oom_arm(fail_calloc, fail_malloc, fail_realloc);
     int rc = wl_jpp_apply(prog, &stats);
     jpp_oom_disarm();
 
@@ -2080,7 +2106,7 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
      * sweep assertions rely on, and measures how many allocations the sweep
      * has to cover. */
     wl_jpp_stats_t base = { 0, 0, 0, 0 };
-    const char *problem = jpp_oom_step(src, relation, -1, -1, &base);
+    const char *problem = jpp_oom_step(src, relation, -1, -1, -1, &base);
     if (problem) {
         FAIL(problem);
         return;
@@ -2102,28 +2128,40 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
 
     unsigned long ncalloc = jpp_calloc_calls;
     unsigned long nmalloc = jpp_malloc_calls;
-    if (ncalloc == 0 || nmalloc == 0) {
+    unsigned long nrealloc = jpp_realloc_calls;
+    /* realloc is reached ONLY through wl_ir_node_add_child(), and the pass
+     * calls that only when it inserts a PROJECT: rebuild_chain() rewires
+     * children[] in place on JOIN nodes that already have the capacity.  So
+     * fixture A legitimately measures realloc=0 and only fixture B can hold
+     * the wrap to account. */
+    if (ncalloc == 0 || nmalloc == 0
+        || (expect_projections && nrealloc == 0)) {
         /* Either --wrap did not take effect (b_lto slipped back on) or the
          * pass stopped allocating; both make the sweep vacuous. */
         snprintf(buf, sizeof(buf),
-            "allocator interposition inert: calloc=%lu malloc=%lu", ncalloc,
-            nmalloc);
+            "allocator interposition inert: calloc=%lu malloc=%lu "
+            "realloc=%lu",
+            ncalloc, nmalloc, nrealloc);
         FAIL(buf);
         return;
     }
-    if (ncalloc >= JPP_OOM_SWEEP_MAX || nmalloc >= JPP_OOM_SWEEP_MAX) {
+    if (ncalloc >= JPP_OOM_SWEEP_MAX || nmalloc >= JPP_OOM_SWEEP_MAX
+        || nrealloc >= JPP_OOM_SWEEP_MAX) {
         snprintf(buf, sizeof(buf),
-            "sweep width %d no longer covers calloc=%lu malloc=%lu",
-            JPP_OOM_SWEEP_MAX, ncalloc, nmalloc);
+            "sweep width %d no longer covers calloc=%lu malloc=%lu "
+            "realloc=%lu",
+            JPP_OOM_SWEEP_MAX, ncalloc, nmalloc, nrealloc);
         FAIL(buf);
         return;
     }
 
-    /* The two routes are swept separately so that a regression in one is
+    /* The three routes are swept separately so that a regression in one is
      * reported on its own terms: the calloc route reaches the key ARRAYS and
-     * the accumulator, the malloc route reaches the key STRINGS. */
+     * the accumulator, the malloc route reaches the key STRINGS, and the
+     * realloc route reaches wl_ir_node_add_child()'s child array -- the only
+     * way to make insert_projections() abandon a projection midway. */
     for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
-        problem = jpp_oom_step(src, relation, n, -1, NULL);
+        problem = jpp_oom_step(src, relation, n, -1, -1, NULL);
         if (problem) {
             snprintf(buf, sizeof(buf), "calloc #%ld: %s", n, problem);
             FAIL(buf);
@@ -2131,9 +2169,17 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
         }
     }
     for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
-        problem = jpp_oom_step(src, relation, -1, n, NULL);
+        problem = jpp_oom_step(src, relation, -1, n, -1, NULL);
         if (problem) {
             snprintf(buf, sizeof(buf), "malloc #%ld: %s", n, problem);
+            FAIL(buf);
+            return;
+        }
+    }
+    for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
+        problem = jpp_oom_step(src, relation, -1, -1, n, NULL);
+        if (problem) {
+            snprintf(buf, sizeof(buf), "realloc #%ld: %s", n, problem);
             FAIL(buf);
             return;
         }
