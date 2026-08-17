@@ -524,7 +524,7 @@ cleanup:
         }
         dp->slot_used = pool_slot_base;
     }
-    free(results);
+    free((void *)results);
     COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
     return rc;
 }
@@ -633,7 +633,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     COL_SESSION(sess)->kfusion_alloc_ns += now_ns() - _phase_t0;
     if (!results || !workers || !worker_sess) {
         free(live_indices);
-        free(results);
+        free((void *)results);
         free(workers);
         free(worker_sess);
         return ENOMEM;
@@ -869,7 +869,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         } else {
             merged = col_rel_merge_k(compact, n_results);
         }
-        free(compact);
+        free((void *)compact);
         if (!merged) {
             rc = ENOMEM;
             goto cleanup_results;
@@ -964,7 +964,7 @@ cleanup_wq:
         wl_arena_free(worker_sess[d].eval_arena);
     }
     free(worker_sess);
-    free(results);
+    free((void *)results);
     free(workers);
     free(live_indices);
     COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
