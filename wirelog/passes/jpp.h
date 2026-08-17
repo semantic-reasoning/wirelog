@@ -68,7 +68,10 @@ typedef struct {
  *
  * Returns:
  *    0: Success (stats populated if non-NULL).
- *   -1: Memory allocation error.
+ *   -1: Memory allocation error.  RESERVED -- not produced today: JPP is a
+ *       pure optimizer and wirelog_optimize() aborts its whole pass sequence
+ *       on any non-zero return, so an allocation failure degrades to a less
+ *       optimized plan and still reports 0.
  *   -2: Invalid program (NULL).
  */
 int

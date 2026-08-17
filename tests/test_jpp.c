@@ -46,8 +46,12 @@
  *              insert_projections() can abandon a projection midway, and it
  *              is reachable from neither of the other two.
  *
- * The wrap must be paired with b_lto=false in tests/meson.build.  Under
- * -flto the wrappers are never reached and no diagnostic is emitted.
+ * The wrap is paired with b_lto=false in tests/meson.build as the portable
+ * guarantee that the linker cannot resolve these calls before --wrap applies.
+ * That pairing is NOT self-enforcing, and the stronger claim once made here --
+ * that -flto silently defeats the wrappers -- did not reproduce: on gcc 16.2.1
+ * a forced-LTO build of this target kept every wrapper live.  See the longer
+ * note at the link_args line in tests/meson.build.
  */
 
 #ifdef __linux__
@@ -1933,7 +1937,10 @@ test_jpp_wide_head_antijoin_key(void)
  * in how wide the head is, which decides whether insert_projections() fires.
  * jpp.c builds join keys at two independent sites, and each fixture is the
  * sole cover for one of them.  Measured, by reverting one site at a time
- * against the finished fix:
+ * against the finished fix, as of commit 0a94da7 -- these are the record of
+ * that counterfactual experiment, not a live invariant, and the two indices
+ * will drift the moment jpp.c's allocation order changes.  The surrounding
+ * claims stay true either way:
  *
  *   - Revert only rebuild_chain() to destroy-then-allocate: BOTH fixtures
  *     fail at calloc #9, "1 of 3 join(s) have zero keys (cross product)".
@@ -2268,7 +2275,13 @@ jpp_oom_step(const char *src, const char *relation, long fail_calloc,
 
     const char *problem = NULL;
 
-    /* Unconditional, at every sweep index. */
+    /* Unconditional, at every sweep index -- and a POLICY PIN, not a
+     * correctness assertion.  jpp.h reserves -1 for allocation failure but
+     * the pass deliberately degrades instead of propagating it, because
+     * wirelog_optimize() aborts its whole pass sequence on any non-zero
+     * return and JPP is a pure optimizer.  Anyone who later decides to
+     * propagate -1 will see this fail and be forced to revisit the choice
+     * consciously; that is what it is for. */
     if (rc != 0) {
         snprintf(detail, sizeof(detail), "rc=%d (expected 0)", rc);
         problem = detail;
@@ -2301,7 +2314,26 @@ jpp_oom_step(const char *src, const char *relation, long fail_calloc,
 
     /* Structural contract: the pass either declined outright, leaving every
      * child pointer as it found it, or it committed a full rebuild, in which
-     * case every JOIN of this connected chain must carry keys. */
+     * case every JOIN of this connected chain must carry keys.
+     *
+     * Why the two strongest wrong-answer detectors -- the zero_keys
+     * cross-product check below and the plan signature after it -- are gated
+     * on the pass having COMMITTED, and why that gate must not be "fixed" by
+     * removing it:
+     *
+     * insert_projections() runs even when rebuild_chain() declined, so a large
+     * share of armed steps (measured: about 45%, 5,700 of 12,562 injection
+     * points) legitimately end with joins_reordered == 0.  Those steps still
+     * hold the parser's ORIGINAL chain, whose body order is deliberately
+     * non-optimal -- and that un-reordered tree legitimately contains one
+     * zero-key JOIN, because a cross product is what the unoptimised order
+     * means.  Asserting unconditionally would therefore produce roughly 5,700
+     * false failures, not extra coverage.
+     *
+     * The gate does not hide the defect it was built for: reverting the
+     * insert_projections() goto adds exactly 65 zero-key instances and every
+     * one of them falls inside the joins_reordered == 1 slice, so every one is
+     * reported. */
     if (!problem) {
         if (joins_children_unchanged(ir, before, nbefore)) {
             if (stats.joins_reordered != 0) {

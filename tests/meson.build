@@ -312,9 +312,36 @@ test_jpp_exe = executable(
   # accumulator desynchronisation fixed in the same commit that added this
   # wrap -- neither the calloc nor the malloc sweep can reach it.
   #
-  # b_lto=false is MANDATORY, not tidiness: with -flto the linker resolves
-  # the calls before --wrap is applied, the wrappers are never reached, and
-  # NO diagnostic is emitted.  The sweeps would pass while testing nothing.
+  # b_lto=false is kept because it is the PORTABLE guarantee that --wrap is
+  # applied before the linker can resolve these calls internally, and the
+  # project default is b_lto=true.  Keep the two ternaries on the SAME
+  # predicate so the pairing cannot drift apart.
+  #
+  # Do not read more into it than that.  Measured on gcc 16.2.1 with this
+  # binutils, forcing b_lto=true on this target alone did NOT break the
+  # interposition: the objects were genuinely LTO (gnu.lto ELF sections
+  # present, zero calloc@plt), yet every allocation still routed through
+  # __wrap_calloc, the baseline counts were unchanged, and with the
+  # insert_projections() goto reverted the LTO build still reported
+  # "realloc #0 ... zero keys (cross product)".  So --wrap surviving -flto is
+  # toolchain-dependent, and on at least one mainstream toolchain it survives.
+  #
+  # Consequently the build does NOT enforce the pairing, and neither does the
+  # test: run_jpp_oom_sweep()'s "allocator interposition inert" assertion
+  # detects one specific condition, ZERO recorded wrapper calls in the unarmed
+  # baseline.  Dropping override_options here is not guaranteed to reach that
+  # condition -- done on gcc 16.2.1 it yields a green 30/30 with a fully live
+  # sweep, not a failure.
+  #
+  # The error direction is at least safe: where LTO genuinely does defeat the
+  # wrap the counts fall to zero and the assertion fires, and where it does
+  # not the sweep is live.  Neither branch leaves a quietly vacuous sweep.
+  #
+  # Threading precondition: the wrap state is process-global and non-atomic.
+  # It is sound because arming is scoped to the wl_jpp_apply() call and that
+  # pass spawns nothing.  If program construction ever leaves an allocating
+  # background thread live, the sweep goes flaky rather than wrong; TSan is
+  # the guard, and the counters would then need to be _Atomic.
   link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc', '-Wl,--wrap=realloc'] : [],
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
 )
