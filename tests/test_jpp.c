@@ -2040,17 +2040,133 @@ joins_children_unchanged(const wirelog_ir_node_t *ir,
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* Canonical plan signature (Issue #1119 item 4)                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * tally_join_keys() proves a JOIN has keys and that they are not NULL.  It
+ * cannot see a join carrying the WRONG-but-non-NULL key name, nor a scan
+ * order that moved, nor a chain that came out a different shape.  A canonical
+ * rendering of the committed tree covers all three in one comparison against
+ * the unarmed baseline.
+ *
+ * PROJECT nodes are descended THROUGH rather than rendered, because their
+ * presence is legitimately variable: an allocation failure may make jpp.c
+ * decline a projection, and declining is correct degradation, not a defect.
+ * Everything else -- join structure, key pairs, scan relation order -- must be
+ * bit-identical to the plan the same fixture produces with no failure
+ * injected, whenever the pass reports that it committed a rebuild.
+ *
+ * Measured on both fixtures: zero committed-plan differences across the whole
+ * sweep, before and after the projection fixes, except on unfixed jpp.c where
+ * fixture B differs exactly at the cross-product steps.
+ *
+ * Forward risk worth stating: both fixtures are all-EDB, so the issue #394
+ * EDB tie-break cannot fire and cannot vary.  A future fixture with an
+ * IDB/EDB tie could legitimately commit a different-but-correct order under
+ * an idb_names allocation failure; this invariant would then need a stated
+ * exception.  It would fail loudly rather than silently, which is the point.
+ *
+ * KNOWN BLIND SPOT, and it follows directly from stripping PROJECTs: because
+ * this rendering descends through a PROJECT rather than recording what that
+ * PROJECT emits, it cannot see a JOIN carrying a key its own child no longer
+ * emits.  Nothing else in this file can either -- tally_join_keys() sees a
+ * non-empty, non-NULL key list and is satisfied.  That shape is not
+ * hypothetical: it is exactly what the empty-key-set guard rejected for this
+ * issue produced, and exactly why those steps were silent while
+ * exec_plan_gen.c's resolve_key_to_colN() fell back to col0.
+ *
+ * It is unreachable today for a structural reason, not by luck: the key
+ * recompute above an inserted projection derives its keys from the PROJECTED
+ * acc[], the same array phys_names[] is rebuilt from, so the keys and the
+ * emitted layout cannot disagree.  If that derivation ever changes -- keys
+ * taken from a pre-projection set, or the layout rebuilt from something other
+ * than acc[] -- this apparatus goes blind to the resulting wrong answer, and
+ * the invariant would need to compare keys against the child's real output
+ * columns instead of stripping the node away.
+ */
+typedef struct {
+    char buf[512];
+    size_t len;
+    bool overflow;
+} jpp_sig_t;
+
+static void
+sig_puts(jpp_sig_t *s, const char *text)
+{
+    size_t n = strlen(text);
+    if (s->overflow || s->len + n + 1 > sizeof(s->buf)) {
+        s->overflow = true;
+        return;
+    }
+    memcpy(s->buf + s->len, text, n);
+    s->len += n;
+    s->buf[s->len] = '\0';
+}
+
+static void
+sig_render(jpp_sig_t *s, const wirelog_ir_node_t *n)
+{
+    if (!n) {
+        sig_puts(s, "_");
+        return;
+    }
+
+    /* Descend through PROJECT: see the note above. */
+    if (n->type == WIRELOG_IR_PROJECT) {
+        sig_render(s, n->child_count > 0 ? n->children[0] : NULL);
+        return;
+    }
+
+    if (n->type == WIRELOG_IR_SCAN) {
+        sig_puts(s, "S[");
+        sig_puts(s, n->relation_name ? n->relation_name : "(null)");
+        sig_puts(s, "]");
+        return;
+    }
+
+    if (n->type == WIRELOG_IR_JOIN) {
+        sig_puts(s, "J{");
+        for (uint32_t k = 0; k < n->join_key_count; k++) {
+            const char *l = n->join_left_keys ? n->join_left_keys[k] : NULL;
+            const char *r = n->join_right_keys ? n->join_right_keys[k] : NULL;
+            if (k)
+                sig_puts(s, ",");
+            sig_puts(s, l ? l : "(null)");
+            sig_puts(s, "=");
+            sig_puts(s, r ? r : "(null)");
+        }
+        sig_puts(s, "}");
+    } else {
+        char kind[24];
+        snprintf(kind, sizeof(kind), "T%d", (int)n->type);
+        sig_puts(s, kind);
+    }
+
+    sig_puts(s, "(");
+    for (uint32_t i = 0; i < n->child_count; i++) {
+        if (i)
+            sig_puts(s, " ");
+        sig_render(s, n->children[i]);
+    }
+    sig_puts(s, ")");
+}
+
 /*
  * One sweep step.  Returns NULL when the invariants hold, otherwise a static
  * description of the violation.  @fail_calloc / @fail_malloc / @fail_realloc
  * select which allocation inside wl_jpp_apply() returns NULL (< 0 fails
- * none).
+ * none).  @expect_sig, when non-NULL, is the canonical plan the unarmed run
+ * committed; @out_sig, when non-NULL, receives this run's.
  */
 static const char *
 jpp_oom_step(const char *src, const char *relation, long fail_calloc,
-    long fail_malloc, long fail_realloc, wl_jpp_stats_t *out_stats)
+    long fail_malloc, long fail_realloc, wl_jpp_stats_t *out_stats,
+    const char *expect_sig, jpp_sig_t *out_sig)
 {
-    static char detail[192];
+    /* Wide enough to hold two rendered plan signatures. */
+    static char detail[1152];
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(src, &err);
     if (!prog)
@@ -2132,6 +2248,23 @@ jpp_oom_step(const char *src, const char *relation, long fail_calloc,
         }
     }
 
+    /* The committed plan must be the plan.  Only meaningful when the pass
+     * says it committed a rebuild; a declined pass legitimately leaves the
+     * parser's original chain, which is a different tree. */
+    if (!problem && (out_sig || stats.joins_reordered == 1)) {
+        jpp_sig_t sig = { { 0 }, 0, false };
+        sig_render(&sig, ir);
+        if (sig.overflow) {
+            problem = "plan signature overflowed";
+        } else if (expect_sig && strcmp(sig.buf, expect_sig) != 0) {
+            snprintf(detail, sizeof(detail), "committed plan %s, expected %s",
+                sig.buf, expect_sig);
+            problem = detail;
+        }
+        if (out_sig)
+            *out_sig = sig;
+    }
+
     if (out_stats)
         *out_stats = stats;
     wirelog_program_free(prog);
@@ -2150,7 +2283,9 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
      * sweep assertions rely on, and measures how many allocations the sweep
      * has to cover. */
     wl_jpp_stats_t base = { 0, 0, 0, 0 };
-    const char *problem = jpp_oom_step(src, relation, -1, -1, -1, &base);
+    jpp_sig_t base_sig = { { 0 }, 0, false };
+    const char *problem
+        = jpp_oom_step(src, relation, -1, -1, -1, &base, NULL, &base_sig);
     if (problem) {
         FAIL(problem);
         return;
@@ -2205,7 +2340,8 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
      * realloc route reaches wl_ir_node_add_child()'s child array -- the only
      * way to make insert_projections() abandon a projection midway. */
     for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
-        problem = jpp_oom_step(src, relation, n, -1, -1, NULL);
+        problem = jpp_oom_step(src, relation, n, -1, -1, NULL,
+                base_sig.buf, NULL);
         if (problem) {
             snprintf(buf, sizeof(buf), "calloc #%ld: %s", n, problem);
             FAIL(buf);
@@ -2213,7 +2349,8 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
         }
     }
     for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
-        problem = jpp_oom_step(src, relation, -1, n, -1, NULL);
+        problem = jpp_oom_step(src, relation, -1, n, -1, NULL,
+                base_sig.buf, NULL);
         if (problem) {
             snprintf(buf, sizeof(buf), "malloc #%ld: %s", n, problem);
             FAIL(buf);
@@ -2221,7 +2358,8 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
         }
     }
     for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
-        problem = jpp_oom_step(src, relation, -1, -1, n, NULL);
+        problem = jpp_oom_step(src, relation, -1, -1, n, NULL,
+                base_sig.buf, NULL);
         if (problem) {
             snprintf(buf, sizeof(buf), "realloc #%ld: %s", n, problem);
             FAIL(buf);
