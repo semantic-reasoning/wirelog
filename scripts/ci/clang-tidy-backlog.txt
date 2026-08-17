@@ -1,0 +1,47 @@
+# scripts/ci/clang-tidy-backlog.txt - Issue #1100.
+#
+# The libwirelog.so sources that are NOT clang-tidy clean yet.  They are
+# excluded from the scan by scripts/ci/check-clang-tidy-ratchet.py; the
+# ratchet only guarantees that the files in clang-tidy-allowlist.txt stay
+# clean.
+#
+# The register is monotonically non-increasing:
+#
+#   - Entries may be REMOVED, by cleaning the file up and moving it to
+#     clang-tidy-allowlist.txt.
+#   - Entries may NOT be ADDED.  Demoting a file that regressed keeps the
+#     allowlist/backlog partition exact, so the ratchet itself would still
+#     pass -- which makes it the cheapest way to make a regression
+#     disappear.  scripts/ci/check-clang-tidy-backlog-monotonic.sh diffs
+#     this file against the merge base with the base branch (not its tip,
+#     which would flag a line that main removed while your branch was
+#     open) and rejects additions.
+#   - A genuinely new source file that is not clean on arrival is the one
+#     case that needs a line added here, and it needs an explicit decision
+#     recorded in the PR description.
+#
+# NO DIAGNOSTIC COUNTS.  A count would look like useful precision and is
+# not: the numbers are toolchain-version-dependent.  LLVM 22 renamed the
+# clang-analyzer-valist.* checks out from under .clang-tidy:58 (see #1114),
+# which would have moved counts here with no source change at all.  Run
+#   scripts/ci/check-clang-tidy-ratchet.py --build-dir build --mode regenerate
+# for the current numbers.
+#
+# Paths are repository-relative and sorted under the C locale (LC_ALL=C
+# sort), matching clang-tidy-allowlist.txt.
+#
+# wirelog/ir/program.c is the reason this issue exists: it was clean, and
+# regressed to bugprone-branch-clone after f1d2a2c with nothing failing.
+wirelog/columnar/arrangement.c
+wirelog/columnar/eval.c
+wirelog/columnar/eval_delta.c
+wirelog/columnar/eval_plan.c
+wirelog/columnar/eval_tdd_queue.c
+wirelog/columnar/expr.c
+wirelog/columnar/join.c
+wirelog/columnar/kfusion.c
+wirelog/columnar/merge.c
+wirelog/columnar/mobius.c
+wirelog/ir/program.c
+wirelog/ir/stratify.c
+wirelog/passes/jpp.c

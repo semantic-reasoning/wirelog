@@ -758,6 +758,62 @@ if sh.found()
        suite: 'sbom')
 endif
 
+# Issue #1100: clang-tidy ratchet (suite 'tidy').  No CI job has run
+# clang-tidy since efbde27 removed it, and wirelog/ir/program.c regressed
+# after f1d2a2c with nothing failing.  The gate re-analyses every file in
+# scripts/ci/clang-tidy-allowlist.txt on every run; the 13 files in
+# clang-tidy-backlog.txt are excluded, and the two lists must partition the
+# libwirelog.so entries of compile_commands.json exactly.
+#
+# As with the perf gate above, suite membership excludes nothing (there is
+# no add_test_setup in this project), so these run in a default
+# `meson test`.  Opting out is a runtime decision instead: the ratchet SKIPs
+# unless clang-tidy is present at a supported major
+# (scripts/ci/clang-tidy-supported-majors.txt), the host is Linux on
+# x86_64, and the database is free of -fsanitize= / MSVC command lines --
+# so the sanitizer, tsan, macOS, MSVC and build-arm jobs skip it rather
+# than reporting an uncalibrated verdict.  The arch guard is what covers
+# build-arm: it is Linux, uninstrumented and not MSVC, so only the target
+# check distinguishes it.  WIRELOG_TIDY_REQUIRED=1 (set by build-primary)
+# turns those skips into failures; WIRELOG_TIDY_SKIP=1 forces a skip.
+#
+# Cost: ~12-16 s wall at 8 jobs, ~113 s summed CPU, on a suite whose
+# baseline is ~20 s wall.  priority: 100 starts it early so it overlaps the
+# rest rather than trailing them.  The 900 s timeout is generous against
+# the 12.7 s worst single file (exec_plan_gen.c) on a loaded runner.
+if not is_windows
+  test('clang_tidy_ratchet', py3,
+       args: [meson.project_source_root() / 'scripts/ci/check-clang-tidy-ratchet.py',
+              '--build-dir', meson.project_build_root(),
+              '--mode', 'ratchet'],
+       suite: 'tidy',
+       timeout: 900,
+       priority: 100)
+
+  # Sensitivity control: a fixture that no meson target compiles and that
+  # appears in neither list, carrying one deliberate bugprone-integer-
+  # division.  Without it a ratchet that silently analysed the wrong file
+  # (issue #1079's symlinked build dir) would report everything clean.
+  test('clang_tidy_sensitivity', py3,
+       args: [meson.project_source_root() / 'scripts/ci/check-clang-tidy-ratchet.py',
+              '--build-dir', meson.project_build_root(),
+              '--mode', 'sensitivity'],
+       suite: 'tidy',
+       timeout: 300,
+       priority: 100)
+
+  # Demotion guard: the partition assertion above catches a DELETED
+  # allowlist line, but moving one to the backlog keeps the partition exact.
+  # Compares against the merge base with the base branch, so a backlog line
+  # that main removes while a branch is open is not misread as an addition.
+  # SKIPs when no merge base is available (shallow clone, tarball).
+  if sh.found()
+    test('clang_tidy_backlog_monotonic', sh,
+         args: [meson.project_source_root() / 'scripts/ci/check-clang-tidy-backlog-monotonic.sh'],
+         suite: 'tidy')
+  endif
+endif
+
 # Issue #689 / Blocker B2: standalone-include compile matrix for the
 # public-headers SSoT.  One executable per public header, each
 # compiled in isolation against tests/standalone/test_standalone_<H>.c

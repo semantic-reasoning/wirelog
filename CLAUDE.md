@@ -77,3 +77,43 @@ After fork, call `wl_log_init()` again if the child changes the sink.
 The header at `wirelog/util/log.h` is internal — enforced by
 `scripts/check_log_header_not_public.sh`. Never include it from a
 public header.
+
+## clang-tidy Ratchet (Issue #1100)
+
+`meson test --suite tidy` re-runs clang-tidy over every source in
+`scripts/ci/clang-tidy-allowlist.txt` (58 files today) and fails on any
+diagnostic. The 13 files that are not clean yet live in
+`scripts/ci/clang-tidy-backlog.txt` and are skipped. The two lists must
+partition the `libwirelog.so` entries of `build/compile_commands.json`
+exactly, so an allowlist line cannot simply be deleted; moving one to the
+backlog is caught separately by
+`scripts/ci/check-clang-tidy-backlog-monotonic.sh`. **Fix the file, do not
+demote it.**
+
+The gate SKIPs (exit 77) with a named reason unless clang-tidy is present
+at a major listed in `scripts/ci/clang-tidy-supported-majors.txt`, the host
+is Linux on x86_64, and the compilation database is free of `-fsanitize=`
+and MSVC command lines — the allowlist was calibrated on one toolchain,
+one architecture and one build configuration, and `clang-analyzer-*`
+results move between LLVM releases and between targets. CI's
+`build-primary` job sets `WIRELOG_TIDY_REQUIRED=1`, which turns those skips
+into failures; `WIRELOG_TIDY_SKIP=1` forces a skip and
+`WIRELOG_TIDY_JOBS=N` overrides the parallelism (default `min(8, ncpu)`).
+
+Cost is ~113 s of summed CPU, so the wall-clock hit depends entirely on
+core count: about +15 s on an 8-core workstation, but roughly **+60 s on a
+standard 2-vCPU GitHub runner**, where `min(8, ncpu)` yields 2 jobs.
+
+After a toolchain bump, re-derive the lists with:
+
+```
+scripts/ci/check-clang-tidy-ratchet.py --build-dir build --mode regenerate
+```
+
+Two limitations are known and deliberate. Each file is analysed under the
+single command line meson recorded for it, so `exec_plan_gen.c` is only
+ever scanned with `ENABLE_K_FUSION` at its `#ifndef` default of 1 — the
+`ENABLE_K_FUSION=0` variant `bench_flowlog_seq` builds is never seen — and
+`relation.c`'s `#ifdef WL_RADIX_BENCH` regions are never scanned at all,
+even though both files are allowlisted (#1115). And the backlog carries no
+diagnostic counts, because counts are toolchain-version-dependent (#1114).

@@ -1,0 +1,19 @@
+# scripts/ci/clang-tidy-supported-majors.txt - Issue #1100.
+#
+# LLVM major versions the clang-tidy ratchet is calibrated for, one per
+# line, most preferred first.  scripts/ci/check-clang-tidy-ratchet.py SKIPs
+# on any other major; .github/workflows/ci-pr.yml installs the first entry.
+#
+# Why a pin at all: 9 of the 13 backlog diagnostics are path-sensitive
+# clang-analyzer results that move between LLVM releases, and LLVM 22
+# renamed the clang-analyzer-valist.* checks out from under .clang-tidy
+# entirely (see #1114).  An unpinned gate would fail, or silently stop
+# covering checks, on the first toolchain bump.
+#
+# To adopt a new major: run
+#   scripts/ci/check-clang-tidy-ratchet.py --build-dir build --mode regenerate
+# on the new toolchain, review every line that changes state, update
+# clang-tidy-allowlist.txt / clang-tidy-backlog.txt, then edit this file.
+# Note that clang-tidy-backlog.txt is monotonically non-increasing, so a
+# bump that dirties a currently clean file must fix it, not demote it.
+22
