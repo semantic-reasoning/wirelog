@@ -60,7 +60,6 @@ Checks: >
   clang-analyzer-security.*,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   clang-analyzer-unix.*,
-  clang-analyzer-valist.*,
   misc-redundant-expression,
   portability-restrict-system-includes,
   portability-simd-intrinsics,

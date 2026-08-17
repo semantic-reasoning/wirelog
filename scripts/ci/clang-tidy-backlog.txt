@@ -21,9 +21,8 @@
 #     recorded in the PR description.
 #
 # NO DIAGNOSTIC COUNTS.  A count would look like useful precision and is
-# not: the numbers are toolchain-version-dependent.  LLVM 22 renamed the
-# clang-analyzer-valist.* checks out from under .clang-tidy:58 (see #1114),
-# which would have moved counts here with no source change at all.  Run
+# not: the numbers are toolchain-version-dependent and could move here
+# with no source change after a toolchain update (see #1114).  Run
 #   scripts/ci/check-clang-tidy-ratchet.py --build-dir build --mode regenerate
 # for the current numbers.
 #
