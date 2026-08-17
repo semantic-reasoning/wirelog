@@ -1,7 +1,12 @@
 # NOTE: // NOLINT and // NOLINTNEXTLINE comments are the sole permitted
 # use of C++-style (//) comments in this codebase. They are tool-required
 # pragmas for clang-tidy suppression, not code comments. This is a
-# documented policy exception -- see docs/LINTING.md for details.
+# documented policy exception.
+#
+# ENFORCEMENT (issue #1100): scripts/ci/clang-tidy-allowlist.txt is the
+# register of sources that must stay clean under this config;
+# clang-tidy-backlog.txt holds the ones that are not clean yet. Both are
+# enforced by scripts/ci/check-clang-tidy-ratchet.py (meson suite 'tidy').
 #
 # CHECK SELECTION STRATEGY: Explicit C-safe allowlist.
 # We do NOT use wildcards (e.g., bugprone-*) because they silently include

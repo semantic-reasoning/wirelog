@@ -1,0 +1,108 @@
+# scripts/ci/clang-tidy-allowlist.txt - Issue #1100.
+#
+# The libwirelog.so sources that are clang-tidy clean under the repository
+# .clang-tidy.  scripts/ci/check-clang-tidy-ratchet.py analyses every file
+# listed here on every run; one diagnostic fails the build.
+#
+# This is a ratchet register, in the shape of
+# scripts/ci/phase-label-allowlist.txt:
+#
+#   - It may only GROW.  A file moves here when it is cleaned up.
+#   - It may not shrink.  Together with clang-tidy-backlog.txt it must
+#     partition the libwirelog.so translation units in
+#     compile_commands.json exactly, so deleting a line to hide a
+#     regression fails the partition assertion.
+#   - Moving a line to the backlog fails
+#     scripts/ci/check-clang-tidy-backlog-monotonic.sh.  Fix the file.
+#
+# Paths are repository-relative and sorted under the C locale (LC_ALL=C
+# sort).  Keep it that way: a re-sort under a collating locale moves
+# diff.c relative to diff_arrangement.c and produces a spurious diff.
+#
+# LIMITATION -- x86_64 Linux only.  clang-analyzer results are target- and
+# toolchain-dependent, so "clean" below is a claim about x86_64 Linux at
+# the LLVM major in clang-tidy-supported-majors.txt, and nothing else.  The
+# gate SKIPs elsewhere rather than reporting an uncalibrated verdict.
+#
+# LIMITATION -- one preprocessor configuration only.  Each file is analysed
+# under the single command line meson recorded for it, so code behind
+# non-default conditionals is never seen even though the file is listed as
+# clean here:
+#
+#   wirelog/exec_plan_gen.c   analysed only with ENABLE_K_FUSION at 1, the
+#                             #ifndef default at :43-44, because the
+#                             database entry carries no -DENABLE_K_FUSION.
+#                             Every #if ENABLE_K_FUSION guard in the file
+#                             (e.g. :1866) has an arm that is never seen,
+#                             and the ENABLE_K_FUSION=0 variant that
+#                             bench_flowlog_seq builds
+#                             (bench/meson.build:126) is never analysed.
+#   wirelog/columnar/relation.c
+#                             analysed only with WL_RADIX_BENCH undefined,
+#                             so every #ifdef WL_RADIX_BENCH region in the
+#                             file (e.g. :56) is invisible here.  The macro
+#                             is set only by bench/meson.build:109.
+#
+# The line references above are examples, NOT an enumeration -- both files
+# carry several such guards.  Please keep it that way: an exhaustive list
+# would go stale on the next edit to either file with nothing to catch it.
+#
+# Covering both configurations needs a second scan pass; tracked as #1115.
+wirelog/api_facade.c
+wirelog/arena/arena.c
+wirelog/arena/compound_arena.c
+wirelog/columnar/arithmetic.c
+wirelog/columnar/cache.c
+wirelog/columnar/compound_side.c
+wirelog/columnar/delta_pool.c
+wirelog/columnar/diff.c
+wirelog/columnar/diff_arrangement.c
+wirelog/columnar/diff_bridge.c
+wirelog/columnar/diff_trace.c
+wirelog/columnar/diff_vtable.c
+wirelog/columnar/eval_dedup.c
+wirelog/columnar/eval_stack.c
+wirelog/columnar/eval_tdd_plan.c
+wirelog/columnar/filter.c
+wirelog/columnar/frontier.c
+wirelog/columnar/frontier_epoch.c
+wirelog/columnar/handle_remap.c
+wirelog/columnar/handle_remap_apply.c
+wirelog/columnar/handle_remap_apply_side.c
+wirelog/columnar/inline.c
+wirelog/columnar/lftj.c
+wirelog/columnar/mem_ledger.c
+wirelog/columnar/ops.c
+wirelog/columnar/partition.c
+wirelog/columnar/progress.c
+wirelog/columnar/relation.c
+wirelog/columnar/rotation_pinned.c
+wirelog/columnar/rotation_standard.c
+wirelog/columnar/session.c
+wirelog/columnar/session_hash.c
+wirelog/crc32.c
+wirelog/exec_plan_gen.c
+wirelog/intern.c
+wirelog/io/csv_adapter.c
+wirelog/io/csv_reader.c
+wirelog/io/io_adapter.c
+wirelog/io/io_ctx.c
+wirelog/ir/api.c
+wirelog/ir/ir.c
+wirelog/parser/ast.c
+wirelog/parser/lexer.c
+wirelog/parser/parser.c
+wirelog/passes/fusion.c
+wirelog/passes/magic_sets.c
+wirelog/passes/sip.c
+wirelog/passes/subsumption.c
+wirelog/session.c
+wirelog/session_facts.c
+wirelog/string_ops.c
+wirelog/thread_c11.c
+wirelog/util/lockfree_queue.c
+wirelog/util/log.c
+wirelog/util/log_emit.c
+wirelog/wirelog-easy.c
+wirelog/wirelog_advanced.c
+wirelog/workqueue.c

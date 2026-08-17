@@ -121,7 +121,12 @@ jobs:
       CC: sccache gcc
 
     steps:
+      # fetch-depth 0: the clang-tidy backlog monotonicity check below
+      # compares against the MERGE BASE with the base branch, and a shallow
+      # clone has none.  Matches rc-changelog-freeze and the uncrustify job.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -139,6 +144,68 @@ jobs:
 
       - name: Test
         run: meson test -C builddir --print-errorlogs
+
+      # =======================================================================
+      # Issue #1100: clang-tidy ratchet CI gate
+      #
+      # Installed AFTER the Test step on purpose: the tidy suite runs in a
+      # default `meson test` (there is no add_test_setup in this project), so
+      # having clang-tidy on PATH earlier would run the ~15 s scan twice.
+      # Without it there, the Test step reports the tidy tests as SKIPped and
+      # the dedicated step below runs them once with WIRELOG_TIDY_REQUIRED=1,
+      # which turns any skip into a failure.
+      #
+      # This is the only job that installs clang-tidy, so the ratchet's
+      # guarantee is Linux/gcc-configured-build only.  The other jobs
+      # (build-arm, build-matrix macOS + MSVC, build-mbedtls,
+      # sanitizer-matrix, tsan) skip it at runtime rather than reporting a
+      # verdict from a configuration the allowlist was not calibrated for.
+      # =======================================================================
+      - name: Install clang-tidy (pinned major)
+        run: |
+          major="$(grep -vE '^[[:space:]]*(#|$)' \
+                     scripts/ci/clang-tidy-supported-majors.txt | head -1)"
+          echo "Pinned clang-tidy major: $major"
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$major"
+          sudo apt-get install -y "clang-tidy-$major"
+          "clang-tidy-$major" --version
+
+      - name: clang-tidy ratchet gate
+        env:
+          WIRELOG_TIDY_REQUIRED: "1"
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          major="$(grep -vE '^[[:space:]]*(#|$)' \
+                     scripts/ci/clang-tidy-supported-majors.txt | head -1)"
+          export CLANG_TIDY="clang-tidy-$major"
+
+          # The backlog monotonicity check needs the base ref present as a
+          # remote-tracking ref so it can resolve a merge base.  The
+          # checkout above is full-depth, so this is normally a no-op; the
+          # `|| true` keeps a transient network blip from masking the real
+          # verdict with a bare `git fetch` exit code.
+          #
+          # If the ref still cannot be resolved, the check does NOT skip:
+          # WIRELOG_TIDY_REQUIRED=1 above turns every skip into a failure,
+          # deliberately, because a demotion guard that silently skips in CI
+          # is not a guard.  Expect a named failure, not a silent pass.
+          base="${GITHUB_BASE_REF:-main}"
+          git fetch --no-tags origin \
+            "$base:refs/remotes/origin/$base" || true
+          export WIRELOG_TIDY_BASE_REF="origin/$base"
+
+          meson test -C builddir --suite tidy --print-errorlogs || {
+            echo "=== clang-tidy ratchet failed. Context:"
+            echo "=== clang-tidy version:"
+            "$CLANG_TIDY" --version
+            echo "=== allowlist size: $(grep -cvE '^[[:space:]]*(#|$)' \
+              scripts/ci/clang-tidy-allowlist.txt)"
+            echo "=== backlog size:   $(grep -cvE '^[[:space:]]*(#|$)' \
+              scripts/ci/clang-tidy-backlog.txt)"
+            exit 1
+          }
 
       # =======================================================================
       # Issue #744: SBOM snapshot CI gate
