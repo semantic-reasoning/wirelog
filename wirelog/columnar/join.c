@@ -181,7 +181,7 @@ col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
         for (uint32_t c = 0; c < rel->ncols; c++)
             memcpy(new_cols[c], rel->columns[c],
                 sizeof(int64_t) * rel->nrows);
-        free(rel->columns);
+        free((void *)rel->columns);
         rel->columns = new_cols;
         rel->arena_owned = false;
     } else if (rel->columns) {
