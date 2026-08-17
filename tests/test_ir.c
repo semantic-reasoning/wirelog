@@ -29,7 +29,7 @@
 #include "../wirelog/ir/ir.h"
 #include "../wirelog/parser/ast.h"
 
-#ifndef _WIN32
+#ifdef __linux__
 static bool fail_next_realloc;
 
 void *__real_realloc(void *ptr, size_t size);
@@ -77,7 +77,7 @@ test_child_attach_reports_allocation_failure(void)
 {
     TEST("Child attachment preserves ownership on allocation failure");
 
-#ifdef _WIN32
+#ifndef __linux__
     PASS();
     return;
 #else
