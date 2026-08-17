@@ -357,7 +357,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * per iteration (14K+ iterations for CRDT). */
     uint32_t *snap = (uint32_t *)malloc(nrels * sizeof(uint32_t));
     if (!snap) {
-        free(delta_rels);
+        free((void *)delta_rels);
         return ENOMEM;
     }
 
@@ -797,7 +797,7 @@ stride_error:
             /* Issue #282: Restore diff_operators_active on error path */
             sess->diff_operators_active = saved_diff_operators_active;
             free(snap);
-            free(delta_rels);
+            free((void *)delta_rels);
             return outer_rc;
         }
 
@@ -855,7 +855,7 @@ stride_error:
                 col_rel_destroy(delta_rels[ri]);
         }
         free(snap);
-        free(delta_rels);
+        free((void *)delta_rels);
         return agg_rc;
     }
 
@@ -867,7 +867,7 @@ stride_error:
         session_remove_rel(sess, dname);
     }
     free(snap);
-    free(delta_rels);
+    free((void *)delta_rels);
     delta_pool_reset(sess->delta_pool);
     sess->rotation_ops->rotate_eval_arena(sess);
     col_mat_cache_clear(&sess->mat_cache);
@@ -1185,7 +1185,7 @@ col_eval_nonrecursive_relation_parallel(const wl_plan_relation_t *rp,
     nonrec_rule_worker_ctx_t *ctxs = (nonrec_rule_worker_ctx_t *)calloc(
         W, sizeof(nonrec_rule_worker_ctx_t));
     if (!worker_rels || !ctxs) {
-        free(worker_rels);
+        free((void *)worker_rels);
         free(ctxs);
         free(ops_copy);
         tdd_cleanup_workers(coord);
@@ -1332,10 +1332,10 @@ col_eval_nonrecursive_relation_parallel(const wl_plan_relation_t *rp,
                     for (uint32_t ri = 0; ri < coord->nrels + 1; ri++)
                         col_rel_destroy(worker_rels[w][ri]);
                 }
-                free(worker_rels[w]);
+                free((void *)worker_rels[w]);
             }
         }
-        free(worker_rels);
+        free((void *)worker_rels);
     }
     tdd_cleanup_workers(coord);
     if (!merge_started && rc == EOVERFLOW)
@@ -1439,7 +1439,7 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
                 /* Free any unowned partition slots on error */
                 for (uint32_t w = 0; w < W; w++)
                     col_rel_destroy(parts[w]); /* NULL-safe */
-                free(parts);
+                free((void *)parts);
             }
         }
 
@@ -1651,8 +1651,8 @@ cleanup:
                 col_rel_destroy(worker_rels[w][r]);
         }
         for (uint32_t w = 0; w < W; w++)
-            free(worker_rels[w]);
-        free(worker_rels);
+            free((void *)worker_rels[w]);
+        free((void *)worker_rels);
     }
     if (rc != 0)
         tdd_cleanup_workers(coord);
@@ -1756,7 +1756,7 @@ tdd_seed_global_read_initial_deltas(const wl_plan_stratum_t *sp,
         if (rc != 0) {
             for (uint32_t w = 0; w < W; w++)
                 col_rel_destroy(parts[w]);
-            free(parts);
+            free((void *)parts);
             return rc;
         }
 
@@ -1782,7 +1782,7 @@ tdd_seed_global_read_initial_deltas(const wl_plan_stratum_t *sp,
         }
         for (uint32_t w = 0; w < W; w++)
             col_rel_destroy(parts[w]);
-        free(parts);
+        free((void *)parts);
         if (rc != 0)
             return rc;
     }
@@ -3263,7 +3263,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                 }
                 for (uint32_t w = 0; w < W; w++)
                     col_rel_destroy(parts[w]);
-                free(parts);
+                free((void *)parts);
             }
         } else if (edb_part_name && rel->nrows > 0
             && strcmp(name, edb_part_name) == 0
@@ -3299,7 +3299,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                 }
                 for (uint32_t w = 0; w < W; w++)
                     col_rel_destroy(parts[w]);
-                free(parts);
+                free((void *)parts);
             }
         } else {
             /* Zero-copy EDB sharing: workers borrow the coordinator's
@@ -3874,7 +3874,7 @@ tdd_save_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
 fail:
     for (uint32_t ri = 0; ri < sp->relation_count; ri++)
         col_rel_destroy(saved[ri]);
-    free(saved);
+    free((void *)saved);
     return NULL;
 }
 
@@ -3927,7 +3927,7 @@ tdd_free_saved_coord_idb(const wl_plan_stratum_t *sp, col_rel_t **saved)
         return;
     for (uint32_t ri = 0; ri < sp->relation_count; ri++)
         col_rel_destroy(saved[ri]);
-    free(saved);
+    free((void *)saved);
 }
 
 /*
@@ -4083,7 +4083,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
         if (rc != 0) {
             for (uint32_t w = 0; w < W; w++)
                 col_rel_destroy(parts[w]);
-            free(parts);
+            free((void *)parts);
             col_rel_destroy(combined);
             return rc;
         }
@@ -4111,7 +4111,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             snap[w * nrels + ri] = widb ? widb->nrows : 0;
             col_rel_destroy(parts[w]);
         }
-        free(parts);
+        free((void *)parts);
         coord->tdd_exchange_scatter_ns += now_ns() - scatter_t0;
 
         /* Step 8: Broadcast combined_delta as $d$ via col_shared zero-copy */
@@ -4275,7 +4275,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         if (rc != 0) {
             for (uint32_t w = 0; w < W; w++)
                 col_rel_destroy(parts[w]);
-            free(parts);
+            free((void *)parts);
             return rc;
         }
 
@@ -4330,7 +4330,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
 
         for (uint32_t w = 0; w < W; w++)
             col_rel_destroy(parts[w]);
-        free(parts);
+        free((void *)parts);
         coord->tdd_exchange_scatter_ns += now_ns() - scatter_t0;
         if (rc != 0)
             return rc;
@@ -4494,7 +4494,7 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             }
             for (uint32_t w = 0; w < W; w++)
                 col_rel_destroy(parts[w]);
-            free(parts);
+            free((void *)parts);
             return rc;
         }
 
@@ -4520,7 +4520,7 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
         }
         for (uint32_t w = 0; w < W; w++)
             col_rel_destroy(parts[w]);
-        free(parts);
+        free((void *)parts);
         if (rc != 0)
             return rc;
     }
@@ -4958,7 +4958,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
             /* Reset worker contexts for this sub-pass (reuse allocation) */
             for (uint32_t w = 0; w < W; w++) {
-                memset(ctxs[w].delta_rels, 0, nrels * sizeof(col_rel_t *));
+                memset((void *)ctxs[w].delta_rels, 0,
+                    nrels * sizeof(col_rel_t *));
                 ctxs[w].sp = sp;
                 ctxs[w].worker_sess = &coord->tdd_workers[w];
                 ctxs[w].stratum_idx = stratum_idx;
@@ -5046,7 +5047,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
                     /* Clear and reconstruct from queue messages. */
                     for (uint32_t w = 0; w < W; w++)
-                        memset(ctxs[w].delta_rels, 0,
+                        memset((void *)ctxs[w].delta_rels, 0,
                             nrels * sizeof(col_rel_t *));
                     wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
                         ctxs, msgs, msg_count, W, nrels);
