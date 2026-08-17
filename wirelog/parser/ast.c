@@ -39,12 +39,12 @@ wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line,
     return node;
 }
 
-void
+int
 wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent,
     wl_parser_ast_node_t *child)
 {
     if (!parent || !child)
-        return;
+        return -1;
 
     if (parent->child_count >= parent->child_capacity) {
         uint32_t new_cap = parent->child_capacity == 0
@@ -53,12 +53,13 @@ wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent,
         wl_parser_ast_node_t **new_children = (wl_parser_ast_node_t **)realloc(
             (void *)parent->children, new_cap * sizeof(wl_parser_ast_node_t *));
         if (!new_children)
-            return;
+            return -1;
         parent->children = new_children;
         parent->child_capacity = new_cap;
     }
 
     parent->children[parent->child_count++] = child;
+    return 0;
 }
 
 static char *

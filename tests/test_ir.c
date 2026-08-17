@@ -27,6 +27,23 @@
 
 #include "../wirelog/wirelog-ir.h"
 #include "../wirelog/ir/ir.h"
+#include "../wirelog/parser/ast.h"
+
+#ifndef _WIN32
+static bool fail_next_realloc;
+
+void *__real_realloc(void *ptr, size_t size);
+
+void *
+__wrap_realloc(void *ptr, size_t size)
+{
+    if (fail_next_realloc) {
+        fail_next_realloc = false;
+        return NULL;
+    }
+    return __real_realloc(ptr, size);
+}
+#endif
 
 /* ======================================================================== */
 /* Test Helpers                                                             */
@@ -54,6 +71,84 @@ static int tests_failed = 0;
             tests_failed++;             \
             printf(" FAIL: %s\n", msg); \
         } while (0)
+
+static void
+test_child_attach_reports_allocation_failure(void)
+{
+    TEST("Child attachment preserves ownership on allocation failure");
+
+#ifdef _WIN32
+    PASS();
+    return;
+#else
+    wirelog_ir_node_t *node = wl_ir_node_create(WIRELOG_IR_JOIN);
+    wl_ir_expr_t *expr = wl_ir_expr_create(WL_IR_EXPR_ARITH);
+    wl_parser_ast_node_t *ast
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_PROGRAM, 1, 1);
+    if (!node || !expr || !ast) {
+        wl_ir_node_free(node);
+        wl_ir_expr_free(expr);
+        wl_parser_ast_node_free(ast);
+        FAIL("failed to create attachment test roots");
+        return;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (wl_ir_node_add_child(node, wl_ir_node_create(WIRELOG_IR_SCAN)) != 0
+            || wl_ir_expr_add_child(expr,
+            wl_ir_expr_create(WL_IR_EXPR_VAR)) != 0
+            || wl_parser_ast_node_add_child(ast,
+            wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, 1,
+            1)) != 0) {
+            wl_ir_node_free(node);
+            wl_ir_expr_free(expr);
+            wl_parser_ast_node_free(ast);
+            FAIL("failed to populate attachment test roots");
+            return;
+        }
+    }
+
+    wirelog_ir_node_t *node_child = wl_ir_node_create(WIRELOG_IR_SCAN);
+    wl_ir_expr_t *expr_child = wl_ir_expr_create(WL_IR_EXPR_VAR);
+    wl_parser_ast_node_t *ast_child
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, 1, 1);
+    if (!node_child || !expr_child || !ast_child) {
+        wl_ir_node_free(node_child);
+        wl_ir_expr_free(expr_child);
+        wl_parser_ast_node_free(ast_child);
+        wl_ir_node_free(node);
+        wl_ir_expr_free(expr);
+        wl_parser_ast_node_free(ast);
+        FAIL("failed to create unattached children");
+        return;
+    }
+
+    fail_next_realloc = true;
+    int node_result = wl_ir_node_add_child(node, node_child);
+    bool node_preserved = node_result == -1 && node->child_count == 4;
+
+    fail_next_realloc = true;
+    int expr_result = wl_ir_expr_add_child(expr, expr_child);
+    bool expr_preserved = expr_result == -1 && expr->child_count == 4;
+
+    fail_next_realloc = true;
+    int ast_result = wl_parser_ast_node_add_child(ast, ast_child);
+    bool ast_preserved = ast_result == -1 && ast->child_count == 4;
+
+    wl_ir_node_free(node);
+    wl_ir_expr_free(expr);
+    wl_parser_ast_node_free(ast);
+    wl_ir_node_free(node_child);
+    wl_ir_expr_free(expr_child);
+    wl_parser_ast_node_free(ast_child);
+
+    if (!node_preserved || !expr_preserved || !ast_preserved) {
+        FAIL("attachment failure changed parent ownership or child count");
+        return;
+    }
+    PASS();
+#endif
+}
 
 /* ======================================================================== */
 /* IR Node Creation Tests                                                   */
@@ -1044,6 +1139,7 @@ main(void)
     test_expr_string_constant();
     test_expr_bool();
     test_expr_aggregate();
+    test_child_attach_reports_allocation_failure();
 
     /* Public API */
     test_get_child_out_of_bounds();

@@ -828,8 +828,20 @@ build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
             }
         }
 
-        wl_ir_node_add_child(join, current);
-        wl_ir_node_add_child(join, scan);
+        if (wl_ir_node_add_child(join, current) != 0) {
+            wl_ir_node_free(join);
+            wl_ir_node_free(scan);
+            wl_ir_node_free(current);
+            return NULL;
+        }
+        if (wl_ir_node_add_child(join, scan) != 0) {
+            join->children[0] = NULL;
+            join->child_count = 0;
+            wl_ir_node_free(join);
+            wl_ir_node_free(scan);
+            wl_ir_node_free(current);
+            return NULL;
+        }
         current = join;
 
         /* Add this prefix atom's variables to the bound set */
@@ -871,7 +883,11 @@ build_demand_rule_ir(const char *body_magic_name, const char *guard_magic_name,
         }
     }
 
-    wl_ir_node_add_child(root, current);
+    if (wl_ir_node_add_child(root, current) != 0) {
+        wl_ir_node_free(root);
+        wl_ir_node_free(current);
+        return NULL;
+    }
     return root;
 }
 
@@ -992,8 +1008,18 @@ insert_magic_guard(wirelog_ir_node_t *ir_root, const char *magic_name,
     /* Left-deep: the composite body stays on the left, where the plan can
      * express it as a subtree.  The right child must be a single relation
      * (Issue #989). */
-    wl_ir_node_add_child(guard_join, body);       /* left: original body */
-    wl_ir_node_add_child(guard_join, magic_scan); /* right: magic demand */
+    if (wl_ir_node_add_child(guard_join, body) != 0) {
+        wl_ir_node_free(guard_join);
+        wl_ir_node_free(magic_scan);
+        return MS_GUARD_ERROR;
+    }
+    if (wl_ir_node_add_child(guard_join, magic_scan) != 0) {
+        guard_join->children[0] = NULL;
+        guard_join->child_count = 0;
+        wl_ir_node_free(guard_join);
+        wl_ir_node_free(magic_scan);
+        return MS_GUARD_ERROR;
+    }
 
     /* Replace body in parent */
     ir_root->children[0] = guard_join;

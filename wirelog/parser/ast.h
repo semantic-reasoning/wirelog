@@ -122,7 +122,10 @@ wl_parser_ast_node_t *
 wl_parser_ast_node_create(wl_parser_ast_node_type_t type, uint32_t line,
     uint32_t col);
 
-void
+/* Returns 0 after ownership transfers to @child's parent, or -1 when either
+ * argument is NULL or the child-array growth allocation fails.  On failure,
+ * the caller retains ownership of @child. */
+int
 wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent,
     wl_parser_ast_node_t *child);
 

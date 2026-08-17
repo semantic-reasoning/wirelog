@@ -236,7 +236,10 @@ insert_semijoins_in_chain(wirelog_ir_node_t *join_root)
          * wrapper inserted by JPP — we preserve it intact so column
          * indices remain correct for downstream operators).
          */
-        wl_ir_node_add_child(sj, left);
+        if (wl_ir_node_add_child(sj, left) != 0) {
+            wl_ir_node_free(sj);
+            return -1;
+        }
 
         /* SEMIJOIN child[1] = clone of right SCAN (for relation name) */
         wirelog_ir_node_t *scan_clone = clone_scan_metadata(right);
@@ -247,7 +250,13 @@ insert_semijoins_in_chain(wirelog_ir_node_t *join_root)
             wl_ir_node_free(sj);
             return -1;
         }
-        wl_ir_node_add_child(sj, scan_clone);
+        if (wl_ir_node_add_child(sj, scan_clone) != 0) {
+            sj->children[0] = NULL;
+            sj->child_count = 0;
+            wl_ir_node_free(sj);
+            wl_ir_node_free(scan_clone);
+            return -1;
+        }
 
         /* Re-point parent JOIN's left child to the SEMIJOIN */
         node->children[0] = sj;

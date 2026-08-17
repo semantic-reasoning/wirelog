@@ -161,7 +161,10 @@ wirelog_ir_node_t *
 wl_ir_node_create(wirelog_ir_node_type_t type);
 void
 wl_ir_node_set_relation(wirelog_ir_node_t *node, const char *name);
-void
+/* Returns 0 after ownership transfers to @child's parent, or -1 when either
+ * argument is NULL or the child-array growth allocation fails.  On failure,
+ * the caller retains ownership of @child. */
+int
 wl_ir_node_add_child(wirelog_ir_node_t *node, wirelog_ir_node_t *child);
 void
 wl_ir_node_free(wirelog_ir_node_t *node);
@@ -172,7 +175,10 @@ wl_ir_node_free(wirelog_ir_node_t *node);
 
 wl_ir_expr_t *
 wl_ir_expr_create(wl_ir_expr_type_t type);
-void
+/* Returns 0 after ownership transfers to @child's parent, or -1 when either
+ * argument is NULL or the child-array growth allocation fails.  On failure,
+ * the caller retains ownership of @child. */
+int
 wl_ir_expr_add_child(wl_ir_expr_t *parent, wl_ir_expr_t *child);
 void
 wl_ir_expr_free(wl_ir_expr_t *expr);

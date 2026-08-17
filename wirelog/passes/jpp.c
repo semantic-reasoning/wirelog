@@ -866,7 +866,10 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
 
                     /* Insert: parent_join->children[0] = proj,
                      *          proj->child = current_join */
-                    wl_ir_node_add_child(proj, joins[i]);
+                    if (wl_ir_node_add_child(proj, joins[i]) != 0) {
+                        wl_ir_node_free(proj);
+                        continue;
+                    }
                     joins[i + 1]->children[0] = proj;
 
                     /* Update acc to reflect projection */

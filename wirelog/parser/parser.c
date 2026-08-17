@@ -87,6 +87,25 @@ parser_error(wl_parser_t *parser, const char *msg)
         wl_parser_lexer_token_type_str(parser->current.type));
 }
 
+static bool
+parser_add_child(wl_parser_t *parser, wl_parser_ast_node_t *parent,
+    wl_parser_ast_node_t *child)
+{
+    if (wl_parser_ast_node_add_child(parent, child) == 0)
+        return true;
+    wl_parser_ast_node_free(child);
+    parser_error(parser, "out of memory while adding a parser tree child");
+    return false;
+}
+
+#define PARSER_ADD_CHILD_OR_RETURN(parent, child) \
+        do { \
+            if (!parser_add_child(parser, (parent), (child))) { \
+                wl_parser_ast_node_free(parent); \
+                return NULL; \
+            } \
+        } while (0)
+
 /* ======================================================================== */
 /* Token Consumption                                                        */
 /* ======================================================================== */
@@ -370,7 +389,7 @@ parse_string_fn_expr(wl_parser_t *parser)
             wl_parser_ast_node_free(node);
             return NULL;
         }
-        wl_parser_ast_node_add_child(node, arg);
+        PARSER_ADD_CHILD_OR_RETURN(node, arg);
 
         while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
             arg = parse_arithmetic_expr(parser);
@@ -378,7 +397,7 @@ parse_string_fn_expr(wl_parser_t *parser)
                 wl_parser_ast_node_free(node);
                 return NULL;
             }
-            wl_parser_ast_node_add_child(node, arg);
+            PARSER_ADD_CHILD_OR_RETURN(node, arg);
         }
     }
 
@@ -483,8 +502,8 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         bin->arith_op = op;
-        wl_parser_ast_node_add_child(bin, left_arg);
-        wl_parser_ast_node_add_child(bin, right_arg);
+        PARSER_ADD_CHILD_OR_RETURN(bin, left_arg);
+        PARSER_ADD_CHILD_OR_RETURN(bin, right_arg);
         return bin;
     }
 
@@ -506,7 +525,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_BNOT;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -528,7 +547,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_HASH;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -550,7 +569,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_MD5;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -572,7 +591,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_SHA1;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -594,7 +613,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_SHA256;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -616,7 +635,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_SHA512;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -649,8 +668,8 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *node = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         node->arith_op = WIRELOG_ARITH_HMAC_SHA256;
-        wl_parser_ast_node_add_child(node, msg);
-        wl_parser_ast_node_add_child(node, key);
+        PARSER_ADD_CHILD_OR_RETURN(node, msg);
+        PARSER_ADD_CHILD_OR_RETURN(node, key);
         return node;
     }
 
@@ -672,7 +691,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_CRC32_ETH;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -694,7 +713,7 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *unary = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         unary->arith_op = WIRELOG_ARITH_CRC32_CAST;
-        wl_parser_ast_node_add_child(unary, arg);
+        PARSER_ADD_CHILD_OR_RETURN(unary, arg);
         return unary;
     }
 
@@ -745,8 +764,8 @@ parse_factor(wl_parser_t *parser)
         wl_parser_ast_node_t *node = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         node->arith_op = WIRELOG_ARITH_UUID5;
-        wl_parser_ast_node_add_child(node, ns);
-        wl_parser_ast_node_add_child(node, name);
+        PARSER_ADD_CHILD_OR_RETURN(node, ns);
+        PARSER_ADD_CHILD_OR_RETURN(node, name);
         return node;
     }
 
@@ -829,8 +848,8 @@ parse_arithmetic_expr(wl_parser_t *parser)
         wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
         bin->arith_op = op;
-        wl_parser_ast_node_add_child(bin, left);
-        wl_parser_ast_node_add_child(bin, right);
+        PARSER_ADD_CHILD_OR_RETURN(bin, left);
+        PARSER_ADD_CHILD_OR_RETURN(bin, right);
         left = bin;
     }
 
@@ -890,7 +909,7 @@ parse_aggregate_expr(wl_parser_t *parser)
     wl_parser_ast_node_t *agg
         = wl_parser_ast_node_create(WL_PARSER_AST_NODE_AGGREGATE, line, col);
     agg->agg_fn = fn;
-    wl_parser_ast_node_add_child(agg, expr);
+    PARSER_ADD_CHILD_OR_RETURN(agg, expr);
     return agg;
 }
 
@@ -975,7 +994,7 @@ parse_compound_term(wl_parser_t *parser, uint32_t depth)
         wl_parser_ast_node_free(compound);
         return NULL;
     }
-    wl_parser_ast_node_add_child(compound, arg);
+    PARSER_ADD_CHILD_OR_RETURN(compound, arg);
 
     while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
         arg = parse_atom_arg_at_depth(parser, depth + 1);
@@ -983,7 +1002,7 @@ parse_compound_term(wl_parser_t *parser, uint32_t depth)
             wl_parser_ast_node_free(compound);
             return NULL;
         }
-        wl_parser_ast_node_add_child(compound, arg);
+        PARSER_ADD_CHILD_OR_RETURN(compound, arg);
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
@@ -1068,7 +1087,7 @@ parse_atom(wl_parser_t *parser)
             wl_parser_ast_node_free(atom);
             return NULL;
         }
-        wl_parser_ast_node_add_child(atom, arg);
+        PARSER_ADD_CHILD_OR_RETURN(atom, arg);
 
         while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
             arg = parse_atom_arg(parser);
@@ -1076,7 +1095,7 @@ parse_atom(wl_parser_t *parser)
                 wl_parser_ast_node_free(atom);
                 return NULL;
             }
-            wl_parser_ast_node_add_child(atom, arg);
+            PARSER_ADD_CHILD_OR_RETURN(atom, arg);
         }
     }
 
@@ -1158,7 +1177,7 @@ parse_predicate(wl_parser_t *parser)
 
         wl_parser_ast_node_t *neg
             = wl_parser_ast_node_create(WL_PARSER_AST_NODE_NEGATION, line, col);
-        wl_parser_ast_node_add_child(neg, atom);
+        PARSER_ADD_CHILD_OR_RETURN(neg, atom);
         return neg;
     }
 
@@ -1191,8 +1210,8 @@ parse_predicate(wl_parser_t *parser)
             wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
                 WL_PARSER_AST_NODE_BINARY_EXPR, op_line, op_col);
             bin->arith_op = op;
-            wl_parser_ast_node_add_child(bin, left);
-            wl_parser_ast_node_add_child(bin, right_factor);
+            PARSER_ADD_CHILD_OR_RETURN(bin, left);
+            PARSER_ADD_CHILD_OR_RETURN(bin, right_factor);
             left = bin;
         }
 
@@ -1216,8 +1235,8 @@ parse_predicate(wl_parser_t *parser)
         wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
         cmp->cmp_op = cmp_op;
-        wl_parser_ast_node_add_child(cmp, left);
-        wl_parser_ast_node_add_child(cmp, right);
+        PARSER_ADD_CHILD_OR_RETURN(cmp, left);
+        PARSER_ADD_CHILD_OR_RETURN(cmp, right);
         return cmp;
     }
 
@@ -1249,8 +1268,8 @@ parse_predicate(wl_parser_t *parser)
         wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
         cmp->cmp_op = cmp_op;
-        wl_parser_ast_node_add_child(cmp, left);
-        wl_parser_ast_node_add_child(cmp, right);
+        PARSER_ADD_CHILD_OR_RETURN(cmp, left);
+        PARSER_ADD_CHILD_OR_RETURN(cmp, right);
         return cmp;
     }
 
@@ -1280,8 +1299,8 @@ parse_predicate(wl_parser_t *parser)
         wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
         cmp->cmp_op = cmp_op;
-        wl_parser_ast_node_add_child(cmp, left);
-        wl_parser_ast_node_add_child(cmp, right);
+        PARSER_ADD_CHILD_OR_RETURN(cmp, left);
+        PARSER_ADD_CHILD_OR_RETURN(cmp, right);
         return cmp;
     }
 
@@ -1307,8 +1326,8 @@ parse_predicate(wl_parser_t *parser)
             wl_parser_ast_node_t *cmp = wl_parser_ast_node_create(
                 WL_PARSER_AST_NODE_COMPARISON, cmp_line, cmp_col);
             cmp->cmp_op = cmp_op;
-            wl_parser_ast_node_add_child(cmp, left);
-            wl_parser_ast_node_add_child(cmp, right);
+            PARSER_ADD_CHILD_OR_RETURN(cmp, left);
+            PARSER_ADD_CHILD_OR_RETURN(cmp, right);
             return cmp;
         }
 
@@ -1352,7 +1371,7 @@ parse_head(wl_parser_t *parser)
             wl_parser_ast_node_free(head);
             return NULL;
         }
-        wl_parser_ast_node_add_child(head, arg);
+        PARSER_ADD_CHILD_OR_RETURN(head, arg);
 
         while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
             arg = parse_head_arg(parser);
@@ -1360,7 +1379,7 @@ parse_head(wl_parser_t *parser)
                 wl_parser_ast_node_free(head);
                 return NULL;
             }
-            wl_parser_ast_node_add_child(head, arg);
+            PARSER_ADD_CHILD_OR_RETURN(head, arg);
         }
     }
 
@@ -1383,6 +1402,11 @@ parse_fact(wl_parser_t *parser, wl_parser_ast_node_t *head)
     /* Convert HEAD node to FACT node, reusing name and children */
     wl_parser_ast_node_t *fact = wl_parser_ast_node_create(
         WL_PARSER_AST_NODE_FACT, head->line, head->col);
+    if (!fact) {
+        parser_error(parser, "out of memory while creating fact");
+        wl_parser_ast_node_free(head);
+        return NULL;
+    }
     fact->name = head->name;
     head->name = NULL;
 
@@ -1441,7 +1465,7 @@ parse_rule_or_fact(wl_parser_t *parser)
 
     wl_parser_ast_node_t *rule
         = wl_parser_ast_node_create(WL_PARSER_AST_NODE_RULE, line, col);
-    wl_parser_ast_node_add_child(rule, head);
+    PARSER_ADD_CHILD_OR_RETURN(rule, head);
 
     /* Parse body predicates */
     wl_parser_ast_node_t *pred = parse_predicate(parser);
@@ -1449,7 +1473,7 @@ parse_rule_or_fact(wl_parser_t *parser)
         wl_parser_ast_node_free(rule);
         return NULL;
     }
-    wl_parser_ast_node_add_child(rule, pred);
+    PARSER_ADD_CHILD_OR_RETURN(rule, pred);
 
     while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
         pred = parse_predicate(parser);
@@ -1457,7 +1481,7 @@ parse_rule_or_fact(wl_parser_t *parser)
             wl_parser_ast_node_free(rule);
             return NULL;
         }
-        wl_parser_ast_node_add_child(rule, pred);
+        PARSER_ADD_CHILD_OR_RETURN(rule, pred);
     }
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_DOT,
@@ -1531,7 +1555,7 @@ parse_declaration(wl_parser_t *parser)
                 WL_PARSER_AST_NODE_TYPED_PARAM, attr_line, attr_col);
             param->name = attr_name;
             param->type_name = type_name;
-            wl_parser_ast_node_add_child(decl, param);
+            PARSER_ADD_CHILD_OR_RETURN(decl, param);
 
             if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
                 break;
@@ -1582,7 +1606,7 @@ parse_input_directive(wl_parser_t *parser)
                 WL_PARSER_AST_NODE_INPUT_PARAM, p_line, p_col);
             param->name = strdup_safe("filename");
             param->str_value = token_to_str_value(&parser->previous);
-            wl_parser_ast_node_add_child(input, param);
+            PARSER_ADD_CHILD_OR_RETURN(input, param);
             /* Allow trailing key=value params after positional */
             if (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)
                 && parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
@@ -1622,7 +1646,7 @@ input_kv_params:
                     WL_PARSER_AST_NODE_INPUT_PARAM, p_line, p_col);
                 param->name = param_name;
                 param->str_value = param_value;
-                wl_parser_ast_node_add_child(input, param);
+                PARSER_ADD_CHILD_OR_RETURN(input, param);
 
                 if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
                     break;
@@ -1667,7 +1691,7 @@ parse_output_directive(wl_parser_t *parser)
                     WL_PARSER_AST_NODE_OUTPUT_PARAM, p_line, p_col);
                 param->name = strdup_safe("filename");
                 param->str_value = token_to_str_value(&parser->previous);
-                wl_parser_ast_node_add_child(output, param);
+                PARSER_ADD_CHILD_OR_RETURN(output, param);
                 /* Allow trailing key=value params after positional */
                 if (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)
                     && parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
@@ -1708,7 +1732,7 @@ output_kv_params:
                         WL_PARSER_AST_NODE_OUTPUT_PARAM, p_line, p_col);
                     param->name = param_name;
                     param->str_value = param_value;
-                    wl_parser_ast_node_add_child(output, param);
+                    PARSER_ADD_CHILD_OR_RETURN(output, param);
 
                     if (!parser_match(parser, WL_PARSER_LEXER_TOK_COMMA))
                         break;
@@ -1860,7 +1884,7 @@ parse_program(wl_parser_t *parser)
         }
 
         if (node) {
-            wl_parser_ast_node_add_child(program, node);
+            PARSER_ADD_CHILD_OR_RETURN(program, node);
         } else if (parser->had_error) {
             wl_parser_ast_node_free(program);
             return NULL;

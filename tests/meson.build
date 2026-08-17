@@ -91,6 +91,8 @@ test_ir_exe = executable(
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
+  link_args: host_machine.system() == 'windows' ? [] : ['-Wl,--wrap=realloc'],
+  override_options: ['b_lto=false'],
 )
 
 test_program_exe = executable(
