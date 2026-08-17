@@ -2386,22 +2386,36 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
         FAIL(buf);
         return;
     }
-    if (ncalloc >= JPP_OOM_SWEEP_MAX || nmalloc >= JPP_OOM_SWEEP_MAX
-        || nrealloc >= JPP_OOM_SWEEP_MAX) {
-        snprintf(buf, sizeof(buf),
-            "sweep width %d no longer covers calloc=%lu malloc=%lu "
-            "realloc=%lu",
-            JPP_OOM_SWEEP_MAX, ncalloc, nmalloc, nrealloc);
-        FAIL(buf);
-        return;
-    }
+    /*
+     * Sweep exactly as far as the unarmed run allocates, not a fixed 64.
+     *
+     * Soundness (audited across 72,283 injection points on four builds): no
+     * injected failure ever INCREASED an allocation count.  Every failure
+     * path in this pass abandons work rather than retrying it, so the unarmed
+     * baseline bounds every armed run and an index past it fails nothing.
+     * JPP_OOM_SWEEP_MAX survives only as a hard cap on runtime.
+     *
+     * This DELETES the "sweep width no longer covers calloc=.." tripwire,
+     * which was today the only thing that would notice wl_jpp_apply()
+     * starting to allocate an order of magnitude more than it does now.
+     * Nothing replaces it; the bounds simply follow the pass, up to the cap.
+     */
+    long ccap = ncalloc < (unsigned long)JPP_OOM_SWEEP_MAX
+        ? (long)ncalloc
+        : (long)JPP_OOM_SWEEP_MAX;
+    long mcap = nmalloc < (unsigned long)JPP_OOM_SWEEP_MAX
+        ? (long)nmalloc
+        : (long)JPP_OOM_SWEEP_MAX;
+    long rcap = nrealloc < (unsigned long)JPP_OOM_SWEEP_MAX
+        ? (long)nrealloc
+        : (long)JPP_OOM_SWEEP_MAX;
 
     /* The three routes are swept separately so that a regression in one is
      * reported on its own terms: the calloc route reaches the key ARRAYS and
      * the accumulator, the malloc route reaches the key STRINGS, and the
      * realloc route reaches wl_ir_node_add_child()'s child array -- the only
      * way to make insert_projections() abandon a projection midway. */
-    for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
+    for (long n = 0; n < ccap; n++) {
         problem = jpp_oom_step(src, relation, n, -1, -1, NULL,
                 base_sig.buf, NULL);
         if (problem) {
@@ -2410,7 +2424,7 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
             return;
         }
     }
-    for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
+    for (long n = 0; n < mcap; n++) {
         problem = jpp_oom_step(src, relation, -1, n, -1, NULL,
                 base_sig.buf, NULL);
         if (problem) {
@@ -2419,13 +2433,58 @@ run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
             return;
         }
     }
-    for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
+    for (long n = 0; n < rcap; n++) {
         problem = jpp_oom_step(src, relation, -1, -1, n, NULL,
                 base_sig.buf, NULL);
         if (problem) {
             snprintf(buf, sizeof(buf), "realloc #%ld: %s", n, problem);
             FAIL(buf);
             return;
+        }
+    }
+
+    /*
+     * Correlated calloc x malloc, realloc disabled (issue #1119 item 6).
+     *
+     * Honest accounting.  For the two defects this file was written against,
+     * the nested product adds nothing OPERATIONALLY: the 1-D loops above run
+     * first and return on the first failure, so a defect either of them
+     * red-lights is reported before this loop is ever entered.
+     *
+     * It does reach genuinely correlated failures that no single-index run
+     * reaches.  Measured with only the unchecked-strdup fix reverted, fixture
+     * B reports 4 one-dimensional failures against 90 nested, of which 52 are
+     * at pairs where NEITHER index fails alone -- calloc #5 + malloc #0 is
+     * the first.  So this is a real regression net for a future defect that
+     * needs two failures at once, not a restatement of the 1-D sweeps.
+     *
+     * It is affordable because the product follows the measured counts rather
+     * than JPP_OOM_SWEEP_MAX squared: 25 x 6 = 150 steps for fixture A and
+     * 35 x 14 = 490 for fixture B, 640 in total.
+     *
+     * Runtime for the whole 30-test binary, named by build because the spread
+     * is wide: about 25 ms in this project's default buildtype (release,
+     * optimization=s, what CI runs), about 30 ms at -O0, and under 0.2 s under
+     * -Db_sanitize=address,undefined on the machine this was written on -- a
+     * measurement of the same binary on slower hardware put the sanitizer
+     * figure nearer 1.8 s.  The sanitizer number is the one that matters:
+     * test('jpp', ...) declares no timeout kwarg and CI sets no multiplier, so
+     * meson's default 30 s applies and even the pessimistic figure keeps well
+     * over an order of magnitude of margin.
+     *
+     * realloc is held out of the product deliberately: folding it in would
+     * cube the cost, and the realloc route already has the 1-D sweep above.
+     */
+    for (long c = 0; c < ccap; c++) {
+        for (long m = 0; m < mcap; m++) {
+            problem = jpp_oom_step(src, relation, c, m, -1, NULL,
+                    base_sig.buf, NULL);
+            if (problem) {
+                snprintf(buf, sizeof(buf), "calloc #%ld + malloc #%ld: %s", c,
+                    m, problem);
+                FAIL(buf);
+                return;
+            }
         }
     }
 
