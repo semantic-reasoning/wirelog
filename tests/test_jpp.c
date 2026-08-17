@@ -12,9 +12,93 @@
 #include "../wirelog/wirelog-parser.h"
 
 #include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ======================================================================== */
+/* Allocator interposition for the JPP OOM sweeps (Issue #1111)             */
+/* ======================================================================== */
+
+/*
+ * jpp.c must be all-or-nothing per join chain: an allocation failure inside
+ * wl_jpp_apply() may leave a plan unoptimized, but must never leave a JOIN
+ * node carrying keys that do not describe the join it sits on.  The failure
+ * the issue names is a JOIN left with ZERO keys, which exec_plan_gen.c runs
+ * as a cross product -- wrong answers, exit status 0.
+ *
+ * Reaching those paths needs allocator interposition, so tests/meson.build
+ * links this binary with --wrap=calloc AND --wrap=malloc.  Both are needed:
+ * the key arrays come from calloc, but the key STRINGS come from
+ * strdup_safe(), which uses malloc (wirelog/ir/ir.c).  A calloc-only sweep
+ * can never exercise the unchecked strdup path, and that path is not merely
+ * "a different failure mode": exec_plan_gen.c's resolve_key_to_colN() falls
+ * back to column 0 when a key name is NULL, so a NULL key silently produces
+ * a WRONG join rather than a cross product.
+ *
+ * The wrap must be paired with b_lto=false in tests/meson.build.  Under
+ * -flto the wrappers are never reached and no diagnostic is emitted.
+ */
+
+#ifdef __linux__
+
+static bool jpp_oom_armed;
+static long jpp_calloc_countdown = -1; /* < 0: count but never fail */
+static long jpp_malloc_countdown = -1;
+static unsigned long jpp_calloc_calls;
+static unsigned long jpp_malloc_calls;
+
+void *__real_calloc(size_t nmemb, size_t size);
+void *__real_malloc(size_t size);
+
+void *
+__wrap_calloc(size_t nmemb, size_t size)
+{
+    if (jpp_oom_armed) {
+        jpp_calloc_calls++;
+        if (jpp_calloc_countdown >= 0 && jpp_calloc_countdown-- == 0)
+            return NULL;
+    }
+    return __real_calloc(nmemb, size);
+}
+
+void *
+__wrap_malloc(size_t size)
+{
+    if (jpp_oom_armed) {
+        jpp_malloc_calls++;
+        if (jpp_malloc_countdown >= 0 && jpp_malloc_countdown-- == 0)
+            return NULL;
+    }
+    return __real_malloc(size);
+}
+
+/*
+ * Arm the countdowns.  A negative countdown counts calls without failing
+ * any.  Arming is scoped to the wl_jpp_apply() call itself so that parsing
+ * and program construction never see a failing allocator.
+ */
+static void
+jpp_oom_arm(long calloc_nth, long malloc_nth)
+{
+    jpp_calloc_countdown = calloc_nth;
+    jpp_malloc_countdown = malloc_nth;
+    jpp_calloc_calls = 0;
+    jpp_malloc_calls = 0;
+    jpp_oom_armed = true;
+}
+
+static void
+jpp_oom_disarm(void)
+{
+    jpp_oom_armed = false;
+    jpp_calloc_countdown = -1;
+    jpp_malloc_countdown = -1;
+}
+
+#endif /* __linux__ */
 
 /* ======================================================================== */
 /* Test Helpers                                                             */
@@ -1740,6 +1824,353 @@ test_jpp_wide_head_antijoin_key(void)
 }
 
 /* ======================================================================== */
+/* OOM sweep over wl_jpp_apply (Issue #1111)                                */
+/* ======================================================================== */
+
+/*
+ * TWO fixtures, and neither is redundant.  They share a body and differ only
+ * in how wide the head is, which decides whether insert_projections() fires.
+ * jpp.c builds join keys at two independent sites, and each fixture is the
+ * sole cover for one of them.  Measured, by reverting one site at a time
+ * against the finished fix:
+ *
+ *   - Revert only rebuild_chain() to destroy-then-allocate: BOTH fixtures
+ *     fail at calloc #9, "1 of 3 join(s) have zero keys (cross product)".
+ *   - Revert only the key recomputation above an inserted projection in
+ *     insert_projections(): Fixture A PASSES and Fixture B fails at
+ *     calloc #27, same message.
+ *
+ * So dropping Fixture B would silently retire all coverage of the second
+ * site.  Fixture A is kept because it isolates the issue's named defect to
+ * rebuild_chain() alone: with no PROJECT in the tree, a zero-key JOIN cannot
+ * be blamed on, or repaired by, insert_projections().
+ *
+ * Connectivity is equally load-bearing: a, b, c and d form a single connected
+ * conjunct (x-y, y-w, w-v, v-z), so every JOIN in the rebuilt chain shares at
+ * least one variable with its accumulated left side and a zero-key JOIN is
+ * therefore always a defect here.  For a DISCONNECTED rule a zero-key JOIN is
+ * the CORRECT answer -- a cross product is what a disconnected conjunct means
+ * -- so that assertion would be wrong on correct code.
+ *
+ * The body order (a, d, c, b) is deliberately non-optimal so that greedy_order
+ * reports a change and rebuild_chain() actually runs.
+ */
+#define JPP_OOM_DECLS              \
+        ".decl a(x: int32, y: int32)\n" \
+        ".decl b(y: int32, w: int32)\n" \
+        ".decl c(w: int32, v: int32)\n" \
+        ".decl d(v: int32, z: int32)\n"
+
+/* Everything from here to the sweep driver is Linux-only: without --wrap
+ * there is nothing to drive it, and leaving the helpers defined elsewhere
+ * would break the macOS and MSVC builds on -Wunused-function. */
+#ifdef __linux__
+
+/* Fixture A -- every body variable is live in the head, so no PROJECT is
+ * inserted and rebuild_chain() is the only key-building site in play. */
+static const char *const JPP_OOM_SRC_ALL_LIVE = JPP_OOM_DECLS
+    ".decl p(x: int32, y: int32, w: int32, v: int32, z: int32)\n"
+    "p(x, y, w, v, z) :- a(x, y), d(v, z), c(w, v), b(y, w).\n";
+
+/* Fixture B -- same body, narrow head, so intermediate PROJECTs ARE inserted.
+ * This is the one that reaches the second build-then-install site, the key
+ * recomputation above an inserted projection in insert_projections(). */
+static const char *const JPP_OOM_SRC_PROJECTED = JPP_OOM_DECLS
+    ".decl q(x: int32, z: int32)\n"
+    "q(x, z) :- a(x, y), d(v, z), c(w, v), b(y, w).\n";
+
+#define JPP_OOM_MAX_JOINS 16
+#define JPP_OOM_SWEEP_MAX 64
+
+typedef struct {
+    const wirelog_ir_node_t *node;
+    const wirelog_ir_node_t *child0;
+    const wirelog_ir_node_t *child1;
+} jpp_join_snapshot_t;
+
+/*
+ * Look through any PROJECT wrapper.  insert_projections() legitimately
+ * splices a PROJECT between two JOINs, which is a structural change that is
+ * NOT a reorder; comparing raw child pointers would read it as one.  Only
+ * the operand underneath tells us whether rebuild_chain() committed.
+ */
+static const wirelog_ir_node_t *
+strip_projects(const wirelog_ir_node_t *node)
+{
+    while (node && node->type == WIRELOG_IR_PROJECT && node->child_count > 0)
+        node = node->children[0];
+    return node;
+}
+
+static uint32_t
+snapshot_joins(const wirelog_ir_node_t *node, jpp_join_snapshot_t *out,
+    uint32_t max)
+{
+    if (!node || max == 0)
+        return 0;
+    uint32_t n = 0;
+    if (node->type == WIRELOG_IR_JOIN) {
+        out[0].node = node;
+        out[0].child0 = node->child_count > 0
+            ? strip_projects(node->children[0])
+            : NULL;
+        out[0].child1 = node->child_count > 1
+            ? strip_projects(node->children[1])
+            : NULL;
+        n = 1;
+    }
+    for (uint32_t i = 0; i < node->child_count && n < max; i++)
+        n += snapshot_joins(node->children[i], out + n, max - n);
+    return n;
+}
+
+/*
+ * Every JOIN reachable from @node is tallied into:
+ *   @zero_keys: JOINs left with no join key at all (the cross-product bug),
+ *   @null_elems: JOINs claiming N keys but holding a NULL name in [0, N)
+ *                (the wrong-column bug behind the unchecked strdup).
+ */
+static void
+tally_join_keys(const wirelog_ir_node_t *node, uint32_t *njoin,
+    uint32_t *zero_keys, uint32_t *null_elems)
+{
+    if (!node)
+        return;
+    if (node->type == WIRELOG_IR_JOIN) {
+        (*njoin)++;
+        if (node->join_key_count == 0) {
+            (*zero_keys)++;
+        } else if (!node->join_left_keys || !node->join_right_keys) {
+            (*null_elems)++;
+        } else {
+            for (uint32_t i = 0; i < node->join_key_count; i++) {
+                if (!node->join_left_keys[i] || !node->join_right_keys[i]) {
+                    (*null_elems)++;
+                    break;
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < node->child_count; i++)
+        tally_join_keys(node->children[i], njoin, zero_keys, null_elems);
+}
+
+/* True when no snapshotted JOIN has had either child pointer replaced. */
+static bool
+joins_children_unchanged(const wirelog_ir_node_t *ir,
+    const jpp_join_snapshot_t *before, uint32_t nbefore)
+{
+    jpp_join_snapshot_t after[JPP_OOM_MAX_JOINS];
+    uint32_t nafter = snapshot_joins(ir, after, JPP_OOM_MAX_JOINS);
+
+    if (nafter != nbefore)
+        return false;
+    for (uint32_t i = 0; i < nbefore; i++) {
+        bool matched = false;
+        for (uint32_t j = 0; j < nafter; j++) {
+            if (after[j].node != before[i].node)
+                continue;
+            matched = true;
+            if (after[j].child0 != before[i].child0
+                || after[j].child1 != before[i].child1)
+                return false;
+            break;
+        }
+        if (!matched)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * One sweep step.  Returns NULL when the invariants hold, otherwise a static
+ * description of the violation.  @fail_calloc / @fail_malloc select which
+ * allocation inside wl_jpp_apply() returns NULL (< 0 fails none).
+ */
+static const char *
+jpp_oom_step(const char *src, const char *relation, long fail_calloc,
+    long fail_malloc, wl_jpp_stats_t *out_stats)
+{
+    static char detail[192];
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return "parse failed";
+
+    wirelog_ir_node_t *ir = find_relation_ir(prog, relation);
+    if (!ir) {
+        wirelog_program_free(prog);
+        return "relation IR not found";
+    }
+
+    jpp_join_snapshot_t before[JPP_OOM_MAX_JOINS];
+    uint32_t nbefore = snapshot_joins(ir, before, JPP_OOM_MAX_JOINS);
+    if (nbefore != 3) {
+        wirelog_program_free(prog);
+        return "fixture no longer builds a 3-join chain";
+    }
+
+    wl_jpp_stats_t stats = { 0, 0, 0, 0 };
+    jpp_oom_arm(fail_calloc, fail_malloc);
+    int rc = wl_jpp_apply(prog, &stats);
+    jpp_oom_disarm();
+
+    const char *problem = NULL;
+
+    /* Unconditional, at every sweep index. */
+    if (rc != 0) {
+        snprintf(detail, sizeof(detail), "rc=%d (expected 0)", rc);
+        problem = detail;
+    }
+
+    uint32_t njoin = 0, zero_keys = 0, null_elems = 0;
+    if (!problem) {
+        tally_join_keys(ir, &njoin, &zero_keys, &null_elems);
+        if (njoin != nbefore) {
+            snprintf(detail, sizeof(detail), "join count %u -> %u", nbefore,
+                njoin);
+            problem = detail;
+        } else if (null_elems != 0) {
+            snprintf(detail, sizeof(detail),
+                "%u join(s) claim keys but hold a NULL key name", null_elems);
+            problem = detail;
+        }
+    }
+
+    /* Structural contract: the pass either declined outright, leaving every
+     * child pointer as it found it, or it committed a full rebuild, in which
+     * case every JOIN of this connected chain must carry keys. */
+    if (!problem) {
+        if (joins_children_unchanged(ir, before, nbefore)) {
+            if (stats.joins_reordered != 0) {
+                snprintf(detail, sizeof(detail),
+                    "chain untouched but joins_reordered=%u",
+                    stats.joins_reordered);
+                problem = detail;
+            }
+        } else if (stats.joins_reordered != 1) {
+            snprintf(detail, sizeof(detail),
+                "chain rewired but joins_reordered=%u",
+                stats.joins_reordered);
+            problem = detail;
+        } else if (zero_keys != 0) {
+            snprintf(detail, sizeof(detail),
+                "chain rebuilt but %u of %u join(s) have zero keys "
+                "(cross product)",
+                zero_keys, njoin);
+            problem = detail;
+        }
+    }
+
+    if (out_stats)
+        *out_stats = stats;
+    wirelog_program_free(prog);
+    return problem;
+}
+
+static void
+run_jpp_oom_sweep(const char *name, const char *src, const char *relation,
+    bool expect_projections)
+{
+    TEST(name);
+
+    char buf[256];
+
+    /* Unarmed baseline: proves the fixture still has the properties the
+     * sweep assertions rely on, and measures how many allocations the sweep
+     * has to cover. */
+    wl_jpp_stats_t base = { 0, 0, 0, 0 };
+    const char *problem = jpp_oom_step(src, relation, -1, -1, &base);
+    if (problem) {
+        FAIL(problem);
+        return;
+    }
+    if (base.joins_reordered != 1) {
+        snprintf(buf, sizeof(buf),
+            "fixture no longer reorders (joins_reordered=%u)",
+            base.joins_reordered);
+        FAIL(buf);
+        return;
+    }
+    if (expect_projections != (base.projections_inserted > 0)) {
+        snprintf(buf, sizeof(buf),
+            "fixture projections_inserted=%u, expected %s",
+            base.projections_inserted, expect_projections ? "> 0" : "0");
+        FAIL(buf);
+        return;
+    }
+
+    unsigned long ncalloc = jpp_calloc_calls;
+    unsigned long nmalloc = jpp_malloc_calls;
+    if (ncalloc == 0 || nmalloc == 0) {
+        /* Either --wrap did not take effect (b_lto slipped back on) or the
+         * pass stopped allocating; both make the sweep vacuous. */
+        snprintf(buf, sizeof(buf),
+            "allocator interposition inert: calloc=%lu malloc=%lu", ncalloc,
+            nmalloc);
+        FAIL(buf);
+        return;
+    }
+    if (ncalloc >= JPP_OOM_SWEEP_MAX || nmalloc >= JPP_OOM_SWEEP_MAX) {
+        snprintf(buf, sizeof(buf),
+            "sweep width %d no longer covers calloc=%lu malloc=%lu",
+            JPP_OOM_SWEEP_MAX, ncalloc, nmalloc);
+        FAIL(buf);
+        return;
+    }
+
+    /* The two routes are swept separately so that a regression in one is
+     * reported on its own terms: the calloc route reaches the key ARRAYS and
+     * the accumulator, the malloc route reaches the key STRINGS. */
+    for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
+        problem = jpp_oom_step(src, relation, n, -1, NULL);
+        if (problem) {
+            snprintf(buf, sizeof(buf), "calloc #%ld: %s", n, problem);
+            FAIL(buf);
+            return;
+        }
+    }
+    for (long n = 0; n < JPP_OOM_SWEEP_MAX; n++) {
+        problem = jpp_oom_step(src, relation, -1, n, NULL);
+        if (problem) {
+            snprintf(buf, sizeof(buf), "malloc #%ld: %s", n, problem);
+            FAIL(buf);
+            return;
+        }
+    }
+
+    PASS();
+}
+#endif /* __linux__ */
+
+static void
+test_jpp_oom_all_live_head(void)
+{
+#ifndef __linux__
+    TEST("jpp #1111: OOM sweep, all head variables live (no PROJECT)");
+    PASS();
+    return;
+#else
+    run_jpp_oom_sweep(
+        "jpp #1111: OOM sweep, all head variables live (no PROJECT)",
+        JPP_OOM_SRC_ALL_LIVE, "p", false);
+#endif
+}
+
+static void
+test_jpp_oom_projected_head(void)
+{
+#ifndef __linux__
+    TEST("jpp #1111: OOM sweep, narrow head (PROJECTs inserted)");
+    PASS();
+    return;
+#else
+    run_jpp_oom_sweep("jpp #1111: OOM sweep, narrow head (PROJECTs inserted)",
+        JPP_OOM_SRC_PROJECTED, "q", true);
+#endif
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -1790,6 +2221,10 @@ main(void)
     test_jpp_wide_head_antijoin_key();
     test_jpp_nullary_chain();
     test_jpp_plan_unchanged_narrow();
+
+    /* Allocation-failure sweeps (issue #1111) */
+    test_jpp_oom_all_live_head();
+    test_jpp_oom_projected_head();
 
     printf("\n  Total: %d  Passed: %d  Failed: %d\n\n", tests_run, tests_passed,
         tests_failed);

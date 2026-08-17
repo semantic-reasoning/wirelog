@@ -171,23 +171,80 @@ var_in_set(const char *var, char **set, uint32_t nset)
 /* ======================================================================== */
 
 /*
- * Mirrors the logic of setup_join_keys() in program.c but operates
- * on variable name arrays directly.
+ * A join key set that has been fully built but not yet installed on a node.
+ *
+ * Key construction is split into a build step that allocates but mutates no
+ * IR node, and an install step that mutates one node but allocates nothing.
+ * That split is what lets a caller be all-or-nothing: it can build every key
+ * set it needs first, and only start destroying the old keys once every
+ * replacement is in hand.  Building in place instead -- destroy, then
+ * allocate -- leaves a JOIN with zero keys when the allocation fails, and a
+ * zero-key JOIN is executed as a cross product, so the query silently returns
+ * wrong answers with exit status 0 (issue #1111).
+ *
+ * The strings are OWNED copies, never aliases into a SCAN's column_names:
+ * install hands them straight to node->join_left_keys/join_right_keys, whose
+ * elements are freed by free_join_keys() and wl_ir_node_free().
+ */
+typedef struct {
+    char **left;
+    char **right;
+    uint32_t count;
+} jpp_staged_keys_t;
+
+/*
+ * Release a staged key set that was never installed.  Safe on a zeroed
+ * struct and on one that install() has already emptied.
  */
 static void
-jpp_setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
-    uint32_t right_count, wirelog_ir_node_t *join)
+jpp_free_staged_keys(jpp_staged_keys_t *staged)
 {
+    if (!staged)
+        return;
+    for (uint32_t i = 0; i < staged->count; i++) {
+        free(staged->left[i]);
+        free(staged->right[i]);
+    }
+    free((void *)staged->left);
+    free((void *)staged->right);
+    staged->left = NULL;
+    staged->right = NULL;
+    staged->count = 0;
+}
+
+/*
+ * Build the join key set for a JOIN of @left_vars against @right_vars.
+ * Mirrors the logic of setup_join_keys() in program.c but operates on
+ * variable name arrays directly and touches no IR node.
+ *
+ * Returns false ONLY on allocation failure; *out is empty in that case and
+ * needs no cleanup.  A true return with out->count == 0 means the two sides
+ * share no variable, which is a legitimate cross product -- `p(x,y) :- a(x),
+ * b(y).` has no join key and ir/program.c's setup_join_keys() produces the
+ * same empty set.  Keeping those two outcomes on separate channels (the bool
+ * and the count) is the point: the old in-place builder reported both as
+ * "node now has zero keys".
+ */
+static bool
+jpp_build_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
+    uint32_t right_count, jpp_staged_keys_t *out)
+{
+    out->left = NULL;
+    out->right = NULL;
+    out->count = 0;
+
     uint32_t key_count
         = count_shared_vars(left_vars, left_count, right_vars, right_count);
     if (key_count == 0)
-        return;
+        return true;
 
-    join->join_left_keys = (char **)calloc(key_count, sizeof(char *));
-    join->join_right_keys = (char **)calloc(key_count, sizeof(char *));
-    if (!join->join_left_keys || !join->join_right_keys)
-        return;
-    join->join_key_count = key_count;
+    char **left = (char **)calloc(key_count, sizeof(char *));
+    char **right = (char **)calloc(key_count, sizeof(char *));
+    if (!left || !right) {
+        free((void *)left);
+        free((void *)right);
+        return false;
+    }
 
     uint32_t k = 0;
     for (uint32_t i = 0; i < left_count; i++) {
@@ -197,13 +254,34 @@ jpp_setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
             if (!right_vars[j])
                 continue;
             if (strcmp(left_vars[i], right_vars[j]) == 0) {
-                join->join_left_keys[k] = strdup_safe(left_vars[i]);
-                join->join_right_keys[k] = strdup_safe(right_vars[j]);
+                left[k] = strdup_safe(left_vars[i]);
+                right[k] = strdup_safe(right_vars[j]);
+                if (!left[k] || !right[k]) {
+                    /* A NULL key name is not a benign short key list:
+                     * exec_plan_gen.c's resolve_key_to_colN() falls back to
+                     * column 0 for a NULL name, turning the join into a
+                     * silently WRONG join rather than a cross product, and
+                     * ir.c prints key names through %s. */
+                    free(left[k]);
+                    free(right[k]);
+                    for (uint32_t f = 0; f < k; f++) {
+                        free(left[f]);
+                        free(right[f]);
+                    }
+                    free((void *)left);
+                    free((void *)right);
+                    return false;
+                }
                 k++;
                 break;
             }
         }
     }
+
+    out->left = left;
+    out->right = right;
+    out->count = k;
+    return true;
 }
 
 /* ======================================================================== */
@@ -261,6 +339,28 @@ free_join_keys(wirelog_ir_node_t *node)
     node->join_left_keys = NULL;
     node->join_right_keys = NULL;
     node->join_key_count = 0;
+}
+
+/* ======================================================================== */
+/* Internal: install a staged key set on a JOIN node                        */
+/* ======================================================================== */
+
+/*
+ * Replace @node's join keys with the previously built @staged set.
+ * Allocates nothing and therefore cannot fail: every caller may treat this
+ * as the commit half of a build-then-install pair.  Ownership of the staged
+ * arrays and strings transfers to @node, and @staged is left empty.
+ */
+static void
+jpp_install_join_keys(wirelog_ir_node_t *node, jpp_staged_keys_t *staged)
+{
+    free_join_keys(node);
+    node->join_left_keys = staged->left;
+    node->join_right_keys = staged->right;
+    node->join_key_count = staged->count;
+    staged->left = NULL;
+    staged->right = NULL;
+    staged->count = 0;
 }
 
 /* ======================================================================== */
@@ -440,51 +540,104 @@ greedy_order(wirelog_ir_node_t **scans, uint32_t nscan, uint32_t *order,
  *   join_nodes[0] = JOIN(ordered[0], ordered[1])
  *   join_nodes[1] = JOIN(join_nodes[0], ordered[2])
  *   ...
+ *
+ * All-or-nothing.  The work is split into two phases:
+ *
+ *   Phase 1 computes and allocates every replacement key set but mutates
+ *   nothing, so a failure anywhere in it can be reported with the chain
+ *   still exactly as it was found.  Hoisting the computation ahead of the
+ *   mutation is sound because every input to it comes from
+ *   scan_vars(ordered_scans[k]) or from the accumulator, and the two node
+ *   sets are disjoint: collect_scans() yields only non-JOIN nodes and
+ *   collect_joins() only JOIN nodes, so nothing here reads a join_nodes[i]
+ *   child that phase 2 goes on to overwrite.
+ *
+ *   Phase 2 rewires the children and installs the staged keys.  It performs
+ *   no allocation and cannot fail.
+ *
+ * Returns true when the chain was rebuilt, false when it was left untouched.
+ * The caller must not count a false return as a reorder (issue #1111).
  */
-static void
+static bool
 rebuild_chain(wirelog_ir_node_t **join_nodes, uint32_t njoin,
     wirelog_ir_node_t **ordered_scans, uint32_t nscan)
 {
     if (njoin == 0 || nscan < 2)
-        return;
+        return false;
 
-    /* First pass: clear old join keys on all JOIN nodes */
-    for (uint32_t i = 0; i < njoin; i++)
-        free_join_keys(join_nodes[i]);
+    /* ---- Phase 1: compute only.  Allocates; mutates nothing. ---- */
 
-    /* Build the chain bottom-up */
-    /* Deepest join: children are ordered_scans[0] and ordered_scans[1] */
-    join_nodes[0]->children[0] = ordered_scans[0];
-    join_nodes[0]->children[1] = ordered_scans[1];
+    jpp_staged_keys_t *staged
+        = (jpp_staged_keys_t *)calloc(njoin, sizeof(jpp_staged_keys_t));
+    if (!staged) {
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+            "jpp: cannot stage join keys for a chain of %u joins; leaving "
+            "the chain in its original order",
+            njoin);
+        return false;
+    }
 
-    /* Set up join keys for deepest */
+    /* Deepest join: children will be ordered_scans[0] and ordered_scans[1] */
     uint32_t lcount, rcount;
     char **lvars = scan_vars(ordered_scans[0], &lcount);
     char **rvars = scan_vars(ordered_scans[1], &rcount);
-    jpp_setup_join_keys(lvars, lcount, rvars, rcount, join_nodes[0]);
+    bool ok = jpp_build_join_keys(lvars, lcount, rvars, rcount, &staged[0]);
 
     /* Accumulate variable set */
-    uint32_t acc_count;
-    char **acc = merge_vars(lvars, lcount, rvars, rcount, &acc_count);
+    uint32_t acc_count = 0;
+    char **acc = NULL;
+    if (ok) {
+        acc = merge_vars(lvars, lcount, rvars, rcount, &acc_count);
+        ok = acc != NULL;
+    }
 
     /* Remaining joins */
-    for (uint32_t i = 1; i < njoin; i++) {
-        join_nodes[i]->children[0] = join_nodes[i - 1];
-        join_nodes[i]->children[1] = ordered_scans[i + 1];
-
+    for (uint32_t i = 1; ok && i < njoin; i++) {
         uint32_t scount;
         char **svars = scan_vars(ordered_scans[i + 1], &scount);
-        jpp_setup_join_keys(acc, acc_count, svars, scount, join_nodes[i]);
+        ok = jpp_build_join_keys(acc, acc_count, svars, scount, &staged[i]);
+        if (!ok)
+            break;
 
         /* Merge into accumulated */
         uint32_t new_count;
         char **new_acc = merge_vars(acc, acc_count, svars, scount, &new_count);
+        if (!new_acc) {
+            ok = false;
+            break;
+        }
         free((void *)acc);
         acc = new_acc;
         acc_count = new_count;
     }
 
     free((void *)acc);
+
+    if (!ok) {
+        for (uint32_t i = 0; i < njoin; i++)
+            jpp_free_staged_keys(&staged[i]);
+        free(staged);
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+            "jpp: cannot rebuild the join keys for a chain of %u scans; "
+            "leaving the chain in its original order",
+            nscan);
+        return false;
+    }
+
+    /* ---- Phase 2: commit only.  No allocation; cannot fail. ---- */
+
+    join_nodes[0]->children[0] = ordered_scans[0];
+    join_nodes[0]->children[1] = ordered_scans[1];
+    jpp_install_join_keys(join_nodes[0], &staged[0]);
+
+    for (uint32_t i = 1; i < njoin; i++) {
+        join_nodes[i]->children[0] = join_nodes[i - 1];
+        join_nodes[i]->children[1] = ordered_scans[i + 1];
+        jpp_install_join_keys(join_nodes[i], &staged[i]);
+    }
+
+    free(staged);
+    return true;
 }
 
 /* ======================================================================== */
@@ -890,14 +1043,30 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
 
                     /* Recalculate join keys for parent join using PROJECTED acc.
                      * After projection, column indices change, so join keys must
-                     * reference the projected columns in the PROJECT output. */
-                    free_join_keys(joins[i + 1]);
+                     * reference the projected columns in the PROJECT output.
+                     *
+                     * Build first, install second, for the same reason as
+                     * rebuild_chain(): freeing the old keys up front and then
+                     * failing to allocate the new ones leaves this JOIN with
+                     * zero keys, which executes as a cross product (#1111).
+                     * Keeping the existing keys is correct as a fallback -- a
+                     * variable shared with scans[i + 2] is by construction in
+                     * the `needed` set and so survives the PROJECT, making the
+                     * recomputed key NAMES identical to the ones already on
+                     * the node. */
                     uint32_t rscount;
                     char **rsvars = scan_vars(scans[i + 2], &rscount);
                     /* Use projected acc (current acc after shrinking) which has
                      * correct indices for the columns in the PROJECT output */
-                    jpp_setup_join_keys(acc, acc_count, rsvars, rscount,
-                        joins[i + 1]);
+                    jpp_staged_keys_t rkeys = { 0 };
+                    if (jpp_build_join_keys(acc, acc_count, rsvars, rscount,
+                        &rkeys)) {
+                        jpp_install_join_keys(joins[i + 1], &rkeys);
+                    } else {
+                        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+                            "jpp: cannot recompute the join keys above an "
+                            "inserted projection; keeping the existing keys");
+                    }
 
                     projections++;
                 } else {
@@ -996,10 +1165,13 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
         if (ordered) {
             for (uint32_t i = 0; i < nscan; i++)
                 ordered[i] = scans[order[i]];
-            rebuild_chain(joins, depth, ordered, nscan);
+            /* Only a chain that was actually rebuilt counts as reordered.
+             * Reporting the reorder unconditionally overstated the statistic
+             * both when rebuild_chain() declined and when this calloc failed
+             * so it never ran at all (issue #1111). */
+            result.reordered = rebuild_chain(joins, depth, ordered, nscan);
             free((void *)ordered);
         }
-        result.reordered = true;
     }
 
     /* Intermediate column projection elimination (Issue #191).

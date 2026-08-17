@@ -303,6 +303,15 @@ test_jpp_exe = executable(
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
+  # Issue #1111: the allocation-failure sweeps need calloc AND malloc
+  # interposition -- jpp.c allocates its key arrays with calloc and the key
+  # strings through strdup_safe(), which uses malloc.
+  #
+  # b_lto=false is MANDATORY, not tidiness: with -flto the linker resolves
+  # the calls before --wrap is applied, the wrappers are never reached, and
+  # NO diagnostic is emitted.  The sweeps would pass while testing nothing.
+  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc'] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
 )
 
 test('jpp', test_jpp_exe)
