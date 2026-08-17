@@ -165,6 +165,7 @@ jpp_zero_calloc_watch_end(void)
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+static int tests_skipped = 0;
 
 #define TEST(name)                            \
         do {                                      \
@@ -182,6 +183,19 @@ static int tests_failed = 0;
         do {                                  \
             tests_failed++;                   \
             printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
+
+/*
+ * A test that could not run here, as distinct from one that ran and passed.
+ * exit 77 is this repo's skip idiom but is unusable in this binary: 77 is a
+ * whole-process verdict and test_jpp runs 30 tests in one process.  So the
+ * skip is reported per test, and counted separately in the summary, while
+ * tests_run still advances so the numbering stays stable across platforms.
+ */
+#define SKIP(reason)                         \
+        do {                                     \
+            tests_skipped++;                     \
+            printf(" ... SKIP: %s\n", (reason)); \
         } while (0)
 
 /* ======================================================================== */
@@ -2496,8 +2510,9 @@ static void
 test_jpp_oom_all_live_head(void)
 {
 #ifndef __linux__
-    TEST("jpp #1111: OOM sweep, all head variables live (no PROJECT)");
-    PASS();
+    TEST("jpp #1111: OOM sweep, all head variables live (no PROJECT)"
+        " (skipped: no --wrap)");
+    SKIP("--wrap is a GNU ld/lld feature with no ld64 or MSVC equivalent");
     return;
 #else
     run_jpp_oom_sweep(
@@ -2510,8 +2525,9 @@ static void
 test_jpp_oom_projected_head(void)
 {
 #ifndef __linux__
-    TEST("jpp #1111: OOM sweep, narrow head (PROJECTs inserted)");
-    PASS();
+    TEST("jpp #1111: OOM sweep, narrow head (PROJECTs inserted)"
+        " (skipped: no --wrap)");
+    SKIP("--wrap is a GNU ld/lld feature with no ld64 or MSVC equivalent");
     return;
 #else
     run_jpp_oom_sweep("jpp #1111: OOM sweep, narrow head (PROJECTs inserted)",
@@ -2575,7 +2591,7 @@ main(void)
     test_jpp_oom_all_live_head();
     test_jpp_oom_projected_head();
 
-    printf("\n  Total: %d  Passed: %d  Failed: %d\n\n", tests_run, tests_passed,
-        tests_failed);
+    printf("\n  Total: %d  Passed: %d  Failed: %d  Skipped: %d\n\n", tests_run,
+        tests_passed, tests_failed, tests_skipped);
     return tests_failed > 0 ? 1 : 0;
 }
