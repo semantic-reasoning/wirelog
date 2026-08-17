@@ -51,7 +51,7 @@ wl_parser_ast_node_add_child(wl_parser_ast_node_t *parent,
                                ? INITIAL_CHILD_CAPACITY
                                : parent->child_capacity * 2;
         wl_parser_ast_node_t **new_children = (wl_parser_ast_node_t **)realloc(
-            parent->children, new_cap * sizeof(wl_parser_ast_node_t *));
+            (void *)parent->children, new_cap * sizeof(wl_parser_ast_node_t *));
         if (!new_children)
             return;
         parent->children = new_children;
@@ -111,7 +111,7 @@ wl_parser_ast_node_free(wl_parser_ast_node_t *node)
     for (uint32_t i = 0; i < node->child_count; i++) {
         wl_parser_ast_node_free(node->children[i]);
     }
-    free(node->children);
+    free((void *)node->children);
     free(node->name);
     free(node->str_value);
     free(node->type_name);
