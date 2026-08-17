@@ -1020,8 +1020,11 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     /* Insert: parent_join->children[0] = proj,
                      *          proj->child = current_join */
                     if (wl_ir_node_add_child(proj, joins[i]) != 0) {
+                        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+                            "jpp: cannot attach an inserted projection; "
+                            "leaving this level unprojected");
                         wl_ir_node_free(proj);
-                        continue;
+                        goto next_level;
                     }
                     joins[i + 1]->children[0] = proj;
 
@@ -1075,6 +1078,17 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
             }
         }
 
+        /*
+         * Abandoning ONE projection must not abandon the loop's bookkeeping.
+         * `continue` here would skip both the free() below and the tail merge
+         * of scans[i + 2] into acc[] and phys_names[], leaving the next
+         * iteration to run on an accumulator that no longer describes the
+         * chain: jpp_build_join_keys() would then find no shared variable,
+         * succeed with count == 0, and jpp_install_join_keys() would replace
+         * that JOIN's correct keys with an empty set -- a cross product, and
+         * exactly the #1111 signature.  Jump past the projection work only.
+         */
+next_level:
         free((void *)needed);
 
         /* Merge next scan's vars into acc and physical layout for the next

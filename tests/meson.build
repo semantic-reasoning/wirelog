@@ -307,10 +307,15 @@ test_jpp_exe = executable(
   # interposition -- jpp.c allocates its key arrays with calloc and the key
   # strings through strdup_safe(), which uses malloc.
   #
+  # Issue #1119: realloc as well.  insert_projections() reaches realloc only
+  # through wl_ir_node_add_child(), and that is the ONLY route to the
+  # accumulator desynchronisation fixed in the same commit that added this
+  # wrap -- neither the calloc nor the malloc sweep can reach it.
+  #
   # b_lto=false is MANDATORY, not tidiness: with -flto the linker resolves
   # the calls before --wrap is applied, the wrappers are never reached, and
   # NO diagnostic is emitted.  The sweeps would pass while testing nothing.
-  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc'] : [],
+  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=calloc', '-Wl,--wrap=malloc', '-Wl,--wrap=realloc'] : [],
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
 )
 
