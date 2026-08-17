@@ -1980,6 +1980,39 @@ tally_join_keys(const wirelog_ir_node_t *node, uint32_t *njoin,
         tally_join_keys(node->children[i], njoin, zero_keys, null_elems);
 }
 
+/*
+ * Count PROJECT nodes that name their own output columns but leave one of
+ * those names NULL.
+ *
+ * exec_plan_gen.c hands a PROJECT's column_names[] back verbatim as the
+ * node's output layout, and resolve_key_to_colN() answers "col0" for any key
+ * it cannot find in that layout.  So a NULL entry is not cosmetic: where the
+ * missing name is a join key of the JOIN above, the join silently reads the
+ * wrong column; everywhere else it is a naming defect.  Either way jpp.c must
+ * decline the projection rather than install it half-named.
+ *
+ * A PROJECT with no column_names[] at all is a different, legitimate shape
+ * (nothing claims to name the columns), so only allocated arrays are checked.
+ */
+static void
+tally_null_project_names(const wirelog_ir_node_t *node, uint32_t *nproject,
+    uint32_t *null_names)
+{
+    if (!node)
+        return;
+    if (node->type == WIRELOG_IR_PROJECT && node->column_names) {
+        (*nproject)++;
+        for (uint32_t i = 0; i < node->column_count; i++) {
+            if (!node->column_names[i]) {
+                (*null_names)++;
+                break;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < node->child_count; i++)
+        tally_null_project_names(node->children[i], nproject, null_names);
+}
+
 /* True when no snapshotted JOIN has had either child pointer replaced. */
 static bool
 joins_children_unchanged(const wirelog_ir_node_t *ir,
@@ -2059,6 +2092,17 @@ jpp_oom_step(const char *src, const char *relation, long fail_calloc,
         } else if (null_elems != 0) {
             snprintf(detail, sizeof(detail),
                 "%u join(s) claim keys but hold a NULL key name", null_elems);
+            problem = detail;
+        }
+    }
+
+    if (!problem) {
+        uint32_t nproject = 0, null_names = 0;
+        tally_null_project_names(ir, &nproject, &null_names);
+        if (null_names != 0) {
+            snprintf(detail, sizeof(detail),
+                "%u of %u project(s) hold a NULL output column name",
+                null_names, nproject);
             problem = detail;
         }
     }

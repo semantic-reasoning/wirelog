@@ -1013,6 +1013,28 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                             }
                             proj->project_indices[p] = phys_idx;
                             proj->column_names[p] = strdup_safe(acc[v]);
+                            if (!proj->column_names[p]) {
+                                /* A half-named PROJECT is not a cosmetic
+                                 * defect: exec_plan_gen.c returns
+                                 * column_names[] verbatim as this node's
+                                 * output layout, and resolve_key_to_colN()
+                                 * answers "col0" for any key it cannot find
+                                 * there -- so where the missing name is a
+                                 * join key of the JOIN above, the join reads
+                                 * the WRONG column and still reports success.
+                                 *
+                                 * Declining is exact here: proj is still
+                                 * detached, and neither the children[0]
+                                 * splice nor the acc[]/phys_names[] rewrites
+                                 * below have run, so nothing outside proj has
+                                 * been touched yet. */
+                                WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+                                    "jpp: cannot name the columns of an "
+                                    "inserted projection; leaving this level "
+                                    "unprojected");
+                                wl_ir_node_free(proj);
+                                goto next_level;
+                            }
                             p++;
                         }
                     }
