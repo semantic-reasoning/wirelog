@@ -118,7 +118,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
     int64_t **retract_data = (int64_t **)calloc(rc_cnt, sizeof(int64_t *));
     uint32_t *retract_nrows = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
     if (!retract_data || !retract_nrows) {
-        free(retract_data);
+        free((void *)retract_data);
         free(retract_nrows);
         return ENOMEM;
     }
@@ -205,7 +205,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             r->retract_backup_sorted_nrows = 0;
             r->retract_backup_run_count = 0;
         }
-        free(retract_data);
+        free((void *)retract_data);
         free(retract_nrows);
         return rc;
     }
@@ -243,7 +243,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
                     }
                     free(retract_data[i]);
                 }
-                free(retract_data);
+                free((void *)retract_data);
                 free(retract_nrows);
                 return rc;
             }
@@ -296,7 +296,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
             if (!src_buf) {
                 for (uint32_t i = 0; i < rc_cnt; i++)
                     free(retract_data[i]);
-                free(retract_data);
+                free((void *)retract_data);
                 free(retract_nrows);
                 return ENOMEM;
             }
@@ -344,7 +344,7 @@ col_stratum_step_retraction_nonrecursive(const wl_plan_stratum_t *sp,
     /* Cleanup: free stolen retraction buffers */
     for (uint32_t i = 0; i < rc_cnt; i++)
         free(retract_data[i]);
-    free(retract_data);
+    free((void *)retract_data);
     free(retract_nrows);
     return 0;
 }
@@ -368,7 +368,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t *prev_nrows = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
     uint32_t *prev_ncols = (uint32_t *)calloc(rc_cnt, sizeof(uint32_t));
     if (!prev_data || !prev_nrows || !prev_ncols) {
-        free(prev_data);
+        free((void *)prev_data);
         free(prev_nrows);
         free(prev_ncols);
         return ENOMEM;
@@ -505,7 +505,7 @@ cleanup:
         }
         free(prev_data[i]);
     }
-    free(prev_data);
+    free((void *)prev_data);
     free(prev_nrows);
     free(prev_ncols);
     return rc;
