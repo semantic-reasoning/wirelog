@@ -37,6 +37,32 @@ All notable changes to wirelog are documented in this file.
   `wl_ir_stratify_dep_graph_t` by hand, which `stratify.h` now documents as
   supported for this one function.
 
+- **Arrangement row counts that overflow their hash-table sizes are rejected**
+  (#1074): the arrangement layer sized both its bucket array and its chain
+  array from `nrows * 2` in 32-bit arithmetic, and neither computation
+  checked for wrap. `arr_next_pow2` returns 0 rather than saturating, so the
+  bucket count was 0 for every `nrows` in `[0x40000001, 0x7FFFFFFF]` and
+  again in `[0xC0000001, 0xFFFFFFFF]` -- 2147483646 row counts, about half
+  the 32-bit space. A zero bucket count matched a freshly zeroed
+  arrangement's own bucket count, so the allocation was skipped and the
+  bucket-head array stayed `NULL`, giving an out-of-bounds read through a
+  null pointer while indexing. Separately, the incremental update path sized
+  its chain array as `nrows * 2` clamped up to a 16-entry floor, so a
+  two-billion-row relation was indexed into a 64-byte allocation -- an
+  out-of-bounds write. That path was not covered by the bucket-count check,
+  because `arr_next_pow2(0)` is 16 and matches the existing bucket count, so
+  the load-factor test never diverted to a full rebuild. Both paths now
+  reject the relation as unrepresentable.
+
+  The incremental guard is deliberately broader than the unsafe range. A row
+  count in `[0x80000000, 0xC0000000]` whose load factor had changed used to
+  divert to a full rebuild and complete safely, and is now refused as well.
+  That case needs a relation of at least 2^31 rows -- some 34 GB of backing
+  store across two columns -- and the success it gives up was a 16-bucket
+  table with 134-million-entry chains, so one test on the row count ahead of
+  both products is worth more than preserving it. The cost is one comparison
+  per arrangement build, not per row.
+
 ### Performance
 
 ### Security

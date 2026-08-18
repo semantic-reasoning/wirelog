@@ -1777,6 +1777,27 @@ test_arrangement_exe = executable(
 test('arrangement', test_arrangement_exe)
 
 # ============================================================================
+# Arrangement next-pow2 Overflow Tests (Issue #1074)
+# ============================================================================
+
+test_arrangement_pow2_overflow_exe = executable(
+  'test_arrangement_pow2_overflow',
+  files('test_arrangement_pow2_overflow.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('arrangement_pow2_overflow', test_arrangement_pow2_overflow_exe)
+
+# ============================================================================
 # Delta Arrangement Cache Tests (Phase 3C - 3C-001-Ext)
 # ============================================================================
 

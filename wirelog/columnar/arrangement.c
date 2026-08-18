@@ -193,7 +193,15 @@ arr_key_cols_valid(const col_rel_t *rel, const uint32_t *key_cols,
     return true;
 }
 
-/* Round n up to the next power of 2; minimum 16. */
+/*
+ * Round n up to the next power of 2; minimum 16.
+ *
+ * Returns 0 -- not a saturated value -- for every n above 0x80000000: the
+ * smear fills to 0xFFFFFFFF and `n + 1u` wraps.  Callers must reject that
+ * themselves; both in this file do, below.  The byte-identical
+ * wl_columnar_filter_next_pow2 in filter.c has the same return and more
+ * callers.  See follow-up issue (next_pow2 family).
+ */
 static uint32_t
 arr_next_pow2(uint32_t n)
 {
@@ -234,6 +242,46 @@ arr_build_full(col_arrangement_t *arr, const col_rel_t *rel)
     uint32_t nrows = rel->nrows;
     uint32_t nbuckets = arr_next_pow2(nrows > 0 ? nrows * 2u : 16u);
 
+    /*
+     * arr_next_pow2 returns 0 above 0x80000000, so nbuckets is 0 for nrows
+     * in [0x40000001, 0x7FFFFFFF] and again in [0xC0000001, 0xFFFFFFFF] --
+     * 2147483646 row counts, about half the 32-bit space.  Zero would then
+     * pass the "size changed" test below against a zeroed arrangement, skip
+     * the allocation, and leave arr_index_rows to load ht_head[hash & ~0u]
+     * through a NULL pointer.
+     *
+     * Test the bucket count, not the row count.  Beyond being this file's
+     * own invalid-arrangement predicate -- col_arrangement_find_first uses
+     * `arr->nbuckets == 0`, where `< 16u` would invent a second and
+     * unstated minimum -- it is the form the analyzer can use.  It clears
+     * the memset below when non-zero-ness is established by a test on the
+     * value flowing into it, or on its producer's output, and not when the
+     * test is on the producer's input domain.  So the same guard written
+     * against nrows here still reports the diagnostic, as does making
+     * arr_next_pow2 saturate by rejecting its input; a saturation applied
+     * after the smear, which constrains what it returns, does clear it.
+     * A primitive-only fix was available; this one is preferred because it
+     * rejects the relation rather than silently resizing it.
+     *
+     * The domain left open is deliberate.  Row counts in
+     * [0x80000000, 0xC0000000] still build here, degenerately -- nbuckets
+     * floors at 16 for two billion rows -- and that is memory-safe: the
+     * chain sizing below takes max(nrows, ht_cap * 2), which never lands
+     * under nrows, unlike the bare nrows * 2u in arr_update_incremental.
+     * Unifying the two guards on row count measures one diagnostic, so the
+     * asymmetry with that function is required rather than an oversight.
+     *
+     * ENOMEM is reused deliberately: the relation is unrepresentable rather
+     * than out of memory, and EOVERFLOW would say so.  It is not that
+     * EOVERFLOW is unavailable -- join.c, which consumes these
+     * arrangements, returns it as rc=84 in nine places.  It is that all
+     * seven call sites of this function and arr_update_incremental discard
+     * the value and collapse to NULL, so the distinction could never reach
+     * a caller.
+     */
+    if (nbuckets == 0)
+        return ENOMEM;
+
     /* Reallocate bucket heads if size changed. */
     if (nbuckets != arr->nbuckets) {
         uint32_t *head = (uint32_t *)malloc(nbuckets * sizeof(uint32_t));
@@ -271,6 +319,28 @@ arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
     uint32_t nrows = rel->nrows;
     if (old_nrows >= nrows)
         return 0;
+
+    /*
+     * Both sizes below are nrows * 2, which wraps for nrows >= 0x80000000 --
+     * every row count in the top half of the range.  The chain array is the
+     * dangerous one: the wrapped product is 0, the 16-entry floor rounds it
+     * up, and arr_index_rows writes past a 64-byte allocation.  The
+     * arr_build_full guard does not cover it, because arr_next_pow2(0) is 16
+     * and matches the arrangement's existing bucket count, so the load-factor
+     * test below never diverts to the rebuild.
+     *
+     * This refuses more than the unsafe range, deliberately.  Where nrows is
+     * in [0x80000000, 0xC0000000] and `needed` differs from arr->nbuckets,
+     * the call used to divert to arr_build_full and complete safely, and is
+     * now rejected.  What that costs is a relation of at least 2^31 rows --
+     * some 34 GB of backing store across two columns -- whose success was a
+     * 16-bucket table with 134-million-entry chains.  One test on the row
+     * count, ahead of both products, is worth more than preserving it.
+     *
+     * ENOMEM is reused for the reason given in arr_build_full.
+     */
+    if (nrows > UINT32_MAX / 2u)
+        return ENOMEM;
 
     /* If load factor would exceed 50%, full rebuild needed. */
     uint32_t needed = arr_next_pow2(nrows * 2u);
