@@ -139,10 +139,8 @@ parse_compound_metadata(const char *type_name, wl_intern_t *intern)
                 5) == 0) ty = WIRELOG_TYPE_INT32;
             else if (tlen == 5 && strncmp(tok, "int64",
                 5) == 0) ty = WIRELOG_TYPE_INT64;
-            else if (tlen == 6 && strncmp(tok, "string",
-                6) == 0) ty = WIRELOG_TYPE_STRING;
-            else if (tlen == 6 && strncmp(tok, "symbol",
-                6) == 0) ty = WIRELOG_TYPE_STRING;
+            else if (tlen == 6 && (strncmp(tok, "string", 6) == 0
+                || strncmp(tok, "symbol", 6) == 0)) ty = WIRELOG_TYPE_STRING;
             else {
                 free(functor_name); return result;
             }

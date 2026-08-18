@@ -27,6 +27,10 @@
 #     from the data,
 #   * an int64 slot declared explicitly must still reject a symbol,
 #   * and a compound-free relation must be untouched.
+#
+# `string` and `symbol` are two spellings of one slot type.  Every case
+# above spells it `symbol`, so one case spells it `string` -- otherwise
+# nothing in the tree would notice if that spelling stopped decoding.
 
 import os
 import subprocess
@@ -62,6 +66,16 @@ o(a,b,c) :- p(a, pair(b,c)).
 # applied slot 0's type to the whole compound would fail here.
 MIXED = '''\
 .decl p(id: int64, lbl: pair(symbol, int64) inline)
+.decl o(a: int64, b: symbol, c: int64)
+.input p(filename="%s")
+.output o
+o(a,b,c) :- p(a, pair(b,c)).
+'''
+
+# The `string` spelling of a symbol slot, mixed the same way as above so a
+# pass cannot come from every slot happening to be interned.
+STRING_SPELLING = '''\
+.decl p(id: int64, lbl: pair(string, int64) inline)
 .decl o(a: int64, b: symbol, c: int64)
 .input p(filename="%s")
 .output o
@@ -130,6 +144,13 @@ def main() -> int:
         r = run(exe, MIXED, td, "mix", "1\taa\t7\n")
         if 'o(1, "aa", 7)' not in r.stdout:
             fail("mixed slots: expected o(1, \"aa\", 7); stdout=%r stderr=%r"
+                 % (r.stdout.strip(), r.stderr.strip()))
+
+        # `string` names the same slot type as `symbol`.
+        r = run(exe, STRING_SPELLING, td, "str", "1\tcc\t9\n")
+        if 'o(1, "cc", 9)' not in r.stdout:
+            fail("string slot spelling: expected o(1, \"cc\", 9); "
+                 "stdout=%r stderr=%r"
                  % (r.stdout.strip(), r.stderr.strip()))
 
         # Control: no compound anywhere, unchanged.
