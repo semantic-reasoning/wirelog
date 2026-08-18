@@ -41,6 +41,5 @@ wirelog/columnar/join.c
 wirelog/columnar/kfusion.c
 wirelog/columnar/merge.c
 wirelog/columnar/mobius.c
-wirelog/ir/program.c
 wirelog/ir/stratify.c
 wirelog/passes/jpp.c
