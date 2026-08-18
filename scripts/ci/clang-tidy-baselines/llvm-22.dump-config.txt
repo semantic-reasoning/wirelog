@@ -1,0 +1,62 @@
+# Normalized clang-tidy --dump-config baseline for LLVM 22.
+# The User: line is intentionally omitted because it is host-dependent.
+Checks:          "clang-diagnostic-*,-*, bugprone-assert-side-effect, bugprone-assignment-in-if-condition, bugprone-bool-pointer-implicit-conversion, bugprone-branch-clone, bugprone-implicit-widening-of-multiplication-result, bugprone-incorrect-roundings, bugprone-infinite-loop, bugprone-integer-division, bugprone-macro-parentheses, bugprone-macro-repeated-side-effects, bugprone-misplaced-widening-cast, bugprone-multi-level-implicit-pointer-conversion, bugprone-multiple-statement-macro, bugprone-narrowing-conversions, bugprone-not-null-terminated-result, bugprone-redundant-branch-condition, bugprone-signal-handler, bugprone-signed-char-misuse, bugprone-sizeof-container, bugprone-sizeof-expression, bugprone-spuriously-wake-up-functions, bugprone-suspicious-enum-usage, bugprone-suspicious-include, bugprone-suspicious-memory-comparison, bugprone-suspicious-memset-usage, bugprone-suspicious-missing-comma, bugprone-suspicious-realloc-usage, bugprone-suspicious-semicolon, bugprone-suspicious-string-compare, bugprone-swapped-arguments, bugprone-terminating-continue, bugprone-too-small-loop-variable, bugprone-undefined-memory-manipulation, cert-dcl03-c, cert-env33-c, cert-err34-c, cert-flp30-c, cert-msc30-c, cert-str34-c, clang-analyzer-core.*, clang-analyzer-deadcode.*, clang-analyzer-nullability.*, clang-analyzer-security.*, -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling, clang-analyzer-unix.*, misc-redundant-expression, portability-restrict-system-includes, portability-simd-intrinsics, readability-misleading-indentation, readability-redundant-declaration,\n"
+WarningsAsErrors: ''
+HeaderFileExtensions:
+  - ''
+  - h
+  - hh
+  - hpp
+  - hxx
+ImplementationFileExtensions:
+  - c
+  - cc
+  - cpp
+  - cxx
+HeaderFilterRegex: 'wirelog/.*\.h$'
+ExcludeHeaderFilterRegex: ''
+FormatStyle:     none
+CheckOptions:
+  bugprone-assert-side-effect.AssertMacros: assert
+  bugprone-assert-side-effect.CheckFunctionCalls: 'false'
+  bugprone-assert-side-effect.IgnoredFunctions: __builtin_expect
+  bugprone-implicit-widening-of-multiplication-result.IgnoreConstantIntExpr: 'false'
+  bugprone-implicit-widening-of-multiplication-result.IncludeStyle: llvm
+  bugprone-implicit-widening-of-multiplication-result.UseCXXHeadersInCppSources: 'true'
+  bugprone-implicit-widening-of-multiplication-result.UseCXXStaticCastsInCppSources: 'true'
+  bugprone-misplaced-widening-cast.CheckImplicitCasts: 'false'
+  bugprone-multi-level-implicit-pointer-conversion.EnableInC: 'true'
+  bugprone-narrowing-conversions.IgnoreConversionFromTypes: ''
+  bugprone-narrowing-conversions.PedanticMode: 'false'
+  bugprone-narrowing-conversions.WarnOnEquivalentBitWidth: 'true'
+  bugprone-narrowing-conversions.WarnOnFloatingPointNarrowingConversion: 'true'
+  bugprone-narrowing-conversions.WarnOnIntegerNarrowingConversion: 'true'
+  bugprone-narrowing-conversions.WarnOnIntegerToFloatingPointNarrowingConversion: 'true'
+  bugprone-narrowing-conversions.WarnWithinTemplateInstantiation: 'false'
+  bugprone-not-null-terminated-result.WantToUseSafeFunctions: 'true'
+  bugprone-signal-handler.AsyncSafeFunctionSet: POSIX
+  bugprone-signed-char-misuse.CharTypedefsToIgnore: ''
+  bugprone-signed-char-misuse.DiagnoseSignedUnsignedCharComparisons: 'true'
+  bugprone-sizeof-expression.WarnOnOffsetDividedBySizeOf: 'true'
+  bugprone-sizeof-expression.WarnOnSizeOfCompareToConstant: 'true'
+  bugprone-sizeof-expression.WarnOnSizeOfConstant: 'true'
+  bugprone-sizeof-expression.WarnOnSizeOfInLoopTermination: 'true'
+  bugprone-sizeof-expression.WarnOnSizeOfIntegerExpression: 'false'
+  bugprone-sizeof-expression.WarnOnSizeOfPointer: 'false'
+  bugprone-sizeof-expression.WarnOnSizeOfPointerToAggregate: 'true'
+  bugprone-sizeof-expression.WarnOnSizeOfThis: 'true'
+  bugprone-suspicious-enum-usage.StrictMode: 'false'
+  bugprone-suspicious-missing-comma.MaxConcatenatedTokens: '5'
+  bugprone-suspicious-missing-comma.RatioThreshold: '0.200000'
+  bugprone-suspicious-missing-comma.SizeThreshold: '5'
+  bugprone-suspicious-string-compare.StringCompareLikeFunctions: ''
+  bugprone-suspicious-string-compare.WarnOnImplicitComparison: 'true'
+  bugprone-suspicious-string-compare.WarnOnLogicalNotComparison: 'false'
+  bugprone-too-small-loop-variable.MagnitudeBitsUpperLimit: '16'
+  cert-str34-c.CharTypedefsToIgnore: ''
+  cert-str34-c.DiagnoseSignedUnsignedCharComparisons: 'false'
+  portability-restrict-system-includes.Includes: '*'
+  portability-simd-intrinsics.Std: ''
+  portability-simd-intrinsics.Suggest: 'false'
+  readability-redundant-declaration.IgnoreMacros: 'true'
+SystemHeaders:   false

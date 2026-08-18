@@ -8,18 +8,22 @@
  * scripts/ci/clang-tidy-allowlist.txt or clang-tidy-backlog.txt.  It exists
  * only so scripts/ci/check-clang-tidy-ratchet.py --mode sensitivity can
  * prove that the ratchet can still see a diagnostic it is supposed to see.
+ * The included wirelog header provides a second diagnostic so the same
+ * control also proves HeaderFilterRegex still covers project headers.
  *
  * A ratchet that reports every file clean because it lost its config, or
  * because it silently analysed the wrong source, passes exactly as loudly
  * as one that works.  Issue #1079 -- a symlinked build directory quietly
  * changing what was analysed -- is that failure mode.  This is the control.
  *
- * The body below must produce EXACTLY ONE diagnostic under the repository
- * .clang-tidy: bugprone-integer-division, on the marked line.  Zero
- * diagnostics, a different check, a different line, or a compile error all
- * fail the check.  Do not "fix" the integer division below, and do not add
- * anything else to this file.
+ * The body below must produce one diagnostic under the repository .clang-tidy:
+ * bugprone-integer-division, on the marked line.  The included header must
+ * produce the second diagnostic.  Missing either diagnostic, a different
+ * check, a different line, or a compile error all fail the check.  Do not
+ * "fix" the integer division below, and do not add anything else to this file.
  */
+
+#include "../wirelog/clang_tidy_sensitivity_fixture.h"
 
 double wl_clang_tidy_fixture_ratio(int a, int b);
 
