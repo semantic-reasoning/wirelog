@@ -3,6 +3,7 @@
 
 import importlib.util
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -55,6 +56,33 @@ class RatchetGuardTests(unittest.TestCase):
             self.assertEqual(
                 RATCHET.check_nolint_baseline([decreased], "22"), 0)
         RATCHET.BASELINE_DIR = old_dir
+
+    def test_allowlisted_sources_with_nolint_have_a_baseline_key(self):
+        """Every allowlisted source carrying a NOLINT marker must appear in
+        the baseline.
+
+        The baseline is only consulted for allowlisted targets, so a file
+        promoted after the baseline was written arrives with suppressions
+        the baseline does not know about and the ratchet fails on main --
+        which is how wirelog/ir/program.c broke the gate.  This asserts
+        presence only, never a count, so it cannot go stale when a
+        toolchain bump changes how many warnings a marker suppresses.
+        """
+        marker = re.compile(r"//\s*NOLINT(NEXTLINE|BEGIN|END)?\b")
+        allowlist = ROOT / "scripts/ci/clang-tidy-allowlist.txt"
+        baseline = RATCHET.read_nolint_baseline("22")
+        missing = []
+        for raw in allowlist.read_text(encoding="utf-8").splitlines():
+            entry = raw.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            source = ROOT / entry
+            if not source.is_file():
+                continue
+            text = source.read_text(encoding="utf-8", errors="replace")
+            if marker.search(text) and entry not in baseline:
+                missing.append(entry)
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":
