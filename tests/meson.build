@@ -834,6 +834,10 @@ if not is_windows
        timeout: 300,
        priority: 100)
 
+  test('clang_tidy_guard_unit', py3,
+       args: [meson.project_source_root() / 'tests/test_clang_tidy_ratchet_guards.py'],
+       suite: 'tidy')
+
   # Demotion guard: the partition assertion above catches a DELETED
   # allowlist line, but moving one to the backlog keeps the partition exact.
   # Compares against the merge base with the base branch, so a backlog line

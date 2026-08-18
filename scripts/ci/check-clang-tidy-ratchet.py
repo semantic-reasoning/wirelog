@@ -92,6 +92,8 @@ BACKLOG = REPO_ROOT / "scripts/ci/clang-tidy-backlog.txt"
 SUPPORTED_MAJORS = REPO_ROOT / "scripts/ci/clang-tidy-supported-majors.txt"
 CONFIG_FILE = REPO_ROOT / ".clang-tidy"
 FIXTURE = REPO_ROOT / "tests/clang_tidy_fixture.c"
+HEADER_FIXTURE = REPO_ROOT / "wirelog/clang_tidy_sensitivity_fixture.h"
+BASELINE_DIR = REPO_ROOT / "scripts/ci/clang-tidy-baselines"
 
 # A parse that silently selected nothing would make the partition assertion
 # trivially true -- the exact shape of failure this gate exists to catch.
@@ -105,10 +107,15 @@ DIAG_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+):(?P<col>\d+): "
                      r"(?P<severity>warning|error): (?P<message>.*)$")
 CHECK_RE = re.compile(r"\[([A-Za-z0-9_.,-]+)\]\s*$")
 VERSION_RE = re.compile(r"LLVM version (\d+)\.")
+NOLINT_RE = re.compile(
+    r"Suppressed\s+\d+\s+warnings?\s+\((?P<categories>[^)]*)\)\."
+)
+NOLINT_CATEGORY_RE = re.compile(r"(?P<count>\d+)\s+NOLINT(?:NEXTLINE)?")
 
 # The marker comment in tests/clang_tidy_fixture.c that pins the line the
 # sensitivity check expects its one diagnostic on.
 FIXTURE_MARKER = "WL_TIDY_FIXTURE_EXPECT"
+HEADER_FIXTURE_MARKER = "WL_TIDY_HEADER_FIXTURE_EXPECT"
 FIXTURE_CHECK = "bugprone-integer-division"
 
 
@@ -118,6 +125,10 @@ class GateError(Exception):
 
 class SkipGate(Exception):
     """A calibration guard rejected this environment."""
+
+
+def baseline_path(version: str, suffix: str) -> pathlib.Path:
+    return BASELINE_DIR / f"llvm-{version}.{suffix}.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +312,45 @@ def check_configuration(entries: list[dict]) -> None:
                            "which clang-tidy cannot consume as-is")
 
 
+def normalized_config_lines(text: str) -> set[str]:
+    """Return stable config lines, excluding YAML framing and the host user."""
+    return {
+        line.rstrip()
+        for line in text.splitlines()
+        if line.strip() not in ("---", "...")
+        and not line.startswith("User:")
+        and not line.lstrip().startswith("#")
+        and line.strip()
+    }
+
+
+def check_config_baseline(exe: str, version: str) -> None:
+    """Fail if a recorded clang-tidy config value was weakened or removed."""
+    path = baseline_path(version, "dump-config")
+    if not path.is_file():
+        raise GateError(f"clang-tidy config baseline missing: {path}")
+    proc = subprocess.run(
+        [exe, f"--config-file={CONFIG_FILE}", "--dump-config"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise GateError(f"{exe} --dump-config failed with exit "
+                        f"{proc.returncode}: {proc.stderr.strip()}")
+    expected = normalized_config_lines(path.read_text(encoding="utf-8"))
+    actual = normalized_config_lines(proc.stdout)
+    missing = sorted(expected - actual)
+    added = sorted(actual - expected)
+    if missing:
+        print("check-clang-tidy-ratchet: FAIL: clang-tidy configuration "
+              "baseline no longer matches:", file=sys.stderr)
+        for line in missing:
+            print(f"  missing or changed: {line}", file=sys.stderr)
+        raise GateError("clang-tidy configuration baseline mismatch")
+    if added:
+        print("check-clang-tidy-ratchet: NOTICE: clang-tidy emitted "
+              f"{len(added)} unrecorded config line(s); review on toolchain "
+              "updates", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Running clang-tidy
 # ---------------------------------------------------------------------------
@@ -308,13 +358,14 @@ def check_configuration(entries: list[dict]) -> None:
 class Result:
     def __init__(self, source: pathlib.Path, returncode: int,
                  stdout: str, stderr: str, diagnostics: list[str],
-                 configuration: str = "default"):
+                 configuration: str = "default", nolint_count: int = 0):
         self.source = source
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
         self.diagnostics = diagnostics
         self.configuration = configuration
+        self.nolint_count = nolint_count
 
 
 def parse_diagnostics(stdout: str, cwd: pathlib.Path) -> list[str]:
@@ -346,6 +397,30 @@ def parse_diagnostics(stdout: str, cwd: pathlib.Path) -> list[str]:
     return kept
 
 
+def parse_all_diagnostics(stdout: str, cwd: pathlib.Path) -> list[str]:
+    """Normalize diagnostics for the sensitivity fixture, including tests."""
+    diagnostics = []
+    for line in stdout.splitlines():
+        match = DIAG_RE.match(line)
+        if match is None:
+            continue
+        raw = pathlib.Path(match.group("path"))
+        resolved = raw if raw.is_absolute() else cwd / raw
+        diagnostics.append("{}:{}:{}: {}: {}".format(
+            rel_to_repo(resolved.resolve()), match.group("line"),
+            match.group("col"), match.group("severity"),
+            match.group("message")))
+    return diagnostics
+
+
+def parse_nolint_count(stderr: str) -> int:
+    """Extract clang-tidy's NOLINT suppression count from stderr."""
+    return sum(int(category.group("count"))
+               for match in NOLINT_RE.finditer(stderr)
+               for category in NOLINT_CATEGORY_RE.finditer(
+                   match.group("categories")))
+
+
 def run_clang_tidy(exe: str, db_dir: pathlib.Path, entry: dict,
                    configuration: str = "default") -> Result:
     source = entry_source(entry)
@@ -355,7 +430,8 @@ def run_clang_tidy(exe: str, db_dir: pathlib.Path, entry: dict,
     proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
                           check=False)
     return Result(source, proc.returncode, proc.stdout, proc.stderr,
-                  parse_diagnostics(proc.stdout, cwd), configuration)
+                  parse_diagnostics(proc.stdout, cwd), configuration,
+                  parse_nolint_count(proc.stderr))
 
 
 def job_count() -> int:
@@ -456,6 +532,54 @@ def run_alternate_configs(exe: str, entries: list[dict],
         return list(pool.map(run, specs))
 
 
+def nolint_key(result: Result) -> str:
+    label = (f" [{result.configuration}]"
+             if result.configuration != "default" else "")
+    return f"{rel_to_repo(result.source)}{label}"
+
+
+def read_nolint_baseline(version: str) -> dict[str, int]:
+    path = baseline_path(version, "nolint-counts")
+    if not path.is_file():
+        raise GateError(f"clang-tidy NOLINT baseline missing: {path}")
+    baseline: dict[str, int] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, count = line.rpartition(" ")
+        if not separator or not key or not count.isdigit():
+            raise GateError(f"invalid NOLINT baseline line: {raw!r}")
+        if key in baseline:
+            raise GateError(f"duplicate NOLINT baseline entry: {key}")
+        baseline[key] = int(count)
+    return baseline
+
+
+def check_nolint_baseline(results: list[Result], version: str) -> int:
+    expected = read_nolint_baseline(version)
+    observed = {nolint_key(result): result.nolint_count for result in results}
+    increased = []
+    decreased = []
+    for key, count in sorted(observed.items()):
+        previous = expected.get(key, 0)
+        if count > previous:
+            increased.append((key, previous, count))
+        elif count < previous:
+            decreased.append((key, previous, count))
+    if increased:
+        print("check-clang-tidy-ratchet: FAIL: NOLINT suppression count "
+              "increased:", file=sys.stderr)
+        for key, previous, count in increased:
+            print(f"  {key}: baseline {previous}, observed {count}",
+                  file=sys.stderr)
+        return 1
+    if decreased:
+        print("check-clang-tidy-ratchet: NOTICE: NOLINT suppression count "
+              "decreased for " f"{len(decreased)} scan(s)", file=sys.stderr)
+    return 0
+
+
 def report_failures(results: list[Result]) -> int:
     """Print the failures; return the process exit code."""
     dirty = [r for r in results if r.diagnostics]
@@ -502,7 +626,7 @@ def report_failures(results: list[Result]) -> int:
 # Modes
 # ---------------------------------------------------------------------------
 
-def mode_ratchet(exe: str, entries: list[dict]) -> int:
+def mode_ratchet(exe: str, entries: list[dict], version: str) -> int:
     selected = {rel_to_repo(entry_source(e)): e for e in entries}
     allow = read_list(ALLOWLIST)
     backlog = read_list(BACKLOG)
@@ -546,6 +670,7 @@ def mode_ratchet(exe: str, entries: list[dict]) -> int:
     results += run_alternate_configs(exe, entries, set(allow))
 
     rc = report_failures(results)
+    rc = max(rc, check_nolint_baseline(results, version))
     if rc == 0:
         print(f"check-clang-tidy-ratchet: OK; {len(allow)} file(s) clean, "
               f"{len(backlog)} in backlog, "
@@ -592,19 +717,19 @@ def rewrite_for_fixture(entry: dict, fixture: pathlib.Path,
     }
 
 
-def fixture_expected_line() -> int:
-    if not FIXTURE.is_file():
-        raise GateError(f"sensitivity fixture missing: {FIXTURE}")
-    lines = FIXTURE.read_text(encoding="utf-8").splitlines()
-    hits = [n for n, text in enumerate(lines, 1) if FIXTURE_MARKER in text]
+def fixture_expected_line(path: pathlib.Path, marker: str) -> int:
+    if not path.is_file():
+        raise GateError(f"sensitivity fixture missing: {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    hits = [n for n, text in enumerate(lines, 1) if marker in text]
     if len(hits) != 1:
         raise GateError(
-            f"expected exactly one {FIXTURE_MARKER} marker in "
-            f"{rel_to_repo(FIXTURE)}, found {len(hits)}")
+            f"expected exactly one {marker} marker in "
+            f"{rel_to_repo(path)}, found {len(hits)}")
     return hits[0]
 
 
-def mode_sensitivity(exe: str, entries: list[dict]) -> int:
+def mode_sensitivity(exe: str, entries: list[dict], _version: str) -> int:
     """Prove the gate can still see a diagnostic it is supposed to see.
 
     A ratchet that reports everything clean because it silently analysed the
@@ -614,7 +739,9 @@ def mode_sensitivity(exe: str, entries: list[dict]) -> int:
     Zero diagnostics, a different check, a different line, or a compile
     error all fail.
     """
-    expected_line = fixture_expected_line()
+    expected_line = fixture_expected_line(FIXTURE, FIXTURE_MARKER)
+    expected_header_line = fixture_expected_line(
+        HEADER_FIXTURE, HEADER_FIXTURE_MARKER)
     donor = entries[0]
 
     with tempfile.TemporaryDirectory(prefix="wl-tidy-fixture-") as tmp:
@@ -623,29 +750,36 @@ def mode_sensitivity(exe: str, entries: list[dict]) -> int:
         prune_db([synthetic], workdir)
         result = run_clang_tidy(exe, workdir, synthetic)
 
-    diagnostics = [line for line in result.stdout.splitlines()
-                   if DIAG_RE.match(line)]
+    diagnostics = parse_all_diagnostics(result.stdout,
+                                        pathlib.Path(synthetic["directory"]))
     problems: list[str] = []
-    if len(diagnostics) != 1:
-        problems.append(f"expected 1 diagnostic, got {len(diagnostics)}")
+    if len(diagnostics) != 2:
+        problems.append(f"expected 2 diagnostics, got {len(diagnostics)}")
     else:
-        match = DIAG_RE.match(diagnostics[0])
-        assert match is not None
-        check = CHECK_RE.search(match.group("message"))
-        name = check.group(1) if check else "<no check name>"
-        if name != FIXTURE_CHECK:
-            problems.append(f"expected check {FIXTURE_CHECK}, got {name}")
-        if int(match.group("line")) != expected_line:
-            problems.append(f"expected the diagnostic on line "
-                            f"{expected_line}, got {match.group('line')}")
-        if match.group("severity") != "warning":
-            problems.append(
-                f"expected a warning, got {match.group('severity')}")
+        expected = {
+            rel_to_repo(FIXTURE): expected_line,
+            rel_to_repo(HEADER_FIXTURE): expected_header_line,
+        }
+        for diagnostic in diagnostics:
+            match = DIAG_RE.match(diagnostic)
+            assert match is not None
+            path = match.group("path")
+            check = CHECK_RE.search(match.group("message"))
+            name = check.group(1) if check else "<no check name>"
+            if name != FIXTURE_CHECK:
+                problems.append(f"expected check {FIXTURE_CHECK}, got {name}")
+            if path not in expected:
+                problems.append(f"unexpected diagnostic path {path}")
+            elif int(match.group("line")) != expected[path]:
+                problems.append(f"expected {path} at line {expected[path]}, "
+                                f"got {match.group('line')}")
+            if match.group("severity") != "warning":
+                problems.append(
+                    f"expected a warning, got {match.group('severity')}")
 
     if not problems:
-        print("check-clang-tidy-ratchet: OK; sensitivity fixture reports "
-              f"exactly one {FIXTURE_CHECK} at "
-              f"{rel_to_repo(FIXTURE)}:{expected_line}")
+        print("check-clang-tidy-ratchet: OK; sensitivity fixtures report "
+              f"{FIXTURE_CHECK} in source and header")
         return 0
 
     print("check-clang-tidy-ratchet: FAIL: the sensitivity fixture did not "
@@ -663,7 +797,7 @@ def mode_sensitivity(exe: str, entries: list[dict]) -> int:
     return 1
 
 
-def mode_regenerate(exe: str, entries: list[dict]) -> int:
+def mode_regenerate(exe: str, entries: list[dict], _version: str) -> int:
     """Maintainer helper: print the clean/dirty split of every selected TU.
 
     Not wired into CI.  Run it after a toolchain bump to re-derive the two
@@ -706,12 +840,13 @@ def main() -> int:
             raise GateError(f"clang-tidy config missing: {CONFIG_FILE}")
         exe = resolve_clang_tidy()
         version = check_version(exe)
+        check_config_baseline(exe, version)
         entries = select_entries(pathlib.Path(args.build_dir).resolve())
         check_configuration(entries)
         print(f"check-clang-tidy-ratchet: using {exe} (LLVM {version}), "
               f"{len(entries)} libwirelog.so translation unit(s), "
               f"{job_count()} job(s)")
-        return MODES[args.mode](exe, entries)
+        return MODES[args.mode](exe, entries, version)
     except SkipGate as skip:
         if required:
             print(f"check-clang-tidy-ratchet: FAIL: {skip} "
