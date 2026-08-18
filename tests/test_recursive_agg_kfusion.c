@@ -571,11 +571,9 @@ test_group_by_two_columns(void)
 /* ---------------------------------------------------------------------- */
 
 /*
- * count() is not an ordering aggregate: there is no sense in which one of a
- * group's counts dominates the others, so the canonicalisation refuses any
- * relation whose REDUCE is not MIN or MAX and leaves every row standing.
- * Both spellings of the program are asserted -- fused and not -- because the
- * refusal has to survive the rewrite that hid the REDUCE.
+ * count() is not monotone across a recursive fixpoint.  It is rejected before
+ * either spelling reaches canonicalisation, including the fused form whose
+ * REDUCE operators would otherwise be hidden by the rewrite.
  */
 #define COUNT_BASE                                                      \
         ".decl Edge(x: int64, y: int64)\n"                              \
@@ -586,35 +584,52 @@ test_group_by_two_columns(void)
         "Label(x, count(l)) :- Label(y, l), Edge(y, x).\n"
 
 static void
-test_count_not_canonicalized(void)
+test_count_rejected(void)
 {
-    TEST("count(): groups keep every value, fused and unfused");
+    TEST("recursive count(): rejected before fusion");
 
     static const char *unfused = COUNT_BASE;
     static const char *fused = COUNT_BASE
         "Label(x, count(l)) :- Label(y, l), Label(y, m), Edge(y, x).\n";
-    /* Groups 3 and 4 hold more than one count.  Canonicalising this relation
-     * would keep one row per group, which is what the assertion detects. */
-    static const char *const want_unfused[] = {
-        "1|1", "2|1", "3|1", "3|2", "4|1", "4|2", NULL
-    };
-    static const char *const want_fused[] = {
-        "1|1", "2|1", "3|1", "3|2", "4|1", "4|2", "4|4", NULL
-    };
+    for (size_t w = 0; w < N_WORKER_COUNTS; w++) {
+        collect_t c;
+        ASSERT(eval_relation_at(unfused, "Label", k_worker_counts[w],
+            NO_SYMBOL_COLUMN, &c) != 0,
+            "unfused recursive count() was accepted");
+
+        ASSERT(eval_relation_at(fused, "Label", k_worker_counts[w],
+            NO_SYMBOL_COLUMN, &c) != 0,
+            "fused recursive count() was accepted");
+    }
+    PASS();
+}
+
+#define SUM_BASE                                                       \
+        ".decl Edge(x: int64, y: int64)\n"                       \
+        ".decl Label(x: int64, l: int64)\n"                      \
+        "Edge(1,3). Edge(2,3). Edge(3,4).\n"                     \
+        "Label(x, sum(y)) :- Edge(x, y).\n"                      \
+        "Label(y, sum(x)) :- Edge(x, y).\n"                      \
+        "Label(x, sum(l)) :- Label(y, l), Edge(y, x).\n"
+
+static void
+test_sum_rejected(void)
+{
+    TEST("recursive sum(): rejected before fusion");
+
+    static const char *unfused = SUM_BASE;
+    static const char *fused = SUM_BASE
+        "Label(x, sum(l)) :- Label(y, l), Label(y, m), Edge(y, x).\n";
 
     for (size_t w = 0; w < N_WORKER_COUNTS; w++) {
         collect_t c;
         ASSERT(eval_relation_at(unfused, "Label", k_worker_counts[w],
-            NO_SYMBOL_COLUMN, &c) == 0,
-            "evaluation failed");
-        ASSERT(saw_exactly(&c, want_unfused),
-            "unfused count() relation was reduced");
+            NO_SYMBOL_COLUMN, &c) != 0,
+            "unfused recursive sum() was accepted");
 
         ASSERT(eval_relation_at(fused, "Label", k_worker_counts[w],
-            NO_SYMBOL_COLUMN, &c) == 0,
-            "evaluation failed");
-        ASSERT(saw_exactly(&c, want_fused),
-            "fused count() relation was reduced");
+            NO_SYMBOL_COLUMN, &c) != 0,
+            "fused recursive sum() was accepted");
     }
     PASS();
 }
@@ -795,7 +810,8 @@ main(void)
     test_cross_rule_fusion();
     test_single_idb_atom_control();
     test_group_by_two_columns();
-    test_count_not_canonicalized();
+    test_count_rejected();
+    test_sum_rejected();
     test_mixed_min_max_not_canonicalized();
     test_operand_type_is_order_independent();
     test_operand_domain_conflict_is_vetoed();

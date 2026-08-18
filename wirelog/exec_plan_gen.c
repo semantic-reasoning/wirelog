@@ -3349,6 +3349,42 @@ plan_stratum_record_refs(wl_plan_stratum_t *st)
 /* Public API                                                               */
 /* ======================================================================== */
 
+/* COUNT and SUM are not monotone reducers across a recursive fixpoint.  The
+ * plan must reject them before any rewrite can hide the REDUCE operator and
+ * otherwise expose a relation whose rows violate its declared functional
+ * dependency.  AVG is included defensively; parsed AVG expressions are
+ * rejected earlier in translate_ir_node(). */
+static int
+validate_recursive_aggregates(const wl_plan_t *plan)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *stratum = &plan->strata[s];
+        if (!stratum->is_recursive || !stratum->relations)
+            continue;
+
+        for (uint32_t r = 0; r < stratum->relation_count; r++) {
+            const wl_plan_relation_t *relation = &stratum->relations[r];
+            for (uint32_t o = 0; o < relation->op_count; o++) {
+                const wl_plan_op_t *op = &relation->ops[o];
+                if (op->op != WL_PLAN_OP_REDUCE
+                    || (op->agg_fn != WIRELOG_AGG_COUNT
+                    && op->agg_fn != WIRELOG_AGG_SUM
+                    && op->agg_fn != WIRELOG_AGG_AVG))
+                    continue;
+
+                WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                    "recursive aggregate '%s' is not supported in "
+                    "relation '%s' of stratum %u: count, sum and average "
+                    "are non-monotone across fixpoint iteration",
+                    wirelog_agg_fn_str(op->agg_fn), relation->name,
+                    stratum->stratum_id);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 void
 wl_plan_free(wl_plan_t *plan)
 {
@@ -3821,6 +3857,14 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
             wl_plan_free(plan);
             return -1;
         }
+    }
+
+    /* Reject non-monotone recursive aggregates while the original REDUCE
+     * operators are still visible.  Rewrites below may move them into opaque
+     * backend metadata or discard their shape entirely. */
+    if (validate_recursive_aggregates(plan) != 0) {
+        wl_plan_free(plan);
+        return -1;
     }
 
     /* Rewrite K-atom recursive rules for complete semi-naive evaluation.

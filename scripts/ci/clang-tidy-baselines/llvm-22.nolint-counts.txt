@@ -3,3 +3,4 @@
 # Missing keys are treated as zero; increases fail the ratchet.
 wirelog/columnar/partition.c 1
 wirelog/io/csv_reader.c 1
+wirelog/ir/program.c 9
