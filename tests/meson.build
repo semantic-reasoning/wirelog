@@ -106,6 +106,21 @@ test_program_exe = executable(
   dependencies: [threads_dep],
 )
 
+if host_machine.system() == 'linux'
+  test_column_names_oom_exe = executable(
+    'test_column_names_oom',
+    files('test_column_names_oom.c'),
+    parser_src,
+    ir_src,
+    io_src,
+    thread_src,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [threads_dep],
+    link_args: ['-Wl,--wrap=malloc'],
+    override_options: ['b_lto=false'],
+  )
+endif
+
 test_stratify_exe = executable(
   'test_stratify',
   files('test_stratify.c'),
@@ -147,6 +162,9 @@ test('lexer', test_lexer_exe)
 test('parser', test_parser_exe)
 test('ir', test_ir_exe)
 test('program', test_program_exe)
+if host_machine.system() == 'linux'
+  test('column_names_oom', test_column_names_oom_exe)
+endif
 test('stratify', test_stratify_exe)
 test('stratify_scc_bounds', test_stratify_scc_bounds_exe)
 test('parse_duplicate_decl_no_leak', test_parse_duplicate_decl_no_leak_exe)
