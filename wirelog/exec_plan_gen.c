@@ -20,6 +20,8 @@
 #include "wirelog-types.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1072,8 +1074,15 @@ collect_output_columns(const wirelog_ir_node_t *node, col_ctx_t *out)
         if (col_ctx_alloc(out, node->column_count) != 0)
             return -1;
         for (uint32_t i = 0; i < out->count; i++) {
-            out->names[i]
-                = dup_str(node->column_names ? node->column_names[i] : NULL);
+            const char *name
+                = node->column_names ? node->column_names[i] : NULL;
+            if (name) {
+                out->names[i] = dup_str(name);
+                if (!out->names[i]) {
+                    col_ctx_free(out);
+                    return -1;
+                }
+            }
             out->types[i] = node->column_types ? node->column_types[i]
                                                : WL_IR_COLTYPE_UNKNOWN;
         }
@@ -1108,7 +1117,14 @@ collect_output_columns(const wirelog_ir_node_t *node, col_ctx_t *out)
             for (uint32_t i = 0; i < proj.count; i++) {
                 uint32_t idx = node->project_indices[i];
                 if (idx < left.count) {
-                    proj.names[i] = dup_str(left.names[idx]);
+                    if (left.names[idx]) {
+                        proj.names[i] = dup_str(left.names[idx]);
+                        if (!proj.names[i]) {
+                            col_ctx_free(&proj);
+                            col_ctx_free(&left);
+                            return -1;
+                        }
+                    }
                     proj.types[i] = col_ctx_type_at(&left, idx);
                 }
             }
@@ -1125,10 +1141,14 @@ collect_output_columns(const wirelog_ir_node_t *node, col_ctx_t *out)
         col_ctx_t left, right;
         memset(&left, 0, sizeof(left));
         memset(&right, 0, sizeof(right));
-        if (node->child_count > 0)
-            collect_output_columns(node->children[0], &left);
-        if (node->child_count > 1)
-            collect_output_columns(node->children[1], &right);
+        if (node->child_count == 0
+            || collect_output_columns(node->children[0], &left) != 0
+            || (node->child_count > 1
+            && collect_output_columns(node->children[1], &right) != 0)) {
+            col_ctx_free(&left);
+            col_ctx_free(&right);
+            return -1;
+        }
 
         if (col_ctx_alloc(out, left.count + right.count) != 0) {
             col_ctx_free(&left);
@@ -1164,15 +1184,25 @@ collect_output_columns(const wirelog_ir_node_t *node, col_ctx_t *out)
              * projection would read as untyped. */
             col_ctx_t child;
             memset(&child, 0, sizeof(child));
-            if (node->child_count > 0)
-                collect_output_columns(node->children[0], &child);
+            if (node->child_count == 0
+                || collect_output_columns(node->children[0], &child) != 0) {
+                col_ctx_free(&child);
+                return -1;
+            }
 
             if (col_ctx_alloc(out, node->column_count) != 0) {
                 col_ctx_free(&child);
                 return -1;
             }
             for (uint32_t i = 0; i < out->count; i++) {
-                out->names[i] = dup_str(node->column_names[i]);
+                if (node->column_names[i]) {
+                    out->names[i] = dup_str(node->column_names[i]);
+                    if (!out->names[i]) {
+                        col_ctx_free(out);
+                        col_ctx_free(&child);
+                        return -1;
+                    }
+                }
                 if (node->project_indices && i < node->project_count)
                     out->types[i]
                         = col_ctx_type_at(&child, node->project_indices[i]);
@@ -1253,27 +1283,44 @@ resolve_project_indices(const wirelog_ir_node_t *project_node)
 
 /**
  * Resolve a join key variable name to "colN" format using the child's
- * column layout.  Returns a newly allocated string like "col1".
- * Falls back to "col0" if the name is not found.
+ * column layout.  An explicit, in-range colN is also accepted because some
+ * optimizer passes have already rewritten names to positional form.  An
+ * unknown name is an error; silently selecting col0 changes query semantics.
  */
 static char *
 resolve_key_to_colN(const char *key_name, const wirelog_ir_node_t *child)
 {
     char buf[32];
-    uint32_t idx = 0; /* fallback */
+    if (!key_name || !child)
+        return NULL;
 
-    if (key_name && child) {
-        col_ctx_t ctx;
-        if (collect_output_columns(child, &ctx) == 0) {
-            for (uint32_t c = 0; c < ctx.count; c++) {
-                if (ctx.names[c] && strcmp(ctx.names[c], key_name) == 0) {
-                    idx = c;
-                    break;
-                }
-            }
+    col_ctx_t ctx = { 0 };
+    if (collect_output_columns(child, &ctx) != 0)
+        return NULL;
+
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t c = 0; c < ctx.count; c++) {
+        if (ctx.names[c] && strcmp(ctx.names[c], key_name) == 0) {
+            idx = c;
+            break;
         }
-        col_ctx_free(&ctx);
     }
+
+    if (idx == UINT32_MAX) {
+        const char *digits = key_name;
+        if (strncmp(digits, "col", 3) == 0 && digits[3] != '\0') {
+            char *end = NULL;
+            errno = 0;
+            unsigned long explicit_idx = strtoul(digits + 3, &end, 10);
+            if (errno == 0 && end != digits + 3 && *end == '\0'
+                && explicit_idx <= UINT32_MAX
+                && explicit_idx < ctx.count)
+                idx = (uint32_t)explicit_idx;
+        }
+    }
+    col_ctx_free(&ctx);
+    if (idx == UINT32_MAX)
+        return NULL;
 
     snprintf(buf, sizeof(buf), "col%u", idx);
     return dup_str(buf);
@@ -1537,6 +1584,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             node->join_right_keys, node->join_key_count,
             node->child_count > 1 ? node->children[1] : NULL);
         op->key_count = node->join_key_count;
+        if (op->key_count > 0 && (!op->left_keys || !op->right_keys))
+            return -1;
         return 0;
     }
 
@@ -1576,6 +1625,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             node->join_right_keys, node->join_key_count,
             node->child_count > 1 ? node->children[1] : NULL);
         op->key_count = node->join_key_count;
+        if (op->key_count > 0 && (!op->left_keys || !op->right_keys))
+            return -1;
         return 0;
     }
 
@@ -1615,6 +1666,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             node->join_right_keys, node->join_key_count,
             node->child_count > 1 ? node->children[1] : NULL);
         op->key_count = node->join_key_count;
+        if (op->key_count > 0 && (!op->left_keys || !op->right_keys))
+            return -1;
         op->project_indices
             = dup_indices(node->project_indices, node->project_count);
         op->project_count = node->project_count;

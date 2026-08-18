@@ -1274,6 +1274,18 @@ free_var_names(char **names, uint32_t count)
     free((void *)names);
 }
 
+/* A NULL source denotes an intentional anonymous slot.  Callers use this
+ * helper only for names that must be present; strdup_safe() returning NULL is
+ * therefore an allocation failure, not an absent variable. */
+static int
+dup_required_name(char **dst, const char *src)
+{
+    if (!dst || !src)
+        return -1;
+    *dst = strdup_safe(src);
+    return *dst ? 0 : -1;
+}
+
 static char **
 merge_var_names(char **left, uint32_t left_count, char **right,
     uint32_t right_count, uint32_t *out_count)
@@ -1287,7 +1299,8 @@ merge_var_names(char **left, uint32_t left_count, char **right,
     }
 
     for (uint32_t i = 0; i < left_count; i++) {
-        merged[i] = left[i] ? strdup_safe(left[i]) : NULL;
+        if (left[i] && dup_required_name(&merged[i], left[i]) != 0)
+            goto fail;
     }
 
     for (uint32_t i = 0; i < right_count; i++) {
@@ -1297,16 +1310,23 @@ merge_var_names(char **left, uint32_t left_count, char **right,
          * needs ~2^32 variable slots, each already backed by a char * in
          * these arrays and by a parsed token upstream. */
         // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
-        merged[left_count + i] = right[i] ? strdup_safe(right[i]) : NULL;
+        if (right[i]
+            && dup_required_name(&merged[left_count + i], right[i]) != 0)
+            goto fail;
     }
 
     *out_count = max_count;
     return merged;
+
+fail:
+    free_var_names(merged, max_count);
+    *out_count = 0;
+    return NULL;
 }
 
 /* ---- Join Key Extraction ---- */
 
-static void
+static int
 setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
     uint32_t right_count, wirelog_ir_node_t *join)
 {
@@ -1335,12 +1355,12 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
     }
 
     if (key_count == 0)
-        return;
+        return 0;
 
     join->join_left_keys = (char **)calloc(key_count, sizeof(char *));
     join->join_right_keys = (char **)calloc(key_count, sizeof(char *));
     if (!join->join_left_keys || !join->join_right_keys)
-        return;
+        goto fail;
     join->join_key_count = key_count;
 
     uint32_t k = 0;
@@ -1366,13 +1386,33 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
                  * models each strcmp() call site as an independent opaque
                  * value and so cannot relate the two tallies. */
                 // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
-                join->join_left_keys[k] = strdup_safe(left_vars[i]);
-                join->join_right_keys[k] = strdup_safe(right_vars[j]);
+                if (dup_required_name(&join->join_left_keys[k], left_vars[i])
+                    != 0
+                    || dup_required_name(&join->join_right_keys[k],
+                    right_vars[j]) != 0)
+                    goto fail;
                 k++;
                 break;
             }
         }
     }
+    return 0;
+
+fail:
+    if (join->join_left_keys) {
+        for (uint32_t i = 0; i < key_count; i++)
+            free(join->join_left_keys[i]);
+    }
+    if (join->join_right_keys) {
+        for (uint32_t i = 0; i < key_count; i++)
+            free(join->join_right_keys[i]);
+    }
+    free(join->join_left_keys);
+    free(join->join_right_keys);
+    join->join_left_keys = NULL;
+    join->join_right_keys = NULL;
+    join->join_key_count = 0;
+    return -1;
 }
 
 /* ---- Scan Building with Intra-atom Filters ---- */
@@ -1618,13 +1658,23 @@ concat_var_names_positional(char **left, uint32_t left_count, char **right,
         return NULL;
     }
 
-    for (uint32_t i = 0; i < left_count; i++)
-        merged[i] = strdup_safe(left ? left[i] : NULL);
+    for (uint32_t i = 0; i < left_count; i++) {
+        if (left && left[i]
+            && dup_required_name(&merged[i], left[i]) != 0)
+            goto fail;
+    }
     for (uint32_t i = 0; i < right_count; i++)
-        merged[left_count + i] = strdup_safe(right ? right[i] : NULL);
+        if (right && right[i]
+            && dup_required_name(&merged[left_count + i], right[i]) != 0)
+            goto fail;
 
     *out_count = total;
     return merged;
+
+fail:
+    free_var_names(merged, total);
+    *out_count = 0;
+    return NULL;
 }
 
 static int
@@ -1636,15 +1686,24 @@ set_single_join_key(wirelog_ir_node_t *join, const char *key)
     join->join_left_keys = (char **)calloc(1, sizeof(char *));
     join->join_right_keys = (char **)calloc(1, sizeof(char *));
     if (!join->join_left_keys || !join->join_right_keys)
-        return -1;
+        goto fail;
 
     join->join_key_count = 1;
-    join->join_left_keys[0] = strdup_safe(key);
-    join->join_right_keys[0] = strdup_safe(key);
-    if (!join->join_left_keys[0] || !join->join_right_keys[0])
-        return -1;
+    if (dup_required_name(&join->join_left_keys[0], key) != 0
+        || dup_required_name(&join->join_right_keys[0], key) != 0)
+        goto fail;
 
     return 0;
+
+fail:
+    free(join->join_left_keys ? join->join_left_keys[0] : NULL);
+    free(join->join_right_keys ? join->join_right_keys[0] : NULL);
+    free(join->join_left_keys);
+    free(join->join_right_keys);
+    join->join_left_keys = NULL;
+    join->join_right_keys = NULL;
+    join->join_key_count = 0;
+    return -1;
 }
 
 static wirelog_ir_node_t *
@@ -1664,17 +1723,23 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
     if (!side_name)
         return NULL;
 
+    uint32_t count = compound_arg->child_count + 1u;
+    char **var_names = NULL;
     wirelog_ir_node_t *scan = wl_ir_node_create(WIRELOG_IR_SCAN);
     if (!scan) {
         free(side_name);
         return NULL;
     }
     wl_ir_node_set_relation(scan, side_name);
+    if (side_name && !scan->relation_name) {
+        free(side_name);
+        wl_ir_node_free(scan);
+        return NULL;
+    }
     free(side_name);
 
-    uint32_t count = compound_arg->child_count + 1u;
     scan->column_names = (char **)calloc(count, sizeof(char *));
-    char **var_names = (char **)calloc(count, sizeof(char *));
+    var_names = (char **)calloc(count, sizeof(char *));
     /* __compound_<f>_<n> is (handle: int64, arg0..arg{n-1}: int64) -- see
      * docs/COMPOUND_TERMS.md, "Side-relation tier".  The argument columns
      * hold values whose original type the side relation does not record, so
@@ -1689,13 +1754,16 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
     scan->column_count = count;
     scan->column_types[0] = WL_IR_COLTYPE_SCALAR;
 
-    scan->column_names[0] = strdup_safe(handle_var);
-    var_names[0] = strdup_safe(handle_var);
+    if (dup_required_name(&scan->column_names[0], handle_var) != 0
+        || dup_required_name(&var_names[0], handle_var) != 0)
+        goto fail;
     for (uint32_t i = 0; i < compound_arg->child_count; i++) {
         const wl_parser_ast_node_t *child = compound_arg->children[i];
         if (child && child->type == WL_PARSER_AST_NODE_VARIABLE) {
-            scan->column_names[i + 1u] = strdup_safe(child->name);
-            var_names[i + 1u] = strdup_safe(child->name);
+            if (dup_required_name(&scan->column_names[i + 1u], child->name)
+                != 0
+                || dup_required_name(&var_names[i + 1u], child->name) != 0)
+                goto fail;
         }
     }
 
@@ -1727,6 +1795,11 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
     *out_var_names = var_names;
     *out_var_count = count;
     return result;
+
+fail:
+    free_var_names(var_names, count);
+    wl_ir_node_free(scan);
+    return NULL;
 }
 
 static bool
@@ -1787,6 +1860,12 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
     }
 
     wl_ir_node_set_relation(scan, atom->name);
+    if (atom->name && !scan->relation_name) {
+        wl_ir_node_free(scan);
+        *out_var_names = NULL;
+        *out_var_count = 0;
+        return NULL;
+    }
 
     uint32_t arg_count = atom->child_count;
     wl_ir_relation_info_t *rel_info = find_relation_info(prog, atom->name);
@@ -1856,9 +1935,11 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         if (arg->type == WL_PARSER_AST_NODE_VARIABLE) {
             // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             physical_args[phys_idx] = arg;
-            scan->column_names[phys_idx] = strdup_safe(arg->name);
+            if (dup_required_name(&scan->column_names[phys_idx], arg->name)
+                != 0
+                || dup_required_name(&var_names[phys_idx], arg->name) != 0)
+                goto fail_scan_build;
             scan->column_types[phys_idx] = declared_coltype(rel_info, i);
-            var_names[phys_idx] = strdup_safe(arg->name);
             phys_idx++;
         } else if (rel_info && i < rel_info->column_count
             && rel_info->columns[i].compound_kind
@@ -1869,8 +1950,11 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
                 // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                 physical_args[phys_idx] = child;
                 if (child->type == WL_PARSER_AST_NODE_VARIABLE) {
-                    scan->column_names[phys_idx] = strdup_safe(child->name);
-                    var_names[phys_idx] = strdup_safe(child->name);
+                    if (dup_required_name(&scan->column_names[phys_idx],
+                        child->name) != 0
+                        || dup_required_name(&var_names[phys_idx],
+                        child->name) != 0)
+                        goto fail_scan_build;
                 } else {
                     scan->column_names[phys_idx] = NULL;
                     var_names[phys_idx] = NULL;
@@ -1888,9 +1972,15 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             char *handle_var = make_side_handle_var(atom, i);
             // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             physical_args[phys_idx] = arg;
-            if (handle_var) {
-                scan->column_names[phys_idx] = strdup_safe(handle_var);
-                var_names[phys_idx] = strdup_safe(handle_var);
+            if (!handle_var)
+                goto fail_scan_build;
+            if (dup_required_name(&scan->column_names[phys_idx], handle_var)
+                != 0
+                || dup_required_name(&var_names[phys_idx], handle_var) != 0) {
+                free(handle_var);
+                goto fail_scan_build;
+            }
+            {
                 side_bindings[side_binding_count].arg = arg;
                 side_bindings[side_binding_count].handle_var = handle_var;
                 side_binding_count++;
@@ -1908,6 +1998,21 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             phys_idx++;
         }
     }
+
+    goto scan_build_complete;
+
+fail_scan_build:
+    for (uint32_t i = 0; i < side_binding_count; i++)
+        free(side_bindings[i].handle_var);
+    free(side_bindings);
+    free((void *)physical_args);
+    free_var_names(var_names, physical_count);
+    wl_ir_node_free(scan);
+    *out_var_names = NULL;
+    *out_var_count = 0;
+    return NULL;
+
+scan_build_complete:
 
     wirelog_ir_node_t *result = scan;
 
@@ -2033,6 +2138,7 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
 
     char **result_vars = var_names;
     uint32_t result_vcount = physical_count;
+    bool lowering_failed = false;
 
     for (uint32_t i = 0; i < side_binding_count; i++) {
         char **side_vars = NULL;
@@ -2046,15 +2152,16 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             wl_ir_node_free(side_scan);
             wl_ir_node_free(join);
             free_var_names(side_vars, side_vcount);
-            result = wrap_false_filter(result);
-            continue;
+            lowering_failed = true;
+            break;
         }
 
         if (wl_ir_node_add_child(join, result) != 0) {
             wl_ir_node_free(join);
             wl_ir_node_free(side_scan);
             free_var_names(side_vars, side_vcount);
-            continue;
+            lowering_failed = true;
+            break;
         }
         if (wl_ir_node_add_child(join, side_scan) != 0) {
             join->children[0] = NULL;
@@ -2062,7 +2169,8 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             wl_ir_node_free(join);
             wl_ir_node_free(side_scan);
             free_var_names(side_vars, side_vcount);
-            continue;
+            lowering_failed = true;
+            break;
         }
         result = join;
 
@@ -2074,8 +2182,8 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         if (!combined) {
             result_vars = NULL;
             result_vcount = 0;
-            result = wrap_false_filter(result);
-            continue;
+            lowering_failed = true;
+            break;
         }
         result_vars = combined;
         result_vcount = combined_count;
@@ -2087,6 +2195,13 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         free(side_bindings[i].handle_var);
     free(side_bindings);
     free((void *)physical_args);
+    if (lowering_failed) {
+        free_var_names(result_vars, result_vcount);
+        wl_ir_node_free(result);
+        *out_var_names = NULL;
+        *out_var_count = 0;
+        return NULL;
+    }
     *out_var_names = result_vars;
     *out_var_count = result_vcount;
     return result;
@@ -2291,6 +2406,14 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     "convert_rule: build_atom_scan returned NULL for "
                     "body atom index=%u relation=%s",
                     i, b->name ? b->name : "?");
+                for (uint32_t s = 0; s <= scan_count; s++)
+                    free_var_names(scan_vars[s], scan_vcounts[s]);
+                for (uint32_t s = 0; s < scan_count; s++)
+                    wl_ir_node_free(scans[s]);
+                free((void *)scans);
+                free((void *)scan_vars);
+                free(scan_vcounts);
+                return NULL;
             }
             scan_count++;
         }
@@ -2325,8 +2448,21 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 break;
             }
 
-            setup_join_keys(cur_vars, cur_vcount, scan_vars[i], scan_vcounts[i],
-                join);
+            if (setup_join_keys(cur_vars, cur_vcount, scan_vars[i],
+                scan_vcounts[i], join) != 0) {
+                wl_ir_node_free(join);
+                wl_ir_node_free(current);
+                for (uint32_t j = i; j < scan_count; j++)
+                    wl_ir_node_free(scans[j]);
+                for (uint32_t s = 0; s < scan_count; s++)
+                    free_var_names(scan_vars[s], scan_vcounts[s]);
+                if (cur_vars_is_merged)
+                    free_var_names(cur_vars, cur_vcount);
+                free((void *)scans);
+                free((void *)scan_vars);
+                free(scan_vcounts);
+                return NULL;
+            }
 
             if (wl_ir_node_add_child(join, current) != 0) {
                 wl_ir_node_free(join);
@@ -2350,6 +2486,22 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             uint32_t merged_count;
             char **merged = merge_var_names(cur_vars, cur_vcount, scan_vars[i],
                     scan_vcounts[i], &merged_count);
+            if (!merged && merged_count == 0
+                && cur_vcount + scan_vcounts[i] > 0) {
+                /* join owns both current and scans[i] after the two child
+                 * attachments above. */
+                wl_ir_node_free(join);
+                for (uint32_t j = i + 1; j < scan_count; j++)
+                    wl_ir_node_free(scans[j]);
+                for (uint32_t s = 0; s < scan_count; s++)
+                    free_var_names(scan_vars[s], scan_vcounts[s]);
+                if (cur_vars_is_merged)
+                    free_var_names(cur_vars, cur_vcount);
+                free((void *)scans);
+                free((void *)scan_vars);
+                free(scan_vcounts);
+                return NULL;
+            }
             if (cur_vars_is_merged) {
                 free_var_names(cur_vars, cur_vcount);
             }
@@ -2484,8 +2636,21 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             if (neg_scan) {
                 wirelog_ir_node_t *aj = wl_ir_node_create(WIRELOG_IR_ANTIJOIN);
                 if (aj) {
-                    setup_join_keys(cur_vars, cur_vcount, neg_vars, neg_vcount,
-                        aj);
+                    if (setup_join_keys(cur_vars, cur_vcount, neg_vars,
+                        neg_vcount, aj) != 0) {
+                        wl_ir_node_free(aj);
+                        wl_ir_node_free(neg_scan);
+                        free_var_names(neg_vars, neg_vcount);
+                        wl_ir_node_free(current);
+                        for (uint32_t s = 0; s < scan_count; s++)
+                            free_var_names(scan_vars[s], scan_vcounts[s]);
+                        if (cur_vars_is_merged)
+                            free_var_names(cur_vars, cur_vcount);
+                        free((void *)scans);
+                        free((void *)scan_vars);
+                        free(scan_vcounts);
+                        return NULL;
+                    }
                     if (wl_ir_node_add_child(aj, current) != 0) {
                         wl_ir_node_free(aj);
                         wl_ir_node_free(neg_scan);
@@ -2527,6 +2692,11 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         root = wl_ir_node_create(WIRELOG_IR_AGGREGATE);
         if (root) {
             wl_ir_node_set_relation(root, head->name);
+            if (head->name && !root->relation_name) {
+                wl_ir_node_free(root);
+                root = NULL;
+                goto conversion_failed;
+            }
             root->agg_fn = agg_node->agg_fn;
             for (uint32_t i = 0; i < head->child_count; i++) {
                 if (head->children[i]->type == WL_PARSER_AST_NODE_AGGREGATE) {
@@ -2542,19 +2712,34 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             }
 
             root->column_count = cur_vcount;
+            bool root_names_ok = true;
             if (cur_vcount > 0) {
                 root->column_names
                     = (char **)calloc(cur_vcount, sizeof(char *));
                 if (root->column_names) {
-                    for (uint32_t j = 0; j < cur_vcount; j++)
-                        root->column_names[j] = strdup_safe(cur_vars[j]);
+                    for (uint32_t j = 0; j < cur_vcount; j++) {
+                        if (cur_vars[j]
+                            && dup_required_name(&root->column_names[j],
+                            cur_vars[j]) != 0) {
+                            root_names_ok = false;
+                            break;
+                        }
+                    }
                 } else {
-                    root->column_count = 0;
+                    root_names_ok = false;
                 }
             }
 
-            root->group_by_count = non_agg_count;
-            if (non_agg_count > 0) {
+            if (!root_names_ok) {
+                wl_ir_node_free(root);
+                wl_ir_node_free(current);
+                root = NULL;
+                current = NULL;
+            }
+
+            if (root)
+                root->group_by_count = non_agg_count;
+            if (root && non_agg_count > 0) {
                 root->group_by_indices
                     = (uint32_t *)calloc(non_agg_count, sizeof(uint32_t));
                 uint32_t gi = 0;
@@ -2589,6 +2774,11 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         root = wl_ir_node_create(WIRELOG_IR_PROJECT);
         if (root) {
             wl_ir_node_set_relation(root, head->name);
+            if (head->name && !root->relation_name) {
+                wl_ir_node_free(root);
+                root = NULL;
+                goto conversion_failed;
+            }
             root->project_count = head->child_count;
 
             if (head->child_count > 0) {
@@ -2611,6 +2801,15 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     }
 
     /* ---- Cleanup ---- */
+
+    goto conversion_cleanup;
+
+conversion_failed:
+    wl_ir_node_free(current);
+    current = NULL;
+    root = NULL;
+
+conversion_cleanup:
 
     for (uint32_t i = 0; i < scan_count; i++) {
         free_var_names(scan_vars[i], scan_vcounts[i]);
