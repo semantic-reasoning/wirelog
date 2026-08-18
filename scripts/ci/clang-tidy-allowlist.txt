@@ -40,6 +40,7 @@ wirelog/api_facade.c
 wirelog/arena/arena.c
 wirelog/arena/compound_arena.c
 wirelog/columnar/arithmetic.c
+wirelog/columnar/arrangement.c
 wirelog/columnar/cache.c
 wirelog/columnar/compound_side.c
 wirelog/columnar/delta_pool.c
