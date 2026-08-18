@@ -78,6 +78,7 @@ wirelog/io/io_ctx.c
 wirelog/ir/api.c
 wirelog/ir/ir.c
 wirelog/ir/program.c
+wirelog/ir/stratify.c
 wirelog/parser/ast.c
 wirelog/parser/lexer.c
 wirelog/parser/parser.c
