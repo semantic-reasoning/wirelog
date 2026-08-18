@@ -31,7 +31,6 @@
 #
 # wirelog/ir/program.c is the reason this issue exists: it was clean, and
 # regressed to bugprone-branch-clone after f1d2a2c with nothing failing.
-wirelog/columnar/arrangement.c
 wirelog/columnar/eval.c
 wirelog/columnar/eval_delta.c
 wirelog/columnar/eval_plan.c
