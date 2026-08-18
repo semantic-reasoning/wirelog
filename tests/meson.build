@@ -117,6 +117,17 @@ test_stratify_exe = executable(
   dependencies: [threads_dep],
 )
 
+test_stratify_scc_bounds_exe = executable(
+  'test_stratify_scc_bounds',
+  files('test_stratify_scc_bounds.c'),
+  parser_src,
+  ir_src,
+  io_src,
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+)
+
 test_parse_duplicate_decl_no_leak_exe = executable(
   'test_parse_duplicate_decl_no_leak',
   files('test_parse_duplicate_decl_no_leak.c'),
@@ -137,6 +148,7 @@ test('parser', test_parser_exe)
 test('ir', test_ir_exe)
 test('program', test_program_exe)
 test('stratify', test_stratify_exe)
+test('stratify_scc_bounds', test_stratify_scc_bounds_exe)
 test('parse_duplicate_decl_no_leak', test_parse_duplicate_decl_no_leak_exe)
 
 # ============================================================================

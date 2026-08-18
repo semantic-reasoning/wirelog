@@ -275,10 +275,30 @@ wl_ir_stratify_scc_detect(const wl_ir_stratify_dep_graph_t *graph)
         goto cleanup_error;
     }
 
-    /* Count outgoing edges per node */
+    /*
+     * Count outgoing edges per node.
+     *
+     * Both endpoints are tested here so that this pass admits exactly the
+     * edges the fill loop below stores.  Testing only `from` here counted an
+     * edge with an out-of-range `to`, reserving an adjacency slot the fill
+     * loop never wrote while adj_start[] still spanned it -- so the traversal
+     * read an indeterminate neighbour index and subscripted with it (#1083).
+     * The two predicates must stay identical.
+     *
+     * Nothing in CI will tell you if they stop being identical.  Before
+     * #1083 this file was in the clang-tidy backlog with an
+     * uninitialized.Assign report pointing straight at the consequence of
+     * this predicate, which makes it easy to assume the analyser backstops
+     * the invariant.  It does not: the allocation change below is what
+     * silences all three diagnostics, and with it in place a re-broken
+     * predicate measures ZERO clang-tidy diagnostics.  The file is on the
+     * ratchet allowlist and would stay green.  tests/test_stratify_scc_bounds.c
+     * is the only thing that catches a recurrence.
+     */
     for (uint32_t e = 0; e < graph->edge_count; e++) {
         uint32_t from = graph->edges[e].from;
-        if (from < n)
+        uint32_t to = graph->edges[e].to;
+        if (from < n && to < n)
             adj_count_arr[from]++;
     }
 
@@ -288,11 +308,38 @@ wl_ir_stratify_scc_detect(const wl_ir_stratify_dep_graph_t *graph)
         adj_start[i + 1] = adj_start[i] + adj_count_arr[i];
 
     uint32_t total_adj = adj_start[n];
-    if (total_adj > 0) {
-        adj = (uint32_t *)malloc(total_adj * sizeof(uint32_t));
-        if (!adj)
-            goto cleanup_error;
-    }
+
+    /*
+     * One slack slot, so the request is never for zero objects: calloc(0, n)
+     * is permitted to return NULL, and with both endpoints tested above
+     * total_adj == 0 is the COMMON case -- it holds for every program whose
+     * IDB relations have no IDB-to-IDB edges -- so a NULL there would send a
+     * routine graph down the error path.  The slack is unconditional rather
+     * than `total_adj ? total_adj : 1` on purpose: a branch on total_adj lets
+     * the static analyser explore a state where the buffer has the concrete
+     * length 1, which it cannot correlate with the counting loop, and it then
+     * reports two false clang-analyzer-security.ArrayBound hits on a file the
+     * ratchet requires to be clean.
+     *
+     * calloc, not malloc, and this is not a mask: after the predicate fix
+     * above no reserved slot is left unwritten, so the zeroes are never read.
+     * They exist to keep tests/test_stratify_scc_bounds.c deterministic.  If
+     * the two predicates ever drift apart again, an unwritten slot reads back
+     * as 0 -- a phantom edge to node 0 that merges components on every single
+     * run -- instead of heap garbage whose value decides what happens next.
+     *
+     * Reverting to malloc does not disarm that test: with the predicate
+     * drifted it still fails 25 runs out of 25, as a SIGSEGV under the
+     * MALLOC_PERTURB_ that `meson test` always sets and as a clean assertion
+     * failure without it.  What malloc costs is the failure MODE, not the
+     * outcome.  calloc is what makes the failure identical on every allocator
+     * and in every heap state, and legible -- a named semantic assertion
+     * rather than a crash whose cause the next reader has to reconstruct.
+     */
+    size_t slots = (size_t)total_adj + 1u;
+    adj = (uint32_t *)calloc(slots, sizeof(uint32_t));
+    if (!adj)
+        goto cleanup_error;
 
     /* Fill adjacency list */
     memset(adj_count_arr, 0, n * sizeof(uint32_t));

@@ -19,6 +19,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Out-of-range dependency-graph edges no longer corrupt SCC detection**
+  (#1083): `wl_ir_stratify_scc_detect()` builds its adjacency list in two
+  passes that disagreed with each other. The counting pass reserved a slot
+  for every edge with an in-range `from`; the fill pass stored only edges
+  with an in-range `from` *and* `to`. An edge with an out-of-range `to`
+  therefore reserved a slot that was never written, and `adj_start[]` still
+  spanned it, so the traversal used an indeterminate value as an array index
+  -- producing an out-of-bounds read and, depending on that value,
+  out-of-bounds writes, through `disc[]`, `low[]`, `on_stack[]`, `stack[]`,
+  `adj_start[]` and `result->scc_id[]`. Both passes now test both endpoints.
+
+  Not reachable through `wirelog_parse_string()` or any other public entry
+  point: `wl_ir_stratify_dep_graph_build()` is the only in-tree producer of
+  a dependency graph and has never emitted an out-of-range endpoint. The
+  defect was reachable only by an embedder or a test constructing a
+  `wl_ir_stratify_dep_graph_t` by hand, which `stratify.h` now documents as
+  supported for this one function.
+
 ### Performance
 
 ### Security

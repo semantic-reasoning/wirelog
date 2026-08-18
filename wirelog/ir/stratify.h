@@ -248,6 +248,15 @@ wl_ir_stratify_dep_graph_free(wl_ir_stratify_dep_graph_t *graph);
  * condensation DAG) receive lower IDs. This directly maps to execution
  * order — stratum 0 has no IDB dependencies and executes first.
  *
+ * Edge bounds: an edge whose @from or @to is >= graph->relation_count is
+ * ignored outright — it contributes to no node's adjacency and to no SCC.
+ * This is a guarantee of THIS function only. It is not a property of
+ * wl_ir_stratify_dep_graph_t, and other readers of graph->edges do not all
+ * bounds-check their endpoints, so it must not be generalised to them.
+ * wl_ir_stratify_dep_graph_build() never emits such an edge; the guarantee
+ * is what makes hand-built graphs (unit tests, future producers) well
+ * defined here.
+ *
  * Returns: (transfer full): SCC result, or NULL on error
  */
 wl_ir_stratify_scc_result_t *
