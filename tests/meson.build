@@ -805,9 +805,10 @@ endif
 # Issue #1100: clang-tidy ratchet (suite 'tidy').  No CI job has run
 # clang-tidy since efbde27 removed it, and wirelog/ir/program.c regressed
 # after f1d2a2c with nothing failing.  The gate re-analyses every file in
-# scripts/ci/clang-tidy-allowlist.txt on every run; the 13 files in
+# scripts/ci/clang-tidy-allowlist.txt on every run; the files in
 # clang-tidy-backlog.txt are excluded, and the two lists must partition the
-# libwirelog.so entries of compile_commands.json exactly.
+# libwirelog.so entries of compile_commands.json exactly.  Neither count is
+# recorded here: promoting a file moves both.
 #
 # As with the perf gate above, suite membership excludes nothing (there is
 # no add_test_setup in this project), so these run in a default

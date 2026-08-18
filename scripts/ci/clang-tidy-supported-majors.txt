@@ -4,7 +4,7 @@
 # line, most preferred first.  scripts/ci/check-clang-tidy-ratchet.py SKIPs
 # on any other major; .github/workflows/ci-pr.yml installs the first entry.
 #
-# Why a pin at all: 9 of the 13 backlog diagnostics are path-sensitive
+# Why a pin at all: most backlog diagnostics are path-sensitive
 # clang-analyzer results that move between LLVM releases, and check names
 # can change between LLVM releases (see #1114).  An unpinned gate would
 # fail, or silently stop covering checks, on the first toolchain bump.

@@ -81,9 +81,11 @@ public header.
 ## clang-tidy Ratchet (Issue #1100)
 
 `meson test --suite tidy` re-runs clang-tidy over every source in
-`scripts/ci/clang-tidy-allowlist.txt` (58 files today) and fails on any
-diagnostic. The 13 files that are not clean yet live in
-`scripts/ci/clang-tidy-backlog.txt` and are skipped. The two lists must
+`scripts/ci/clang-tidy-allowlist.txt` and fails on any diagnostic. The
+files that are not clean yet live in `scripts/ci/clang-tidy-backlog.txt`
+and are skipped. Neither count is written down here on purpose: they move
+whenever a file is promoted, and `.github/workflows/ci-pr.yml` derives
+both at runtime. The two lists must
 partition the `libwirelog.so` entries of `build/compile_commands.json`
 exactly, so an allowlist line cannot simply be deleted; moving one to the
 backlog is caught separately by
