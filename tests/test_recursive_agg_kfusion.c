@@ -108,6 +108,23 @@
  *       the operand's domain: the last one decides.  See the comment on the
  *       case itself.
  *
+ *   test_same_stratum_consumer_rejected
+ *       Issue #1021's repro, in a fused and an unfused spelling.  A relation
+ *       that reads a recursive min()/max() from inside that aggregate's own
+ *       SCC is refused at plan time.  The fused spelling is what pins the
+ *       check above rewrite_multiway_delta(): after the rewrite the
+ *       aggregate relation holds no REDUCE for a check to find.
+ *
+ *   test_stratified_consumer_control
+ *       The same program with the feedback rule removed, so the consumer
+ *       lands in its own stratum.  Accepted, and its answer pinned, because
+ *       that is the workaround the diagnostic names.
+ *
+ *   test_single_relation_aggregate_control
+ *       A recursive min() alone in its stratum -- CC-min's shape, and
+ *       SSSP-max's.  Accepted, asserted here rather than inferred from the
+ *       conformance harness.
+ *
  * Not covered here, and not silently skipped:
  *
  *   - incremental (--watch) evaluation of a fused aggregate relation.
@@ -115,13 +132,24 @@
  *     by the same K_FUSION hiding, so the insert is dropped before any
  *     aggregate runs.  That is issue #1019.
  *
- *   - a -DENABLE_K_FUSION=0 build as a cross-check oracle.  That build
- *     aborts on this program family; issue #1020.
+ *   - a -DENABLE_K_FUSION=0 build as a cross-check oracle.  This file is
+ *     built once, in whatever configuration the tree is configured with, so
+ *     it cannot compare the two.  It is not that the unfused build refuses
+ *     to run these programs: #1020 is closed and the whole family above runs
+ *     under -DENABLE_K_FUSION=0 without aborting.  It answers some of them
+ *     differently, which is exactly why a second build is worth having, and
+ *     why running these fixtures under ENABLE_K_FUSION=0 is a precondition
+ *     for narrowing #1021's rejection.  No job does that today -- though the
+ *     tree does already build and run an unfused binary,
+ *     k_fusion_memory_nofusion in tests/meson.build, so the pattern to copy
+ *     exists.
  *
- *   - a same-stratum consumer of a relation whose labels are dominated away
- *     at fixpoint can retain rows derived from labels that no longer exist,
- *     which is internally contradictory output.  That is issue #1021 and is
- *     a property of canonicalising at fixpoint rather than per iteration.
+ *   - a same-stratum consumer that is *accepted*.  There is no longer such a
+ *     case to cover: #1021 refuses the shape outright rather than making it
+ *     answer correctly, so what is pinned above is the refusal and the one
+ *     workaround.  Moving the reduction into per-iteration consolidation,
+ *     which would readmit part of the shape, is deferred to milestone
+ *     0.70.0; see docs/SEMANTICS.md.
  */
 
 #include "../wirelog/backend.h"
@@ -799,6 +827,151 @@ test_operand_domain_conflict_is_vetoed(void)
 
 /* ---------------------------------------------------------------------- */
 
+/*
+ * Issue #1021: a recursive min/max aggregate may not share an SCC with any
+ * other relation.
+ *
+ * REPRO_FUSED below is the issue's repro.  Big reads Label from inside
+ * Label's own stratum, so it sees each round's per-rule minimum rather than
+ * the relation's -- and which rounds it sees is decided by the evaluation
+ * strategy, not by the program.  Both builds answer it wrongly and they do
+ * not agree on how: the default build settles every Label at 1 and still
+ * reports Big(3) Big(4), no surviving label exceeding 1, while an
+ * ENABLE_K_FUSION=0 build additionally leaves the aggregate itself at
+ * Label(3,2) Label(4,3).  Plan generation now refuses the shape.
+ *
+ * Both spellings matter, and they are not the file's usual redundant-rule
+ * pair.  REPRO_FUSED carries the self-recursive rule, which together with
+ * the Big feedback takes Label to two delta positions: after
+ * rewrite_multiway_delta() its operator list is exactly {K_FUSION, EXCHANGE}
+ * and no REDUCE is visible in it at all.  REPRO_UNFUSED drops that rule and
+ * keeps the REDUCE operators in place.  A check placed below the rewrites
+ * passes the second and silently ignores the first, which is the shape of
+ * the mistake #975 and #1019 each made once, so the pair is what pins the
+ * check above them.
+ *
+ * Note what REPRO_UNFUSED is not.  It is not a second wrong answer: it
+ * evaluates to Label(1,1) (2,2) (3,3) (4,4) with Big(3) Big(4), the least
+ * fixpoint, identically in both builds.  It is refused all the same, which
+ * is the point -- the rule is keyed on the SCC shape, not on whether a
+ * particular program happens to come out right, because coming out right is
+ * what cannot be predicted from the program.  Asserting rejection of a
+ * spelling that answers correctly is deliberate, and the break is disclosed
+ * in the CHANGELOG entry for #1021 alongside the four other known
+ * over-rejections.
+ *
+ * No worker-count axis here, unlike the cases above.  Rejection happens in
+ * wl_plan_from_program(), before any session exists; running it at four
+ * worker counts would repeat one plan-time decision four times.
+ */
+#define REPRO_SEED                                              \
+        ".decl Edge(x: int64, y: int64)\n"                      \
+        ".decl Label(x: int64, l: int64)\n"                     \
+        ".decl Big(x: int64)\n"                                 \
+        "Edge(1,2). Edge(2,3). Edge(3,4).\n"                    \
+        "Label(x, min(x)) :- Edge(x, y).\n"                     \
+        "Label(y, min(y)) :- Edge(x, y).\n"
+
+#define REPRO_FEEDBACK                                          \
+        "Big(x)           :- Label(x, l), l > 2.\n"             \
+        "Label(x, min(9)) :- Big(x).\n"
+
+#define REPRO_FUSED                                             \
+        REPRO_SEED                                              \
+        "Label(x, min(l)) :- Label(y, l), Edge(y, x).\n"        \
+        REPRO_FEEDBACK
+
+#define REPRO_UNFUSED                                           \
+        REPRO_SEED                                              \
+        REPRO_FEEDBACK
+
+static void
+test_same_stratum_consumer_rejected(void)
+{
+    TEST("a same-stratum consumer of a recursive min(): rejected");
+
+    collect_t c;
+
+    ASSERT(eval_relation_at(REPRO_FUSED, "Label", 1,
+        NO_SYMBOL_COLUMN, &c) != 0,
+        "the fused spelling of the #1021 repro was accepted");
+
+    ASSERT(eval_relation_at(REPRO_UNFUSED, "Label", 1,
+        NO_SYMBOL_COLUMN, &c) != 0,
+        "the unfused spelling of the #1021 repro was accepted");
+    PASS();
+}
+
+/*
+ * The control the rejection has to leave alone, and the workaround the
+ * diagnostic names: drop the rule that feeds Big back into Label, and Big
+ * lands in a stratum of its own above Label's.  This is also the issue's own
+ * expected answer for the repro -- every label reaches 1, so nothing exceeds
+ * 2 and Big is empty -- and both builds already agree on it.
+ *
+ * It is the case that catches a check written over "is there a REDUCE and
+ * more than one relation in the program", or one that keyed on the stratum
+ * rather than on the SCC.
+ */
+#define STRATIFIED_CONTROL                                      \
+        REPRO_SEED                                              \
+        "Label(x, min(l)) :- Label(y, l), Edge(y, x).\n"        \
+        "Big(x)           :- Label(x, l), l > 2.\n"
+
+static void
+test_stratified_consumer_control(void)
+{
+    TEST("a higher-stratum consumer of a recursive min(): accepted");
+
+    static const char *const want_label[] = {
+        "1|1", "2|1", "3|1", "4|1", NULL
+    };
+
+    for (size_t w = 0; w < N_WORKER_COUNTS; w++) {
+        collect_t c;
+        ASSERT(eval_relation_at(STRATIFIED_CONTROL, "Label",
+            k_worker_counts[w], NO_SYMBOL_COLUMN, &c) == 0,
+            "the stratified control was rejected");
+        ASSERT(saw_exactly(&c, want_label),
+            "every label must reach the minimum reachable id, which is 1");
+
+        ASSERT(eval_relation_at(STRATIFIED_CONTROL, "Big",
+            k_worker_counts[w], NO_SYMBOL_COLUMN, &c) == 0,
+            "the stratified control was rejected");
+        ASSERT(c.count == 0,
+            "no label exceeds 2, so Big must be empty");
+    }
+    PASS();
+}
+
+/*
+ * CC-min, the shape the rejection most plausibly breaks by accident: a
+ * recursive min() whose stratum holds exactly one relation.  Asserted
+ * explicitly rather than left to the conformance harness, because a check
+ * that refused it would take out `bench/workloads/cc.dl` and
+ * `sssp.dl` with it, and the failure would surface as an unrelated
+ * benchmark regression rather than as this file going red.
+ */
+static void
+test_single_relation_aggregate_control(void)
+{
+    TEST("a recursive min() alone in its stratum: accepted");
+
+    static const char *const want[] = { "1|1", "2|1", "3|1", "4|1", NULL };
+
+    for (size_t w = 0; w < N_WORKER_COUNTS; w++) {
+        collect_t c;
+        ASSERT(eval_relation_at(MIN_BASE, "Label", k_worker_counts[w],
+            NO_SYMBOL_COLUMN, &c) == 0,
+            "a single-relation recursive aggregate stratum was rejected");
+        ASSERT(saw_exactly(&c, want),
+            "CC-min must still answer with the minimum reachable id");
+    }
+    PASS();
+}
+
+/* ---------------------------------------------------------------------- */
+
 int
 main(void)
 {
@@ -815,6 +988,9 @@ main(void)
     test_mixed_min_max_not_canonicalized();
     test_operand_type_is_order_independent();
     test_operand_domain_conflict_is_vetoed();
+    test_same_stratum_consumer_rejected();
+    test_stratified_consumer_control();
+    test_single_relation_aggregate_control();
 
     printf("\n=== %d/%d passed, %d failed ===\n", pass_count, test_count,
         fail_count);

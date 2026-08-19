@@ -3402,11 +3402,157 @@ plan_stratum_record_refs(wl_plan_stratum_t *st)
 /* Public API                                                               */
 /* ======================================================================== */
 
+/*
+ * plan_relation_has_reduce - True when @relation still carries a REDUCE
+ * operator of its own.
+ *
+ * Keyed on the operator rather than on wl_plan_relation_t.recursive_agg
+ * deliberately.  recursive_agg records only the reductions that can be
+ * canonicalised -- a head whose rules disagree on the aggregate function
+ * leaves has_spec false -- yet such a relation still reduces per rule, still
+ * has its per-iteration content read by a same-stratum consumer, and still
+ * answers differently in different builds.  The operator is the thing that
+ * exists in every one of those cases.
+ */
+static bool
+plan_relation_has_reduce(const wl_plan_relation_t *relation)
+{
+    for (uint32_t o = 0; o < relation->op_count; o++) {
+        if (relation->ops[o].op == WL_PLAN_OP_REDUCE)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * plan_relation_reads - True when an operator of @relation names @name,
+ * under exactly the predicate plan_stratum_record_refs() records with.
+ */
+static bool
+plan_relation_reads(const wl_plan_relation_t *relation, const char *name)
+{
+    for (uint32_t o = 0; o < relation->op_count; o++) {
+        const char *read = plan_op_referenced_relation(&relation->ops[o]);
+        if (read && strcmp(read, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * validate_recursive_aggregate_consumers - Issue #1021.  A recursive MIN/MAX
+ * aggregate may not share an SCC with any other relation.
+ *
+ * The rule as coded is "no other relation of a recursive stratum may read a
+ * relation that carries a REDUCE".  That is the same rule: wl_ir_stratify
+ * assigns one stratum per SCC (ir/stratify.c, stratum_id[i] = scc_id[i]), and
+ * an SCC with two or more relations is strongly connected, so some other
+ * relation of it necessarily reads the aggregate directly.  State it as the
+ * SCC rule when explaining it -- "no other relation may reference R"
+ * understates how much surface this removes.
+ *
+ * Why the whole shape and not some narrower predicate.  A same-stratum
+ * consumer sees each round's per-rule REDUCE output, before that round's
+ * cross-rule domination has run; what it therefore observes is, in general,
+ * decided by the evaluation strategy rather than by the program.  "In
+ * general" is doing real work in that sentence -- see the last paragraph
+ * below.  The issue's repro
+ * makes that visible twice over -- the default build answers Big(3) Big(4)
+ * over labels that are all 1, and an ENABLE_K_FUSION=0 build corrupts the
+ * aggregate itself as well, so two builds give two different wrong answers.
+ * It is not merely that the consumer reads the aggregate column
+ * non-monotonically: a consumer with no predicate on that column at all
+ * (Seen(x) :- Label(x, l)) is configuration-dependent for the same reason.
+ *
+ * The rule is coarse and knowingly refuses programs that answer correctly
+ * today; the CHANGELOG entry for #1021 names five.  The obvious leniency --
+ * readmit a consumer that carries its own MIN/MAX -- is unsound, and was
+ * measured to be.  Over a propagating a:
+ *
+ *     a(x, min(v)) :- a(y, v), Edge(y, x).
+ *     b(x, min(v)) :- a(x, v), v > 2.
+ *     a(x, min(9)) :- b(x, v).
+ *
+ * yields b(3,3) b(4,3) in both build configurations.  The third rule is
+ * load-bearing: it is what puts b in a's SCC.  Drop it and b is a higher
+ * stratum, a settles to all-1, and b comes out empty in both builds -- so
+ * the shorter spelling of this example proves nothing.  Of the two rows,
+ * b(3,3) is the one no final a justifies in either configuration; b(4,3) is
+ * unjustified only in the default build, the unfused one leaving a(4,3)
+ * behind.
+ *
+ * There is one class where the outcome *is* predictable from the program,
+ * and it is the reason to expect this rule to be narrowed rather than kept.
+ * When the aggregated value is functionally determined by the group key --
+ * `M(x, min(x)) :- Edge(x, _).` with `Root(x) :- M(x, v).` feeding back --
+ * no value is ever dominated away, so a round's content is the fixpoint's
+ * content and configuration-dependence is impossible by construction, not
+ * merely absent from the samples anyone happened to run.  That program is
+ * refused here all the same, because this check reasons about shape and not
+ * about functional dependencies.  Recognising the class is #1135's best
+ * candidate for a narrowing predicate.
+ *
+ * Returns 0 when no stratum has the shape, -1 after logging the first that
+ * does.
+ */
+static int
+validate_recursive_aggregate_consumers(const wl_plan_t *plan)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *stratum = &plan->strata[s];
+        if (!stratum->is_recursive || !stratum->relations
+            || stratum->relation_count < 2)
+            continue;
+
+        for (uint32_t r = 0; r < stratum->relation_count; r++) {
+            const wl_plan_relation_t *agg = &stratum->relations[r];
+            if (!plan_relation_has_reduce(agg))
+                continue;
+
+            for (uint32_t c = 0; c < stratum->relation_count; c++) {
+                const wl_plan_relation_t *consumer = &stratum->relations[c];
+                if (c == r || !plan_relation_reads(consumer, agg->name))
+                    continue;
+
+                /* One remedy, not two.  An earlier draft also offered
+                 * "give the consumer its own min/max and no non-monotone
+                 * read of the aggregate column".  That is vacuous for every
+                 * program that can reach this message: the check inspects
+                 * neither the consumer's operators nor its filters, so a
+                 * same-SCC consumer is refused whatever it carries -- the
+                 * advice would have told the reader to do what they already
+                 * do.  It is also wrong on its own terms, because such a
+                 * program is configuration-dependent too: over a
+                 * propagating a, `b(x, min(v)) :- a(x, v).` with the
+                 * feedback rule intact answers b all-1 by default and
+                 * b(3,2) b(4,3) under ENABLE_K_FUSION=0.  Whether that
+                 * class can ever be readmitted is #1135's question, not a
+                 * workaround to hand out here. */
+                WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                    "relation '%s' of stratum %u reads recursive aggregate "
+                    "relation '%s' from the same stratum: a recursive "
+                    "min/max aggregate may not share an SCC with any other "
+                    "relation, because a same-SCC consumer observes the "
+                    "aggregate's per-iteration content and what it observes "
+                    "is configuration-dependent.  Break the feedback edge "
+                    "into '%s' so that '%s' lands in a later stratum",
+                    consumer->name, stratum->stratum_id, agg->name,
+                    agg->name, consumer->name);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* COUNT and SUM are not monotone reducers across a recursive fixpoint.  The
  * plan must reject them before any rewrite can hide the REDUCE operator and
  * otherwise expose a relation whose rows violate its declared functional
  * dependency.  AVG is included defensively; parsed AVG expressions are
- * rejected earlier in translate_ir_node(). */
+ * rejected earlier in translate_ir_node().
+ *
+ * The second pass, validate_recursive_aggregate_consumers(), rejects a
+ * further shape for a related reason (#1021); see the comment on it. */
 static int
 validate_recursive_aggregates(const wl_plan_t *plan)
 {
@@ -3435,7 +3581,8 @@ validate_recursive_aggregates(const wl_plan_t *plan)
             }
         }
     }
-    return 0;
+
+    return validate_recursive_aggregate_consumers(plan);
 }
 
 void
@@ -3914,7 +4061,19 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
 
     /* Reject non-monotone recursive aggregates while the original REDUCE
      * operators are still visible.  Rewrites below may move them into opaque
-     * backend metadata or discard their shape entirely. */
+     * backend metadata or discard their shape entirely.
+     *
+     * Do not move this call below rewrite_lftj_chains() or
+     * rewrite_multiway_delta().  Both passes of the validation key on
+     * WL_PLAN_OP_REDUCE, and after those two rewrites there is no REDUCE left
+     * to key on: the #1021 repro's Label relation is exactly {K_FUSION,
+     * EXCHANGE} at that point, its operators having been moved into
+     * wl_plan_op_k_fusion_t.k_ops[].  A check placed lower down would
+     * silently never fire on precisely the shapes fusion applies to, while
+     * still passing its own tests on the unfused spellings -- which is how
+     * the same mistake got made once in #975 and again in #1019.  It has to
+     * sit here, after plan_stratum_record_refs() above and before the four
+     * rewrites below. */
     if (validate_recursive_aggregates(plan) != 0) {
         wl_plan_free(plan);
         return -1;
