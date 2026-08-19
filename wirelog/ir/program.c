@@ -1277,13 +1277,10 @@ free_var_names(char **names, uint32_t count)
 /* A NULL source denotes an intentional anonymous slot.  Callers use this
  * helper only for names that must be present; strdup_safe() returning NULL is
  * therefore an allocation failure, not an absent variable. */
-static int
-dup_required_name(char **dst, const char *src)
+static char *
+dup_required_name(const char *src)
 {
-    if (!dst || !src)
-        return -1;
-    *dst = strdup_safe(src);
-    return *dst ? 0 : -1;
+    return src ? strdup_safe(src) : NULL;
 }
 
 static char **
@@ -1299,8 +1296,11 @@ merge_var_names(char **left, uint32_t left_count, char **right,
     }
 
     for (uint32_t i = 0; i < left_count; i++) {
-        if (left[i] && dup_required_name(&merged[i], left[i]) != 0)
-            goto fail;
+        if (left && left[i]) {
+            merged[i] = dup_required_name(left[i]);
+            if (!merged[i])
+                goto fail;
+        }
     }
 
     for (uint32_t i = 0; i < right_count; i++) {
@@ -1310,9 +1310,13 @@ merge_var_names(char **left, uint32_t left_count, char **right,
          * needs ~2^32 variable slots, each already backed by a char * in
          * these arrays and by a parsed token upstream. */
         // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
-        if (right[i]
-            && dup_required_name(&merged[left_count + i], right[i]) != 0)
-            goto fail;
+        char **slot = &merged[left_count + i];
+        if (right && right[i]) {
+            char *copy = dup_required_name(right[i]);
+            if (!copy)
+                goto fail;
+            memcpy((void *)slot, (const void *)&copy, sizeof(copy));
+        }
     }
 
     *out_count = max_count;
@@ -1386,10 +1390,9 @@ setup_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
                  * models each strcmp() call site as an independent opaque
                  * value and so cannot relate the two tallies. */
                 // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
-                if (dup_required_name(&join->join_left_keys[k], left_vars[i])
-                    != 0
-                    || dup_required_name(&join->join_right_keys[k],
-                    right_vars[j]) != 0)
+                join->join_left_keys[k] = dup_required_name(left_vars[i]);
+                join->join_right_keys[k] = dup_required_name(right_vars[j]);
+                if (!join->join_left_keys[k] || !join->join_right_keys[k])
                     goto fail;
                 k++;
                 break;
@@ -1407,8 +1410,8 @@ fail:
         for (uint32_t i = 0; i < key_count; i++)
             free(join->join_right_keys[i]);
     }
-    free(join->join_left_keys);
-    free(join->join_right_keys);
+    free((void *)join->join_left_keys);
+    free((void *)join->join_right_keys);
     join->join_left_keys = NULL;
     join->join_right_keys = NULL;
     join->join_key_count = 0;
@@ -1651,30 +1654,7 @@ static char **
 concat_var_names_positional(char **left, uint32_t left_count, char **right,
     uint32_t right_count, uint32_t *out_count)
 {
-    uint32_t total = left_count + right_count;
-    char **merged = (char **)calloc(total > 0 ? total : 1, sizeof(char *));
-    if (!merged) {
-        *out_count = 0;
-        return NULL;
-    }
-
-    for (uint32_t i = 0; i < left_count; i++) {
-        if (left && left[i]
-            && dup_required_name(&merged[i], left[i]) != 0)
-            goto fail;
-    }
-    for (uint32_t i = 0; i < right_count; i++)
-        if (right && right[i]
-            && dup_required_name(&merged[left_count + i], right[i]) != 0)
-            goto fail;
-
-    *out_count = total;
-    return merged;
-
-fail:
-    free_var_names(merged, total);
-    *out_count = 0;
-    return NULL;
+    return merge_var_names(left, left_count, right, right_count, out_count);
 }
 
 static int
@@ -1689,8 +1669,9 @@ set_single_join_key(wirelog_ir_node_t *join, const char *key)
         goto fail;
 
     join->join_key_count = 1;
-    if (dup_required_name(&join->join_left_keys[0], key) != 0
-        || dup_required_name(&join->join_right_keys[0], key) != 0)
+    join->join_left_keys[0] = dup_required_name(key);
+    join->join_right_keys[0] = dup_required_name(key);
+    if (!join->join_left_keys[0] || !join->join_right_keys[0])
         goto fail;
 
     return 0;
@@ -1698,8 +1679,8 @@ set_single_join_key(wirelog_ir_node_t *join, const char *key)
 fail:
     free(join->join_left_keys ? join->join_left_keys[0] : NULL);
     free(join->join_right_keys ? join->join_right_keys[0] : NULL);
-    free(join->join_left_keys);
-    free(join->join_right_keys);
+    free((void *)join->join_left_keys);
+    free((void *)join->join_right_keys);
     join->join_left_keys = NULL;
     join->join_right_keys = NULL;
     join->join_key_count = 0;
@@ -1754,15 +1735,16 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
     scan->column_count = count;
     scan->column_types[0] = WL_IR_COLTYPE_SCALAR;
 
-    if (dup_required_name(&scan->column_names[0], handle_var) != 0
-        || dup_required_name(&var_names[0], handle_var) != 0)
+    scan->column_names[0] = dup_required_name(handle_var);
+    var_names[0] = dup_required_name(handle_var);
+    if (!scan->column_names[0] || !var_names[0])
         goto fail;
     for (uint32_t i = 0; i < compound_arg->child_count; i++) {
         const wl_parser_ast_node_t *child = compound_arg->children[i];
         if (child && child->type == WL_PARSER_AST_NODE_VARIABLE) {
-            if (dup_required_name(&scan->column_names[i + 1u], child->name)
-                != 0
-                || dup_required_name(&var_names[i + 1u], child->name) != 0)
+            scan->column_names[i + 1u] = dup_required_name(child->name);
+            var_names[i + 1u] = dup_required_name(child->name);
+            if (!scan->column_names[i + 1u] || !var_names[i + 1u])
                 goto fail;
         }
     }
@@ -1935,9 +1917,9 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         if (arg->type == WL_PARSER_AST_NODE_VARIABLE) {
             // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             physical_args[phys_idx] = arg;
-            if (dup_required_name(&scan->column_names[phys_idx], arg->name)
-                != 0
-                || dup_required_name(&var_names[phys_idx], arg->name) != 0)
+            scan->column_names[phys_idx] = dup_required_name(arg->name);
+            var_names[phys_idx] = dup_required_name(arg->name);
+            if (!scan->column_names[phys_idx] || !var_names[phys_idx])
                 goto fail_scan_build;
             scan->column_types[phys_idx] = declared_coltype(rel_info, i);
             phys_idx++;
@@ -1950,10 +1932,11 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
                 // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                 physical_args[phys_idx] = child;
                 if (child->type == WL_PARSER_AST_NODE_VARIABLE) {
-                    if (dup_required_name(&scan->column_names[phys_idx],
-                        child->name) != 0
-                        || dup_required_name(&var_names[phys_idx],
-                        child->name) != 0)
+                    scan->column_names[phys_idx] = dup_required_name(
+                        child->name);
+                    var_names[phys_idx] = dup_required_name(child->name);
+                    if (!scan->column_names[phys_idx]
+                        || !var_names[phys_idx])
                         goto fail_scan_build;
                 } else {
                     scan->column_names[phys_idx] = NULL;
@@ -1974,9 +1957,10 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             physical_args[phys_idx] = arg;
             if (!handle_var)
                 goto fail_scan_build;
-            if (dup_required_name(&scan->column_names[phys_idx], handle_var)
-                != 0
-                || dup_required_name(&var_names[phys_idx], handle_var) != 0) {
+            scan->column_names[phys_idx] = dup_required_name(handle_var);
+            var_names[phys_idx] = dup_required_name(handle_var);
+            if (!scan->column_names[phys_idx]
+                || !var_names[phys_idx]) {
                 free(handle_var);
                 goto fail_scan_build;
             }
@@ -2718,11 +2702,13 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     = (char **)calloc(cur_vcount, sizeof(char *));
                 if (root->column_names) {
                     for (uint32_t j = 0; j < cur_vcount; j++) {
-                        if (cur_vars[j]
-                            && dup_required_name(&root->column_names[j],
-                            cur_vars[j]) != 0) {
-                            root_names_ok = false;
-                            break;
+                        if (cur_vars[j]) {
+                            root->column_names[j]
+                                = dup_required_name(cur_vars[j]);
+                            if (!root->column_names[j]) {
+                                root_names_ok = false;
+                                break;
+                            }
                         }
                     }
                 } else {
