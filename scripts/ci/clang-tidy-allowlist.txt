@@ -49,6 +49,7 @@ wirelog/columnar/diff_arrangement.c
 wirelog/columnar/diff_bridge.c
 wirelog/columnar/diff_trace.c
 wirelog/columnar/diff_vtable.c
+wirelog/columnar/eval.c
 wirelog/columnar/eval_dedup.c
 wirelog/columnar/eval_stack.c
 wirelog/columnar/eval_tdd_plan.c
