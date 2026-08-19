@@ -4,3 +4,4 @@
 wirelog/columnar/partition.c 1
 wirelog/io/csv_reader.c 1
 wirelog/ir/program.c 9
+wirelog/passes/jpp.c 7
