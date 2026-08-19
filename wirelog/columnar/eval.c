@@ -267,8 +267,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         sess->delta_pool, rp->name, result.rel);
                     if (!copy)
                         return ENOMEM;
-                    if ((rc = col_rel_append_all(copy, result.rel,
-                        sess->eval_arena)) != 0) {
+                    rc = col_rel_append_all(copy, result.rel,
+                            sess->eval_arena);
+                    if (rc != 0) {
                         col_rel_destroy(copy);
                         return rc;
                     }
@@ -589,8 +590,22 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
                 /* Post-eval skip: evaluation produced 0 rows — safety net for
                  * cases not caught by pre-scan (e.g. filters eliminating all
-                 * rows). */
-                if (result.rel && result.rel->nrows == 0) {
+                 * rows).
+                 *
+                 * The !result.rel arm is not analyzer appeasement.
+                 * eval_stack_pop() yields {NULL, ...} only for an empty
+                 * stack, and the stack.top == 0 check three lines above has
+                 * already excluded that, so a NULL here would mean a NULL rel
+                 * was pushed.  It is dispositioned as "no result" to match
+                 * that same branch rather than as an error, so one observable
+                 * state does not get two dispositions depending on which
+                 * check saw it first.  (diff.c and join.c return EINVAL on a
+                 * NULL pop because they pop without a prior emptiness check.)
+                 * Otherwise the statements below dereference result.rel:
+                 * ->name on the rename arm, ->ncols on the schema-adoption
+                 * arm.  col_rel_destroy(NULL) is a no-op, so the continue
+                 * leaks nothing. */
+                if (!result.rel || result.rel->nrows == 0) {
                     if (result.owned)
                         col_rel_destroy(result.rel);
                     continue;
@@ -616,8 +631,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                             outer_rc = ENOMEM;
                             goto stride_error;
                         }
-                        if ((rc = col_rel_append_all(copy, result.rel,
-                            sess->eval_arena)) != 0) {
+                        rc = col_rel_append_all(copy, result.rel,
+                                sess->eval_arena);
+                        if (rc != 0) {
                             col_rel_destroy(copy);
                             outer_rc = rc;
                             goto stride_error;
@@ -1819,7 +1835,6 @@ tdd_seed_global_read_initial_deltas(const wl_plan_stratum_t *sp,
  *      exchange; deltas are heap-allocated (col_rel_new_like) so they
  *      remain valid across delta_pool_reset.
  */
-static void tdd_dedup_rel(col_rel_t *r);
 static int bdx_hash_diff(col_rel_t *delta, const col_rel_t *base);
 static int tdd_hashset_diff(col_rel_t *delta, const col_rel_t *base);
 static int
@@ -1953,7 +1968,22 @@ tdd_worker_subpass_fn(void *arg)
         eval_entry_t result = eval_stack_pop(&stack);
         eval_stack_drain(&stack);
 
-        if (result.rel && result.rel->nrows == 0) {
+        /* Post-eval skip: evaluation produced 0 rows.
+         *
+         * The !result.rel arm is not analyzer appeasement.  eval_stack_pop()
+         * yields {NULL, ...} only for an empty stack, and the stack.top == 0
+         * check three lines above has already excluded that, so a NULL here
+         * would mean a NULL rel was pushed.  It is dispositioned as "no
+         * result" to match that same branch rather than as an error, so one
+         * observable state does not get two dispositions depending on which
+         * check saw it first.  (diff.c and join.c return EINVAL on a NULL
+         * pop because they pop without a prior emptiness check.)
+         *
+         * Three dereferences follow otherwise: col_rel_new_like() below
+         * reads src->ncols unguarded, which clang-tidy cannot see because it
+         * is cross-TU, and ->name / ->ncols on the non-outbound path.
+         * col_rel_destroy(NULL) is a no-op, so the continue leaks nothing. */
+        if (!result.rel || result.rel->nrows == 0) {
             if (result.owned)
                 col_rel_destroy(result.rel);
             continue;
@@ -2437,7 +2467,7 @@ tdd_dedup_rel(col_rel_t *r)
             free(ht);
             free(keep);
             col_rel_radix_sort_int64(r);
-            sorted = true; /* fall through to sorted dedup below */
+            /* Fall through to the sorted dedup below. */
         } else {
             memset(ht, 0xFF, cap * sizeof(uint32_t)); /* 0xFF = UINT32_MAX */
             memset(keep, 0, nrows);
@@ -2634,8 +2664,6 @@ tdd_preregister_idb_on_workers(const wl_plan_stratum_t *sp,
 /* Forward declaration — defined below tdd_exchange_deltas. */
 static int tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W);
-static void tdd_dedup_rel(col_rel_t *r);
-static int bdx_hash_diff(col_rel_t *delta, const col_rel_t *base);
 
 /*
  * tdd_broadcast_relation_delta:
@@ -3182,7 +3210,7 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
         const char *edb_name_found = NULL;
         for (uint32_t r = 0; r < nrels; r++) {
             col_rel_t *rel = coord->rels[r];
-            if (!rel || !rel->name)
+            if (!rel)
                 continue;
             /* IDB: appears in sp->relations */
             for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
