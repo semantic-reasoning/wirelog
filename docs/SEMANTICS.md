@@ -154,7 +154,7 @@ not assume symmetric coverage.
 - `CHANGELOG.md` — entry for #718.
 - `stable-release-plan.md` §3, §7 — public-surface and conformance plans.
 
-## Recursive aggregation residue (Status: Implemented for MIN/MAX)
+## Recursive aggregation residue (Status: Implemented for MIN/MAX outside a shared SCC)
 
 Tracked under #692.
 
@@ -203,6 +203,40 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
   one aggregate.
 - Both checks cover the parser path only. IR built directly through the API
   still reaches the crash.
+- **A recursive MIN/MAX aggregate may not share an SCC with any other
+  relation** (#1021). The heading above says "outside a shared SCC" because
+  of this: MIN/MAX is implemented, but only for an aggregate whose stratum
+  holds it alone. Plan generation refuses the rest.
+
+  The reason is that canonicalization runs at the fixpoint, so a relation in
+  the aggregate's own SCC reads the aggregate's per-iteration content --
+  each round's per-rule REDUCE output, before that round's cross-rule
+  domination. What such a consumer observes is decided by the evaluation
+  strategy rather than by the program, and the two build configurations
+  disagree: the issue's repro answers `Big(3) Big(4)` over labels that all
+  settle at 1 in the default build, and additionally corrupts the aggregate
+  to `Label(3,2) Label(4,3)` under `ENABLE_K_FUSION=0`. This is *not* limited
+  to consumers that read the aggregate column non-monotonically; a consumer
+  with no predicate on that column at all is configuration-dependent for the
+  same reason.
+
+  Stated as an SCC rule rather than as "no other relation may reference the
+  aggregate" because `wl_ir_stratify` assigns one stratum per SCC, so the two
+  are the same rule and the second understates it.
+
+  The check is `validate_recursive_aggregates()` in `wirelog/exec_plan_gen.c`,
+  and it must stay above `rewrite_lftj_chains()` and
+  `rewrite_multiway_delta()`: after those, a fused aggregate relation holds no
+  REDUCE operator to find.
+
+  The rule is coarse and knowingly refuses programs that answer correctly in
+  both build configurations today; the CHANGELOG entry for #1021 names five.
+  One of the five is not merely accidentally correct: when the aggregated
+  value is functionally determined by the group key, no value is ever
+  dominated away, so a round's content is the fixpoint's content and
+  configuration-dependence is impossible by construction. The rule refuses
+  that class anyway, because it reasons about SCC shape rather than about
+  functional dependencies. Narrowing it is Future work, below.
 
 ### References
 
@@ -215,6 +249,66 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
 - `wirelog/columnar/eval.c` — recursive aggregate canonicalization.
 - `wirelog/ir/program.c` — `convert_rule` multi-aggregate head rejection.
 - `tests/test_recursive_agg_conformance.c` — active columnar harness.
+- Issue #1021 — a recursive MIN/MAX aggregate may not share an SCC with any
+  other relation.
+- `wirelog/exec_plan_gen.c` — `validate_recursive_aggregates`, both passes.
+- `tests/test_recursive_agg_kfusion.c` — the #1021 rejection and its two
+  acceptance controls.
+
+---
+
+## Per-iteration recursive aggregate domination (Status: Future)
+
+Target: milestone 0.70.0. Tracked under #1135. Narrows the #1021 rejection
+above.
+
+### What is deferred
+
+Recursive MIN/MAX canonicalization runs once, at the fixpoint. Moving it into
+per-iteration consolidation (`col_op_consolidate_diff`,
+`wirelog/columnar/diff.c`) would make each round's cross-rule domination
+visible to that round's readers.
+
+That does not by itself make a same-SCC consumer well defined, and this
+section does not claim it would. The observation window has two halves:
+
+- **Intra-round** — a consumer that reads one rule's REDUCE output before a
+  sibling rule of the same head has contributed a dominating value in the
+  same round. Eager domination in consolidation removes this half.
+- **Inter-round** — a consumer that reads a value that a *later* round
+  dominates away. This half survives eager domination, and it is the half
+  the #1021 repro exercises, which is why #1021 is a plan-time rejection
+  rather than a scheduling change.
+
+So the deferred work buys real correctness, but not all of it, and the
+rejection above cannot simply be lifted once it lands.
+
+### Preconditions
+
+- A CI job that runs the recursive-aggregate fixtures under
+  `ENABLE_K_FUSION=0`. Every fixture a narrowing would readmit has to be
+  shown to answer the same in both build configurations, and no job does that
+  today.
+
+  The tree is not starting from nothing here. `k_fusion_memory_nofusion`
+  (`tests/meson.build`) is built with `c_args: ['-DENABLE_K_FUSION=0']` and
+  runs in the default `meson test`, evaluating a transitive closure at K=2
+  and K=4; `bench/meson.build` has a second such target. So the meson pattern
+  for an unfused test binary already exists and is short to copy. What is
+  missing is a target that puts *these* programs through it. (Separately,
+  `scripts/ci/check-clang-tidy-ratchet.py` scans `wirelog/exec_plan_gen.c`
+  under the macro via `ALTERNATE_CONFIGS`, but that is static analysis and
+  runs nothing.)
+- Re-admission fixtures, the programs #1021 refuses that answer correctly in
+  both configurations now, and the counter-fixtures a narrowing must keep
+  refusing. Both sets are written out in #1135.
+
+### Non-goal
+
+`wl_plan_stratum_t.is_monotone` is computed (negation only) and has no
+consumer. It is not a clearance signal for this work: it does not decide
+whether a same-stratum rule reads an aggregate column non-monotonically, and
+#1021 established that non-monotone reads are not the whole hazard anyway.
 
 ---
 

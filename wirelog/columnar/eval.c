@@ -168,11 +168,20 @@ col_canonicalize_recursive_aggregates(const wl_plan_stratum_t *sp,
      * any rewrite runs.
      *
      * Timing is unchanged: this is the fixpoint, not per-iteration
-     * consolidation.  A same-stratum consumer can therefore hold rows derived
-     * from labels this reduction then dominates away, leaving output that
-     * contradicts itself.  Moving it into consolidation needs
-     * wl_plan_stratum_t.is_monotone, which is hardcoded false and never
-     * computed -- that is issue #1021, not this one.
+     * consolidation.  A same-stratum consumer would therefore hold rows
+     * derived from labels this reduction then dominates away, output that
+     * contradicts itself.  #1021 settled that by refusing the shape at plan
+     * time -- a recursive min/max aggregate may not share an SCC with any
+     * other relation -- rather than by changing when this runs, so nothing
+     * here had to move.  Moving the reduction into consolidation is still
+     * open and would readmit the intra-round half of the shape; that is
+     * deferred to milestone 0.70.0, see docs/SEMANTICS.md.
+     *
+     * The correction that matters to a reader of the old comment here:
+     * wl_plan_stratum_t.is_monotone is no longer "hardcoded false and never
+     * computed".  wl_plan_from_program() computes it (negation only), and it
+     * still has no consumer, so a true value is not yet a signal anything may
+     * act on.
      */
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         const wl_plan_relation_t *rp = &sp->relations[ri];
