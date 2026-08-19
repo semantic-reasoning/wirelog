@@ -85,6 +85,7 @@ wirelog/parser/ast.c
 wirelog/parser/lexer.c
 wirelog/parser/parser.c
 wirelog/passes/fusion.c
+wirelog/passes/jpp.c
 wirelog/passes/magic_sets.c
 wirelog/passes/sip.c
 wirelog/passes/subsumption.c
