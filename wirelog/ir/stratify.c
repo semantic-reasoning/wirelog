@@ -74,13 +74,13 @@ graph_add_edge(wl_ir_stratify_dep_graph_t *g, uint32_t from, uint32_t to,
  * @param prog    Program (for relation name lookup)
  * @param dep     Dependency type context (POSITIVE normally, NEGATION inside ANTIJOIN)
  */
-static void
+static int
 walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi,
     wl_ir_stratify_dep_graph_t *g, const struct wirelog_program *prog,
     wl_ir_stratify_dep_type_t dep)
 {
     if (!node)
-        return;
+        return 0;
 
     switch (node->type) {
     case WIRELOG_IR_SCAN:
@@ -91,7 +91,8 @@ walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi,
         if (rel) {
             uint32_t to_gi = graph_find_relation(g, prog, rel);
             if (to_gi != UINT32_MAX) {
-                graph_add_edge(g, head_gi, to_gi, dep);
+                if (graph_add_edge(g, head_gi, to_gi, dep) != 0)
+                    return -1;
             }
             /* EDB relations (not in graph) are silently ignored */
         }
@@ -100,42 +101,57 @@ walk_ir_tree(const wirelog_ir_node_t *node, uint32_t head_gi,
 
     case WIRELOG_IR_ANTIJOIN:
         /* children[0] = positive side, children[1] = negated side */
-        if (node->child_count >= 1)
-            walk_ir_tree(node->children[0], head_gi, g, prog, dep);
-        if (node->child_count >= 2)
-            walk_ir_tree(node->children[1], head_gi, g, prog,
-                WL_IR_STRATIFY_DEP_NEGATION);
+        if (node->child_count >= 1
+            && walk_ir_tree(node->children[0], head_gi, g, prog, dep) != 0)
+            return -1;
+        if (node->child_count >= 2
+            && walk_ir_tree(node->children[1], head_gi, g, prog,
+            WL_IR_STRATIFY_DEP_NEGATION)
+            != 0)
+            return -1;
         break;
 
     case WIRELOG_IR_AGGREGATE:
         /* Aggregate child SCANs get AGGREGATION edges */
-        for (uint32_t i = 0; i < node->child_count; i++)
-            walk_ir_tree(node->children[i], head_gi, g, prog,
-                WL_IR_STRATIFY_DEP_AGGREGATION);
+        for (uint32_t i = 0; i < node->child_count; i++) {
+            if (walk_ir_tree(node->children[i], head_gi, g, prog,
+                WL_IR_STRATIFY_DEP_AGGREGATION)
+                != 0)
+                return -1;
+        }
         break;
 
     default:
         /* PROJECT, FILTER, JOIN, FLATMAP, UNION — recurse into children */
-        for (uint32_t i = 0; i < node->child_count; i++)
-            walk_ir_tree(node->children[i], head_gi, g, prog, dep);
+        for (uint32_t i = 0; i < node->child_count; i++) {
+            if (walk_ir_tree(node->children[i], head_gi, g, prog, dep) != 0)
+                return -1;
+        }
         break;
     }
+
+    return 0;
 }
 
 /* ======================================================================== */
 /* Dependency Graph — Build                                                 */
 /* ======================================================================== */
 
-wl_ir_stratify_dep_graph_t *
-wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
+int
+wl_ir_stratify_dep_graph_build_ex(const struct wirelog_program *prog,
+    wl_ir_stratify_dep_graph_t **out_graph)
 {
+    if (!out_graph)
+        return -1;
+    *out_graph = NULL;
+
     if (!prog || prog->rule_count == 0)
-        return NULL;
+        return 0;
 
     wl_ir_stratify_dep_graph_t *g = (wl_ir_stratify_dep_graph_t *)calloc(
         1, sizeof(wl_ir_stratify_dep_graph_t));
     if (!g)
-        return NULL;
+        return -1;
 
     /*
      * Step 1: Identify IDB relations (those that appear as rule heads).
@@ -145,7 +161,7 @@ wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
         = (uint32_t *)calloc(prog->relation_count, sizeof(uint32_t));
     if (!idb_flags) {
         free(g);
-        return NULL;
+        return -1;
     }
 
     /* Mark relations that are rule heads as IDB */
@@ -171,14 +187,14 @@ wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
     if (idb_count == 0) {
         free(idb_flags);
         free(g);
-        return NULL;
+        return 0;
     }
 
     g->relation_map = (uint32_t *)calloc(idb_count, sizeof(uint32_t));
     if (!g->relation_map) {
         free(idb_flags);
         free(g);
-        return NULL;
+        return -1;
     }
 
     g->relation_count = idb_count;
@@ -201,11 +217,25 @@ wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
         if (head_gi == UINT32_MAX)
             continue;
 
-        walk_ir_tree(prog->rules[r].ir_root, head_gi, g, prog,
-            WL_IR_STRATIFY_DEP_POSITIVE);
+        if (walk_ir_tree(prog->rules[r].ir_root, head_gi, g, prog,
+            WL_IR_STRATIFY_DEP_POSITIVE)
+            != 0) {
+            wl_ir_stratify_dep_graph_free(g);
+            return -1;
+        }
     }
 
-    return g;
+    *out_graph = g;
+    return 0;
+}
+
+wl_ir_stratify_dep_graph_t *
+wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog)
+{
+    wl_ir_stratify_dep_graph_t *graph = NULL;
+    if (wl_ir_stratify_dep_graph_build_ex(prog, &graph) != 0)
+        return NULL;
+    return graph;
 }
 
 void
@@ -477,7 +507,11 @@ wl_ir_stratify_program(struct wirelog_program *program)
     }
 
     /* Step 1: Build dependency graph */
-    wl_ir_stratify_dep_graph_t *graph = wl_ir_stratify_dep_graph_build(program);
+    wl_ir_stratify_dep_graph_t *graph = NULL;
+    int graph_status = wl_ir_stratify_dep_graph_build_ex(program, &graph);
+    if (graph_status != 0)
+        return -1;
+
     if (!graph) {
         /* No IDB relations (shouldn't happen with rule_count > 0,
            but handle gracefully) */

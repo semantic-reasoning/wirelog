@@ -223,9 +223,32 @@ typedef struct {
  *          - prog has 0 rules
  *          - No IDB relations found
  *          - Memory allocation failed
+ *
+ * This compatibility API preserves the historical NULL contract, which is
+ * ambiguous between "empty graph" and "allocation failed".  New internal
+ * callers that must distinguish those outcomes should use
+ * wl_ir_stratify_dep_graph_build_ex().
  */
 wl_ir_stratify_dep_graph_t *
 wl_ir_stratify_dep_graph_build(const struct wirelog_program *prog);
+
+/**
+ * wl_ir_stratify_dep_graph_build_ex:
+ * @prog: Program with converted rules (rule IR trees must exist)
+ * @out_graph: Receives the dependency graph on success, or NULL when the
+ *             program has no graph to build.
+ *
+ * Build a dependency graph from the program's rule IR trees, reporting memory
+ * failures separately from the valid "no graph" cases.
+ *
+ * Returns:
+ *    0: Success. *out_graph is either a dependency graph or NULL for
+ *       prog == NULL, a 0-rule program, or a program with no IDB relations.
+ *   -1: Memory allocation error or invalid out_graph. *out_graph is NULL.
+ */
+int
+wl_ir_stratify_dep_graph_build_ex(const struct wirelog_program *prog,
+    wl_ir_stratify_dep_graph_t **out_graph);
 
 /**
  * wl_ir_stratify_dep_graph_free:

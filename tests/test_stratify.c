@@ -25,24 +25,42 @@ static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+#ifdef __linux__
+extern void *__real_realloc(void *ptr, size_t size);
+
+static int fail_next_realloc = 0;
+static int forced_realloc_failures = 0;
+
+void *
+__wrap_realloc(void *ptr, size_t size)
+{
+    if (fail_next_realloc) {
+        fail_next_realloc = 0;
+        forced_realloc_failures++;
+        return NULL;
+    }
+    return __real_realloc(ptr, size);
+}
+#endif
+
 #define TEST(name)                      \
-    do {                                \
-        tests_run++;                    \
-        printf("  [TEST] %-55s", name); \
-        fflush(stdout);                 \
-    } while (0)
+        do {                                \
+            tests_run++;                    \
+            printf("  [TEST] %-55s", name); \
+            fflush(stdout);                 \
+        } while (0)
 
 #define PASS()             \
-    do {                   \
-        tests_passed++;    \
-        printf(" PASS\n"); \
-    } while (0)
+        do {                   \
+            tests_passed++;    \
+            printf(" PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                   \
-    do {                            \
-        tests_failed++;             \
-        printf(" FAIL: %s\n", msg); \
-    } while (0)
+        do {                            \
+            tests_failed++;             \
+            printf(" FAIL: %s\n", msg); \
+        } while (0)
 
 /* Helper: parse string, build program, convert rules, merge unions */
 static struct wirelog_program *
@@ -89,8 +107,8 @@ test_dep_graph_simple(void)
     TEST("Dep graph: r(x) :- a(x). -> 1 POSITIVE edge");
 
     struct wirelog_program *prog = make_full_program(".decl a(x: int32)\n"
-                                                     ".decl r(x: int32)\n"
-                                                     "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -108,7 +126,7 @@ test_dep_graph_simple(void)
     if (g->relation_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 IDB relation, got %u",
-                 g->relation_count);
+            g->relation_count);
         wl_ir_stratify_dep_graph_free(g);
         wl_ir_program_free(prog);
         FAIL(buf);
@@ -120,7 +138,7 @@ test_dep_graph_simple(void)
     if (g->edge_count != 0) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 0 edges (EDB dep), got %u",
-                 g->edge_count);
+            g->edge_count);
         wl_ir_stratify_dep_graph_free(g);
         wl_ir_program_free(prog);
         FAIL(buf);
@@ -140,12 +158,12 @@ test_dep_graph_negation(void)
     /* r depends on p (POSITIVE) and negates q.
        p and q are also IDB so edges appear in graph. */
     struct wirelog_program *prog = make_full_program(".decl base(x: int32)\n"
-                                                     ".decl p(x: int32)\n"
-                                                     ".decl q(x: int32)\n"
-                                                     ".decl r(x: int32)\n"
-                                                     "p(x) :- base(x).\n"
-                                                     "q(x) :- base(x).\n"
-                                                     "r(x) :- p(x), !q(x).\n");
+            ".decl p(x: int32)\n"
+            ".decl q(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "p(x) :- base(x).\n"
+            "q(x) :- base(x).\n"
+            "r(x) :- p(x), !q(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -163,7 +181,7 @@ test_dep_graph_negation(void)
     if (g->relation_count != 3) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 3 IDB relations, got %u",
-                 g->relation_count);
+            g->relation_count);
         wl_ir_stratify_dep_graph_free(g);
         wl_ir_program_free(prog);
         FAIL(buf);
@@ -174,7 +192,7 @@ test_dep_graph_negation(void)
     if (g->edge_count < 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected >= 2 edges, got %u",
-                 g->edge_count);
+            g->edge_count);
         wl_ir_stratify_dep_graph_free(g);
         wl_ir_program_free(prog);
         FAIL(buf);
@@ -209,9 +227,9 @@ test_dep_graph_recursive(void)
 
     struct wirelog_program *prog
         = make_full_program(".decl Arc(x: int32, y: int32)\n"
-                            ".decl Tc(x: int32, y: int32)\n"
-                            "Tc(x, y) :- Arc(x, y).\n"
-                            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -253,10 +271,10 @@ test_dep_graph_multiple(void)
     TEST("Dep graph: multiple IDB relations, correct edge count");
 
     struct wirelog_program *prog = make_full_program(".decl a(x: int32)\n"
-                                                     ".decl b(x: int32)\n"
-                                                     ".decl c(x: int32)\n"
-                                                     "b(x) :- a(x).\n"
-                                                     "c(x) :- b(x).\n");
+            ".decl b(x: int32)\n"
+            ".decl c(x: int32)\n"
+            "b(x) :- a(x).\n"
+            "c(x) :- b(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -274,7 +292,7 @@ test_dep_graph_multiple(void)
     if (g->relation_count != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 IDB relations, got %u",
-                 g->relation_count);
+            g->relation_count);
         wl_ir_stratify_dep_graph_free(g);
         wl_ir_program_free(prog);
         FAIL(buf);
@@ -286,7 +304,7 @@ test_dep_graph_multiple(void)
     if (g->edge_count != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 IDB-IDB edge, got %u",
-                 g->edge_count);
+            g->edge_count);
         wl_ir_stratify_dep_graph_free(g);
         wl_ir_program_free(prog);
         FAIL(buf);
@@ -335,10 +353,10 @@ test_scc_no_recursion(void)
 
     /* b(x) :- a(x). c(x) :- b(x). No cycles = each in own SCC */
     struct wirelog_program *prog = make_full_program(".decl a(x: int32)\n"
-                                                     ".decl b(x: int32)\n"
-                                                     ".decl c(x: int32)\n"
-                                                     "b(x) :- a(x).\n"
-                                                     "c(x) :- b(x).\n");
+            ".decl b(x: int32)\n"
+            ".decl c(x: int32)\n"
+            "b(x) :- a(x).\n"
+            "c(x) :- b(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -393,9 +411,9 @@ test_scc_direct_recursion(void)
 
     struct wirelog_program *prog
         = make_full_program(".decl Arc(x: int32, y: int32)\n"
-                            ".decl Tc(x: int32, y: int32)\n"
-                            "Tc(x, y) :- Arc(x, y).\n"
-                            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -441,11 +459,11 @@ test_scc_mutual_recursion(void)
 
     /* a and b mutually depend on each other */
     struct wirelog_program *prog = make_full_program(".decl base(x: int32)\n"
-                                                     ".decl a(x: int32)\n"
-                                                     ".decl b(x: int32)\n"
-                                                     "a(x) :- b(x).\n"
-                                                     "b(x) :- a(x).\n"
-                                                     "a(x) :- base(x).\n");
+            ".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
+            "a(x) :- b(x).\n"
+            "b(x) :- a(x).\n"
+            "a(x) :- base(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -500,18 +518,18 @@ test_scc_two_sccs(void)
 
     /* {a,b} cycle and {d,e} cycle, connected by c */
     struct wirelog_program *prog = make_full_program(".decl base(x: int32)\n"
-                                                     ".decl a(x: int32)\n"
-                                                     ".decl b(x: int32)\n"
-                                                     ".decl c(x: int32)\n"
-                                                     ".decl d(x: int32)\n"
-                                                     ".decl e(x: int32)\n"
-                                                     "a(x) :- b(x).\n"
-                                                     "b(x) :- a(x).\n"
-                                                     "a(x) :- base(x).\n"
-                                                     "c(x) :- a(x).\n"
-                                                     "d(x) :- e(x).\n"
-                                                     "e(x) :- d(x).\n"
-                                                     "d(x) :- c(x).\n");
+            ".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
+            ".decl c(x: int32)\n"
+            ".decl d(x: int32)\n"
+            ".decl e(x: int32)\n"
+            "a(x) :- b(x).\n"
+            "b(x) :- a(x).\n"
+            "a(x) :- base(x).\n"
+            "c(x) :- a(x).\n"
+            "d(x) :- e(x).\n"
+            "e(x) :- d(x).\n"
+            "d(x) :- c(x).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -561,9 +579,9 @@ test_stratify_simple(void)
 
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
-                                                   ".decl r(x: int32)\n"
-                                                   "r(x) :- a(x).\n",
-                                                   &err);
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse returned NULL");
@@ -573,7 +591,7 @@ test_stratify_simple(void)
     if (wirelog_program_get_stratum_count(prog) != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 stratum, got %u",
-                 wirelog_program_get_stratum_count(prog));
+            wirelog_program_get_stratum_count(prog));
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -597,10 +615,10 @@ test_stratify_recursive_tc(void)
     wirelog_error_t err;
     wirelog_program_t *prog
         = wirelog_parse_string(".decl Arc(x: int32, y: int32)\n"
-                               ".decl Tc(x: int32, y: int32)\n"
-                               "Tc(x, y) :- Arc(x, y).\n"
-                               "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
-                               &err);
+            ".decl Tc(x: int32, y: int32)\n"
+            "Tc(x, y) :- Arc(x, y).\n"
+            "Tc(x, y) :- Tc(x, z), Arc(z, y).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse returned NULL");
@@ -610,7 +628,7 @@ test_stratify_recursive_tc(void)
     if (wirelog_program_get_stratum_count(prog) != 1) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 1 stratum, got %u",
-                 wirelog_program_get_stratum_count(prog));
+            wirelog_program_get_stratum_count(prog));
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -634,11 +652,11 @@ test_stratify_two_strata(void)
 
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
-                                                   ".decl b(x: int32)\n"
-                                                   ".decl c(x: int32)\n"
-                                                   "b(x) :- a(x).\n"
-                                                   "c(x) :- b(x).\n",
-                                                   &err);
+            ".decl b(x: int32)\n"
+            ".decl c(x: int32)\n"
+            "b(x) :- a(x).\n"
+            "c(x) :- b(x).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse returned NULL");
@@ -648,7 +666,7 @@ test_stratify_two_strata(void)
     if (wirelog_program_get_stratum_count(prog) != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 strata, got %u",
-                 wirelog_program_get_stratum_count(prog));
+            wirelog_program_get_stratum_count(prog));
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -673,12 +691,12 @@ test_stratify_two_strata(void)
 
     /* b must be in earlier stratum than c */
     bool b_first = (strcmp(s0->rule_names[0], "b") == 0
-                    && strcmp(s1->rule_names[0], "c") == 0);
+        && strcmp(s1->rule_names[0], "c") == 0);
     if (!b_first) {
         char buf[200];
         snprintf(buf, sizeof(buf),
-                 "expected b in s0, c in s1; got s0=%s, s1=%s",
-                 s0->rule_names[0], s1->rule_names[0]);
+            "expected b in s0, c in s1; got s0=%s, s1=%s",
+            s0->rule_names[0], s1->rule_names[0]);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -696,11 +714,11 @@ test_stratify_unstratifiable(void)
     /* p depends on !q, q depends on !p -> negation cycle within SCC */
     wirelog_error_t err = WIRELOG_OK;
     wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
-                                                   ".decl p(x: int32)\n"
-                                                   ".decl q(x: int32)\n"
-                                                   "p(x) :- base(x), !q(x).\n"
-                                                   "q(x) :- base(x), !p(x).\n",
-                                                   &err);
+            ".decl p(x: int32)\n"
+            ".decl q(x: int32)\n"
+            "p(x) :- base(x), !q(x).\n"
+            "q(x) :- base(x), !p(x).\n",
+            &err);
 
     if (prog != NULL) {
         wirelog_program_free(prog);
@@ -716,6 +734,61 @@ test_stratify_unstratifiable(void)
     PASS();
 }
 
+#ifdef __linux__
+static void
+test_stratify_edge_realloc_failure_is_memory_error(void)
+{
+    TEST("Stratify: edge realloc failure is not accepted");
+
+    /*
+     * This program is unstratifiable only if both IDB negation edges are
+     * present in the dependency graph.  Before #1127, dropping the first edge
+     * after graph_add_edge()'s realloc failed made wl_ir_stratify_program()
+     * return success.  The wrapper assertion keeps this test non-vacuous: if
+     * --wrap=realloc or b_lto=false is removed, the program is rejected as a
+     * normal negation cycle and this test fails instead of silently passing.
+     */
+    struct wirelog_program *prog
+        = make_full_program(".decl base(x: int32)\n"
+            ".decl p(x: int32)\n"
+            ".decl q(x: int32)\n"
+            "p(x) :- base(x), !q(x).\n"
+            "q(x) :- base(x), !p(x).\n");
+    if (!prog) {
+        FAIL("program is NULL");
+        return;
+    }
+
+    forced_realloc_failures = 0;
+    fail_next_realloc = 1;
+    int rc = wl_ir_stratify_program(prog);
+    fail_next_realloc = 0;
+
+    if (forced_realloc_failures != 1) {
+        wl_ir_program_free(prog);
+        FAIL("expected exactly one forced realloc failure");
+        return;
+    }
+
+    if (rc != -1) {
+        char buf[100];
+        snprintf(buf, sizeof(buf), "expected memory error -1, got %d", rc);
+        wl_ir_program_free(prog);
+        FAIL(buf);
+        return;
+    }
+
+    if (prog->is_stratified) {
+        wl_ir_program_free(prog);
+        FAIL("program must not be marked stratified after allocation failure");
+        return;
+    }
+
+    wl_ir_program_free(prog);
+    PASS();
+}
+#endif
+
 static void
 test_stratify_multiple_sccs(void)
 {
@@ -724,19 +797,19 @@ test_stratify_multiple_sccs(void)
     /* {a,b} mutual recursion, c depends on a, {d,e} mutual recursion depends on c */
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
-                                                   ".decl a(x: int32)\n"
-                                                   ".decl b(x: int32)\n"
-                                                   ".decl c(x: int32)\n"
-                                                   ".decl d(x: int32)\n"
-                                                   ".decl e(x: int32)\n"
-                                                   "a(x) :- b(x).\n"
-                                                   "b(x) :- a(x).\n"
-                                                   "a(x) :- base(x).\n"
-                                                   "c(x) :- a(x).\n"
-                                                   "d(x) :- e(x).\n"
-                                                   "e(x) :- d(x).\n"
-                                                   "d(x) :- c(x).\n",
-                                                   &err);
+            ".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
+            ".decl c(x: int32)\n"
+            ".decl d(x: int32)\n"
+            ".decl e(x: int32)\n"
+            "a(x) :- b(x).\n"
+            "b(x) :- a(x).\n"
+            "a(x) :- base(x).\n"
+            "c(x) :- a(x).\n"
+            "d(x) :- e(x).\n"
+            "e(x) :- d(x).\n"
+            "d(x) :- c(x).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse returned NULL");
@@ -746,7 +819,7 @@ test_stratify_multiple_sccs(void)
     if (wirelog_program_get_stratum_count(prog) != 3) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 3 strata, got %u",
-                 wirelog_program_get_stratum_count(prog));
+            wirelog_program_get_stratum_count(prog));
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -796,9 +869,9 @@ test_stratify_self_negation(void)
 
     wirelog_error_t err = WIRELOG_OK;
     wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
-                                                   ".decl p(x: int32)\n"
-                                                   "p(x) :- a(x), !p(x).\n",
-                                                   &err);
+            ".decl p(x: int32)\n"
+            "p(x) :- a(x), !p(x).\n",
+            &err);
 
     if (prog != NULL) {
         wirelog_program_free(prog);
@@ -821,13 +894,13 @@ test_stratify_edb_only_deps(void)
 
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(".decl a(x: int32)\n"
-                                                   ".decl b(x: int32)\n"
-                                                   ".decl c(x: int32)\n"
-                                                   ".decl r(x: int32)\n"
-                                                   ".decl s(x: int32)\n"
-                                                   "r(x) :- a(x).\n"
-                                                   "s(x) :- b(x).\n",
-                                                   &err);
+            ".decl b(x: int32)\n"
+            ".decl c(x: int32)\n"
+            ".decl r(x: int32)\n"
+            ".decl s(x: int32)\n"
+            "r(x) :- a(x).\n"
+            "s(x) :- b(x).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse returned NULL");
@@ -839,7 +912,7 @@ test_stratify_edb_only_deps(void)
     if (wirelog_program_get_stratum_count(prog) != 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected 2 strata, got %u",
-                 wirelog_program_get_stratum_count(prog));
+            wirelog_program_get_stratum_count(prog));
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -862,16 +935,16 @@ test_stratify_diamond_deps(void)
 
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
-                                                   ".decl a(x: int32)\n"
-                                                   ".decl b(x: int32)\n"
-                                                   ".decl c(x: int32)\n"
-                                                   ".decl d(x: int32)\n"
-                                                   "a(x) :- base(x).\n"
-                                                   "b(x) :- a(x).\n"
-                                                   "c(x) :- a(x).\n"
-                                                   "d(x) :- b(x).\n"
-                                                   "d(x) :- c(x).\n",
-                                                   &err);
+            ".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
+            ".decl c(x: int32)\n"
+            ".decl d(x: int32)\n"
+            "a(x) :- base(x).\n"
+            "b(x) :- a(x).\n"
+            "c(x) :- a(x).\n"
+            "d(x) :- b(x).\n"
+            "d(x) :- c(x).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse returned NULL");
@@ -885,7 +958,7 @@ test_stratify_diamond_deps(void)
     if (count < 3) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected >= 3 strata for diamond, got %u",
-                 count);
+            count);
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -910,11 +983,11 @@ test_stratify_negation_across_strata_valid(void)
        p is in an earlier stratum -> valid stratification. */
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(".decl base(x: int32)\n"
-                                                   ".decl p(x: int32)\n"
-                                                   ".decl r(x: int32)\n"
-                                                   "p(x) :- base(x).\n"
-                                                   "r(x) :- base(x), !p(x).\n",
-                                                   &err);
+            ".decl p(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "p(x) :- base(x).\n"
+            "r(x) :- base(x), !p(x).\n",
+            &err);
 
     if (!prog) {
         FAIL("parse returned NULL — valid program rejected");
@@ -931,7 +1004,7 @@ test_stratify_negation_across_strata_valid(void)
     if (wirelog_program_get_stratum_count(prog) < 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "expected >= 2 strata, got %u",
-                 wirelog_program_get_stratum_count(prog));
+            wirelog_program_get_stratum_count(prog));
         wirelog_program_free(prog);
         FAIL(buf);
         return;
@@ -948,8 +1021,8 @@ test_stratify_aggregation_edge(void)
 
     struct wirelog_program *prog
         = make_full_program(".decl sssp2(x: int32, d: int32)\n"
-                            ".decl sssp(x: int32, d: int32)\n"
-                            "sssp(x, min(d)) :- sssp2(x, d).\n");
+            ".decl sssp(x: int32, d: int32)\n"
+            "sssp(x, min(d)) :- sssp2(x, d).\n");
 
     if (!prog) {
         FAIL("program is NULL");
@@ -1015,6 +1088,9 @@ main(void)
     test_stratify_recursive_tc();
     test_stratify_two_strata();
     test_stratify_unstratifiable();
+#ifdef __linux__
+    test_stratify_edge_realloc_failure_is_memory_error();
+#endif
     test_stratify_multiple_sccs();
     test_stratify_no_rules();
 
@@ -1026,7 +1102,7 @@ main(void)
     test_stratify_aggregation_edge();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
-           tests_passed, tests_failed, tests_run);
+        tests_passed, tests_failed, tests_run);
 
     return tests_failed > 0 ? 1 : 0;
 }

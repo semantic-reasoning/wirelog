@@ -130,6 +130,8 @@ test_stratify_exe = executable(
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
+  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=realloc'] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
 )
 
 test_stratify_scc_bounds_exe = executable(
