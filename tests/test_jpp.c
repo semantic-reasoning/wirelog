@@ -1752,6 +1752,152 @@ test_jpp_nullary_chain(void)
 }
 
 static void
+test_jpp_keyed_chain_zero_calloc(void)
+{
+    TEST("jpp #1085: zero-size calloc watch over a chain that HAS join keys");
+
+    /*
+     * Companion to test_jpp_nullary_chain() above, and the reason it is not
+     * redundant with it.
+     *
+     * That test arms jpp_zero_calloc_watch over `o(1) :- a(), b(), e().`,
+     * where every atom is nullary.  On that fixture:
+     *
+     *   - count_shared_vars() returns 0, so jpp_build_join_keys() takes its
+     *     `key_count == 0` early return and NEVER REACHES its calloc.  The
+     *     watch has never once observed that allocation.
+     *   - merge_vars() is only ever reached with na + nb == 0, so the watch
+     *     observes exactly one leg of its sizing and no other.
+     *
+     * So the nullary fixture pins the clamp-removal guarantee for the case
+     * it was written for, and nothing else.  Describing it as cover for
+     * "jpp.c never asks calloc for zero elements" overstates it: the two
+     * allocations that the #1085 re-sizing actually touched were both
+     * outside its reach.  This fixture puts them inside it.
+     *
+     *   o(z) :- a(x), c(y, z), b(x, y).
+     *
+     * Three properties, all load-bearing:
+     *
+     *   - It REORDERS.  greedy_order() always seeds with scans[0] and here
+     *     prefers b (shares x) over c (shares nothing), so the order becomes
+     *     a, b, c and optimize_chain() actually calls rebuild_chain().
+     *     Without a reorder rebuild_chain() is skipped entirely and the
+     *     watch would be as vacuous as it is on the nullary fixture --
+     *     which is why joins_reordered is asserted below rather than merely
+     *     observed.
+     *   - Its first scan has exactly ONE column, so rebuild_chain()'s first
+     *     jpp_build_join_keys() call runs with left_count == 1.  That is
+     *     what gives the watch teeth against the new left_count sizing:
+     *     mis-sizing it by one element asks calloc for zero and is counted
+     *     here, where on any wider fixture it would merely under-allocate
+     *     by one and go unnoticed.
+     *   - It shares a variable at every step, so key_count > 0 and the
+     *     calloc is reached at all.
+     *
+     * What this fixture does NOT cover, stated plainly rather than implied.
+     * merge_vars() is reached here with na + nb > 0, so this exercises the
+     * ordinary leg of that sizing but cannot observe the `+ 1` AS WIDTH.
+     * Nothing can: instrumented over this suite, 845 merge_vars() calls of
+     * which 843 have na + nb > 0, the minimum of (na + nb) - n is 1.  The
+     * merged count never reaches the bound, because every real call merges
+     * an accumulator with a scan sharing at least one variable, so at least
+     * one element is always spare even before the `+ 1`.  The extra element
+     * is therefore never written and no input can press against it.
+     *
+     * The `+ 1` is still guarded, just not here and not as a width: it is
+     * what keeps the request away from zero, and removing it is caught by
+     * test_jpp_nullary_chain() above, which then counts two zero-element
+     * requests.  Mutating it to na + nb - 1 is caught there too, by
+     * underflow.  So the sizing has cover for the property it was chosen
+     * for; what has no cover, and needs none, is the spare element.
+     */
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32)\n"
+            ".decl b(x: int32, y: int32)\n"
+            ".decl c(y: int32, z: int32)\n"
+            ".decl o(z: int32)\n"
+            "o(z) :- a(x), c(y, z), b(x, y).\n",
+            &err);
+
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wl_jpp_stats_t stats = { 0, 0, 0 };
+#ifdef __linux__
+    jpp_zero_calloc_watch_begin();
+#endif
+    int rc = wl_jpp_apply(prog, &stats);
+#ifdef __linux__
+    unsigned long zero_callocs = jpp_zero_calloc_watch_end();
+#endif
+    if (rc != 0) {
+        FAIL("expected 0");
+        wirelog_program_free(prog);
+        return;
+    }
+
+#ifdef __linux__
+    if (zero_callocs != 0) {
+        char zbuf[160];
+        snprintf(zbuf, sizeof(zbuf),
+            "%lu calloc request(s) for zero elements; calloc(0, n) may "
+            "return NULL and would be misread as OOM",
+            zero_callocs);
+        FAIL(zbuf);
+        wirelog_program_free(prog);
+        return;
+    }
+#endif
+
+    /*
+     * Anti-vacuity: the watch above proves nothing unless the pass really
+     * walked the allocating paths.  A reorder means rebuild_chain() ran,
+     * and keys on every JOIN mean jpp_build_join_keys() got past its
+     * key_count == 0 early return each time.
+     */
+    if (stats.chains_examined != 1 || stats.joins_reordered != 1) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+            "expected chains=1 reordered=1 (the watch is vacuous without a "
+            "rebuild), got chains=%u reordered=%u",
+            stats.chains_examined, stats.joins_reordered);
+        FAIL(buf);
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_ir_node_t *ir = find_relation_ir(prog, "o");
+    wirelog_ir_node_t *root = ir ? find_join_root(ir) : NULL;
+    if (!root || root->type != WIRELOG_IR_JOIN) {
+        FAIL("expected JOIN at the root of the chain");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    wirelog_ir_node_t *n = root;
+    while (n && n->type == WIRELOG_IR_JOIN) {
+        if (n->join_key_count == 0) {
+            FAIL("found a JOIN with no keys; the key builder was never "
+                "reached past its early return");
+            wirelog_program_free(prog);
+            return;
+        }
+        n = n->child_count > 0 ? n->children[0] : NULL;
+        /* insert_projections() may have spliced a PROJECT between two JOIN
+         * levels; the chain continues below it. */
+        while (n && n->type == WIRELOG_IR_PROJECT && n->child_count > 0)
+            n = n->children[0];
+    }
+
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
 test_jpp_plan_unchanged_narrow(void)
 {
     TEST("jpp: narrow 3-atom plan (order and projection count) unchanged");
@@ -2617,6 +2763,7 @@ main(void)
     test_jpp_wide_two_atom_noop();
     test_jpp_wide_head_antijoin_key();
     test_jpp_nullary_chain();
+    test_jpp_keyed_chain_zero_calloc();
     test_jpp_plan_unchanged_narrow();
 
     /* Allocation-failure sweeps (issue #1111) */

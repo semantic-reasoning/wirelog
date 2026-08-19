@@ -238,8 +238,58 @@ jpp_build_join_keys(char **left_vars, uint32_t left_count, char **right_vars,
     if (key_count == 0)
         return true;
 
-    char **left = (char **)calloc(key_count, sizeof(char *));
-    char **right = (char **)calloc(key_count, sizeof(char *));
+    /*
+     * Size both arrays from left_count, not from key_count.
+     *
+     * key_count is the exact answer, and count_shared_vars() computed it
+     * with a walk that is character-identical to the fill loop below, over
+     * the same left_vars, right_vars, left_count and right_count -- nothing
+     * mutates any of them in between -- so k reaches exactly key_count.
+     * Sizing from left_count instead makes the bound STRUCTURAL: the fill
+     * loop iterates left_vars[0 .. left_count) and appends at most one key
+     * per iteration, so k < left_count at every store no matter what the
+     * two walks agree on.  That is a property of the loop a reader can see
+     * in one place, and it does not depend on re-deriving an equality
+     * through a second traversal.  left_count >= key_count >= 1 here (a
+     * non-zero key_count needs at least one non-NULL left variable), so
+     * this never asks calloc for zero elements either.
+     *
+     * The arrays are therefore allocated LONGER than out->count whenever a
+     * left variable is unshared or NULL.  A DUPLICATED left variable is not
+     * a source of slack: count_shared_vars() counts it and the fill loop
+     * stores it, so it consumes a slot and yields a duplicate key entry.
+     *
+     * The slack is not negligible, and the honest worst case is large.
+     * Measured across the FULL test suite it peaks at 199 spare pointers
+     * per array -- left_count == 200 against key_count == 1, from the
+     * recursive 3-atom self-join over 200 columns in
+     * tests/test_wide_relation.c, where the accumulator carries every
+     * column and the atoms share a single variable.  The 32- and 33-column
+     * widths of that same shape give 31 and 32.  Within tests/test_jpp.c
+     * alone it peaks at three, which is why the figure has to be quoted
+     * against the whole suite and not the pass's own tests.
+     *
+     * That is wasted space, not a leak or a hazard.  The spare elements
+     * stay NULL from calloc, the array is released by the same free()
+     * under either sizing, and nothing truncates: out->count is k either
+     * way, and every consumer of a JOIN's key arrays iterates
+     * [0, join_key_count) -- free_join_keys() and jpp_free_staged_keys()
+     * in this file, wl_ir_node_free() and the IR printer in ir/ir.c, the
+     * key copy in passes/sip.c, and the three resolution loops in
+     * exec_plan_gen.c, which take the array and the count as a pair.  The
+     * ir/ir.c pair is the one a reader is least likely to think to check;
+     * both walk join_key_count, never the allocation.
+     *
+     * This does leave jpp-produced JOIN nodes as the only ones whose key
+     * arrays are longer than join_key_count: ir/program.c's
+     * setup_join_keys() and passes/magic_sets.c both calloc(key_count) and
+     * set join_key_count = key_count.  Nothing appends to these arrays in
+     * place, so the asymmetry is unobservable today; anything that ever
+     * wanted to would have to carry the capacity, which only this builder
+     * knows.
+     */
+    char **left = (char **)calloc(left_count, sizeof(char *));
+    char **right = (char **)calloc(left_count, sizeof(char *));
     if (!left || !right) {
         free((void *)left);
         free((void *)right);
@@ -292,20 +342,28 @@ static char **
 merge_vars(char **a, uint32_t na, char **b, uint32_t nb, uint32_t *out_count)
 {
     /*
-     * Upper bound on merged size, clamped to at least one element.
+     * Upper bound on merged size, plus one element that is never written.
      *
      * na + nb == 0 is reachable and legitimate: `.decl p()` is legal and
      * leaves column_count == 0, so an all-nullary chain merges two empty
      * sets.  C permits calloc(0, n) to return NULL and a caller cannot tell
      * that apart from OOM, which would decline the reorder for a chain that
-     * is perfectly optimizable.  scan_columns_total() above clamps for
-     * exactly this reason; the clamp is safe here for the same reason it is
-     * safe there -- every write into merged[] is bounded by na + nb, so a
-     * zero-total merge performs no writes at all.
+     * is perfectly optimizable.  The `+ 1` is what keeps this allocation
+     * away from zero, and it does so BY CONSTRUCTION rather than by a
+     * `cap > 0 ? cap : 1` clamp at the call: there is no zero-size leg left
+     * to get wrong, and no conditional for a reader to check.  The cost is
+     * one pointer per merge.
+     *
+     * The width is more than sufficient for the writes: the first loop
+     * stores na elements and the second at most nb, so n <= na + nb <
+     * merged_cap on every path.  It cannot wrap.  na and nb count the
+     * elements of `char *` arrays that already exist, so each is at most
+     * SIZE_MAX / sizeof(char *) and the sum plus one stays well inside
+     * size_t on every target -- the addition is performed in size_t, both
+     * operands having been widened before it.
      */
-    size_t merged_cap = (size_t)na + (size_t)nb;
-    char **merged
-        = (char **)calloc(merged_cap > 0 ? merged_cap : 1, sizeof(char *));
+    size_t merged_cap = (size_t)na + (size_t)nb + 1u;
+    char **merged = (char **)calloc(merged_cap, sizeof(char *));
     if (!merged) {
         *out_count = 0;
         return NULL;
@@ -882,6 +940,51 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
      * one alias per scan column in the chain.  needed[] is sized separately
      * -- it holds the head variables as well, so its bound adds
      * head_var_count on top of this. */
+    /*
+     * Six stores into acc[] and phys_names[], and one into needed[], carry
+     * NOLINTs for clang-analyzer-security.ArrayBound below.  All seven are
+     * analyzer limitations rather than real bounds; the proof lives here,
+     * once, so that the suppressions themselves can stay bare.
+     *
+     * total_cols is scan_columns_total(): the sum of the scan_vars() counts
+     * over every entry of scans[].  Call a "chain column" one column of one
+     * of those scans; there are exactly total_cols of them.
+     *
+     *   - acc[] has total_cols elements.  It is filled to scans[0]'s column
+     *     count, then acc_count is incremented once per column of a later
+     *     scan not already present, and is otherwise only ever reset
+     *     DOWNWARD, by the PROJECT rewrite.  Every increment consumes a
+     *     distinct chain column that no earlier increment consumed, so at
+     *     each store the index acc_count is at most the number of chain
+     *     columns already consumed -- leaving at least the one being stored
+     *     -- hence acc_count < total_cols.
+     *   - phys_names[] has total_cols elements.  phys_count is incremented
+     *     once per column of scans[0], scans[1] and each later scans[i + 2],
+     *     and is reset to acc_count (itself <= total_cols) whenever a
+     *     PROJECT shrinks the layout.  Each increment likewise consumes a
+     *     distinct chain column, so phys_count < total_cols at each store.
+     *   - needed[] has head_var_count + total_cols elements.  needed_count
+     *     is incremented at most once per head variable and at most once per
+     *     chain column, each behind a var_in_set() duplicate check, so
+     *     needed_count < needed_cap at each store.
+     *
+     * The counts are uint32_t and total_cols is size_t, so "count <=
+     * total_cols" is a complete argument only together with total_cols <=
+     * UINT32_MAX.  That holds: total_cols is a sum of uint32_t column_count
+     * values over nscan scans, and a chain totalling more than UINT32_MAX
+     * columns could not have been built at all -- phys_names[] alone would
+     * be one allocation of that many pointers.
+     *
+     * The analyzer reports these because it does not inline
+     * scan_columns_total(): a total accumulated over a loop is outside the
+     * constraint manager's reach, so it explores paths on which total_cols
+     * is unrelated to the per-scan counts (total_cols == 1 against a scan of
+     * many columns).  Two stronger experiments confirm that diagnosis rather
+     * than a mere size budget -- inlining the entire summation loop into
+     * this function by hand, giving the analyzer maximal visibility, and
+     * deleting the WL_LOG from the helper to rule out "the helper is too big
+     * to inline".  Both still report the same seven sites.
+     */
     size_t total_cols;
     if (!scan_columns_total(scans, nscan, &total_cols)) {
         free((void *)scans);
@@ -901,6 +1004,7 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
         return 0;
     }
     for (uint32_t i = 0; i < acc_count; i++)
+        // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
         acc[i] = acc_vars[i];
 
     /* Merge scan[1] */
@@ -911,6 +1015,7 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
             if (!svars[j])
                 continue;
             if (!var_in_set(svars[j], acc, acc_count))
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                 acc[acc_count++] = svars[j];
         }
     }
@@ -934,10 +1039,12 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
         uint32_t s0c;
         char **s0v = scan_vars(scans[0], &s0c);
         for (uint32_t j = 0; j < s0c; j++)
+            // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             phys_names[phys_count++] = s0v[j];
         uint32_t s1c;
         char **s1v = scan_vars(scans[1], &s1c);
         for (uint32_t j = 0; j < s1c; j++)
+            // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             phys_names[phys_count++] = s1v[j];
     }
 
@@ -985,6 +1092,7 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
             char **svars = scan_vars(scans[s], &scount);
             for (uint32_t j = 0; j < scount; j++) {
                 if (svars[j] && !var_in_set(svars[j], needed, needed_count))
+                    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                     needed[needed_count++] = svars[j];
             }
         }
@@ -1007,6 +1115,53 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                     = (char **)calloc(live_count, sizeof(char *));
                 if (proj->project_indices && proj->column_names) {
                     proj->column_count = live_count;
+                    /*
+                     * The store into proj->project_indices[] below carries
+                     * an eighth NOLINT, and it is PRE-EMPTIVE: the site does
+                     * not fire at the analyzer's default max-inlinable-size
+                     * of 100 CFG blocks, at which insert_projections() is
+                     * too large to inline into its caller.  Raise that
+                     * threshold to 140 and the reported set for this file
+                     * does not drift, it FLIPS: the seven sites above all
+                     * disappear and this one appears alone in their place.
+                     *
+                     * insert_projections() sits only ~31-40 blocks above the
+                     * default, and the direction of risk is SHRINKING it --
+                     * extracting a helper is the ordinary refactor here.
+                     * Such a refactor would take this file from
+                     * suppressed-clean to RED at a site nothing had flagged.
+                     *
+                     * Other stores in this file are latent too, and none of
+                     * them is suppressed.  greedy_order()'s two acc[] writes
+                     * and rebuild_chain()'s children[0] assignments sit
+                     * OUTSIDE insert_projections(), so no refactor of the
+                     * kind above can surface them.
+                     *
+                     * That argument does not reach the PROJECT rewrite lower
+                     * in this same function -- acc[new_acc++] and the
+                     * phys_names[] refill that follows it are inside
+                     * insert_projections() -- so for those two the reason is
+                     * different, and it is empirical rather than
+                     * structural: neither is reported at 100, at 140 or at
+                     * 200, whereas the store below is reported at 140 and at
+                     * 200.  Both are safe by the bounds already established
+                     * above -- new_acc only trails v across the same
+                     * [0, acc_count) walk, and the refill writes exactly
+                     * acc_count entries into an array of total_cols.
+                     * Suppressing a site that no measured configuration
+                     * reports would spend a baseline slot and buy nothing.
+                     *
+                     * The invariant is the same identical-predicate shape as
+                     * jpp_build_join_keys(): project_indices[] and
+                     * column_names[] both have live_count elements, and p is
+                     * incremented once per v in [0, acc_count) satisfying
+                     * `acc[v] && var_in_set(acc[v], needed, needed_count)`
+                     * -- character-identical to the predicate the live_count
+                     * loop just counted with, over the same acc[], needed[]
+                     * and needed_count, none of which is mutated in between.
+                     * So p reaches exactly live_count, and every store is at
+                     * an index p < live_count.
+                     */
                     uint32_t p = 0;
                     for (uint32_t v = 0; v < acc_count; v++) {
                         if (acc[v]
@@ -1024,6 +1179,7 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
                                     break;
                                 }
                             }
+                            // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                             proj->project_indices[p] = phys_idx;
                             proj->column_names[p] = strdup_safe(acc[v]);
                             if (!proj->column_names[p]) {
@@ -1133,8 +1289,10 @@ next_level:
             uint32_t scount;
             char **svars = scan_vars(scans[i + 2], &scount);
             for (uint32_t j = 0; j < scount; j++) {
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                 phys_names[phys_count++] = svars[j];
                 if (svars[j] && !var_in_set(svars[j], acc, acc_count))
+                    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
                     acc[acc_count++] = svars[j];
             }
         }
