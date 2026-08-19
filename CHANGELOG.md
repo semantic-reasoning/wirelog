@@ -13,6 +13,161 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **A recursive `min()`/`max()` aggregate may no longer share an SCC with any
+  other relation** (#1021): plan generation refuses the shape. This is a
+  compatibility break -- programs that run today are refused -- and it is
+  deliberate, because in general what those programs answer cannot be
+  predicted from the program. "In general" is precise rather than hedging:
+  there is a class where it can be, and that class is refused too. See "Why
+  the rule is this coarse" below.
+
+  A relation in the same SCC as a recursive aggregate reads that aggregate's
+  *per-iteration* content: it observes each round's per-rule `REDUCE` output
+  before that round's cross-rule domination has run. What it observes is
+  decided by the evaluation strategy rather than by the program, and the two
+  build configurations do not agree on it. For
+
+      Edge(1,2). Edge(2,3). Edge(3,4).
+      Label(x, min(x)) :- Edge(x, y).
+      Label(y, min(y)) :- Edge(x, y).
+      Label(x, min(l)) :- Label(y, l), Edge(y, x).
+      Big(x)           :- Label(x, l), l > 2.
+      Label(x, min(9)) :- Big(x).
+
+  the default build settled every label at 1 and still reported `Big(3)` and
+  `Big(4)` -- two nodes said to carry a label above 2 when no surviving label
+  exceeds 1. (`Label(4,4)` does exist transiently, in an intermediate round;
+  that it is visible to `Big` at all is the defect.) An `ENABLE_K_FUSION=0`
+  build corrupted the aggregate as well,
+  answering `Label(3,2) Label(4,3)`. Two configurations, two different wrong
+  answers, exit status 0 from both.
+
+  The rule as coded is "no other relation of a recursive stratum may read a
+  relation that carries a `REDUCE`". That is the same rule as the SCC one
+  stated above: `wl_ir_stratify` assigns one stratum per SCC, and a
+  multi-relation SCC is strongly connected, so some other relation of it
+  necessarily reads the aggregate directly. Phrasing it as "no other relation
+  may reference R" would understate how much surface this removes.
+
+  Programs that answer correctly today and are refused anyway. Five are
+  known; each was measured in both build configurations, which agree on all
+  five. The mutual recursion
+
+      A(x, min(x)) :- Edge(x, y).      B(x, min(v)) :- A(x, v).
+      A(y, min(y)) :- Edge(x, y).      A(x, min(v)) :- B(y, v), Edge(y, x).
+
+  answers `A` and `B` all-1 over the path above. The bipartite propagation
+
+      L(x, min(x)) :- Edge(x, y).
+      R(y, min(v)) :- L(x, v), Edge(x, y).
+      L(y, min(v)) :- R(x, v), Edge(y, x).
+
+  answers `L(1,1) (2,2) (3,3) (4,4)` and `R(2,1) (3,2) (4,3) (5,4)` over the
+  path `1->2->3->4->5`. And the repro above *without* its self-recursive
+  third rule --
+
+      Label(x, min(x)) :- Edge(x, y).
+      Label(y, min(y)) :- Edge(x, y).
+      Big(x)           :- Label(x, l), l > 2.
+      Label(x, min(9)) :- Big(x).
+
+  -- answers `Label(1,1) (2,2) (3,3) (4,4)` with `Big(3) Big(4)`, which is
+  the least fixpoint, in both configurations. That one is worth reading
+  twice: it is the same SCC shape as the defect, one rule shorter, and it is
+  refused despite being right.
+
+  The fourth is the `max()` analogue of the `A`/`B` pair above, which answers
+  `A` and `B` `(1,1) (2,2) (3,3) (4,4)`. The fifth is the one that matters
+  most, because it is not merely a program that happens to come out right:
+
+      M(x, min(x)) :- Edge(x, _).
+      Root(x)      :- M(x, v).
+      M(x, min(x)) :- Root(x).
+
+  answers `M(1,1) (2,2) (3,3) (4,4)` and `Root(1) (2) (3) (4)` over
+  `1->2->3->4->5`. Here the aggregated value is functionally determined by
+  the group key, so no value is ever dominated away, so a round's content is
+  the fixpoint's content -- configuration-dependence is impossible by
+  construction, not merely absent from the samples anyone ran. For this class
+  the outcome *is* predictable from the program, and the rule refuses it
+  anyway because it reasons about SCC shape and not about functional
+  dependencies. That is the strongest argument that this rule should be
+  narrowed rather than kept, and #1135 carries it as the leading candidate
+  predicate.
+
+  A third shape, `Seen(x) :- Label(x, l).` together with
+  `Label(x, min(9)) :- Seen(x).`, is refused and is **not** in that list: it
+  carries no predicate on the aggregate column at all, and it is still
+  configuration-dependent today, the default build answering `Label` all-1
+  where an `ENABLE_K_FUSION=0` build answers `Label(3,2) Label(4,3)`. It is
+  the clearest evidence that the trouble is not "the consumer reads the
+  aggregate column non-monotonically" but the broader "a same-SCC consumer
+  observes per-iteration content".
+
+  Why the rule is this coarse. The obvious leniency -- readmit a consumer
+  that carries its own `min()`/`max()` -- is unsound, and was measured to be.
+  Over a propagating `a`:
+
+      a(x, min(x)) :- Edge(x, y).
+      a(y, min(y)) :- Edge(x, y).
+      a(x, min(v)) :- a(y, v), Edge(y, x).
+      b(x, min(v)) :- a(x, v), v > 2.
+      a(x, min(9)) :- b(x, v).
+
+  yields `b(3,3)` and `b(4,3)` in both configurations. The last rule is not
+  decoration: it is what puts `b` in `a`'s SCC, and without it `b` sits in a
+  higher stratum, `a` settles to all-1, nothing satisfies `v > 2` and `b` is
+  empty in both builds. Of the two rows, `b(3,3)` is the one that carries the
+  argument -- no final `a` justifies it in either configuration, `a(3)` being
+  1 by default and 2 under `ENABLE_K_FUSION=0`. (`b(4,3)` is unjustified only
+  in the default build; the unfused one leaves `a(4,3)` behind, which does
+  satisfy the guard.) Narrowing the rule is milestone 0.70.0 work and wants a
+  CI job that runs these fixtures under `ENABLE_K_FUSION=0`, so that a
+  narrowing can be shown not to readmit a configuration-dependent shape. The
+  tree already runs an unfused binary in the default `meson test` --
+  `k_fusion_memory_nofusion` (`tests/meson.build`) is built with
+  `-DENABLE_K_FUSION=0` and evaluates a transitive closure at K=2 and K=4 --
+  so the meson pattern for such a job exists and is short to copy. What is
+  missing is that no job runs the *recursive-aggregate* fixtures unfused.
+  Tracked under #1135, which carries both the programs a narrowing must
+  readmit and the ones it must keep refusing; see also
+  `docs/SEMANTICS.md`, "Per-iteration recursive aggregate domination".
+
+  Relations whose rules disagree on the aggregate function are refused too,
+  which is intended rather than overreach. Such a head leaves
+  `wl_plan_relation_t.recursive_agg.has_spec` false and is never
+  canonicalised, yet it still reduces per rule and still gives
+  configuration-dependent output to a same-SCC consumer. The check therefore
+  keys on the `REDUCE` operator rather than on the recorded specification.
+
+  One workaround, verified: break the feedback edge, so the consumer lands in
+  a later stratum. Removing `Label(x, min(9)) :- Big(x).` from the program
+  above does exactly that and yields `Label` all-1 with an empty `Big`,
+  identically in both configurations.
+
+  An earlier draft of this entry, and of the diagnostic, offered a second
+  remedy -- give the consumer its own `min()`/`max()` and no non-monotone
+  read of the aggregate column. It is withdrawn. It is vacuous, because the
+  check inspects neither the consumer's operators nor its filters, so a
+  same-SCC consumer is refused whatever it carries; and it is wrong on its
+  own terms, because `b(x, min(v)) :- a(x, v).` over a propagating `a` with
+  the feedback rule intact answers `b` all-1 by default and
+  `b(1,1) (2,1) (3,2) (4,3)` under `ENABLE_K_FUSION=0`. Whether that class
+  can be readmitted is #1135's question; it was never a workaround.
+
+  The rejection is silent at the default log level: the CLI prints only
+  `Plan generation failed: rc=-1`. Run with `WL_LOG=EVAL:1` to get the
+  diagnostic, which names the relations involved and the workaround.
+  `wl_plan_from_program()` has no error channel of its own, so this entry
+  inherits that gap from #991's
+  rejection rather than widening it; it is now tracked as #1137. It is not
+  covered by #979, which fixed the parse and rule-lowering half and left plan
+  generation alone.
+
+  `wl_plan_stratum_t.is_monotone` is untouched. It has been computed since
+  #1021's first step and still has no consumer; this change neither reads it
+  nor makes it readable.
+
 ### Deprecated
 
 ### Removed
