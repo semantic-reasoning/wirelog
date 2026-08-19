@@ -19,6 +19,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Partial NULL guard in the columnar evaluator's post-eval skip** (#1075):
+  two sites in `wirelog/columnar/eval.c` tested
+  `result.rel && result.rel->nrows == 0`. A NULL `result.rel` short-circuits
+  that condition, so it fell straight through to statements that dereference
+  it -- `result.rel->name` on the rename arm, `result.rel->ncols` on the
+  schema-adoption arm and, in the TDD worker subpass, `col_rel_new_like()`,
+  which reads `src->ncols` with no NULL check of its own. Both guards now
+  test `!result.rel || result.rel->nrows == 0` and disposition a NULL as "no
+  result", the same disposition the `stack.top == 0` branch three lines above
+  already gives an empty stack. `col_rel_destroy(NULL)` is a no-op, so the
+  skip path leaks nothing.
+
+  Not reachable today: `eval_stack_pop()` yields a NULL relation only for an
+  empty stack, which that `stack.top == 0` check already excludes, and no
+  in-tree caller pushes a NULL relation. The change closes the guard against
+  a future push path rather than a live crash, and no regression test can
+  reach it without editing library code.
+
 - **Out-of-range dependency-graph edges no longer corrupt SCC detection**
   (#1083): `wl_ir_stratify_scc_detect()` builds its adjacency list in two
   passes that disagreed with each other. The counting pass reserved a slot
