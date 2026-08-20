@@ -85,6 +85,62 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
 
+  tsan:
+    name: TSan / ${{ matrix.compiler }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+          - compiler: clang
+            cc: clang
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Verify checkout identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          echo "verified $actual_sha"
+
+      - name: Install TSan dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libmbedtls-dev
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Configure TSan
+        run: |
+          meson setup builddir-tsan \
+            -Db_sanitize=thread \
+            -Db_lundef=false \
+            -Dthreads=posix \
+            -Dtests=true \
+            --buildtype=debug
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build TSan
+        run: meson compile -C builddir-tsan
+
+      - name: Test TSan
+        run: meson test -C builddir-tsan --print-errorlogs
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+
   msan-fuzz:
     name: MSan fuzz smoke / clang
     runs-on: ubuntu-latest
