@@ -228,10 +228,20 @@ SSSP, SG, and Bipartite W=1 sub-ms graph workloads.  Like the other
 release perf gates, it is opt-in via `WIRELOG_PERF_GATE=1` and is meant
 for stable perf runners, not normal shared local/default runs.
 
-Use a release/perf build with `-Dwirelog_log_max_level=error` and a
-stable timing host, including the `performance` CPU governor where the
-platform exposes one.  `WIRELOG_PERF_REQUIRE=1` turns host or build
-misconfiguration from SKIP into FAIL for release runners.
+The authoritative issue #948 job uses two release/perf build directories on
+the `wirelog-perf` self-hosted Linux runner. Configure the trace build with
+`-Dwirelog_log_max_level=trace` and run `log_perf_gate` there; configure the
+second with `-Dwirelog_log_max_level=error` and run `crdt_perf_gate`,
+`cspa_w1_gate`, and `sub_ms_graph_perf_gate` there. The runner preflight must
+verify CPU 0 is online and its cpufreq governor reads `performance` before
+either build starts. `WIRELOG_PERF_REQUIRE=1` turns any remaining host or
+build misconfiguration from SKIP into FAIL.
+
+GitHub-hosted runners remain diagnostic only: their missing or non-
+`performance` governor intentionally causes the timing gates to SKIP. The
+stable job runs `scripts/ci/check-perf-gate-execution.sh` against both
+`meson-logs/testlog.txt` files, so a green build cannot be mistaken for timing
+coverage.
 
 Current enforcement is correctness sentinels plus median/mean/stdev/CoV
 reporting with a CoV <= 5% noise ceiling.  There is no absolute

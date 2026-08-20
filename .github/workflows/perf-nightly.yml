@@ -292,6 +292,102 @@ jobs:
           if-no-files-found: warn
           retention-days: 35
 
+  # Authoritative timing coverage for issue #948.  GitHub-hosted runners do
+  # not expose a usable cpufreq governor, so the timing assertions must run on
+  # an isolated runner provisioned with the `wirelog-perf` label.  This job is
+  # schedule/workflow_dispatch only; it never executes fork PR code.
+  perf-stable:
+    name: Perf stable runner / trace + stripped builds
+    runs-on: [self-hosted, linux, x64, wirelog-perf]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build linux-tools-common linux-tools-generic
+
+      - name: Verify stable timing host
+        shell: bash
+        run: |
+          set -euo pipefail
+          governor=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+          test -r "$governor" || {
+            echo "stable perf runner must expose $governor" >&2
+            exit 1
+          }
+          if [[ -r /sys/devices/system/cpu/cpu0/online ]] &&
+             [[ "$(cat /sys/devices/system/cpu/cpu0/online)" != 1 ]]; then
+            echo 'stable perf runner requires CPU 0 to be online' >&2
+            exit 1
+          fi
+          sudo -n cpupower frequency-set -g performance
+          actual=$(<"$governor")
+          [[ "$actual" == performance ]] || {
+            echo "stable perf runner governor is '$actual', expected 'performance'" >&2
+            exit 1
+          }
+
+      - name: Configure trace build
+        run: >
+          meson setup build-perf-trace
+          --buildtype=release
+          -Dwirelog_log_max_level=trace
+          -Dtests=true
+          -DmbedTLS=disabled
+        env:
+          CC: gcc
+
+      - name: Build trace build
+        run: meson compile -C build-perf-trace
+
+      - name: Run log timing gate
+        env:
+          WIRELOG_PERF_GATE: '1'
+          WIRELOG_PERF_REQUIRE: '1'
+        run: >
+          taskset -c 0 meson test -C build-perf-trace log_perf_gate
+          --print-errorlogs --num-processes 1
+
+      - name: Configure stripped build
+        run: >
+          meson setup build-perf-error
+          --buildtype=release
+          -Dwirelog_log_max_level=error
+          -Dtests=true
+          -DmbedTLS=disabled
+        env:
+          CC: gcc
+
+      - name: Build stripped build
+        run: meson compile -C build-perf-error
+
+      - name: Run evaluator timing gates
+        env:
+          WIRELOG_PERF_GATE: '1'
+          WIRELOG_PERF_REQUIRE: '1'
+        run: >
+          taskset -c 0 meson test -C build-perf-error
+          crdt_perf_gate cspa_w1_gate sub_ms_graph_perf_gate
+          --print-errorlogs --num-processes 1
+
+      - name: Verify timing gates executed
+        run: >
+          scripts/ci/check-perf-gate-execution.sh
+          build-perf-trace/meson-logs/testlog.txt
+          build-perf-error/meson-logs/testlog.txt
+
+      - name: Upload authoritative perf logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-stable-test-logs
+          path: |
+            build-perf-trace/meson-logs/testlog.txt
+            build-perf-error/meson-logs/testlog.txt
+          if-no-files-found: error
+          retention-days: 35
+
   # ==========================================================================
   # Stress nightly (Issue #594): runs the W=4 / R=500 freeze-cycle and
   # W=4 / R=5000 apply-roundtrip workloads under TSan instrumentation on

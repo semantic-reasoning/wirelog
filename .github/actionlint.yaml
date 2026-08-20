@@ -1,0 +1,7 @@
+self-hosted-runner:
+  # The runner is provisioned outside GitHub-hosted Actions. See
+  # docs/RELEASE_PROCESS.md for its CPU-governor contract.
+  labels:
+    - wirelog-perf
+
+config-variables: null
