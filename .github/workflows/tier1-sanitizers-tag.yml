@@ -1,0 +1,16 @@
+name: Tier-1 Sanitizers (tag)
+
+on:
+  push:
+    tags:
+      - 'v1.*'
+
+permissions:
+  contents: read
+
+jobs:
+  sanitizer-verification:
+    uses: ./.github/workflows/tier1-sanitizers.yml
+    with:
+      ref: ${{ github.ref_name }}
+      expected_sha: ${{ github.sha }}

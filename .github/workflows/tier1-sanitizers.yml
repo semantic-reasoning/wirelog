@@ -1,0 +1,136 @@
+name: Tier-1 Sanitizers
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact tag or commit to verify.
+        required: true
+        type: string
+      expected_sha:
+        description: Commit SHA that the caller resolved for ref.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  asan-ubsan:
+    name: ASan/UBSan / ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+          - os: ubuntu-24.04-arm
+            compiler: gcc
+            cc: gcc
+          - os: macos-latest
+            compiler: apple-clang
+            cc: clang
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Verify checkout identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          echo "verified $actual_sha"
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build abigail-tools
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install meson ninja
+
+      - name: Configure ASan/UBSan
+        run: >
+          meson setup builddir-san
+          -Db_sanitize=address,undefined
+          -Db_lundef=false
+          -Dtests=true
+          --buildtype=debug
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build ASan/UBSan
+        run: meson compile -C builddir-san
+
+      - name: Test ASan/UBSan
+        run: meson test -C builddir-san --print-errorlogs
+        env:
+          ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
+          UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
+
+  msan-fuzz:
+    name: MSan fuzz smoke / clang
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Verify checkout identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          echo "verified $actual_sha"
+
+      - name: Install MSan fuzz dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang meson ninja-build
+
+      - name: Configure MSan fuzz build
+        env:
+          CC: clang
+        run: >
+          meson setup builddir-msan
+          -Denable_fuzz=true
+          -Db_sanitize=memory
+          -Db_lundef=false
+          -Dtests=true
+          --buildtype=debug
+
+      - name: Build MSan fuzz targets
+        run: |
+          meson compile -C builddir-msan \
+            parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+
+      - name: Run MSan fuzz smoke tests
+        run: |
+          meson test -C builddir-msan \
+            parser_fuzz_smoke csv_reader_fuzz_smoke \
+            intern_fuzz_smoke compound_arena_fuzz_smoke \
+            --print-errorlogs
+        env:
+          MSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1:exit_code=86

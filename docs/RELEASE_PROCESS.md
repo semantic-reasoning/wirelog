@@ -206,8 +206,13 @@ When cutting a release tag:
    git tag -s vX.Y.Z -m "wirelog X.Y.Z"
    git push origin vX.Y.Z
    ```
-   The `release-tag.yml` workflow (#749 B19, when shipped) re-runs
-   the full CI matrix on the tagged commit and produces the
+   The [Tier-1 Sanitizers (tag) workflow](../.github/workflows/tier1-sanitizers-tag.yml)
+   re-runs the sanitizer matrix on the tagged commit. It verifies the
+   ASan/UBSan Linux GCC, Linux Clang, Linux ARM64 GCC, and macOS Apple
+   Clang legs plus the MSan parser/CSV/intern/compound-arena fuzz smoke
+   targets required by #693. The `release-tag.yml` workflow (#749 B19,
+   when shipped) will call this reusable workflow as part of the full
+   tagged-commit gate and block artifact publication on failure. It also produces the
    verification artefacts (signed tarball, checksums, SBOM, ABI
    manifest, SLSA provenance attestation).
 5. **Author the GitHub Release**:
