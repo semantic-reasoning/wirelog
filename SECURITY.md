@@ -24,10 +24,6 @@ Do not report security vulnerabilities through public GitHub issues,
 discussions, or pull requests. Public reports can expose users before a fix is
 available.
 
-We aim to acknowledge vulnerability reports within a few business days. The
-acknowledgment target is not a guarantee of a fix timeline; investigation,
-coordination, and release timing depend on the issue and affected versions.
-
 Our response targets are:
 
 - acknowledge receipt within **3 business days**;
@@ -37,6 +33,11 @@ Our response targets are:
 - target coordinated disclosure within **90 calendar days** of a confirmed
   report, unless the reporter and maintainers agree to another date or an
   active exploit requires an accelerated advisory.
+
+The fix or mitigation target is to provide a usable resolution by the
+coordinated-disclosure target where practical. If that is not possible, the
+maintainers will explain the reason and publish the next target in the
+14-calendar-day status update cycle.
 
 These are service targets, not guarantees. We may disclose earlier when users
 need an urgent mitigation, and we will not disclose sensitive details before a
