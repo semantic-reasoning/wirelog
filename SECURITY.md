@@ -2,23 +2,21 @@
 
 ## Supported Versions
 
-wirelog is still pre-1.0. Security fixes are currently made on `main`; release
-branch backports begin with supported 1.x release lines.
-
-Full GA PSIRT/CVE-intake activation and the explicit 1.x support-window
-declaration are deferred and tracked by #753. Until that lands, the pre-1.0
-policy in this file remains unchanged.
+The canonical 1.x lifecycle policy is [docs/SUPPORT_POLICY.md](docs/SUPPORT_POLICY.md).
+This table is the security-response summary; it does not create a separate
+support promise.
 
 | Version line | Security support |
 | --- | --- |
 | `main` / current pre-1.0 development | Supported for security fixes on `main` |
-| Current supported 1.x line, when available | Supported |
-| Older supported 1.x lines, when explicitly announced | Backports considered under the policy below |
+| Maintained `1.x` line | Security fixes and applicable CVE backports under the support policy |
+| Older `1.x` line after its EOL | Not supported; upgrade and advisory guidance only |
 | Unmaintained 0.x release tags and unsupported old branches | Not supported |
 
 ## Reporting Vulnerabilities
 
-Please report suspected vulnerabilities privately by email:
+Please report suspected vulnerabilities privately by email to the PSIRT intake
+contact:
 
 **inquiry@cleverplant.com**
 
@@ -29,6 +27,20 @@ available.
 We aim to acknowledge vulnerability reports within a few business days. The
 acknowledgment target is not a guarantee of a fix timeline; investigation,
 coordination, and release timing depend on the issue and affected versions.
+
+Our response targets are:
+
+- acknowledge receipt within **3 business days**;
+- complete an initial severity/impact triage within **7 calendar days**;
+- provide an update at least every **14 calendar days** while an active report
+  is being investigated; and
+- target coordinated disclosure within **90 calendar days** of a confirmed
+  report, unless the reporter and maintainers agree to another date or an
+  active exploit requires an accelerated advisory.
+
+These are service targets, not guarantees. We may disclose earlier when users
+need an urgent mitigation, and we will not disclose sensitive details before a
+fix or mitigation is available unless required by law or an imminent threat.
 
 Commercial licensing, general support, feature requests, and ordinary bug
 reports are separate from vulnerability intake, even if they use the same
@@ -61,13 +73,16 @@ subject so we can route the report.
 
 ## CVE and Advisory Process
 
-After triage, we will classify the report, identify affected versions and build
+After triage, we classify the report, identify affected versions and build
 configurations, and prepare a fix or mitigation when warranted.
 
-For confirmed vulnerabilities with user impact, we will coordinate disclosure
-and request CVE assignment when warranted. The project does not claim CNA
-status. Advisory content may include affected versions, severity, impact,
-mitigations, fixed versions, and reporter credit when requested and appropriate.
+For a confirmed vulnerability that warrants a CVE, an authorized maintainer
+requests an ID through the applicable MITRE CVE request process or a GitHub
+CNA relationship available to the project. wirelog does **not** claim CNA
+status. The CVE ID is recorded in the advisory together with affected
+versions, severity, mitigations, fixed versions, and reporter credit when
+requested and appropriate. We do not invent or reserve a CVE number before it
+is assigned.
 
 ## Severity Rubric
 

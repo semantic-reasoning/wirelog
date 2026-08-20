@@ -378,7 +378,12 @@ changes that policy.
   `docs/SECURITY_MODEL.md` — see #715 (subprojects pin
   verification) and the per-release checklist tracked under
   v1.0.0 GA.
-- CVE intake / PSIRT activation per #698 B11.
+- Confirm the PSIRT contact and disclosure procedure in
+  [`SECURITY.md`](../SECURITY.md), including the advisory/CVE ID when one is
+  assigned.
+- Confirm the supported-version and EOL state in
+  [`docs/SUPPORT_POLICY.md`](SUPPORT_POLICY.md); record any 1.x backport
+  decision in the release notes.
 - Subprojects pin SHA256 verification at release time.
 
 ---
@@ -395,6 +400,8 @@ changes that policy.
 - #750 — GPG + cosign-keyless signing pipeline.
 - #751 — tarball + SHA256 + BLAKE3 + provenance attestation.
 - #752 — GA release-facing deferrals/readiness follow-up in release process docs.
-- #753 — GA PSIRT/CVE-intake activation and 1.x support-window declaration deferral.
+- #753 — GA PSIRT/CVE-intake policy and 1.x support-window declaration.
+- #1144 — operational verification of the PSIRT mailbox, CVE assignment path,
+  and published GPG key.
 - #744 — SBOM automation (SPDX + CycloneDX).
 - `stable-release-plan.md` §12.8 — GA exit conditions.
