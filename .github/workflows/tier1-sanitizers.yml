@@ -87,15 +87,27 @@ jobs:
 
   tsan:
     name: TSan / ${{ matrix.compiler }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - compiler: gcc
             cc: gcc
+            runs_on: ubuntu-latest
+            platform: linux
           - compiler: clang
             cc: clang
+            runs_on: ubuntu-latest
+            platform: linux
+          - compiler: arm64-gcc
+            cc: gcc
+            runs_on: ubuntu-24.04-arm
+            platform: linux
+          - compiler: apple-clang
+            cc: clang
+            runs_on: macos-latest
+            platform: macos
 
     steps:
       - name: Checkout exact tag commit
@@ -116,10 +128,14 @@ jobs:
 
       - name: Install TSan dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            sudo apt-get install -y clang
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y meson ninja-build libmbedtls-dev
+            if [ "${{ matrix.compiler }}" = "clang" ]; then
+              sudo apt-get install -y clang
+            fi
+          else
+            brew install meson ninja mbedtls
           fi
 
       - name: Configure TSan
