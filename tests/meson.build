@@ -526,12 +526,14 @@ endif
 # does not exclude anything -- there is no add_test_setup in this project, so
 # every perf entry runs in a default `meson test` and opts out at runtime via
 # WIRELOG_PERF_GATE.
-# Requires WIRELOG_PERF_GATE=1 and -Dwirelog_log_max_level=trace. Linux also
-# requires a 'performance' cpufreq governor; Windows uses thread affinity +
+# Requires WIRELOG_PERF_GATE=1 and a stable timing host. The authoritative CI
+# job uses separate trace and error build directories: log_perf_gate runs in
+# the trace build, while the three evaluator timing gates run in the error
+# build. Linux requires a 'performance' cpufreq governor; Windows uses thread affinity +
 # HIGH_PRIORITY_CLASS via bench_stability_prep() (issue #508 Phase 2).
 # A baseline coefficient-of-variation self-check converts noisy runs to SKIP
 # instead of FAIL so shared CI runners never flag a false regression.
-#   Linux:   taskset -c 0 WIRELOG_PERF_GATE=1 meson test -C build --suite perf
+#   Linux:   env WIRELOG_PERF_GATE=1 taskset -c 0 meson test -C build --suite perf
 #   Windows: set WIRELOG_PERF_GATE=1 & meson test -C build --suite perf
 # math_dep supplies sqrt() for the variance self-check.
 test_log_perf_gate_exe = executable(
@@ -1441,13 +1443,11 @@ test('crdt_perf_gate', test_crdt_perf_gate_exe,
        'WIRELOG_CRDT_DATA_DIR=' + meson.project_source_root() / 'bench/data/crdt',
      ])
 
-# NOTE: the three *timing* gates (crdt_perf_gate, cspa_w1_gate,
-# sub_ms_graph_perf_gate) remain unreachable in CI, and the correctness
-# entries below do not change that.  They require
-# WL_LOG_COMPILE_MAX_LEVEL <= ERROR, while test_log_perf_gate.c requires
-# >= TRACE; one build dir cannot satisfy both, and both perf workflows
-# configure -Dwirelog_log_max_level=trace.  So seeing `crdt_correctness_full
-# OK` in the perf job does not mean the timing gates ran.  Tracked separately.
+# Issue #948: the authoritative stable CI job uses two build directories
+# because log_perf_gate measures the trace-enabled logger while the evaluator
+# timing gates are measured with inner-loop log sites stripped at ERROR. Its
+# scripts/ci/check-perf-gate-execution.sh check consumes both Meson logs and
+# rejects missing, skipped, or correctness-only test records.
 #
 # Issue #947: the result-count sentinel inside the gate above never executed,
 # because the perf-host skips (WIRELOG_PERF_GATE, log ceiling, cpufreq
@@ -4051,7 +4051,7 @@ test('rss_bounded_asan', test_rss_bounded_exe,
 # compile-time-skipped under sanitizers (wall-clock timing is invalidated
 # by ASan/TSan instrumentation).
 #
-#   Linux:   WIRELOG_PERF_GATE=1 taskset -c 0 meson test -C build --suite perf
+#   Linux:   env WIRELOG_PERF_GATE=1 taskset -c 0 meson test -C build --suite perf
 #   Other:   no shipped stability design today -- test SKIPs at runtime.
 # ============================================================================
 

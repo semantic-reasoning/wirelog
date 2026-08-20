@@ -542,14 +542,16 @@ perf hardware and a realistic budget is established.
 | `rotate_latency_release` | `stress-release` | 100000 | on | standard | release-tier (manual) |
 | `rotate_latency_release_pinned` | `stress-release` | 100000 | on | pinned | release-tier (manual) |
 
-The `perf` suite is invoked only by `.github/workflows/perf-nightly.yml`
-(via `meson test --suite perf`); `ci-pr.yml` does NOT pass `--suite perf`
-so the rotate-latency gate does not run on per-PR CI. This mirrors
-`test_log_perf_gate.c`'s nightly-only cadence: rotation latency is a
-dedicated-hardware signal (cpufreq governor pre-check, opt-in env)
-and shared per-PR runners cannot supply the stability budget. The
-release-tier entries (`stress-release` suite) have no automation
-today; release engineers invoke them manually.
+The `perf` suite is invoked by `.github/workflows/perf-nightly.yml` (via
+`meson test --suite perf`) and by the path-filtered `perf-suite-required.yml`;
+`ci-pr.yml` does NOT pass `--suite perf`. The authoritative timing coverage
+for issue #948 runs in the nightly workflow's `perf-stable` job on a
+`wirelog-perf` self-hosted Linux runner. It uses a trace build for
+`log_perf_gate` and an ERROR-ceiling build for the three evaluator timing
+gates, then verifies both Meson logs. GitHub-hosted runs remain diagnostic
+because they cannot guarantee the `performance` cpufreq governor. The
+release-tier entries (`stress-release` suite) have no automation today;
+release engineers invoke them manually.
 
 All entries set `WIRELOG_PERF_GATE=1` in the meson env so the binary
 opts in. Bare invocation (`./test_rotate_latency`) without the env
