@@ -631,6 +631,12 @@ test('public_header_surface', py3,
             meson.project_source_root()],
      suite: 'abi')
 
+# Issue #753: PSIRT response targets and the supported-version policy must
+# remain present and internally linked. Static text scan; no build-tree input.
+test('support_policy', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-support-policy.py'],
+     suite: 'abi')
+
 # Issue #761: backstop CI lint preventing wl_*/WL_* prefixes from leaking
 # back onto public installed headers after the v0.40 API audit closes its
 # sibling rename issues (#762 / #756 / #757 / #758 / #759 / #760).
