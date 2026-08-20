@@ -209,7 +209,8 @@ When cutting a release tag:
    The [Tier-1 Sanitizers (tag) workflow](../.github/workflows/tier1-sanitizers-tag.yml)
    re-runs the sanitizer matrix on the tagged commit. It verifies the
    ASan/UBSan Linux GCC, Linux Clang, Linux ARM64 GCC, and macOS Apple
-   Clang legs plus the Linux GCC/Clang TSan legs and MSan
+   Clang legs plus the Linux GCC/Clang, Linux ARM64 GCC, and macOS Apple
+   Clang TSan legs and MSan
    parser/CSV/intern/compound-arena fuzz smoke targets required by #693.
    The `release-tag.yml` workflow (#749 B19,
    when shipped) will call this reusable workflow as part of the full
