@@ -232,6 +232,15 @@ When cutting a release tag:
    after the at-tag gate succeeds (publisher wiring is #1152): tarball +
    checksums + SBOM + ABI manifest + provenance file.
 
+   The repository-side deterministic archive and checksum recipe is
+   `scripts/release/make-tarball.sh <output-dir>`. It uses the tagged
+   `git archive` tree and `gzip -n`, then emits SHA256 and BLAKE3 files.
+   Downstream consumers can run
+   `scripts/release/verify-release.sh <tarball>` for checksum verification.
+   When the signed inputs are available, pass `--tag`, `--signature
+   <file> --certificate <file>`, and `--attestation <file>` to perform the
+   corresponding GPG, Sigstore blob, and GitHub provenance checks as well.
+
 ### Perf-suite graph gate
 
 The `sub_ms_graph_perf_gate` entry in `--suite perf` covers the Reach,
