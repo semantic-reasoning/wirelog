@@ -206,17 +206,20 @@ When cutting a release tag:
    git tag -s vX.Y.Z -m "wirelog X.Y.Z"
    git push origin vX.Y.Z
    ```
-   The [Tier-1 Sanitizers (tag) workflow](../.github/workflows/tier1-sanitizers-tag.yml)
-   re-runs the sanitizer matrix on the tagged commit. It verifies the
+   The [release-tag verification workflow](../.github/workflows/release-tag.yml)
+   runs the default and ABI suites, the dedicated `wirelog-perf` runner
+   with `WIRELOG_PERF_REQUIRE=1`, mbedTLS-enabled crypto validation, and
+   a 60-second-per-target fuzz seed campaign on the tagged commit. It
+   calls the reusable Tier-1 sanitizer workflow, which verifies the
    ASan/UBSan Linux GCC, Linux Clang, Linux ARM64 GCC, and macOS Apple
    Clang legs plus the Linux GCC/Clang, Linux ARM64 GCC, and macOS Apple
-   Clang TSan legs and MSan
-   parser/CSV/intern/compound-arena fuzz smoke targets required by #693.
-   The `release-tag.yml` workflow (#749 B19,
-   when shipped) will call this reusable workflow as part of the full
-   tagged-commit gate and block artifact publication on failure. It also produces the
-   verification artefacts (signed tarball, checksums, SBOM, ABI
-   manifest, SLSA provenance attestation).
+   Clang TSan legs and MSan parser/CSV/intern/compound-arena smoke.
+   Its aggregate gate fails on any missing or unsuccessful job; artifact
+   signing, tarball, SBOM, and publication must depend on this gate
+   (publisher integration is tracked in #1152).
+   Artifact production is a downstream operation and must not run until
+   this gate succeeds; wiring the signing/tarball/SBOM/provenance
+   publishers is tracked in #1152.
 5. **Author the GitHub Release**:
    ```bash
    gh release create vX.Y.Z \
@@ -225,8 +228,9 @@ When cutting a release tag:
    ```
    The release body MUST be the verbatim CHANGELOG section for
    `[X.Y.Z]`.  The CI gate enforces equality.
-6. **Attach release artefacts** produced by the at-tag workflow:
-   tarball + checksums + SBOM + ABI manifest + provenance file.
+6. **Attach release artefacts** produced by the downstream publishers
+   after the at-tag gate succeeds (publisher wiring is #1152): tarball +
+   checksums + SBOM + ABI manifest + provenance file.
 
 ### Perf-suite graph gate
 
