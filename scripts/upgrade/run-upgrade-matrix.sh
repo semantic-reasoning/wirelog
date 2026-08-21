@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: run-upgrade-matrix.sh [--old-ref REF] [--candidate-ref REF]
+
+REF must resolve to a commit in the current repository. The candidate is
+tested from its checked-out git tree; the release archive is created from the
+same tree after this gate passes.
+EOF
+}
+
+old_ref=v0.30.0
+candidate_ref=HEAD
+while (($#)); do
+    case "$1" in
+        --old-ref) old_ref=${2:?missing value for --old-ref}; shift 2 ;;
+        --candidate-ref) candidate_ref=${2:?missing value for --candidate-ref}; shift 2 ;;
+        -h|--help) usage >&2; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+
+root=$(git rev-parse --show-toplevel)
+old_commit=$(git rev-parse --verify "${old_ref}^{commit}")
+candidate_commit=$(git rev-parse --verify "${candidate_ref}^{commit}")
+[[ -n "$old_commit" && -n "$candidate_commit" ]] || {
+    echo 'upgrade matrix: refs must resolve to commits' >&2
+    exit 2
+}
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/wirelog-upgrade.XXXXXX")
+log_dir=${UPGRADE_MATRIX_LOG_DIR:-$tmp/evidence}
+mkdir -p "$log_dir"
+trap 'rm -rf "$tmp"' EXIT
+
+extract() {
+    local commit=$1 destination=$2
+    mkdir -p "$destination"
+    git archive --format=tar "$commit" | tar -xf - -C "$destination"
+}
+
+build_tree() {
+    local source=$1 name=$2 prefix="$tmp/prefix-$2" build="$tmp/build-$2"
+    meson setup "$build" "$source" --buildtype=release -Dtests=false \
+        -Dprefix="$prefix" >"$log_dir/$name-configure.log" 2>&1
+    meson compile -C "$build" >"$log_dir/$name-build.log" 2>&1
+    meson install -C "$build" >"$log_dir/$name-install.log" 2>&1
+    local lib
+    lib=$(find -L "$prefix" \( -name 'libwirelog.so' -o -name 'libwirelog.dylib' \) -print -quit)
+    [[ -n "$lib" ]] || {
+        echo "upgrade matrix: installed libwirelog not found for $name" >&2
+        exit 1
+    }
+    printf '%s\n' "$prefix|$(dirname "$lib")"
+}
+
+compile_and_run() {
+    local label=$1 prefix=$2 libdir=$3 source=$4 program=$5 output=$6
+    local exe="$tmp/$label"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I"$prefix/include" \
+        "$source" -L"$libdir" -lwirelog -Wl,-rpath,"$libdir" -o "$exe" \
+        >"$log_dir/$label-compile.log" 2>&1
+    "$exe" "$program" >"$output"
+    [[ -s "$output" ]] || {
+        echo "upgrade matrix: $label produced no output" >&2
+        exit 1
+    }
+}
+
+old_source=$tmp/old
+candidate_source=$tmp/candidate
+extract "$old_commit" "$old_source"
+extract "$candidate_commit" "$candidate_source"
+old_install=$(build_tree "$old_source" old)
+candidate_install=$(build_tree "$candidate_source" candidate)
+old_prefix=${old_install%%|*}
+old_libdir=${old_install#*|}
+candidate_prefix=${candidate_install%%|*}
+candidate_libdir=${candidate_install#*|}
+
+run_case() {
+    local name=$1 old_program=$2 candidate_program=$3 old_consumer=$4 candidate_consumer=$5
+    local old_out="$log_dir/$name-old.out" candidate_out="$log_dir/$name-candidate.out"
+    compile_and_run "$name-old" "$old_prefix" "$old_libdir" \
+        "$old_consumer" "$old_program" "$old_out"
+    compile_and_run "$name-candidate" "$candidate_prefix" "$candidate_libdir" \
+        "$candidate_consumer" "$candidate_program" "$candidate_out"
+    cmp -s "$old_out" "$candidate_out" || {
+        echo "upgrade matrix: $name output mismatch" >&2
+        diff -u "$old_out" "$candidate_out" >&2 || true
+        exit 1
+    }
+    printf 'PASS %s (%s -> %s)\n' "$name" "$old_commit" "$candidate_commit"
+}
+
+run_executor_case() {
+    local program=$1 consumer=$2 probe=$3 old_lib candidate_out old_lib_symbols
+    candidate_out="$log_dir/executor-candidate.out"
+    compile_and_run executor-candidate "$candidate_prefix" "$candidate_libdir" \
+        "$consumer" "$program" "$candidate_out"
+
+    old_lib=$(find -L "$old_libdir" -maxdepth 1 -name 'libwirelog.so' -print -quit)
+    [[ -n "$old_lib" ]] || { echo 'upgrade matrix: old library missing' >&2; exit 1; }
+    old_lib_symbols="$log_dir/executor-old-exported-symbols.txt"
+    nm -D --defined-only "$old_lib" >"$old_lib_symbols"
+    local symbol
+    for symbol in \
+        wirelog_executor_create wirelog_executor_free \
+        wirelog_load_facts_from_csv wirelog_evaluate \
+        wirelog_result_get_relation wirelog_result_relation_cardinality \
+        wirelog_result_write_csv wirelog_result_free; do
+        if grep -Eq "[[:space:]]${symbol}$" "$old_lib_symbols"; then
+            echo "upgrade matrix: v0.30.0 unexpectedly exports $symbol" >&2
+            exit 1
+        fi
+    done
+
+    local old_obj="$tmp/executor-old-probe.o" old_exe="$tmp/executor-old.so"
+    local old_compile_log="$log_dir/executor-old-probe-compile.log"
+    local old_link_log="$log_dir/executor-old-link.log"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I"$old_prefix/include" \
+        -c "$probe" -o "$old_obj" >"$old_compile_log" 2>&1
+    if "${CC:-cc}" -shared "$old_obj" -L"$old_libdir" -lwirelog \
+        -Wl,--no-undefined -Wl,-z,defs -Wl,-rpath,"$old_libdir" -o "$old_exe" \
+        >"$old_link_log" 2>&1; then
+        echo 'upgrade matrix: v0.30.0 executor unexpectedly linked' >&2
+        exit 1
+    fi
+    for symbol in \
+        wirelog_executor_create wirelog_executor_free \
+        wirelog_load_facts_from_csv wirelog_evaluate \
+        wirelog_result_get_relation wirelog_result_relation_cardinality \
+        wirelog_result_write_csv wirelog_result_free; do
+        grep -Fq "$symbol" "$old_link_log" || {
+            echo "upgrade matrix: expected missing-symbol diagnostic absent: $symbol" >&2
+            exit 1
+        }
+    done
+    [[ "$(cat "$candidate_out")" == 'reach-count 3' ]] || {
+        echo 'upgrade matrix: candidate executor output changed' >&2
+        exit 1
+    }
+    local linker_digest
+    linker_digest=$(sha256sum "$old_link_log" | awk '{print $1}')
+    printf '{"status":"EXPECTED_UNSUPPORTED","old_commit":"%s","candidate_commit":"%s","missing_symbols":["wirelog_executor_create","wirelog_executor_free","wirelog_load_facts_from_csv","wirelog_evaluate","wirelog_result_get_relation","wirelog_result_relation_cardinality","wirelog_result_write_csv","wirelog_result_free"],"candidate_output":"reach-count 3","linker_diagnostic_file":"executor-old-link.log","linker_diagnostic_sha256":"%s"}\n' \
+        "$old_commit" "$candidate_commit" "$linker_digest" >"$log_dir/executor-status.json"
+    printf 'EXPECTED_UNSUPPORTED executor (v0.30.0 declarations are not exported; candidate passed)\n'
+}
+
+run_case easy \
+    "$root/tests/upgrade/easy/program.dl" \
+    "$root/tests/upgrade/easy/program.dl" \
+    "$root/tests/upgrade/easy/legacy.c" \
+    "$root/tests/upgrade/easy/migrated.c"
+run_case session \
+    "$root/tests/upgrade/session/program.dl" \
+    "$root/tests/upgrade/session/program.dl" \
+    "$root/tests/upgrade/session/legacy.c" \
+    "$root/tests/upgrade/session/migrated.c"
+run_executor_case \
+    "$root/tests/upgrade/executor/program.dl" \
+    "$root/tests/upgrade/executor/consumer.c" \
+    "$root/tests/upgrade/executor/link-probe.c"
+
+printf 'Upgrade matrix passed: old=%s candidate=%s\n' "$old_commit" "$candidate_commit"

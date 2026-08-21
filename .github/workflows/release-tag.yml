@@ -161,6 +161,34 @@ jobs:
           meson compile -C build-mbedtls
           meson test -C build-mbedtls cryptographic_hashes --print-errorlogs
 
+  upgrade:
+    name: Tag / 0.30.0 upgrade matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged candidate and baseline tag
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git rev-parse --verify 'v0.30.0^{commit}'
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build
+      - name: Run synthetic consumer upgrade matrix
+        env:
+          UPGRADE_MATRIX_LOG_DIR: upgrade-evidence
+        run: scripts/upgrade/run-upgrade-matrix.sh --old-ref v0.30.0 --candidate-ref "$TAG_REF"
+      - name: Upload upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: upgrade-matrix-${{ github.ref_name }}
+          path: upgrade-evidence/
+          if-no-files-found: error
+          retention-days: 35
+
   sanitizers:
     name: Tag / Tier-1 sanitizers
     # Meson has no separate asan/tsan suite: the reusable workflow runs the
@@ -175,7 +203,7 @@ jobs:
   release-verification:
     name: Tag / release verification gate
     if: ${{ always() }}
-    needs: [default, abi, perf, fuzz, mbedtls, sanitizers]
+    needs: [default, abi, perf, fuzz, mbedtls, sanitizers, upgrade]
     runs-on: ubuntu-latest
     steps:
       - name: Require every tagged verification job
@@ -184,7 +212,7 @@ jobs:
         run: |
           echo "verification results: $RESULTS"
           IFS=',' read -ra statuses <<< "$RESULTS"
-          test "${#statuses[@]}" -eq 6
+          test "${#statuses[@]}" -eq 7
           for result in "${statuses[@]}"; do
             test "$result" = success
           done

@@ -1,0 +1,7 @@
+.decl edge(x: int64, y: int64)
+.decl reach(x: int64, y: int64)
+.output reach
+edge(1, 2).
+edge(2, 3).
+reach(X, Y) :- edge(X, Y).
+reach(X, Y) :- edge(X, Z), reach(Z, Y).
