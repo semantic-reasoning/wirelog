@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 env:
   EXPECTED_SHA: ${{ github.sha }}
@@ -186,3 +188,40 @@ jobs:
           for result in "${statuses[@]}"; do
             test "$result" = success
           done
+
+  release-artifacts:
+    name: Tag / source artifacts and provenance
+    if: ${{ needs.release-verification.result == 'success' }}
+    needs: [release-verification]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install checksum tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y b3sum
+      - name: Build deterministic source archive
+        run: scripts/release/make-tarball.sh dist "$TAG_REF"
+      - name: Attest source archive provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/wirelog-*.tar.gz
+      - name: Download provenance attestation bundle
+        run: |
+          (cd dist && gh attestation download "wirelog-"*.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --limit 1)
+          attestation=$(find dist -maxdepth 1 -type f -name 'sha256*.jsonl' -print -quit)
+          test -n "$attestation"
+          mv "$attestation" "dist/wirelog-${TAG_REF#v}.intoto.jsonl"
+      - name: Upload source archive, checksums, and attestation
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-artifacts-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 35

@@ -1,6 +1,7 @@
 ./.github/workflows/lint-main.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-pr.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/tier1-sanitizers.yml@UNKNOWN:NOASSERTION
+actions/attest-build-provenance@v2:NOASSERTION
 actions/cache@v4:NOASSERTION
 actions/cache@v5:NOASSERTION
 actions/cache@v5:NOASSERTION
