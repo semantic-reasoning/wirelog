@@ -7,9 +7,10 @@
 set -euo pipefail
 
 SKIP=77
-# Issue #748 calibration: 5-repetition W=8 baseline budget, with a 5% envelope.
-# Override for a provisioned runner while recording the new 5-rep median.
-WL_DOOP_PERF_GATE_TARGET_MS="${WL_DOOP_PERF_GATE_TARGET_MS:-1500000}"
+# The target is deliberately supplied by the provisioned runner: the checked-
+# in README DOOP row is repeat=1, not the required 5-repetition calibration.
+# A runner must record its 5-rep median and pass median*1.05 here.
+WL_DOOP_PERF_GATE_TARGET_MS="${WL_DOOP_PERF_GATE_TARGET_MS:-}"
 EXPECTED_TUPLES=6276657
 EXPECTED_ITERS="${WL_DOOP_PERF_GATE_EXPECTED_ITERS:-28}"
 WORKERS=8
@@ -48,6 +49,19 @@ bench_bin="${WIRELOG_DOOP_BENCH_BIN:-bench/bench_flowlog}"
 [[ -d "$data_dir" ]] || skip "DOOP data directory not found: $data_dir"
 [[ -x "$bench_bin" ]] || fail "bench_flowlog not found or not executable: $bench_bin"
 
+[[ -n "$WL_DOOP_PERF_GATE_TARGET_MS" ]] || \
+    skip "no calibrated 5-repetition W=8 target; set WL_DOOP_PERF_GATE_TARGET_MS"
+
+# The 6,276,657 oracle belongs to the recovered zxing artifact.  Require the
+# provisioned runner to pin its sorted .facts manifest so a refreshed upstream
+# archive cannot silently turn this into a different benchmark.
+expected_manifest="${WIRELOG_DOOP_DATASET_MANIFEST_SHA256:-}"
+[[ -n "$expected_manifest" ]] || \
+    skip "DOOP dataset manifest is not pinned; set WIRELOG_DOOP_DATASET_MANIFEST_SHA256"
+actual_manifest=$(sha256sum "$data_dir"/*.facts | sort -k2 | sha256sum | awk '{print $1}')
+[[ "$actual_manifest" == "$expected_manifest" ]] || \
+    fail "DOOP dataset manifest $actual_manifest != pinned $expected_manifest"
+
 # Validate the complete catalogue before starting a multi-minute run.
 for fact in \
     DirectSuperclass DirectSuperinterface MainClass FormalParam ComponentType \
@@ -73,7 +87,12 @@ set -e
 
 row=$(awk -F '\t' '$1 == "doop" { print; exit }' "$tmp")
 [[ -n "$row" ]] || fail "bench_flowlog produced no DOOP result row"
+[[ "$(awk -F '\t' '{print NF}' <<<"$row")" == 12 ]] || \
+    fail "DOOP result row has an unexpected field count"
 IFS=$'\t' read -r workload _ facts workers repeat min_ms median_ms max_ms rss tuples iters result <<<"$row"
+
+[[ "$workers" == "$WORKERS" && "$repeat" == "$REPEAT" ]] || \
+    fail "DOOP result reports workers=$workers repeat=$repeat, expected $WORKERS/$REPEAT"
 
 # Correctness sentinels intentionally precede any timing assertion.
 [[ "$tuples" == "$EXPECTED_TUPLES" ]] || \
