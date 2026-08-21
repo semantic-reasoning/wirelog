@@ -22,6 +22,14 @@ fail() { echo "doop_w8_gate: FAIL: $*" >&2; exit 1; }
 [[ "${WIRELOG_PERF_GATE:-0}" == 1 ]] || \
     skip "set WIRELOG_PERF_GATE=1 to run on dedicated performance hardware"
 
+# The shipped stability contract is Linux cpufreq-specific.  In particular,
+# do not turn a Windows release build's inherited PERF_REQUIRE setting into a
+# false log-ceiling failure when there is no governor to validate.
+case "$(uname -s 2>/dev/null || printf unknown)" in
+    Linux*) ;;
+    *) skip "cpufreq governor stability gate is Linux-only" ;;
+esac
+
 if [[ "${WIRELOG_PERF_LOG_COMPILE_MAX_LEVEL:-1}" -gt 1 ]]; then
     if [[ "${WIRELOG_PERF_REQUIRE:-0}" == 1 ]]; then
         fail "WIRELOG_PERF_REQUIRE=1 but log compile ceiling is above ERROR"
