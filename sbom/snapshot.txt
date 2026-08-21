@@ -1,5 +1,6 @@
 ./.github/workflows/lint-main.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-pr.yml@UNKNOWN:NOASSERTION
+./.github/workflows/tier1-sanitizers.yml@UNKNOWN:NOASSERTION
 actions/cache@v4:NOASSERTION
 actions/cache@v5:NOASSERTION
 actions/cache@v5:NOASSERTION
@@ -9,6 +10,7 @@ actions/cache@v5:NOASSERTION
 actions/cache@v5:NOASSERTION
 actions/checkout@v4.2.2:NOASSERTION
 actions/checkout@v4.2.2:NOASSERTION
+actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
 actions/checkout@v5:NOASSERTION
@@ -55,6 +57,7 @@ actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
 actions/upload-artifact@v7:NOASSERTION
+agent-workflows@2.1.0:Apache-2.0
 codecov/codecov-action@v6:NOASSERTION
 docker/login-action@v4.2.0:NOASSERTION
 docker/setup-buildx-action@v4.0.0:NOASSERTION
@@ -68,6 +71,7 @@ mymindstorm/setup-emsdk@v14:NOASSERTION
 nanoarrow@0.8.0.9000:Apache
 nttld/setup-ndk@v1:NOASSERTION
 ossf/scorecard-action@v2.3.1:NOASSERTION
+pyrewire@1.0.4:Apache-2.0 OR GPL-3.0-or-later
 r-lib/actions/check-r-package@v2:NOASSERTION
 r-lib/actions/setup-pandoc@v2:NOASSERTION
 r-lib/actions/setup-pandoc@v2:NOASSERTION
