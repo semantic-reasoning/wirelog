@@ -2139,6 +2139,24 @@ test_affected_rules_exe = executable(
 test('affected_rules', test_affected_rules_exe)
 
 # ============================================================================
+# Issue #1140: Base-Case Skip NULL Template
+# ============================================================================
+
+test_base_skip_null_template_exe = executable(
+  'test_base_skip_null_template',
+  files('test_base_skip_null_template.c'),
+  backend_src,
+  intern_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('base_skip_null_template', test_base_skip_null_template_exe)
+
+# ============================================================================
 # Phase 4: Per-Stratum Frontier Integration Tests (US-4-005)
 # ============================================================================
 

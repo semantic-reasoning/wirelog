@@ -99,14 +99,30 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                      * requires. Skipping MAP would leave the wrong ncols
                      * on the stack. */
                     col_rel_t *full = session_find_rel(sess, op->relation_name);
+                    /* Issue #1140: the lookup can miss -- session_find_rel()
+                     * returns NULL for a relation that was never inserted.
+                     * Abandon the optimization rather than build $base_skip
+                     * from a template that is not there: falling through to
+                     * col_op_variable() gives the missing relation its normal
+                     * ENOENT disposition, so one state does not get two
+                     * answers depending on which check saw it first.  The
+                     * previous "full ? full : NULL" argument guarded nothing
+                     * -- both arms yield full. */
+                    if (!full)
+                        goto normal_eval;
                     col_rel_t *empty = col_rel_pool_new_like(
-                        sess->delta_pool, "$base_skip", full ? full : NULL);
-                    if (!empty) {
-                        rc = ENOMEM; break;
-                    }
+                        sess->delta_pool, "$base_skip", full);
+                    /* Issue #1140: these exits return rather than break.  A
+                     * break here leaves the for loop, not a switch, and the
+                     * function then falls through to "return 0" -- reporting
+                     * success with nothing pushed on the stack, which the
+                     * caller reads as a rule that produced no rows. */
+                    if (!empty)
+                        return ENOMEM;
                     rc = eval_stack_push(stack, empty, true);
                     if (rc != 0) {
-                        col_rel_destroy(empty); break;
+                        col_rel_destroy(empty);
+                        return rc;
                     }
                     continue;
                 }
