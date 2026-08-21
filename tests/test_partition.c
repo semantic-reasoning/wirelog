@@ -1345,6 +1345,93 @@ test_exchange_graph_mismatch_falls_back_both_sides(void)
     return 0;
 }
 
+/*
+ * test_new_like_rejects_null_template:
+ * Issue #1140: col_rel_new_like() dereferences its src template
+ * unconditionally (src->ncols). A caller that obtained the template from a
+ * lookup which can miss therefore faults instead of seeing an allocation
+ * failure it already checks for. Rejecting NULL makes the existing
+ * "if (!result)" checks at every call site sufficient.
+ */
+static int
+test_new_like_rejects_null_template(void)
+{
+    TEST("col_rel_new_like rejects a NULL template");
+
+    if (col_rel_new_like("clone", NULL) != NULL) {
+        FAIL("expected NULL for a NULL src");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/*
+ * test_pool_new_like_rejects_null_template_no_pool:
+ * Issue #1140: the rejection sits above the !pool branch, so it holds when
+ * no pool is supplied. This pins that the malloc fallback is never entered
+ * with a NULL template -- not that the fallback rejects one itself.
+ */
+static int
+test_pool_new_like_rejects_null_template_no_pool(void)
+{
+    TEST("col_rel_pool_new_like(NULL pool) rejects a NULL template");
+
+    if (col_rel_pool_new_like(NULL, "clone", NULL) != NULL) {
+        FAIL("expected NULL for a NULL like");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+/*
+ * test_pool_new_like_rejects_null_template_keeps_slot:
+ * Issue #1140: the NULL-template rejection must happen before the pool slot
+ * is taken, otherwise every rejected call burns a slot. Asserts the
+ * rejection and pool->slot_used on both sides of it -- the return value
+ * alone cannot witness a burned slot (see the inline comment below).
+ */
+static int
+test_pool_new_like_rejects_null_template_keeps_slot(void)
+{
+    TEST("col_rel_pool_new_like rejects NULL template without taking a slot");
+
+    delta_pool_t *pool = delta_pool_create(4, sizeof(col_rel_t), 64 * 1024);
+    if (!pool) {
+        FAIL("delta_pool_create");
+        return 1;
+    }
+    col_rel_t *src = col_rel_new_auto("src", 2);
+    if (!src) {
+        FAIL("alloc");
+        delta_pool_destroy(pool);
+        return 1;
+    }
+
+    /* slot_used is asserted directly: a burned slot is not observable
+     * through the return value, because an exhausted pool still falls back
+     * to col_rel_new_like() and returns a valid relation. */
+    int ok = (col_rel_pool_new_like(pool, "clone", NULL) == NULL)
+        && (pool->slot_used == 0);
+
+    col_rel_t *good = col_rel_pool_new_like(pool, "good", src);
+    if (!good || good->ncols != 2 || pool->slot_used != 1)
+        ok = 0;
+
+    if (good)
+        col_rel_destroy(good);
+    col_rel_destroy(src);
+    delta_pool_destroy(pool);
+
+    if (!ok) {
+        FAIL("NULL template not rejected, or the pool lost a slot");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1378,6 +1465,11 @@ main(void)
     test_exchange_w1_noop();
     test_col_rel_new_like_inherits_graph_flag();
     test_exchange_graph_mismatch_falls_back_both_sides();
+
+    /* Issue #1140: NULL template rejection in the *_like constructors */
+    test_new_like_rejects_null_template();
+    test_pool_new_like_rejects_null_template_no_pool();
+    test_pool_new_like_rejects_null_template_keeps_slot();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

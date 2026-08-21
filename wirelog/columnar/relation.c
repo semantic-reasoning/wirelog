@@ -850,10 +850,17 @@ col_rel_new_auto(const char *name, uint32_t ncols)
     return r;
 }
 
-/* Helper: create owned relation copying col_names from src. */
+/* Helper: create owned relation copying col_names from src.
+ *
+ * Issue #1140: a NULL src is rejected rather than dereferenced.  Several
+ * callers obtain their template from a lookup that can miss and check only
+ * the returned relation, so failing here is what makes that check
+ * sufficient. */
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src)
 {
+    if (!src)
+        return NULL;
     col_rel_t *r = NULL;
     if (col_rel_alloc(&r, name) != 0)
         return NULL;
@@ -892,6 +899,10 @@ col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like)
 {
+    /* Issue #1140: reject before delta_pool_alloc_slot() so a rejected call
+     * does not burn a pool slot. */
+    if (!like)
+        return NULL;
     if (!pool)
         return col_rel_new_like(name, like); /* Fallback to malloc */
     col_rel_t *r = (col_rel_t *)delta_pool_alloc_slot(pool);

@@ -870,7 +870,9 @@ fill_filtered_rel(const uint8_t *buf, uint32_t bsz, col_rel_t *rel,
  * Apply a serialized filter expression to a relation, returning a new
  * pool-allocated relation containing only the passing rows.
  * The returned relation is owned by pool and freed when the pool resets.
- * Returns NULL on allocation failure.
+ * Returns NULL on allocation failure, and (Issue #1140) also when rel is
+ * NULL, since col_rel_pool_new_like() now rejects a NULL template instead
+ * of dereferencing it.
  */
 col_rel_t *
 wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
@@ -914,7 +916,9 @@ wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len)
  *
  * If the source grew, the stale entry is rebuilt in-place.  If no entry
  * exists, one is created.  On any allocation failure the function returns
- * NULL (caller handles ENOMEM).
+ * NULL (caller handles ENOMEM).  Unlike the uncached variant, @rel must be
+ * non-NULL: it is dereferenced here before any constructor sees it, so the
+ * Issue #1140 rejection in col_rel_pool_new_like() does not cover it.
  *
  * The returned pointer is valid until the cache entry is evicted (i.e., until
  * source_nrows changes or the session is destroyed).  Callers that hold it

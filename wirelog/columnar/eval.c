@@ -1979,10 +1979,11 @@ tdd_worker_subpass_fn(void *arg)
          * check saw it first.  (diff.c and join.c return EINVAL on a NULL
          * pop because they pop without a prior emptiness check.)
          *
-         * Three dereferences follow otherwise: col_rel_new_like() below
-         * reads src->ncols unguarded, which clang-tidy cannot see because it
-         * is cross-TU, and ->name / ->ncols on the non-outbound path.
-         * col_rel_destroy(NULL) is a no-op, so the continue leaks nothing. */
+         * Two dereferences follow otherwise: ->name / ->ncols on the
+         * non-outbound path.  col_rel_new_like() below no longer needs one:
+         * since Issue #1140 it rejects a NULL src and returns NULL, which
+         * its caller already checks.  col_rel_destroy(NULL) is a no-op, so
+         * the continue leaks nothing. */
         if (!result.rel || result.rel->nrows == 0) {
             if (result.owned)
                 col_rel_destroy(result.rel);
