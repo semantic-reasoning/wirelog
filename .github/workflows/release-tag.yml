@@ -1,0 +1,188 @@
+name: Release tag verification
+
+on:
+  push:
+    tags:
+      - 'v1.*'
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_SHA: ${{ github.sha }}
+  TAG_REF: ${{ github.ref_name }}
+
+jobs:
+  default:
+    name: Tag / default
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+      - name: Build and test default suite
+        run: |
+          meson setup build-default -Dtests=true --buildtype=debug
+          meson compile -C build-default
+          meson test -C build-default --print-errorlogs
+
+  abi:
+    name: Tag / ABI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build abigail-tools
+      - name: Build and test ABI suite
+        run: |
+          meson setup build-abi -Dtests=true --buildtype=debug
+          meson compile -C build-abi
+          meson test -C build-abi --suite abi --print-errorlogs
+
+  perf:
+    name: Tag / performance and RSS
+    runs-on: [self-hosted, linux, x64, wirelog-perf]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit and stable host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          governor=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+          test -r "$governor"
+          test "$(cat "$governor")" = performance
+      - name: Install dependencies
+        run: |
+          command -v meson
+          command -v ninja
+          command -v taskset
+      - name: Build trace and stripped configurations
+        env:
+          CC: gcc
+        run: |
+          meson setup build-perf-trace --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
+          meson setup build-perf-error --buildtype=release -Dwirelog_log_max_level=error -Dtests=true -DmbedTLS=disabled
+          meson compile -C build-perf-trace
+          meson compile -C build-perf-error
+      - name: Run complete perf suite
+        env:
+          WIRELOG_PERF_GATE: '1'
+        run: |
+          # The complete suite includes both trace-only and stripped-build
+          # sentinels. Strict execution is enforced below on the dedicated
+          # release gates that support WIRELOG_PERF_REQUIRE=1.
+          taskset -c 0 meson test -C build-perf-trace --suite perf --print-errorlogs --num-processes 1
+      - name: Run required timing and RSS gates
+        env:
+          WIRELOG_PERF_GATE: '1'
+          WIRELOG_PERF_REQUIRE: '1'
+        run: |
+          taskset -c 0 meson test -C build-perf-trace log_perf_gate --print-errorlogs --num-processes 1
+          taskset -c 0 meson test -C build-perf-error crdt_perf_gate cspa_w1_gate sub_ms_graph_perf_gate rss_bounded_release --print-errorlogs --num-processes 1
+          scripts/ci/check-perf-gate-execution.sh \
+            build-perf-trace/meson-logs/testlog.txt \
+            build-perf-error/meson-logs/testlog.txt
+          awk -v wanted='test:         stress-release - wirelog:rss_bounded_release' '
+            $0 == wanted { capture = 1; next }
+            capture && /^===================================/ { exit }
+            capture { print }
+          ' build-perf-error/meson-logs/testlog.txt > rss-gate.log
+          grep -Eq '^result:[[:space:]]+exit status 0$' rss-gate.log
+          ! grep -Fq 'SKIP:' rss-gate.log
+
+  fuzz:
+    name: Tag / fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang meson ninja-build
+      - name: Build fuzz targets
+        run: |
+          CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Dtests=true
+          meson compile -C build-fuzz parser_fuzz csv_reader_fuzz intern_fuzz compound_arena_fuzz
+      - name: Run 60-second seed campaign per target
+        run: |
+          scripts/fuzz/run-libfuzzer-soak.sh --build-dir build-fuzz --work-dir fuzz-evidence --duration 60s --all
+          meson test -C build-fuzz --suite fuzz --print-errorlogs
+      - name: Upload fuzz evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-tag-fuzz-${{ github.ref_name }}
+          path: fuzz-evidence
+          if-no-files-found: error
+          retention-days: 35
+
+  mbedtls:
+    name: Tag / mbedTLS enabled
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build libmbedtls-dev
+      - name: Build and test enabled crypto validation
+        run: |
+          meson setup build-mbedtls -Dtests=true -DmbedTLS=enabled --buildtype=debug
+          meson compile -C build-mbedtls
+          meson test -C build-mbedtls cryptographic_hashes --print-errorlogs
+
+  sanitizers:
+    name: Tag / Tier-1 sanitizers
+    # Meson has no separate asan/tsan suite: the reusable workflow runs the
+    # complete test graph in ASan/UBSan and TSan-configured build directories.
+    # This is the repository's equivalent of the issue's --suite asan/tsan
+    # requirement and keeps sanitizer coverage from silently narrowing.
+    uses: ./.github/workflows/tier1-sanitizers.yml
+    with:
+      ref: ${{ github.ref_name }}
+      expected_sha: ${{ github.sha }}
+
+  release-verification:
+    name: Tag / release verification gate
+    if: ${{ always() }}
+    needs: [default, abi, perf, fuzz, mbedtls, sanitizers]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every tagged verification job
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          echo "verification results: $RESULTS"
+          IFS=',' read -ra statuses <<< "$RESULTS"
+          test "${#statuses[@]}" -eq 6
+          for result in "${statuses[@]}"; do
+            test "$result" = success
+          done
