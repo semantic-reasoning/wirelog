@@ -252,6 +252,11 @@ main(void)
         ".decl right(key: int64)\n"
         ".decl out(key: int64)\n"
         "out(key) :- left(key), right(key).\n";
+    static const char anti_join_source[]
+        = ".decl item(x: int64)\n"
+        ".decl blocked(x: int64)\n"
+        ".decl out(x: int64)\n"
+        "out(x) :- item(x), !blocked(x).\n";
     static const char false_filter_source[]
         = ".decl item(key: int64, payload: pair/2 inline)\n"
         ".decl out(key: int64)\n"
@@ -281,6 +286,9 @@ main(void)
         WIRELOG_IR_SCAN, WL_IR_EXPR_CMP) != 0)
         return 1;
     if (sweep_conversion(join_source, WIRELOG_IR_JOIN,
+        WIRELOG_IR_SCAN, -1) != 0)
+        return 1;
+    if (sweep_conversion(anti_join_source, WIRELOG_IR_ANTIJOIN,
         WIRELOG_IR_SCAN, -1) != 0)
         return 1;
     if (sweep_conversion(false_filter_source, WIRELOG_IR_FILTER,
