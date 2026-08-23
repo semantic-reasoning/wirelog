@@ -227,7 +227,7 @@ retraction_rel_name(const char *rel, char *buf, size_t sz)
  *     per-rule pre-scan in its relation loop.
  * The other two are not blinded, because they pass an inner operator list
  * that still carries the FORCE_DELTA ops the rewrite hid:
- *   - col_op_k_fusion_serial() and col_op_k_fusion() (columnar/ops.c)
+ *   - col_op_k_fusion_serial() and col_op_k_fusion() (columnar/kfusion.c)
  *     evaluate meta->k_ops[d] directly.
  * Call sites are named by function on purpose: line numbers drift.
  *
