@@ -1527,17 +1527,30 @@ test('cspa_correctness', test_cspa_perf_gate_exe,
 # already-built benchmark driver so its 35-file catalogue and rules remain a
 # single source of truth.  It is intentionally opt-in: the zxing fixture is
 # large and the gate is for a provisioned performance runner.
-test('doop_w8_gate', find_program(meson.project_source_root() /
-      'scripts/ci/run-doop-perf-gate.sh'),
-     suite: 'perf',
-     timeout: 3600,
-     env: [
-       'WIRELOG_DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop',
-       'WIRELOG_DOOP_BENCH_BIN=' + meson.project_build_root() / 'bench/bench_flowlog',
-       'WIRELOG_PERF_LOG_COMPILE_MAX_LEVEL=' +
-         _log_level_map[_log_opt].to_string(),
-     ],
-     depends: bench_flowlog)
+#
+# Registered through the shared `sh` handle above rather than find_program()
+# on the script itself.  Meson rewrites a `#!/usr/bin/env bash` shebang into a
+# bare, unresolved `bash` argv[0] on Windows, and CreateProcess resolves a bare
+# name from the system directory before PATH -- so it lands on
+# System32\bash.exe, the WSL launcher, which exits 1 before the script can
+# reach its own non-Linux skip.  The handle is resolved once at configure time
+# instead, and on the CI images that resolves to Git for Windows' native MSYS2
+# bash; no WSL is involved.  The script then self-skips on every non-Linux
+# host, which is what keeps the Windows leg of perf-nightly.yml green when it
+# runs this suite with WIRELOG_PERF_GATE=1.
+if sh.found()
+  test('doop_w8_gate', sh,
+       args: [meson.project_source_root() / 'scripts/ci/run-doop-perf-gate.sh'],
+       suite: 'perf',
+       timeout: 3600,
+       env: [
+         'WIRELOG_DOOP_DATA_DIR=' + meson.project_source_root() / 'bench/data/doop',
+         'WIRELOG_DOOP_BENCH_BIN=' + meson.project_build_root() / 'bench/bench_flowlog',
+         'WIRELOG_PERF_LOG_COMPILE_MAX_LEVEL=' +
+           _log_level_map[_log_opt].to_string(),
+       ],
+       depends: bench_flowlog)
+endif
 
 # ============================================================================
 # Sub-ms graph W=1 perf-suite gate.
