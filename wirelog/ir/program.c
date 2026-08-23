@@ -81,9 +81,12 @@ typedef struct {
  * Returns: compound_metadata_t with kind=NONE if not a compound type.
  */
 static compound_metadata_t
-parse_compound_metadata(const char *type_name, wl_intern_t *intern)
+parse_compound_metadata(const char *type_name, wl_intern_t *intern,
+    bool *out_failed)
 {
     compound_metadata_t result = {0};
+    if (out_failed)
+        *out_failed = false;
     result.kind = WIRELOG_COMPOUND_KIND_NONE;
     result.functor_id = 0;
     result.arity = 0;
@@ -102,8 +105,11 @@ parse_compound_metadata(const char *type_name, wl_intern_t *intern)
         return result;
 
     char *functor_name = (char *)malloc(functor_len + 1);
-    if (!functor_name)
+    if (!functor_name) {
+        if (out_failed)
+            *out_failed = true;
         return result;
+    }
 
     memcpy(functor_name, type_name, functor_len);
     functor_name[functor_len] = '\0';
@@ -184,8 +190,10 @@ parse_compound_metadata(const char *type_name, wl_intern_t *intern)
     /* Intern the functor name to get ID (default: side-relation). */
     int64_t functor_id = wl_intern_put(intern, functor_name);
     if (functor_id < 0) {
+        if (out_failed)
+            *out_failed = true;
         free(functor_name);
-        return result; /* Intern failed */
+        return result;
     }
     result.functor_id = (uint32_t)functor_id;
     result.arity = (uint32_t)arity_val;
@@ -501,8 +509,16 @@ collect_decl(struct wirelog_program *prog,
                     = type_name_to_column_type(param->type_name);
 
                 /* Phase 1B: Extract compound metadata if present */
+                bool metadata_failed = false;
                 compound_metadata_t meta = parse_compound_metadata(
-                    param->type_name, prog->intern);
+                    param->type_name, prog->intern, &metadata_failed);
+                if (metadata_failed) {
+                    wl_ir_program_set_error(prog,
+                        "allocation failed while parsing compound metadata "
+                        "for relation '%s' column '%s'",
+                        decl_node->name, param->name ? param->name : "?");
+                    return -1;
+                }
                 rel->columns[idx].compound_kind = meta.kind;
                 rel->columns[idx].compound_functor_id = meta.functor_id;
                 rel->columns[idx].compound_arity = meta.arity;
@@ -1522,13 +1538,16 @@ static wirelog_ir_node_t *
 wrap_column_cmp_filter(wirelog_ir_node_t *child, uint32_t left_col,
     const wl_ir_expr_t *right_expr)
 {
-    if (!right_expr)
-        return child;
+    if (!right_expr) {
+        wl_ir_node_free(child);
+        return NULL;
+    }
 
     wirelog_ir_node_t *filter = wl_ir_node_create(WIRELOG_IR_FILTER);
     if (!filter) {
         wl_ir_expr_free((wl_ir_expr_t *)right_expr);
-        return child;
+        wl_ir_node_free(child);
+        return NULL;
     }
 
     wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
@@ -1538,28 +1557,41 @@ wrap_column_cmp_filter(wirelog_ir_node_t *child, uint32_t left_col,
         wl_ir_expr_free(lhs);
         wl_ir_expr_free((wl_ir_expr_t *)right_expr);
         wl_ir_node_free(filter);
-        return child;
+        wl_ir_node_free(child);
+        return NULL;
     }
 
     cmp->cmp_op = WIRELOG_CMP_EQ;
     char col[32];
     snprintf(col, sizeof(col), "col%u", left_col);
     lhs->var_name = strdup_safe(col);
+    if (!lhs->var_name) {
+        wl_ir_expr_free(lhs);
+        wl_ir_expr_free((wl_ir_expr_t *)right_expr);
+        wl_ir_expr_free(cmp);
+        wl_ir_node_free(filter);
+        wl_ir_node_free(child);
+        return NULL;
+    }
     if (!ir_expr_attach(cmp, lhs)) {
         wl_ir_expr_free((wl_ir_expr_t *)right_expr);
         wl_ir_expr_free(cmp);
         wl_ir_node_free(filter);
-        return child;
+        wl_ir_node_free(child);
+        return NULL;
     }
-    if (!ir_expr_attach(cmp, (wl_ir_expr_t *)right_expr)) {
+    if (wl_ir_expr_add_child(cmp, (wl_ir_expr_t *)right_expr) != 0) {
+        wl_ir_expr_free((wl_ir_expr_t *)right_expr);
         wl_ir_expr_free(cmp);
         wl_ir_node_free(filter);
-        return child;
+        wl_ir_node_free(child);
+        return NULL;
     }
     filter->filter_expr = cmp;
     if (wl_ir_node_add_child(filter, child) != 0) {
         wl_ir_node_free(filter);
-        return child;
+        wl_ir_node_free(child);
+        return NULL;
     }
     return filter;
 }
@@ -1582,40 +1614,55 @@ wrap_duplicate_var_filters(wirelog_ir_node_t *child, char **var_names,
                 continue;
 
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
-            if (!f)
-                continue;
+            if (!f) {
+                wl_ir_node_free(result);
+                return NULL;
+            }
 
             wl_ir_expr_t *cmp = wl_ir_expr_create(WL_IR_EXPR_CMP);
-            if (cmp) {
-                cmp->cmp_op = WIRELOG_CMP_EQ;
-                wl_ir_expr_t *lhs = wl_ir_expr_create(WL_IR_EXPR_VAR);
-                if (lhs) {
-                    char col[32];
-                    snprintf(col, sizeof(col), "col%u", i);
-                    lhs->var_name = strdup_safe(col);
-                }
-                wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_VAR);
-                if (rhs) {
-                    char col[32];
-                    snprintf(col, sizeof(col), "col%u", j);
-                    rhs->var_name = strdup_safe(col);
-                }
-                if (!ir_expr_attach(cmp, lhs)) {
-                    wl_ir_expr_free(rhs);
-                    wl_ir_expr_free(cmp);
-                    wl_ir_node_free(f);
-                    continue;
-                }
-                if (!ir_expr_attach(cmp, rhs)) {
-                    wl_ir_expr_free(cmp);
-                    wl_ir_node_free(f);
-                    continue;
-                }
+            wl_ir_expr_t *lhs = wl_ir_expr_create(WL_IR_EXPR_VAR);
+            wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_VAR);
+            if (!cmp || !lhs || !rhs) {
+                wl_ir_expr_free(cmp);
+                wl_ir_expr_free(lhs);
+                wl_ir_expr_free(rhs);
+                wl_ir_node_free(f);
+                wl_ir_node_free(result);
+                return NULL;
+            }
+            cmp->cmp_op = WIRELOG_CMP_EQ;
+            char col[32];
+            snprintf(col, sizeof(col), "col%u", i);
+            lhs->var_name = strdup_safe(col);
+            snprintf(col, sizeof(col), "col%u", j);
+            rhs->var_name = strdup_safe(col);
+            if (!lhs->var_name || !rhs->var_name) {
+                wl_ir_expr_free(lhs);
+                wl_ir_expr_free(rhs);
+                wl_ir_expr_free(cmp);
+                wl_ir_node_free(f);
+                wl_ir_node_free(result);
+                return NULL;
+            }
+            if (!ir_expr_attach(cmp, lhs)) {
+                wl_ir_expr_free(rhs);
+                wl_ir_expr_free(cmp);
+                wl_ir_node_free(f);
+                wl_ir_node_free(result);
+                return NULL;
+            }
+            if (wl_ir_expr_add_child(cmp, rhs) != 0) {
+                wl_ir_expr_free(rhs);
+                wl_ir_expr_free(cmp);
+                wl_ir_node_free(f);
+                wl_ir_node_free(result);
+                return NULL;
             }
             f->filter_expr = cmp;
             if (wl_ir_node_add_child(f, result) != 0) {
                 wl_ir_node_free(f);
-                continue;
+                wl_ir_node_free(result);
+                return NULL;
             }
             result = f;
         }
@@ -1757,15 +1804,27 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
             continue;
         if (child->type == WL_PARSER_AST_NODE_INTEGER) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_INT);
-            if (rhs) {
-                rhs->int_value = child->int_value;
-                result = wrap_column_cmp_filter(result, i + 1u, rhs);
+            if (!rhs)
+                goto fail;
+            rhs->int_value = child->int_value;
+            result = wrap_column_cmp_filter(result, i + 1u, rhs);
+            if (!result) {
+                scan = NULL;
+                goto fail;
             }
         } else if (child->type == WL_PARSER_AST_NODE_STRING) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
-            if (rhs) {
-                rhs->str_value = strdup_safe(child->str_value);
-                result = wrap_column_cmp_filter(result, i + 1u, rhs);
+            if (!rhs)
+                goto fail;
+            rhs->str_value = strdup_safe(child->str_value);
+            if (!rhs->str_value) {
+                wl_ir_expr_free(rhs);
+                goto fail;
+            }
+            result = wrap_column_cmp_filter(result, i + 1u, rhs);
+            if (!result) {
+                scan = NULL;
+                goto fail;
             }
         } else if (child->type == WL_PARSER_AST_NODE_COMPOUND_TERM) {
             unsupported_nested_pattern = true;
@@ -2092,9 +2151,27 @@ scan_build_complete:
 
     if (compound_mismatch)
         result = wrap_false_filter(result);
+    if (!result) {
+        free_var_names(var_names, physical_count);
+        for (uint32_t i = 0; i < side_binding_count; i++)
+            free(side_bindings[i].handle_var);
+        free(side_bindings);
+        free((void *)physical_args);
+        *out_var_names = NULL;
+        *out_var_count = 0;
+        return NULL;
+    }
+
+    char **result_vars = var_names;
+    uint32_t result_vcount = physical_count;
+    bool lowering_failed = false;
 
     /* Step 1a: Intra-atom FILTER for duplicate variables */
     result = wrap_duplicate_var_filters(result, var_names, physical_count);
+    if (!result) {
+        lowering_failed = true;
+        goto lowering_failed_cleanup;
+    }
 
     /* Step 1b: Intra-atom FILTER for constants */
     for (uint32_t i = 0; i < physical_count; i++) {
@@ -2110,20 +2187,34 @@ scan_build_complete:
             if (rhs) {
                 rhs->int_value = arg->int_value;
                 result = wrap_column_cmp_filter(result, i, rhs);
+                if (!result) {
+                    lowering_failed = true;
+                    goto lowering_failed_cleanup;
+                }
+            }else {
+                lowering_failed = true;
+                goto lowering_failed_cleanup;
             }
         } else if (arg->type == WL_PARSER_AST_NODE_STRING) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
             if (rhs) {
                 rhs->str_value = strdup_safe(arg->str_value);
+                if (!rhs->str_value) {
+                    wl_ir_expr_free(rhs);
+                    lowering_failed = true;
+                    goto lowering_failed_cleanup;
+                }
                 result = wrap_column_cmp_filter(result, i, rhs);
+                if (!result) {
+                    lowering_failed = true;
+                    goto lowering_failed_cleanup;
+                }
+            }else {
+                lowering_failed = true;
+                goto lowering_failed_cleanup;
             }
         }
     }
-
-    char **result_vars = var_names;
-    uint32_t result_vcount = physical_count;
-    bool lowering_failed = false;
-
     for (uint32_t i = 0; i < side_binding_count; i++) {
         char **side_vars = NULL;
         uint32_t side_vcount = 0;
@@ -2173,8 +2264,13 @@ scan_build_complete:
         result_vcount = combined_count;
         result = wrap_duplicate_var_filters(result, result_vars,
                 result_vcount);
+        if (!result) {
+            lowering_failed = true;
+            break;
+        }
     }
 
+lowering_failed_cleanup:
     for (uint32_t i = 0; i < side_binding_count; i++)
         free(side_bindings[i].handle_var);
     free(side_bindings);
@@ -2241,20 +2337,25 @@ wl_ir_program_constant_expr(const wl_parser_ast_node_t *node)
     }
     if (node->type == WL_PARSER_AST_NODE_STRING) {
         wl_ir_expr_t *expr = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
-        if (expr)
+        if (expr) {
             expr->str_value = strdup_safe(node->str_value);
+            if (!expr->str_value) {
+                wl_ir_expr_free(expr);
+                return NULL;
+            }
+        }
         return expr;
     }
     return NULL;
 }
 
-static void
+static bool
 wl_ir_program_push_constant_filter_to_scan(wirelog_ir_node_t **scan,
     char **vars, uint32_t var_count, const char *var_name,
     const wl_parser_ast_node_t *constant)
 {
     if (!scan || !*scan || !vars || !var_name || !constant)
-        return;
+        return false;
 
     for (uint32_t i = 0; i < var_count; i++) {
         if (!vars[i] || strcmp(vars[i], var_name) != 0)
@@ -2262,18 +2363,24 @@ wl_ir_program_push_constant_filter_to_scan(wirelog_ir_node_t **scan,
 
         wl_ir_expr_t *rhs = wl_ir_program_constant_expr(constant);
         if (!rhs)
-            continue;
-        *scan = wrap_column_cmp_filter(*scan, i, rhs);
+            return false;
+        wirelog_ir_node_t *filtered = wrap_column_cmp_filter(*scan, i, rhs);
+        if (!filtered) {
+            *scan = NULL;
+            return false;
+        }
+        *scan = filtered;
     }
+    return true;
 }
 
-static void
+static bool
 wl_ir_program_push_constant_filters(const wl_parser_ast_node_t *rule_node,
     wirelog_ir_node_t **scans, char ***scan_vars, uint32_t *scan_vcounts,
     uint32_t scan_count)
 {
     if (!rule_node || !scans || !scan_vars || !scan_vcounts)
-        return;
+        return false;
 
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *body = rule_node->children[i];
@@ -2283,11 +2390,13 @@ wl_ir_program_push_constant_filters(const wl_parser_ast_node_t *rule_node,
             continue;
 
         for (uint32_t scan_idx = 0; scan_idx < scan_count; scan_idx++) {
-            wl_ir_program_push_constant_filter_to_scan(&scans[scan_idx],
+            if (!wl_ir_program_push_constant_filter_to_scan(&scans[scan_idx],
                 scan_vars[scan_idx], scan_vcounts[scan_idx], var_name,
-                constant);
+                constant))
+                return false;
         }
     }
+    return true;
 }
 
 /* ---- Single Rule Conversion ---- */
@@ -2403,8 +2512,17 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         }
     }
 
-    wl_ir_program_push_constant_filters(rule_node, scans, scan_vars,
-        scan_vcounts, scan_count);
+    if (!wl_ir_program_push_constant_filters(rule_node, scans, scan_vars,
+        scan_vcounts, scan_count)) {
+        for (uint32_t s = 0; s < scan_count; s++) {
+            free_var_names(scan_vars[s], scan_vcounts[s]);
+            wl_ir_node_free(scans[s]);
+        }
+        free((void *)scans);
+        free((void *)scan_vars);
+        free(scan_vcounts);
+        return NULL;
+    }
 
     /* ---- Step 2: JOIN across multiple scans ---- */
 
@@ -2429,7 +2547,10 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     wl_ir_node_free(scans[j]);
                     scans[j] = NULL;
                 }
-                break;
+                wl_ir_program_set_error(prog,
+                    "allocation failed while constructing a join for rule '%s'",
+                    head->name ? head->name : "?");
+                goto conversion_failed;
             }
 
             if (setup_join_keys(cur_vars, cur_vcount, scan_vars[i],
@@ -2454,7 +2575,10 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     wl_ir_node_free(scans[j]);
                     scans[j] = NULL;
                 }
-                break;
+                wl_ir_program_set_error(prog,
+                    "allocation failed while attaching the left join input "
+                    "for rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
             }
             if (wl_ir_node_add_child(join, scans[i]) != 0) {
                 join->children[0] = NULL;
@@ -2464,7 +2588,10 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                     wl_ir_node_free(scans[j]);
                     scans[j] = NULL;
                 }
-                break;
+                wl_ir_program_set_error(prog,
+                    "allocation failed while attaching the right join input "
+                    "for rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
             }
 
             uint32_t merged_count;
@@ -2755,6 +2882,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 wl_ir_node_free(current);
                 root = NULL;
             }
+        } else {
+            goto conversion_failed;
         }
     } else {
         root = wl_ir_node_create(WIRELOG_IR_PROJECT);
@@ -2783,6 +2912,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 wl_ir_node_free(current);
                 root = NULL;
             }
+        } else {
+            goto conversion_failed;
         }
     }
 
