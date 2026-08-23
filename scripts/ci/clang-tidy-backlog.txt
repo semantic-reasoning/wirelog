@@ -38,4 +38,3 @@ wirelog/columnar/expr.c
 wirelog/columnar/join.c
 wirelog/columnar/kfusion.c
 wirelog/columnar/merge.c
-wirelog/columnar/mobius.c

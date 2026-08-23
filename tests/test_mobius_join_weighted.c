@@ -442,6 +442,91 @@ test_wide_relation_join(void)
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
+/* ================================================================
+ * Test 5 (Issue #1076): a non-pristine dst is rejected
+ *
+ * col_op_join_weighted() overwrites dst->ncols and then appends at
+ * dst->nrows through dst->columns[0..ocols).  A dst that already carries
+ * rows, or whose columns array is narrower than ocols, overflows both --
+ * ASan reports a heap-buffer-overflow WRITE at internal.h:414 reached
+ * from mobius.c.  The documented ncols==0 precondition does not bound
+ * nrows, capacity or columns, so the function now requires the whole
+ * relation pristine.
+ *
+ * dst here is left with capacity==0 and columns==NULL deliberately: the
+ * pre-fix grow path then allocates 16 rows and the write at index 8 lands
+ * in bounds, so before the fix this case returns 0 and fails the
+ * assertion cleanly rather than corrupting the heap.
+ * ================================================================ */
+static void
+test_non_pristine_dst_rejected(void)
+{
+    TEST("col_op_join_weighted rejects a dst carrying rows (#1076)");
+
+    col_rel_t *lhs = test_rel_alloc(1);
+    col_rel_t *rhs = test_rel_alloc(1);
+    col_rel_t *dst = test_rel_alloc(0);
+    ASSERT(lhs && rhs && dst, "test_rel_alloc failed");
+
+    int64_t lrow[] = { 1 };
+    int64_t rrow[] = { 1 };
+    ASSERT(test_rel_append_row_mult(lhs, lrow, 2) == 0, "append lhs row");
+    ASSERT(test_rel_append_row_mult(rhs, rrow, 3) == 0, "append rhs row");
+
+    dst->nrows = 8;
+
+    int rc = col_op_join_weighted(lhs, rhs, 0, dst);
+
+    ASSERT(rc == EINVAL, "returns EINVAL for a dst with nrows != 0");
+    ASSERT(dst->nrows == 8, "dst is left untouched on rejection");
+
+    test_rel_free(lhs);
+    test_rel_free(rhs);
+    test_rel_free(dst);
+    PASS();
+}
+
+/* ================================================================
+ * Test 6 (Issue #1076): a dst of the wrong arity is rejected
+ *
+ * This pins the ncols clause of the precondition specifically.  The other
+ * three clauses do not see this shape: dst is pristine in nrows, capacity
+ * and columns.  What is wrong is that dst carries three columns while the
+ * join produces two, and col_op_join_weighted() overwrites dst->ncols
+ * without resizing col_names, merge_columns or retract_backup_columns --
+ * which ncols also bounds.  Widening desyncs them and
+ * col_rel_free_contents() then frees past the allocation.
+ *
+ * Here ncols narrows (3 -> 2), which leaks rather than overflows, so the
+ * pre-fix run returns 0 and fails the assertion cleanly with no memory
+ * error.  The widening direction is the one that corrupts.
+ * ================================================================ */
+static void
+test_wrong_arity_dst_rejected(void)
+{
+    TEST("col_op_join_weighted rejects a dst of the wrong arity (#1076)");
+
+    col_rel_t *lhs = test_rel_alloc(1);
+    col_rel_t *rhs = test_rel_alloc(1);
+    col_rel_t *dst = test_rel_alloc(3); /* join produces 2 columns */
+    ASSERT(lhs && rhs && dst, "test_rel_alloc failed");
+
+    int64_t lrow[] = { 1 };
+    int64_t rrow[] = { 1 };
+    ASSERT(test_rel_append_row_mult(lhs, lrow, 2) == 0, "append lhs row");
+    ASSERT(test_rel_append_row_mult(rhs, rrow, 3) == 0, "append rhs row");
+
+    int rc = col_op_join_weighted(lhs, rhs, 0, dst);
+
+    ASSERT(rc == EINVAL, "returns EINVAL for a dst with ncols != 0");
+    ASSERT(dst->ncols == 3, "dst->ncols is not overwritten on rejection");
+
+    test_rel_free(lhs);
+    test_rel_free(rhs);
+    test_rel_free(dst);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -462,6 +547,8 @@ main(void)
     test_multiple_keys_different_mults();
     test_output_multiplicity_is_product();
     test_wide_relation_join();
+    test_non_pristine_dst_rejected();
+    test_wrong_arity_dst_rejected();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);
