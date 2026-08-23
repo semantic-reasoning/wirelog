@@ -318,7 +318,7 @@ test_worker_skips_gc_epoch_boundary_dispatch(void)
 
     /* Regression for the TSan data race that surfaced once workers
      * started borrowing the coordinator's compound_arena (Issue #579 /
-     * R-5).  The dispatch sites at ops.c (col_op_k_fusion entry) and
+     * R-5).  The dispatch sites at columnar/kfusion.c (col_op_k_fusion entry) and
      * eval.c (recursive sub-pass tail) advance arena->current_epoch,
      * which is a write on a pointer that workers share with the
      * coordinator.  The gate predicate must therefore reject worker
@@ -363,7 +363,7 @@ test_worker_skips_gc_epoch_boundary_dispatch(void)
         return 1;
     }
 
-    /* The gate predicate that ops.c:col_op_k_fusion and
+    /* The gate predicate that columnar/kfusion.c:col_op_k_fusion and
      * eval_serial.c:col_eval_stratum apply before dispatching
      * gc_epoch_boundary.  Mirroring it here pins the invariant: any
      * future relaxation of the worker check at either call site will
