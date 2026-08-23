@@ -3,7 +3,28 @@
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+normalize_root() {
+    local supplied=$1
+    case "$supplied" in
+        [[:alpha:]]:[\\/]* )
+            if ! command -v cygpath >/dev/null 2>&1; then
+                echo "ERROR: cygpath is required to normalize Windows root: $supplied" >&2
+                return 2
+            fi
+            if ! supplied=$(cygpath -u -- "$supplied"); then
+                echo "ERROR: cygpath could not normalize Windows root: $supplied" >&2
+                return 2
+            fi
+            ;;
+    esac
+    printf '%s\n' "$supplied"
+}
+
 root=${1:-$(cd "$script_dir/../.." && pwd)}
+if [ "$#" -gt 0 ]; then
+    root=$(normalize_root "$root")
+fi
 oracle="$root/scripts/release/downstream-matrix-oracles.tsv"
 runner="$root/scripts/release/run-downstream-matrix.sh"
 download="$root/bench/data/doop/download.sh"
