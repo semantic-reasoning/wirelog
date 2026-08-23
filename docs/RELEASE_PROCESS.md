@@ -420,6 +420,8 @@ changes that policy.
 - #750 — GPG + cosign-keyless signing pipeline.
 - #751 — tarball + SHA256 + BLAKE3 + provenance attestation.
 - #752 — GA release-facing deferrals/readiness follow-up in release process docs.
+- #1157 — resolved executor policy: v0.30.0 executor compatibility is unsupported;
+  the release maintainer owns the decision and no compatibility shim is shipped.
 - #753 — GA PSIRT/CVE-intake policy and 1.x support-window declaration.
 - #1144 — operational verification of the PSIRT mailbox, CVE assignment path,
   and published GPG key.

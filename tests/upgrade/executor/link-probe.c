@@ -1,10 +1,12 @@
 #include <wirelog/wirelog.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
     wirelog_error_t error = WIRELOG_ERR_UNKNOWN;
-    wirelog_executor_t *executor = wirelog_executor_create(NULL, &error);
-    (void)wirelog_load_facts_from_csv(executor, NULL, NULL, &error);
+    wirelog_program_t *program = (wirelog_program_t *)(void *)argv;
+    wirelog_executor_t *executor = wirelog_executor_create(program, &error);
+    (void)argc;
+    (void)wirelog_load_facts_from_csv(executor, argv[0], argv[0], &error);
     (void)wirelog_evaluate(executor, &error);
     (void)wirelog_result_get_relation(NULL, NULL);
     (void)wirelog_result_relation_cardinality(NULL, NULL);

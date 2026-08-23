@@ -208,6 +208,7 @@ not a claim of external validation.
 | Numerical fail-closed overflow and recursive aggregation canonicalization | See the `0.41 -> 0.43` section.  No 0.30 public API rename is needed, but callers may observe fail-closed errors or canonicalized recursive aggregate results. |
 | Security/export posture | No source migration needed when using the default build.  `mbedTLS=disabled` remains the default; see `docs/SECURITY_MODEL.md` before enabling crypto built-ins. |
 | Fuzz, SBOM, security policy, and release gates | No source migration needed for library consumers.  These are release-process and maintainer-tooling changes unless your downstream packaging pipeline adopts them. |
+| v0.30.0 executor facade (#1157) | **Unsupported in 1.0; no compatibility shim is provided.** Rebuild executor consumers against the current public API and migrate to the supported session/easy facade as appropriate. The release matrix records the historical link failure as `EXPECTED_UNSUPPORTED`, not as a compatibility pass. |
 
 ### Advanced session API is public via wirelog-advanced.h (#717)
 
