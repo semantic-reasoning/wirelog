@@ -43,6 +43,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/eval_tdd_plan.c',
   subdir_wirelog / 'columnar/eval_plan.c',
   subdir_wirelog / 'columnar/eval_stack.c',
+  subdir_wirelog / 'columnar/eval_serial.c',
   subdir_wirelog / 'columnar/eval.c',
   subdir_wirelog / 'columnar/arrangement.c',
   subdir_wirelog / 'columnar/frontier.c',
