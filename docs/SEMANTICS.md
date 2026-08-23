@@ -246,7 +246,7 @@ from producing semantically correct output at workers in {1, 4, 8, 16}.
   rule heads are validated; rule *bodies* and facts on undeclared relations
   are not.
 - `wirelog/columnar/ops.c` — `col_op_reduce`.
-- `wirelog/columnar/eval.c` — recursive aggregate canonicalization.
+- `wirelog/columnar/eval_serial.c` — recursive aggregate canonicalization.
 - `wirelog/ir/program.c` — `convert_rule` multi-aggregate head rejection.
 - `tests/test_recursive_agg_conformance.c` — active columnar harness.
 - Issue #1021 — a recursive MIN/MAX aggregate may not share an SCC with any

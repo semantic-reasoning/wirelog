@@ -1805,6 +1805,16 @@ stratum_has_preseeded_delta(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess);
 uint32_t
 rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id);
+/* Defined in columnar/eval_serial.c; also called from the TDD final-merge
+ * path in columnar/eval.c. */
+int
+wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess);
+/* Defined in columnar/eval.c; called from the serial stratum evaluator in
+ * columnar/eval_serial.c. */
+int
+wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
+    wl_col_session_t *coord);
 
 /* ======================================================================== */
 /* Relation Partitioning (columnar/partition.c)                             */

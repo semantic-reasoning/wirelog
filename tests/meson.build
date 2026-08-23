@@ -973,6 +973,7 @@ backend_src = files(
   '../wirelog/columnar/eval_tdd_plan.c',
   '../wirelog/columnar/eval_plan.c',
   '../wirelog/columnar/eval_stack.c',
+  '../wirelog/columnar/eval_serial.c',
   '../wirelog/columnar/eval.c',
   '../wirelog/columnar/arrangement.c',
   '../wirelog/columnar/frontier.c',

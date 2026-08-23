@@ -302,7 +302,7 @@ once and the surrounding overhead dominates.
 | `ops.c:2420` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
 | `ops.c:2423` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see :2410 note) |
 | `ops.c:6750` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
-| `ops.c:6299` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before the branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:1875`, which resets the TDD counter before `thread_create()` |
+| `ops.c:6299` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before the branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:292`, which resets the TDD counter before `thread_create()` |
 | `ops.c:6771` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 | `ops.c:6773` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll |
 
@@ -316,7 +316,7 @@ and the wasted work is bounded.
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `eval.c:1875` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
+| `eval.c:292` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
 
 ### 5.6 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
 
@@ -484,7 +484,7 @@ that enforces this is the `sess->coordinator == NULL` predicate:
   guard noted in the surrounding `ops.c:5451-5455` comment block;
   the `coordinator == NULL` conjunct is the load-bearing
   coordinator-only invariant.
-- `wirelog/columnar/eval.c:933-935` (eval-stratum sub-pass tail): the
+- `wirelog/columnar/eval_serial.c:788-791` (eval-stratum sub-pass tail): the
   same gate.
 
 The rotation strategy itself does **not** re-check the predicate
@@ -749,7 +749,7 @@ advisory leg); issue #826 (native TSan SEGV triage);
   gate.
 - `wirelog/columnar/ops.c:5456-5459` — compound-arena gate (K-fusion
   side).
-- `wirelog/columnar/eval.c:933-935` — compound-arena gate (eval-
+- `wirelog/columnar/eval_serial.c:788-791` — compound-arena gate (eval-
   stratum side).
 - `wirelog/columnar/mem_ledger.{h,c}` — accounting atomics + MSVC
   shim.
