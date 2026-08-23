@@ -488,6 +488,18 @@ cleanup:
                 uint32_t nr = prev_nrows[i];
                 r->columns = col_columns_alloc(nc, nr > 0 ? nr : 1);
                 if (r->columns) {
+                    /* Issue #1076: the buffer above is nc wide, and
+                     * col_rel_row_copy_in() bounds its loop by r->ncols.
+                     * Every other geometry field is restored below;
+                     * ncols has to be restored here because the copy
+                     * loop reads it.  nc == r->ncols on every reachable
+                     * path today -- ncols is fixed at construction, and
+                     * the only post-construction writer reachable from
+                     * evaluation is col_rel_set_schema(), which is a
+                     * no-op once non-zero -- so this makes the
+                     * invariant a property of this block rather than of
+                     * the whole call graph. */
+                    r->ncols = nc;
                     for (uint32_t row = 0; row < nr; row++) {
                         const int64_t *rowp
                             = prev_data[i] + (size_t)row * nc;
