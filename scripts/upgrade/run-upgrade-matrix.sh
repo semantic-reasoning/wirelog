@@ -32,6 +32,10 @@ candidate_commit=$(git rev-parse --verify "${candidate_ref}^{commit}")
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/wirelog-upgrade.XXXXXX")
 log_dir=${UPGRADE_MATRIX_LOG_DIR:-$tmp/evidence}
+if [[ -e "$log_dir" && -n "$(find "$log_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+    echo "upgrade matrix: evidence directory must be empty: $log_dir" >&2
+    exit 2
+fi
 mkdir -p "$log_dir"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -105,17 +109,12 @@ run_executor_case() {
     [[ -n "$old_lib" ]] || { echo 'upgrade matrix: old library missing' >&2; exit 1; }
     old_lib_symbols="$log_dir/executor-old-exported-symbols.txt"
     nm -D --defined-only "$old_lib" >"$old_lib_symbols"
-    local symbol
-    for symbol in \
-        wirelog_executor_create wirelog_executor_free \
-        wirelog_load_facts_from_csv wirelog_evaluate \
-        wirelog_result_get_relation wirelog_result_relation_cardinality \
-        wirelog_result_write_csv wirelog_result_free; do
-        if grep -Eq "[[:space:]]${symbol}$" "$old_lib_symbols"; then
-            echo "upgrade matrix: v0.30.0 unexpectedly exports $symbol" >&2
-            exit 1
-        fi
-    done
+    local abi_report="$log_dir/executor-abi.tsv"
+    local declared_symbols="$tmp/executor-declared-symbols.txt"
+    "$root/scripts/ci/check-executor-abi.sh" \
+        "$old_prefix/include/wirelog/wirelog.h" "$old_lib" \
+        "$abi_report" "$declared_symbols"
+    mapfile -t executor_symbols <"$declared_symbols"
 
     local old_obj="$tmp/executor-old-probe.o" old_exe="$tmp/executor-old.so"
     local old_compile_log="$log_dir/executor-old-probe-compile.log"
@@ -128,11 +127,7 @@ run_executor_case() {
         echo 'upgrade matrix: v0.30.0 executor unexpectedly linked' >&2
         exit 1
     fi
-    for symbol in \
-        wirelog_executor_create wirelog_executor_free \
-        wirelog_load_facts_from_csv wirelog_evaluate \
-        wirelog_result_get_relation wirelog_result_relation_cardinality \
-        wirelog_result_write_csv wirelog_result_free; do
+    for symbol in "${executor_symbols[@]}"; do
         grep -Fq "$symbol" "$old_link_log" || {
             echo "upgrade matrix: expected missing-symbol diagnostic absent: $symbol" >&2
             exit 1
@@ -144,24 +139,28 @@ run_executor_case() {
     }
     local linker_digest
     linker_digest=$(sha256sum "$old_link_log" | awk '{print $1}')
-    printf '{"status":"EXPECTED_UNSUPPORTED","old_commit":"%s","candidate_commit":"%s","missing_symbols":["wirelog_executor_create","wirelog_executor_free","wirelog_load_facts_from_csv","wirelog_evaluate","wirelog_result_get_relation","wirelog_result_relation_cardinality","wirelog_result_write_csv","wirelog_result_free"],"candidate_output":"reach-count 3","linker_diagnostic_file":"executor-old-link.log","linker_diagnostic_sha256":"%s"}\n' \
-        "$old_commit" "$candidate_commit" "$linker_digest" >"$log_dir/executor-status.json"
+    missing_json=$(printf '"%s",' "${executor_symbols[@]}" | sed 's/,$//')
+    printf '{"status":"EXPECTED_UNSUPPORTED","old_commit":"%s","candidate_commit":"%s","missing_symbols":[%s],"candidate_output":"reach-count 3","linker_diagnostic_file":"executor-old-link.log","linker_diagnostic_sha256":"%s"}\n' \
+        "$old_commit" "$candidate_commit" "$missing_json" "$linker_digest" >"$log_dir/executor-status.json"
+    "$root/scripts/ci/validate-executor-status.sh" \
+        "$log_dir/executor-status.json" "$old_link_log" \
+        "$old_commit" "$candidate_commit" "$candidate_out" "$declared_symbols" "$abi_report"
     printf 'EXPECTED_UNSUPPORTED executor (v0.30.0 declarations are not exported; candidate passed)\n'
 }
 
 run_case easy \
-    "$root/tests/upgrade/easy/program.dl" \
-    "$root/tests/upgrade/easy/program.dl" \
-    "$root/tests/upgrade/easy/legacy.c" \
-    "$root/tests/upgrade/easy/migrated.c"
+    "$candidate_source/tests/upgrade/easy/program.dl" \
+    "$candidate_source/tests/upgrade/easy/program.dl" \
+    "$candidate_source/tests/upgrade/easy/legacy.c" \
+    "$candidate_source/tests/upgrade/easy/migrated.c"
 run_case session \
-    "$root/tests/upgrade/session/program.dl" \
-    "$root/tests/upgrade/session/program.dl" \
-    "$root/tests/upgrade/session/legacy.c" \
-    "$root/tests/upgrade/session/migrated.c"
+    "$candidate_source/tests/upgrade/session/program.dl" \
+    "$candidate_source/tests/upgrade/session/program.dl" \
+    "$candidate_source/tests/upgrade/session/legacy.c" \
+    "$candidate_source/tests/upgrade/session/migrated.c"
 run_executor_case \
-    "$root/tests/upgrade/executor/program.dl" \
-    "$root/tests/upgrade/executor/consumer.c" \
-    "$root/tests/upgrade/executor/link-probe.c"
+    "$candidate_source/tests/upgrade/executor/program.dl" \
+    "$candidate_source/tests/upgrade/executor/consumer.c" \
+    "$candidate_source/tests/upgrade/executor/link-probe.c"
 
 printf 'Upgrade matrix passed: old=%s candidate=%s\n' "$old_commit" "$candidate_commit"
