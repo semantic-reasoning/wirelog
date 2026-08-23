@@ -26,11 +26,17 @@ grep -Fq '154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7' "$or
 grep -Fq 'MATRIX_REPEAT=1' "$runner"
 grep -Fq -- '--repeat "$MATRIX_REPEAT"' "$runner"
 
+negative_fixture=$(mktemp)
+negative_log=$(mktemp)
+trap 'rm -f "$negative_fixture" "$negative_log"' EXIT
+printf 'deliberately invalid checksum fixture\n' > "$negative_fixture"
 set +e
-DOOP_ZXING_URL=file:///etc/hosts "$download" >/tmp/wirelog-doop-checksum-negative.log 2>&1
+DOOP_ZXING_URL="file://${negative_fixture}" \
+DOOP_ZXING_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+    "$download" >"$negative_log" 2>&1
 mismatch_rc=$?
 set -e
 test "$mismatch_rc" -ne 0
-grep -Fq 'checksum mismatch' /tmp/wirelog-doop-checksum-negative.log
+grep -Fq 'checksum mismatch' "$negative_log"
 
 echo 'downstream matrix contract fixtures: OK'
