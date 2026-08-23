@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **43**).
+match the script's count (currently **44**).
 
 Format: `file:line` | field | operation | order | justification.
 
@@ -290,21 +290,26 @@ atomic APIs (`atomic_load`/`atomic_store`); they default to
 `memory_order_seq_cst`, which is acceptable here because init runs
 once and the surrounding overhead dominates.
 
-### 5.4 `wirelog/columnar/ops.c` — K-fusion cancel/budget (11 rows)
+### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget (10 rows)
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `ops.c:2194` | `ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across K-fusion workers; counter only |
-| `ops.c:2387` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
-| `ops.c:2395` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
-| `ops.c:2405` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `ops.c:2410` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
-| `ops.c:2420` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `ops.c:2423` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see :2410 note) |
-| `ops.c:6750` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
-| `ops.c:6299` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before the branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:292`, which resets the TDD counter before `thread_create()` |
-| `ops.c:6771` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
-| `ops.c:6773` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll |
+| `join.c:137` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
+| `join.c:355` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
+| `join.c:363` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
+| `join.c:373` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:378` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
+| `join.c:388` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:391` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see :378 note) |
+| `join.c:1958` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
+| `join.c:1979` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
+| `join.c:1981` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
+
+### 5.5 `wirelog/columnar/kfusion.c` — K-fusion shared counter (1 row)
+
+| `file:line` | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `kfusion.c:663` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:292`, which resets the TDD counter before `thread_create()` |
 
 The `stop` flag's `memory_order_relaxed` store is deliberate:
 cancellation is **cooperative**, not preemptive. A worker may observe
@@ -312,19 +317,19 @@ the previous value for up to one cache-line propagation interval; that
 is acceptable because each worker re-polls before every tuple batch
 and the wasted work is bounded.
 
-### 5.5 `wirelog/columnar/eval.c` — shared counter (1 row)
+### 5.6 `wirelog/columnar/eval.c` — shared counter (1 row)
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `eval.c:292` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
 
-### 5.6 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
+### 5.7 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `session.c:1484` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
+| `session.c:1499` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
 
-### 5.7 `wirelog/intern.c` — shared symbol table (3 rows)
+### 5.8 `wirelog/intern.c` — shared symbol table (3 rows)
 
 The intern table is shared, unsynchronized, by every parallel worker
 (Issue #958). Writers (`wl_intern_put`, `wl_intern_get`) serialize on
@@ -340,15 +345,17 @@ named in the justification.
 | `intern.c:84` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize` and `wl_intern_free`. The writer holds `intern->lock` (or, in `free`, has exclusive access), so no edge is needed |
 | `intern.c:86` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by `wl_intern_put` after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
 
-### 5.8 Total
+### 5.9 Total
 
-22 + 4 + 2 + 10 + 1 + 1 + 3 = **43 atomic call sites**.
+22 + 4 + 2 + 10 + 1 + 1 + 1 + 3 = **44 atomic call sites**.
 
 `scripts/ci/check-threading-doc.sh` extracts the same count from
-`grep -rE '\batomic_(load|store|fetch_add|fetch_sub|compare_exchange|exchange|init|thread_fence)(_explicit)?\s*\(' wirelog/ --include='*.c' --include='*.h'`
+`grep -rE '(^|[^[:alnum:]_])atomic_(load|store|fetch_add|fetch_sub|fetch_or|fetch_and|fetch_xor|compare_exchange_weak|compare_exchange_strong|exchange|init|thread_fence)(_explicit)?[[:space:]]*\(' wirelog/ --include='*.c' --include='*.h'`
 minus the MSVC shim definitions in `mem_ledger.h:46-81` and
-`lockfree_queue.c:22-37`, and compares against the row count in
-this section. A mismatch fails `meson test --suite abi:threading_doc`.
+`lockfree_queue.c:22-37`. It also resolves each audit row to a unique
+source file and logical (backslash-continued) line, checks the documented
+operation, and compares the resolved-row count with the source count. A
+mismatch or stale citation fails `meson test --suite abi:threading_doc`.
 
 ---
 
@@ -412,7 +419,7 @@ emits a non-fused chain.
 #define WL_KFUSION_MIN_PARALLEL_K 4
 ```
 
-At the dispatch site (`ops.c:5498-5513`), the runtime picks between
+At the dispatch site (`kfusion.c:609-623`), the runtime picks between
 parallel and serial K-fusion:
 
 ```c
@@ -440,7 +447,7 @@ So:
 The serial-vs-parallel cutover at K = 4 was set empirically. Below
 that threshold the workqueue dispatch overhead and the per-worker
 session allocation (`COL_SESSION(sess)->kfusion_alloc_ns` profiled
-at `ops.c:5522`) exceed the saved tuple work for the CRDT and
+at `kfusion.c:633`) exceed the saved tuple work for the CRDT and
 DDISASM workloads measured in the v0.40 perf gate
 (`tests/test_crdt_perf_gate.c`, `bench/bench_flowlog.c`). The
 `ops.c:17-19` comment block records the measurement summary:
@@ -472,7 +479,7 @@ Workers are forbidden to advance the arena's epoch counter or to
 free its memory; only the coordinator may do so. The live invariant
 that enforces this is the `sess->coordinator == NULL` predicate:
 
-- `wirelog/columnar/ops.c:5456-5460` (K-fusion path):
+- `wirelog/columnar/kfusion.c:561-569` (K-fusion path):
   ```c
   if (sess->coordinator == NULL
       && sess->compound_arena && sess->rotation_ops
@@ -481,7 +488,7 @@ that enforces this is the `sess->coordinator == NULL` predicate:
   }
   ```
   The `sess->compound_arena` conjunct is the defensive NULL-pointer
-  guard noted in the surrounding `ops.c:5451-5455` comment block;
+  guard noted in the surrounding `kfusion.c:555-565` comment block;
   the `coordinator == NULL` conjunct is the load-bearing
   coordinator-only invariant.
 - `wirelog/columnar/eval_serial.c:788-791` (eval-stratum sub-pass tail): the
@@ -745,9 +752,9 @@ advisory leg); issue #826 (native TSan SEGV triage);
   `posix`).
 - `wirelog/columnar/ops.c:17-22` — `WL_KFUSION_MIN_PARALLEL_K` plus
   the rationale comment block citing the DDISASM K = 3 measurement.
-- `wirelog/columnar/ops.c:5498-5513` — K-fusion parallel-dispatch
+- `wirelog/columnar/kfusion.c:609-623` — K-fusion parallel-dispatch
   gate.
-- `wirelog/columnar/ops.c:5456-5459` — compound-arena gate (K-fusion
+- `wirelog/columnar/kfusion.c:561-569` — compound-arena gate (K-fusion
   side).
 - `wirelog/columnar/eval_serial.c:788-791` — compound-arena gate (eval-
   stratum side).

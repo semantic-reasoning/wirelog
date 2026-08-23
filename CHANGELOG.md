@@ -1496,14 +1496,14 @@ All notable changes to wirelog are documented in this file.
   per-test, not as a numeric ratio, so future additions on
   either side cannot silently regress parity.  Result at this
   commit: 15 paired + 14 annotated = 29 easy tests covered.
-- **`scripts/ci/check-threading-doc.sh`** (#734): static gate
+- **`scripts/ci/check-threading-doc.sh`** (#734, #1173): static gate
   registered as `meson test --suite abi:threading_doc` that counts
-  `atomic_*` call sites in `wirelog/` production sources and asserts
-  the count matches the number of audit-table rows in
-  `docs/THREADING.md` §5.  Drift in either direction (atomic_* added
-  in code without a doc row, or doc row removed without code change)
-  fails the gate with a clear diagnostic pointing at the section to
-  update.
+  `atomic_*` call sites in `wirelog/` production sources, resolves every
+  `docs/THREADING.md` §5 audit row to a unique logical source line, and
+  checks its documented operation. Drift in either direction (atomic_*
+  added in code without a doc row, doc row removed without code change,
+  or a citation moved under a different basename/line) fails the gate with
+  a diagnostic naming the stale row and remediation.
 - **Compile-only smoke test for `WIRELOG_DEPRECATED_SINCE`** (#782):
   `tests/standalone/test_standalone_wirelog_deprecated_macro.c`
   annotates a static probe function with
