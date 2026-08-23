@@ -31,8 +31,9 @@ env:
 jobs:
   # ==========================================================================
   # Build scope gate
-  # Keep lint/policy checks active for every PR, but avoid the expensive build
-  # and sanitizer matrix when a PR only changes documentation or metadata.
+  # Keep lint/policy checks active for every PR.  The active main ruleset
+  # requires concrete build and sanitizer contexts, so docs-only PRs run the
+  # same matrix instead of relying on skipped-job semantics.
   # ==========================================================================
   build-scope:
     name: Detect build-triggering changes
@@ -71,12 +72,29 @@ jobs:
           done <<< "$changed_files"
 
           if [ "$build_required" = true ]; then
-            echo "build-required=true" >> "$GITHUB_OUTPUT"
             echo "Build-triggering source or build-definition changes detected."
           else
-            echo "build-required=false" >> "$GITHUB_OUTPUT"
-            echo "No source or build-definition changes detected; build matrix will be skipped."
+            echo "Documentation/metadata-only changes detected; required CI matrix still runs."
           fi
+          # A skipped job can be interpreted differently by branch-protection
+          # and by external status consumers. Emit every required context with
+          # a real result on every PR.
+          echo "build-required=true" >> "$GITHUB_OUTPUT"
+
+  # Always run the lightweight documentation policy gate.  Job-level skips on
+  # the required build matrix report Success to branch protection, while this
+  # job ensures docs-only changes still execute the policy validation that is
+  # otherwise registered inside the skipped Meson build.
+  docs-policy:
+    name: Docs / policy validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate support policy
+        run: python3 scripts/ci/check-support-policy.py
 
   # ==========================================================================
   # Issue #747 B18: RC changelog freeze gate (stable always-emitting context)
