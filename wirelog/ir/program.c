@@ -1167,8 +1167,13 @@ convert_expr(const wl_parser_ast_node_t *node)
     switch (node->type) {
     case WL_PARSER_AST_NODE_VARIABLE: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_VAR);
-        if (e)
+        if (e) {
             e->var_name = strdup_safe(node->name);
+            if (!e->var_name) {
+                wl_ir_expr_free(e);
+                return NULL;
+            }
+        }
         return e;
     }
     case WL_PARSER_AST_NODE_INTEGER: {
@@ -1179,8 +1184,13 @@ convert_expr(const wl_parser_ast_node_t *node)
     }
     case WL_PARSER_AST_NODE_STRING: {
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
-        if (e)
+        if (e) {
             e->str_value = strdup_safe(node->str_value);
+            if (!e->str_value) {
+                wl_ir_expr_free(e);
+                return NULL;
+            }
+        }
         return e;
     }
     case WL_PARSER_AST_NODE_BINARY_EXPR: {
@@ -1251,12 +1261,12 @@ convert_expr(const wl_parser_ast_node_t *node)
     }
 }
 
-static void
+static bool
 rewrite_expr_vars_to_columns(wl_ir_expr_t *expr, char **vars,
     uint32_t var_count)
 {
     if (!expr)
-        return;
+        return false;
 
     if (expr->type == WL_IR_EXPR_VAR && expr->var_name) {
         for (uint32_t i = 0; i < var_count; i++) {
@@ -1264,17 +1274,20 @@ rewrite_expr_vars_to_columns(wl_ir_expr_t *expr, char **vars,
                 char col[32];
                 snprintf(col, sizeof(col), "col%u", i);
                 char *next = strdup_safe(col);
-                if (next) {
-                    free(expr->var_name);
-                    expr->var_name = next;
-                }
-                return;
+                if (!next)
+                    return false;
+                free(expr->var_name);
+                expr->var_name = next;
+                return true;
             }
         }
     }
 
-    for (uint32_t i = 0; i < expr->child_count; i++)
-        rewrite_expr_vars_to_columns(expr->children[i], vars, var_count);
+    for (uint32_t i = 0; i < expr->child_count; i++) {
+        if (!rewrite_expr_vars_to_columns(expr->children[i], vars, var_count))
+            return false;
+    }
+    return true;
 }
 
 /* ---- Variable Name Tracking Helpers ---- */
@@ -1517,19 +1530,23 @@ static wirelog_ir_node_t *
 wrap_false_filter(wirelog_ir_node_t *child)
 {
     wirelog_ir_node_t *filter = wl_ir_node_create(WIRELOG_IR_FILTER);
-    if (!filter)
-        return child;
+    if (!filter) {
+        wl_ir_node_free(child);
+        return NULL;
+    }
 
     wl_ir_expr_t *expr = wl_ir_expr_create(WL_IR_EXPR_BOOL);
     if (!expr) {
         wl_ir_node_free(filter);
-        return child;
+        wl_ir_node_free(child);
+        return NULL;
     }
     expr->bool_value = false;
     filter->filter_expr = expr;
     if (wl_ir_node_add_child(filter, child) != 0) {
         wl_ir_node_free(filter);
-        return child;
+        wl_ir_node_free(child);
+        return NULL;
     }
     return filter;
 }
@@ -1832,6 +1849,10 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
     }
     if (unsupported_nested_pattern)
         result = wrap_false_filter(result);
+    if (!result) {
+        scan = NULL;
+        goto fail;
+    }
 
     *out_var_names = var_names;
     *out_var_count = count;
@@ -2152,6 +2173,7 @@ scan_build_complete:
     if (compound_mismatch)
         result = wrap_false_filter(result);
     if (!result) {
+        scan = NULL;
         free_var_names(var_names, physical_count);
         for (uint32_t i = 0; i < side_binding_count; i++)
             free(side_bindings[i].handle_var);
@@ -2477,6 +2499,9 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     char ***scan_vars = (char ***)calloc(scan_cap, sizeof(char **));
     uint32_t *scan_vcounts = (uint32_t *)calloc(scan_cap, sizeof(uint32_t));
     if (!scans || !scan_vars || !scan_vcounts) {
+        wl_ir_program_set_error(prog,
+            "allocation failed while preparing rule '%s'",
+            head->name ? head->name : "?");
         free((void *)scans);
         free((void *)scan_vars);
         free(scan_vcounts);
@@ -2495,6 +2520,10 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             scans[scan_count] = build_atom_scan(b, prog,
                     &scan_vars[scan_count], &scan_vcounts[scan_count]);
             if (!scans[scan_count]) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while lowering body atom '%s' in rule "
+                    "'%s'", b->name ? b->name : "?",
+                    head->name ? head->name : "?");
                 WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
                     "convert_rule: build_atom_scan returned NULL for "
                     "body atom index=%u relation=%s",
@@ -2514,6 +2543,9 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
 
     if (!wl_ir_program_push_constant_filters(rule_node, scans, scan_vars,
         scan_vcounts, scan_count)) {
+        wl_ir_program_set_error(prog,
+            "allocation failed while pushing constant filters in rule '%s'",
+            head->name ? head->name : "?");
         for (uint32_t s = 0; s < scan_count; s++) {
             free_var_names(scan_vars[s], scan_vcounts[s]);
             wl_ir_node_free(scans[s]);
@@ -2634,37 +2666,69 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
         if (b->type == WL_PARSER_AST_NODE_COMPARISON && current) {
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
-            if (!f)
-                continue;
+            if (!f) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while creating an explicit filter in "
+                    "rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
+            }
             f->filter_expr = convert_expr(b);
-            if (!f->filter_expr || wl_ir_node_add_child(f, current) != 0) {
+            if (!f->filter_expr) {
                 wl_ir_node_free(f);
+                wl_ir_program_set_error(prog,
+                    "allocation failed while converting an explicit filter "
+                    "in rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
+            }
+            if (wl_ir_node_add_child(f, current) != 0) {
+                wl_ir_node_free(f);
+                wl_ir_program_set_error(prog,
+                    "allocation failed while attaching an explicit filter "
+                    "in rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
             } else {
                 current = f;
             }
         } else if (b->type == WL_PARSER_AST_NODE_BOOLEAN) {
             if (!b->bool_value && current) {
                 wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
-                if (!f)
-                    continue;
+                if (!f) {
+                    wl_ir_program_set_error(prog,
+                        "allocation failed while creating a false filter in "
+                        "rule '%s'", head->name ? head->name : "?");
+                    goto conversion_failed;
+                }
                 wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_BOOL);
-                if (e)
-                    e->bool_value = false;
-                f->filter_expr = e;
-                if (wl_ir_node_add_child(f, current) != 0)
+                if (!e) {
                     wl_ir_node_free(f);
-                else
+                    goto conversion_failed;
+                }
+                e->bool_value = false;
+                f->filter_expr = e;
+                if (wl_ir_node_add_child(f, current) != 0) {
+                    wl_ir_node_free(f);
+                    goto conversion_failed;
+                } else
                     current = f;
             }
             /* Boolean True -> no-op */
         } else if (b->type == WL_PARSER_AST_NODE_STR_FUNCTION && current) {
             /* Standalone string predicate: contains(x, y), str_prefix(x, y), etc. */
             wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
-            if (!f)
-                continue;
+            if (!f) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while creating a string filter in "
+                    "rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
+            }
             f->filter_expr = convert_expr(b);
-            if (!f->filter_expr || wl_ir_node_add_child(f, current) != 0) {
+            if (!f->filter_expr) {
                 wl_ir_node_free(f);
+                goto conversion_failed;
+            }
+            if (wl_ir_node_add_child(f, current) != 0) {
+                wl_ir_node_free(f);
+                goto conversion_failed;
             } else {
                 current = f;
             }
@@ -2818,8 +2882,25 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
 
             if (agg_node->child_count >= 1) {
                 root->agg_expr = convert_expr(agg_node->children[0]);
-                rewrite_expr_vars_to_columns(root->agg_expr, cur_vars,
-                    cur_vcount);
+                if (!root->agg_expr) {
+                    wl_ir_program_set_error(prog,
+                        "allocation failed while converting an aggregate "
+                        "expression in rule '%s'",
+                        head->name ? head->name : "?");
+                    wl_ir_node_free(root);
+                    root = NULL;
+                    goto conversion_failed;
+                }
+                if (!rewrite_expr_vars_to_columns(root->agg_expr, cur_vars,
+                    cur_vcount)) {
+                    wl_ir_program_set_error(prog,
+                        "allocation failed while rewriting an aggregate "
+                        "expression in rule '%s'",
+                        head->name ? head->name : "?");
+                    wl_ir_node_free(root);
+                    root = NULL;
+                    goto conversion_failed;
+                }
             }
 
             root->column_count = cur_vcount;
@@ -2844,10 +2925,14 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             }
 
             if (!root_names_ok) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while copying aggregate column names "
+                    "in rule '%s'", head->name ? head->name : "?");
                 wl_ir_node_free(root);
                 wl_ir_node_free(current);
                 root = NULL;
                 current = NULL;
+                goto conversion_failed;
             }
 
             if (root)
@@ -2855,6 +2940,15 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             if (root && non_agg_count > 0) {
                 root->group_by_indices
                     = (uint32_t *)calloc(non_agg_count, sizeof(uint32_t));
+                if (!root->group_by_indices) {
+                    wl_ir_program_set_error(prog,
+                        "allocation failed while building aggregate grouping "
+                        "indices in rule '%s'",
+                        head->name ? head->name : "?");
+                    wl_ir_node_free(root);
+                    root = NULL;
+                    goto conversion_failed;
+                }
                 uint32_t gi = 0;
                 for (uint32_t i = 0; i < head->child_count; i++) {
                     if (head->children[i]->type
@@ -2883,6 +2977,9 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 root = NULL;
             }
         } else {
+            wl_ir_program_set_error(prog,
+                "allocation failed while creating an aggregate root for rule "
+                "'%s'", head->name ? head->name : "?");
             goto conversion_failed;
         }
     } else {
@@ -2899,10 +2996,24 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             if (head->child_count > 0) {
                 root->project_exprs = (wl_ir_expr_t **)calloc(
                     head->child_count, sizeof(wl_ir_expr_t *));
-                if (root->project_exprs) {
-                    for (uint32_t i = 0; i < head->child_count; i++) {
-                        root->project_exprs[i]
-                            = convert_expr(head->children[i]);
+                if (!root->project_exprs) {
+                    wl_ir_program_set_error(prog,
+                        "allocation failed while building project expressions "
+                        "in rule '%s'", head->name ? head->name : "?");
+                    wl_ir_node_free(root);
+                    root = NULL;
+                    goto conversion_failed;
+                }
+                for (uint32_t i = 0; i < head->child_count; i++) {
+                    root->project_exprs[i] = convert_expr(head->children[i]);
+                    if (!root->project_exprs[i]) {
+                        wl_ir_program_set_error(prog,
+                            "allocation failed while converting a project "
+                            "expression in rule '%s'",
+                            head->name ? head->name : "?");
+                        wl_ir_node_free(root);
+                        root = NULL;
+                        goto conversion_failed;
                     }
                 }
             }
@@ -2913,6 +3024,9 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 root = NULL;
             }
         } else {
+            wl_ir_program_set_error(prog,
+                "allocation failed while creating a project root for rule "
+                "'%s'", head->name ? head->name : "?");
             goto conversion_failed;
         }
     }
