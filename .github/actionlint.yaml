@@ -3,5 +3,9 @@ self-hosted-runner:
   # docs/RELEASE_PROCESS.md for its CPU-governor contract.
   labels:
     - wirelog-perf
+    - wirelog-ga
+
+runner-label:
+  - wirelog-ga
 
 config-variables: null

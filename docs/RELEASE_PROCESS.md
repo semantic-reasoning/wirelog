@@ -241,6 +241,14 @@ When cutting a release tag:
    <file> --certificate <file>`, and `--attestation <file>` to perform the
    corresponding GPG, Sigstore blob, and GitHub provenance checks as well.
 
+7. **Retain the GA downstream evidence.** The tag workflow's
+   `Tag / six-workload downstream matrix` job is a release-blocking check for
+   #1163. It builds and verifies the exact candidate tarball, then runs the
+   six-workload matrix on the isolated `wirelog-ga` runner. Link the successful
+   workflow run and its 90-day evidence artifact from #1156/#1163 and the GA
+   release notes. A repository-side green build or a nightly portfolio result
+   is not sufficient closure evidence for this gate.
+
 ### Perf-suite graph gate
 
 The `sub_ms_graph_perf_gate` entry in `--suite perf` covers the Reach,

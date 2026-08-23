@@ -781,6 +781,15 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1163: the GA downstream matrix must contain exactly six pinned
+# workloads, and the mutable DOOP source must fail its checksum negative case.
+if sh.found()
+  test('downstream_matrix_contract', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-downstream-matrix.sh',
+              meson.project_source_root()],
+       suite: 'abi')
+endif
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss
