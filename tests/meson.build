@@ -726,12 +726,15 @@ if sh.found()
        suite: 'abi')
 endif
 
-# Issue #734: docs/THREADING.md atomics audit row count must match
-# the count of atomic_* call sites in wirelog/ production sources.
-# Static text scan; no build-tree input required.
+# Issue #734/#1173: docs/THREADING.md atomics audit rows must resolve to
+# logical atomic_* source lines, and the count must match production sources.
+# Static shell checks; no build-tree input required.
 if sh.found()
   test('threading_doc', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-threading-doc.sh'],
+       suite: 'abi')
+  test('threading_doc_selftest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-threading-doc.sh'],
        suite: 'abi')
 endif
 
