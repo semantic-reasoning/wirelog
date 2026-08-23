@@ -119,6 +119,19 @@ if host_machine.system() == 'linux'
     link_args: ['-Wl,--wrap=malloc'],
     override_options: ['b_lto=false'],
   )
+
+  test_program_oom_exe = executable(
+    'test_program_oom',
+    files('test_program_oom.c'),
+    parser_src,
+    ir_src,
+    io_src,
+    thread_src,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [threads_dep],
+    link_args: ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc'],
+    override_options: ['b_lto=false'],
+  )
 endif
 
 test_stratify_exe = executable(
@@ -166,6 +179,7 @@ test('ir', test_ir_exe)
 test('program', test_program_exe)
 if host_machine.system() == 'linux'
   test('column_names_oom', test_column_names_oom_exe)
+  test('program_oom', test_program_oom_exe)
 endif
 test('stratify', test_stratify_exe)
 test('stratify_scc_bounds', test_stratify_scc_bounds_exe)
