@@ -364,7 +364,7 @@ test_worker_skips_gc_epoch_boundary_dispatch(void)
     }
 
     /* The gate predicate that ops.c:col_op_k_fusion and
-     * eval.c:col_eval_stratum apply before dispatching
+     * eval_serial.c:col_eval_stratum apply before dispatching
      * gc_epoch_boundary.  Mirroring it here pins the invariant: any
      * future relaxation of the worker check at either call site will
      * trip this assertion. */

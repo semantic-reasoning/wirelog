@@ -8,7 +8,7 @@
  *
  * A recursive relation whose head carries min()/max() is reduced twice: once
  * per rule by col_op_reduce(), and once over the whole relation at fixpoint
- * by the recursive-aggregate canonicalisation in columnar/eval.c.  Only the
+ * by the recursive-aggregate canonicalisation in columnar/eval_serial.c.  Only the
  * second one can see across rules, so only it can turn the union of each
  * rule's partial minimum into the relation's minimum.
  *

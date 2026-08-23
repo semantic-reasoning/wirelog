@@ -3284,7 +3284,7 @@ test_fact_arity_mismatch_maps_to_parse_error(void)
  * col_rel_append_all() (columnar/relation.c) copies dst->ncols columns from
  * it, unclamped against src->ncols -- ASAN reports
  * "heap-buffer-overflow READ of size 8" in col_rel_append_all under
- * col_eval_stratum() (columnar/eval.c), exit 139.  Outside a recursive
+ * col_eval_stratum() (columnar/eval_serial.c), exit 139.  Outside a recursive
  * stratum it is a silent wrong answer instead.
  *
  * The predicate compares PHYSICAL width, not logical, and that is the whole
