@@ -2768,6 +2768,15 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             wirelog_ir_node_t *neg_scan
                 = build_atom_scan(neg_atom, prog, &neg_vars, &neg_vcount);
 
+            if (!neg_scan) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while lowering negated atom '%s' in "
+                    "rule '%s'", neg_atom->name ? neg_atom->name : "?",
+                    head->name ? head->name : "?");
+                free_var_names(neg_vars, neg_vcount);
+                goto conversion_failed;
+            }
+
             /* Safety / range restriction (issue #920): every named variable in
              * a negated atom must also be bound by a positive body atom. A
              * variable that occurs only under negation has an unbounded range,
@@ -2808,39 +2817,47 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 return NULL;
             }
 
-            if (neg_scan) {
-                wirelog_ir_node_t *aj = wl_ir_node_create(WIRELOG_IR_ANTIJOIN);
-                if (aj) {
-                    if (setup_join_keys(cur_vars, cur_vcount, neg_vars,
-                        neg_vcount, aj) != 0) {
-                        wl_ir_node_free(aj);
-                        wl_ir_node_free(neg_scan);
-                        free_var_names(neg_vars, neg_vcount);
-                        wl_ir_node_free(current);
-                        for (uint32_t s = 0; s < scan_count; s++)
-                            free_var_names(scan_vars[s], scan_vcounts[s]);
-                        if (cur_vars_is_merged)
-                            free_var_names(cur_vars, cur_vcount);
-                        free((void *)scans);
-                        free((void *)scan_vars);
-                        free(scan_vcounts);
-                        return NULL;
-                    }
-                    if (wl_ir_node_add_child(aj, current) != 0) {
-                        wl_ir_node_free(aj);
-                        wl_ir_node_free(neg_scan);
-                    } else if (wl_ir_node_add_child(aj, neg_scan) != 0) {
-                        aj->children[0] = NULL;
-                        aj->child_count = 0;
-                        wl_ir_node_free(aj);
-                        wl_ir_node_free(neg_scan);
-                    } else {
-                        current = aj;
-                    }
-                } else {
-                    wl_ir_node_free(neg_scan);
-                }
+            wirelog_ir_node_t *aj = wl_ir_node_create(WIRELOG_IR_ANTIJOIN);
+            if (!aj) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while creating an anti-join for rule "
+                    "'%s'", head->name ? head->name : "?");
+                wl_ir_node_free(neg_scan);
+                free_var_names(neg_vars, neg_vcount);
+                goto conversion_failed;
             }
+            if (setup_join_keys(cur_vars, cur_vcount, neg_vars, neg_vcount,
+                aj) != 0) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while building anti-join keys for "
+                    "rule '%s'", head->name ? head->name : "?");
+                wl_ir_node_free(aj);
+                wl_ir_node_free(neg_scan);
+                free_var_names(neg_vars, neg_vcount);
+                goto conversion_failed;
+            }
+            if (wl_ir_node_add_child(aj, current) != 0) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while attaching the positive anti-join "
+                    "input for rule '%s'", head->name ? head->name : "?");
+                wl_ir_node_free(aj);
+                wl_ir_node_free(neg_scan);
+                free_var_names(neg_vars, neg_vcount);
+                goto conversion_failed;
+            }
+            if (wl_ir_node_add_child(aj, neg_scan) != 0) {
+                wl_ir_node_free(aj);
+                aj = NULL;
+                wl_ir_node_free(neg_scan);
+                current = NULL;
+                wl_ir_program_set_error(prog,
+                    "allocation failed while attaching the negated anti-join "
+                    "input for rule '%s'", head->name ? head->name : "?");
+                free_var_names(neg_vars, neg_vcount);
+                goto conversion_failed;
+            }
+
+            current = aj;
 
             free_var_names(neg_vars, neg_vcount);
         }
