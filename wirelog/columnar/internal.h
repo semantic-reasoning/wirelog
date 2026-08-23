@@ -564,7 +564,7 @@ col_rel_binary_search_row(const col_rel_t *rel, uint32_t lo, uint32_t hi,
  * string, the comparison is therefore over the strings.
  *
  * There are two reducers -- col_op_reduce() in ops.c and the recursive
- * canonicalisation in eval.c -- and they must agree.  Two copies could
+ * canonicalisation in eval_serial.c -- and they must agree.  Two copies could
  * drift into a fixpoint that is lexicographic within an iteration and
  * id-ordered across iterations, which is worse than the original bug, so
  * both call this.

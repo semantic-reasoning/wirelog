@@ -930,7 +930,7 @@ validate_fact_arities(struct wirelog_program *program,
  *   cc(y, min(c)) :- cc(x, c, d), edge(x, y).   -> SIGSEGV (exit 139)
  *
  * ASAN reports "heap-buffer-overflow READ of size 8" in col_rel_append_all()
- * under col_eval_stratum() (columnar/eval.c).  Issue #973 rejects the
+ * under col_eval_stratum() (columnar/eval_serial.c).  Issue #973 rejects the
  * multi-aggregate spelling of the same crash; this is the single-aggregate
  * one, which that check cannot see because nothing about its aggregate count
  * is wrong.
@@ -2444,7 +2444,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
      * tuple narrower than the .decl.  col_op_reduce() (columnar/ops.c) then
      * sizes its output region as group_by_count + 1 while col_rel_append_all()
      * (columnar/relation.c) copies dst->ncols columns from it, unclamped -- an
-     * out-of-bounds read under col_eval_stratum() (columnar/eval.c):
+     * out-of-bounds read under col_eval_stratum() (columnar/eval_serial.c):
      *   .decl cc(n:int64, lo:int64, hi:int64)
      *   cc(y, min(c), max(c)) :- cc(x, c, d), edge(x, y).   -> SIGSEGV
      *

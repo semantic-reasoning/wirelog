@@ -37,7 +37,7 @@
  *   test_recursive_min_workers / test_recursive_max_workers
  *       The same property through the recursive fixpoint, at W = 1, 4, 8
  *       and 16.  A second reducer -- the recursive-aggregate
- *       canonicalisation in columnar/eval.c -- runs only on this path and
+ *       canonicalisation in columnar/eval_serial.c -- runs only on this path and
  *       flipped independently of col_op_reduce().
  *
  *   test_join_chain_aggregate
@@ -357,7 +357,7 @@ test_max_lexicographic(void)
  * Connected-component labelling over symbols.  {"zz","aa","mm"} form one
  * component and {"pp","bb"} another, so the answer is the lexicographic
  * minimum (or maximum) of each component -- propagated through the
- * recursive rule, which is what makes the eval.c canonicalisation run.
+ * recursive rule, which is what makes the eval_serial.c canonicalisation run.
  */
 #define CC_EDGES                                     \
         ".decl E(x: symbol, y: symbol)\n"            \
