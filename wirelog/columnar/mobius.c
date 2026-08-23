@@ -28,7 +28,9 @@
  *
  * Output layout: all lhs columns followed by all rhs columns (key column
  * is duplicated; callers may project as needed).  dst->ncols is initialised
- * by this function; dst must be caller-allocated with ncols==0 on entry.
+ * by this function; dst must be caller-allocated and pristine on entry
+ * (ncols==0, nrows==0, capacity==0, columns==NULL), and is rejected with
+ * EINVAL otherwise (Issue #1076).
  *
  * Returns 0 on success, non-zero (ENOMEM / EINVAL) on error.
  */
@@ -39,6 +41,15 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
     if (!lhs || !rhs || !dst)
         return EINVAL;
     if (key_col >= lhs->ncols || key_col >= rhs->ncols)
+        return EINVAL;
+    /* Issue #1076: dst->ncols is overwritten below, and the append path
+     * indexes dst->columns[0..ocols) at dst->nrows.  A dst that already
+     * carries rows, or whose columns array is narrower than ocols,
+     * overflows both (ASan: heap-buffer-overflow WRITE at
+     * internal.h:414).  ncols==0 alone does not bound nrows, capacity or
+     * columns, so require the whole relation pristine. */
+    if (dst->ncols != 0 || dst->nrows != 0 || dst->capacity != 0 ||
+        dst->columns != NULL)
         return EINVAL;
 
     uint32_t ocols = lhs->ncols + rhs->ncols;
@@ -136,7 +147,11 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
  *   - key in both:       delta_mult = curr_mult - prev_mult (skipped if 0)
  *
  * Both input relations must have timestamps != NULL.
- * out_delta must be caller-allocated, empty (nrows==0) on entry.
+ * out_delta must be caller-allocated and carry no data on entry
+ * (nrows==0, capacity==0, columns==NULL), and its ncols must be either 0
+ * or already equal to the input arity, because this function overwrites
+ * ncols without resizing the arrays it also bounds.  Rejected with EINVAL
+ * otherwise (Issue #1076).
  *
  * Returns 0 on success, EINVAL on bad arguments, ENOMEM on allocation failure.
  */
@@ -149,6 +164,23 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
     if (prev_collection->ncols == 0 || curr_collection->ncols == 0)
         return EINVAL;
     if (prev_collection->ncols != curr_collection->ncols)
+        return EINVAL;
+    /* Issue #1076: see col_op_join_weighted.  "empty (nrows==0)" alone is
+     * not sufficient -- an out_delta with nrows==0 but a pre-allocated
+     * columns array narrower than ncols still overruns it on the first
+     * append.  ncols itself is overwritten below, so it is deliberately
+     * not required to be zero: every caller passes a typed relation. */
+    if (out_delta->nrows != 0 || out_delta->capacity != 0 ||
+        out_delta->columns != NULL)
+        return EINVAL;
+    /* Issue #1076: ncols is overwritten below, and it is also the length
+     * bound for col_names, merge_columns and retract_backup_columns, which
+     * this function does not touch.  Silently widening it would desync
+     * those from what the caller allocated and corrupt the heap in
+     * col_rel_free_contents().  A typed out_delta must therefore already
+     * match the input arity; ncols == 0 (untyped) stays allowed. */
+    if (out_delta->ncols != 0 &&
+        out_delta->ncols != prev_collection->ncols)
         return EINVAL;
 
     uint32_t ncols = prev_collection->ncols;

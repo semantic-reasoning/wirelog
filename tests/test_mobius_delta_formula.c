@@ -441,6 +441,126 @@ test_wide_relation_delta(void)
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
+/* ================================================================
+ * Test 6 (Issue #1076): an out_delta carrying rows is rejected
+ *
+ * The append path grows out_delta only when nrows >= capacity, to
+ * capacity ? capacity * 2 : 16 -- which can still be <= nrows.  An
+ * out_delta handed over with nrows already past its buffer therefore
+ * writes off the end: ASan reports a heap-buffer-overflow WRITE at
+ * internal.h:414 reached from mobius.c.
+ *
+ * capacity and columns are left at 0/NULL so the pre-fix grow path
+ * allocates 16 rows and the write at index 8 lands in bounds; before the
+ * fix this case returns 0 and fails the assertion cleanly instead of
+ * corrupting the heap.
+ * ================================================================ */
+static void
+test_non_empty_out_delta_rejected(void)
+{
+    TEST("col_compute_delta_mobius rejects an out_delta with rows (#1076)");
+
+    col_rel_t *prev = test_rel_alloc(1);
+    col_rel_t *curr = test_rel_alloc(1);
+    col_rel_t *out = test_rel_alloc(1);
+    ASSERT(prev && curr && out, "test_rel_alloc failed");
+
+    int64_t row[] = { 42 };
+    ASSERT(test_rel_append_row_mult(curr, row, 1) == 0, "append curr row");
+
+    out->nrows = 8;
+
+    int rc = col_compute_delta_mobius(prev, curr, out);
+
+    ASSERT(rc == EINVAL, "returns EINVAL for an out_delta with nrows != 0");
+    ASSERT(out->nrows == 8, "out_delta is left untouched on rejection");
+
+    test_rel_free(prev);
+    test_rel_free(curr);
+    test_rel_free(out);
+    PASS();
+}
+
+/* ================================================================
+ * Test 7 (Issue #1076): an out_delta whose arity disagrees is rejected
+ *
+ * out_delta->ncols is overwritten by this function, but ncols is also the
+ * length bound for col_names, merge_columns and retract_backup_columns,
+ * which it does not touch.  Widening it silently desyncs those from what
+ * the caller allocated: col_rel_free_contents() then walks col_names to
+ * the new, larger ncols and reads past the allocation (ASan:
+ * heap-buffer-overflow READ, followed by free() on garbage pointers).
+ *
+ * The relation here is pristine in nrows/capacity/columns -- the check
+ * added for shapes A and C does not catch it -- but carries one column
+ * against three-column inputs.
+ * ================================================================ */
+static void
+test_arity_mismatch_out_delta_rejected(void)
+{
+    TEST("col_compute_delta_mobius rejects a wrong-arity out_delta (#1076)");
+
+    col_rel_t *prev = test_rel_alloc(3);
+    col_rel_t *curr = test_rel_alloc(3);
+    col_rel_t *out = test_rel_alloc(1); /* pristine, but one column */
+    ASSERT(prev && curr && out, "test_rel_alloc failed");
+
+    int64_t row[] = { 1, 2, 3 };
+    ASSERT(test_rel_append_row_mult(curr, row, 1) == 0, "append curr row");
+
+    int rc = col_compute_delta_mobius(prev, curr, out);
+
+    ASSERT(rc == EINVAL, "returns EINVAL when out_delta->ncols != input ncols");
+    ASSERT(out->ncols == 1, "out_delta->ncols is not overwritten on rejection");
+
+    test_rel_free(prev);
+    test_rel_free(curr);
+    test_rel_free(out);
+    PASS();
+}
+
+/* ================================================================
+ * Test 8 (Issue #1076): an out_delta with a lying capacity is rejected
+ *
+ * This is the case the documented contract did not cover: nrows == 0 is
+ * satisfied, so the old precondition was met.  The arity matches too, so
+ * the check added for Test 7 does not see it either -- what is wrong is
+ * that capacity claims four rows while the buffers hold one, and
+ * timestamps is NULL.  Because nrows < capacity the append path skips
+ * the grow that would have allocated timestamps, so the first append
+ * writes out_delta->timestamps[0] through a NULL pointer.
+ *
+ * This case is what pins the capacity/columns half of the precondition:
+ * remove only those clauses and this is the sole test that fails.
+ * ================================================================ */
+static void
+test_lying_capacity_out_delta_rejected(void)
+{
+    TEST("col_compute_delta_mobius rejects a lying capacity (#1076)");
+
+    col_rel_t *prev = test_rel_alloc(1);
+    col_rel_t *curr = test_rel_alloc(1);
+    col_rel_t *out = test_rel_alloc(1);
+    ASSERT(prev && curr && out, "test_rel_alloc failed");
+
+    int64_t row[] = { 7 };
+    ASSERT(test_rel_append_row_mult(curr, row, 1) == 0, "append curr row");
+
+    /* nrows stays 0 and ncols matches: only capacity/columns are wrong. */
+    out->capacity = 4;
+    out->columns = col_columns_alloc(1, 1);
+    ASSERT(out->columns != NULL, "col_columns_alloc failed");
+
+    int rc = col_compute_delta_mobius(prev, curr, out);
+
+    ASSERT(rc == EINVAL, "returns EINVAL for an out_delta with capacity != 0");
+
+    test_rel_free(prev);
+    test_rel_free(curr);
+    test_rel_free(out);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -463,6 +583,9 @@ main(void)
     test_new_key_appears();
     test_key_vanishes();
     test_wide_relation_delta();
+    test_non_empty_out_delta_rejected();
+    test_arity_mismatch_out_delta_rejected();
+    test_lying_capacity_out_delta_rejected();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);
