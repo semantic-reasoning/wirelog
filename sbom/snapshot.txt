@@ -70,7 +70,7 @@ ilammy/msvc-dev-cmd@v1:NOASSERTION
 mozilla-actions/sccache-action@v0.0.10:NOASSERTION
 msys2/setup-msys2@v2:NOASSERTION
 mymindstorm/setup-emsdk@v14:NOASSERTION
-nanoarrow@0.8.0.9000:Apache
+nanoarrow@0.9.0.9000:Apache
 nttld/setup-ndk@v1:NOASSERTION
 ossf/scorecard-action@v2.3.1:NOASSERTION
 r-lib/actions/check-r-package@v2:NOASSERTION
@@ -81,4 +81,4 @@ r-lib/actions/setup-r-dependencies@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-tinytex@v2:NOASSERTION
-# nanoarrow-resolved-sha: 65ab7e9f29244589ccbe7f95900c1295633baf42
+# nanoarrow-resolved-sha: 3f824063f59848e05692ab520de8ab4d9ebb1880

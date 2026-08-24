@@ -45,7 +45,7 @@ syft dir:"$repo_root" -o syft-json 2>/dev/null \
   | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' \
   | sort > "$repo_root/sbom/snapshot.txt"
 
-# Append nanoarrow commit SHA as a comment (since revision=main has no hash)
+# Append the resolved nanoarrow commit SHA as a comment for provenance.
 nanoarrow_sha=$(git -C "$repo_root/subprojects/nanoarrow" rev-parse HEAD 2>/dev/null || true)
 if [ -n "$nanoarrow_sha" ]; then
     printf '# nanoarrow-resolved-sha: %s\n' "$nanoarrow_sha" >> "$repo_root/sbom/snapshot.txt"
