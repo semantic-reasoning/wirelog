@@ -51,8 +51,13 @@ negative_fixture=$(mktemp)
 negative_log=$(mktemp)
 trap 'rm -f "$negative_fixture" "$negative_log"' EXIT
 printf 'deliberately invalid checksum fixture\n' > "$negative_fixture"
+negative_url="file://${negative_fixture}"
+if command -v cygpath >/dev/null 2>&1; then
+    negative_path=$(cygpath -m -- "$negative_fixture")
+    negative_url="file:///${negative_path#/}"
+fi
 set +e
-DOOP_ZXING_URL="file://${negative_fixture}" \
+DOOP_ZXING_URL="$negative_url" \
 DOOP_ZXING_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
     "$download" >"$negative_log" 2>&1
 mismatch_rc=$?
