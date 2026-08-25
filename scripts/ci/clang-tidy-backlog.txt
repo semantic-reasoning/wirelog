@@ -36,4 +36,3 @@ wirelog/columnar/eval_tdd_queue.c
 wirelog/columnar/expr.c
 wirelog/columnar/join.c
 wirelog/columnar/kfusion.c
-wirelog/columnar/merge.c

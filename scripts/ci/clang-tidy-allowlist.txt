@@ -64,6 +64,7 @@ wirelog/columnar/handle_remap_apply_side.c
 wirelog/columnar/inline.c
 wirelog/columnar/lftj.c
 wirelog/columnar/mem_ledger.c
+wirelog/columnar/merge.c
 wirelog/columnar/mobius.c
 wirelog/columnar/ops.c
 wirelog/columnar/partition.c

@@ -1481,7 +1481,6 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             col_rel_row_move(rel, compacted + j, delta_phys + j);
         old_nrows = compacted;
         rel->nrows = compacted + d_unique;
-        max_rows = old_nrows + d_unique;
     }
 
     uint32_t oi = 0, di = 0, out = 0;
