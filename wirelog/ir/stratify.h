@@ -295,6 +295,22 @@ void
 wl_ir_stratify_scc_free(wl_ir_stratify_scc_result_t *result);
 
 /**
+ * wl_ir_stratify_mark_recursive_strata:
+ * @graph: Dependency graph whose edges are inspected
+ * @scc: SCC result for @graph
+ * @strata: Strata array to mark
+ * @num_strata: Number of entries in @strata
+ *
+ * Mark strata recursive for multi-node SCCs and valid positive or aggregation
+ * self-loops. Malformed edge endpoints and out-of-range SCC IDs are ignored.
+ */
+void
+wl_ir_stratify_mark_recursive_strata(
+    const wl_ir_stratify_dep_graph_t *graph,
+    const wl_ir_stratify_scc_result_t *scc, wirelog_stratum_t *strata,
+    uint32_t num_strata);
+
+/**
  * wl_ir_stratify_program:
  * @program: Program to stratify (modified in place)
  *
