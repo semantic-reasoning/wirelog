@@ -49,6 +49,14 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error)
     return wl_ir_parse_string_err(program_text, error, NULL, 0);
 }
 
+const char *
+wirelog_program_get_plan_error(const wirelog_program_t *program)
+{
+    if (!program || program->plan_error[0] == '\0')
+        return "";
+    return program->plan_error;
+}
+
 wirelog_program_t *
 wl_ir_parse_string_err(const char *program_text, wirelog_error_t *error,
     char *errbuf, size_t errcap)

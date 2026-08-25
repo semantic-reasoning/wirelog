@@ -22,6 +22,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,18 @@
 /* ======================================================================== */
 /* Internal helpers                                                         */
 /* ======================================================================== */
+
+static void
+set_plan_error(struct wirelog_program *prog, const char *fmt, ...)
+{
+    if (!prog || !fmt)
+        return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(prog->plan_error, sizeof(prog->plan_error), fmt, ap);
+    va_end(ap);
+}
 
 static char *
 dup_str(const char *s)
@@ -3519,7 +3532,8 @@ plan_relation_reads(const wl_plan_relation_t *relation, const char *name)
  * does.
  */
 static int
-validate_recursive_aggregate_consumers(const wl_plan_t *plan)
+validate_recursive_aggregate_consumers(const wl_plan_t *plan,
+    struct wirelog_program *prog)
 {
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         const wl_plan_stratum_t *stratum = &plan->strata[s];
@@ -3561,6 +3575,13 @@ validate_recursive_aggregate_consumers(const wl_plan_t *plan)
                     "into '%s' so that '%s' lands in a later stratum",
                     consumer->name, stratum->stratum_id, agg->name,
                     agg->name, consumer->name);
+                set_plan_error(prog,
+                    "relation '%s' of stratum %u reads recursive aggregate "
+                    "relation '%s' from the same stratum: a recursive "
+                    "min/max aggregate may not share an SCC with any "
+                    "other relation; break the feedback edge into '%s'",
+                    consumer->name, stratum->stratum_id, agg->name,
+                    consumer->name);
                 return -1;
             }
         }
@@ -3577,7 +3598,8 @@ validate_recursive_aggregate_consumers(const wl_plan_t *plan)
  * The second pass, validate_recursive_aggregate_consumers(), rejects a
  * further shape for a related reason (#1021); see the comment on it. */
 static int
-validate_recursive_aggregates(const wl_plan_t *plan)
+validate_recursive_aggregates(const wl_plan_t *plan,
+    struct wirelog_program *prog)
 {
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         const wl_plan_stratum_t *stratum = &plan->strata[s];
@@ -3600,12 +3622,18 @@ validate_recursive_aggregates(const wl_plan_t *plan)
                     "are non-monotone across fixpoint iteration",
                     wirelog_agg_fn_str(op->agg_fn), relation->name,
                     stratum->stratum_id);
+                set_plan_error(prog,
+                    "recursive aggregate '%s' is not supported in relation "
+                    "'%s' of stratum %u: count, sum and average are "
+                    "non-monotone across fixpoint iteration",
+                    wirelog_agg_fn_str(op->agg_fn), relation->name,
+                    stratum->stratum_id);
                 return -1;
             }
         }
     }
 
-    return validate_recursive_aggregate_consumers(plan);
+    return validate_recursive_aggregate_consumers(plan, prog);
 }
 
 void
@@ -3653,9 +3681,17 @@ wl_plan_free(wl_plan_t *plan)
 }
 
 int
-wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
+wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
 {
-    if (!prog || !out)
+    if (!prog)
+        return -1;
+
+    prog->plan_error[0] = '\0';
+    /* Every failure path has at least a bounded generic diagnostic; the
+     * validation failures below replace it with their actionable reason. */
+    set_plan_error(prog, "execution plan generation failed");
+
+    if (!out)
         return -1;
 
     *out = NULL;
@@ -4097,7 +4133,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
      * the same mistake got made once in #975 and again in #1019.  It has to
      * sit here, after plan_stratum_record_refs() above and before the four
      * rewrites below. */
-    if (validate_recursive_aggregates(plan) != 0) {
+    if (validate_recursive_aggregates(plan, prog) != 0) {
         wl_plan_free(plan);
         return -1;
     }
@@ -4113,6 +4149,7 @@ wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out)
     }
     rewrite_insert_exchanges(plan);
 
+    prog->plan_error[0] = '\0';
     *out = plan;
     return 0;
 }

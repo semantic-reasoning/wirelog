@@ -155,6 +155,16 @@ wirelog_parse_string(const char *program_text, wirelog_error_t *error);
 WIRELOG_API void
 wirelog_program_free(wirelog_program_t *program);
 
+/**
+ * Return the reason from the most recent execution-plan generation attempt.
+ * The returned string is borrowed from @program until its next plan attempt
+ * or destruction; an empty string means no diagnostic is available.
+ * Program handles are not safe for concurrent plan generation and diagnostic
+ * access; callers must serialize those operations.
+ */
+WIRELOG_API const char *
+wirelog_program_get_plan_error(const wirelog_program_t *program);
+
 /* ======================================================================== */
 /* Symbol Interning                                                         */
 /* ======================================================================== */
