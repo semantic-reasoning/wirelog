@@ -53,6 +53,16 @@ col_idb_consolidate(col_rel_t *r, wl_col_session_t *sess)
     if (stk.top > 0) {
         eval_entry_t ce = eval_stack_pop(&stk);
         if (ce.owned && ce.rel != r) {
+            /*
+             * r is an IDB relation from the coordinator session, not a
+             * worker or $d$ shared view.  Consolidation preserves the input
+             * arity: single-row inputs are returned unchanged, while a
+             * borrowed input is copied by col_rel_pool_new_like().  The
+             * copied result owns freshly allocated columns, so r->columns
+             * is owned here as well.  A future caller that permits shared IDB
+             * views, or a schema-changing consolidator, must replace this
+             * with ownership-aware release and arity validation.
+             */
             col_columns_free(r->columns, r->ncols);
             r->columns = ce.rel->columns;
             r->nrows = ce.rel->nrows;
