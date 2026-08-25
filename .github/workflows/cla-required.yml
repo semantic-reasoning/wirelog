@@ -23,15 +23,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          attempts=12
+          # CLA Assistant publishes the hosted status asynchronously. Keep
+          # this bounded, but allow the provider roughly five minutes to
+          # publish it before failing closed.
+          attempts=31
           interval=10
+          overall_timeout=300
+          max_request_timeout=10
+          deadline=$((SECONDS + overall_timeout))
           status_url="https://api.github.com/repos/${REPOSITORY}/commits/${HEAD_SHA}/status"
 
           echo "Checking ${CLA_CONTEXT} on PR head SHA ${HEAD_SHA}."
 
           for attempt in $(seq 1 "$attempts"); do
+            remaining=$((deadline - SECONDS))
+            if [ "$remaining" -le 0 ]; then
+              break
+            fi
+            request_timeout="$remaining"
+            if [ "$request_timeout" -gt "$max_request_timeout" ]; then
+              request_timeout="$max_request_timeout"
+            fi
             response="$(
               curl --fail --silent --show-error --location \
+                --connect-timeout "$request_timeout" \
+                --max-time "$request_timeout" \
                 --header "Accept: application/vnd.github+json" \
                 --header "Authorization: Bearer ${GH_TOKEN}" \
                 --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -77,9 +93,16 @@ jobs:
             esac
 
             if [ "$attempt" -lt "$attempts" ]; then
-              sleep "$interval"
+              remaining=$((deadline - SECONDS))
+              if [ "$remaining" -gt 0 ]; then
+                sleep_for="$interval"
+                if [ "$sleep_for" -gt "$remaining" ]; then
+                  sleep_for="$remaining"
+                fi
+                sleep "$sleep_for"
+              fi
             fi
           done
 
-          echo "::error::Timed out waiting for ${CLA_CONTEXT} to report success on ${HEAD_SHA}; latest state was ${cla_state}."
+          echo "::error::Timed out after ${overall_timeout}s (maximum ${attempts} attempts at ${interval}s intervals; request timeout capped at ${max_request_timeout}s) waiting for ${CLA_CONTEXT} to report success on ${HEAD_SHA}; latest state was ${cla_state}."
           exit 1

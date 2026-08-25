@@ -345,6 +345,15 @@ synthetic PR targeting `1.0` and verify:
 4. Merge is blocked while any required check is failing or pending.
 5. Linear-history and signed-commit constraints are enforced.
 
+The repository-owned `CLA signoff gate` polls for a bounded 300-second window,
+with each API request capped at 10 seconds, for the hosted `license/cla` status
+to appear on the exact PR head SHA. This bounded grace period covers normal
+asynchronous publication delays; it does not treat a missing or pending status
+as success. If the status is still missing or pending after the deadline, the
+gate fails closed and the workflow must be rerun after the hosted status is
+published. An explicit `failure` or `error` status continues to fail
+immediately.
+
 Phase B prerequisites for final #746 acceptance are not fully present in
 this repository state yet: `CODEOWNERS` and the always-emitting
 `CLA signoff gate` workflow are present, but final synthetic PR
