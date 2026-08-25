@@ -90,6 +90,35 @@ wl_columnar_eval_checked_count_inc(uint32_t count, size_t *out)
     return 0;
 }
 
+/* Checked addition for TDD row-count fields; UINT32_MAX is a valid total. */
+int
+wl_columnar_eval_checked_row_add(uint32_t total, uint32_t addend,
+    uint32_t *out)
+{
+    if (!out)
+        return EINVAL;
+    if (addend > UINT32_MAX - total)
+        return EOVERFLOW;
+    *out = total + addend;
+    return 0;
+}
+
+static void
+tdd_destroy_delta_slots(col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
+    uint32_t nrels)
+{
+    if (!ctxs)
+        return;
+    for (uint32_t w = 0; w < W; w++) {
+        if (!ctxs[w].delta_rels)
+            continue;
+        for (uint32_t ri = 0; ri < nrels; ri++) {
+            col_rel_destroy(ctxs[w].delta_rels[ri]);
+            ctxs[w].delta_rels[ri] = NULL;
+        }
+    }
+}
+
 /* Relation-plan dispatch is implemented in columnar/eval_plan.c. */
 /* Serial stratum evaluation is implemented in columnar/eval_serial.c. */
 
@@ -1855,7 +1884,11 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
     for (uint32_t w = 0; w < W; w++) {
         col_rel_t *d = ctxs[w].delta_rels[ri];
         if (d && d->nrows > 0) {
-            total += d->nrows;
+            if (wl_columnar_eval_checked_row_add(total, d->nrows,
+                &total) != 0) {
+                tdd_destroy_delta_slots(ctxs, W, sp->relation_count);
+                return EOVERFLOW;
+            }
             if (ncols == 0)
                 ncols = d->ncols;
         }
@@ -1997,7 +2030,11 @@ tdd_gather_for_worker(wl_col_session_t *coord, uint32_t dst, uint32_t W,
     for (uint32_t src = 0; src < W; src++) {
         col_rel_t *part = coord->exchange_bufs[src][dst];
         if (part && part->nrows > 0) {
-            total_rows += part->nrows;
+            if (wl_columnar_eval_checked_row_add(total_rows, part->nrows,
+                &total_rows) != 0) {
+                tdd_free_exchange_bufs(coord);
+                return EOVERFLOW;
+            }
             if (ncols == 0)
                 ncols = part->ncols;
         }
@@ -2155,7 +2192,12 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
             for (uint32_t w = 0; w < W; w++) {
                 col_rel_t *d = ctxs[w].delta_rels[ri];
                 if (d && d->nrows > 0) {
-                    total += d->nrows;
+                    if (wl_columnar_eval_checked_row_add(total, d->nrows,
+                        &total) != 0) {
+                        tdd_destroy_delta_slots(ctxs, W, nrels);
+                        rc = EOVERFLOW;
+                        goto exchange_done;
+                    }
                     if (ncols == 0) ncols = d->ncols;
                 }
             }
@@ -2606,7 +2648,11 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
-                total_rows += d->nrows;
+                if (wl_columnar_eval_checked_row_add(total_rows, d->nrows,
+                    &total_rows) != 0) {
+                    tdd_destroy_delta_slots(ctxs, W, nrels);
+                    return EOVERFLOW;
+                }
                 if (ncols == 0)
                     ncols = d->ncols;
             }
@@ -3199,7 +3245,11 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
-                total += d->nrows;
+                if (wl_columnar_eval_checked_row_add(total, d->nrows,
+                    &total) != 0) {
+                    tdd_destroy_delta_slots(ctxs, W, nrels);
+                    return EOVERFLOW;
+                }
                 if (ncols == 0)
                     ncols = d->ncols;
             }
@@ -3398,7 +3448,11 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
-                total += d->nrows;
+                if (wl_columnar_eval_checked_row_add(total, d->nrows,
+                    &total) != 0) {
+                    tdd_destroy_delta_slots(ctxs, W, nrels);
+                    return EOVERFLOW;
+                }
                 if (ncols == 0)
                     ncols = d->ncols;
             }
@@ -3449,8 +3503,14 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         }
         if (out_any_accepted)
             *out_any_accepted = true;
-        if (out_accepted_rows)
-            *out_accepted_rows += combined->nrows;
+        if (out_accepted_rows) {
+            if (wl_columnar_eval_checked_row_add(*out_accepted_rows,
+                combined->nrows, out_accepted_rows) != 0) {
+                col_rel_destroy(combined);
+                tdd_destroy_delta_slots(ctxs, W, nrels);
+                return EOVERFLOW;
+            }
+        }
 
         if (coord_idb) {
             if (coord_idb->ncols == 0 && combined->ncols > 0) {
@@ -3591,7 +3651,11 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
-                total += d->nrows;
+                if (wl_columnar_eval_checked_row_add(total, d->nrows,
+                    &total) != 0) {
+                    tdd_destroy_delta_slots(ctxs, W, nrels);
+                    return EOVERFLOW;
+                }
                 if (ncols == 0)
                     ncols = d->ncols;
             }
@@ -3641,8 +3705,14 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
 
         if (out_any_accepted)
             *out_any_accepted = true;
-        if (out_accepted_rows)
-            *out_accepted_rows += combined->nrows;
+        if (out_accepted_rows) {
+            if (wl_columnar_eval_checked_row_add(*out_accepted_rows,
+                combined->nrows, out_accepted_rows) != 0) {
+                col_rel_destroy(combined);
+                tdd_destroy_delta_slots(ctxs, W, nrels);
+                return EOVERFLOW;
+            }
+        }
 
         if (coord_idb) {
             if (coord_idb->ncols == 0 && combined->ncols > 0) {
