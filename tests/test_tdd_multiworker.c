@@ -57,6 +57,45 @@ static int tests_failed = 0;
 /* Helpers                                                                  */
 /* ======================================================================== */
 
+static int
+test_checked_size_mul_boundaries(void)
+{
+    TEST("checked TDD nrels byte-size multiplication boundaries");
+
+    size_t bytes = SIZE_MAX;
+    size_t pointer_limit = SIZE_MAX / sizeof(col_rel_t *);
+    bool ok = wl_columnar_eval_checked_size_mul(0, sizeof(col_rel_t *),
+            &bytes) == 0
+        && bytes == 0;
+    ok = ok && wl_columnar_eval_checked_size_mul(3, sizeof(col_rel_t *),
+            &bytes) == 0
+        && bytes == 3 * sizeof(col_rel_t *);
+    ok = ok && wl_columnar_eval_checked_size_mul(pointer_limit,
+            sizeof(col_rel_t *), &bytes) == 0
+        && bytes == pointer_limit * sizeof(col_rel_t *);
+    if (pointer_limit < SIZE_MAX)
+        ok = ok && wl_columnar_eval_checked_size_mul(pointer_limit + 1,
+                sizeof(col_rel_t *), &bytes) == EOVERFLOW
+            && bytes == pointer_limit * sizeof(col_rel_t *);
+    ok = ok && wl_columnar_eval_checked_size_mul(2, SIZE_MAX, &bytes)
+        == EOVERFLOW;
+    size_t slots = 0;
+    ok = ok && wl_columnar_eval_checked_count_inc(0, &slots) == 0
+        && slots == 1;
+    if ((size_t)UINT32_MAX < SIZE_MAX)
+        ok = ok && wl_columnar_eval_checked_count_inc(UINT32_MAX, &slots) == 0
+            && slots == (size_t)UINT32_MAX + 1;
+    else
+        ok = ok && wl_columnar_eval_checked_count_inc(UINT32_MAX, &slots)
+            == EOVERFLOW;
+    if (!ok) {
+        FAIL("size multiplication boundary mismatch");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 struct count_ctx {
     int64_t count;
 };
@@ -658,6 +697,7 @@ main(void)
 {
     printf("=== test_tdd_multiworker (Issue #404) ===\n");
 
+    test_checked_size_mul_boundaries();
     test_w1_expected_count();
     test_w1_vs_w4_tuple_count();
     test_w1_vs_w8_tuple_count();

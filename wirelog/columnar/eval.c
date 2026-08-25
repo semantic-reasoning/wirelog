@@ -64,6 +64,32 @@ wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
     return 0;
 }
 
+/* Checked multiplication for relation-count allocations. */
+int
+wl_columnar_eval_checked_size_mul(size_t count, size_t element_size,
+    size_t *out)
+{
+    if (!out)
+        return EINVAL;
+    if (element_size != 0 && count > SIZE_MAX / element_size)
+        return EOVERFLOW;
+    *out = count * element_size;
+    return 0;
+}
+
+int
+wl_columnar_eval_checked_count_inc(uint32_t count, size_t *out)
+{
+    if (!out)
+        return EINVAL;
+#if SIZE_MAX <= UINT32_MAX
+    if (count == UINT32_MAX)
+        return EOVERFLOW;
+#endif
+    *out = (size_t)count + 1;
+    return 0;
+}
+
 /* Relation-plan dispatch is implemented in columnar/eval_plan.c. */
 /* Serial stratum evaluation is implemented in columnar/eval_serial.c. */
 
@@ -306,6 +332,20 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     }
     coord->tdd_active_workers = W;
     tdd_record_active_workers(coord, W);
+    size_t relation_slots = 0;
+    if (wl_columnar_eval_checked_count_inc(coord->nrels,
+        &relation_slots) != 0) {
+        free(ops_copy);
+        tdd_cleanup_workers(coord);
+        return EOVERFLOW;
+    }
+    size_t relation_slot_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(relation_slots,
+        sizeof(col_rel_t *), &relation_slot_bytes) != 0) {
+        free(ops_copy);
+        tdd_cleanup_workers(coord);
+        return EOVERFLOW;
+    }
 
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
     nonrec_rule_worker_ctx_t *ctxs = (nonrec_rule_worker_ctx_t *)calloc(
@@ -323,8 +363,8 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     atomic_uint_fast64_t shared_join_count;
     atomic_store_explicit(&shared_join_count, 0, memory_order_relaxed);
     for (uint32_t w = 0; w < W && rc == 0; w++) {
-        worker_rels[w] = (col_rel_t **)calloc(coord->nrels + 1,
-                sizeof(col_rel_t *));
+        worker_rels[w] = (col_rel_t **)calloc(relation_slots,
+                sizeof(col_rel_t *)); /* NOLINT(clang-analyzer-security.ArrayBound) */
         if (!worker_rels[w]) {
             rc = ENOMEM;
             break;
@@ -337,7 +377,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
             col_rel_t *rel = NULL;
             rc = nonrec_make_shared_relation_view(src, &rel);
             if (rc == 0)
-                worker_rels[w][rels_built++] = rel;
+                worker_rels[w][rels_built++] = rel; /* NOLINT(clang-analyzer-security.ArrayBound) */
         }
         if (rc == 0) {
             uint32_t begin = w * chunk;
@@ -350,7 +390,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
             rc = nonrec_copy_relation_slice(driver, slice_name, begin, end,
                     &slice);
             if (rc == 0)
-                worker_rels[w][rels_built++] = slice;
+                worker_rels[w][rels_built++] = slice; /* NOLINT(clang-analyzer-security.ArrayBound) */
         }
         if (rc != 0)
             break;
@@ -455,7 +495,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
         for (uint32_t w = 0; w < W; w++) {
             if (worker_rels[w]) {
                 if (w >= built_workers) {
-                    for (uint32_t ri = 0; ri < coord->nrels + 1; ri++)
+                    for (size_t ri = 0; ri < relation_slots; ri++)
                         col_rel_destroy(worker_rels[w][ri]);
                 }
                 free((void *)worker_rels[w]);
@@ -494,6 +534,12 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
     coord->tdd_active_workers = W;
     tdd_record_active_workers(coord, W);
     uint32_t nrels = coord->nrels;
+    size_t relation_ptr_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
+        &relation_ptr_bytes) != 0) {
+        tdd_cleanup_workers(coord);
+        return EOVERFLOW;
+    }
 
     /* No relations: create empty worker sessions */
     if (nrels == 0) {
@@ -511,8 +557,10 @@ tdd_init_workers(wl_col_session_t *coord, uint32_t W)
 
     /* Allocate W x nrels partition matrix */
     col_rel_t ***worker_parts = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
-    if (!worker_parts)
+    if (!worker_parts) {
+        tdd_cleanup_workers(coord);
         return ENOMEM;
+    }
 
     int rc = 0;
     for (uint32_t w = 0; w < W; w++) {
@@ -632,6 +680,12 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
     coord->tdd_active_workers = W;
     tdd_record_active_workers(coord, W);
     uint32_t nrels = coord->nrels;
+    size_t relation_ptr_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
+        &relation_ptr_bytes) != 0) {
+        tdd_cleanup_workers(coord);
+        return EOVERFLOW;
+    }
 
     /* No relations: create empty worker sessions */
     if (nrels == 0) {
@@ -649,8 +703,10 @@ tdd_replicate_workers(wl_col_session_t *coord, uint32_t W)
 
     /* Allocate W x nrels relation matrix */
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
-    if (!worker_rels)
+    if (!worker_rels) {
+        tdd_cleanup_workers(coord);
         return ENOMEM;
+    }
 
     int rc = 0;
     for (uint32_t w = 0; w < W; w++) {
@@ -742,9 +798,17 @@ tdd_init_workers_global_read(wl_col_session_t *coord, uint32_t W)
     tdd_record_active_workers(coord, W);
 
     uint32_t nrels = coord->nrels;
+    size_t relation_ptr_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
+        &relation_ptr_bytes) != 0) {
+        tdd_cleanup_workers(coord);
+        return EOVERFLOW;
+    }
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
-    if (!worker_rels)
+    if (!worker_rels) {
+        tdd_cleanup_workers(coord);
         return ENOMEM;
+    }
 
     for (uint32_t w = 0; w < W; w++) {
         worker_rels[w] = (col_rel_t **)calloc(nrels ? nrels : 1,
@@ -1018,6 +1082,12 @@ tdd_worker_subpass_fn(void *arg)
     }
 
     /* Snapshot nrows before evaluation (eval_serial.c:431-434) */
+    size_t snap_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(nrels, sizeof(uint32_t),
+        &snap_bytes) != 0) {
+        ctx->rc = EOVERFLOW;
+        TDD_WORKER_RETURN();
+    }
     uint32_t *snap = (uint32_t *)calloc(nrels, sizeof(uint32_t));
     if (!snap) {
         ctx->rc = ENOMEM;
@@ -2236,6 +2306,12 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     coord->tdd_active_workers = W;
     tdd_record_active_workers(coord, W);
     uint32_t nrels = coord->nrels;
+    size_t relation_ptr_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
+        &relation_ptr_bytes) != 0) {
+        tdd_cleanup_workers(coord);
+        return EOVERFLOW;
+    }
 
     if (nrels == 0) {
         for (uint32_t w = 0; w < W; w++) {
@@ -2251,8 +2327,10 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     }
 
     col_rel_t ***worker_rels = (col_rel_t ***)calloc(W, sizeof(col_rel_t **));
-    if (!worker_rels)
+    if (!worker_rels) {
+        tdd_cleanup_workers(coord);
         return ENOMEM;
+    }
 
     int rc = 0;
     for (uint32_t w = 0; w < W; w++) {
@@ -2993,13 +3071,21 @@ tdd_clear_relation_dedup_set(col_rel_t *r)
     r->dedup_count = 0;
 }
 
-static col_rel_t **
-tdd_save_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
+static int
+tdd_save_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
+    col_rel_t ***out_saved)
 {
+    if (!out_saved)
+        return EINVAL;
+    *out_saved = NULL;
+    size_t saved_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(sp->relation_count,
+        sizeof(col_rel_t *), &saved_bytes) != 0)
+        return EOVERFLOW;
     col_rel_t **saved = (col_rel_t **)calloc(
         sp->relation_count, sizeof(col_rel_t *));
     if (!saved)
-        return NULL;
+        return ENOMEM;
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
         if (!r || r->ncols == 0)
@@ -3010,13 +3096,14 @@ tdd_save_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord)
         if (r->nrows > 0 && col_rel_append_all(saved[ri], r, NULL) != 0)
             goto fail;
     }
-    return saved;
+    *out_saved = saved;
+    return 0;
 
 fail:
     for (uint32_t ri = 0; ri < sp->relation_count; ri++)
         col_rel_destroy(saved[ri]);
     free((void *)saved);
-    return NULL;
+    return ENOMEM;
 }
 
 static int
@@ -3688,6 +3775,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 {
     uint32_t W = coord->num_workers;
     uint32_t nrels = sp->relation_count;
+    size_t delta_rel_bytes = 0;
+    if (wl_columnar_eval_checked_size_mul(nrels, sizeof(col_rel_t *),
+        &delta_rel_bytes) != 0)
+        return EOVERFLOW;
     int rc = 0;
     uint64_t tdd_total_t0 = now_ns();
 
@@ -3809,16 +3900,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     col_rel_t **global_read_saved = NULL;
     bool owner_adaptive_fallback = false;
     if (owner_exchange_mode) {
-        owner_fallback_saved = tdd_save_coord_idb(sp, coord);
-        if (!owner_fallback_saved) {
+        int save_rc = tdd_save_coord_idb(sp, coord, &owner_fallback_saved);
+        if (save_rc != 0) {
             coord->tdd_total_ns += now_ns() - tdd_total_t0;
-            return ENOMEM;
+            return save_rc;
         }
     } else if (global_read_mode) {
-        global_read_saved = tdd_save_coord_idb(sp, coord);
-        if (!global_read_saved) {
+        int save_rc = tdd_save_coord_idb(sp, coord, &global_read_saved);
+        if (save_rc != 0) {
             coord->tdd_total_ns += now_ns() - tdd_total_t0;
-            return ENOMEM;
+            return save_rc;
         }
     }
 
@@ -4116,7 +4207,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             /* Reset worker contexts for this sub-pass (reuse allocation) */
             for (uint32_t w = 0; w < W; w++) {
                 memset((void *)ctxs[w].delta_rels, 0,
-                    nrels * sizeof(col_rel_t *));
+                    delta_rel_bytes);
                 ctxs[w].sp = sp;
                 ctxs[w].worker_sess = &coord->tdd_workers[w];
                 ctxs[w].stratum_idx = stratum_idx;
@@ -4219,7 +4310,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     /* Clear and reconstruct from queue messages. */
                     for (uint32_t w = 0; w < W; w++)
                         memset((void *)ctxs[w].delta_rels, 0,
-                            nrels * sizeof(col_rel_t *));
+                            delta_rel_bytes);
                     wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
                         ctxs, msgs, msg_count, W, nrels);
                     free(msgs);

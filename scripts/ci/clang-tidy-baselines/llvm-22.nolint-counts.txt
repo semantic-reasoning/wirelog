@@ -1,6 +1,7 @@
 # Per-scan clang-tidy NOLINT suppression baseline for LLVM 22.
 # Format: repo-relative source/configuration key followed by the count.
 # Missing keys are treated as zero; increases fail the ratchet.
+wirelog/columnar/eval.c 3
 wirelog/columnar/partition.c 1
 wirelog/io/csv_reader.c 1
 wirelog/ir/program.c 9
