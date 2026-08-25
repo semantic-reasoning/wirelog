@@ -49,6 +49,27 @@ collect_scans(wirelog_ir_node_t *node, wirelog_ir_node_t **out, uint32_t max)
     return n;
 }
 
+/* Count every non-JOIN leaf without the bounded output-array semantics of
+* collect_scans().  JPP only supports left-deep JOIN chains; this count is
+* used to reject bushy trees before any scratch allocation or mutation. */
+static uint32_t
+count_join_leaves(const wirelog_ir_node_t *node)
+{
+    if (!node)
+        return 0;
+    if (node->type != WIRELOG_IR_JOIN)
+        return 1;
+
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        uint32_t child = count_join_leaves(node->children[i]);
+        if (child > UINT32_MAX - total)
+            return UINT32_MAX;
+        total += child;
+    }
+    return total;
+}
+
 /* ======================================================================== */
 /* Internal: variable set operations                                        */
 /* ======================================================================== */
@@ -921,6 +942,8 @@ insert_projections(wirelog_ir_node_t *join_root, char **head_vars,
         return 0; /* Need at least 3 atoms for intermediate projection */
 
     uint32_t nscan = depth + 1;
+    if (count_join_leaves(join_root) != nscan)
+        return 0; /* Bushy JOINs are outside the projection contract. */
     wirelog_ir_node_t **scans
         = (wirelog_ir_node_t **)calloc(nscan, sizeof(wirelog_ir_node_t *));
     wirelog_ir_node_t **joins
@@ -1336,6 +1359,8 @@ optimize_chain(wirelog_ir_node_t *join_root, char **head_vars,
     uint32_t nscan = depth + 1;
     if (nscan < 3)
         return result; /* Two-atom chains don't benefit from reordering */
+    if (count_join_leaves(join_root) != nscan)
+        return result; /* Only optimize complete left-deep chains. */
 
     /* Collect SCAN leaves and JOIN nodes */
     wirelog_ir_node_t **scans

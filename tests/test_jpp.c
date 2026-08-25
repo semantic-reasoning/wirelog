@@ -555,6 +555,62 @@ test_jpp_three_atom_reorder(void)
     PASS();
 }
 
+static void
+test_jpp_bushy_join_is_unchanged(void)
+{
+    TEST("jpp #1139: bushy JOIN is left unchanged");
+
+    wirelog_error_t err;
+    wirelog_program_t *prog
+        = wirelog_parse_string(".decl a(x: int32, y: int32)\n"
+            ".decl b(y: int32, z: int32)\n"
+            ".decl c(z: int32, w: int32)\n"
+            ".decl d(w: int32, v: int32)\n"
+            ".decl out(x: int32, v: int32)\n"
+            "out(x, v) :- a(x, y), b(y, z), c(z, w), d(w, v).\n",
+            &err);
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+
+    wirelog_ir_node_t *root = find_join_root(find_relation_ir(prog, "out"));
+    if (!root || root->type != WIRELOG_IR_JOIN
+        || root->child_count != 2
+        || root->children[0]->type != WIRELOG_IR_JOIN
+        || root->children[0]->child_count != 2) {
+        FAIL("expected left-deep four-atom JOIN fixture");
+        wirelog_program_free(prog);
+        return;
+    }
+
+    /* The parser builds JOIN(JOIN(JOIN(a,b),c),d). Reuse the existing
+     * nodes to form JOIN(JOIN(a,b),JOIN(c,d)) without changing ownership. */
+    wirelog_ir_node_t *left_chain = root->children[0];
+    wirelog_ir_node_t *deep = left_chain->children[0];
+    wirelog_ir_node_t *c = left_chain->children[1];
+    wirelog_ir_node_t *d = root->children[1];
+    root->children[0] = deep;
+    root->children[1] = left_chain;
+    left_chain->children[0] = c;
+    left_chain->children[1] = d;
+
+    wl_jpp_stats_t stats = { 0 };
+    int rc = wl_jpp_apply(prog, &stats);
+    bool unchanged = rc == 0
+        && stats.joins_reordered == 0
+        && stats.projections_inserted == 0
+        && root->children[1] == left_chain
+        && left_chain->children[0] == c
+        && left_chain->children[1] == d
+        && count_type_in_tree(root, WIRELOG_IR_SCAN) == 4;
+    if (!unchanged)
+        FAIL("bushy JOIN was reordered or truncated");
+    else
+        PASS();
+    wirelog_program_free(prog);
+}
+
 /* ======================================================================== */
 /* Stats Tests                                                              */
 /* ======================================================================== */
@@ -2733,6 +2789,7 @@ main(void)
 
     /* Reorder */
     test_jpp_three_atom_reorder();
+    test_jpp_bushy_join_is_unchanged();
 
     /* Stats */
     test_jpp_already_optimal_three_atom();
