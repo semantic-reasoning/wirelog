@@ -39,12 +39,14 @@ session_rel_hash_string(const char *name, uint32_t nbuckets)
     return (uint32_t)(h & (uint64_t)(nbuckets - 1));
 }
 
-/* Round n up to the next power of 2; minimum 16. */
+/* Round n up to the next power of 2; minimum 16. Returns 0 on overflow. */
 static uint32_t
 session_rel_next_pow2(uint32_t n)
 {
     if (n < 16u)
         return 16u;
+    if (n > UINT32_MAX / 2u + 1u)
+        return 0;
     n--;
     n |= n >> 1;
     n |= n >> 2;
@@ -67,7 +69,11 @@ int
 session_rel_build_hash(wl_col_session_t *sess)
 {
     uint32_t nrels = sess->nrels;
+    if (nrels > UINT32_MAX / 2u)
+        return ENOMEM;
     uint32_t nbuckets = session_rel_next_pow2(nrels > 0 ? nrels * 2u : 16u);
+    if (nbuckets == 0)
+        return ENOMEM;
 
     /* Reallocate bucket heads if size changed. */
     if (nbuckets != sess->rel_hash_nbuckets) {
@@ -147,7 +153,11 @@ session_rel_hash_insert(wl_col_session_t *sess, uint32_t idx)
     }
 
     /* Rebuild if load factor would exceed 50% or chain array capacity insufficient. */
+    if (sess->nrels > UINT32_MAX / 2u)
+        return ENOMEM;
     uint32_t needed = session_rel_next_pow2(sess->nrels * 2u);
+    if (needed == 0)
+        return ENOMEM;
     if (needed != sess->rel_hash_nbuckets || idx >= sess->rel_hash_chain_cap) {
         return session_rel_build_hash(sess);
     }

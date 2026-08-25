@@ -294,7 +294,7 @@ once and the surrounding overhead dominates.
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `join.c:137` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
+| `join.c:151` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
 | `join.c:355` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
 | `join.c:363` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
 | `join.c:373` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
