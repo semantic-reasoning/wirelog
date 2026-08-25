@@ -1078,6 +1078,26 @@ test_plan_gen_exe = executable(
 
 test('plan_gen', test_plan_gen_exe)
 
+if host_machine.system() == 'linux'
+  test_plan_gen_oom_exe = executable(
+    'test_plan_gen_oom',
+    files('test_plan_gen_oom.c'),
+    parser_src,
+    ir_src,
+    optimizer_src,
+    backend_src,
+    io_src,
+    arena_src,
+    thread_src,
+    workqueue_src,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+    link_args: ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc'],
+    override_options: ['b_lto=false'],
+  )
+  test('plan_gen_oom', test_plan_gen_oom_exe, suite: 'unit')
+endif
+
 test_recursive_agg_conformance_exe = executable(
   'test_recursive_agg_conformance',
   files('test_recursive_agg_conformance.c'),
