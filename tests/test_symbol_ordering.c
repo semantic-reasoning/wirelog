@@ -603,6 +603,39 @@ test_inline_compound_relation(void)
     PASS();
 }
 
+static void
+test_typed_inline_slot_ordering(void)
+{
+    TEST("explicit inline slot types drive string ordering");
+
+    const char *src =
+        ".decl ev(id: int64, lbl: pair(symbol, symbol) inline)\n"
+        "ev(1, \"zz\", \"aa\").\n"
+        "ev(2, \"aa\", \"zz\").\n"
+        ".decl out(a: symbol, b: symbol)\n"
+        "out(a, b) :- ev(i, pair(a, b)), a < b.\n";
+    collect_t c;
+    ASSERT(eval_relation(src, "out", &c) == 0, "evaluation failed");
+    ASSERT(c.count == 1, "expected exactly one ordered pair");
+    ASSERT(saw(&c, "aa|zz"),
+        "explicit inline symbol slots must compare lexicographically");
+    ASSERT(!saw(&c, "zz|aa"),
+        "inline slot comparison must not use intern-id ordering");
+
+    const char *mixed_src =
+        ".decl mixed(prefix: int64, lbl: pair(symbol, int64) inline, "
+        "suffix: int64)\n"
+        "mixed(1, \"zz\", 5, 10).\n"
+        "mixed(2, \"aa\", 6, 11).\n"
+        ".decl mixed_out(a: symbol)\n"
+        "mixed_out(a) :- mixed(i, pair(a, n), s), a < \"zz\".\n";
+    ASSERT(eval_relation(mixed_src, "mixed_out", &c) == 0,
+        "mixed inline-slot evaluation failed");
+    ASSERT(c.count == 1 && saw(&c, "aa"),
+        "slot types must use logical stride with a scalar before the compound");
+    PASS();
+}
+
 int
 main(void)
 {
@@ -617,6 +650,7 @@ main(void)
     test_string_function_results_order_lexicographically();
     test_types_survive_the_column_layout_operators();
     test_inline_compound_relation();
+    test_typed_inline_slot_ordering();
 
     printf("\n--- Results: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)

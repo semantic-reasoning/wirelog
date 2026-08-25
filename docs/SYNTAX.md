@@ -257,15 +257,14 @@ that destructures the column read it regardless:
 data. Rejecting is forced rather than chosen — `0` is a valid `int64` and a
 valid intern id, so no filler value could mean "not written".
 
-One thing a fact can do that an `.input` file cannot: put a **symbol** in an
-inline compound slot. `p(1, "aa", "bb").` against
+An inline compound fact can contain symbols. `p(1, "aa", "bb").` against
 `.decl p(id: int64, lbl: pair/2 inline)` works, and
-`o(a, b, c) :- p(a, pair(b, c)).` gives `o(1, "aa", "bb")`. The same three
-values in a CSV file fail the load, because the `.decl` grammar records one
-type per declared column and has no way to say that slot 1 of `lbl` is a
-symbol — so the loader types every inline slot as `int64` and the reader
-cannot parse `aa`. This is a gap in the `.input` path, not a property of the
-storage; the slots are ordinary `int64` cells and hold interned ids fine.
+`o(a, b, c) :- p(a, pair(b, c)).` gives `o(1, "aa", "bb")`. For `.input`, the
+legacy slash form keeps every slot at `int64`, so the same CSV values fail the
+load. Use the typed form, for example
+`.decl p(id: int64, lbl: pair(symbol, symbol) inline)`, to declare the slot
+types and let the loader intern the text fields. The slots remain ordinary
+`int64` cells; the declaration controls decoding and comparison semantics.
 
 The physical width is also the row stride reported by
 `wirelog_program_get_facts`. It agrees with the `column_count` of

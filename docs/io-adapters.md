@@ -90,10 +90,11 @@ scalar, so the two numbers agree for every relation that declares no inline
 compound column.
 
 `wirelog_io_ctx_col_type(ctx, i)` is indexed by the same physical position:
-`i` runs over slots, not over declared columns. Each slot of an inline
-compound reports `WIRELOG_TYPE_INT64`, because the slots carry raw `int64`
-payload and the declared type of the compound column does not describe them.
-For the relation above the types are `INT64, INT64, INT64, STRING`.
+`i` runs over slots, not over declared columns. Legacy slash declarations
+report `WIRELOG_TYPE_INT64` for each inline slot because no per-slot type was
+given. The typed form, such as `pair(symbol, int64) inline`, reports the
+declared type for each slot; for the relation above, if `p` uses that form,
+the types are `INT64, STRING, INT64, STRING`.
 
 Before #985 both accessors reported the *declared* column count and the
 declared per-column types, which named a stride the storage does not use. The
