@@ -32,6 +32,19 @@
 #define WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL \
         wl_columnar_eval_dedup_set_init_from_rel
 
+int
+wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out)
+{
+    if (!out)
+        return EINVAL;
+    /* wl_mpsc_queue_create rounds capacity to a uint32 power of two;
+     * 2^31 is its largest non-wrapping request on the current base. */
+    if (nrels > (UINT32_C(1) << 30))
+        return EOVERFLOW;
+    *out = nrels > 0 ? nrels * 2u : 2u;
+    return 0;
+}
+
 /* Relation-plan dispatch is implemented in columnar/eval_plan.c. */
 /* Serial stratum evaluation is implemented in columnar/eval_serial.c. */
 
@@ -3659,6 +3672,13 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     int rc = 0;
     uint64_t tdd_total_t0 = now_ns();
 
+    uint32_t delta_queue_capacity = 0;
+    if (wl_columnar_eval_delta_queue_capacity(nrels,
+        &delta_queue_capacity) != 0) {
+        coord->tdd_total_ns += now_ns() - tdd_total_t0;
+        return ENOMEM;
+    }
+
     /* Pre-register empty IDB relations on coordinator
      * (eval_serial.c:276-289) */
     for (uint32_t ri = 0; ri < nrels; ri++) {
@@ -3929,8 +3949,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
     /* Issue #410: Create MPSC delta queue for dual-write transport.
      * Capacity = W × nrels × 2 (2x headroom; at most W×nrels per sub-pass).
-     * Failure is non-fatal: enqueue is skipped when delta_queue is NULL. */
-    coord->delta_queue = wl_mpsc_queue_create(W, nrels * 2 < 2 ? 2 : nrels * 2);
+     * Failure is non-fatal: enqueue is skipped when delta_queue is NULL.
+     * An unrepresentable nrels*2 request is rejected before any stratum
+     * state allocation, using the evaluator's ENOMEM failure signal. */
+    coord->delta_queue = wl_mpsc_queue_create(W, delta_queue_capacity);
 
     /* Issue #390: BDX snap array — pre-subpass IDB sizes per worker/relation.
      * Used to truncate worker IDB back to clean partition state after each

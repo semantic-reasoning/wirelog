@@ -98,7 +98,9 @@ typedef struct wl_work_queue wl_work_queue_t;
 
 /**
  * wl_workqueue_create:
- * @num_workers: Number of worker threads to spawn.  Must be >= 1.
+ * @num_workers: Number of worker threads to spawn.  Must be in the range
+ *               1..2^30; larger values cannot be rounded to a representable
+ *               power-of-two ring capacity.
  *
  * Create a work queue backed by a fixed-size thread pool.
  * Worker threads are created immediately and block until work is

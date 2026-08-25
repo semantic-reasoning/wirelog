@@ -65,6 +65,30 @@ struct wl_work_queue {
     uint32_t num_workers;
 };
 
+static int
+workqueue_ring_capacity(uint32_t num_workers, uint32_t *out)
+{
+    if (!out || num_workers == 0
+        || num_workers > (UINT32_C(1) << 30))
+        return -1;
+
+    uint64_t min_cap = (uint64_t)num_workers * 2u;
+    if (min_cap < 256u)
+        min_cap = 256u;
+    uint32_t cap = 1u;
+    while ((uint64_t)cap < min_cap) {
+        if (cap > UINT32_MAX / 2u)
+            return -1;
+        cap <<= 1u;
+    }
+#if UINTPTR_MAX <= UINT32_MAX
+    if (cap > SIZE_MAX / sizeof(wl_work_item_t))
+        return -1;
+#endif
+    *out = cap;
+    return 0;
+}
+
 /* ======================================================================== */
 /* Worker Thread                                                             */
 /* ======================================================================== */
@@ -114,10 +138,10 @@ worker_thread(void *arg)
 wl_work_queue_t *
 wl_workqueue_create(uint32_t num_workers)
 {
-    if (num_workers == 0)
-        return NULL;
-    /* Guard: ring capacity = num_workers * 2 must not overflow uint32_t */
-    if (num_workers > UINT32_MAX / 2u)
+    uint32_t ring_capacity = 0;
+    /* Validate capacity before allocating the queue, synchronization state,
+     * worker array, or ring storage. */
+    if (workqueue_ring_capacity(num_workers, &ring_capacity) != 0)
         return NULL;
 
     wl_work_queue_t *wq = (wl_work_queue_t *)calloc(1, sizeof(wl_work_queue_t));
@@ -161,16 +185,8 @@ wl_workqueue_create(uint32_t num_workers)
     /* Allocate ring buffer dynamically (Phase 0: support W=512+).
      * Capacity = num_workers * 2, rounded up to power of 2, minimum 256.
      * This ensures a full batch of W items always fits without back-pressure. */
-    uint32_t min_cap = num_workers * 2u;
-    if (min_cap < 256u)
-        min_cap = 256u;
-
-    /* Round up to next power of 2 */
-    uint32_t cap = 1u;
-    while (cap < min_cap)
-        cap <<= 1u;
-
-    wq->ring = (wl_work_item_t *)calloc(cap, sizeof(wl_work_item_t));
+    wq->ring = (wl_work_item_t *)calloc(ring_capacity,
+            sizeof(wl_work_item_t));
     if (!wq->ring) {
         free(wq->threads);
         cond_destroy(&wq->all_done);
@@ -179,7 +195,7 @@ wl_workqueue_create(uint32_t num_workers)
         free(wq);
         return NULL;
     }
-    wq->capacity = cap;
+    wq->capacity = ring_capacity;
 
     for (uint32_t i = 0; i < num_workers; i++) {
         if (thread_create(&wq->threads[i], worker_thread, wq) != 0) {
