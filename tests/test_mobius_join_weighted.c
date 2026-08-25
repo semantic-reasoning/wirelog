@@ -527,6 +527,46 @@ test_wrong_arity_dst_rejected(void)
     PASS();
 }
 
+/* ================================================================
+ * Test 7 (Issue #1182): a dst with timestamps is rejected
+ *
+ * timestamps is an owned output buffer.  Allowing it with capacity==0 would
+ * pass it to realloc() during the first append, even though the caller has
+ * not given the join ownership of that allocation.
+ * ================================================================ */
+static void
+test_timestamps_dst_rejected(void)
+{
+    TEST("col_op_join_weighted rejects a dst with timestamps (#1182)");
+
+    col_rel_t *lhs = test_rel_alloc(1);
+    col_rel_t *rhs = test_rel_alloc(1);
+    col_rel_t *dst = test_rel_alloc(0);
+    ASSERT(lhs && rhs && dst, "test_rel_alloc failed");
+
+    int64_t lrow[] = { 1 };
+    int64_t rrow[] = { 1 };
+    ASSERT(test_rel_append_row_mult(lhs, lrow, 2) == 0, "append lhs row");
+    ASSERT(test_rel_append_row_mult(rhs, rrow, 3) == 0, "append rhs row");
+
+    dst->timestamps = (col_delta_timestamp_t *)malloc(
+        sizeof(*dst->timestamps));
+    ASSERT(dst->timestamps != NULL, "timestamp allocation failed");
+
+    int rc = col_op_join_weighted(lhs, rhs, 0, dst);
+
+    ASSERT(rc == EINVAL, "returns EINVAL for a dst with timestamps");
+    ASSERT(dst->ncols == 0 && dst->nrows == 0 && dst->capacity == 0,
+        "dst shape is left untouched");
+    ASSERT(dst->columns == NULL, "dst columns is left untouched");
+    ASSERT(dst->timestamps != NULL, "dst timestamps is left untouched");
+
+    test_rel_free(lhs);
+    test_rel_free(rhs);
+    test_rel_free(dst);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -549,6 +589,7 @@ main(void)
     test_wide_relation_join();
     test_non_pristine_dst_rejected();
     test_wrong_arity_dst_rejected();
+    test_timestamps_dst_rejected();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);

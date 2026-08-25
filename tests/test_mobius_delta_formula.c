@@ -561,6 +561,45 @@ test_lying_capacity_out_delta_rejected(void)
     PASS();
 }
 
+/* ================================================================
+ * Test 9 (Issue #1182): an out_delta with timestamps is rejected
+ *
+ * timestamps is an owned output buffer.  Allowing it with capacity==0 would
+ * pass it to realloc() during the first append, even though the caller has
+ * not given the delta computation ownership of that allocation.
+ * ================================================================ */
+static void
+test_timestamps_out_delta_rejected(void)
+{
+    TEST(
+        "col_compute_delta_mobius rejects an out_delta with timestamps (#1182)");
+
+    col_rel_t *prev = test_rel_alloc(1);
+    col_rel_t *curr = test_rel_alloc(1);
+    col_rel_t *out = test_rel_alloc(1);
+    ASSERT(prev && curr && out, "test_rel_alloc failed");
+
+    int64_t row[] = { 42 };
+    ASSERT(test_rel_append_row_mult(curr, row, 1) == 0, "append curr row");
+
+    out->timestamps = (col_delta_timestamp_t *)malloc(
+        sizeof(*out->timestamps));
+    ASSERT(out->timestamps != NULL, "timestamp allocation failed");
+
+    int rc = col_compute_delta_mobius(prev, curr, out);
+
+    ASSERT(rc == EINVAL, "returns EINVAL for an out_delta with timestamps");
+    ASSERT(out->ncols == 1 && out->nrows == 0 && out->capacity == 0,
+        "out_delta shape is left untouched");
+    ASSERT(out->columns == NULL, "out_delta columns is left untouched");
+    ASSERT(out->timestamps != NULL, "out_delta timestamps is left untouched");
+
+    test_rel_free(prev);
+    test_rel_free(curr);
+    test_rel_free(out);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -586,6 +625,7 @@ main(void)
     test_non_empty_out_delta_rejected();
     test_arity_mismatch_out_delta_rejected();
     test_lying_capacity_out_delta_rejected();
+    test_timestamps_out_delta_rejected();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);

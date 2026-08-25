@@ -29,8 +29,8 @@
  * Output layout: all lhs columns followed by all rhs columns (key column
  * is duplicated; callers may project as needed).  dst->ncols is initialised
  * by this function; dst must be caller-allocated and pristine on entry
- * (ncols==0, nrows==0, capacity==0, columns==NULL), and is rejected with
- * EINVAL otherwise (Issue #1076).
+ * (ncols==0, nrows==0, capacity==0, columns==NULL, timestamps==NULL), and
+ * is rejected with EINVAL otherwise (Issues #1076, #1182).
  *
  * Returns 0 on success, non-zero (ENOMEM / EINVAL) on error.
  */
@@ -49,7 +49,7 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
      * internal.h:414).  ncols==0 alone does not bound nrows, capacity or
      * columns, so require the whole relation pristine. */
     if (dst->ncols != 0 || dst->nrows != 0 || dst->capacity != 0 ||
-        dst->columns != NULL)
+        dst->columns != NULL || dst->timestamps != NULL)
         return EINVAL;
 
     uint32_t ocols = lhs->ncols + rhs->ncols;
@@ -148,10 +148,10 @@ col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
  *
  * Both input relations must have timestamps != NULL.
  * out_delta must be caller-allocated and carry no data on entry
- * (nrows==0, capacity==0, columns==NULL), and its ncols must be either 0
- * or already equal to the input arity, because this function overwrites
- * ncols without resizing the arrays it also bounds.  Rejected with EINVAL
- * otherwise (Issue #1076).
+ * (nrows==0, capacity==0, columns==NULL, timestamps==NULL), and its ncols
+ * must be either 0 or already equal to the input arity, because this function
+ * overwrites ncols without resizing the arrays it also bounds.  Rejected with
+ * EINVAL otherwise (Issues #1076, #1182).
  *
  * Returns 0 on success, EINVAL on bad arguments, ENOMEM on allocation failure.
  */
@@ -171,7 +171,7 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
      * append.  ncols itself is overwritten below, so it is deliberately
      * not required to be zero: every caller passes a typed relation. */
     if (out_delta->nrows != 0 || out_delta->capacity != 0 ||
-        out_delta->columns != NULL)
+        out_delta->columns != NULL || out_delta->timestamps != NULL)
         return EINVAL;
     /* Issue #1076: ncols is overwritten below, and it is also the length
      * bound for col_names, merge_columns and retract_backup_columns, which
