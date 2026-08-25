@@ -80,6 +80,14 @@ make_delta_name(const char *name)
     return d;
 }
 
+#ifdef WIRELOG_TEST_DELTA_NAME
+char *
+wl_test_make_delta_name(const char *name)
+{
+    return make_delta_name(name);
+}
+#endif
+
 /*
  * Intern every static string literal that the plan evaluator may encounter
  * before a session starts evaluating expressions.  Otherwise evaluation

@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+char *wl_test_make_delta_name(const char *name);
+
 /* ----------------------------------------------------------------
  * Test framework
  * ---------------------------------------------------------------- */
@@ -109,17 +111,34 @@ test_tc_plan_generation(void)
 
     /* Should have at least 1 relation (tc) in some stratum */
     int found_tc = 0;
+    int checked_delta_names = 0;
     for (uint32_t s = 0; s < plan->stratum_count; s++) {
         for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
-            if (plan->strata[s].relations[r].name
-                && strcmp(plan->strata[s].relations[r].name, "tc") == 0) {
+            const wl_plan_relation_t *relation
+                = &plan->strata[s].relations[r];
+            if (relation->name) {
+                ASSERT(relation->delta_name != NULL,
+                    "plan relation delta name is missing");
+                char expected[256];
+                int written = snprintf(expected, sizeof(expected), "$d$%s",
+                        relation->name);
+                ASSERT(written >= 0 && (size_t)written < sizeof(expected),
+                    "delta name fixture unexpectedly too long");
+                ASSERT(strcmp(relation->delta_name, expected) == 0,
+                    "plan relation delta name mismatch");
+                ASSERT(relation->delta_name[written] == '\0',
+                    "plan relation delta name not terminated");
+                checked_delta_names++;
+            }
+            if (relation->name && strcmp(relation->name, "tc") == 0) {
                 found_tc = 1;
-                ASSERT(plan->strata[s].relations[r].op_count > 0,
+                ASSERT(relation->op_count > 0,
                     "tc has no ops");
             }
         }
     }
     ASSERT(found_tc, "tc relation not found in plan");
+    ASSERT(checked_delta_names > 0, "no plan delta names were checked");
 
     /* edge should be an EDB */
     int found_edge_edb = 0;
@@ -132,6 +151,24 @@ test_tc_plan_generation(void)
 
     wl_plan_free(plan);
     wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_delta_name_invariant(void)
+{
+    TEST("delta name prefix and termination invariant");
+    char *name = wl_test_make_delta_name("edge");
+    ASSERT(name != NULL, "non-empty delta name allocation failed");
+    ASSERT(strcmp(name, "$d$edge") == 0, "delta name content mismatch");
+    ASSERT(name[strlen("$d$edge")] == '\0', "delta name not terminated");
+    free(name);
+
+    char *empty = wl_test_make_delta_name("");
+    ASSERT(empty != NULL, "empty delta name allocation failed");
+    ASSERT(strcmp(empty, "$d$") == 0, "empty delta name mismatch");
+    ASSERT(empty[3] == '\0', "empty delta name not terminated");
+    free(empty);
     PASS();
 }
 
@@ -914,6 +951,7 @@ main(void)
 {
     printf("=== Plan Generator Tests ===\n");
 
+    test_delta_name_invariant();
     test_tc_plan_generation();
     test_plan_generation_preinterns_static_string_literals();
     test_tc_end_to_end();
