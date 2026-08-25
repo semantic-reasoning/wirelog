@@ -1082,6 +1082,77 @@ out:
     return rc;
 }
 
+/* Issue #994: conjunction is commutative, so both atom orders must derive the
+ * same row when a side compound is not the first body atom. */
+static int
+test_side_compound_in_non_first_atom_matches(void)
+{
+    static const char *const spellings[2] = {
+        ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl gate(id: int64)\n"
+        ".decl hot(id: int64, r: int64)\n"
+        "hot(ID, R) :- gate(ID), event(ID, metadata(_, _, _, R)).\n",
+        ".decl event(id: int64, payload: metadata/4 side)\n"
+        ".decl gate(id: int64)\n"
+        ".decl hot(id: int64, r: int64)\n"
+        "hot(ID, R) :- event(ID, metadata(_, _, _, R)), gate(ID).\n",
+    };
+
+    for (unsigned v = 0; v < 2; v++) {
+        wirelog_program_t *prog = parse_or_die(spellings[v], "T994a");
+        if (!prog)
+            return 1;
+        wirelog_session_t *s = NULL;
+        if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &s)
+            != WIRELOG_OK || !s) {
+            wirelog_program_free(prog);
+            return 1;
+        }
+
+        int rc = 0;
+        uint64_t handle = 0;
+        if (make_compound4(s, "metadata", 1, 2, 3, 42, &handle)
+            != WIRELOG_OK) {
+            fprintf(stderr, "T994a compound allocation failed\n");
+            rc = 1;
+            goto out;
+        }
+        int64_t event_row[2] = { 7, (int64_t)handle };
+        int64_t other_event[2] = { 8, (int64_t)handle };
+        int64_t gate_row[1] = { 7 };
+        int64_t other_gate[1] = { 9 };
+        if (wirelog_session_insert(s, "event", event_row, 1, 2)
+            != WIRELOG_OK
+            || wirelog_session_insert(s, "event", other_event, 1, 2)
+            != WIRELOG_OK
+            || wirelog_session_insert(s, "gate", gate_row, 1, 1)
+            != WIRELOG_OK
+            || wirelog_session_insert(s, "gate", other_gate, 1, 1)
+            != WIRELOG_OK) {
+            fprintf(stderr, "T994a insert failed\n");
+            rc = 1;
+            goto out;
+        }
+        struct tuple_filter f = { .target_relation = "hot" };
+        if (wirelog_session_snapshot(s, filter_tuples, &f) != WIRELOG_OK) {
+            fprintf(stderr, "T994a snapshot failed\n");
+            rc = 1;
+            goto out;
+        }
+        if (f.count != 1 || f.ncols[0] != 2 || f.rows[0][0] != 7
+            || f.rows[0][1] != 42) {
+            fprintf(stderr, "T994a: expected exactly hot(7, 42)\n");
+            rc = 1;
+        }
+out:
+        wirelog_session_destroy(s);
+        wirelog_program_free(prog);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
 /* Parity (#785): mirrors test_side_compound_constant_child_filters. */
 static int
 test_side_compound_constant_child_filters(void)
@@ -1787,6 +1858,7 @@ main(void)
     failures += test_inline_compound_duplicate_child_variables_filter();
     failures += test_side_compound_public_allocation_saturates();
     failures += test_side_compound_body_field_binding();
+    failures += test_side_compound_in_non_first_atom_matches();
     failures += test_side_compound_constant_child_filters();
     failures += test_side_compound_duplicate_child_variables_filter();
     failures += test_side_compound_wrong_functor_handle_no_match();

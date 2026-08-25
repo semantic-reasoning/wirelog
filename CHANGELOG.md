@@ -13,6 +13,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Positive `side` compound patterns now work in any body-atom position**
+  (#994): their generated side-relation joins are spliced onto the left-deep
+  body chain, so conjunction order no longer changes the result.
+
 - **A recursive `min()`/`max()` aggregate may no longer share an SCC with any
   other relation** (#1021): plan generation refuses the shape. This is a
   compatibility break -- programs that run today are refused -- and it is
