@@ -354,10 +354,18 @@ test_large_batch_submission(void)
 static void
 test_overflow_protection(void)
 {
-    TEST("overflow protection for W > UINT32_MAX/2");
+    TEST("overflow protection before power-of-two rounding");
 
-    uint32_t huge_workers = UINT32_MAX;
-    wl_work_queue_t *wq = wl_workqueue_create(huge_workers);
+    uint32_t boundary_workers = UINT32_C(1) << 30;
+    wl_work_queue_t *wq = wl_workqueue_create(boundary_workers + 1u);
+    ASSERT(wq == NULL,
+        "create(2^30+1) should reject before the rounding loop");
+
+    wq = wl_workqueue_create(UINT32_MAX / 2u);
+    ASSERT(wq == NULL,
+        "create(UINT32_MAX/2) should reject an unrepresentable rounded cap");
+
+    wq = wl_workqueue_create(UINT32_MAX);
     ASSERT(wq == NULL,
         "create(UINT32_MAX) should return NULL (overflow protection)");
 

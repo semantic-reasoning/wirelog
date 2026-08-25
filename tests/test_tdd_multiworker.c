@@ -23,6 +23,7 @@
 #include "../wirelog/wirelog.h"
 #include "columnar/internal.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -569,6 +570,31 @@ test_reconstruct_duplicate(void)
     return 0;
 }
 
+static void
+test_delta_queue_capacity_boundaries(void)
+{
+    TEST("delta queue capacity rejects multiplication overflow");
+
+    uint32_t capacity = 0;
+    if (wl_columnar_eval_delta_queue_capacity(0, &capacity) != 0
+        || capacity != 2u
+        || wl_columnar_eval_delta_queue_capacity(1, &capacity) != 0
+        || capacity != 2u
+        || wl_columnar_eval_delta_queue_capacity(UINT32_C(1) << 30,
+        &capacity) != 0
+        || capacity != (UINT32_C(1) << 31)
+        || wl_columnar_eval_delta_queue_capacity((UINT32_C(1) << 30) + 1u,
+        &capacity) != EOVERFLOW
+        || wl_columnar_eval_delta_queue_capacity(UINT32_MAX / 2u,
+        &capacity) != EOVERFLOW
+        || wl_columnar_eval_delta_queue_capacity(UINT32_MAX, &capacity)
+        != EOVERFLOW) {
+        FAIL("unexpected delta queue capacity boundary result");
+        return;
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
@@ -600,6 +626,7 @@ main(void)
     test_reconstruct_full_matrix();
     test_reconstruct_sparse();
     test_reconstruct_duplicate();
+    test_delta_queue_capacity_boundaries();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

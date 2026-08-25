@@ -1815,6 +1815,8 @@ wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
 int
 wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
+int
+wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
 
 /* ======================================================================== */
 /* Relation Partitioning (columnar/partition.c)                             */
