@@ -800,27 +800,24 @@ test_semijoin_with_composite_right_child_rejected(void)
     PASS();
 }
 
-/*
- * Issue #994: the same rejection reached from ordinary source, with no IR
- * surgery and no magic sets.
- *
- * build_atom_scan() returns a composite JOIN(scan, side_scan) for a `side`
- * compound pattern, and convert_rule() installs that whole subtree as the
- * right child of the outer chain join -- so any body whose *non-first* atom
- * carries a side compound is right-deep.  That has always been
- * unrepresentable: before #989 it produced a plan that silently matched
- * nothing, and the rule returned no rows while the identical rule with the
- * atoms swapped returned the right answer.
- *
- * Pinning the rejection here records that this is a deliberate trade -- a
- * plan-generation error in place of a silent wrong answer -- and not an
- * accident.  It is not the fix; #994 tracks flattening the subtree into the
- * left spine so the rule works in either atom position.
- */
-static void
-test_side_compound_in_non_first_atom_rejected(void)
+static const wl_plan_relation_t *
+find_plan_relation(const wl_plan_t *plan, const char *name)
 {
-    TEST("side compound in a non-first body atom is rejected (#994)");
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
+            const wl_plan_relation_t *rel = &plan->strata[s].relations[r];
+            if (rel->name && strcmp(rel->name, name) == 0)
+                return rel;
+        }
+    }
+    return NULL;
+}
+
+/* Issue #994: side-compound joins must lower from either atom position. */
+static void
+test_side_compound_lowers_in_either_atom_position(void)
+{
+    TEST("side compound lowers from any body-atom position (#994)");
 
     const char *src = ".decl event(id: int64, payload: metadata/4 side)\n"
         ".decl gate(id: int64)\n"
@@ -832,19 +829,37 @@ test_side_compound_in_non_first_atom_rejected(void)
     ASSERT(prog != NULL, "parse failed");
 
     wl_plan_t *plan = NULL;
-    int rc = wl_plan_from_program(prog, &plan);
-    if (rc == 0) {
+    if (wl_plan_from_program(prog, &plan) != 0 || !plan) {
         wl_plan_free(plan);
         wirelog_program_free(prog);
-        FAIL("side compound in a non-first atom should be rejected");
+        FAIL("side compound in a non-first atom must lower");
         return;
     }
-    ASSERT(plan == NULL, "plan must not be returned on error");
-    wirelog_program_free(prog);
+    const wl_plan_relation_t *hot = find_plan_relation(plan, "hot");
+    ASSERT(hot != NULL, "hot relation plan not found");
 
-    /* Control: the same rule with the compound atom first is representable
-     * and must still be accepted -- the rejection is positional, not a ban
-     * on side compounds. */
+    const wl_plan_op_t *chain = NULL;
+    const wl_plan_op_t *side = NULL;
+    for (uint32_t i = 0; i < hot->op_count; i++) {
+        const wl_plan_op_t *op = &hot->ops[i];
+        if (op->op != WL_PLAN_OP_JOIN || !op->right_relation)
+            continue;
+        if (strcmp(op->right_relation, "event") == 0)
+            chain = op;
+        if (strcmp(op->right_relation, "__compound_metadata_4") == 0)
+            side = op;
+    }
+    ASSERT(chain != NULL, "event join not found");
+    ASSERT(side != NULL, "side-compound join not found");
+    ASSERT(side > chain, "side join must follow the chain join");
+    ASSERT(side->key_count == 1, "side join must have one key");
+    ASSERT(strcmp(side->right_keys[0], "col0") == 0,
+        "side join must use side handle column");
+    wirelog_program_free(prog);
+    wl_plan_free(plan);
+
+    /* Control: the same rule with the compound atom first must also lower;
+     * both spellings are accepted. */
     const char *ok_src = ".decl event(id: int64, payload: metadata/4 side)\n"
         ".decl gate(id: int64)\n"
         ".decl hot(id: int64, r: int64)\n"
@@ -911,7 +926,7 @@ main(void)
     test_join_with_composite_right_child_rejected();
     test_antijoin_with_composite_right_child_rejected();
     test_semijoin_with_composite_right_child_rejected();
-    test_side_compound_in_non_first_atom_rejected();
+    test_side_compound_lowers_in_either_atom_position();
     test_plan_free_null();
     test_load_facts_null_safe();
 

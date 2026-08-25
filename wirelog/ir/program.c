@@ -1326,6 +1326,7 @@ merge_var_names(char **left, uint32_t left_count, char **right,
 
     for (uint32_t i = 0; i < left_count; i++) {
         if (left && left[i]) {
+            // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
             merged[i] = dup_required_name(left[i]);
             if (!merged[i])
                 goto fail;
@@ -1693,6 +1694,25 @@ typedef struct {
     char *handle_var;
 } side_compound_binding_t;
 
+static void
+free_side_binding_arrays(side_compound_binding_t **bindings,
+    uint32_t *counts, uint32_t capacity)
+{
+    if (!bindings) {
+        free(counts);
+        return;
+    }
+    for (uint32_t i = 0; i < capacity; i++) {
+        if (!bindings[i])
+            continue;
+        for (uint32_t j = 0; j < (counts ? counts[i] : 0); j++)
+            free(bindings[i][j].handle_var);
+        free(bindings[i]);
+    }
+    free((void *)bindings);
+    free(counts);
+}
+
 static char *
 make_side_handle_var(const wl_parser_ast_node_t *atom, uint32_t col_idx)
 {
@@ -1719,36 +1739,6 @@ concat_var_names_positional(char **left, uint32_t left_count, char **right,
     uint32_t right_count, uint32_t *out_count)
 {
     return merge_var_names(left, left_count, right, right_count, out_count);
-}
-
-static int
-set_single_join_key(wirelog_ir_node_t *join, const char *key)
-{
-    if (!join || !key)
-        return -1;
-
-    join->join_left_keys = (char **)calloc(1, sizeof(char *));
-    join->join_right_keys = (char **)calloc(1, sizeof(char *));
-    if (!join->join_left_keys || !join->join_right_keys)
-        goto fail;
-
-    join->join_key_count = 1;
-    join->join_left_keys[0] = dup_required_name(key);
-    join->join_right_keys[0] = dup_required_name(key);
-    if (!join->join_left_keys[0] || !join->join_right_keys[0])
-        goto fail;
-
-    return 0;
-
-fail:
-    free(join->join_left_keys ? join->join_left_keys[0] : NULL);
-    free(join->join_right_keys ? join->join_right_keys[0] : NULL);
-    free((void *)join->join_left_keys);
-    free((void *)join->join_right_keys);
-    join->join_left_keys = NULL;
-    join->join_right_keys = NULL;
-    join->join_key_count = 0;
-    return -1;
 }
 
 static wirelog_ir_node_t *
@@ -1814,6 +1804,12 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
     }
 
     wirelog_ir_node_t *result = scan;
+    result = wrap_duplicate_var_filters(result, var_names, count);
+    if (!result) {
+        scan = NULL;
+        goto fail;
+    }
+    scan = result;
     bool unsupported_nested_pattern = false;
     for (uint32_t i = 0; i < compound_arg->child_count; i++) {
         const wl_parser_ast_node_t *child = compound_arg->children[i];
@@ -1829,6 +1825,7 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
                 scan = NULL;
                 goto fail;
             }
+            scan = result;
         } else if (child->type == WL_PARSER_AST_NODE_STRING) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
             if (!rhs)
@@ -1843,6 +1840,7 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
                 scan = NULL;
                 goto fail;
             }
+            scan = result;
         } else if (child->type == WL_PARSER_AST_NODE_COMPOUND_TERM) {
             unsupported_nested_pattern = true;
         }
@@ -1861,6 +1859,87 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
 fail:
     free_var_names(var_names, count);
     wl_ir_node_free(scan);
+    return NULL;
+}
+
+/* Splice an atom's side-compound scans onto the existing left spine.  The
+ * caller owns left_vars; this helper returns a newly merged variable list on
+ * success and consumes left on failure. */
+static wirelog_ir_node_t *
+attach_side_compound_joins(wirelog_ir_node_t *left, char **left_vars,
+    uint32_t left_count, const side_compound_binding_t *bindings,
+    uint32_t binding_count, char ***out_vars, uint32_t *out_count)
+{
+    *out_vars = NULL;
+    *out_count = 0;
+    if (!left || !bindings || binding_count == 0) {
+        wl_ir_node_free(left);
+        return NULL;
+    }
+
+    wirelog_ir_node_t *result = left;
+    char **result_vars = left_vars;
+    uint32_t result_count = left_count;
+    bool owns_vars = false;
+
+    for (uint32_t i = 0; i < binding_count; i++) {
+        char **side_vars = NULL;
+        uint32_t side_count = 0;
+        wirelog_ir_node_t *side_scan = build_side_compound_scan(
+            bindings[i].arg, bindings[i].handle_var, &side_vars,
+            &side_count);
+        wirelog_ir_node_t *join = wl_ir_node_create(WIRELOG_IR_JOIN);
+        if (!side_scan || !join
+            || setup_join_keys(result_vars, result_count, side_vars,
+            side_count, join) != 0
+            || join->join_key_count == 0) {
+            wl_ir_node_free(side_scan);
+            wl_ir_node_free(join);
+            free_var_names(side_vars, side_count);
+            goto fail;
+        }
+
+        if (wl_ir_node_add_child(join, result) != 0) {
+            wl_ir_node_free(join);
+            wl_ir_node_free(side_scan);
+            free_var_names(side_vars, side_count);
+            goto fail;
+        }
+        if (wl_ir_node_add_child(join, side_scan) != 0) {
+            join->children[0] = NULL;
+            join->child_count = 0;
+            wl_ir_node_free(join);
+            wl_ir_node_free(side_scan);
+            free_var_names(side_vars, side_count);
+            goto fail;
+        }
+        result = join;
+
+        uint32_t merged_count = 0;
+        char **merged = concat_var_names_positional(result_vars,
+                result_count, side_vars, side_count, &merged_count);
+        if (owns_vars) {
+            free_var_names(result_vars, result_count);
+            result_vars = NULL;
+            result_count = 0;
+            owns_vars = false;
+        }
+        free_var_names(side_vars, side_count);
+        if (!merged)
+            goto fail;
+        result_vars = merged;
+        result_count = merged_count;
+        owns_vars = true;
+    }
+
+    *out_vars = result_vars;
+    *out_count = result_count;
+    return result;
+
+fail:
+    if (owns_vars)
+        free_var_names(result_vars, result_count);
+    wl_ir_node_free(result);
     return NULL;
 }
 
@@ -1889,12 +1968,14 @@ atom_has_declared_side_compound_pattern(const wl_parser_ast_node_t *atom,
 static wirelog_ir_node_t *
 build_atom_scan(const wl_parser_ast_node_t *atom,
     const struct wirelog_program *prog, char ***out_var_names,
-    uint32_t *out_var_count)
+    uint32_t *out_var_count, side_compound_binding_t **out_side_bindings,
+    uint32_t *out_side_count)
 {
     /* Validate required arguments. atom, out_var_names, and out_var_count
      * are dereferenced unconditionally below; prog is tolerated as NULL
      * (skips compound annotation). */
-    if (!atom || !out_var_names || !out_var_count) {
+    if (!atom || !out_var_names || !out_var_count || !out_side_bindings
+        || !out_side_count) {
         WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
             "build_atom_scan: invalid arguments atom=%p "
             "out_var_names=%p out_var_count=%p",
@@ -1904,8 +1985,17 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
             *out_var_names = NULL;
         if (out_var_count)
             *out_var_count = 0;
+        if (out_side_bindings)
+            *out_side_bindings = NULL;
+        if (out_side_count)
+            *out_side_count = 0;
         return NULL;
     }
+
+    *out_var_names = NULL;
+    *out_var_count = 0;
+    *out_side_bindings = NULL;
+    *out_side_count = 0;
 
     WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
         "build_atom_scan: enter relation=%s arity=%u",
@@ -1916,16 +2006,12 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
         WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
             "build_atom_scan: wl_ir_node_create(SCAN) failed for relation=%s",
             atom->name ? atom->name : "?");
-        *out_var_names = NULL;
-        *out_var_count = 0;
         return NULL;
     }
 
     wl_ir_node_set_relation(scan, atom->name);
     if (atom->name && !scan->relation_name) {
         wl_ir_node_free(scan);
-        *out_var_names = NULL;
-        *out_var_count = 0;
         return NULL;
     }
 
@@ -2184,15 +2270,15 @@ scan_build_complete:
         return NULL;
     }
 
-    char **result_vars = var_names;
-    uint32_t result_vcount = physical_count;
-    bool lowering_failed = false;
-
     /* Step 1a: Intra-atom FILTER for duplicate variables */
     result = wrap_duplicate_var_filters(result, var_names, physical_count);
     if (!result) {
-        lowering_failed = true;
-        goto lowering_failed_cleanup;
+        for (uint32_t i = 0; i < side_binding_count; i++)
+            free(side_bindings[i].handle_var);
+        free(side_bindings);
+        free((void *)physical_args);
+        free_var_names(var_names, physical_count);
+        return NULL;
     }
 
     /* Step 1b: Intra-atom FILTER for constants */
@@ -2210,12 +2296,22 @@ scan_build_complete:
                 rhs->int_value = arg->int_value;
                 result = wrap_column_cmp_filter(result, i, rhs);
                 if (!result) {
-                    lowering_failed = true;
-                    goto lowering_failed_cleanup;
+                    wl_ir_node_free(result);
+                    for (uint32_t j = 0; j < side_binding_count; j++)
+                        free(side_bindings[j].handle_var);
+                    free(side_bindings);
+                    free((void *)physical_args);
+                    free_var_names(var_names, physical_count);
+                    return NULL;
                 }
             }else {
-                lowering_failed = true;
-                goto lowering_failed_cleanup;
+                wl_ir_node_free(result);
+                for (uint32_t j = 0; j < side_binding_count; j++)
+                    free(side_bindings[j].handle_var);
+                free(side_bindings);
+                free((void *)physical_args);
+                free_var_names(var_names, physical_count);
+                return NULL;
             }
         } else if (arg->type == WL_PARSER_AST_NODE_STRING) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
@@ -2223,89 +2319,47 @@ scan_build_complete:
                 rhs->str_value = strdup_safe(arg->str_value);
                 if (!rhs->str_value) {
                     wl_ir_expr_free(rhs);
-                    lowering_failed = true;
-                    goto lowering_failed_cleanup;
+                    wl_ir_node_free(result);
+                    for (uint32_t j = 0; j < side_binding_count; j++)
+                        free(side_bindings[j].handle_var);
+                    free(side_bindings);
+                    free((void *)physical_args);
+                    free_var_names(var_names, physical_count);
+                    return NULL;
                 }
                 result = wrap_column_cmp_filter(result, i, rhs);
                 if (!result) {
-                    lowering_failed = true;
-                    goto lowering_failed_cleanup;
+                    wl_ir_node_free(result);
+                    for (uint32_t j = 0; j < side_binding_count; j++)
+                        free(side_bindings[j].handle_var);
+                    free(side_bindings);
+                    free((void *)physical_args);
+                    free_var_names(var_names, physical_count);
+                    return NULL;
                 }
             }else {
-                lowering_failed = true;
-                goto lowering_failed_cleanup;
+                wl_ir_node_free(result);
+                for (uint32_t j = 0; j < side_binding_count; j++)
+                    free(side_bindings[j].handle_var);
+                free(side_bindings);
+                free((void *)physical_args);
+                free_var_names(var_names, physical_count);
+                return NULL;
             }
         }
     }
-    for (uint32_t i = 0; i < side_binding_count; i++) {
-        char **side_vars = NULL;
-        uint32_t side_vcount = 0;
-        wirelog_ir_node_t *side_scan = build_side_compound_scan(
-            side_bindings[i].arg, side_bindings[i].handle_var,
-            &side_vars, &side_vcount);
-        wirelog_ir_node_t *join = wl_ir_node_create(WIRELOG_IR_JOIN);
-        if (!side_scan || !join
-            || set_single_join_key(join, side_bindings[i].handle_var) != 0) {
-            wl_ir_node_free(side_scan);
-            wl_ir_node_free(join);
-            free_var_names(side_vars, side_vcount);
-            lowering_failed = true;
-            break;
-        }
-
-        if (wl_ir_node_add_child(join, result) != 0) {
-            wl_ir_node_free(join);
-            wl_ir_node_free(side_scan);
-            free_var_names(side_vars, side_vcount);
-            lowering_failed = true;
-            break;
-        }
-        if (wl_ir_node_add_child(join, side_scan) != 0) {
-            join->children[0] = NULL;
-            join->child_count = 0;
-            wl_ir_node_free(join);
-            wl_ir_node_free(side_scan);
-            free_var_names(side_vars, side_vcount);
-            lowering_failed = true;
-            break;
-        }
-        result = join;
-
-        uint32_t combined_count = 0;
-        char **combined = concat_var_names_positional(result_vars,
-                result_vcount, side_vars, side_vcount, &combined_count);
-        free_var_names(result_vars, result_vcount);
-        free_var_names(side_vars, side_vcount);
-        if (!combined) {
-            result_vars = NULL;
-            result_vcount = 0;
-            lowering_failed = true;
-            break;
-        }
-        result_vars = combined;
-        result_vcount = combined_count;
-        result = wrap_duplicate_var_filters(result, result_vars,
-                result_vcount);
-        if (!result) {
-            lowering_failed = true;
-            break;
-        }
-    }
-
-lowering_failed_cleanup:
-    for (uint32_t i = 0; i < side_binding_count; i++)
-        free(side_bindings[i].handle_var);
-    free(side_bindings);
     free((void *)physical_args);
-    if (lowering_failed) {
-        free_var_names(result_vars, result_vcount);
-        wl_ir_node_free(result);
-        *out_var_names = NULL;
-        *out_var_count = 0;
+    if (!result) {
+        for (uint32_t i = 0; i < side_binding_count; i++)
+            free(side_bindings[i].handle_var);
+        free(side_bindings);
+        free_var_names(var_names, physical_count);
         return NULL;
     }
-    *out_var_names = result_vars;
-    *out_var_count = result_vcount;
+    *out_var_names = var_names;
+    *out_var_count = physical_count;
+    *out_side_bindings = side_bindings;
+    *out_side_count = side_binding_count;
     return result;
 }
 
@@ -2498,10 +2552,17 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         = (wirelog_ir_node_t **)calloc(scan_cap, sizeof(wirelog_ir_node_t *));
     char ***scan_vars = (char ***)calloc(scan_cap, sizeof(char **));
     uint32_t *scan_vcounts = (uint32_t *)calloc(scan_cap, sizeof(uint32_t));
-    if (!scans || !scan_vars || !scan_vcounts) {
+    side_compound_binding_t **scan_side
+        = (side_compound_binding_t **)calloc(scan_cap,
+            sizeof(side_compound_binding_t *));
+    uint32_t *scan_side_counts
+        = (uint32_t *)calloc(scan_cap, sizeof(uint32_t));
+    if (!scans || !scan_vars || !scan_vcounts || !scan_side
+        || !scan_side_counts) {
         wl_ir_program_set_error(prog,
             "allocation failed while preparing rule '%s'",
             head->name ? head->name : "?");
+        free_side_binding_arrays(scan_side, scan_side_counts, scan_cap);
         free((void *)scans);
         free((void *)scan_vars);
         free(scan_vcounts);
@@ -2518,7 +2579,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 "convert_rule: build scan for body atom relation=%s",
                 b->name ? b->name : "?");
             scans[scan_count] = build_atom_scan(b, prog,
-                    &scan_vars[scan_count], &scan_vcounts[scan_count]);
+                    &scan_vars[scan_count], &scan_vcounts[scan_count],
+                    &scan_side[scan_count], &scan_side_counts[scan_count]);
             if (!scans[scan_count]) {
                 wl_ir_program_set_error(prog,
                     "allocation failed while lowering body atom '%s' in rule "
@@ -2535,6 +2597,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 free((void *)scans);
                 free((void *)scan_vars);
                 free(scan_vcounts);
+                free_side_binding_arrays(scan_side, scan_side_counts,
+                    scan_cap);
                 return NULL;
             }
             scan_count++;
@@ -2553,6 +2617,7 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         free((void *)scans);
         free((void *)scan_vars);
         free(scan_vcounts);
+        free_side_binding_arrays(scan_side, scan_side_counts, scan_cap);
         return NULL;
     }
 
@@ -2567,10 +2632,40 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         current = scans[0];
         cur_vars = scan_vars[0];
         cur_vcount = scan_vcounts[0];
+        if (scan_side_counts[0] > 0) {
+            char **spliced_vars = NULL;
+            uint32_t spliced_count = 0;
+            wirelog_ir_node_t *spliced = attach_side_compound_joins(
+                current, cur_vars, cur_vcount, scan_side[0],
+                scan_side_counts[0], &spliced_vars, &spliced_count);
+            if (!spliced) {
+                current = NULL;
+                goto conversion_failed;
+            }
+            current = spliced;
+            cur_vars = spliced_vars;
+            cur_vcount = spliced_count;
+            cur_vars_is_merged = true;
+        }
     } else if (scan_count > 1) {
         current = scans[0];
         cur_vars = scan_vars[0];
         cur_vcount = scan_vcounts[0];
+        if (scan_side_counts[0] > 0) {
+            char **spliced_vars = NULL;
+            uint32_t spliced_count = 0;
+            wirelog_ir_node_t *spliced = attach_side_compound_joins(
+                current, cur_vars, cur_vcount, scan_side[0],
+                scan_side_counts[0], &spliced_vars, &spliced_count);
+            if (!spliced) {
+                current = NULL;
+                goto conversion_failed;
+            }
+            current = spliced;
+            cur_vars = spliced_vars;
+            cur_vcount = spliced_count;
+            cur_vars_is_merged = true;
+        }
 
         for (uint32_t i = 1; i < scan_count; i++) {
             wirelog_ir_node_t *join = wl_ir_node_create(WIRELOG_IR_JOIN);
@@ -2598,6 +2693,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 free((void *)scans);
                 free((void *)scan_vars);
                 free(scan_vcounts);
+                free_side_binding_arrays(scan_side, scan_side_counts,
+                    scan_cap);
                 return NULL;
             }
 
@@ -2643,6 +2740,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 free((void *)scans);
                 free((void *)scan_vars);
                 free(scan_vcounts);
+                free_side_binding_arrays(scan_side, scan_side_counts,
+                    scan_cap);
                 return NULL;
             }
             if (cur_vars_is_merged) {
@@ -2653,6 +2752,22 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             cur_vcount = merged_count;
             cur_vars_is_merged = true;
             current = join;
+
+            if (scan_side_counts[i] > 0) {
+                char **spliced_vars = NULL;
+                uint32_t spliced_count = 0;
+                wirelog_ir_node_t *spliced = attach_side_compound_joins(
+                    current, cur_vars, cur_vcount, scan_side[i],
+                    scan_side_counts[i], &spliced_vars, &spliced_count);
+                if (!spliced) {
+                    current = NULL;
+                    goto conversion_failed;
+                }
+                free_var_names(cur_vars, cur_vcount);
+                current = spliced;
+                cur_vars = spliced_vars;
+                cur_vcount = spliced_count;
+            }
         }
     }
 
@@ -2760,13 +2875,21 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 free((void *)scans);
                 free((void *)scan_vars);
                 free(scan_vcounts);
+                free_side_binding_arrays(scan_side, scan_side_counts,
+                    scan_cap);
                 return NULL;
             }
 
             char **neg_vars = NULL;
             uint32_t neg_vcount = 0;
+            side_compound_binding_t *neg_side = NULL;
+            uint32_t neg_side_count = 0;
             wirelog_ir_node_t *neg_scan
-                = build_atom_scan(neg_atom, prog, &neg_vars, &neg_vcount);
+                = build_atom_scan(neg_atom, prog, &neg_vars, &neg_vcount,
+                    &neg_side, &neg_side_count);
+            for (uint32_t k = 0; k < neg_side_count; k++)
+                free(neg_side[k].handle_var);
+            free(neg_side);
 
             if (!neg_scan) {
                 wl_ir_program_set_error(prog,
@@ -2814,6 +2937,8 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
                 free((void *)scans);
                 free((void *)scan_vars);
                 free(scan_vcounts);
+                free_side_binding_arrays(scan_side, scan_side_counts,
+                    scan_cap);
                 return NULL;
             }
 
@@ -3069,6 +3194,7 @@ conversion_cleanup:
     free((void *)scans);
     free((void *)scan_vars);
     free(scan_vcounts);
+    free_side_binding_arrays(scan_side, scan_side_counts, scan_cap);
 
     return root;
 }
