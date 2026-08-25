@@ -132,7 +132,9 @@ if [ -n "$added" ]; then
          "$backlog_rel relative to the merge base with $base_ref" \
          "($merge_base):" >&2
     echo "" >&2
-    printf '  %s\n' $added >&2
+    while IFS= read -r entry; do
+        printf '  %s\n' "$entry"
+    done <<< "$added" >&2
     echo "" >&2
     echo "The backlog may only shrink. Fix the source before adding it to" >&2
     echo "the register; new translation units must enter the allowlist clean." >&2

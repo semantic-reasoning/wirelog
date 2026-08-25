@@ -2,6 +2,7 @@
 """Unit tests for the clang-tidy ratchet's fail-closed guards."""
 
 import importlib.util
+import json
 import pathlib
 import re
 import tempfile
@@ -36,6 +37,34 @@ class RatchetGuardTests(unittest.TestCase):
         self.assertEqual(RATCHET.check_version("clang-tidy", False), "99")
         with self.assertRaises(RATCHET.SkipGate):
             RATCHET.check_version("clang-tidy", True)
+
+    def test_launcher_aware_compiler_detection(self):
+        for launcher in ("ccache", "sccache", "distcc", "icecc"):
+            self.assertEqual(
+                RATCHET.compiler_name([launcher, "/usr/bin/clang"]),
+                "clang")
+        self.assertEqual(
+            RATCHET.compiler_name(["C:\\tools\\cl.exe", "/c"]), "cl.exe")
+        self.assertEqual(
+            RATCHET.compiler_name(["/usr/bin/ccache", "/usr/bin/cc"]), "cc")
+        self.assertTrue(RATCHET.is_msvc_command(
+            ["ccache", "--direct", "C:\\tools\\cl.exe", "/c"]))
+        self.assertFalse(RATCHET.is_msvc_command(
+            ["sccache", "--start-server", "/usr/bin/clang", "-c"]))
+
+    def test_pruned_database_requires_each_target_once(self):
+        entry = {"directory": str(ROOT), "file": "wirelog/example.c"}
+        with tempfile.TemporaryDirectory() as temp:
+            directory = pathlib.Path(temp)
+            database = directory / "compile_commands.json"
+            database.write_text(json.dumps([entry]), encoding="utf-8")
+            RATCHET.validate_pruned_db(directory, [entry])
+            database.write_text(json.dumps([]), encoding="utf-8")
+            with self.assertRaises(RATCHET.GateError):
+                RATCHET.validate_pruned_db(directory, [entry])
+            database.write_text(json.dumps([entry, entry]), encoding="utf-8")
+        with self.assertRaises(RATCHET.GateError):
+            RATCHET.validate_pruned_db(directory, [entry])
 
     def test_config_values_are_compared_but_user_is_ignored(self):
         baseline = RATCHET.normalized_config_lines(
