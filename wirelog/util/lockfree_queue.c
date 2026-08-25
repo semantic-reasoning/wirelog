@@ -198,10 +198,18 @@ struct wl_mpsc_queue {
     wl_spsc_queue_t *workers;     /* per-worker SPSC rings   */
     uint32_t num_workers;
     uint32_t dequeue_idx;         /* round-robin scan cursor */
+    wl_mpsc_payload_destroy_fn destroy_payload;
 };
 
 wl_mpsc_queue_t *
 wl_mpsc_queue_create(uint32_t num_workers, uint32_t capacity)
+{
+    return wl_mpsc_queue_create_with_destructor(num_workers, capacity, NULL);
+}
+
+wl_mpsc_queue_t *
+wl_mpsc_queue_create_with_destructor(uint32_t num_workers, uint32_t capacity,
+    wl_mpsc_payload_destroy_fn destroy_payload)
 {
     if (num_workers == 0 || capacity < 2)
         return NULL;
@@ -219,6 +227,7 @@ wl_mpsc_queue_create(uint32_t num_workers, uint32_t capacity)
 
     q->num_workers = num_workers;
     q->dequeue_idx = 0;
+    q->destroy_payload = destroy_payload;
 
     for (uint32_t i = 0; i < num_workers; i++) {
         if (spsc_init(&q->workers[i], capacity) != 0) {
@@ -238,6 +247,12 @@ wl_mpsc_queue_destroy(wl_mpsc_queue_t *q)
 {
     if (!q)
         return;
+    if (q->destroy_payload) {
+        wl_delta_msg_t item;
+        while (wl_mpsc_dequeue(q, &item))
+            if (item.delta)
+                q->destroy_payload(item.delta);
+    }
     for (uint32_t i = 0; i < q->num_workers; i++)
         spsc_destroy(&q->workers[i]);
     free(q->workers);

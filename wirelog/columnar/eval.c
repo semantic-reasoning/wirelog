@@ -26,6 +26,12 @@
 #define TDD_OWNER_FALLBACK_MIN_ITER 31u
 #define TDD_OWNER_FALLBACK_DELTA_ROWS 512u
 
+static void
+tdd_destroy_delta_payload(void *payload)
+{
+    col_rel_destroy((col_rel_t *)payload);
+}
+
 #define WL_COLUMNAR_EVAL_DEDUP_ROW_HASH wl_columnar_eval_dedup_row_hash
 #define WL_COLUMNAR_EVAL_DEDUP_SET_INSERT wl_columnar_eval_dedup_set_insert
 #define WL_COLUMNAR_EVAL_DEDUP_SET_CONTAINS wl_columnar_eval_dedup_set_contains
@@ -4132,7 +4138,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      * Failure is non-fatal: enqueue is skipped when delta_queue is NULL.
      * An unrepresentable nrels*2 request is rejected before any stratum
      * state allocation, using the evaluator's ENOMEM failure signal. */
-    coord->delta_queue = wl_mpsc_queue_create(W, delta_queue_capacity);
+    coord->delta_queue = wl_mpsc_queue_create_with_destructor(
+        W, delta_queue_capacity, tdd_destroy_delta_payload);
 
     /* Issue #390: BDX snap array — pre-subpass IDB sizes per worker/relation.
      * Used to truncate worker IDB back to clean partition state after each
@@ -4368,23 +4375,25 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(
                     max_msgs > 0 ? max_msgs : 1u, sizeof(wl_delta_msg_t));
                 if (!msgs) {
+                    /* Queue-only workers have not written ctxs yet.  Drain
+                     * and destroy their queued deltas before aborting; do
+                     * not continue with a silently empty exchange. */
                     wl_columnar_eval_tdd_queue_discard_delta_queue(
                         coord->delta_queue, W, nrels);
                     rc = ENOMEM;
+                    coord->tdd_queue_drain_ns += now_ns() - queue_t0;
                     goto done;
                 }
-                {
-                    uint32_t msg_count = wl_mpsc_dequeue_all(
-                        coord->delta_queue, msgs, max_msgs);
+                uint32_t msg_count = wl_mpsc_dequeue_all(
+                    coord->delta_queue, msgs, max_msgs);
 
-                    /* Clear and reconstruct from queue messages. */
-                    for (uint32_t w = 0; w < W; w++)
-                        memset((void *)ctxs[w].delta_rels, 0,
-                            delta_rel_bytes);
-                    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
-                        ctxs, msgs, msg_count, W, nrels);
-                    free(msgs);
-                }
+                /* Clear and reconstruct from queue messages. */
+                for (uint32_t w = 0; w < W; w++)
+                    memset((void *)ctxs[w].delta_rels, 0,
+                        delta_rel_bytes);
+                wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
+                    ctxs, msgs, msg_count, W, nrels);
+                free(msgs);
                 coord->tdd_queue_drain_ns += now_ns() - queue_t0;
             }
 

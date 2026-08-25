@@ -36,6 +36,14 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+static uint32_t discard_destroy_count = 0;
+
+static void
+count_discard_destroy(void *payload)
+{
+    discard_destroy_count++;
+    free(payload);
+}
 
 #define TEST(name)                            \
         do {                                      \
@@ -655,6 +663,42 @@ test_delta_queue_capacity_boundaries(void)
         return;
     }
     PASS();
+    return;
+}
+
+static int
+test_discard_drains_all_messages(void)
+{
+    TEST("tdd discard drains more than one W*nrels batch");
+
+    wl_mpsc_queue_t *queue = wl_mpsc_queue_create(2, 16);
+    if (!queue) {
+        FAIL("queue creation failed");
+        return 1;
+    }
+    discard_destroy_count = 0;
+    for (uint32_t i = 0; i < 12; i++) {
+        void *delta = malloc(1);
+        if (!delta || wl_mpsc_enqueue(queue, i % 2, delta, 0, i) != 0) {
+            free(delta);
+            wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
+                queue, count_discard_destroy);
+            wl_mpsc_queue_destroy(queue);
+            FAIL("delta enqueue failed");
+            return 1;
+        }
+    }
+
+    wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
+        queue, count_discard_destroy);
+    int empty = wl_mpsc_size(queue) == 0 && discard_destroy_count == 12;
+    wl_mpsc_queue_destroy(queue);
+    if (!empty) {
+        FAIL("discard left queued deltas");
+        return 1;
+    }
+    PASS();
+    return 0;
 }
 
 static void
@@ -747,6 +791,7 @@ main(void)
     test_delta_queue_capacity_boundaries();
     test_tdd_matrix_size_boundaries();
     test_tdd_queue_discard_large_dimensions();
+    test_discard_drains_all_messages();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

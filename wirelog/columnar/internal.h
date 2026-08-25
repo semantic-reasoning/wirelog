@@ -2013,6 +2013,11 @@ void
 wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
     uint32_t W, uint32_t nrels);
 
+/* Allocation-free ownership-test seam; drains every live message. */
+void
+wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
+    wl_mpsc_queue_t *queue, wl_mpsc_payload_destroy_fn destroy_payload);
+
 int
 wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
     wl_col_session_t *sess, col_rel_t *delta, uint32_t rel_idx,

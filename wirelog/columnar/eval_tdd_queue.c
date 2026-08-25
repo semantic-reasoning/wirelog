@@ -13,6 +13,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+static void
+tdd_destroy_delta_payload(void *payload)
+{
+    col_rel_destroy((col_rel_t *)payload);
+}
+
 void
 wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
     col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
@@ -32,22 +38,29 @@ wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
 }
 
 void
+wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
+    wl_mpsc_queue_t *queue, wl_mpsc_payload_destroy_fn destroy_payload)
+{
+    if (!queue || !destroy_payload)
+        return;
+    wl_delta_msg_t msg;
+    while (wl_mpsc_dequeue(queue, &msg))
+        if (msg.delta)
+            destroy_payload(msg.delta);
+}
+
+void
 wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
     uint32_t W, uint32_t nrels)
 {
     if (!queue)
         return;
+    /* This error-path drain is intentionally allocation-free and ignores the
+    * historical sizing hints: every live queue message must be reclaimed. */
     (void)W;
     (void)nrels;
-    wl_delta_msg_t msgs[256];
-    for (;;) {
-        uint32_t msg_count = wl_mpsc_dequeue_all(queue, msgs,
-                (uint32_t)(sizeof(msgs) / sizeof(msgs[0])));
-        for (uint32_t i = 0; i < msg_count; i++)
-            col_rel_destroy((col_rel_t *)msgs[i].delta);
-        if (msg_count < sizeof(msgs) / sizeof(msgs[0]))
-            break;
-    }
+    wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(queue,
+        tdd_destroy_delta_payload);
 }
 
 int
