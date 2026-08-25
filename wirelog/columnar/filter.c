@@ -782,11 +782,15 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
 /* --- Hash join helpers --------------------------------------------------- */
 
+/* Returns 0 when the requested power of two cannot be represented. */
+
 uint32_t
 wl_columnar_filter_next_pow2(uint32_t n)
 {
     if (n < 16)
         return 16;
+    if (n > UINT32_MAX / 2u + 1u)
+        return 0;
     n--;
     n |= n >> 1;
     n |= n >> 2;

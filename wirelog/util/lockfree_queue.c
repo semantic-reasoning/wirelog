@@ -92,12 +92,14 @@ typedef struct {
     uint32_t _pad_head[15];    /* Pad to avoid next allocation boundary */
 } wl_spsc_queue_t;
 
-/* Round v up to the nearest power of 2 (minimum 2). */
+/* Round v up to the nearest power of 2 (minimum 2); return 0 on overflow. */
 static uint32_t
 next_pow2(uint32_t v)
 {
     if (v < 2)
         v = 2;
+    if (v > UINT32_MAX / 2u + 1u)
+        return 0;
     v--;
     v |= v >> 1;
     v |= v >> 2;
@@ -111,6 +113,8 @@ static int
 spsc_init(wl_spsc_queue_t *q, uint32_t capacity)
 {
     capacity = next_pow2(capacity);
+    if (capacity == 0)
+        return -1;
     q->slots = (wl_delta_msg_t *)calloc(capacity, sizeof(wl_delta_msg_t));
     if (!q->slots)
         return -1;

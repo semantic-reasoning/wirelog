@@ -188,6 +188,23 @@ test_keyed_join_overflow(void)
 }
 
 static int
+test_filter_next_pow2_overflow_contract(void)
+{
+    TEST("filter next_pow2 returns zero only on overflow");
+
+    if (wl_columnar_filter_next_pow2(15) != 16
+        || wl_columnar_filter_next_pow2(16) != 16
+        || wl_columnar_filter_next_pow2(0x80000000u) != 0x80000000u
+        || wl_columnar_filter_next_pow2(0x80000001u) != 0
+        || wl_columnar_filter_next_pow2(UINT32_MAX) != 0) {
+        FAIL("unexpected next_pow2 boundary result");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
 test_unary_join_overflow(void)
 {
     TEST("unary join overflow returns EOVERFLOW");
@@ -255,6 +272,7 @@ main(void)
     printf("=== test_join_overflow ===\n");
 
     test_keyed_join_overflow();
+    test_filter_next_pow2_overflow_contract();
     test_unary_join_overflow();
     test_diff_join_overflow();
     test_k_fusion_worker_limit_overflow();

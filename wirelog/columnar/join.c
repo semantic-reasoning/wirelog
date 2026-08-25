@@ -63,6 +63,20 @@ col_op_resolve_key(const col_rel_t *rel, const char *name, const char *side,
     return 0;
 }
 
+/* Return a valid hash bucket count, rejecting representational overflow. */
+static int
+col_join_bucket_count(uint32_t nrows, uint32_t *out)
+{
+    if (!out || nrows > UINT32_MAX / 2u)
+        return ENOMEM;
+    uint32_t count = wl_columnar_filter_next_pow2(
+        nrows > 0 ? nrows * 2u : 1u);
+    if (count == 0)
+        return ENOMEM;
+    *out = count;
+    return 0;
+}
+
 #define WL_JOIN_PAR_MIN_LEFT_ROWS_DEFAULT 4096u
 
 static uint32_t
@@ -956,8 +970,18 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         uint32_t probe_kcol = right_is_unary ? lk[0] : rk[0];
 
         /* Build hash set from the unary relation's single column. */
-        uint32_t nbuckets = wl_columnar_filter_next_pow2(build->nrows >
-                0 ? build->nrows * 2 : 1);
+        uint32_t nbuckets;
+        if (col_join_bucket_count(build->nrows, &nbuckets) != 0) {
+            free(tmp);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            return ENOMEM;
+        }
         uint32_t *ht_head = (uint32_t *)calloc(nbuckets, sizeof(uint32_t));
         uint32_t *ht_next = (uint32_t *)malloc(
             (build->nrows > 0 ? build->nrows : 1) * sizeof(uint32_t));
@@ -1090,8 +1114,17 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
         if (!arr) {
             /* Ephemeral hash table (delta path or arrangement unavailable). */
-            nbuckets_ep = wl_columnar_filter_next_pow2(right->nrows >
-                    0 ? right->nrows * 2 : 1);
+            if (col_join_bucket_count(right->nrows, &nbuckets_ep) != 0) {
+                free(tmp);
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                if (left_e.owned)
+                    col_rel_destroy(left);
+                return ENOMEM;
+            }
             ht_head_ep = (uint32_t *)calloc(nbuckets_ep, sizeof(uint32_t));
             ht_next_ep = (uint32_t *)malloc(
                 (right->nrows > 0 ? right->nrows : 1) * sizeof(uint32_t));
@@ -1347,8 +1380,17 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     /* Hash antijoin: build hash set from right, iterate left. */
-    uint32_t aj_nbuckets = wl_columnar_filter_next_pow2(right->nrows >
-            0 ? right->nrows * 2 : 1);
+    uint32_t aj_nbuckets;
+    if (col_join_bucket_count(right->nrows, &aj_nbuckets) != 0) {
+        col_rel_destroy(out);
+        free(lk);
+        free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
     uint32_t *aj_head = (uint32_t *)calloc(aj_nbuckets, sizeof(uint32_t));
     uint32_t *aj_next
         = (uint32_t *)malloc((right->nrows + 1) * sizeof(uint32_t));
@@ -1489,8 +1531,18 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     /* Build hash set from right relation join keys: O(|R|) */
-    uint32_t nbuckets = wl_columnar_filter_next_pow2(right->nrows >
-            0 ? right->nrows * 2 : 1);
+    uint32_t nbuckets;
+    if (col_join_bucket_count(right->nrows, &nbuckets) != 0) {
+        free(tmp);
+        col_rel_destroy(out);
+        free(lk);
+        free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
     uint32_t *ht_head = (uint32_t *)calloc(nbuckets, sizeof(uint32_t));
     uint32_t *ht_next = (uint32_t *)malloc((right->nrows > 0 ? right->nrows : 1)
             * sizeof(uint32_t));
@@ -2065,8 +2117,18 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     } else {
         /* Ephemeral hash table fallback (same as col_op_join) */
-        uint32_t nbuckets_ep = wl_columnar_filter_next_pow2(right->nrows >
-                0 ? right->nrows * 2 : 1);
+        uint32_t nbuckets_ep;
+        if (col_join_bucket_count(right->nrows, &nbuckets_ep) != 0) {
+            free(tmp);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            return ENOMEM;
+        }
         uint32_t *ht_head_ep = (uint32_t *)calloc(nbuckets_ep,
                 sizeof(uint32_t));
         uint32_t *ht_next_ep = (uint32_t *)malloc(

@@ -97,6 +97,17 @@ test_create_destroy(void)
     PASS();
 }
 
+static void
+test_capacity_overflow_rejected(void)
+{
+    TEST("capacity overflow is rejected before allocation");
+
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create(1, UINT32_MAX);
+    ASSERT(q == NULL, "overflowing capacity must return NULL");
+
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * Test 2: single producer enqueue/dequeue correctness
  * ---------------------------------------------------------------- */
@@ -436,6 +447,7 @@ main(void)
     printf("=== lockfree_queue tests ===\n\n");
 
     test_create_destroy();
+    test_capacity_overflow_rejected();
     test_single_producer();
     test_rel_idx_field();
     test_new_fields();

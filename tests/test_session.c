@@ -11,6 +11,7 @@
  */
 
 #include "../wirelog/backend.h"
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -20,6 +21,8 @@
 #include "../wirelog/wirelog.h"
 
 #include <stdio.h>
+#include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -43,22 +46,40 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
+
+static void
+test_session_hash_overflow_rejected(void)
+{
+    TEST("session hash rejects overflowing relation counts");
+
+    wl_col_session_t sess = { 0 };
+    sess.nrels = UINT32_MAX / 2u + 2u;
+
+    int rc = session_rel_build_hash(&sess);
+
+    if (rc != ENOMEM || sess.rel_hash_nbuckets != 0
+        || sess.rel_hash_head != NULL) {
+        FAIL("overflowing relation count changed hash state");
+        return;
+    }
+    PASS();
+}
 
 /* ======================================================================== */
 /* Delta Collector                                                          */
@@ -77,7 +98,7 @@ typedef struct {
 
 static void
 collect_delta(const char *relation, const int64_t *row, uint32_t ncols,
-              int32_t diff, void *user_data)
+    int32_t diff, void *user_data)
 {
     delta_collector_t *c = (delta_collector_t *)user_data;
     if (c->count >= MAX_DELTAS)
@@ -104,7 +125,7 @@ typedef struct {
 
 static void
 collect_tuple(const char *relation, const int64_t *row, uint32_t ncols,
-              void *user_data)
+    void *user_data)
 {
     tuple_collector_t *c = (tuple_collector_t *)user_data;
     if (c->count >= MAX_DELTAS)
@@ -134,7 +155,7 @@ count_deltas(const delta_collector_t *c, const char *relation, int32_t diff)
 
 static bool
 has_delta(const delta_collector_t *c, const char *relation,
-          const int64_t *expected, uint32_t ncols, int32_t diff)
+    const int64_t *expected, uint32_t ncols, int32_t diff)
 {
     for (int i = 0; i < c->count; i++) {
         if (strcmp(c->relations[i], relation) != 0)
@@ -156,7 +177,7 @@ has_delta(const delta_collector_t *c, const char *relation,
 
 static bool
 has_tuple(const tuple_collector_t *c, const char *relation,
-          const int64_t *expected, uint32_t ncols)
+    const int64_t *expected, uint32_t ncols)
 {
     for (int i = 0; i < c->count; i++) {
         if (strcmp(c->relations[i], relation) != 0)
@@ -211,8 +232,8 @@ static void
 test_session_create_destroy_impl(const wl_compute_backend_t *backend)
 {
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -254,8 +275,8 @@ test_session_create_multi_worker_rejected(void)
     TEST("session: multi-worker accepted");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -285,9 +306,9 @@ test_session_step_initial_delta(void)
     TEST("session: initial step produces diff=+1 deltas");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32, y: int32)\n"
-                                ".decl b(y: int32, z: int32)\n"
-                                ".decl r(x: int32, y: int32, z: int32)\n"
-                                "r(x, y, z) :- a(x, y), b(y, z).\n");
+            ".decl b(y: int32, z: int32)\n"
+            ".decl r(x: int32, y: int32, z: int32)\n"
+            "r(x, y, z) :- a(x, y), b(y, z).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -338,8 +359,8 @@ test_session_step_initial_delta(void)
     if (!has_delta(&deltas, "r", expected, 3, +1)) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "expected r(1,2,3) diff=+1, got %d deltas total",
-                 deltas.count);
+            "expected r(1,2,3) diff=+1, got %d deltas total",
+            deltas.count);
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -349,7 +370,7 @@ test_session_step_initial_delta(void)
     if (count_deltas(&deltas, "r", +1) != 1) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected exactly 1 positive delta, got %d",
-                 count_deltas(&deltas, "r", +1));
+            count_deltas(&deltas, "r", +1));
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -372,9 +393,9 @@ test_session_step_incremental_delta(void)
     TEST("session: incremental step produces only new deltas");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32, y: int32)\n"
-                                ".decl b(y: int32, z: int32)\n"
-                                ".decl r(x: int32, y: int32, z: int32)\n"
-                                "r(x, y, z) :- a(x, y), b(y, z).\n");
+            ".decl b(y: int32, z: int32)\n"
+            ".decl r(x: int32, y: int32, z: int32)\n"
+            "r(x, y, z) :- a(x, y), b(y, z).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -426,8 +447,8 @@ test_session_step_incremental_delta(void)
     if (!has_delta(&deltas, "r", expected, 3, +1)) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "expected r(1,4,5) diff=+1, got %d deltas total",
-                 deltas.count);
+            "expected r(1,4,5) diff=+1, got %d deltas total",
+            deltas.count);
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -437,7 +458,7 @@ test_session_step_incremental_delta(void)
     if (count_deltas(&deltas, "r", +1) != 1) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected exactly 1 positive delta, got %d",
-                 count_deltas(&deltas, "r", +1));
+            count_deltas(&deltas, "r", +1));
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -458,8 +479,8 @@ test_session_step_no_change(void)
     TEST("session: step with no changes produces no deltas");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -528,8 +549,8 @@ test_session_remove_single_delta(void)
     TEST("session: remove tuple produces diff=-1 delta");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -589,7 +610,7 @@ test_session_remove_single_delta(void)
     if (!has_delta(&deltas, "r", expected, 1, -1)) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected r(1) diff=-1, got %d total deltas",
-                 deltas.count);
+            deltas.count);
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -599,7 +620,7 @@ test_session_remove_single_delta(void)
     if (count_deltas(&deltas, "r", -1) != 1) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected exactly 1 retraction, got %d",
-                 count_deltas(&deltas, "r", -1));
+            count_deltas(&deltas, "r", -1));
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -623,8 +644,8 @@ test_session_remove_nonexistent(void)
     TEST("session: remove non-existent tuple is no-op");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -664,8 +685,8 @@ test_session_snapshot_empty(void)
     TEST("session: snapshot of empty session returns 0 tuples");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -717,9 +738,9 @@ test_session_snapshot_after_insert(void)
     TEST("session: snapshot reflects current derived state");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32, y: int32)\n"
-                                ".decl b(y: int32, z: int32)\n"
-                                ".decl r(x: int32, y: int32, z: int32)\n"
-                                "r(x, y, z) :- a(x, y), b(y, z).\n");
+            ".decl b(y: int32, z: int32)\n"
+            ".decl r(x: int32, y: int32, z: int32)\n"
+            "r(x, y, z) :- a(x, y), b(y, z).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -763,8 +784,8 @@ test_session_snapshot_after_insert(void)
     if (!has_tuple(&tuples, "r", expected, 3)) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "expected r(1,2,3) in snapshot, got %d tuples total",
-                 tuples.count);
+            "expected r(1,2,3) in snapshot, got %d tuples total",
+            tuples.count);
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -774,7 +795,7 @@ test_session_snapshot_after_insert(void)
     if (tuples.count != 1) {
         char msg[64];
         snprintf(msg, sizeof(msg), "expected exactly 1 tuple, got %d",
-                 tuples.count);
+            tuples.count);
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -796,8 +817,8 @@ test_session_duplicate_insert(void)
     TEST("session: duplicate insert produces single positive delta");
 
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -832,7 +853,7 @@ test_session_duplicate_insert(void)
     if (!has_delta(&deltas, "r", expected, 1, +1)) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected r(5) diff=+1, got %d deltas total",
-                 deltas.count);
+            deltas.count);
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -842,8 +863,8 @@ test_session_duplicate_insert(void)
     if (count_deltas(&deltas, "r", +1) != 1) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "expected exactly 1 positive delta (set semantics), got %d",
-                 count_deltas(&deltas, "r", +1));
+            "expected exactly 1 positive delta (set semantics), got %d",
+            count_deltas(&deltas, "r", +1));
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -867,11 +888,11 @@ test_session_tc_insert(void)
     /* Program:
        tc(X, Y) :- edge(X, Y).
        tc(X, Z) :- edge(X, Y), tc(Y, Z).
-    */
+     */
     wl_plan_t *ffi = build_plan(".decl edge(x: int32, y: int32)\n"
-                                ".decl tc(x: int32, y: int32)\n"
-                                "tc(X, Y) :- edge(X, Y).\n"
-                                "tc(X, Z) :- edge(X, Y), tc(Y, Z).\n");
+            ".decl tc(x: int32, y: int32)\n"
+            "tc(X, Y) :- edge(X, Y).\n"
+            "tc(X, Z) :- edge(X, Y), tc(Y, Z).\n");
 
     if (!ffi) {
         FAIL("failed to parse TC program");
@@ -937,7 +958,7 @@ test_session_tc_insert(void)
     if (new_tc_count != 3) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected 3 new TC deltas, got %d",
-                 new_tc_count);
+            new_tc_count);
         wl_session_destroy(session);
         wl_plan_free(ffi);
         FAIL(msg);
@@ -967,6 +988,7 @@ main(void)
 {
     printf("test_session: persistent columnar session delta tests\n");
 
+    test_session_hash_overflow_rejected();
     test_session_create_destroy();
     test_session_create_destroy_columnar();
     test_session_create_multi_worker_rejected();
@@ -987,6 +1009,6 @@ main(void)
     /* test_session_tc_insert(); */
 
     printf("\n  %d tests: %d passed, %d failed\n", tests_run, tests_passed,
-           tests_failed);
+        tests_failed);
     return tests_failed > 0 ? 1 : 0;
 }

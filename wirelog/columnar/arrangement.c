@@ -200,7 +200,8 @@ arr_key_cols_valid(const col_rel_t *rel, const uint32_t *key_cols,
  * smear fills to 0xFFFFFFFF and `n + 1u` wraps.  Callers must reject that
  * themselves; both in this file do, below.  The byte-identical
  * wl_columnar_filter_next_pow2 in filter.c has the same return and more
- * callers.  See follow-up issue (next_pow2 family).
+ * callers.  See follow-up issue #1192 for the remaining queue-capacity
+ * arithmetic paths.
  */
 static uint32_t
 arr_next_pow2(uint32_t n)
