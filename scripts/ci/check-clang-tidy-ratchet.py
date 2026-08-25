@@ -83,6 +83,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 
 SKIP_EXIT = 77
 
@@ -177,6 +178,30 @@ def entry_source(entry: dict) -> pathlib.Path:
     return (pathlib.Path(entry["directory"]) / entry["file"]).resolve()
 
 
+LAUNCHERS = {"ccache", "sccache", "distcc", "icecc", "gomacc"}
+
+
+def command_basename(token: str) -> str:
+    """Normalize POSIX and Windows-style executable paths in a command."""
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def compiler_name(tokens: list[str]) -> str:
+    """Return the compiler after any supported compiler-cache launcher."""
+    for token in tokens:
+        name = command_basename(token)
+        if name in LAUNCHERS:
+            continue
+        return name
+    return ""
+
+
+def is_msvc_command(tokens: list[str]) -> bool:
+    """Recognize direct or launcher-wrapped cl.exe command lines."""
+    return any(command_basename(token) in ("cl", "cl.exe")
+               for token in tokens)
+
+
 def select_entries(build_dir: pathlib.Path) -> list[dict]:
     """Pick one canonical entry per libwirelog.so translation unit."""
     db_path = build_dir / "compile_commands.json"
@@ -224,7 +249,45 @@ def prune_db(entries: list[dict], workdir: pathlib.Path) -> pathlib.Path:
     """
     db_path = workdir / "compile_commands.json"
     db_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    try:
+        written = json.loads(db_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"cannot validate pruned compilation database: {exc}") \
+            from exc
+    expected_sources = {entry_source(entry) for entry in entries}
+    written_sources = {entry_source(entry) for entry in written}
+    duplicates = sorted(source for source, count in
+                        Counter(entry_source(entry) for entry in written).items()
+                        if count != 1)
+    if duplicates:
+        raise GateError("pruned compilation database has duplicate target(s): "
+                        + ", ".join(rel_to_repo(path) for path in duplicates))
+    missing = sorted(expected_sources - written_sources)
+    if missing:
+        raise GateError("pruned compilation database is missing target(s): "
+                        + ", ".join(rel_to_repo(path) for path in missing))
     return db_path
+
+
+def validate_pruned_db(db_dir: pathlib.Path, entries: list[dict]) -> None:
+    """Ensure every target has a real compile command before clang-tidy runs."""
+    db_path = db_dir / "compile_commands.json"
+    try:
+        database = json.loads(db_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"cannot read pruned compilation database {db_path}: "
+                        f"{exc}") from exc
+    available = {entry_source(entry) for entry in database}
+    duplicates = sorted(source for source, count in
+                        Counter(entry_source(entry) for entry in database).items()
+                        if count != 1)
+    if duplicates:
+        raise GateError("pruned compilation database has duplicate target(s): "
+                        + ", ".join(rel_to_repo(path) for path in duplicates))
+    missing = sorted({entry_source(entry) for entry in entries} - available)
+    if missing:
+        raise GateError("pruned compilation database is missing target(s): "
+                        + ", ".join(rel_to_repo(path) for path in missing))
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +440,7 @@ def check_configuration(entries: list[dict]) -> None:
                     f"({token} on {rel_to_repo(entry_source(entry))}); the "
                     "allowlist was calibrated against an uninstrumented "
                     "default build")
-        compiler = pathlib.PurePath(tokens[0]).name.lower() if tokens else ""
-        if compiler in ("cl", "cl.exe"):
+        if is_msvc_command(tokens):
             raise SkipGate("the database records MSVC-style command lines, "
                            "which clang-tidy cannot consume as-is")
 
@@ -521,6 +583,7 @@ def job_count() -> int:
 
 def run_all(exe: str, db_dir: pathlib.Path,
             entries: list[dict]) -> list[Result]:
+    validate_pruned_db(db_dir, entries)
     jobs = job_count()
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [pool.submit(run_clang_tidy, exe, db_dir, entry)

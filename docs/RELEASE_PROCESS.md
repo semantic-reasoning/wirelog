@@ -4,7 +4,7 @@ This document is the **canonical procedure for cutting a wirelog
 release tag and publishing the release notes that accompany it**.
 It is the operational counterpart of:
 
-- `CONTRIBUTING.md` — Changelog Conventions (the per-PR rules).
+- [`CONTRIBUTING.md`](../CONTRIBUTING.md) — Changelog Conventions (the per-PR rules).
 - `CHANGELOG.md` — the source-of-truth changelog.
 - `docs/MIGRATION.md` — version-to-version migration recipes.
 - `docs/SECURITY_MODEL.md` — vulnerability-disclosure policy.

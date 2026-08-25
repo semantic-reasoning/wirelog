@@ -99,7 +99,8 @@ git add -u' > .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
 
-See [docs/LINTING.md](docs/LINTING.md) for complete linting documentation, check rationale, and rollout plan.
+See the [clang-tidy Ratchet](CLAUDE.md#clang-tidy-ratchet-issue-1100) section
+and the ratchet registers under `scripts/ci/` for linting policy and checks.
 
 ### Perf-suite gate for heap-touching edits
 
