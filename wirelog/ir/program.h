@@ -39,6 +39,7 @@ typedef struct {
      * layout break rather than a manifest update.  A side array keeps the
      * ABI still, the same shape as plan->edb_declared_width (#1038). */
     wirelog_column_type_t *slot_types;
+    bool *slot_type_declared;
     uint32_t slot_type_count;
     uint32_t column_count;
     /* Issue #977: true once a `.decl` for this relation has been collected.

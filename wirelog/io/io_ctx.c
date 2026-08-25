@@ -59,29 +59,16 @@ wirelog_io_ctx_create_for_relation(const wl_ir_relation_info_t *rel,
          * or a trailing `symbol` lands on an inline slot and the file is
          * read under the wrong types.
          *
-         * Each inline slot is pinned to WIRELOG_TYPE_INT64, which is a
-         * CHOICE about this path and not a fact about the storage.  The
-         * slots are ordinary int64 cells and hold interned string ids
-         * perfectly well: `p(1, "aa", "bb").` against
-         * `.decl p(id: int64, lbl: pair/2 inline)` with
-         * `o(a,b,c) :- p(a, pair(b,c)).` evaluates to o(1, "aa", "bb") in
-         * this same release, through the fact path.  The `.input` path
-         * cannot do that, and the reason is a missing input, not a property
-         * of the layout: the grammar records one type per *declared* column
-         * (`rel->columns[i].type`, which for any `functor/arity` spelling is
-         * just WIRELOG_TYPE_INT64 -- see type_name_to_column_type() in
-         * ir/program.c), so there is nowhere to say that slot 1 of `lbl` is
-         * a symbol and slot 2 an integer.  Absent per-slot types, int64 is
-         * the only defensible default.
+         * Legacy slash declarations keep every inline slot at INT64.  An
+         * explicit declaration such as `pair(symbol, int64) inline` carries
+         * its per-slot types in rel->slot_types, so the input path can load
+         * interned symbols as well as numeric cells.  The slots remain
+         * ordinary int64 storage; the type only selects how the adapter
+         * decodes and renders each value.
          *
-         * Consequence, stated as the limitation it is: a symbol cannot be
-         * loaded into an inline compound slot from an `.input` file.  The
-         * 3-field CSV matching the fact above fails the load outright --
-         * "adapter 'csv' failed to read data" -- because the integer-only
-         * reader cannot parse "aa".  It fails loudly rather than
-         * fabricating, which is the right failure, but it is still a gap.
-         * Lifting it needs per-slot compound types in the `.decl` grammar;
-         * a follow-up issue tracks that. */
+         * An untyped slash declaration still rejects symbolic input, because
+         * its all-INT64 contract gives the adapter no authority to intern a
+         * text field. */
         uint32_t k = 0;
         for (uint32_t i = 0; i < rel->column_count; i++) {
             if (rel->columns[i].compound_kind

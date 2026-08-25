@@ -265,6 +265,7 @@ relation_info_free(wl_ir_relation_info_t *info)
         free(info->columns);
     }
     free(info->slot_types); /* Issue #1037 */
+    free(info->slot_type_declared);
     if (info->input_param_names) {
         for (uint32_t i = 0; i < info->input_param_count; i++) {
             free(info->input_param_names[i]);
@@ -481,19 +482,23 @@ collect_decl(struct wirelog_program *prog,
         }
     }
 
+    /* Issue #724: a second .decl for the same relation overwrites the
+     * columns array.  Reset it even for `.decl r()` so no stale columns or
+     * per-slot metadata survive a zero-column redeclaration. */
+    if (rel->columns) {
+        for (uint32_t i = 0; i < rel->column_count; i++)
+            free((char *)rel->columns[i].name);
+        free(rel->columns);
+        rel->columns = NULL;
+        rel->column_count = 0;
+    }
+    free(rel->slot_types);
+    free(rel->slot_type_declared);
+    rel->slot_types = NULL;
+    rel->slot_type_declared = NULL;
+    rel->slot_type_count = 0;
+
     if (col_count > 0) {
-        /* Issue #724: a second .decl for the same relation overwrites the
-         * columns array.  Free any prior allocation so the per-column
-         * name strings and the array itself do not leak when programs
-         * are assembled by concatenating templates that share a
-         * declaration. */
-        if (rel->columns) {
-            for (uint32_t i = 0; i < rel->column_count; i++)
-                free((char *)rel->columns[i].name);
-            free(rel->columns);
-            rel->columns = NULL;
-            rel->column_count = 0;
-        }
         rel->columns
             = (wirelog_column_t *)calloc(col_count, sizeof(wirelog_column_t));
         if (!rel->columns)
@@ -533,18 +538,32 @@ collect_decl(struct wirelog_program *prog,
                 if (meta.has_slot_types
                     && meta.kind == WIRELOG_COMPOUND_KIND_INLINE) {
                     if (!rel->slot_types) {
-                        rel->slot_types = (wirelog_column_type_t *)calloc(
-                            (size_t)rel->column_count * 4,
-                            sizeof(wirelog_column_type_t));
-                        rel->slot_type_count = rel->slot_types
-                            ? rel->column_count * 4 : 0;
+                        wirelog_column_type_t *slot_types
+                            = (wirelog_column_type_t *)calloc(
+                                (size_t)rel->column_count * 4,
+                                sizeof(wirelog_column_type_t));
+                        bool *slot_type_declared = (bool *)calloc(
+                            (size_t)rel->column_count * 4, sizeof(bool));
+                        if (!slot_types || !slot_type_declared) {
+                            free(slot_types);
+                            free(slot_type_declared);
+                            wl_ir_program_set_error(prog,
+                                "allocation failed for inline slot types "
+                                "in relation '%s'", decl_node->name);
+                            return -1;
+                        }
+                        rel->slot_types = slot_types;
+                        rel->slot_type_declared = slot_type_declared;
+                        rel->slot_type_count = rel->column_count * 4;
                         for (uint32_t z = 0; z < rel->slot_type_count; z++)
                             rel->slot_types[z] = WIRELOG_TYPE_INT64;
                     }
-                    if (rel->slot_types
+                    if (rel->slot_types && rel->slot_type_declared
                         && (idx * 4 + meta.arity) <= rel->slot_type_count) {
-                        for (uint32_t si = 0; si < meta.arity; si++)
+                        for (uint32_t si = 0; si < meta.arity; si++) {
                             rel->slot_types[idx * 4 + si] = meta.slot_types[si];
+                            rel->slot_type_declared[idx * 4 + si] = true;
+                        }
                     }
                 }
 
@@ -1489,10 +1508,11 @@ compound_arg_functor_matches(const wl_parser_ast_node_t *arg,
 /*
  * The comparison lattice value of logical column @logical_idx, or UNKNOWN
  * when the relation was never declared, was declared with fewer columns than
- * the atom uses, or the column is a compound.  Compound columns carry no
- * meaningful `type`: type_name_to_column_type() does not recognise
- * "pair/2 inline" and falls through to its INT32 default, so reporting that
- * would be reporting a parser artifact as a declaration (Issue #962).
+ * the atom uses, or the column is a compound without explicit slot types.
+ * Compound columns carry no useful top-level `type`: type_name_to_column_type()
+ * does not recognise "pair/2 inline" and falls through to its INT32 default,
+ * so reporting that would be reporting a parser artifact as a declaration
+ * (Issue #962).
  */
 static wl_ir_coltype_t
 declared_coltype(const wl_ir_relation_info_t *rel_info, uint32_t logical_idx)
@@ -1504,6 +1524,21 @@ declared_coltype(const wl_ir_relation_info_t *rel_info, uint32_t logical_idx)
     if (col->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
         return WL_IR_COLTYPE_UNKNOWN;
     return wl_ir_coltype_from_column_type(col->type);
+}
+
+static wl_ir_coltype_t
+declared_inline_slot_coltype(const wl_ir_relation_info_t *rel_info,
+    uint32_t logical_idx, uint32_t slot_idx)
+{
+    if (!rel_info || !rel_info->slot_types || !rel_info->slot_type_declared
+        || logical_idx >= rel_info->column_count || slot_idx >= 4)
+        return WL_IR_COLTYPE_UNKNOWN;
+
+    uint32_t index = logical_idx * 4u + slot_idx;
+    if (index >= rel_info->slot_type_count
+        || !rel_info->slot_type_declared[index])
+        return WL_IR_COLTYPE_UNKNOWN;
+    return wl_ir_coltype_from_column_type(rel_info->slot_types[index]);
 }
 
 static uint32_t
@@ -2108,10 +2143,12 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
                     scan->column_names[phys_idx] = NULL;
                     var_names[phys_idx] = NULL;
                 }
-                /* A declaration names the functor and arity of an inline
-                 * compound but not the types of its arguments, so these
-                 * slots genuinely have no declared type. */
-                scan->column_types[phys_idx] = WL_IR_COLTYPE_UNKNOWN;
+                /* Legacy functor/arity declarations remain UNKNOWN, while
+                 * #1037's explicit per-slot types reach comparison planning.
+                 * The metadata uses logical-column stride (col*4+slot),
+                 * whereas phys_idx is the packed physical position. */
+                scan->column_types[phys_idx]
+                    = declared_inline_slot_coltype(rel_info, i, c);
                 phys_idx++;
             }
         } else if (rel_info && i < rel_info->column_count
