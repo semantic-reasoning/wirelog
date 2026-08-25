@@ -81,17 +81,34 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
     if (!r->col_shared)
         return 0;
     if (new_cap == 0)
-        new_cap = r->capacity;
+        new_cap = r->capacity ? r->capacity : COL_REL_INIT_CAP;
+    /* Allocate all private columns before changing ownership.  This keeps
+     * an allocation failure from leaving a partially privatized relation. */
+    int64_t **private_cols = (int64_t **)calloc(r->ncols,
+            sizeof(int64_t *));
+    if (!private_cols)
+        return ENOMEM;
     for (uint32_t c = 0; c < r->ncols; c++) {
         if (!r->col_shared[c])
             continue;
-        int64_t *priv = (int64_t *)malloc((size_t)new_cap * sizeof(int64_t));
-        if (!priv)
+        private_cols[c] = (int64_t *)malloc((size_t)new_cap
+                * sizeof(int64_t));
+        if (!private_cols[c]) {
+            for (uint32_t i = 0; i < r->ncols; i++)
+                free(private_cols[i]);
+            free(private_cols);
             return ENOMEM;
-        memcpy(priv, r->columns[c], (size_t)r->nrows * sizeof(int64_t));
-        r->columns[c] = priv;
+        }
+        memcpy(private_cols[c], r->columns[c],
+            (size_t)r->nrows * sizeof(int64_t));
+    }
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        if (!private_cols[c])
+            continue;
+        r->columns[c] = private_cols[c];
         r->col_shared[c] = false;
     }
+    free(private_cols);
     /* If all columns are now owned, free the shared-flags array */
     bool any_shared = false;
     for (uint32_t c = 0; c < r->ncols; c++)
@@ -105,6 +122,48 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
     return 0;
 }
 
+uint64_t
+col_rel_owned_ledger_bytes(const col_rel_t *r)
+{
+    if (!r || r->arena_owned || !r->columns || r->capacity == 0)
+        return 0;
+    uint64_t owned_cols = 0;
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        if ((!r->col_shared || !r->col_shared[c]) && r->columns[c])
+            owned_cols++;
+    }
+    if (owned_cols == 0)
+        return 0;
+    if (owned_cols > UINT64_MAX / r->capacity / sizeof(int64_t))
+        return UINT64_MAX;
+    return owned_cols * r->capacity * sizeof(int64_t);
+}
+
+void
+col_rel_ledger_reconcile(col_rel_t *r, uint64_t before_bytes)
+{
+    if (!r || !r->mem_ledger)
+        return;
+    uint64_t after_bytes = col_rel_owned_ledger_bytes(r);
+    if (after_bytes > before_bytes) {
+        wl_mem_ledger_alloc(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
+            after_bytes - before_bytes);
+    } else if (before_bytes > after_bytes) {
+        wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
+            before_bytes - after_bytes);
+    }
+}
+
+void
+col_rel_ledger_release(col_rel_t *r)
+{
+    if (!r || !r->mem_ledger)
+        return;
+    uint64_t bytes = col_rel_owned_ledger_bytes(r);
+    if (bytes > 0)
+        wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION, bytes);
+}
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 void
@@ -112,10 +171,8 @@ col_rel_free_contents(col_rel_t *r)
 {
     if (!r)
         return;
-    /* Report data buffer deallocation to ledger before memset zeroes fields */
-    if (r->mem_ledger && r->columns && r->capacity > 0 && r->ncols > 0)
-        wl_mem_ledger_free(r->mem_ledger, WL_MEM_SUBSYS_RELATION,
-            (uint64_t)r->capacity * r->ncols * sizeof(int64_t));
+    /* Release only currently heap-owned, non-borrowed data buffers. */
+    col_rel_ledger_release(r);
     free(r->name);
     if (!r->arena_owned) {
         if (r->col_shared && r->columns) {
@@ -431,12 +488,13 @@ int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
     if (r->nrows >= r->capacity) {
+        uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
         uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
         if (new_cap <= r->capacity) /* overflow guard */
             return ENOMEM;
         /* COW: unshare shared columns before in-place growth (Issue #396) */
         if (r->col_shared) {
-            int cow_rc = col_rel_cow_unshare(r, new_cap);
+            int cow_rc = col_rel_cow_unshare(r, 0);
             if (cow_rc != 0)
                 return cow_rc;
         }
@@ -445,15 +503,19 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
         if (r->timestamps) {
             col_delta_timestamp_t *new_ts = (col_delta_timestamp_t *)realloc(
                 r->timestamps, new_cap * sizeof(col_delta_timestamp_t));
-            if (!new_ts)
+            if (!new_ts) {
+                col_rel_ledger_reconcile(r, ledger_before);
                 return ENOMEM;
+            }
             r->timestamps = new_ts;
         }
         if (r->arena_owned) {
             /* Arena data cannot be realloc'd; migrate to heap */
             int64_t **new_cols = col_columns_alloc(r->ncols, new_cap);
-            if (!new_cols)
+            if (!new_cols) {
+                col_rel_ledger_reconcile(r, ledger_before);
                 return ENOMEM;
+            }
             for (uint32_t c = 0; c < r->ncols; c++)
                 memcpy(new_cols[c], r->columns[c],
                     sizeof(int64_t) * r->nrows);
@@ -462,21 +524,20 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
             r->columns = new_cols;
             r->arena_owned = false;
         } else if (r->columns) {
-            if (col_columns_realloc(r->columns, r->ncols, new_cap) != 0)
+            if (col_columns_realloc_atomic(r->columns, r->ncols, r->capacity,
+                new_cap) != 0) {
+                col_rel_ledger_reconcile(r, ledger_before);
                 return ENOMEM;
+            }
         } else {
             r->columns = col_columns_alloc(r->ncols, new_cap);
-            if (!r->columns)
+            if (!r->columns) {
+                col_rel_ledger_reconcile(r, ledger_before);
                 return ENOMEM;
-        }
-        /* Track capacity growth in ledger (Issue #224): only the delta bytes
-        * added by this growth event.  r->capacity is still the old value. */
-        if (r->mem_ledger && r->ncols > 0) {
-            uint64_t delta = (uint64_t)(new_cap - r->capacity) * r->ncols
-                * sizeof(int64_t);
-            wl_mem_ledger_alloc(r->mem_ledger, WL_MEM_SUBSYS_RELATION, delta);
+            }
         }
         r->capacity = new_cap;
+        col_rel_ledger_reconcile(r, ledger_before);
     }
     if (r->timestamps)
         memset(&r->timestamps[r->nrows], 0, sizeof(col_delta_timestamp_t));
@@ -503,6 +564,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 
     /* Ensure dst has sufficient capacity */
     if (new_nrows > dst->capacity) {
+        uint64_t ledger_before = col_rel_owned_ledger_bytes(dst);
         uint32_t new_cap = dst->capacity ? dst->capacity * 2 : COL_REL_INIT_CAP;
         while (new_cap < new_nrows) {
             uint32_t next_cap = new_cap * 2;
@@ -513,7 +575,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 
         /* COW: unshare shared columns before in-place growth (Issue #396) */
         if (dst->col_shared) {
-            int cow_rc = col_rel_cow_unshare(dst, new_cap);
+            int cow_rc = col_rel_cow_unshare(dst, 0);
             if (cow_rc != 0)
                 return cow_rc;
         }
@@ -522,8 +584,10 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
         if (dst->timestamps) {
             col_delta_timestamp_t *new_ts = (col_delta_timestamp_t *)realloc(
                 dst->timestamps, new_cap * sizeof(col_delta_timestamp_t));
-            if (!new_ts)
+            if (!new_ts) {
+                col_rel_ledger_reconcile(dst, ledger_before);
                 return ENOMEM;
+            }
             dst->timestamps = new_ts;
         }
 
@@ -532,8 +596,10 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             if (arena) {
                 int64_t **new_cols
                     = (int64_t **)calloc(dst->ncols, sizeof(int64_t *));
-                if (!new_cols)
+                if (!new_cols) {
+                    col_rel_ledger_reconcile(dst, ledger_before);
                     return ENOMEM;
+                }
                 bool ok = true;
                 for (uint32_t c = 0; c < dst->ncols; c++) {
                     new_cols[c] = (int64_t *)wl_arena_alloc(arena,
@@ -548,6 +614,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                 if (!ok) {
                     /* Arena alloc failed; don't free arena columns */
                     free((void *)new_cols);
+                    col_rel_ledger_reconcile(dst, ledger_before);
                     return ENOMEM;
                 }
                 free((void *)dst->columns); /* free old columns array only */
@@ -556,8 +623,10 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                 /* Fallback to heap if arena unavailable */
                 int64_t **new_cols
                     = col_columns_alloc(dst->ncols, new_cap);
-                if (!new_cols)
+                if (!new_cols) {
+                    col_rel_ledger_reconcile(dst, ledger_before);
                     return ENOMEM;
+                }
                 for (uint32_t c = 0; c < dst->ncols; c++)
                     memcpy(new_cols[c], dst->columns[c],
                         sizeof(int64_t) * dst->nrows);
@@ -566,21 +635,21 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                 dst->arena_owned = false;
             }
         } else if (dst->columns) {
-            if (col_columns_realloc(dst->columns, dst->ncols, new_cap) != 0)
+            if (col_columns_realloc_atomic(dst->columns, dst->ncols,
+                dst->capacity,
+                new_cap) != 0) {
+                col_rel_ledger_reconcile(dst, ledger_before);
                 return ENOMEM;
+            }
         } else {
             dst->columns = col_columns_alloc(dst->ncols, new_cap);
-            if (!dst->columns)
+            if (!dst->columns) {
+                col_rel_ledger_reconcile(dst, ledger_before);
                 return ENOMEM;
-        }
-
-        /* Track capacity growth in ledger */
-        if (dst->mem_ledger && dst->ncols > 0) {
-            uint64_t delta = (uint64_t)(new_cap - dst->capacity) * dst->ncols
-                * sizeof(int64_t);
-            wl_mem_ledger_alloc(dst->mem_ledger, WL_MEM_SUBSYS_RELATION, delta);
+            }
         }
         dst->capacity = new_cap;
+        col_rel_ledger_reconcile(dst, ledger_before);
     }
 
     /* Bulk copy all rows per-column */
@@ -618,8 +687,10 @@ col_rel_compact(col_rel_t *r)
 {
     if (!r || r->ncols == 0)
         return;
+    uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
 
     if (r->nrows == 0) {
+        col_rel_ledger_release(r);
         if (!r->arena_owned) {
             if (r->col_shared && r->columns) {
                 /* COW: free only non-shared columns (Issue #396) */
@@ -663,7 +734,7 @@ col_rel_compact(col_rel_t *r)
 
         /* COW: unshare shared columns before in-place realloc (Issue #396) */
         if (r->col_shared) {
-            if (col_rel_cow_unshare(r, tight) != 0)
+            if (col_rel_cow_unshare(r, 0) != 0)
                 goto free_merge_buf; /* non-fatal on failure */
         }
 
@@ -679,10 +750,14 @@ col_rel_compact(col_rel_t *r)
             r->columns = new_cols;
             r->arena_owned = false;
         } else {
-            if (col_columns_realloc(r->columns, r->ncols, tight) != 0)
+            if (col_columns_realloc_atomic(r->columns, r->ncols, r->capacity,
+                tight) != 0) {
+                col_rel_ledger_reconcile(r, ledger_before);
                 goto free_merge_buf;
+            }
         }
         r->capacity = tight;
+        col_rel_ledger_reconcile(r, ledger_before);
 
         /* Shrink timestamps to match new capacity (non-fatal on failure). */
         if (r->timestamps) {
@@ -725,6 +800,7 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
     if (dst->ncols != src->ncols)
         return EINVAL;
+    uint64_t ledger_before = col_rel_owned_ledger_bytes(dst);
 
     /* Allocate (or reuse) the col_shared flags array before touching columns */
     if (!dst->col_shared) {
@@ -762,6 +838,7 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
     dst->capacity = src->capacity;
     dst->sorted_nrows = src->sorted_nrows;
     dst->base_nrows = src->base_nrows;
+    col_rel_ledger_reconcile(dst, ledger_before);
 
     return 0;
 }
@@ -2200,8 +2277,10 @@ col_rel_radix_sort_int64(col_rel_t *r)
     /* COW: unshare shared columns before in-place sort (Issue #396).
      * If unshare fails, skip the sort to avoid mutating borrowed buffers. */
     if (r->col_shared) {
+        uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
         if (col_rel_cow_unshare(r, 0) != 0)
             return;
+        col_rel_ledger_reconcile(r, ledger_before);
     }
 
     col_rel_radix_sort(r, 0, r->nrows);

@@ -127,9 +127,7 @@ col_join_attach_ledger(wl_col_session_t *sess, col_rel_t *rel)
     if (!sess || !rel || rel->mem_ledger)
         return;
     rel->mem_ledger = &sess->mem_ledger;
-    if (rel->capacity > 0 && rel->ncols > 0)
-        wl_mem_ledger_alloc(rel->mem_ledger, WL_MEM_SUBSYS_RELATION,
-            (uint64_t)rel->capacity * rel->ncols * sizeof(int64_t));
+    col_rel_ledger_reconcile(rel, 0);
 }
 
 static bool
@@ -187,6 +185,7 @@ col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
         return EINVAL;
     if (nrows <= rel->capacity)
         return 0;
+    uint64_t ledger_before = col_rel_owned_ledger_bytes(rel);
     uint32_t old_cap = rel->capacity;
     if (rel->arena_owned) {
         int64_t **new_cols = col_columns_alloc(rel->ncols, nrows);
@@ -199,7 +198,8 @@ col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
         rel->columns = new_cols;
         rel->arena_owned = false;
     } else if (rel->columns) {
-        if (col_columns_realloc(rel->columns, rel->ncols, nrows) != 0)
+        if (col_columns_realloc_atomic(rel->columns, rel->ncols, old_cap,
+            nrows) != 0)
             return ENOMEM;
     } else {
         rel->columns = col_columns_alloc(rel->ncols, nrows);
@@ -207,9 +207,7 @@ col_join_reserve_exact(col_rel_t *rel, uint32_t nrows)
             return ENOMEM;
     }
     rel->capacity = nrows;
-    if (rel->mem_ledger && rel->ncols > 0)
-        wl_mem_ledger_alloc(rel->mem_ledger, WL_MEM_SUBSYS_RELATION,
-            (uint64_t)(nrows - old_cap) * rel->ncols * sizeof(int64_t));
+    col_rel_ledger_reconcile(rel, ledger_before);
     return 0;
 }
 

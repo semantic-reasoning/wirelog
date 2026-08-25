@@ -178,6 +178,37 @@ col_columns_realloc(int64_t **cols, uint32_t ncols, uint32_t new_cap)
     return 0;
 }
 
+/** Resize all columns transactionally. Returns 0 on success, ENOMEM on failure. */
+static inline int
+col_columns_realloc_atomic(int64_t **cols, uint32_t ncols, uint32_t old_cap,
+    uint32_t new_cap)
+{
+    int64_t **replacement = (int64_t **)calloc(ncols, sizeof(int64_t *));
+    if (!replacement)
+        return ENOMEM;
+    for (uint32_t c = 0; c < ncols; c++) {
+        replacement[c] = (int64_t *)malloc((size_t)new_cap
+                * sizeof(int64_t));
+        if (!replacement[c]) {
+            for (uint32_t i = 0; i < c; i++)
+                free(replacement[i]);
+            free(replacement);
+            return ENOMEM;
+        }
+        if (cols[c]) {
+            uint32_t copy_cap = old_cap < new_cap ? old_cap : new_cap;
+            memcpy(replacement[c], cols[c],
+                (size_t)copy_cap * sizeof(int64_t));
+        }
+    }
+    for (uint32_t c = 0; c < ncols; c++) {
+        free(cols[c]);
+        cols[c] = replacement[c];
+    }
+    free(replacement);
+    return 0;
+}
+
 /** Copy one row from a col_rel_t into a column-major destination buffer. */
 static inline void
 col_columns_copy_row(int64_t **dst_cols, uint32_t dst_row,
@@ -1255,6 +1286,12 @@ typedef struct {
 
 void
 col_rel_free_contents(col_rel_t *r);
+uint64_t
+col_rel_owned_ledger_bytes(const col_rel_t *r);
+void
+col_rel_ledger_reconcile(col_rel_t *r, uint64_t before_bytes);
+void
+col_rel_ledger_release(col_rel_t *r);
 void
 col_rel_destroy(col_rel_t *r);
 int

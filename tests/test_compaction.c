@@ -14,6 +14,8 @@
 
 #include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/delta_pool.h"
+#include "../wirelog/arena/arena.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -33,6 +35,20 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+static uint64_t
+relation_ledger_bytes(const wl_mem_ledger_t *ledger)
+{
+    return (uint64_t)atomic_load_explicit(
+        &ledger->subsys_bytes[WL_MEM_SUBSYS_RELATION], memory_order_relaxed);
+}
+
+static uint64_t
+ledger_current_bytes(const wl_mem_ledger_t *ledger)
+{
+    return (uint64_t)atomic_load_explicit(&ledger->current_bytes,
+               memory_order_relaxed);
+}
 
 #define TEST(name)                            \
         do {                                      \
@@ -541,6 +557,127 @@ test_compact_insert_retract_cycle(void)
     return ok ? 0 : 1;
 }
 
+/* Issue #1103: the relation ledger follows currently owned heap buffers. */
+static int
+test_relation_ledger_lifecycle(void)
+{
+    TEST("relation ledger lifecycle and ownership transitions");
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_init(&ledger, 0);
+
+    col_rel_t *rel = col_rel_new_auto("ledger", 2);
+    if (!rel) {
+        FAIL("heap relation allocation failed");
+        return 1;
+    }
+    rel->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(rel, 0);
+    if (relation_ledger_bytes(&ledger) != 64u * 2u * sizeof(int64_t)
+        || ledger_current_bytes(&ledger) != relation_ledger_bytes(&ledger)) {
+        FAIL("initial heap relation charge is incorrect");
+        col_rel_destroy(rel);
+        return 1;
+    }
+
+    int64_t row[2] = {1, 2};
+    for (uint32_t i = 0; i < 65; i++) {
+        if (col_rel_append_row(rel, row) != 0) {
+            FAIL("heap relation growth failed");
+            col_rel_destroy(rel);
+            return 1;
+        }
+    }
+    if (relation_ledger_bytes(&ledger) != 128u * 2u * sizeof(int64_t)
+        || ledger_current_bytes(&ledger) != relation_ledger_bytes(&ledger)) {
+        FAIL("growth did not reconcile the full owned capacity");
+        col_rel_destroy(rel);
+        return 1;
+    }
+    rel->nrows = 1;
+    col_rel_compact(rel);
+    if (relation_ledger_bytes(&ledger) != 64u * 2u * sizeof(int64_t)) {
+        FAIL("compaction shrink did not release bytes");
+        col_rel_destroy(rel);
+        return 1;
+    }
+    rel->nrows = 0;
+    col_rel_compact(rel);
+    if (relation_ledger_bytes(&ledger) != 0
+        || ledger_current_bytes(&ledger) != 0) {
+        FAIL("empty compaction did not release relation bytes");
+        col_rel_destroy(rel);
+        return 1;
+    }
+    col_rel_destroy(rel);
+
+    col_rel_t *src = col_rel_new_auto("source", 1);
+    col_rel_t *view = col_rel_new_auto("view", 1);
+    if (!src || !view) {
+        FAIL("shared-view relation allocation failed");
+        col_rel_destroy(src);
+        col_rel_destroy(view);
+        return 1;
+    }
+    src->mem_ledger = &ledger;
+    view->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(src, 0);
+    col_rel_ledger_reconcile(view, 0);
+    uint64_t source_charge = 64u * sizeof(int64_t);
+    if (relation_ledger_bytes(&ledger) != source_charge * 2u
+        || col_rel_install_shared_view(view, src) != 0
+        || relation_ledger_bytes(&ledger) != source_charge) {
+        FAIL("shared-view installation did not transfer accounting");
+        col_rel_destroy(src);
+        col_rel_destroy(view);
+        return 1;
+    }
+    col_rel_destroy(view);
+    if (relation_ledger_bytes(&ledger) != source_charge) {
+        FAIL("shared-view destruction changed source accounting");
+        col_rel_destroy(src);
+        return 1;
+    }
+    col_rel_destroy(src);
+    if (relation_ledger_bytes(&ledger) != 0) {
+        FAIL("source destruction did not release its charge");
+        return 1;
+    }
+
+    delta_pool_t *pool = delta_pool_create(2, sizeof(col_rel_t), 64 * 1024);
+    wl_arena_t *arena = wl_arena_create(64 * 1024);
+    col_rel_t *arena_rel = pool && arena
+        ? col_rel_pool_new_auto(pool, arena, "arena", 1) : NULL;
+    if (!arena_rel || !arena_rel->arena_owned) {
+        FAIL("arena relation allocation failed");
+        if (arena_rel)
+            col_rel_destroy(arena_rel);
+        delta_pool_destroy(pool);
+        wl_arena_free(arena);
+        return 1;
+    }
+    arena_rel->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(arena_rel, 0);
+    arena_rel->nrows = arena_rel->capacity;
+    if (relation_ledger_bytes(&ledger) != 0
+        || col_rel_append_row(arena_rel, row) != 0
+        || relation_ledger_bytes(&ledger) != 128u * sizeof(int64_t)) {
+        FAIL("arena-to-heap migration accounting is incorrect");
+        col_rel_destroy(arena_rel);
+        delta_pool_destroy(pool);
+        wl_arena_free(arena);
+        return 1;
+    }
+    col_rel_destroy(arena_rel);
+    delta_pool_destroy(pool);
+    wl_arena_free(arena);
+    if (relation_ledger_bytes(&ledger) != 0) {
+        FAIL("arena relation destruction leaked ledger bytes");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -556,6 +693,7 @@ main(void)
     test_compact_merge_buf_freed();
     test_compact_empty_relation();
     test_compact_insert_retract_cycle();
+    test_relation_ledger_lifecycle();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);
