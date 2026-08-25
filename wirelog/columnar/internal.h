@@ -1817,6 +1817,9 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
 int
 wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
+int
+wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
+    size_t element_size, size_t *out);
 
 /* ======================================================================== */
 /* Relation Partitioning (columnar/partition.c)                             */

@@ -45,6 +45,25 @@ wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out)
     return 0;
 }
 
+int
+wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
+    size_t element_size, size_t *out)
+{
+    if (!out || element_size == 0)
+        return EINVAL;
+    if (W == 0 || nrels == 0) {
+        *out = 0;
+        return 0;
+    }
+    if ((size_t)nrels > SIZE_MAX / (size_t)W)
+        return EOVERFLOW;
+    size_t count = (size_t)W * nrels;
+    if (count > UINT32_MAX || count > SIZE_MAX / element_size)
+        return EOVERFLOW;
+    *out = count;
+    return 0;
+}
+
 /* Relation-plan dispatch is implemented in columnar/eval_plan.c. */
 /* Serial stratum evaluation is implemented in columnar/eval_serial.c. */
 
@@ -3168,7 +3187,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             col_rel_t *widb = session_find_rel(
                 &coord->tdd_workers[w], rel_name);
             if (widb)
-                widb->nrows = snap[w * nrels + ri];
+                widb->nrows = snap[(size_t)w * nrels + ri];
         }
         coord->tdd_exchange_coordinator_ns += now_ns() - prepare_t0;
 
@@ -3230,7 +3249,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             /* Step 6: Update snap after hash-exchange */
             col_rel_t *widb = session_find_rel(
                 &coord->tdd_workers[w], rel_name);
-            snap[w * nrels + ri] = widb ? widb->nrows : 0;
+            snap[(size_t)w * nrels + ri] = widb ? widb->nrows : 0;
             col_rel_destroy(parts[w]);
         }
         free((void *)parts);
@@ -3958,8 +3977,13 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
      * Used to truncate worker IDB back to clean partition state after each
      * sub-pass (removes cross-partition pollution from join output). */
     if (bdx_mode) {
-        bdx_snap = (uint32_t *)calloc(
-            (size_t)W * nrels, sizeof(uint32_t));
+        size_t bdx_count = 0;
+        if (wl_columnar_eval_tdd_matrix_size(W, nrels,
+            sizeof(uint32_t), &bdx_count) != 0) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+        bdx_snap = (uint32_t *)calloc(bdx_count, sizeof(uint32_t));
         if (!bdx_snap) {
             rc = ENOMEM;
             goto done;
@@ -3969,7 +3993,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 col_rel_t *widb = session_find_rel(
                     &coord->tdd_workers[w], sp->relations[ri].name);
-                bdx_snap[w * nrels + ri] = widb ? widb->nrows : 0;
+                bdx_snap[(size_t)w * nrels + ri] = widb ? widb->nrows : 0;
             }
         }
         /* Initialize coordinator IDB from worker partitions for dedup.
@@ -4171,10 +4195,24 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
              * ctx and queue; shadow assert verifies agreement (debug only). */
             if (coord->delta_queue) {
                 uint64_t queue_t0 = now_ns();
-                uint32_t max_msgs = W * nrels;
+                size_t matrix_count = 0;
+                if (wl_columnar_eval_tdd_matrix_size(W, nrels,
+                    sizeof(wl_delta_msg_t), &matrix_count) != 0) {
+                    wl_columnar_eval_tdd_queue_discard_delta_queue(
+                        coord->delta_queue, W, nrels);
+                    rc = EOVERFLOW;
+                    goto done;
+                }
+                uint32_t max_msgs = (uint32_t)matrix_count;
                 wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(
                     max_msgs > 0 ? max_msgs : 1u, sizeof(wl_delta_msg_t));
-                if (msgs) {
+                if (!msgs) {
+                    wl_columnar_eval_tdd_queue_discard_delta_queue(
+                        coord->delta_queue, W, nrels);
+                    rc = ENOMEM;
+                    goto done;
+                }
+                {
                     uint32_t msg_count = wl_mpsc_dequeue_all(
                         coord->delta_queue, msgs, max_msgs);
 

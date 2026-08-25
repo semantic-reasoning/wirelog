@@ -309,7 +309,7 @@ once and the surrounding overhead dominates.
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `kfusion.c:663` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:305`, which resets the TDD counter before `thread_create()` |
+| `kfusion.c:663` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:324`, which resets the TDD counter before `thread_create()` |
 
 The `stop` flag's `memory_order_relaxed` store is deliberate:
 cancellation is **cooperative**, not preemptive. A worker may observe
@@ -321,7 +321,7 @@ and the wasted work is bounded.
 
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `eval.c:305` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
+| `eval.c:324` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
 
 ### 5.7 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
 

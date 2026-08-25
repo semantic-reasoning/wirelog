@@ -37,17 +37,17 @@ wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
 {
     if (!queue)
         return;
-    uint32_t max_msgs = W * nrels;
-    if (max_msgs == 0)
-        max_msgs = 1;
-    wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(max_msgs,
-            sizeof(wl_delta_msg_t));
-    if (!msgs)
-        return;
-    uint32_t msg_count = wl_mpsc_dequeue_all(queue, msgs, max_msgs);
-    for (uint32_t i = 0; i < msg_count; i++)
-        col_rel_destroy((col_rel_t *)msgs[i].delta);
-    free(msgs);
+    (void)W;
+    (void)nrels;
+    wl_delta_msg_t msgs[256];
+    for (;;) {
+        uint32_t msg_count = wl_mpsc_dequeue_all(queue, msgs,
+                (uint32_t)(sizeof(msgs) / sizeof(msgs[0])));
+        for (uint32_t i = 0; i < msg_count; i++)
+            col_rel_destroy((col_rel_t *)msgs[i].delta);
+        if (msg_count < sizeof(msgs) / sizeof(msgs[0]))
+            break;
+    }
 }
 
 int
