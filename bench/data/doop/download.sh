@@ -1,11 +1,13 @@
 #!/bin/bash
 # Download DOOP (zxing) benchmark dataset
 # Source: FlowLog VLDB 2026 artifact (mirrored on HuggingFace).
+# The dataset revision is immutable; keep it aligned with the archive and
+# extracted-file manifests recorded in scripts/release/downstream-matrix-oracles.tsv.
 # The original host (pages.cs.wisc.edu/~m0riarty) is no longer available.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-URL="${DOOP_ZXING_URL:-https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/resolve/main/dataset/csv/zxing.zip}"
+URL="${DOOP_ZXING_URL:-https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/resolve/da9e91b3ff75d94604f57ba2b21ef3aa97e241ec/dataset/csv/zxing.zip}"
 EXPECTED_SHA256="${DOOP_ZXING_SHA256:-154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7}"
 TMPZIP="/tmp/zxing_doop_$$.zip"
 TMPDIR="/tmp/zxing_doop_$$"

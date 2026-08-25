@@ -30,6 +30,14 @@ zxing archive and `bench/data/doop/download.sh` rejects any archive other than
 SHA256
 `154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`.
 
+The DOOP archive URL is pinned to Hugging Face dataset revision
+`da9e91b3ff75d94604f57ba2b21ef3aa97e241ec`. Its `zxing.zip` blob is 72,025,076
+bytes with ETag/SHA256
+`154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`; the
+extracted `.facts` manifest is recorded in the oracle file. The download
+script still permits an explicit `DOOP_ZXING_URL` override for controlled
+fixtures, but the default is immutable.
+
 The pinned W=1 oracle is:
 
 The correctness matrix uses one serial run per workload (`workers=1`,
