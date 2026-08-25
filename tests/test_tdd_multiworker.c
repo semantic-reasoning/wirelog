@@ -595,6 +595,60 @@ test_delta_queue_capacity_boundaries(void)
     PASS();
 }
 
+static void
+test_tdd_matrix_size_boundaries(void)
+{
+    TEST("TDD W*nrels matrix sizing rejects wrapped counts");
+
+    size_t count = 0;
+    if (wl_columnar_eval_tdd_matrix_size(0, 0, sizeof(uint32_t), &count)
+        != 0
+        || count != 0
+        || wl_columnar_eval_tdd_matrix_size(1, 1, sizeof(uint32_t), &count)
+        != 0
+        || count != 1
+        || wl_columnar_eval_tdd_matrix_size(2, UINT32_MAX / 2u,
+        1, &count) != 0
+        || count != UINT32_MAX - 1u
+        || wl_columnar_eval_tdd_matrix_size(2, UINT32_MAX / 2u + 1u,
+        1, &count) != EOVERFLOW
+        || wl_columnar_eval_tdd_matrix_size(UINT32_MAX, 2,
+        sizeof(uint32_t), &count) != EOVERFLOW) {
+        FAIL("unexpected TDD matrix-size boundary result");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_tdd_queue_discard_large_dimensions(void)
+{
+    TEST("TDD queue discard drains without W*nrels allocation");
+
+    wl_mpsc_queue_t *queue = wl_mpsc_queue_create(2, 4);
+    col_rel_t *first = col_rel_new_auto("$discard$first", 1);
+    col_rel_t *second = col_rel_new_auto("$discard$second", 1);
+    if (!queue || !first || !second
+        || wl_mpsc_enqueue(queue, 0, first, 0, 0) != 0
+        || wl_mpsc_enqueue(queue, 1, second, 0, 1) != 0) {
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+        wl_mpsc_queue_destroy(queue);
+        FAIL("could not prepare discard queue");
+        return;
+    }
+
+    wl_columnar_eval_tdd_queue_discard_delta_queue(queue, UINT32_MAX, 2);
+    wl_delta_msg_t msg;
+    if (wl_mpsc_dequeue(queue, &msg) != 0) {
+        wl_mpsc_queue_destroy(queue);
+        FAIL("discard left queued payloads");
+        return;
+    }
+    wl_mpsc_queue_destroy(queue);
+    PASS();
+}
+
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
@@ -627,6 +681,8 @@ main(void)
     test_reconstruct_sparse();
     test_reconstruct_duplicate();
     test_delta_queue_capacity_boundaries();
+    test_tdd_matrix_size_boundaries();
+    test_tdd_queue_discard_large_dimensions();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
