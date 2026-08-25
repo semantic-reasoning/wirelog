@@ -46,6 +46,7 @@ test "$actual" = "$expected"
 grep -Fq '154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7' "$oracle"
 grep -Fq 'MATRIX_REPEAT=1' "$runner"
 grep -Fq -- '--repeat "$MATRIX_REPEAT"' "$runner"
+grep -Fq 'flowlog_benchmark/resolve/da9e91b3ff75d94604f57ba2b21ef3aa97e241ec/' "$download"
 
 negative_fixture=$(mktemp)
 negative_log=$(mktemp)
