@@ -2211,16 +2211,22 @@ clone_exchange_opaque(const wl_plan_op_t *src, wl_plan_op_t *dst)
         dm->edb_key_col_count = sm->edb_key_col_count;
         dm->edb_key_col_idxs
             = (uint32_t *)malloc(sm->edb_key_col_count * sizeof(uint32_t));
-        if (dm->edb_key_col_idxs) {
-            memcpy(dm->edb_key_col_idxs, sm->edb_key_col_idxs,
-                sm->edb_key_col_count * sizeof(uint32_t));
-        } else {
-            dm->edb_key_col_count = 0; /* non-fatal: replicate fallback */
+        if (!dm->edb_key_col_idxs) {
+            free(dm->key_col_idxs);
+            free(dm);
+            return -1;
         }
+        memcpy(dm->edb_key_col_idxs, sm->edb_key_col_idxs,
+            sm->edb_key_col_count * sizeof(uint32_t));
     }
     if (sm->edb_rel_name) {
         dm->edb_rel_name = strdup_safe(sm->edb_rel_name);
-        /* non-fatal: replicate fallback if strdup fails */
+        if (!dm->edb_rel_name) {
+            free(dm->edb_key_col_idxs);
+            free(dm->key_col_idxs);
+            free(dm);
+            return -1;
+        }
     }
     dst->opaque_data = dm;
     return 0;
@@ -2255,24 +2261,24 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
     if (src->relation_name) {
         dst->relation_name = dup_str(src->relation_name);
         if (!dst->relation_name)
-            return -1;
+            goto fail;
     }
     if (src->right_relation) {
         dst->right_relation = dup_str(src->right_relation);
         if (!dst->right_relation)
-            return -1;
+            goto fail;
     }
     if (src->left_keys && src->key_count > 0) {
         char **lk = (char **)malloc(src->key_count * sizeof(char *));
         if (!lk)
-            return -1;
+            goto fail;
         for (uint32_t i = 0; i < src->key_count; i++) {
             lk[i] = dup_str(src->left_keys[i]);
             if (!lk[i]) {
                 for (uint32_t j = 0; j < i; j++)
                     free(lk[j]);
                 free((void *)lk);
-                return -1;
+                goto fail;
             }
         }
         dst->left_keys = (const char *const *)lk;
@@ -2280,14 +2286,14 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
     if (src->right_keys && src->key_count > 0) {
         char **rk = (char **)malloc(src->key_count * sizeof(char *));
         if (!rk)
-            return -1;
+            goto fail;
         for (uint32_t i = 0; i < src->key_count; i++) {
             rk[i] = dup_str(src->right_keys[i]);
             if (!rk[i]) {
                 for (uint32_t j = 0; j < i; j++)
                     free(rk[j]);
                 free((void *)rk);
-                return -1;
+                goto fail;
             }
         }
         dst->right_keys = (const char *const *)rk;
@@ -2296,11 +2302,16 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
         = dup_indices(src->project_indices, src->project_count);
     dst->group_by_indices
         = dup_indices(src->group_by_indices, src->group_by_count);
+    if ((src->project_indices && src->project_count > 0
+        && !dst->project_indices)
+        || (src->group_by_indices && src->group_by_count > 0
+        && !dst->group_by_indices))
+        goto fail;
 
     if (src->filter_expr.data && src->filter_expr.size > 0) {
         dst->filter_expr.data = (uint8_t *)malloc(src->filter_expr.size);
         if (!dst->filter_expr.data)
-            return -1;
+            goto fail;
         memcpy(dst->filter_expr.data, src->filter_expr.data,
             src->filter_expr.size);
         dst->filter_expr.size = src->filter_expr.size;
@@ -2310,7 +2321,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
         dst->right_filter_expr.data
             = (uint8_t *)malloc(src->right_filter_expr.size);
         if (!dst->right_filter_expr.data)
-            return -1;
+            goto fail;
         memcpy(dst->right_filter_expr.data, src->right_filter_expr.data,
             src->right_filter_expr.size);
         dst->right_filter_expr.size = src->right_filter_expr.size;
@@ -2319,7 +2330,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
     if (src->agg_expr.data && src->agg_expr.size > 0) {
         dst->agg_expr.data = (uint8_t *)malloc(src->agg_expr.size);
         if (!dst->agg_expr.data)
-            return -1;
+            goto fail;
         memcpy(dst->agg_expr.data, src->agg_expr.data, src->agg_expr.size);
         dst->agg_expr.size = src->agg_expr.size;
     }
@@ -2328,24 +2339,31 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
         dst->map_exprs = (wl_plan_expr_buffer_t *)calloc(
             src->map_expr_count, sizeof(wl_plan_expr_buffer_t));
         if (!dst->map_exprs)
-            return -1;
+            goto fail;
         for (uint32_t i = 0; i < src->map_expr_count; i++) {
             if (src->map_exprs[i].data && src->map_exprs[i].size > 0) {
                 dst->map_exprs[i].data
                     = (uint8_t *)malloc(src->map_exprs[i].size);
                 if (!dst->map_exprs[i].data)
-                    return -1;
+                    goto fail;
                 memcpy(dst->map_exprs[i].data, src->map_exprs[i].data,
                     src->map_exprs[i].size);
                 dst->map_exprs[i].size = src->map_exprs[i].size;
             }
         }
     }
-    if (src->op == WL_PLAN_OP_LFTJ)
-        return clone_lftj_opaque(src, dst);
-    if (src->op == WL_PLAN_OP_EXCHANGE)
-        return clone_exchange_opaque(src, dst);
+    if (src->op == WL_PLAN_OP_LFTJ
+        && clone_lftj_opaque(src, dst) != 0)
+        goto fail;
+    if (src->op == WL_PLAN_OP_EXCHANGE
+        && clone_exchange_opaque(src, dst) != 0)
+        goto fail;
     return 0;
+
+fail:
+    free_op(dst);
+    memset(dst, 0, sizeof(*dst));
+    return -1;
 }
 
 /* Only the non-K-Fusion build calls this: the multi-way expansion site
@@ -3249,14 +3267,11 @@ rewrite_lftj_chains(wl_plan_t *plan)
                         ok = false;
                         break;
                     }
-                    /* Issue #1032: the only externally observable evidence
-                     * that an LFTJ was produced.  build_lftj_op() frees the
-                     * chain's operators and keeps only rel_names[], so any
-                     * consumer that does not descend into it sees a rule that
-                     * reads nothing -- and without this line "the rewrite fired
-                     * and the consumer coped" is indistinguishable from "the
-                     * rewrite never fired", which is what made the blindness
-                     * untestable.  TRACE, so release builds strip it. */
+                    /* Issue #1032: build_lftj_op() owns the replacement
+                     * metadata; rewrite_lftj_chains() frees the original
+                     * operators only after the complete replacement list is
+                     * ready.  This trace is the externally observable
+                     * evidence that the rewrite fired. */
                     WL_LOG(WL_LOG_SEC_ARRANGEMENT, WL_LOG_TRACE,
                         "lftj rewrite relation=%s chain_at=%u k=%u "
                         "left_key=%s right_key=%s",
