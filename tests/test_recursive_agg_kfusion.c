@@ -139,10 +139,9 @@
  *     under -DENABLE_K_FUSION=0 without aborting.  It answers some of them
  *     differently, which is exactly why a second build is worth having, and
  *     why running these fixtures under ENABLE_K_FUSION=0 is a precondition
- *     for narrowing #1021's rejection.  No job does that today -- though the
- *     tree does already build and run an unfused binary,
- *     k_fusion_memory_nofusion in tests/meson.build, so the pattern to copy
- *     exists.
+ *     for narrowing #1021's rejection.  The matching
+ *     recursive_agg_kfusion_nofusion target now provides that cross-check,
+ *     alongside the existing k_fusion_memory_nofusion pattern.
  *
  *   - a same-stratum consumer that is *accepted*.  There is no longer such a
  *     case to cover: #1021 refuses the shape outright rather than making it
@@ -299,9 +298,12 @@ eval_relation_at(const char *src, const char *relation, uint32_t workers,
         return -1;
     }
 
-    wl_fusion_apply(prog, NULL);
-    wl_jpp_apply(prog, NULL);
-    wl_sip_apply(prog, NULL);
+    if (wl_fusion_apply(prog, NULL) != 0
+        || wl_jpp_apply(prog, NULL) != 0
+        || wl_sip_apply(prog, NULL) != 0) {
+        wirelog_program_free(prog);
+        return -1;
+    }
 
     wl_plan_t *plan = NULL;
     if (wl_plan_from_program(prog, &plan) != 0) {
@@ -327,6 +329,29 @@ eval_relation_at(const char *src, const char *relation, uint32_t workers,
     wl_plan_free(plan);
     wirelog_program_free(prog);
     return result;
+}
+
+/* Return true only when plan generation rejects a valid parsed program. */
+static bool
+plan_generation_rejected(const char *src)
+{
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return false;
+
+    if (wl_fusion_apply(prog, NULL) != 0
+        || wl_jpp_apply(prog, NULL) != 0
+        || wl_sip_apply(prog, NULL) != 0) {
+        wirelog_program_free(prog);
+        return false;
+    }
+
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    return rc != 0;
 }
 
 /* The worker counts test_recursive_agg_conformance.c already pins. */
@@ -890,14 +915,10 @@ test_same_stratum_consumer_rejected(void)
 {
     TEST("a same-stratum consumer of a recursive min(): rejected");
 
-    collect_t c;
-
-    ASSERT(eval_relation_at(REPRO_FUSED, "Label", 1,
-        NO_SYMBOL_COLUMN, &c) != 0,
+    ASSERT(plan_generation_rejected(REPRO_FUSED),
         "the fused spelling of the #1021 repro was accepted");
 
-    ASSERT(eval_relation_at(REPRO_UNFUSED, "Label", 1,
-        NO_SYMBOL_COLUMN, &c) != 0,
+    ASSERT(plan_generation_rejected(REPRO_UNFUSED),
         "the unfused spelling of the #1021 repro was accepted");
     PASS();
 }
