@@ -2000,14 +2000,27 @@ typedef struct {
  *
  * Precondition: ctxs[w].delta_rels[ri] == NULL for all w,ri (freshly reset).
  * Postcondition: ctxs[msg.worker_id].delta_rels[msg.rel_idx] holds the
- *                delta pointer from each message (last write wins on dup).
+ *                last valid, non-aliased delta for each pair.  Distinct
+ *                duplicates are destroyed; repeated pointer aliases are
+ *                retained under one slot owner.  Invalid messages are
+ *                destroyed exactly once unless the same pointer also has a
+ *                valid occurrence, in which case that valid occurrence
+ *                retains the sole ownership token.
  *
- * Pure: no allocations, no side effects, no atomics.  O(count) time, O(1) space.
+ * No allocations or atomics are performed.  The matrix is mutated and
+ * rejected/replaced payloads are destroyed.  The bounded malformed-input
+ * checks use O(count * (num_workers * nrels + count)) time and O(1) space.
  */
 void
 wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
     col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
     uint32_t count, uint32_t num_workers, uint32_t nrels);
+
+void
+wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
+    uint32_t count, uint32_t num_workers, uint32_t nrels,
+    wl_mpsc_payload_destroy_fn destroy_payload);
 
 void
 wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
