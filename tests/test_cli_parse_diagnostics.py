@@ -92,6 +92,36 @@ CASES = [
         'z(1).\n',
         ["__graph_metadata"],
     ),
+    (
+        "recursive count aggregate",
+        '.decl plan_edge(x: int64, y: int64)\n'
+        'plan_edge(1, 2).\n'
+        '.decl plan_count(x: int64, n: int64)\n'
+        'plan_count(1, 1).\n'
+        'plan_count(y, count(n)) :- plan_count(x, n), plan_edge(x, y).\n',
+        ["recursive aggregate", "count", "plan_count"],
+    ),
+    (
+        "recursive sum aggregate",
+        '.decl plan_sum_edge(x: int64, y: int64)\n'
+        'plan_sum_edge(1, 2).\n'
+        '.decl plan_sum(x: int64, n: int64)\n'
+        'plan_sum(1, 1).\n'
+        'plan_sum(y, sum(n)) :- plan_sum(x, n), plan_sum_edge(x, y).\n',
+        ["recursive aggregate", "sum", "plan_sum"],
+    ),
+    (
+        "recursive min aggregate same SCC",
+        '.decl plan_edge(x: int64, y: int64)\n'
+        'plan_edge(1, 2). plan_edge(2, 3).\n'
+        '.decl plan_label(x: int64, l: int64)\n'
+        'plan_label(x, min(x)) :- plan_edge(x, y).\n'
+        'plan_label(y, min(y)) :- plan_edge(x, y).\n'
+        '.decl plan_big(x: int64)\n'
+        'plan_big(x) :- plan_label(x, l), l > 0.\n'
+        'plan_label(x, min(9)) :- plan_big(x).\n',
+        ["same stratum", "plan_label", "plan_big"],
+    ),
 ]
 
 # A syntactically malformed program.  This is the errbuf that

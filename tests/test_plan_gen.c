@@ -892,6 +892,55 @@ test_plan_free_null(void)
     PASS();
 }
 
+static void
+test_plan_generation_diagnostics(void)
+{
+    TEST("plan-generation diagnostics are retained on the public program");
+
+    ASSERT(wirelog_program_get_plan_error(NULL)[0] == '\0',
+        "NULL program must have an empty plan diagnostic");
+
+    const char *src =
+        ".decl plan_edge(x: int64, y: int64)\n"
+        "plan_edge(1, 2).\n"
+        ".decl plan_count(x: int64, n: int64)\n"
+        "plan_count(1, 1).\n"
+        "plan_count(y, count(n)) :- plan_count(x, n), plan_edge(x, y).\n";
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "diagnostic fixture failed to parse");
+
+    wl_plan_t *plan = NULL;
+    ASSERT(wl_plan_from_program(prog, &plan) != 0,
+        "recursive count fixture unexpectedly generated a plan");
+    ASSERT(plan == NULL, "failed plan generation must leave plan NULL");
+    const char *detail = wirelog_program_get_plan_error(prog);
+    ASSERT(detail && strstr(detail, "recursive aggregate") != NULL,
+        "plan diagnostic must identify recursive aggregate rejection");
+    ASSERT(strstr(detail, "plan_count") != NULL,
+        "plan diagnostic must identify the rejected relation");
+
+    ASSERT(wl_plan_from_program(prog, NULL) != 0,
+        "NULL output must be rejected");
+    detail = wirelog_program_get_plan_error(prog);
+    ASSERT(strcmp(detail, "execution plan generation failed") == 0,
+        "NULL output must retain the generic plan diagnostic");
+
+    wirelog_program_free(prog);
+
+    wirelog_program_t *ok = wirelog_parse_string(
+        ".decl plan_ok(x: int64)\nplan_ok(1).\n", &err);
+    ASSERT(ok != NULL, "control fixture failed to parse");
+    wl_plan_t *ok_plan = NULL;
+    ASSERT(wl_plan_from_program(ok, &ok_plan) == 0 && ok_plan != NULL,
+        "valid control unexpectedly failed plan generation");
+    ASSERT(wirelog_program_get_plan_error(ok)[0] == '\0',
+        "successful plan generation must clear its previous diagnostic");
+    wl_plan_free(ok_plan);
+    wirelog_program_free(ok);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * Test: wl_session_load_facts NULL-safe
  * ---------------------------------------------------------------- */
@@ -927,6 +976,7 @@ main(void)
     test_antijoin_with_composite_right_child_rejected();
     test_semijoin_with_composite_right_child_rejected();
     test_side_compound_lowers_in_either_atom_position();
+    test_plan_generation_diagnostics();
     test_plan_free_null();
     test_load_facts_null_safe();
 

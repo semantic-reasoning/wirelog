@@ -445,7 +445,11 @@ wl_run_pipeline(const char *source, uint32_t num_workers, bool delta_mode,
     wl_plan_t *plan = NULL;
     int rc = wl_plan_from_program(prog, &plan);
     if (rc != 0) {
-        fprintf(stderr, "Plan generation failed: rc=%d\n", rc);
+        const char *detail = wirelog_program_get_plan_error(prog);
+        if (detail && detail[0] != '\0')
+            fprintf(stderr, "Plan error: %s\n", detail);
+        else
+            fprintf(stderr, "Plan generation failed: rc=%d\n", rc);
         wirelog_program_free(prog);
         return -1;
     }

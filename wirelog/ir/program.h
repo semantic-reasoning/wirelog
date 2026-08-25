@@ -193,6 +193,9 @@ struct wirelog_program {
      * program on the failure path, since this dies with the struct. */
     char parse_error[512];
 
+    /* Reason from the most recent execution-plan generation attempt. */
+    char plan_error[512];
+
     /* Symbol intern table (string -> int64 mapping) */
     wl_intern_t *intern;
 

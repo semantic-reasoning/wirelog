@@ -23,7 +23,9 @@ struct wirelog_program;
 
 /**
  * wl_plan_from_program:
- * @prog: Parsed, stratified program (must not be NULL).
+ * @prog: Parsed, stratified mutable program (must not be NULL).  The
+ *        generator records its latest bounded diagnostic on the program;
+ *        callers must serialize plan generation and diagnostic access.
  * @out:  (out) Pointer to the newly created execution plan on success.
  *
  * Convert a parsed+stratified wirelog_program_t into a wl_plan_t
@@ -47,7 +49,7 @@ struct wirelog_program;
  *      unrecognized IR node type).
  */
 int
-wl_plan_from_program(const struct wirelog_program *prog, wl_plan_t **out);
+wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out);
 
 /**
  * wl_plan_free:
