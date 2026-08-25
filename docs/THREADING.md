@@ -295,15 +295,15 @@ once and the surrounding overhead dominates.
 | `file:line` | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `join.c:151` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
-| `join.c:355` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
-| `join.c:363` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
-| `join.c:373` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `join.c:378` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
-| `join.c:388` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `join.c:391` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see :378 note) |
-| `join.c:1958` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
-| `join.c:1979` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
-| `join.c:1981` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
+| `join.c:369` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
+| `join.c:377` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
+| `join.c:387` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:392` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
+| `join.c:402` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:405` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see :392 note) |
+| `join.c:2010` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
+| `join.c:2031` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
+| `join.c:2033` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 
 ### 5.5 `wirelog/columnar/kfusion.c` — K-fusion shared counter (1 row)
 
