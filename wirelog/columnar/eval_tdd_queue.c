@@ -19,22 +19,78 @@ tdd_destroy_delta_payload(void *payload)
     col_rel_destroy((col_rel_t *)payload);
 }
 
+static bool
+tdd_matrix_contains_payload(const col_eval_tdd_worker_ctx_t *ctxs,
+    uint32_t num_workers, uint32_t nrels, const void *payload)
+{
+    for (uint32_t w = 0; w < num_workers; w++)
+        for (uint32_t ri = 0; ri < nrels; ri++)
+            if (ctxs[w].delta_rels[ri] == payload)
+                return true;
+    return false;
+}
+
+static void
+tdd_reconstruct_delta_matrix_with_destroyer(
+    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
+    uint32_t count, uint32_t num_workers, uint32_t nrels,
+    wl_mpsc_payload_destroy_fn destroy_payload)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t w = msgs[i].worker_id;
+        uint32_t ri = msgs[i].rel_idx;
+        void *payload = msgs[i].delta;
+
+        if (w >= num_workers || ri >= nrels || !payload)
+            continue;
+
+        /* A pointer can be mentioned by more than one malformed message.
+         * Keep its first matrix owner and reject later aliases. */
+        if (tdd_matrix_contains_payload(ctxs, num_workers, nrels, payload))
+            continue;
+        ctxs[w].delta_rels[ri] = (col_rel_t *)payload;
+    }
+
+    /* Destroy every rejected/replaced payload exactly once.  Deferring this
+     * pass handles invalid-before-valid aliases without dangling a slot. */
+    for (uint32_t i = 0; i < count; i++) {
+        void *payload = msgs[i].delta;
+        if (!payload || tdd_matrix_contains_payload(ctxs, num_workers, nrels,
+            payload))
+            continue;
+        bool seen = false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (msgs[j].delta == payload) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen)
+            destroy_payload(payload);
+    }
+}
+
 void
 wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
     col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
     uint32_t count, uint32_t num_workers, uint32_t nrels)
 {
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t w = msgs[i].worker_id;
-        uint32_t ri = msgs[i].rel_idx;
+    if (!ctxs || (!msgs && count != 0))
+        return;
+    tdd_reconstruct_delta_matrix_with_destroyer(ctxs, msgs, count,
+        num_workers, nrels, tdd_destroy_delta_payload);
+}
 
-        if (w >= num_workers || ri >= nrels) {
-            col_rel_destroy((col_rel_t *)msgs[i].delta);
-            continue;
-        }
-
-        ctxs[w].delta_rels[ri] = (col_rel_t *)msgs[i].delta;
-    }
+void
+wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
+    uint32_t count, uint32_t num_workers, uint32_t nrels,
+    wl_mpsc_payload_destroy_fn destroy_payload)
+{
+    if (!ctxs || (!msgs && count != 0) || !destroy_payload)
+        return;
+    tdd_reconstruct_delta_matrix_with_destroyer(ctxs, msgs, count,
+        num_workers, nrels, destroy_payload);
 }
 
 void

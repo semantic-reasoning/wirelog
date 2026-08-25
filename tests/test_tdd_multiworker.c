@@ -685,7 +685,7 @@ test_reconstruct_sparse(void)
 static int
 test_reconstruct_duplicate(void)
 {
-    TEST("tdd_reconstruct_delta_matrix: duplicate pair, last write wins");
+    TEST("tdd_reconstruct_delta_matrix: duplicate ownership is exact-once");
 
     col_eval_tdd_worker_ctx_t ctxs[1];
     col_rel_t *dr[4];
@@ -693,19 +693,89 @@ test_reconstruct_duplicate(void)
     memset(ctxs, 0, sizeof(ctxs));
     ctxs[0].delta_rels = dr;
 
-    col_rel_t *first = (col_rel_t *)(uintptr_t)0xBEEF1u;
-    col_rel_t *second = (col_rel_t *)(uintptr_t)0xBEEF2u;
+    col_rel_t *first = (col_rel_t *)calloc(1, sizeof(col_rel_t));
+    col_rel_t *second = (col_rel_t *)calloc(1, sizeof(col_rel_t));
     wl_delta_msg_t msgs[2] = {
         {.delta = first,  .worker_id = 0, .rel_idx = 1},
         {.delta = second, .worker_id = 0, .rel_idx = 1},
     };
 
-    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(ctxs, msgs, 2, 1, 4);
+    discard_destroy_count = 0;
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+        ctxs, msgs, 2, 1, 4, count_discard_destroy);
 
-    if (ctxs[0].delta_rels[1] != second) {
-        FAIL("last write did not win for duplicate pair");
+    if (ctxs[0].delta_rels[1] != second || discard_destroy_count != 1) {
+        FAIL("distinct duplicate did not destroy the replaced payload");
         return 1;
     }
+
+    count_discard_destroy(ctxs[0].delta_rels[1]);
+    if (discard_destroy_count != 2) {
+        FAIL("retained duplicate payload was not destroyed once");
+        return 1;
+    }
+
+    col_rel_t *alias = (col_rel_t *)calloc(1, sizeof(col_rel_t));
+    memset(dr, 0, sizeof(dr));
+    wl_delta_msg_t aliases[2] = {
+        {.delta = alias, .worker_id = 0, .rel_idx = 1},
+        {.delta = alias, .worker_id = 0, .rel_idx = 1},
+    };
+    discard_destroy_count = 0;
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+        ctxs, aliases, 2, 1, 4, count_discard_destroy);
+    if (ctxs[0].delta_rels[1] != alias || discard_destroy_count != 0) {
+        FAIL("same-pointer duplicate was mishandled");
+        return 1;
+    }
+    count_discard_destroy(alias);
+
+    col_rel_t *cross_key = (col_rel_t *)calloc(1, sizeof(col_rel_t));
+    memset(dr, 0, sizeof(dr));
+    wl_delta_msg_t cross_key_msgs[2] = {
+        {.delta = cross_key, .worker_id = 0, .rel_idx = 1},
+        {.delta = cross_key, .worker_id = 0, .rel_idx = 2},
+    };
+    discard_destroy_count = 0;
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+        ctxs, cross_key_msgs, 2, 1, 4, count_discard_destroy);
+    if (ctxs[0].delta_rels[1] != cross_key
+        || ctxs[0].delta_rels[2] != NULL || discard_destroy_count != 0) {
+        FAIL("cross-key alias was not retained under one owner");
+        return 1;
+    }
+    count_discard_destroy(cross_key);
+
+    col_rel_t *invalid = (col_rel_t *)calloc(1, sizeof(col_rel_t));
+    memset(dr, 0, sizeof(dr));
+    wl_delta_msg_t invalid_msgs[2] = {
+        {.delta = invalid, .worker_id = 9, .rel_idx = 0},
+        {.delta = invalid, .worker_id = 9, .rel_idx = 0},
+    };
+    discard_destroy_count = 0;
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+        ctxs, invalid_msgs, 2, 1, 4, count_discard_destroy);
+    if (discard_destroy_count != 1 || ctxs[0].delta_rels[1] != NULL) {
+        FAIL("invalid duplicate was not destroyed exactly once");
+        return 1;
+    }
+
+    col_rel_t *invalid_then_valid = (col_rel_t *)calloc(1,
+            sizeof(col_rel_t));
+    memset(dr, 0, sizeof(dr));
+    wl_delta_msg_t invalid_then_valid_msgs[2] = {
+        {.delta = invalid_then_valid, .worker_id = 9, .rel_idx = 0},
+        {.delta = invalid_then_valid, .worker_id = 0, .rel_idx = 3},
+    };
+    discard_destroy_count = 0;
+    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+        ctxs, invalid_then_valid_msgs, 2, 1, 4, count_discard_destroy);
+    if (ctxs[0].delta_rels[3] != invalid_then_valid
+        || discard_destroy_count != 0) {
+        FAIL("invalid-before-valid alias was mishandled");
+        return 1;
+    }
+    count_discard_destroy(invalid_then_valid);
     PASS();
     return 0;
 }
