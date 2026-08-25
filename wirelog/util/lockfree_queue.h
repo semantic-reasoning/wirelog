@@ -54,7 +54,9 @@
  * wl_delta_msg_t:
  *
  * Element type enqueued by a worker and dequeued by the coordinator.
- * The @delta pointer is caller-owned; the queue does not manage its lifetime.
+ * The @delta pointer is transferred to the queue on a successful enqueue.
+ * A queue configured with a payload destructor reclaims messages that remain
+ * queued at destruction; dequeued messages transfer ownership to the caller.
  */
 typedef struct {
     void    *delta;     /* delta relation pointer                  */
@@ -65,6 +67,9 @@ typedef struct {
     uint16_t flags;     /* message status flags                    */
     int16_t rc;         /* return/result code                      */
 } wl_delta_msg_t;
+
+/* Called exactly once for each non-NULL payload still queued at destruction. */
+typedef void (*wl_mpsc_payload_destroy_fn)(void *payload);
 
 /**
  * wl_mpsc_queue_t:
@@ -91,11 +96,30 @@ wl_mpsc_queue_t *
 wl_mpsc_queue_create(uint32_t num_workers, uint32_t capacity);
 
 /**
+ * wl_mpsc_queue_create_with_destructor:
+ * @num_workers: Number of producer threads.  Must be >= 1.
+ * @capacity: Per-worker ring buffer capacity.  Must be >= 2.
+ * @destroy_payload: Optional destructor for non-NULL payloads still queued
+ *                   at destroy.  It receives no context.
+ *
+ * A successful enqueue transfers @delta ownership to the queue.  A failed
+ * enqueue leaves ownership with the caller.  Dequeue operations transfer
+ * ownership to their output buffer/caller.  A NULL destructor preserves the
+ * non-owning behavior of wl_mpsc_queue_create().  The callback is never
+ * called for a failed enqueue or a message already returned by dequeue.
+ */
+wl_mpsc_queue_t *
+wl_mpsc_queue_create_with_destructor(uint32_t num_workers, uint32_t capacity,
+    wl_mpsc_payload_destroy_fn destroy_payload);
+
+/**
  * wl_mpsc_queue_destroy:
  * @q: (transfer full) Queue to destroy.  NULL-safe.
  *
- * Free all resources.  All threads must have stopped using the queue
- * before this is called.
+ * Free all resources.  If the queue was created with a payload destructor,
+ * destroy every still-queued non-NULL @delta exactly once before freeing the
+ * ring storage.  All threads must have stopped using the queue before this
+ * is called.
  */
 void
 wl_mpsc_queue_destroy(wl_mpsc_queue_t *q);

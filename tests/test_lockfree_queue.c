@@ -37,6 +37,14 @@ typedef volatile int atomic_int;
 static int test_count = 0;
 static int pass_count = 0;
 static int fail_count = 0;
+static int payload_destroy_count = 0;
+
+static void
+counted_payload_destroy(void *payload)
+{
+    payload_destroy_count++;
+    free(payload);
+}
 
 #define TEST(name)                                         \
         do {                                                   \
@@ -437,6 +445,81 @@ test_concurrent(void)
     PASS();
 }
 
+static void
+test_payload_ownership(void)
+{
+    TEST("payload ownership transfers and queued payloads are reclaimed");
+
+    payload_destroy_count = 0;
+    wl_mpsc_queue_t *q = wl_mpsc_queue_create_with_destructor(
+        1, 4, counted_payload_destroy);
+    ASSERT(q != NULL, "create with destructor failed");
+
+    int *dequeued = (int *)malloc(sizeof(int));
+    int *pending_a = (int *)malloc(sizeof(int));
+    int *pending_b = (int *)malloc(sizeof(int));
+    ASSERT(dequeued && pending_a && pending_b, "payload allocation failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, dequeued, 0, 0) == 0,
+        "enqueue dequeued payload failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, pending_a, 0, 1) == 0,
+        "enqueue pending payload a failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, pending_b, 0, 2) == 0,
+        "enqueue pending payload b failed");
+
+    wl_delta_msg_t msg;
+    ASSERT(wl_mpsc_dequeue(q, &msg) == 1, "dequeue payload failed");
+    ASSERT(msg.delta == dequeued, "dequeued payload mismatch");
+    free(msg.delta); /* ownership transferred to the receiver */
+    ASSERT(payload_destroy_count == 0,
+        "queue destroyed a payload transferred by dequeue");
+
+    wl_mpsc_queue_destroy(q);
+    ASSERT(payload_destroy_count == 2,
+        "queue did not destroy exactly the two pending payloads");
+
+    payload_destroy_count = 0;
+    q = wl_mpsc_queue_create_with_destructor(1, 4, counted_payload_destroy);
+    ASSERT(q != NULL, "create dequeue_all queue failed");
+    int *batch_a = (int *)malloc(sizeof(int));
+    int *batch_b = (int *)malloc(sizeof(int));
+    ASSERT(batch_a && batch_b, "dequeue_all allocation failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, batch_a, 0, 0) == 0,
+        "enqueue dequeue_all payload a failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, batch_b, 0, 1) == 0,
+        "enqueue dequeue_all payload b failed");
+    wl_delta_msg_t batch[2];
+    ASSERT(wl_mpsc_dequeue_all(q, batch, 2) == 2,
+        "dequeue_all did not transfer both payloads");
+    free(batch[0].delta);
+    free(batch[1].delta);
+    wl_mpsc_queue_destroy(q);
+    ASSERT(payload_destroy_count == 0,
+        "queue destroyed payloads transferred by dequeue_all");
+
+    q = wl_mpsc_queue_create_with_destructor(0, 4, counted_payload_destroy);
+    ASSERT(q == NULL, "invalid destructor queue creation succeeded");
+
+    /* A failed enqueue retains ownership with the caller. */
+    payload_destroy_count = 0;
+    q = wl_mpsc_queue_create_with_destructor(1, 2, counted_payload_destroy);
+    ASSERT(q != NULL, "create saturation queue failed");
+    int *full_a = (int *)malloc(sizeof(int));
+    int *full_b = (int *)malloc(sizeof(int));
+    int *caller_owned = (int *)malloc(sizeof(int));
+    ASSERT(full_a && full_b && caller_owned, "saturation allocation failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, full_a, 0, 0) == 0,
+        "enqueue full payload a failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, full_b, 0, 1) == 0,
+        "enqueue full payload b failed");
+    ASSERT(wl_mpsc_enqueue(q, 0, caller_owned, 0, 2) != 0,
+        "full queue accepted third payload");
+    free(caller_owned);
+    wl_mpsc_queue_destroy(q);
+    ASSERT(payload_destroy_count == 2,
+        "failed enqueue payload was destroyed by queue");
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -454,6 +537,7 @@ main(void)
     test_multiple_producers();
     test_saturation();
     test_concurrent();
+    test_payload_ownership();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n",
         pass_count, fail_count, test_count);
