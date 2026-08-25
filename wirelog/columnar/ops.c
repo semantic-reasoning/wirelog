@@ -783,6 +783,8 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             goto cleanup_arrays;
         }
         rc = eval_stack_push(stack, out, true);
+        if (rc != 0)
+            col_rel_destroy(out);
     }
 
 cleanup_arrays:
