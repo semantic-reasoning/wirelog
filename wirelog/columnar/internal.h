@@ -1820,6 +1820,11 @@ wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
 int
 wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
     size_t element_size, size_t *out);
+int
+wl_columnar_eval_checked_size_mul(size_t count, size_t element_size,
+    size_t *out);
+int
+wl_columnar_eval_checked_count_inc(uint32_t count, size_t *out);
 
 /* ======================================================================== */
 /* Relation Partitioning (columnar/partition.c)                             */
