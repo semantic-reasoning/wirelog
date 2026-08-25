@@ -16,9 +16,8 @@
 #     this file against the merge base with the base branch (not its tip,
 #     which would flag a line that main removed while your branch was
 #     open) and rejects additions.
-#   - A genuinely new source file that is not clean on arrival is the one
-#     case that needs a line added here, and it needs an explicit decision
-#     recorded in the PR description.
+#   - A genuinely new source file must be clean before it enters either
+#     register. There is no reviewer override for adding a dirty source.
 #
 # NO DIAGNOSTIC COUNTS.  A count would look like useful precision and is
 # not: the numbers are toolchain-version-dependent and could move here

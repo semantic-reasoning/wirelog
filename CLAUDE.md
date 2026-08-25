@@ -112,6 +112,13 @@ After a toolchain bump, re-derive the lists with:
 scripts/ci/check-clang-tidy-ratchet.py --build-dir build --mode regenerate
 ```
 
+Regeneration is the only mode that accepts an LLVM major not yet listed in
+`scripts/ci/clang-tidy-supported-majors.txt`; after reviewing its output, add
+the major and its config, effective-check, and NOLINT baselines. New dirty
+translation units must be fixed before entering the allowlist/backlog
+register; the backlog is monotonically non-increasing and has no reviewer
+override.
+
 The two configuration-gated sources receive an additional scan using the
 alternate macros used by the bench targets: `ENABLE_K_FUSION=0` for
 `exec_plan_gen.c` and `WL_RADIX_BENCH=1` for `relation.c`. The scans are
