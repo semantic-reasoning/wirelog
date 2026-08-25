@@ -491,6 +491,45 @@ wl_ir_stratify_scc_free(wl_ir_stratify_scc_result_t *result)
 /* Stratification Pipeline                                                  */
 /* ======================================================================== */
 
+void
+wl_ir_stratify_mark_recursive_strata(
+    const wl_ir_stratify_dep_graph_t *graph,
+    const wl_ir_stratify_scc_result_t *scc, wirelog_stratum_t *strata,
+    uint32_t num_strata)
+{
+    if (!graph || !scc || !scc->scc_id || !strata)
+        return;
+
+    uint32_t *scc_size = (uint32_t *)calloc(num_strata, sizeof(uint32_t));
+    if (!scc_size)
+        return;
+
+    for (uint32_t i = 0; i < graph->relation_count; i++) {
+        uint32_t s = scc->scc_id[i];
+        if (s < num_strata)
+            scc_size[s]++;
+    }
+
+    for (uint32_t s = 0; s < num_strata; s++)
+        strata[s].is_recursive = (scc_size[s] > 1);
+
+    for (uint32_t e = 0; e < graph->edge_count; e++) {
+        const wl_ir_stratify_dep_edge_t *edge = &graph->edges[e];
+        if (edge->from >= graph->relation_count
+            || edge->to >= graph->relation_count)
+            continue;
+        if (edge->from == edge->to
+            && (edge->type == WL_IR_STRATIFY_DEP_POSITIVE
+            || edge->type == WL_IR_STRATIFY_DEP_AGGREGATION)) {
+            uint32_t s = scc->scc_id[edge->from];
+            if (s < num_strata)
+                strata[s].is_recursive = true;
+        }
+    }
+
+    free(scc_size);
+}
+
 int
 wl_ir_stratify_program(struct wirelog_program *program)
 {
@@ -674,34 +713,9 @@ wl_ir_stratify_program(struct wirelog_program *program)
     for (uint32_t s = 0; s < num_strata; s++)
         program->strata[s].rule_count = rules_per_stratum[s];
 
-    /* Step 6: Detect recursive strata.
-       A stratum is recursive if its SCC contains >1 node (mutual recursion)
-       or if any edge within the SCC is a self-loop (self-recursion). */
-    {
-        /* Count nodes per SCC */
-        uint32_t *scc_size = (uint32_t *)calloc(num_strata, sizeof(uint32_t));
-        if (scc_size) {
-            for (uint32_t i = 0; i < graph->relation_count; i++)
-                scc_size[scc->scc_id[i]]++;
-
-            for (uint32_t s = 0; s < num_strata; s++)
-                program->strata[s].is_recursive = (scc_size[s] > 1);
-
-            /* Also check self-loops (self-recursion in singleton SCC).
-               Both positive and aggregation edges indicate recursion;
-               e.g. dist(y, min(d+w)) :- dist(x, d), wedge(x, y, w). */
-            for (uint32_t e = 0; e < graph->edge_count; e++) {
-                if (graph->edges[e].from == graph->edges[e].to
-                    && (graph->edges[e].type == WL_IR_STRATIFY_DEP_POSITIVE
-                    || graph->edges[e].type
-                    == WL_IR_STRATIFY_DEP_AGGREGATION)) {
-                    uint32_t s = scc->scc_id[graph->edges[e].from];
-                    program->strata[s].is_recursive = true;
-                }
-            }
-            free(scc_size);
-        }
-    }
+    /* Step 6: Detect recursive strata. */
+    wl_ir_stratify_mark_recursive_strata(graph, scc, program->strata,
+        num_strata);
 
     program->is_stratified = true;
 

@@ -160,6 +160,102 @@ test_scc_out_of_range_from_yields_empty_adjacency(void)
     PASS();
 }
 
+static void
+test_step6_marks_only_valid_self_loops(void)
+{
+    TEST("stratify: Step 6 ignores malformed self-loop endpoints");
+
+    wl_ir_stratify_dep_edge_t edges[] = {
+        { 0, 0, WL_IR_STRATIFY_DEP_POSITIVE },
+        { 1, 1, WL_IR_STRATIFY_DEP_AGGREGATION },
+        { 9, 9, WL_IR_STRATIFY_DEP_POSITIVE },
+        { 0, 9, WL_IR_STRATIFY_DEP_POSITIVE },
+        { 9, 0, WL_IR_STRATIFY_DEP_AGGREGATION },
+    };
+    wl_ir_stratify_dep_graph_t graph = {
+        .relation_count = 2,
+        .edges = edges,
+        .edge_count = sizeof(edges) / sizeof(edges[0]),
+        .edge_capacity = sizeof(edges) / sizeof(edges[0]),
+    };
+    uint32_t scc_ids[] = { 0, 1 };
+    wl_ir_stratify_scc_result_t scc = {
+        .scc_id = scc_ids,
+        .scc_count = 2,
+    };
+    wirelog_stratum_t strata[2] = { 0 };
+
+    wl_ir_stratify_mark_recursive_strata(&graph, &scc, strata, 2);
+
+    if (!strata[0].is_recursive || !strata[1].is_recursive) {
+        FAIL("valid positive and aggregation self-loops were not marked");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_step6_ignores_out_of_range_scc_id(void)
+{
+    TEST("stratify: Step 6 ignores an out-of-range SCC ID");
+
+    wl_ir_stratify_dep_edge_t edges[] = {
+        { 0, 0, WL_IR_STRATIFY_DEP_POSITIVE },
+    };
+    wl_ir_stratify_dep_graph_t graph = {
+        .relation_count = 1,
+        .edges = edges,
+        .edge_count = 1,
+        .edge_capacity = 1,
+    };
+    uint32_t scc_ids[] = { 9 };
+    wl_ir_stratify_scc_result_t scc = {
+        .scc_id = scc_ids,
+        .scc_count = 1,
+    };
+    wirelog_stratum_t strata[2] = { 0 };
+
+    wl_ir_stratify_mark_recursive_strata(&graph, &scc, strata, 2);
+
+    if (strata[0].is_recursive || strata[1].is_recursive) {
+        FAIL("out-of-range SCC ID marked a stratum");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_step6_ignores_out_of_range_edge(void)
+{
+    TEST("stratify: Step 6 ignores an out-of-range self-loop");
+
+    wl_ir_stratify_dep_edge_t edge = {
+        9, 9, WL_IR_STRATIFY_DEP_POSITIVE,
+    };
+    wl_ir_stratify_dep_graph_t graph = {
+        .relation_count = 2,
+        .edges = &edge,
+        .edge_count = 1,
+        .edge_capacity = 1,
+    };
+    /* The extra sentinel makes the pre-fix unchecked read deterministic. */
+    uint32_t scc_ids[10] = { 0, 1 };
+    scc_ids[9] = 1;
+    wl_ir_stratify_scc_result_t scc = {
+        .scc_id = scc_ids,
+        .scc_count = 2,
+    };
+    wirelog_stratum_t strata[2] = { 0 };
+
+    wl_ir_stratify_mark_recursive_strata(&graph, &scc, strata, 2);
+
+    if (strata[0].is_recursive || strata[1].is_recursive) {
+        FAIL("out-of-range edge marked a stratum");
+        return;
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -171,6 +267,9 @@ main(void)
 
     test_scc_out_of_range_to_is_ignored();
     test_scc_out_of_range_from_yields_empty_adjacency();
+    test_step6_marks_only_valid_self_loops();
+    test_step6_ignores_out_of_range_scc_id();
+    test_step6_ignores_out_of_range_edge();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
         tests_passed, tests_failed, tests_run);
