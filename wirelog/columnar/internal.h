@@ -1828,6 +1828,10 @@ wl_columnar_eval_checked_count_inc(uint32_t count, size_t *out);
 int
 wl_columnar_eval_checked_row_add(uint32_t total, uint32_t addend,
     uint32_t *out);
+int
+wl_columnar_eval_checked_hash_capacity(uint32_t nrows, uint32_t *out);
+int
+tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src);
 
 /* ======================================================================== */
 /* Relation Partitioning (columnar/partition.c)                             */
