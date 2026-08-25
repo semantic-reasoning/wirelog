@@ -96,6 +96,29 @@ test_checked_size_mul_boundaries(void)
     return 0;
 }
 
+static int
+test_checked_row_add_boundaries(void)
+{
+    TEST("checked TDD row-count addition boundaries");
+
+    uint32_t out = 123;
+    bool ok = wl_columnar_eval_checked_row_add(0, 0, &out) == 0 && out == 0;
+    ok = ok && wl_columnar_eval_checked_row_add(7, 5, &out) == 0 && out == 12;
+    ok = ok && wl_columnar_eval_checked_row_add(UINT32_MAX - 1u, 1u,
+            &out) == 0 && out == UINT32_MAX;
+    ok = ok && wl_columnar_eval_checked_row_add(UINT32_MAX, 1u,
+            &out) == EOVERFLOW && out == UINT32_MAX;
+    ok = ok && wl_columnar_eval_checked_row_add(UINT32_MAX - 1u, 2u,
+            &out) == EOVERFLOW && out == UINT32_MAX;
+
+    if (!ok) {
+        FAIL("row-count addition boundary mismatch");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 struct count_ctx {
     int64_t count;
 };
@@ -698,6 +721,7 @@ main(void)
     printf("=== test_tdd_multiworker (Issue #404) ===\n");
 
     test_checked_size_mul_boundaries();
+    test_checked_row_add_boundaries();
     test_w1_expected_count();
     test_w1_vs_w4_tuple_count();
     test_w1_vs_w8_tuple_count();

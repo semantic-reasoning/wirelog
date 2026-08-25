@@ -1825,6 +1825,9 @@ wl_columnar_eval_checked_size_mul(size_t count, size_t element_size,
     size_t *out);
 int
 wl_columnar_eval_checked_count_inc(uint32_t count, size_t *out);
+int
+wl_columnar_eval_checked_row_add(uint32_t total, uint32_t addend,
+    uint32_t *out);
 
 /* ======================================================================== */
 /* Relation Partitioning (columnar/partition.c)                             */
