@@ -107,6 +107,7 @@ DIAG_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+):(?P<col>\d+): "
                      r"(?P<severity>warning|error): (?P<message>.*)$")
 CHECK_RE = re.compile(r"\[([A-Za-z0-9_.,-]+)\]\s*$")
 VERSION_RE = re.compile(r"LLVM version (\d+)\.")
+CHECK_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 NOLINT_RE = re.compile(
     r"Suppressed\s+\d+\s+warnings?\s+\((?P<categories>[^)]*)\)\."
 )
@@ -255,7 +256,7 @@ def resolve_clang_tidy() -> str:
     raise SkipGate("clang-tidy not found on PATH")
 
 
-def check_version(exe: str) -> str:
+def check_version(exe: str, require_supported: bool = True) -> str:
     try:
         proc = subprocess.run([exe, "--version"], capture_output=True,
                               text=True, check=False)
@@ -266,7 +267,7 @@ def check_version(exe: str) -> str:
         raise SkipGate(f"cannot parse a version out of `{exe} --version`")
     major = match.group(1)
     allowed = supported_majors()
-    if major not in allowed:
+    if require_supported and major not in allowed:
         raise SkipGate(
             f"clang-tidy major {major} is not in the supported set "
             f"({', '.join(allowed)}); the allowlist was calibrated against "
@@ -274,6 +275,76 @@ def check_version(exe: str) -> str:
             f"Update {rel_to_repo(SUPPORTED_MAJORS)} once the lists have "
             "been re-derived on the new toolchain.")
     return match.group(0).removeprefix("LLVM version ").rstrip(".")
+
+
+def effective_checks_from_output(output: str) -> list[str]:
+    """Parse and canonicalize clang-tidy's ``--list-checks`` output."""
+    lines = output.splitlines()
+    try:
+        marker = next(i for i, line in enumerate(lines)
+                      if line.strip() == "Enabled checks:")
+    except StopIteration as exc:
+        raise GateError("clang-tidy --list-checks did not report enabled "
+                        "checks") from exc
+    names: list[str] = []
+    for line in lines[marker + 1:]:
+        name = line.strip()
+        if not name:
+            continue
+        if not CHECK_NAME_RE.fullmatch(name):
+            raise GateError("clang-tidy --list-checks returned malformed "
+                            f"check name: {name!r}")
+        names.append(name)
+    if not names:
+        raise GateError("clang-tidy --list-checks returned no enabled checks")
+    if len(names) != len(set(names)):
+        raise GateError("clang-tidy --list-checks returned duplicate check "
+                        "names")
+    return sorted(names)
+
+
+def effective_checks(exe: str) -> list[str]:
+    """Return clang-tidy's effective check set, including wildcard expansion."""
+    try:
+        proc = subprocess.run(
+            [exe, f"--config-file={CONFIG_FILE}", "--list-checks"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise GateError(f"cannot run {exe} --list-checks: {exc}") from exc
+    if proc.returncode != 0:
+        raise GateError(f"{exe} --list-checks failed with exit "
+                        f"{proc.returncode}: {proc.stderr.strip()}")
+    return effective_checks_from_output(proc.stdout)
+
+
+def read_check_baseline(version: str) -> list[str]:
+    path = baseline_path(version, "checks")
+    if not path.is_file():
+        raise GateError(f"clang-tidy effective-check baseline missing: {path}")
+    checks = read_list(path)
+    if checks != sorted(checks):
+        raise GateError(f"{path.name} is not sorted")
+    malformed = [name for name in checks if not CHECK_NAME_RE.fullmatch(name)]
+    if malformed:
+        raise GateError(f"{path.name} has malformed check name(s): "
+                        f"{', '.join(malformed)}")
+    return checks
+
+
+def check_effective_checks(exe: str, version: str) -> None:
+    """Fail when wildcard expansion or the configured check set changes."""
+    expected = read_check_baseline(version)
+    actual = effective_checks(exe)
+    missing = sorted(set(expected) - set(actual))
+    added = sorted(set(actual) - set(expected))
+    if missing or added:
+        print("check-clang-tidy-ratchet: FAIL: effective clang-tidy check "
+              "set changed:", file=sys.stderr)
+        for name in missing:
+            print(f"  missing: {name}", file=sys.stderr)
+        for name in added:
+            print(f"  added: {name}", file=sys.stderr)
+        raise GateError("clang-tidy effective-check baseline mismatch")
 
 
 SUPPORTED_ARCHES = ("x86_64", "amd64")
@@ -649,9 +720,8 @@ def mode_ratchet(exe: str, entries: list[dict], version: str) -> int:
             for path in overlap:
                 print(f"    {path}", file=sys.stderr)
         if missing:
-            print("  built but listed in NEITHER file (add a new file to the "
-                  "allowlist if it is clean, to the backlog if it is not):",
-                  file=sys.stderr)
+            print("  built but listed in NEITHER file (fix the source, then "
+                  "add it to the allowlist):", file=sys.stderr)
             for path in missing:
                 print(f"    {path}", file=sys.stderr)
         if unknown:
@@ -839,10 +909,21 @@ def main() -> int:
         if not CONFIG_FILE.is_file():
             raise GateError(f"clang-tidy config missing: {CONFIG_FILE}")
         exe = resolve_clang_tidy()
-        version = check_version(exe)
-        check_config_baseline(exe, version)
+        version = check_version(exe, args.mode != "regenerate")
         entries = select_entries(pathlib.Path(args.build_dir).resolve())
         check_configuration(entries)
+        if args.mode == "regenerate":
+            checks = effective_checks(exe)
+            print(f"check-clang-tidy-ratchet: regenerate mode accepts "
+                  f"unlisted LLVM majors; {len(checks)} effective checks "
+                  f"reported by {exe} (LLVM {version})")
+        else:
+            if version not in supported_majors():
+                raise SkipGate(
+                    f"clang-tidy major {version} is not in the supported set "
+                    f"({', '.join(supported_majors())})")
+            check_config_baseline(exe, version)
+            check_effective_checks(exe, version)
         print(f"check-clang-tidy-ratchet: using {exe} (LLVM {version}), "
               f"{len(entries)} libwirelog.so translation unit(s), "
               f"{job_count()} job(s)")

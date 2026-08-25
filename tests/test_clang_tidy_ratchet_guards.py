@@ -6,6 +6,7 @@ import pathlib
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -17,6 +18,25 @@ SPEC.loader.exec_module(RATCHET)
 
 
 class RatchetGuardTests(unittest.TestCase):
+    def test_effective_checks_are_canonical_and_sorted(self):
+        self.assertEqual(
+            RATCHET.effective_checks_from_output(
+                "Enabled checks:\n  z-check\n  a-check\n"),
+            ["a-check", "z-check"])
+
+    def test_effective_checks_reject_malformed_output(self):
+        with self.assertRaises(RATCHET.GateError):
+            RATCHET.effective_checks_from_output(
+                "Enabled checks:\n  bad name\n")
+
+    @mock.patch.object(RATCHET.subprocess, "run")
+    def test_regenerate_can_probe_an_unlisted_major(self, run):
+        run.return_value = RATCHET.subprocess.CompletedProcess(
+            ["clang-tidy"], 0, "LLVM version 99.0.0\n", "")
+        self.assertEqual(RATCHET.check_version("clang-tidy", False), "99")
+        with self.assertRaises(RATCHET.SkipGate):
+            RATCHET.check_version("clang-tidy", True)
+
     def test_config_values_are_compared_but_user_is_ignored(self):
         baseline = RATCHET.normalized_config_lines(
             "User: one\nHeaderFilterRegex: 'wirelog/.*'\n")

@@ -102,24 +102,20 @@ if [ -z "$merge_base" ]; then
          "deepen the fetch or set WIRELOG_TIDY_BASE_REF to override"
 fi
 
-# The fork point may predate the backlog file itself, in which case git diff
-# reports every line as an addition.  Every line being new is exactly right
-# for the commit that introduces the register and there is nothing to
-# ratchet against, so this is a pass rather than a skip -- it must not turn
-# into a failure under WIRELOG_TIDY_REQUIRED=1 on the introducing PR.
-#
-# This branch is a LOCAL-ONLY weakening: it also returns 0, even under
-# WIRELOG_TIDY_REQUIRED=1, for a branch forked before the register existed
-# that never merges main, and for a WIRELOG_TIDY_BASE_REF pointed at an old
-# tag.  Neither is reachable in CI once #1100 lands -- on a pull_request
-# merge ref the merge base is always the base-branch tip, which has the
-# file, and WIRELOG_TIDY_BASE_REF is origin/$GITHUB_BASE_REF, never a tag.
+# The fork point may predate the backlog file itself.  Permit exactly the
+# introducing change (the file must be added at the tip); an old base ref or
+# a branch that simply omits the register must not bypass the required gate.
 if ! git -C "$repo_root" cat-file -e "$merge_base:$backlog_rel" 2> /dev/null
 then
-    echo "check-clang-tidy-backlog-monotonic: OK ($backlog_rel does not" \
-         "exist at the merge base with $base_ref yet; nothing to compare" \
-         "against)"
-    exit 0
+    if [ -f "$backlog" ] && \
+       ! git -C "$repo_root" diff --quiet --diff-filter=A "$merge_base" \
+           -- "$backlog_rel"; then
+        echo "check-clang-tidy-backlog-monotonic: OK (register introduced" \
+             "on this branch; nothing to compare against)"
+        exit 0
+    fi
+    skip "$backlog_rel is absent at the merge base but was not introduced" \
+         "by this branch"
 fi
 
 # --unified=0 so context lines cannot be mistaken for additions; '+++' is
@@ -138,11 +134,8 @@ if [ -n "$added" ]; then
     echo "" >&2
     printf '  %s\n' $added >&2
     echo "" >&2
-    echo "The backlog may only shrink.  If one of these came from the" >&2
-    echo "allowlist, the file regressed and the fix is to fix the file, not" >&2
-    echo "to demote it.  If it is a genuinely new source that is not clean" >&2
-    echo "on arrival, say so explicitly in the PR description; a reviewer" >&2
-    echo "has to agree to it." >&2
+    echo "The backlog may only shrink. Fix the source before adding it to" >&2
+    echo "the register; new translation units must enter the allowlist clean." >&2
     exit 1
 fi
 
