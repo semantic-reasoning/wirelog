@@ -495,6 +495,9 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     if (src->nrows == 0)
         return 0;
 
+    if (src->nrows > UINT32_MAX - dst->nrows)
+        return EOVERFLOW;
+
     uint32_t dst_base = dst->nrows;
     uint32_t new_nrows = dst->nrows + src->nrows;
 
