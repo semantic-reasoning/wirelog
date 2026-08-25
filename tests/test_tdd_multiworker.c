@@ -127,6 +127,76 @@ test_checked_row_add_boundaries(void)
     return 0;
 }
 
+static int
+test_checked_hash_capacity_boundaries(void)
+{
+    TEST("checked TDD dedup hash capacity boundaries");
+
+    uint32_t capacity = UINT32_C(0xA5A5A5A5);
+    bool ok = wl_columnar_eval_checked_hash_capacity(0, &capacity) == 0
+        && capacity == 4u;
+    ok = ok && wl_columnar_eval_checked_hash_capacity(1, &capacity) == 0
+        && capacity == 4u;
+    ok = ok && wl_columnar_eval_checked_hash_capacity(3, &capacity) == 0
+        && capacity == 8u;
+    if (SIZE_MAX >= UINT64_C(1) << 34) {
+        ok = ok
+            && wl_columnar_eval_checked_hash_capacity(UINT32_C(1) << 30,
+                &capacity) == 0
+            && capacity == (UINT32_C(1) << 31);
+    }
+    ok = ok
+        && wl_columnar_eval_checked_hash_capacity((UINT32_C(1) << 30) + 1u,
+            &capacity) == EOVERFLOW
+        && capacity == (SIZE_MAX >= UINT64_C(1) << 34
+            ? (UINT32_C(1) << 31) : UINT32_C(0xA5A5A5A5));
+    ok = ok
+        && wl_columnar_eval_checked_hash_capacity(UINT32_MAX / 2u,
+            &capacity) == EOVERFLOW
+        && capacity == (SIZE_MAX >= UINT64_C(1) << 34
+            ? (UINT32_C(1) << 31) : UINT32_C(0xA5A5A5A5));
+    ok = ok
+        && wl_columnar_eval_checked_hash_capacity(UINT32_MAX, &capacity)
+        == EOVERFLOW
+        && capacity == (SIZE_MAX >= UINT64_C(1) << 34
+            ? (UINT32_C(1) << 31) : UINT32_C(0xA5A5A5A5));
+    if (!ok) {
+        FAIL("hash capacity boundary mismatch");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_sorted_merge_row_overflow(void)
+{
+    TEST("TDD sorted merge rejects row-count overflow");
+
+    col_rel_t *dst = col_rel_new_auto("merge-overflow-dst", 1);
+    col_rel_t *src = col_rel_new_auto("merge-overflow-src", 1);
+    bool ok = dst != NULL && src != NULL;
+    if (ok) {
+        dst->nrows = UINT32_MAX;
+        dst->capacity = UINT32_MAX;
+        src->nrows = 1;
+        uint32_t old_rows = dst->nrows;
+        uint32_t old_capacity = dst->capacity;
+        ok = tdd_sorted_merge_append(dst, src) == EOVERFLOW
+            && dst->nrows == old_rows
+            && dst->capacity == old_capacity
+            && dst->merge_columns == NULL;
+    }
+    col_rel_destroy(dst);
+    col_rel_destroy(src);
+    if (!ok) {
+        FAIL("sorted merge overflow mutated destination");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 struct count_ctx {
     int64_t count;
 };
@@ -766,6 +836,8 @@ main(void)
 
     test_checked_size_mul_boundaries();
     test_checked_row_add_boundaries();
+    test_checked_hash_capacity_boundaries();
+    test_sorted_merge_row_overflow();
     test_w1_expected_count();
     test_w1_vs_w4_tuple_count();
     test_w1_vs_w8_tuple_count();

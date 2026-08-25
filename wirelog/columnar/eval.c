@@ -96,6 +96,29 @@ wl_columnar_eval_checked_count_inc(uint32_t count, size_t *out)
     return 0;
 }
 
+int
+wl_columnar_eval_checked_hash_capacity(uint32_t nrows, uint32_t *out)
+{
+    if (!out)
+        return EINVAL;
+    if (nrows > UINT32_MAX / 2u)
+        return EOVERFLOW;
+
+    uint32_t required = nrows * 2u;
+    uint32_t cap = 4u;
+    while (cap < required) {
+        if (cap > UINT32_MAX / 2u)
+            return EOVERFLOW;
+        cap <<= 1;
+    }
+#if SIZE_MAX <= UINT32_MAX
+    if (cap > SIZE_MAX / sizeof(uint32_t))
+        return EOVERFLOW;
+#endif
+    *out = cap;
+    return 0;
+}
+
 /* Checked addition for TDD row-count fields; UINT32_MAX is a valid total. */
 int
 wl_columnar_eval_checked_row_add(uint32_t total, uint32_t addend,
@@ -1628,6 +1651,22 @@ tdd_merge_worker_results(const wl_plan_stratum_t *sp,
  *
  * Storage is column-major: r->columns[col][row].
  */
+static bool
+tdd_relation_rows_sorted(const col_rel_t *r)
+{
+    if (!r || r->nrows <= 1 || r->ncols == 0)
+        return true;
+    for (uint32_t i = 1; i < r->nrows; i++) {
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            if (r->columns[c][i - 1] < r->columns[c][i])
+                break;
+            if (r->columns[c][i - 1] > r->columns[c][i])
+                return false;
+        }
+    }
+    return true;
+}
+
 static void
 tdd_dedup_rel(col_rel_t *r)
 {
@@ -1658,68 +1697,77 @@ tdd_dedup_rel(col_rel_t *r)
          * Open-addressing table with FNV-1a row hashing, load <= 0.5.
          * Two-pass: first pass marks unique rows (read-only on columns),
          * second pass compacts in-place. */
-        uint32_t cap = 4;
-        while (cap < nrows * 2)
-            cap <<= 1;
-        uint32_t mask = cap - 1;
-        uint32_t *ht = (uint32_t *)malloc(cap * sizeof(uint32_t));
-        uint8_t  *keep = (uint8_t *)malloc(nrows);
-
-        if (!ht || !keep) {
-            /* Allocation failure: fall back to sort-based path */
-            free(ht);
-            free(keep);
+        uint32_t cap = 0;
+        if (wl_columnar_eval_checked_hash_capacity(nrows, &cap) != 0) {
+            /* The hash table cannot represent this row count safely.
+             * Sorting has no capacity-doubling arithmetic and preserves the
+             * same deduplication result. */
             col_rel_radix_sort_int64(r);
-            /* Fall through to the sorted dedup below. */
+            if (!tdd_relation_rows_sorted(r))
+                return;
         } else {
-            memset(ht, 0xFF, cap * sizeof(uint32_t)); /* 0xFF = UINT32_MAX */
-            memset(keep, 0, nrows);
+            uint32_t mask = cap - 1;
+            uint32_t *ht = (uint32_t *)malloc(cap * sizeof(uint32_t));
+            uint8_t  *keep = (uint8_t *)malloc(nrows);
 
-            /* First pass: build hash table, mark unique rows */
-            for (uint32_t i = 0; i < nrows; i++) {
-                uint64_t h = 14695981039346656037ULL; /* FNV-1a offset basis */
-                for (uint32_t c = 0; c < ncols; c++) {
-                    h ^= (uint64_t)r->columns[c][i];
-                    h *= 1099511628211ULL; /* FNV prime */
-                }
-                uint32_t slot = (uint32_t)(h & mask);
-                for (;;) {
-                    uint32_t ex = ht[slot];
-                    if (ex == UINT32_MAX) {
-                        ht[slot] = i;
-                        keep[i] = 1;
-                        break;
-                    }
-                    bool eq = true;
+            if (!ht || !keep) {
+                /* Allocation failure: fall back to sort-based path */
+                free(ht);
+                free(keep);
+                col_rel_radix_sort_int64(r);
+                if (!tdd_relation_rows_sorted(r))
+                    return;
+                /* Fall through to the sorted dedup below. */
+            } else {
+                memset(ht, 0xFF, cap * sizeof(uint32_t)); /* 0xFF = UINT32_MAX */
+                memset(keep, 0, nrows);
+
+                /* First pass: build hash table, mark unique rows */
+                for (uint32_t i = 0; i < nrows; i++) {
+                    uint64_t h = 14695981039346656037ULL; /* FNV-1a offset basis */
                     for (uint32_t c = 0; c < ncols; c++) {
-                        if (r->columns[c][ex] != r->columns[c][i]) {
-                            eq = false;
+                        h ^= (uint64_t)r->columns[c][i];
+                        h *= 1099511628211ULL; /* FNV prime */
+                    }
+                    uint32_t slot = (uint32_t)(h & mask);
+                    for (;;) {
+                        uint32_t ex = ht[slot];
+                        if (ex == UINT32_MAX) {
+                            ht[slot] = i;
+                            keep[i] = 1;
                             break;
                         }
+                        bool eq = true;
+                        for (uint32_t c = 0; c < ncols; c++) {
+                            if (r->columns[c][ex] != r->columns[c][i]) {
+                                eq = false;
+                                break;
+                            }
+                        }
+                        if (eq)
+                            break; /* duplicate */
+                        slot = (slot + 1) & mask;
                     }
-                    if (eq)
-                        break; /* duplicate */
-                    slot = (slot + 1) & mask;
                 }
-            }
-            free(ht);
+                free(ht);
 
-            /* Second pass: compact columns in-place */
-            uint32_t out = 0;
-            for (uint32_t i = 0; i < nrows; i++) {
-                if (!keep[i])
-                    continue;
-                if (out != i) {
-                    col_columns_copy_row(r->columns, out,
-                        (int64_t *const *)r->columns, i, ncols);
-                    if (r->timestamps)
-                        r->timestamps[out] = r->timestamps[i];
+                /* Second pass: compact columns in-place */
+                uint32_t out = 0;
+                for (uint32_t i = 0; i < nrows; i++) {
+                    if (!keep[i])
+                        continue;
+                    if (out != i) {
+                        col_columns_copy_row(r->columns, out,
+                            (int64_t *const *)r->columns, i, ncols);
+                        if (r->timestamps)
+                            r->timestamps[out] = r->timestamps[i];
+                    }
+                    out++;
                 }
-                out++;
+                free(keep);
+                r->nrows = out;
+                return;
             }
-            free(keep);
-            r->nrows = out;
-            return;
         }
     }
 
@@ -1765,7 +1813,9 @@ tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src)
     uint32_t N = dst->nrows;
     uint32_t D = src->nrows;
     uint32_t ncols = dst->ncols;
-    uint32_t total = N + D;
+    uint32_t total = 0;
+    if (wl_columnar_eval_checked_row_add(N, D, &total) != 0)
+        return EOVERFLOW;
 
     if (N == 0)
         return col_rel_append_all(dst, src, NULL);
@@ -3011,6 +3061,10 @@ bdx_hash_diff(col_rel_t *delta, const col_rel_t *base)
         return EINVAL;
     if (base->nrows > UINT32_MAX - 1)
         return ENOMEM;
+#if SIZE_MAX <= UINT32_MAX
+    if (base->nrows > SIZE_MAX / 2)
+        return ENOMEM;
+#endif
 
     size_t target = (size_t)base->nrows * 2;
     size_t cap_sz = 4;
@@ -3020,6 +3074,8 @@ bdx_hash_diff(col_rel_t *delta, const col_rel_t *base)
         cap_sz <<= 1;
     }
     if (cap_sz > UINT32_MAX)
+        return ENOMEM;
+    if (cap_sz > SIZE_MAX / sizeof(uint32_t))
         return ENOMEM;
 
     uint32_t cap = (uint32_t)cap_sz;
