@@ -352,6 +352,65 @@ test_4way_join_result(void)
     PASS();
 }
 
+/* Test 5: a full evaluation stack does not leak the LFTJ output relation. */
+static void
+test_lftj_stack_overflow_releases_output(void)
+{
+    TEST("LFTJ releases output when the evaluation stack is full");
+
+    const char *src = ".decl r1(x: int32, a: int32)\n"
+        ".decl r2(x: int32, b: int32)\n"
+        ".decl r3(x: int32, c: int32)\n"
+        ".decl out(x: int32, a: int32, b: int32, c: int32)\n"
+        "r1(1, 10). r2(1, 100). r3(1, 1000).\n"
+        "out(x, a, b, c) :- r1(x, a), r2(x, b), r3(x, c).\n";
+    wirelog_program_t *prog = NULL;
+    wl_plan_t *plan = NULL;
+    ASSERT(make_plan_no_opt(src, &plan, &prog) == 0,
+        "make_plan_no_opt failed");
+
+    wl_session_t *sess = NULL;
+    ASSERT(wl_session_create(wl_backend_columnar(), plan, 1, &sess) == 0,
+        "session_create failed");
+    ASSERT(wl_session_load_facts(sess, prog) == 0,
+        "session_load_facts failed");
+
+    const wl_plan_op_t *lftj_op = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count && !lftj_op; s++) {
+        const wl_plan_stratum_t *stratum = &plan->strata[s];
+        for (uint32_t r = 0; r < stratum->relation_count && !lftj_op; r++) {
+            const wl_plan_relation_t *relation = &stratum->relations[r];
+            for (uint32_t o = 0; o < relation->op_count; o++) {
+                if (relation->ops[o].op == WL_PLAN_OP_LFTJ) {
+                    lftj_op = &relation->ops[o];
+                    break;
+                }
+            }
+        }
+    }
+    ASSERT(lftj_op != NULL, "expected an LFTJ operator");
+
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    for (uint32_t i = 0; i < COL_STACK_MAX; i++) {
+        col_rel_t *filler = col_rel_new_auto("$lftj_stack_filler", 0);
+        ASSERT(filler != NULL, "filler relation allocation failed");
+        ASSERT(eval_stack_push(&stack, filler, true) == 0,
+            "filler push failed");
+    }
+
+    int rc = col_op_lftj(lftj_op, &stack, COL_SESSION(sess));
+    ASSERT(rc == ENOBUFS, "full stack must reject the LFTJ output");
+    ASSERT(stack.top == COL_STACK_MAX,
+        "failed LFTJ push must not change the stack depth");
+
+    eval_stack_drain(&stack);
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
 /* Test 5: IDB relation in chain prevents LFTJ rewrite. */
 static void
 test_idb_not_rewritten(void)
@@ -559,6 +618,7 @@ main(void)
     test_3way_join_result();
     test_4way_join_result();
     test_idb_not_rewritten();
+    test_lftj_stack_overflow_releases_output();
     test_tdd_lftj_metadata_is_conservative();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
