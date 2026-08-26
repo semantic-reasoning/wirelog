@@ -564,6 +564,13 @@ Supported column types:
 - `functor/arity side` -- explicit side-relation compound storage
 - `functor/arity inline` -- inline compound storage, limited to arity 4
 
+Integer literals are signed 64-bit values in the range
+`-9223372036854775808` through `9223372036854775807`. A negative literal is
+written with `-` immediately before its digits (for example `-5`); whitespace
+between the sign and digits is not accepted. Values outside this range are
+parse errors. The minus sign remains a binary subtraction operator when used
+between expressions.
+
 There is **no floating-point type**. `float` is not a type keyword and there
 is no decimal literal, so `.decl v(x: float)` and `1.5` are both syntax
 errors; every value the engine stores and computes on is a 64-bit integer.

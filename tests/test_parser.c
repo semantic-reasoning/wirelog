@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "../wirelog/parser/parser.h"
 
@@ -1421,6 +1422,56 @@ test_parse_single_fact(void)
 }
 
 static void
+test_parse_signed_integer_literals(void)
+{
+    TEST("signed integer literals in facts and rule heads");
+    PARSE("v(-5). w(-9223372036854775808) :- v(-5).");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *fact = child(program, 0);
+    const wl_parser_ast_node_t *rule = child(program, 1);
+    if (!fact || fact->type != WL_PARSER_AST_NODE_FACT
+        || child(fact, 0)->int_value != -5
+        || !rule || rule->type != WL_PARSER_AST_NODE_RULE
+        || child(child(rule, 0), 0)->int_value != INT64_MIN) {
+        CLEANUP();
+        FAIL("signed literals did not produce expected integer AST values");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_signed_integer_errors(void)
+{
+    TEST("signed integer whitespace and overflow errors");
+    const char *sources[] = {
+        "v(- 5).", "v(--5).", "v(9223372036854775808).",
+        "v(-9223372036854775809)."
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        PARSE(sources[i]);
+        if (program != NULL) {
+            CLEANUP();
+            FAIL("invalid signed literal unexpectedly parsed");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_parse_signed_integer_expressions(void)
+{
+    TEST("signed literals in comparisons and subtraction");
+    PARSE("v(X) :- base(X), X > -5.\n"
+        "out(X - -5) :- base(X).");
+    ASSERT_PARSED();
+    CLEANUP();
+    PASS();
+}
+
+static void
 test_parse_multiple_facts(void)
 {
     TEST("multiple inline facts");
@@ -2089,6 +2140,9 @@ main(void)
 
     printf("\n--- Inline Facts ---\n");
     test_parse_single_fact();
+    test_parse_signed_integer_literals();
+    test_parse_signed_integer_errors();
+    test_parse_signed_integer_expressions();
     test_parse_multiple_facts();
     test_parse_facts_mixed_with_rules();
     test_parse_fact_rejects_variables();

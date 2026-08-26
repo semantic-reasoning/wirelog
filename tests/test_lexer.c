@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdint.h>
 
 #include "../wirelog/parser/lexer.h"
 
@@ -208,6 +209,18 @@ test_integer_large(void)
     wl_parser_lexer_t lex;
     wl_parser_lexer_init(&lex, "2147483647");
     ASSERT_TOK_VAL(lex, WL_PARSER_LEXER_TOK_INTEGER, 2147483647LL);
+    PASS();
+}
+
+static void
+test_integer_overflow(void)
+{
+    TEST("integer overflow is rejected");
+    wl_parser_lexer_t lex;
+    /* The lexer admits INT64_MAX + 1 as an unsigned magnitude so the parser
+     * can represent INT64_MIN after an adjacent minus sign. */
+    wl_parser_lexer_init(&lex, "9223372036854775809");
+    ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_ERROR);
     PASS();
 }
 
@@ -901,6 +914,7 @@ main(void)
     test_integer_literal();
     test_integer_zero();
     test_integer_large();
+    test_integer_overflow();
     test_string_literal();
     test_string_empty();
     test_string_escaped_quote();

@@ -26,9 +26,10 @@
  *   atom        = IDENT "(" atom_args? ")"
  *   negative    = "!" atom
  *   atom_args   = atom_arg ("," atom_arg)*
- *   atom_arg    = IDENT | INTEGER | STRING | "_"
+ *   atom_arg    = IDENT | signed_integer | STRING | "_"
  *   arith_expr  = factor (arith_op factor)*
- *   factor      = IDENT | INTEGER | STRING
+ *   factor      = IDENT | signed_integer | STRING
+ *   signed_int  = INTEGER | "-" INTEGER  (no whitespace between '-' and INTEGER)
  *   compare     = arith_expr compare_op arith_expr
  *   aggregate   = agg_op "(" arith_expr ")"
  */
@@ -170,6 +171,69 @@ token_text_equals(const wl_parser_lexer_token_t *token, const char *text)
 {
     size_t len = strlen(text);
     return token->length == len && strncmp(token->start, text, len) == 0;
+}
+
+static bool
+tokens_are_adjacent(const wl_parser_lexer_token_t *left,
+    const wl_parser_lexer_token_t *right)
+{
+    return left->start + left->length == right->start;
+}
+
+static wl_parser_ast_node_t *
+parse_integer_literal(wl_parser_t *parser)
+{
+    uint32_t line = parser->current.line;
+    uint32_t col = parser->current.col;
+    bool negative = false;
+
+    if (parser_match(parser, WL_PARSER_LEXER_TOK_MINUS)) {
+        wl_parser_lexer_token_t minus = parser->previous;
+        if (!parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)) {
+            parser_error(parser, "expected integer immediately after '-'");
+            return NULL;
+        }
+        if (!tokens_are_adjacent(&minus, &parser->current)) {
+            parser_error(parser, "expected integer immediately after '-'");
+            return NULL;
+        }
+        line = minus.line;
+        col = minus.col;
+        negative = true;
+    }
+
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_INTEGER,
+        "expected integer literal")) {
+        return NULL;
+    }
+
+    const uint64_t max_positive = (uint64_t)INT64_MAX;
+    const uint64_t max_negative_magnitude = max_positive + UINT64_C(1);
+    uint64_t magnitude = parser->previous.uint_value;
+    int64_t value;
+
+    if (negative) {
+        if (magnitude > max_negative_magnitude) {
+            parser_error(parser, "integer literal below INT64_MIN");
+            return NULL;
+        }
+        value = magnitude == max_negative_magnitude
+            ? INT64_MIN
+            : -(int64_t)magnitude;
+    } else {
+        if (magnitude > max_positive) {
+            parser_error(parser, "integer literal above INT64_MAX");
+            return NULL;
+        }
+        value = (int64_t)magnitude;
+    }
+
+    wl_parser_ast_node_t *node
+        = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INTEGER, line, col);
+    if (!node)
+        return NULL;
+    node->int_value = value;
+    return node;
 }
 
 static char *
@@ -436,11 +500,9 @@ parse_factor(wl_parser_t *parser)
         return node;
     }
 
-    if (parser_match(parser, WL_PARSER_LEXER_TOK_INTEGER)) {
-        wl_parser_ast_node_t *node
-            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INTEGER, line, col);
-        node->int_value = parser->previous.int_value;
-        return node;
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)
+        || parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
+        return parse_integer_literal(parser);
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_STRING)) {
@@ -1041,11 +1103,9 @@ parse_atom_arg_at_depth(wl_parser_t *parser, uint32_t depth)
         return node;
     }
 
-    if (parser_match(parser, WL_PARSER_LEXER_TOK_INTEGER)) {
-        wl_parser_ast_node_t *node
-            = wl_parser_ast_node_create(WL_PARSER_AST_NODE_INTEGER, line, col);
-        node->int_value = parser->previous.int_value;
-        return node;
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)
+        || parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
+        return parse_integer_literal(parser);
     }
 
     if (parser_match(parser, WL_PARSER_LEXER_TOK_STRING)) {
@@ -1274,7 +1334,8 @@ parse_predicate(wl_parser_t *parser)
     }
 
     /* Comparison starting with integer constant */
-    if (parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)) {
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)
+        || parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
         wl_parser_ast_node_t *left = parse_arithmetic_expr(parser);
         if (!left)
             return NULL;
