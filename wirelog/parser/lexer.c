@@ -205,6 +205,12 @@ scan_number(wl_parser_lexer_t *lexer)
         value = c_locale ? _strtod_l(text, &end, c_locale) : 0.0;
         if (c_locale)
             _free_locale(c_locale);
+#elif defined(__APPLE__)
+        /* Apple's SDK does not expose strtod_l for the iOS deployment
+         * target.  iOS applications use the process's invariant POSIX
+         * numeric locale for this parser path; keep the locale-specific
+         * implementation for hosted POSIX builds below. */
+        value = strtod(text, &end);
 #else
         locale_t c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
         value = c_locale ? strtod_l(text, &end, c_locale) : 0.0;
