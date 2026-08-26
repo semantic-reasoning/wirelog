@@ -895,15 +895,6 @@ test_tdd_queue_discard_large_dimensions(void)
     PASS();
 }
 
-static int discard_destroy_count = 0;
-
-static void
-count_discard_destroy(void *payload)
-{
-    discard_destroy_count++;
-    free(payload);
-}
-
 static void
 test_discard_drains_all_messages(void)
 {
