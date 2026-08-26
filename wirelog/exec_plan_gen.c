@@ -2413,6 +2413,13 @@ expand_multiway_delta(const wl_plan_op_t *ops, uint32_t op_count,
     const uint32_t *delta_pos, uint32_t k,
     uint32_t *out_count)
 {
+    if (!ops || !delta_pos || !out_count)
+        return NULL;
+    for (uint32_t p = 0; p < k; p++) {
+        if (delta_pos[p] >= op_count)
+            return NULL;
+    }
+
     /* Total ops: K copies of original + K CONCATs + 1 CONSOLIDATE
      * (each copy followed by a CONCAT, then CONSOLIDATE at the end) */
     uint32_t total = k * op_count + k + 1;
@@ -2613,6 +2620,13 @@ expand_multiway_k_fusion(const wl_plan_op_t *ops, uint32_t op_count,
     const uint32_t *delta_pos, uint32_t k,
     uint32_t *out_count)
 {
+    if (!ops || !delta_pos || !out_count)
+        return NULL;
+    for (uint32_t p = 0; p < k; p++) {
+        if (delta_pos[p] >= op_count)
+            return NULL;
+    }
+
     wl_plan_op_t *result = (wl_plan_op_t *)calloc(1, sizeof(wl_plan_op_t));
     if (!result)
         return NULL;
