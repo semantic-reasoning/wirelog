@@ -575,19 +575,16 @@ static bool
 seed_multi_adornment_relations(const struct wirelog_program *prog,
     const ms_adorned_set_t *processed, ms_relset_t *u, uint32_t *count)
 {
-    if (count)
-        *count = 0;
+    *count = 0;
 
     for (uint32_t i = 0; i < processed->count; i++) {
         const ms_adorned_t *ap = &processed->items[i];
-        if (!ap->rel_name || ap->bound_mask == 0
-            || !is_idb(prog, ap->rel_name))
+        if (!is_idb(prog, ap->rel_name))
             continue;
 
         bool already_checked = false;
         for (uint32_t j = 0; j < i; j++) {
-            if (processed->items[j].rel_name
-                && strcmp(processed->items[j].rel_name, ap->rel_name) == 0) {
+            if (strcmp(processed->items[j].rel_name, ap->rel_name) == 0) {
                 already_checked = true;
                 break;
             }
@@ -598,8 +595,7 @@ seed_multi_adornment_relations(const struct wirelog_program *prog,
         bool found_different_mask = false;
         for (uint32_t j = i + 1; j < processed->count; j++) {
             const ms_adorned_t *other = &processed->items[j];
-            if (!other->rel_name || other->bound_mask == 0
-                || strcmp(other->rel_name, ap->rel_name) != 0)
+            if (strcmp(other->rel_name, ap->rel_name) != 0)
                 continue;
             if (other->bound_mask != ap->bound_mask) {
                 found_different_mask = true;
@@ -608,8 +604,7 @@ seed_multi_adornment_relations(const struct wirelog_program *prog,
         }
 
         if (found_different_mask) {
-            if (count)
-                (*count)++;
+            (*count)++;
             if (!relset_add(u, ap->rel_name))
                 return false;
         }
