@@ -228,7 +228,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev
+          sudo apt-get install -y meson ninja-build pkg-config libmbedtls-dev
 
       - name: Configure with mbedTLS enabled
         run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
