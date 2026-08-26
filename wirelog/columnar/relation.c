@@ -96,7 +96,7 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
         if (!private_cols[c]) {
             for (uint32_t i = 0; i < r->ncols; i++)
                 free(private_cols[i]);
-            free(private_cols);
+            free((void *)private_cols);
             return ENOMEM;
         }
         memcpy(private_cols[c], r->columns[c],
@@ -108,7 +108,7 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
         r->columns[c] = private_cols[c];
         r->col_shared[c] = false;
     }
-    free(private_cols);
+    free((void *)private_cols);
     /* If all columns are now owned, free the shared-flags array */
     bool any_shared = false;
     for (uint32_t c = 0; c < r->ncols; c++)
