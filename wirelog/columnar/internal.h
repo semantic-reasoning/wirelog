@@ -192,7 +192,7 @@ col_columns_realloc_atomic(int64_t **cols, uint32_t ncols, uint32_t old_cap,
         if (!replacement[c]) {
             for (uint32_t i = 0; i < c; i++)
                 free(replacement[i]);
-            free(replacement);
+            free((void *)replacement);
             return ENOMEM;
         }
         if (cols[c]) {
@@ -205,7 +205,7 @@ col_columns_realloc_atomic(int64_t **cols, uint32_t ncols, uint32_t old_cap,
         free(cols[c]);
         cols[c] = replacement[c];
     }
-    free(replacement);
+    free((void *)replacement);
     return 0;
 }
 
@@ -441,8 +441,13 @@ col_rel_row_copy_out(const col_rel_t *r, uint32_t row, int64_t *dst)
 static inline void
 col_rel_row_copy_in(col_rel_t *r, uint32_t row, const int64_t *src)
 {
-    for (uint32_t c = 0; c < r->ncols; c++)
-        r->columns[c][row] = src[c];
+    if (!r || !r->columns || !src)
+        return;
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        if (r->columns[c] == NULL)
+            return;
+        memcpy(&r->columns[c][row], &src[c], sizeof(int64_t));
+    }
 }
 
 /** Compute buffer size in bytes for row_count rows. */
