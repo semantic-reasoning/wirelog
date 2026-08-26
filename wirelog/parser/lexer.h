@@ -145,6 +145,7 @@ typedef struct {
 
     /* Parsed value (for integer literals) */
     int64_t int_value;
+    uint64_t uint_value;
 } wl_parser_lexer_token_t;
 
 /* ======================================================================== */

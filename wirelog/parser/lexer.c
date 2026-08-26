@@ -14,6 +14,7 @@
 #include "lexer.h"
 
 #include <ctype.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,7 @@ make_token(const wl_parser_lexer_t *lexer, wl_parser_lexer_token_type_t type)
     token.line = lexer->start_line;
     token.col = lexer->start_col;
     token.int_value = 0;
+    token.uint_value = 0;
     return token;
 }
 
@@ -89,6 +91,7 @@ make_error(wl_parser_lexer_t *lexer, const char *message)
     token.line = lexer->start_line;
     token.col = lexer->start_col;
     token.int_value = 0;
+    token.uint_value = 0;
     snprintf(lexer->error_msg, sizeof(lexer->error_msg), "%s", message);
     return token;
 }
@@ -165,12 +168,21 @@ scan_integer(wl_parser_lexer_t *lexer)
     wl_parser_lexer_token_t token
         = make_token(lexer, WL_PARSER_LEXER_TOK_INTEGER);
 
-    /* Parse the integer value */
-    int64_t value = 0;
+    /* Parse unsigned magnitude; the parser decides whether a preceding
+     * adjacent '-' makes INT64_MAX + 1 valid as INT64_MIN. */
+    const uint64_t max_signed_magnitude
+        = (uint64_t)INT64_MAX + UINT64_C(1);
+    uint64_t value = 0;
     for (const char *p = token.start; p < lexer->current; p++) {
-        value = value * 10 + (*p - '0');
+        uint64_t digit = (uint64_t)(*p - '0');
+        if (value > (max_signed_magnitude - digit) / UINT64_C(10)) {
+            return make_error(lexer, "integer literal out of int64 range");
+        }
+        value = value * UINT64_C(10) + digit;
     }
-    token.int_value = value;
+    token.uint_value = value;
+    if (value <= (uint64_t)INT64_MAX)
+        token.int_value = (int64_t)value;
 
     return token;
 }
