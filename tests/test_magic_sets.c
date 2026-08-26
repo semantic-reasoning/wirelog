@@ -827,19 +827,22 @@ test_multiple_adornments(void)
         return;
     }
 
-    wl_magic_demand_t demands[3];
+    wl_magic_demand_t demands[4];
     demands[0].relation_name = "R";
     demands[0].bound_mask = 0x1; /* x bound */
     demands[0].arity = 2;
     demands[1].relation_name = "R";
     demands[1].bound_mask = 0x2; /* y bound */
     demands[1].arity = 2;
-    demands[2].relation_name = "S";
-    demands[2].bound_mask = 0x1; /* x bound */
+    demands[2].relation_name = "R";
+    demands[2].bound_mask = 0x3; /* both bound */
     demands[2].arity = 2;
+    demands[3].relation_name = "S";
+    demands[3].bound_mask = 0x1; /* x bound */
+    demands[3].arity = 2;
 
     wl_magic_sets_stats_t stats;
-    int rc = wl_magic_sets_apply_with_demands(prog, demands, 3, &stats);
+    int rc = wl_magic_sets_apply_with_demands(prog, demands, 4, &stats);
     if (rc != 0) {
         wirelog_program_free(prog);
         FAIL("magic sets returned error");
