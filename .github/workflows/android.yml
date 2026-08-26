@@ -80,7 +80,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build binutils
+          sudo apt-get install -y meson ninja-build binutils file
 
       - name: Install NDK r27c
         id: setup-ndk
