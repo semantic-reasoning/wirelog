@@ -81,6 +81,13 @@ option(
 )
 
 option(
+  'mbedTLS_prefix',
+  type: 'string',
+  value: '',
+  description: 'Explicit single-prefix metadata-free mbedTLS installation to use after pkg-config/CMake discovery fails (native builds only).'
+)
+
+option(
   'wirelog_log_max_level',
   type: 'combo',
   choices: ['error', 'warn', 'info', 'debug', 'trace'],

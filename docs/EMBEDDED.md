@@ -34,6 +34,7 @@ The Meson options below are user-visible for embedded builds:
 | `threads` | Selects threading backend: `native` auto-detects C11/POSIX, `posix` forces pthreads. See `docs/THREADING.md`. |
 | `wirelog_log_max_level` | Release and embedded builds should usually set `-Dwirelog_log_max_level=error` to compile out higher-volume logging sites. |
 | `mbedTLS` | Defaults to `disabled`. Keep disabled unless crypto built-ins are required; enabling changes dependency and export posture. See `docs/SECURITY_MODEL.md`. |
+| `mbedTLS_prefix` | Optional native-build fallback for a metadata-free, single-prefix mbedTLS install. Use `-DmbedTLS_prefix=/path` only when `<path>/include` and `<path>/lib` (or `lib64`) contain the matching headers and libraries. |
 | `io_plugin_dlopen` | Enables optional CLI plugin loading through `dlopen` where supported. Most embedded hosts link adapters directly or own dynamic loading themselves. |
 | `android` | Opt-in Android cross-build path. Source build support exists; packaged AAR/Prefab artifacts are deferred. |
 | `ios` | Opt-in iOS build path. Source build support exists; packaged XCFramework artifacts are deferred. |

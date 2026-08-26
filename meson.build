@@ -174,6 +174,7 @@ endif
 #Phase 2A : nanoarrow for columnar backend(via meson wrap)
 nanoarrow_proj = subproject('nanoarrow', default_options: ['tests=disabled', 'apps=disabled', 'ipc=disabled', 'device=disabled', 'testing=disabled'])
 nanoarrow_dep = nanoarrow_proj.get_variable('nanoarrow_dep')
+fs = import('fs')
 
 #Built-in functions : xxHash3 for hash() function
 xxhash_proj = subproject('xxhash', default_options: [])
@@ -262,6 +263,103 @@ if mbedtls_option == 'auto' or mbedtls_option == 'enabled'
       mbedtls_psa_rejections += [_mbedtls_candidate + ': failed PSA Crypto link probe']
     endif
   endforeach
+
+  if mbedtls_psa_provider == '' and get_option('mbedTLS_prefix') != ''
+    if meson.is_cross_build()
+      mbedtls_psa_rejections += ['metadata-free prefix: disabled for cross builds']
+    else
+      _mbedtls_prefix = get_option('mbedTLS_prefix')
+      _mbedtls_realpath = find_program('realpath', required: false)
+      if not _mbedtls_realpath.found()
+        mbedtls_psa_rejections += ['metadata-free prefix: realpath is unavailable']
+      else
+        _mbedtls_prefix_realpath_result = run_command(_mbedtls_realpath,
+          '-e', _mbedtls_prefix, check: false)
+        _mbedtls_prefix_realpath = _mbedtls_prefix_realpath_result.stdout().strip()
+        if _mbedtls_prefix_realpath_result.returncode() != 0 or _mbedtls_prefix_realpath == ''
+          mbedtls_psa_rejections += ['metadata-free prefix: cannot resolve ' + _mbedtls_prefix]
+        else
+      _mbedtls_prefix_include = include_directories(_mbedtls_prefix / 'include')
+      _mbedtls_lib_dirs = [_mbedtls_prefix / 'lib', _mbedtls_prefix / 'lib64']
+      foreach _mbedtls_candidate : mbedtls_psa_candidates
+        if mbedtls_psa_provider != ''
+          continue
+        endif
+        _mbedtls_header_path = _mbedtls_prefix / 'include' / 'psa' / 'crypto.h'
+        _mbedtls_header_realpath_result = run_command(_mbedtls_realpath,
+          '-e', _mbedtls_header_path, check: false)
+        _mbedtls_header_realpath = _mbedtls_header_realpath_result.stdout().strip()
+        if _mbedtls_header_realpath_result.returncode() != 0 or not _mbedtls_header_realpath.startswith(_mbedtls_prefix_realpath + '/')
+          mbedtls_psa_rejections += ['metadata-free prefix: missing <psa/crypto.h> under ' + _mbedtls_prefix]
+          break
+        endif
+
+        _mbedtls_component_names = []
+        if _mbedtls_candidate == 'tfpsacrypto'
+          _mbedtls_component_names = ['tfpsacrypto', 'mbedcrypto']
+        elif _mbedtls_candidate == 'mbedcrypto'
+          _mbedtls_component_names = ['mbedcrypto']
+        else
+          _mbedtls_component_names = ['mbedtls', 'mbedx509', 'mbedcrypto']
+        endif
+
+        _mbedtls_fallback_link_args = []
+        _mbedtls_missing_components = []
+        foreach _mbedtls_component : _mbedtls_component_names
+          _mbedtls_component_path = ''
+            foreach _mbedtls_lib_dir : _mbedtls_lib_dirs
+              foreach _mbedtls_suffix : ['.so', '.a', '.dylib', '.lib']
+              if _mbedtls_component_path == '' and fs.exists(_mbedtls_lib_dir / ('lib' + _mbedtls_component + _mbedtls_suffix))
+                _mbedtls_component_path = _mbedtls_lib_dir / ('lib' + _mbedtls_component + _mbedtls_suffix)
+              elif _mbedtls_component_path == '' and fs.exists(_mbedtls_lib_dir / (_mbedtls_component + _mbedtls_suffix))
+                _mbedtls_component_path = _mbedtls_lib_dir / (_mbedtls_component + _mbedtls_suffix)
+              endif
+            endforeach
+          endforeach
+          if _mbedtls_component_path == ''
+            _mbedtls_missing_components += [_mbedtls_component]
+            continue
+          endif
+          _mbedtls_component_realpath_result = run_command(_mbedtls_realpath,
+            '-e', _mbedtls_component_path, check: false)
+          _mbedtls_component_realpath = _mbedtls_component_realpath_result.stdout().strip()
+          if _mbedtls_component_realpath_result.returncode() != 0 or not _mbedtls_component_realpath.startswith(_mbedtls_prefix_realpath + '/')
+            _mbedtls_missing_components += [_mbedtls_component + ' (outside prefix)']
+            continue
+          endif
+          _mbedtls_fallback_link_args += [_mbedtls_component_path]
+        endforeach
+        if _mbedtls_missing_components.length() > 0
+          mbedtls_psa_rejections += ['metadata-free ' + _mbedtls_candidate + ': missing libraries ' + ', '.join(_mbedtls_missing_components)]
+          continue
+        endif
+
+        _mbedtls_fallback_transitive_deps = [threads_dep]
+        _mbedtls_dl_dep = cc.find_library('dl', required: false)
+        if _mbedtls_dl_dep.found()
+          _mbedtls_fallback_transitive_deps += [_mbedtls_dl_dep]
+        endif
+        _mbedtls_fallback_candidate_dep = declare_dependency(
+          dependencies: _mbedtls_fallback_transitive_deps,
+          link_args: _mbedtls_fallback_link_args,
+          include_directories: _mbedtls_prefix_include)
+        if cc.links(mbedtls_psa_probe,
+            dependencies: [_mbedtls_fallback_candidate_dep],
+            name: 'PSA Crypto hash, HMAC, and random APIs via metadata-free ' + _mbedtls_candidate)
+          mbedtls_dep = [_mbedtls_fallback_candidate_dep]
+          mbedtls_psa_provider = _mbedtls_candidate
+          mbedtls_psa_provider_version = 'unknown'
+          message('  mbedTLS discovery: metadata-free prefix')
+          message('  mbedTLS prefix: ' + _mbedtls_prefix)
+          message('  mbedTLS libraries: ' + ', '.join(_mbedtls_component_names))
+        else
+          mbedtls_psa_rejections += ['metadata-free ' + _mbedtls_candidate + ': failed PSA Crypto link probe']
+        endif
+      endforeach
+        endif
+      endif
+    endif
+  endif
 
   if mbedtls_psa_provider != ''
     message('  mbedTLS PSA provider: ' + mbedtls_psa_provider + ' ' + mbedtls_psa_provider_version)
