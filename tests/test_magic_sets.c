@@ -10,7 +10,7 @@
  *   2. Magic relation and rule generation
  *   3. All-free adornment optimization (skip magic)
  *   4. No demand through negation (ANTIJOIN right child)
- *   5. Multiple adornments for the same relation
+ *   5. Multiple adornments for the same relation downgrade safely
  *   6. EDB relations do not get magic relations
  *   7. Correctness: magic-optimized result == full result (integration)
  */
@@ -799,7 +799,7 @@ test_negation_no_demand(void)
 
 /* ======================================================================== */
 /* Test 6: test_multiple_adornments                                         */
-/* Same relation used with both bf and fb adornments.                      */
+/* Same relation demanded with both bf and fb adornments downgrades.       */
 /* ======================================================================== */
 
 static void
@@ -808,25 +808,18 @@ test_multiple_adornments(void)
     TEST("test_multiple_adornments");
 
     /*
-     * A(x, y) :- Edge(x, z), B(z, y).     // B with first arg bound -> B_bf
-     * B(x, y) :- Edge(y, z), A(z, x).     // A with first arg bound -> A_bf
-     *
-     * With demand A_bf (x bound):
-     *   Rule for A: bound={x}, atoms=[Edge(x,z), B(z,y)]
-     *     Edge EDB, adds {x,z}
-     *     B(z,y): z bound -> adornment bf -> $m$B_bf
-     *   Process B_bf:
-     *     Rule for B: bound={z}, atoms=[Edge(y,z), A(z,x)]
-     *       Edge EDB, adds {y,z}  (note: z already bound)
-     *       A(z,x): z bound -> adornment bf -> $m$A_bf (already in set)
-     *   -> adorned: {A_bf, B_bf}
+     * R has two distinct same-relation adornments.  Until the pass can union
+     * those demands, it must downgrade R to unrestricted instead of inserting
+     * two conjunctive guards.  S is a single-adornment control and must still
+     * get normal magic-set treatment in the same pass invocation.
      */
     const char *src = ".decl Edge(x: int32, y: int32)\n"
-        ".decl A(x: int32, y: int32)\n"
-        ".decl B(x: int32, y: int32)\n"
-        ".output A\n"
-        "A(x, y) :- Edge(x, z), B(z, y).\n"
-        "B(x, y) :- Edge(y, z), A(z, x).\n";
+        ".decl R(x: int32, y: int32)\n"
+        ".decl S(x: int32, y: int32)\n"
+        ".output R\n"
+        ".output S\n"
+        "R(x, y) :- Edge(x, y).\n"
+        "S(x, y) :- Edge(x, y).\n";
 
     struct wirelog_program *prog = parse_and_optimize(src);
     if (!prog) {
@@ -834,39 +827,79 @@ test_multiple_adornments(void)
         return;
     }
 
-    wl_magic_demand_t demands[1];
-    demands[0].relation_name = "A";
+    wl_magic_demand_t demands[3];
+    demands[0].relation_name = "R";
     demands[0].bound_mask = 0x1; /* x bound */
     demands[0].arity = 2;
+    demands[1].relation_name = "R";
+    demands[1].bound_mask = 0x2; /* y bound */
+    demands[1].arity = 2;
+    demands[2].relation_name = "S";
+    demands[2].bound_mask = 0x1; /* x bound */
+    demands[2].arity = 2;
 
     wl_magic_sets_stats_t stats;
-    int rc = wl_magic_sets_apply_with_demands(prog, demands, 1, &stats);
+    int rc = wl_magic_sets_apply_with_demands(prog, demands, 3, &stats);
     if (rc != 0) {
         wirelog_program_free(prog);
         FAIL("magic sets returned error");
         return;
     }
 
-    bool has_a_magic = has_relation(prog, "$m$A_bf");
-    bool has_b_magic = has_relation(prog, "$m$B_bf");
-
-    if (!has_a_magic || !has_b_magic) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "expected $m$A_bf=%s $m$B_bf=%s",
-            has_a_magic ? "yes" : "NO", has_b_magic ? "yes" : "NO");
+    if (has_relation(prog, "$m$R_bf") || has_relation(prog, "$m$R_fb")) {
         wirelog_program_free(prog);
-        FAIL(msg);
+        FAIL("multi-adornment R must not get magic relations");
+        return;
+    }
+    if (has_rule_for(prog, "$m$R_bf") || has_rule_for(prog, "$m$R_fb")) {
+        wirelog_program_free(prog);
+        FAIL("multi-adornment R must not get magic demand rules");
         return;
     }
 
-    /* At least A_bf and B_bf must be adorned; mutual recursion may
-     * discover additional adornments (A_bb, B_bb) as bound vars propagate. */
-    if (stats.adorned_predicates < 2) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "expected adorned_predicates>=2, got %u",
-            stats.adorned_predicates);
+    const wirelog_ir_node_t *r_body = rule_body_root(prog, "R", 0);
+    if (ir_contains_type(r_body, WIRELOG_IR_JOIN)) {
         wirelog_program_free(prog);
-        FAIL(msg);
+        FAIL("multi-adornment R must not get a magic guard");
+        return;
+    }
+
+    if (!has_relation(prog, "$m$S_bf")) {
+        wirelog_program_free(prog);
+        FAIL("single-adornment S must still get its magic relation");
+        return;
+    }
+    const wirelog_ir_node_t *s_body = rule_body_root(prog, "S", 0);
+    if (!ir_contains_type(s_body, WIRELOG_IR_JOIN)) {
+        wirelog_program_free(prog);
+        FAIL("single-adornment S must still get a magic guard");
+        return;
+    }
+
+    if (stats.multi_adornment_relations != 1) {
+        printf(" [multi_adornment_relations=%u]",
+            stats.multi_adornment_relations);
+        wirelog_program_free(prog);
+        FAIL("expected R to be the one multi-adornment downgrade");
+        return;
+    }
+    if (stats.unrestrictable_relations != 1) {
+        printf(" [unrestrictable_relations=%u]",
+            stats.unrestrictable_relations);
+        wirelog_program_free(prog);
+        FAIL("expected R and only R to be unrestrictable");
+        return;
+    }
+    if (stats.adorned_predicates != 1) {
+        printf(" [adorned_predicates=%u]", stats.adorned_predicates);
+        wirelog_program_free(prog);
+        FAIL("expected S_bf to be the one surviving adorned predicate");
+        return;
+    }
+    if (stats.original_rules_modified != 1) {
+        printf(" [original_rules_modified=%u]", stats.original_rules_modified);
+        wirelog_program_free(prog);
+        FAIL("expected only S to be guarded");
         return;
     }
 

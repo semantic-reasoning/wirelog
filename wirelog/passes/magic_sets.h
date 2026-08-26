@@ -94,6 +94,15 @@ struct wirelog_program;
  *                         2 BFS, so they never enter `processed` and the guard
  *                         loop never sees them.  The wide head is what remains
  *                         reachable in practice.
+ * @multi_adornment_relations: IDB relations downgraded because Phase 2 found
+ *                         two or more distinct nonzero adornments for the same
+ *                         relation (#995).  The current pass has one rule set
+ *                         per relation, not per adornment, so guarding those
+ *                         rules once per adornment would conjoin demands that
+ *                         should be unioned and silently lose answers.  Until
+ *                         union guards or true adorned-rule splitting exists,
+ *                         each such relation is added to the guard-viability
+ *                         set before closure and is left unrestricted.
  * @unrestrictable_relations: Relations excluded from the transformation
  *                         entirely by the guard-viability closure (#1027).
  *                         Seeded by an IDB body occurrence that binds nothing
@@ -146,7 +155,8 @@ struct wirelog_program;
  *
  *                         Seeds also cover IDBs behind unguarded
  *                         .output/.printsize consumers, IDBs under negation
- *                         (#1047), and IDBs feeding aggregate rules (#1048).
+ *                         (#1047), IDBs feeding aggregate rules (#1048), and
+ *                         same-relation multiple adornments (#995).
  *                         The closure is conservative: every such relation
  *                         and every positive IDB dependency it reads is left
  *                         unrestricted.
@@ -159,8 +169,8 @@ struct wirelog_program;
  * assignment of guards being consistent, not from any one rule's skip; the
  * guard-viability closure above is what enforces that across the consumer
  * shapes it seeds, including output, negation and aggregate consumers.  The
- * remaining limitations are conservative over-approximation and the separate
- * multiple-adornment issue (#995), not unseen #1047/#1048 shapes.
+ * remaining limitations are conservative over-approximation, including the
+ * multiple-adornment downgrade (#995), not unseen #1047/#1048 shapes.
  *
  * They are the only signal that a demand did not reach a rule -- but only for
  * a caller that supplies a stats struct.  The library's own pipeline passes
@@ -203,6 +213,7 @@ typedef struct {
     uint32_t skipped_aggregate;
     uint32_t skipped_constant_head;
     uint32_t skipped_unsupported_head;
+    uint32_t multi_adornment_relations;
     uint32_t unrestrictable_relations;
 } wl_magic_sets_stats_t;
 
