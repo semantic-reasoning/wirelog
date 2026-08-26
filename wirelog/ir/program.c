@@ -585,6 +585,12 @@ collect_decl(struct wirelog_program *prog,
         }
     }
 
+    if (rel->column_count > 0 && !rel->columns) {
+        wl_ir_program_set_error(prog,
+            "missing column metadata for relation '%s'", decl_node->name);
+        return -1;
+    }
+
     uint32_t physical_offset = 0;
     for (uint32_t i = 0; i < rel->column_count; i++) {
         wirelog_column_t *col = &rel->columns[i];
