@@ -171,12 +171,14 @@ scan_integer(wl_parser_lexer_t *lexer)
      * adjacent '-' makes INT64_MAX + 1 valid as INT64_MIN. */
     const uint64_t max_signed_magnitude = (uint64_t)INT64_MAX + 1;
     uint64_t value = 0;
+    if (lexer->current - token.start > 19)
+        return make_error(lexer, "integer literal out of int64 range");
     for (const char *p = token.start; p < lexer->current; p++) {
         uint64_t digit = (uint64_t)(*p - '0');
-        if (value > (max_signed_magnitude - digit) / 10)
-            return make_error(lexer, "integer literal out of int64 range");
         value = value * 10 + digit;
     }
+    if (value > max_signed_magnitude)
+        return make_error(lexer, "integer literal out of int64 range");
     token.uint_value = value;
     if (value <= (uint64_t)INT64_MAX)
         token.int_value = (int64_t)value;
