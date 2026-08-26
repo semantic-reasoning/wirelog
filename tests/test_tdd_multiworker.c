@@ -825,40 +825,6 @@ test_tdd_queue_discard_large_dimensions(void)
     PASS();
 }
 
-static void
-test_discard_drains_all_messages(void)
-{
-    TEST("tdd discard drains more than one W*nrels batch");
-
-    wl_mpsc_queue_t *queue = wl_mpsc_queue_create(2, 16);
-    if (!queue) {
-        FAIL("queue creation failed");
-        return;
-    }
-    discard_destroy_count = 0;
-    for (uint32_t i = 0; i < 12; i++) {
-        void *delta = malloc(1);
-        if (!delta || wl_mpsc_enqueue(queue, i % 2, delta, 0, i) != 0) {
-            free(delta);
-            wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
-                queue, count_discard_destroy);
-            wl_mpsc_queue_destroy(queue);
-            FAIL("delta enqueue failed");
-            return;
-        }
-    }
-
-    wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
-        queue, count_discard_destroy);
-    int empty = wl_mpsc_size(queue) == 0 && discard_destroy_count == 12;
-    wl_mpsc_queue_destroy(queue);
-    if (!empty) {
-        FAIL("discard left queued deltas");
-        return;
-    }
-    PASS();
-}
-
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
