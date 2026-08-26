@@ -584,34 +584,21 @@ seed_multi_adornment_relations(const struct wirelog_program *prog,
             || !is_idb(prog, ap->rel_name))
             continue;
 
-        bool already_checked = false;
-        for (uint32_t j = 0; j < i; j++) {
-            if (processed->items[j].rel_name
-                && strcmp(processed->items[j].rel_name, ap->rel_name) == 0) {
-                already_checked = true;
-                break;
-            }
-        }
-        if (already_checked)
-            continue;
+        bool already_unrestrictable = relset_contains(u, ap->rel_name);
 
-        bool found_different_mask = false;
         for (uint32_t j = i + 1; j < processed->count; j++) {
             const ms_adorned_t *other = &processed->items[j];
             if (!other->rel_name || other->bound_mask == 0
                 || strcmp(other->rel_name, ap->rel_name) != 0)
                 continue;
             if (other->bound_mask != ap->bound_mask) {
-                found_different_mask = true;
+                if (count)
+                    (*count)++;
+                if (!already_unrestrictable
+                    && !relset_add(u, ap->rel_name))
+                    return false;
                 break;
             }
-        }
-
-        if (found_different_mask) {
-            if (count)
-                (*count)++;
-            if (!relset_add(u, ap->rel_name))
-                return false;
         }
     }
 
