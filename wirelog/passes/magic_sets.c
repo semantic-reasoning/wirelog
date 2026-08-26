@@ -566,6 +566,59 @@ close_unrestrictable(const struct wirelog_program *prog, ms_relset_t *u)
 }
 
 /*
+ * Same-relation multiple adornments are not safe under this pass's current
+ * one-rule-set-per-relation rewrite (#995).  Inserting one guard per
+ * adornment conjoins demands that should be unioned, so downgrade the relation
+ * to the same all-or-nothing path used by guard viability before closure.
+ */
+static bool
+seed_multi_adornment_relations(const struct wirelog_program *prog,
+    const ms_adorned_set_t *processed, ms_relset_t *u, uint32_t *count)
+{
+    if (count)
+        *count = 0;
+
+    for (uint32_t i = 0; i < processed->count; i++) {
+        const ms_adorned_t *ap = &processed->items[i];
+        if (!ap->rel_name || ap->bound_mask == 0
+            || !is_idb(prog, ap->rel_name))
+            continue;
+
+        bool already_checked = false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (processed->items[j].rel_name
+                && strcmp(processed->items[j].rel_name, ap->rel_name) == 0) {
+                already_checked = true;
+                break;
+            }
+        }
+        if (already_checked)
+            continue;
+
+        bool found_different_mask = false;
+        for (uint32_t j = i + 1; j < processed->count; j++) {
+            const ms_adorned_t *other = &processed->items[j];
+            if (!other->rel_name || other->bound_mask == 0
+                || strcmp(other->rel_name, ap->rel_name) != 0)
+                continue;
+            if (other->bound_mask != ap->bound_mask) {
+                found_different_mask = true;
+                break;
+            }
+        }
+
+        if (found_different_mask) {
+            if (count)
+                (*count)++;
+            if (!relset_add(u, ap->rel_name))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+/*
  * The value domain of variable @var as bound somewhere under @node.
  *
  * Used to type the magic guard SCAN, whose columns hold the same values as
@@ -1053,6 +1106,7 @@ wl_magic_sets_apply_with_demands(struct wirelog_program *prog,
         stats->skipped_aggregate = 0;
         stats->skipped_constant_head = 0;
         stats->skipped_unsupported_head = 0;
+        stats->multi_adornment_relations = 0;
         stats->unrestrictable_relations = 0;
     }
 
@@ -1247,6 +1301,13 @@ next_atom:
         }
     }
 
+    uint32_t multi_adornment_relations = 0;
+    if (!seed_multi_adornment_relations(prog, &processed, &unrestrictable,
+        &multi_adornment_relations))
+        closure_incomplete = true;
+    if (stats)
+        stats->multi_adornment_relations = multi_adornment_relations;
+
     /*
      * === Guard-viability closure (Issue #1027) ===
      *
@@ -1280,11 +1341,12 @@ next_atom:
     if (closure_incomplete) {
         /*
          * Declined: `magic_sets_applied` stays false and the IR is untouched.
-         * Both closure-derived counters are zeroed because neither describes
-         * anything that happened -- `unrestrictable` is a partial set here.
+         * Closure-derived counters are zeroed because none describes anything
+         * that happened -- `unrestrictable` is a partial set here.
          */
         if (stats) {
             stats->adorned_predicates = 0;
+            stats->multi_adornment_relations = 0;
             stats->unrestrictable_relations = 0;
         }
         adorned_set_free(&processed);
