@@ -14,8 +14,6 @@
 #include "lexer.h"
 
 #include <ctype.h>
-#include <errno.h>
-#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,17 +169,14 @@ scan_integer(wl_parser_lexer_t *lexer)
 
     /* Parse unsigned magnitude; the parser decides whether a preceding
      * adjacent '-' makes INT64_MAX + 1 valid as INT64_MIN. */
-    const uint64_t max_signed_magnitude
-        = (uint64_t)INT64_MAX + UINT64_C(1);
-    errno = 0;
-    char *end = NULL;
-    unsigned long long parsed = strtoull(token.start, &end, 10);
-    if (errno == ERANGE || end != lexer->current
-        || parsed > UINT64_MAX)
-        return make_error(lexer, "integer literal out of int64 range");
-    uint64_t value = (uint64_t)parsed;
-    if (value > max_signed_magnitude)
-        return make_error(lexer, "integer literal out of int64 range");
+    const uint64_t max_signed_magnitude = (uint64_t)INT64_MAX + 1;
+    uint64_t value = 0;
+    for (const char *p = token.start; p < lexer->current; p++) {
+        uint64_t digit = (uint64_t)(*p - '0');
+        if (value > (max_signed_magnitude - digit) / 10)
+            return make_error(lexer, "integer literal out of int64 range");
+        value = value * 10 + digit;
+    }
     token.uint_value = value;
     if (value <= (uint64_t)INT64_MAX)
         token.int_value = (int64_t)value;
