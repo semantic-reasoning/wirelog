@@ -11,9 +11,16 @@
  * version 3 of the License, or (at your option) any later version.
  */
 
+#ifndef _WIN32
+#define _GNU_SOURCE 1
+#endif
+
 #include "lexer.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <math.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +84,7 @@ make_token(const wl_parser_lexer_t *lexer, wl_parser_lexer_token_type_t type)
     token.col = lexer->start_col;
     token.int_value = 0;
     token.uint_value = 0;
+    token.float_value = 0.0;
     return token;
 }
 
@@ -91,6 +99,7 @@ make_error(wl_parser_lexer_t *lexer, const char *message)
     token.col = lexer->start_col;
     token.int_value = 0;
     token.uint_value = 0;
+    token.float_value = 0.0;
     snprintf(lexer->error_msg, sizeof(lexer->error_msg), "%s", message);
     return token;
 }
@@ -158,10 +167,63 @@ scan_string(wl_parser_lexer_t *lexer)
 }
 
 static wl_parser_lexer_token_t
-scan_integer(wl_parser_lexer_t *lexer)
+scan_number(wl_parser_lexer_t *lexer)
 {
     while (!is_at_end(lexer) && isdigit((unsigned char)peek(lexer))) {
         advance(lexer);
+    }
+
+    bool is_float = false;
+    if (peek(lexer) == '.' && isdigit((unsigned char)peek_next(lexer))) {
+        is_float = true;
+        advance(lexer);
+        while (!is_at_end(lexer) && isdigit((unsigned char)peek(lexer)))
+            advance(lexer);
+    }
+    if (peek(lexer) == 'e' || peek(lexer) == 'E') {
+        is_float = true;
+        advance(lexer);
+        if (peek(lexer) == '+' || peek(lexer) == '-')
+            advance(lexer);
+        if (!isdigit((unsigned char)peek(lexer)))
+            return make_error(lexer, "malformed float exponent");
+        while (!is_at_end(lexer) && isdigit((unsigned char)peek(lexer)))
+            advance(lexer);
+    }
+
+    if (is_float) {
+        wl_parser_lexer_token_t token
+            = make_token(lexer, WL_PARSER_LEXER_TOK_FLOAT);
+        char *text = wl_parser_lexer_token_to_string(&token);
+        if (!text)
+            return make_error(lexer, "out of memory parsing float literal");
+        errno = 0;
+        char *end = NULL;
+        double value;
+#ifdef _WIN32
+        _locale_t c_locale = _create_locale(LC_NUMERIC, "C");
+        value = c_locale ? _strtod_l(text, &end, c_locale) : 0.0;
+        if (c_locale)
+            _free_locale(c_locale);
+#else
+        locale_t c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+        value = c_locale ? strtod_l(text, &end, c_locale) : 0.0;
+        if (c_locale)
+            freelocale(c_locale);
+#endif
+        int parse_errno = errno;
+        /* ERANGE also reports gradual underflow.  A non-zero finite
+         * subnormal (for example 5e-324) is a valid binary64 value; only an
+         * underflow all the way to zero is rejected. */
+        bool invalid = end == NULL || end == text
+            || *end != '\0' || !isfinite(value)
+            || (parse_errno == ERANGE && value == 0.0);
+        free(text);
+        if (invalid)
+            return make_error(lexer,
+                       "float literal is not a finite binary64 value");
+        token.float_value = value == 0.0 ? 0.0 : value;
+        return token;
     }
 
     wl_parser_lexer_token_t token
@@ -237,6 +299,8 @@ identifier_type(const char *start, uint32_t length)
         return WL_PARSER_LEXER_TOK_STRING_TYPE;
     if (IS_KW("symbol"))
         return WL_PARSER_LEXER_TOK_SYMBOL_TYPE;
+    if (IS_KW("float"))
+        return WL_PARSER_LEXER_TOK_FLOAT_TYPE;
 
     /* Bitwise operator keywords */
     if (IS_KW("band"))
@@ -406,7 +470,7 @@ scan_token(wl_parser_lexer_t *lexer)
 
     /* Integer literals */
     if (isdigit((unsigned char)c)) {
-        return scan_integer(lexer);
+        return scan_number(lexer);
     }
 
     /* String literals */
@@ -524,6 +588,8 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "IDENT";
     case WL_PARSER_LEXER_TOK_INTEGER:
         return "INTEGER";
+    case WL_PARSER_LEXER_TOK_FLOAT:
+        return "FLOAT";
     case WL_PARSER_LEXER_TOK_STRING:
         return "STRING";
     case WL_PARSER_LEXER_TOK_TRUE:
@@ -550,6 +616,8 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "STRING_TYPE";
     case WL_PARSER_LEXER_TOK_SYMBOL_TYPE:
         return "SYMBOL_TYPE";
+    case WL_PARSER_LEXER_TOK_FLOAT_TYPE:
+        return "FLOAT_TYPE";
     case WL_PARSER_LEXER_TOK_LPAREN:
         return "LPAREN";
     case WL_PARSER_LEXER_TOK_RPAREN:

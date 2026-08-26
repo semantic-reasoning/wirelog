@@ -14,11 +14,11 @@
  *     val(1,9). val(1,5). val(1,2).  ->  t(1, 9)   [mean 5]
  *     val(1,1). val(1,2). val(1,9).  ->  t(1, 1)   [mean 4]
  *
- * There is no float type to return a mean in -- storage is int64_t
- * throughout and the lexer has no `float` type keyword or decimal literal --
- * so the choice was truncating integer division or rejection.  Rejection was
- * taken: widening to float later is a compatible change, whereas replacing
- * truncation with float later would silently change every program's numbers.
+ * The legacy executor still has no float column lane to return a mean in --
+ * storage is int64_t throughout -- so the choice was truncating integer
+ * division or rejection.  Rejection was taken: widening to float later is a
+ * compatible change, whereas replacing truncation with float later would
+ * silently change every program's numbers.
  * See docs/SYNTAX.md and the #973 precedent (reject first, support later).
  *
  * Case map:

@@ -72,6 +72,8 @@ typedef struct {
     int64_t *fact_data;
     uint32_t fact_count;
     uint32_t fact_capacity;
+    bool has_float_facts; /* prevents legacy executor reinterpretation */
+    bool has_float_compound_slots; /* includes side compounds */
     /* Issue #535: RDF named-graph support */
     bool has_graph_column;
     uint32_t graph_column_index;  /* valid only when has_graph_column == true */

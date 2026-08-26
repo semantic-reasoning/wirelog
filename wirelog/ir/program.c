@@ -59,6 +59,14 @@ type_name_to_column_type(const char *type_name)
     return WIRELOG_TYPE_INT32;
 }
 
+static int64_t
+float_lane_bits(double value)
+{
+    int64_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 /* ======================================================================== */
 /* Compound Column Metadata Parsing (Issue #531)                            */
 /* ======================================================================== */
@@ -147,6 +155,8 @@ parse_compound_metadata(const char *type_name, wl_intern_t *intern,
                 5) == 0) ty = WIRELOG_TYPE_INT64;
             else if (tlen == 6 && (strncmp(tok, "string", 6) == 0
                 || strncmp(tok, "symbol", 6) == 0)) ty = WIRELOG_TYPE_STRING;
+            else if (tlen == 5 && strncmp(tok, "float", 5) == 0)
+                ty = WIRELOG_TYPE_FLOAT;
             else {
                 free(functor_name); return result;
             }
@@ -497,6 +507,7 @@ collect_decl(struct wirelog_program *prog,
     rel->slot_types = NULL;
     rel->slot_type_declared = NULL;
     rel->slot_type_count = 0;
+    rel->has_float_compound_slots = false;
 
     if (col_count > 0) {
         rel->columns
@@ -528,6 +539,15 @@ collect_decl(struct wirelog_program *prog,
                 rel->columns[idx].compound_functor_id = meta.functor_id;
                 rel->columns[idx].compound_arity = meta.arity;
                 rel->columns[idx].compound_inline_col_offset = 0;
+
+                if (meta.has_slot_types) {
+                    for (uint32_t si = 0; si < meta.arity; si++) {
+                        if (meta.slot_types[si] == WIRELOG_TYPE_FLOAT) {
+                            rel->has_float_compound_slots = true;
+                            break;
+                        }
+                    }
+                }
 
                 /* Issue #1037: fixed stride col*4+slot.  A physically packed
                  * array would have to be built in column order and misaligns
@@ -822,6 +842,9 @@ collect_fact(struct wirelog_program *prog,
         const wl_parser_ast_node_t *arg = fact_node->children[i];
         if (arg->type == WL_PARSER_AST_NODE_INTEGER) {
             rel->fact_data[offset + i] = arg->int_value;
+        } else if (arg->type == WL_PARSER_AST_NODE_FLOAT) {
+            rel->fact_data[offset + i] = float_lane_bits(arg->float_value);
+            rel->has_float_facts = true;
         } else if (arg->type == WL_PARSER_AST_NODE_STRING) {
             rel->fact_data[offset + i]
                 = wl_intern_put(prog->intern, arg->str_value);
@@ -889,7 +912,7 @@ atom_physical_column_count(const wl_parser_ast_node_t *atom,
  *
  * Nothing is taken away by tightening.  The flat spelling `pred(1,10,20).`
  * is the redirect, and it is the *only* spelling that ever worked: the fact
- * grammar admits integer and string constants only, so `pred(1, f(10,20)).`
+ * grammar admits numeric and string constants only, so `pred(1, f(10,20)).`
  * and `pred(1, [10,20]).` are parse errors, and the head grammar likewise
  * has no compound-term production.  Before this change the flat spelling was
  * rejected and the broken one accepted, which is to say the relation had no
@@ -1205,6 +1228,12 @@ convert_expr(const wl_parser_ast_node_t *node)
         wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_CONST_INT);
         if (e)
             e->int_value = node->int_value;
+        return e;
+    }
+    case WL_PARSER_AST_NODE_FLOAT: {
+        wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_CONST_FLOAT);
+        if (e)
+            e->float_value = node->float_value;
         return e;
     }
     case WL_PARSER_AST_NODE_STRING: {
@@ -1867,6 +1896,17 @@ build_side_compound_scan(const wl_parser_ast_node_t *compound_arg,
                 goto fail;
             }
             scan = result;
+        } else if (child->type == WL_PARSER_AST_NODE_FLOAT) {
+            wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_FLOAT);
+            if (!rhs)
+                goto fail;
+            rhs->float_value = child->float_value;
+            result = wrap_column_cmp_filter(result, i + 1u, rhs);
+            if (!result) {
+                scan = NULL;
+                goto fail;
+            }
+            scan = result;
         } else if (child->type == WL_PARSER_AST_NODE_STRING) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
             if (!rhs)
@@ -2356,6 +2396,29 @@ scan_build_complete:
                 free_var_names(var_names, physical_count);
                 return NULL;
             }
+        } else if (arg->type == WL_PARSER_AST_NODE_FLOAT) {
+            wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_FLOAT);
+            if (rhs) {
+                rhs->float_value = arg->float_value;
+                result = wrap_column_cmp_filter(result, i, rhs);
+                if (!result) {
+                    wl_ir_node_free(result);
+                    for (uint32_t j = 0; j < side_binding_count; j++)
+                        free(side_bindings[j].handle_var);
+                    free(side_bindings);
+                    free((void *)physical_args);
+                    free_var_names(var_names, physical_count);
+                    return NULL;
+                }
+            } else {
+                wl_ir_node_free(result);
+                for (uint32_t j = 0; j < side_binding_count; j++)
+                    free(side_bindings[j].handle_var);
+                free(side_bindings);
+                free((void *)physical_args);
+                free_var_names(var_names, physical_count);
+                return NULL;
+            }
         } else if (arg->type == WL_PARSER_AST_NODE_STRING) {
             wl_ir_expr_t *rhs = wl_ir_expr_create(WL_IR_EXPR_CONST_STR);
             if (rhs) {
@@ -2410,6 +2473,7 @@ static bool
 wl_ir_program_ast_is_constant(const wl_parser_ast_node_t *node)
 {
     return node && (node->type == WL_PARSER_AST_NODE_INTEGER
+           || node->type == WL_PARSER_AST_NODE_FLOAT
            || node->type == WL_PARSER_AST_NODE_STRING);
 }
 
@@ -2452,6 +2516,12 @@ wl_ir_program_constant_expr(const wl_parser_ast_node_t *node)
         wl_ir_expr_t *expr = wl_ir_expr_create(WL_IR_EXPR_CONST_INT);
         if (expr)
             expr->int_value = node->int_value;
+        return expr;
+    }
+    if (node->type == WL_PARSER_AST_NODE_FLOAT) {
+        wl_ir_expr_t *expr = wl_ir_expr_create(WL_IR_EXPR_CONST_FLOAT);
+        if (expr)
+            expr->float_value = node->float_value;
         return expr;
     }
     if (node->type == WL_PARSER_AST_NODE_STRING) {

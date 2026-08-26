@@ -30,6 +30,7 @@
 typedef enum {
     WL_IR_EXPR_VAR,       /* variable reference (by name) */
     WL_IR_EXPR_CONST_INT, /* integer constant */
+    WL_IR_EXPR_CONST_FLOAT, /* finite binary64 constant */
     WL_IR_EXPR_CONST_STR, /* string constant */
     WL_IR_EXPR_ARITH,     /* binary arithmetic (+,-,*,/,%) */
     WL_IR_EXPR_CMP,       /* comparison (=,!=,<,>,<=,>=) */
@@ -46,6 +47,7 @@ struct wl_ir_expr {
     /* Data (usage depends on type) */
     char *var_name;    /* WL_IR_EXPR_VAR: variable name */
     int64_t int_value; /* WL_IR_EXPR_CONST_INT */
+    double float_value; /* WL_IR_EXPR_CONST_FLOAT */
     char *str_value;   /* WL_IR_EXPR_CONST_STR */
     bool bool_value;   /* WL_IR_EXPR_BOOL */
 

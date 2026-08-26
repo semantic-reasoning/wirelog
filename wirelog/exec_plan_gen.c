@@ -709,6 +709,7 @@ expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
         return WL_IR_COLTYPE_STRING;
 
     case WL_IR_EXPR_CONST_INT:
+    case WL_IR_EXPR_CONST_FLOAT:
     case WL_IR_EXPR_BOOL:
     case WL_IR_EXPR_ARITH:
     case WL_IR_EXPR_CMP:
@@ -809,6 +810,10 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         if (expr_buf_push_u8(buf, WL_PLAN_EXPR_CONST_INT) != 0)
             return -1;
         return expr_buf_push_i64(buf, expr->int_value);
+
+    case WL_IR_EXPR_CONST_FLOAT:
+        /* Kept in IR until the typed columnar evaluator lands. */
+        return -1;
 
     case WL_IR_EXPR_CONST_STR: {
         if (!expr->str_value)
@@ -1709,10 +1714,9 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
          * diagnostic.
          *
          * Implementing it needs a return type this engine does not have.
-         * Every value is an int64_t (columnar/internal.h), and while
-         * WIRELOG_TYPE_FLOAT exists in the public enum it is vestigial: the
-         * lexer has type keywords for int32/int64/string/symbol only and no
-         * decimal literal, so neither `.decl v(x: float)` nor `1.5` parses.
+         * The current columnar evaluator still consumes int64 lanes.  The
+         * parser and IR now preserve finite binary64 values, but this
+         * lowering path rejects them until typed columnar evaluation lands.
          * The only implementable semantics today is truncating integer
          * division, and that is the one choice that cannot be corrected
          * later without silently changing existing programs' numbers --
@@ -1726,7 +1730,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
          * Placed at lowering, not in the lexer: `average`/`AVG` keep
          * tokenizing, the AST keeps its AGGREGATE node and the public
          * WIRELOG_AGG_AVG stays as it is, so nothing about the surface
-         * syntax has to be un-done when float arrives.
+         * syntax remains available while typed execution is added.
          */
         if (node->agg_fn == WIRELOG_AGG_AVG) {
             WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
@@ -3709,6 +3713,44 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
         return -1;
 
     *out = NULL;
+
+    /* The parser/IR representation is intentionally landed before the
+     * columnar float consumers.  Do not let a float relation reach the legacy
+     * int64 evaluator in this intermediate state: it would reinterpret a
+     * binary64 lane as an integer and silently produce wrong answers. */
+    for (uint32_t ri = 0; ri < prog->relation_count; ri++) {
+        const wl_ir_relation_info_t *rel = &prog->relations[ri];
+        if (rel->has_float_facts) {
+            set_plan_error(prog,
+                "relation '%s' has float facts but float columnar support "
+                "is not available", rel->name);
+            return -1;
+        }
+        if (rel->has_float_compound_slots) {
+            set_plan_error(prog,
+                "relation '%s' has float compound slots but float "
+                "columnar support is not available", rel->name);
+            return -1;
+        }
+        for (uint32_t ci = 0; ci < rel->column_count; ci++) {
+            if (rel->columns && rel->columns[ci].type == WIRELOG_TYPE_FLOAT) {
+                set_plan_error(prog,
+                    "float relation '%s' is not executable until float "
+                    "columnar support is available", rel->name);
+                return -1;
+            }
+        }
+        for (uint32_t si = 0; si < rel->slot_type_count; si++) {
+            if (rel->slot_type_declared && rel->slot_types
+                && rel->slot_type_declared[si]
+                && rel->slot_types[si] == WIRELOG_TYPE_FLOAT) {
+                set_plan_error(prog,
+                    "relation '%s' has float compound slots but float "
+                    "columnar support is not available", rel->name);
+                return -1;
+            }
+        }
+    }
 
     /* Issue #287/#962: plan generation emits WL_LOG diagnostics -- cmp_to_tag()
      * reports ordering comparisons that fall back to intern-id order -- and it

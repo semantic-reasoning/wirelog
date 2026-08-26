@@ -26,16 +26,18 @@
  *   atom        = IDENT "(" atom_args? ")"
  *   negative    = "!" atom
  *   atom_args   = atom_arg ("," atom_arg)*
- *   atom_arg    = IDENT | signed_integer | STRING | "_"
+ *   atom_arg    = IDENT | signed_number | STRING | "_"
  *   arith_expr  = factor (arith_op factor)*
- *   factor      = IDENT | signed_integer | STRING
+ *   factor      = IDENT | signed_number | STRING
  *   signed_int  = INTEGER | "-" INTEGER  (no whitespace between '-' and INTEGER)
+ *   signed_number = signed_int | FLOAT | "-" FLOAT
  *   compare     = arith_expr compare_op arith_expr
  *   aggregate   = agg_op "(" arith_expr ")"
  */
 
 #include "parser.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,6 +238,33 @@ parse_integer_literal(wl_parser_t *parser)
     return node;
 }
 
+static wl_parser_ast_node_t *
+parse_float_literal(wl_parser_t *parser)
+{
+    wl_parser_lexer_token_t minus = parser->current;
+    bool negative = parser_match(parser, WL_PARSER_LEXER_TOK_MINUS);
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_FLOAT,
+        "expected float literal"))
+        return NULL;
+
+    double value = parser->previous.float_value;
+    if (negative)
+        value = -value;
+    if (!isfinite(value)) {
+        parser_error(parser, "float literal is not finite after negation");
+        return NULL;
+    }
+
+    wl_parser_ast_node_t *node = wl_parser_ast_node_create(
+        WL_PARSER_AST_NODE_FLOAT,
+        negative ? minus.line : parser->previous.line,
+        negative ? minus.col : parser->previous.col);
+    if (!node)
+        return NULL;
+    node->float_value = value == 0.0 ? 0.0 : value;
+    return node;
+}
+
 static char *
 parse_declaration_type(wl_parser_t *parser)
 {
@@ -247,9 +276,11 @@ parse_declaration_type(wl_parser_t *parser)
         return strdup_safe("string");
     if (parser_match(parser, WL_PARSER_LEXER_TOK_SYMBOL_TYPE))
         return strdup_safe("symbol");
+    if (parser_match(parser, WL_PARSER_LEXER_TOK_FLOAT_TYPE))
+        return strdup_safe("float");
 
     if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-        "expected type (int32, int64, string, symbol, or compound functor/arity)"))
+        "expected type (int32, int64, string, symbol, float, or compound functor/arity)"))
     {
         return NULL;
     }
@@ -275,9 +306,11 @@ parse_declaration_type(wl_parser_t *parser)
                 WL_PARSER_LEXER_TOK_STRING_TYPE)) t = "string";
             else if (parser_match(parser,
                 WL_PARSER_LEXER_TOK_SYMBOL_TYPE)) t = "symbol";
+            else if (parser_match(parser,
+                WL_PARSER_LEXER_TOK_FLOAT_TYPE)) t = "float";
             else {
                 parser_error(parser, "expected a slot type (int32, int64, "
-                    "string, symbol) in a compound type list");
+                    "string, symbol, float) in a compound type list");
                 free(functor);
                 return NULL;
             }
@@ -498,6 +531,15 @@ parse_factor(wl_parser_t *parser)
             = wl_parser_ast_node_create(WL_PARSER_AST_NODE_VARIABLE, line, col);
         node->name = token_to_name(&parser->previous);
         return node;
+    }
+
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_FLOAT))
+        return parse_float_literal(parser);
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
+        wl_parser_lexer_token_t next = wl_parser_lexer_peek_token(
+            &parser->lexer);
+        if (next.type == WL_PARSER_LEXER_TOK_FLOAT)
+            return parse_float_literal(parser);
     }
 
     if (parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)
@@ -836,7 +878,7 @@ parse_factor(wl_parser_t *parser)
         return parse_string_fn_expr(parser);
     }
 
-    parser_error(parser, "expected variable, integer, or string");
+    parser_error(parser, "expected variable, number, or string");
     return NULL;
 }
 
@@ -1103,6 +1145,15 @@ parse_atom_arg_at_depth(wl_parser_t *parser, uint32_t depth)
         return node;
     }
 
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_FLOAT))
+        return parse_float_literal(parser);
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
+        wl_parser_lexer_token_t next = wl_parser_lexer_peek_token(
+            &parser->lexer);
+        if (next.type == WL_PARSER_LEXER_TOK_FLOAT)
+            return parse_float_literal(parser);
+    }
+
     if (parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)
         || parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
         return parse_integer_literal(parser);
@@ -1333,8 +1384,14 @@ parse_predicate(wl_parser_t *parser)
         return cmp;
     }
 
-    /* Comparison starting with integer constant */
-    if (parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)
+    /* Comparison starting with a numeric constant */
+    bool starts_float = parser_check(parser, WL_PARSER_LEXER_TOK_FLOAT);
+    if (!starts_float && parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
+        wl_parser_lexer_token_t next = wl_parser_lexer_peek_token(
+            &parser->lexer);
+        starts_float = next.type == WL_PARSER_LEXER_TOK_FLOAT;
+    }
+    if (starts_float || parser_check(parser, WL_PARSER_LEXER_TOK_INTEGER)
         || parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
         wl_parser_ast_node_t *left = parse_arithmetic_expr(parser);
         if (!left)
@@ -1481,13 +1538,14 @@ parse_fact(wl_parser_t *parser, wl_parser_ast_node_t *head)
 
     wl_parser_ast_node_free(head);
 
-    /* Validate: fact arguments must be constants (INTEGER or STRING) */
+    /* Validate: fact arguments must be numeric or string constants. */
     for (uint32_t i = 0; i < fact->child_count; i++) {
         wl_parser_ast_node_type_t arg_type = fact->children[i]->type;
         if (arg_type != WL_PARSER_AST_NODE_INTEGER
+            && arg_type != WL_PARSER_AST_NODE_FLOAT
             && arg_type != WL_PARSER_AST_NODE_STRING) {
             parser_error(
-                parser, "fact arguments must be constants (integer or string)");
+                parser, "fact arguments must be constants (number or string)");
             wl_parser_ast_node_free(fact);
             return NULL;
         }

@@ -1415,8 +1415,9 @@ test('recursive_agg_kfusion_nofusion', test_recursive_agg_kfusion_nofusion_exe,
      suite: 'semantics', timeout: 120)
 
 # Issue #978: average() was never implemented -- col_op_reduce() had no AVG
-# arm, so each group kept the first operand the scan happened to reach.  With
-# no float type to return a mean in, it is rejected at lowering instead.
+# arm, so each group kept the first operand the scan happened to reach.  The
+# legacy int64 executor has no float lane to return a mean in, so it is
+# rejected at lowering instead.
 test_average_rejected_exe = executable(
   'test_average_rejected',
   files('test_average_rejected.c'),

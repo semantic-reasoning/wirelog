@@ -33,6 +33,7 @@ typedef enum {
     /* Literals */
     WL_PARSER_LEXER_TOK_IDENT,   /* identifier: _?[a-zA-Z]+[a-zA-Z0-9_]* */
     WL_PARSER_LEXER_TOK_INTEGER, /* integer literal: [0-9]+ */
+    WL_PARSER_LEXER_TOK_FLOAT,   /* finite decimal/exponent literal */
     WL_PARSER_LEXER_TOK_STRING,  /* "string literal" */
 
     /* Boolean literals */
@@ -54,6 +55,7 @@ typedef enum {
     WL_PARSER_LEXER_TOK_INT64,       /* int64 */
     WL_PARSER_LEXER_TOK_STRING_TYPE, /* string (as type name, not literal) */
     WL_PARSER_LEXER_TOK_SYMBOL_TYPE, /* symbol */
+    WL_PARSER_LEXER_TOK_FLOAT_TYPE,  /* float (binary64) */
 
     /* Punctuation */
     WL_PARSER_LEXER_TOK_LPAREN, /* ( */
@@ -146,6 +148,7 @@ typedef struct {
     /* Parsed value (for integer literals) */
     int64_t int_value;
     uint64_t uint_value;
+    double float_value;
 } wl_parser_lexer_token_t;
 
 /* ======================================================================== */

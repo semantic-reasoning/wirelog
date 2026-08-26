@@ -118,6 +118,7 @@ wl_ir_expr_clone(const wl_ir_expr_t *expr)
         return NULL;
 
     clone->int_value = expr->int_value;
+    clone->float_value = expr->float_value;
     clone->bool_value = expr->bool_value;
     clone->arith_op = expr->arith_op;
     clone->cmp_op = expr->cmp_op;
@@ -373,6 +374,9 @@ ir_expr_to_buf(const wl_ir_expr_t *expr, char *buf, size_t bufsize, size_t *pos)
     case WL_IR_EXPR_CONST_INT:
         ir_buf_append(buf, bufsize, pos, "%lld",
             (long long)expr->int_value);
+        break;
+    case WL_IR_EXPR_CONST_FLOAT:
+        ir_buf_append(buf, bufsize, pos, "%.17g", expr->float_value);
         break;
     case WL_IR_EXPR_CONST_STR:
         ir_buf_append(buf, bufsize, pos, "\"%s\"",
