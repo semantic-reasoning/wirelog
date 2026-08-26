@@ -68,6 +68,14 @@ wirelog exposes the following mbedTLS-backed Datalog built-ins:
 
 wirelog does not currently expose broader digest-family or generic
 HMAC-family built-ins as callable Datalog functions.
+
+For a native installation without pkg-config or CMake metadata, configure
+with `-DmbedTLS_prefix=/path/to/mbedtls`. The fallback only considers matching
+headers under `<prefix>/include` and complete library bundles under
+`<prefix>/lib` or `<prefix>/lib64`, then reruns the PSA link probe. It is never
+used for cross builds, and `mbedTLS=disabled` ignores the prefix. Existing
+metadata-based discovery always takes priority.
+
 Digest and HMAC built-ins take their input bytes from the operand's
 declared type (#963): the string's own bytes for a `symbol`/`string`
 column, `strlen()` many with no NUL terminator, and the 8-byte `int64`

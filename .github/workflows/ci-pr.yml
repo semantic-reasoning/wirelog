@@ -456,7 +456,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev
+          sudo apt-get install -y meson ninja-build pkg-config libmbedtls-dev
 
       - name: Configure with mbedTLS enabled
         run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
@@ -475,6 +475,9 @@ jobs:
       # evaluator arms compiled in.
       - name: Test mbedTLS crypto built-ins
         run: meson test -C builddir-mbedtls cryptographic_hashes symbol_digests --print-errorlogs
+
+      - name: Test metadata-free mbedTLS prefix discovery
+        run: scripts/ci/test-mbedtls-prefix.sh
 
   # ==========================================================================
   # Phase: Sanitizer Matrix (starts after lint, parallel with build-primary)
