@@ -193,6 +193,23 @@ test_parse_decl_string_type(void)
 }
 
 static void
+test_parse_decl_float_type(void)
+{
+    TEST(".decl with float type");
+    PARSE(".decl Value(x: float)");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *decl = child(program, 0);
+    const wl_parser_ast_node_t *param = child(decl, 0);
+    if (!param || !param->type_name || strcmp(param->type_name, "float") != 0) {
+        CLEANUP();
+        FAIL("expected float type name");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
 test_parse_decl_empty_params(void)
 {
     TEST(".decl with empty params");
@@ -1442,6 +1459,54 @@ test_parse_signed_integer_literals(void)
 }
 
 static void
+test_parse_float_literals(void)
+{
+    TEST("float literals in facts, heads, and compound terms");
+    PARSE("v(- 1.5). w(1e3, 1.5e-2) :- v(-1.5). "
+        "ordered(x) :- 1.5 < x.");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *fact = child(program, 0);
+    const wl_parser_ast_node_t *rule = child(program, 1);
+    if (!fact || fact->type != WL_PARSER_AST_NODE_FACT
+        || child(fact, 0)->type != WL_PARSER_AST_NODE_FLOAT
+        || child(fact, 0)->float_value != -1.5
+        || !rule || child(child(rule, 0), 0)->type != WL_PARSER_AST_NODE_FLOAT
+        || child(child(rule, 0), 1)->type != WL_PARSER_AST_NODE_FLOAT) {
+        CLEANUP();
+        FAIL("float literals did not produce FLOAT AST nodes");
+        return;
+    }
+    const wl_parser_ast_node_t *ordered = child(program, 2);
+    const wl_parser_ast_node_t *ordered_cmp = child(ordered, 1);
+    const wl_parser_ast_node_t *ordered_left = child(ordered_cmp, 0);
+    if (!ordered_cmp || ordered_cmp->type != WL_PARSER_AST_NODE_COMPARISON
+        || !ordered_left || ordered_left->type != WL_PARSER_AST_NODE_FLOAT
+        || ordered_left->float_value != 1.5) {
+        CLEANUP();
+        FAIL("float-leading comparison was not preserved in the AST");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parse_float_errors(void)
+{
+    TEST("ambiguous decimal spellings are rejected");
+    const char *sources[] = { "v(.5).", "v(1.).", "v(1.5.)." };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        PARSE(sources[i]);
+        if (program != NULL) {
+            CLEANUP();
+            FAIL("invalid decimal unexpectedly parsed");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
 test_parse_signed_integer_errors(void)
 {
     TEST("signed integer whitespace and overflow errors");
@@ -2074,6 +2139,7 @@ main(void)
     test_parse_decl_string_type();
     test_parse_decl_empty_params();
     test_parse_decl_three_attrs();
+    test_parse_decl_float_type();
     test_parse_decl_compound_types();
     test_parse_decl_compound_rejects_zero_arity();
     test_parse_decl_compound_rejects_bad_modifier();
@@ -2141,6 +2207,8 @@ main(void)
     printf("\n--- Inline Facts ---\n");
     test_parse_single_fact();
     test_parse_signed_integer_literals();
+    test_parse_float_literals();
+    test_parse_float_errors();
     test_parse_signed_integer_errors();
     test_parse_signed_integer_expressions();
     test_parse_multiple_facts();

@@ -580,6 +580,34 @@ test_expr_bool(void)
 }
 
 static void
+test_expr_float_constant(void)
+{
+    TEST("float expression constant stores binary64 value");
+    wl_ir_expr_t *expr = wl_ir_expr_create(WL_IR_EXPR_CONST_FLOAT);
+    if (!expr) {
+        FAIL("failed to create float expression");
+        return;
+    }
+    expr->float_value = 1.5;
+    if (expr->type != WL_IR_EXPR_CONST_FLOAT || expr->float_value != 1.5) {
+        wl_ir_expr_free(expr);
+        FAIL("float expression value was not preserved");
+        return;
+    }
+    wl_ir_expr_t *clone = wl_ir_expr_clone(expr);
+    if (!clone || clone->type != WL_IR_EXPR_CONST_FLOAT
+        || clone->float_value != 1.5) {
+        wl_ir_expr_free(clone);
+        wl_ir_expr_free(expr);
+        FAIL("float expression clone did not preserve value");
+        return;
+    }
+    wl_ir_expr_free(clone);
+    wl_ir_expr_free(expr);
+    PASS();
+}
+
+static void
 test_expr_aggregate(void)
 {
     TEST("Create aggregate expression (min)");
@@ -1138,6 +1166,7 @@ main(void)
     test_create_expression_tree();
     test_expr_string_constant();
     test_expr_bool();
+    test_expr_float_constant();
     test_expr_aggregate();
     test_child_attach_reports_allocation_failure();
 

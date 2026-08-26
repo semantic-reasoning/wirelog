@@ -153,6 +153,8 @@ wl_parser_ast_node_type_str(wl_parser_ast_node_type_t type)
         return "VARIABLE";
     case WL_PARSER_AST_NODE_INTEGER:
         return "INTEGER";
+    case WL_PARSER_AST_NODE_FLOAT:
+        return "FLOAT";
     case WL_PARSER_AST_NODE_STRING:
         return "STRING";
     case WL_PARSER_AST_NODE_WILDCARD:
@@ -291,6 +293,8 @@ wl_parser_ast_print(const wl_parser_ast_node_t *node, int indent)
         fprintf(stderr, " name=\"%s\"", node->name);
     if (node->type == WL_PARSER_AST_NODE_INTEGER)
         fprintf(stderr, " value=%lld", (long long)node->int_value);
+    if (node->type == WL_PARSER_AST_NODE_FLOAT)
+        fprintf(stderr, " value=%.17g", node->float_value);
     if (node->str_value)
         fprintf(stderr, " str=\"%s\"", node->str_value);
     if (node->type == WL_PARSER_AST_NODE_BOOLEAN)

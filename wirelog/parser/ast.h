@@ -52,6 +52,7 @@ typedef enum {
     /* Terms / Arguments */
     WL_PARSER_AST_NODE_VARIABLE,  /* name = variable name */
     WL_PARSER_AST_NODE_INTEGER,   /* int_value = integer constant */
+    WL_PARSER_AST_NODE_FLOAT,     /* float_value = binary64 constant */
     WL_PARSER_AST_NODE_STRING,    /* str_value = string constant */
     WL_PARSER_AST_NODE_WILDCARD,  /* _ placeholder */
     WL_PARSER_AST_NODE_AGGREGATE, /* agg_fn, children[0] = arithmetic expr */
@@ -92,6 +93,7 @@ struct wl_parser_ast_node {
     /* Node data (usage depends on type) */
     char *name;        /* Relation/variable/attribute name */
     int64_t int_value; /* Integer constant value */
+    double float_value; /* Finite binary64 constant value */
     char *str_value;   /* String constant or param value */
     bool bool_value;   /* Boolean predicate value */
     bool is_planning;  /* .plan optimization marker (rules only) */

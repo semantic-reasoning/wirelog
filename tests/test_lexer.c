@@ -14,6 +14,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
+#include <locale.h>
 
 #include "../wirelog/parser/lexer.h"
 
@@ -225,6 +226,108 @@ test_integer_overflow(void)
 }
 
 static void
+test_float_literals(void)
+{
+    TEST("finite decimal and exponent float literals");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "1.5 1e3 1.5e-2");
+    wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&lex);
+    if (tok.type != WL_PARSER_LEXER_TOK_FLOAT || tok.float_value != 1.5) {
+        FAIL("expected 1.5 FLOAT");
+        return;
+    }
+    tok = wl_parser_lexer_next_token(&lex);
+    if (tok.type != WL_PARSER_LEXER_TOK_FLOAT || tok.float_value != 1000.0) {
+        FAIL("expected 1e3 FLOAT");
+        return;
+    }
+    tok = wl_parser_lexer_next_token(&lex);
+    if (tok.type != WL_PARSER_LEXER_TOK_FLOAT
+        || tok.float_value != 1.5e-2) {
+        FAIL("expected 1.5e-2 FLOAT");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_float_literal_errors(void)
+{
+    TEST("malformed and non-finite float literals are rejected");
+    const char *sources[] = { "1e", "1.5e+", "1e999", "1.0e-999" };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        wl_parser_lexer_t lex;
+        wl_parser_lexer_init(&lex, sources[i]);
+        if (wl_parser_lexer_next_token(&lex).type
+            != WL_PARSER_LEXER_TOK_ERROR) {
+            FAIL("invalid float unexpectedly tokenized");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void
+test_float_subnormal_and_zero(void)
+{
+    TEST("subnormal floats are accepted and signed zero is canonicalized");
+    wl_parser_lexer_t lex;
+    wl_parser_lexer_init(&lex, "5e-324 -0.0");
+    wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&lex);
+    if (tok.type != WL_PARSER_LEXER_TOK_FLOAT || tok.float_value <= 0.0) {
+        FAIL("minimum subnormal was rejected");
+        return;
+    }
+    tok = wl_parser_lexer_next_token(&lex);
+    if (tok.type != WL_PARSER_LEXER_TOK_MINUS) {
+        FAIL("expected minus token before zero");
+        return;
+    }
+    tok = wl_parser_lexer_next_token(&lex);
+    if (tok.type != WL_PARSER_LEXER_TOK_FLOAT || tok.float_value != 0.0) {
+        FAIL("negative zero was not canonicalized");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_float_literal_uses_c_locale(void)
+{
+    TEST("float literal parsing is independent of LC_NUMERIC");
+    const char *saved = setlocale(LC_NUMERIC, NULL);
+    char *saved_copy = NULL;
+    if (saved) {
+        size_t saved_len = strlen(saved);
+        saved_copy = (char *)malloc(saved_len + 1);
+        if (saved_copy)
+            memcpy(saved_copy, saved, saved_len + 1);
+    }
+    const char *locales[] = {
+        "C.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "de_DE", "fr_FR"
+    };
+    for (size_t i = 0; i < sizeof(locales) / sizeof(locales[0]); i++) {
+        if (!setlocale(LC_NUMERIC, locales[i]))
+            continue;
+        wl_parser_lexer_t lex;
+        wl_parser_lexer_init(&lex, "1.5");
+        wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&lex);
+        if (tok.type != WL_PARSER_LEXER_TOK_FLOAT || tok.float_value != 1.5) {
+            if (saved_copy)
+                setlocale(LC_NUMERIC, saved_copy);
+            free(saved_copy);
+            FAIL("LC_NUMERIC changed float parsing");
+            return;
+        }
+        break;
+    }
+    if (saved_copy)
+        setlocale(LC_NUMERIC, saved_copy);
+    free(saved_copy);
+    PASS();
+}
+
+static void
 test_string_literal(void)
 {
     TEST("string literal");
@@ -332,10 +435,11 @@ test_type_keywords(void)
 {
     TEST("type keywords");
     wl_parser_lexer_t lex;
-    wl_parser_lexer_init(&lex, "int32 int64 string");
+    wl_parser_lexer_init(&lex, "int32 int64 string float");
     ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_INT32);
     ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_INT64);
     ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_STRING_TYPE);
+    ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_FLOAT_TYPE);
     ASSERT_TOK(lex, WL_PARSER_LEXER_TOK_EOF);
     PASS();
 }
@@ -915,6 +1019,10 @@ main(void)
     test_integer_zero();
     test_integer_large();
     test_integer_overflow();
+    test_float_literals();
+    test_float_literal_errors();
+    test_float_subnormal_and_zero();
+    test_float_literal_uses_c_locale();
     test_string_literal();
     test_string_empty();
     test_string_escaped_quote();

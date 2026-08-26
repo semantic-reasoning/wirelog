@@ -59,6 +59,39 @@ static int fail_count = 0;
             }                 \
         } while (0)
 
+static bool
+expr_contains_float_constant(const wl_ir_expr_t *expr)
+{
+    if (!expr)
+        return false;
+    if (expr->type == WL_IR_EXPR_CONST_FLOAT)
+        return true;
+    for (uint32_t i = 0; i < expr->child_count; i++) {
+        if (expr_contains_float_constant(expr->children[i]))
+            return true;
+    }
+    return false;
+}
+
+static bool
+node_contains_float_constant(const wirelog_ir_node_t *node)
+{
+    if (!node)
+        return false;
+    if (expr_contains_float_constant(node->filter_expr)
+        || expr_contains_float_constant(node->agg_expr))
+        return true;
+    for (uint32_t i = 0; i < node->project_count; i++) {
+        if (expr_contains_float_constant(node->project_exprs[i]))
+            return true;
+    }
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        if (node_contains_float_constant(node->children[i]))
+            return true;
+    }
+    return false;
+}
+
 /* ----------------------------------------------------------------
  * Snapshot counting callback
  * ---------------------------------------------------------------- */
@@ -978,6 +1011,61 @@ test_plan_generation_diagnostics(void)
     PASS();
 }
 
+static void
+test_float_plan_rejected_until_columnar_support(void)
+{
+    TEST("float plans are rejected before the legacy int64 executor");
+    wirelog_error_t err;
+    const char *sources[] = {
+        ".decl value(x: float)\nvalue(1.5).\n",
+        ".decl value(x: int64)\nvalue(1.5).\n",
+        ".decl value(x: box(float))\nvalue(1.5).\n",
+        ".decl value(x: box(float))\n",
+        ".decl value(x: box(float) inline)\n",
+        ".decl src(x: int64)\nsrc(1).\n"
+        ".decl out(x: int64)\nout(1.5) :- src(x).\n",
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        wirelog_program_t *prog = wirelog_parse_string(sources[i], &err);
+        ASSERT(prog != NULL, "float fixture failed to parse");
+        if (i == 5) {
+            ASSERT(prog->rule_count == 1 && prog->rules[0].ir_root != NULL,
+                "float rule was not converted to IR");
+            ASSERT(node_contains_float_constant(prog->rules[0].ir_root),
+                "float rule literal was not preserved in the IR");
+        }
+        wl_plan_t *plan = NULL;
+        ASSERT(wl_plan_from_program(prog, &plan) != 0,
+            "float relation must not reach int64 executor yet");
+        ASSERT(plan == NULL, "rejected float plan must remain NULL");
+        const char *detail = wirelog_program_get_plan_error(prog);
+        if (i < 3) {
+            ASSERT(detail && strstr(detail, "float") != NULL,
+                "float rejection must explain the unsupported execution path");
+        }
+        wirelog_program_free(prog);
+    }
+    PASS();
+}
+
+static void
+test_float_compound_metadata_resets_on_redeclaration(void)
+{
+    TEST("float compound metadata resets on redeclaration");
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        ".decl redecl(x: box(float))\n"
+        ".decl redecl(x: int64)\n"
+        "redecl(1).\n", &err);
+    ASSERT(prog != NULL, "redeclaration fixture failed to parse");
+    wl_plan_t *plan = NULL;
+    ASSERT(wl_plan_from_program(prog, &plan) == 0 && plan != NULL,
+        "integer redeclaration retained stale float metadata");
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * Test: wl_session_load_facts NULL-safe
  * ---------------------------------------------------------------- */
@@ -1015,6 +1103,8 @@ main(void)
     test_semijoin_with_composite_right_child_rejected();
     test_side_compound_lowers_in_either_atom_position();
     test_plan_generation_diagnostics();
+    test_float_plan_rejected_until_columnar_support();
+    test_float_compound_metadata_resets_on_redeclaration();
     test_plan_free_null();
     test_load_facts_null_safe();
 

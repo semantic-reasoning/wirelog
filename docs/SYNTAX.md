@@ -140,9 +140,9 @@ val(1, 1). val(1, 2). val(1, 9).     /* answered t(1, 1);  mean is 4 */
 Both were wrong, silently, with exit status 0.
 
 It is rejected rather than implemented because there is no type to return a
-mean in. Every value in the engine is a 64-bit integer; `float` is not a
-`.decl` type keyword and there is no decimal literal, so `.decl v(x: float)`
-and `1.5` are both syntax errors. The only implementable semantics today is
+mean in. Float syntax is being added in stages; the parser now recognizes the
+`float` declaration type and finite decimal/exponent literals, while execution
+and aggregation support remains pending. The only implementable semantics today is
 truncating integer division — and that is precisely the choice that could
 not be corrected later, because replacing it with a real mean would change
 the numbers every existing program prints, with no error anywhere. Widening
@@ -193,8 +193,8 @@ which was filed against the parse stage and needs widening to cover this
 `EVAL`-section message too.
 
 `average` stays a reserved keyword and `WIRELOG_AGG_AVG` stays in the public
-enum, so nothing about the surface syntax has to be un-done if a float type
-arrives later.
+enum, so adding the parser-level float spelling does not require changing the
+aggregate surface syntax while typed execution is completed.
 
 **One caveat on the workaround.** It is exact for a non-recursive rule. Do not
 reach for it inside a *recursive* stratum: recursive `sum` and `count` are
@@ -241,7 +241,7 @@ q(1, 2).            /* accepted: a side compound is one handle column */
 ```
 
 The flat spelling is the only spelling. `p(1, pair(2,3)).` and `p(1, [2,3]).`
-are parse errors — facts admit integer and string constants only — and the
+are parse errors — facts admit numeric and string constants only — and the
 head grammar has no compound-term production either, so `p(x, pair(y,z))` in a
 rule head is a parse error as well. Flat is what a rule writes
 (`p(x, y, z) :- src(x, y, z).`) and flat is what an `.input` file carries: one
@@ -369,7 +369,7 @@ Edge(2, 3).
 Name(1, "alice").
 ```
 
-Inline facts contain only constants (integers or strings), not variables.
+Inline facts contain only numeric or string constants, not variables.
 
 ---
 
@@ -560,6 +560,7 @@ Supported column types:
 - `int64` -- 64-bit signed integer
 - `string` -- variable-length string
 - `symbol` -- interned symbol (string stored as integer ID)
+- `float` -- finite IEEE-754 binary64 value (execution support in progress)
 - `functor/arity` -- compound term handle stored in a 64-bit column
 - `functor/arity side` -- explicit side-relation compound storage
 - `functor/arity inline` -- inline compound storage, limited to arity 4
@@ -571,10 +572,13 @@ between the sign and digits is not accepted. Values outside this range are
 parse errors. The minus sign remains a binary subtraction operator when used
 between expressions.
 
-There is **no floating-point type**. `float` is not a type keyword and there
-is no decimal literal, so `.decl v(x: float)` and `1.5` are both syntax
-errors; every value the engine stores and computes on is a 64-bit integer.
-This is why [`average()` is not supported](#average-is-not-supported).
+Float literals use either `digits.digits` with an optional exponent or
+`digits` with an exponent (for example `1.5`, `1e3`, and `1.5e-2`). The
+initial grammar rejects `.5`, `1.`, malformed exponents, and non-finite
+results. A unary minus may be separated from a float literal by whitespace;
+`-0.0` is represented canonically as `0.0`. Runtime columnar support is being
+implemented incrementally; [`average()` is not supported](#average-is-not-supported)
+until that work is complete.
 
 ---
 
