@@ -230,34 +230,34 @@ Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
 match the script's count (currently **44**).
 
-Format: `file:line` | field | operation | order | justification.
+Format: `file:function[#N]` | field | operation | order | justification.
 
 ### 5.1 `wirelog/columnar/mem_ledger.c` — accounting (22 rows)
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `mem_ledger.c:73` | `*peak_atom` (subsys or global) | `atomic_load_explicit` | `relaxed` | Read-current for monotone peak-update CAS loop; no happens-before edge required |
-| `mem_ledger.c:75` | `*peak_atom` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Monotone high-water bump; if another thread won, retry; observed values are non-decreasing |
-| `mem_ledger.c:94` | `ledger->total_budget` | `atomic_store_explicit` | `relaxed` | Set-once at init; readers see the value eventually via per-counter relaxed loads |
-| `mem_ledger.c:108` | `ledger->subsys_bytes[subsys]` | `atomic_fetch_add_explicit` | `relaxed` | Per-subsystem counter; ordering of distinct subsystems is independent |
-| `mem_ledger.c:114` | `ledger->current_bytes` | `atomic_fetch_add_explicit` | `relaxed` | Aggregate accounting counter; per-allocator skew is tolerated |
-| `mem_ledger.c:133` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Read-current for clamp-to-zero free path |
-| `mem_ledger.c:138` | `ledger->subsys_bytes[subsys]` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop; loss-of-race retries |
-| `mem_ledger.c:145` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Read-current for clamp-to-zero free path |
-| `mem_ledger.c:150` | `ledger->current_bytes` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop |
-| `mem_ledger.c:162` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path; no edge required |
-| `mem_ledger.c:166` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Query path |
-| `mem_ledger.c:176` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path |
-| `mem_ledger.c:180` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Query path |
-| `mem_ledger.c:192` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path |
-| `mem_ledger.c:198` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Query path |
-| `mem_ledger.c:210` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Snapshot path |
-| `mem_ledger.c:214` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Snapshot path |
-| `mem_ledger.c:227` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Reporter path |
-| `mem_ledger.c:229` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Reporter path |
-| `mem_ledger.c:231` | `ledger->peak_bytes` | `atomic_load_explicit` | `relaxed` | Reporter path |
-| `mem_ledger.c:240` | `ledger->subsys_bytes[i]` | `atomic_load_explicit` | `relaxed` | Reporter per-subsys path |
-| `mem_ledger.c:242` | `ledger->subsys_peak[i]` | `atomic_load_explicit` | `relaxed` | Reporter per-subsys path |
+| `mem_ledger.c:update_peak` | `*peak_atom` (subsys or global) | `atomic_load_explicit` | `relaxed` | Read-current for monotone peak-update CAS loop; no happens-before edge required |
+| `mem_ledger.c:update_peak` | `*peak_atom` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Monotone high-water bump; if another thread won, retry; observed values are non-decreasing |
+| `mem_ledger.c:wl_mem_ledger_init` | `ledger->total_budget` | `atomic_store_explicit` | `relaxed` | Set-once at init; readers see the value eventually via per-counter relaxed loads |
+| `mem_ledger.c:wl_mem_ledger_alloc` | `ledger->subsys_bytes[subsys]` | `atomic_fetch_add_explicit` | `relaxed` | Per-subsystem counter; ordering of distinct subsystems is independent |
+| `mem_ledger.c:wl_mem_ledger_alloc#2` | `ledger->current_bytes` | `atomic_fetch_add_explicit` | `relaxed` | Aggregate accounting counter; per-allocator skew is tolerated |
+| `mem_ledger.c:wl_mem_ledger_free` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Read-current for clamp-to-zero free path |
+| `mem_ledger.c:wl_mem_ledger_free` | `ledger->subsys_bytes[subsys]` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop; loss-of-race retries |
+| `mem_ledger.c:wl_mem_ledger_free#2` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Read-current for clamp-to-zero free path |
+| `mem_ledger.c:wl_mem_ledger_free#2` | `ledger->current_bytes` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop |
+| `mem_ledger.c:wl_mem_ledger_over_budget` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path; no edge required |
+| `mem_ledger.c:wl_mem_ledger_over_budget#2` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Query path |
+| `mem_ledger.c:wl_mem_ledger_subsys_over_budget` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path |
+| `mem_ledger.c:wl_mem_ledger_subsys_over_budget#2` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Query path |
+| `mem_ledger.c:wl_mem_ledger_should_backpressure` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path |
+| `mem_ledger.c:wl_mem_ledger_should_backpressure#2` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Query path |
+| `mem_ledger.c:wl_mem_ledger_bytes_remaining` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Snapshot path |
+| `mem_ledger.c:wl_mem_ledger_bytes_remaining#2` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Snapshot path |
+| `mem_ledger.c:wl_mem_ledger_report` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Reporter path |
+| `mem_ledger.c:wl_mem_ledger_report#2` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Reporter path |
+| `mem_ledger.c:wl_mem_ledger_report#3` | `ledger->peak_bytes` | `atomic_load_explicit` | `relaxed` | Reporter path |
+| `mem_ledger.c:wl_mem_ledger_report#4` | `ledger->subsys_bytes[i]` | `atomic_load_explicit` | `relaxed` | Reporter per-subsys path |
+| `mem_ledger.c:wl_mem_ledger_report#5` | `ledger->subsys_peak[i]` | `atomic_load_explicit` | `relaxed` | Reporter per-subsys path |
 
 The ledger's design accepts **accounting skew** between
 `current_bytes` and the sum of `subsys_bytes[]`; this is documented in
@@ -266,12 +266,12 @@ The ledger's design accepts **accounting skew** between
 
 ### 5.2 `wirelog/util/lockfree_queue.c` — SPSC ring buffer (4 rows)
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `lockfree_queue.c:50` | (macro `WL_ATOMIC_LOAD_RELAXED`) | `atomic_load_explicit` | `relaxed` | Producer reading its own `tail` cursor / consumer reading own `head` cursor (no synchronization edge needed for own cursor) |
-| `lockfree_queue.c:52` | (macro `WL_ATOMIC_LOAD_ACQUIRE`) | `atomic_load_explicit` | `acquire` | Producer reading consumer's `head` cursor (or vice versa) to determine free slots; pairs with peer's release-store and acquires every slot the peer published |
-| `lockfree_queue.c:54` | (macro `WL_ATOMIC_STORE_RELAXED`) | `atomic_store_explicit` | `relaxed` | Producer writing its own `tail` (or consumer writing own `head`) **when no slot is being published** in the same step |
-| `lockfree_queue.c:56` | (macro `WL_ATOMIC_STORE_RELEASE`) | `atomic_store_explicit` | `release` | Producer publishing a new slot (writes `slots[i]` then `tail`); the release ordering ensures the consumer that acquire-loads `tail` sees the slot contents |
+| `lockfree_queue.c:WL_ATOMIC_LOAD_RELAXED` | (macro `WL_ATOMIC_LOAD_RELAXED`) | `atomic_load_explicit` | `relaxed` | Producer reading its own `tail` cursor / consumer reading own `head` cursor (no synchronization edge needed for own cursor) |
+| `lockfree_queue.c:WL_ATOMIC_LOAD_ACQUIRE` | (macro `WL_ATOMIC_LOAD_ACQUIRE`) | `atomic_load_explicit` | `acquire` | Producer reading consumer's `head` cursor (or vice versa) to determine free slots; pairs with peer's release-store and acquires every slot the peer published |
+| `lockfree_queue.c:WL_ATOMIC_STORE_RELAXED` | (macro `WL_ATOMIC_STORE_RELAXED`) | `atomic_store_explicit` | `relaxed` | Producer writing its own `tail` (or consumer writing own `head`) **when no slot is being published** in the same step |
+| `lockfree_queue.c:WL_ATOMIC_STORE_RELEASE` | (macro `WL_ATOMIC_STORE_RELEASE`) | `atomic_store_explicit` | `release` | Producer publishing a new slot (writes `slots[i]` then `tail`); the release ordering ensures the consumer that acquire-loads `tail` sees the slot contents |
 
 The 64-byte padding between `tail` and `head`
 (`lockfree_queue.c:69-81`) prevents false sharing; without it the
@@ -280,10 +280,10 @@ throughput by 2-10x.
 
 ### 5.3 `wirelog/io/io_adapter.c` — one-shot init gate (2 rows)
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `io_adapter.c:88` | `s_mutex_init_ok` | `atomic_store` | `seq_cst` (default) | One-shot mutex-init publish; the bare API used here gives sequential consistency which is the strongest order and safe for an init publisher |
-| `io_adapter.c:112` | `s_mutex_init_ok` | `atomic_load` | `seq_cst` (default) | Pairs with the init publish; gates all later mutex operations |
+| `io_adapter.c:init_mutex` | `s_mutex_init_ok` | `atomic_store` | `seq_cst` (default) | One-shot mutex-init publish; the bare API used here gives sequential consistency which is the strongest order and safe for an init publisher |
+| `io_adapter.c:ensure_builtins` | `s_mutex_init_ok` | `atomic_load` | `seq_cst` (default) | Pairs with the init publish; gates all later mutex operations |
 
 This is the only site in `wirelog/` that uses the **non-explicit**
 atomic APIs (`atomic_load`/`atomic_store`); they default to
@@ -292,24 +292,24 @@ once and the surrounding overhead dominates.
 
 ### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget (10 rows)
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `join.c:151` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
-| `join.c:369` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
-| `join.c:377` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
-| `join.c:387` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `join.c:392` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
-| `join.c:402` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `join.c:405` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see :392 note) |
-| `join.c:2010` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
-| `join.c:2031` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
-| `join.c:2033` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
+| `join.c:col_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
+| `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
+| `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
+| `join.c:col_join_keyed_count_worker_fn` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
+| `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see the preceding cancellation note) |
+| `join.c:wl_columnar_join_diff_op` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
+| `join.c:wl_columnar_join_diff_op#2` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
+| `join.c:wl_columnar_join_diff_op#3` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 
 ### 5.5 `wirelog/columnar/kfusion.c` — K-fusion shared counter (1 row)
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `kfusion.c:663` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `thread_create()` |
+| `kfusion.c:col_op_k_fusion` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `thread_create()` |
 
 The `stop` flag's `memory_order_relaxed` store is deliberate:
 cancellation is **cooperative**, not preemptive. A worker may observe
@@ -319,15 +319,15 @@ and the wasted work is bounded.
 
 ### 5.6 `wirelog/columnar/eval.c` — shared counter (1 row)
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `eval.c:399` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
+| `eval.c:wl_columnar_eval_nonrec_relation_parallel` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
 
 ### 5.7 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `session.c:1499` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
+| `session.c:col_worker_session_create` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
 
 ### 5.8 `wirelog/intern.c` — shared symbol table (3 rows)
 
@@ -339,23 +339,22 @@ operations and a lock there costs more than the parallelism is worth.
 The three sites are the macro bodies; the call sites they serve are
 named in the justification.
 
-| `file:line` | Field | Op | Order | Justification |
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `intern.c:82` | `intern->count` | `atomic_load_explicit` | `acquire` | `WL_INTERN_LOAD_ACQUIRE`, used by `wl_intern_reverse`/`wl_intern_count`. Pairs with the release store below: an id below the observed count names a fully written entry, and the segment holding it is allocated and never moves |
-| `intern.c:84` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize` and `wl_intern_free`. The writer holds `intern->lock` (or, in `free`, has exclusive access), so no edge is needed |
-| `intern.c:86` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by `wl_intern_put` after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
+| `intern.c:WL_INTERN_LOAD_ACQUIRE` | `intern->count` | `atomic_load_explicit` | `acquire` | `WL_INTERN_LOAD_ACQUIRE`, used by `wl_intern_reverse`/`wl_intern_count`. Pairs with the release store below: an id below the observed count names a fully written entry, and the segment holding it is allocated and never moves |
+| `intern.c:WL_INTERN_LOAD_RELAXED` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize` and `wl_intern_free`. The writer holds `intern->lock` (or, in `free`, has exclusive access), so no edge is needed |
+| `intern.c:WL_INTERN_STORE_RELEASE` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by `wl_intern_put` after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
 
 ### 5.9 Total
 
 22 + 4 + 2 + 10 + 1 + 1 + 1 + 3 = **44 atomic call sites**.
 
-`scripts/ci/check-threading-doc.sh` extracts the same count from
-`grep -rE '(^|[^[:alnum:]_])atomic_(load|store|fetch_add|fetch_sub|fetch_or|fetch_and|fetch_xor|compare_exchange_weak|compare_exchange_strong|exchange|init|thread_fence)(_explicit)?[[:space:]]*\(' wirelog/ --include='*.c' --include='*.h'`
-minus the MSVC shim definitions in `mem_ledger.h:46-81` and
-`lockfree_queue.c:22-37`. It also resolves each audit row to a unique
-source file and logical (backslash-continued) line, checks the documented
-operation, and compares the resolved-row count with the source count. A
-mismatch or stale citation fails `meson test --suite abi:threading_doc`.
+`scripts/ci/check-threading-doc.sh` uses
+`scripts/ci/threading_doc_anchors.py` to discover the same source sites,
+ignoring comments, strings, and function-pointer declarations. Each audit
+row resolves to a unique `file:function[#N]` or macro anchor, checks the
+documented operation, and is compared against the complete source inventory.
+A mismatch or stale anchor fails `meson test --suite abi:threading_doc`.
 
 ---
 
