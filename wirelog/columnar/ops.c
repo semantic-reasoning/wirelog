@@ -808,6 +808,7 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     /* Resolve each relation and populate LFTJ input descriptors. */
     uint32_t total_binary_ncols = 0u;
     uint32_t lftj_nk_total = 0u;
+    wirelog_column_type_t key_type = WIRELOG_TYPE_INT64;
     int rc = 0;
     for (uint32_t i = 0; i < k; i++) {
         col_rel_t *rel = session_find_rel(sess, meta->rel_names[i]);
@@ -817,6 +818,14 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
         uint32_t kc = meta->key_cols[i];
         if (kc >= rel->ncols) {
+            rc = EINVAL;
+            goto cleanup_arrays;
+        }
+        wirelog_column_type_t relation_key_type = rel->column_types
+            ? rel->column_types[kc] : WIRELOG_TYPE_INT64;
+        if (i == 0)
+            key_type = relation_key_type;
+        else if (relation_key_type != key_type) {
             rc = EINVAL;
             goto cleanup_arrays;
         }
@@ -860,7 +869,6 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         }
         inputs[i].ncols = rel->ncols;
         inputs[i].key_col = kc;
-
         ncols[i] = rel->ncols;
         binary_offsets[i] = total_binary_ncols;
         lftj_offsets[i] = 1u + lftj_nk_total; /* 1: shared key lives at [0] */
@@ -892,7 +900,8 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                                   out,
                                   0 };
 
-        rc = wl_lftj_join(inputs, k, lftj_binary_cb, &ctx);
+        rc = wl_columnar_lftj_join_typed(inputs, key_type, k, lftj_binary_cb,
+                &ctx);
         if (rc == 0)
             rc = ctx.rc;
 

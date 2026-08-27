@@ -1728,6 +1728,10 @@ col_rel_radix_sort_int64(col_rel_t *r);
 int
 col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
     uint32_t key_col);
+int
+wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
+    uint32_t nrows,
+    uint32_t ncols, uint32_t key_col, wirelog_column_type_t key_type);
 
 /** Index-permutation radix sort on sub-range [start_row, start_row+nrows).
  *  Uses col_rel_get() for key extraction -- layout independent.

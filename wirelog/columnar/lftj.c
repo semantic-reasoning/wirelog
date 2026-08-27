@@ -21,6 +21,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#define WL_COLUMNAR_LFTJ_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define WL_COLUMNAR_LFTJ_NOINLINE __attribute__((noinline))
+#else
+#define WL_COLUMNAR_LFTJ_NOINLINE
+#endif
+
 /* ======================================================================== */
 /* LFTJ Iterator                                                            */
 /* ======================================================================== */
@@ -37,6 +45,7 @@ typedef struct {
     uint32_t ncols;   /* columns per row                              */
     uint32_t key_col; /* column used as join key                      */
     uint32_t pos;     /* current iterator position (nrows = at-end)   */
+    wirelog_column_type_t key_type;
 } lftj_iter_t;
 
 /* Current key at iterator position (undefined when at-end). */
@@ -44,6 +53,14 @@ static inline int64_t
 lftj_key(const lftj_iter_t *it)
 {
     return it->sorted[(size_t)it->pos * it->ncols + it->key_col];
+}
+
+static inline int
+lftj_compare_key(const lftj_iter_t *it, int64_t left, int64_t right)
+{
+    if (it->key_type == WIRELOG_TYPE_FLOAT)
+        return wl_columnar_float_compare_bits(left, right);
+    return left < right ? -1 : left > right ? 1 : 0;
 }
 
 /* True when iterator is exhausted. */
@@ -68,7 +85,7 @@ lftj_seek(lftj_iter_t *it, int64_t target)
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2u;
         int64_t midkey = it->sorted[(size_t)mid * it->ncols + it->key_col];
-        if (midkey < target)
+        if (lftj_compare_key(it, midkey, target) < 0)
             lo = mid + 1u;
         else
             hi = mid;
@@ -92,7 +109,7 @@ lftj_key_range(const lftj_iter_t *it, int64_t key, uint32_t *out_lo,
     while (left < right) {
         uint32_t mid = left + (right - left) / 2u;
         int64_t midkey = it->sorted[(size_t)mid * it->ncols + it->key_col];
-        if (midkey <= key)
+        if (lftj_compare_key(it, midkey, key) <= 0)
             left = mid + 1u;
         else
             right = mid;
@@ -105,12 +122,14 @@ lftj_key_range(const lftj_iter_t *it, int64_t key, uint32_t *out_lo,
  * Returns 0 on success, ENOMEM on allocation failure.
  */
 static int
-lftj_iter_init(lftj_iter_t *it, const wl_lftj_input_t *inp)
+lftj_iter_init(lftj_iter_t *it, const wl_lftj_input_t *inp,
+    wirelog_column_type_t key_type)
 {
     it->nrows = inp->nrows;
     it->ncols = inp->ncols;
     it->key_col = inp->key_col;
     it->pos = 0;
+    it->key_type = key_type;
     it->sorted = NULL;
 
     if (inp->nrows == 0)
@@ -127,8 +146,8 @@ lftj_iter_init(lftj_iter_t *it, const wl_lftj_input_t *inp)
      * platform-specific qsort_r path that did not exist on Android NDK
      * bionic libc.  Returning ENOMEM on radix scratch alloc failure
      * lets the caller surface OOM cleanly. */
-    if (col_radix_sort_rows_by_key(it->sorted, inp->nrows, inp->ncols,
-        inp->key_col) != 0) {
+    if (wl_columnar_relation_radix_sort_rows_by_key_typed(it->sorted,
+        inp->nrows, inp->ncols, inp->key_col, key_type) != 0) {
         free(it->sorted);
         it->sorted = NULL;
         return ENOMEM;
@@ -208,8 +227,9 @@ lftj_emit_product(const lftj_iter_t *iters, uint32_t k, int64_t key,
 /* Public API                                                               */
 /* ======================================================================== */
 
-int
-wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
+WL_COLUMNAR_LFTJ_NOINLINE int
+wl_columnar_lftj_join_typed(const wl_lftj_input_t *inputs,
+    wirelog_column_type_t key_type, uint32_t k, wl_lftj_result_fn cb,
     void *user)
 {
     if (!inputs || k < 2u || k > WL_LFTJ_MAX_K || !cb)
@@ -240,7 +260,17 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
 
     int rc = 0;
     for (uint32_t i = 0; i < k; i++) {
-        rc = lftj_iter_init(&iters[i], &inputs[i]);
+        if (key_type == WIRELOG_TYPE_FLOAT) {
+            for (uint32_t row = 0; row < inputs[i].nrows; row++) {
+                int64_t bits = inputs[i].data[(size_t)row * inputs[i].ncols
+                        + inputs[i].key_col];
+                if (!wl_columnar_float_bits_valid(bits)) {
+                    rc = EINVAL;
+                    goto cleanup;
+                }
+            }
+        }
+        rc = lftj_iter_init(&iters[i], &inputs[i], key_type);
         if (rc != 0)
             goto cleanup;
     }
@@ -278,7 +308,7 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
         int64_t max_key = lftj_key(&iters[0]);
         for (uint32_t i = 1u; i < k; i++) {
             int64_t ki = lftj_key(&iters[i]);
-            if (ki > max_key)
+            if (lftj_compare_key(&iters[i], ki, max_key) > 0)
                 max_key = ki;
         }
 
@@ -293,7 +323,7 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
                 if (lftj_at_end(&iters[i]))
                     goto done;
                 int64_t cur = lftj_key(&iters[i]);
-                if (cur > max_key) {
+                if (lftj_compare_key(&iters[i], cur, max_key) > 0) {
                     max_key = cur;
                     i = 0; /* restart */
                 } else {
@@ -318,7 +348,8 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
              * Advance all iterators past max_key and compute next max_key.
              * If any iterator reaches end, the join is complete.
              */
-            int64_t next_max = INT64_MIN;
+            int64_t next_max = 0;
+            bool have_next_max = false;
             bool any_end = false;
             for (uint32_t j = 0; j < k; j++) {
                 iters[j].pos = ranges[j * 2u + 1u]; /* skip past range */
@@ -327,8 +358,11 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
                     break;
                 }
                 int64_t nk = lftj_key(&iters[j]);
-                if (nk > next_max)
+                if (!have_next_max
+                    || lftj_compare_key(&iters[j], nk, next_max) > 0) {
                     next_max = nk;
+                    have_next_max = true;
+                }
             }
             if (any_end)
                 goto done;
@@ -346,4 +380,12 @@ cleanup:
         lftj_iter_free(&iters[i]);
     free(iters);
     return rc;
+}
+
+int
+wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
+    void *user)
+{
+    return wl_columnar_lftj_join_typed(inputs, WIRELOG_TYPE_INT64, k, cb,
+               user);
 }

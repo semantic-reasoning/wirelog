@@ -304,6 +304,42 @@ test_3way_join_result(void)
     PASS();
 }
 
+/* Test 4: planned/session LFTJ uses numeric FLOAT key semantics. */
+static void
+test_float_join_result(void)
+{
+    TEST("planned 3-way FLOAT join matches -0.0 and +0.0 numerically");
+
+    const char *src = ".decl r1(x: float)\n"
+        ".decl r2(x: float)\n"
+        ".decl r3(x: float)\n"
+        ".decl out(x: float)\n"
+        "r1(-1.0). r1(-0.0).\n"
+        "r2(-1.0). r2(0.0).\n"
+        "r3(-1.0). r3(0.0).\n"
+        "out(x) :- r1(x), r2(x), r3(x).\n";
+
+    wirelog_program_t *prog = NULL;
+    wl_plan_t *plan = NULL;
+    ASSERT(make_plan_no_opt(src, &plan, &prog) == 0,
+        "float plan construction failed");
+    ASSERT(count_lftj_ops(plan) >= 1, "expected FLOAT LFTJ operator");
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+
+    collect_t coll;
+    ASSERT(run_session_no_opt(src, &coll) == 0,
+        "float session evaluation failed");
+    ASSERT(!coll.oom, "tuple collector overflowed");
+    uint32_t out_count = 0;
+    for (uint32_t i = 0; i < coll.count; i++) {
+        if (coll.ncols[i] == 1)
+            out_count++;
+    }
+    ASSERT(out_count == 2, "expected -1.0 and one canonicalized zero result");
+    PASS();
+}
+
 /* Test 4: 4-way join produces correct result via session. */
 static void
 test_4way_join_result(void)
@@ -616,6 +652,7 @@ main(void)
     test_plan_has_lftj();
     test_plan_no_lftj_for_binary();
     test_3way_join_result();
+    test_float_join_result();
     test_4way_join_result();
     test_idb_not_rewritten();
     test_lftj_stack_overflow_releases_output();
