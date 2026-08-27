@@ -33,14 +33,19 @@ while IFS=$'\t' read -r anchor operation; do
         echo "check-threading-doc: FAIL: $anchor has invalid operation '$operation'" >&2
         exit 1
     }
-    matches=$(awk -F '\t' -v anchor="$anchor" -v operation="$operation" \
-        '$5 == anchor && $4 == operation' "$tmp_dir/inventory")
+    matches=$(awk -F '\t' -v anchor="$anchor" '$5 == anchor' \
+        "$tmp_dir/inventory")
     count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l)
     [ "$count" -eq 1 ] || {
         echo "check-threading-doc: FAIL: $anchor does not resolve uniquely to $operation" >&2
         exit 1
     }
-    key="$anchor:$operation"
+    resolved_operation=$(printf '%s\n' "$matches" | cut -f4)
+    [ "$resolved_operation" = "$operation" ] || {
+        echo "check-threading-doc: FAIL: $anchor resolves to $resolved_operation, documented $operation" >&2
+        exit 1
+    }
+    key="$anchor"
     if grep -Fqx "$key" "$tmp_dir/keys"; then
         echo "check-threading-doc: FAIL: duplicate audit anchor $key" >&2
         exit 1

@@ -237,14 +237,14 @@ Format: `file:function[#N]` | field | operation | order | justification.
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `mem_ledger.c:update_peak` | `*peak_atom` (subsys or global) | `atomic_load_explicit` | `relaxed` | Read-current for monotone peak-update CAS loop; no happens-before edge required |
-| `mem_ledger.c:update_peak` | `*peak_atom` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Monotone high-water bump; if another thread won, retry; observed values are non-decreasing |
+| `mem_ledger.c:update_peak#2` | `*peak_atom` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Monotone high-water bump; if another thread won, retry; observed values are non-decreasing |
 | `mem_ledger.c:wl_mem_ledger_init` | `ledger->total_budget` | `atomic_store_explicit` | `relaxed` | Set-once at init; readers see the value eventually via per-counter relaxed loads |
 | `mem_ledger.c:wl_mem_ledger_alloc` | `ledger->subsys_bytes[subsys]` | `atomic_fetch_add_explicit` | `relaxed` | Per-subsystem counter; ordering of distinct subsystems is independent |
 | `mem_ledger.c:wl_mem_ledger_alloc#2` | `ledger->current_bytes` | `atomic_fetch_add_explicit` | `relaxed` | Aggregate accounting counter; per-allocator skew is tolerated |
 | `mem_ledger.c:wl_mem_ledger_free` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Read-current for clamp-to-zero free path |
-| `mem_ledger.c:wl_mem_ledger_free` | `ledger->subsys_bytes[subsys]` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop; loss-of-race retries |
-| `mem_ledger.c:wl_mem_ledger_free#2` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Read-current for clamp-to-zero free path |
-| `mem_ledger.c:wl_mem_ledger_free#2` | `ledger->current_bytes` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop |
+| `mem_ledger.c:wl_mem_ledger_free#2` | `ledger->subsys_bytes[subsys]` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop; loss-of-race retries |
+| `mem_ledger.c:wl_mem_ledger_free#3` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Read-current for clamp-to-zero free path |
+| `mem_ledger.c:wl_mem_ledger_free#4` | `ledger->current_bytes` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop |
 | `mem_ledger.c:wl_mem_ledger_over_budget` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path; no edge required |
 | `mem_ledger.c:wl_mem_ledger_over_budget#2` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Query path |
 | `mem_ledger.c:wl_mem_ledger_subsys_over_budget` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path |
@@ -297,10 +297,10 @@ once and the surrounding overhead dominates.
 | `join.c:col_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
 | `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
 | `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
-| `join.c:col_join_keyed_count_worker_fn` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
-| `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
-| `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see the preceding cancellation note) |
+| `join.c:col_join_keyed_count_worker_fn#3` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:col_join_keyed_count_worker_fn#4` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag — best-effort signal, **not a synchronization point**; readers may observe the previous value for a bounded period |
+| `join.c:col_join_keyed_count_worker_fn#5` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
+| `join.c:col_join_keyed_count_worker_fn#6` | `*ctx->stop` | `atomic_store_explicit` | `relaxed` | Cooperative cancel flag (see the preceding cancellation note) |
 | `join.c:wl_columnar_join_diff_op` | `stop` (local) | `atomic_load_explicit` | `relaxed` | Compaction-loop cancel poll |
 | `join.c:wl_columnar_join_diff_op#2` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 | `join.c:wl_columnar_join_diff_op#3` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
@@ -349,7 +349,8 @@ named in the justification.
 
 22 + 4 + 2 + 10 + 1 + 1 + 1 + 3 = **44 atomic call sites**.
 
-`scripts/ci/check-threading-doc.sh` uses
+The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
+the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
 `scripts/ci/threading_doc_anchors.py` to discover the same source sites,
 ignoring comments, strings, and function-pointer declarations. Each audit
 row resolves to a unique `file:function[#N]` or macro anchor, checks the
