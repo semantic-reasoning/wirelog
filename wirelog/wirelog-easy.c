@@ -26,6 +26,7 @@
 #include "wirelog/exec_plan.h"
 #include "wirelog/exec_plan_gen.h"
 #include "wirelog/intern.h"
+#include "wirelog/ir/program.h"
 #include "wirelog/session.h"
 #include "wirelog/session_facts.h"
 #include "wirelog/wirelog-parser.h"
@@ -53,6 +54,41 @@ struct wirelog_easy_session {
     uint32_t num_workers;
     bool plan_built; /* true once first wirelog_easy_step-class call ran */
 };
+
+static bool
+easy_relation_has_float(const wirelog_easy_session_t *s, const char *relation)
+{
+    if (!s || !s->prog || !relation)
+        return false;
+    for (uint32_t i = 0; i < s->prog->relation_count; i++) {
+        const wl_ir_relation_info_t *info = &s->prog->relations[i];
+        if (!info->name || strcmp(info->name, relation) != 0)
+            continue;
+        if (info->has_float_compound_slots)
+            return true;
+        for (uint32_t c = 0; c < info->column_count; c++)
+            if (info->columns[c].type == WIRELOG_TYPE_FLOAT)
+                return true;
+        return false;
+    }
+    return false;
+}
+
+static bool
+easy_program_has_float(const wirelog_easy_session_t *s)
+{
+    if (!s || !s->prog)
+        return false;
+    for (uint32_t i = 0; i < s->prog->relation_count; i++) {
+        const wl_ir_relation_info_t *info = &s->prog->relations[i];
+        if (info->has_float_compound_slots)
+            return true;
+        for (uint32_t c = 0; c < info->column_count; c++)
+            if (info->columns[c].type == WIRELOG_TYPE_FLOAT)
+                return true;
+    }
+    return false;
+}
 
 /* ======================================================================== */
 /* Internal: lazy plan/session build                                        */
@@ -209,6 +245,9 @@ wirelog_easy_make_compound(wirelog_easy_session_t *s, const char *functor,
         *handle_out = WIRELOG_COMPOUND_HANDLE_NULL;
     if (!s || !functor || !args || arity == 0 || !handle_out)
         return WIRELOG_ERR_EXEC;
+    for (uint32_t i = 0; i < arity; i++)
+        if (args[i].type == WIRELOG_TYPE_FLOAT)
+            return WIRELOG_ERR_EXEC;
 
     wirelog_error_t err = ensure_plan_built(s, s->num_workers);
     if (err != WIRELOG_OK)
@@ -240,6 +279,8 @@ wirelog_easy_insert(wirelog_easy_session_t *s, const char *relation,
 {
     if (!s || !relation || !row)
         return WIRELOG_ERR_EXEC;
+    if (easy_relation_has_float(s, relation))
+        return WIRELOG_ERR_EXEC;
     wirelog_error_t err = ensure_plan_built(s, s->num_workers);
     if (err != WIRELOG_OK)
         return err;
@@ -253,6 +294,8 @@ wirelog_easy_remove(wirelog_easy_session_t *s, const char *relation,
     uint32_t ncols)
 {
     if (!s || !relation || !row)
+        return WIRELOG_ERR_EXEC;
+    if (easy_relation_has_float(s, relation))
         return WIRELOG_ERR_EXEC;
     wirelog_error_t err = ensure_plan_built(s, s->num_workers);
     if (err != WIRELOG_OK)
@@ -340,6 +383,8 @@ wirelog_easy_set_delta_cb(wirelog_easy_session_t *s, wirelog_on_delta_fn cb,
     void *user_data)
 {
     if (!s)
+        return WIRELOG_ERR_EXEC;
+    if (cb && easy_program_has_float(s))
         return WIRELOG_ERR_EXEC;
     wirelog_error_t err = ensure_plan_built(s, s->num_workers);
     if (err != WIRELOG_OK)
@@ -464,6 +509,8 @@ wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
     void *user_data)
 {
     if (!s || !relation || !cb)
+        return WIRELOG_ERR_EXEC;
+    if (easy_relation_has_float(s, relation))
         return WIRELOG_ERR_EXEC;
     wirelog_error_t err = ensure_plan_built(s, s->num_workers);
     if (err != WIRELOG_OK)
