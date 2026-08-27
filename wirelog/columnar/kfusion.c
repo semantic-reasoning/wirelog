@@ -82,6 +82,16 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
     for (uint32_t i = 0; i < k; i++) {
         if (relations[i]->ncols != nc)
             return NULL; /* Schema mismatch */
+        if (!wl_columnar_relation_float_values_valid(relations[i]))
+            return NULL;
+        for (uint32_t c = 0; c < nc; c++) {
+            wirelog_column_type_t expected = relations[0]->column_types
+                ? relations[0]->column_types[c] : WIRELOG_TYPE_INT64;
+            wirelog_column_type_t actual = relations[i]->column_types
+                ? relations[i]->column_types[c] : WIRELOG_TYPE_INT64;
+            if (expected != actual)
+                return NULL;
+        }
         total_rows += relations[i]->nrows;
     }
 
@@ -125,7 +135,7 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
         do {                                                                     \
             col_rel_row_copy_out((rel_ptr), (row_idx), _rb);                     \
             if (last_row == NULL                                                 \
-                || row_cmp_dispatch(last_row, _rb, nc) != 0) {                   \
+                || col_rel_row_values_cmp(relations[0], last_row, _rb) != 0) {  \
                 if (col_rel_append_row(out, _rb) != 0) {                         \
                     MERGE_K_RELEASE();                                           \
                     col_rel_destroy(out);                                        \
@@ -156,6 +166,11 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
 
         while (li < left->nrows && ri < right->nrows) {
             int cmp = col_rel_row_cmp2(left, li, right, ri);
+            if (cmp == WL_COLUMNAR_CMP_INCOMPATIBLE) {
+                MERGE_K_RELEASE();
+                col_rel_destroy(out);
+                return NULL;
+            }
 
             if (cmp < 0) {
                 MERGE_K_APPEND(left, li);

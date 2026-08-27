@@ -19,7 +19,7 @@ fi
 rows="$tmp_dir/rows"
 sed -nE 's/^\| `([^`]+:[A-Za-z_][A-Za-z0-9_]*(#[0-9]+)?)` \| [^|]* \| `([^`]*)` \|.*/\1\t\3/p' "$doc" >"$rows"
 row_count=$(wc -l <"$rows")
-expected_rows="${WIRELOG_THREADING_EXPECTED_ROWS:-44}"
+expected_rows="${WIRELOG_THREADING_EXPECTED_ROWS:-53}"
 [ "$row_count" -eq "$expected_rows" ] || {
     echo "check-threading-doc: FAIL: expected $expected_rows audit rows, found $row_count" >&2
     exit 1

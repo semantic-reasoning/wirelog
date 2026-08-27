@@ -40,6 +40,7 @@ typedef struct {
     int64_t *data;
     uint64_t rows;
     uint32_t cols;
+    wirelog_column_type_t *types;
     uint64_t capacity_rows;
 } wl_result_relation_t;
 
@@ -170,6 +171,7 @@ free_result_relation(wl_result_relation_t *rel)
     if (!rel)
         return;
     free(rel->name);
+    free(rel->types);
     free(rel->data);
 }
 
@@ -230,6 +232,34 @@ append_result_row(wl_result_relation_t *rel, const int64_t *row)
     }
     memcpy(rel->data + rel->rows * rel->cols, row, rel->cols * sizeof(int64_t));
     rel->rows++;
+    return true;
+}
+
+static bool
+result_set_types_from_program(wirelog_result_t *result,
+    const wirelog_program_t *program)
+{
+    for (uint32_t i = 0; i < result->count; i++) {
+        wl_result_relation_t *out = &result->relations[i];
+        const wl_ir_relation_info_t *decl = find_relation(program, out->name);
+        if (!decl || out->cols == 0)
+            continue;
+        wirelog_column_type_t *types = (wirelog_column_type_t *)malloc(
+            (size_t)out->cols * sizeof(*types));
+        if (!types)
+            return false;
+        uint32_t k = 0;
+        for (uint32_t c = 0; c < decl->column_count && k < out->cols; c++) {
+            wirelog_column_t *col = &decl->columns[c];
+            uint32_t width = col->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                ? col->compound_arity : 1;
+            for (uint32_t slot = 0; slot < width && k < out->cols; slot++)
+                types[k++] = width > 1 ? WIRELOG_TYPE_INT64 : col->type;
+        }
+        while (k < out->cols)
+            types[k++] = WIRELOG_TYPE_INT64;
+        out->types = types;
+    }
     return true;
 }
 
@@ -586,6 +616,11 @@ wirelog_evaluate(wirelog_executor_t *executor, wirelog_error_t *error)
         set_error(error, ctx.failed ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC);
         return NULL;
     }
+    if (!result_set_types_from_program(result, executor->program)) {
+        wirelog_result_free(result);
+        set_error(error, WIRELOG_ERR_MEMORY);
+        return NULL;
+    }
 
     set_error(error, WIRELOG_OK);
     return result;
@@ -629,7 +664,14 @@ wirelog_result_write_csv(const wirelog_result_t *result,
         for (uint32_t c = 0; c < rel->cols; c++) {
             if (c > 0)
                 fputc(',', out);
-            fprintf(out, "%" PRId64, rel->data[r * rel->cols + c]);
+            int64_t raw = rel->data[r * rel->cols + c];
+            if (rel->types && rel->types[c] == WIRELOG_TYPE_FLOAT) {
+                double value;
+                memcpy(&value, &raw, sizeof(value));
+                fprintf(out, "%.17g", value);
+            } else {
+                fprintf(out, "%" PRId64, raw);
+            }
         }
         fputc('\n', out);
     }

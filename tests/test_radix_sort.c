@@ -514,6 +514,41 @@ test_k16_path(void)
                "k=16 path: nrows=50001 (above threshold) matches qsort");
 }
 
+static int
+test_float_order(void)
+{
+    TEST("Float relation sort uses numeric IEEE-754 order");
+    const wirelog_column_type_t types[] = { WIRELOG_TYPE_FLOAT };
+    const double values[] = { -100.0, -1.0, 0.0, 1.0, 2.5 };
+    const double input[] = { 1.0, -100.0, 2.5, 0.0, -1.0 };
+    col_rel_t *r = col_rel_new_auto("float", 1);
+    if (!r || col_rel_set_column_types(r, types, 1) != 0) {
+        col_rel_destroy(r);
+        FAIL("float relation allocation or type setup failed");
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(input) / sizeof(input[0]); i++) {
+        int64_t bits = wl_columnar_float_to_bits(input[i]);
+        if (col_rel_append_row(r, &bits) != 0) {
+            col_rel_destroy(r);
+            FAIL("float row append failed");
+            return 1;
+        }
+    }
+    col_rel_radix_sort_int64(r);
+    for (uint32_t i = 0; i < r->nrows; i++) {
+        double got = wl_columnar_float_from_bits(col_rel_get(r, i, 0));
+        if (got != values[i]) {
+            col_rel_destroy(r);
+            FAIL("float rows are not in numeric order");
+            return 1;
+        }
+    }
+    col_rel_destroy(r);
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -538,6 +573,7 @@ main(void)
     test_k8_path();
     test_k16_boundary();
     test_k16_path();
+    test_float_order();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);

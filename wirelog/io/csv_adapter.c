@@ -105,7 +105,8 @@ csv_read(wirelog_io_ctx_t *ctx, int64_t **out_data,
     uint32_t num_cols = wirelog_io_ctx_num_cols(ctx);
     int has_string = 0;
     for (uint32_t i = 0; i < num_cols; i++) {
-        if (wirelog_io_ctx_col_type(ctx, i) == WIRELOG_TYPE_STRING) {
+        if (wirelog_io_ctx_col_type(ctx, i) == WIRELOG_TYPE_STRING
+            || wirelog_io_ctx_col_type(ctx, i) == WIRELOG_TYPE_FLOAT) {
             has_string = 1;
             break;
         }

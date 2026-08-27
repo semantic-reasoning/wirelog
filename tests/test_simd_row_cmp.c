@@ -24,6 +24,8 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200112L
 
+#include "../wirelog/wirelog-types.h"
+
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -65,6 +67,7 @@ typedef struct {
     char *name;
     uint32_t ncols;
     int64_t **columns;
+    wirelog_column_type_t *column_types;
     uint32_t nrows;
     uint32_t capacity;
     char **col_names;

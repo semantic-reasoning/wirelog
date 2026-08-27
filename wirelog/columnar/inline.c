@@ -132,8 +132,11 @@ wl_col_rel_store_inline_compound(col_rel_t *rel, uint32_t row_idx,
         return EINVAL;
     }
 
-    for (uint32_t k = 0; k < arity; k++)
-        col_rel_set(rel, row_idx, offset + k, args[k]);
+    for (uint32_t k = 0; k < arity; k++) {
+        rc = col_rel_set(rel, row_idx, offset + k, args[k]);
+        if (rc != 0)
+            return rc;
+    }
     WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
         "event=store path=inline rel=%s row=%u logical_col=%u offset=%u "
         "arity=%u",

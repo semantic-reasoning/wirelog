@@ -1307,9 +1307,18 @@ wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
         const expr_instr_t *in = &c->instrs[k];
         switch ((wl_plan_expr_tag_t)in->op) {
         case WL_PLAN_EXPR_VAR:
-        case WL_PLAN_EXPR_VAR_FLOAT:
             expr_push(&s, (in->iarg < ncols) ? row[in->iarg] : 0);
             break;
+        case WL_PLAN_EXPR_VAR_FLOAT: {
+            int64_t value = (in->iarg < ncols) ? row[in->iarg] : 0;
+            double decoded;
+            if (in->iarg >= ncols || !expr_float_load(value, &decoded)) {
+                *out_val = 0;
+                return 1;
+            }
+            expr_push(&s, value);
+            break;
+        }
         case WL_PLAN_EXPR_CMP_STR_EQ: {
             int64_t b = expr_pop(&s), a = expr_pop(&s);
             const char *sa = intern ? wl_intern_reverse(intern, a) : NULL;
@@ -1355,10 +1364,41 @@ wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
             break;
         }
         case WL_PLAN_EXPR_CONST_INT:
-        case WL_PLAN_EXPR_CONST_FLOAT:
         case WL_PLAN_EXPR_BOOL:
             expr_push(&s, in->larg);
             break;
+        case WL_PLAN_EXPR_CONST_FLOAT: {
+            double decoded;
+            if (!expr_float_load(in->larg, &decoded)) {
+                *out_val = 0;
+                return 1;
+            }
+            expr_push(&s, in->larg);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+        case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+        case WL_PLAN_EXPR_ARITH_FLOAT_DIV: {
+            int64_t bbits = expr_pop(&s), abits = expr_pop(&s), result;
+            double a, b, value;
+            if (!expr_float_load(abits, &a) || !expr_float_load(bbits, &b)) {
+                *out_val = 0;
+                return 1;
+            }
+            switch ((wl_plan_expr_tag_t)in->op) {
+            case WL_PLAN_EXPR_ARITH_FLOAT_ADD: value = a + b; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_SUB: value = a - b; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_MUL: value = a * b; break;
+            default: value = a / b; break;
+            }
+            if (!expr_float_store(value, &result)) {
+                *out_val = 0;
+                return 1;
+            }
+            expr_push(&s, result);
+            break;
+        }
         case WL_PLAN_EXPR_ARITH_ADD: {
             int64_t b = expr_pop(&s), a = expr_pop(&s);
             int64_t v;
@@ -1477,6 +1517,30 @@ wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
         case WL_PLAN_EXPR_CMP_GTE: {
             int64_t b = expr_pop(&s), a = expr_pop(&s);
             expr_push(&s, a >= b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT:
+        case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_GTE: {
+            int64_t bbits = expr_pop(&s), abits = expr_pop(&s);
+            double a, b;
+            if (!expr_float_load(abits, &a) || !expr_float_load(bbits, &b)) {
+                *out_val = 0;
+                return 1;
+            }
+            bool result;
+            switch ((wl_plan_expr_tag_t)in->op) {
+            case WL_PLAN_EXPR_CMP_FLOAT_EQ: result = a == b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_NEQ: result = a != b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LT: result = a < b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_GT: result = a > b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LTE: result = a <= b; break;
+            default: result = a >= b; break;
+            }
+            expr_push(&s, result ? 1 : 0);
             break;
         }
         case WL_PLAN_EXPR_AGG_COUNT:

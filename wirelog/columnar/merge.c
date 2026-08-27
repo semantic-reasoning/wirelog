@@ -362,13 +362,17 @@ static inline int
 col_rel_row_cmp_raw(const col_rel_t *r, uint32_t row_idx,
     const int64_t *raw_row)
 {
-    uint32_t ncols = r->ncols;
-    for (uint32_t c = 0; c < ncols; c++) {
-        int64_t va = r->columns[c][row_idx];
-        int64_t vb = raw_row[c];
-        if (va < vb)
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        int64_t value = r->columns[c][row_idx];
+        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
+            int cmp = wl_columnar_float_compare_bits(value, raw_row[c]);
+            if (cmp != 0)
+                return cmp;
+            continue;
+        }
+        if (value < raw_row[c])
             return -1;
-        if (va > vb)
+        if (value > raw_row[c])
             return 1;
     }
     return 0;
@@ -385,6 +389,27 @@ col_rel_row_cmp_raw(const col_rel_t *r, uint32_t row_idx,
  * Returns 0 on success, -1 to signal fallback to sort+merge (too many
  * uniques or allocation failure).
  */
+static uint32_t
+col_op_consolidate_hash_row(const col_rel_t *rel, const int64_t *row,
+    uint32_t nc)
+{
+    uint32_t hash = 2166136261u;
+    for (uint32_t c = 0; c < nc; c++)
+        hash = wl_columnar_hash_value(hash, rel, c, row[c]);
+    return hash;
+}
+
+static bool
+col_op_consolidate_hash_rows_equal(const col_rel_t *rel,
+    const int64_t *left, const int64_t *right, uint32_t nc)
+{
+    for (uint32_t c = 0; c < nc; c++) {
+        if (!wl_columnar_value_equal(rel, c, left[c], rel, c, right[c]))
+            return false;
+    }
+    return true;
+}
+
 static int
 col_op_consolidate_hash_dedup(col_rel_t *rel)
 {
@@ -428,18 +453,13 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
         for (uint32_t c = 0; c < nc; c++)
             rb[c] = rel->columns[c][r];
 
-        /* FNV-1a hash */
-        uint64_t h = 14695981039346656037ULL;
-        for (uint32_t c = 0; c < nc; c++) {
-            h ^= (uint64_t)rb[c];
-            h *= 1099511628211ULL;
-        }
+        uint32_t h = col_op_consolidate_hash_row(rel, rb, nc);
 
         uint32_t slot = (uint32_t)(h & ht_mask);
         bool found = false;
         while (ht_used[slot]) {
             int64_t *sv = ht_vals + (size_t)slot * nc;
-            if (memcmp(sv, rb, row_bytes) == 0) {
+            if (col_op_consolidate_hash_rows_equal(rel, sv, rb, nc)) {
                 found = true;
                 break;
             }
@@ -478,12 +498,8 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
                 for (uint32_t s = 0; s < ht_cap; s++) {
                     if (ht_used[s]) {
                         int64_t *sv = ht_vals + (size_t)s * nc;
-                        uint64_t rh = 14695981039346656037ULL;
-                        for (uint32_t c2 = 0; c2 < nc; c2++) {
-                            rh ^= (uint64_t)sv[c2];
-                            rh *= 1099511628211ULL;
-                        }
-                        uint32_t ns = (uint32_t)(rh & new_mask);
+                        uint32_t rh = col_op_consolidate_hash_row(rel, sv, nc);
+                        uint32_t ns = rh & new_mask;
                         while (new_used[ns])
                             ns = (ns + 1) & new_mask;
                         memcpy(new_vals + (size_t)ns * nc, sv,
@@ -578,6 +594,8 @@ int
 col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     uint32_t seg_count)
 {
+    if (!wl_columnar_relation_float_values_valid(rel))
+        return EINVAL;
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
 
@@ -822,6 +840,13 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         return EINVAL;
 
     col_rel_t *in = e.rel;
+    if (!wl_columnar_relation_float_values_valid(in)) {
+        if (e.seg_boundaries)
+            free(e.seg_boundaries);
+        if (e.owned)
+            col_rel_destroy(in);
+        return EINVAL;
+    }
     uint32_t nc = in->ncols;
     uint32_t nr = in->nrows;
 
@@ -1020,6 +1045,8 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
 static int UNUSED
 col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
 {
+    if (!wl_columnar_relation_float_values_valid(rel))
+        return EINVAL;
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
 
@@ -1259,6 +1286,9 @@ int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     col_rel_t *delta_out, int *out_fast_path)
 {
+    if (!wl_columnar_relation_float_values_valid(rel)
+        || (delta_out && !wl_columnar_relation_float_values_valid(delta_out)))
+        return EINVAL;
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
 

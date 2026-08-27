@@ -203,6 +203,10 @@ write_tuple_csv(FILE *f, const wl_ir_relation_info_t *rel,
                 fprintf(f, "%s", str);
             else
                 fprintf(f, "%" PRId64, row[i]);
+        } else if (physical_column_type(rel, i) == WIRELOG_TYPE_FLOAT) {
+            double value;
+            memcpy(&value, &row[i], sizeof(value));
+            fprintf(f, "%.17g", value);
         } else {
             fprintf(f, "%" PRId64, row[i]);
         }
@@ -252,6 +256,10 @@ print_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
                 fprintf(ctx->out, "\"%s\"", str);
             else
                 fprintf(ctx->out, "%" PRId64, row[i]);
+        } else if (physical_column_type(rel, i) == WIRELOG_TYPE_FLOAT) {
+            double value;
+            memcpy(&value, &row[i], sizeof(value));
+            fprintf(ctx->out, "%.17g", value);
         } else {
             fprintf(ctx->out, "%" PRId64, row[i]);
         }
@@ -402,6 +410,10 @@ delta_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
                 fprintf(ctx->out, "\"%s\"", str);
             else
                 fprintf(ctx->out, "%" PRId64, row[i]);
+        } else if (physical_column_type(rel, i) == WIRELOG_TYPE_FLOAT) {
+            double value;
+            memcpy(&value, &row[i], sizeof(value));
+            fprintf(ctx->out, "%.17g", value);
         } else {
             fprintf(ctx->out, "%" PRId64, row[i]);
         }
