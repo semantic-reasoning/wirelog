@@ -305,12 +305,12 @@ once and the surrounding overhead dominates.
 | `join.c:wl_columnar_join_diff_op#2` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 | `join.c:wl_columnar_join_diff_op#3` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Backpressure poll; advisory, no edge required |
 | `join.c:col_semijoin_fill_worker_fn` | `*ctx->write_error` | `atomic_load_explicit` | `relaxed` | Cooperative fill cancellation after another worker reports a typed write failure |
-| `join.c:col_semijoin_fill_worker_fn` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish the first typed output-write failure to sibling workers and the coordinator |
-| `join.c:col_semijoin_fill_worker_fn#2` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a later projected column in the same output row |
+| `join.c:col_semijoin_fill_worker_fn#2` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish the first typed output-write failure to sibling workers and the coordinator |
+| `join.c:col_semijoin_fill_worker_fn#3` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a later projected column in the same output row |
 | `join.c:col_join_cross_fill_worker_fn` | `*ctx->write_error` | `atomic_load_explicit` | `relaxed` | Stop cooperative cross-product filling after a sibling reports a typed write failure |
-| `join.c:col_join_cross_fill_worker_fn` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a typed output-write failure to sibling workers and the coordinator |
-| `join.c:col_join_cross_fill_worker_fn#2` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a later left-side output column |
-| `join.c:col_join_cross_fill_worker_fn#3` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a right-side output column |
+| `join.c:col_join_cross_fill_worker_fn#2` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a typed output-write failure to sibling workers and the coordinator |
+| `join.c:col_join_cross_fill_worker_fn#3` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a later left-side output column |
+| `join.c:col_join_cross_fill_worker_fn#4` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a right-side output column |
 | `join.c:col_join_parallel_cross` | `write_error` | `atomic_load_explicit` | `relaxed` | Coordinator observes worker write status after the workqueue barrier |
 | `join.c:wl_columnar_semijoin_op` | `write_error` | `atomic_load_explicit` | `relaxed` | Coordinator observes typed semijoin fill status after the workqueue barrier |
 
