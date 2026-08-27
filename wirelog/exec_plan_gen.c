@@ -686,15 +686,7 @@ cmp_to_tag(wirelog_cmp_op_t op, wl_ir_coltype_t lhs, wl_ir_coltype_t rhs)
 /*
  * Map IR agg fn -> plan expr tag, or -1 when the aggregate has no tag.
  *
- * WIRELOG_AGG_AVG used to map to WL_PLAN_EXPR_AGG_SUM, commented
- * "approximate: no AVG tag": the serialized plan said SUM where the program
- * said average, so a backend reading the plan could not tell the two apart
- * and no diagnostic was emitted either way.  average() is now refused at the
- * WIRELOG_IR_AGGREGATE arm below, which is the only route the parser can
- * take here -- an AGGREGATE node is always a top-level head argument, so
- * min(average(v)) and the like are parse errors and this expression form
- * never carries AVG.  Failing rather than substituting keeps that true for
- * any future caller that builds IR directly (Issue #978).
+ * AVG has its own tag so the reducer can retain the aggregate identity.
  */
 static int
 agg_to_tag(wirelog_agg_fn_t fn)
@@ -709,7 +701,7 @@ agg_to_tag(wirelog_agg_fn_t fn)
     case WIRELOG_AGG_MAX:
         return WL_PLAN_EXPR_AGG_MAX;
     case WIRELOG_AGG_AVG:
-        return -1;
+        return WL_PLAN_EXPR_AGG_AVG;
     }
     return -1; /* not an aggregate this plan format can encode */
 }
@@ -738,7 +730,6 @@ expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
 
     case WL_IR_EXPR_CONST_INT:
     case WL_IR_EXPR_BOOL:
-    case WL_IR_EXPR_ARITH:
     case WL_IR_EXPR_CMP:
     case WL_IR_EXPR_AGG:
         return WL_IR_COLTYPE_SCALAR;
@@ -802,8 +793,9 @@ agg_operand_from_coltype(wl_ir_coltype_t t)
 {
     switch (t) {
     case WL_IR_COLTYPE_SCALAR:
-    case WL_IR_COLTYPE_FLOAT:
         return WL_PLAN_AGG_OPERAND_SCALAR;
+    case WL_IR_COLTYPE_FLOAT:
+        return WL_PLAN_AGG_OPERAND_FLOAT;
     case WL_IR_COLTYPE_STRING:
         return WL_PLAN_AGG_OPERAND_STRING;
     case WL_IR_COLTYPE_UNKNOWN:
@@ -1771,48 +1763,6 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     }
 
     case WIRELOG_IR_AGGREGATE: {
-        /*
-         * average() is not implemented and is refused here rather than
-         * answered wrongly (Issue #978).
-         *
-         * col_op_reduce() seeds each group with the group's first operand
-         * and its update switch has arms for COUNT/SUM/MIN/MAX only, so
-         * WIRELOG_AGG_AVG fell through `default: break;` and the seed was
-         * returned untouched.  The answer followed scan order rather than
-         * the data -- val(1,9). val(1,5). val(1,2). gave 9, and reordering
-         * the same three facts gave 1 -- with exit status 0 and no
-         * diagnostic.
-         *
-         * Implementing it needs a return type this engine does not have.
-         * The current columnar evaluator still consumes int64 lanes.  The
-         * parser and IR now preserve finite binary64 values, but this
-         * lowering path rejects them until typed columnar evaluation lands.
-         * The only implementable semantics today is truncating integer
-         * division, and that is the one choice that cannot be corrected
-         * later without silently changing existing programs' numbers --
-         * whereas widening a rejection to a real mean accepts strictly more
-         * programs and rewrites none.  Precedent agrees: Soufflé refuses
-         * integer operands to mean() outright, and PostgreSQL, SQLite,
-         * MySQL and cozo all widen the result type rather than truncate.
-         * This follows the sequence adopted for #973: reject first, support
-         * later.
-         *
-         * Placed at lowering, not in the lexer: `average`/`AVG` keep
-         * tokenizing, the AST keeps its AGGREGATE node and the public
-         * WIRELOG_AGG_AVG stays as it is, so nothing about the surface
-         * syntax remains available while typed execution is added.
-         */
-        if (node->agg_fn == WIRELOG_AGG_AVG) {
-            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
-                "'average' is not supported: every value is a 64-bit "
-                "integer, so there is no type to return a mean in. Compute "
-                "it from sum and count instead: "
-                "s(g, sum(v)) :- val(g, v). "
-                "c(g, count(v)) :- val(g, v). "
-                "t(g, x / y) :- s(g, x), c(g, y).");
-            return -1;
-        }
-
         /* Translate child first */
         if (node->child_count > 0) {
             if (translate_ir_node(node->children[0], ops) != 0)
@@ -1873,6 +1823,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
              */
             op->agg_operand_type = agg_operand_from_coltype(
                 expr_result_type(node->agg_expr, &agg_ctx));
+            op->agg_result_type = op->agg_operand_type;
             col_ctx_free(&agg_ctx);
             if (agg_rc != 0)
                 return -1;
@@ -2347,6 +2298,7 @@ clone_plan_op(const wl_plan_op_t *src, wl_plan_op_t *dst)
      * (Issue #965).  The lookup itself is skipped entirely under
      * K-fusion -- see #975, which is a separate defect. */
     dst->agg_operand_type = src->agg_operand_type;
+    dst->agg_result_type = src->agg_result_type;
     dst->key_count = src->key_count;
     dst->project_count = src->project_count;
     dst->group_by_count = src->group_by_count;

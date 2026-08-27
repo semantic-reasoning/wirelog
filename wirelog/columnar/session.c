@@ -1177,6 +1177,19 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         if (plan->edb_declared_width != NULL
             && plan->edb_declared_width[i] != WL_PLAN_WIDTH_UNDECLARED)
             r->declared_ncols = plan->edb_declared_width[i];
+        if (plan->edb_column_types && plan->edb_column_type_counts
+            && plan->edb_column_types[i]
+            && plan->edb_column_type_counts[i] > 0) {
+            /* The EDB is still empty, so its declared physical types can be
+             * installed before the first host insertion. */
+            rc = col_rel_set_schema(r, plan->edb_column_type_counts[i], NULL);
+            if (rc != 0 || col_rel_set_column_types(r,
+                plan->edb_column_types[i],
+                plan->edb_column_type_counts[i]) != 0) {
+                col_rel_destroy(r);
+                goto oom;
+            }
+        }
         rc = session_add_rel(sess, r);
         if (rc != 0) {
             col_rel_destroy(r);
