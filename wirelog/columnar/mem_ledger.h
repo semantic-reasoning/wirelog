@@ -39,6 +39,7 @@ typedef volatile uint64_t wl_atomic_u64;
  * fetch_add still routes through _InterlockedCompareExchange64 for the
  * read-modify-write ops. */
 typedef volatile bool atomic_bool;
+typedef volatile int atomic_int;
 typedef volatile uint_fast64_t atomic_uint_fast64_t;
 #define ATOMIC_VAR_INIT(x) (x)
 
