@@ -539,7 +539,7 @@ jobs:
           -Db_sanitize=address,undefined
           -Db_lundef=false
           -Dtests=true
-          --buildtype=debug
+          --buildtype=debugoptimized
         env:
           CC: sccache ${{ matrix.cc }}
 
