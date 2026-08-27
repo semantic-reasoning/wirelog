@@ -68,6 +68,8 @@
  *                            Payload: [name_len:u16] [name:u8*name_len]
  *   WL_PLAN_EXPR_CONST_INT:  64-bit signed integer literal.
  *                            Payload: [value:i64] (8 bytes, little-endian)
+ *   WL_PLAN_EXPR_CONST_FLOAT: finite binary64 literal.
+ *                            Payload: [bits:u64] (8 bytes, little-endian)
  *   WL_PLAN_EXPR_CONST_STR:  String literal.
  *                            Payload: [len:u16] [data:u8*len]
  *   WL_PLAN_EXPR_BOOL:       Boolean literal.
@@ -75,7 +77,9 @@
  *
  * Binary operator tags (pop 2, push 1):
  *   WL_PLAN_EXPR_ARITH_ADD .. WL_PLAN_EXPR_ARITH_MOD
+ *   WL_PLAN_EXPR_ARITH_FLOAT_ADD .. WL_PLAN_EXPR_ARITH_FLOAT_DIV
  *   WL_PLAN_EXPR_CMP_EQ     .. WL_PLAN_EXPR_CMP_GTE
+ *   WL_PLAN_EXPR_CMP_FLOAT_EQ .. WL_PLAN_EXPR_CMP_FLOAT_GTE
  *
  * Unary aggregate tags (pop 1, push 1):
  *   WL_PLAN_EXPR_AGG_COUNT .. WL_PLAN_EXPR_AGG_MAX
@@ -86,6 +90,8 @@ typedef enum {
     WL_PLAN_EXPR_CONST_INT = 0x02,
     WL_PLAN_EXPR_CONST_STR = 0x03,
     WL_PLAN_EXPR_BOOL = 0x04,
+    WL_PLAN_EXPR_VAR_FLOAT = 0x05, /* variable containing a binary64 lane */
+    WL_PLAN_EXPR_CONST_FLOAT = 0x06, /* payload: binary64 bits, little-endian */
 
     /* Arithmetic operators (binary, pop 2 push 1) */
     WL_PLAN_EXPR_ARITH_ADD = 0x10,
@@ -100,6 +106,12 @@ typedef enum {
     WL_PLAN_EXPR_ARITH_BXOR = 0x17,
     WL_PLAN_EXPR_ARITH_SHL = 0x18,
     WL_PLAN_EXPR_ARITH_SHR = 0x19,
+
+    /* Floating-point arithmetic (binary64, finite operands/results). */
+    WL_PLAN_EXPR_ARITH_FLOAT_ADD = 0x70,
+    WL_PLAN_EXPR_ARITH_FLOAT_SUB = 0x71,
+    WL_PLAN_EXPR_ARITH_FLOAT_MUL = 0x72,
+    WL_PLAN_EXPR_ARITH_FLOAT_DIV = 0x73,
 
     /* Unary bitwise NOT */
     WL_PLAN_EXPR_ARITH_BNOT = 0x1A,
@@ -136,6 +148,14 @@ typedef enum {
     WL_PLAN_EXPR_CMP_GT = 0x25,
     WL_PLAN_EXPR_CMP_LTE = 0x26,
     WL_PLAN_EXPR_CMP_GTE = 0x27,
+
+    /* Floating-point comparisons (binary64, finite operands). */
+    WL_PLAN_EXPR_CMP_FLOAT_EQ = 0x74,
+    WL_PLAN_EXPR_CMP_FLOAT_NEQ = 0x75,
+    WL_PLAN_EXPR_CMP_FLOAT_LT = 0x76,
+    WL_PLAN_EXPR_CMP_FLOAT_GT = 0x77,
+    WL_PLAN_EXPR_CMP_FLOAT_LTE = 0x78,
+    WL_PLAN_EXPR_CMP_FLOAT_GTE = 0x79,
 
     /* Aggregate operators (unary, pop 1 push 1) */
     WL_PLAN_EXPR_AGG_COUNT = 0x30,
@@ -665,6 +685,11 @@ typedef struct {
      * WL_PLAN_WIDTH_UNDECLARED.  Allocated with edb_relations; freed in
      * wl_plan_free. */
     const uint32_t *edb_declared_width;
+    /* Parallel per-EDB physical type arrays.  These are additive metadata
+     * used by typed columnar backends; NULL preserves hand-built legacy
+     * plans' int64 default. */
+    const wirelog_column_type_t *const *edb_column_types;
+    const uint32_t *edb_column_type_counts;
     struct wl_intern *intern; /* borrowed from program; lifetime >= plan */
 } wl_plan_t;
 
