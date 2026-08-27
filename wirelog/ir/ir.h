@@ -90,8 +90,9 @@ struct wl_ir_expr {
  */
 typedef enum {
     WL_IR_COLTYPE_UNKNOWN = 0, /* not established -- calloc() default */
-    WL_IR_COLTYPE_SCALAR = 1,  /* int/uint/float/bool: compared by value */
+    WL_IR_COLTYPE_SCALAR = 1,  /* int/uint/bool: compared by value */
     WL_IR_COLTYPE_STRING = 2,  /* interned symbol id: compared by content */
+    WL_IR_COLTYPE_FLOAT = 3,   /* binary64 value, kept distinct for typing */
 } wl_ir_coltype_t;
 
 /**

@@ -49,9 +49,10 @@ wl_ir_coltype_from_column_type(wirelog_column_type_t type)
     case WIRELOG_TYPE_INT64:
     case WIRELOG_TYPE_UINT32:
     case WIRELOG_TYPE_UINT64:
-    case WIRELOG_TYPE_FLOAT:
     case WIRELOG_TYPE_BOOL:
         return WL_IR_COLTYPE_SCALAR;
+    case WIRELOG_TYPE_FLOAT:
+        return WL_IR_COLTYPE_FLOAT;
     }
     return WL_IR_COLTYPE_UNKNOWN;
 }

@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,6 +40,24 @@ static inline int64_t
 expr_pop(expr_stack_t *s)
 {
     return s->top != 0 ? s->vals[--s->top] : 0;
+}
+
+static bool
+expr_float_load(int64_t lane, double *out)
+{
+    memcpy(out, &lane, sizeof(*out));
+    return isfinite(*out);
+}
+
+static bool
+expr_float_store(double value, int64_t *out)
+{
+    if (!isfinite(value))
+        return false;
+    if (value == 0.0)
+        value = 0.0;
+    memcpy(out, &value, sizeof(*out));
+    return true;
 }
 
 #ifdef WL_MBEDTLS_ENABLED
@@ -365,6 +384,31 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             break;
         }
 
+        case WL_PLAN_EXPR_VAR_FLOAT: {
+            if (i + 2 > size)
+                goto bad;
+            uint16_t nlen;
+            memcpy(&nlen, buf + i, 2);
+            i += 2;
+            if (i + nlen > size)
+                goto bad;
+            long col = 0;
+            if (nlen > 3 && buf[i] == 'c' && buf[i + 1] == 'o'
+                && buf[i + 2] == 'l') {
+                char tmp[16] = { 0 };
+                uint32_t cplen = (nlen - 3 < 15) ? nlen - 3 : 15;
+                memcpy(tmp, buf + i + 3, cplen);
+                col = strtol(tmp, NULL, 10);
+            }
+            i += nlen;
+            double value;
+            if (col < 0 || (uint32_t)col >= ncols
+                || !expr_float_load(row[col], &value))
+                goto bad;
+            expr_push(&s, row[col]);
+            break;
+        }
+
         case WL_PLAN_EXPR_CONST_INT: {
             if (i + 8 > size)
                 goto bad;
@@ -372,6 +416,19 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             memcpy(&v, buf + i, 8);
             i += 8;
             expr_push(&s, v);
+            break;
+        }
+
+        case WL_PLAN_EXPR_CONST_FLOAT: {
+            if (i + 8 > size)
+                goto bad;
+            int64_t bits;
+            memcpy(&bits, buf + i, 8);
+            i += 8;
+            double value;
+            if (!expr_float_load(bits, &value))
+                goto bad;
+            expr_push(&s, bits);
             break;
         }
 
@@ -445,6 +502,25 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
             if (wl_columnar_arithmetic_checked_mod_int64(a, b, &v) != 0)
                 goto bad;
             expr_push(&s, v);
+            break;
+        }
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+        case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+        case WL_PLAN_EXPR_ARITH_FLOAT_DIV: {
+            int64_t bbits = expr_pop(&s), abits = expr_pop(&s), result;
+            double a, b, value;
+            if (!expr_float_load(abits, &a) || !expr_float_load(bbits, &b))
+                goto bad;
+            switch ((wl_plan_expr_tag_t)tag) {
+            case WL_PLAN_EXPR_ARITH_FLOAT_ADD: value = a + b; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_SUB: value = a - b; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_MUL: value = a * b; break;
+            default: value = a / b; break;
+            }
+            if (!expr_float_store(value, &result))
+                goto bad;
+            expr_push(&s, result);
             break;
         }
         case WL_PLAN_EXPR_ARITH_BAND: {
@@ -720,6 +796,28 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         case WL_PLAN_EXPR_CMP_GTE: {
             int64_t b = expr_pop(&s), a = expr_pop(&s);
             expr_push(&s, a >= b ? 1 : 0);
+            break;
+        }
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT:
+        case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_GTE: {
+            int64_t bbits = expr_pop(&s), abits = expr_pop(&s);
+            double a, b;
+            if (!expr_float_load(abits, &a) || !expr_float_load(bbits, &b))
+                goto bad;
+            bool result;
+            switch ((wl_plan_expr_tag_t)tag) {
+            case WL_PLAN_EXPR_CMP_FLOAT_EQ: result = a == b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_NEQ: result = a != b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LT: result = a < b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_GT: result = a > b; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LTE: result = a <= b; break;
+            default: result = a >= b; break;
+            }
+            expr_push(&s, result ? 1 : 0);
             break;
         }
 
@@ -1038,7 +1136,21 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
             i = pos;
             break;
         }
+        case WL_PLAN_EXPR_VAR_FLOAT: {
+            uint32_t pos = i;
+            uint32_t col = 0;
+            if (!wl_columnar_expr_parse_var_col(buf, size, &pos, &col))
+                return NULL;
+            i = pos;
+            break;
+        }
         case WL_PLAN_EXPR_CONST_INT:
+            i++;
+            if (i + 8 > size)
+                return NULL;
+            i += 8;
+            break;
+        case WL_PLAN_EXPR_CONST_FLOAT:
             i++;
             if (i + 8 > size)
                 return NULL;
@@ -1064,6 +1176,10 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
         case WL_PLAN_EXPR_ARITH_BNOT:
         case WL_PLAN_EXPR_ARITH_SHL:
         case WL_PLAN_EXPR_ARITH_SHR:
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+        case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+        case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
         /* Comparison operators (no payload) */
         case WL_PLAN_EXPR_CMP_EQ:
         case WL_PLAN_EXPR_CMP_NEQ:
@@ -1071,6 +1187,12 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
         case WL_PLAN_EXPR_CMP_GT:
         case WL_PLAN_EXPR_CMP_LTE:
         case WL_PLAN_EXPR_CMP_GTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT:
+        case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_GTE:
         /* Issue #966: string-ordering comparisons (no payload).  #962 made
          * these correct by emitting them; they were absent here, so any
          * predicate containing one fell to `default: return NULL` and the
@@ -1128,8 +1250,19 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
             i = pos;
             break;
         }
+        case WL_PLAN_EXPR_VAR_FLOAT: {
+            uint32_t pos = i;
+            wl_columnar_expr_parse_var_col(buf, size, &pos, &instr->iarg);
+            i = pos;
+            break;
+        }
         case WL_PLAN_EXPR_CONST_INT:
             i++; /* skip opcode */
+            memcpy(&instr->larg, buf + i, 8);
+            i += 8;
+            break;
+        case WL_PLAN_EXPR_CONST_FLOAT:
+            i++;
             memcpy(&instr->larg, buf + i, 8);
             i += 8;
             break;
@@ -1174,6 +1307,7 @@ wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
         const expr_instr_t *in = &c->instrs[k];
         switch ((wl_plan_expr_tag_t)in->op) {
         case WL_PLAN_EXPR_VAR:
+        case WL_PLAN_EXPR_VAR_FLOAT:
             expr_push(&s, (in->iarg < ncols) ? row[in->iarg] : 0);
             break;
         case WL_PLAN_EXPR_CMP_STR_EQ: {
@@ -1221,6 +1355,7 @@ wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
             break;
         }
         case WL_PLAN_EXPR_CONST_INT:
+        case WL_PLAN_EXPR_CONST_FLOAT:
         case WL_PLAN_EXPR_BOOL:
             expr_push(&s, in->larg);
             break;
