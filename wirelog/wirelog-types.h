@@ -173,6 +173,45 @@ typedef void (*wirelog_on_tuple_fn)(const char *relation, const int64_t *row,
 typedef void (*wirelog_on_delta_fn)(const char *relation, const int64_t *row,
     uint32_t ncols, int32_t diff, void *user_data);
 
+/* Versioned typed row descriptors.  Float lanes contain host-order
+ * IEEE-754 binary64 bits and are copied with memcpy at the API boundary. */
+typedef struct wirelog_typed_row_v1 {
+    uint32_t struct_size;
+    uint16_t abi_version;
+    uint16_t reserved;
+    uint32_t logical_ncols;
+    uint32_t physical_nlanes;
+    uint32_t physical_stride;
+    const uint32_t *types;
+    const uint32_t *lane_offsets;
+    const uint32_t *physical_types;
+    const uint64_t *lanes;
+} wirelog_typed_row_v1_t;
+
+typedef enum {
+    WIRELOG_TYPED_ERROR_NONE = 0,
+    WIRELOG_TYPED_ERROR_DESCRIPTOR = 1,
+    WIRELOG_TYPED_ERROR_SCHEMA = 2,
+    WIRELOG_TYPED_ERROR_VALUE = 3,
+} wirelog_typed_error_code_t;
+
+typedef struct wirelog_typed_error_v1 {
+    uint32_t struct_size;
+    uint32_t code;
+    uint32_t row_index;
+    uint32_t logical_col;
+    char *message;
+    uint32_t message_capacity;
+} wirelog_typed_error_v1_t;
+
+typedef struct wirelog_typed_compound_arg_v1 {
+    uint32_t type;
+    uint64_t bits;
+} wirelog_typed_compound_arg_v1_t;
+
+typedef void (*wirelog_on_typed_tuple_fn)(const char *relation,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *user_data);
+
 /* ======================================================================== */
 /* Relation Types                                                           */
 /* ======================================================================== */

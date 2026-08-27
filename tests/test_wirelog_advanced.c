@@ -116,6 +116,125 @@ count_rows(const char *relation, const int64_t *row, uint32_t ncols,
     st->rows++;
 }
 
+static wirelog_program_t *parse_or_die(const char *src, const char *what);
+
+struct typed_snapshot_state {
+    uint32_t rows;
+    uint64_t lane;
+};
+
+static void
+capture_typed_tuple(const char *relation, const wirelog_typed_row_v1_t *row,
+    int32_t diff, void *user_data)
+{
+    struct typed_snapshot_state *st = user_data;
+    if (strcmp(relation, "out") == 0 && row->logical_ncols == 1 && diff > 0) {
+        st->rows++;
+        st->lane = row->lanes[0];
+    }
+}
+
+static int
+test_typed_float_ingress(void)
+{
+    static const char *src =
+        ".decl point(x: float)\n"
+        ".decl out(x: float)\n"
+        "out(X) :- point(X).\n";
+    wirelog_program_t *prog = parse_or_die(src, "T-typed-float");
+    if (!prog)
+        return 1;
+    wirelog_session_t *session = NULL;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, 1, &session)
+        != WIRELOG_OK) {
+        wirelog_program_free(prog);
+        return 1;
+    }
+
+    double value = 1.5;
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    uint32_t types[] = { WIRELOG_TYPE_FLOAT };
+    uint64_t lanes[] = { bits };
+    uint32_t offsets[] = { 0 };
+    wirelog_typed_row_v1_t rows = {
+        sizeof(rows), 1, 0, 1, 1, 1, types, offsets, types, lanes
+    };
+    wirelog_typed_error_v1_t typed_error = {
+        sizeof(typed_error), WIRELOG_TYPED_ERROR_NONE, UINT32_MAX, UINT32_MAX,
+        NULL, 0
+    };
+    int rc = 0;
+    if (wirelog_session_insert_typed(session, "point", &rows, 1, &typed_error)
+        != WIRELOG_OK || typed_error.code != WIRELOG_TYPED_ERROR_NONE) {
+        fprintf(stderr, "T-typed-float: typed insert failed (%u)\n",
+            typed_error.code);
+        rc = 1;
+    }
+    int64_t legacy_lane;
+    memcpy(&legacy_lane, &bits, sizeof(legacy_lane));
+    if (wirelog_session_insert(session, "point", &legacy_lane, 1, 1)
+        != WIRELOG_ERR_EXEC) {
+        fprintf(stderr, "T-typed-float: legacy float insert accepted\n");
+        rc = 1;
+    }
+    struct typed_snapshot_state snapshot = { 0, 0 };
+    if (wirelog_session_snapshot_typed(session, capture_typed_tuple, &snapshot)
+        != WIRELOG_OK || snapshot.rows != 1) {
+        fprintf(stderr, "T-typed-float: snapshot rows=%u\n", snapshot.rows);
+        rc = 1;
+    } else {
+        uint64_t expected;
+        memcpy(&expected, &value, sizeof(expected));
+        if (snapshot.lane != expected) {
+            fprintf(stderr, "T-typed-float: lane was not bit-preserving\n");
+            rc = 1;
+        }
+    }
+
+    double infinity = 1.0 / 0.0;
+    uint64_t bad_bits;
+    memcpy(&bad_bits, &infinity, sizeof(bad_bits));
+    rows.lanes = &bad_bits;
+    typed_error.code = WIRELOG_TYPED_ERROR_NONE;
+    if (wirelog_session_insert_typed(session, "point", &rows, 1, &typed_error)
+        != WIRELOG_ERR_EXEC || typed_error.code != WIRELOG_TYPED_ERROR_VALUE) {
+        fprintf(stderr, "T-typed-float: nonfinite value was accepted\n");
+        rc = 1;
+    }
+    snapshot.rows = 0;
+    if (wirelog_session_snapshot_typed(session, capture_typed_tuple, &snapshot)
+        != WIRELOG_OK || snapshot.rows != 1) {
+        fprintf(stderr, "T-typed-float: failed insert changed relation\n");
+        rc = 1;
+    }
+    rows.lanes = lanes;
+    if (wirelog_session_remove_typed(session, "point", &rows, 1,
+        &typed_error) != WIRELOG_OK) {
+        fprintf(stderr, "T-typed-float: typed remove failed\n");
+        rc = 1;
+    }
+    wirelog_typed_compound_arg_v1_t typed_arg = {
+        WIRELOG_TYPE_FLOAT, bits
+    };
+    uint64_t compound_handle = WIRELOG_COMPOUND_HANDLE_NULL;
+    if (wirelog_session_make_compound_typed(session, "f", 1, &typed_arg, 1,
+        &compound_handle) != WIRELOG_OK
+        || compound_handle == WIRELOG_COMPOUND_HANDLE_NULL) {
+        fprintf(stderr, "T-typed-float: typed compound failed\n");
+        rc = 1;
+    }
+    wirelog_compound_arg_t legacy_arg = { WIRELOG_TYPE_FLOAT, legacy_lane };
+    if (wirelog_session_make_compound(session, "f", 1, &legacy_arg,
+        &compound_handle) != WIRELOG_ERR_EXEC) {
+        fprintf(stderr, "T-typed-float: legacy float compound accepted\n");
+        rc = 1;
+    }
+    wirelog_session_destroy(session);
+    wirelog_program_free(prog);
+    return rc;
+}
+
 static void
 count_deltas(const char *relation, const int64_t *row, uint32_t ncols,
     int32_t diff, void *user_data)
@@ -1873,6 +1992,7 @@ main(void)
     failures += test_delta_cb_multi_round_recursive_insert();
     failures += test_issue_665_partial_conjunction_default_workers();
     failures += test_issue_665_partial_conjunction_multi_worker();
+    failures += test_typed_float_ingress();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
     else

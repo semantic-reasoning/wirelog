@@ -1680,6 +1680,9 @@ col_session_insert(wl_session_t *session, const char *relation,
     if (!session || !relation || !data)
         return EINVAL;
 
+    if (num_rows == 0)
+        return 0;
+
     /* Issue #662: When a delta callback is installed, EDB inserts must take
      * the incremental path so arrangement caches are invalidated and the
      * outer-epoch counter advances; otherwise a subsequent col_session_step
@@ -1998,20 +2001,24 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         }
     }
 
+    int64_t row_stack[COL_STACK_MAX];
+    int64_t *row_buf = row_stack;
+    if (num_cols > COL_STACK_MAX) {
+        row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
+        if (!row_buf) {
+            col_rel_destroy(rdelta);
+            return ENOMEM;
+        }
+    }
+
     /* Register $r$<name> in session (replacing any prior) */
     session_remove_rel(sess, rname);
     rc = session_add_rel(sess, rdelta);
     if (rc != 0) {
         col_rel_destroy(rdelta);
+        if (row_buf != row_stack)
+            free(row_buf);
         return rc;
-    }
-
-    int64_t row_stack[COL_STACK_MAX];
-    int64_t *row_buf = row_stack;
-    if (num_cols > COL_STACK_MAX) {
-        row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
-        if (!row_buf)
-            return ENOMEM;
     }
 
     /* Remove rows from the EDB using existing compact logic */

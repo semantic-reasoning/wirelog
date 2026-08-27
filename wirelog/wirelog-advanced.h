@@ -170,6 +170,34 @@ WIRELOG_API wirelog_error_t
 wirelog_session_remove(wirelog_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols);
 
+/** Insert @num_rows borrowed, versioned typed rows.
+ * FLOAT lanes are host-order IEEE-754 binary64 bits.  The descriptor's
+ * logical/physical schema must match the relation; callbacks and input
+ * buffers are used synchronously and never retained.  On failure, @error
+ * receives the first invalid row/column and a bounded diagnostic message. */
+WIRELOG_API wirelog_error_t
+wirelog_session_insert_typed(wirelog_session_t *session,
+    const char *relation, const wirelog_typed_row_v1_t *rows,
+    uint32_t num_rows, wirelog_typed_error_v1_t *error);
+
+/** Retract @num_rows typed rows; see wirelog_session_insert_typed(). */
+WIRELOG_API wirelog_error_t
+wirelog_session_remove_typed(wirelog_session_t *session,
+    const char *relation, const wirelog_typed_row_v1_t *rows,
+    uint32_t num_rows, wirelog_typed_error_v1_t *error);
+
+WIRELOG_API wirelog_error_t
+wirelog_session_set_typed_delta_cb(wirelog_session_t *session,
+    wirelog_on_typed_tuple_fn callback, void *user_data);
+
+/** Snapshot rows through a borrowed typed descriptor valid during callback.
+ * The descriptor arrays and lane storage are owned by the library only until
+ * the callback returns; callback registration is synchronous and allocation
+ * failure suppresses that callback without changing session state. */
+WIRELOG_API wirelog_error_t
+wirelog_session_snapshot_typed(wirelog_session_t *session,
+    wirelog_on_typed_tuple_fn callback, void *user_data);
+
 /**
  * wirelog_session_step:
  * @session: Session.
@@ -241,6 +269,13 @@ wirelog_session_snapshot(wirelog_session_t *session,
 WIRELOG_API wirelog_error_t
 wirelog_session_make_compound(wirelog_session_t *session, const char *functor,
     uint32_t arity, const wirelog_compound_arg_t *args, uint64_t *handle_out);
+
+/** Construct a compound using fixed-width typed argument codes and bit lanes. */
+WIRELOG_API wirelog_error_t
+wirelog_session_make_compound_typed(wirelog_session_t *session,
+    const char *functor, uint32_t arity,
+    const wirelog_typed_compound_arg_v1_t *args, uint32_t arg_count,
+    uint64_t *handle_out);
 
 #ifdef __cplusplus
 }
