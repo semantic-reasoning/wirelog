@@ -76,6 +76,16 @@ dup_str(const char *s)
     return d;
 }
 
+static void
+free_edb_type_arrays(wirelog_column_type_t **types, uint32_t count)
+{
+    if (!types)
+        return;
+    for (uint32_t i = 0; i < count; i++)
+        free((void *)types[i]);
+    free((void *)types);
+}
+
 /* Allocate "$d$<name>" for delta relation name caching (Issue #285). */
 static char *
 make_delta_name(const char *name)
@@ -240,6 +250,14 @@ expr_buf_push_i64(expr_buf_t *buf, int64_t v)
         u >>= 8;
     }
     return 0;
+}
+
+static int
+expr_buf_push_f64(expr_buf_t *buf, double v)
+{
+    uint64_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    return expr_buf_push_i64(buf, (int64_t)bits);
 }
 
 static int
@@ -485,6 +503,16 @@ arith_to_tag(wirelog_arith_op_t op, wl_ir_coltype_t t0, wl_ir_coltype_t t1)
         return arith_digest_tag(op, t0, t1);
     }
 
+    if (t0 == WL_IR_COLTYPE_FLOAT && t1 == WL_IR_COLTYPE_FLOAT) {
+        switch (op) {
+        case WIRELOG_ARITH_ADD: return WL_PLAN_EXPR_ARITH_FLOAT_ADD;
+        case WIRELOG_ARITH_SUB: return WL_PLAN_EXPR_ARITH_FLOAT_SUB;
+        case WIRELOG_ARITH_MUL: return WL_PLAN_EXPR_ARITH_FLOAT_MUL;
+        case WIRELOG_ARITH_DIV: return WL_PLAN_EXPR_ARITH_FLOAT_DIV;
+        default: return 0;
+        }
+    }
+
     switch (op) {
     case WIRELOG_ARITH_ADD:
         return WL_PLAN_EXPR_ARITH_ADD;
@@ -709,12 +737,26 @@ expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
         return WL_IR_COLTYPE_STRING;
 
     case WL_IR_EXPR_CONST_INT:
-    case WL_IR_EXPR_CONST_FLOAT:
     case WL_IR_EXPR_BOOL:
     case WL_IR_EXPR_ARITH:
     case WL_IR_EXPR_CMP:
     case WL_IR_EXPR_AGG:
         return WL_IR_COLTYPE_SCALAR;
+
+    case WL_IR_EXPR_CONST_FLOAT:
+        return WL_IR_COLTYPE_FLOAT;
+
+    case WL_IR_EXPR_ARITH: {
+        bool saw_float = false;
+        bool saw_nonfloat = false;
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+            wl_ir_coltype_t t = expr_result_type(expr->children[i], ctx);
+            saw_float |= t == WL_IR_COLTYPE_FLOAT;
+            saw_nonfloat |= t != WL_IR_COLTYPE_FLOAT;
+        }
+        return saw_float && !saw_nonfloat ? WL_IR_COLTYPE_FLOAT
+                                          : WL_IR_COLTYPE_SCALAR;
+    }
 
     case WL_IR_EXPR_STR_FN:
         switch (expr->str_fn) {
@@ -760,6 +802,7 @@ agg_operand_from_coltype(wl_ir_coltype_t t)
 {
     switch (t) {
     case WL_IR_COLTYPE_SCALAR:
+    case WL_IR_COLTYPE_FLOAT:
         return WL_PLAN_AGG_OPERAND_SCALAR;
     case WL_IR_COLTYPE_STRING:
         return WL_PLAN_AGG_OPERAND_STRING;
@@ -798,7 +841,11 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
             }
         }
         uint16_t len = (uint16_t)strlen(emit_name);
-        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_VAR) != 0)
+        uint8_t var_tag = col_ctx_lookup_type(ctx, expr->var_name)
+            == WL_IR_COLTYPE_FLOAT
+            ? WL_PLAN_EXPR_VAR_FLOAT
+            : WL_PLAN_EXPR_VAR;
+        if (expr_buf_push_u8(buf, var_tag) != 0)
             return -1;
         if (expr_buf_push_u16(buf, len) != 0)
             return -1;
@@ -812,8 +859,9 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         return expr_buf_push_i64(buf, expr->int_value);
 
     case WL_IR_EXPR_CONST_FLOAT:
-        /* Kept in IR until the typed columnar evaluator lands. */
-        return -1;
+        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_CONST_FLOAT) != 0)
+            return -1;
+        return expr_buf_push_f64(buf, expr->float_value);
 
     case WL_IR_EXPR_CONST_STR: {
         if (!expr->str_value)
@@ -834,6 +882,14 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         return expr_buf_push_u8(buf, expr->bool_value ? 1 : 0);
 
     case WL_IR_EXPR_ARITH: {
+        wl_ir_coltype_t t0 = (expr->child_count > 0)
+            ? expr_result_type(expr->children[0], ctx)
+            : WL_IR_COLTYPE_UNKNOWN;
+        wl_ir_coltype_t t1 = (expr->child_count > 1)
+            ? expr_result_type(expr->children[1], ctx)
+            : WL_IR_COLTYPE_UNKNOWN;
+        if ((t0 == WL_IR_COLTYPE_FLOAT) != (t1 == WL_IR_COLTYPE_FLOAT))
+            return -1;
         /* Serialize children first (postfix) */
         for (uint32_t i = 0; i < expr->child_count; i++) {
             if (serialize_expr(buf, expr->children[i], ctx) != 0)
@@ -841,26 +897,40 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         }
         /* Operand domains select between the integer and the string digest
          * opcode families (Issue #963). */
-        wl_ir_coltype_t t0 = (expr->child_count > 0)
-            ? expr_result_type(expr->children[0], ctx)
-            : WL_IR_COLTYPE_UNKNOWN;
-        wl_ir_coltype_t t1 = (expr->child_count > 1)
-            ? expr_result_type(expr->children[1], ctx)
-            : WL_IR_COLTYPE_UNKNOWN;
-        return expr_buf_push_u8(buf, arith_to_tag(expr->arith_op, t0, t1));
+        uint8_t tag = arith_to_tag(expr->arith_op, t0, t1);
+        return tag == 0 ? -1 : expr_buf_push_u8(buf, tag);
     }
 
     case WL_IR_EXPR_CMP: {
-        for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], ctx) != 0)
-                return -1;
-        }
         wl_ir_coltype_t lhs = (expr->child_count > 0)
             ? expr_result_type(expr->children[0], ctx)
             : WL_IR_COLTYPE_UNKNOWN;
         wl_ir_coltype_t rhs = (expr->child_count > 1)
             ? expr_result_type(expr->children[1], ctx)
             : WL_IR_COLTYPE_UNKNOWN;
+        if ((lhs == WL_IR_COLTYPE_FLOAT) != (rhs == WL_IR_COLTYPE_FLOAT))
+            return -1;
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+            if (serialize_expr(buf, expr->children[i], ctx) != 0)
+                return -1;
+        }
+        if (lhs == WL_IR_COLTYPE_FLOAT && rhs == WL_IR_COLTYPE_FLOAT) {
+            switch (expr->cmp_op) {
+            case WIRELOG_CMP_EQ: return expr_buf_push_u8(buf,
+                           WL_PLAN_EXPR_CMP_FLOAT_EQ);
+            case WIRELOG_CMP_NEQ: return expr_buf_push_u8(buf,
+                           WL_PLAN_EXPR_CMP_FLOAT_NEQ);
+            case WIRELOG_CMP_LT: return expr_buf_push_u8(buf,
+                           WL_PLAN_EXPR_CMP_FLOAT_LT);
+            case WIRELOG_CMP_GT: return expr_buf_push_u8(buf,
+                           WL_PLAN_EXPR_CMP_FLOAT_GT);
+            case WIRELOG_CMP_LTE: return expr_buf_push_u8(buf,
+                           WL_PLAN_EXPR_CMP_FLOAT_LTE);
+            case WIRELOG_CMP_GTE: return expr_buf_push_u8(buf,
+                           WL_PLAN_EXPR_CMP_FLOAT_GTE);
+            }
+            return -1;
+        }
         return expr_buf_push_u8(buf, cmp_to_tag(expr->cmp_op, lhs, rhs));
     }
 
@@ -3694,6 +3764,12 @@ wl_plan_free(wl_plan_t *plan)
     free((void *)plan->edb_has_graph_column);
     free((void *)plan->edb_graph_col_index);
     free((void *)plan->edb_declared_width);
+    if (plan->edb_column_types) {
+        for (uint32_t i = 0; i < plan->edb_count; i++)
+            free((void *)plan->edb_column_types[i]);
+        free((void *)plan->edb_column_types);
+    }
+    free((void *)plan->edb_column_type_counts);
 
     free(plan);
 }
@@ -3713,44 +3789,6 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
         return -1;
 
     *out = NULL;
-
-    /* The parser/IR representation is intentionally landed before the
-     * columnar float consumers.  Do not let a float relation reach the legacy
-     * int64 evaluator in this intermediate state: it would reinterpret a
-     * binary64 lane as an integer and silently produce wrong answers. */
-    for (uint32_t ri = 0; ri < prog->relation_count; ri++) {
-        const wl_ir_relation_info_t *rel = &prog->relations[ri];
-        if (rel->has_float_facts) {
-            set_plan_error(prog,
-                "relation '%s' has float facts but float columnar support "
-                "is not available", rel->name);
-            return -1;
-        }
-        if (rel->has_float_compound_slots) {
-            set_plan_error(prog,
-                "relation '%s' has float compound slots but float "
-                "columnar support is not available", rel->name);
-            return -1;
-        }
-        for (uint32_t ci = 0; ci < rel->column_count; ci++) {
-            if (rel->columns && rel->columns[ci].type == WIRELOG_TYPE_FLOAT) {
-                set_plan_error(prog,
-                    "float relation '%s' is not executable until float "
-                    "columnar support is available", rel->name);
-                return -1;
-            }
-        }
-        for (uint32_t si = 0; si < rel->slot_type_count; si++) {
-            if (rel->slot_type_declared && rel->slot_types
-                && rel->slot_type_declared[si]
-                && rel->slot_types[si] == WIRELOG_TYPE_FLOAT) {
-                set_plan_error(prog,
-                    "relation '%s' has float compound slots but float "
-                    "columnar support is not available", rel->name);
-                return -1;
-            }
-        }
-    }
 
     /* Issue #287/#962: plan generation emits WL_LOG diagnostics -- cmp_to_tag()
      * reports ordering comparisons that fall back to intern-id order -- and it
@@ -3807,7 +3845,14 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
      * it define the relation.  WL_PLAN_WIDTH_UNDECLARED for a relation with
      * no `.decl` -- those are legitimate and stay caller-defined. */
     uint32_t *edb_decl_w = (uint32_t *)malloc(edb_cap * sizeof(uint32_t));
-    if (!edb_has_graph || !edb_graph_idx || !edb_decl_w) {
+    wirelog_column_type_t **edb_types
+        = (wirelog_column_type_t **)calloc(edb_cap, sizeof(*edb_types));
+    uint32_t *edb_type_counts = (uint32_t *)calloc(edb_cap,
+            sizeof(*edb_type_counts));
+    if (!edb_has_graph || !edb_graph_idx || !edb_decl_w || !edb_types
+        || !edb_type_counts) {
+        free(edb_type_counts);
+        free_edb_type_arrays(edb_types, 0);
         free(edb_decl_w);
         free(edb_graph_idx);
         free(edb_has_graph);
@@ -3837,6 +3882,7 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
         }
         if (!is_idb || has_facts) {
             if (edb_count >= edb_cap) {
+                uint32_t old_edb_cap = edb_cap;
                 edb_cap *= 2;
                 char **tmp = (char **)realloc((void *)edb_rels,
                         edb_cap * sizeof(char *));
@@ -3847,6 +3893,8 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
                     free(edb_has_graph);
                     free(edb_graph_idx);
                     free(edb_decl_w);
+                    free_edb_type_arrays(edb_types, edb_count);
+                    free(edb_type_counts);
                     free(plan);
                     return -1;
                 }
@@ -3860,6 +3908,8 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
                     free(edb_has_graph);
                     free(edb_graph_idx);
                     free(edb_decl_w);
+                    free_edb_type_arrays(edb_types, edb_count);
+                    free(edb_type_counts);
                     free(plan);
                     return -1;
                 }
@@ -3873,6 +3923,8 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
                     free(edb_has_graph);
                     free(edb_graph_idx);
                     free(edb_decl_w);
+                    free_edb_type_arrays(edb_types, edb_count);
+                    free(edb_type_counts);
                     free(plan);
                     return -1;
                 }
@@ -3886,10 +3938,48 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
                     free(edb_has_graph);
                     free(edb_graph_idx);
                     free(edb_decl_w);
+                    free_edb_type_arrays(edb_types, edb_count);
+                    free(edb_type_counts);
                     free(plan);
                     return -1;
                 }
                 edb_decl_w = wtmp;
+                wirelog_column_type_t **ttmp
+                    = (wirelog_column_type_t **)realloc((void *)edb_types,
+                        edb_cap * sizeof(*edb_types));
+                if (!ttmp) {
+                    for (uint32_t j = 0; j < edb_count; j++)
+                        free(edb_rels[j]);
+                    free((void *)edb_rels);
+                    free(edb_has_graph);
+                    free(edb_graph_idx);
+                    free(edb_decl_w);
+                    free_edb_type_arrays(edb_types, edb_count);
+                    free(edb_type_counts);
+                    free(plan);
+                    return -1;
+                }
+                edb_types = ttmp;
+                uint32_t *ctmp = (uint32_t *)realloc(edb_type_counts,
+                        edb_cap * sizeof(*edb_type_counts));
+                if (!ctmp) {
+                    for (uint32_t j = 0; j < edb_count; j++)
+                        free(edb_rels[j]);
+                    free((void *)edb_rels);
+                    free(edb_has_graph);
+                    free(edb_graph_idx);
+                    free(edb_decl_w);
+                    free_edb_type_arrays(edb_types, edb_count);
+                    free(edb_type_counts);
+                    free(plan);
+                    return -1;
+                }
+                edb_type_counts = ctmp;
+                memset((void *)(edb_types + old_edb_cap), 0,
+                    (size_t)(edb_cap - old_edb_cap) * sizeof(*edb_types));
+                memset(edb_type_counts + old_edb_cap, 0,
+                    (size_t)(edb_cap - old_edb_cap)
+                    * sizeof(*edb_type_counts));
             }
             edb_rels[edb_count] = dup_str(rel->name);
             if (!edb_rels[edb_count]) {
@@ -3899,6 +3989,8 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
                 free(edb_has_graph);
                 free(edb_graph_idx);
                 free(edb_decl_w);
+                free_edb_type_arrays(edb_types, edb_count);
+                free(edb_type_counts);
                 free(plan);
                 return -1;
             }
@@ -3911,6 +4003,49 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
             edb_decl_w[edb_count] = rel->has_decl
                 ? wl_ir_relation_physical_width(rel)
                 : WL_PLAN_WIDTH_UNDECLARED;
+            uint32_t type_count = rel->has_decl
+                ? wl_ir_relation_physical_width(rel) : 0;
+            if (type_count > 0) {
+                edb_types[edb_count] = (wirelog_column_type_t *)calloc(
+                    type_count, sizeof(*edb_types[edb_count]));
+                if (!edb_types[edb_count]) {
+                    for (uint32_t j = 0; j < edb_count; j++)
+                        free(edb_rels[j]);
+                    free((void *)edb_rels);
+                    free(edb_has_graph);
+                    free(edb_graph_idx);
+                    free(edb_decl_w);
+                    free_edb_type_arrays(edb_types, edb_count);
+                    free(edb_type_counts);
+                    free(plan);
+                    return -1;
+                }
+                edb_type_counts[edb_count] = type_count;
+                uint32_t physical_index = 0;
+                for (uint32_t logical_index = 0;
+                    logical_index < rel->column_count; logical_index++) {
+                    const wirelog_column_t *column
+                        = &rel->columns[logical_index];
+                    uint32_t width = column->compound_kind
+                        == WIRELOG_COMPOUND_KIND_INLINE
+                        ? column->compound_arity : 1u;
+                    for (uint32_t slot = 0; slot < width
+                        && physical_index < type_count; slot++) {
+                        wirelog_column_type_t type = column->type;
+                        if (column->compound_kind
+                            == WIRELOG_COMPOUND_KIND_INLINE) {
+                            uint32_t slot_index = logical_index * 4u + slot;
+                            if (rel->slot_types && rel->slot_type_declared
+                                && slot_index < rel->slot_type_count
+                                && rel->slot_type_declared[slot_index])
+                                type = rel->slot_types[slot_index];
+                            else
+                                type = WIRELOG_TYPE_INT64;
+                        }
+                        edb_types[edb_count][physical_index++] = type;
+                    }
+                }
+            }
             edb_count++;
         }
     }
@@ -3920,6 +4055,9 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
     plan->edb_has_graph_column = (const bool *)edb_has_graph;
     plan->edb_graph_col_index = (const uint32_t *)edb_graph_idx;
     plan->edb_declared_width = (const uint32_t *)edb_decl_w;
+    plan->edb_column_types
+        = (const wirelog_column_type_t *const *)edb_types;
+    plan->edb_column_type_counts = (const uint32_t *)edb_type_counts;
 
     /* ----------------------------------------------------------------
      * Build strata
