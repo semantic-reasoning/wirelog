@@ -3967,6 +3967,7 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
                 edb_types[edb_count] = (wirelog_column_type_t *)calloc(
                     type_count, sizeof(*edb_types[edb_count]));
                 if (!edb_types[edb_count]) {
+                    free(edb_rels[edb_count]);
                     for (uint32_t j = 0; j < edb_count; j++)
                         free(edb_rels[j]);
                     free((void *)edb_rels);
