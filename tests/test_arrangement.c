@@ -80,7 +80,7 @@ static int fail_count = 0;
  * ---------------------------------------------------------------- */
 
 /*
- * Mirror of col_rel_t (first 5 fields only).
+ * Mirror of col_rel_t (first 6 fields only).
  * Full definition is in columnar_nanoarrow.c:49-62.
  *
  * Memory layout (x86-64, LP64):
@@ -88,14 +88,16 @@ static int fail_count = 0;
  *   uint32_t   ncols     -> 4 bytes  (offset  8)
  *   [padding             -> 4 bytes  (offset 12)]
  *   int64_t  **columns   -> 8 bytes  (offset 16)
- *   uint32_t   nrows     -> 4 bytes  (offset 24)
- *   uint32_t   capacity  -> 4 bytes  (offset 28)
+ *   void       *column_types -> 8 bytes (offset 24)
+ *   uint32_t   nrows     -> 4 bytes  (offset 32)
+ *   uint32_t   capacity  -> 4 bytes  (offset 36)
  */
 typedef struct {
     char *name;
     uint32_t ncols;
     uint32_t _ncols_pad; /* explicit alignment padding */
     int64_t **columns;
+    void *column_types;
     uint32_t nrows;
     uint32_t capacity;
     /* omitted: col_names, schema, schema_ok, timestamps */

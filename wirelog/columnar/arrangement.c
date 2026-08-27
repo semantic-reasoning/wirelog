@@ -13,10 +13,6 @@
 
 #include "../wirelog-internal.h"
 
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
-
 #include <errno.h>
 #ifndef _MSC_VER
 #include <stdatomic.h>
@@ -30,49 +26,55 @@
 /* ======================================================================== */
 
 /*
- * arr_hash_key: FNV-1a hash over key columns of a single row.
+ * arr_hash_key: legacy FNV-1a hash over key columns of a single row.
+ *
+ * This is the untyped arrangement API.  The 32-bit arithmetic is the
+ * low-32 projection of the historical 64-bit FNV-1a chain: the low 32 bits
+ * of its basis and prime are 0x84222325 and 435 respectively.
  * nbuckets MUST be a power of 2.
  */
 static uint32_t
 arr_hash_key(const int64_t *row, const uint32_t *key_cols, uint32_t key_count,
     uint32_t nbuckets)
 {
-    uint64_t h = 14695981039346656037ULL; /* FNV-1a basis */
+    uint32_t h = (uint32_t)14695981039346656037ULL;
     for (uint32_t k = 0; k < key_count; k++) {
         uint64_t v = (uint64_t)row[key_cols[k]];
-        for (int b = 0; b < 8; b++) {
-            h ^= v & 0xFFu;
-            h *= 1099511628211ULL;
+        for (uint32_t b = 0; b < sizeof(v); b++) {
+            h ^= (uint32_t)(v & 0xffu);
+            h *= 435u;
             v >>= 8;
         }
     }
-    return (uint32_t)(h & (uint64_t)(nbuckets - 1));
+    return h & (nbuckets - 1u);
+}
+
+static uint32_t
+arr_hash_key_typed(const col_rel_t *rel, const int64_t *row,
+    const uint32_t *key_cols, uint32_t key_count, uint32_t nbuckets)
+{
+    uint32_t h = (uint32_t)14695981039346656037ULL;
+    for (uint32_t k = 0; k < key_count; k++) {
+        uint64_t v = wl_columnar_value_key(rel, key_cols[k],
+                row[key_cols[k]]);
+        for (uint32_t b = 0; b < 8u; b++) {
+            h ^= (uint32_t)(v & 0xffu);
+            h *= 435u;
+            v >>= 8;
+        }
+    }
+    return h & (nbuckets - 1u);
 }
 
 /*
  * arr_hash_rows_batch:
  * Hash a contiguous run of rows in one call, for the arrangement build.
  *
- * Returns the low 32 bits of the same FNV-1a chain arr_hash_key() computes
- * on the probe side; callers apply `& (nbuckets - 1)` themselves.  See
- * internal.h for the contract.
- *
- * Why 32-bit arithmetic reproduces a 64-bit hash exactly
- * -----------------------------------------------------
- * The arrangement hash runs a 64-bit chain but only its low bits are ever
- * observed: the result is masked with `nbuckets - 1`, and nbuckets is a
- * uint32_t, so at most the low 32 bits can survive.
- *
- * Those low 32 bits are computable in 32-bit arithmetic alone. Each step is
- * h = (h ^ byte) * PRIME. Multiplication modulo 2^32 depends only on its
- * operands modulo 2^32, and xoring in a byte touches only the low 8 bits, so
- * low32(h_next) is a function of low32(h) and the byte -- the high half never
- * feeds back. Starting from low32 of the basis therefore tracks the 64-bit
- * chain's low half exactly, step for step.
- *
- * That matters because AVX2 has no 64x64->64 multiply; emulating one costs
- * several instructions and would have made this barely worth vectorizing. In
- * 32-bit form each step is a single _mm256_mullo_epi32 over eight rows.
+ * Returns the low-32 value of the same legacy FNV-1a chain as arr_hash_key(),
+ * after applying the typed value-key canonicalization used by
+ * arr_hash_key_typed().  Typed arrangement probes must use
+ * col_arrangement_find_first_typed(), so build and probe canonicalize keys
+ * identically.  Callers apply `& (nbuckets - 1)` themselves.
  */
 void
 arr_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
@@ -82,60 +84,18 @@ arr_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
         return;
 
     const uint32_t n = row_end - row_begin;
-    const uint32_t basis32 = (uint32_t)14695981039346656037ULL;
-    const uint32_t prime32 = (uint32_t)1099511628211ULL;
-    uint32_t r = 0;
-
-#ifdef __AVX2__
-    /*
-     * Eight rows per iteration. Each key column contributes eight dependent
-     * steps, one per byte, but all eight rows advance together.
-     *
-     * The two 256-bit loads hold rows r..r+3 and r+4..r+7 as four int64_t
-     * each. Rather than deinterleave, the byte for step b is extracted with a
-     * variable shift and a mask, then packed to 32-bit lanes -- the same
-     * shuffle/unpack trick used by the join kernel is unnecessary here
-     * because we need one byte at a time, not whole words.
-     */
-    const __m256i prime_v = _mm256_set1_epi32((int)prime32);
-    const __m256i bytemask = _mm256_set1_epi32(0xFF);
-    const __m256i pack = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-
-    for (; n >= 8 && r <= n - 8; r += 8) {
-        __m256i h = _mm256_set1_epi32((int)basis32);
-
+    /* Keep one scalar implementation as the canonical typed path.  In
+     * particular, use the low-32 legacy constants rather than the ordinary
+     * 32-bit FNV constants: the arrangement contract is the low 32 bits of
+     * the historical 64-bit chain. */
+    for (uint32_t r = 0; r < n; r++) {
+        uint32_t h = (uint32_t)14695981039346656037ULL;
         for (uint32_t k = 0; k < key_count; k++) {
-            const int64_t *col = rel->columns[key_cols[k]] + row_begin + r;
-            __m256i a0 = _mm256_loadu_si256((const __m256i *)col);
-            __m256i a1 = _mm256_loadu_si256((const __m256i *)(col + 4));
-
-            for (int b = 0; b < 8; b++) {
-                /* Byte b of each row, as eight 32-bit lanes in row order. */
-                __m256i s0 = _mm256_srli_epi64(a0, b * 8);
-                __m256i s1 = _mm256_srli_epi64(a1, b * 8);
-                s0 = _mm256_and_si256(s0, bytemask);
-                s1 = _mm256_and_si256(s1, bytemask);
-
-                /* Each holds 4 values in the even 32-bit lanes; gather them
-                 * into the low half, then join the two groups. */
-                __m256i p0 = _mm256_permutevar8x32_epi32(s0, pack);
-                __m256i p1 = _mm256_permutevar8x32_epi32(s1, pack);
-                __m256i bytes = _mm256_permute2x128_si256(p0, p1, 0x20);
-
-                h = _mm256_mullo_epi32(_mm256_xor_si256(h, bytes), prime_v);
-            }
-        }
-
-        _mm256_storeu_si256((__m256i *)(out_hashes + r), h);
-    }
-#endif /* __AVX2__ */
-
-    for (; r < n; r++) {
-        uint32_t h = basis32;
-        for (uint32_t k = 0; k < key_count; k++) {
-            uint64_t v = (uint64_t)rel->columns[key_cols[k]][row_begin + r];
-            for (int b = 0; b < 8; b++) {
-                h = (h ^ (uint32_t)(v & 0xFFu)) * prime32;
+            uint64_t v = wl_columnar_value_key(rel, key_cols[k],
+                    rel->columns[key_cols[k]][row_begin + r]);
+            for (uint32_t b = 0; b < 8u; b++) {
+                h ^= (uint32_t)(v & 0xffu);
+                h *= 435u;
                 v >>= 8;
             }
         }
@@ -590,6 +550,33 @@ col_arrangement_find_first(const col_arrangement_t *arr,
         for (uint32_t k = 0; k < arr->key_count; k++) {
             if (columns[arr->key_cols[k]][row]
                 != key_row[arr->key_cols[k]]) {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            return row;
+        row = arr->ht_next[row];
+    }
+    return UINT32_MAX;
+}
+
+uint32_t
+col_arrangement_find_first_typed(const col_arrangement_t *arr,
+    const col_rel_t *rel, const int64_t *key_row)
+{
+    if (!arr || !rel || !rel->columns || !key_row || arr->nbuckets == 0)
+        return UINT32_MAX;
+
+    uint32_t bucket = arr_hash_key_typed(rel, key_row, arr->key_cols,
+            arr->key_count, arr->nbuckets);
+    uint32_t row = arr->ht_head[bucket];
+    while (row != UINT32_MAX) {
+        bool match = true;
+        for (uint32_t k = 0; k < arr->key_count; k++) {
+            uint32_t col = arr->key_cols[k];
+            if (!wl_columnar_value_equal(rel, col, rel->columns[col][row],
+                rel, col, key_row[col])) {
                 match = false;
                 break;
             }

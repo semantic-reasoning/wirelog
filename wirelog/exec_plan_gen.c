@@ -1845,6 +1845,12 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                 "(.decl R(c: symbol)) if the column holds symbols",
                 op->agg_fn == WIRELOG_AGG_MIN ? "min" : "max");
         }
+        if (op->agg_fn == WIRELOG_AGG_AVG
+            && op->agg_operand_type != WL_PLAN_AGG_OPERAND_FLOAT) {
+            WL_LOG(WL_LOG_SEC_EVAL, WL_LOG_ERROR,
+                "average requires a float operand");
+            return -1;
+        }
 
         /* Record whether the relation as a whole may be reduced under this
          * aggregate, while the operator is still an operator (Issue #975).

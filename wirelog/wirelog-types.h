@@ -90,11 +90,7 @@ typedef enum {
     WIRELOG_AGG_MIN,   /* min / MIN */
     WIRELOG_AGG_MAX,   /* max / MAX */
     /*
-     * average / AVG.  Parses into this value, but a rule carrying it is
-     * rejected when it is lowered (#978): every value is a 64-bit integer,
-     * so there is no type to return a mean in.  Kept in the enum, and kept
-     * a reserved keyword, so the surface syntax does not have to change if
-     * a float type arrives.  Compute a mean as sum/count.
+     * average / AVG.  Requires a float operand and returns a binary64 mean.
      */
     WIRELOG_AGG_AVG,
 } wirelog_agg_fn_t;

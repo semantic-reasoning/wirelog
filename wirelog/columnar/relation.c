@@ -234,13 +234,12 @@ col_rel_destroy(col_rel_t *r)
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
 {
-    if (r->ncols != 0 && r->schema_ok)
+    if (r->ncols != 0)
         return 0; /* already initialised */
 
-    bool initialize_storage = r->ncols == 0;
     r->ncols = ncols;
 
-    if (initialize_storage && ncols > 0) {
+    if (ncols > 0) {
         r->capacity = COL_REL_INIT_CAP;
         r->columns = col_columns_alloc(ncols, r->capacity);
         if (!r->columns)
@@ -312,37 +311,91 @@ col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
         return EINVAL;
     wirelog_column_type_t *copy = NULL;
     if (ncols > 0) {
-        copy = (wirelog_column_type_t *)malloc((size_t)ncols * sizeof(*copy));
+        copy = (wirelog_column_type_t *)malloc(
+            (size_t)ncols * sizeof(*copy));
         if (!copy)
             return ENOMEM;
-        for (uint32_t c = 0; c < ncols; c++) {
-            copy[c] = types ? types[c] : WIRELOG_TYPE_INT64;
-            if (copy[c] == WIRELOG_TYPE_FLOAT) {
-                for (uint32_t row = 0; row < r->nrows; row++) {
-                    if (!wl_columnar_float_bits_valid(r->columns[c][row])) {
-                        free(copy);
-                        return EINVAL;
-                    }
+        for (uint32_t i = 0; i < ncols; i++)
+            copy[i] = types ? types[i] : WIRELOG_TYPE_INT64;
+    }
+    if (r->nrows > 0 && !r->column_types) {
+        for (uint32_t i = 0; i < ncols; i++) {
+            if (copy && copy[i] == WIRELOG_TYPE_FLOAT) {
+                free(copy);
+                return EINVAL;
+            }
+        }
+    }
+    /* Validate existing rows before changing their physical interpretation.
+     * This keeps a schema update transactional when a relation was already
+     * populated through a legacy path. */
+    for (uint32_t c = 0; c < ncols; c++) {
+        if (copy && copy[c] == WIRELOG_TYPE_FLOAT) {
+            for (uint32_t row = 0; row < r->nrows; row++) {
+                if (!wl_columnar_float_bits_valid(r->columns[c][row])) {
+                    free(copy);
+                    return EINVAL;
                 }
             }
         }
     }
-    if (r->schema_ok)
-        ArrowSchemaRelease(&r->schema);
-    r->schema_ok = false;
+    if (r->schema_ok) {
+        for (uint32_t i = 0; i < ncols; i++) {
+            enum ArrowType arrow_type = copy[i]
+                == WIRELOG_TYPE_FLOAT ? NANOARROW_TYPE_DOUBLE
+                                       : NANOARROW_TYPE_INT64;
+            if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
+                != NANOARROW_OK) {
+                for (uint32_t j = 0; j <= i; j++) {
+                    enum ArrowType old_type = r->column_types
+                        && r->column_types[j] == WIRELOG_TYPE_FLOAT
+                        ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+                    (void)ArrowSchemaInitFromType(r->schema.children[j],
+                        old_type);
+                    ArrowSchemaSetName(r->schema.children[j],
+                        r->col_names && r->col_names[j]
+                            ? r->col_names[j] : "");
+                }
+                free(copy);
+                return EINVAL;
+            }
+            const char *name = r->col_names && r->col_names[i]
+                ? r->col_names[i] : "";
+            ArrowSchemaSetName(r->schema.children[i], name);
+        }
+    } else if (ncols > 0) {
+        ArrowSchemaInit(&r->schema);
+        if (ArrowSchemaSetTypeStruct(&r->schema, (int64_t)ncols)
+            != NANOARROW_OK) {
+            ArrowSchemaRelease(&r->schema);
+            free(copy);
+            return EINVAL;
+        }
+        for (uint32_t i = 0; i < ncols; i++) {
+            enum ArrowType arrow_type = copy[i] == WIRELOG_TYPE_FLOAT
+                ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+            if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
+                != NANOARROW_OK) {
+                ArrowSchemaRelease(&r->schema);
+                free(copy);
+                return EINVAL;
+            }
+            ArrowSchemaSetName(r->schema.children[i],
+                r->col_names && r->col_names[i] ? r->col_names[i] : "");
+        }
+        r->schema_ok = true;
+    }
     free(r->column_types);
     r->column_types = copy;
-    if (col_rel_set_schema(r, r->ncols,
-        (const char *const *)r->col_names) != 0) {
-        free(r->column_types);
-        r->column_types = NULL;
-        return EINVAL;
-    }
-    for (uint32_t c = 0; c < ncols; c++) {
-        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
-            for (uint32_t row = 0; row < r->nrows; row++)
-                r->columns[c][row]
-                    = wl_columnar_float_canonical_bits(r->columns[c][row]);
+    if (r->column_types) {
+        for (uint32_t c = 0; c < ncols; c++) {
+            if (r->column_types[c] != WIRELOG_TYPE_FLOAT)
+                continue;
+            for (uint32_t row = 0; row < r->nrows; row++) {
+                if (r->columns[c][row]
+                    == wl_columnar_float_to_bits(-0.0))
+                    r->columns[c][row] = wl_columnar_float_to_bits(0.0);
+            }
         }
     }
     return 0;
@@ -536,6 +589,15 @@ col_rel_apply_compound_schema(col_rel_t *r,
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
+    if (!r || !row)
+        return EINVAL;
+    if (r->column_types) {
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            if (r->column_types[c] == WIRELOG_TYPE_FLOAT
+                && !wl_columnar_float_bits_valid(row[c]))
+                return EINVAL;
+        }
+    }
     if (r->nrows >= r->capacity) {
         uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
         uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
@@ -590,7 +652,15 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
     }
     if (r->timestamps)
         memset(&r->timestamps[r->nrows], 0, sizeof(col_delta_timestamp_t));
-    col_rel_row_copy_in(r, r->nrows, row);
+    if (col_rel_row_copy_in(r, r->nrows, row) != 0)
+        return EINVAL;
+    if (r->column_types) {
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            if (r->column_types[c] == WIRELOG_TYPE_FLOAT
+                && r->columns[c][r->nrows] == wl_columnar_float_to_bits(-0.0))
+                r->columns[c][r->nrows] = wl_columnar_float_to_bits(0.0);
+        }
+    }
     r->nrows++;
     return 0;
 }
@@ -602,8 +672,53 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 {
+    if (!dst || !src || dst->ncols != src->ncols)
+        return EINVAL;
     if (src->nrows == 0)
         return 0;
+
+    /* A typed relation must never receive lanes whose physical meaning is
+     * unknown or differs from its own.  Legacy untyped relations are treated
+     * as int64, which preserves the pre-typed append contract. */
+    if (dst->column_types || src->column_types) {
+        for (uint32_t c = 0; c < dst->ncols; c++) {
+            wirelog_column_type_t dst_type = dst->column_types
+                ? dst->column_types[c] : WIRELOG_TYPE_INT64;
+            wirelog_column_type_t src_type = src->column_types
+                ? src->column_types[c] : WIRELOG_TYPE_INT64;
+            /* Existing integer-family relations all use the same int64
+             * storage lane, and legacy producers do not carry metadata.
+             * Float lanes are different: accepting an untyped or differently
+             * typed float source would reinterpret its bits. */
+            if ((dst_type == WIRELOG_TYPE_FLOAT
+                || src_type == WIRELOG_TYPE_FLOAT)
+                && dst_type != src_type)
+                return EINVAL;
+            if (!dst->column_types && src->column_types
+                && src_type == WIRELOG_TYPE_FLOAT && dst->nrows > 0)
+                return EINVAL;
+        }
+    }
+
+    if (src->column_types) {
+        for (uint32_t row = 0; row < src->nrows; row++) {
+            for (uint32_t c = 0; c < src->ncols; c++) {
+                if (src->column_types[c] == WIRELOG_TYPE_FLOAT
+                    && !wl_columnar_float_bits_valid(src->columns[c][row]))
+                    return EINVAL;
+            }
+        }
+        if (!dst->column_types) {
+            for (uint32_t row = 0; row < dst->nrows; row++) {
+                for (uint32_t c = 0; c < dst->ncols; c++) {
+                    if (src->column_types[c] == WIRELOG_TYPE_FLOAT
+                        && !wl_columnar_float_bits_valid(
+                            dst->columns[c][row]))
+                        return EINVAL;
+                }
+            }
+        }
+    }
 
     if (src->nrows > UINT32_MAX - dst->nrows)
         return EOVERFLOW;
@@ -701,10 +816,31 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
         col_rel_ledger_reconcile(dst, ledger_before);
     }
 
+    /* Install source metadata only after all potentially failing destination
+     * growth has completed.  A rejected append therefore cannot change an
+     * untyped destination's schema. */
+    if (!dst->column_types && src->column_types) {
+        int type_rc = col_rel_set_column_types(dst, src->column_types,
+                dst->ncols);
+        if (type_rc != 0)
+            return type_rc;
+    }
+
     /* Bulk copy all rows per-column */
     for (uint32_t c = 0; c < dst->ncols; c++)
         memcpy(dst->columns[c] + dst_base, src->columns[c],
             (size_t)src->nrows * sizeof(int64_t));
+    if (dst->column_types) {
+        for (uint32_t c = 0; c < dst->ncols; c++) {
+            if (dst->column_types[c] != WIRELOG_TYPE_FLOAT)
+                continue;
+            for (uint32_t row = dst_base; row < new_nrows; row++) {
+                if (dst->columns[c][row]
+                    == wl_columnar_float_to_bits(-0.0))
+                    dst->columns[c][row] = wl_columnar_float_to_bits(0.0);
+            }
+        }
+    }
     dst->nrows = new_nrows;
 
     /* Copy timestamps if both have tracking enabled */
@@ -847,15 +983,26 @@ free_merge_buf:
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
+    wirelog_column_type_t *shared_types = NULL;
     if (dst->ncols != src->ncols)
         return EINVAL;
+    if (src->column_types && src->ncols > 0) {
+        shared_types = (wirelog_column_type_t *)malloc(
+            (size_t)src->ncols * sizeof(*shared_types));
+        if (!shared_types)
+            return ENOMEM;
+        memcpy(shared_types, src->column_types,
+            (size_t)src->ncols * sizeof(*shared_types));
+    }
     uint64_t ledger_before = col_rel_owned_ledger_bytes(dst);
 
     /* Allocate (or reuse) the col_shared flags array before touching columns */
     if (!dst->col_shared) {
         dst->col_shared = (bool *)calloc(dst->ncols, sizeof(bool));
-        if (!dst->col_shared)
+        if (!dst->col_shared) {
+            free(shared_types);
             return ENOMEM;
+        }
     }
 
     /* Free dst's existing owned columns */
@@ -871,6 +1018,7 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
         if (!dst->columns) {
             free(dst->col_shared);
             dst->col_shared = NULL;
+            free(shared_types);
             return ENOMEM;
         }
     }
@@ -887,6 +1035,22 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
     dst->capacity = src->capacity;
     dst->sorted_nrows = src->sorted_nrows;
     dst->base_nrows = src->base_nrows;
+    free(dst->column_types);
+    dst->column_types = shared_types;
+    if (dst->schema_ok) {
+        for (uint32_t c = 0; c < dst->ncols; c++) {
+            enum ArrowType arrow_type = dst->column_types
+                && dst->column_types[c] == WIRELOG_TYPE_FLOAT
+                ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+            if (ArrowSchemaInitFromType(dst->schema.children[c], arrow_type)
+                != NANOARROW_OK) {
+                col_rel_ledger_reconcile(dst, ledger_before);
+                return EINVAL;
+            }
+            ArrowSchemaSetName(dst->schema.children[c],
+                dst->col_names && dst->col_names[c] ? dst->col_names[c] : "");
+        }
+    }
     col_rel_ledger_reconcile(dst, ledger_before);
 
     return 0;
@@ -998,15 +1162,15 @@ col_rel_new_like(const char *name, const col_rel_t *src)
         col_rel_destroy(r);
         return NULL;
     }
+    /* Issue #535: inherit graph-column metadata so deltas/clones route by
+     * __graph_id consistently with their source relation. */
+    r->has_graph_column = src->has_graph_column;
+    r->graph_col_idx = src->graph_col_idx;
     if (src->column_types
         && col_rel_set_column_types(r, src->column_types, src->ncols) != 0) {
         col_rel_destroy(r);
         return NULL;
     }
-    /* Issue #535: inherit graph-column metadata so deltas/clones route by
-     * __graph_id consistently with their source relation. */
-    r->has_graph_column = src->has_graph_column;
-    r->graph_col_idx = src->graph_col_idx;
     /* Issue #534 Task #1: inherit compound metadata so FILTER/PROJECT/LFTJ
      * outputs remain INLINE-kind and the logical<->physical translation
      * stays valid for downstream ops. compound_arity_map is a separately
@@ -1058,11 +1222,6 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
             return col_rel_new_like(name, like); /* Fallback */
         }
     }
-    if (like->column_types
-        && col_rel_set_column_types(r, like->column_types, like->ncols) != 0) {
-        col_rel_destroy(r);
-        return col_rel_new_like(name, like);
-    }
     /* Copy col_names so col_rel_col_idx works for downstream operators */
     if (like->col_names && like->ncols > 0) {
         r->col_names = (char **)calloc(like->ncols, sizeof(char *));
@@ -1076,6 +1235,11 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     /* Issue #535: inherit graph-column metadata (see col_rel_new_like). */
     r->has_graph_column = like->has_graph_column;
     r->graph_col_idx = like->graph_col_idx;
+    if (like->column_types
+        && col_rel_set_column_types(r, like->column_types, like->ncols) != 0) {
+        col_rel_destroy(r);
+        return NULL;
+    }
     /* Issue #534 Task #1: inherit compound metadata so pool-allocated
      * FILTER/PROJECT outputs retain INLINE schema. Mirrors col_rel_new_like
      * with the same deep-copy discipline. */
@@ -1326,6 +1490,17 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
             }
         }
     }
+    if (src->column_types && src->ncols > 0u) {
+        dst->column_types = (wirelog_column_type_t *)malloc(
+            (size_t)src->ncols * sizeof(*dst->column_types));
+        if (!dst->column_types) {
+            col_rel_free_contents(dst);
+            free(dst);
+            return ENOMEM;
+        }
+        memcpy(dst->column_types, src->column_types,
+            (size_t)src->ncols * sizeof(*dst->column_types));
+    }
 
     /*
      * Group D: persistent merge buffer.  When src has a merge buffer
@@ -1438,8 +1613,11 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
             return ENOMEM;
         }
         for (uint32_t i = 0; i < src->ncols; i++) {
+            enum ArrowType arrow_type = src->column_types
+                && src->column_types[i] == WIRELOG_TYPE_FLOAT
+                ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
             if (ArrowSchemaInitFromType(dst->schema.children[i],
-                NANOARROW_TYPE_INT64)
+                arrow_type)
                 != NANOARROW_OK) {
                 ArrowSchemaRelease(&dst->schema);
                 col_rel_free_contents(dst);
@@ -1451,13 +1629,6 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
             ArrowSchemaSetName(dst->schema.children[i], cname);
         }
         dst->schema_ok = true;
-    }
-
-    if (src->column_types
-        && col_rel_set_column_types(dst, src->column_types, src->ncols) != 0) {
-        col_rel_free_contents(dst);
-        free(dst);
-        return ENOMEM;
     }
 
     *out = dst;
@@ -1570,6 +1741,15 @@ col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
             for (uint32_t c = 0; c < nc; c++) {
                 int64_t va = col_rel_get(r, start_row + j - 1, c);
                 int64_t vb = tbuf[c];
+                if (r->column_types
+                    && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
+                    int fcmp = wl_columnar_float_compare_bits(va, vb);
+                    if (fcmp != 0) {
+                        cmp = fcmp;
+                        break;
+                    }
+                    continue;
+                }
                 if (va > vb) {
                     cmp = 1;
                     break;
@@ -2161,6 +2341,16 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 {
     if (nrows <= 1)
         return 0;
+
+    /* IEEE-754 keys need a different sign transform from signed integers.
+     * Keep the established radix fast path for integer-only relations and
+     * use the typed comparator until the float radix path is introduced. */
+    if (r->column_types) {
+        for (uint32_t c = 0; c < r->ncols; c++) {
+            if (r->column_types[c] == WIRELOG_TYPE_FLOAT)
+                return col_rel_insertion_sort(r, start_row, nrows);
+        }
+    }
 
     /* Hybrid threshold: insertion sort for small segments (Issue #343) */
     if (nrows <= 32)
