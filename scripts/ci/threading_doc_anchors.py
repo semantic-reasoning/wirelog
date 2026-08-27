@@ -139,11 +139,11 @@ def inventory(source: Path) -> list[Site]:
         line = end + 1
 
     sites: list[Site] = []
-    counts: dict[tuple[str, str], int] = {}
+    counts: dict[str, int] = {}
 
     def add(match: re.Match[str], line_number: int, symbol: str) -> None:
         operation = match.group(0).split("(", 1)[0].strip()
-        key = (symbol, operation)
+        key = symbol
         counts[key] = counts.get(key, 0) + 1
         suffix = "" if counts[key] == 1 else f"#{counts[key]}"
         anchor = f"{basename}:{symbol}{suffix}"

@@ -73,6 +73,11 @@ sed 's/atomic_store_explicit`/not_atomic`/' "$fixture/docs/THREADING.md" \
     >"$fixture/docs/THREADING.md.tmp" && mv "$fixture/docs/THREADING.md.tmp" "$fixture/docs/THREADING.md"
 expect_failure 'has invalid operation' run_checker
 
+# A valid but wrong operation must not pass anchor-only resolution.
+sed 's/atomic_load_explicit`/atomic_store_explicit`/' "$fixture/docs/THREADING.md" \
+    >"$fixture/docs/THREADING.md.tmp" && mv "$fixture/docs/THREADING.md.tmp" "$fixture/docs/THREADING.md"
+expect_failure 'resolves to atomic_load_explicit, documented atomic_store_explicit' run_checker
+
 # A function pointer declaration/call and comment/string text do not create sites.
 make_fixture
 printf '%s\n' \
