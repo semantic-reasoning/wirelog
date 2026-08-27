@@ -344,12 +344,14 @@ col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
             enum ArrowType arrow_type = copy[i]
                 == WIRELOG_TYPE_FLOAT ? NANOARROW_TYPE_DOUBLE
                                        : NANOARROW_TYPE_INT64;
+            ArrowSchemaRelease(r->schema.children[i]);
             if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
                 != NANOARROW_OK) {
                 for (uint32_t j = 0; j <= i; j++) {
                     enum ArrowType old_type = r->column_types
                         && r->column_types[j] == WIRELOG_TYPE_FLOAT
                         ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+                    ArrowSchemaRelease(r->schema.children[j]);
                     (void)ArrowSchemaInitFromType(r->schema.children[j],
                         old_type);
                     ArrowSchemaSetName(r->schema.children[j],
@@ -1042,6 +1044,7 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
             enum ArrowType arrow_type = dst->column_types
                 && dst->column_types[c] == WIRELOG_TYPE_FLOAT
                 ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+            ArrowSchemaRelease(dst->schema.children[c]);
             if (ArrowSchemaInitFromType(dst->schema.children[c], arrow_type)
                 != NANOARROW_OK) {
                 col_rel_ledger_reconcile(dst, ledger_before);
