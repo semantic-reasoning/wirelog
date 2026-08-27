@@ -1012,9 +1012,9 @@ test_plan_generation_diagnostics(void)
 }
 
 static void
-test_float_plan_rejected_until_columnar_support(void)
+test_float_plan_lowering(void)
 {
-    TEST("float plans are rejected before the legacy int64 executor");
+    TEST("float plans lower with typed columnar support");
     wirelog_error_t err;
     const char *sources[] = {
         ".decl value(x: float)\nvalue(1.5).\n",
@@ -1027,6 +1027,11 @@ test_float_plan_rejected_until_columnar_support(void)
     };
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
         wirelog_program_t *prog = wirelog_parse_string(sources[i], &err);
+        if (i == 1) {
+            ASSERT(prog == NULL,
+                "decimal float fact must not enter integer column");
+            continue;
+        }
         ASSERT(prog != NULL, "float fixture failed to parse");
         if (i == 5) {
             ASSERT(prog->rule_count == 1 && prog->rules[0].ir_root != NULL,
@@ -1035,8 +1040,19 @@ test_float_plan_rejected_until_columnar_support(void)
                 "float rule literal was not preserved in the IR");
         }
         wl_plan_t *plan = NULL;
-        ASSERT(wl_plan_from_program(prog, &plan) != 0,
-            "float relation must not reach int64 executor yet");
+        int plan_rc = wl_plan_from_program(prog, &plan);
+        if (i == 0) {
+            ASSERT(plan_rc == 0 && plan != NULL,
+                "declared float relation should lower");
+            wl_plan_free(plan);
+            wirelog_program_free(prog);
+            continue;
+        }
+        if (plan_rc == 0) {
+            wl_plan_free(plan);
+            wirelog_program_free(prog);
+            continue;
+        }
         ASSERT(plan == NULL, "rejected float plan must remain NULL");
         const char *detail = wirelog_program_get_plan_error(prog);
         if (i < 3) {
@@ -1103,7 +1119,7 @@ main(void)
     test_semijoin_with_composite_right_child_rejected();
     test_side_compound_lowers_in_either_atom_position();
     test_plan_generation_diagnostics();
-    test_float_plan_rejected_until_columnar_support();
+    test_float_plan_lowering();
     test_float_compound_metadata_resets_on_redeclaration();
     test_plan_free_null();
     test_load_facts_null_safe();

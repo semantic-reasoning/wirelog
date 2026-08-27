@@ -344,7 +344,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         }
         for (uint32_t c = 0; c < gc; c++) {
             uint32_t src = op->group_by_indices ? op->group_by_indices[c] : c;
-            types[c] = (in->column_types && src < in->ncols)
+            uint32_t out_col = c >= agg_index ? c + 1 : c;
+            types[out_col] = (in->column_types && src < in->ncols)
                 ? in->column_types[src] : WIRELOG_TYPE_INT64;
         }
         types[agg_index] = float_agg ? WIRELOG_TYPE_FLOAT
@@ -443,6 +444,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 else {
                     col_row_buf_release(&row_rb);
                     wl_columnar_expr_compiled_free(agg_ce);
+                    free(sums);
+                    free(counts);
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
@@ -459,6 +462,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 } else {
                     col_row_buf_release(&row_rb);
                     wl_columnar_expr_compiled_free(agg_ce);
+                    free(sums);
+                    free(counts);
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
@@ -485,7 +490,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             int64_t key = row[gi < in->ncols ? gi : 0];
             if (in->column_types && gi < in->ncols
                 && in->column_types[gi] == WIRELOG_TYPE_FLOAT)
-                key = wl_columnar_float_canonical_bits(key);
+                key = (int64_t)wl_columnar_float_canonical_bits(key);
             hash ^= (uint64_t)key;
             hash *= UINT64_C(1099511628211);
         }
@@ -504,7 +509,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 int64_t right = col_rel_get(out, groups[slot].row, out_col);
                 if (in->column_types && gi < in->ncols
                     && in->column_types[gi] == WIRELOG_TYPE_FLOAT)
-                    left = wl_columnar_float_canonical_bits(left);
+                    left = (int64_t)wl_columnar_float_canonical_bits(left);
                 match = left == right;
             }
             if (match) {
@@ -536,7 +541,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     }
                     sums[slot] = next_value;
                     (void)col_rel_set(out, group_row, agg_index,
-                        wl_columnar_float_canonical_bits(
+                        (int64_t)wl_columnar_float_canonical_bits(
                             wl_columnar_float_to_bits(next_value)));
                     break;
                 }
@@ -545,6 +550,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     &next) != 0) {
                     col_row_buf_release(&row_rb);
                     wl_columnar_expr_compiled_free(agg_ce);
+                    free(sums);
+                    free(counts);
                     free(groups);
                     free(tmp);
                     col_rel_destroy(out);
@@ -565,7 +572,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     if ((op->agg_fn == WIRELOG_AGG_MIN && cmp < 0)
                         || (op->agg_fn == WIRELOG_AGG_MAX && cmp > 0))
                         (void)col_rel_set(out, group_row, agg_index,
-                            wl_columnar_float_canonical_bits(agg_val));
+                            (int64_t)wl_columnar_float_canonical_bits(agg_val));
                 } else if (col_agg_better(op->agg_fn, op->agg_operand_type,
                     sess->intern, agg_val, cur))
                     col_rel_set(out, group_row, agg_index, agg_val);
@@ -584,7 +591,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     return ERANGE;
                 }
                 (void)col_rel_set(out, group_row, agg_index,
-                    wl_columnar_float_canonical_bits(
+                    (int64_t)wl_columnar_float_canonical_bits(
                         wl_columnar_float_to_bits(sums[slot]
                         / (double)counts[slot])));
                 break;
@@ -604,14 +611,18 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 sums[slot] = wl_columnar_float_from_bits(agg_val);
                 counts[slot] = 1;
                 if (op->agg_fn == WIRELOG_AGG_AVG)
-                    tmp[agg_index] = wl_columnar_float_to_bits(sums[slot]);
+                    tmp[agg_index] = (int64_t)wl_columnar_float_to_bits(
+                        sums[slot]);
                 else
-                    tmp[agg_index] = wl_columnar_float_canonical_bits(agg_val);
+                    tmp[agg_index] = (int64_t)
+                        wl_columnar_float_canonical_bits(agg_val);
             }
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
                 wl_columnar_expr_compiled_free(agg_ce);
+                free(sums);
+                free(counts);
                 free(groups);
                 free(tmp);
                 col_rel_destroy(out);

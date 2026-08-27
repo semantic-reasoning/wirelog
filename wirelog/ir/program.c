@@ -16,6 +16,8 @@
 #include "../util/log.h"
 
 #include <ctype.h>
+#include <float.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +59,25 @@ type_name_to_column_type(const char *type_name)
 
     /* Default to int32 for unknown types */
     return WIRELOG_TYPE_INT32;
+}
+
+static bool
+int64_exact_as_binary64(int64_t value)
+{
+    if (value == 0)
+        return true;
+    double converted = (double)value;
+    int exponent = 0;
+    (void)frexp(fabs(converted), &exponent);
+    int shift = exponent - DBL_MANT_DIG;
+    if (shift <= 0)
+        return true;
+    uint64_t magnitude = value < 0
+        ? (uint64_t)(-(value + 1)) + UINT64_C(1)
+        : (uint64_t)value;
+    if (shift >= 64)
+        return false;
+    return (magnitude & ((UINT64_C(1) << shift) - UINT64_C(1))) == 0;
 }
 
 static int64_t
@@ -956,6 +977,46 @@ validate_fact_arities(struct wirelog_program *program,
                     rel->name, node->child_count, rel->name, declared,
                     node->line);
             return -1;
+        }
+        /* Scalar float/integer facts must agree with the declared lane.  An
+         * integer literal may enter a float lane only when binary64 can
+         * represent it exactly; decimal literals must never be truncated
+         * into an integer lane.  Compound slot typing is validated by its
+         * dedicated metadata path below and is intentionally not inferred
+         * from the logical column count here. */
+        bool all_scalar = rel->column_count == node->child_count
+            && rel->columns;
+        if (all_scalar) {
+            for (uint32_t c = 0; c < rel->column_count; c++) {
+                if (rel->columns[c].compound_kind
+                    != WIRELOG_COMPOUND_KIND_NONE) {
+                    all_scalar = false;
+                    break;
+                }
+            }
+        }
+        if (all_scalar) {
+            for (uint32_t c = 0; c < node->child_count; c++) {
+                const wl_parser_ast_node_t *arg = node->children[c];
+                wirelog_column_type_t declared_type = rel->columns[c].type;
+                if (arg->type == WL_PARSER_AST_NODE_FLOAT
+                    && declared_type != WIRELOG_TYPE_FLOAT) {
+                    wl_ir_program_set_error(program,
+                        "float fact for integer column %u of relation '%s' "
+                        "is not allowed (line %u)", c, rel->name,
+                        node->line);
+                    return -1;
+                }
+                if (arg->type == WL_PARSER_AST_NODE_INTEGER
+                    && declared_type == WIRELOG_TYPE_FLOAT
+                    && !int64_exact_as_binary64(arg->int_value)) {
+                    wl_ir_program_set_error(program,
+                        "integer fact for float column %u of relation '%s' "
+                        "is not exactly representable (line %u)", c,
+                        rel->name, node->line);
+                    return -1;
+                }
+            }
         }
     }
 

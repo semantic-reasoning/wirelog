@@ -1177,15 +1177,26 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
         if (plan->edb_declared_width != NULL
             && plan->edb_declared_width[i] != WL_PLAN_WIDTH_UNDECLARED)
             r->declared_ncols = plan->edb_declared_width[i];
+        /* Preserve declared physical lane types before the first fact is
+         * inserted.  In particular, float facts are binary64 bits in the
+         * existing 64-bit storage lane and must not be accepted as legacy
+         * integers merely because the relation starts empty. */
+        bool has_float_type = false;
         if (plan->edb_column_types && plan->edb_column_type_counts
             && plan->edb_column_types[i]
             && plan->edb_column_type_counts[i] > 0) {
-            /* The EDB is still empty, so its declared physical types can be
-             * installed before the first host insertion. */
-            rc = col_rel_set_schema(r, plan->edb_column_type_counts[i], NULL);
-            if (rc != 0 || col_rel_set_column_types(r,
-                plan->edb_column_types[i],
-                plan->edb_column_type_counts[i]) != 0) {
+            uint32_t type_count = plan->edb_column_type_counts[i];
+            for (uint32_t c = 0; c < type_count; c++)
+                has_float_type |= plan->edb_column_types[i][c]
+                    == WIRELOG_TYPE_FLOAT;
+        }
+        if (has_float_type) {
+            uint32_t type_count = plan->edb_column_type_counts[i];
+            rc = col_rel_set_schema(r, type_count, NULL);
+            if (rc == 0)
+                rc = col_rel_set_column_types(r,
+                        plan->edb_column_types[i], type_count);
+            if (rc != 0) {
                 col_rel_destroy(r);
                 goto oom;
             }

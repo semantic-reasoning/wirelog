@@ -44,6 +44,13 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         return EINVAL;
 
     col_rel_t *in = e.rel;
+    if (!wl_columnar_relation_float_values_valid(in)) {
+        if (e.seg_boundaries)
+            free(e.seg_boundaries);
+        if (e.owned)
+            col_rel_destroy(in);
+        return EINVAL;
+    }
     uint32_t nc = in->ncols;
     uint32_t nr = in->nrows;
 

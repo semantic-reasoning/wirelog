@@ -110,6 +110,7 @@ typedef struct {
     uint32_t ncols;
     uint32_t _ncols_pad; /* explicit alignment padding */
     int64_t **columns;
+    void *column_types;
     uint32_t nrows;
     uint32_t capacity;
     /* omitted: col_names, schema, schema_ok, timestamps */

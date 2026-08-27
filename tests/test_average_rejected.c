@@ -1,5 +1,5 @@
 /*
- * tests/test_average_rejected.c - average() is rejected at lowering (#978)
+ * tests/test_average_rejected.c - average() lowering and float execution (#978)
  *
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
@@ -41,6 +41,7 @@
  */
 
 #include "../wirelog/columnar/columnar_nanoarrow.h"
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -332,16 +333,38 @@ test_documented_workaround_evaluates(void)
     PASS();
 }
 
+static void
+test_float_average_evaluates(void)
+{
+    TEST("average() over float values returns a binary64 mean");
+    static const char *src =
+        ".decl val(g: int64, v: float)\n"
+        "val(1, 9.0).\nval(1, 5.0).\nval(1, 2.0).\n"
+        "val(2, 4.0).\n"
+        ".decl t(g: int64, a: float)\n"
+        "t(g, average(v)) :- val(g, v).\n";
+    collect_t c;
+    ASSERT(eval_relation(src, "t", &c) == 0, "evaluation failed");
+    ASSERT(c.count == 2, "expected one row per group");
+    ASSERT(saw_pair(&c, 1,
+        (int64_t)wl_columnar_float_to_bits(16.0 / 3.0)),
+        "group 1 average should be 16/3");
+    ASSERT(saw_pair(&c, 2, wl_columnar_float_to_bits(4.0)),
+        "group 2 average should be 4");
+    PASS();
+}
+
 /* ---------------------------------------------------------------------- */
 
 int
 main(void)
 {
-    printf("=== average() rejected at lowering (Issue #978) ===\n");
+    printf("=== average() lowering and float evaluation ===\n");
 
     test_average_rejected_at_lowering();
     test_other_aggregates_still_evaluate();
     test_documented_workaround_evaluates();
+    test_float_average_evaluates();
 
     printf("\n%d/%d passed, %d failed\n", pass_count, test_count, fail_count);
     return fail_count == 0 ? 0 : 1;

@@ -12,6 +12,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -536,10 +537,19 @@ csv_parse_line_via_ctx(const char *line, char delimiter,
             if (values[col] < 0)
                 return -1;
         } else {
-            /* Parse integer field */
+            /* Parse a declared binary64 field without losing precision. */
             char *end;
             errno = 0;
-            values[col] = strtoll(p, &end, 10);
+            if (col_types[col] == WIRELOG_TYPE_FLOAT) {
+                double value = strtod(p, &end);
+                if (end == p || errno == ERANGE || !isfinite(value))
+                    return -1;
+                if (value == 0.0)
+                    value = 0.0;
+                memcpy(&values[col], &value, sizeof(value));
+            } else {
+                values[col] = strtoll(p, &end, 10);
+            }
             if (end == p)
                 return -1; /* not a valid integer */
             if (errno == ERANGE)

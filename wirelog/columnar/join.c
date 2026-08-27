@@ -219,6 +219,7 @@ typedef struct {
     uint32_t project_count;
     uint64_t begin;
     uint64_t end;
+    atomic_int *write_error;
 } col_join_cross_ctx_t;
 
 typedef struct {
@@ -267,6 +268,7 @@ typedef struct {
     uint64_t out_begin;
     uint64_t count;
     uint32_t *left_hashes;
+    atomic_int *write_error;
 } col_semijoin_ctx_t;
 
 static int64_t
@@ -290,21 +292,94 @@ col_join_output_width(const col_rel_t *left, const col_rel_t *right,
         ? op->project_count : left->ncols + right->ncols;
 }
 
-static void
+static int
+col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
+    const col_rel_t *right, const wl_plan_op_t *op)
+{
+    uint32_t width = col_join_output_width(left, right, op);
+    wirelog_column_type_t *types = (wirelog_column_type_t *)malloc(
+        (size_t)width * sizeof(*types));
+    if (width > 0 && !types)
+        return ENOMEM;
+    for (uint32_t c = 0; c < width; c++) {
+        uint32_t source = (op && op->project_count > 0
+            && op->project_indices) ? op->project_indices[c] : c;
+        const col_rel_t *source_rel = source < left->ncols ? left : right;
+        uint32_t source_col = source < left->ncols ? source
+            : source - left->ncols;
+        types[c] = source_rel->column_types
+            ? source_rel->column_types[source_col] : WIRELOG_TYPE_INT64;
+    }
+    int rc = col_rel_set_column_types(out, types, width);
+    free(types);
+    return rc;
+}
+
+static int
+col_join_set_left_output_types(col_rel_t *out, const col_rel_t *left,
+    const wl_plan_op_t *op)
+{
+    uint32_t width = op && op->project_count > 0 ? op->project_count
+        : left->ncols;
+    wirelog_column_type_t *types = (wirelog_column_type_t *)malloc(
+        (size_t)width * sizeof(*types));
+    if (width > 0 && !types)
+        return ENOMEM;
+    for (uint32_t c = 0; c < width; c++) {
+        uint32_t source = op && op->project_count > 0
+            ? op->project_indices[c] : c;
+        types[c] = left->column_types
+            ? left->column_types[source] : WIRELOG_TYPE_INT64;
+    }
+    int rc = col_rel_set_column_types(out, types, width);
+    free(types);
+    return rc;
+}
+
+static bool
+col_join_key_types_compatible(const col_rel_t *left, const uint32_t *lk,
+    const col_rel_t *right, const uint32_t *rk, uint32_t key_count)
+{
+    for (uint32_t k = 0; k < key_count; k++) {
+        wirelog_column_type_t left_type = left->column_types
+            ? left->column_types[lk[k]] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t right_type = right->column_types
+            ? right->column_types[rk[k]] : WIRELOG_TYPE_INT64;
+        if ((left_type == WIRELOG_TYPE_FLOAT)
+            != (right_type == WIRELOG_TYPE_FLOAT))
+            return false;
+    }
+    return true;
+}
+
+static int
 col_join_write_pair_at(col_rel_t *out, uint64_t out_row,
     const col_rel_t *left, uint32_t lr, const col_rel_t *right, uint32_t rr,
     const uint32_t *project_indices, uint32_t project_count)
 {
     if (project_count > 0 && project_indices) {
-        for (uint32_t c = 0; c < project_count; c++)
-            out->columns[c][out_row] = col_join_pair_value(left, lr, right,
-                    rr, project_indices[c]);
+        for (uint32_t c = 0; c < project_count; c++) {
+            int rc = col_rel_set(out, (uint32_t)out_row, c,
+                    col_join_pair_value(left, lr, right, rr,
+                    project_indices[c]));
+            if (rc != 0)
+                return rc;
+        }
     } else {
-        for (uint32_t c = 0; c < left->ncols; c++)
-            out->columns[c][out_row] = left->columns[c][lr];
-        for (uint32_t c = 0; c < right->ncols; c++)
-            out->columns[left->ncols + c][out_row] = right->columns[c][rr];
+        for (uint32_t c = 0; c < left->ncols; c++) {
+            int rc = col_rel_set(out, (uint32_t)out_row, c,
+                    left->columns[c][lr]);
+            if (rc != 0)
+                return rc;
+        }
+        for (uint32_t c = 0; c < right->ncols; c++) {
+            int rc = col_rel_set(out, (uint32_t)out_row, left->ncols + c,
+                    right->columns[c][rr]);
+            if (rc != 0)
+                return rc;
+        }
     }
+    return 0;
 }
 
 static bool
@@ -416,9 +491,12 @@ col_join_keyed_fill_worker_fn(void *arg)
 
     if (ctx->pairs_complete && (uint64_t)ctx->pair_count == ctx->count) {
         for (uint32_t i = 0; i < ctx->pair_count; i++) {
-            col_join_write_pair_at(ctx->out, out_row++, left,
-                ctx->pairs[i].lr, right, ctx->pairs[i].rr,
-                ctx->op->project_indices, ctx->op->project_count);
+            ctx->rc = col_join_write_pair_at(ctx->out, out_row, left,
+                    ctx->pairs[i].lr, right, ctx->pairs[i].rr,
+                    ctx->op->project_indices, ctx->op->project_count);
+            if (ctx->rc != 0)
+                return;
+            out_row++;
         }
         return;
     }
@@ -432,8 +510,12 @@ col_join_keyed_fill_worker_fn(void *arg)
             uint32_t rr = e - 1;
             if (col_join_keys_match_rel(left, lr, ctx->lk, right, rr, ctx->rk,
                 ctx->kc)) {
-                col_join_write_pair_at(ctx->out, out_row++, left, lr, right,
-                    rr, ctx->op->project_indices, ctx->op->project_count);
+                ctx->rc = col_join_write_pair_at(ctx->out, out_row, left, lr,
+                        right, rr, ctx->op->project_indices,
+                        ctx->op->project_count);
+                if (ctx->rc != 0)
+                    return;
+                out_row++;
             }
         }
     }
@@ -484,17 +566,31 @@ col_semijoin_fill_worker_fn(void *arg)
         : left->ncols;
 
     for (uint32_t lr = ctx->begin; lr < ctx->end; lr++) {
+        if (atomic_load_explicit(ctx->write_error, memory_order_relaxed) != 0)
+            return;
         if (!col_semijoin_row_found(ctx, lr))
             continue;
         if (ctx->op->project_count > 0 && ctx->op->project_indices) {
             for (uint32_t c = 0; c < ocols; c++) {
                 uint32_t si = ctx->op->project_indices[c];
-                out->columns[c][out_row] = (si < left->ncols)
-                    ? left->columns[si][lr] : 0;
+                int rc = col_rel_set(out, (uint32_t)out_row, c,
+                        (si < left->ncols) ? left->columns[si][lr] : 0);
+                if (rc != 0) {
+                    atomic_store_explicit(ctx->write_error, rc,
+                        memory_order_relaxed);
+                    return;
+                }
             }
         } else {
-            for (uint32_t c = 0; c < left->ncols; c++)
-                out->columns[c][out_row] = left->columns[c][lr];
+            for (uint32_t c = 0; c < left->ncols; c++) {
+                int rc = col_rel_set(out, (uint32_t)out_row, c,
+                        left->columns[c][lr]);
+                if (rc != 0) {
+                    atomic_store_explicit(ctx->write_error, rc,
+                        memory_order_relaxed);
+                    return;
+                }
+            }
         }
         out_row++;
     }
@@ -523,16 +619,39 @@ col_join_cross_fill_worker_fn(void *arg)
     uint32_t lr = (uint32_t)(ctx->begin / right_rows);
     uint32_t rpos = (uint32_t)(ctx->begin % right_rows);
     while (oi < ctx->end) {
+        if (atomic_load_explicit(ctx->write_error, memory_order_relaxed) != 0)
+            return;
         uint32_t rr = right->nrows - 1u - rpos;
         if (ctx->project_count > 0 && ctx->project_indices) {
-            for (uint32_t c = 0; c < ctx->project_count; c++)
-                out->columns[c][oi] = col_join_pair_value(left, lr, right, rr,
-                        ctx->project_indices[c]);
+            for (uint32_t c = 0; c < ctx->project_count; c++) {
+                int rc = col_rel_set(out, (uint32_t)oi, c,
+                        col_join_pair_value(left, lr, right, rr,
+                        ctx->project_indices[c]));
+                if (rc != 0) {
+                    atomic_store_explicit(ctx->write_error, rc,
+                        memory_order_relaxed);
+                    return;
+                }
+            }
         } else {
-            for (uint32_t c = 0; c < left->ncols; c++)
-                out->columns[c][oi] = left->columns[c][lr];
-            for (uint32_t c = 0; c < right->ncols; c++)
-                out->columns[left->ncols + c][oi] = right->columns[c][rr];
+            for (uint32_t c = 0; c < left->ncols; c++) {
+                int rc = col_rel_set(out, (uint32_t)oi, c,
+                        left->columns[c][lr]);
+                if (rc != 0) {
+                    atomic_store_explicit(ctx->write_error, rc,
+                        memory_order_relaxed);
+                    return;
+                }
+            }
+            for (uint32_t c = 0; c < right->ncols; c++) {
+                int rc = col_rel_set(out, (uint32_t)oi, left->ncols + c,
+                        right->columns[c][rr]);
+                if (rc != 0) {
+                    atomic_store_explicit(ctx->write_error, rc,
+                        memory_order_relaxed);
+                    return;
+                }
+            }
         }
         oi++;
         rpos++;
@@ -577,6 +696,10 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
             col_join_output_width(left, right, op));
     if (!out)
         return ENOMEM;
+    if (col_join_set_output_types(out, left, right, op) != 0) {
+        col_rel_destroy(out);
+        return ENOMEM;
+    }
     col_join_attach_ledger(sess, out);
     if (col_join_reserve_exact(out, nrows) != 0) {
         col_rel_destroy(out);
@@ -592,6 +715,7 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
     }
 
     uint64_t chunk = (emit_total + W - 1u) / W;
+    atomic_int write_error = ATOMIC_VAR_INIT(0);
     int rc = 0;
     for (uint32_t w = 0; w < W; w++) {
         uint64_t begin = (uint64_t)w * chunk;
@@ -607,6 +731,7 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         ctxs[w].project_count = op ? op->project_count : 0;
         ctxs[w].begin = begin;
         ctxs[w].end = end;
+        ctxs[w].write_error = &write_error;
         if (wl_workqueue_submit(sess->wq, col_join_cross_fill_worker_fn,
             &ctxs[w]) != 0) {
             rc = ENOMEM;
@@ -614,6 +739,8 @@ col_join_parallel_cross(wl_col_session_t *sess, const col_rel_t *left,
         }
     }
     wl_workqueue_wait_all(sess->wq);
+    if (rc == 0)
+        rc = atomic_load_explicit(&write_error, memory_order_relaxed);
     free(ctxs);
     if (rc != 0) {
         col_rel_destroy(out);
@@ -633,34 +760,9 @@ col_join_hash_rel_keys(const col_rel_t *rel, uint32_t row,
     const uint32_t *key_cols, uint32_t kc)
 {
     uint32_t h = 2166136261u;
-    if (kc == 1) {
-        uint64_t v = (uint64_t)rel->columns[key_cols[0]][row];
-        h ^= (uint32_t)(v & 0xffffffff);
-        h *= 16777619u;
-        h ^= (uint32_t)(v >> 32);
-        h *= 16777619u;
-        return h;
-    }
-    if (kc == 2) {
-        uint64_t v = (uint64_t)rel->columns[key_cols[0]][row];
-        h ^= (uint32_t)(v & 0xffffffff);
-        h *= 16777619u;
-        h ^= (uint32_t)(v >> 32);
-        h *= 16777619u;
-        v = (uint64_t)rel->columns[key_cols[1]][row];
-        h ^= (uint32_t)(v & 0xffffffff);
-        h *= 16777619u;
-        h ^= (uint32_t)(v >> 32);
-        h *= 16777619u;
-        return h;
-    }
-    for (uint32_t i = 0; i < kc; i++) {
-        uint64_t v = (uint64_t)rel->columns[key_cols[i]][row];
-        h ^= (uint32_t)(v & 0xffffffff);
-        h *= 16777619u;
-        h ^= (uint32_t)(v >> 32);
-        h *= 16777619u;
-    }
+    for (uint32_t i = 0; i < kc; i++)
+        h = wl_columnar_hash_value(h, rel, key_cols[i],
+                rel->columns[key_cols[i]][row]);
     return h;
 }
 
@@ -669,14 +771,11 @@ col_join_keys_match_rel(const col_rel_t *left, uint32_t lr,
     const uint32_t *lk, const col_rel_t *right, uint32_t rr,
     const uint32_t *rk, uint32_t kc)
 {
-    if (kc == 1)
-        return left->columns[lk[0]][lr] == right->columns[rk[0]][rr];
-    if (kc == 2)
-        return left->columns[lk[0]][lr] == right->columns[rk[0]][rr]
-               && left->columns[lk[1]][lr] == right->columns[rk[1]][rr];
-    for (uint32_t k = 0; k < kc; k++)
-        if (left->columns[lk[k]][lr] != right->columns[rk[k]][rr])
+    for (uint32_t k = 0; k < kc; k++) {
+        if (!wl_columnar_value_equal(left, lk[k], left->columns[lk[k]][lr],
+            right, rk[k], right->columns[rk[k]][rr]))
             return false;
+    }
     return true;
 }
 
@@ -691,15 +790,25 @@ col_join_append_pair(col_rel_t *out, const col_rel_t *left, uint32_t lr,
             memset(&out->timestamps[out_row], 0,
                 sizeof(col_delta_timestamp_t));
         if (project_count > 0 && project_indices) {
-            for (uint32_t c = 0; c < project_count; c++)
-                out->columns[c][out_row] = col_join_pair_value(left, lr, right,
-                        rr, project_indices[c]);
+            for (uint32_t c = 0; c < project_count; c++) {
+                int rc = col_rel_set(out, out_row, c,
+                        col_join_pair_value(left, lr, right, rr,
+                        project_indices[c]));
+                if (rc != 0)
+                    return rc;
+            }
         } else {
-            for (uint32_t c = 0; c < left->ncols; c++)
-                out->columns[c][out_row] = left->columns[c][lr];
-            for (uint32_t c = 0; c < right->ncols; c++)
-                out->columns[left->ncols + c][out_row]
-                    = right->columns[c][rr];
+            for (uint32_t c = 0; c < left->ncols; c++) {
+                int rc = col_rel_set(out, out_row, c, left->columns[c][lr]);
+                if (rc != 0)
+                    return rc;
+            }
+            for (uint32_t c = 0; c < right->ncols; c++) {
+                int rc = col_rel_set(out, out_row, left->ncols + c,
+                        right->columns[c][rr]);
+                if (rc != 0)
+                    return rc;
+            }
         }
         out->nrows++;
         return 0;
@@ -745,6 +854,12 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(left_e.rel);
             return ENOMEM;
         }
+        if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
+            col_rel_destroy(out);
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
+            return ENOMEM;
+        }
         if (left_e.owned)
             col_rel_destroy(left_e.rel);
         return eval_stack_push_delta(stack, out, true, false);
@@ -786,11 +901,20 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
              * empty result — this rule copy produces no tuples from this
              * permutation (correct semi-naive, issue #85). */
             uint32_t ocols = col_join_output_width(left_e.rel, right, op);
+            col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
+            if (!empty) {
+                if (left_e.owned)
+                    col_rel_destroy(left_e.rel);
+                return ENOMEM;
+            }
+            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
+                col_rel_destroy(empty);
+                if (left_e.owned)
+                    col_rel_destroy(left_e.rel);
+                return ENOMEM;
+            }
             if (left_e.owned)
                 col_rel_destroy(left_e.rel);
-            col_rel_t *empty = col_rel_new_auto("$join_empty", ocols);
-            if (!empty)
-                return ENOMEM;
             int push_rc = eval_stack_push(stack, empty, true);
             if (push_rc != 0)
                 col_rel_destroy(empty);
@@ -900,6 +1024,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 op->right_keys ? op->right_keys[k] : NULL, "right", "JOIN",
                 op->right_relation);
     }
+    if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
+        free(lk);
+        free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return EINVAL;
+    }
 
     uint32_t ocols = col_join_output_width(left, right, op);
     /* Materialized results outlive the current delta-pool reset while they
@@ -911,6 +1044,14 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!out) {
         free(lk);
         free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
+    if (col_join_set_output_types(out, left, right, op) != 0) {
+        free(lk);
+        free(rk);
+        col_rel_destroy(out);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -995,14 +1136,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             return ENOMEM;
         }
         for (uint32_t bi = 0; bi < build->nrows; bi++) {
-            int64_t key = col_rel_get(build, bi, build_kcol);
-            /* Inline FNV-1a hash for single int64 value */
-            uint32_t h = 2166136261u;
-            uint64_t v = (uint64_t)key;
-            h ^= (uint32_t)(v & 0xffffffff);
-            h *= 16777619u;
-            h ^= (uint32_t)(v >> 32);
-            h *= 16777619u;
+            uint32_t h = col_join_hash_rel_keys(build, bi, &build_kcol, 1);
             h &= (nbuckets - 1);
             ht_next[bi] = ht_head[h];
             ht_head[h] = bi + 1; /* 1-based; 0 = end of chain */
@@ -1012,20 +1146,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         int join_rc = 0;
         for (uint32_t pr = 0; pr < probe->nrows && join_rc == 0; pr++) {
             int64_t pkey = probe->columns[probe_kcol][pr];
-            /* Inline FNV-1a hash for single int64 value */
-            uint32_t h = 2166136261u;
-            uint64_t v = (uint64_t)pkey;
-            h ^= (uint32_t)(v & 0xffffffff);
-            h *= 16777619u;
-            h ^= (uint32_t)(v >> 32);
-            h *= 16777619u;
+            uint32_t h = col_join_hash_rel_keys(probe, pr, &probe_kcol, 1);
             h &= (nbuckets - 1);
 
             for (uint32_t e = ht_head[h]; e != 0; e = ht_next[e - 1]) {
                 uint32_t bi = e - 1;
                 int64_t bkey
                     = col_rel_get(build, bi, build_kcol);
-                if (pkey != bkey)
+                if (!wl_columnar_value_equal(build, build_kcol, bkey,
+                    probe, probe_kcol, pkey))
                     continue;
                 uint32_t lr = right_is_unary ? pr : bi;
                 uint32_t rr = right_is_unary ? bi : pr;
@@ -1187,9 +1316,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     /* Arrangement probe: fill key_row at right-side positions. */
                     for (uint32_t k = 0; k < kc; k++)
                         key_row[rk[k]] = left->columns[lk[k]][lr];
-                    uint32_t rr = col_arrangement_find_first(arr,
-                            right->columns,
-                            right->ncols, key_row);
+                    uint32_t rr = col_arrangement_find_first_typed(arr,
+                            right, key_row);
                     while (rr != UINT32_MAX && join_rc == 0) {
                         /* Verify key match: find_next may return collision rows. */
                         if (col_join_keys_match_rel(left, lr, lk, right, rr, rk,
@@ -1367,6 +1495,15 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 op->right_keys ? op->right_keys[k] : NULL, "right", "ANTIJOIN",
                 op->right_relation);
     }
+    if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
+        free(lk);
+        free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return EINVAL;
+    }
 
     col_rel_t *out = col_rel_pool_new_like(sess->delta_pool, "$antijoin", left);
     if (!out) {
@@ -1504,6 +1641,13 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 op->right_keys ? op->right_keys[k] : NULL, "right", "SEMIJOIN",
                 op->right_relation);
     }
+    if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return EINVAL;
+    }
 
     /* Output: project_indices selects output columns from left */
     uint32_t ocols = op->project_count ? op->project_count : left->ncols;
@@ -1511,6 +1655,14 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         = col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena, "$semijoin",
             ocols);
     if (!out) {
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
+    if (col_join_set_left_output_types(out, left, op) != 0) {
+        col_rel_destroy(out);
         free(lk);
         free(rk);
         if (left_e.owned)
@@ -1579,6 +1731,7 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             uint32_t *left_hashes = (uint32_t *)malloc(
                 sizeof(uint32_t) * (size_t)(left->nrows ? left->nrows : 1));
             if (ctxs && offsets) {
+                atomic_int write_error = ATOMIC_VAR_INIT(0);
                 uint32_t chunk = (left->nrows + W - 1u) / W;
                 int prc = 0;
                 for (uint32_t w = 0; w < W; w++) {
@@ -1600,6 +1753,7 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     ctxs[w].begin = begin;
                     ctxs[w].end = end;
                     ctxs[w].left_hashes = left_hashes;
+                    ctxs[w].write_error = &write_error;
                     if (wl_workqueue_submit(sess->wq,
                         col_semijoin_count_worker_fn, &ctxs[w]) != 0)
                         prc = ENOMEM;
@@ -1629,6 +1783,9 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
                             prc = ENOMEM;
                     }
                     wl_workqueue_wait_all(sess->wq);
+                    if (prc == 0)
+                        prc = atomic_load_explicit(&write_error,
+                                memory_order_relaxed);
                 }
                 if (prc != 0)
                     out->nrows = 0;
@@ -1730,6 +1887,12 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(left_e.rel);
             return ENOMEM;
         }
+        if (col_join_set_left_output_types(out, left_e.rel, op) != 0) {
+            col_rel_destroy(out);
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
+            return ENOMEM;
+        }
         if (left_e.owned)
             col_rel_destroy(left_e.rel);
         return eval_stack_push_delta(stack, out, true, false);
@@ -1760,6 +1923,10 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_t *empty = col_rel_new_auto("$join_diff_empty", ocols);
             if (!empty)
                 return ENOMEM;
+            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
+                col_rel_destroy(empty);
+                return ENOMEM;
+            }
             int push_rc = eval_stack_push(stack, empty, true);
             if (push_rc != 0)
                 col_rel_destroy(empty);
@@ -1860,6 +2027,13 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 "JOIN(diff)",
                 op->right_relation);
     }
+    if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
+        free(lk);
+        free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return EINVAL;
+    }
 
     uint32_t ocols = col_join_output_width(left, right, op);
     /* Materialized results outlive the current delta-pool reset while they
@@ -1871,6 +2045,14 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!out) {
         free(lk);
         free(rk);
+        if (left_e.owned)
+            col_rel_destroy(left);
+        return ENOMEM;
+    }
+    if (col_join_set_output_types(out, left, right, op) != 0) {
+        free(lk);
+        free(rk);
+        col_rel_destroy(out);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;

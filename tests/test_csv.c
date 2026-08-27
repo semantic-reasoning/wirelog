@@ -14,6 +14,7 @@
 #include "test_tmpdir.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -692,6 +693,36 @@ test_csv_via_ctx_callback(void)
     PASS();
 }
 
+static void
+test_csv_via_ctx_float(void)
+{
+    TEST("read_file_via_ctx: preserves declared FLOAT values");
+    char path[512];
+    test_tmppath(path, sizeof(path), "wirelog_test_csv_float.csv");
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        FAIL("cannot create temp file"); return;
+    }
+    fprintf(f, "1.5\n-0.0\n");
+    fclose(f);
+    wirelog_column_type_t types[] = { WIRELOG_TYPE_FLOAT };
+    int64_t *data = NULL;
+    uint32_t nrows = 0, ncols = 0;
+    int rc = wl_csv_read_file_via_ctx(path, ',', types, 1,
+            &data, &nrows, &ncols, fake_intern_cb, NULL);
+    remove(path);
+    if (rc != 0 || nrows != 2 || ncols != 1) {
+        free(data); FAIL("float CSV read failed"); return;
+    }
+    double first;
+    memcpy(&first, &data[0], sizeof(first));
+    if (first != 1.5 || data[1] != 0) {
+        free(data); FAIL("float CSV bits were not preserved"); return;
+    }
+    free(data);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -728,6 +759,7 @@ main(void)
 
     printf("\n--- Callback-based Reading (#455) ---\n");
     test_csv_via_ctx_callback();
+    test_csv_via_ctx_float();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n\n",
         tests_passed, tests_failed, tests_run);

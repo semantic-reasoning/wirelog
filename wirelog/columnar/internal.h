@@ -33,6 +33,7 @@
 #include "nanoarrow/nanoarrow.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -40,6 +41,44 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#define WL_COLUMNAR_CMP_INCOMPATIBLE INT_MIN
+
+/* Float lanes use the existing 64-bit storage but retain binary64 semantics. */
+static inline double
+wl_columnar_float_from_bits(int64_t bits)
+{
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static inline int64_t
+wl_columnar_float_to_bits(double value)
+{
+    int64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static inline int
+wl_columnar_float_compare_bits(int64_t left_bits, int64_t right_bits)
+{
+    double left = wl_columnar_float_from_bits(left_bits);
+    double right = wl_columnar_float_from_bits(right_bits);
+    bool left_valid = isfinite(left);
+    bool right_valid = isfinite(right);
+    if (!left_valid || !right_valid) {
+        return WL_COLUMNAR_CMP_INCOMPATIBLE;
+    }
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+static inline bool
+wl_columnar_float_bits_valid(int64_t bits)
+{
+    return isfinite(wl_columnar_float_from_bits(bits));
+}
 
 #ifdef _MSC_VER
 #include <windows.h> /* For GetTickCount64() in now_ns() */
@@ -244,8 +283,7 @@ typedef struct {
     char *name;                /* owned, null-terminated                */
     uint32_t ncols;            /* columns per tuple (0 = unset)         */
     int64_t **columns;         /* owned, column-major: columns[col][row] */
-    /* Physical type for each lane.  NULL means the legacy int64 layout. */
-    wirelog_column_type_t *column_types;
+    wirelog_column_type_t *column_types; /* physical type per lane       */
     uint32_t nrows;            /* current row count                     */
     uint32_t capacity;         /* allocated row capacity                */
     char **col_names;          /* owned array of ncols owned strings    */
@@ -392,45 +430,72 @@ typedef struct {
     uint32_t declared_ncols;
 } col_rel_t;
 
-static inline double
-wl_columnar_float_from_bits(int64_t bits)
-{
-    double value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-static inline int64_t
-wl_columnar_float_to_bits(double value)
-{
-    int64_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
+/* Float lanes are stored as binary64 bits but invalid values are rejected at
+ * the relation boundary.  Sorting/consolidation also has entry points that
+ * operate on relations assembled by older internal callers, so validate the
+ * invariant before a comparator can return WL_COLUMNAR_CMP_INCOMPATIBLE. */
 static inline bool
-wl_columnar_float_bits_valid(int64_t bits)
+wl_columnar_relation_float_values_valid(const col_rel_t *rel)
 {
-    return isfinite(wl_columnar_float_from_bits(bits));
+    if (!rel || !rel->columns)
+        return false;
+    if (!rel->column_types)
+        return true;
+    for (uint32_t c = 0; c < rel->ncols; c++) {
+        if (rel->column_types[c] != WIRELOG_TYPE_FLOAT)
+            continue;
+        for (uint32_t row = 0; row < rel->nrows; row++) {
+            if (!wl_columnar_float_bits_valid(rel->columns[c][row]))
+                return false;
+        }
+    }
+    return true;
 }
 
-static inline int
-wl_columnar_float_compare_bits(int64_t left_bits, int64_t right_bits)
-{
-    double left = wl_columnar_float_from_bits(left_bits);
-    double right = wl_columnar_float_from_bits(right_bits);
-    if (!isfinite(left) || !isfinite(right))
-        return 0;
-    return left < right ? -1 : left > right ? 1 : 0;
-}
-
-static inline int64_t
+static inline uint64_t
 wl_columnar_float_canonical_bits(int64_t bits)
 {
     double value = wl_columnar_float_from_bits(bits);
     if (value == 0.0)
-        return wl_columnar_float_to_bits(0.0);
-    return bits;
+        return (uint64_t)wl_columnar_float_to_bits(0.0);
+    return (uint64_t)bits;
+}
+
+static inline uint64_t
+wl_columnar_value_key(const col_rel_t *rel, uint32_t col, int64_t bits)
+{
+    if (rel && rel->column_types
+        && rel->column_types[col] == WIRELOG_TYPE_FLOAT)
+        return wl_columnar_float_canonical_bits(bits);
+    return (uint64_t)bits;
+}
+
+static inline bool
+wl_columnar_value_equal(const col_rel_t *left, uint32_t left_col,
+    int64_t left_bits, const col_rel_t *right, uint32_t right_col,
+    int64_t right_bits)
+{
+    wirelog_column_type_t left_type = left && left->column_types
+        ? left->column_types[left_col] : WIRELOG_TYPE_INT64;
+    wirelog_column_type_t right_type = right && right->column_types
+        ? right->column_types[right_col] : WIRELOG_TYPE_INT64;
+    if (left_type != right_type)
+        return false;
+    if (left_type == WIRELOG_TYPE_FLOAT)
+        return wl_columnar_float_compare_bits(left_bits, right_bits) == 0;
+    return left_bits == right_bits;
+}
+
+static inline uint32_t
+wl_columnar_hash_value(uint32_t hash, const col_rel_t *rel, uint32_t col,
+    int64_t bits)
+{
+    uint64_t value = wl_columnar_value_key(rel, col, bits);
+    hash ^= (uint32_t)value;
+    hash *= 16777619u;
+    hash ^= (uint32_t)(value >> 32);
+    hash *= 16777619u;
+    return hash;
 }
 
 /* ======================================================================== */
@@ -448,10 +513,19 @@ col_rel_get(const col_rel_t *r, uint32_t row, uint32_t col)
 }
 
 /** Write a single cell value at (row, col). */
-static inline void
+static inline int
 col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
 {
+    if (!r || !r->columns || col >= r->ncols)
+        return EINVAL;
+    if (r->column_types && r->column_types[col] == WIRELOG_TYPE_FLOAT) {
+        if (!wl_columnar_float_bits_valid(val))
+            return EINVAL;
+        if (val == wl_columnar_float_to_bits(-0.0))
+            val = wl_columnar_float_to_bits(0.0);
+    }
     r->columns[col][row] = val;
+    return 0;
 }
 
 /** Gather a row into an internal scratch buffer and return const pointer.
@@ -482,16 +556,29 @@ col_rel_row_copy_out(const col_rel_t *r, uint32_t row, int64_t *dst)
 }
 
 /** Copy one row in from a caller-provided buffer. */
-static inline void
+static inline int
 col_rel_row_copy_in(col_rel_t *r, uint32_t row, const int64_t *src)
 {
     if (!r || !r->columns || !src)
-        return;
+        return EINVAL;
     for (uint32_t c = 0; c < r->ncols; c++) {
         if (r->columns[c] == NULL)
-            return;
-        memcpy(&r->columns[c][row], &src[c], sizeof(int64_t));
+            return EINVAL;
+        int64_t value = 0;
+        memcpy(&value, &src[c], sizeof(value));
+        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT
+            && !wl_columnar_float_bits_valid(value))
+            return EINVAL;
     }
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        int64_t value = 0;
+        memcpy(&value, &src[c], sizeof(value));
+        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT
+            && value == wl_columnar_float_to_bits(-0.0))
+            value = wl_columnar_float_to_bits(0.0);
+        memcpy(&r->columns[c][row], &value, sizeof(value));
+    }
+    return 0;
 }
 
 /** Compute buffer size in bytes for row_count rows. */
@@ -554,6 +641,26 @@ col_row_buf_release(col_row_buf_t *b)
 /* Compare two rows using direct column access for cache efficiency.         */
 /* ======================================================================== */
 
+/** Compare two raw rows using the relation's typed lane semantics. */
+static inline int
+col_rel_row_values_cmp(const col_rel_t *r, const int64_t *left,
+    const int64_t *right)
+{
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
+            int cmp = wl_columnar_float_compare_bits(left[c], right[c]);
+            if (cmp != 0)
+                return cmp;
+            continue;
+        }
+        if (left[c] < right[c])
+            return -1;
+        if (left[c] > right[c])
+            return 1;
+    }
+    return 0;
+}
+
 /** Compare two rows within the same relation lexicographically.
  *  Returns -1, 0, or +1. Direct column access for cache efficiency
  *  (Issue #334). */
@@ -563,10 +670,20 @@ col_rel_row_cmp(const col_rel_t *r, uint32_t row_a, uint32_t row_b)
     uint32_t ncols = r->ncols;
     /* Unrolled fast paths for common widths (ncols=2,4) */
     if (ncols == 2) {
-        int64_t a0 = r->columns[0][row_a];
-        int64_t b0 = r->columns[0][row_b];
-        if (a0 != b0)
-            return (a0 < b0) ? -1 : 1;
+        int cmp0;
+        if (r->column_types && r->column_types[0] == WIRELOG_TYPE_FLOAT)
+            cmp0 = wl_columnar_float_compare_bits(r->columns[0][row_a],
+                    r->columns[0][row_b]);
+        else {
+            int64_t a0 = r->columns[0][row_a];
+            int64_t b0 = r->columns[0][row_b];
+            cmp0 = a0 < b0 ? -1 : a0 > b0 ? 1 : 0;
+        }
+        if (cmp0 != 0)
+            return cmp0;
+        if (r->column_types && r->column_types[1] == WIRELOG_TYPE_FLOAT)
+            return wl_columnar_float_compare_bits(r->columns[1][row_a],
+                       r->columns[1][row_b]);
         int64_t a1 = r->columns[1][row_a];
         int64_t b1 = r->columns[1][row_b];
         if (a1 != b1)
@@ -575,6 +692,13 @@ col_rel_row_cmp(const col_rel_t *r, uint32_t row_a, uint32_t row_b)
     }
     if (ncols == 4) {
         for (uint32_t c = 0; c < 4; c++) {
+            if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
+                int cmp = wl_columnar_float_compare_bits(
+                    r->columns[c][row_a], r->columns[c][row_b]);
+                if (cmp != 0)
+                    return cmp;
+                continue;
+            }
             int64_t va = r->columns[c][row_a];
             int64_t vb = r->columns[c][row_b];
             if (va < vb)
@@ -586,6 +710,13 @@ col_rel_row_cmp(const col_rel_t *r, uint32_t row_a, uint32_t row_b)
     }
     /* General scalar path */
     for (uint32_t c = 0; c < ncols; c++) {
+        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
+            int cmp = wl_columnar_float_compare_bits(
+                r->columns[c][row_a], r->columns[c][row_b]);
+            if (cmp != 0)
+                return cmp;
+            continue;
+        }
         int64_t va = r->columns[c][row_a];
         int64_t vb = r->columns[c][row_b];
         if (va < vb)
@@ -604,6 +735,19 @@ col_rel_row_cmp2(const col_rel_t *ra, uint32_t row_a,
 {
     uint32_t ncols = ra->ncols;
     for (uint32_t c = 0; c < ncols; c++) {
+        wirelog_column_type_t left_type = ra->column_types
+            ? ra->column_types[c] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t right_type = rb->column_types
+            ? rb->column_types[c] : WIRELOG_TYPE_INT64;
+        if (left_type != right_type)
+            return WL_COLUMNAR_CMP_INCOMPATIBLE;
+        if (left_type == WIRELOG_TYPE_FLOAT) {
+            int cmp = wl_columnar_float_compare_bits(ra->columns[c][row_a],
+                    rb->columns[c][row_b]);
+            if (cmp != 0)
+                return cmp;
+            continue;
+        }
         int64_t va = ra->columns[c][row_a];
         int64_t vb = rb->columns[c][row_b];
         if (va < vb)
@@ -1346,8 +1490,11 @@ col_rel_destroy(col_rel_t *r);
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names);
 int
-col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
-    uint32_t ncols);
+col_rel_set_column_types(col_rel_t *r,
+    const wirelog_column_type_t *types, uint32_t ncols);
+uint32_t
+col_arrangement_find_first_typed(const col_arrangement_t *arr,
+    const col_rel_t *rel, const int64_t *key_row);
 int
 col_rel_alloc(col_rel_t **out, const char *name);
 
