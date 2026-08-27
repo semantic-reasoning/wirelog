@@ -19,6 +19,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#define WL_COLUMNAR_RELATION_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define WL_COLUMNAR_RELATION_NOINLINE __attribute__((noinline))
+#else
+#define WL_COLUMNAR_RELATION_NOINLINE
+#endif
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -1657,9 +1665,10 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
  * Allocates one tmp row-major scratch buffer.  Returns 0 on success,
  * -1 if scratch allocation fails (the input is then unmodified).
  */
-int
-col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
-    uint32_t key_col)
+WL_COLUMNAR_RELATION_NOINLINE int
+wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
+    uint32_t nrows,
+    uint32_t ncols, uint32_t key_col, wirelog_column_type_t key_type)
 {
     if (!data || ncols == 0 || nrows <= 1 || key_col >= ncols)
         return 0;
@@ -1676,9 +1685,10 @@ col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
 
     /*
      * LSD radix over the 8 bytes of the int64_t key column.  Byte 0
-     * (LSB) processed first; byte 7 (MSB) last.  The sign bit on byte
-     * 7 is flipped so unsigned bucket order matches signed int64
-     * order.  Stable: rows with equal key keep their relative order.
+     * (LSB) is processed first; byte 7 (MSB) last.  Integer keys flip
+     * the sign bit so unsigned bucket order matches signed int64 order;
+     * float keys use the monotonic IEEE-754 transform below.  Stable:
+     * rows with equal key keep their relative order.
      */
     for (int b = 0; b < 8; b++) {
         int shift = b * 8;
@@ -1686,9 +1696,13 @@ col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
 
         memset(count, 0, sizeof(count));
         for (uint32_t row = 0; row < nrows; row++) {
-            uint8_t bv = (uint8_t)((uint64_t)
-                src[(size_t)row * ncols + key_col] >> shift);
-            if (is_sign_byte)
+            uint64_t raw = (uint64_t)src[(size_t)row * ncols + key_col];
+            uint64_t ordered = key_type == WIRELOG_TYPE_FLOAT
+                ? ((raw & UINT64_C(0x8000000000000000))
+                        ? ~raw : raw ^ UINT64_C(0x8000000000000000))
+                : raw;
+            uint8_t bv = (uint8_t)(ordered >> shift);
+            if (is_sign_byte && key_type != WIRELOG_TYPE_FLOAT)
                 bv ^= 0x80u;
             count[bv]++;
         }
@@ -1698,9 +1712,13 @@ col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
             prefix[i] = prefix[i - 1] + count[i - 1];
 
         for (uint32_t row = 0; row < nrows; row++) {
-            uint8_t bv = (uint8_t)((uint64_t)
-                src[(size_t)row * ncols + key_col] >> shift);
-            if (is_sign_byte)
+            uint64_t raw = (uint64_t)src[(size_t)row * ncols + key_col];
+            uint64_t ordered = key_type == WIRELOG_TYPE_FLOAT
+                ? ((raw & UINT64_C(0x8000000000000000))
+                        ? ~raw : raw ^ UINT64_C(0x8000000000000000))
+                : raw;
+            uint8_t bv = (uint8_t)(ordered >> shift);
+            if (is_sign_byte && key_type != WIRELOG_TYPE_FLOAT)
                 bv ^= 0x80u;
             uint32_t out_pos = prefix[bv]++;
             memcpy(dst + (size_t)out_pos * ncols,
@@ -1720,6 +1738,14 @@ col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
 
     free(tmp);
     return 0;
+}
+
+int
+col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
+    uint32_t key_col)
+{
+    return wl_columnar_relation_radix_sort_rows_by_key_typed(data, nrows,
+               ncols, key_col, WIRELOG_TYPE_INT64);
 }
 
 /*

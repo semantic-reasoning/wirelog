@@ -40,29 +40,29 @@ static int pass_count = 0;
 static int fail_count = 0;
 
 #define TEST(name)                                      \
-    do {                                                \
-        test_count++;                                   \
-        printf("TEST %d: %s ... ", test_count, (name)); \
-    } while (0)
+        do {                                                \
+            test_count++;                                   \
+            printf("TEST %d: %s ... ", test_count, (name)); \
+        } while (0)
 
 #define PASS()            \
-    do {                  \
-        pass_count++;     \
-        printf("PASS\n"); \
-    } while (0)
+        do {                  \
+            pass_count++;     \
+            printf("PASS\n"); \
+        } while (0)
 
 #define FAIL(msg)                    \
-    do {                             \
-        fail_count++;                \
-        printf("FAIL: %s\n", (msg)); \
-        return;                      \
-    } while (0)
+        do {                             \
+            fail_count++;                \
+            printf("FAIL: %s\n", (msg)); \
+            return;                      \
+        } while (0)
 
 #define ASSERT(cond, msg) \
-    do {                  \
-        if (!(cond))      \
+        do {                  \
+            if (!(cond))      \
             FAIL(msg);    \
-    } while (0)
+        } while (0)
 
 /* ----------------------------------------------------------------
  * Collecting callback: accumulates output rows into a flat buffer
@@ -89,7 +89,7 @@ collect_cb(const int64_t *row, uint32_t ncols, void *user)
     if (ctx->nrows >= ctx->capacity) {
         uint32_t new_cap = ctx->capacity ? ctx->capacity * 2u : 16u;
         int64_t *nb = (int64_t *)realloc(ctx->rows, (size_t)new_cap * ncols
-                                                        * sizeof(int64_t));
+                * sizeof(int64_t));
         if (!nb) {
             ctx->oom = 1;
             return;
@@ -99,7 +99,7 @@ collect_cb(const int64_t *row, uint32_t ncols, void *user)
     }
 
     memcpy(ctx->rows + (size_t)ctx->nrows * ncols, row,
-           ncols * sizeof(int64_t));
+        ncols * sizeof(int64_t));
     ctx->nrows++;
 }
 
@@ -535,9 +535,9 @@ test_8way_with_values(void)
     ASSERT(rc == 0, "8-way join with values must return 0");
     ASSERT(!ctx.oom, "no OOM");
     ASSERT(ctx.nrows == NKEYS_V,
-           "expected 50 output rows (one per shared key)");
+        "expected 50 output rows (one per shared key)");
     ASSERT(ctx.ncols == (uint32_t)(NREL_V + 1),
-           "expected 9 output columns (key + 8 id columns)");
+        "expected 9 output columns (key + 8 id columns)");
 
     /* Spot-check: first output row with key=0 must have ids 0,1000,...,7000. */
     bool found_key0 = false;
@@ -548,7 +548,7 @@ test_8way_with_values(void)
         found_key0 = true;
         for (int i = 0; i < NREL_V; i++)
             ASSERT(rp[1 + i] == (int64_t)(i * 1000),
-                   "key=0 row must have id = i*1000 for each relation");
+                "key=0 row must have id = i*1000 for each relation");
     }
     ASSERT(found_key0, "output must contain a row with key=0");
 
@@ -751,6 +751,56 @@ test_einval_k_too_large(void)
     PASS();
 }
 
+static int64_t
+float_bits(double value)
+{
+    int64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static void
+test_float_key_semantics(void)
+{
+    TEST("float keys use numeric equality and ordering");
+
+    int64_t left[] = { float_bits(-2.0), float_bits(-1.0),
+                       float_bits(-0.0), float_bits(1.0) };
+    int64_t right[] = { float_bits(0.0), float_bits(-1.0),
+                        float_bits(2.0) };
+    wl_lftj_input_t inputs[2] = {
+        { left, 4, 1, 0 },
+        { right, 3, 1, 0 },
+    };
+    int64_t count = 0;
+    int rc = wl_columnar_lftj_join_typed(inputs, WIRELOG_TYPE_FLOAT, 2,
+            count_cb,
+            &count);
+
+    ASSERT(rc == 0, "typed float LFTJ must return 0");
+    ASSERT(count == 2, "expected -1 and canonicalized zero matches");
+    PASS();
+}
+
+static void
+test_integer_negative_key_order(void)
+{
+    TEST("integer keys retain signed ordering");
+
+    int64_t left[] = { -2, 0 };
+    int64_t right[] = { -2, 1 };
+    wl_lftj_input_t inputs[2] = {
+        { left, 2, 1, 0 },
+        { right, 2, 1, 0 },
+    };
+    int64_t count = 0;
+    int rc = wl_lftj_join(inputs, 2, count_cb, &count);
+
+    ASSERT(rc == 0, "integer LFTJ must return 0");
+    ASSERT(count == 1, "expected only the negative key to match");
+    PASS();
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -775,6 +825,8 @@ main(void)
     test_einval_null_data();
     test_8way_single_shared_key();
     test_einval_k_too_large();
+    test_float_key_semantics();
+    test_integer_negative_key_order();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
