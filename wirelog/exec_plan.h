@@ -82,7 +82,7 @@
  *   WL_PLAN_EXPR_CMP_FLOAT_EQ .. WL_PLAN_EXPR_CMP_FLOAT_GTE
  *
  * Unary aggregate tags (pop 1, push 1):
- *   WL_PLAN_EXPR_AGG_COUNT .. WL_PLAN_EXPR_AGG_MAX
+ *   WL_PLAN_EXPR_AGG_COUNT .. WL_PLAN_EXPR_AGG_AVG
  */
 typedef enum {
     /* Value producers */
@@ -162,6 +162,7 @@ typedef enum {
     WL_PLAN_EXPR_AGG_SUM = 0x31,
     WL_PLAN_EXPR_AGG_MIN = 0x32,
     WL_PLAN_EXPR_AGG_MAX = 0x33,
+    WL_PLAN_EXPR_AGG_AVG = 0x34,
 
     /* String function operators (operands are intern IDs as int64_t) */
     WL_PLAN_EXPR_STR_FN_STRLEN     = 0x40, /* unary:   pop 1 push 1 */
@@ -320,6 +321,7 @@ typedef enum {
     WL_PLAN_AGG_OPERAND_UNKNOWN = 0,
     WL_PLAN_AGG_OPERAND_SCALAR = 1,
     WL_PLAN_AGG_OPERAND_STRING = 2,
+    WL_PLAN_AGG_OPERAND_FLOAT = 3,
 } wl_plan_agg_operand_t;
 
 /**
@@ -528,6 +530,9 @@ typedef struct {
      * other operator, and on a REDUCE whose operand type could not be
      * established. */
     wl_plan_agg_operand_t agg_operand_type;
+    /* REDUCE only: result domain.  FLOAT is binary64; other numeric
+     * aggregates retain the legacy int64 lane. */
+    wl_plan_agg_operand_t agg_result_type;
 } wl_plan_op_t;
 
 /* ======================================================================== */

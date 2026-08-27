@@ -332,6 +332,33 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
 
+    bool float_agg = op->agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT;
+    if (ocols > 0) {
+        wirelog_column_type_t *types = (wirelog_column_type_t *)malloc(
+            (size_t)ocols * sizeof(*types));
+        if (!types) {
+            col_rel_destroy(out);
+            if (e.owned)
+                col_rel_destroy(in);
+            return ENOMEM;
+        }
+        for (uint32_t c = 0; c < gc; c++) {
+            uint32_t src = op->group_by_indices ? op->group_by_indices[c] : c;
+            types[c] = (in->column_types && src < in->ncols)
+                ? in->column_types[src] : WIRELOG_TYPE_INT64;
+        }
+        types[agg_index] = float_agg ? WIRELOG_TYPE_FLOAT
+                                     : WIRELOG_TYPE_INT64;
+        int type_rc = col_rel_set_column_types(out, types, ocols);
+        free(types);
+        if (type_rc != 0) {
+            col_rel_destroy(out);
+            if (e.owned)
+                col_rel_destroy(in);
+            return type_rc;
+        }
+    }
+
     int64_t *tmp = (int64_t *)malloc(sizeof(int64_t) * (ocols ? ocols : 1));
     if (!tmp) {
         col_rel_destroy(out);
@@ -384,6 +411,20 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             col_rel_destroy(in);
         return ENOMEM;
     }
+    double *sums = (double *)calloc(map_cap, sizeof(*sums));
+    uint64_t *counts = (uint64_t *)calloc(map_cap, sizeof(*counts));
+    if (!sums || !counts) {
+        free(sums);
+        free(counts);
+        free(groups);
+        col_row_buf_release(&row_rb);
+        wl_columnar_expr_compiled_free(agg_ce);
+        free(tmp);
+        col_rel_destroy(out);
+        if (e.owned)
+            col_rel_destroy(in);
+        return ENOMEM;
+    }
     uint32_t map_mask = map_cap - 1;
 
     /* Index groups by their key so reduction remains linear in the number of
@@ -427,13 +468,25 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 }
             }
         }
+        if (float_agg && !wl_columnar_float_bits_valid(agg_val)) {
+            free(sums); free(counts); free(groups);
+            col_row_buf_release(&row_rb);
+            wl_columnar_expr_compiled_free(agg_ce); free(tmp);
+            col_rel_destroy(out);
+            if (e.owned) col_rel_destroy(in);
+            return EINVAL;
+        }
 
         /* Use an open-addressed key index instead of scanning all output
          * groups for every input row. */
         uint64_t hash = UINT64_C(1469598103934665603);
         for (uint32_t k = 0; k < gc; k++) {
             uint32_t gi = op->group_by_indices ? op->group_by_indices[k] : k;
-            hash ^= (uint64_t)row[gi < in->ncols ? gi : 0];
+            int64_t key = row[gi < in->ncols ? gi : 0];
+            if (in->column_types && gi < in->ncols
+                && in->column_types[gi] == WIRELOG_TYPE_FLOAT)
+                key = wl_columnar_float_canonical_bits(key);
+            hash ^= (uint64_t)key;
             hash *= UINT64_C(1099511628211);
         }
         if (!hash)
@@ -447,8 +500,12 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 uint32_t gi
                     = op->group_by_indices ? op->group_by_indices[k] : k;
                 uint32_t out_col = k >= agg_index ? k + 1 : k;
-                match = row[gi < in->ncols ? gi : 0]
-                    == col_rel_get(out, groups[slot].row, out_col);
+                int64_t left = row[gi < in->ncols ? gi : 0];
+                int64_t right = col_rel_get(out, groups[slot].row, out_col);
+                if (in->column_types && gi < in->ncols
+                    && in->column_types[gi] == WIRELOG_TYPE_FLOAT)
+                    left = wl_columnar_float_canonical_bits(left);
+                match = left == right;
             }
             if (match) {
                 found = true;
@@ -466,6 +523,23 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 break;
             case WIRELOG_AGG_SUM:
             {
+                if (float_agg) {
+                    double value = wl_columnar_float_from_bits(agg_val);
+                    double next_value = sums[slot] + value;
+                    if (!isfinite(next_value)) {
+                        free(sums); free(counts); free(groups);
+                        col_row_buf_release(&row_rb);
+                        wl_columnar_expr_compiled_free(agg_ce); free(tmp);
+                        col_rel_destroy(out);
+                        if (e.owned) col_rel_destroy(in);
+                        return ERANGE;
+                    }
+                    sums[slot] = next_value;
+                    (void)col_rel_set(out, group_row, agg_index,
+                        wl_columnar_float_canonical_bits(
+                            wl_columnar_float_to_bits(next_value)));
+                    break;
+                }
                 int64_t next;
                 if (wl_columnar_arithmetic_checked_add_int64(cur, agg_val,
                     &next) != 0) {
@@ -486,9 +560,33 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 /* Ordered by the operand's declared domain, not by the
                  * raw int64 -- for a symbol column that int64 is an
                  * intern id (Issue #965). */
-                if (col_agg_better(op->agg_fn, op->agg_operand_type,
+                if (float_agg) {
+                    int cmp = wl_columnar_float_compare_bits(agg_val, cur);
+                    if ((op->agg_fn == WIRELOG_AGG_MIN && cmp < 0)
+                        || (op->agg_fn == WIRELOG_AGG_MAX && cmp > 0))
+                        (void)col_rel_set(out, group_row, agg_index,
+                            wl_columnar_float_canonical_bits(agg_val));
+                } else if (col_agg_better(op->agg_fn, op->agg_operand_type,
                     sess->intern, agg_val, cur))
                     col_rel_set(out, group_row, agg_index, agg_val);
+                break;
+            case WIRELOG_AGG_AVG:
+                if (!float_agg)
+                    break;
+                sums[slot] += wl_columnar_float_from_bits(agg_val);
+                counts[slot]++;
+                if (!isfinite(sums[slot])) {
+                    free(sums); free(counts); free(groups);
+                    col_row_buf_release(&row_rb);
+                    wl_columnar_expr_compiled_free(agg_ce); free(tmp);
+                    col_rel_destroy(out);
+                    if (e.owned) col_rel_destroy(in);
+                    return ERANGE;
+                }
+                (void)col_rel_set(out, group_row, agg_index,
+                    wl_columnar_float_canonical_bits(
+                        wl_columnar_float_to_bits(sums[slot]
+                        / (double)counts[slot])));
                 break;
             default:
                 break;
@@ -502,6 +600,14 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                 tmp[out_col] = row[gi < in->ncols ? gi : 0];
             }
             tmp[agg_index] = (op->agg_fn == WIRELOG_AGG_COUNT) ? 1 : agg_val;
+            if (float_agg) {
+                sums[slot] = wl_columnar_float_from_bits(agg_val);
+                counts[slot] = 1;
+                if (op->agg_fn == WIRELOG_AGG_AVG)
+                    tmp[agg_index] = wl_columnar_float_to_bits(sums[slot]);
+                else
+                    tmp[agg_index] = wl_columnar_float_canonical_bits(agg_val);
+            }
             int rc = col_rel_append_row(out, tmp);
             if (rc != 0) {
                 col_row_buf_release(&row_rb);
@@ -521,6 +627,8 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     col_row_buf_release(&row_rb);
     wl_columnar_expr_compiled_free(agg_ce);
     free(groups);
+    free(sums);
+    free(counts);
     free(tmp);
     if (e.owned)
         col_rel_destroy(in);

@@ -199,6 +199,7 @@ col_rel_free_contents(col_rel_t *r)
             free(r->col_names[i]);
         free((void *)r->col_names);
     }
+    free(r->column_types);
     free(r->dedup_slots);
     free(r->compound_arity_map);
     if (r->schema_ok)
@@ -233,12 +234,13 @@ col_rel_destroy(col_rel_t *r)
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
 {
-    if (r->ncols != 0)
+    if (r->ncols != 0 && r->schema_ok)
         return 0; /* already initialised */
 
+    bool initialize_storage = r->ncols == 0;
     r->ncols = ncols;
 
-    if (ncols > 0) {
+    if (initialize_storage && ncols > 0) {
         r->capacity = COL_REL_INIT_CAP;
         r->columns = col_columns_alloc(ncols, r->capacity);
         if (!r->columns)
@@ -286,7 +288,10 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
         return EINVAL;
     }
     for (uint32_t i = 0; i < ncols; i++) {
-        if (ArrowSchemaInitFromType(r->schema.children[i], NANOARROW_TYPE_INT64)
+        enum ArrowType arrow_type = r->column_types
+            && r->column_types[i] == WIRELOG_TYPE_FLOAT
+            ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+        if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
             != NANOARROW_OK) {
             ArrowSchemaRelease(&r->schema);
             return EINVAL;
@@ -296,6 +301,50 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
         ArrowSchemaSetName(r->schema.children[i], cname);
     }
     r->schema_ok = true;
+    return 0;
+}
+
+int
+col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
+    uint32_t ncols)
+{
+    if (!r || ncols != r->ncols)
+        return EINVAL;
+    wirelog_column_type_t *copy = NULL;
+    if (ncols > 0) {
+        copy = (wirelog_column_type_t *)malloc((size_t)ncols * sizeof(*copy));
+        if (!copy)
+            return ENOMEM;
+        for (uint32_t c = 0; c < ncols; c++) {
+            copy[c] = types ? types[c] : WIRELOG_TYPE_INT64;
+            if (copy[c] == WIRELOG_TYPE_FLOAT) {
+                for (uint32_t row = 0; row < r->nrows; row++) {
+                    if (!wl_columnar_float_bits_valid(r->columns[c][row])) {
+                        free(copy);
+                        return EINVAL;
+                    }
+                }
+            }
+        }
+    }
+    if (r->schema_ok)
+        ArrowSchemaRelease(&r->schema);
+    r->schema_ok = false;
+    free(r->column_types);
+    r->column_types = copy;
+    if (col_rel_set_schema(r, r->ncols,
+        (const char *const *)r->col_names) != 0) {
+        free(r->column_types);
+        r->column_types = NULL;
+        return EINVAL;
+    }
+    for (uint32_t c = 0; c < ncols; c++) {
+        if (r->column_types && r->column_types[c] == WIRELOG_TYPE_FLOAT) {
+            for (uint32_t row = 0; row < r->nrows; row++)
+                r->columns[c][row]
+                    = wl_columnar_float_canonical_bits(r->columns[c][row]);
+        }
+    }
     return 0;
 }
 
@@ -949,6 +998,11 @@ col_rel_new_like(const char *name, const col_rel_t *src)
         col_rel_destroy(r);
         return NULL;
     }
+    if (src->column_types
+        && col_rel_set_column_types(r, src->column_types, src->ncols) != 0) {
+        col_rel_destroy(r);
+        return NULL;
+    }
     /* Issue #535: inherit graph-column metadata so deltas/clones route by
      * __graph_id consistently with their source relation. */
     r->has_graph_column = src->has_graph_column;
@@ -1003,6 +1057,11 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
             memset(r, 0, sizeof(*r));
             return col_rel_new_like(name, like); /* Fallback */
         }
+    }
+    if (like->column_types
+        && col_rel_set_column_types(r, like->column_types, like->ncols) != 0) {
+        col_rel_destroy(r);
+        return col_rel_new_like(name, like);
     }
     /* Copy col_names so col_rel_col_idx works for downstream operators */
     if (like->col_names && like->ncols > 0) {
@@ -1392,6 +1451,13 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
             ArrowSchemaSetName(dst->schema.children[i], cname);
         }
         dst->schema_ok = true;
+    }
+
+    if (src->column_types
+        && col_rel_set_column_types(dst, src->column_types, src->ncols) != 0) {
+        col_rel_free_contents(dst);
+        free(dst);
+        return ENOMEM;
     }
 
     *out = dst;

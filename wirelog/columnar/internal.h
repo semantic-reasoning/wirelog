@@ -33,6 +33,7 @@
 #include "nanoarrow/nanoarrow.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -243,6 +244,8 @@ typedef struct {
     char *name;                /* owned, null-terminated                */
     uint32_t ncols;            /* columns per tuple (0 = unset)         */
     int64_t **columns;         /* owned, column-major: columns[col][row] */
+    /* Physical type for each lane.  NULL means the legacy int64 layout. */
+    wirelog_column_type_t *column_types;
     uint32_t nrows;            /* current row count                     */
     uint32_t capacity;         /* allocated row capacity                */
     char **col_names;          /* owned array of ncols owned strings    */
@@ -388,6 +391,47 @@ typedef struct {
      * allocation path correct by default, as the block above requires. */
     uint32_t declared_ncols;
 } col_rel_t;
+
+static inline double
+wl_columnar_float_from_bits(int64_t bits)
+{
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static inline int64_t
+wl_columnar_float_to_bits(double value)
+{
+    int64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static inline bool
+wl_columnar_float_bits_valid(int64_t bits)
+{
+    return isfinite(wl_columnar_float_from_bits(bits));
+}
+
+static inline int
+wl_columnar_float_compare_bits(int64_t left_bits, int64_t right_bits)
+{
+    double left = wl_columnar_float_from_bits(left_bits);
+    double right = wl_columnar_float_from_bits(right_bits);
+    if (!isfinite(left) || !isfinite(right))
+        return 0;
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+static inline int64_t
+wl_columnar_float_canonical_bits(int64_t bits)
+{
+    double value = wl_columnar_float_from_bits(bits);
+    if (value == 0.0)
+        return wl_columnar_float_to_bits(0.0);
+    return bits;
+}
 
 /* ======================================================================== */
 /* col_rel_t Accessor Layer (Phase C, Issue #332)                           */
@@ -1301,6 +1345,9 @@ void
 col_rel_destroy(col_rel_t *r);
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names);
+int
+col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
+    uint32_t ncols);
 int
 col_rel_alloc(col_rel_t **out, const char *name);
 
