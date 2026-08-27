@@ -1157,6 +1157,16 @@ col_rel_new_like(const char *name, const col_rel_t *src)
     col_rel_t *r = NULL;
     if (col_rel_alloc(&r, name) != 0)
         return NULL;
+    if (src->column_types && src->ncols > 0) {
+        r->column_types = (wirelog_column_type_t *)malloc(
+            (size_t)src->ncols * sizeof(*r->column_types));
+        if (!r->column_types) {
+            col_rel_destroy(r);
+            return NULL;
+        }
+        memcpy(r->column_types, src->column_types,
+            (size_t)src->ncols * sizeof(*r->column_types));
+    }
     if (col_rel_set_schema(r, src->ncols, (const char *const *)src->col_names)
         != 0) {
         col_rel_destroy(r);
@@ -1166,11 +1176,6 @@ col_rel_new_like(const char *name, const col_rel_t *src)
      * __graph_id consistently with their source relation. */
     r->has_graph_column = src->has_graph_column;
     r->graph_col_idx = src->graph_col_idx;
-    if (src->column_types
-        && col_rel_set_column_types(r, src->column_types, src->ncols) != 0) {
-        col_rel_destroy(r);
-        return NULL;
-    }
     /* Issue #534 Task #1: inherit compound metadata so FILTER/PROJECT/LFTJ
      * outputs remain INLINE-kind and the logical<->physical translation
      * stays valid for downstream ops. compound_arity_map is a separately
