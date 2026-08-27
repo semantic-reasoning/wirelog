@@ -25,6 +25,7 @@
 #define WL_COLUMNAR_LFTJ_H
 
 #include <stdint.h>
+#include "wirelog/wirelog-types.h"
 
 /* Maximum number of input relations supported by wl_lftj_join. */
 #define WL_LFTJ_MAX_K 64
@@ -66,7 +67,7 @@ typedef struct {
  * single key value. Phase 2 will address this via a materialization API.
  */
 typedef void (*wl_lftj_result_fn)(const int64_t *row, uint32_t ncols,
-                                  void *user);
+    void *user);
 
 /* ======================================================================== */
 /* Multi-way Join                                                           */
@@ -95,6 +96,12 @@ typedef void (*wl_lftj_result_fn)(const int64_t *row, uint32_t ncols,
  */
 int
 wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
-             void *user);
+    void *user);
+
+/* Internal typed variant used by the columnar planner. */
+int
+wl_columnar_lftj_join_typed(const wl_lftj_input_t *inputs,
+    wirelog_column_type_t key_type, uint32_t k,
+    wl_lftj_result_fn cb, void *user);
 
 #endif /* WL_COLUMNAR_LFTJ_H */
