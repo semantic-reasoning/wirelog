@@ -437,7 +437,11 @@ typedef struct {
 static inline bool
 wl_columnar_relation_float_values_valid(const col_rel_t *rel)
 {
-    if (!rel || !rel->columns)
+    if (!rel)
+        return false;
+    if (rel->nrows == 0)
+        return true;
+    if (!rel->columns)
         return false;
     if (!rel->column_types)
         return true;

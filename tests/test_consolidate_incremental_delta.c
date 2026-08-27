@@ -253,6 +253,24 @@ test_rel_contains_row(const col_rel_t *r, const int64_t *row)
     return 0;
 }
 
+static void
+test_empty_relation_float_validation(void)
+{
+    TEST("empty relation without columns is valid for float validation");
+
+    col_rel_t *empty = test_rel_alloc(2);
+    ASSERT(empty, "test_rel_alloc failed");
+    ASSERT(wl_columnar_relation_float_values_valid(empty),
+        "empty relation should be valid without column storage");
+
+    empty->nrows = 1;
+    ASSERT(!wl_columnar_relation_float_values_valid(empty),
+        "non-empty relation must have column storage");
+
+    test_rel_free(empty);
+    PASS();
+}
+
 /* ================================================================
  * Test 1: empty old + delta -> all rows new
  *
@@ -950,6 +968,7 @@ main(void)
     test_fastpath_counter_sorted_after();
     test_fastpath_counter_interleaved();
     test_fastpath_counter_null_safe();
+    test_empty_relation_float_validation();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);

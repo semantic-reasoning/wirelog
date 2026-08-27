@@ -304,11 +304,18 @@ col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
     for (uint32_t c = 0; c < width; c++) {
         uint32_t source = (op && op->project_count > 0
             && op->project_indices) ? op->project_indices[c] : c;
-        const col_rel_t *source_rel = source < left->ncols ? left : right;
-        uint32_t source_col = source < left->ncols ? source
-            : source - left->ncols;
-        types[c] = source_rel->column_types
-            ? source_rel->column_types[source_col] : WIRELOG_TYPE_INT64;
+        if (source < left->ncols) {
+            types[c] = left->column_types
+                ? left->column_types[source] : WIRELOG_TYPE_INT64;
+        } else if (source - left->ncols < right->ncols) {
+            uint32_t source_col = source - left->ncols;
+            types[c] = right->column_types
+                ? right->column_types[source_col] : WIRELOG_TYPE_INT64;
+        } else {
+            /* Keep the existing invalid-projection value semantics while
+             * avoiding an out-of-bounds read from the source schema. */
+            types[c] = WIRELOG_TYPE_INT64;
+        }
     }
     int rc = col_rel_set_column_types(out, types, width);
     free(types);
@@ -328,7 +335,7 @@ col_join_set_left_output_types(col_rel_t *out, const col_rel_t *left,
     for (uint32_t c = 0; c < width; c++) {
         uint32_t source = op && op->project_count > 0
             ? op->project_indices[c] : c;
-        types[c] = left->column_types
+        types[c] = source < left->ncols && left->column_types
             ? left->column_types[source] : WIRELOG_TYPE_INT64;
     }
     int rc = col_rel_set_column_types(out, types, width);
