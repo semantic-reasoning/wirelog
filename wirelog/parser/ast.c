@@ -167,6 +167,8 @@ wl_parser_ast_node_type_str(wl_parser_ast_node_type_t type)
         return "BINARY_EXPR";
     case WL_PARSER_AST_NODE_STR_FUNCTION:
         return "STR_FUNCTION";
+    case WL_PARSER_AST_NODE_EXTENSION_CALL:
+        return "EXTENSION_CALL";
     case WL_PARSER_AST_NODE_FACT:
         return "FACT";
     case WL_PARSER_AST_NODE_TYPED_PARAM:

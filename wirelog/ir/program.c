@@ -2748,6 +2748,13 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
         const wl_parser_ast_node_t *b = rule_node->children[i];
         if (!b)
             continue;
+        if (b->type == WL_PARSER_AST_NODE_EXTENSION_CALL) {
+            wl_ir_program_set_error(prog,
+                "scalar extension call '%s' is not executable yet in rule "
+                "'%s'", b->name ? b->name : "?",
+                head->name ? head->name : "?");
+            goto conversion_failed;
+        }
         if (b->type == WL_PARSER_AST_NODE_ATOM) {
             WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
                 "convert_rule: build scan for body atom relation=%s",
@@ -3028,6 +3035,15 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
 
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
+        if (b->type == WL_PARSER_AST_NODE_NEGATION && b->child_count >= 1
+            && b->children[0]->type == WL_PARSER_AST_NODE_EXTENSION_CALL) {
+            wl_ir_program_set_error(prog,
+                "negated scalar extension call '%s' is not executable yet "
+                "in rule '%s'", b->children[0]->name
+                    ? b->children[0]->name : "?",
+                head->name ? head->name : "?");
+            goto conversion_failed;
+        }
         if (b->type == WL_PARSER_AST_NODE_NEGATION && b->child_count >= 1
             && current) {
             const wl_parser_ast_node_t *neg_atom = b->children[0];
