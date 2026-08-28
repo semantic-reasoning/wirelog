@@ -28,6 +28,8 @@
 typedef struct {
     int64_t vals[COL_FILTER_STACK];
     uint32_t types[COL_FILTER_STACK];
+    const uint8_t *string_data[COL_FILTER_STACK];
+    uint32_t string_lengths[COL_FILTER_STACK];
     uint32_t top;
 } expr_stack_t;
 
@@ -37,6 +39,8 @@ expr_push(expr_stack_t *s, int64_t v)
     if (s->top < COL_FILTER_STACK) {
         s->vals[s->top++] = v;
         s->types[s->top - 1] = WIRELOG_EXTENSION_VALUE_INT64;
+        s->string_data[s->top - 1] = NULL;
+        s->string_lengths[s->top - 1] = 0;
     }
 }
 static inline void
@@ -45,6 +49,20 @@ expr_push_typed(expr_stack_t *s, int64_t v, uint32_t type)
     if (s->top < COL_FILTER_STACK) {
         s->vals[s->top] = v;
         s->types[s->top++] = type;
+        s->string_data[s->top - 1] = NULL;
+        s->string_lengths[s->top - 1] = 0;
+    }
+}
+
+static inline void
+expr_push_string(expr_stack_t *s, int64_t value, const uint8_t *data,
+    uint32_t length)
+{
+    if (s->top < COL_FILTER_STACK) {
+        s->vals[s->top] = value;
+        s->types[s->top] = WIRELOG_EXTENSION_VALUE_STRING;
+        s->string_data[s->top] = data;
+        s->string_lengths[s->top++] = length;
     }
 }
 static inline int64_t
@@ -464,18 +482,20 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             i += 2;
             if (i + slen > size)
                 goto bad;
+            int64_t value = 0;
             if (intern) {
                 char *tmp = (char *)malloc((size_t)slen + 1);
-                if (!tmp)
+                if (!tmp) {
+                    if (status)
+                        *status = WL_COLUMNAR_EXPR_ALLOCATION_FAILURE;
                     goto bad;
+                }
                 memcpy(tmp, buf + i, slen);
                 tmp[slen] = '\0';
-                int64_t id = wl_intern_put(intern, tmp);
+                value = wl_intern_put(intern, tmp);
                 free(tmp);
-                expr_push_typed(&s, id, WIRELOG_EXTENSION_VALUE_STRING);
-            } else {
-                expr_push_typed(&s, 0, WIRELOG_EXTENSION_VALUE_STRING);
             }
+            expr_push_string(&s, value, buf + i, slen);
             i += slen;
             break;
         }
@@ -536,18 +556,24 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                 uint32_t expected = descriptor->argument_types
                     ? descriptor->argument_types[arg] : 0;
                 uint32_t actual = s.types[index];
-                if (actual == WIRELOG_EXTENSION_VALUE_STRING
-                    || (expected != 0 && actual != expected)) {
+                if (expected != 0 && actual != expected) {
                     if (status)
                         *status = WL_COLUMNAR_EXPR_TYPE_MISMATCH;
                     goto bad;
                 }
                 args[arg].type = actual;
                 args[arg].size = actual == WIRELOG_EXTENSION_VALUE_BOOL
-                    ? sizeof(uint8_t) : sizeof(int64_t);
+                    ? sizeof(uint8_t)
+                    : actual == WIRELOG_EXTENSION_VALUE_STRING
+                    ? s.string_lengths[index] : sizeof(int64_t);
                 if (actual == WIRELOG_EXTENSION_VALUE_BOOL)
                     args[arg].as.bool_value = s.vals[index] != 0;
-                else
+                else if (actual == WIRELOG_EXTENSION_VALUE_STRING) {
+                    args[arg].as.string_value.data =
+                        (const char *)s.string_data[index];
+                    args[arg].as.string_value.length =
+                        s.string_lengths[index];
+                }else
                     args[arg].as.int64_value = s.vals[index];
             }
             s.top -= nargs;
