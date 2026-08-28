@@ -31,6 +31,7 @@
 #include "../wirelog/wirelog.h"
 
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -225,21 +226,26 @@ find_rel_mirror(wl_session_t *sess, const char *rel_name)
  *   uint32_t *key_cols     8  (offset  0)
  *   uint32_t  key_count    4  (offset  8)
  *   uint32_t  nbuckets     4  (offset 12) — packed with key_count, no pad
- *   uint32_t *ht_head      8  (offset 16)
+ *   uint64_t *ht_head      8  (offset 16)
  *   uint32_t *ht_next      8  (offset 24)
  *   uint32_t  ht_cap       4  (offset 32)
  *   uint32_t  indexed_rows 4  (offset 36)
  *   uint64_t  content_hash 8  (offset 40)
- *                         = 48 bytes total
+ *   uint32_t  generation   4  (offset 48)
+ *                         = 56 bytes total
  * ================================================================ */
 static void
 test_arrangement_struct_size(void)
 {
     TEST("col_arrangement_t struct size (layout sentinel)");
 
-    /* 48 bytes: 3 pointers (24) + 4 uint32 (16) + 1 uint64 (8) */
-    ASSERT(sizeof(col_arrangement_t) == 48,
-        "col_arrangement_t must be 48 bytes; update if struct changes");
+    /* 56 bytes: 3 pointers (24) + 5 uint32 (20) + 1 uint64 (8). */
+    ASSERT(sizeof(col_arrangement_t) == 56,
+        "col_arrangement_t must be 56 bytes; update if struct changes");
+    ASSERT(offsetof(col_arrangement_t, ht_head) == 16,
+        "ht_head layout changed unexpectedly");
+    ASSERT(offsetof(col_arrangement_t, generation) == 48,
+        "generation layout changed unexpectedly");
 
     PASS();
 }
@@ -568,6 +574,63 @@ test_arrangement_registry_cache(void)
 }
 
 /* ================================================================
+ * Test 9: versioned bucket heads handle rebuilds and generation wrap.
+ * ================================================================ */
+static void
+test_arrangement_generation_wrap(void)
+{
+    TEST("arrangement: versioned heads ignore stale buckets and wrap safely");
+
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+        "edge(1, 2). edge(2, 3). edge(3, 4).\n"
+        ".decl reach(x: int32, y: int32)\n"
+        "reach(x, y) :- edge(x, y).\n";
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    ASSERT(make_session(src, &sess, &plan, &prog) == 0,
+        "session creation failed");
+
+    uint32_t key_cols[] = { 0 };
+    col_arrangement_t *arr
+        = col_session_get_arrangement(sess, "edge", key_cols, 1);
+    ASSERT(arr != NULL && arr->generation != 0,
+        "arrangement must have a live generation");
+    uint32_t old_generation = arr->generation;
+
+    test_col_rel_mirror_t *rel = find_rel_mirror(sess, "edge");
+    ASSERT(rel != NULL, "edge relation not found in session");
+    int64_t key_row[2] = { 2, 0 };
+
+    /* An empty rebuild must not expose rows from the previous generation. */
+    rel->nrows = 0;
+    col_session_invalidate_arrangements(sess, "edge");
+    arr = col_session_get_arrangement(sess, "edge", key_cols, 1);
+    ASSERT(arr != NULL && arr->indexed_rows == 0,
+        "empty relation must rebuild as empty");
+    ASSERT(col_arrangement_find_first(arr, rel->columns, rel->ncols, key_row)
+        == UINT32_MAX,
+        "empty rebuild must hide stale rows");
+
+    col_session_invalidate_arrangements(sess, "edge");
+    arr->generation = UINT32_MAX;
+    rel->nrows = 3;
+    arr = col_session_get_arrangement(sess, "edge", key_cols, 1);
+    ASSERT(arr != NULL, "arrangement must rebuild after generation wrap");
+    ASSERT(arr->generation == 1,
+        "wrapped generation must reset to one");
+    ASSERT(old_generation != UINT32_MAX,
+        "test setup must start below the wrap boundary");
+
+    ASSERT(col_arrangement_find_first(arr, rel->columns, rel->ncols, key_row)
+        != UINT32_MAX,
+        "find_first must work after a wrapped rebuild");
+
+    free_session(sess, plan, prog);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -584,6 +647,7 @@ main(void)
     test_arrangement_find_next_chain();
     test_arrangement_invalidate();
     test_arrangement_registry_cache();
+    test_arrangement_generation_wrap();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
