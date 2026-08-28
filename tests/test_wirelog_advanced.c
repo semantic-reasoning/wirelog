@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -192,7 +193,7 @@ test_typed_float_ingress(void)
         }
     }
 
-    double infinity = 1.0 / 0.0;
+    double infinity = INFINITY;
     uint64_t bad_bits;
     memcpy(&bad_bits, &infinity, sizeof(bad_bits));
     rows.lanes = &bad_bits;
