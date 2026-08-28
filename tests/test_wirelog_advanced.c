@@ -58,6 +58,27 @@ static const char *PROG_SRC =
     "path(X,Z) :- path(X,Y), edge(Y,Z).\n";
 
 static int extension_destroy_calls;
+static int snapshot_extension_fail;
+static wirelog_program_t *parse_or_die(const char *src, const char *what);
+
+struct public_snapshot_rows {
+    uint32_t rows;
+};
+
+static void
+count_public_snapshot_rows(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    ((struct public_snapshot_rows *)user_data)->rows++;
+}
+
+static const char *SNAPSHOT_EXTENSION_SRC =
+    ".decl src(x: int64)\n"
+    ".decl out(x: int64)\n"
+    "out(x) :- src(x), @call(\"test.public_snapshot\", x).\n";
 
 static int
 test_extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
@@ -68,6 +89,88 @@ test_extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
     (void)result;
     (void)user_data;
     return 0;
+}
+
+static int
+snapshot_extension_invoke(const wirelog_extension_value_t *args,
+    uint32_t nargs, wirelog_extension_value_t *result, void *user_data)
+{
+    (void)args;
+    (void)nargs;
+    (void)user_data;
+    if (snapshot_extension_fail)
+        return 1;
+    result->type = WIRELOG_EXTENSION_VALUE_BOOL;
+    result->size = sizeof(uint8_t);
+    result->as.bool_value = 1;
+    return 0;
+}
+
+static int
+test_public_snapshot_extension_execution(void)
+{
+    const uint32_t argument_types[] = { WIRELOG_EXTENSION_VALUE_INT64 };
+    wirelog_extension_descriptor_t descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION, sizeof(descriptor),
+        "test.public_snapshot", 1, argument_types,
+        WIRELOG_EXTENSION_VALUE_BOOL, snapshot_extension_invoke, NULL, NULL
+    };
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create();
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_program_t *prog = parse_or_die(SNAPSHOT_EXTENSION_SRC,
+            "T-snapshot-extension");
+    wirelog_session_t *session = NULL;
+    struct public_snapshot_rows rows = { 0 };
+    int64_t value = 7;
+    int rc = 0;
+
+    snapshot_extension_fail = 0;
+    if (!registry || !prog
+        || wirelog_extension_register(registry, &descriptor) != 0)
+        rc = 1;
+    snapshot = registry ? wirelog_extension_snapshot_acquire(registry) : NULL;
+    if (!rc && (!snapshot
+        || wirelog_session_create_with_snapshot(prog,
+        WIRELOG_BACKEND_DEFAULT, 1, snapshot, &session) != WIRELOG_OK
+        || !session))
+        rc = 1;
+    if (snapshot) {
+        wirelog_extension_snapshot_release(snapshot);
+        snapshot = NULL;
+    }
+    if (!rc && wirelog_extension_unregister(registry,
+        descriptor.name) != 0)
+        rc = 1;
+    if (!rc && wirelog_session_insert(session, "src", &value, 1, 1)
+        != WIRELOG_OK)
+        rc = 1;
+    if (!rc && (wirelog_session_snapshot(session, count_public_snapshot_rows,
+        &rows) != WIRELOG_OK || rows.rows != 1)) {
+        fprintf(stderr, "T-snapshot-extension: rows=%u\n", rows.rows);
+        rc = 1;
+    }
+    snapshot_extension_fail = 1;
+    value = 8;
+    if (!rc && wirelog_session_insert(session, "src", &value, 1, 1)
+        != WIRELOG_OK)
+        rc = 1;
+    rows.rows = 0;
+    if (!rc && wirelog_session_snapshot(session, count_public_snapshot_rows,
+        &rows) != WIRELOG_ERR_EXEC) {
+        fprintf(stderr, "T-snapshot-extension: failing callback succeeded\n");
+        rc = 1;
+    }
+    if (rows.rows != 0)
+        rc = 1;
+
+    wirelog_session_destroy(session);
+    wirelog_extension_snapshot_release(snapshot);
+    wirelog_program_free(prog);
+    if (registry && wirelog_extension_registry_destroy(registry) != 0)
+        rc = 1;
+    snapshot_extension_fail = 0;
+    return rc;
 }
 
 static void
@@ -2083,6 +2186,7 @@ main(void)
     failures += test_create_invalid_backend();
     failures += test_create_with_snapshot_lifetime();
     failures += test_create_with_snapshot_invalid_args();
+    failures += test_public_snapshot_extension_execution();
     failures += test_inline_facts_seeded();
     failures += test_insert_step_delta();
     failures += test_relation_name_lifetime();
