@@ -15,6 +15,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "wirelog/wirelog-advanced.h"
+#include "wirelog/wirelog-extension.h"
 #include "wirelog/wirelog.h"
 #include "wirelog/intern.h"
 #include "wirelog/passes/fusion.h"
@@ -55,6 +56,26 @@ static const char *PROG_SRC =
     ".decl path(a:symbol,b:symbol)\n"
     "path(X,Y) :- edge(X,Y).\n"
     "path(X,Z) :- path(X,Y), edge(Y,Z).\n";
+
+static int extension_destroy_calls;
+
+static int
+test_extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    (void)args;
+    (void)nargs;
+    (void)result;
+    (void)user_data;
+    return 0;
+}
+
+static void
+test_extension_destroy(void *user_data)
+{
+    (void)user_data;
+    extension_destroy_calls++;
+}
 
 static const char *RELATION_NAME_LIFETIME_SRC
     = ".decl edge(x: int64, y: int64)\n"
@@ -421,6 +442,103 @@ test_create_invalid_backend(void)
         rc = 1;
     }
     wirelog_program_free(prog);
+    return rc;
+}
+
+/* The additive snapshot API must retain independently of the caller, so a
+ * caller may release its reference and unregister the addon immediately. */
+static int
+test_create_with_snapshot_lifetime(void)
+{
+    wirelog_extension_registry_t *registry = NULL;
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_program_t *prog = NULL;
+    wirelog_session_t *session = NULL;
+    const uint32_t argument_types[] = { WIRELOG_EXTENSION_VALUE_INT64 };
+    wirelog_extension_descriptor_t descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION,
+        sizeof(descriptor),
+        "test.public_snapshot",
+        1,
+        argument_types,
+        WIRELOG_EXTENSION_VALUE_BOOL,
+        test_extension_invoke,
+        NULL,
+        test_extension_destroy
+    };
+    int rc = 0;
+
+    extension_destroy_calls = 0;
+    registry = wirelog_extension_registry_create();
+    prog = parse_or_die(PROG_SRC, "T-snapshot-public");
+    if (!registry || !prog
+        || wirelog_extension_register(registry, &descriptor) != 0) {
+        rc = 1;
+        goto cleanup;
+    }
+    snapshot = wirelog_extension_snapshot_acquire(registry);
+    if (!snapshot
+        || wirelog_session_create_with_snapshot(prog,
+        WIRELOG_BACKEND_DEFAULT, 2, snapshot, &session) != WIRELOG_OK
+        || !session) {
+        fprintf(stderr, "T-snapshot-public: creation failed\n");
+        rc = 1;
+        goto cleanup;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    snapshot = NULL;
+    if (wirelog_extension_unregister(registry, descriptor.name) != 0
+        || extension_destroy_calls != 0) {
+        fprintf(stderr, "T-snapshot-public: snapshot was not retained\n");
+        rc = 1;
+    }
+    wirelog_session_destroy(session);
+    session = NULL;
+    if (extension_destroy_calls != 1) {
+        fprintf(stderr, "T-snapshot-public: destroy calls=%d\n",
+            extension_destroy_calls);
+        rc = 1;
+    }
+
+cleanup:
+    wirelog_session_destroy(session);
+    wirelog_extension_snapshot_release(snapshot);
+    wirelog_program_free(prog);
+    if (registry && wirelog_extension_registry_destroy(registry) != 0)
+        rc = 1;
+    return rc;
+}
+
+/* Invalid arguments must clear out and must not consume the caller's
+ * snapshot reference, including when backend selection fails. */
+static int
+test_create_with_snapshot_invalid_args(void)
+{
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create();
+    wirelog_extension_snapshot_t *snapshot = registry
+        ? wirelog_extension_snapshot_acquire(registry) : NULL;
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T-snapshot-invalid");
+    wirelog_session_t *session = (wirelog_session_t *)0xdeadbeef;
+    int rc = 0;
+
+    if (!registry || !snapshot || !prog)
+        rc = 1;
+    if (wirelog_session_create_with_snapshot(NULL, WIRELOG_BACKEND_DEFAULT,
+        1, snapshot, &session) != WIRELOG_ERR_EXEC || session != NULL)
+        rc = 1;
+    session = (wirelog_session_t *)0xdeadbeef;
+    if (wirelog_session_create_with_snapshot(prog,
+        (wirelog_backend_kind_t)999, 1, snapshot, &session)
+        != WIRELOG_ERR_EXEC || session != NULL)
+        rc = 1;
+    if (wirelog_session_create_with_snapshot(prog, WIRELOG_BACKEND_DEFAULT,
+        1, snapshot, NULL) != WIRELOG_ERR_EXEC)
+        rc = 1;
+    wirelog_extension_snapshot_release(snapshot);
+    wirelog_program_free(prog);
+    if (registry && wirelog_extension_registry_destroy(registry) != 0)
+        rc = 1;
     return rc;
 }
 
@@ -1963,6 +2081,8 @@ main(void)
     failures += test_create_destroy_basic();
     failures += test_create_columnar();
     failures += test_create_invalid_backend();
+    failures += test_create_with_snapshot_lifetime();
+    failures += test_create_with_snapshot_invalid_args();
     failures += test_inline_facts_seeded();
     failures += test_insert_step_delta();
     failures += test_relation_name_lifetime();

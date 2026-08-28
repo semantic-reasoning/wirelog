@@ -82,6 +82,7 @@
     <elf-symbol name='wirelog_result_relation_cardinality' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_result_write_csv' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_create' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='wirelog_session_create_with_snapshot' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_destroy' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_insert' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_insert_typed' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>

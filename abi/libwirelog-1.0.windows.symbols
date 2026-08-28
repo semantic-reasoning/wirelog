@@ -57,6 +57,7 @@ wirelog_program_get_stratum_count
 wirelog_program_is_stratified
 wirelog_program_relation_has_input
 wirelog_session_create
+wirelog_session_create_with_snapshot
 wirelog_session_destroy
 wirelog_session_insert
 wirelog_session_insert_typed

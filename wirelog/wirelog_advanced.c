@@ -425,10 +425,10 @@ resolve_backend(wirelog_backend_kind_t kind)
     }
 }
 
-wirelog_error_t
-wirelog_session_create(wirelog_program_t *program,
+static wirelog_error_t
+wirelog_session_create_impl(wirelog_program_t *program,
     wirelog_backend_kind_t backend, uint32_t num_workers,
-    wirelog_session_t **out)
+    wirelog_extension_snapshot_t *snapshot, wirelog_session_t **out)
 {
     if (!out)
         return WIRELOG_ERR_EXEC;
@@ -449,8 +449,8 @@ wirelog_session_create(wirelog_program_t *program,
     }
 
     wl_session_t *inner = NULL;
-    rc = wl_session_create(be, plan, num_workers > 0 ? num_workers : 1,
-            &inner);
+    rc = wl_session_create_with_snapshot(be, plan,
+            num_workers > 0 ? num_workers : 1, snapshot, &inner);
     if (rc != 0 || !inner) {
         wl_plan_free(plan);
         return (rc == ENOMEM) ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC;
@@ -480,6 +480,24 @@ wirelog_session_create(wirelog_program_t *program,
     s->inner = inner;
     *out = s;
     return WIRELOG_OK;
+}
+
+wirelog_error_t
+wirelog_session_create(wirelog_program_t *program,
+    wirelog_backend_kind_t backend, uint32_t num_workers,
+    wirelog_session_t **out)
+{
+    return wirelog_session_create_impl(program, backend, num_workers, NULL,
+               out);
+}
+
+wirelog_error_t
+wirelog_session_create_with_snapshot(wirelog_program_t *program,
+    wirelog_backend_kind_t backend, uint32_t num_workers,
+    wirelog_extension_snapshot_t *snapshot, wirelog_session_t **out)
+{
+    return wirelog_session_create_impl(program, backend, num_workers,
+               snapshot, out);
 }
 
 void
