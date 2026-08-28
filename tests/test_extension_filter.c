@@ -87,6 +87,35 @@ run_filter_case(const uint8_t *buf, uint32_t size,
 }
 
 static int
+run_map_error_case(const uint8_t *buf, uint32_t size,
+    wl_col_session_t *session, int expected_rc)
+{
+    col_rel_t *input = col_rel_new_auto("input", 1);
+    wl_plan_expr_buffer_t expression = { (uint8_t *)buf, size };
+    wl_plan_op_t op = { 0 };
+    eval_stack_t stack;
+    int64_t row = 1;
+    int rc;
+
+    if (!input || col_rel_append_row(input, &row) != 0) {
+        col_rel_destroy(input);
+        return check(0, "map input allocation");
+    }
+    op.map_exprs = &expression;
+    op.map_expr_count = 1;
+    op.project_count = 1;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, input, true);
+    rc = col_op_map(&op, &stack, session);
+    while (stack.top > 0) {
+        eval_entry_t entry = eval_stack_pop(&stack);
+        if (entry.owned)
+            col_rel_destroy(entry.rel);
+    }
+    return check(rc == expected_rc, "map preserves extension status");
+}
+
+static int
 check(int condition, const char *message)
 {
     if (!condition)
@@ -382,6 +411,17 @@ main(void)
     size = put_call(buf, 0, "test.pred", 0);
     failures += run(buf, size, &ctx, &value,
             WL_COLUMNAR_EXPR_ARITY_MISMATCH);
+
+    /* MAP/head must preserve the evaluator's extension status for its
+    * coordinator instead of collapsing missing addons into ERANGE. */
+    {
+        wl_col_session_t map_session = { 0 };
+        map_session.base.extension_snapshot = snapshot;
+        size = put_bool(buf, 0, 1);
+        size = put_call(buf, size, "missing.pred", 1);
+        failures += run_map_error_case(buf, size, &map_session,
+                WL_COLUMNAR_EXPR_MISSING_EXTENSION);
+    }
 
     /* The acquired snapshot keeps the unregistered callback alive. */
     failures += check(wirelog_extension_unregister(registry, "test.pred") == 0,
