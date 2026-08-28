@@ -1441,6 +1441,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Step 2: Set identity fields */
     out_worker->worker_id = worker_id;
     out_worker->coordinator = coordinator;
+    out_worker->extension_expr_status = 0;
 
     /* Prevent accidental wl_session_destroy on stack-allocated worker */
     out_worker->base.backend = NULL;
@@ -2087,6 +2088,7 @@ col_session_step(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
     const wl_plan_t *plan = sess->plan;
+    sess->extension_expr_status = 0;
 
     if (sess->delta_cb && !sess->pending_input_change
         && sess->last_inserted_relation == NULL

@@ -274,6 +274,8 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         col_rel_destroy(out);
                         if (e.owned)
                             col_rel_destroy(e.rel);
+                        if (sess)
+                            sess->extension_expr_status = expr_status;
                         return expr_status;
                     }
                     tmp[c] = val;

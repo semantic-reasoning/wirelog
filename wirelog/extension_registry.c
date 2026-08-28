@@ -40,12 +40,28 @@ struct wirelog_extension_snapshot {
     bool *destroy_entries;
 };
 
-static void
+void
 wl_extension_error_set(const char *message)
 {
     if (!message) message = "";
     strncpy(wl_extension_error, message, sizeof(wl_extension_error) - 1);
     wl_extension_error[sizeof(wl_extension_error) - 1] = '\0';
+}
+
+void
+wl_extension_error_set_expr_status(int status)
+{
+    switch (status) {
+    case 2: wl_extension_error_set("malformed scalar extension call"); break;
+    case 3: wl_extension_error_set("scalar extension is missing"); break;
+    case 4: wl_extension_error_set("scalar extension arity mismatch"); break;
+    case 5: wl_extension_error_set("scalar extension type mismatch"); break;
+    case 6: wl_extension_error_set("scalar extension callback failed"); break;
+    case 7: wl_extension_error_set(
+            "scalar extension returned an invalid result"); break;
+    case 8: wl_extension_error_set("scalar extension allocation failed"); break;
+    default: break;
+    }
 }
 
 static char *

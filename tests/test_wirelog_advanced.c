@@ -195,6 +195,8 @@ test_public_map_extension_execution(void)
     if (!rc && wirelog_session_snapshot(session, capture_public_map_rows,
         &rows) != WIRELOG_ERR_EXEC)
         rc = 1;
+    if (!rc && !strstr(wirelog_extension_last_error(), "callback"))
+        rc = 1;
     if (rows.rows != 0)
         rc = 1;
 
