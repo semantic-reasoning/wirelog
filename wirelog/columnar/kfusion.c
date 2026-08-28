@@ -244,6 +244,9 @@ col_rel_merge_k(col_rel_t **relations, uint32_t k)
 static int
 col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst)
 {
+    size_t head_bytes = 0;
+    size_t next_bytes = 0;
+
     memset(dst, 0, sizeof(*dst));
 
     dst->rel_name = wl_strdup(src->rel_name);
@@ -269,13 +272,21 @@ col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst)
     dst->arr.content_hash = src->arr.content_hash;
     dst->arr.nbuckets = src->arr.nbuckets;
     dst->arr.ht_cap = src->arr.ht_cap;
+    dst->arr.generation = src->arr.generation;
     /* Issue #216: copy LRU metadata so worker clones inherit access state. */
     dst->lru_clock = src->lru_clock;
     dst->mem_bytes = src->mem_bytes;
 
     if (src->arr.nbuckets > 0 && src->arr.ht_head) {
+        head_bytes = (size_t)src->arr.nbuckets * sizeof(uint64_t);
+        if (head_bytes / sizeof(uint64_t) != src->arr.nbuckets) {
+            free(dst->key_cols);
+            free(dst->rel_name);
+            memset(dst, 0, sizeof(*dst));
+            return ENOMEM;
+        }
         dst->arr.ht_head
-            = (uint32_t *)malloc(src->arr.nbuckets * sizeof(uint32_t));
+            = (uint64_t *)malloc(head_bytes);
         if (!dst->arr.ht_head) {
             free(dst->key_cols);
             free(dst->rel_name);
@@ -283,12 +294,20 @@ col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst)
             return ENOMEM;
         }
         memcpy(dst->arr.ht_head, src->arr.ht_head,
-            src->arr.nbuckets * sizeof(uint32_t));
+            head_bytes);
     }
 
     if (src->arr.ht_cap > 0 && src->arr.ht_next) {
+        next_bytes = (size_t)src->arr.ht_cap * sizeof(uint32_t);
+        if (next_bytes / sizeof(uint32_t) != src->arr.ht_cap) {
+            free(dst->arr.ht_head);
+            free(dst->key_cols);
+            free(dst->rel_name);
+            memset(dst, 0, sizeof(*dst));
+            return ENOMEM;
+        }
         dst->arr.ht_next
-            = (uint32_t *)malloc(src->arr.ht_cap * sizeof(uint32_t));
+            = (uint32_t *)malloc(next_bytes);
         if (!dst->arr.ht_next) {
             free(dst->arr.ht_head);
             free(dst->key_cols);
@@ -297,7 +316,7 @@ col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst)
             return ENOMEM;
         }
         memcpy(dst->arr.ht_next, src->arr.ht_next,
-            src->arr.ht_cap * sizeof(uint32_t));
+            next_bytes);
     }
 
     return 0;

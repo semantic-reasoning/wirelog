@@ -448,7 +448,8 @@ test_float_typed_arrangement_probe(void)
     arr.key_count = 1;
     arr.nbuckets = 16;
     arr.ht_cap = rel->nrows;
-    arr.ht_head = (uint32_t *)malloc(arr.nbuckets * sizeof(uint32_t));
+    arr.indexed_rows = rel->nrows;
+    arr.ht_head = (uint64_t *)malloc(arr.nbuckets * sizeof(uint64_t));
     arr.ht_next = (uint32_t *)malloc(arr.ht_cap * sizeof(uint32_t));
     if (!arr.ht_head || !arr.ht_next) {
         printf("  FAIL arrangement allocation\n");
@@ -459,12 +460,12 @@ test_float_typed_arrangement_probe(void)
         return;
     }
     for (uint32_t i = 0; i < arr.nbuckets; i++)
-        arr.ht_head[i] = UINT32_MAX;
+        arr.ht_head[i] = UINT64_C(0xFFFFFFFF);
     uint32_t hashes[2];
     arr_hash_rows_batch(rel, 0, rel->nrows, key_cols, 1, hashes);
     for (uint32_t row = 0; row < rel->nrows; row++) {
         uint32_t bucket = hashes[row] & (arr.nbuckets - 1u);
-        arr.ht_next[row] = arr.ht_head[bucket];
+        arr.ht_next[row] = (uint32_t)arr.ht_head[bucket];
         arr.ht_head[bucket] = row;
     }
     uint32_t row = col_arrangement_find_first_typed(&arr, rel, negative_zero);

@@ -186,6 +186,10 @@ test_lru_clock_and_mem_bytes(void)
     ASSERT(entry != NULL, "entry must exist after get_arrangement");
     ASSERT(entry->lru_clock > 0, "lru_clock must be > 0 after first access");
     ASSERT(entry->mem_bytes > 0, "mem_bytes must be > 0 after build");
+    ASSERT(entry->mem_bytes
+        == (size_t)arr1->nbuckets * sizeof(uint64_t)
+        + (size_t)arr1->ht_cap * sizeof(uint32_t),
+        "mem_bytes must include tagged bucket heads and chain storage");
     ASSERT(cs->arr_total_bytes >= entry->mem_bytes,
         "arr_total_bytes must include entry mem_bytes");
 

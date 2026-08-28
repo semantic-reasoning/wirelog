@@ -225,7 +225,8 @@ typedef struct {
  * Rows are hashed into `nbuckets` buckets using FNV-1a over the key values.
  *
  * The hash table uses chaining (separate lists per bucket):
- *   ht_head[bucket]  UINT32_MAX = empty; else = first row index in chain
+ *   ht_head[bucket]  upper 32 bits = generation, lower 32 bits = row index
+ *                    UINT32_MAX row index = empty
  *   ht_next[row]     UINT32_MAX = end of chain; else = next row in chain
  *
  * `indexed_rows` tracks how many rows from the relation are currently
@@ -233,16 +234,22 @@ typedef struct {
  *
  * `content_hash` stores a fingerprint of the relation when last rebuilt
  * (reserved for future staleness detection; currently unused).
+ *
+ * Arrangement rebuild and probe operations are session-owned.  Worker
+ * sessions use independent clones, so a rebuild is never concurrent with a
+ * probe of the same arrangement; the tagged 64-bit head is not a published
+ * cross-thread atomic value.
  */
 typedef struct {
     uint32_t *key_cols;    /* owned, column positions in the relation     */
     uint32_t key_count;    /* number of key columns                       */
     uint32_t nbuckets;     /* hash table size (power of 2)                */
-    uint32_t *ht_head;     /* owned, size=nbuckets; UINT32_MAX=empty      */
+    uint64_t *ht_head;     /* owned, tagged generation + row index        */
     uint32_t *ht_next;     /* owned, size=capacity; UINT32_MAX=end        */
     uint32_t ht_cap;       /* allocated size of ht_next[]                 */
     uint32_t indexed_rows; /* rows indexed so far                         */
     uint64_t content_hash; /* fingerprint at last full rebuild (reserved) */
+    uint32_t generation;   /* current bucket epoch; zero means unbuilt    */
 } col_arrangement_t;
 
 /**

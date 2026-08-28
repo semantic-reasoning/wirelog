@@ -21,6 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define ARR_HEAD_ROW(value) ((uint32_t)((value) & UINT64_C(0xFFFFFFFF)))
+#define ARR_HEAD_GENERATION(value) ((uint32_t)((value) >> 32))
+#define ARR_MAKE_HEAD(generation, row) \
+        (((uint64_t)(generation) << 32) | (uint64_t)(row))
+
 /* ======================================================================== */
 /* Arrangement Layer (Phase 3C)                                             */
 /* ======================================================================== */
@@ -107,7 +112,8 @@ arr_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
  * arr_index_rows:
  * Hash rows [@begin, @nrows) in batches and prepend each to its bucket chain.
  *
- * Chains use a UINT32_MAX empty sentinel and store the row index directly.
+ * Chains use a UINT32_MAX empty sentinel and store the row index in the low
+ * half of a tagged bucket head.
  * Rows are inserted in ascending order exactly as the per-row loop did, so
  * chain order is preserved bucket for bucket.
  *
@@ -131,8 +137,11 @@ arr_index_rows(col_arrangement_t *arr, const col_rel_t *rel, uint32_t begin,
         for (uint32_t j = 0; j < chunk; j++) {
             uint32_t row = base + j;
             uint32_t bucket = scratch[j] & (nbuckets - 1);
-            arr->ht_next[row] = arr->ht_head[bucket];
-            arr->ht_head[bucket] = row;
+            uint64_t head = arr->ht_head[bucket];
+            if (ARR_HEAD_GENERATION(head) != arr->generation)
+                head = ARR_MAKE_HEAD(arr->generation, UINT32_MAX);
+            arr->ht_next[row] = ARR_HEAD_ROW(head);
+            arr->ht_head[bucket] = ARR_MAKE_HEAD(arr->generation, row);
         }
 
         /* Advance by the clamped chunk so base cannot wrap past UINT32_MAX. */
@@ -177,6 +186,21 @@ arr_next_pow2(uint32_t n)
     return n + 1u;
 }
 
+static bool
+arr_memory_bytes(const col_arrangement_t *arr, size_t *out)
+{
+    size_t head_bytes = (size_t)arr->nbuckets * sizeof(uint64_t);
+    size_t next_bytes = (size_t)arr->ht_cap * sizeof(uint32_t);
+    if ((arr->nbuckets != 0
+        && head_bytes / sizeof(uint64_t) != arr->nbuckets)
+        || (arr->ht_cap != 0
+        && next_bytes / sizeof(uint32_t) != arr->ht_cap)
+        || head_bytes > SIZE_MAX - next_bytes)
+        return false;
+    *out = head_bytes + next_bytes;
+    return true;
+}
+
 /*
  * arr_free_contents: free hash table arrays only.
  * key_cols is NOT freed here — it is always owned by the registry entry
@@ -194,6 +218,7 @@ arr_free_contents(col_arrangement_t *arr)
     arr->nbuckets = 0;
     arr->ht_cap = 0;
     arr->indexed_rows = 0;
+    arr->generation = 0;
 }
 
 /* Full rebuild: index all nrows rows in rel into arr. */
@@ -243,28 +268,61 @@ arr_build_full(col_arrangement_t *arr, const col_rel_t *rel)
     if (nbuckets == 0)
         return ENOMEM;
 
-    /* Reallocate bucket heads if size changed. */
-    if (nbuckets != arr->nbuckets) {
-        uint32_t *head = (uint32_t *)malloc(nbuckets * sizeof(uint32_t));
-        if (!head)
-            return ENOMEM;
-        free(arr->ht_head);
-        arr->ht_head = head;
-        arr->nbuckets = nbuckets;
-    }
-    memset(arr->ht_head, 0xFF, nbuckets * sizeof(uint32_t)); /* UINT32_MAX */
+    uint64_t *new_head = NULL;
+    uint32_t *new_next = NULL;
+    uint32_t new_cap = arr->ht_cap;
 
+    /* Prepare every potentially failing allocation before publishing any
+     * part of the new arrangement.  This keeps a failed rebuild usable. */
+    if (nbuckets != arr->nbuckets) {
+        size_t head_bytes = (size_t)nbuckets * sizeof(uint64_t);
+        if (nbuckets != 0 && head_bytes / sizeof(uint64_t) != nbuckets)
+            return ENOMEM;
+        new_head = (uint64_t *)malloc(head_bytes);
+        if (!new_head)
+            return ENOMEM;
+        /* Zero has generation zero, which cannot match a live generation. */
+        memset(new_head, 0, head_bytes);
+    }
     /* Grow chain array if needed. */
     if (nrows > arr->ht_cap) {
-        uint32_t new_cap = nrows > arr->ht_cap * 2u ? nrows : arr->ht_cap * 2u;
+        uint32_t doubled = arr->ht_cap > UINT32_MAX / 2u
+            ? UINT32_MAX : arr->ht_cap * 2u;
+        new_cap = nrows > doubled ? nrows : doubled;
         if (new_cap < 16u)
             new_cap = 16u;
-        uint32_t *nxt = (uint32_t *)malloc(new_cap * sizeof(uint32_t));
-        if (!nxt)
+        size_t next_bytes = (size_t)new_cap * sizeof(uint32_t);
+        if (new_cap != 0 && next_bytes / sizeof(uint32_t) != new_cap) {
+            free(new_head);
             return ENOMEM;
+        }
+        new_next = (uint32_t *)malloc(next_bytes);
+        if (!new_next) {
+            free(new_head);
+            return ENOMEM;
+        }
+    }
+
+    if (new_head) {
+        free(arr->ht_head);
+        arr->ht_head = new_head;
+        arr->nbuckets = nbuckets;
+    }
+    if (new_next) {
         free(arr->ht_next);
-        arr->ht_next = nxt;
+        arr->ht_next = new_next;
         arr->ht_cap = new_cap;
+    }
+
+    /* Start a new epoch.  Only wraparound needs a full clear; normal rebuilds
+     * lazily replace each bucket head as that bucket receives its first row. */
+    if (arr->generation == UINT32_MAX) {
+        memset(arr->ht_head, 0, nbuckets * sizeof(uint64_t));
+        arr->generation = 1;
+    } else {
+        arr->generation++;
+        if (arr->generation == 0)
+            arr->generation = 1;
     }
 
     arr_index_rows(arr, rel, 0, nrows, nbuckets);
@@ -428,15 +486,18 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
             continue;
 
         /* Found: update if stale. */
-        if (e->arr.indexed_rows == 0 && rel->nrows > 0) {
+        if (e->arr.indexed_rows == 0) {
             /* Deduct stale bytes before rebuild; restore on failure. */
             cs->arr_total_bytes -= e->mem_bytes;
             if (arr_build_full(&e->arr, rel) != 0) {
                 cs->arr_total_bytes += e->mem_bytes;
                 return NULL;
             }
-            e->mem_bytes = (size_t)e->arr.nbuckets * sizeof(uint32_t)
-                + (size_t)e->arr.ht_cap * sizeof(uint32_t);
+            if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
+                arr_free_contents(&e->arr);
+                e->mem_bytes = 0;
+                return NULL;
+            }
             cs->arr_total_bytes += e->mem_bytes;
         } else if (e->arr.indexed_rows < rel->nrows) {
             uint32_t old = e->arr.indexed_rows;
@@ -445,8 +506,11 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
                 cs->arr_total_bytes += e->mem_bytes; /* restore on failure */
                 return NULL;
             }
-            e->mem_bytes = (size_t)e->arr.nbuckets * sizeof(uint32_t)
-                + (size_t)e->arr.ht_cap * sizeof(uint32_t);
+            if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
+                arr_free_contents(&e->arr);
+                e->mem_bytes = 0;
+                return NULL;
+            }
             cs->arr_total_bytes += e->mem_bytes;
         }
         /* Bump LRU clock on every access. */
@@ -517,7 +581,7 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
     e->arr.key_count = key_count;
 
     /* Initial build. */
-    if (rel->nrows > 0 && arr_build_full(&e->arr, rel) != 0) {
+    if (arr_build_full(&e->arr, rel) != 0) {
         free(e->rel_name);
         free(e->key_cols);
         memset(e, 0, sizeof(*e));
@@ -525,8 +589,15 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
             cs->arr_count--;
         return NULL;
     }
-    e->mem_bytes = (size_t)e->arr.nbuckets * sizeof(uint32_t)
-        + (size_t)e->arr.ht_cap * sizeof(uint32_t);
+    if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
+        arr_free_contents(&e->arr);
+        free(e->rel_name);
+        free(e->key_cols);
+        memset(e, 0, sizeof(*e));
+        if (slot == cs->arr_count - 1)
+            cs->arr_count--;
+        return NULL;
+    }
     cs->arr_total_bytes += e->mem_bytes;
     e->lru_clock = ++cs->arr_clock;
     return &e->arr;
@@ -537,14 +608,17 @@ col_arrangement_find_first(const col_arrangement_t *arr,
     int64_t *const *columns, uint32_t rel_ncols,
     const int64_t *key_row)
 {
-    if (!arr || !columns || !key_row || arr->nbuckets == 0)
+    if (!arr || !columns || !key_row || arr->nbuckets == 0
+        || arr->indexed_rows == 0)
         return UINT32_MAX;
 
     (void)rel_ncols; /* used for bounds checking in debug builds */
 
     uint32_t bucket
         = arr_hash_key(key_row, arr->key_cols, arr->key_count, arr->nbuckets);
-    uint32_t row = arr->ht_head[bucket];
+    uint64_t head = arr->ht_head[bucket];
+    uint32_t row = ARR_HEAD_GENERATION(head) == arr->generation
+        ? ARR_HEAD_ROW(head) : UINT32_MAX;
     while (row != UINT32_MAX) {
         bool match = true;
         for (uint32_t k = 0; k < arr->key_count; k++) {
@@ -565,12 +639,15 @@ uint32_t
 col_arrangement_find_first_typed(const col_arrangement_t *arr,
     const col_rel_t *rel, const int64_t *key_row)
 {
-    if (!arr || !rel || !rel->columns || !key_row || arr->nbuckets == 0)
+    if (!arr || !rel || !rel->columns || !key_row || arr->nbuckets == 0
+        || arr->indexed_rows == 0)
         return UINT32_MAX;
 
     uint32_t bucket = arr_hash_key_typed(rel, key_row, arr->key_cols,
             arr->key_count, arr->nbuckets);
-    uint32_t row = arr->ht_head[bucket];
+    uint64_t head = arr->ht_head[bucket];
+    uint32_t row = ARR_HEAD_GENERATION(head) == arr->generation
+        ? ARR_HEAD_ROW(head) : UINT32_MAX;
     while (row != UINT32_MAX) {
         bool match = true;
         for (uint32_t k = 0; k < arr->key_count; k++) {
