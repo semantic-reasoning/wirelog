@@ -935,6 +935,7 @@ public_standalone_headers = [
   ['wirelog_easy',      'test_standalone_wirelog_easy.c'],
   ['wirelog_advanced',  'test_standalone_wirelog_advanced.c'],
   ['io_adapter',        'test_standalone_io_adapter.c'],
+  ['wirelog_extension', 'test_standalone_wirelog_extension.c'],
 ]
 foreach hdr : public_standalone_headers
   exe = executable(
@@ -5031,6 +5032,18 @@ test_io_adapter_exe = executable(
   install: false,
 )
 test('io_adapter', test_io_adapter_exe)
+
+# Scalar addon registry ABI/lifecycle core (Issue #1245, first atomic unit).
+test_extension_registry_exe = executable(
+  'test_extension_registry',
+  files('test_extension_registry.c', '../wirelog/extension_registry.c'),
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
+  dependencies: [threads_dep],
+  install: false,
+)
+test('extension_registry', test_extension_registry_exe)
 
 # ============================================================================
 # I/O Context Accessor Tests (#452)

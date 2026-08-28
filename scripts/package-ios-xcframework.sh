@@ -117,9 +117,11 @@ archive_for() {
 copy_headers() {
     local build_dir="$1"
     local headers_dir="$2"
+    local header
+    local basename
 
     rm -rf "$headers_dir"
-    mkdir -p "$headers_dir/io"
+    mkdir -p "$headers_dir/io" "$headers_dir/wirelog/io"
 
     for header in \
         wirelog/wirelog.h \
@@ -129,12 +131,45 @@ copy_headers() {
         wirelog/wirelog-optimizer.h \
         wirelog/wirelog-export.h \
         wirelog/wirelog-easy.h \
-        wirelog/wirelog-advanced.h; do
-        cp "$repo_root/$header" "$headers_dir/"
+        wirelog/wirelog-advanced.h \
+        wirelog/wirelog-extension.h; do
+        basename="${header##*/}"
+        cp "$repo_root/$header" "$headers_dir/$basename"
+        cp "$repo_root/$header" "$headers_dir/wirelog/$basename"
     done
     cp "$repo_root/wirelog/io/io_adapter.h" "$headers_dir/io/"
-    cp "$build_dir/wirelog/wirelog-version.h" "$headers_dir/"
+    cp "$repo_root/wirelog/io/io_adapter.h" "$headers_dir/wirelog/io/"
+    cp "$build_dir/wirelog/wirelog-version.h" "$headers_dir/wirelog-version.h"
+    cp "$build_dir/wirelog/wirelog-version.h" "$headers_dir/wirelog/wirelog-version.h"
     cp "$repo_root/wirelog/module.modulemap" "$headers_dir/"
+}
+
+validate_header_layout() {
+    local headers_dir="$1"
+    local header
+    local basename
+    local public_headers=(
+        wirelog/wirelog.h
+        wirelog/wirelog-types.h
+        wirelog/wirelog-ir.h
+        wirelog/wirelog-parser.h
+        wirelog/wirelog-optimizer.h
+        wirelog/wirelog-export.h
+        wirelog/wirelog-easy.h
+        wirelog/wirelog-advanced.h
+        wirelog/wirelog-extension.h
+    )
+
+    for header in "${public_headers[@]}"; do
+        basename="${header##*/}"
+        test -f "$headers_dir/$basename"
+        test -f "$headers_dir/wirelog/$basename"
+    done
+    test -f "$headers_dir/io/io_adapter.h"
+    test -f "$headers_dir/wirelog/io/io_adapter.h"
+    test -f "$headers_dir/wirelog-version.h"
+    test -f "$headers_dir/wirelog/wirelog-version.h"
+    test -f "$headers_dir/module.modulemap"
 }
 
 validate_xcframework() {
@@ -178,7 +213,9 @@ lipo -create \
     -output "$sim_lib"
 
 copy_headers "$device_build" "$device_headers"
+validate_header_layout "$device_headers"
 copy_headers "$sim_arm64_build" "$sim_headers"
+validate_header_layout "$sim_headers"
 
 xcodebuild -create-xcframework \
     -library "$device_lib" \

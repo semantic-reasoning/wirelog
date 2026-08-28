@@ -445,6 +445,7 @@ wirelog_sources += wirelog_backend_src
 wirelog_sources += wirelog_crc32_src
 wirelog_sources += wirelog_workqueue_src
 wirelog_sources += wirelog_io_src
+wirelog_sources += wirelog_extension_src
 wirelog_sources += wirelog_string_ops_src
 wirelog_sources += wirelog_wl_easy_src
 wirelog_sources += wirelog_advanced_src
@@ -461,6 +462,7 @@ wirelog_public_headers = [
   'wirelog/wirelog-export.h',
   'wirelog/wirelog-easy.h',
   'wirelog/wirelog-advanced.h',
+  'wirelog/wirelog-extension.h',
 ]
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==

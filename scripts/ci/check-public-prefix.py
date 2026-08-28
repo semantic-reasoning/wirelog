@@ -54,6 +54,7 @@ PUBLIC_HEADERS = (
     "wirelog/wirelog-export.h",
     "wirelog/wirelog-easy.h",
     "wirelog/wirelog-advanced.h",
+    "wirelog/wirelog-extension.h",
     "wirelog/io/io_adapter.h",
 )
 
