@@ -554,8 +554,10 @@ cleanup:
  */
 static int
 col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
-    wl_col_session_t *sess, bool adaptive_parallel)
+    wl_col_session_t *sess, bool adaptive_parallel, bool *parallel_executed)
 {
+    if (parallel_executed)
+        *parallel_executed = false;
     if (!op->opaque_data)
         return EINVAL;
 
@@ -639,6 +641,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         free(live_indices);
         return col_op_k_fusion_serial(op, stack, sess);
     }
+    if (parallel_executed)
+        *parallel_executed = true;
 
     col_rel_t **results = (col_rel_t **)calloc(live_count, sizeof(col_rel_t *));
     col_op_k_fusion_worker_t *workers = (col_op_k_fusion_worker_t *)calloc(
@@ -1007,7 +1011,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     if (k == 0)
         return EINVAL;
     if (k >= WL_KFUSION_MIN_PARALLEL_K)
-        return col_op_k_fusion_dispatch(op, stack, sess, false);
+        return col_op_k_fusion_dispatch(op, stack, sess, false, NULL);
 
     /* Preserve the established serial safety cases and avoid allocating
      * policy state in worker sessions. */
@@ -1030,10 +1034,15 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_kfusion_adaptive_decision_t decision = wl_kfusion_adaptive_begin(
         sess->kfusion_adaptive, meta, k, sess->num_workers, size_class);
     uint64_t started = now_ns();
+    bool parallel_executed = false;
     int rc = decision == WL_KFUSION_ADAPTIVE_DECISION_PARALLEL
-        ? col_op_k_fusion_dispatch(op, stack, sess, true)
+        ? col_op_k_fusion_dispatch(op, stack, sess, true,
+            &parallel_executed)
         : col_op_k_fusion_serial(op, stack, sess);
     uint64_t elapsed = now_ns() - started;
+    if (decision == WL_KFUSION_ADAPTIVE_DECISION_PARALLEL
+        && !parallel_executed)
+        decision = WL_KFUSION_ADAPTIVE_DECISION_SERIAL;
     wl_kfusion_adaptive_observe(sess->kfusion_adaptive, meta, k,
         sess->num_workers, size_class, decision, elapsed, rc == 0);
     return rc;
