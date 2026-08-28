@@ -1371,6 +1371,24 @@ convert_expr(const wl_parser_ast_node_t *node)
         }
         return e;
     }
+    case WL_PARSER_AST_NODE_EXTENSION_CALL: {
+        wl_ir_expr_t *e = wl_ir_expr_create(WL_IR_EXPR_EXTENSION_CALL);
+        if (!e)
+            return NULL;
+        e->extension_name = strdup_safe(node->name);
+        if (!e->extension_name) {
+            wl_ir_expr_free(e);
+            return NULL;
+        }
+        for (uint32_t ci = 0; ci < node->child_count; ci++) {
+            wl_ir_expr_t *child = convert_expr(node->children[ci]);
+            if (!child || !ir_expr_attach(e, child)) {
+                wl_ir_expr_free(e);
+                return NULL;
+            }
+        }
+        return e;
+    }
     default:
         return NULL;
     }
@@ -2744,16 +2762,26 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     }
 
     uint32_t scan_count = 0;
+    wirelog_ir_node_t *current = NULL;
+    char **cur_vars = NULL;
+    uint32_t cur_vcount = 0;
+    bool cur_vars_is_merged = false;
     for (uint32_t i = 1; i < rule_node->child_count; i++) {
         const wl_parser_ast_node_t *b = rule_node->children[i];
         if (!b)
             continue;
         if (b->type == WL_PARSER_AST_NODE_EXTENSION_CALL) {
-            wl_ir_program_set_error(prog,
-                "scalar extension call '%s' is not executable yet in rule "
-                "'%s'", b->name ? b->name : "?",
-                head->name ? head->name : "?");
-            goto conversion_failed;
+            if (scan_count == 0) {
+                wl_ir_program_set_error(prog,
+                    "scalar extension call '%s' appears before any relation "
+                    "scan in rule '%s'; place it after a positive relation "
+                    "atom", b->name ? b->name : "?",
+                    head->name ? head->name : "?");
+                goto conversion_failed;
+            }
+            /* Extension calls are predicates.  They do not contribute a
+             * relation scan; Step 3 lowers them into a FILTER expression. */
+            continue;
         }
         if (b->type == WL_PARSER_AST_NODE_ATOM) {
             WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_DEBUG,
@@ -2803,11 +2831,6 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
     }
 
     /* ---- Step 2: JOIN across multiple scans ---- */
-
-    wirelog_ir_node_t *current = NULL;
-    char **cur_vars = NULL;
-    uint32_t cur_vcount = 0;
-    bool cur_vars_is_merged = false;
 
     if (scan_count == 1) {
         current = scans[0];
@@ -3028,6 +3051,27 @@ convert_rule(const wl_parser_ast_node_t *rule_node,
             } else {
                 current = f;
             }
+        } else if (b->type == WL_PARSER_AST_NODE_EXTENSION_CALL && current) {
+            wirelog_ir_node_t *f = wl_ir_node_create(WIRELOG_IR_FILTER);
+            if (!f) {
+                wl_ir_program_set_error(prog,
+                    "allocation failed while creating an extension filter in "
+                    "rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
+            }
+            f->filter_expr = convert_expr(b);
+            if (!f->filter_expr) {
+                wl_ir_node_free(f);
+                wl_ir_program_set_error(prog,
+                    "allocation failed while converting extension filter in "
+                    "rule '%s'", head->name ? head->name : "?");
+                goto conversion_failed;
+            }
+            if (wl_ir_node_add_child(f, current) != 0) {
+                wl_ir_node_free(f);
+                goto conversion_failed;
+            }
+            current = f;
         }
     }
 

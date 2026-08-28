@@ -1063,7 +1063,8 @@ test('optimizer_equivalence', test_optimizer_equivalence_exe, suite: 'optimizer'
 
 test_plan_gen_exe = executable(
   'test_plan_gen',
-  files('test_plan_gen.c'),
+  files('test_plan_gen.c', '../wirelog/api_facade.c',
+        '../wirelog/extension_registry.c'),
   parser_src,
   ir_src,
   optimizer_src,
@@ -1074,7 +1075,8 @@ test_plan_gen_exe = executable(
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: ['-DWIRELOG_TEST_DELTA_NAME'],
+  c_args: ['-DWIRELOG_TEST_DELTA_NAME',
+           '-DWIRELOG_TEST_EXTENSION_SERIALIZATION'],
 )
 
 test('plan_gen', test_plan_gen_exe)

@@ -239,6 +239,19 @@ expr_buf_push_u16(expr_buf_t *buf, uint16_t v)
 }
 
 static int
+expr_buf_push_u32(expr_buf_t *buf, uint32_t v)
+{
+    if (expr_buf_ensure(buf, 4) != 0)
+        return -1;
+    /* little-endian */
+    for (uint32_t i = 0; i < 4; i++) {
+        buf->data[buf->size++] = (uint8_t)(v & 0xFF);
+        v >>= 8;
+    }
+    return 0;
+}
+
+static int
 expr_buf_push_i64(expr_buf_t *buf, int64_t v)
 {
     if (expr_buf_ensure(buf, 8) != 0)
@@ -732,6 +745,7 @@ expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
     case WL_IR_EXPR_BOOL:
     case WL_IR_EXPR_CMP:
     case WL_IR_EXPR_AGG:
+    case WL_IR_EXPR_EXTENSION_CALL:
         return WL_IR_COLTYPE_SCALAR;
 
     case WL_IR_EXPR_CONST_FLOAT:
@@ -774,6 +788,60 @@ expr_result_type(const wl_ir_expr_t *expr, const col_ctx_t *ctx)
     }
 
     return WL_IR_COLTYPE_UNKNOWN;
+}
+
+static bool
+expr_contains_extension_call(const wl_ir_expr_t *expr)
+{
+    if (!expr)
+        return false;
+    if (expr->type == WL_IR_EXPR_EXTENSION_CALL)
+        return true;
+    for (uint32_t i = 0; i < expr->child_count; i++) {
+        if (expr_contains_extension_call(expr->children[i]))
+            return true;
+    }
+    return false;
+}
+
+static int
+validate_extension_plan_context(const wirelog_ir_node_t *node,
+    struct wirelog_program *prog)
+{
+    if (!node)
+        return 0;
+
+    if ((node->type == WIRELOG_IR_FILTER
+        || node->type == WIRELOG_IR_FLATMAP)
+        && expr_contains_extension_call(node->filter_expr)) {
+        set_plan_error(prog,
+            "scalar extension call in FILTER/FLATMAP is not executable until "
+            "the evaluator extension unit is implemented");
+        return -1;
+    }
+    if (node->type == WIRELOG_IR_AGGREGATE
+        && expr_contains_extension_call(node->agg_expr)) {
+        set_plan_error(prog,
+            "scalar extension call in aggregate expression is not supported "
+            "by the current evaluator");
+        return -1;
+    }
+    if (node->type == WIRELOG_IR_PROJECT) {
+        for (uint32_t i = 0; i < node->project_count; i++) {
+            if (node->project_exprs
+                && expr_contains_extension_call(node->project_exprs[i])) {
+                set_plan_error(prog,
+                    "scalar extension call in MAP/head expression is not "
+                    "supported by the current evaluator");
+                return -1;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        if (validate_extension_plan_context(node->children[i], prog) != 0)
+            return -1;
+    }
+    return 0;
 }
 
 /**
@@ -872,6 +940,25 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         if (expr_buf_push_u8(buf, WL_PLAN_EXPR_BOOL) != 0)
             return -1;
         return expr_buf_push_u8(buf, expr->bool_value ? 1 : 0);
+
+    case WL_IR_EXPR_EXTENSION_CALL: {
+        if (!expr->extension_name)
+            return -1;
+        size_t name_len = strlen(expr->extension_name);
+        if (name_len > UINT16_MAX)
+            return -1;
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+            if (serialize_expr(buf, expr->children[i], ctx) != 0)
+                return -1;
+        }
+        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_EXTENSION_CALL) != 0
+            || expr_buf_push_u16(buf, (uint16_t)name_len) != 0
+            || expr_buf_push_bytes(buf, (const uint8_t *)expr->extension_name,
+            (uint32_t)name_len) != 0
+            || expr_buf_push_u32(buf, expr->child_count) != 0)
+            return -1;
+        return 0;
+    }
 
     case WL_IR_EXPR_ARITH: {
         wl_ir_coltype_t t0 = (expr->child_count > 0)
@@ -978,6 +1065,16 @@ serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, const col_ctx_t *ctx,
     out_buf->size = buf.size;
     return 0;
 }
+
+#ifdef WIRELOG_TEST_EXTENSION_SERIALIZATION
+int
+wl_exec_plan_gen_serialize_expr_for_test(const wl_ir_expr_t *expr,
+    wl_plan_expr_buffer_t *out)
+{
+    col_ctx_t ctx = { 0 };
+    return serialize_expr_to_buffer_ctx(expr, &ctx, out);
+}
+#endif
 
 /* ======================================================================== */
 /* Operator list builder                                                    */
@@ -1476,6 +1573,15 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
     if (nfilts == 0)
         return node;
 
+    for (uint32_t i = 0; i < nfilts; i++) {
+        if (expr_contains_extension_call(filt_exprs[i])) {
+            /* Right-filter expressions are evaluated by join operators in a
+             * separate context.  Until callback execution is wired there,
+             * reject rather than emit a plan that silently ignores the call. */
+            return NULL;
+        }
+    }
+
     /* Resolve column names from the base SCAN for variable resolution */
     col_ctx_t ctx;
     collect_output_columns(node, &ctx);
@@ -1598,6 +1704,10 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             collect_output_columns(child0, &child_ctx);
             for (uint32_t i = 0; i < node->project_count; i++) {
                 if (node->project_exprs[i]) {
+                    if (expr_contains_extension_call(node->project_exprs[i])) {
+                        col_ctx_free(&child_ctx);
+                        return -1;
+                    }
                     if (serialize_expr_to_buffer_ctx(
                             node->project_exprs[i], &child_ctx,
                             &op->map_exprs[i])
@@ -1613,6 +1723,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     }
 
     case WIRELOG_IR_FILTER: {
+        if (expr_contains_extension_call(node->filter_expr))
+            return -1;
         /* Translate child first */
         if (node->child_count > 0) {
             if (translate_ir_node(node->children[0], ops) != 0)
@@ -1778,6 +1890,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
         op->group_by_count = node->group_by_count;
         op->aggregate_index = node->aggregate_index;
         if (node->agg_expr) {
+            if (expr_contains_extension_call(node->agg_expr))
+                return -1;
             const wirelog_ir_node_t *child0
                 = (node->child_count > 0) ? node->children[0] : NULL;
             col_ctx_t agg_ctx;
@@ -1885,6 +1999,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     }
 
     case WIRELOG_IR_FLATMAP: {
+        if (expr_contains_extension_call(node->filter_expr))
+            return -1;
         /* Decompose into FILTER + MAP per ARCHITECTURE.md:267 */
         /* Translate child (source) first */
         if (node->child_count > 0) {
@@ -1945,6 +2061,11 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                 collect_output_columns(child2, &child_ctx2);
                 for (uint32_t i = 0; i < node->project_count; i++) {
                     if (node->project_exprs[i]) {
+                        if (expr_contains_extension_call(
+                                node->project_exprs[i])) {
+                            col_ctx_free(&child_ctx2);
+                            return -1;
+                        }
                         if (serialize_expr_to_buffer_ctx(
                                 node->project_exprs[i], &child_ctx2,
                                 &map->map_exprs[i])
@@ -3747,6 +3868,19 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
         return -1;
 
     *out = NULL;
+
+    /* Extension-call bytecode is intentionally not executable until the
+     * evaluator context and callback status unit lands.  Reject every
+     * expression-bearing plan context up front, before an unsupported FILTER
+     * can be emitted as if it were executable. */
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        const wirelog_ir_node_t *root = prog->relation_irs
+            ? prog->relation_irs[i] : NULL;
+        if (!root)
+            continue;
+        if (validate_extension_plan_context(root, prog) != 0)
+            return -1;
+    }
 
     /* Issue #287/#962: plan generation emits WL_LOG diagnostics -- cmp_to_tag()
      * reports ordering comparisons that fall back to intern-id order -- and it
