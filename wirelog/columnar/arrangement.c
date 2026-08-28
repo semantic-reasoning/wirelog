@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ARR_HEAD_ROW(value) ((uint32_t)((value) & UINT64_C(0xFFFFFFFF)))
+#define ARR_HEAD_ROW(value) ((uint32_t)((value)&UINT64_C(0xFFFFFFFF)))
 #define ARR_HEAD_GENERATION(value) ((uint32_t)((value) >> 32))
 #define ARR_MAKE_HEAD(generation, row) \
         (((uint64_t)(generation) << 32) | (uint64_t)(row))
