@@ -141,6 +141,7 @@ endif
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
 wirelog_io_src = files('io/csv_reader.c', 'io/io_adapter.c', 'io/io_ctx.c', 'io/csv_adapter.c')
+wirelog_extension_src = files('extension_registry.c')
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #String Operations Module(Issue #143)

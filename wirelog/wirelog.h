@@ -37,7 +37,7 @@
  *
  * Individual sub-headers (wirelog-types.h, wirelog-parser.h,
  * wirelog-ir.h, wirelog-optimizer.h, wirelog-export.h, wirelog-easy.h,
- * wirelog-advanced.h, io/io_adapter.h) are still installed for
+ * wirelog-advanced.h, wirelog-extension.h, io/io_adapter.h) are still installed for
  * backwards compatibility but should not be included directly in
  * new code.
  */
@@ -344,6 +344,7 @@ wirelog_config_threads(void);
 #include "wirelog/wirelog-optimizer.h"
 #include "wirelog/wirelog-easy.h"
 #include "wirelog/wirelog-advanced.h"
+#include "wirelog/wirelog-extension.h"
 #include "wirelog/io/io_adapter.h"
 
 #endif /* WIRELOG_H */
