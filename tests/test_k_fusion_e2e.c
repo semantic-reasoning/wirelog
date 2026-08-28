@@ -538,6 +538,7 @@ test_k2_all_inactive_branches_preserve_target_schema(void)
     eval_stack_drain(&stack);
 
     col_rel_destroy(target);
+    wl_kfusion_adaptive_destroy(sess.kfusion_adaptive);
     free(sess.rels);
     session_rel_free_hash(&sess);
     PASS();
