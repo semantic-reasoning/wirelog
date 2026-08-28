@@ -1118,6 +1118,8 @@ typedef struct col_filt_arr_entry {
  */
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
+    /* base.extension_snapshot is borrowed from the coordinator in workers;
+     * col_worker_session_destroy must never release that reference. */
     const col_frontier_ops_t *frontier_ops; /* frontier vtable (#261)   */
     const col_rotation_ops_t *rotation_ops; /* rotation vtable (#600)   */
     const wl_plan_t *plan;     /* borrowed, lifetime: caller             */

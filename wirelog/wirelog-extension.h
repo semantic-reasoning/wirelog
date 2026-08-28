@@ -23,8 +23,9 @@ typedef struct wirelog_extension_registry wirelog_extension_registry_t;
 typedef struct wirelog_extension_snapshot wirelog_extension_snapshot_t;
 
 /*
- * Snapshot handles are caller-owned. The caller must keep each handle alive
- * while using it and must not release or use the same handle concurrently.
+ * Snapshot handles are reference-counted and may be shared by retaining them.
+ * The caller must keep a reference alive while using a handle and must not
+ * release or use the same handle concurrently with its final release.
  */
 
 typedef enum wirelog_extension_value_type {
@@ -74,6 +75,8 @@ wirelog_extension_unregister(wirelog_extension_registry_t *registry,
     const char *name);
 WIRELOG_API wirelog_extension_snapshot_t *
 wirelog_extension_snapshot_acquire(wirelog_extension_registry_t *registry);
+WIRELOG_API void
+wirelog_extension_snapshot_retain(wirelog_extension_snapshot_t *snapshot);
 WIRELOG_API void
 wirelog_extension_snapshot_release(wirelog_extension_snapshot_t *snapshot);
 WIRELOG_API const wirelog_extension_descriptor_t *

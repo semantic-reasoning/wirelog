@@ -28,6 +28,7 @@ extern "C" {
 #endif
 
 #include "backend.h"
+#include "wirelog/wirelog-extension.h"
 
 /*
  * Note: concrete session types embed wl_session_t as their first field,
@@ -37,6 +38,9 @@ extern "C" {
  */
 struct wl_session {
     const wl_compute_backend_t *backend;
+    /* Owned reference; workers borrow this pointer and never release it. */
+    wirelog_extension_snapshot_t *extension_snapshot;
+    bool owns_extension_snapshot;
 };
 
 /* Wrapper functions that delegate to the backend vtable */
@@ -66,6 +70,16 @@ struct wl_session {
 int
 wl_session_create(const wl_compute_backend_t *backend, const wl_plan_t *plan,
     uint32_t num_workers, wl_session_t **out);
+
+/**
+ * wl_session_create_with_snapshot:
+ * Create a session while retaining an optional scalar-addon snapshot.
+ * The caller retains ownership of its input reference.
+ */
+int
+wl_session_create_with_snapshot(const wl_compute_backend_t *backend,
+    const wl_plan_t *plan, uint32_t num_workers,
+    wirelog_extension_snapshot_t *snapshot, wl_session_t **out);
 
 /**
  * wl_session_destroy:

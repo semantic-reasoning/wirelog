@@ -4431,6 +4431,7 @@ test('e2e_asan_side_relation_nested', test_e2e_asan_side_relation_nested_exe,
 test_worker_session_exe = executable(
   'test_worker_session',
   files('test_worker_session.c'),
+  files('../wirelog/extension_registry.c'),
   backend_src,
   parser_src,
   ir_src,
@@ -5071,6 +5072,19 @@ test_extension_registry_exe = executable(
   install: false,
 )
 test('extension_registry', test_extension_registry_exe)
+
+# Session-owned extension snapshot lifetime (Issue #1250 atomic unit).
+test_session_extension_snapshot_exe = executable(
+  'test_session_extension_snapshot',
+  files('test_session_extension_snapshot.c',
+        '../wirelog/session.c', '../wirelog/extension_registry.c'),
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
+  dependencies: [threads_dep],
+  install: false,
+)
+test('session_extension_snapshot', test_session_extension_snapshot_exe)
 
 # ============================================================================
 # I/O Context Accessor Tests (#452)

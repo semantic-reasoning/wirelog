@@ -28,6 +28,15 @@ int
 wl_session_create(const wl_compute_backend_t *backend, const wl_plan_t *plan,
     uint32_t num_workers, wl_session_t **out)
 {
+    return wl_session_create_with_snapshot(backend, plan, num_workers, NULL,
+               out);
+}
+
+int
+wl_session_create_with_snapshot(const wl_compute_backend_t *backend,
+    const wl_plan_t *plan, uint32_t num_workers,
+    wirelog_extension_snapshot_t *snapshot, wl_session_t **out)
+{
     int rc;
     if (!backend || !backend->session_create || !out)
         return -1;
@@ -36,6 +45,11 @@ wl_session_create(const wl_compute_backend_t *backend, const wl_plan_t *plan,
     if (rc == 0 && *out) {
         /* Ensure the backend pointer is correctly bound */
         (*out)->backend = backend;
+        if (snapshot) {
+            wirelog_extension_snapshot_retain(snapshot);
+            (*out)->extension_snapshot = snapshot;
+            (*out)->owns_extension_snapshot = true;
+        }
     }
     return rc;
 }
@@ -43,9 +57,14 @@ wl_session_create(const wl_compute_backend_t *backend, const wl_plan_t *plan,
 void
 wl_session_destroy(wl_session_t *session)
 {
-    if (!session || !session->backend || !session->backend->session_destroy)
+    wirelog_extension_snapshot_t *snapshot;
+    if (!session)
         return;
-    session->backend->session_destroy(session);
+    snapshot = session->owns_extension_snapshot
+        ? session->extension_snapshot : NULL;
+    if (session->backend && session->backend->session_destroy)
+        session->backend->session_destroy(session);
+    wirelog_extension_snapshot_release(snapshot);
 }
 
 int

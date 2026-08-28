@@ -33,6 +33,7 @@ struct wirelog_extension_registry {
 
 struct wirelog_extension_snapshot {
     wirelog_extension_registry_t *registry;
+    size_t references;
     wl_extension_entry_t **entries;
     size_t count;
     size_t *pins;
@@ -287,7 +288,8 @@ wirelog_extension_snapshot_acquire(wirelog_extension_registry_t *registry)
         wl_extension_error_set("allocation failed");
         return NULL;
     }
-    snapshot->registry = registry; snapshot->count = registry->count;
+    snapshot->registry = registry; snapshot->references = 1;
+    snapshot->count = registry->count;
     registry->active_snapshots++;
     for (i = 0; i < snapshot->count; i++) {
         snapshot->entries[i] = registry->entries[i];
@@ -298,11 +300,32 @@ wirelog_extension_snapshot_acquire(wirelog_extension_registry_t *registry)
 }
 
 void
+wirelog_extension_snapshot_retain(wirelog_extension_snapshot_t *snapshot)
+{
+    if (!snapshot)
+        return;
+    mutex_lock(&snapshot->registry->mutex);
+    snapshot->references++;
+    mutex_unlock(&snapshot->registry->mutex);
+}
+
+void
 wirelog_extension_snapshot_release(wirelog_extension_snapshot_t *snapshot)
 {
     size_t i;
+    bool destroy_snapshot;
     if (!snapshot) return;
     mutex_lock(&snapshot->registry->mutex);
+    if (snapshot->references == 0) {
+        mutex_unlock(&snapshot->registry->mutex);
+        return;
+    }
+    snapshot->references--;
+    destroy_snapshot = snapshot->references == 0;
+    if (!destroy_snapshot) {
+        mutex_unlock(&snapshot->registry->mutex);
+        return;
+    }
     for (i = 0; i < snapshot->count; i++) {
         snapshot->entries[i]->pins -= snapshot->pins[i];
         snapshot->pins[i] = 0;
