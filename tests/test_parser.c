@@ -2089,6 +2089,25 @@ test_parser_extension_call_name_errors(void)
     PASS();
 }
 
+static void
+test_parser_negated_extension_call(void)
+{
+    TEST("negated extension call has explicit AST node");
+    PARSE(".decl R(x: string)\nR(x) :- !@call(\"demo.fn\", x).");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *rule = child(program, 1);
+    const wl_parser_ast_node_t *negation = child(rule, 1);
+    if (!negation || negation->type != WL_PARSER_AST_NODE_NEGATION
+        || negation->child_count != 1
+        || child(negation, 0)->type != WL_PARSER_AST_NODE_EXTENSION_CALL) {
+        CLEANUP();
+        FAIL("expected negated extension call AST");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
 /* ======================================================================== */
 /* Parser: Error Cases                                                      */
 /* ======================================================================== */
@@ -2299,6 +2318,7 @@ main(void)
     test_parser_extension_call_trim_and_relation_name();
     test_parser_extension_call_errors();
     test_parser_extension_call_name_errors();
+    test_parser_negated_extension_call();
 
     printf("\n--- Error Cases ---\n");
     test_parse_error_missing_horn();
