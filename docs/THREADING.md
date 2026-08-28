@@ -318,7 +318,7 @@ once and the surrounding overhead dominates.
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `kfusion.c:col_op_k_fusion` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `thread_create()` |
+| `kfusion.c:col_op_k_fusion_dispatch` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `thread_create()` |
 
 The `stop` flag's `memory_order_relaxed` store is deliberate:
 cancellation is **cooperative**, not preemptive. A worker may observe
