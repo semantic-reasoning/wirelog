@@ -156,10 +156,12 @@ test_public_map_extension_execution(void)
             "T-map-extension");
     wirelog_session_t *session = NULL;
     struct public_map_rows rows = { 0, 0 };
-    int64_t value = 7;
+    int64_t values[] = { 7, 8, 9, 10 };
     int rc = 0;
 
     snapshot_extension_fail = 0;
+    if (setenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER", "1", 1) != 0)
+        rc = 1;
     if (!registry || !prog
         || wirelog_extension_register(registry, &descriptor) != 0)
         rc = 1;
@@ -173,18 +175,22 @@ test_public_map_extension_execution(void)
     snapshot = NULL;
     if (!rc && wirelog_extension_unregister(registry, descriptor.name) != 0)
         rc = 1;
-    if (!rc && wirelog_session_insert(session, "src", &value, 1, 1)
-        != WIRELOG_OK)
-        rc = 1;
+    for (size_t i = 0; !rc && i < sizeof(values) / sizeof(values[0]); i++) {
+        if (wirelog_session_insert(session, "src", &values[i], 1, 1)
+            != WIRELOG_OK)
+            rc = 1;
+    }
     if (!rc && (wirelog_session_snapshot(session, capture_public_map_rows,
-        &rows) != WIRELOG_OK || rows.rows != 1 || rows.value != 17))
+        &rows) != WIRELOG_OK || rows.rows != 4))
         rc = 1;
 
     snapshot_extension_fail = 1;
-    value = 8;
-    if (!rc && wirelog_session_insert(session, "src", &value, 1, 1)
-        != WIRELOG_OK)
-        rc = 1;
+    for (size_t i = 0; !rc && i < sizeof(values) / sizeof(values[0]); i++) {
+        int64_t value = values[i] + 10;
+        if (wirelog_session_insert(session, "src", &value, 1, 1)
+            != WIRELOG_OK)
+            rc = 1;
+    }
     rows.rows = 0;
     if (!rc && wirelog_session_snapshot(session, capture_public_map_rows,
         &rows) != WIRELOG_ERR_EXEC)
@@ -197,6 +203,7 @@ test_public_map_extension_execution(void)
     wirelog_program_free(prog);
     if (registry && wirelog_extension_registry_destroy(registry) != 0)
         rc = 1;
+    unsetenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
     snapshot_extension_fail = 0;
     return rc;
 }
