@@ -53,6 +53,7 @@ struct wirelog_easy_session {
     wl_intern_t *intern_mut;
     uint32_t num_workers;
     bool plan_built; /* true once first wirelog_easy_step-class call ran */
+    wirelog_extension_snapshot_t *extension_snapshot; /* owns one reference */
 };
 
 static bool
@@ -111,8 +112,9 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
     }
 
     wl_session_t *session = NULL;
-    rc = wl_session_create(wl_backend_columnar(), plan,
-            num_workers > 0 ? num_workers : 1, &session);
+    rc = wl_session_create_with_snapshot(wl_backend_columnar(), plan,
+            num_workers > 0 ? num_workers : 1, s->extension_snapshot,
+            &session);
     if (rc != 0 || !session) {
         wl_plan_free(plan);
         return (rc == ENOMEM) ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC;
@@ -152,10 +154,18 @@ wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
         return WIRELOG_ERR_EXEC;
     *out = NULL;
 
-    if (opts && opts->size < sizeof(wirelog_easy_open_opts_t))
+    const size_t old_opts_size = offsetof(wirelog_easy_open_opts_t,
+            extension_snapshot);
+    const size_t snapshot_end = old_opts_size
+        + sizeof(((wirelog_easy_open_opts_t *)0)->extension_snapshot);
+    if (opts && opts->size < old_opts_size)
         return WIRELOG_ERR_EXEC;
     if (opts && opts->_reserved)
         return WIRELOG_ERR_EXEC;
+
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    if (opts && opts->size >= snapshot_end)
+        snapshot = opts->extension_snapshot;
 
     wirelog_error_t err = WIRELOG_OK;
     wirelog_program_t *prog = wirelog_parse_string(dl_src, &err);
@@ -181,6 +191,9 @@ wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
     s->session = NULL;
     s->num_workers = opts ? opts->num_workers : 0;
     s->plan_built = false;
+    s->extension_snapshot = snapshot;
+    if (s->extension_snapshot)
+        wirelog_extension_snapshot_retain(s->extension_snapshot);
 
     if (opts && opts->eager_build) {
         err = ensure_plan_built(s, s->num_workers);
@@ -190,6 +203,7 @@ wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
             if (s->plan)
                 wl_plan_free(s->plan);
             wirelog_program_free(prog);
+            wirelog_extension_snapshot_release(s->extension_snapshot);
             free(s);
             return err;
         }
@@ -216,6 +230,7 @@ wirelog_easy_close(wirelog_easy_session_t *s)
         wl_plan_free(s->plan);
     if (s->prog)
         wirelog_program_free(s->prog);
+    wirelog_extension_snapshot_release(s->extension_snapshot);
     free(s);
 }
 

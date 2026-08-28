@@ -36,6 +36,7 @@ extern "C" {
 #endif
 
 #include "wirelog/wirelog.h"
+#include "wirelog/wirelog-extension.h"
 #include "wirelog/wirelog-types.h"
 
 #include <stdbool.h>
@@ -70,12 +71,13 @@ typedef struct wirelog_easy_session wirelog_easy_session_t;
  * The struct is ABI-versioned via @size.  Callers MUST initialize it
  * with the WIRELOG_EASY_OPEN_OPTS_INIT macro (or assign
  * `.size = sizeof(wirelog_easy_open_opts_t)` explicitly) so future field
- * additions remain ABI-safe.  Library validates `size` on entry and
- * returns WIRELOG_ERR_EXEC if it is smaller than the runtime
- * sizeof(wirelog_easy_open_opts_t) compiled into libwirelog.
+ * additions remain ABI-safe.  Older callers may pass the size of the
+ * prefix they know; fields appended after that prefix are ignored.
  *
- * @size:         sizeof(wirelog_easy_open_opts_t) at the caller's compile
- *                time.  REQUIRED.  Use WIRELOG_EASY_OPEN_OPTS_INIT.
+ * @size:         Number of bytes in the initialized options prefix.  It must
+ *                cover the fields the caller supplies; appended fields are
+ *                ignored when they fall outside this prefix.  REQUIRED.
+ *                Use WIRELOG_EASY_OPEN_OPTS_INIT.
  * @num_workers:  Number of worker threads for the underlying session.
  *                0 (the default) is permanently mapped to 1; do not
  *                rely on a different default in future releases.
@@ -87,6 +89,11 @@ typedef struct wirelog_easy_session wirelog_easy_session_t;
  *                (legacy wirelog_easy_open behavior).
  * @_reserved:    Reserved for future use; must be NULL.  Non-NULL
  *                returns WIRELOG_ERR_EXEC.
+ * @extension_snapshot: Optional immutable scalar-addon snapshot.  When the
+ *                field is present in @size and non-NULL, the easy session
+ *                retains its own reference until wirelog_easy_close().  The
+ *                caller retains ownership of its reference and may release
+ *                it immediately after wirelog_easy_open_opts() returns.
  *
  * Lifetime: opts is read once during wirelog_easy_open_opts() and may be
  * freed by the caller immediately after the call returns.
@@ -96,20 +103,24 @@ typedef struct {
     uint32_t num_workers;
     bool eager_build;
     const void *_reserved;
+    wirelog_extension_snapshot_t *extension_snapshot;
 } wirelog_easy_open_opts_t;
 
 #define WIRELOG_EASY_OPEN_OPTS_INIT \
         { .size = sizeof(wirelog_easy_open_opts_t), \
           .num_workers = 0, \
           .eager_build = false, \
-          ._reserved = NULL }
+          ._reserved = NULL, \
+          .extension_snapshot = NULL }
 
 /**
  * wirelog_easy_open_opts:
  * @dl_src: Datalog source text (must not be NULL).
  * @opts:   Optional configuration (may be NULL → defaults).  If
  *          non-NULL, must have @size set to
- *          sizeof(wirelog_easy_open_opts_t) (use WIRELOG_EASY_OPEN_OPTS_INIT).
+ *          at least the size of the fields known by the caller (use
+ *          WIRELOG_EASY_OPEN_OPTS_INIT).  Appended fields are read only when
+ *          covered by @size.
  * @out:    (out) Receives the new session handle on success.
  *
  * Same contract as wirelog_easy_open() but with optional configuration.
