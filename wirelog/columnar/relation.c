@@ -298,6 +298,7 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
         enum ArrowType arrow_type = r->column_types
             && r->column_types[i] == WIRELOG_TYPE_FLOAT
             ? NANOARROW_TYPE_DOUBLE : NANOARROW_TYPE_INT64;
+        ArrowSchemaRelease(r->schema.children[i]);
         if (ArrowSchemaInitFromType(r->schema.children[i], arrow_type)
             != NANOARROW_OK) {
             ArrowSchemaRelease(&r->schema);
