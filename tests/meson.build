@@ -1476,6 +1476,20 @@ test_arr_hash_rows_batch_exe = executable(
 
 test('arr_hash_rows_batch', test_arr_hash_rows_batch_exe)
 
+# Issue #807: validate the scalar kc <= 2 join-hash probe chain using the
+# actual structured CRDT and CSPA fixtures.  This is a standalone model so
+# candidate hash functions can be compared without changing production code.
+test_join_hash_probe_exe = executable(
+  'test_join_hash_probe',
+  files('test_join_hash_probe.c'),
+)
+test('join_hash_probe', test_join_hash_probe_exe,
+     timeout: 120,
+     env: [
+       'WIRELOG_JOIN_HASH_CRDT_DIR=' + meson.project_source_root() / 'bench/data/crdt',
+       'WIRELOG_JOIN_HASH_CSPA_DIR=' + meson.project_source_root() / 'bench/data/cspa',
+     ])
+
 # ============================================================================
 # CRDT W=1 perf-suite gate.
 #
