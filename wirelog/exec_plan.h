@@ -66,6 +66,8 @@
  * Value-producing tags (push one value onto the evaluation stack):
  *   WL_PLAN_EXPR_VAR:        Variable reference.
  *                            Payload: [name_len:u16] [name:u8*name_len]
+ *   WL_PLAN_EXPR_VAR_STRING: Interned string variable reference.
+ *                            Payload: [name_len:u16] [name:u8*name_len]
  *   WL_PLAN_EXPR_CONST_INT:  64-bit signed integer literal.
  *                            Payload: [value:i64] (8 bytes, little-endian)
  *   WL_PLAN_EXPR_CONST_FLOAT: finite binary64 literal.
@@ -95,6 +97,7 @@ typedef enum {
     WL_PLAN_EXPR_BOOL = 0x04,
     WL_PLAN_EXPR_VAR_FLOAT = 0x05, /* variable containing a binary64 lane */
     WL_PLAN_EXPR_CONST_FLOAT = 0x06, /* payload: binary64 bits, little-endian */
+    WL_PLAN_EXPR_VAR_STRING = 0x07, /* variable containing an interned string */
 
     /* Scalar extension call (postfix operands, then name and arity payload). */
     WL_PLAN_EXPR_EXTENSION_CALL = 0x80,

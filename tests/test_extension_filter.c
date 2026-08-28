@@ -288,6 +288,39 @@ main(void)
         wirelog_extension_snapshot_release(snapshot);
         snapshot = wirelog_extension_snapshot_acquire(registry);
         ctx.extensions = snapshot;
+
+        /* A typed string column variable is resolved through the intern
+         * table and passed as borrowed bytes, not as its numeric ID. */
+        {
+            wl_intern_t *string_intern = wl_intern_create();
+            int64_t string_id = string_intern
+                ? wl_intern_put(string_intern, "café") : -1;
+            int64_t string_row = string_id;
+            wl_columnar_expr_status_t string_status = WL_COLUMNAR_EXPR_OK;
+            int64_t string_value = 0;
+            failures += check(string_intern != NULL && string_id >= 0,
+                    "create string intern table");
+            if (string_intern && string_id >= 0) {
+                ctx.intern = string_intern;
+                expected_string = (const uint8_t *)"caf\xc3\xa9";
+                expected_string_length = 5;
+                buf[0] = (uint8_t)WL_PLAN_EXPR_VAR_STRING;
+                buf[1] = 4;
+                buf[2] = 0;
+                memcpy(buf + 3, "col0", 4);
+                size = put_call(buf, 7, "test.pred", 1);
+                callback_mode = 4;
+                failures += check(wl_columnar_expr_eval_run_ctx(buf, size,
+                        &string_row, 1, &string_value, &ctx, &string_status)
+                        == WL_COLUMNAR_EXPR_OK
+                        && string_status == WL_COLUMNAR_EXPR_OK
+                        && string_value == 1,
+                        "string column callback argument");
+                ctx.intern = NULL;
+            }
+            wl_intern_free(string_intern);
+        }
+
         expected_string = utf8_nul;
         expected_string_length = sizeof(utf8_nul);
         size = put_string_bytes(buf, 0, utf8_nul, sizeof(utf8_nul));
