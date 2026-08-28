@@ -28,6 +28,8 @@
 #include "wirelog/ir/program.h"
 #include "wirelog/session.h"
 #include "wirelog/session_facts.h"
+#include "wirelog/wirelog-internal.h"
+#include "wirelog/columnar/internal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -696,6 +698,9 @@ wirelog_session_snapshot(wirelog_session_t *session,
     if (session_has_float_relation(session))
         return WIRELOG_ERR_EXEC;
     int rc = wl_session_snapshot(session->inner, callback, user_data);
+    if (rc != 0)
+        wl_extension_error_set_expr_status(
+            COL_SESSION(session->inner)->extension_expr_status);
     return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
 }
 

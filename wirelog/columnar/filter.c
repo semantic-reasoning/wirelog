@@ -767,6 +767,8 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     e.rel->ncols, &val, &expr_ctx, &status);
             if (err != WL_COLUMNAR_EXPR_OK
                 && status >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED) {
+                if (sess)
+                    sess->extension_expr_status = status;
                 col_row_buf_release(&row_rb);
                 wl_columnar_expr_compiled_free(ce);
                 col_rel_destroy(out);

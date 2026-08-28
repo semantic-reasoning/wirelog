@@ -15,6 +15,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Internal bridge used when evaluator failures are reported after worker
+ * threads have joined.  The implementation stores the message in the
+ * caller's thread-local error slot. */
+void
+wl_extension_error_set(const char *message);
+
+void
+wl_extension_error_set_expr_status(int status);
+
 /* ======================================================================== */
 /* String Utilities (Pure C11)                                             */
 /* ======================================================================== */

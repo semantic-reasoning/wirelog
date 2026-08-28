@@ -1279,6 +1279,9 @@ typedef struct wl_col_session_t {
      * iteration > 0 (FORCE_DELTA with absent delta -> empty short-circuit).
      * Only valid during col_eval_stratum execution. */
     uint32_t current_iteration;
+    /* Last scalar-extension evaluator status.  Written by the coordinator
+     * after worker barriers, never by a worker into caller TLS. */
+    int extension_expr_status;
     /* Delta-seeded incremental evaluation (issue #83).
      * When true, EDB delta relations have been pre-seeded into the session
      * before re-evaluation. FORCE_DELTA at iteration 0 pushes empty (not full)

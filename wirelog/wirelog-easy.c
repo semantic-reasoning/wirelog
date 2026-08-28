@@ -21,6 +21,8 @@
  */
 
 #include "wirelog/wirelog-easy.h"
+#include "wirelog/wirelog-internal.h"
+#include "wirelog/columnar/internal.h"
 
 #include "wirelog/backend.h"
 #include "wirelog/exec_plan.h"
@@ -533,5 +535,8 @@ wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
     wirelog_easy_snapshot_filter_t filter
         = { .wanted = relation, .user_cb = cb, .user_data = user_data };
     int rc = wl_session_snapshot(s->session, snapshot_trampoline, &filter);
+    if (rc != 0)
+        wl_extension_error_set_expr_status(
+            COL_SESSION(s->session)->extension_expr_status);
     return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
 }

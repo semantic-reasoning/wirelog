@@ -181,6 +181,19 @@ tdd_record_active_workers(wl_col_session_t *coord, uint32_t W)
 }
 
 static void
+record_worker_expr_status(wl_col_session_t *coord,
+    const wl_col_session_t *worker, int rc)
+{
+    if (!coord || coord->extension_expr_status != 0)
+        return;
+    if (worker && worker->extension_expr_status != 0)
+        coord->extension_expr_status = worker->extension_expr_status;
+    else if (rc >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+        && rc <= WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
+        coord->extension_expr_status = rc;
+}
+
+static void
 tdd_dedup_rel(col_rel_t *r);
 
 typedef struct {
@@ -479,9 +492,12 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
             }
         }
         wl_workqueue_wait_all(coord->wq);
-        for (uint32_t w = 0; w < W; w++)
+        for (uint32_t w = 0; w < W; w++) {
+            record_worker_expr_status(coord, ctxs[w].worker_sess,
+                ctxs[w].rc);
             if (ctxs[w].rc != 0 && rc == 0)
                 rc = ctxs[w].rc;
+        }
     }
 
     bool merge_started = false;
@@ -4397,6 +4413,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
             /* Collect first worker error */
             for (uint32_t w = 0; w < W; w++) {
+                record_worker_expr_status(coord, ctxs[w].worker_sess,
+                    ctxs[w].rc);
                 if (ctxs[w].rc != 0 && rc == 0)
                     rc = ctxs[w].rc;
             }
@@ -4714,6 +4732,8 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
 
     /* Collect first worker error */
     for (uint32_t w = 0; w < W; w++) {
+        record_worker_expr_status(coord, ctxs[w].worker_sess,
+            ctxs[w].rc);
         if (ctxs[w].rc != 0 && rc == 0)
             rc = ctxs[w].rc;
     }
@@ -4879,6 +4899,8 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
 
     /* Collect first worker error (if any) */
     for (uint32_t w = 0; w < num_workers; w++) {
+        record_worker_expr_status(coord, ctxs[w].worker_sess,
+            ctxs[w].rc);
         if (ctxs[w].rc != 0 && rc == 0)
             rc = ctxs[w].rc;
     }
