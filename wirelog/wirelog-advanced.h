@@ -50,6 +50,7 @@ extern "C" {
 #endif
 
 #include "wirelog/wirelog.h"
+#include "wirelog/wirelog-extension.h"
 #include "wirelog/wirelog-types.h"
 
 #include <stdint.h>
@@ -122,6 +123,33 @@ WIRELOG_API wirelog_error_t
 wirelog_session_create(wirelog_program_t *program,
     wirelog_backend_kind_t backend, uint32_t num_workers,
     wirelog_session_t **out);
+
+/**
+ * wirelog_session_create_with_snapshot:
+ * @program:     Parsed and (optionally) optimized program borrowed by the
+ *               session, as for wirelog_session_create().
+ * @backend:     Compute backend selector.
+ * @num_workers: Worker count.  0 maps to 1.
+ * @snapshot:    Scalar-addon snapshot reference borrowed by this call.
+ *               On success the session retains an independent reference;
+ *               the caller retains ownership and may release its reference
+ *               immediately after this function returns.  The snapshot is
+ *               not retained or released when creation fails.
+ * @out:         (out) Receives the new session, or NULL on every error.
+ *
+ * Create an advanced session with an immutable scalar-addon snapshot.  This
+ * additive API has the same plan-building, inline-fact, and ownership
+ * semantics as wirelog_session_create(); the existing API and ABI are
+ * unchanged.  The caller must keep @program alive until destruction of the
+ * returned session.
+ *
+ * Returns: WIRELOG_OK on success, or the same error values as
+ * wirelog_session_create().
+ */
+WIRELOG_API wirelog_error_t
+wirelog_session_create_with_snapshot(wirelog_program_t *program,
+    wirelog_backend_kind_t backend, uint32_t num_workers,
+    wirelog_extension_snapshot_t *snapshot, wirelog_session_t **out);
 
 /**
  * wirelog_session_destroy:

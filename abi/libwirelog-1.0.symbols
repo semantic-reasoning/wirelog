@@ -80,6 +80,7 @@ wirelog_result_get_relation
 wirelog_result_relation_cardinality
 wirelog_result_write_csv
 wirelog_session_create
+wirelog_session_create_with_snapshot
 wirelog_session_destroy
 wirelog_session_insert
 wirelog_session_insert_typed
