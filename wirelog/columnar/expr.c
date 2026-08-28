@@ -546,7 +546,10 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                     *status = WL_COLUMNAR_EXPR_ARITY_MISMATCH;
                 goto bad;
             }
-            if (descriptor->result_type != WIRELOG_EXTENSION_VALUE_BOOL) {
+            if (descriptor->result_type != WIRELOG_EXTENSION_VALUE_BOOL
+                && (!ctx->allow_extension_scalar_result
+                || descriptor->result_type
+                != WIRELOG_EXTENSION_VALUE_INT64)) {
                 if (status)
                     *status = WL_COLUMNAR_EXPR_INVALID_RESULT;
                 goto bad;
@@ -584,14 +587,24 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                     *status = WL_COLUMNAR_EXPR_CALLBACK_FAILURE;
                 goto bad;
             }
-            if (result.type != WIRELOG_EXTENSION_VALUE_BOOL
-                || result.size != sizeof(uint8_t)) {
+            if (result.type == WIRELOG_EXTENSION_VALUE_BOOL) {
+                if (result.size != sizeof(uint8_t)) {
+                    if (status)
+                        *status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+                    goto bad;
+                }
+                expr_push_typed(&s, result.as.bool_value != 0,
+                    WIRELOG_EXTENSION_VALUE_BOOL);
+            } else if (ctx->allow_extension_scalar_result
+                && result.type == WIRELOG_EXTENSION_VALUE_INT64
+                && result.size == sizeof(int64_t)) {
+                expr_push_typed(&s, result.as.int64_value,
+                    WIRELOG_EXTENSION_VALUE_INT64);
+            } else {
                 if (status)
                     *status = WL_COLUMNAR_EXPR_INVALID_RESULT;
                 goto bad;
             }
-            expr_push_typed(&s, result.as.bool_value != 0,
-                WIRELOG_EXTENSION_VALUE_BOOL);
             break;
         }
 

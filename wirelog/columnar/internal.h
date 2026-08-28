@@ -1852,6 +1852,7 @@ typedef struct wl_columnar_expr_compiled wl_columnar_expr_compiled_t;
 typedef struct {
     wl_intern_t *intern;
     const wirelog_extension_snapshot_t *extensions; /* borrowed */
+    bool allow_extension_scalar_result;
 } wl_columnar_expr_context_t;
 
 typedef enum {

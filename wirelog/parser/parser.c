@@ -1022,11 +1022,16 @@ parse_aggregate_expr(wl_parser_t *parser)
 /* ======================================================================== */
 
 static wl_parser_ast_node_t *
+parse_predicate(wl_parser_t *parser);
+
+static wl_parser_ast_node_t *
 parse_head_arg(wl_parser_t *parser)
 {
     if (is_aggregate_token(parser->current.type)) {
         return parse_aggregate_expr(parser);
     }
+    if (parser->current.type == WL_PARSER_LEXER_TOK_AT)
+        return parse_predicate(parser);
     return parse_arithmetic_expr(parser);
 }
 
