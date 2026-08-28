@@ -32,6 +32,7 @@
     <elf-symbol name='wirelog_extension_snapshot_find' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_extension_snapshot_pin' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_extension_snapshot_release' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='wirelog_extension_snapshot_retain' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_extension_snapshot_unpin' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_extension_unregister' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_io_ctx_col_type' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>

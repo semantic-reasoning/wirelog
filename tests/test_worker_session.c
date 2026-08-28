@@ -33,6 +33,7 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+static int extension_destroy_calls;
 
 #define TEST(name)                            \
         do {                                      \
@@ -56,7 +57,9 @@ static int tests_failed = 0;
 
 /* Create a coordinator session with "edge(x,y)" EDB and "path(x,y)" IDB. */
 static wl_col_session_t *
-make_coordinator(wl_plan_t **plan_out, wirelog_program_t **prog_out)
+make_coordinator_with_snapshot(wl_plan_t **plan_out,
+    wirelog_program_t **prog_out,
+    wirelog_extension_snapshot_t *snapshot)
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(
@@ -79,7 +82,8 @@ make_coordinator(wl_plan_t **plan_out, wirelog_program_t **prog_out)
     }
 
     wl_session_t *session = NULL;
-    rc = wl_session_create(wl_backend_columnar(), plan, 2, &session);
+    rc = wl_session_create_with_snapshot(wl_backend_columnar(), plan, 2,
+            snapshot, &session);
     if (rc != 0 || !session) {
         wl_plan_free(plan);
         wirelog_program_free(prog);
@@ -89,6 +93,30 @@ make_coordinator(wl_plan_t **plan_out, wirelog_program_t **prog_out)
     *plan_out = plan;
     *prog_out = prog;
     return COL_SESSION(session);
+}
+
+static wl_col_session_t *
+make_coordinator(wl_plan_t **plan_out, wirelog_program_t **prog_out)
+{
+    return make_coordinator_with_snapshot(plan_out, prog_out, NULL);
+}
+
+static int
+extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    (void)args;
+    (void)nargs;
+    (void)result;
+    (void)user_data;
+    return 0;
+}
+
+static void
+extension_destroy(void *user_data)
+{
+    (void)user_data;
+    extension_destroy_calls++;
 }
 
 /* Insert edge rows into coordinator session. */
@@ -205,6 +233,85 @@ test_create_destroy(void)
 
     col_worker_session_destroy(&worker);
     cleanup_coordinator(coord, plan, prog);
+    PASS();
+    return 0;
+}
+
+static int
+test_worker_borrows_extension_snapshot(void)
+{
+    TEST("worker borrows coordinator extension snapshot lifetime");
+
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create();
+    wirelog_extension_descriptor_t descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION,
+        sizeof(descriptor),
+        "test.worker_snapshot",
+        0,
+        NULL,
+        WIRELOG_EXTENSION_VALUE_INT64,
+        extension_invoke,
+        NULL,
+        extension_destroy
+    };
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = NULL;
+    wl_col_session_t worker;
+    int failures = 0;
+
+    if (!registry
+        || wirelog_extension_register(registry, &descriptor) != 0)
+        failures++;
+    snapshot = wirelog_extension_snapshot_acquire(registry);
+    if (!snapshot)
+        failures++;
+    coord = make_coordinator_with_snapshot(&plan, &prog, snapshot);
+    if (!coord)
+        failures++;
+    if (snapshot)
+        wirelog_extension_snapshot_release(snapshot);
+    if (registry && wirelog_extension_unregister(registry,
+        "test.worker_snapshot") != 0)
+        failures++;
+    if (snapshot && coord
+        && !wirelog_extension_snapshot_find(coord->base.extension_snapshot,
+        "test.worker_snapshot"))
+        failures++;
+
+    memset(&worker, 0, sizeof(worker));
+    if (coord && col_worker_session_create(coord, 0, NULL, 0, &worker) != 0)
+        failures++;
+    if (coord && worker.base.extension_snapshot
+        != coord->base.extension_snapshot)
+        failures++;
+    wl_session_destroy(&worker.base);
+    if (snapshot && coord
+        && !wirelog_extension_snapshot_find(coord->base.extension_snapshot,
+        "test.worker_snapshot"))
+        failures++;
+    col_worker_session_destroy(&worker);
+    if (snapshot && coord
+        && !wirelog_extension_snapshot_find(coord->base.extension_snapshot,
+        "test.worker_snapshot"))
+        failures++;
+    failures += extension_destroy_calls != 0;
+
+    if (coord)
+        cleanup_coordinator(coord, plan, prog);
+    else {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+    }
+    failures += extension_destroy_calls != 1;
+    if (registry)
+        failures += wirelog_extension_registry_destroy(registry) != 0;
+    if (failures) {
+        FAIL("worker snapshot lifetime");
+        return 1;
+    }
     PASS();
     return 0;
 }
@@ -1379,6 +1486,7 @@ main(void)
     printf("Per-Worker Session State Tests (Issue #315)\n");
 
     test_create_destroy();
+    test_worker_borrows_extension_snapshot();
     test_identity_fields();
     test_borrowed_fields();
     test_rels_independent();
