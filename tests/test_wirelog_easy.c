@@ -9,9 +9,12 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../wirelog/wirelog-easy.h"
+#include "../wirelog/wirelog-extension.h"
 #include "../wirelog/util/log.h"
 
 #include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +85,233 @@ static const char *RELATION_NAME_LIFETIME_SRC
     = ".decl edge(x: int64, y: int64)\n"
     ".decl reach(x: int64, y: int64)\n"
     "reach(X, Y) :- edge(X, Y).\n";
+
+/* ======================================================================== */
+/* Extension snapshot lifetime                                              */
+/* ======================================================================== */
+
+static int easy_snapshot_destroy_calls;
+
+static int
+easy_snapshot_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    (void)args;
+    (void)nargs;
+    (void)result;
+    (void)user_data;
+    return 0;
+}
+
+static void
+easy_snapshot_destroy(void *user_data)
+{
+    (void)user_data;
+    easy_snapshot_destroy_calls++;
+}
+
+static wirelog_extension_registry_t *
+easy_snapshot_registry(wirelog_extension_snapshot_t **snapshot_out)
+{
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create();
+    wirelog_extension_descriptor_t descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION,
+        sizeof(descriptor),
+        "easy.test",
+        0,
+        NULL,
+        WIRELOG_EXTENSION_VALUE_BOOL,
+        easy_snapshot_invoke,
+        NULL,
+        easy_snapshot_destroy
+    };
+
+    if (!registry
+        || wirelog_extension_register(registry, &descriptor) != 0) {
+        if (registry)
+            wirelog_extension_registry_destroy(registry);
+        return NULL;
+    }
+    *snapshot_out = wirelog_extension_snapshot_acquire(registry);
+    if (!*snapshot_out) {
+        wirelog_extension_registry_destroy(registry);
+        return NULL;
+    }
+    return registry;
+}
+
+/* PARITY: easy facade snapshot ownership is specific to this API. */
+static void
+test_easy_snapshot_lazy_lifetime(void)
+{
+    TEST(
+        "easy snapshot survives caller release and unregister before lazy build");
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_extension_registry_t *registry = easy_snapshot_registry(&snapshot);
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    easy_snapshot_destroy_calls = 0;
+    opts.extension_snapshot = snapshot;
+
+    if (!registry || wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts,
+        &session) != WIRELOG_OK || !session) {
+        FAIL("snapshot-aware lazy open failed");
+        if (snapshot)
+            wirelog_extension_snapshot_release(snapshot);
+        if (registry)
+            wirelog_extension_registry_destroy(registry);
+        return;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    if (wirelog_extension_unregister(registry, "easy.test") != 0
+        || easy_snapshot_destroy_calls != 0
+        || wirelog_easy_step(session) != WIRELOG_OK) {
+        FAIL("easy session did not retain snapshot through lazy build");
+        wirelog_easy_close(session);
+        wirelog_extension_registry_destroy(registry);
+        return;
+    }
+    wirelog_easy_close(session);
+    if (easy_snapshot_destroy_calls != 1
+        || wirelog_extension_registry_destroy(registry) != 0) {
+        FAIL("easy snapshot was not destroyed exactly once");
+        return;
+    }
+    PASS();
+}
+
+/* PARITY: easy facade snapshot ownership is specific to this API. */
+static void
+test_easy_snapshot_eager_and_close_before_build(void)
+{
+    TEST(
+        "easy snapshot releases exactly once on eager build and pre-build close");
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_extension_registry_t *registry = easy_snapshot_registry(&snapshot);
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    easy_snapshot_destroy_calls = 0;
+    opts.eager_build = true;
+    opts.extension_snapshot = snapshot;
+
+    if (!registry || wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts,
+        &session) != WIRELOG_OK || !session) {
+        FAIL("snapshot-aware eager open failed");
+        if (snapshot)
+            wirelog_extension_snapshot_release(snapshot);
+        if (registry)
+            wirelog_extension_registry_destroy(registry);
+        return;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    if (wirelog_extension_unregister(registry, "easy.test") != 0
+        || easy_snapshot_destroy_calls != 0) {
+        FAIL("eager easy session lost its snapshot reference");
+        wirelog_easy_close(session);
+        wirelog_extension_registry_destroy(registry);
+        return;
+    }
+    wirelog_easy_close(session);
+    if (easy_snapshot_destroy_calls != 1
+        || wirelog_extension_registry_destroy(registry) != 0) {
+        FAIL("eager snapshot was not destroyed exactly once");
+        return;
+    }
+    PASS();
+}
+
+/* PARITY: easy facade snapshot ownership is specific to this API. */
+static void
+test_easy_snapshot_close_before_build(void)
+{
+    TEST("easy close before lazy build releases its snapshot reference");
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_extension_registry_t *registry = easy_snapshot_registry(&snapshot);
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    easy_snapshot_destroy_calls = 0;
+    opts.extension_snapshot = snapshot;
+
+    if (!registry || wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts,
+        &session) != WIRELOG_OK || !session) {
+        FAIL("snapshot-aware open for close-before-build failed");
+        if (snapshot)
+            wirelog_extension_snapshot_release(snapshot);
+        if (registry)
+            wirelog_extension_registry_destroy(registry);
+        return;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    if (wirelog_extension_unregister(registry, "easy.test") != 0
+        || easy_snapshot_destroy_calls != 0) {
+        FAIL("snapshot was released before easy close");
+        wirelog_easy_close(session);
+        wirelog_extension_registry_destroy(registry);
+        return;
+    }
+    wirelog_easy_close(session);
+    if (easy_snapshot_destroy_calls != 1
+        || wirelog_extension_registry_destroy(registry) != 0) {
+        FAIL("pre-build close did not release snapshot exactly once");
+        return;
+    }
+    PASS();
+}
+
+/* PARITY: easy facade snapshot ownership is specific to this API. */
+static void
+test_easy_snapshot_failure_preserves_caller_reference(void)
+{
+    TEST("easy snapshot failure preserves caller reference");
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_extension_registry_t *registry = easy_snapshot_registry(&snapshot);
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = (wirelog_easy_session_t *)0xdeadbeef;
+    easy_snapshot_destroy_calls = 0;
+    opts.extension_snapshot = snapshot;
+
+    if (!registry || wirelog_easy_open_opts("not datalog", &opts, &session)
+        == WIRELOG_OK || session != NULL
+        || wirelog_extension_unregister(registry, "easy.test") != 0) {
+        FAIL("invalid easy open did not preserve snapshot ownership");
+        if (session)
+            wirelog_easy_close(session);
+        if (snapshot)
+            wirelog_extension_snapshot_release(snapshot);
+        if (registry)
+            wirelog_extension_registry_destroy(registry);
+        return;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    if (easy_snapshot_destroy_calls != 1
+        || wirelog_extension_registry_destroy(registry) != 0) {
+        FAIL("failed easy open leaked or consumed snapshot reference");
+        return;
+    }
+    PASS();
+}
+
+/* PARITY: easy facade options-prefix compatibility is specific to this API. */
+static void
+test_easy_snapshot_old_options_size_compatibility(void)
+{
+    TEST("old easy options size ignores appended snapshot field");
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    opts.size = (uint32_t)offsetof(wirelog_easy_open_opts_t,
+            extension_snapshot);
+    opts.extension_snapshot = (wirelog_extension_snapshot_t *)(uintptr_t)1;
+    if (wirelog_easy_open_opts(ACCESS_CONTROL_SRC, &opts, &session)
+        != WIRELOG_OK || !session) {
+        FAIL("old options prefix was rejected or new field was read");
+        if (session)
+            wirelog_easy_close(session);
+        return;
+    }
+    wirelog_easy_close(session);
+    PASS();
+}
 
 /* ======================================================================== */
 /* Delta Collector                                                          */
@@ -2221,6 +2451,11 @@ main(void)
     test_open_opts_init_macro();
     test_open_opts_eager_build_ok();
     test_open_opts_eager_build_propagates_parse_error();
+    test_easy_snapshot_lazy_lifetime();
+    test_easy_snapshot_eager_and_close_before_build();
+    test_easy_snapshot_close_before_build();
+    test_easy_snapshot_failure_preserves_caller_reference();
+    test_easy_snapshot_old_options_size_compatibility();
     test_num_workers_default_is_one();
     test_num_workers_explicit_four();
     test_intern_returns_same_id();
