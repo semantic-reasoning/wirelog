@@ -50,8 +50,9 @@ extern "C" {
 #endif
 
 #include "wirelog/wirelog.h"
-#include "wirelog/wirelog-extension.h"
 #include "wirelog/wirelog-types.h"
+
+typedef struct wirelog_extension_snapshot wirelog_extension_snapshot_t;
 
 #include <stdint.h>
 

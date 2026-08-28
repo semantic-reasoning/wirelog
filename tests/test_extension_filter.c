@@ -7,6 +7,8 @@
 static int callback_mode;
 static int callback_calls;
 static int fail_on_call;
+static const uint8_t *expected_string;
+static size_t expected_string_length;
 
 static int
 check(int condition, const char *message);
@@ -33,9 +35,18 @@ extension_callback(const wirelog_extension_value_t *args, uint32_t nargs,
         result->as.bool_value = 1;
         return 0;
     }
+    if (callback_mode == 4) {
+        if (nargs != 1 || args[0].type != WIRELOG_EXTENSION_VALUE_STRING
+            || args[0].size != expected_string_length
+            || args[0].as.string_value.data == NULL
+            || args[0].as.string_value.length != expected_string_length
+            || memcmp(args[0].as.string_value.data, expected_string,
+            expected_string_length) != 0)
+            return 1;
+    }
     result->type = WIRELOG_EXTENSION_VALUE_BOOL;
     result->size = sizeof(uint8_t);
-    result->as.bool_value = nargs > 0
+    result->as.bool_value = callback_mode == 4 ? 1 : nargs > 0
         ? (args[0].type == WIRELOG_EXTENSION_VALUE_BOOL
             ? args[0].as.bool_value : args[0].as.int64_value != 0)
         : 1;
@@ -102,14 +113,20 @@ put_bool(uint8_t *buf, uint32_t pos, uint8_t value)
 }
 
 static uint32_t
-put_string(uint8_t *buf, uint32_t pos, const char *value)
+put_string_bytes(uint8_t *buf, uint32_t pos, const uint8_t *value,
+    size_t len)
 {
-    size_t len = strlen(value);
     buf[pos++] = (uint8_t)WL_PLAN_EXPR_CONST_STR;
     buf[pos++] = (uint8_t)len;
     buf[pos++] = (uint8_t)(len >> 8);
     memcpy(buf + pos, value, len);
     return pos + (uint32_t)len;
+}
+
+static uint32_t
+put_string(uint8_t *buf, uint32_t pos, const char *value)
+{
+    return put_string_bytes(buf, pos, (const uint8_t *)value, strlen(value));
 }
 
 static uint32_t
@@ -232,6 +249,57 @@ main(void)
     size = put_call(buf, size, "test.pred", 1);
     failures += run(buf, size, &ctx, &value,
             WL_COLUMNAR_EXPR_TYPE_MISMATCH);
+
+    /* String literals are passed as borrowed plan-buffer bytes, including
+     * empty and embedded-NUL values; they do not require an intern table. */
+    {
+        static const uint8_t utf8_nul[] = { 0xc3, 0xa9, 0x00, 0xf0, 0x9f,
+                                            0x8c, 0x8d };
+        uint32_t string_type = WIRELOG_EXTENSION_VALUE_STRING;
+        descriptor.argument_types = &string_type;
+        failures += check(wirelog_extension_unregister(registry,
+                "test.pred") == 0, "unregister int predicate");
+        failures += check(wirelog_extension_register(registry, &descriptor)
+                == 0, "register string predicate");
+        wirelog_extension_snapshot_release(snapshot);
+        snapshot = wirelog_extension_snapshot_acquire(registry);
+        ctx.extensions = snapshot;
+        expected_string = utf8_nul;
+        expected_string_length = sizeof(utf8_nul);
+        size = put_string_bytes(buf, 0, utf8_nul, sizeof(utf8_nul));
+        size = put_call(buf, size, "test.pred", 1);
+        callback_mode = 4;
+        failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+        failures += check(value == 1, "string literal bytes and length");
+
+        expected_string = (const uint8_t *)"";
+        expected_string_length = 0;
+        size = put_string_bytes(buf, 0, expected_string, 0);
+        size = put_call(buf, size, "test.pred", 1);
+        failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+        failures += check(value == 1, "empty string literal");
+
+        /* A string literal remains incompatible with an INT64 descriptor. */
+        descriptor.argument_types = &int_type;
+        failures += check(wirelog_extension_unregister(registry,
+                "test.pred") == 0, "unregister string predicate");
+        failures += check(wirelog_extension_register(registry, &descriptor)
+                == 0, "restore int predicate");
+        wirelog_extension_snapshot_release(snapshot);
+        snapshot = wirelog_extension_snapshot_acquire(registry);
+        ctx.extensions = snapshot;
+        failures += run(buf, size, &ctx, &value,
+                WL_COLUMNAR_EXPR_TYPE_MISMATCH);
+        descriptor.argument_types = &bool_type;
+        failures += check(wirelog_extension_unregister(registry,
+                "test.pred") == 0, "unregister temporary int predicate");
+        failures += check(wirelog_extension_register(registry, &descriptor)
+                == 0, "restore bool predicate");
+        wirelog_extension_snapshot_release(snapshot);
+        snapshot = wirelog_extension_snapshot_acquire(registry);
+        ctx.extensions = snapshot;
+        callback_mode = 0;
+    }
 
     /* Truncated extension metadata is malformed, not an invocation. */
     buf[0] = (uint8_t)WL_PLAN_EXPR_EXTENSION_CALL;
