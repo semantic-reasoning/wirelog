@@ -192,6 +192,33 @@ test_extension_call_ir_and_plan(void)
     ASSERT(memcmp(serialized.data, expected, sizeof(expected)) == 0,
         "extension postfix bytes are not stable");
     free(serialized.data);
+
+    {
+        const char *string_src = ".decl src(x: string)\n"
+            ".decl out(x: string)\n"
+            "out(@call(\"text.keep\", x)) :- src(x).\n";
+        wirelog_program_t *string_prog = wirelog_parse_string(string_src,
+                &err);
+        ASSERT(string_prog != NULL, "string MAP extension failed to parse");
+        wl_plan_t *string_plan = NULL;
+        ASSERT(wl_plan_from_program(string_prog, &string_plan) == 0
+            && string_plan != NULL, "string MAP extension plan failed");
+        const wl_plan_op_t *map = find_plan_op(string_plan, WL_PLAN_OP_MAP);
+        const uint8_t string_var[] = {
+            WL_PLAN_EXPR_VAR_STRING, 4, 0, 'c', 'o', 'l', '0',
+            WL_PLAN_EXPR_EXTENSION_CALL, 9, 0,
+            't', 'e', 'x', 't', '.', 'k', 'e', 'e', 'p',
+            1, 0, 0, 0
+        };
+        ASSERT(map != NULL && map->map_exprs != NULL
+            && map->map_exprs[0].size == sizeof(string_var)
+            && memcmp(map->map_exprs[0].data, string_var,
+            sizeof(string_var)) == 0,
+            "string variable postfix encoding is not stable");
+        wl_plan_free(string_plan);
+        wirelog_program_free(string_prog);
+    }
+
     wirelog_program_free(prog);
     PASS();
 }

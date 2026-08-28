@@ -942,10 +942,11 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
             }
         }
         uint16_t len = (uint16_t)strlen(emit_name);
-        uint8_t var_tag = col_ctx_lookup_type(ctx, expr->var_name)
-            == WL_IR_COLTYPE_FLOAT
+        wl_ir_coltype_t var_type = col_ctx_lookup_type(ctx, expr->var_name);
+        uint8_t var_tag = var_type == WL_IR_COLTYPE_FLOAT
             ? WL_PLAN_EXPR_VAR_FLOAT
-            : WL_PLAN_EXPR_VAR;
+            : var_type == WL_IR_COLTYPE_STRING
+            ? WL_PLAN_EXPR_VAR_STRING : WL_PLAN_EXPR_VAR;
         if (expr_buf_push_u8(buf, var_tag) != 0)
             return -1;
         if (expr_buf_push_u16(buf, len) != 0)

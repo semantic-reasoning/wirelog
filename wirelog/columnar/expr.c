@@ -418,6 +418,34 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             break;
         }
 
+        case WL_PLAN_EXPR_VAR_STRING: {
+            if (i > size || size - i < 2)
+                goto bad;
+            uint16_t nlen;
+            memcpy(&nlen, buf + i, 2);
+            i += 2;
+            if (i + nlen > size)
+                goto bad;
+            long col = 0;
+            if (nlen > 3 && buf[i] == 'c' && buf[i + 1] == 'o'
+                && buf[i + 2] == 'l') {
+                char tmp[16] = { 0 };
+                uint32_t cplen = (nlen - 3 < 15) ? nlen - 3 : 15;
+                memcpy(tmp, buf + i + 3, cplen);
+                col = strtol(tmp, NULL, 10);
+            }
+            i += nlen;
+            if (!intern || col < 0 || (uint32_t)col >= ncols)
+                goto bad;
+            int64_t id = row[col];
+            const char *value = wl_intern_reverse(intern, id);
+            if (!value)
+                goto bad;
+            expr_push_string(&s, id, (const uint8_t *)value,
+                (uint32_t)strlen(value));
+            break;
+        }
+
         case WL_PLAN_EXPR_VAR_FLOAT: {
             if (i + 2 > size)
                 goto bad;
