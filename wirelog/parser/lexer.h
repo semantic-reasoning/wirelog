@@ -64,6 +64,7 @@ typedef enum {
     WL_PARSER_LEXER_TOK_DOT,    /* . */
     WL_PARSER_LEXER_TOK_COLON,  /* : */
     WL_PARSER_LEXER_TOK_BANG,   /* ! */
+    WL_PARSER_LEXER_TOK_AT,     /* @ */
 
     /* Operators */
     WL_PARSER_LEXER_TOK_HORN,    /* :- */

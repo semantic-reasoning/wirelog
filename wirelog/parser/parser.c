@@ -1174,6 +1174,116 @@ parse_atom_arg_at_depth(wl_parser_t *parser, uint32_t depth)
 /* Atom Parsing                                                             */
 /* ======================================================================== */
 
+static void
+trim_ascii_whitespace(char *value)
+{
+    size_t start = 0;
+    size_t length;
+
+    if (!value)
+        return;
+    length = strlen(value);
+    while (start < length
+        && (value[start] == ' ' || value[start] == '\t'
+        || value[start] == '\n' || value[start] == '\r'
+        || value[start] == '\f' || value[start] == '\v'))
+        start++;
+    while (length > start
+        && (value[length - 1] == ' ' || value[length - 1] == '\t'
+        || value[length - 1] == '\n' || value[length - 1] == '\r'
+        || value[length - 1] == '\f' || value[length - 1] == '\v'))
+        length--;
+    if (start)
+        memmove(value, value + start, length - start);
+    value[length - start] = '\0';
+}
+
+static bool
+valid_extension_name(const char *value)
+{
+    bool saw_dot = false;
+    bool segment_has_char = false;
+
+    if (!value || !value[0])
+        return false;
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')
+            || (*p >= '0' && *p <= '9') || *p == '_') {
+            segment_has_char = true;
+        } else if (*p == '.' && segment_has_char) {
+            saw_dot = true;
+            segment_has_char = false;
+        } else {
+            return false;
+        }
+    }
+    return saw_dot && segment_has_char;
+}
+
+static wl_parser_ast_node_t *
+parse_extension_call_after_lparen(wl_parser_t *parser, uint32_t line,
+    uint32_t col)
+{
+    char *function_name;
+    wl_parser_ast_node_t *call;
+
+    if (!parser_match(parser, WL_PARSER_LEXER_TOK_STRING)) {
+        parser_error(parser,
+            "extension call requires a quoted function name as its first argument");
+        return NULL;
+    }
+    function_name = token_to_str_value(&parser->previous);
+    if (!function_name) {
+        parser_error(parser, "out of memory while reading extension name");
+        return NULL;
+    }
+    trim_ascii_whitespace(function_name);
+    if (strlen(function_name) > 255 || !valid_extension_name(function_name)) {
+        free(function_name);
+        parser_error(parser,
+            "extension function name must be namespace.name using ASCII "
+            "letters, digits, and underscores");
+        return NULL;
+    }
+
+    call = wl_parser_ast_node_create(WL_PARSER_AST_NODE_EXTENSION_CALL, line,
+            col);
+    if (!call) {
+        free(function_name);
+        parser_error(parser, "out of memory while creating extension call");
+        return NULL;
+    }
+    call->name = function_name;
+
+    if (!parser_check(parser, WL_PARSER_LEXER_TOK_RPAREN)) {
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_COMMA,
+            "expected ',' after extension function name")) {
+            wl_parser_ast_node_free(call);
+            return NULL;
+        }
+        wl_parser_ast_node_t *arg = parse_atom_arg(parser);
+        if (!arg) {
+            wl_parser_ast_node_free(call);
+            return NULL;
+        }
+        PARSER_ADD_CHILD_OR_RETURN(call, arg);
+        while (parser_match(parser, WL_PARSER_LEXER_TOK_COMMA)) {
+            arg = parse_atom_arg(parser);
+            if (!arg) {
+                wl_parser_ast_node_free(call);
+                return NULL;
+            }
+            PARSER_ADD_CHILD_OR_RETURN(call, arg);
+        }
+    }
+    if (!parser_consume(parser, WL_PARSER_LEXER_TOK_RPAREN,
+        "expected ')' after extension call")) {
+        wl_parser_ast_node_free(call);
+        return NULL;
+    }
+    return call;
+}
+
 static wl_parser_ast_node_t *
 parse_atom(wl_parser_t *parser)
 {
@@ -1262,6 +1372,25 @@ parse_predicate(wl_parser_t *parser)
     uint32_t line = parser->current.line;
     uint32_t col = parser->current.col;
 
+    /* The sigil keeps the extension namespace separate from relation names. */
+    if (parser_match(parser, WL_PARSER_LEXER_TOK_AT)) {
+        char *marker;
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+            "expected 'call' after '@'"))
+            return NULL;
+        marker = token_to_name(&parser->previous);
+        if (!marker || strcmp(marker, "call") != 0) {
+            free(marker);
+            parser_error(parser, "expected '@call' extension marker");
+            return NULL;
+        }
+        free(marker);
+        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+            "expected '(' after '@call'"))
+            return NULL;
+        return parse_extension_call_after_lparen(parser, line, col);
+    }
+
     /* Boolean predicate */
     if (parser_match(parser, WL_PARSER_LEXER_TOK_TRUE)) {
         wl_parser_ast_node_t *node
@@ -1276,13 +1405,31 @@ parse_predicate(wl_parser_t *parser)
         return node;
     }
 
-    /* Negative atom */
+    /* Negative atom or explicitly marked extension call. */
     if (parser_match(parser, WL_PARSER_LEXER_TOK_BANG)) {
-        if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
-            "expected relation name after '!'")) {
-            return NULL;
+        wl_parser_ast_node_t *atom;
+        if (parser_match(parser, WL_PARSER_LEXER_TOK_AT)) {
+            char *marker;
+            if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+                "expected 'call' after '!@'"))
+                return NULL;
+            marker = token_to_name(&parser->previous);
+            if (!marker || strcmp(marker, "call") != 0) {
+                free(marker);
+                parser_error(parser, "expected '!@call' extension marker");
+                return NULL;
+            }
+            free(marker);
+            if (!parser_consume(parser, WL_PARSER_LEXER_TOK_LPAREN,
+                "expected '(' after '!@call'"))
+                return NULL;
+            atom = parse_extension_call_after_lparen(parser, line, col);
+        } else {
+            if (!parser_consume(parser, WL_PARSER_LEXER_TOK_IDENT,
+                "expected relation name after '!'"))
+                return NULL;
+            atom = parse_atom(parser);
         }
-        wl_parser_ast_node_t *atom = parse_atom(parser);
         if (!atom)
             return NULL;
 

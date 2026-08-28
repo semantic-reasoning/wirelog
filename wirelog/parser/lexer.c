@@ -511,6 +511,9 @@ scan_token(wl_parser_lexer_t *lexer)
             return make_token(lexer, WL_PARSER_LEXER_TOK_NEQ);
         return make_token(lexer, WL_PARSER_LEXER_TOK_BANG);
 
+    case '@':
+        return make_token(lexer, WL_PARSER_LEXER_TOK_AT);
+
     case '=':
         return make_token(lexer, WL_PARSER_LEXER_TOK_EQ);
 
@@ -636,6 +639,8 @@ wl_parser_lexer_token_type_str(wl_parser_lexer_token_type_t type)
         return "COLON";
     case WL_PARSER_LEXER_TOK_BANG:
         return "BANG";
+    case WL_PARSER_LEXER_TOK_AT:
+        return "AT";
     case WL_PARSER_LEXER_TOK_HORN:
         return "HORN";
     case WL_PARSER_LEXER_TOK_EQ:
