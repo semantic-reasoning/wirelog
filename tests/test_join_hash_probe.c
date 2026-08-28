@@ -16,6 +16,8 @@
 #include <string.h>
 #include <time.h>
 
+#define JOIN_HASH_REPETITIONS 5
+
 struct key_set {
     int64_t *values;
     size_t count;
@@ -46,6 +48,14 @@ wall_now_ms(void)
         return 0.0;
     return (double)timestamp.tv_sec * 1000.0
            + (double)timestamp.tv_nsec / 1000000.0;
+}
+
+static int
+compare_double(const void *left, const void *right)
+{
+    double a = *(const double *)left;
+    double b = *(const double *)right;
+    return a < b ? -1 : a > b;
 }
 
 static uint32_t
@@ -227,9 +237,21 @@ run_case(const char *name, const char *build_path, const char *probe_path)
         free(probe.values);
         return 1;
     }
-    struct probe_metrics metrics = { 0 };
-    rc = measure_join(&build, &probe, &metrics);
     uint64_t expected = sorted_join_rows(&build, &probe);
+    struct probe_metrics metrics = { 0 };
+    double wall_samples[JOIN_HASH_REPETITIONS];
+    for (size_t repeat = 0; repeat < JOIN_HASH_REPETITIONS; repeat++) {
+        struct probe_metrics sample = { 0 };
+        rc = measure_join(&build, &probe, &sample);
+        if (rc != 0 || expected == UINT64_MAX
+            || sample.join_rows != expected) {
+            metrics = sample;
+            break;
+        }
+        if (repeat == 0)
+            metrics = sample;
+        wall_samples[repeat] = sample.elapsed_ms;
+    }
     if (rc != 0 || expected == UINT64_MAX
         || metrics.join_rows != expected) {
         fprintf(stderr,
@@ -240,18 +262,22 @@ run_case(const char *name, const char *build_path, const char *probe_path)
         free(probe.values);
         return 1;
     }
+    qsort(wall_samples, JOIN_HASH_REPETITIONS, sizeof(*wall_samples),
+        compare_double);
+    metrics.elapsed_ms = wall_samples[JOIN_HASH_REPETITIONS / 2];
     printf("join_hash_probe\t%s\tbuild_rows=%zu\tprobe_rows=%zu"
         "\ttable_size=%" PRIu32 "\tload=%.3f"
         "\tinsert_avg=%.3f\tlookup_avg=%.3f"
         "\tmax_insert=%" PRIu32 "\tmax_lookup=%" PRIu32
         "\tcollisions=%" PRIu64 "\tjoin_rows=%" PRIu64
-        "\twall_ms=%.3f\n",
+        "\trepetitions=%d\tmedian_wall_ms=%.3f\n",
         name, build.count, probe.count, metrics.capacity,
         metrics.capacity ? (double)build.count / metrics.capacity : 0.0,
         build.count ? (double)metrics.insert_probes / build.count : 0.0,
         probe.count ? (double)metrics.lookup_probes / probe.count : 0.0,
         metrics.max_insert_probe, metrics.max_lookup_probe,
-        metrics.collisions, metrics.join_rows, metrics.elapsed_ms);
+        metrics.collisions, metrics.join_rows, JOIN_HASH_REPETITIONS,
+        metrics.elapsed_ms);
     free(build.values);
     free(probe.values);
     return 0;
