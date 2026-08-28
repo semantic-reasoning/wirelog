@@ -143,7 +143,7 @@ wirelog_extension_registry_destroy(wirelog_extension_registry_t *registry)
         mutex_unlock(&registry->mutex);
         wl_extension_error_set("registry is not empty"); return -1;
     }
-    free(registry->entries);
+    free((void *)registry->entries);
     mutex_unlock(&registry->mutex);
     mutex_destroy(&registry->mutex);
     free(registry);
@@ -199,8 +199,9 @@ wirelog_extension_register(wirelog_extension_registry_t *registry,
     }
     if (registry->count == registry->capacity) {
         size_t capacity = registry->capacity ? registry->capacity * 2 : 8;
-        wl_extension_entry_t **grown = realloc(registry->entries,
-                capacity * sizeof(*grown));
+        wl_extension_entry_t **grown = (wl_extension_entry_t **)realloc(
+            (void *)registry->entries,
+            capacity * sizeof(*grown));
         if (!grown) {
             mutex_unlock(&registry->mutex); wl_extension_entry_discard(entry);
             wl_extension_error_set("allocation failed"); return -1;
@@ -240,7 +241,8 @@ wirelog_extension_unregister(wirelog_extension_registry_t *registry,
     }
     { wl_extension_entry_t *entry = registry->entries[i];
       bool destroy;
-      memmove(&registry->entries[i], &registry->entries[i + 1],
+      memmove((void *)&registry->entries[i],
+          (const void *)&registry->entries[i + 1],
           (registry->count - i - 1) * sizeof(*registry->entries));
       registry->count--; entry->registered = false;
       destroy = wl_extension_entry_release_locked(entry);
@@ -262,23 +264,26 @@ wirelog_extension_snapshot_acquire(wirelog_extension_registry_t *registry)
         wl_extension_error_set("allocation failed"); return NULL;
     }
     mutex_lock(&registry->mutex);
-    snapshot->entries = calloc(registry->count, sizeof(*snapshot->entries));
+    snapshot->entries = (wl_extension_entry_t **)calloc(registry->count,
+            sizeof(*snapshot->entries));
     if (registry->count && !snapshot->entries) {
-        mutex_unlock(&registry->mutex); free(snapshot);
+        mutex_unlock(&registry->mutex); free((void *)snapshot);
         wl_extension_error_set("allocation failed"); return NULL;
     }
-    snapshot->pins = calloc(registry->count, sizeof(*snapshot->pins));
+    snapshot->pins = (size_t *)calloc(registry->count,
+            sizeof(*snapshot->pins));
     if (registry->count && !snapshot->pins) {
-        mutex_unlock(&registry->mutex); free(snapshot->entries); free(snapshot);
+        mutex_unlock(&registry->mutex);
+        free((void *)snapshot->entries); free((void *)snapshot);
         wl_extension_error_set("allocation failed"); return NULL;
     }
-    snapshot->destroy_entries = calloc(registry->count,
+    snapshot->destroy_entries = (bool *)calloc(registry->count,
             sizeof(*snapshot->destroy_entries));
     if (registry->count && !snapshot->destroy_entries) {
         mutex_unlock(&registry->mutex);
-        free(snapshot->pins);
-        free(snapshot->entries);
-        free(snapshot);
+        free((void *)snapshot->pins);
+        free((void *)snapshot->entries);
+        free((void *)snapshot);
         wl_extension_error_set("allocation failed");
         return NULL;
     }
@@ -311,10 +316,10 @@ wirelog_extension_snapshot_release(wirelog_extension_snapshot_t *snapshot)
     for (i = 0; i < snapshot->count; i++)
         if (snapshot->destroy_entries[i])
             wl_extension_entry_destroy(snapshot->entries[i]);
-    free(snapshot->destroy_entries);
-    free(snapshot->pins);
-    free(snapshot->entries);
-    free(snapshot);
+    free((void *)snapshot->destroy_entries);
+    free((void *)snapshot->pins);
+    free((void *)snapshot->entries);
+    free((void *)snapshot);
     wl_extension_error_set(NULL);
 }
 
