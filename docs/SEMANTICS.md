@@ -14,6 +14,16 @@ Each entry is tagged with its **Status**:
 
 Until 1.0 ships, expect most entries to be **Current**.
 
+## Weighted evaluation boundary (Status: Current)
+
+Wirelog's normative weight model is the signed-integer Z-set/differential
+model: inserts contribute `+1`, removals `-1`, duplicate derivations add, and
+joins multiply. This is not a general probabilistic semiring. The proposed
+future extension and its retraction, optimizer, and ABI constraints are in
+[`docs/design/weighted-semiring-addon.md`](design/weighted-semiring-addon.md).
+No probabilistic semantics or public weight API is currently provided. Scalar
+row-local addons proposed by issue #912 cannot change this evaluation model.
+
 ---
 
 ## Inline `.dl` facts (Status: Current)

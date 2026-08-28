@@ -75,6 +75,13 @@ assumptions should update `docs/SECURITY_MODEL.md`.
 I/O adapter changes that affect the installed adapter ABI or host/plugin
 integration should be reflected in `docs/io-adapters.md`.
 
+The weighted/probabilistic evaluation proposal is intentionally outside the
+current public and internal runtime boundary. See
+[`docs/design/weighted-semiring-addon.md`](design/weighted-semiring-addon.md).
+Any future implementation should begin as a separate backend; a public weight
+ABI would require a distinct version namespace, `WIRELOG_API` declarations,
+registration in `wirelog_public_headers`, and an ABI-manifest review.
+
 ## Changing Internals Checklist
 
 Before landing an internal change, check whether it crosses a public boundary:

@@ -790,6 +790,13 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #913: keep the weighted/semiring design proposal explicit about its
+# current Z-set baseline, future-only ABI, retraction contract, and links.
+test('weighted_semiring_design', py3,
+     args: [meson.project_source_root() /
+            'scripts/ci/check-weighted-semiring-design.py'],
+     suite: 'abi')
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss

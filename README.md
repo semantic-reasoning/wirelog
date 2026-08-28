@@ -48,6 +48,10 @@ meson test -C build
 
 For fine-grained control over plans, backends, or worker counts, use the `wirelog_session_*` API in [`wirelog/wirelog-advanced.h`](wirelog/wirelog-advanced.h). The internal `wl_session_*` primitives in `wirelog/session.h` are not part of the installed surface and may change without notice.
 
+The future weighted/probabilistic evaluation design is documented in
+[`docs/design/weighted-semiring-addon.md`](docs/design/weighted-semiring-addon.md).
+It is a design proposal, not a currently available API.
+
 ## Features
 
 - **Incremental evaluation** -- timely-differential dataflow evaluation propagates only new facts, not full re-derivation
