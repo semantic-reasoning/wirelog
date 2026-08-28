@@ -730,3 +730,26 @@ contributes its own bytes, so `hmac_sha256(sym, 42)` and
 `int64` bytes for the numeric one. Applying the comparison rule here
 would leave every mixed call digesting an interned id, which is the
 defect the digest functions were fixed for.
+
+### Scalar Addon Calls
+
+Scalar addons use the explicit `@call` marker so their syntax cannot be
+confused with an existing relation named `call`:
+
+```
+result(y) :- input(x), @call("vendor.normalize", x, y).
+```
+
+The addon name must be a quoted `namespace.name` made from ASCII letters,
+digits, underscores, and dots, with at least one dot. The name is trimmed
+before validation. The ordinary relation form remains unchanged, including
+string arguments:
+
+```
+call("literal", x).
+```
+
+Addon calls are resolved against an explicit registry snapshot at compile or
+session creation. A serialized plan stores the stable name and ABI identity,
+never a function pointer or descriptor address. Runtime FILTER/MAP support and
+the callback lifetime contract are tracked separately in issue #1250.
