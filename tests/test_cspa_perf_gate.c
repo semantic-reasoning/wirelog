@@ -378,6 +378,15 @@ main(void)
     const int correctness_only
         = parse_bool_env_("WIRELOG_GATE_CORRECTNESS_ONLY", 0);
 
+    if (correctness_only
+        && parse_bool_env_("WIRELOG_SKIP_CSPA_CORRECTNESS", 0)) {
+        fprintf(stderr,
+            "test_cspa_perf_gate: SKIP: CSPA correctness is covered by "
+            "the non-sanitized ARM build; ARM ASan execution exceeds the "
+            "CI timeout\n");
+        return SKIP_EXIT;
+    }
+
     if (!correctness_only && !parse_bool_env_("WIRELOG_PERF_GATE", 0)) {
         fprintf(stderr,
             "test_cspa_perf_gate: SKIP: set WIRELOG_PERF_GATE=1 to run "

@@ -552,10 +552,10 @@ jobs:
           # (the same 20,381-tuple sentinel).  On the ARM ASan runner this
           # workload does not terminate within five minutes despite passing
           # on the other sanitizer platforms; keep the full sanitizer suite
-          # while avoiding a duplicate platform-specific long-running test.
+          # while explicitly skipping only this duplicate test.
           if [ "${{ matrix.os }}" = "ubuntu-24.04-arm" ]; then
-            meson test -C builddir-san --print-errorlogs \
-              --exclude cspa_correctness
+            WIRELOG_SKIP_CSPA_CORRECTNESS=1 \
+              meson test -C builddir-san --print-errorlogs
           else
             meson test -C builddir-san --print-errorlogs
           fi
