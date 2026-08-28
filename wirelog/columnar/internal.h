@@ -21,6 +21,7 @@
 #include "columnar/diff_trace.h"
 #include "columnar/delta_pool.h"
 #include "columnar/mem_ledger.h"
+#include "columnar/kfusion_adaptive.h"
 #include "columnar/progress.h"
 #include "session.h"
 #include "intern.h"
@@ -1218,6 +1219,9 @@ typedef struct wl_col_session_t {
     uint64_t kfusion_dispatch_ns;
     uint64_t kfusion_merge_ns;
     uint64_t kfusion_cleanup_ns;
+    /* Coordinator-owned adaptive policy for K=2/K=3 K-fusion. Worker
+    * session copies set this to NULL and never mutate or free it. */
+    wl_kfusion_adaptive_ctx_t *kfusion_adaptive;
     /* Exchange path timing (Issue #413): accumulated wall time spent in
      * tdd_exchange_deltas / tdd_bdx_exchange_deltas across all sub-pass
      * barriers.  Used to compute serial_fraction = exchange_time_ns / total_ns

@@ -998,6 +998,7 @@ backend_src = files(
   '../wirelog/columnar/join.c',
   '../wirelog/columnar/merge.c',
   '../wirelog/columnar/kfusion.c',
+  '../wirelog/columnar/kfusion_adaptive.c',
   '../wirelog/columnar/diff.c',
   '../wirelog/columnar/inline.c',
   '../wirelog/columnar/eval_dedup.c',
@@ -1843,6 +1844,14 @@ test_k_fusion_e2e_exe = executable(
 )
 
 test('k_fusion_e2e', test_k_fusion_e2e_exe)
+
+test_k_fusion_adaptive_exe = executable(
+  'test_k_fusion_adaptive',
+  files('test_k_fusion_adaptive.c'),
+  files('../wirelog/columnar/kfusion_adaptive.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+)
+test('k_fusion_adaptive', test_k_fusion_adaptive_exe)
 
 # ============================================================================
 # K-Fusion Memory Isolation Tests (Issue #196)

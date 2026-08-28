@@ -1342,6 +1342,7 @@ col_session_destroy(wl_session_t *session)
     session_rel_free_hash(sess);
     col_mat_cache_clear(&sess->mat_cache);
     wl_workqueue_destroy(sess->wq);
+    wl_kfusion_adaptive_destroy(sess->kfusion_adaptive);
     /* Free arrangement registry (Phase 3C) */
     for (uint32_t i = 0; i < sess->arr_count; i++) {
         free(sess->arr_entries[i].rel_name);
@@ -1447,6 +1448,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Step 3: NULL all owned pointers (safe for cleanup on early abort) */
     out_worker->wq = NULL;
     out_worker->wq_workers = 0;
+    out_worker->kfusion_adaptive = NULL;
     out_worker->eval_arena = NULL;
     out_worker->delta_pool = NULL;
     out_worker->rels = NULL;

@@ -422,32 +422,35 @@ emits a non-fused chain.
 
 ### 7.2 Parallel-runtime threshold (K ≥ 4)
 
-`wirelog/columnar/ops.c:19` defines:
+`wirelog/columnar/kfusion.c` defines:
 
 ```
 #define WL_KFUSION_MIN_PARALLEL_K 4
 ```
 
-At the dispatch site (`kfusion.c:609-623`), the runtime picks between
+At the dispatch site, the runtime picks between
 parallel and serial K-fusion:
 
 ```c
 uint32_t active_workers = live_count < sess->num_workers
     ? live_count : sess->num_workers;
 wl_work_queue_t *wq = NULL;
-if (active_workers > 1 && live_count >= WL_KFUSION_MIN_PARALLEL_K) {
+if (active_workers > 1
+    && (live_count >= WL_KFUSION_MIN_PARALLEL_K || adaptive_parallel)) {
     /* ... ensure workqueue, dispatch parallel branches ... */
     wq = sess->wq;
 }
-if (!wq || live_count < WL_KFUSION_MIN_PARALLEL_K) {
+if (!wq || (live_count < WL_KFUSION_MIN_PARALLEL_K
+        && !adaptive_parallel)) {
     return col_op_k_fusion_serial(op, stack, sess);
 }
 ```
 
 So:
 
-- **K = 2 or K = 3**: plan emits `WL_PLAN_OP_K_FUSION`, runtime takes
-  the **serial** branch (`col_op_k_fusion_serial`).
+- **K = 2 or K = 3**: plan emits `WL_PLAN_OP_K_FUSION`, runtime starts on
+  the **serial** branch and may enable parallel dispatch after adaptive
+  evidence (`col_op_k_fusion_serial`).
 - **K ≥ 4 and `num_workers > 1`**: runtime allocates per-worker
   sessions and dispatches branches in parallel.
 
@@ -459,18 +462,38 @@ session allocation (`COL_SESSION(sess)->kfusion_alloc_ns` profiled
 at `kfusion.c:633`) exceed the saved tuple work for the CRDT and
 DDISASM workloads measured in the v0.40 perf gate
 (`tests/test_crdt_perf_gate.c`, `bench/bench_flowlog.c`). The
-`ops.c:17-19` comment block records the measurement summary:
+    `kfusion.c` comment block records the measurement summary:
 **DDISASM K = 3 is 14% slower with 8-worker parallel than serial.**
 
 Cross-reference: #731 (CRDT median-time perf gate landing) for the
 empirical evidence anchoring K = 4.
 
-### 7.4 Workload-adaptive future work
+### 7.4 Workload-adaptive low-K dispatch
 
-The threshold is currently a compile-time constant. A
-workload-adaptive variant (e.g. K-fusion dispatch decided per-stratum
-based on tuple-count estimates) is out of scope for v0.41 and would
-require a separate evaluator restructure.
+K=2 and K=3 use a session-local conservative policy in
+`wirelog/columnar/kfusion_adaptive.c`. Each K-fusion operator starts in
+the serial path. The policy records the complete invocation duration,
+including branch evaluation, workqueue wait, merge, cleanup, and result
+stack effects. After three valid serial observations it permits parallel
+probe invocations; three valid parallel observations must beat the serial
+EWMA by at least 5% before the policy enters the parallel state.
+
+The policy has three states: `UNKNOWN`, `SERIAL`, and `PARALLEL`. A
+cooldown provides hysteresis after transitions, and invalid timing,
+dispatch errors, insufficient observations, or ambiguous results return
+to the serial fallback. A change in operator, worker count, or relation
+size class creates a fresh record, so stale measurements are not reused.
+
+The adaptive records belong only to the coordinator session. K-fusion
+worker session copies set the policy pointer to `NULL`; workers never
+update or free coordinator state. Session snapshot profiling preserves
+the learned records, while session destruction releases them.
+
+The fixed `K >= 4` threshold and its parallel path are unchanged. The
+adaptive policy does not change planner metadata, public ABI, merge logic,
+or worker cleanup semantics. Deterministic policy tests use synthetic
+observations rather than wall-clock sleeps; workload-level calibration
+remains a pinned-runner measurement task.
 
 ---
 
@@ -759,7 +782,7 @@ advisory leg); issue #826 (native TSan SEGV triage);
 - `wirelog/meson.build:40-72` — `cc.links()` C11-threads detection.
 - `meson_options.txt:14-19` — `threads` build option (`native` |
   `posix`).
-- `wirelog/columnar/ops.c:17-22` — `WL_KFUSION_MIN_PARALLEL_K` plus
+- `wirelog/columnar/kfusion.c:10` — `WL_KFUSION_MIN_PARALLEL_K` plus
   the rationale comment block citing the DDISASM K = 3 measurement.
 - `wirelog/columnar/kfusion.c:609-623` — K-fusion parallel-dispatch
   gate.
