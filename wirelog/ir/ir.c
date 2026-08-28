@@ -105,6 +105,7 @@ wl_ir_expr_free(wl_ir_expr_t *expr)
     free((void *)expr->children);
     free(expr->var_name);
     free(expr->str_value);
+    free(expr->extension_name);
     free(expr);
 }
 
@@ -137,6 +138,14 @@ wl_ir_expr_clone(const wl_ir_expr_t *expr)
     if (expr->str_value) {
         clone->str_value = strdup_safe(expr->str_value);
         if (!clone->str_value) {
+            wl_ir_expr_free(clone);
+            return NULL;
+        }
+    }
+
+    if (expr->extension_name) {
+        clone->extension_name = strdup_safe(expr->extension_name);
+        if (!clone->extension_name) {
             wl_ir_expr_free(clone);
             return NULL;
         }
@@ -419,6 +428,15 @@ ir_expr_to_buf(const wl_ir_expr_t *expr, char *buf, size_t bufsize, size_t *pos)
         for (uint32_t ci = 0; ci < expr->child_count; ci++) {
             if (ci > 0)
                 ir_buf_append(buf, bufsize, pos, ", ");
+            ir_expr_to_buf(expr->children[ci], buf, bufsize, pos);
+        }
+        ir_buf_append(buf, bufsize, pos, ")");
+        break;
+    case WL_IR_EXPR_EXTENSION_CALL:
+        ir_buf_append(buf, bufsize, pos, "@call(\"%s\"",
+            expr->extension_name ? expr->extension_name : "?");
+        for (uint32_t ci = 0; ci < expr->child_count; ci++) {
+            ir_buf_append(buf, bufsize, pos, ", ");
             ir_expr_to_buf(expr->children[ci], buf, bufsize, pos);
         }
         ir_buf_append(buf, bufsize, pos, ")");

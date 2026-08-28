@@ -81,7 +81,8 @@ node_contains_float_constant(const wirelog_ir_node_t *node)
     if (expr_contains_float_constant(node->filter_expr)
         || expr_contains_float_constant(node->agg_expr))
         return true;
-    for (uint32_t i = 0; i < node->project_count; i++) {
+    for (uint32_t i = 0; node->project_exprs
+        && i < node->project_count; i++) {
         if (expr_contains_float_constant(node->project_exprs[i]))
             return true;
     }
@@ -90,6 +91,221 @@ node_contains_float_constant(const wirelog_ir_node_t *node)
             return true;
     }
     return false;
+}
+
+static wl_ir_expr_t *
+find_expr_type(const wirelog_ir_node_t *node, wl_ir_expr_type_t type)
+{
+    if (!node)
+        return NULL;
+    const wl_ir_expr_t *exprs[] = {
+        node->filter_expr, node->agg_expr
+    };
+    for (size_t i = 0; i < sizeof(exprs) / sizeof(exprs[0]); i++) {
+        if (exprs[i] && exprs[i]->type == type)
+            return (wl_ir_expr_t *)exprs[i];
+        if (exprs[i]) {
+            for (uint32_t c = 0; c < exprs[i]->child_count; c++) {
+                if (exprs[i]->children[c]->type == type)
+                    return exprs[i]->children[c];
+            }
+        }
+    }
+    for (uint32_t i = 0; node->project_exprs
+        && i < node->project_count; i++) {
+        if (node->project_exprs[i]
+            && node->project_exprs[i]->type == type)
+            return node->project_exprs[i];
+    }
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        wl_ir_expr_t *found = find_expr_type(node->children[i], type);
+        if (found)
+            return found;
+    }
+    return NULL;
+}
+
+static const wl_plan_op_t *
+find_plan_op(const wl_plan_t *plan, wl_plan_op_type_t type)
+{
+    if (!plan)
+        return NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; r++) {
+            const wl_plan_relation_t *rel = &plan->strata[s].relations[r];
+            for (uint32_t o = 0; o < rel->op_count; o++) {
+                if (rel->ops[o].op == type)
+                    return &rel->ops[o];
+            }
+        }
+    }
+    return NULL;
+}
+
+static void
+test_extension_call_ir_and_plan(void)
+{
+    TEST("scalar extension call lowers to IR and postfix plan");
+    const char *src = ".decl src(x: int64)\n"
+        ".decl out(x: int64)\n"
+        "out(x) :- src(x), @call(\"math.is_even\", x).\n";
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "extension filter failed to parse and lower");
+    wl_ir_expr_t *call = find_expr_type(prog->rules[0].ir_root,
+            WL_IR_EXPR_EXTENSION_CALL);
+    ASSERT(call != NULL, "extension call missing from IR");
+    ASSERT(strcmp(call->extension_name, "math.is_even") == 0,
+        "extension name missing from IR");
+    ASSERT(call->child_count == 1 && call->children[0]->type == WL_IR_EXPR_VAR,
+        "extension arguments missing from IR");
+
+    wl_ir_expr_t *clone = wl_ir_expr_clone(call);
+    ASSERT(clone != NULL && clone != call, "extension IR clone failed");
+    ASSERT(clone->extension_name != call->extension_name
+        && strcmp(clone->extension_name, call->extension_name) == 0,
+        "extension name was not deep-cloned");
+    wl_ir_expr_free(clone);
+
+    wl_plan_t *plan = NULL;
+    ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,
+        "unsupported extension filter generated a plan");
+    ASSERT(strstr(wirelog_program_get_plan_error(prog),
+        "not executable until") != NULL,
+        "extension filter rejection lacks a deterministic diagnostic");
+
+    wl_plan_expr_buffer_t serialized = { 0 };
+    ASSERT(wl_exec_plan_gen_serialize_expr_for_test(call, &serialized) == 0,
+        "extension serialization helper failed");
+    const uint8_t expected[] = {
+        WL_PLAN_EXPR_VAR, 1, 0, 'x',
+        WL_PLAN_EXPR_EXTENSION_CALL, 12, 0,
+        'm', 'a', 't', 'h', '.', 'i', 's', '_', 'e', 'v', 'e', 'n',
+        1, 0, 0, 0
+    };
+    ASSERT(serialized.size == sizeof(expected),
+        "extension postfix plan has unexpected size");
+    ASSERT(memcmp(serialized.data, expected, sizeof(expected)) == 0,
+        "extension postfix bytes are not stable");
+    free(serialized.data);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_existing_expression_plan_encoding_unchanged(void)
+{
+    TEST("ordinary expression plan encoding remains unchanged");
+    const char *src = ".decl src(x: int64)\n"
+        ".decl out(x: int64)\n"
+        "out(x) :- src(x), x = 7.\n";
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "ordinary expression failed to parse");
+    wl_plan_t *plan = NULL;
+    ASSERT(wl_plan_from_program(prog, &plan) == 0 && plan != NULL,
+        "ordinary expression failed to generate a plan");
+    const wl_plan_op_t *filter = find_plan_op(plan, WL_PLAN_OP_FILTER);
+    const uint8_t expected[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0',
+        WL_PLAN_EXPR_CONST_INT, 7, 0, 0, 0, 0, 0, 0, 0,
+        WL_PLAN_EXPR_CMP_EQ
+    };
+    ASSERT(filter != NULL && filter->filter_expr.size == sizeof(expected),
+        "ordinary filter encoding changed size");
+    ASSERT(memcmp(filter->filter_expr.data, expected, sizeof(expected)) == 0,
+        "ordinary filter encoding changed");
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_extension_call_unsupported_contexts_rejected(void)
+{
+    TEST("extension calls reject unsupported contexts deterministically");
+    const char *sources[] = {
+        ".decl src(x: int64)\n.decl out(x: int64)\n"
+        "out(x) :- @call(\"math.answer\", x), src(x).\n",
+        ".decl src(x: int64)\n.decl out(x: int64)\n"
+        "out(@call(\"math.answer\", x)) :- src(x).\n",
+        ".decl src(x: int64)\n.decl out(x: int64)\n"
+        "out(x) :- src(x), !@call(\"math.answer\", x).\n",
+        ".decl src(x: int64)\n.decl out(x: int64)\n"
+        "out(x) :- src(x), @call(\"math.outer\", "
+        "@call(\"math.inner\", x)).\n"
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        wirelog_error_t err;
+        char diagnostic[512] = { 0 };
+        wirelog_program_t *prog = wl_ir_parse_string_err(sources[i], &err,
+                diagnostic, sizeof(diagnostic));
+        if (i == 0) {
+            ASSERT(prog == NULL, "leading extension call was silently kept");
+            ASSERT(strstr(diagnostic, "before any relation scan") != NULL,
+                "leading extension call lacks an IR diagnostic");
+            continue;
+        }
+        if (prog) {
+            wl_plan_t *plan = NULL;
+            ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,
+                "unsupported extension context generated a plan");
+            ASSERT(wirelog_program_get_plan_error(prog)[0] != '\0',
+                "unsupported extension context lacks a diagnostic");
+            wirelog_program_free(prog);
+        } else {
+            ASSERT(err == WIRELOG_ERR_PARSE,
+                "unsupported extension context returned wrong parse error");
+        }
+    }
+
+    {
+        const char *src = ".decl src(x: int64)\n"
+            ".decl out(x: int64)\n"
+            "out(x) :- src(x), @call(\"math.answer\", x).\n";
+        wirelog_error_t err;
+        wirelog_program_t *prog = wirelog_parse_string(src, &err);
+        ASSERT(prog != NULL, "length-validation fixture failed to parse");
+        wl_ir_expr_t *call = find_expr_type(prog->rules[0].ir_root,
+                WL_IR_EXPR_EXTENSION_CALL);
+        ASSERT(call != NULL, "length-validation call missing from IR");
+        char *long_name = (char *)malloc(UINT16_MAX + 2u);
+        ASSERT(long_name != NULL, "length-validation allocation failed");
+        memset(long_name, 'a', UINT16_MAX + 1u);
+        long_name[UINT16_MAX + 1u] = '\0';
+        free(call->extension_name);
+        call->extension_name = long_name;
+        wl_plan_t *plan = NULL;
+        ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,
+            "overlong extension name was serialized");
+        wirelog_program_free(prog);
+    }
+    PASS();
+}
+
+static void
+test_optimized_flatmap_extension_filter_rejected(void)
+{
+    TEST("optimized FLATMAP extension filter is rejected");
+    const char *src = ".decl src(x: int64)\n"
+        ".decl out(x: int64)\n"
+        "out(x) :- src(x), @call(\"math.answer\", x).\n";
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "optimized FLATMAP fixture failed to parse");
+    ASSERT(wirelog_optimize(prog, &err),
+        "optimized FLATMAP fixture failed to optimize");
+    ASSERT(prog->rules[0].ir_root != NULL
+        && prog->rules[0].ir_root->type == WIRELOG_IR_FLATMAP,
+        "optimizer did not produce the FLATMAP regression shape");
+    wl_plan_t *plan = NULL;
+    ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,
+        "optimized FLATMAP extension filter generated a plan");
+    ASSERT(strstr(wirelog_program_get_plan_error(prog),
+        "FILTER/FLATMAP") != NULL,
+        "optimized FLATMAP rejection lacks a deterministic diagnostic");
+    wirelog_program_free(prog);
+    PASS();
 }
 
 /* ----------------------------------------------------------------
@@ -1121,6 +1337,10 @@ main(void)
     test_plan_generation_diagnostics();
     test_float_plan_lowering();
     test_float_compound_metadata_resets_on_redeclaration();
+    test_extension_call_ir_and_plan();
+    test_existing_expression_plan_encoding_unchanged();
+    test_extension_call_unsupported_contexts_rejected();
+    test_optimized_flatmap_extension_filter_rejected();
     test_plan_free_null();
     test_load_facts_null_safe();
 

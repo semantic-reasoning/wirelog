@@ -18,6 +18,13 @@
 
 #include "exec_plan.h"
 
+#ifdef WIRELOG_TEST_EXTENSION_SERIALIZATION
+struct wl_ir_expr;
+int
+wl_exec_plan_gen_serialize_expr_for_test(const struct wl_ir_expr *expr,
+    wl_plan_expr_buffer_t *out);
+#endif
+
 /* Forward declaration (opaque in public header) */
 struct wirelog_program;
 

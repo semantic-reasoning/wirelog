@@ -37,6 +37,7 @@ typedef enum {
     WL_IR_EXPR_AGG,       /* aggregate function */
     WL_IR_EXPR_BOOL,      /* boolean literal */
     WL_IR_EXPR_STR_FN,    /* string function (strlen, cat, substr, ...) */
+    WL_IR_EXPR_EXTENSION_CALL, /* scalar addon call; name + child args */
 } wl_ir_expr_type_t;
 
 typedef struct wl_ir_expr wl_ir_expr_t;
@@ -49,6 +50,7 @@ struct wl_ir_expr {
     int64_t int_value; /* WL_IR_EXPR_CONST_INT */
     double float_value; /* WL_IR_EXPR_CONST_FLOAT */
     char *str_value;   /* WL_IR_EXPR_CONST_STR */
+    char *extension_name; /* WL_IR_EXPR_EXTENSION_CALL */
     bool bool_value;   /* WL_IR_EXPR_BOOL */
 
     wirelog_arith_op_t arith_op; /* WL_IR_EXPR_ARITH */
