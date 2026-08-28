@@ -62,6 +62,7 @@ wirelog/columnar/handle_remap.c
 wirelog/columnar/handle_remap_apply.c
 wirelog/columnar/handle_remap_apply_side.c
 wirelog/columnar/inline.c
+wirelog/columnar/kfusion_adaptive.c
 wirelog/columnar/lftj.c
 wirelog/columnar/mem_ledger.c
 wirelog/columnar/merge.c
