@@ -804,6 +804,30 @@ expr_contains_extension_call(const wl_ir_expr_t *expr)
     return false;
 }
 
+static bool
+expr_is_direct_extension_call(const wl_ir_expr_t *expr)
+{
+    if (!expr || expr->type != WL_IR_EXPR_EXTENSION_CALL)
+        return false;
+    for (uint32_t i = 0; i < expr->child_count; i++) {
+        if (expr_contains_extension_call(expr->children[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool
+right_filter_contains_extension(const wirelog_ir_node_t *node)
+{
+    while (node && node->type == WIRELOG_IR_FILTER
+        && node->child_count > 0) {
+        if (expr_contains_extension_call(node->filter_expr))
+            return true;
+        node = node->children[0];
+    }
+    return false;
+}
+
 static int
 validate_extension_plan_context(const wirelog_ir_node_t *node,
     struct wirelog_program *prog)
@@ -811,12 +835,18 @@ validate_extension_plan_context(const wirelog_ir_node_t *node,
     if (!node)
         return 0;
 
-    if ((node->type == WIRELOG_IR_FILTER
-        || node->type == WIRELOG_IR_FLATMAP)
+    if (node->type == WIRELOG_IR_FILTER
+        && expr_contains_extension_call(node->filter_expr)
+        && !expr_is_direct_extension_call(node->filter_expr)) {
+        set_plan_error(prog,
+            "only a direct boolean scalar extension call is supported in "
+            "FILTER expressions");
+        return -1;
+    }
+    if (node->type == WIRELOG_IR_FLATMAP
         && expr_contains_extension_call(node->filter_expr)) {
         set_plan_error(prog,
-            "scalar extension call in FILTER/FLATMAP is not executable until "
-            "the evaluator extension unit is implemented");
+            "scalar extension call in MAP/FLATMAP is not supported");
         return -1;
     }
     if (node->type == WIRELOG_IR_AGGREGATE
@@ -836,6 +866,15 @@ validate_extension_plan_context(const wirelog_ir_node_t *node,
                 return -1;
             }
         }
+    }
+    if ((node->type == WIRELOG_IR_JOIN
+        || node->type == WIRELOG_IR_ANTIJOIN
+        || node->type == WIRELOG_IR_SEMIJOIN)
+        && node->child_count > 1
+        && right_filter_contains_extension(node->children[1])) {
+        set_plan_error(prog,
+            "scalar extension call in right-filter is not supported");
+        return -1;
     }
     for (uint32_t i = 0; i < node->child_count; i++) {
         if (validate_extension_plan_context(node->children[i], prog) != 0)
@@ -1576,8 +1615,9 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
     for (uint32_t i = 0; i < nfilts; i++) {
         if (expr_contains_extension_call(filt_exprs[i])) {
             /* Right-filter expressions are evaluated by join operators in a
-             * separate context.  Until callback execution is wired there,
-             * reject rather than emit a plan that silently ignores the call. */
+             * separate context.  This unit supports only the ordinary FILTER
+             * operator, so reject rather than emit a plan that silently
+             * ignores the call. */
             return NULL;
         }
     }
@@ -1723,7 +1763,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     }
 
     case WIRELOG_IR_FILTER: {
-        if (expr_contains_extension_call(node->filter_expr))
+        if (expr_contains_extension_call(node->filter_expr)
+            && !expr_is_direct_extension_call(node->filter_expr))
             return -1;
         /* Translate child first */
         if (node->child_count > 0) {
@@ -3869,10 +3910,10 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
 
     *out = NULL;
 
-    /* Extension-call bytecode is intentionally not executable until the
-     * evaluator context and callback status unit lands.  Reject every
-     * expression-bearing plan context up front, before an unsupported FILTER
-     * can be emitted as if it were executable. */
+    /* Validate extension-call placement up front.  Direct boolean calls in a
+     * normal FILTER are executable through the snapshot-aware interpreter;
+     * MAP, joins' right filters, aggregates, and nested calls remain rejected
+     * until their evaluator contexts are wired. */
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         const wirelog_ir_node_t *root = prog->relation_irs
             ? prog->relation_irs[i] : NULL;

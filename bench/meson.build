@@ -71,6 +71,7 @@ bench_backend_src = files(
   # Issue #884: columnar/ops.c calls into ethernet_crc32()/castagnoli_crc32()
   # for the CRC-32 evaluator cases.
   subdir_wirelog / 'crc32.c',
+  subdir_wirelog / 'extension_registry.c',
 )
 
 bench_io_src = files(
