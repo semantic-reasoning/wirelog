@@ -552,9 +552,9 @@ cleanup:
  * parallel (or sequentially on single-threaded systems).
  * Results are merged via col_rel_merge_k() after all workers complete.
  */
-int
-col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
-    wl_col_session_t *sess)
+static int
+col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess, bool adaptive_parallel)
 {
     if (!op->opaque_data)
         return EINVAL;
@@ -624,7 +624,8 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
     uint32_t active_workers = live_count < sess->num_workers
         ? live_count : sess->num_workers;
     wl_work_queue_t *wq = NULL; /* NULL when serial or in workers */
-    if (active_workers > 1 && live_count >= WL_KFUSION_MIN_PARALLEL_K) {
+    if (active_workers > 1
+        && (live_count >= WL_KFUSION_MIN_PARALLEL_K || adaptive_parallel)) {
         int ensure_rc = wl_columnar_session_ensure_workqueue(sess,
                 active_workers);
         if (ensure_rc != 0) {
@@ -633,7 +634,8 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         }
         wq = sess->wq;
     }
-    if (!wq || live_count < WL_KFUSION_MIN_PARALLEL_K) {
+    if (!wq || (live_count < WL_KFUSION_MIN_PARALLEL_K
+        && !adaptive_parallel)) {
         free(live_indices);
         return col_op_k_fusion_serial(op, stack, sess);
     }
@@ -694,6 +696,7 @@ col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d] = *sess;
         worker_sess[d].wq = NULL; /* prevent nested K-fusion from workers */
         worker_sess[d].wq_workers = 0;
+        worker_sess[d].kfusion_adaptive = NULL;
         worker_sess[d].num_workers = 1;
         worker_sess[d].tdd_workers = NULL;
         worker_sess[d].tdd_workers_cap = 0;
@@ -983,5 +986,55 @@ cleanup_wq:
     free(workers);
     free(live_indices);
     COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
+    return rc;
+}
+
+/*
+ * Adaptive low-K entry point.  The existing fixed K>=4 path is deliberately
+ * untouched.  K=2/K=3 starts serial, then periodically samples the complete
+ * parallel invocation; the policy only changes dispatch and never participates
+ * in result construction or worker cleanup.
+ */
+int
+col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess)
+{
+    if (!op || !op->opaque_data || !stack || !sess)
+        return EINVAL;
+
+    wl_plan_op_k_fusion_t *meta = (wl_plan_op_k_fusion_t *)op->opaque_data;
+    uint32_t k = meta->k;
+    if (k == 0)
+        return EINVAL;
+    if (k >= WL_KFUSION_MIN_PARALLEL_K)
+        return col_op_k_fusion_dispatch(op, stack, sess, false);
+
+    /* Preserve the established serial safety cases and avoid allocating
+     * policy state in worker sessions. */
+    if (sess->tdd_subpass_active || sess->coordinator
+        || sess->num_workers <= 1)
+        return col_op_k_fusion_serial(op, stack, sess);
+
+    if (!sess->kfusion_adaptive) {
+        sess->kfusion_adaptive = wl_kfusion_adaptive_create();
+        if (!sess->kfusion_adaptive)
+            return col_op_k_fusion_serial(op, stack, sess);
+    }
+
+    uint64_t size_class = 0;
+    if (op->relation_name) {
+        col_rel_t *target = session_find_rel(sess, op->relation_name);
+        if (target)
+            size_class = target->nrows;
+    }
+    wl_kfusion_adaptive_decision_t decision = wl_kfusion_adaptive_begin(
+        sess->kfusion_adaptive, meta, k, sess->num_workers, size_class);
+    uint64_t started = now_ns();
+    int rc = decision == WL_KFUSION_ADAPTIVE_DECISION_PARALLEL
+        ? col_op_k_fusion_dispatch(op, stack, sess, true)
+        : col_op_k_fusion_serial(op, stack, sess);
+    uint64_t elapsed = now_ns() - started;
+    wl_kfusion_adaptive_observe(sess->kfusion_adaptive, meta, k,
+        sess->num_workers, size_class, decision, elapsed, rc == 0);
     return rc;
 }
