@@ -797,6 +797,17 @@ test('weighted_semiring_design', py3,
             'scripts/ci/check-weighted-semiring-design.py'],
      suite: 'abi')
 
+# Issue #912: keep the future scalar-function addon boundary, callback
+# contract, and cross-document links explicit without adding runtime API.
+test('scalar_function_addon_design', py3,
+     args: [meson.project_source_root() /
+            'scripts/ci/check-scalar-function-addon-design.py'],
+     suite: 'abi')
+test('scalar_function_addon_design_fixtures', py3,
+     args: [meson.project_source_root() /
+            'tests/test_scalar_function_addon_design.py'],
+     suite: 'abi')
+
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss
