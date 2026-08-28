@@ -25,6 +25,10 @@
 
 char *wl_test_make_delta_name(const char *name);
 
+static const char *k_semijoin_chain_src;
+static wirelog_ir_node_t *find_composite_left_joinlike(
+    wirelog_ir_node_t *node, wirelog_ir_node_type_t type);
+
 /* ----------------------------------------------------------------
  * Test framework
  * ---------------------------------------------------------------- */
@@ -168,11 +172,11 @@ test_extension_call_ir_and_plan(void)
     wl_ir_expr_free(clone);
 
     wl_plan_t *plan = NULL;
-    ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,
-        "unsupported extension filter generated a plan");
-    ASSERT(strstr(wirelog_program_get_plan_error(prog),
-        "not executable until") != NULL,
-        "extension filter rejection lacks a deterministic diagnostic");
+    ASSERT(wl_plan_from_program(prog, &plan) == 0 && plan != NULL,
+        "direct extension filter failed to generate a plan");
+    ASSERT(find_plan_op(plan, WL_PLAN_OP_FILTER) != NULL,
+        "direct extension filter plan is missing");
+    wl_plan_free(plan);
 
     wl_plan_expr_buffer_t serialized = { 0 };
     ASSERT(wl_exec_plan_gen_serialize_expr_for_test(call, &serialized) == 0,
@@ -302,9 +306,81 @@ test_optimized_flatmap_extension_filter_rejected(void)
     ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,
         "optimized FLATMAP extension filter generated a plan");
     ASSERT(strstr(wirelog_program_get_plan_error(prog),
-        "FILTER/FLATMAP") != NULL,
+        "MAP/FLATMAP") != NULL,
         "optimized FLATMAP rejection lacks a deterministic diagnostic");
     wirelog_program_free(prog);
+    PASS();
+}
+
+static char *
+test_copy_string(const char *value)
+{
+    size_t length = strlen(value) + 1;
+    char *copy = (char *)malloc(length);
+    if (copy)
+        memcpy(copy, value, length);
+    return copy;
+}
+
+static wirelog_ir_node_t *
+test_wrap_right_filter(wirelog_ir_node_t *right)
+{
+    wirelog_ir_node_t *filter = wl_ir_node_create(WIRELOG_IR_FILTER);
+    wl_ir_expr_t *call = wl_ir_expr_create(WL_IR_EXPR_EXTENSION_CALL);
+    if (!filter || !call) {
+        wl_ir_node_free(filter);
+        wl_ir_expr_free(call);
+        return NULL;
+    }
+    filter->filter_expr = call;
+    call->extension_name = test_copy_string("test.right");
+    if (!call->extension_name || wl_ir_node_add_child(filter, right) != 0) {
+        wl_ir_node_free(filter);
+        return NULL;
+    }
+    return filter;
+}
+
+static void
+test_extension_right_filters_rejected(void)
+{
+    TEST("extension right-filters reject deterministically");
+    const char *sources[] = {
+        ".decl a(x: int64, y: int64)\n.decl b(y: int64, z: int64)\n"
+        ".decl blocked(z: int64)\n.decl out(x: int64)\n"
+        "out(x) :- a(x, y), b(y, z), !blocked(z).\n",
+        k_semijoin_chain_src
+    };
+    const wirelog_ir_node_type_t types[] = {
+        WIRELOG_IR_ANTIJOIN, WIRELOG_IR_SEMIJOIN
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        wirelog_error_t err;
+        wirelog_program_t *prog = wirelog_parse_string(
+            i == 1 ? k_semijoin_chain_src : sources[i], &err);
+        ASSERT(prog != NULL, "right-filter fixture failed to parse");
+        if (i == 1) {
+            wl_fusion_apply(prog, NULL);
+            wl_jpp_apply(prog, NULL);
+            wl_sip_apply(prog, NULL);
+        }
+        wirelog_ir_node_t *joinlike = NULL;
+        for (uint32_t r = 0; r < prog->rule_count && !joinlike; r++)
+            joinlike = find_composite_left_joinlike(prog->rules[r].ir_root,
+                    types[i]);
+        ASSERT(joinlike != NULL, "right-filter joinlike node missing");
+        wirelog_ir_node_t *right = joinlike->children[1];
+        joinlike->children[1] = test_wrap_right_filter(right);
+        ASSERT(joinlike->children[1] != NULL, "right-filter wrapper failed");
+        ASSERT(wl_ir_program_rebuild_relation_irs(prog) == 0,
+            "right-filter IR rebuild failed");
+        wl_plan_t *plan = NULL;
+        ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,
+            "extension right-filter generated a plan");
+        ASSERT(strstr(wirelog_program_get_plan_error(prog), "right-filter")
+            != NULL, "right-filter rejection lacks a deterministic diagnostic");
+        wirelog_program_free(prog);
+    }
     PASS();
 }
 
@@ -1341,6 +1417,7 @@ main(void)
     test_existing_expression_plan_encoding_unchanged();
     test_extension_call_unsupported_contexts_rejected();
     test_optimized_flatmap_extension_filter_rejected();
+    test_extension_right_filters_rejected();
     test_plan_free_null();
     test_load_facts_null_safe();
 

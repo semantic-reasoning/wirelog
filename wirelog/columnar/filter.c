@@ -745,6 +745,10 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     int64_t *const row = row_rb.ptr;
+    wl_columnar_expr_context_t expr_ctx = {
+        sess ? sess->intern : NULL,
+        sess ? sess->base.extension_snapshot : NULL
+    };
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         col_rel_row_copy_out(e.rel, r, row);
         int pass;
@@ -757,8 +761,20 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                        ? (val != 0 ? 1 : 0)
                        : 0; /* on error: reject row */
         } else {
-            pass = wl_columnar_expr_filter_row(buf, bsz, row, e.rel->ncols,
-                    sess->intern);
+            int64_t val = 0;
+            wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_OK;
+            int err = wl_columnar_expr_eval_run_ctx(buf, bsz, row,
+                    e.rel->ncols, &val, &expr_ctx, &status);
+            if (err != WL_COLUMNAR_EXPR_OK
+                && status >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED) {
+                col_row_buf_release(&row_rb);
+                wl_columnar_expr_compiled_free(ce);
+                col_rel_destroy(out);
+                if (e.owned)
+                    col_rel_destroy(e.rel);
+                return err;
+            }
+            pass = err == WL_COLUMNAR_EXPR_OK && val != 0;
         }
         if (pass) {
             int rc = col_rel_append_row(out, row);

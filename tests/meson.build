@@ -20,6 +20,7 @@ ir_src = files(
   '../wirelog/session.c',
   '../wirelog/exec_plan_gen.c',
   '../wirelog/session_facts.c',
+  '../wirelog/extension_registry.c',
   # program.c uses WL_LOG (Issue #539 observability); bundle the logger so
   # every test executable that links ir_src resolves the symbols.
   '../wirelog/util/log.c',
@@ -1032,6 +1033,7 @@ backend_src = files(
   # the engine in so every backend-test binary has the symbols at
   # link time.
   '../wirelog/crc32.c',
+  '../wirelog/extension_registry.c',
 )
 
 arena_src = files(
@@ -5060,6 +5062,23 @@ test_session_extension_snapshot_exe = executable(
   install: false,
 )
 test('session_extension_snapshot', test_session_extension_snapshot_exe)
+
+test_extension_filter_exe = executable(
+  'test_extension_filter',
+  files('test_extension_filter.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  workqueue_src,
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('extension_filter', test_extension_filter_exe)
 
 # ============================================================================
 # I/O Context Accessor Tests (#452)

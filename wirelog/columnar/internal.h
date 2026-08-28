@@ -1849,6 +1849,23 @@ col_compute_delta_mobius(const col_rel_t *prev_collection,
 /* Checked expression arithmetic (columnar/arithmetic.c). */
 typedef struct wl_columnar_expr_compiled wl_columnar_expr_compiled_t;
 
+typedef struct {
+    wl_intern_t *intern;
+    const wirelog_extension_snapshot_t *extensions; /* borrowed */
+} wl_columnar_expr_context_t;
+
+typedef enum {
+    WL_COLUMNAR_EXPR_OK = 0,
+    WL_COLUMNAR_EXPR_MALFORMED = 1,
+    WL_COLUMNAR_EXPR_EXTENSION_MALFORMED,
+    WL_COLUMNAR_EXPR_MISSING_EXTENSION,
+    WL_COLUMNAR_EXPR_ARITY_MISMATCH,
+    WL_COLUMNAR_EXPR_TYPE_MISMATCH,
+    WL_COLUMNAR_EXPR_CALLBACK_FAILURE,
+    WL_COLUMNAR_EXPR_INVALID_RESULT,
+    WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
+} wl_columnar_expr_status_t;
+
 wl_columnar_expr_compiled_t *
 wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
     const wl_intern_t *intern);
@@ -1861,6 +1878,11 @@ int
 wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size,
     const int64_t *row, uint32_t ncols, int64_t *out_val,
     wl_intern_t *intern);
+int
+wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, int64_t *out_val,
+    const wl_columnar_expr_context_t *ctx,
+    wl_columnar_expr_status_t *status);
 int
 wl_columnar_expr_filter_row(const uint8_t *buf, uint32_t size,
     const int64_t *row, uint32_t ncols, wl_intern_t *intern);

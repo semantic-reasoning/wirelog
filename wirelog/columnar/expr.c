@@ -27,14 +27,25 @@
 
 typedef struct {
     int64_t vals[COL_FILTER_STACK];
+    uint32_t types[COL_FILTER_STACK];
     uint32_t top;
 } expr_stack_t;
 
 static inline void
 expr_push(expr_stack_t *s, int64_t v)
 {
-    if (s->top < COL_FILTER_STACK)
+    if (s->top < COL_FILTER_STACK) {
         s->vals[s->top++] = v;
+        s->types[s->top - 1] = WIRELOG_EXTENSION_VALUE_INT64;
+    }
+}
+static inline void
+expr_push_typed(expr_stack_t *s, int64_t v, uint32_t type)
+{
+    if (s->top < COL_FILTER_STACK) {
+        s->vals[s->top] = v;
+        s->types[s->top++] = type;
+    }
 }
 static inline int64_t
 expr_pop(expr_stack_t *s)
@@ -351,11 +362,16 @@ filt_digest_bytes(filt_bytes_t *out, int64_t v, bool as_symbol,
  * Returns 0 on success, non-zero on malformed bytecode.
  */
 int
-wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
-    uint32_t ncols, int64_t *out_val, wl_intern_t *intern)
+wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, int64_t *out_val,
+    const wl_columnar_expr_context_t *ctx,
+    wl_columnar_expr_status_t *status)
 {
     expr_stack_t s;
     s.top = 0;
+    wl_intern_t *intern = ctx ? ctx->intern : NULL;
+    if (status)
+        *status = WL_COLUMNAR_EXPR_OK;
 
     uint32_t i = 0;
     while (i < size) {
@@ -363,7 +379,7 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         switch ((wl_plan_expr_tag_t)tag) {
 
         case WL_PLAN_EXPR_VAR: {
-            if (i + 2 > size)
+            if (i > size || size - i < 2)
                 goto bad;
             uint16_t nlen;
             memcpy(&nlen, buf + i, 2);
@@ -435,7 +451,8 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         case WL_PLAN_EXPR_BOOL: {
             if (i + 1 > size)
                 goto bad;
-            expr_push(&s, buf[i++] ? 1 : 0);
+            expr_push_typed(&s, buf[i++] ? 1 : 0,
+                WIRELOG_EXTENSION_VALUE_BOOL);
             break;
         }
 
@@ -455,11 +472,100 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
                 tmp[slen] = '\0';
                 int64_t id = wl_intern_put(intern, tmp);
                 free(tmp);
-                expr_push(&s, id);
+                expr_push_typed(&s, id, WIRELOG_EXTENSION_VALUE_STRING);
             } else {
-                expr_push(&s, 0);
+                expr_push_typed(&s, 0, WIRELOG_EXTENSION_VALUE_STRING);
             }
             i += slen;
+            break;
+        }
+
+        case WL_PLAN_EXPR_EXTENSION_CALL: {
+            uint16_t name_len;
+            uint32_t nargs;
+            char name[256];
+            const wirelog_extension_descriptor_t *descriptor;
+            wirelog_extension_value_t args[COL_FILTER_STACK];
+            wirelog_extension_value_t result = { 0 };
+
+            if (i > size || size - i < 2) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_EXTENSION_MALFORMED;
+                goto bad;
+            }
+            name_len = (uint16_t)buf[i] | (uint16_t)buf[i + 1] << 8;
+            i += 2;
+            if (name_len == 0 || name_len >= sizeof(name)
+                || i > size || size - i < name_len
+                || size - i - name_len < 4) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_EXTENSION_MALFORMED;
+                goto bad;
+            }
+            memcpy(name, buf + i, name_len);
+            name[name_len] = '\0';
+            i += name_len;
+            nargs = (uint32_t)buf[i] | (uint32_t)buf[i + 1] << 8
+                | (uint32_t)buf[i + 2] << 16 | (uint32_t)buf[i + 3] << 24;
+            i += 4;
+            if (!ctx || !ctx->extensions) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
+                goto bad;
+            }
+            descriptor = wirelog_extension_snapshot_find(ctx->extensions,
+                    name);
+            if (!descriptor) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
+                goto bad;
+            }
+            if (nargs != descriptor->arity || nargs > s.top
+                || nargs > COL_FILTER_STACK) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_ARITY_MISMATCH;
+                goto bad;
+            }
+            if (descriptor->result_type != WIRELOG_EXTENSION_VALUE_BOOL) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+                goto bad;
+            }
+            for (uint32_t arg = 0; arg < nargs; arg++) {
+                uint32_t index = s.top - nargs + arg;
+                uint32_t expected = descriptor->argument_types
+                    ? descriptor->argument_types[arg] : 0;
+                uint32_t actual = s.types[index];
+                if (actual == WIRELOG_EXTENSION_VALUE_STRING
+                    || (expected != 0 && actual != expected)) {
+                    if (status)
+                        *status = WL_COLUMNAR_EXPR_TYPE_MISMATCH;
+                    goto bad;
+                }
+                args[arg].type = actual;
+                args[arg].size = actual == WIRELOG_EXTENSION_VALUE_BOOL
+                    ? sizeof(uint8_t) : sizeof(int64_t);
+                if (actual == WIRELOG_EXTENSION_VALUE_BOOL)
+                    args[arg].as.bool_value = s.vals[index] != 0;
+                else
+                    args[arg].as.int64_value = s.vals[index];
+            }
+            s.top -= nargs;
+            if (!descriptor->invoke
+                || descriptor->invoke(args, nargs, &result,
+                descriptor->user_data) != 0) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_CALLBACK_FAILURE;
+                goto bad;
+            }
+            if (result.type != WIRELOG_EXTENSION_VALUE_BOOL
+                || result.size != sizeof(uint8_t)) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_INVALID_RESULT;
+                goto bad;
+            }
+            expr_push_typed(&s, result.as.bool_value != 0,
+                WIRELOG_EXTENSION_VALUE_BOOL);
             break;
         }
 
@@ -990,7 +1096,19 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
 
 bad:
     *out_val = 0;
-    return 1;
+    if (status && *status == WL_COLUMNAR_EXPR_OK)
+        *status = WL_COLUMNAR_EXPR_MALFORMED;
+    return status ? *status : WL_COLUMNAR_EXPR_MALFORMED;
+}
+
+int
+wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
+    uint32_t ncols, int64_t *out_val, wl_intern_t *intern)
+{
+    wl_columnar_expr_context_t ctx = { intern, NULL };
+    wl_columnar_expr_status_t status;
+    return wl_columnar_expr_eval_run_ctx(buf, size, row, ncols, out_val,
+               &ctx, &status) == WL_COLUMNAR_EXPR_OK ? 0 : 1;
 }
 
 /*
