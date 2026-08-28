@@ -81,6 +81,12 @@ current public and internal runtime boundary. See
 Any future implementation should begin as a separate backend; a public weight
 ABI would require a distinct version namespace, `WIRELOG_API` declarations,
 registration in `wirelog_public_headers`, and an ABI-manifest review.
+The scalar-function addon proposal is future-only and does not reuse the I/O
+adapter registry. Its intended future boundary is a pinned, opaque registry
+snapshot between serialized expression plans and row-local evaluator calls;
+see [`docs/design/scalar-function-addon.md`](design/scalar-function-addon.md).
+Any eventual public header would require `WIRELOG_API`, registration in
+`wirelog_public_headers`, a distinct ABI version, and an ABI-manifest review.
 
 ## Changing Internals Checklist
 

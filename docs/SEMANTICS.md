@@ -24,6 +24,18 @@ future extension and its retraction, optimizer, and ABI constraints are in
 No probabilistic semantics or public weight API is currently provided. Scalar
 row-local addons proposed by issue #912 cannot change this evaluation model.
 
+## Scalar addon boundary (Status: Current)
+
+Built-in expression functions retain their current parser, plan, evaluator,
+and optimization semantics. Issue #912 proposes a future row-local scalar
+function addon, but provides no runtime or public API; its registry, callback,
+error, and lifetime constraints are documented in
+[`docs/design/scalar-function-addon.md`](design/scalar-function-addon.md).
+
+An addon callback cannot change the engine's relational, differential, or
+aggregate semantics. In particular, callback errors are not silently converted
+to false predicates.
+
 ---
 
 ## Inline `.dl` facts (Status: Current)

@@ -50,6 +50,8 @@ For fine-grained control over plans, backends, or worker counts, use the `wirelo
 
 The future weighted/probabilistic evaluation design is documented in
 [`docs/design/weighted-semiring-addon.md`](docs/design/weighted-semiring-addon.md).
+The future scalar-function addon design is documented in
+[`docs/design/scalar-function-addon.md`](docs/design/scalar-function-addon.md).
 It is a design proposal, not a currently available API.
 
 ## Features
