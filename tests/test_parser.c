@@ -2021,6 +2021,74 @@ test_parser_compound_error_trailing_comma(void)
     PASS();
 }
 
+static void
+test_parser_extension_call(void)
+{
+    TEST("generic scalar extension call");
+    PARSE(".decl R(x: string)\nR(x) :- @call(\"demo.fn\", x).");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *rule = child(program, 1);
+    const wl_parser_ast_node_t *call = child(rule, 1);
+    if (!call || call->type != WL_PARSER_AST_NODE_EXTENSION_CALL
+        || strcmp(call->name, "demo.fn") != 0 || call->child_count != 1
+        || child(call, 0)->type != WL_PARSER_AST_NODE_VARIABLE
+        || strcmp(child(call, 0)->name, "x") != 0) {
+        CLEANUP();
+        FAIL("expected normalized extension call AST");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parser_extension_call_trim_and_relation_name(void)
+{
+    TEST("extension call trim and call relation compatibility");
+    PARSE(
+        ".decl R(x: string)\nR(x) :- @call(\"  demo.fn  \", x), call(\"literal\", x).");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *rule = child(program, 1);
+    const wl_parser_ast_node_t *extension = child(rule, 1);
+    const wl_parser_ast_node_t *relation = child(rule, 2);
+    if (!extension || extension->type != WL_PARSER_AST_NODE_EXTENSION_CALL
+        || strcmp(extension->name, "demo.fn") != 0 || !relation
+        || relation->type != WL_PARSER_AST_NODE_ATOM
+        || strcmp(relation->name, "call") != 0) {
+        CLEANUP();
+        FAIL("expected extension and ordinary call relation");
+        return;
+    }
+    CLEANUP();
+    PASS();
+}
+
+static void
+test_parser_extension_call_errors(void)
+{
+    TEST("extension call malformed name errors");
+    PARSE(".decl R(x: string)\nR(x) :- @call(\"   \", x).");
+    if (program) {
+        CLEANUP();
+        FAIL("blank extension name should fail");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_parser_extension_call_name_errors(void)
+{
+    TEST("extension call names require namespace");
+    PARSE(".decl R(x: string)\nR(x) :- @call(\"missing\", x).");
+    if (program) {
+        CLEANUP();
+        FAIL("unqualified extension name should fail");
+        return;
+    }
+    PASS();
+}
+
 /* ======================================================================== */
 /* Parser: Error Cases                                                      */
 /* ======================================================================== */
@@ -2227,6 +2295,10 @@ main(void)
     test_parser_compound_error_empty_args();
     test_parser_compound_error_unbalanced_paren();
     test_parser_compound_error_trailing_comma();
+    test_parser_extension_call();
+    test_parser_extension_call_trim_and_relation_name();
+    test_parser_extension_call_errors();
+    test_parser_extension_call_name_errors();
 
     printf("\n--- Error Cases ---\n");
     test_parse_error_missing_horn();

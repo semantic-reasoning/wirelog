@@ -64,6 +64,7 @@ typedef enum {
     /* Expressions */
     WL_PARSER_AST_NODE_BINARY_EXPR, /* arith_op, children[0]=left, children[1]=right */
     WL_PARSER_AST_NODE_STR_FUNCTION, /* str_fn, children = arguments */
+    WL_PARSER_AST_NODE_EXTENSION_CALL, /* name=addon function, children=args */
 
     /* Inline facts */
     WL_PARSER_AST_NODE_FACT, /* name=relation, children=constant args */
