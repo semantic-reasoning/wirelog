@@ -229,6 +229,11 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
     int64_t *const row = row_rb.ptr;
+    wl_columnar_expr_context_t expr_ctx = {
+        sess ? sess->intern : NULL,
+        sess ? sess->base.extension_snapshot : NULL,
+        true
+    };
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         col_rel_row_copy_out(e.rel, r, row);
         for (uint32_t c = 0; c < pc; c++) {
@@ -254,9 +259,11 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     tmp[c] = val;
                 } else {
                     int64_t val = 0;
-                    if (wl_columnar_expr_eval_i64(op->map_exprs[c].data,
-                        op->map_exprs[c].size, row, e.rel->ncols,
-                        &val, sess->intern) != 0) {
+                    wl_columnar_expr_status_t expr_status
+                        = WL_COLUMNAR_EXPR_OK;
+                    if (wl_columnar_expr_eval_run_ctx(
+                            op->map_exprs[c].data, op->map_exprs[c].size, row,
+                            e.rel->ncols, &val, &expr_ctx, &expr_status) != 0) {
                         if (ce_map) {
                             for (uint32_t i = 0; i < ce_map_count; i++)
                                 wl_columnar_expr_compiled_free(ce_map[i]);

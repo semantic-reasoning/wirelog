@@ -164,6 +164,11 @@ main(void)
         WIRELOG_EXTENSION_ABI_VERSION, sizeof(descriptor), "test.pred", 1,
         &int_type, WIRELOG_EXTENSION_VALUE_BOOL, extension_callback, NULL, NULL
     };
+    wirelog_extension_descriptor_t scalar_descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION, sizeof(scalar_descriptor),
+        "test.scalar", 1, &int_type, WIRELOG_EXTENSION_VALUE_INT64,
+        extension_callback, NULL, NULL
+    };
     wirelog_extension_registry_t *registry =
         wirelog_extension_registry_create();
     wirelog_extension_snapshot_t *snapshot;
@@ -176,9 +181,12 @@ main(void)
     failures += check(registry != NULL, "registry create");
     failures += check(wirelog_extension_register(registry, &descriptor) == 0,
             "register predicate");
+    failures += check(wirelog_extension_register(registry,
+            &scalar_descriptor) == 0, "register scalar callback");
     snapshot = wirelog_extension_snapshot_acquire(registry);
     ctx.intern = NULL;
     ctx.extensions = snapshot;
+    ctx.allow_extension_scalar_result = false;
 
     {
         wl_col_session_t session = { 0 };
@@ -210,6 +218,22 @@ main(void)
     size = put_call(buf, 9, "test.pred", 1);
     failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
     failures += check(value == 0, "false result");
+
+    /* MAP/head evaluation may accept an INT64 scalar result, while ordinary
+     * FILTER evaluation remains BOOL-only. */
+    size = put_var(buf, 0);
+    size = put_call(buf, size, "test.scalar", 1);
+    callback_mode = 2;
+    ctx.allow_extension_scalar_result = true;
+    failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    failures += check(value == 1, "scalar result in map context");
+    ctx.allow_extension_scalar_result = false;
+    failures += run(buf, size, &ctx, &value,
+            WL_COLUMNAR_EXPR_INVALID_RESULT);
+    callback_mode = 0;
+
+    size = put_var(buf, 0);
+    size = put_call(buf, size, "test.pred", 1);
 
     callback_mode = 1;
     failures += run(buf, size, &ctx, &value,
@@ -332,6 +356,8 @@ main(void)
     size = put_bool(buf, 0, 1);
     size = put_call(buf, size, "test.pred", 1);
     failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    failures += check(wirelog_extension_unregister(registry, "test.scalar")
+            == 0, "unregister scalar callback");
     wirelog_extension_snapshot_release(snapshot);
     failures += check(wirelog_extension_registry_destroy(registry) == 0,
             "registry destroy");

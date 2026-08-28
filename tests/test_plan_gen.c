@@ -250,6 +250,17 @@ test_extension_call_unsupported_contexts_rejected(void)
                 "leading extension call lacks an IR diagnostic");
             continue;
         }
+        if (i == 1) {
+            wl_plan_t *plan = NULL;
+            ASSERT(prog != NULL, "direct MAP extension call failed to parse");
+            ASSERT(wl_plan_from_program(prog, &plan) == 0 && plan != NULL,
+                "direct MAP extension call failed to generate a plan");
+            ASSERT(find_plan_op(plan, WL_PLAN_OP_MAP) != NULL,
+                "direct MAP extension call has no MAP operator");
+            wl_plan_free(plan);
+            wirelog_program_free(prog);
+            continue;
+        }
         if (prog) {
             wl_plan_t *plan = NULL;
             ASSERT(wl_plan_from_program(prog, &plan) != 0 && plan == NULL,

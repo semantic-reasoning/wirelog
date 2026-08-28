@@ -860,9 +860,11 @@ validate_extension_plan_context(const wirelog_ir_node_t *node,
         for (uint32_t i = 0; i < node->project_count; i++) {
             if (node->project_exprs
                 && expr_contains_extension_call(node->project_exprs[i])) {
+                if (expr_is_direct_extension_call(node->project_exprs[i]))
+                    continue;
                 set_plan_error(prog,
-                    "scalar extension call in MAP/head expression is not "
-                    "supported by the current evaluator");
+                    "only a direct scalar extension call is supported in "
+                    "MAP/head expressions");
                 return -1;
             }
         }
@@ -1744,10 +1746,6 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             collect_output_columns(child0, &child_ctx);
             for (uint32_t i = 0; i < node->project_count; i++) {
                 if (node->project_exprs[i]) {
-                    if (expr_contains_extension_call(node->project_exprs[i])) {
-                        col_ctx_free(&child_ctx);
-                        return -1;
-                    }
                     if (serialize_expr_to_buffer_ctx(
                             node->project_exprs[i], &child_ctx,
                             &op->map_exprs[i])
