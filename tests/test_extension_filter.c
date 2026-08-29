@@ -5,10 +5,11 @@
 #include "wirelog/wirelog-parser.h"
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 
 static int callback_mode;
-static int callback_calls;
+static _Atomic int callback_calls;
 static int fail_on_call;
 static const uint8_t *expected_string;
 static size_t expected_string_length;
@@ -160,6 +161,67 @@ run_map_error_case(const uint8_t *buf, uint32_t size,
 }
 
 static int
+run_kfusion_policy_case(const uint8_t *buf, uint32_t size,
+    wirelog_extension_snapshot_t *snapshot, int expected_rc)
+{
+    wl_col_session_t session = { 0 };
+    wl_plan_op_t branches[4][2] = { 0 };
+    wl_plan_op_t *branch_ptrs[4];
+    uint32_t branch_counts[4] = { 2, 2, 2, 2 };
+    wl_plan_op_k_fusion_t meta = { 4, branch_ptrs, branch_counts };
+    wl_plan_op_t kfusion = { 0 };
+    wl_plan_expr_buffer_t expression = { (uint8_t *)buf, size };
+    col_rel_t *input = col_rel_new_auto("input", 1);
+    int64_t row = 1;
+    eval_stack_t stack;
+    int rc;
+
+    if (!input || col_rel_append_row(input, &row) != 0)
+        return check(0, "K-fusion input allocation");
+    session.num_workers = 4;
+    session.callback_configured_workers = 4;
+    session.callback_active_workers = 1;
+    session.callback_parallel_execution = false;
+    session.base.extension_snapshot = snapshot;
+    session.delta_pool = delta_pool_create(16, sizeof(col_rel_t), 4096);
+    if (!session.delta_pool || session_add_rel(&session, input) != 0)
+        return check(0, "K-fusion session setup");
+    for (uint32_t i = 0; i < 4; i++) {
+        branches[i][0].op = WL_PLAN_OP_VARIABLE;
+        branches[i][0].relation_name = "input";
+        branches[i][0].delta_mode = WL_DELTA_FORCE_FULL;
+        branches[i][1].op = WL_PLAN_OP_MAP;
+        branches[i][1].map_exprs = &expression;
+        branches[i][1].map_expr_count = 1;
+        branches[i][1].project_count = 1;
+        branch_ptrs[i] = branches[i];
+    }
+    kfusion.op = WL_PLAN_OP_K_FUSION;
+    kfusion.relation_name = "out";
+    kfusion.opaque_data = &meta;
+    eval_stack_init(&stack);
+    callback_calls = 0;
+    rc = col_op_k_fusion(&kfusion, &stack, &session);
+    int failures = check(rc == expected_rc,
+            expected_rc == 0 ? "K-fusion accepts safe callback"
+                             : "K-fusion rejects unsafe callback");
+    if (expected_rc != 0)
+        failures += check(callback_calls == 0,
+                "K-fusion rejects before callback invocation");
+    else
+        failures += check(callback_calls > 0,
+                "K-fusion invokes safe callback");
+    eval_stack_drain(&stack);
+    wl_workqueue_destroy(session.wq);
+    wl_kfusion_adaptive_destroy(session.kfusion_adaptive);
+    delta_pool_destroy(session.delta_pool);
+    session_rel_free_hash(&session);
+    free(session.rels);
+    col_rel_destroy(input);
+    return failures;
+}
+
+static int
 check(int condition, const char *message)
 {
     if (!condition)
@@ -265,6 +327,7 @@ main(void)
         "test.scalar", 1, &int_type, WIRELOG_EXTENSION_VALUE_INT64,
         extension_callback, NULL, NULL
     };
+    wirelog_extension_descriptor_t safe_descriptor = scalar_descriptor;
     wirelog_extension_registry_t *registry =
         wirelog_extension_registry_create();
     wirelog_extension_snapshot_t *snapshot;
@@ -281,10 +344,14 @@ main(void)
     descriptor.addon_abi_version = 7;
     scalar_descriptor.addon_abi_identity = UINT64_C(0x1020304050607080);
     scalar_descriptor.addon_abi_version = 9;
+    safe_descriptor.name = "test.safe";
+    safe_descriptor.callback_policy = WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE;
     failures += check(wirelog_extension_register(registry, &descriptor) == 0,
             "register predicate");
     failures += check(wirelog_extension_register(registry,
             &scalar_descriptor) == 0, "register scalar callback");
+    failures += check(wirelog_extension_register(registry,
+            &safe_descriptor) == 0, "register thread-safe callback");
     snapshot = wirelog_extension_snapshot_acquire(registry);
     ctx.intern = NULL;
     ctx.extensions = snapshot;
@@ -355,6 +422,14 @@ main(void)
         fail_on_call = 0;
         delta_pool_destroy(session.delta_pool);
     }
+
+    size = put_var(buf, 0);
+    size = put_call(buf, size, "test.pred", 1);
+    failures += run_kfusion_policy_case(buf, size, snapshot,
+            WL_COLUMNAR_EXPR_CALLBACK_POLICY);
+    size = put_var(buf, 0);
+    size = put_call(buf, size, "test.safe", 1);
+    failures += run_kfusion_policy_case(buf, size, snapshot, 0);
 
     size = put_var(buf, 0);
     size = put_call(buf, size, "test.pred", 1);
@@ -565,6 +640,8 @@ main(void)
     failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
     failures += check(wirelog_extension_unregister(registry, "test.scalar")
             == 0, "unregister scalar callback");
+    failures += check(wirelog_extension_unregister(registry, "test.safe")
+            == 0, "unregister thread-safe callback");
     wirelog_extension_snapshot_release(snapshot);
     failures += check(wirelog_extension_registry_destroy(registry) == 0,
             "registry destroy");
