@@ -44,6 +44,12 @@ typedef struct wirelog_extension_value {
     } as;
 } wirelog_extension_value_t;
 
+/* Callback arguments are borrowed for the duration of invoke().  The engine
+ * copies accepted BOOL and INT64 results after invoke() returns; callbacks
+ * must therefore not expect the engine to retain pointers or release memory.
+ * STRING results are reserved for a future ownership-aware ABI and are
+ * rejected by the current evaluator. */
+
 typedef int (*wirelog_extension_scalar_fn)(
     const wirelog_extension_value_t *args, uint32_t nargs,
     wirelog_extension_value_t *result, void *user_data);
