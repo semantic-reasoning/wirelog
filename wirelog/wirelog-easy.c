@@ -106,7 +106,8 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
         return WIRELOG_OK;
 
     wl_plan_t *plan = NULL;
-    int rc = wl_plan_from_program(s->prog, &plan);
+    int rc = wl_plan_from_program_with_snapshot(
+        s->prog, s->extension_snapshot, &plan);
     if (rc != 0 || !plan) {
         if (plan)
             wl_plan_free(plan);
