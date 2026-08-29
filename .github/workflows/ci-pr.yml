@@ -312,6 +312,7 @@ jobs:
     needs: [build-arm, build-mbedtls, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
