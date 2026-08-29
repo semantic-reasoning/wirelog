@@ -55,8 +55,9 @@ typedef int (*wirelog_extension_scalar_fn)(
     wirelog_extension_value_t *result, void *user_data);
 typedef void (*wirelog_extension_destroy_fn)(void *user_data);
 
-/* Callback capabilities. A zero policy is the legacy/unspecified contract;
- * runtime enforcement is added by the follow-up evaluator policy unit. */
+/* Callback capabilities. A zero policy is the legacy/unspecified contract.
+ * Unless REENTRANT is declared, a callback must not recursively evaluate the
+ * same logical session.  The evaluator enforces this synchronously. */
 #define WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE  (1u << 0)
 #define WIRELOG_EXTENSION_CALLBACK_DETERMINISTIC (1u << 1)
 #define WIRELOG_EXTENSION_CALLBACK_PURE        (1u << 2)

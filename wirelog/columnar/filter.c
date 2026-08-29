@@ -750,7 +750,8 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
         .extensions = sess ? sess->base.extension_snapshot : NULL,
         .configured_worker_count = sess ? sess->callback_configured_workers : 1,
         .active_worker_count = sess ? sess->callback_active_workers : 1,
-        .parallel_execution = sess ? sess->callback_parallel_execution : false
+        .parallel_execution = sess ? sess->callback_parallel_execution : false,
+        .session_key = sess ? sess->callback_session_key : NULL
     };
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         col_rel_row_copy_out(e.rel, r, row);

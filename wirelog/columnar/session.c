@@ -967,6 +967,7 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     sess->callback_configured_workers = sess->num_workers;
     sess->callback_active_workers = 1;
     sess->callback_parallel_execution = false;
+    sess->callback_session_key = sess;
 
     /* Dynamic join output limit (Issue #221) */
     {
@@ -1447,6 +1448,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->worker_id = worker_id;
     out_worker->coordinator = coordinator;
     out_worker->extension_expr_status = 0;
+    out_worker->callback_session_key = coordinator->callback_session_key;
 
     /* Prevent accidental wl_session_destroy on stack-allocated worker */
     out_worker->base.backend = NULL;

@@ -13,6 +13,10 @@ static _Atomic int callback_calls;
 static int fail_on_call;
 static const uint8_t *expected_string;
 static size_t expected_string_length;
+static const uint8_t *nested_buf;
+static uint32_t nested_size;
+static wl_columnar_expr_context_t *nested_ctx;
+static int nested_rc;
 
 static int
 check(int condition, const char *message);
@@ -95,6 +99,17 @@ extension_callback(const wirelog_extension_value_t *args, uint32_t nargs,
         result->size = sizeof(returned_string) - 1;
         result->as.string_value.data = returned_string;
         result->as.string_value.length = sizeof(returned_string) - 1;
+        return 0;
+    }
+    if (callback_mode == 6) {
+        int64_t nested_value = 0;
+        wl_columnar_expr_status_t nested_status = WL_COLUMNAR_EXPR_OK;
+        nested_rc = wl_columnar_expr_eval_run_ctx(nested_buf, nested_size,
+                &nested_value, 1, &nested_value, nested_ctx, &nested_status);
+        nested_rc = nested_status;
+        result->type = WIRELOG_EXTENSION_VALUE_BOOL;
+        result->size = sizeof(uint8_t);
+        result->as.bool_value = 1;
         return 0;
     }
     result->type = WIRELOG_EXTENSION_VALUE_BOOL;
@@ -504,6 +519,25 @@ main(void)
     ctx.active_worker_count = 1;
     ctx.parallel_execution = false;
     failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+
+    /* A callback may not recursively invoke the same logical evaluator
+     * session unless it declares REENTRANT.  The guard must be restored after
+     * the callback so a later serial evaluation remains usable. */
+    ctx.session_key = &ctx;
+    nested_buf = buf;
+    nested_size = size;
+    nested_ctx = &ctx;
+    nested_rc = WL_COLUMNAR_EXPR_OK;
+    callback_mode = 6;
+    callback_calls = 0;
+    failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    failures += check(callback_calls == 1,
+            "nested evaluator does not invoke callback twice");
+    failures += check(nested_rc == WL_COLUMNAR_EXPR_CALLBACK_REENTRANT,
+            "nested evaluator reports reentrancy policy");
+    callback_mode = 0;
+    failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    ctx.session_key = NULL;
 
     buf[0] = (uint8_t)WL_PLAN_EXPR_CONST_INT;
     memset(buf + 1, 0, 8);
