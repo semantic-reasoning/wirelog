@@ -140,6 +140,89 @@ capture_public_map_rows(const char *relation, const int64_t *row,
     }
 }
 
+static void
+ignore_typed_tuple(const char *relation, const wirelog_typed_row_v1_t *row,
+    int32_t diff, void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)diff;
+    (void)user_data;
+}
+
+static int
+run_scalar_extension_failure_diagnostic(bool typed_snapshot)
+{
+    const uint32_t argument_types[] = { WIRELOG_EXTENSION_VALUE_INT64 };
+    wirelog_extension_descriptor_t descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION, sizeof(descriptor),
+        "test.public_snapshot", 1, argument_types,
+        WIRELOG_EXTENSION_VALUE_BOOL, snapshot_extension_invoke, NULL, NULL
+    };
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create();
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_program_t *prog = parse_or_die(SNAPSHOT_EXTENSION_SRC,
+            "T-extension-failure-diagnostic");
+    wirelog_session_t *session = NULL;
+    int64_t value = 7;
+    int rc = 0;
+
+    snapshot_extension_fail = 0;
+    if (!registry || !prog
+        || wirelog_extension_register(registry, &descriptor) != 0)
+        rc = 1;
+    snapshot = registry ? wirelog_extension_snapshot_acquire(registry) : NULL;
+    if (!rc && (!snapshot
+        || wirelog_session_create_with_snapshot(prog,
+        WIRELOG_BACKEND_DEFAULT, 1, snapshot, &session) != WIRELOG_OK
+        || !session))
+        rc = 1;
+    if (snapshot) {
+        wirelog_extension_snapshot_release(snapshot);
+        snapshot = NULL;
+    }
+    if (!rc && wirelog_extension_unregister(registry, descriptor.name) != 0)
+        rc = 1;
+    if (!rc && wirelog_session_insert(session, "src", &value, 1, 1)
+        != WIRELOG_OK)
+        rc = 1;
+
+    snapshot_extension_fail = 1;
+    wirelog_error_t error = WIRELOG_OK;
+    if (!rc) {
+        if (typed_snapshot)
+            error = wirelog_session_snapshot_typed(session,
+                    ignore_typed_tuple, NULL);
+        else
+            error = wirelog_session_step(session);
+        if (error != WIRELOG_ERR_EXEC
+            || !strstr(wirelog_extension_last_error(), "callback"))
+            rc = 1;
+    }
+
+    wirelog_session_destroy(session);
+    wirelog_extension_snapshot_release(snapshot);
+    wirelog_program_free(prog);
+    if (registry && wirelog_extension_registry_destroy(registry) != 0)
+        rc = 1;
+    snapshot_extension_fail = 0;
+    return rc;
+}
+
+static int
+test_scalar_extension_step_failure_diagnostic(void)
+{
+    return run_scalar_extension_failure_diagnostic(false);
+}
+
+/* The easy facade has no typed snapshot API. */
+static int
+test_scalar_extension_typed_snapshot_failure_diagnostic(void)
+{
+    return run_scalar_extension_failure_diagnostic(true);
+}
+
 static int
 test_public_map_extension_execution(void)
 {
@@ -2292,6 +2375,8 @@ main(void)
     failures += test_create_with_snapshot_invalid_args();
     failures += test_public_snapshot_extension_execution();
     failures += test_public_map_extension_execution();
+    failures += test_scalar_extension_step_failure_diagnostic();
+    failures += test_scalar_extension_typed_snapshot_failure_diagnostic();
     failures += test_inline_facts_seeded();
     failures += test_insert_step_delta();
     failures += test_relation_name_lifetime();

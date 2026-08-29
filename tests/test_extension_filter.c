@@ -1,5 +1,8 @@
 #include "columnar/internal.h"
+#include "exec_plan_gen.h"
+#include "session.h"
 #include "wirelog/wirelog-extension.h"
+#include "wirelog/wirelog-parser.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -12,6 +15,47 @@ static size_t expected_string_length;
 
 static int
 check(int condition, const char *message);
+
+static void
+ignore_snapshot_tuple(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)user_data;
+}
+
+static int
+check_snapshot_clears_extension_status(void)
+{
+    static const char *source =
+        ".decl input(x: int64)\n"
+        ".decl output(x: int64)\n"
+        "output(x) :- input(x).\n";
+    wirelog_error_t error = WIRELOG_OK;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    int rc = program ? wl_plan_from_program(program, &plan) : -1;
+
+    if (rc == 0)
+        rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+    if (rc == 0) {
+        /* Simulate status retained from an earlier scalar callback failure. */
+        COL_SESSION(session)->extension_expr_status =
+            WL_COLUMNAR_EXPR_CALLBACK_FAILURE;
+        rc = wl_session_snapshot(session, ignore_snapshot_tuple, NULL);
+    }
+    int failures = check(rc == 0, "non-extension snapshot execution");
+    if (session)
+        failures += check(COL_SESSION(session)->extension_expr_status == 0,
+                "snapshot clears stale extension status");
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    return failures;
+}
 
 static int
 extension_callback(const wirelog_extension_value_t *args, uint32_t nargs,
@@ -206,6 +250,8 @@ main(void)
     uint32_t size;
     int64_t value = 0;
     int failures = 0;
+
+    failures += check_snapshot_clears_extension_status();
 
     failures += check(registry != NULL, "registry create");
     failures += check(wirelog_extension_register(registry, &descriptor) == 0,

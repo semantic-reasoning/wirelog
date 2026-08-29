@@ -91,6 +91,7 @@ static const char *RELATION_NAME_LIFETIME_SRC
 /* ======================================================================== */
 
 static int easy_snapshot_destroy_calls;
+static int easy_snapshot_fail;
 
 static int
 easy_snapshot_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
@@ -98,8 +99,12 @@ easy_snapshot_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
 {
     (void)args;
     (void)nargs;
-    (void)result;
     (void)user_data;
+    if (easy_snapshot_fail)
+        return 1;
+    result->type = WIRELOG_EXTENSION_VALUE_INT64;
+    result->size = sizeof(int64_t);
+    result->as.int64_value = args[0].as.int64_value + 1;
     return 0;
 }
 
@@ -113,15 +118,18 @@ easy_snapshot_destroy(void *user_data)
 static wirelog_extension_registry_t *
 easy_snapshot_registry(wirelog_extension_snapshot_t **snapshot_out)
 {
+    static const uint32_t argument_types[] = {
+        WIRELOG_EXTENSION_VALUE_INT64
+    };
     wirelog_extension_registry_t *registry =
         wirelog_extension_registry_create();
     wirelog_extension_descriptor_t descriptor = {
         WIRELOG_EXTENSION_ABI_VERSION,
         sizeof(descriptor),
         "easy.test",
-        0,
-        NULL,
-        WIRELOG_EXTENSION_VALUE_BOOL,
+        1,
+        argument_types,
+        WIRELOG_EXTENSION_VALUE_INT64,
         easy_snapshot_invoke,
         NULL,
         easy_snapshot_destroy
@@ -310,6 +318,63 @@ test_easy_snapshot_old_options_size_compatibility(void)
         return;
     }
     wirelog_easy_close(session);
+    PASS();
+}
+
+static void
+test_scalar_extension_step_failure_diagnostic(void)
+{
+    static const char *src =
+        ".decl src(x: int64)\n"
+        ".decl out(x: int64)\n"
+        "out(@call(\"easy.test\", x)) :- src(x).\n";
+    TEST("scalar extension step failure exposes callback diagnostic");
+    wirelog_extension_snapshot_t *snapshot = NULL;
+    wirelog_extension_registry_t *registry = easy_snapshot_registry(&snapshot);
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    int64_t value = 7;
+    bool ok = true;
+
+    easy_snapshot_fail = 0;
+    opts.num_workers = 1;
+    opts.eager_build = true;
+    opts.extension_snapshot = snapshot;
+    wirelog_error_t open_error = wirelog_easy_open_opts(src, &opts, &session);
+    if (!registry || !snapshot || open_error != WIRELOG_OK || !session) {
+        fprintf(stderr, "easy extension open: error=%d session=%p\n",
+            open_error, (void *)session);
+        ok = false;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    snapshot = NULL;
+    if (ok && wirelog_easy_insert(session, "src", &value, 1) != WIRELOG_OK) {
+        fprintf(stderr, "easy extension insert failed\n");
+        ok = false;
+    }
+
+    easy_snapshot_fail = 1;
+    if (ok) {
+        wirelog_error_t error = wirelog_easy_step(session);
+        const char *diagnostic = wirelog_extension_last_error();
+        if (error != WIRELOG_ERR_EXEC || !strstr(diagnostic, "callback")) {
+            fprintf(stderr, "easy extension failure: error=%d diagnostic=%s\n",
+                error, diagnostic);
+            ok = false;
+        }
+    }
+
+    wirelog_easy_close(session);
+    wirelog_extension_snapshot_release(snapshot);
+    if (registry && wirelog_extension_unregister(registry, "easy.test") != 0)
+        ok = false;
+    if (registry && wirelog_extension_registry_destroy(registry) != 0)
+        ok = false;
+    easy_snapshot_fail = 0;
+    if (!ok) {
+        FAIL("step failure did not preserve scalar callback diagnostic");
+        return;
+    }
     PASS();
 }
 
@@ -2456,6 +2521,7 @@ main(void)
     test_easy_snapshot_close_before_build();
     test_easy_snapshot_failure_preserves_caller_reference();
     test_easy_snapshot_old_options_size_compatibility();
+    test_scalar_extension_step_failure_diagnostic();
     test_num_workers_default_is_one();
     test_num_workers_explicit_four();
     test_intern_returns_same_id();

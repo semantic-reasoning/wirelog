@@ -563,6 +563,9 @@ wirelog_session_step(wirelog_session_t *session)
     if (!session)
         return WIRELOG_ERR_EXEC;
     int rc = wl_session_step(session->inner);
+    if (rc != 0)
+        wl_extension_error_set_expr_status(
+            COL_SESSION(session->inner)->extension_expr_status);
     return (rc == 0 && !session->typed_callback_failed) ? WIRELOG_OK
                                                         : WIRELOG_ERR_EXEC;
 }
@@ -684,6 +687,9 @@ wirelog_session_snapshot_typed(wirelog_session_t *session,
     session->typed_callback_failed = false;
     struct typed_snapshot_context ctx = { session, callback, user_data };
     int rc = wl_session_snapshot(session->inner, typed_snapshot_bridge, &ctx);
+    if (rc != 0)
+        wl_extension_error_set_expr_status(
+            COL_SESSION(session->inner)->extension_expr_status);
     return rc == 0 && !session->typed_callback_failed ? WIRELOG_OK
                                                       : WIRELOG_ERR_EXEC;
 }

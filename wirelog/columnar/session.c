@@ -2350,6 +2350,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 
     wl_col_session_t *sess = COL_SESSION(session);
     const wl_plan_t *plan = sess->plan;
+    sess->extension_expr_status = 0;
 
     /* K-fusion's pre-seeded delta expansion is designed for step-style
      * outbound evaluation.  On the snapshot route it can suppress the EDB
