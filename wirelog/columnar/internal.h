@@ -1116,6 +1116,13 @@ typedef struct col_filt_arr_entry {
  * wl_session_t* to wl_col_session_t* is valid per C11 pointer
  * compatibility (address of struct == address of first member).
  */
+typedef struct {
+    const char *relation;
+    int64_t *row;
+    uint32_t ncols;
+    int32_t diff;
+} wl_col_delta_event_t;
+
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     /* base.extension_snapshot is borrowed from the coordinator in workers;
@@ -1136,6 +1143,10 @@ typedef struct wl_col_session_t {
     uint32_t rel_hash_chain_cap;  /* allocated capacity of rel_hash_next[]  */
     wirelog_on_delta_fn delta_cb;   /* delta callback (NULL = disabled)       */
     void *delta_data;          /* opaque user context for delta_cb       */
+    wl_col_delta_event_t *delta_events; /* staged observer events */
+    size_t delta_event_count;
+    size_t delta_event_capacity;
+    bool delta_event_transaction;
     wl_arena_t *eval_arena;    /* arena for per-iteration temporaries    */
     col_mat_cache_t mat_cache; /* materialization cache (US-006)        */
     uint32_t total_iterations; /* fixed-point iterations in last eval   */
@@ -2087,6 +2098,10 @@ tdd_stratum_mixed_slice_candidate(const wl_plan_stratum_t *sp);
 int
 col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);
+void
+wl_columnar_delta_events_clear(wl_col_session_t *sess);
+void
+wl_columnar_delta_events_publish(wl_col_session_t *sess);
 bool
 stratum_has_preseeded_delta(const wl_plan_stratum_t *sp,
     wl_col_session_t *sess);
