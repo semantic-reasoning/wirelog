@@ -952,7 +952,7 @@ test_unknown_character(void)
 {
     TEST("unknown character produces error");
     wl_parser_lexer_t lex;
-    wl_parser_lexer_init(&lex, "@");
+    wl_parser_lexer_init(&lex, "~");
     wl_parser_lexer_token_t tok = wl_parser_lexer_next_token(&lex);
     if (tok.type != WL_PARSER_LEXER_TOK_ERROR) {
         FAIL("expected WL_PARSER_LEXER_TOK_ERROR for unknown char");

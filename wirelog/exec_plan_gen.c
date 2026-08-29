@@ -919,7 +919,7 @@ agg_operand_from_coltype(wl_ir_coltype_t t)
  */
 static int
 serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
-    const col_ctx_t *ctx)
+    const col_ctx_t *ctx, bool extension_arg)
 {
     if (!expr)
         return -1;
@@ -945,7 +945,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         wl_ir_coltype_t var_type = col_ctx_lookup_type(ctx, expr->var_name);
         uint8_t var_tag = var_type == WL_IR_COLTYPE_FLOAT
             ? WL_PLAN_EXPR_VAR_FLOAT
-            : var_type == WL_IR_COLTYPE_STRING
+            : extension_arg && var_type == WL_IR_COLTYPE_STRING
             ? WL_PLAN_EXPR_VAR_STRING : WL_PLAN_EXPR_VAR;
         if (expr_buf_push_u8(buf, var_tag) != 0)
             return -1;
@@ -990,7 +990,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         if (name_len > UINT16_MAX)
             return -1;
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], ctx) != 0)
+            if (serialize_expr(buf, expr->children[i], ctx, true) != 0)
                 return -1;
         }
         if (expr_buf_push_u8(buf, WL_PLAN_EXPR_EXTENSION_CALL) != 0
@@ -1013,7 +1013,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
             return -1;
         /* Serialize children first (postfix) */
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], ctx) != 0)
+            if (serialize_expr(buf, expr->children[i], ctx, false) != 0)
                 return -1;
         }
         /* Operand domains select between the integer and the string digest
@@ -1032,7 +1032,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
         if ((lhs == WL_IR_COLTYPE_FLOAT) != (rhs == WL_IR_COLTYPE_FLOAT))
             return -1;
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], ctx) != 0)
+            if (serialize_expr(buf, expr->children[i], ctx, false) != 0)
                 return -1;
         }
         if (lhs == WL_IR_COLTYPE_FLOAT && rhs == WL_IR_COLTYPE_FLOAT) {
@@ -1057,7 +1057,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
 
     case WL_IR_EXPR_AGG: {
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], ctx) != 0)
+            if (serialize_expr(buf, expr->children[i], ctx, false) != 0)
                 return -1;
         }
         int agg_tag = agg_to_tag(expr->agg_fn);
@@ -1069,7 +1069,7 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
     case WL_IR_EXPR_STR_FN:
         /* Serialize arguments first (postfix), then emit the function opcode */
         for (uint32_t i = 0; i < expr->child_count; i++) {
-            if (serialize_expr(buf, expr->children[i], ctx) != 0)
+            if (serialize_expr(buf, expr->children[i], ctx, false) != 0)
                 return -1;
         }
         return expr_buf_push_u8(buf, str_fn_to_tag(expr->str_fn));
@@ -1098,7 +1098,7 @@ serialize_expr_to_buffer_ctx(const wl_ir_expr_t *expr, const col_ctx_t *ctx,
     if (expr_buf_init(&buf) != 0)
         return -1;
 
-    if (serialize_expr(&buf, expr, ctx) != 0) {
+    if (serialize_expr(&buf, expr, ctx, false) != 0) {
         free(buf.data);
         return -1;
     }
@@ -1640,7 +1640,7 @@ unwrap_filters_collect(const wirelog_ir_node_t *node,
             ok = false;
             break;
         }
-        if (serialize_expr(&tmp, filt_exprs[i], &ctx) != 0) {
+        if (serialize_expr(&tmp, filt_exprs[i], &ctx, false) != 0) {
             free(tmp.data);
             ok = false;
             break;
