@@ -194,6 +194,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, wirelog-ga]
     concurrency: wirelog-ga-downstream
     timeout-minutes: 360
+    env:
+      WIRELOG_GA_ISOLATION_CONTROL: ${{ vars.WIRELOG_GA_ISOLATION_CONTROL }}
+      WIRELOG_GA_ISOLATION_ASSERTION: ${{ vars.WIRELOG_GA_ISOLATION_ASSERTION }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -213,6 +216,11 @@ jobs:
           governor=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
           test -r "$governor"
           test "$(cat "$governor")" = performance
+          test -n "$WIRELOG_GA_ISOLATION_CONTROL"
+          test "$WIRELOG_GA_ISOLATION_CONTROL" != *$'\t'*
+          test "$WIRELOG_GA_ISOLATION_CONTROL" != *$'\n'*
+          test "$WIRELOG_GA_ISOLATION_ASSERTION" = dedicated-runner-group
+          test "$RUNNER_GROUP" = wirelog-ga
           command -v meson
           command -v ninja
           command -v sha256sum
@@ -241,6 +249,7 @@ jobs:
           path: |
             downstream-dist/
             downstream-evidence/
+            downstream-evidence/isolation-evidence.tsv
           if-no-files-found: error
           retention-days: 90
       - name: Clean dedicated runner workspace

@@ -29,9 +29,10 @@ oracle="$root/scripts/release/downstream-matrix-oracles.tsv"
 runner="$root/scripts/release/run-downstream-matrix.sh"
 phase_runner="$root/scripts/release/run-downstream-phase.sh"
 archive_validator="$root/scripts/release/validate-downstream-tarball.sh"
+isolation_writer="$root/scripts/release/write-isolation-evidence.sh"
 download="$root/bench/data/doop/download.sh"
 
-bash -n "$runner" "$phase_runner" "$archive_validator" "$download"
+bash -n "$runner" "$phase_runner" "$archive_validator" "$isolation_writer" "$download"
 "$runner" --help >/dev/null 2>&1
 set +e
 "$runner" >/dev/null 2>&1
@@ -67,6 +68,30 @@ grep -Fq 'phases.tsv' "$runner"
 grep -Fq 'archive-members.tsv' "$runner"
 grep -Fq 'run-downstream-phase.sh' "$runner"
 grep -Fq 'archive-validate' "$runner"
+grep -Fq 'isolation-evidence.tsv' "$runner"
+grep -Fq 'WIRELOG_GA_ISOLATION_CONTROL' "$runner"
+grep -Fq 'WIRELOG_GA_ISOLATION_ASSERTION' "$runner"
+grep -Fq 'WIRELOG_GA_ISOLATION_CONTROL' "$root/.github/workflows/release-tag.yml"
+grep -Fq 'dedicated-runner-group' "$root/.github/workflows/release-tag.yml"
+grep -Fq 'declared_labels' "$isolation_writer"
+grep -Fq 'assertion_result' "$isolation_writer"
+grep -Fq 'tsv_escape' "$isolation_writer"
+
+isolation_fixture=$(mktemp)
+"$isolation_writer" "$isolation_fixture" \
+    0123456789012345678901234567890123456789 'workflow name' 'run id' \
+    '2026-08-30T00:00:00Z' 'runner name' 'wirelog-ga' $'control\tvalue\nnext' \
+    dedicated-runner-group 'repository-variable:test'
+awk -F '\t' 'NR == 1 { if (NF != 14) bad = 1; next } { if (NF != 14) bad = 1; rows++ } END { if (rows != 1) bad = 1; exit bad + 0 }' "$isolation_fixture" >/dev/null
+grep -Fq 'control\tvalue\nnext' "$isolation_fixture"
+grep -Fq $'\tPASS\t' "$isolation_fixture"
+printf 'bad\n' > "$isolation_fixture"
+set +e
+awk -F '\t' 'NR == 1 { if (NF != 14) bad = 1; next } { if (NF != 14) bad = 1; rows++ } END { if (rows != 1) bad = 1; exit bad + 0 }' "$isolation_fixture" >/dev/null
+malformed_isolation_rc=$?
+set -e
+test "$malformed_isolation_rc" -ne 0
+rm -f "$isolation_fixture"
 grep -Fq 'flowlog_benchmark/resolve/da9e91b3ff75d94604f57ba2b21ef3aa97e241ec/' "$download"
 
 negative_fixture=$(mktemp)
