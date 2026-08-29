@@ -49,6 +49,18 @@ typedef int (*wirelog_extension_scalar_fn)(
     wirelog_extension_value_t *result, void *user_data);
 typedef void (*wirelog_extension_destroy_fn)(void *user_data);
 
+/* Callback capabilities. A zero policy is the legacy/unspecified contract;
+ * runtime enforcement is added by the follow-up evaluator policy unit. */
+#define WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE  (1u << 0)
+#define WIRELOG_EXTENSION_CALLBACK_DETERMINISTIC (1u << 1)
+#define WIRELOG_EXTENSION_CALLBACK_PURE        (1u << 2)
+#define WIRELOG_EXTENSION_CALLBACK_REENTRANT   (1u << 3)
+#define WIRELOG_EXTENSION_CALLBACK_POLICY_KNOWN_MASK \
+        (WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE \
+        | WIRELOG_EXTENSION_CALLBACK_DETERMINISTIC \
+        | WIRELOG_EXTENSION_CALLBACK_PURE \
+        | WIRELOG_EXTENSION_CALLBACK_REENTRANT)
+
 /* size is the sizeof the struct known by the caller; fields beyond size are
  * ignored, allowing this descriptor to grow without breaking old addons. */
 typedef struct wirelog_extension_descriptor {
@@ -66,6 +78,8 @@ typedef struct wirelog_extension_descriptor {
      * These append-only fields are available only when covered by @size. */
     uint64_t addon_abi_identity;
     uint32_t addon_abi_version;
+    /* Capability declarations; zero means legacy/unspecified. */
+    uint32_t callback_policy;
 } wirelog_extension_descriptor_t;
 
 WIRELOG_API wirelog_extension_registry_t *
