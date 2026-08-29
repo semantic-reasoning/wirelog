@@ -89,6 +89,14 @@ extension_callback(const wirelog_extension_value_t *args, uint32_t nargs,
             expected_string_length) != 0)
             return 1;
     }
+    if (callback_mode == 5) {
+        static const char returned_string[] = "not-owned";
+        result->type = WIRELOG_EXTENSION_VALUE_STRING;
+        result->size = sizeof(returned_string) - 1;
+        result->as.string_value.data = returned_string;
+        result->as.string_value.length = sizeof(returned_string) - 1;
+        return 0;
+    }
     result->type = WIRELOG_EXTENSION_VALUE_BOOL;
     result->size = sizeof(uint8_t);
     result->as.bool_value = callback_mode == 4 ? 1 : nargs > 0
@@ -152,12 +160,14 @@ run_map_error_case(const uint8_t *buf, uint32_t size,
     eval_stack_init(&stack);
     eval_stack_push(&stack, input, true);
     rc = col_op_map(&op, &stack, session);
+    int stack_empty = stack.top == 0;
     while (stack.top > 0) {
         eval_entry_t entry = eval_stack_pop(&stack);
         if (entry.owned)
             col_rel_destroy(entry.rel);
     }
-    return check(rc == expected_rc, "map preserves extension status");
+    return check(rc == expected_rc && (expected_rc == 0 || stack_empty),
+               "map error discards partial output and preserves extension status");
 }
 
 static int
@@ -218,6 +228,48 @@ run_kfusion_policy_case(const uint8_t *buf, uint32_t size,
     session_rel_free_hash(&session);
     free(session.rels);
     col_rel_destroy(input);
+    return failures;
+}
+
+static int
+check_session_rejects_string_result(wirelog_extension_snapshot_t *snapshot)
+{
+    static const char *source =
+        ".decl input(x: int64)\n"
+        ".decl output(x: int64)\n"
+        "output(x) :- input(x), @call(\"test.pred\", x).\n";
+    wirelog_error_t error = WIRELOG_OK;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    int64_t row = 1;
+    int failures = 0;
+
+    if (!program || wl_plan_from_program_with_snapshot(program, snapshot,
+        &plan) != 0 || wl_session_create_with_snapshot(
+            wl_backend_columnar(), plan, 1, snapshot, &session) != 0) {
+        failures += check(0, "session setup for result ownership");
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+        return failures;
+    }
+    callback_mode = 5;
+    failures += check(wl_session_insert(session, "input", &row, 1, 1) == 0,
+            "session input for result ownership");
+    failures += check(wl_session_step(session)
+            == WL_COLUMNAR_EXPR_INVALID_RESULT,
+            "session rejects unsupported string result");
+    failures += check(COL_SESSION(session)->extension_expr_status
+            == WL_COLUMNAR_EXPR_INVALID_RESULT,
+            "session retains invalid-result diagnostic");
+    col_rel_t *output = session_find_rel(COL_SESSION(session), "output");
+    failures += check(output == NULL || output->nrows == 0,
+            "invalid result does not publish partial output");
+    callback_mode = 0;
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
     return failures;
 }
 
@@ -431,6 +483,8 @@ main(void)
     size = put_call(buf, size, "test.safe", 1);
     failures += run_kfusion_policy_case(buf, size, snapshot, 0);
 
+    failures += check_session_rejects_string_result(snapshot);
+
     size = put_var(buf, 0);
     size = put_call(buf, size, "test.pred", 1);
     callback_mode = 0;
@@ -482,6 +536,26 @@ main(void)
     callback_mode = 3;
     failures += run(buf, size, &ctx, &value,
             WL_COLUMNAR_EXPR_INVALID_RESULT);
+    callback_mode = 5;
+    callback_calls = 0;
+    failures += run(buf, size, &ctx, &value,
+            WL_COLUMNAR_EXPR_INVALID_RESULT);
+    failures += check(callback_calls == 1,
+            "unsupported string result is rejected without retention");
+    {
+        wl_col_session_t result_session = { 0 };
+        result_session.base.extension_snapshot = snapshot;
+        callback_calls = 0;
+        failures += run_filter_case(buf, size, &result_session, 0,
+                WL_COLUMNAR_EXPR_INVALID_RESULT);
+        failures += check(callback_calls > 0,
+                "filter invokes callback before rejecting string result");
+        callback_calls = 0;
+        failures += run_map_error_case(buf, size, &result_session,
+                WL_COLUMNAR_EXPR_INVALID_RESULT);
+        failures += check(callback_calls > 0,
+                "map invokes callback before rejecting string result");
+    }
     callback_mode = 0;
 
     /* A BOOL argument is accepted and retains its type through the stack. */
