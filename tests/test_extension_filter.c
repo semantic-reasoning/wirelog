@@ -215,6 +215,29 @@ put_call(uint8_t *buf, uint32_t pos, const char *name, uint32_t nargs)
     return pos + sizeof(nargs);
 }
 
+static uint32_t
+put_call_abi(uint8_t *buf, uint32_t pos, const char *name, uint32_t nargs,
+    uint64_t identity, uint32_t version)
+{
+    size_t len = strlen(name);
+    buf[pos++] = (uint8_t)WL_PLAN_EXPR_EXTENSION_CALL_ABI;
+    buf[pos++] = (uint8_t)len;
+    buf[pos++] = (uint8_t)(len >> 8);
+    memcpy(buf + pos, name, len);
+    pos += (uint32_t)len;
+    buf[pos++] = (uint8_t)nargs;
+    buf[pos++] = (uint8_t)(nargs >> 8);
+    buf[pos++] = (uint8_t)(nargs >> 16);
+    buf[pos++] = (uint8_t)(nargs >> 24);
+    for (uint32_t shift = 0; shift < 8; shift++)
+        buf[pos++] = (uint8_t)(identity >> (shift * 8));
+    buf[pos++] = (uint8_t)version;
+    buf[pos++] = (uint8_t)(version >> 8);
+    buf[pos++] = (uint8_t)(version >> 16);
+    buf[pos++] = (uint8_t)(version >> 24);
+    return pos;
+}
+
 static int
 run(const uint8_t *buf, uint32_t size,
     const wl_columnar_expr_context_t *ctx, int64_t *value,
@@ -254,6 +277,10 @@ main(void)
     failures += check_snapshot_clears_extension_status();
 
     failures += check(registry != NULL, "registry create");
+    descriptor.addon_abi_identity = UINT64_C(0x0123456789abcdef);
+    descriptor.addon_abi_version = 7;
+    scalar_descriptor.addon_abi_identity = UINT64_C(0x1020304050607080);
+    scalar_descriptor.addon_abi_version = 9;
     failures += check(wirelog_extension_register(registry, &descriptor) == 0,
             "register predicate");
     failures += check(wirelog_extension_register(registry,
@@ -262,6 +289,50 @@ main(void)
     ctx.intern = NULL;
     ctx.extensions = snapshot;
     ctx.allow_extension_scalar_result = false;
+
+    /* ABI-tagged calls use explicit little-endian identity/version fields. */
+    size = put_var(buf, 0);
+    size = put_call_abi(buf, size, "test.pred", 1,
+            UINT64_C(0x0123456789abcdef), 7);
+    failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    failures += check(value == 1, "ABI-tagged predicate result");
+    callback_calls = 0;
+    {
+        uint32_t identity_pos = 7 + 1 + 2
+            + (uint32_t)strlen("test.pred") + 4;
+        buf[identity_pos] ^= 1;
+        failures += run(buf, size, &ctx, &value,
+                WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH);
+        failures += check(callback_calls == 0,
+                "identity mismatch suppresses callback");
+        buf[identity_pos] ^= 1;
+        buf[identity_pos + 8] ^= 1;
+        failures += run(buf, size, &ctx, &value,
+                WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH);
+        failures += check(callback_calls == 0,
+                "version mismatch suppresses callback");
+        buf[identity_pos + 8] ^= 1;
+        failures += run(buf, size - 1, &ctx, &value,
+                WL_COLUMNAR_EXPR_EXTENSION_MALFORMED);
+    }
+    {
+        wl_col_session_t abi_session = { 0 };
+        abi_session.base.extension_snapshot = snapshot;
+        abi_session.delta_pool = delta_pool_create(16, sizeof(col_rel_t),
+                4096);
+        size = put_var(buf, 0);
+        size = put_call_abi(buf, size, "test.pred", 1,
+                UINT64_C(0x0123456789abcdef), 7);
+        failures += run_filter_case(buf, size, &abi_session, 2, 0);
+        size = put_var(buf, 0);
+        size = put_call_abi(buf, size, "test.scalar", 1,
+                UINT64_C(0x1020304050607080), 9);
+        abi_session.base.extension_snapshot = snapshot;
+        callback_mode = 2;
+        failures += run_map_error_case(buf, size, &abi_session, 0);
+        callback_mode = 0;
+        delta_pool_destroy(abi_session.delta_pool);
+    }
 
     {
         wl_col_session_t session = { 0 };

@@ -528,9 +528,12 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             break;
         }
 
-        case WL_PLAN_EXPR_EXTENSION_CALL: {
+        case WL_PLAN_EXPR_EXTENSION_CALL:
+        case WL_PLAN_EXPR_EXTENSION_CALL_ABI: {
             uint16_t name_len;
             uint32_t nargs;
+            uint64_t addon_abi_identity = 0;
+            uint32_t addon_abi_version = 0;
             char name[256];
             const wirelog_extension_descriptor_t *descriptor;
             wirelog_extension_value_t args[COL_FILTER_STACK];
@@ -556,6 +559,22 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             nargs = (uint32_t)buf[i] | (uint32_t)buf[i + 1] << 8
                 | (uint32_t)buf[i + 2] << 16 | (uint32_t)buf[i + 3] << 24;
             i += 4;
+            if ((wl_plan_expr_tag_t)tag == WL_PLAN_EXPR_EXTENSION_CALL_ABI) {
+                if (size - i < 12) {
+                    if (status)
+                        *status = WL_COLUMNAR_EXPR_EXTENSION_MALFORMED;
+                    goto bad;
+                }
+                for (uint32_t shift = 0; shift < 8; shift++)
+                    addon_abi_identity |=
+                        (uint64_t)buf[i + shift] << (shift * 8);
+                i += 8;
+                addon_abi_version = (uint32_t)buf[i]
+                    | (uint32_t)buf[i + 1] << 8
+                    | (uint32_t)buf[i + 2] << 16
+                    | (uint32_t)buf[i + 3] << 24;
+                i += 4;
+            }
             if (!ctx || !ctx->extensions) {
                 if (status)
                     *status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
@@ -566,6 +585,13 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             if (!descriptor) {
                 if (status)
                     *status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
+                goto bad;
+            }
+            if ((wl_plan_expr_tag_t)tag == WL_PLAN_EXPR_EXTENSION_CALL_ABI
+                && (addon_abi_identity != descriptor->addon_abi_identity
+                || addon_abi_version != descriptor->addon_abi_version)) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH;
                 goto bad;
             }
             if (nargs != descriptor->arity || nargs > s.top
