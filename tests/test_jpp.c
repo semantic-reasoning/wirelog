@@ -362,10 +362,10 @@ test_jpp_extension_tree_is_conservative(void)
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(
         ".decl a(x: int32, y: int32)\n"
-        ".decl b(z: int32, w: int32)\n"
-        ".decl c(x: int32, z: int32)\n"
+        ".decl c(w: int32, z: int32)\n"
+        ".decl b(y: int32, w: int32)\n"
         ".decl out(x: int32)\n"
-        "out(x) :- a(x, y), b(x, z), c(x, w), @call(\"test.fn\", x).\n",
+        "out(x) :- a(x, y), c(w, z), b(y, w), @call(\"test.fn\", x).\n",
         &err);
     if (!prog) {
         FAIL("parse failed");
