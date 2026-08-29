@@ -61,6 +61,11 @@ typedef struct wirelog_extension_descriptor {
     wirelog_extension_scalar_fn invoke;
     void *user_data;
     wirelog_extension_destroy_fn destroy;
+    /* Stable identity and version of the addon's callable ABI contract.
+     * Both zero means legacy metadata is absent; exactly one zero is invalid.
+     * These append-only fields are available only when covered by @size. */
+    uint64_t addon_abi_identity;
+    uint32_t addon_abi_version;
 } wirelog_extension_descriptor_t;
 
 WIRELOG_API wirelog_extension_registry_t *
