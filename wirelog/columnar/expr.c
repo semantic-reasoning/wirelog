@@ -25,12 +25,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define WL_CALLBACK_SESSION_STACK_MAX 64
+
 #if defined(_MSC_VER)
-static __declspec(thread) const void *wl_active_callback_session_key;
+static __declspec(thread) const void *wl_callback_session_stack[
+    WL_CALLBACK_SESSION_STACK_MAX];
+static __declspec(thread) uint32_t wl_callback_session_depth;
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-static _Thread_local const void *wl_active_callback_session_key;
+static _Thread_local const void *wl_callback_session_stack[
+    WL_CALLBACK_SESSION_STACK_MAX];
+static _Thread_local uint32_t wl_callback_session_depth;
 #else
-static __thread const void *wl_active_callback_session_key;
+static __thread const void *wl_callback_session_stack[
+    WL_CALLBACK_SESSION_STACK_MAX];
+static __thread uint32_t wl_callback_session_depth;
 #endif
 
 typedef struct {
@@ -610,12 +618,17 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                 goto bad;
             }
             if (ctx->session_key
-                && wl_active_callback_session_key == ctx->session_key
                 && !(descriptor->callback_policy
                 & WIRELOG_EXTENSION_CALLBACK_REENTRANT)) {
-                if (status)
-                    *status = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT;
-                goto bad;
+                for (uint32_t depth = 0;
+                    depth < wl_callback_session_depth; depth++) {
+                    if (wl_callback_session_stack[depth]
+                        == ctx->session_key) {
+                        if (status)
+                            *status = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT;
+                        goto bad;
+                    }
+                }
             }
             if (nargs != descriptor->arity || nargs > s.top
                 || nargs > COL_FILTER_STACK) {
@@ -657,13 +670,21 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                     args[arg].as.int64_value = s.vals[index];
             }
             s.top -= nargs;
-            const void *previous_session_key =
-                wl_active_callback_session_key;
-            wl_active_callback_session_key = ctx->session_key;
+            if (ctx->session_key
+                && wl_callback_session_depth
+                >= WL_CALLBACK_SESSION_STACK_MAX) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT;
+                goto bad;
+            }
+            if (ctx->session_key)
+                wl_callback_session_stack[wl_callback_session_depth++]
+                    = ctx->session_key;
             int callback_rc = descriptor->invoke
                 ? descriptor->invoke(args, nargs, &result,
                     descriptor->user_data) : -1;
-            wl_active_callback_session_key = previous_session_key;
+            if (ctx->session_key)
+                wl_callback_session_depth--;
             if (callback_rc != 0) {
                 if (status)
                     *status = WL_COLUMNAR_EXPR_CALLBACK_FAILURE;
