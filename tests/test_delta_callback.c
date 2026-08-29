@@ -20,6 +20,7 @@
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog-parser.h"
+#include "../wirelog/wirelog-extension.h"
 #include "../wirelog/wirelog.h"
 
 #include <stdio.h>
@@ -34,21 +35,32 @@ static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+static int
+fail_extension(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    (void)args;
+    (void)nargs;
+    (void)result;
+    (void)user_data;
+    return 1;
+}
+
 #define TEST(name)                            \
-    do {                                      \
-        tests_run++;                          \
-        printf("  [%d] %s", tests_run, name); \
-    } while (0)
+        do {                                      \
+            tests_run++;                          \
+            printf("  [%d] %s", tests_run, name); \
+        } while (0)
 #define PASS()                 \
-    do {                       \
-        tests_passed++;        \
-        printf(" ... PASS\n"); \
-    } while (0)
+        do {                       \
+            tests_passed++;        \
+            printf(" ... PASS\n"); \
+        } while (0)
 #define FAIL(msg)                         \
-    do {                                  \
-        tests_failed++;                   \
-        printf(" ... FAIL: %s\n", (msg)); \
-    } while (0)
+        do {                                  \
+            tests_failed++;                   \
+            printf(" ... FAIL: %s\n", (msg)); \
+        } while (0)
 
 /* ======================================================================== */
 /* Plan Helper                                                             */
@@ -91,7 +103,7 @@ typedef struct {
 
 static void
 collect_delta(const char *relation, const int64_t *row, uint32_t ncols,
-              int32_t diff, void *user_data)
+    int32_t diff, void *user_data)
 {
     delta_collector_t *c = (delta_collector_t *)user_data;
     if (c->count >= MAX_DELTAS)
@@ -132,8 +144,8 @@ test_delta_callback_invoked(void)
 
     /* Program: r(x) :- a(x).  EDB: a={42}  Expected delta: r(42) diff=+1 */
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -204,8 +216,8 @@ test_delta_set_difference(void)
      * Step 2: insert a(2) → delta fires r(2) diff=+1, NOT r(1) again
      */
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -300,8 +312,8 @@ test_delta_multi_step(void)
      * Step 2 (no new EDB) → no new deltas (convergence)
      */
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
-                                ".decl r(x: int32)\n"
-                                "r(x) :- a(x).\n");
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return 1;
@@ -344,12 +356,91 @@ test_delta_multi_step(void)
     if (count_step2 != count_step1) {
         char msg[64];
         snprintf(msg, sizeof(msg), "step 2 fired %d extra deltas (expected 0)",
-                 count_step2 - count_step1);
+            count_step2 - count_step1);
         FAIL(msg);
         return 1;
     }
     PASS();
     return 0;
+}
+
+/* A later rule failure must not publish events staged by an earlier rule. */
+static int
+test_no_partial_delta_on_error(void)
+{
+    TEST("No partial delta callbacks on evaluation failure");
+    const char *source = ".decl a(x: int32)\n"
+        ".decl r(x: int32)\n"
+        ".decl s(x: int32)\n"
+        "r(x) :- a(x).\n"
+        "s(x) :- a(x), @call(\"test.fail\", x).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    uint32_t argument_type = WIRELOG_EXTENSION_VALUE_INT64;
+    wirelog_extension_descriptor_t descriptor = {
+        WIRELOG_EXTENSION_ABI_VERSION, sizeof(descriptor), "test.fail", 1,
+        &argument_type, WIRELOG_EXTENSION_VALUE_BOOL, fail_extension, NULL,
+        NULL
+    };
+    wirelog_extension_registry_t *registry
+        = wirelog_extension_registry_create();
+    wirelog_extension_snapshot_t *snapshot = registry
+        ? wirelog_extension_snapshot_acquire(registry) : NULL;
+    wl_plan_t *plan = NULL;
+    if (!program || !registry || !snapshot
+        || wirelog_extension_register(registry, &descriptor) != 0) {
+        wirelog_program_free(program);
+        wirelog_extension_snapshot_release(snapshot);
+        wirelog_extension_registry_destroy(registry);
+        FAIL("could not generate failure plan");
+        return 1;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    snapshot = wirelog_extension_snapshot_acquire(registry);
+    if (!snapshot || wl_plan_from_program_with_snapshot(program, snapshot,
+        &plan) != 0) {
+        wirelog_program_free(program);
+        wirelog_extension_snapshot_release(snapshot);
+        wirelog_extension_unregister(registry, "test.fail");
+        wirelog_extension_registry_destroy(registry);
+        FAIL("could not generate failure plan");
+        return 1;
+    }
+    wirelog_program_free(program);
+    wl_session_t *session = NULL;
+    if (wl_session_create_with_snapshot(wl_backend_columnar(), plan, 1,
+        snapshot, &session) != 0
+        || !session) {
+        wirelog_extension_snapshot_release(snapshot);
+        wl_plan_free(plan);
+        wirelog_extension_unregister(registry, "test.fail");
+        wirelog_extension_registry_destroy(registry);
+        FAIL("session_create failed");
+        return 1;
+    }
+    wirelog_extension_snapshot_release(snapshot);
+    delta_collector_t deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    int64_t input[] = { 7 };
+    wl_session_insert(session, "a", input, 1, 1);
+    int rc = wl_session_step(session);
+    int failures = 0;
+    if (rc == 0) {
+        failures++;
+        FAIL("expected scalar evaluation failure");
+    }
+    if (deltas.count != 0) {
+        failures++;
+        FAIL("partial delta callback was published");
+    }
+    if (failures == 0)
+        PASS();
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    wirelog_extension_unregister(registry, "test.fail");
+    wirelog_extension_registry_destroy(registry);
+    return failures;
 }
 
 /* ======================================================================== */
@@ -365,6 +456,7 @@ main(void)
     test_delta_callback_invoked();
     test_delta_set_difference();
     test_delta_multi_step();
+    test_no_partial_delta_on_error();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);

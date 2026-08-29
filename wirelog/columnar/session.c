@@ -1304,6 +1304,7 @@ col_session_destroy(wl_session_t *session)
     if (!session)
         return;
     wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_delta_events_clear(sess);
 
     /* Issue #959: report the join-output high-water mark before teardown.
      *
@@ -1623,6 +1624,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
 {
     if (!worker)
         return;
+    wl_columnar_delta_events_clear(worker);
 
     /* Free mat_cache entries (all worker-owned since zeroed at create) */
     col_mat_cache_clear(&worker->mat_cache);
@@ -2178,6 +2180,10 @@ col_session_step(wl_session_t *session)
         }
     }
 
+    if (sess->delta_cb) {
+        wl_columnar_delta_events_clear(sess);
+        sess->delta_event_transaction = true;
+    }
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         /* Skip strata not affected by the last incremental insertion */
         if (!col_affected_mask_contains(affected_mask, si))
@@ -2186,8 +2192,18 @@ col_session_step(wl_session_t *session)
         const wl_plan_stratum_t *sp = &plan->strata[si];
         int rc = sess->delta_cb ? col_stratum_step_with_delta(sp, sess, si)
                                 : col_eval_stratum_tdd(sp, sess, si);
-        if (rc != 0)
+        if (rc != 0) {
+            if (sess->delta_cb) {
+                sess->delta_event_transaction = false;
+                wl_columnar_delta_events_clear(sess);
+            }
             return rc;
+        }
+    }
+    if (sess->delta_cb) {
+        sess->delta_event_transaction = false;
+        wl_columnar_delta_events_publish(sess);
+        wl_columnar_delta_events_clear(sess);
     }
 
     /* Issue #158: Cleanup retraction state and delta relations after step */

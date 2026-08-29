@@ -14,6 +14,56 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int
+wl_delta_event_append(wl_col_session_t *sess, const char *relation,
+    const int64_t *row, uint32_t ncols, int32_t diff)
+{
+    wl_col_delta_event_t *grown;
+    int64_t *copy;
+    if (sess->delta_event_count == sess->delta_event_capacity) {
+        size_t next = sess->delta_event_capacity
+            ? sess->delta_event_capacity * 2 : 16;
+        grown = (wl_col_delta_event_t *)realloc(sess->delta_events,
+                next * sizeof(*grown));
+        if (!grown)
+            return ENOMEM;
+        sess->delta_events = grown;
+        sess->delta_event_capacity = next;
+    }
+    copy = (int64_t *)malloc((size_t)ncols * sizeof(*copy));
+    if (!copy)
+        return ENOMEM;
+    memcpy(copy, row, (size_t)ncols * sizeof(*copy));
+    sess->delta_events[sess->delta_event_count++]
+        = (wl_col_delta_event_t){ relation, copy, ncols, diff };
+    return 0;
+}
+
+void
+wl_columnar_delta_events_clear(wl_col_session_t *sess)
+{
+    if (!sess)
+        return;
+    for (size_t i = 0; i < sess->delta_event_count; i++)
+        free(sess->delta_events[i].row);
+    free(sess->delta_events);
+    sess->delta_events = NULL;
+    sess->delta_event_count = 0;
+    sess->delta_event_capacity = 0;
+}
+
+void
+wl_columnar_delta_events_publish(wl_col_session_t *sess)
+{
+    if (!sess || !sess->delta_cb)
+        return;
+    for (size_t i = 0; i < sess->delta_event_count; i++) {
+        wl_col_delta_event_t *event = &sess->delta_events[i];
+        sess->delta_cb(event->relation, event->row, event->ncols,
+            event->diff, sess->delta_data);
+    }
+}
+
 static bool
 col_row_in_sorted(const int64_t *sorted_data, uint32_t nrows, uint32_t ncols,
     const int64_t *row)
@@ -467,7 +517,10 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 const int64_t *rowp = cur_flat + (size_t)row * ncols;
                 if (!col_row_in_sorted(prev_data[ri], prev_nrows[ri], ncols,
                     rowp)) {
-                    sess->delta_cb(r->name, rowp, ncols, +1, sess->delta_data);
+                    rc = wl_delta_event_append(sess, r->name, rowp, ncols,
+                            +1);
+                    if (rc != 0)
+                        goto cleanup;
                 }
             }
         }
@@ -480,15 +533,25 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     = prev_data[ri] + (size_t)row * prev_ncols[ri];
                 if (!col_row_in_sorted(cur_flat, r->nrows, prev_ncols[ri],
                     rowp)) {
-                    sess->delta_cb(r->name, rowp, prev_ncols[ri], -1,
-                        sess->delta_data);
+                    rc = wl_delta_event_append(sess, r->name, rowp,
+                            prev_ncols[ri], -1);
+                    if (rc != 0)
+                        goto cleanup;
                 }
             }
         }
         free(cur_flat);
     }
 
+    /* Publish only after every relation has evaluated and consolidated. */
+    if (!sess->delta_event_transaction) {
+        wl_columnar_delta_events_publish(sess);
+        wl_columnar_delta_events_clear(sess);
+    }
+
 cleanup:
+    if (rc != 0)
+        wl_columnar_delta_events_clear(sess);
     for (uint32_t i = 0; i < rc_cnt; i++) {
         if (rc != 0 && prev_data[i]) {
             /* Error path: restore from flat snapshot into column-major */
