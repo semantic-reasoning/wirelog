@@ -97,13 +97,13 @@ grep -Fq 'flowlog_benchmark/resolve/da9e91b3ff75d94604f57ba2b21ef3aa97e241ec/' "
 negative_fixture=$(mktemp)
 negative_log=$(mktemp)
 malicious_root=$(mktemp -d)
-malicious_archive=$(mktemp --suffix=.tar.gz)
+malicious_archive=$(mktemp "${TMPDIR:-/tmp}/wirelog-malicious.XXXXXX")
 malicious_output=$(mktemp -d)
 malicious_log=$(mktemp)
-traversal_archive=$(mktemp --suffix=.tar.gz)
+traversal_archive=$(mktemp "${TMPDIR:-/tmp}/wirelog-traversal.XXXXXX")
 traversal_output=$(mktemp -d)
 traversal_log=$(mktemp)
-trap 'rm -f "$negative_fixture" "$negative_log" "$malicious_archive" "$malicious_log" "$traversal_archive" "$traversal_log"; rm -rf "$malicious_root" "$malicious_output" "$traversal_output"' EXIT
+trap 'rm -f "$negative_fixture" "$negative_log" "$malicious_archive" "$malicious_archive.sha256" "$malicious_log" "$traversal_archive" "$traversal_log"; rm -rf "$malicious_root" "$malicious_output" "$traversal_output"' EXIT
 printf 'deliberately invalid checksum fixture\n' > "$negative_fixture"
 negative_url="file://${negative_fixture}"
 if command -v cygpath >/dev/null 2>&1; then
