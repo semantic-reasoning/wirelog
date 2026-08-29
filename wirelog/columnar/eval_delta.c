@@ -504,6 +504,10 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         if (r->nrows > 0 && ncols > 0) {
             cur_flat = (int64_t *)malloc(
                 (size_t)r->nrows * ncols * sizeof(int64_t));
+            if (!cur_flat) {
+                rc = ENOMEM;
+                goto cleanup;
+            }
             if (cur_flat) {
                 for (uint32_t row = 0; row < r->nrows; row++)
                     col_rel_row_copy_out(r, row,
@@ -519,8 +523,11 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     rowp)) {
                     rc = wl_delta_event_append(sess, r->name, rowp, ncols,
                             +1);
-                    if (rc != 0)
+                    if (rc != 0) {
+                        free(cur_flat);
+                        cur_flat = NULL;
                         goto cleanup;
+                    }
                 }
             }
         }
@@ -535,8 +542,11 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     rowp)) {
                     rc = wl_delta_event_append(sess, r->name, rowp,
                             prev_ncols[ri], -1);
-                    if (rc != 0)
+                    if (rc != 0) {
+                        free(cur_flat);
+                        cur_flat = NULL;
                         goto cleanup;
+                    }
                 }
             }
         }
