@@ -680,9 +680,19 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             if (ctx->session_key)
                 wl_callback_session_stack[wl_callback_session_depth++]
                     = ctx->session_key;
+            void *callback_lease = wl_extension_callback_lease_acquire(
+                ctx->extensions, descriptor);
+            if (!callback_lease) {
+                if (ctx->session_key)
+                    wl_callback_session_depth--;
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_MISSING_EXTENSION;
+                goto bad;
+            }
             int callback_rc = descriptor->invoke
                 ? descriptor->invoke(args, nargs, &result,
                     descriptor->user_data) : -1;
+            wl_extension_callback_lease_release(callback_lease);
             if (ctx->session_key)
                 wl_callback_session_depth--;
             if (callback_rc != 0) {

@@ -24,6 +24,16 @@ wl_extension_error_set(const char *message);
 void
 wl_extension_error_set_expr_status(int status);
 
+/* Internal callback lifetime lease. The lease token is valid until released,
+ * even if the originating snapshot is released or the entry is unregistered
+ * while the callback is running. */
+void *
+wl_extension_callback_lease_acquire(
+    const wirelog_extension_snapshot_t *snapshot,
+    const wirelog_extension_descriptor_t *descriptor);
+void
+wl_extension_callback_lease_release(void *lease);
+
 /* ======================================================================== */
 /* String Utilities (Pure C11)                                             */
 /* ======================================================================== */
