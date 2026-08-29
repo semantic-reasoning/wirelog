@@ -87,6 +87,28 @@ wl_extension_name_copy(const char *name)
 }
 
 static bool
+wl_extension_value_type_valid(uint32_t type)
+{
+    return type == WIRELOG_EXTENSION_VALUE_INT64
+           || type == WIRELOG_EXTENSION_VALUE_BOOL
+           || type == WIRELOG_EXTENSION_VALUE_STRING;
+}
+
+static bool
+wl_extension_descriptor_valid(const wirelog_extension_descriptor_t *descriptor)
+{
+    if (!descriptor->name || !descriptor->invoke
+        || !wl_extension_value_type_valid(descriptor->result_type)
+        || (descriptor->arity != 0 && !descriptor->argument_types))
+        return false;
+    for (uint32_t i = 0; i < descriptor->arity; i++) {
+        if (!wl_extension_value_type_valid(descriptor->argument_types[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool
 wl_extension_entry_release_locked(wl_extension_entry_t *entry)
 {
     return --entry->references == 0;
@@ -197,8 +219,7 @@ wirelog_extension_register(wirelog_extension_registry_t *registry,
         size_t copy_size = source->size <
             sizeof(owned_source) ? source->size : sizeof(owned_source);
         memcpy(&owned_source, source, copy_size);
-        if (!owned_source.name || !owned_source.invoke ||
-            (owned_source.arity != 0 && !owned_source.argument_types)) {
+        if (!wl_extension_descriptor_valid(&owned_source)) {
             wl_extension_error_set("invalid descriptor"); return -1;
         }
         entry = wl_extension_entry_create(&owned_source);

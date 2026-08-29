@@ -45,6 +45,19 @@ int main(void)
     failures += check(wirelog_extension_register(r,
             &bad) == -1 && strstr(wirelog_extension_last_error(), "size"),
             "size validation");
+    bad = desc;
+    bad.result_type = 99;
+    failures += check(wirelog_extension_register(r, &bad) == -1
+            && strcmp(wirelog_extension_last_error(),
+            "invalid descriptor") == 0,
+            "result type validation");
+    bad = desc;
+    types[0] = 99;
+    failures += check(wirelog_extension_register(r, &bad) == -1
+            && strcmp(wirelog_extension_last_error(),
+            "invalid descriptor") == 0,
+            "argument type validation");
+    types[0] = WIRELOG_EXTENSION_VALUE_INT64;
     {
         wirelog_extension_descriptor_t large = desc;
         large.arity = UINT32_MAX;
