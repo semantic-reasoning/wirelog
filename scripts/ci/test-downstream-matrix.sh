@@ -120,7 +120,10 @@ test "$mismatch_rc" -ne 0
 grep -Fq 'checksum mismatch' "$negative_log"
 
 printf 'candidate\n' > "$malicious_root/meson.build"
-ln -s /etc/passwd "$malicious_root/escape-link"
+# Use a relative target that exists inside the fixture.  An absolute POSIX
+# target is not a valid Windows path under Git Bash and makes the fixture
+# creation fail before the archive validator is exercised.
+ln -s meson.build "$malicious_root/escape-link"
 tar -czf "$malicious_archive" -C "$malicious_root" meson.build escape-link
 sha256sum "$malicious_archive" > "$malicious_archive.sha256"
 set +e
