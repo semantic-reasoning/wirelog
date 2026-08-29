@@ -38,18 +38,45 @@ int main(void)
     failures += check(r != NULL, "create");
     desc.addon_abi_identity = UINT64_C(0x0123456789abcdef);
     desc.addon_abi_version = 7;
+    desc.callback_policy = WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE
+        | WIRELOG_EXTENSION_CALLBACK_DETERMINISTIC
+        | WIRELOG_EXTENSION_CALLBACK_PURE;
     failures += check(wirelog_extension_register(r, &desc) == 0,
             "metadata descriptor register");
     s = wirelog_extension_snapshot_acquire(r);
     d = wirelog_extension_snapshot_find(s, "Math::Sin");
     failures += check(d != NULL && d->addon_abi_identity
-            == UINT64_C(0x0123456789abcdef) && d->addon_abi_version == 7,
+            == UINT64_C(0x0123456789abcdef) && d->addon_abi_version == 7
+            && d->callback_policy
+            == (WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE
+            | WIRELOG_EXTENSION_CALLBACK_DETERMINISTIC
+            | WIRELOG_EXTENSION_CALLBACK_PURE),
             "metadata copied into snapshot");
     wirelog_extension_snapshot_release(s);
     failures += check(wirelog_extension_unregister(r, "Math::Sin") == 0,
             "metadata descriptor unregister");
     desc.addon_abi_identity = 0;
     desc.addon_abi_version = 0;
+    desc.callback_policy = 1u << 12;
+    failures += check(wirelog_extension_register(r, &desc) == -1
+            && strstr(wirelog_extension_last_error(), "callback policy"),
+            "unknown callback policy bits rejected");
+    desc.callback_policy = 0;
+    {
+        wirelog_extension_descriptor_t partial = desc;
+        partial.callback_policy = WIRELOG_EXTENSION_CALLBACK_PURE;
+        partial.size = (uint32_t)offsetof(wirelog_extension_descriptor_t,
+                callback_policy) + sizeof(uint16_t);
+        failures += check(wirelog_extension_register(r, &partial) == 0,
+                "partially covered policy field is accepted as legacy");
+        s = wirelog_extension_snapshot_acquire(r);
+        d = wirelog_extension_snapshot_find(s, "Math::Sin");
+        failures += check(d != NULL && d->callback_policy == 0,
+                "partially covered policy field was not published");
+        wirelog_extension_snapshot_release(s);
+        failures += check(wirelog_extension_unregister(r, "Math::Sin") == 0,
+                "partial policy descriptor unregister");
+    }
     {
         const size_t old_size = offsetof(wirelog_extension_descriptor_t,
                 addon_abi_identity);
@@ -66,7 +93,7 @@ int main(void)
         s = wirelog_extension_snapshot_acquire(r);
         d = wirelog_extension_snapshot_find(s, "Math::Sin");
         failures += check(d != NULL && d->addon_abi_identity == 0
-                && d->addon_abi_version == 0,
+                && d->addon_abi_version == 0 && d->callback_policy == 0,
                 "legacy metadata defaults");
         wirelog_extension_snapshot_release(s);
         failures += check(wirelog_extension_unregister(r, "Math::Sin") == 0,
