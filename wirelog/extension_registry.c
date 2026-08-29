@@ -21,6 +21,7 @@ typedef struct wl_extension_entry {
     size_t references;
     size_t pins;
     bool registered;
+    wirelog_extension_registry_t *registry;
 } wl_extension_entry_t;
 
 struct wirelog_extension_registry {
@@ -29,6 +30,7 @@ struct wirelog_extension_registry {
     size_t count;
     size_t capacity;
     size_t active_snapshots;
+    size_t active_leases;
 };
 
 struct wirelog_extension_snapshot {
@@ -243,7 +245,8 @@ wirelog_extension_registry_destroy(wirelog_extension_registry_t *registry)
         wl_extension_error_set("registry is NULL"); return -1;
     }
     mutex_lock(&registry->mutex);
-    if (registry->count != 0 || registry->active_snapshots != 0) {
+    if (registry->count != 0 || registry->active_snapshots != 0
+        || registry->active_leases != 0) {
         mutex_unlock(&registry->mutex);
         wl_extension_error_set("registry is not empty"); return -1;
     }
@@ -293,6 +296,7 @@ wirelog_extension_register(wirelog_extension_registry_t *registry,
         wl_extension_error_set("invalid descriptor or allocation failed");
         return -1;
     }
+    entry->registry = registry;
     mutex_lock(&registry->mutex);
     for (i = 0; i < registry->count; i++) {
         if (strcmp(registry->entries[i]->name, entry->name) == 0) {
@@ -466,6 +470,48 @@ wirelog_extension_snapshot_find(const wirelog_extension_snapshot_t *snapshot,
         }
     free(normalized); wl_extension_error_set("extension not found");
     return NULL;
+}
+
+/* A callback lease keeps the entry alive independently of its snapshot.  A
+ * callback may release its last snapshot reference or unregister itself, so
+ * the evaluator cannot rely on the snapshot remaining alive until invoke()
+ * returns.  The lease never holds the registry mutex while user code runs. */
+void *
+wl_extension_callback_lease_acquire(
+    const wirelog_extension_snapshot_t *snapshot,
+    const wirelog_extension_descriptor_t *descriptor)
+{
+    size_t i;
+    wl_extension_entry_t *entry = NULL;
+    if (!snapshot || !descriptor)
+        return NULL;
+    mutex_lock(&snapshot->registry->mutex);
+    for (i = 0; i < snapshot->count; i++) {
+        if (&snapshot->entries[i]->descriptor == descriptor) {
+            entry = snapshot->entries[i];
+            entry->references++;
+            snapshot->registry->active_leases++;
+            break;
+        }
+    }
+    mutex_unlock(&snapshot->registry->mutex);
+    return entry;
+}
+
+void
+wl_extension_callback_lease_release(void *lease)
+{
+    wl_extension_entry_t *entry = (wl_extension_entry_t *)lease;
+    bool destroy;
+    if (!entry || !entry->registry)
+        return;
+    mutex_lock(&entry->registry->mutex);
+    if (entry->registry->active_leases != 0)
+        entry->registry->active_leases--;
+    destroy = wl_extension_entry_release_locked(entry);
+    mutex_unlock(&entry->registry->mutex);
+    if (destroy)
+        wl_extension_entry_destroy(entry);
 }
 
 int
