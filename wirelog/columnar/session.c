@@ -1450,6 +1450,10 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->coordinator = coordinator;
     out_worker->extension_expr_status = 0;
     out_worker->callback_session_key = coordinator->callback_session_key;
+    out_worker->delta_events = NULL;
+    out_worker->delta_event_count = 0;
+    out_worker->delta_event_capacity = 0;
+    out_worker->delta_event_transaction = false;
 
     /* Prevent accidental wl_session_destroy on stack-allocated worker */
     out_worker->base.backend = NULL;
