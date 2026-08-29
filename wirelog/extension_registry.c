@@ -62,6 +62,9 @@ wl_extension_error_set_expr_status(int status)
     case 8: wl_extension_error_set("scalar extension allocation failed"); break;
     case 9: wl_extension_error_set(
             "scalar extension ABI identity/version mismatch"); break;
+    case 10: wl_extension_error_set(
+            "scalar extension callback policy forbids concurrent execution "
+            "without THREAD_SAFE"); break;
     default: break;
     }
 }

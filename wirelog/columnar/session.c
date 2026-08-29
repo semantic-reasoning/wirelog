@@ -963,6 +963,11 @@ col_session_create(const wl_plan_t *plan, uint32_t num_workers,
     }
 #undef WL_MAX_WORKERS_HARD_LIMIT
 
+    /* The callback policy uses the effective cap after RAM/env clamping. */
+    sess->callback_configured_workers = sess->num_workers;
+    sess->callback_active_workers = 1;
+    sess->callback_parallel_execution = false;
+
     /* Dynamic join output limit (Issue #221) */
     {
         const char *join_limit_env = getenv("WIRELOG_JOIN_OUTPUT_LIMIT");
