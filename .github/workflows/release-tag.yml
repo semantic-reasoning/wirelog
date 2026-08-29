@@ -231,7 +231,7 @@ jobs:
           test -n "$archive"
           scripts/release/run-downstream-matrix.sh \
             --tarball "$archive" --candidate-sha "$EXPECTED_SHA" \
-            --oracle-sha256 37da1f74d9820d6cd29999b8c232c507fe50350aa9218db3df96925818ebfb14 \
+            --oracle-sha256 4029e35d72e91f83700592d6dddc4f528e5a4400fa9eb822723b3955146df62d \
             --output-dir downstream-evidence
       - name: Upload downstream evidence
         if: always()
