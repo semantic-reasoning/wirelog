@@ -274,9 +274,12 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         col_rel_destroy(out);
                         if (e.owned)
                             col_rel_destroy(e.rel);
-                        if (sess)
+                        if (sess && expr_status
+                            >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED)
                             sess->extension_expr_status = expr_status;
-                        return expr_status;
+                        return expr_status
+                               >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+                            ? expr_status : ERANGE;
                     }
                     tmp[c] = val;
                 }
