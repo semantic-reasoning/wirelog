@@ -44,7 +44,10 @@ typedef struct wirelog_extension_value {
     } as;
 } wirelog_extension_value_t;
 
-/* Callback arguments are borrowed for the duration of invoke().  The engine
+/* Callback arguments are borrowed for the duration of invoke().  The
+ * descriptor and user_data remain valid for the entire synchronous callback,
+ * even if the callback unregisters the extension or releases its snapshot.
+ * The engine
  * copies accepted BOOL and INT64 results after invoke() returns; callbacks
  * must therefore not expect the engine to retain pointers or release memory.
  * STRING results are reserved for a future ownership-aware ABI and are

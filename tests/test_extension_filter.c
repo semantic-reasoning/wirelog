@@ -20,6 +20,9 @@ static wl_columnar_expr_context_t *nested_ctx_a;
 static wl_columnar_expr_context_t *nested_ctx_b;
 static int nested_stage;
 static int nested_rc;
+static wirelog_extension_registry_t *lifetime_registry;
+static wirelog_extension_snapshot_t *lifetime_snapshot;
+static int lifetime_destroy_calls;
 
 static int
 check(int condition, const char *message);
@@ -102,6 +105,21 @@ extension_callback(const wirelog_extension_value_t *args, uint32_t nargs,
         result->size = sizeof(returned_string) - 1;
         result->as.string_value.data = returned_string;
         result->as.string_value.length = sizeof(returned_string) - 1;
+        return 0;
+    }
+    if (callback_mode == 8) {
+        wirelog_extension_snapshot_t *held_snapshot = lifetime_snapshot;
+        if (!lifetime_registry
+            || wirelog_extension_unregister(lifetime_registry,
+            "test.lifetime") != 0)
+            return 1;
+        lifetime_snapshot = NULL;
+        wirelog_extension_snapshot_release(held_snapshot);
+        if (lifetime_destroy_calls != 0)
+            return 1;
+        result->type = WIRELOG_EXTENSION_VALUE_BOOL;
+        result->size = sizeof(uint8_t);
+        result->as.bool_value = 1;
         return 0;
     }
     if (callback_mode == 6) {
@@ -317,6 +335,13 @@ check(int condition, const char *message)
     return condition ? 0 : 1;
 }
 
+static void
+lifetime_destroy(void *user_data)
+{
+    (void)user_data;
+    lifetime_destroy_calls++;
+}
+
 static uint32_t
 put_var(uint8_t *buf, uint32_t pos)
 {
@@ -416,6 +441,7 @@ main(void)
         extension_callback, NULL, NULL
     };
     wirelog_extension_descriptor_t safe_descriptor = scalar_descriptor;
+    wirelog_extension_descriptor_t lifetime_descriptor = descriptor;
     wirelog_extension_registry_t *registry =
         wirelog_extension_registry_create();
     wirelog_extension_snapshot_t *snapshot;
@@ -434,12 +460,16 @@ main(void)
     scalar_descriptor.addon_abi_version = 9;
     safe_descriptor.name = "test.safe";
     safe_descriptor.callback_policy = WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE;
+    lifetime_descriptor.name = "test.lifetime";
+    lifetime_descriptor.destroy = lifetime_destroy;
     failures += check(wirelog_extension_register(registry, &descriptor) == 0,
             "register predicate");
     failures += check(wirelog_extension_register(registry,
             &scalar_descriptor) == 0, "register scalar callback");
     failures += check(wirelog_extension_register(registry,
             &safe_descriptor) == 0, "register thread-safe callback");
+    failures += check(wirelog_extension_register(registry,
+            &lifetime_descriptor) == 0, "register lifetime callback");
     snapshot = wirelog_extension_snapshot_acquire(registry);
     ctx.intern = NULL;
     ctx.extensions = snapshot;
@@ -785,6 +815,19 @@ main(void)
     size = put_bool(buf, 0, 1);
     size = put_call(buf, size, "test.pred", 1);
     failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    lifetime_registry = registry;
+    lifetime_snapshot = snapshot;
+    lifetime_destroy_calls = 0;
+    callback_mode = 8;
+    size = put_var(buf, 0);
+    size = put_call(buf, size, "test.lifetime", 1);
+    failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    failures += check(lifetime_destroy_calls == 1,
+            "in-flight callback defers destroy until lease release");
+    snapshot = NULL;
+    ctx.extensions = NULL;
+    lifetime_registry = NULL;
+    callback_mode = 0;
     failures += check(wirelog_extension_unregister(registry, "test.scalar")
             == 0, "unregister scalar callback");
     failures += check(wirelog_extension_unregister(registry, "test.safe")
