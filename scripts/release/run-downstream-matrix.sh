@@ -43,6 +43,7 @@ command -v git >/dev/null || { echo 'git is required' >&2; exit 2; }
 command -v gcc >/dev/null || { echo 'gcc is required' >&2; exit 2; }
 command -v curl >/dev/null || { echo 'curl is required' >&2; exit 2; }
 command -v unzip >/dev/null || { echo 'unzip is required' >&2; exit 2; }
+command -v realpath >/dev/null || { echo 'realpath is required' >&2; exit 2; }
 
 mkdir -p "$output_dir"
 root=$(mktemp -d "${TMPDIR:-/tmp}/wirelog-downstream.XXXXXX")
@@ -54,7 +55,24 @@ finish() {
 }
 trap finish EXIT
 
-tar -xzf "$tarball" -C "$root"
+validate_tarball() {
+    local member
+    while IFS= read -r -d '' member; do
+        case "$member" in
+            ''|/*|.|..|./*|../*|*/../*|*/..)
+                echo "unsafe archive member path: $member" >&2
+                return 1
+                ;;
+        esac
+    done < <(tar --null -tzf "$tarball")
+    tar -tvzf "$tarball" | awk '$1 !~ /^[-d]/ { bad = 1 } END { exit bad + 0 }' || {
+        echo 'archive contains symlink, hardlink, or special-file entries' >&2
+        return 1
+    }
+}
+
+validate_tarball
+tar --no-same-owner --no-same-permissions -xzf "$tarball" -C "$root"
 candidate_root=$(find "$root" -mindepth 1 -maxdepth 1 -type d -print -quit)
 [[ -n "$candidate_root" && -f "$candidate_root/meson.build" ]] || {
     echo 'candidate archive does not contain one top-level wirelog tree' >&2
@@ -95,6 +113,7 @@ metadata="$output_dir/host-metadata.txt"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$metadata"
 printf 'workload\texpected_manifest\tactual_manifest\n' > "$output_dir/data-manifests.tsv"
+printf 'workload\tprovenance_id\tacquisition_command\tresolved_provenance\n' > "$output_dir/data-provenance.tsv"
 
 oracle_file="$candidate_root/scripts/release/downstream-matrix-oracles.tsv"
 [[ -s "$oracle_file" ]] || { echo "missing oracle file: $oracle_file" >&2; exit 1; }
@@ -120,14 +139,93 @@ manifest_for_doop() {
         done | sha256sum | awk '{print $1}'
 }
 
+validate_data_path() {
+    local path=$1
+    case "$path" in
+        ''|/*|.|..|../*|*/../*|*/..)
+            echo "invalid data path: $path" >&2
+            return 1
+            ;;
+    esac
+    [[ "$path" != *$'\n'* && "$path" != *$'\r'* ]] || {
+        echo 'data path contains a newline' >&2
+        return 1
+    }
+}
+
+validate_provenance() {
+    local provenance=$1
+    [[ "$provenance" =~ ^(candidate-commit:[A-Za-z0-9._/-]+|huggingface:[A-Za-z0-9._/-]+@[0-9a-f]{40}#[A-Za-z0-9._/-]+)$ ]] || {
+        echo "invalid immutable provenance id: $provenance" >&2
+        return 1
+    }
+}
+
+validate_provenance_path() {
+    local provenance=$1 data_path=$2
+    case "$provenance" in
+        candidate-commit:*)
+            [[ "${provenance#candidate-commit:}" == "$data_path" ]] || {
+                echo "candidate provenance path does not match data path: $provenance" >&2
+                return 1
+            }
+            ;;
+        huggingface:*)
+            [[ "$data_path" == bench/data/doop && "$1" == huggingface:* ]] || {
+                echo "remote provenance is only valid for DOOP" >&2
+                return 1
+            }
+            ;;
+    esac
+}
+
+validate_acquisition() {
+    case "$1" in
+        tracked-in-tarball|download-doop-zxing) ;;
+        *) echo "unknown acquisition command id: $1" >&2; return 1 ;;
+    esac
+}
+
 declare -A seen_workloads=()
 workload_count=0
-while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path expected_manifest; do
+while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path expected_manifest provenance acquisition extra; do
     [[ -z "$workload" || "$workload" == \#* ]] && continue
+    [[ -z "$extra" && -n "$provenance" && -n "$acquisition" ]] || {
+        echo "oracle row must contain exactly seven fields: $workload" >&2
+        exit 1
+    }
+    [[ "$expected_tuples" =~ ^[0-9]+$ && "$expected_iterations" =~ ^[0-9]+$ ]] || {
+        echo "invalid numeric oracle for $workload" >&2
+        exit 1
+    }
+    [[ "$expected_manifest" =~ ^[0-9a-f]{64}$ || "$expected_manifest" =~ ^archive:[0-9a-f]{64}\;files:[0-9a-f]{64}$ ]] || {
+        echo "invalid manifest oracle for $workload" >&2
+        exit 1
+    }
+    validate_data_path "$data_path"
+    validate_provenance "$provenance"
+    validate_provenance_path "$provenance" "$data_path"
+    validate_acquisition "$acquisition"
     [[ -z "${seen_workloads[$workload]+x}" ]] || { echo "duplicate workload: $workload" >&2; exit 1; }
     seen_workloads[$workload]=1
     workload_count=$((workload_count + 1))
-    data_dir="$candidate_root/$data_path"
+    data_dir=$(realpath -e -- "$candidate_root/$data_path") || {
+        echo "missing data path: $data_path" >&2
+        exit 1
+    }
+    candidate_root_real=$(realpath -e -- "$candidate_root")
+    [[ "$data_dir" == "$candidate_root_real"/* ]] || {
+        echo "data path escapes candidate tree: $data_path" >&2
+        exit 1
+    }
+    if [[ "$workload" == doop ]]; then
+        [[ "$acquisition" == download-doop-zxing ]] || { echo 'DOOP must use download-doop-zxing' >&2; exit 1; }
+        [[ -z "${DOOP_ZXING_URL:-}" ]] || { echo 'DOOP_ZXING_URL override is not allowed in GA matrix' >&2; exit 1; }
+    else
+        [[ "$acquisition" == tracked-in-tarball ]] || { echo "$workload must use tracked-in-tarball" >&2; exit 1; }
+    fi
+    resolved_provenance=${provenance/candidate-commit:/candidate-commit:$candidate_sha:}
+    printf '%s\t%s\t%s\t%s\n' "$workload" "$provenance" "$acquisition" "$resolved_provenance" >> "$output_dir/data-provenance.tsv"
     if [[ "$expected_manifest" == archive:* ]]; then
         archive_sha=${expected_manifest#archive:}
         archive_sha=${archive_sha%%;files:*}
@@ -199,8 +297,9 @@ run_workload() {
     printf '%s\tPASS\t%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\t%s\t%s\n' "$workload" "$MATRIX_WORKERS" "$MATRIX_REPEAT" "$timeout_seconds" "$tuples" "$iterations" "$expected_tuples" "$expected_iterations" "$median" "$(basename "$log")" >> "$output_dir/results.tsv"
 }
 
-while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path _; do
+while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path _ provenance acquisition extra; do
     [[ -z "$workload" || "$workload" == \#* ]] && continue
+    [[ -z "$extra" && -n "$provenance" && -n "$acquisition" ]] || { echo "invalid oracle row for $workload" >&2; exit 1; }
     case "$workload" in
         cspa-fast) run_workload "$workload" --data-cspa "$candidate_root/$data_path" "$expected_tuples" "$expected_iterations" ;;
         galen) run_workload "$workload" --data-galen "$candidate_root/$data_path" "$expected_tuples" "$expected_iterations" ;;

@@ -24,8 +24,10 @@ are retained in the uploaded evidence.
 ## Dataset and oracle policy
 
 The five repository-tracked datasets are identified by the sorted-file
-manifest hashes in `scripts/release/downstream-matrix-oracles.tsv`; changing
-one requires an intentional oracle update. DOOP is fetched from the FlowLog
+manifest hashes and the `candidate-commit:<path>` provenance identifiers in
+`scripts/release/downstream-matrix-oracles.tsv`; changing one requires an
+intentional oracle update. The acquisition column is a declarative recipe ID,
+not shell text and is never evaluated. DOOP is fetched from the FlowLog
 zxing archive and `bench/data/doop/download.sh` rejects any archive other than
 SHA256
 `154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`.
@@ -34,9 +36,11 @@ The DOOP archive URL is pinned to Hugging Face dataset revision
 `da9e91b3ff75d94604f57ba2b21ef3aa97e241ec`. Its `zxing.zip` blob is 72,025,076
 bytes with ETag/SHA256
 `154593343fefd18306d4098ba9f6286947b134b56ebcf83d8e8eae368d5867e7`; the
-extracted `.facts` manifest is recorded in the oracle file. The download
-script still permits an explicit `DOOP_ZXING_URL` override for controlled
-fixtures, but the default is immutable.
+extracted `.facts` manifest is recorded in the oracle file. The production
+matrix rejects a `DOOP_ZXING_URL` override so the declared provenance and
+effective download source cannot diverge. The downloader retains its override
+variables only for isolated negative fixtures and is not a production policy
+boundary by itself.
 
 The pinned W=1 oracle is:
 
@@ -55,6 +59,6 @@ requirement.
 | DOOP (zxing) | 13,828,835 | 153 |
 
 The workflow uploads the candidate tarball checksums, host metadata, the
-complete result table, and one log per workload. A successful run is the
+complete result table, data-provenance.tsv, and one log per workload. A successful run is the
 external evidence needed to close #1156/#1163 and must be linked from the
 release notes and the corresponding issue.
