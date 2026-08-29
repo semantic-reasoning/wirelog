@@ -480,6 +480,44 @@ scan_is_idb(const wirelog_ir_node_t *scan, const char *const *idb_names,
     return false;
 }
 
+static bool
+expr_contains_extension_call(const wl_ir_expr_t *expr)
+{
+    if (!expr)
+        return false;
+    if (expr->type == WL_IR_EXPR_EXTENSION_CALL)
+        return true;
+    for (uint32_t i = 0; i < expr->child_count; i++)
+        if (expr_contains_extension_call(expr->children[i]))
+            return true;
+    return false;
+}
+
+/* JPP has no registry snapshot at optimizer time, so it cannot distinguish
+* a trusted PURE/DETERMINISTIC attestation from a legacy or partial one.
+* Keep extension-containing trees in source order until an optimizer pass
+* with capability metadata exists.  This prevents join reordering and
+* projection changes from duplicating, moving, or eliminating callbacks. */
+static bool
+node_contains_extension_call(const wirelog_ir_node_t *node)
+{
+    if (!node)
+        return false;
+    if (expr_contains_extension_call(node->filter_expr)
+        || expr_contains_extension_call(node->agg_expr)
+        || expr_contains_extension_call(node->compound_side.handle_expr))
+        return true;
+    if (node->project_exprs) {
+        for (uint32_t i = 0; i < node->project_count; i++)
+            if (expr_contains_extension_call(node->project_exprs[i]))
+                return true;
+    }
+    for (uint32_t i = 0; i < node->child_count; i++)
+        if (node_contains_extension_call(node->children[i]))
+            return true;
+    return false;
+}
+
 /* ======================================================================== */
 /* Internal: greedy reorder a join chain                                    */
 /* ======================================================================== */
@@ -1461,6 +1499,9 @@ optimize_tree(wirelog_ir_node_t *ir, uint32_t *chains_examined,
     const char *const *idb_names, uint32_t idb_count)
 {
     if (!ir)
+        return;
+
+    if (node_contains_extension_call(ir))
         return;
 
     /* UNION: recurse into each child */
