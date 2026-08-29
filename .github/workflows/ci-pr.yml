@@ -349,7 +349,9 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install meson ninja mbedtls uncrustify
+          brew install meson ninja mbedtls uncrustify coreutils gnu-tar
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -531,7 +533,9 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install meson ninja mbedtls
+          brew install meson ninja mbedtls coreutils gnu-tar
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
       - name: Configure with sanitizers
         run: >

@@ -64,7 +64,10 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install meson ninja
+        run: |
+          brew install meson ninja coreutils gnu-tar
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
       - name: Configure ASan/UBSan
         run: >
@@ -135,7 +138,9 @@ jobs:
               sudo apt-get install -y clang
             fi
           else
-            brew install meson ninja mbedtls
+            brew install meson ninja mbedtls coreutils gnu-tar
+            echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+            echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
           fi
 
       - name: Configure TSan
