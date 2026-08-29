@@ -26,6 +26,7 @@ MATRIX_EXTRACTION_TIMEOUT_SECONDS=${MATRIX_EXTRACTION_TIMEOUT_SECONDS:-1800}
 MATRIX_CONFIGURE_TIMEOUT_SECONDS=${MATRIX_CONFIGURE_TIMEOUT_SECONDS:-120}
 MATRIX_BUILD_TIMEOUT_SECONDS=${MATRIX_BUILD_TIMEOUT_SECONDS:-600}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+run_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
@@ -120,6 +121,12 @@ metadata="$output_dir/host-metadata.txt"
 } > "$metadata"
 printf 'workload\texpected_manifest\tactual_manifest\n' > "$output_dir/data-manifests.tsv"
 printf 'workload\tprovenance_id\tacquisition_command\tresolved_provenance\n' > "$output_dir/data-provenance.tsv"
+"$script_dir/write-isolation-evidence.sh" "$output_dir/isolation-evidence.tsv" \
+    "$candidate_sha" "${GITHUB_WORKFLOW:-local}" "${GITHUB_RUN_ID:-local}" \
+    "$run_started_at" "${RUNNER_NAME:-unknown}" "${RUNNER_GROUP:-unknown}" \
+    "${WIRELOG_GA_ISOLATION_CONTROL:-unverified}" \
+    "${WIRELOG_GA_ISOLATION_ASSERTION:-unverified}" \
+    "repository-variable:WIRELOG_GA_ISOLATION_ASSERTION"
 
 oracle_file="$candidate_root/scripts/release/downstream-matrix-oracles.tsv"
 [[ -s "$oracle_file" ]] || { echo "missing oracle file: $oracle_file" >&2; exit 1; }

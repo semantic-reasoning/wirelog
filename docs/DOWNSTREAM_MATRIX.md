@@ -19,7 +19,14 @@ The runner must not be shared with untrusted jobs. The workflow removes its
 candidate archive/evidence directories after artifact upload, and the matrix
 script removes its temporary extraction directory after each run. Host identity,
 kernel, architecture, CPU count, memory, candidate SHA, and completion time
-are retained in the uploaded evidence.
+are retained in the uploaded evidence. The workflow requires the externally
+administered repository variables `WIRELOG_GA_ISOLATION_CONTROL` and
+`WIRELOG_GA_ISOLATION_ASSERTION=dedicated-runner-group`, and requires the
+selected runner group to be `wirelog-ga`. The matrix records these values, the
+declared labels, candidate SHA, workflow/run identity, assertion source and
+result, concurrency group, and cleanup policy in `isolation-evidence.tsv`; this
+is an auditable assertion of the external control, not a claim that the script
+can prove runner dedication by itself.
 
 ## Dataset and oracle policy
 
@@ -65,7 +72,7 @@ timeout. Invalid timeout values are rejected before external work starts.
 | DOOP (zxing) | 13,828,835 | 153 |
 
 The workflow uploads the candidate tarball checksums, host metadata, the
-complete result table, `data-provenance.tsv`, `phases.tsv`, and one log per
-workload. A successful run is the
+complete result table, `data-provenance.tsv`, `phases.tsv`,
+`isolation-evidence.tsv`, and one log per workload. A successful run is the
 external evidence needed to close #1156/#1163 and must be linked from the
 release notes and the corresponding issue.
