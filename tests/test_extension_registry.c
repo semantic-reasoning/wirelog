@@ -1,5 +1,6 @@
 #include "wirelog/wirelog-extension.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int invoke(const wirelog_extension_value_t *a, uint32_t n,
@@ -35,6 +36,65 @@ int main(void)
     wirelog_extension_descriptor_t bad = desc;
     int failures = 0;
     failures += check(r != NULL, "create");
+    desc.addon_abi_identity = UINT64_C(0x0123456789abcdef);
+    desc.addon_abi_version = 7;
+    failures += check(wirelog_extension_register(r, &desc) == 0,
+            "metadata descriptor register");
+    s = wirelog_extension_snapshot_acquire(r);
+    d = wirelog_extension_snapshot_find(s, "Math::Sin");
+    failures += check(d != NULL && d->addon_abi_identity
+            == UINT64_C(0x0123456789abcdef) && d->addon_abi_version == 7,
+            "metadata copied into snapshot");
+    wirelog_extension_snapshot_release(s);
+    failures += check(wirelog_extension_unregister(r, "Math::Sin") == 0,
+            "metadata descriptor unregister");
+    desc.addon_abi_identity = 0;
+    desc.addon_abi_version = 0;
+    {
+        const size_t old_size = offsetof(wirelog_extension_descriptor_t,
+                addon_abi_identity);
+        unsigned char *old_storage = malloc(old_size);
+        failures += check(old_storage != NULL, "legacy descriptor allocation");
+        if (!old_storage) return failures != 0;
+        memset(old_storage, 0, old_size);
+        memcpy(old_storage, &desc, old_size);
+        ((wirelog_extension_descriptor_t *)old_storage)->size =
+            (uint32_t)old_size;
+        failures += check(wirelog_extension_register(r,
+                (const wirelog_extension_descriptor_t *)old_storage) == 0,
+                "legacy descriptor register");
+        s = wirelog_extension_snapshot_acquire(r);
+        d = wirelog_extension_snapshot_find(s, "Math::Sin");
+        failures += check(d != NULL && d->addon_abi_identity == 0
+                && d->addon_abi_version == 0,
+                "legacy metadata defaults");
+        wirelog_extension_snapshot_release(s);
+        failures += check(wirelog_extension_unregister(r, "Math::Sin") == 0,
+                "legacy descriptor unregister");
+        free(old_storage);
+    }
+    desc.addon_abi_identity = 1;
+    desc.addon_abi_version = 0;
+    failures += check(wirelog_extension_register(r, &desc) == -1
+            && strstr(wirelog_extension_last_error(), "metadata"),
+            "half-populated metadata rejected");
+    desc.addon_abi_identity = 0;
+    desc.addon_abi_version = 7;
+    failures += check(wirelog_extension_register(r, &desc) == -1
+            && strstr(wirelog_extension_last_error(), "metadata"),
+            "half-populated metadata rejected 2");
+    desc.addon_abi_version = 0;
+    desc.size = (uint32_t)sizeof(desc) + 64;
+    failures += check(wirelog_extension_register(r, &desc) == 0,
+            "oversized descriptor register");
+    s = wirelog_extension_snapshot_acquire(r);
+    d = wirelog_extension_snapshot_find(s, "Math::Sin");
+    failures += check(d != NULL && d->size == sizeof(*d),
+            "oversized descriptor size is clamped");
+    wirelog_extension_snapshot_release(s);
+    failures += check(wirelog_extension_unregister(r, "Math::Sin") == 0,
+            "oversized descriptor unregister");
+    desc.size = sizeof(desc);
     bad.abi_version++;
     failures += check(wirelog_extension_register(r,
             &bad) == -1 && strstr(wirelog_extension_last_error(), "ABI"),

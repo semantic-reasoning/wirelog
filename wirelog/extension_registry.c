@@ -95,6 +95,37 @@ wl_extension_value_type_valid(uint32_t type)
 }
 
 static bool
+wl_extension_metadata_valid(uint64_t identity, uint32_t version)
+{
+    return (identity == 0 && version == 0)
+           || (identity != 0 && version != 0);
+}
+
+/* Normalize a caller-owned descriptor before reading any field beyond size.
+ * Older addons may pass an allocation ending at the old struct size. */
+static bool
+wl_extension_descriptor_normalize(
+    const wirelog_extension_descriptor_t *source,
+    wirelog_extension_descriptor_t *normalized)
+{
+    size_t copy_size;
+    uint32_t declared_size;
+    if (!source || !normalized) return false;
+    memcpy(&declared_size, (const unsigned char *)source
+        + offsetof(wirelog_extension_descriptor_t, size),
+        sizeof(declared_size));
+    if (declared_size < offsetof(wirelog_extension_descriptor_t, size)
+        + sizeof(declared_size)) return false;
+    memset(normalized, 0, sizeof(*normalized));
+    copy_size = declared_size < sizeof(*normalized)
+        ? (size_t)declared_size : sizeof(*normalized);
+    memcpy(normalized, source, copy_size);
+    normalized->size = (uint32_t)copy_size;
+    return wl_extension_metadata_valid(normalized->addon_abi_identity,
+               normalized->addon_abi_version);
+}
+
+static bool
 wl_extension_descriptor_valid(const wirelog_extension_descriptor_t *descriptor)
 {
     if (!descriptor->name || !descriptor->invoke
@@ -195,35 +226,33 @@ wirelog_extension_register(wirelog_extension_registry_t *registry,
     const wirelog_extension_descriptor_t *source)
 {
     wl_extension_entry_t *entry;
+    wirelog_extension_descriptor_t owned_source;
     size_t i;
     if (!registry || !source) {
         wl_extension_error_set("descriptor or registry is NULL"); return -1;
     }
-    if (source->abi_version != WIRELOG_EXTENSION_ABI_VERSION) {
+    if (!wl_extension_descriptor_normalize(source, &owned_source)) {
+        wl_extension_error_set("invalid descriptor metadata"); return -1;
+    }
+    if (owned_source.abi_version != WIRELOG_EXTENSION_ABI_VERSION) {
         wl_extension_error_set("ABI version mismatch"); return -1;
     }
-    if (source->size < offsetof(wirelog_extension_descriptor_t,
-        result_type) + sizeof(source->result_type)) {
+    if (owned_source.size < offsetof(wirelog_extension_descriptor_t,
+        result_type) + sizeof(owned_source.result_type)) {
         wl_extension_error_set("descriptor size is too small"); return -1;
     }
     {
         const uint64_t max_arity =
             (uint64_t)(SIZE_MAX / sizeof(uint32_t));
-        if ((uint64_t)source->arity > max_arity) {
+        if ((uint64_t)owned_source.arity > max_arity) {
             wl_extension_error_set("extension arity is too large");
             return -1;
         }
     }
-    {
-        wirelog_extension_descriptor_t owned_source = { 0 };
-        size_t copy_size = source->size <
-            sizeof(owned_source) ? source->size : sizeof(owned_source);
-        memcpy(&owned_source, source, copy_size);
-        if (!wl_extension_descriptor_valid(&owned_source)) {
-            wl_extension_error_set("invalid descriptor"); return -1;
-        }
-        entry = wl_extension_entry_create(&owned_source);
+    if (!wl_extension_descriptor_valid(&owned_source)) {
+        wl_extension_error_set("invalid descriptor"); return -1;
     }
+    entry = wl_extension_entry_create(&owned_source);
     if (!entry) {
         wl_extension_error_set("invalid descriptor or allocation failed");
         return -1;
