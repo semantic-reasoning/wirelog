@@ -76,9 +76,13 @@
  *                            Payload: [len:u16] [data:u8*len]
  *   WL_PLAN_EXPR_BOOL:       Boolean literal.
  *                            Payload: [value:u8] (0=false, 1=true)
- *   WL_PLAN_EXPR_EXTENSION_CALL: scalar addon call.
+ *   WL_PLAN_EXPR_EXTENSION_CALL: legacy scalar addon call.
  *                            Payload: [name_len:u16] [name:u8*name_len]
  *                                     [argc:u32], all integer fields little-endian.
+ *   WL_PLAN_EXPR_EXTENSION_CALL_ABI: versioned scalar addon call.
+ *                            Payload: the legacy fields followed by
+ *                                     [identity:u64] [version:u32], all
+ *                                     integer fields little-endian.
  *
  * Binary operator tags (pop 2, push 1):
  *   WL_PLAN_EXPR_ARITH_ADD .. WL_PLAN_EXPR_ARITH_MOD
@@ -101,6 +105,8 @@ typedef enum {
 
     /* Scalar extension call (postfix operands, then name and arity payload). */
     WL_PLAN_EXPR_EXTENSION_CALL = 0x80,
+    /* Scalar extension call with an explicit addon ABI identity/version. */
+    WL_PLAN_EXPR_EXTENSION_CALL_ABI = 0x81,
 
     /* Arithmetic operators (binary, pop 2 push 1) */
     WL_PLAN_EXPR_ARITH_ADD = 0x10,

@@ -60,6 +60,8 @@ wl_extension_error_set_expr_status(int status)
     case 7: wl_extension_error_set(
             "scalar extension returned an invalid result"); break;
     case 8: wl_extension_error_set("scalar extension allocation failed"); break;
+    case 9: wl_extension_error_set(
+            "scalar extension ABI identity/version mismatch"); break;
     default: break;
     }
 }
