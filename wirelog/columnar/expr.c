@@ -594,6 +594,13 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                     *status = WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH;
                 goto bad;
             }
+            if (ctx->parallel_execution && ctx->active_worker_count > 1
+                && !(descriptor->callback_policy
+                & WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE)) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_CALLBACK_POLICY;
+                goto bad;
+            }
             if (nargs != descriptor->arity || nargs > s.top
                 || nargs > COL_FILTER_STACK) {
                 if (status)
@@ -1198,7 +1205,13 @@ int
 wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
     uint32_t ncols, int64_t *out_val, wl_intern_t *intern)
 {
-    wl_columnar_expr_context_t ctx = { intern, NULL };
+    wl_columnar_expr_context_t ctx = {
+        .intern = intern,
+        .extensions = NULL,
+        .configured_worker_count = 1,
+        .active_worker_count = 1,
+        .parallel_execution = false
+    };
     wl_columnar_expr_status_t status;
     return wl_columnar_expr_eval_run_ctx(buf, size, row, ncols, out_val,
                &ctx, &status) == WL_COLUMNAR_EXPR_OK ? 0 : 1;

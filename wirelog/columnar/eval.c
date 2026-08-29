@@ -170,11 +170,15 @@ tdd_cleanup_workers(wl_col_session_t *coord)
     }
     coord->tdd_workers_count = 0;
     coord->tdd_active_workers = 0;
+    coord->callback_active_workers = 1;
+    coord->callback_parallel_execution = false;
 }
 
 static void
 tdd_record_active_workers(wl_col_session_t *coord, uint32_t W)
 {
+    coord->callback_active_workers = W > 0 ? W : 1;
+    coord->callback_parallel_execution = coord->callback_active_workers > 1;
     coord->tdd_last_active_workers = W;
     if (W > coord->tdd_max_active_workers)
         coord->tdd_max_active_workers = W;
@@ -189,7 +193,7 @@ record_worker_expr_status(wl_col_session_t *coord,
     if (worker && worker->extension_expr_status != 0)
         coord->extension_expr_status = worker->extension_expr_status;
     else if (rc >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
-        && rc <= WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
+        && rc <= WL_COLUMNAR_EXPR_CALLBACK_POLICY)
         coord->extension_expr_status = rc;
 }
 

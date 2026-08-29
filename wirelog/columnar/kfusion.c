@@ -721,6 +721,8 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].wq_workers = 0;
         worker_sess[d].kfusion_adaptive = NULL;
         worker_sess[d].num_workers = 1;
+        worker_sess[d].callback_active_workers = active_workers;
+        worker_sess[d].callback_parallel_execution = active_workers > 1;
         worker_sess[d].tdd_workers = NULL;
         worker_sess[d].tdd_workers_cap = 0;
         worker_sess[d].tdd_workers_count = 0;

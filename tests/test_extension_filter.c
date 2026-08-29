@@ -289,6 +289,9 @@ main(void)
     ctx.intern = NULL;
     ctx.extensions = snapshot;
     ctx.allow_extension_scalar_result = false;
+    ctx.configured_worker_count = 1;
+    ctx.active_worker_count = 1;
+    ctx.parallel_execution = false;
 
     /* ABI-tagged calls use explicit little-endian identity/version fields. */
     size = put_var(buf, 0);
@@ -358,6 +361,20 @@ main(void)
     callback_mode = 0;
     failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
     failures += check(value == 1, "true result");
+
+    /* Legacy/policy-zero callbacks are valid at serial width but must not be
+     * invoked when the actual evaluator width is concurrent. */
+    callback_calls = 0;
+    ctx.configured_worker_count = 4;
+    ctx.active_worker_count = 2;
+    ctx.parallel_execution = true;
+    failures += run(buf, size, &ctx, &value,
+            WL_COLUMNAR_EXPR_CALLBACK_POLICY);
+    failures += check(callback_calls == 0,
+            "unsafe callback is rejected before invocation");
+    ctx.active_worker_count = 1;
+    ctx.parallel_execution = false;
+    failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
 
     buf[0] = (uint8_t)WL_PLAN_EXPR_CONST_INT;
     memset(buf + 1, 0, 8);
