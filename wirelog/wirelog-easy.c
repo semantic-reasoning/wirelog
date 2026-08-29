@@ -159,7 +159,7 @@ wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
     const size_t old_opts_size = offsetof(wirelog_easy_open_opts_t,
             extension_snapshot);
     const size_t snapshot_end = old_opts_size
-        + sizeof(((wirelog_easy_open_opts_t *)0)->extension_snapshot);
+        + sizeof(wirelog_extension_snapshot_t *);
     if (opts && opts->size < old_opts_size)
         return WIRELOG_ERR_EXEC;
     if (opts && opts->_reserved)
