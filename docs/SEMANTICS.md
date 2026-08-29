@@ -36,6 +36,14 @@ An addon callback cannot change the engine's relational, differential, or
 aggregate semantics. In particular, callback errors are not silently converted
 to false predicates.
 
+The `DETERMINISTIC` and `PURE` capability bits are addon attestations; Wirelog
+does not independently prove them. Until an optimizer pass has access to the
+extension snapshot that carries those declarations, optimizer passes preserve
+the source order and expression structure of rules containing scalar addon
+calls. This conservative boundary prevents callback duplication, elimination,
+or movement based on an unverified capability declaration. A future optimizer
+contract may enable specific transformations for callbacks with both bits.
+
 ---
 
 ## Inline `.dl` facts (Status: Current)
