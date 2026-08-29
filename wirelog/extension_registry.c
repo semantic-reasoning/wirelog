@@ -103,6 +103,12 @@ wl_extension_metadata_valid(uint64_t identity, uint32_t version)
            || (identity != 0 && version != 0);
 }
 
+static bool
+wl_extension_callback_policy_valid(uint32_t policy)
+{
+    return (policy & ~WIRELOG_EXTENSION_CALLBACK_POLICY_KNOWN_MASK) == 0;
+}
+
 /* Normalize a caller-owned descriptor before reading any field beyond size.
  * Older addons may pass an allocation ending at the old struct size. */
 static bool
@@ -121,10 +127,30 @@ wl_extension_descriptor_normalize(
     memset(normalized, 0, sizeof(*normalized));
     copy_size = declared_size < sizeof(*normalized)
         ? (size_t)declared_size : sizeof(*normalized);
+    /* Never publish a partially copied append-only field. */
+    if (copy_size > offsetof(wirelog_extension_descriptor_t,
+        addon_abi_identity)
+        && copy_size < offsetof(wirelog_extension_descriptor_t,
+        addon_abi_identity) + sizeof(normalized->addon_abi_identity))
+        copy_size = offsetof(wirelog_extension_descriptor_t,
+                addon_abi_identity);
+    if (copy_size > offsetof(wirelog_extension_descriptor_t,
+        addon_abi_version)
+        && copy_size < offsetof(wirelog_extension_descriptor_t,
+        addon_abi_version) + sizeof(normalized->addon_abi_version))
+        copy_size = offsetof(wirelog_extension_descriptor_t,
+                addon_abi_version);
+    if (copy_size > offsetof(wirelog_extension_descriptor_t,
+        callback_policy)
+        && copy_size < offsetof(wirelog_extension_descriptor_t,
+        callback_policy) + sizeof(normalized->callback_policy))
+        copy_size = offsetof(wirelog_extension_descriptor_t,
+                callback_policy);
     memcpy(normalized, source, copy_size);
     normalized->size = (uint32_t)copy_size;
     return wl_extension_metadata_valid(normalized->addon_abi_identity,
-               normalized->addon_abi_version);
+               normalized->addon_abi_version)
+           && wl_extension_callback_policy_valid(normalized->callback_policy);
 }
 
 static bool
@@ -234,7 +260,9 @@ wirelog_extension_register(wirelog_extension_registry_t *registry,
         wl_extension_error_set("descriptor or registry is NULL"); return -1;
     }
     if (!wl_extension_descriptor_normalize(source, &owned_source)) {
-        wl_extension_error_set("invalid descriptor metadata"); return -1;
+        wl_extension_error_set(
+            "invalid descriptor metadata or callback policy");
+        return -1;
     }
     if (owned_source.abi_version != WIRELOG_EXTENSION_ABI_VERSION) {
         wl_extension_error_set("ABI version mismatch"); return -1;
