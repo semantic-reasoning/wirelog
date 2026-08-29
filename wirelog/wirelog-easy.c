@@ -392,6 +392,9 @@ wirelog_easy_step(wirelog_easy_session_t *s)
     if (err != WIRELOG_OK)
         return err;
     int rc = wl_session_step(s->session);
+    if (rc != 0)
+        wl_extension_error_set_expr_status(
+            COL_SESSION(s->session)->extension_expr_status);
     return (rc == 0) ? WIRELOG_OK : WIRELOG_ERR_EXEC;
 }
 
