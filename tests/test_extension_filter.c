@@ -16,6 +16,9 @@ static size_t expected_string_length;
 static const uint8_t *nested_buf;
 static uint32_t nested_size;
 static wl_columnar_expr_context_t *nested_ctx;
+static wl_columnar_expr_context_t *nested_ctx_a;
+static wl_columnar_expr_context_t *nested_ctx_b;
+static int nested_stage;
 static int nested_rc;
 
 static int
@@ -104,9 +107,24 @@ extension_callback(const wirelog_extension_value_t *args, uint32_t nargs,
     if (callback_mode == 6) {
         int64_t nested_value = 0;
         wl_columnar_expr_status_t nested_status = WL_COLUMNAR_EXPR_OK;
-        nested_rc = wl_columnar_expr_eval_run_ctx(nested_buf, nested_size,
-                &nested_value, 1, &nested_value, nested_ctx, &nested_status);
+        (void)wl_columnar_expr_eval_run_ctx(nested_buf, nested_size,
+            &nested_value, 1, &nested_value, nested_ctx, &nested_status);
         nested_rc = nested_status;
+        result->type = WIRELOG_EXTENSION_VALUE_BOOL;
+        result->size = sizeof(uint8_t);
+        result->as.bool_value = 1;
+        return 0;
+    }
+    if (callback_mode == 7) {
+        int64_t nested_value = 0;
+        wl_columnar_expr_status_t nested_status = WL_COLUMNAR_EXPR_OK;
+        int current_stage = nested_stage++;
+        wl_columnar_expr_context_t *target = current_stage == 0
+            ? nested_ctx_b : nested_ctx_a;
+        (void)wl_columnar_expr_eval_run_ctx(nested_buf, nested_size,
+            &nested_value, 1, &nested_value, target, &nested_status);
+        if (current_stage != 0)
+            nested_rc = nested_status;
         result->type = WIRELOG_EXTENSION_VALUE_BOOL;
         result->size = sizeof(uint8_t);
         result->as.bool_value = 1;
@@ -537,6 +555,24 @@ main(void)
             "nested evaluator reports reentrancy policy");
     callback_mode = 0;
     failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    ctx.session_key = NULL;
+
+    /* A stack, rather than one TLS slot, is required for A -> B -> A. */
+    wl_columnar_expr_context_t other_ctx = ctx;
+    ctx.session_key = &ctx;
+    other_ctx.session_key = &other_ctx;
+    nested_ctx_a = &ctx;
+    nested_ctx_b = &other_ctx;
+    nested_stage = 0;
+    nested_rc = WL_COLUMNAR_EXPR_OK;
+    callback_mode = 7;
+    callback_calls = 0;
+    failures += run(buf, size, &ctx, &value, WL_COLUMNAR_EXPR_OK);
+    failures += check(callback_calls == 2,
+            "multi-session nesting invokes only A and B callbacks");
+    failures += check(nested_rc == WL_COLUMNAR_EXPR_CALLBACK_REENTRANT,
+            "callback stack detects A re-entry after B");
+    callback_mode = 0;
     ctx.session_key = NULL;
 
     buf[0] = (uint8_t)WL_PLAN_EXPR_CONST_INT;
