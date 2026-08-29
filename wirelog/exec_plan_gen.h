@@ -17,11 +17,17 @@
 #define WL_EXEC_PLAN_GEN_H
 
 #include "exec_plan.h"
+#include "wirelog-extension.h"
 
 #ifdef WIRELOG_TEST_EXTENSION_SERIALIZATION
 struct wl_ir_expr;
 int
 wl_exec_plan_gen_serialize_expr_for_test(const struct wl_ir_expr *expr,
+    wl_plan_expr_buffer_t *out);
+int
+wl_exec_plan_gen_serialize_expr_with_snapshot_for_test(
+    const struct wl_ir_expr *expr,
+    const wirelog_extension_snapshot_t *snapshot,
     wl_plan_expr_buffer_t *out);
 #endif
 
@@ -57,6 +63,10 @@ struct wirelog_program;
  */
 int
 wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out);
+
+int
+wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
+    const wirelog_extension_snapshot_t *snapshot, wl_plan_t **out);
 
 /**
  * wl_plan_free:

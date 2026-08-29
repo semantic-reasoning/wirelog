@@ -29,6 +29,17 @@ static const char *k_semijoin_chain_src;
 static wirelog_ir_node_t *find_composite_left_joinlike(
     wirelog_ir_node_t *node, wirelog_ir_node_type_t type);
 
+static int
+test_extension_invoke(const wirelog_extension_value_t *args, uint32_t nargs,
+    wirelog_extension_value_t *result, void *user_data)
+{
+    (void)args;
+    (void)nargs;
+    (void)result;
+    (void)user_data;
+    return 0;
+}
+
 /* ----------------------------------------------------------------
  * Test framework
  * ---------------------------------------------------------------- */
@@ -192,6 +203,73 @@ test_extension_call_ir_and_plan(void)
     ASSERT(memcmp(serialized.data, expected, sizeof(expected)) == 0,
         "extension postfix bytes are not stable");
     free(serialized.data);
+
+    {
+        static const uint32_t argument_types[] = {
+            WIRELOG_EXTENSION_VALUE_INT64
+        };
+        wirelog_extension_registry_t *registry
+            = wirelog_extension_registry_create();
+        wirelog_extension_descriptor_t descriptor = {
+            WIRELOG_EXTENSION_ABI_VERSION,
+            sizeof(descriptor),
+            "math.is_even",
+            1,
+            argument_types,
+            WIRELOG_EXTENSION_VALUE_BOOL,
+            test_extension_invoke,
+            NULL,
+            NULL,
+            UINT64_C(0x0102030405060708),
+            7
+        };
+        wirelog_extension_snapshot_t *snapshot = NULL;
+        ASSERT(registry != NULL
+            && wirelog_extension_register(registry, &descriptor) == 0,
+            "metadata descriptor registration failed");
+        snapshot = wirelog_extension_snapshot_acquire(registry);
+        ASSERT(snapshot != NULL, "metadata snapshot acquire failed");
+        wl_plan_expr_buffer_t versioned = { 0 };
+        ASSERT(wl_exec_plan_gen_serialize_expr_with_snapshot_for_test(
+                call, snapshot, &versioned) == 0,
+            "versioned extension serialization failed");
+        const uint8_t expected_versioned[] = {
+            WL_PLAN_EXPR_VAR, 1, 0, 'x',
+            WL_PLAN_EXPR_EXTENSION_CALL_ABI, 12, 0,
+            'm', 'a', 't', 'h', '.', 'i', 's', '_', 'e', 'v', 'e', 'n',
+            1, 0, 0, 0,
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+            7, 0, 0, 0
+        };
+        ASSERT(versioned.size == sizeof(expected_versioned)
+            && memcmp(versioned.data, expected_versioned,
+            sizeof(expected_versioned)) == 0,
+            "versioned extension postfix bytes are not stable");
+        free(versioned.data);
+        wirelog_extension_snapshot_release(snapshot);
+        ASSERT(wirelog_extension_unregister(registry, "math.is_even") == 0
+            && wirelog_extension_registry_destroy(registry) == 0,
+            "metadata registry destroy failed");
+    }
+
+    {
+        wirelog_extension_registry_t *empty_registry
+            = wirelog_extension_registry_create();
+        wirelog_extension_snapshot_t *empty_snapshot
+            = empty_registry
+            ? wirelog_extension_snapshot_acquire(empty_registry) : NULL;
+        wl_plan_t *missing_plan = NULL;
+        ASSERT(empty_registry != NULL && empty_snapshot != NULL,
+            "empty snapshot setup failed");
+        ASSERT(wl_plan_from_program_with_snapshot(prog, empty_snapshot,
+            &missing_plan) != 0 && missing_plan == NULL
+            && strstr(wirelog_program_get_plan_error(prog),
+            "absent from the pinned snapshot") != NULL,
+            "missing snapshot descriptor did not fail with a diagnostic");
+        wirelog_extension_snapshot_release(empty_snapshot);
+        ASSERT(wirelog_extension_registry_destroy(empty_registry) == 0,
+            "empty snapshot registry destroy failed");
+    }
 
     {
         const char *string_src = ".decl src(x: string)\n"

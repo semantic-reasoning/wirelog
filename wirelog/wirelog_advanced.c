@@ -443,7 +443,7 @@ wirelog_session_create_impl(wirelog_program_t *program,
         return WIRELOG_ERR_EXEC;
 
     wl_plan_t *plan = NULL;
-    int rc = wl_plan_from_program(program, &plan);
+    int rc = wl_plan_from_program_with_snapshot(program, snapshot, &plan);
     if (rc != 0 || !plan) {
         if (plan)
             wl_plan_free(plan);

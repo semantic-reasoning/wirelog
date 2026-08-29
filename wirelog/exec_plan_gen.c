@@ -17,6 +17,7 @@
 #include "ir/program.h"
 #include "util/log.h"
 #include "wirelog-ir.h"
+#include "wirelog-extension.h"
 #include "wirelog-types.h"
 
 #include <ctype.h>
@@ -300,6 +301,8 @@ typedef struct {
     char **names;           /* owned; @count entries, each possibly NULL */
     wl_ir_coltype_t *types; /* owned; @count entries */
     uint32_t count;
+    const wirelog_extension_snapshot_t *extension_snapshot;
+    struct wirelog_program *program;
 } col_ctx_t;
 
 static void
@@ -993,11 +996,38 @@ serialize_expr(expr_buf_t *buf, const wl_ir_expr_t *expr,
             if (serialize_expr(buf, expr->children[i], ctx, true) != 0)
                 return -1;
         }
-        if (expr_buf_push_u8(buf, WL_PLAN_EXPR_EXTENSION_CALL) != 0
+        uint8_t call_tag = WL_PLAN_EXPR_EXTENSION_CALL;
+        const wirelog_extension_descriptor_t *descriptor = NULL;
+        if (ctx && ctx->extension_snapshot) {
+            descriptor = wirelog_extension_snapshot_find(
+                ctx->extension_snapshot, expr->extension_name);
+            if (!descriptor) {
+                set_plan_error(ctx->program,
+                    "scalar extension '%s' is absent from the pinned snapshot",
+                    expr->extension_name);
+                return -1;
+            }
+            bool has_identity = descriptor->addon_abi_identity != 0;
+            bool has_version = descriptor->addon_abi_version != 0;
+            if (has_identity != has_version) {
+                set_plan_error(ctx->program,
+                    "scalar extension '%s' has incomplete ABI metadata",
+                    expr->extension_name);
+                return -1;
+            }
+            if (has_identity)
+                call_tag = WL_PLAN_EXPR_EXTENSION_CALL_ABI;
+        }
+        if (expr_buf_push_u8(buf, call_tag) != 0
             || expr_buf_push_u16(buf, (uint16_t)name_len) != 0
             || expr_buf_push_bytes(buf, (const uint8_t *)expr->extension_name,
             (uint32_t)name_len) != 0
-            || expr_buf_push_u32(buf, expr->child_count) != 0)
+            || expr_buf_push_u32(buf, expr->child_count) != 0
+            || (call_tag == WL_PLAN_EXPR_EXTENSION_CALL_ABI
+            && (expr_buf_push_i64(buf,
+            (int64_t)descriptor->addon_abi_identity) != 0
+            || expr_buf_push_u32(buf,
+            descriptor->addon_abi_version) != 0)))
             return -1;
         return 0;
     }
@@ -1114,6 +1144,16 @@ wl_exec_plan_gen_serialize_expr_for_test(const wl_ir_expr_t *expr,
     wl_plan_expr_buffer_t *out)
 {
     col_ctx_t ctx = { 0 };
+    return serialize_expr_to_buffer_ctx(expr, &ctx, out);
+}
+
+int
+wl_exec_plan_gen_serialize_expr_with_snapshot_for_test(
+    const wl_ir_expr_t *expr, const wirelog_extension_snapshot_t *snapshot,
+    wl_plan_expr_buffer_t *out)
+{
+    col_ctx_t ctx = { 0 };
+    ctx.extension_snapshot = snapshot;
     return serialize_expr_to_buffer_ctx(expr, &ctx, out);
 }
 #endif
@@ -1682,7 +1722,9 @@ cleanup:
  * stack-machine sequence.
  */
 static int
-translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
+translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops,
+    struct wirelog_program *prog,
+    const wirelog_extension_snapshot_t *snapshot)
 {
     if (!node)
         return -1;
@@ -1704,7 +1746,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     case WIRELOG_IR_PROJECT: {
         /* Translate child first */
         if (node->child_count > 0) {
-            if (translate_ir_node(node->children[0], ops) != 0)
+            if (translate_ir_node(node->children[0], ops, prog, snapshot) != 0)
                 return -1;
         }
         wl_plan_op_t *op = op_list_push(ops);
@@ -1745,6 +1787,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             const wirelog_ir_node_t *child0
                 = (node->child_count > 0) ? node->children[0] : NULL;
             collect_output_columns(child0, &child_ctx);
+            child_ctx.program = prog;
+            child_ctx.extension_snapshot = snapshot;
             for (uint32_t i = 0; i < node->project_count; i++) {
                 if (node->project_exprs[i]) {
                     if (serialize_expr_to_buffer_ctx(
@@ -1767,7 +1811,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             return -1;
         /* Translate child first */
         if (node->child_count > 0) {
-            if (translate_ir_node(node->children[0], ops) != 0)
+            if (translate_ir_node(node->children[0], ops, prog, snapshot) != 0)
                 return -1;
         }
         wl_plan_op_t *op = op_list_push(ops);
@@ -1779,6 +1823,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             const wirelog_ir_node_t *fchild
                 = (node->child_count > 0) ? node->children[0] : NULL;
             collect_output_columns(fchild, &filt_ctx);
+            filt_ctx.program = prog;
+            filt_ctx.extension_snapshot = snapshot;
             int rc = serialize_expr_to_buffer_ctx(
                 node->filter_expr, &filt_ctx, &op->filter_expr);
             col_ctx_free(&filt_ctx);
@@ -1791,7 +1837,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     case WIRELOG_IR_JOIN: {
         /* Left child first */
         if (node->child_count > 0) {
-            if (translate_ir_node(node->children[0], ops) != 0)
+            if (translate_ir_node(node->children[0], ops, prog, snapshot) != 0)
                 return -1;
         }
         wl_plan_op_t *op = op_list_push(ops);
@@ -1832,7 +1878,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     case WIRELOG_IR_ANTIJOIN: {
         /* Left child first */
         if (node->child_count > 0) {
-            if (translate_ir_node(node->children[0], ops) != 0)
+            if (translate_ir_node(node->children[0], ops, prog, snapshot) != 0)
                 return -1;
         }
         wl_plan_op_t *op = op_list_push(ops);
@@ -1873,7 +1919,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     case WIRELOG_IR_SEMIJOIN: {
         /* Left child first */
         if (node->child_count > 0) {
-            if (translate_ir_node(node->children[0], ops) != 0)
+            if (translate_ir_node(node->children[0], ops, prog, snapshot) != 0)
                 return -1;
         }
         wl_plan_op_t *op = op_list_push(ops);
@@ -1917,7 +1963,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     case WIRELOG_IR_AGGREGATE: {
         /* Translate child first */
         if (node->child_count > 0) {
-            if (translate_ir_node(node->children[0], ops) != 0)
+            if (translate_ir_node(node->children[0], ops, prog, snapshot) != 0)
                 return -1;
         }
         wl_plan_op_t *op = op_list_push(ops);
@@ -1947,6 +1993,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                  */
                 col_ctx_t child_ctx;
                 collect_output_columns(child0, &child_ctx);
+                child_ctx.program = prog;
+                child_ctx.extension_snapshot = snapshot;
                 if (col_ctx_alloc(&agg_ctx, node->column_count) != 0) {
                     col_ctx_free(&child_ctx);
                     return -1;
@@ -1966,6 +2014,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             } else {
                 collect_output_columns(child0, &agg_ctx);
             }
+            agg_ctx.program = prog;
+            agg_ctx.extension_snapshot = snapshot;
             int agg_rc = serialize_expr_to_buffer_ctx(node->agg_expr,
                     &agg_ctx, &op->agg_expr);
             /*
@@ -2017,7 +2067,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
     case WIRELOG_IR_UNION: {
         /* Each child is translated, then CONCAT + CONSOLIDATE */
         for (uint32_t i = 0; i < node->child_count; i++) {
-            int crc = translate_ir_node(node->children[i], ops);
+            int crc = translate_ir_node(node->children[i], ops, prog, snapshot);
             if (crc != 0)
                 return -1;
             /* After the second+ child, emit CONCAT to merge with previous */
@@ -2044,7 +2094,7 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
         /* Decompose into FILTER + MAP per ARCHITECTURE.md:267 */
         /* Translate child (source) first */
         if (node->child_count > 0) {
-            if (translate_ir_node(node->children[0], ops) != 0)
+            if (translate_ir_node(node->children[0], ops, prog, snapshot) != 0)
                 return -1;
         }
 
@@ -2058,6 +2108,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
             const wirelog_ir_node_t *fchild2
                 = (node->child_count > 0) ? node->children[0] : NULL;
             collect_output_columns(fchild2, &filt2_ctx);
+            filt2_ctx.program = prog;
+            filt2_ctx.extension_snapshot = snapshot;
             int frc = serialize_expr_to_buffer_ctx(node->filter_expr,
                     &filt2_ctx, &filt->filter_expr);
             col_ctx_free(&filt2_ctx);
@@ -2099,6 +2151,8 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops)
                 const wirelog_ir_node_t *child2
                     = (node->child_count > 0) ? node->children[0] : NULL;
                 collect_output_columns(child2, &child_ctx2);
+                child_ctx2.program = prog;
+                child_ctx2.extension_snapshot = snapshot;
                 for (uint32_t i = 0; i < node->project_count; i++) {
                     if (node->project_exprs[i]) {
                         if (expr_contains_extension_call(
@@ -3894,7 +3948,8 @@ wl_plan_free(wl_plan_t *plan)
 }
 
 int
-wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
+wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
+    const wirelog_extension_snapshot_t *snapshot, wl_plan_t **out)
 {
     if (!prog)
         return -1;
@@ -4318,7 +4373,7 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
                     return -1;
                 }
 
-                int rc = translate_ir_node(ir_root, &ol);
+                int rc = translate_ir_node(ir_root, &ol, prog, snapshot);
                 if (rc != 0) {
                     /* Clean up ops */
                     for (uint32_t o = 0; o < ol.count; o++)
@@ -4479,6 +4534,12 @@ wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
     prog->plan_error[0] = '\0';
     *out = plan;
     return 0;
+}
+
+int
+wl_plan_from_program(struct wirelog_program *prog, wl_plan_t **out)
+{
+    return wl_plan_from_program_with_snapshot(prog, NULL, out);
 }
 
 /* ======================================================================== */
