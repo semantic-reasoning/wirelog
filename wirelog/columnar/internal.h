@@ -1301,6 +1301,7 @@ typedef struct wl_col_session_t {
     uint32_t callback_configured_workers;
     uint32_t callback_active_workers;
     bool callback_parallel_execution;
+    const void *callback_session_key;
     /* Dynamic join output limit (Issue #221).
      * Maximum output rows per single join operation. Computed at session init
      * based on available physical memory, num_workers, and estimated row width.
@@ -1866,6 +1867,7 @@ typedef struct {
     uint32_t configured_worker_count;
     uint32_t active_worker_count;
     bool parallel_execution;
+    const void *session_key;
 } wl_columnar_expr_context_t;
 
 typedef enum {
@@ -1879,7 +1881,8 @@ typedef enum {
     WL_COLUMNAR_EXPR_INVALID_RESULT,
     WL_COLUMNAR_EXPR_ALLOCATION_FAILURE,
     WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH,
-    WL_COLUMNAR_EXPR_CALLBACK_POLICY
+    WL_COLUMNAR_EXPR_CALLBACK_POLICY,
+    WL_COLUMNAR_EXPR_CALLBACK_REENTRANT
 } wl_columnar_expr_status_t;
 
 wl_columnar_expr_compiled_t *

@@ -25,6 +25,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+static __declspec(thread) const void *wl_active_callback_session_key;
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+static _Thread_local const void *wl_active_callback_session_key;
+#else
+static __thread const void *wl_active_callback_session_key;
+#endif
+
 typedef struct {
     int64_t vals[COL_FILTER_STACK];
     uint32_t types[COL_FILTER_STACK];
@@ -601,6 +609,14 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                     *status = WL_COLUMNAR_EXPR_CALLBACK_POLICY;
                 goto bad;
             }
+            if (ctx->session_key
+                && wl_active_callback_session_key == ctx->session_key
+                && !(descriptor->callback_policy
+                & WIRELOG_EXTENSION_CALLBACK_REENTRANT)) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_CALLBACK_REENTRANT;
+                goto bad;
+            }
             if (nargs != descriptor->arity || nargs > s.top
                 || nargs > COL_FILTER_STACK) {
                 if (status)
@@ -641,9 +657,14 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                     args[arg].as.int64_value = s.vals[index];
             }
             s.top -= nargs;
-            if (!descriptor->invoke
-                || descriptor->invoke(args, nargs, &result,
-                descriptor->user_data) != 0) {
+            const void *previous_session_key =
+                wl_active_callback_session_key;
+            wl_active_callback_session_key = ctx->session_key;
+            int callback_rc = descriptor->invoke
+                ? descriptor->invoke(args, nargs, &result,
+                    descriptor->user_data) : -1;
+            wl_active_callback_session_key = previous_session_key;
+            if (callback_rc != 0) {
                 if (status)
                     *status = WL_COLUMNAR_EXPR_CALLBACK_FAILURE;
                 goto bad;
@@ -1210,7 +1231,8 @@ wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size, const int64_t *row,
         .extensions = NULL,
         .configured_worker_count = 1,
         .active_worker_count = 1,
-        .parallel_execution = false
+        .parallel_execution = false,
+        .session_key = NULL
     };
     wl_columnar_expr_status_t status;
     return wl_columnar_expr_eval_run_ctx(buf, size, row, ncols, out_val,

@@ -65,6 +65,9 @@ wl_extension_error_set_expr_status(int status)
     case 10: wl_extension_error_set(
             "scalar extension callback policy forbids concurrent execution "
             "without THREAD_SAFE"); break;
+    case 11: wl_extension_error_set(
+            "scalar extension callback cannot re-enter the same session");
+        break;
     default: break;
     }
 }
