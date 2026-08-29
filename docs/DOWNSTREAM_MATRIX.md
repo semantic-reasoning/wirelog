@@ -49,6 +49,12 @@ The correctness matrix uses one serial run per workload (`workers=1`,
 calibration belongs to the separate perf issues and is not a GA correctness
 requirement.
 
+Archive validation, extraction, DOOP acquisition, Meson configure, and Meson
+build each have an independent positive-integer timeout (defaults: 1800,
+1800, 1800, 120, and 600 seconds). Each phase records PASS, FAIL, or TIMEOUT, its return code, and
+diagnostic log in `phases.tsv`; workload execution retains its separate
+timeout. Invalid timeout values are rejected before external work starts.
+
 | Workload | Tuples | Iterations |
 | --- | ---: | ---: |
 | CSPA (`cspa-fast`) | 20,381 | 6 |
@@ -59,6 +65,7 @@ requirement.
 | DOOP (zxing) | 13,828,835 | 153 |
 
 The workflow uploads the candidate tarball checksums, host metadata, the
-complete result table, data-provenance.tsv, and one log per workload. A successful run is the
+complete result table, `data-provenance.tsv`, `phases.tsv`, and one log per
+workload. A successful run is the
 external evidence needed to close #1156/#1163 and must be linked from the
 release notes and the corresponding issue.
