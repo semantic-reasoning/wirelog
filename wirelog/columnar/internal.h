@@ -1298,6 +1298,9 @@ typedef struct wl_col_session_t {
      * stratum/operator. Workqueue threads and TDD worker slots are allocated
      * lazily for the selected active width, so workers=N means "use up to N". */
     uint32_t num_workers;
+    uint32_t callback_configured_workers;
+    uint32_t callback_active_workers;
+    bool callback_parallel_execution;
     /* Dynamic join output limit (Issue #221).
      * Maximum output rows per single join operation. Computed at session init
      * based on available physical memory, num_workers, and estimated row width.
@@ -1860,6 +1863,9 @@ typedef struct {
     wl_intern_t *intern;
     const wirelog_extension_snapshot_t *extensions; /* borrowed */
     bool allow_extension_scalar_result;
+    uint32_t configured_worker_count;
+    uint32_t active_worker_count;
+    bool parallel_execution;
 } wl_columnar_expr_context_t;
 
 typedef enum {
@@ -1872,7 +1878,8 @@ typedef enum {
     WL_COLUMNAR_EXPR_CALLBACK_FAILURE,
     WL_COLUMNAR_EXPR_INVALID_RESULT,
     WL_COLUMNAR_EXPR_ALLOCATION_FAILURE,
-    WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH
+    WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH,
+    WL_COLUMNAR_EXPR_CALLBACK_POLICY
 } wl_columnar_expr_status_t;
 
 wl_columnar_expr_compiled_t *
