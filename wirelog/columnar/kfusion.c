@@ -838,6 +838,9 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
     _phase_t0 = now_ns();
     for (uint32_t d = 0; d < live_count; d++) {
         if (workers[d].rc != 0) {
+            if (worker_sess[d].extension_expr_status != 0)
+                sess->extension_expr_status
+                    = worker_sess[d].extension_expr_status;
             rc = workers[d].rc;
             goto cleanup_results;
         }

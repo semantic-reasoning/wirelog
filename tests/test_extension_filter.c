@@ -249,6 +249,9 @@ run_kfusion_policy_case(const uint8_t *buf, uint32_t size,
             expected_rc == 0 ? "K-fusion accepts safe callback"
                              : "K-fusion rejects unsafe callback");
     if (expected_rc != 0)
+        failures += check(session.extension_expr_status == expected_rc,
+                "K-fusion preserves worker extension diagnostic");
+    if (expected_rc != 0)
         failures += check(callback_calls == 0,
                 "K-fusion rejects before callback invocation");
     else
