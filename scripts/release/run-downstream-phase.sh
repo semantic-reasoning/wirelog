@@ -15,11 +15,23 @@ shift 5
     echo "phase timeout must be a positive integer: $timeout_seconds" >&2
     exit 2
 }
-command -v setsid >/dev/null || { echo 'setsid is required' >&2; exit 2; }
+if command -v setsid >/dev/null 2>&1; then
+    process_group_runner=setsid
+else
+    command -v perl >/dev/null 2>&1 || {
+        echo 'setsid or perl is required' >&2
+        exit 2
+    }
+    process_group_runner=perl
+fi
 
 local_status=FAIL
 return_code=0
-setsid --wait "$@" >"$log" 2>&1 &
+if [[ "$process_group_runner" == setsid ]]; then
+    setsid --wait "$@" >"$log" 2>&1 &
+else
+    perl -MPOSIX -e 'setpgid(0, 0) or die "$!\n"; exec @ARGV' -- "$@" >"$log" 2>&1 &
+fi
 child_pid=$!
 deadline=$((SECONDS + timeout_seconds))
 timed_out=0
