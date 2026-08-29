@@ -21,6 +21,11 @@ oracle_sha256=""
 output_dir=""
 MATRIX_WORKERS=1
 MATRIX_REPEAT=1
+MATRIX_DOWNLOAD_TIMEOUT_SECONDS=${MATRIX_DOWNLOAD_TIMEOUT_SECONDS:-1800}
+MATRIX_EXTRACTION_TIMEOUT_SECONDS=${MATRIX_EXTRACTION_TIMEOUT_SECONDS:-1800}
+MATRIX_CONFIGURE_TIMEOUT_SECONDS=${MATRIX_CONFIGURE_TIMEOUT_SECONDS:-120}
+MATRIX_BUILD_TIMEOUT_SECONDS=${MATRIX_BUILD_TIMEOUT_SECONDS:-600}
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
@@ -33,6 +38,13 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$tarball" && -f "$tarball" && "$candidate_sha" =~ ^[0-9a-f]{40}$ \
     && "$oracle_sha256" =~ ^[0-9a-f]{64}$ && -n "$output_dir" ]] || { usage; exit 2; }
+for phase_timeout in "$MATRIX_DOWNLOAD_TIMEOUT_SECONDS" "$MATRIX_EXTRACTION_TIMEOUT_SECONDS" \
+    "$MATRIX_CONFIGURE_TIMEOUT_SECONDS" "$MATRIX_BUILD_TIMEOUT_SECONDS"; do
+    [[ "$phase_timeout" =~ ^[1-9][0-9]*$ ]] || {
+        echo "phase timeout must be a positive integer: $phase_timeout" >&2
+        exit 2
+    }
+done
 command -v sha256sum >/dev/null || { echo 'sha256sum is required' >&2; exit 2; }
 command -v meson >/dev/null || { echo 'meson is required' >&2; exit 2; }
 command -v ninja >/dev/null || { echo 'ninja is required' >&2; exit 2; }
@@ -46,6 +58,7 @@ command -v unzip >/dev/null || { echo 'unzip is required' >&2; exit 2; }
 command -v realpath >/dev/null || { echo 'realpath is required' >&2; exit 2; }
 
 mkdir -p "$output_dir"
+printf 'phase\tstatus\ttimeout_seconds\treturn_code\tlog\n' > "$output_dir/phases.tsv"
 root=$(mktemp -d "${TMPDIR:-/tmp}/wirelog-downstream.XXXXXX")
 run_status=FAILED
 finish() {
@@ -55,24 +68,17 @@ finish() {
 }
 trap finish EXIT
 
-validate_tarball() {
-    local member
-    while IFS= read -r -d '' member; do
-        case "$member" in
-            ''|/*|.|..|./*|../*|*/../*|*/..)
-                echo "unsafe archive member path: $member" >&2
-                return 1
-                ;;
-        esac
-    done < <(tar --null -tzf "$tarball")
-    tar -tvzf "$tarball" | awk '$1 !~ /^[-d]/ { bad = 1 } END { exit bad + 0 }' || {
-        echo 'archive contains symlink, hardlink, or special-file entries' >&2
-        return 1
-    }
+run_phase() {
+    local phase=$1 timeout_seconds=$2 log=$3
+    shift 3
+    "$script_dir/run-downstream-phase.sh" "$phase" "$timeout_seconds" "$log" \
+        "$output_dir/phases.tsv" -- "$@"
 }
 
-validate_tarball
-tar --no-same-owner --no-same-permissions -xzf "$tarball" -C "$root"
+run_phase archive-validate "$MATRIX_EXTRACTION_TIMEOUT_SECONDS" "$output_dir/archive-validate.log" \
+    "$script_dir/validate-downstream-tarball.sh" "$tarball" "$output_dir/archive-members.tsv"
+run_phase archive-extract "$MATRIX_EXTRACTION_TIMEOUT_SECONDS" "$output_dir/archive-extract.log" \
+    tar --no-same-owner --no-same-permissions -xzf "$tarball" -C "$root"
 candidate_root=$(find "$root" -mindepth 1 -maxdepth 1 -type d -print -quit)
 [[ -n "$candidate_root" && -f "$candidate_root/meson.build" ]] || {
     echo 'candidate archive does not contain one top-level wirelog tree' >&2
@@ -230,8 +236,8 @@ while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path e
         archive_sha=${expected_manifest#archive:}
         archive_sha=${archive_sha%%;files:*}
         expected_files=${expected_manifest#*;files:}
-        DOOP_ZXING_SHA256="$archive_sha" \
-            "$candidate_root/bench/data/doop/download.sh" >"$output_dir/doop-download.log" 2>&1
+        run_phase doop-acquisition "$MATRIX_DOWNLOAD_TIMEOUT_SECONDS" "$output_dir/doop-download.log" \
+            env DOOP_ZXING_SHA256="$archive_sha" "$candidate_root/bench/data/doop/download.sh"
         actual_manifest=$(manifest_for_doop "$data_dir")
         [[ "$actual_manifest" == "$expected_files" ]] || {
             echo "doop data manifest $actual_manifest != $expected_files" >&2
@@ -254,9 +260,11 @@ done < "$oracle_file"
 }
 
 build_dir="$root/build"
-meson setup "$build_dir" "$candidate_root" --buildtype=release -Dtests=false \
-    -DmbedTLS=disabled >"$output_dir/configure.log" 2>&1
-meson compile -C "$build_dir" bench_flowlog >"$output_dir/build.log" 2>&1
+run_phase configure "$MATRIX_CONFIGURE_TIMEOUT_SECONDS" "$output_dir/configure.log" \
+    meson setup "$build_dir" "$candidate_root" --buildtype=release -Dtests=false \
+    -DmbedTLS=disabled
+run_phase build "$MATRIX_BUILD_TIMEOUT_SECONDS" "$output_dir/build.log" \
+    meson compile -C "$build_dir" bench_flowlog
 bench="$build_dir/bench/bench_flowlog"
 [[ -x "$bench" ]] || { echo "missing benchmark binary: $bench" >&2; exit 1; }
 
