@@ -362,8 +362,8 @@ test_jpp_extension_tree_is_conservative(void)
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(
         ".decl a(x: int32, y: int32)\n"
-        ".decl b(x: int32, z: int32)\n"
-        ".decl c(x: int32, w: int32)\n"
+        ".decl b(z: int32, w: int32)\n"
+        ".decl c(x: int32, z: int32)\n"
         ".decl out(x: int32)\n"
         "out(x) :- a(x, y), b(x, z), c(x, w), @call(\"test.fn\", x).\n",
         &err);
@@ -373,7 +373,8 @@ test_jpp_extension_tree_is_conservative(void)
     }
     wl_jpp_stats_t stats = { 0, 0, 0 };
     int rc = wl_jpp_apply(prog, &stats);
-    if (rc != 0 || stats.joins_reordered != 0) {
+    if (rc != 0 || stats.joins_reordered != 0
+        || stats.projections_inserted != 0) {
         FAIL("extension-containing tree was reordered");
         wirelog_program_free(prog);
         return;
