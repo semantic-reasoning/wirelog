@@ -157,6 +157,12 @@ try {
     if ($Command -match '\.sh$') {
         $nativeCommand = (Get-Command bash.exe -ErrorAction Stop).Source
         $nativeArguments = @('--noprofile', '--norc', $Command) + $nativeArguments
+    } elseif ($Command -notmatch '[\\/]') {
+        # CreateProcess does not perform PowerShell/POSIX-style PATH lookup
+        # when applicationName is supplied. Resolve bare fixture commands
+        # before passing them to the suspended native process.
+        $resolvedCommand = Get-Command $Command -CommandType Application -ErrorAction Stop
+        $nativeCommand = $resolvedCommand.Source
     }
     # Create suspended, assign to the job, then resume. This closes the race
     # where a fast command could spawn a child before ownership is established.
