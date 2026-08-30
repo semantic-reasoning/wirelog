@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.60.0] - 2026-08-30
+
+### Added
+
 - **Parsed `.input` metadata query** (#1070): applications can use
   `wirelog_program_relation_has_input()` to inspect whether a relation has a
   parsed `.input` directive without opening its source or invoking an I/O
