@@ -7,6 +7,32 @@ param(
 
 Set-StrictMode -Version Latest
 
+function Resolve-GitBash {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $installRoot = [Environment]::GetEnvironmentVariable('GIT_INSTALL_ROOT')
+    if ($installRoot) { $candidates.Add((Join-Path $installRoot 'bin\bash.exe')) }
+    $roots = @(
+        $env:ProgramFiles,
+        $env:ProgramW6432,
+        ${env:ProgramFiles(x86)}
+    )
+    if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Programs') }
+    foreach ($root in $roots) {
+        if ($root) { $candidates.Add((Join-Path $root 'Git\bin\bash.exe')) }
+    }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return (Get-Item -LiteralPath $candidate).FullName
+        }
+    }
+    foreach ($command in @(Get-Command bash.exe -All -CommandType Application -ErrorAction SilentlyContinue)) {
+        if ($command.Source -match '[\\/]Git[\\/]bin[\\/]bash\.exe$') {
+            return $command.Source
+        }
+    }
+    throw 'Git for Windows bash.exe was not found'
+}
+
 # A Windows Job Object owns the complete descendant tree, including children
 # which detach or outlive the phase process. This is the Windows equivalent of
 # the process group used by run-downstream-phase.sh on Unix.
@@ -155,8 +181,13 @@ try {
     $nativeCommand = $Command
     $nativeArguments = @($CommandArguments)
     if ($Command -match '\.sh$') {
-        $nativeCommand = (Get-Command bash.exe -ErrorAction Stop).Source
+        $nativeCommand = Resolve-GitBash
         $nativeArguments = @('--noprofile', '--norc', $Command) + $nativeArguments
+    } elseif ($Command -in @('bash', 'bash.exe')) {
+        # A bare `bash` or `bash.exe` can resolve to the WSL launcher in
+        # System32. Use the
+        # same Git-for-Windows bash executable as the shell-script path above.
+        $nativeCommand = Resolve-GitBash
     } elseif ($Command -notmatch '[\\/]') {
         # CreateProcess does not perform PowerShell/POSIX-style PATH lookup
         # when applicationName is supplied. Resolve bare fixture commands
