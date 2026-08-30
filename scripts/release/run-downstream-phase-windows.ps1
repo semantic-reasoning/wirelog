@@ -188,6 +188,7 @@ try {
         # System32. Use the
         # same Git-for-Windows bash executable as the shell-script path above.
         $nativeCommand = Resolve-GitBash
+        $nativeArguments = @('--noprofile', '--norc') + $nativeArguments
     } elseif ($Command -notmatch '[\\/]') {
         # CreateProcess does not perform PowerShell/POSIX-style PATH lookup
         # when applicationName is supplied. Resolve bare fixture commands
