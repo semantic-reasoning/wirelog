@@ -5,11 +5,10 @@
 #include "wirelog/wirelog-parser.h"
 
 #include <stdio.h>
-#include <stdatomic.h>
 #include <string.h>
 
 static int callback_mode;
-static _Atomic int callback_calls;
+static int callback_calls;
 static int fail_on_call;
 static const uint8_t *expected_string;
 static size_t expected_string_length;
