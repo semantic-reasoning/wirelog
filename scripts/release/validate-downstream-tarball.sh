@@ -7,6 +7,15 @@ tarball=$1
 members_output=$2
 command -v tar >/dev/null || { echo 'tar is required' >&2; exit 2; }
 
+if command -v cygpath >/dev/null 2>&1; then
+    case "$tarball" in
+        [[:alpha:]]:[\\/]* ) tarball=$(cygpath -u -- "$tarball") ;;
+    esac
+    case "$members_output" in
+        [[:alpha:]]:[\\/]* ) members_output=$(cygpath -u -- "$members_output") ;;
+    esac
+fi
+
 tar --quoting-style=escape -tzf "$tarball" > "$members_output"
 while IFS= read -r member; do
     case "$member" in

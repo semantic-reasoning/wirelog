@@ -1,11 +1,12 @@
-param(
-    [Parameter(Mandatory = $true, Position = 0)] [string]$LogPath,
-    [Parameter(Mandatory = $true, Position = 1)] [int]$TimeoutSeconds,
-    [Parameter(Mandatory = $true, Position = 2)] [string]$Command,
-    [Parameter(Position = 3, ValueFromRemainingArguments = $true)] [string[]]$CommandArguments
-)
-
 Set-StrictMode -Version Latest
+
+if ($args.Count -lt 3) {
+    throw 'usage: run-downstream-phase-windows.ps1 LogPath TimeoutSeconds Command [CommandArguments...]'
+}
+$LogPath = [string]$args[0]
+$TimeoutSeconds = [int]$args[1]
+$Command = [string]$args[2]
+$CommandArguments = if ($args.Count -gt 3) { [string[]]$args[3..($args.Count - 1)] } else { [string[]]@() }
 
 function Resolve-GitBash {
     $candidates = [System.Collections.Generic.List[string]]::new()
@@ -128,6 +129,8 @@ namespace Wirelog {
         [DllImport("kernel32.dll", SetLastError = true)] private static extern uint ResumeThread(IntPtr thread);
         [DllImport("kernel32.dll", SetLastError = true)] private static extern bool TerminateProcess(IntPtr process, uint code);
         [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
         private static string Quote(string value) {
             var result = new StringBuilder("\"");
@@ -163,6 +166,15 @@ namespace Wirelog {
         public void Resume() {
             if (ResumeThread(threadHandle) == uint.MaxValue) throw new Win32Exception(Marshal.GetLastWin32Error());
         }
+        public bool WaitForExit(uint milliseconds) {
+            return WaitForSingleObject(processHandle, milliseconds) == 0;
+        }
+        public int GetExitCode() {
+            uint code;
+            if (!GetExitCodeProcess(processHandle, out code))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return (int)code;
+        }
         public void Terminate(uint code) { TerminateProcess(processHandle, code); }
         public void Dispose() { CloseHandle(threadHandle); CloseHandle(processHandle); }
     }
@@ -178,6 +190,14 @@ $timedOut = $false
 $deadline = [Diagnostics.Stopwatch]::GetTimestamp() +
     ([Diagnostics.Stopwatch]::Frequency * $TimeoutSeconds)
 try {
+    try {
+        $gitDir = Split-Path -Parent (Split-Path -Parent (Resolve-GitBash))
+        $gitUsrBin = Join-Path $gitDir 'usr\bin'
+        if (Test-Path -LiteralPath $gitUsrBin -PathType Container) {
+            $env:PATH = "$gitUsrBin;$env:PATH"
+        }
+    } catch { }
+
     $nativeCommand = $Command
     $nativeArguments = @($CommandArguments)
     if ($Command -match '\.sh$') {
@@ -196,23 +216,27 @@ try {
         $resolvedCommand = Get-Command $Command -CommandType Application -ErrorAction Stop
         $nativeCommand = $resolvedCommand.Source
     }
+    if ($nativeCommand -match '[\\/]tar(\.exe)?$') {
+        $nativeArguments = @($nativeArguments | ForEach-Object { $_.Replace('\', '/') })
+        if ($nativeArguments -notcontains '--force-local') {
+            $nativeArguments = @('--force-local') + $nativeArguments
+        }
+    }
     # Create suspended, assign to the job, then resume. This closes the race
     # where a fast command could spawn a child before ownership is established.
     $suspended = [Wirelog.SuspendedProcess]::new($nativeCommand, $nativeArguments)
     $job = [Wirelog.JobObject]::new()
     $job.AssignHandle($suspended.Handle)
-    $process = [Diagnostics.Process]::GetProcessById($suspended.Id)
     $suspended.Resume()
 
-    while (-not $process.HasExited -and [Diagnostics.Stopwatch]::GetTimestamp() -lt $deadline) {
-        Start-Sleep -Milliseconds 100
+    while (-not $suspended.WaitForExit(100) -and [Diagnostics.Stopwatch]::GetTimestamp() -lt $deadline) {
     }
-    if (-not $process.HasExited) {
+    if (-not $suspended.WaitForExit(0)) {
         $timedOut = $true
         $job.Terminate(124)
     }
-    $process.WaitForExit()
-    if ($timedOut) { $exitCode = 124 } else { $exitCode = $process.ExitCode }
+    [void]$suspended.WaitForExit([uint32]::MaxValue)
+    if ($timedOut) { $exitCode = 124 } else { $exitCode = $suspended.GetExitCode() }
 }
 catch {
     [Console]::Error.WriteLine("Windows phase launcher failed: $($_.Exception.Message)")
@@ -222,18 +246,11 @@ catch {
     if ($suspended -ne $null) {
         try { $suspended.Terminate(1) } catch { }
     }
-    if ($process -ne $null) {
-        try {
-            if (-not $process.HasExited) { $process.Kill($true) }
-            $process.WaitForExit()
-        } catch { }
-    }
     $exitCode = 1
 }
 finally {
     if ($job -ne $null) { $job.Dispose() }
     if ($suspended -ne $null) { $suspended.Dispose() }
-    if ($process -ne $null) { $process.Dispose() }
 }
 
 exit $exitCode
