@@ -85,8 +85,11 @@ int main(void)
         if (!old_storage) return failures != 0;
         memset(old_storage, 0, old_size);
         memcpy(old_storage, &desc, old_size);
-        ((wirelog_extension_descriptor_t *)old_storage)->size =
-            (uint32_t)old_size;
+        {
+            const uint32_t legacy_size = (uint32_t)old_size;
+            memcpy(old_storage + offsetof(wirelog_extension_descriptor_t,
+                size), &legacy_size, sizeof(legacy_size));
+        }
         failures += check(wirelog_extension_register(r,
                 (const wirelog_extension_descriptor_t *)old_storage) == 0,
                 "legacy descriptor register");
