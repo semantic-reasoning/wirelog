@@ -127,11 +127,32 @@ test "$mismatch_rc" -ne 0
 grep -Fq 'checksum mismatch' "$negative_log"
 
 printf 'candidate\n' > "$malicious_root/meson.build"
-# Use a relative target that exists inside the fixture.  An absolute POSIX
-# target is not a valid Windows path under Git Bash and makes the fixture
-# creation fail before the archive validator is exercised.
-ln -s meson.build "$malicious_root/escape-link"
-tar -czf "$malicious_archive" -C "$malicious_root" meson.build escape-link
+python3 -c '
+import sys, tarfile, io
+archive = sys.argv[1]
+with tarfile.open(archive, "w:gz") as t:
+    ti = tarfile.TarInfo(name="meson.build")
+    ti.size = 10
+    t.addfile(ti, io.BytesIO(b"candidate\n"))
+    ti2 = tarfile.TarInfo(name="escape-link")
+    ti2.type = tarfile.SYMTYPE
+    ti2.linkname = "meson.build"
+    t.addfile(ti2)
+' "$malicious_archive" 2>/dev/null || python -c '
+import sys, tarfile, io
+archive = sys.argv[1]
+with tarfile.open(archive, "w:gz") as t:
+    ti = tarfile.TarInfo(name="meson.build")
+    ti.size = 10
+    t.addfile(ti, io.BytesIO(b"candidate\n"))
+    ti2 = tarfile.TarInfo(name="escape-link")
+    ti2.type = tarfile.SYMTYPE
+    ti2.linkname = "meson.build"
+    t.addfile(ti2)
+' "$malicious_archive" 2>/dev/null || {
+    ln -s meson.build "$malicious_root/escape-link"
+    tar -czf "$malicious_archive" -C "$malicious_root" meson.build escape-link
+}
 sha256sum "$malicious_archive" > "$malicious_archive.sha256"
 set +e
 "$runner" --tarball "$malicious_archive" \
