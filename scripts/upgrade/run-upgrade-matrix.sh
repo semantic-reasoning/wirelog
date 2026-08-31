@@ -63,10 +63,17 @@ build_tree() {
 compile_and_run() {
     local label=$1 prefix=$2 libdir=$3 source=$4 program=$5 output=$6
     local exe="$tmp/$label"
+    local runtime_log="$log_dir/$label-runtime.log"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I"$prefix/include" \
         "$source" -L"$libdir" -lwirelog -Wl,-rpath,"$libdir" -o "$exe" \
         >"$log_dir/$label-compile.log" 2>&1
-    "$exe" "$program" >"$output"
+    if [[ "$(uname -s)" == Darwin ]]; then
+        DYLD_LIBRARY_PATH="$libdir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+            "$exe" "$program" >"$output" 2>"$runtime_log"
+    else
+        LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$exe" "$program" >"$output" 2>"$runtime_log"
+    fi
     [[ -s "$output" ]] || {
         echo "upgrade matrix: $label produced no output" >&2
         exit 1

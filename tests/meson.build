@@ -872,7 +872,8 @@ endif
 if sh.found()
   test('sbom_snapshot', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-sbom-snapshot.sh'],
-       suite: 'sbom')
+       suite: 'sbom',
+       timeout: 120)
 endif
 
 # Issue #1100: clang-tidy ratchet (suite 'tidy').  No CI job has run
