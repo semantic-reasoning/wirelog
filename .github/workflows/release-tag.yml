@@ -3,7 +3,18 @@ name: Release tag verification
 on:
   push:
     tags:
+      - 'v0.*'
       - 'v1.*'
+  workflow_dispatch:
+    inputs:
+      tag_ref:
+        description: 'Existing immutable release tag to verify'
+        required: true
+        type: string
+      expected_sha:
+        description: 'Commit SHA expected at tag_ref'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,12 +22,34 @@ permissions:
   attestations: write
 
 env:
-  EXPECTED_SHA: ${{ github.sha }}
-  TAG_REF: ${{ github.ref_name }}
+  EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+  TAG_REF: ${{ inputs.tag_ref || github.ref_name }}
 
 jobs:
+  validate-input:
+    name: Validate release tag and commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release input shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG_REF" =~ ^v(0|1)\.[0-9]+\.[0-9]+$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify immutable release reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse "refs/tags/$TAG_REF^{}")" = "$EXPECTED_SHA"
+
   default:
     name: Tag / default
+    needs: [validate-input]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -37,6 +70,7 @@ jobs:
 
   abi:
     name: Tag / ABI
+    needs: [validate-input]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -57,6 +91,7 @@ jobs:
 
   perf:
     name: Tag / performance and RSS
+    needs: [validate-input]
     runs-on: [self-hosted, linux, x64, wirelog-perf]
     timeout-minutes: 360
     steps:
@@ -113,6 +148,7 @@ jobs:
 
   fuzz:
     name: Tag / fuzz smoke
+    needs: [validate-input]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -138,13 +174,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: release-tag-fuzz-${{ github.ref_name }}
+          name: release-tag-fuzz-${{ env.TAG_REF }}
           path: fuzz-evidence
           if-no-files-found: error
           retention-days: 35
 
   mbedtls:
     name: Tag / mbedTLS enabled
+    needs: [validate-input]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -163,6 +200,7 @@ jobs:
 
   upgrade:
     name: Tag / 0.30.0 upgrade matrix
+    needs: [validate-input]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -184,13 +222,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: upgrade-matrix-${{ github.ref_name }}
+          name: upgrade-matrix-${{ env.TAG_REF }}
           path: upgrade-evidence/
           if-no-files-found: error
           retention-days: 35
 
   downstream:
     name: Tag / six-workload downstream matrix
+    needs: [validate-input]
     runs-on: [self-hosted, linux, x64, wirelog-ga]
     concurrency: wirelog-ga-downstream
     timeout-minutes: 360
@@ -245,7 +284,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: downstream-matrix-${{ github.ref_name }}
+          name: downstream-matrix-${{ env.TAG_REF }}
           path: |
             downstream-dist/
             downstream-evidence/
@@ -258,14 +297,15 @@ jobs:
 
   sanitizers:
     name: Tag / Tier-1 sanitizers
+    needs: [validate-input]
     # Meson has no separate asan/tsan suite: the reusable workflow runs the
     # complete test graph in ASan/UBSan and TSan-configured build directories.
     # This is the repository's equivalent of the issue's --suite asan/tsan
     # requirement and keeps sanitizer coverage from silently narrowing.
     uses: ./.github/workflows/tier1-sanitizers.yml
     with:
-      ref: ${{ github.ref_name }}
-      expected_sha: ${{ github.sha }}
+      ref: ${{ inputs.tag_ref || github.ref_name }}
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
 
   release-verification:
     name: Tag / release verification gate
@@ -316,7 +356,7 @@ jobs:
       - name: Upload source archive, checksums, and attestation
         uses: actions/upload-artifact@v7
         with:
-          name: release-artifacts-${{ github.ref_name }}
+          name: release-artifacts-${{ env.TAG_REF }}
           path: dist/
           if-no-files-found: error
           retention-days: 35
