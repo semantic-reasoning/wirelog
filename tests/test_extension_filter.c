@@ -5,10 +5,26 @@
 #include "wirelog/wirelog-parser.h"
 
 #include <stdio.h>
+#ifndef _MSC_VER
+#include <stdatomic.h>
+#else
+#include <windows.h>
+/* MSVC fallback: use volatile int with interlocked operations instead of C11 atomics */
+typedef volatile int atomic_int;
+#ifndef memory_order_relaxed
+#define memory_order_relaxed 0
+#endif
+#ifdef atomic_fetch_add_explicit
+#undef atomic_fetch_add_explicit
+#endif
+#define atomic_fetch_add_explicit(ptr, val, order) \
+        InterlockedExchangeAdd((LONG volatile *)(ptr), (LONG)(val))
+#endif
 #include <string.h>
 
 static int callback_mode;
-static int callback_calls;
+/* The extension callback may run on multiple worker threads. */
+static atomic_int callback_calls;
 static int fail_on_call;
 static const uint8_t *expected_string;
 static size_t expected_string_length;
@@ -72,8 +88,9 @@ extension_callback(const wirelog_extension_value_t *args, uint32_t nargs,
     wirelog_extension_value_t *result, void *user_data)
 {
     (void)user_data;
-    callback_calls++;
-    if (fail_on_call != 0 && callback_calls >= fail_on_call)
+    int call_count =
+        atomic_fetch_add_explicit(&callback_calls, 1, memory_order_relaxed) + 1;
+    if (fail_on_call != 0 && call_count >= fail_on_call)
         return 1;
     if (callback_mode == 1)
         return 1;
