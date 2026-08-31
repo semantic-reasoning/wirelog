@@ -274,6 +274,7 @@ done
 | `11-time-evolution` | Per-epoch delta isolation |
 | `12-snapshot-vs-delta` | Snapshot vs streaming API comparison |
 | `13-daemon-style` | Long-running daemon rotation pattern |
+| `14-arithmetic-operations` | Arithmetic expressions and aggregate functions |
 
 ## Build & Test
 

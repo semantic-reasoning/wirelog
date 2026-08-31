@@ -608,6 +608,7 @@ if not mobile_cross
   subdir('examples/11-time-evolution')
   subdir('examples/12-snapshot-vs-delta')
   subdir('examples/13-daemon-style')
+  subdir('examples/14-arithmetic-operations')
 endif
 
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
