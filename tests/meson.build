@@ -1599,19 +1599,20 @@ test('crdt_correctness_full', test_crdt_perf_gate_exe,
 # so a default invocation skips it at runtime via WIRELOG_PERF_GATE.
 # ============================================================================
 
+test_cspa_perf_gate_sources = files('test_cspa_perf_gate.c') + parser_src + ir_src + optimizer_src + backend_src + io_src + arena_src + thread_src + workqueue_src
+
 test_cspa_perf_gate_exe = executable(
   'test_cspa_perf_gate',
-  files('test_cspa_perf_gate.c'),
-  parser_src,
-  ir_src,
-  optimizer_src,
-  backend_src,
-  io_src,
-  arena_src,
-  thread_src,
-  workqueue_src,
+  test_cspa_perf_gate_sources,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test_cspa_correctness_exe = executable(
+  'test_cspa_correctness',
+  test_cspa_perf_gate_sources,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  override_options: ['optimization=3'],
 )
 test('cspa_w1_gate', test_cspa_perf_gate_exe,
      suite: 'perf',
@@ -1623,7 +1624,7 @@ test('cspa_w1_gate', test_cspa_perf_gate_exe,
 # Issue #947: gold tuple and iteration counts, without a perf host.  Measured
 # at ~1.35s release on the dev host, so it is affordable in the default suite
 # even at the sanitizer legs' ~8x.
-test('cspa_correctness', test_cspa_perf_gate_exe,
+test('cspa_correctness', test_cspa_correctness_exe,
      timeout: 300,
      env: [
        'WIRELOG_GATE_CORRECTNESS_ONLY=1',
