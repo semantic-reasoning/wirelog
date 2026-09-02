@@ -307,6 +307,45 @@ expect_says   'the pairing requirement is explained' 'must be supplied together'
 expect_status '--tag without a value is a usage error' 2 "$vr" "$archive" --tag
 expect_status 'an unknown option is a usage error' 2 "$vr" "$archive" --nope
 
+# --- #1315: names coreutils escapes, and one it does not ----------------------
+#
+# Built from REAL sha256sum/b3sum output, not hand-written manifests: a
+# hand-written unescaped manifest would pin the parsing code without exercising
+# the escaping condition at all, which is the whole point of these cases.
+#
+# `a\nb.tar.gz` is the discriminator. Unescaping the manifest name -- the
+# obvious fix, and the one #1315 suggested -- is ambiguous here: coreutils
+# writes it `a\\nb.tar.gz`, and replacing `\\` then `\n` in sequence yields a
+# newline. Verifying by ESCAPING the expected name instead has no such case.
+# `has space.tar.gz` needs no escaping at all and was broken separately, by
+# reading the name as awk's `$2`.
+# Under $tmp, which line 46's trap already removes. A second mktemp with its
+# own trap would REPLACE that trap and orphan $tmp every run.
+escaping_dir="$tmp/escaping"
+
+verifies_awkward_name() {
+    local name=$1 dir="$escaping_dir/$2"
+    mkdir -p "$dir"
+    printf 'payload' >"$dir/$name"
+    ( cd "$dir" && sha256sum -- "$name" >"$name.sha256" && b3sum -- "$name" >"$name.blake3" )
+    "$vr" "$dir/$name" "$dir/$name.sha256" "$dir/$name.blake3" >/dev/null 2>&1
+}
+
+# No `command -v b3sum` guard here: the tool check near the top already exits 77
+# for the whole suite when b3sum is absent, so a guard would be dead code whose
+# else-branch printed a fake `ok` outside this file's SKIP protocol.
+assert 'an archive whose name contains a backslash verifies' \
+    verifies_awkward_name 'back\slash.tar.gz' backslash
+assert 'an archive whose name contains a newline verifies' \
+    verifies_awkward_name "$(printf 'new\nline.tar.gz')" newline
+assert 'an archive whose name contains a carriage return verifies' \
+    verifies_awkward_name "$(printf 'car\rriage.tar.gz')" carriage
+assert 'an archive whose name contains a space verifies' \
+    verifies_awkward_name 'has space.tar.gz' space
+# The one that would pass under a naive unescape while being wrong.
+assert 'a name containing a literal backslash-n verifies' \
+    verifies_awkward_name 'a\nb.tar.gz' backslash_n
+
 if ((failures)); then
     printf 'test-release-roundtrip: %d case(s) failed\n' "$failures" >&2
     exit 1
