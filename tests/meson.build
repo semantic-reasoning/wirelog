@@ -791,6 +791,18 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1272: the release upgrade matrix must prove the consumer loaded the
+# libraries this release installs, not whatever the host had installed.  The
+# matrix itself only runs on a release tag, so this self-test is the only
+# pre-release coverage the closure parser gets.
+if sh.found()
+  test('shared_library_closure', sh,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-check-shared-library-closure.sh',
+              meson.project_source_root()],
+       suite: 'abi')
+endif
+
 # Issue #913: keep the weighted/semiring design proposal explicit about its
 # current Z-set baseline, future-only ABI, retraction contract, and links.
 test('weighted_semiring_design', py3,
