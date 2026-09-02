@@ -66,13 +66,73 @@ bench_bin="${WIRELOG_DOOP_BENCH_BIN:-bench/bench_flowlog}"
 expected_manifest="${WIRELOG_DOOP_DATASET_MANIFEST_SHA256:-}"
 [[ -n "$expected_manifest" ]] || \
     skip "DOOP dataset manifest is not pinned; set WIRELOG_DOOP_DATASET_MANIFEST_SHA256"
-# LC_ALL=C: en_US collation ignores the hyphen in Method-Modifier.facts and
-# reorders it against MethodHandleConstant.facts, so an unpinned sort yields a
-# different manifest on a non-C runner and this fails as if the dataset had
-# been substituted. See #1294.
-actual_manifest=$(sha256sum "$data_dir"/*.facts | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}')
+# The manifest must be a function of the dataset -- the file names and their
+# contents -- and of nothing else.  Two things that are not the dataset used to
+# leak into it, and both surfaced as the same message below, which reads as
+# tampering:
+#
+#   LC_ALL=C   en_US collation ignores the hyphen in Method-Modifier.facts and
+#              reorders it against MethodHandleConstant.facts, so an unpinned
+#              sort yields a different manifest on a non-C runner (#1294).
+#
+#   the path   sha256sum prints "<hash>  <path>", and the path is whatever
+#              $data_dir expanded to, so relative, absolute and trailing-slash
+#              spellings of one directory gave three different hashes (#1297).
+#              This cd's into the directory instead of stripping the prefix
+#              afterwards: stripping handled the common spellings but not a
+#              backslash, which GNU sha256sum escapes by prefixing the whole
+#              line, so two spellings of a backslash-containing directory still
+#              disagreed.  Never embedding the path removes the class rather
+#              than the instances.
+#
+#              This is also what makes the result agree with manifest_for_doop
+#              in scripts/release/run-downstream-matrix.sh ON A CANONICAL PATH.
+#              The two do NOT agree in general -- manifest_for_doop is not
+#              trailing-slash invariant, counts dotfiles this glob skips, and
+#              excludes symlinks this glob follows.  Those are properties of
+#              that function, which this change does not touch; the divergences
+#              are pinned as assertions in scripts/ci/test-doop-manifest.sh so
+#              a shared-helper refactor has to address them deliberately.
+#
+# A function, not an inline expression, so scripts/ci/test-doop-manifest.sh can
+# lift and exercise it -- the inline form could not be tested without running
+# the whole benchmark.
+doop_dataset_manifest() {
+    # CDPATH= is load-bearing, not hygiene.  `cd` consults $CDPATH for a
+    # RELATIVE argument -- which $data_dir is by default -- and on a hit it
+    # both prints the resolved path to stdout (landing inside this command
+    # substitution, so the manifest becomes a path plus a hash and can never
+    # match a pin) and, worse, silently reaches a DIFFERENT directory.  With
+    # CDPATH pointing at anything that also contains a `doop`, this returned
+    # that directory's hash with exit 0: a manifest that exists to prove the
+    # benchmark ran on the pinned data, certifying data it never read.
+    #
+    # `--` on both commands so an option-shaped NAME is treated as a name:
+    # `cd -- -P` and `sha256sum -- -x.facts` work where the bare forms exit
+    # "invalid option".  It does NOT protect a bare `-`: bash converts that to
+    # $OLDPWD after option parsing, so `cd -- -` still jumps and still prints.
+    # A directory literally named `-` is therefore still mishandled; it passes
+    # the `[[ -d "$data_dir" ]]` check above and is out of scope here.
+    #
+    # The subshell keeps the cd from leaking, and under `set -e` a failed cd
+    # aborts rather than hashing whatever the caller was sitting in.
+    ( CDPATH= cd -- "$1" && sha256sum -- *.facts | LC_ALL=C sort -k2 \
+        | sha256sum | awk '{print $1}' )
+}
+
+actual_manifest=$(doop_dataset_manifest "$data_dir")
+# The message names the formula change. WIRELOG_DOOP_DATASET_MANIFEST_SHA256 is
+# set out-of-band -- nothing in this repository pins it -- so an operator who
+# recorded a value under the old formula gets a mismatch on the first run after
+# this change. Without saying so, that reads as dataset substitution, which is
+# the accusation #1294 and #1297 both exist to stop the gate making falsely.
 [[ "$actual_manifest" == "$expected_manifest" ]] || \
-    fail "DOOP dataset manifest $actual_manifest != pinned $expected_manifest"
+    fail "DOOP dataset manifest $actual_manifest != pinned $expected_manifest
+  If this is the first run since #1297, the pin is stale rather than the data
+  wrong: the manifest no longer embeds the directory path it is given.
+  Re-pin with the value above after confirming the dataset is the one you
+  expect. For the zxing dataset that value is the files: field of
+  scripts/release/downstream-matrix-oracles.tsv."
 
 # Validate the complete catalogue before starting a multi-minute run.
 for fact in \

@@ -33,12 +33,20 @@ set -euo pipefail
 # while fixing a different one.
 SKIP_EXIT=77
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-repo_root="$(cd "$script_dir/../.." && pwd)"
+# CDPATH= : a relative invocation makes cd consult CDPATH and print the
+# resolved path, so these become two-line values and the script dies with a
+# foreign error naming a path that does not exist (#1297).
+script_dir="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 
+# Captured, not piped into grep -q: grep -q stops at the first match, locale -a
+# takes SIGPIPE, and pipefail reports 141 even though the locale WAS found -- so
+# this reads as "not installed" and the gate below exits 0 having asserted
+# nothing. Reproduced at 80k locale names (#1297).
+locales_available=$(locale -a 2>/dev/null || true)
 locale_name=""
 for candidate in en_US.utf8 en_US.UTF-8; do
-    if locale -a 2>/dev/null | grep -Fxq "$candidate"; then
+    if grep -Fxq "$candidate" <<<"$locales_available"; then
         locale_name="$candidate"
         break
     fi
@@ -94,11 +102,11 @@ for fn in manifest_for_doop manifest_for_dir; do
     }
 done
 
-# run-doop-perf-gate.sh's dataset manifest is an inline expression, not a
-# function, so it cannot be lifted the same way. A retyped copy would only
-# assert that GNU sort honours an explicit LC_ALL=C prefix -- a coreutils
-# property nothing in this repository can break, and one that stays true no
-# matter what the real script does. check_pinned is what guards that site.
+# run-doop-perf-gate.sh's dataset manifest was an inline expression when this
+# was written, so it could not be lifted; #1297 made it the function
+# doop_dataset_manifest, and scripts/ci/test-doop-manifest.sh now lifts and
+# exercises it directly. check_pinned below still guards the collation pin at
+# that site, which is what this file is for.
 for fn in manifest_for_doop manifest_for_dir; do
     # "$BASH", not "$SHELL": $SHELL is the user's login shell, while these
     # functions use `read -r -d ''` and are printed by `declare -f`, both
