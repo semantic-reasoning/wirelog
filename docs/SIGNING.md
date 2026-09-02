@@ -113,7 +113,7 @@ Requires `cosign` on `PATH`. Under the hood this runs:
 ```bash
 cosign verify-blob \
     --certificate wirelog-X.Y.Z.tar.gz.pem \
-    --certificate-identity-regexp 'https://github.com/semantic-reasoning/wirelog/.github/workflows/' \
+    --certificate-identity-regexp '^https://github\.com/semantic-reasoning/wirelog/\.github/workflows/release-tag\.yml@refs/(heads/main$|tags/)' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     --signature wirelog-X.Y.Z.tar.gz.sig \
     wirelog-X.Y.Z.tar.gz
@@ -122,19 +122,39 @@ cosign verify-blob \
 Use the raw form if you do not have the repository checked out, or do not have
 the checksum files.
 
-Note the identity pattern is a bare prefix and cosign matches it unanchored, so
-it currently accepts a certificate minted by *any* workflow in this repository
-rather than only the release workflow. In practice that means any workflow
-granted `id-token: write`, which today is only `release-tag.yml`. Anchoring the
-pattern is tracked in
-[#1287](https://github.com/semantic-reasoning/wirelog/issues/1287).
+Note the identity pattern is anchored and names the release workflow, because
+cosign matches `--certificate-identity-regexp` unanchored: a bare prefix would
+accept a certificate minted by *any* workflow in this repository granted
+`id-token: write`. It also constrains the ref, because a workflow run mints a
+certificate for the workflow file **as it exists at the ref being run** — so an
+unconstrained ref would let anyone with write access run a modified
+`release-tag.yml` and mint a certificate this recipe accepts. Both `refs/tags/`
+and `refs/heads/main` are admitted deliberately: the manual immutable-rerun path
+dispatches from `main` while checking out the tag, so requiring a tag ref would
+reject it ([#1287](https://github.com/semantic-reasoning/wirelog/issues/1287)).
+
+Two things the pattern deliberately does **not** bound, so that you can judge
+what this signature is worth rather than assume:
+
+- **Which job minted it.** The certificate identifies the workflow file, not the
+  job — there is no job discriminator in the SAN or in the GitHub OID extensions
+  — and `release-tag.yml` currently grants `id-token: write` to all of its jobs.
+  No identity pattern can separate them; only the workflow's `permissions:` block
+  can ([#1319](https://github.com/semantic-reasoning/wirelog/issues/1319)).
+- **Which tag.** `refs/tags/` accepts any tag name, and the attacker picks the
+  name, so no regex closes this. It needs tag protection or a protected Actions
+  environment ([#1318](https://github.com/semantic-reasoning/wirelog/issues/1318)).
+
+Both require repository write access. Neither affects any published artifact
+today: signing landed after `v0.60.0`, so no release certificate has been minted
+in this repository yet.
 
 ### With the bundle — the recipe that keeps working
 
 ```bash
 cosign verify-blob \
     --bundle wirelog-X.Y.Z.tar.gz.cosign.bundle \
-    --certificate-identity-regexp 'https://github.com/semantic-reasoning/wirelog/.github/workflows/' \
+    --certificate-identity-regexp '^https://github\.com/semantic-reasoning/wirelog/\.github/workflows/release-tag\.yml@refs/(heads/main$|tags/)' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     wirelog-X.Y.Z.tar.gz
 ```
@@ -180,7 +200,7 @@ gh attestation verify wirelog-X.Y.Z.tar.gz \
     --repo semantic-reasoning/wirelog \
     --bundle wirelog-X.Y.Z.intoto.jsonl \
     --predicate-type https://slsa.dev/provenance/v1 \
-    --cert-identity-regex 'https://github.com/semantic-reasoning/wirelog/.github/workflows/' \
+    --cert-identity-regex '^https://github\.com/semantic-reasoning/wirelog/\.github/workflows/release-tag\.yml@refs/(heads/main$|tags/)' \
     --cert-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
 

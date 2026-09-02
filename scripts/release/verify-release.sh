@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 ARCHIVE [ARCHIVE.sha256] [ARCHIVE.blake3] [--tag TAG] [--signature FILE --certificate FILE] [--attestation FILE --repo OWNER/REPO]" >&2
+  echo "usage: $0 ARCHIVE [ARCHIVE.sha256] [ARCHIVE.blake3] [--tag TAG] [--signature FILE --certificate FILE] [--attestation FILE --repo OWNER/REPO] [--identity-regexp RE] [--oidc-issuer URL]" >&2
   exit 2
 }
 [[ $# -ge 1 ]] || usage
@@ -18,8 +18,62 @@ signature=''
 certificate=''
 attestation=''
 repository='semantic-reasoning/wirelog'
-identity_regexp='https://github.com/semantic-reasoning/wirelog/.github/workflows/'
+# Anchored at the start and naming the release workflow file.  cosign matches
+# --certificate-identity-regexp UNANCHORED (pkg/cosign/verify.go compiles the
+# pattern and calls MatchString), so a bare prefix accepts a SAN from any
+# workflow in this repository.  GitHub's documented job_workflow_ref claim is
+# https://github.com/<owner>/<repo>/.github/workflows/<file>@<ref>, and neither
+# owner nor repo can contain a slash, so this was never a cross-repository
+# weakness -- the exposure is within-repository workflow confusion: any workflow
+# granted `id-token: write` could mint a certificate this accepts as a release
+# signature.  release-tag.yml is the only such workflow today, but that bounds
+# the impact far less than it sounds: job_workflow_ref names the WORKFLOW FILE,
+# not the job, and release-tag.yml grants id-token: write at workflow level, so
+# every job that does not re-declare permissions: inherits it.  No identity
+# pattern can separate them -- the certificate carries no job discriminator at
+# all -- so this is bounded by workflow permissions or not at all.  The one
+# exception is instructive: the sanitizers job is `uses:` a reusable workflow,
+# which declares its own contents: read AND would mint a SAN naming the CALLED
+# file, so the anchor already excludes it.  Tracked in #1319, the higher
+# priority of the two residuals here because it is a four-line YAML edit.
+#
+# The ref is constrained, but not to tags alone.  release-tag.yml is reachable
+# by workflow_dispatch as well as by a tag push, and a dispatch's OIDC ref
+# claim names the dispatched ref rather than the tag the job checks out, so
+# requiring @refs/tags/ would reject the manual immutable-rerun path #1272
+# exists to provide.  The accepted set is derived from the workflow's triggers,
+# not from an observed certificate: signing landed after v0.60.0, so no SAN has
+# ever been minted here to read.  Accepting ANY ref is also wrong:
+# workflow_dispatch runs the workflow file from the dispatched ref, so a
+# write-access actor could push a branch carrying a modified release-tag.yml,
+# dispatch it, and mint a certificate this would accept -- bypassing whatever
+# review protects main.  refs/heads/main anchored at the end, or any
+# refs/tags/, admits both real cases and neither of those.
+#
+# RESIDUAL 2, and deliberate: refs/tags/ still admits the same forgery, and by
+# an even shorter route than dispatch.  `on: push: tags:` runs the workflow file as
+# it exists AT THE PUSHED TAG, so pushing v1.99.0 with a modified
+# release-tag.yml needs no dispatch at all; dispatching at a tag is the second
+# route.  No pattern over the tag name closes either, because the attacker
+# chooses the name -- tightening to tags/v[01]\. only invites v1.99.0.  Bounding
+# it needs tag protection or a protected Actions environment, which this script
+# can neither express nor observe.  Tracked in #1318; do not "fix" it here by
+# narrowing the regex.
+#
+# @refs/ is also the right-hand bound.  A bare trailing @ is not: a workflow
+# file named release-tag.yml@evil.yml is legal in git, satisfies the .yml
+# extension, and defeats the anchor entirely.  Every ref in that documented
+# claim begins refs/, so requiring it costs nothing.  Both facts come from
+# GitHub's OIDC documentation, not from a certificate observed here.
+identity_regexp='^https://github\.com/semantic-reasoning/wirelog/\.github/workflows/release-tag\.yml@refs/(heads/main$|tags/)'
 oidc_issuer='https://token.actions.githubusercontent.com'
+# Named rather than inlined in the gh call below, so that the docs-agreement
+# check can see it. That mechanism compares SIGNING.md against values this
+# script assigns to a NAME; a value hardcoded inside an invocation is not a flag
+# it forgot, it is a shape it structurally cannot read. Everything else on that
+# command line already had a name, which is exactly why this was the one that
+# drifted unguarded.
+predicate_type='https://slsa.dev/provenance/v1'
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag)
@@ -149,7 +203,7 @@ if [[ -n "$attestation" ]]; then
   gh attestation verify "$archive" \
     --repo "$repository" \
     --bundle "$attestation" \
-    --predicate-type https://slsa.dev/provenance/v1 \
+    --predicate-type "$predicate_type" \
     --cert-identity-regex "$identity_regexp" \
     --cert-oidc-issuer "$oidc_issuer"
   echo "verified SLSA provenance attestation $attestation"
