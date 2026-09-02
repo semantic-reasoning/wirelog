@@ -27,6 +27,12 @@
 #      expression and cannot be lifted.
 set -euo pipefail
 
+# Meson reads exit 77 as SKIP and exit 0 as a pass, so a branch that cannot
+# check anything must exit 77, or this gate is recorded as having asserted
+# something it never looked at.  Same defect class as #1301, in a gate added
+# while fixing a different one.
+SKIP_EXIT=77
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
@@ -40,7 +46,7 @@ done
 
 if [ -z "$locale_name" ]; then
     echo "check-manifest-collation: SKIP: en_US UTF-8 locale not installed"
-    exit 0
+    exit "$SKIP_EXIT"
 fi
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/wirelog-manifest-collation.XXXXXX")"
