@@ -66,7 +66,11 @@ bench_bin="${WIRELOG_DOOP_BENCH_BIN:-bench/bench_flowlog}"
 expected_manifest="${WIRELOG_DOOP_DATASET_MANIFEST_SHA256:-}"
 [[ -n "$expected_manifest" ]] || \
     skip "DOOP dataset manifest is not pinned; set WIRELOG_DOOP_DATASET_MANIFEST_SHA256"
-actual_manifest=$(sha256sum "$data_dir"/*.facts | sort -k2 | sha256sum | awk '{print $1}')
+# LC_ALL=C: en_US collation ignores the hyphen in Method-Modifier.facts and
+# reorders it against MethodHandleConstant.facts, so an unpinned sort yields a
+# different manifest on a non-C runner and this fails as if the dataset had
+# been substituted. See #1294.
+actual_manifest=$(sha256sum "$data_dir"/*.facts | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}')
 [[ "$actual_manifest" == "$expected_manifest" ]] || \
     fail "DOOP dataset manifest $actual_manifest != pinned $expected_manifest"
 
