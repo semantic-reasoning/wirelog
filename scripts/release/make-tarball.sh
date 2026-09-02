@@ -36,7 +36,10 @@ version=${version%%-*}
 command -v sha256sum >/dev/null || { echo 'sha256sum is required' >&2; exit 1; }
 command -v b3sum >/dev/null || { echo 'b3sum is required' >&2; exit 1; }
 
-mkdir -p "$out_dir"
+# `--`: an out_dir beginning with `-` is otherwise parsed as options here, and
+# mkdir fails before the manifest subshells below are ever reached -- which is
+# why hardening only those two would have left `--` untestable. (#1316)
+mkdir -p -- "$out_dir"
 archive="$out_dir/wirelog-$version.tar.gz"
 prefix="wirelog-$version/"
 
@@ -44,7 +47,31 @@ prefix="wirelog-$version/"
 # gzip -n removes wall-clock metadata so repeated builds are byte-identical.
 git -C "$repo_root" archive --format=tar --prefix="$prefix" "$commit" \
   | gzip -n -9 > "$archive"
-(cd "$(dirname "$archive")" && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
-(cd "$(dirname "$archive")" && b3sum "$(basename "$archive")" > "$(basename "$archive").blake3")
+# Write each manifest from inside the archive's directory, against the bare
+# basename, so no path is embedded in the hash line. Three hardenings, each with
+# a distinct failure this repository has already seen on the reading side
+# (#1311):
+#
+#   CDPATH=  With CDPATH set, `cd` on a RELATIVE path searches CDPATH and lands
+#            in whichever entry matched first, not the intended directory -- so
+#            the manifest is written in the wrong place, or sha256sum finds no
+#            archive there and the run aborts. It also echoes the resolved path
+#            on ITS OWN stdout, which the archive_dir capture below would take
+#            as part of the value. Note it does NOT corrupt the manifest: the
+#            redirection binds to sha256sum, not to cd. release-tag.yml:274,344
+#            pass a relative out_dir, so this is the production shape.
+#   --       An out_dir beginning with `-` is parsed as options -- first by the
+#            mkdir above, which is why that line needs it too, then by dirname,
+#            basename and cd here -- all three receive the value.
+#   -P       `cd` is logical, so an out_dir reached through a symlink followed
+#            by `..` resolves differently for the shell than for the kernel:
+#            with `link -> y/target`, `x/dir/link/..` is `y` (the link target's
+#            PARENT) where the archive is written, but `x/dir` to a logical cd.
+#            The manifest would land beside a different file, or the subshell
+#            fails outright.
+archive_dir=$(CDPATH= cd -P -- "$(dirname -- "$archive")" && pwd -P)
+archive_base=$(basename -- "$archive")
+(CDPATH= cd -P -- "$archive_dir" && sha256sum -- "$archive_base" > "$archive_base.sha256")
+(CDPATH= cd -P -- "$archive_dir" && b3sum -- "$archive_base" > "$archive_base.blake3")
 
 printf '%s\n' "$archive" "$archive.sha256" "$archive.blake3"

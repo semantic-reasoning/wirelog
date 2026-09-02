@@ -346,6 +346,55 @@ assert 'an archive whose name contains a space verifies' \
 assert 'a name containing a literal backslash-n verifies' \
     verifies_awkward_name 'a\nb.tar.gz' backslash_n
 
+# --- #1316: make-tarball.sh's manifest-writing hardening ----------------------
+#
+# Three hardenings, each with its own fixture, because a fixture that passes
+# with any one of them removed is not covering it. Verified: each mutant below
+# is killed by exactly one of these three and by no other.
+#
+#   CDPATH=  a RELATIVE out_dir found through CDPATH sends `cd` to whichever
+#            directory CDPATH matched, so the manifest is written in the wrong
+#            place -- or, in the current form, the resolved path `cd` echoes is
+#            captured into archive_dir and the next cd fails.
+#   -P       an out_dir of the form `x/dir/link/..` resolves to the link
+#            target's PARENT for the kernel that writes the archive, but to
+#            `x/dir` for a logical `cd`.
+#   --       an out_dir beginning with `-` is parsed as options. Note this is
+#            caught at `mkdir -p --`, which runs BEFORE the manifest subshells;
+#            hardening only those two would leave this case unreachable and the
+#            `--` untestable.
+harden_dir="$tmp/harden"
+
+# Everything runs in ONE subshell at $outer_cd, because make-tarball.sh prints
+# paths as given -- a relative out_dir yields relative paths, which only resolve
+# from the directory it was invoked in.
+builds_manifest_naming_archive() {
+    local out=$1 outer_cd=$2 cdpath=$3
+    (
+        cd "$outer_cd" || exit 1
+        local lines arch man
+        lines=$( CDPATH="$cdpath" "$mt" "$out" ) || exit 1
+        arch=$(printf '%s\n' "$lines" | sed -n 1p)
+        man=$(printf '%s\n' "$lines" | sed -n 2p)
+        [ -f "$man" ] || exit 1
+        [ "$(sed -n 's/^[0-9a-f]*  //p' -- "$man")" = "$(basename -- "$arch")" ]
+    )
+}
+
+# All three run from inside $repo: make-tarball.sh derives its repo root from
+# the working directory, so a relative out_dir must be relative to that.
+mkdir -p "$harden_dir/decoy/dist-rel"
+assert 'a relative out_dir is unaffected by CDPATH' \
+    builds_manifest_naming_archive dist-rel "$repo" "$harden_dir/decoy"
+
+mkdir -p "$harden_dir/x/dir" "$harden_dir/y/target"
+ln -sfn "$harden_dir/y/target" "$harden_dir/x/dir/link"
+assert 'an out_dir reached through a symlink and .. writes beside its archive' \
+    builds_manifest_naming_archive "$harden_dir/x/dir/link/.." "$repo" ''
+
+assert 'an out_dir beginning with a dash is not parsed as options' \
+    builds_manifest_naming_archive -outdir "$repo" ''
+
 if ((failures)); then
     printf 'test-release-roundtrip: %d case(s) failed\n' "$failures" >&2
     exit 1
