@@ -65,6 +65,7 @@ done
   exit 1
 }
 
+command -v sha256sum >/dev/null || { echo 'sha256sum is required' >&2; exit 1; }
 command -v b3sum >/dev/null || { echo 'b3sum is required' >&2; exit 1; }
 archive_dir=$(cd "$(dirname "$archive")" && pwd)
 archive_name=$(basename "$archive")
