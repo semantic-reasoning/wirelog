@@ -608,9 +608,6 @@ if not is_windows
 
   # Header must not leak into public surface; testhook symbols must not
   # appear in libwirelog.
-  test('log_abi_header_not_public',
-       find_program(meson.project_source_root() / 'scripts/check_log_header_not_public.sh'),
-       suite: 'abi')
   # Issue #1301: meson reads exit 0 as a pass, so a gate that prints "SKIP:"
   # and exits 0 is recorded as having asserted something it never checked.
   # This is shared rather than per-gate so a gate added later cannot quietly
@@ -618,6 +615,9 @@ if not is_windows
   # neither covered nor explicitly exempted with a reason.
   test('gate_skip_exit_codes',
        find_program(meson.project_source_root() / 'scripts/ci/test-gate-skip-exit-codes.sh'),
+       suite: 'abi')
+  test('log_abi_header_not_public',
+       find_program(meson.project_source_root() / 'scripts/check_log_header_not_public.sh'),
        suite: 'abi')
 
   # Issue #1302: the two claims are registered separately.  A provenance skip
