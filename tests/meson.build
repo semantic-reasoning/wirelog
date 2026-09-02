@@ -904,6 +904,17 @@ if host_machine.system() == 'linux' and sh.found()
        suite: 'sbom')
 endif
 
+# Issue #1293: generate-sbom.sh hardcoded its output to repo_root/sbom, so the
+# real generator could not be run from a test without clobbering the committed
+# baseline -- which is why the locale guard above can only string-match the pin.
+# With an output directory parameter it runs into a temp tree, so a pipeline
+# that reorders AFTER a correctly pinned sort is now caught behaviourally.
+if host_machine.system() == 'linux' and sh.found()
+  test('generate_sbom_selftest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-generate-sbom.sh'],
+       suite: 'sbom')
+endif
+
 # Issue #788: warning-only platform ABI surface advisory checks.
 # Linux remains the hard v1.0 ABI gate.  These checks run on every
 # default `meson test` invocation but only emit GitHub warning

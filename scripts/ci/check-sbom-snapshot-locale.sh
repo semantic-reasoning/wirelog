@@ -8,18 +8,18 @@
 # spurious reordering hunks that buried the real dependency change in a gate
 # whose whole purpose is making dependency drift reviewable.
 #
-# What this actually asserts, which is less than #886's equivalent: that every
-# `sort` in the two SBOM scripts carries the LC_ALL=C pin, plus a sanity check
-# that the fixture's two collations really disagree so the pin is not
-# decorative. It does NOT run generate-sbom.sh -- that script hardcodes its
-# output to $repo_root/sbom/, so invoking it here would clobber the committed
-# baseline. Giving it an output-directory parameter, the way make-tarball.sh
-# takes one, is what would allow a behavioural test; tracked in #1293.
+# What this asserts: that every `sort` in the two SBOM scripts carries the
+# LC_ALL=C pin, plus a sanity check that the fixture's two collations really
+# disagree so the pin is not decorative. It is a string check, so it catches
+# someone deleting the pin but NOT a pipeline rewritten to reorder after a
+# correctly pinned sort.
 #
-# So the guard here is a string check, and it catches the realistic regression
-# -- someone deleting the pin -- but not a pipeline rewritten to reorder after
-# a pinned sort. #886's check-abi-symbols-locale.sh is the stronger shape: it
-# stubs nm and runs the real gate.
+# That second half is now covered behaviourally by scripts/ci/test-generate-sbom.sh,
+# which runs the real generator into a temporary directory -- possible since
+# #1293 gave it an output-directory parameter. Verified: a mutation inserting an
+# unpinned `sort` after the pinned one passes this file and fails that one.
+# Both are kept: this one guards check-sbom-snapshot.sh too, which that test
+# does not run.
 set -euo pipefail
 
 # Meson reads exit 77 as SKIP and exit 0 as a pass, so a branch that cannot
@@ -31,9 +31,15 @@ SKIP_EXIT=77
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
+# Captured, not piped into grep -q: grep -q stops at the first match, locale -a
+# takes SIGPIPE, and pipefail reports 141 even though the locale WAS found -- so
+# this reads as "not installed" and the gate below exits 0 having asserted
+# nothing. Not triggerable at locale -a's size, but it is the same shape that
+# has bitten this repository repeatedly, and the here-string costs nothing.
+locales_available=$(locale -a 2>/dev/null || true)
 locale_name=""
 for candidate in en_US.utf8 en_US.UTF-8; do
-    if locale -a 2>/dev/null | grep -Fxq "$candidate"; then
+    if grep -Fxq "$candidate" <<<"$locales_available"; then
         locale_name="$candidate"
         break
     fi
