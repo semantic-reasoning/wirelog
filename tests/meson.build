@@ -611,8 +611,22 @@ if not is_windows
   test('log_abi_header_not_public',
        find_program(meson.project_source_root() / 'scripts/check_log_header_not_public.sh'),
        suite: 'abi')
+  # Issue #1302: the two claims are registered separately.  A provenance skip
+  # (stripped or non-debug build, or a BSD nm with no --line-numbers) must not
+  # be reported as the verdict for the symbol-leak check, which is unaffected by
+  # either.  One test for both meant the weaker outcome spoke for the stronger.
   test('log_abi_no_testhook_in_libwirelog',
        find_program(meson.project_source_root() / 'scripts/ci/check-no-testhook-in-libwirelog.sh'),
+       args: ['--check=leak', meson.project_build_root()],
+       suite: 'abi')
+  test('log_abi_testhook_provenance',
+       find_program(meson.project_source_root() / 'scripts/ci/check-no-testhook-in-libwirelog.sh'),
+       args: ['--check=provenance', meson.project_build_root()],
+       suite: 'abi')
+  # Its awk predicate was unsatisfiable, so the provenance claim above had never
+  # once been evaluated; this drives both checks from stubbed nm output.
+  test('testhook_gate_selftest',
+       find_program(meson.project_source_root() / 'scripts/ci/test-check-no-testhook.sh'),
        args: [meson.project_build_root()],
        suite: 'abi')
   test('wirelog_easy_abi_opts_symbol',
