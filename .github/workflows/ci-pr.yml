@@ -243,7 +243,7 @@ jobs:
             head -20 sbom/snapshot.txt
             echo "..."
             echo "=== Current scan (first 20):"
-            syft dir:. -o syft-json 2>/dev/null | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' | sort | head -20
+            syft dir:. -o syft-json 2>/dev/null | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' | LC_ALL=C sort | head -20
             exit 1
           }
 

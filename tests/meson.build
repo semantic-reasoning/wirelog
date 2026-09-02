@@ -839,6 +839,16 @@ if host_machine.system() == 'linux' and sh.found()
        suite: 'abi')
 endif
 
+# Issue #1291: sbom/snapshot.txt is a committed artifact, so its order must not
+# depend on the locale of whoever regenerates it.  Same bug class as #886 and
+# the same shape of guard: a pin without a regression test is a pin that gets
+# deleted later.  SKIPs without an en_US locale or jq; needs no syft.
+if host_machine.system() == 'linux' and sh.found()
+  test('sbom_snapshot_locale', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-sbom-snapshot-locale.sh'],
+       suite: 'sbom')
+endif
+
 # Issue #788: warning-only platform ABI surface advisory checks.
 # Linux remains the hard v1.0 ABI gate.  These checks run on every
 # default `meson test` invocation but only emit GitHub warning

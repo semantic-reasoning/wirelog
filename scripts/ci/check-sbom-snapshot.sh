@@ -28,14 +28,14 @@ trap 'rm -rf "$tmpdir"' EXIT
 # Extract current dependency list as "name@version:license"
 syft dir:"$repo_root" -o syft-json 2>/dev/null \
   | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' \
-  | sort > "$tmpdir/current.txt"
+  | LC_ALL=C sort > "$tmpdir/current.txt"
 
 # Compare against baseline (exclude comment lines starting with #)
-grep -v '^#' "$baseline" | sort > "$tmpdir/baseline_clean.txt"
+grep -v '^#' "$baseline" | LC_ALL=C sort > "$tmpdir/baseline_clean.txt"
 
 # Compare against baseline
 if diff -u "$tmpdir/baseline_clean.txt" "$tmpdir/current.txt"; then
-    n=$(wc -l < "$baseline")
+    n=$(wc -l < "$tmpdir/baseline_clean.txt")
     echo "check-sbom-snapshot: OK; $n packages in snapshot match baseline"
     exit 0
 else
