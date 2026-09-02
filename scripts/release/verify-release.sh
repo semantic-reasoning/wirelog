@@ -131,20 +131,58 @@ command -v b3sum >/dev/null || { echo 'b3sum is required' >&2; exit 1; }
 # run to detect tampering, that is the wrong direction to be wrong in.
 archive_dir=$(CDPATH= cd -P -- "$(dirname -- "$archive")" && pwd -P)
 archive_name=$(basename -- "$archive")
+# Compare against the ESCAPED form of the expected name rather than unescaping
+# the manifest's. GNU coreutils escapes exactly three characters in a name --
+# backslash as `\\`, newline as `\n`, carriage return as `\r` -- and marks the
+# whole line with a leading `\`. Determined by scanning all 254 legal filename
+# bytes through sha256sum, not from documentation: tab, other control bytes and
+# UTF-8 are NOT escaped, and neither is a space. b3sum escapes the same three
+# and uses the same marker, which is why both manifests parse identically.
+# Unescaping is ambiguous in the wrong direction: a file genuinely named
+# `a\nb.tar.gz` is written `a\\nb.tar.gz`, and sequential replacement of `\\`
+# then `\n` turns it into a newline. Measured -- the naive form corrupts that
+# name; this one does not. Escaping is a one-way transform with no such case.
+#
+# The name is also taken as everything after the two-character separator, not
+# as awk's `$2`. coreutils does NOT escape spaces, so `$2` silently truncated
+# `has space.tar.gz` to `has` and reported a name mismatch on a correct
+# archive. (#1315)
+nl=$'\n'
+cr=$'\r'
+escaped_form() {
+  local s=$1
+  s=${s//\\/\\\\}      # backslash FIRST: the two rules below each emit one
+  s=${s//$nl/\\n}
+  s=${s//$cr/\\r}
+  printf '%s' "$s"
+}
+expected_name=$(escaped_form "$archive_name")
+
+# Split one coreutils line into hash and name. The leading marker is stripped
+# before the hash is read, or the comparison would face `\<hash>`.
+parse_manifest_line() {
+  local line=$1 rest
+  case $line in \\*) line=${line#\\} ;; esac
+  parsed_hash=${line%% *}
+  rest=${line#"$parsed_hash"}
+  parsed_name=${rest:2}
+}
+
 for manifest in "$sha_file" "$b3_file"; do
-  manifest_name=$(awk 'NF { print $2; exit }' "$manifest")
-  test "$manifest_name" = "$archive_name" || {
-    echo "checksum manifest does not name $archive_name: $manifest_name" >&2
+  parse_manifest_line "$(awk 'NF { print; exit }' "$manifest")"
+  test "$parsed_name" = "$expected_name" || test "$parsed_name" = "$archive_name" || {
+    echo "checksum manifest does not name $archive_name: $parsed_name" >&2
     exit 1
   }
 done
-expected_sha=$(awk 'NF { print $1; exit }' "$sha_file")
-expected_b3=$(awk 'NF { print $1; exit }' "$b3_file")
+parse_manifest_line "$(awk 'NF { print; exit }' "$sha_file")"; expected_sha=$parsed_hash
+parse_manifest_line "$(awk 'NF { print; exit }' "$b3_file")"; expected_b3=$parsed_hash
 # Hash from inside the archive's directory, against the bare basename, rather
 # than passing the full path.
 #
-# GNU coreutils escapes a filename containing a backslash or a newline: it
-# prefixes the WHOLE line with a literal `\` and escapes the character. Passing
+# GNU coreutils escapes a filename containing a backslash, a newline or a
+# carriage return: it prefixes the WHOLE line with a literal `\` and escapes
+# the character. Passing
 # a full path therefore yielded `\<hash>` for any archive under such a path, the
 # comparison below could never match, and this reported "SHA256 mismatch" on a
 # byte-perfect archive -- to a third party following the published verification
@@ -156,15 +194,12 @@ expected_b3=$(awk 'NF { print $1; exit }' "$b3_file")
 # the marker, and stripping it is what makes the hash comparable. Neither stage
 # stops reading early, so there is no SIGPIPE here.
 #
-# It is deliberately UNPINNED by any test, and that is worth stating rather than
-# hiding. Reaching it needs a backslash in the archive's NAME, and such an
-# archive cannot get this far: the manifest-name check above reads `$2` raw, so
-# a coreutils-written manifest (which escapes the name) fails there first with
-# "checksum manifest does not name". Only a hand-written unescaped manifest
-# would exercise this line, and make-tarball.sh never produces one. A fixture
-# for that would pin the line via a scenario that cannot occur end to end, which
-# is worse than saying so. Closing the class means unescaping on the
-# manifest-reading side too; tracked separately.
+# This line is now REACHABLE and pinned. It was not when #1311 wrote it: the
+# manifest-name check above read `$2` raw, so a coreutils-written manifest for
+# such a name failed there first with "checksum manifest does not name", and no
+# archive could get this far. #1315 fixed that side, so an archive whose
+# basename contains a backslash now reaches the hash comparison, and
+# test-release-roundtrip.sh exercises it.
 hash_of() {
     ( CDPATH= cd -P -- "$archive_dir" && "$1" -- "$archive_name" \
         | sed 's/^\\//' | awk '{print $1}' )
