@@ -611,6 +611,15 @@ if not is_windows
   test('log_abi_header_not_public',
        find_program(meson.project_source_root() / 'scripts/check_log_header_not_public.sh'),
        suite: 'abi')
+  # Issue #1301: meson reads exit 0 as a pass, so a gate that prints "SKIP:"
+  # and exits 0 is recorded as having asserted something it never checked.
+  # This is shared rather than per-gate so a gate added later cannot quietly
+  # reintroduce it: the test fails if a meson-registered check script is
+  # neither covered nor explicitly exempted with a reason.
+  test('gate_skip_exit_codes',
+       find_program(meson.project_source_root() / 'scripts/ci/test-gate-skip-exit-codes.sh'),
+       suite: 'abi')
+
   # Issue #1302: the two claims are registered separately.  A provenance skip
   # (stripped or non-debug build, or a BSD nm with no --line-numbers) must not
   # be reported as the verdict for the symbol-leak check, which is unaffected by
@@ -879,8 +888,9 @@ test('scalar_function_addon_design_fixtures', py3,
 # Issue #733 K2 (cross-link #690 B3): pin the dynamic-symbol table of
 # libwirelog.so against `abi/libwirelog-1.0.symbols`.  Any new public
 # symbol must update the allowlist in the same PR; any accidental loss
-# of an exported symbol fails the gate.  Linux/ELF-focused; SKIPs
-# cleanly on platforms without `libwirelog.so` (Windows, static-only).
+# of an exported symbol fails the gate.  Linux/ELF-focused; SKIPs with
+# exit 77 on platforms without `libwirelog.so` (Windows, static-only),
+# so meson records those runs as skipped rather than passed (#1301).
 if sh.found()
   test('abi_symbols', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols.sh',
@@ -929,9 +939,11 @@ endif
 # Where abi_symbols only checks the dynamic-symbol set, abi_manifest uses
 # `abidiff` to catch struct member offsets, function signature changes,
 # and visibility/linkage drift that nm -D cannot see.  Linux/ELF-focused;
-# SKIPs cleanly when libwirelog.so is missing (Windows, static-only),
-# when abidiff is not on PATH, or when the baseline has not been seeded
-# yet (run scripts/release/regenerate-abi-manifest.sh to seed).  Per
+# SKIPs with exit 77 when libwirelog.so is missing (Windows,
+# static-only), when abidiff is not on PATH, or on a non-x86_64 host.
+# A missing committed baseline is a FAILURE, not a skip: it is tracked,
+# so its absence means deletion (#1301); run
+# scripts/release/regenerate-abi-manifest.sh to seed a new one.  Per
 # issue #824, the committed v1.0 libabigail baseline is x86_64-only;
 # Linux arm64 v1.0 ABI coverage is symbol-only via abi_symbols.
 if sh.found()
@@ -943,8 +955,9 @@ endif
 
 # Issue #744: SBOM snapshot gate.  Diffs the detected dependency list
 # (packages + versions) against the committed baseline (sbom/snapshot.txt).
-# SKIPs when syft is not on PATH or when the baseline has not been seeded yet
-# (run scripts/release/generate-sbom.sh to seed).  Fails when dependencies
+# SKIPs with exit 77 when syft is not on PATH (#1301).  A missing committed
+# baseline is a FAILURE, not a skip -- it is tracked, so its absence means
+# deletion; run scripts/release/generate-sbom.sh to seed.  Fails when dependencies
 # change without a baseline update (enforces explicit review of dependency drift).
 if sh.found()
   test('sbom_snapshot', sh,
