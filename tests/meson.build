@@ -710,11 +710,25 @@ sh = find_program('bash', required: false)
 
 # Issue #772: release-template gate.  Asserts that the GitHub Releases
 # body for the current tag matches the corresponding CHANGELOG section.
-# SKIPs cleanly outside tag-triggered CI context (PR builds, main
-# branch); enforces inside the release-tag.yml workflow (#749 B19).
+# SKIPs everywhere in CI today: on PR and main builds HEAD is not a tag,
+# and release-tag.yml's Tag / ABI job both supplies no GH_TOKEN and runs
+# before the release is published.  No open PR changes either; see the
+# script header.  Until then this gate enforces nothing anywhere.
 if sh.found()
   test('release_template', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-release-template.sh'],
+       suite: 'abi')
+endif
+
+# Issue #1288: the gate above exited 0 on all four of its skip paths, so meson
+# reported it OK on every run while it asserted nothing.  Those paths now exit
+# 77.  This self-test drives the real gate through all seven of its terminal
+# outcomes from a fixture repository, including the mismatch it exists to catch
+# -- which, because the gate enforces nowhere in CI today, had never run.
+if sh.found()
+  test('release_template_selftest', sh,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-check-release-template.sh'],
        suite: 'abi')
 endif
 
