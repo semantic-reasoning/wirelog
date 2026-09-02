@@ -53,7 +53,6 @@ command -v tar >/dev/null || { echo 'tar is required' >&2; exit 2; }
 command -v timeout >/dev/null || { echo 'timeout is required' >&2; exit 2; }
 command -v gzip >/dev/null || { echo 'gzip is required' >&2; exit 2; }
 command -v git >/dev/null || { echo 'git is required' >&2; exit 2; }
-command -v gcc >/dev/null || { echo 'gcc is required' >&2; exit 2; }
 command -v curl >/dev/null || { echo 'curl is required' >&2; exit 2; }
 command -v unzip >/dev/null || { echo 'unzip is required' >&2; exit 2; }
 command -v realpath >/dev/null || { echo 'realpath is required' >&2; exit 2; }
@@ -116,7 +115,7 @@ metadata="$output_dir/host-metadata.txt"
     echo "memory_bytes=$(awk '/MemTotal:/ {print $2 * 1024}' /proc/meminfo)"
     echo "meson_version=$(meson --version)"
     echo "ninja_version=$(ninja --version)"
-    echo "gcc_version=$(gcc --version | head -1)"
+    echo "gcc_version=$(gcc --version 2>/dev/null | head -1 || echo unavailable)"
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$metadata"
 printf 'workload\texpected_manifest\tactual_manifest\n' > "$output_dir/data-manifests.tsv"
