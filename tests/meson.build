@@ -778,6 +778,18 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1287: cosign matches --certificate-identity-regexp unanchored, and the
+# pattern was a bare prefix, so it accepted a SAN from any workflow in this
+# repository.  The signer, the verifier and the docs each carried a copy and
+# nothing checked they agreed.  Candidates in the test are literal SAN strings:
+# building one by concatenating the pattern is a tautology that passes even for
+# a pattern rejecting nothing.
+if sh.found()
+  test('identity_pattern', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-identity-pattern.sh'],
+       suite: 'abi')
+endif
+
 # Issue #747 B18: RC changelog selftest for changelog-freeze checker.
 # Shell gate uses the same shared `sh` handle to keep skip behavior
 # consistent on platforms without bash.

@@ -27,6 +27,21 @@ All notable changes to wirelog are documented in this file.
 
 ### Security
 
+- **Release signature verification now names the release workflow.** cosign
+  matches `--certificate-identity-regexp` unanchored, and the pattern was a bare
+  prefix, so it accepted a certificate minted by any workflow in this repository
+  granted `id-token: write`. It is now anchored to `release-tag.yml` and
+  constrained to `refs/heads/main` or a tag — a run mints a certificate for the
+  workflow file as it exists at the ref being run, so an unconstrained ref would
+  let anyone with write access run a modified `release-tag.yml` and mint an
+  accepted certificate. Both refs are admitted deliberately: the manual
+  immutable-rerun path dispatches from `main` while checking out the tag.
+  Two residuals are documented rather than closed, because no identity pattern
+  can close either: the certificate names the workflow file and not the job
+  (#1319), and `refs/tags/` accepts any tag name (#1318). No published artifact
+  is affected — signing landed after v0.60.0, so no release certificate has been
+  minted yet (#1287).
+
 - **Sigstore keyless signing of release artifacts** (#750): the release-tag
   workflow now signs the source archive with `cosign sign-blob`, emitting a
   detached signature, the Fulcio certificate, and a bundle carrying the Rekor

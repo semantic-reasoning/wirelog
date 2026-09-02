@@ -103,7 +103,17 @@ assert 'OIDC issuer is the GitHub Actions issuer' \
 # is #1287's business.
 repository=$(extract_one "$verifier" repository) || repository='<unextractable>'
 identity_names_repository() {
-    [[ "$sign_identity" == *"https://github.com/$repository/.github/workflows/"* ]]
+    # Compare against the pattern with regex escapes removed: since #1287 the
+    # identity is an anchored regexp with escaped dots (github\.com), so a
+    # literal substring test for github.com no longer matches even though the
+    # repository is named correctly. This assertion is about the repository
+    # name, not the regexp syntax -- anchoring is #1287's business and is
+    # asserted in test-identity-pattern.sh.
+    # Unescape only `\.` -- a blanket strip of every backslash also erases an
+    # INVALID escape, so a pattern like `g\ithub\.com` (which GNU grep accepts
+    # silently and Go refuses to compile) would pass this assertion. Verified.
+    local plain=${sign_identity//\\./.}
+    [[ "$plain" == *"https://github.com/$repository/.github/workflows/"* ]]
 }
 assert "certificate identity names the repository the verifier expects ($repository)" \
     identity_names_repository
