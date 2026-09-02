@@ -50,7 +50,6 @@ command -v sha256sum >/dev/null || { echo 'sha256sum is required' >&2; exit 2; }
 command -v meson >/dev/null || { echo 'meson is required' >&2; exit 2; }
 command -v ninja >/dev/null || { echo 'ninja is required' >&2; exit 2; }
 command -v tar >/dev/null || { echo 'tar is required' >&2; exit 2; }
-command -v timeout >/dev/null || { echo 'timeout is required' >&2; exit 2; }
 command -v gzip >/dev/null || { echo 'gzip is required' >&2; exit 2; }
 command -v git >/dev/null || { echo 'git is required' >&2; exit 2; }
 command -v curl >/dev/null || { echo 'curl is required' >&2; exit 2; }
