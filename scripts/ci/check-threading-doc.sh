@@ -71,6 +71,15 @@ resolve_reference_source() {
         while IFS= read -r candidate; do candidates+=("$candidate"); done \
             < <(find "$repo_root/wirelog" -type f -name "$basename" -print | sort)
     fi
+    # Return before iterating when nothing matched. On bash 3.2 -- which the
+    # macOS CI runners ship, and this script is suite-registered with no
+    # platform gate -- `for x in "${arr[@]}"` over an EMPTY array is an
+    # unbound-variable error under `set -u`; bash 4.4 changed that, 3.2
+    # predates it. Without this the script aborts with `candidates[@]: unbound
+    # variable` instead of letting the caller report the citation that did not
+    # resolve. `${#arr[@]}` on an assigned array is safe at 3.2, so the guard
+    # itself is portable.
+    [ "${#candidates[@]}" -gt 0 ] || return 1
     for candidate in "${candidates[@]}"; do
         [ -f "$candidate" ] || continue
         line_count=$(wc -l <"$candidate")
@@ -86,6 +95,15 @@ while IFS= read -r citation; do
     citation=${citation#\`}; citation=${citation%\`}
     basename=${citation%%:*}; locations=${citation#*:}
     IFS=',' read -ra location_list <<<"$locations"
+    # Same bash 3.2 hazard as resolve_reference_source above: `read -ra` over an
+    # empty string yields an assigned-empty array, and iterating one under
+    # `set -u` aborts there. Unreachable today -- the grep below guarantees a
+    # non-empty post-colon part -- but it is one pattern edit away from being
+    # live, and the guard costs a line.
+    [ "${#location_list[@]}" -gt 0 ] || {
+        echo "check-threading-doc: FAIL: prose citation '$citation' has no locations" >&2
+        exit 1
+    }
     for location in "${location_list[@]}"; do
         if [[ "$location" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             start=${BASH_REMATCH[1]}; end=${BASH_REMATCH[2]}
