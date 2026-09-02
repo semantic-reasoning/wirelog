@@ -7,6 +7,15 @@
 
 set -euo pipefail
 
+# Meson reads exit 77 as SKIP and exit 0 as a pass, so a branch that cannot
+# check anything must exit 77 or the gate is recorded as having asserted
+# something it never looked at (#1301).  Matches SKIP_EXIT in
+# check-clang-tidy-backlog-monotonic.sh and SKIP in run-doop-perf-gate.sh.
+#
+# 77 is only safe under meson: a bare workflow `run:` step uses `bash -e`,
+# where 77 fails the job.  Do not invoke this from one.
+SKIP_EXIT=77
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
@@ -20,7 +29,7 @@ done
 
 if [ -z "$locale_name" ]; then
     echo "check-abi-symbols-locale: SKIP: en_US UTF-8 locale not installed"
-    exit 0
+    exit "$SKIP_EXIT"
 fi
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/wirelog-abi-locale.XXXXXX")"

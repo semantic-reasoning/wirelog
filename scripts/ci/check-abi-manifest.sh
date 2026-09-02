@@ -29,22 +29,27 @@
 # link).
 #
 # Exit codes:
+#    0 - manifest matches the committed baseline.
+#    1 - incompatible ABI change, or the committed baseline is missing.
+#        The baseline is tracked, so its absence means it was deleted --
+#        an error, not an inability to check.
+#   77 - SKIP; this host or build cannot check: no libwirelog.so, no
+#        abidiff, or a non-x86_64 host (the baseline is x86_64-only).
+#        Reported to meson as a skip rather than a pass (#1301).
 #
-#   0   - manifest matches baseline (or SKIPped gracefully).
-#   1   - incompatible-change finding (or missing baseline / inputs).
-#
-# SKIP conditions (exit 0 with diagnostic):
-#
-#   - `libwirelog.so` absent (Windows, static-only, cross builds).
-#   - `abidiff` not on PATH (libabigail not installed).
-#   - Baseline `abi/libwirelog-1.0.abi.json` absent (first-time setup;
-#     run `scripts/release/regenerate-abi-manifest.sh` to seed).
-#   - Host architecture is not x86_64.  The v1.0 libabigail baseline is
-#     intentionally x86_64-only; Linux arm64 ABI coverage is symbol-only
-#     unless and until a per-architecture baseline policy is added after
-#     v1.0 (issue #824).
+#        77 is safe only under meson.  A bare workflow `run:` step uses
+#        `bash -e`, where it would fail the job.
 
 set -euo pipefail
+
+# Meson reads exit 77 as SKIP and exit 0 as a pass, so a branch that cannot
+# check anything must exit 77 or the gate is recorded as having asserted
+# something it never looked at (#1301).  Matches SKIP_EXIT in
+# check-clang-tidy-backlog-monotonic.sh and SKIP in run-doop-perf-gate.sh.
+#
+# 77 is only safe under meson: a bare workflow `run:` step uses `bash -e`,
+# where 77 fails the job.  Do not invoke this from one.
+SKIP_EXIT=77
 
 if [ $# -lt 1 ]; then
     echo "usage: $0 <build_root>" >&2
@@ -70,20 +75,25 @@ done
 if [ -z "$lib" ]; then
     echo "check-abi-manifest: SKIP: libwirelog.so not found in $build_root" >&2
     echo "  (expected on Windows / static-only / cross builds)" >&2
-    exit 0
+    exit "$SKIP_EXIT"
 fi
 
 if ! command -v abidiff >/dev/null 2>&1; then
     echo "check-abi-manifest: SKIP: abidiff not on PATH" >&2
     echo "  install libabigail (Ubuntu: apt-get install -y abigail-tools)" >&2
-    exit 0
+    exit "$SKIP_EXIT"
 fi
 
+# Not a skip: abi/libwirelog-1.0.abi.json is committed, so its absence means
+# it was deleted rather than that this build cannot answer.  Reporting that as
+# "nothing to check" retires the gate silently.  check-abi-symbols.sh has
+# always treated a missing allowlist as a hard failure; this matches it.
 if [ ! -f "$baseline" ]; then
-    echo "check-abi-manifest: SKIP: baseline missing: $baseline" >&2
+    echo "check-abi-manifest: FAIL: baseline missing: $baseline" >&2
+    echo "  it is committed, so this means it was deleted." >&2
     echo "  first-time setup: run scripts/release/regenerate-abi-manifest.sh" >&2
     echo "  and commit the resulting abi/libwirelog-1.0.abi.json." >&2
-    exit 0
+    exit 1
 fi
 
 # The committed baseline is generated on Linux x86_64.  abidiff treats
@@ -100,7 +110,7 @@ if [ "$host_arch" != "x86_64" ]; then
     echo "  issue #824 scopes v1.0 Linux arm64 ABI coverage to" >&2
     echo "  abi/libwirelog-1.0.symbols; per-arch libabigail baselines" >&2
     echo "  require a separate post-v1.0 policy and regeneration flow." >&2
-    exit 0
+    exit "$SKIP_EXIT"
 fi
 
 # `--suppr` is optional; pass it only if the suppression file exists so

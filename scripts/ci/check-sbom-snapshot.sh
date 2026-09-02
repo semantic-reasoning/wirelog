@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 # Issue #744: SBOM snapshot CI gate.
 # Diffs the detected dependency list against the committed baseline.
-# SKIPs when syft is not on PATH or baseline file is absent.
+# SKIPs (exit 77) when syft is not on PATH.  A missing baseline is a
+# FAILURE, not a skip: sbom/snapshot.txt is committed, so its absence
+# means it was deleted (#1301).
 
 set -euo pipefail
+
+# Meson reads exit 77 as SKIP and exit 0 as a pass, so a branch that cannot
+# check anything must exit 77 or the gate is recorded as having asserted
+# something it never looked at (#1301).  Matches SKIP_EXIT in
+# check-clang-tidy-backlog-monotonic.sh and SKIP in run-doop-perf-gate.sh.
+#
+# 77 is only safe under meson: a bare workflow `run:` step uses `bash -e`,
+# where 77 fails the job.  Do not invoke this from one.
+SKIP_EXIT=77
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
@@ -12,14 +23,17 @@ baseline="$repo_root/sbom/snapshot.txt"
 # SKIP if syft not available
 if ! command -v syft >/dev/null 2>&1; then
     echo "check-sbom-snapshot: SKIP: syft not on PATH" >&2
-    exit 0
+    exit "$SKIP_EXIT"
 fi
 
-# SKIP if baseline file doesn't exist (first time; regenerate via scripts/release/generate-sbom.sh)
+# NOT a skip: the baseline is committed, so its absence means deletion.
 if [ ! -f "$baseline" ]; then
-    echo "check-sbom-snapshot: SKIP: baseline missing: $baseline" >&2
+    # Not a skip: sbom/snapshot.txt is committed, so its absence means it was
+    # deleted, not that this build cannot answer.
+    echo "check-sbom-snapshot: FAIL: baseline missing: $baseline" >&2
+    echo "  it is committed, so this means it was deleted." >&2
     echo "  first-time: run scripts/release/generate-sbom.sh <build_root>" >&2
-    exit 0
+    exit 1
 fi
 
 tmpdir=$(mktemp -d)

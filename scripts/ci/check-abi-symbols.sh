@@ -26,7 +26,9 @@
 # Where <build_root> contains `libwirelog.so` (or a SOVERSION-
 # qualified link).
 #
-# Exit codes: 0 on match, 1 on diff or missing inputs.
+# Exit codes: 0 on match, 1 on diff or a missing allowlist, 77 on SKIP
+#             (no libwirelog.so, or a Windows POSIX layer) -- reported to
+#             meson as a skip rather than a pass (#1301).
 #
 # To regenerate the allowlist after a deliberate API addition:
 #
@@ -36,6 +38,15 @@
 #       > abi/libwirelog-1.0.symbols
 
 set -euo pipefail
+
+# Meson reads exit 77 as SKIP and exit 0 as a pass, so a branch that cannot
+# check anything must exit 77 or the gate is recorded as having asserted
+# something it never looked at (#1301).  Matches SKIP_EXIT in
+# check-clang-tidy-backlog-monotonic.sh and SKIP in run-doop-perf-gate.sh.
+#
+# 77 is only safe under meson: a bare workflow `run:` step uses `bash -e`,
+# where 77 fails the job.  Do not invoke this from one.
+SKIP_EXIT=77
 
 if [ $# -lt 1 ]; then
     echo "usage: $0 <build_root>" >&2
@@ -50,7 +61,7 @@ allowlist="$repo_root/abi/libwirelog-1.0.symbols"
 case "$(uname -s)" in
   MSYS*|MINGW*|CYGWIN*)
     echo "check-abi-symbols: SKIP: Windows POSIX layer ($(uname -s)) detected" >&2
-    exit 0
+    exit "$SKIP_EXIT"
     ;;
 esac
 
@@ -71,7 +82,7 @@ done
 if [ -z "$lib" ]; then
     echo "check-abi-symbols: SKIP: libwirelog.so not found in $build_root" >&2
     echo "  (expected on Windows / static-only / cross builds)" >&2
-    exit 0
+    exit "$SKIP_EXIT"
 fi
 
 if [ ! -f "$allowlist" ]; then
