@@ -824,9 +824,21 @@ endif
 # release tag.  Extracted to scripts/release/derive-owned-sonames.sh so its
 # edge cases -- symlink chains, .p object directories, .symbols by-products,
 # an empty tree -- are exercised on every PR.
-# Linux-gated: the fixture builds a symlink chain with `ln -s`, which on
-# MSYS/Git-Bash copies instead of linking, so the symlink assertions would pass
-# for a different reason there rather than exercising what they name.
+# Linux-gated, for two reasons rather than the one first recorded here:
+#   Windows -- the fixture builds a symlink chain with `ln -s`, which on
+#     MSYS/Git-Bash copies instead of linking, so the symlink assertions would
+#     pass for a different reason rather than exercising what they name.
+#   macOS -- the locale case ASSERTS that en_US collation orders a hyphenated
+#     pair differently from C. That is glibc applying the UCA rule of ignoring
+#     punctuation at the primary level; Darwin's en_US.UTF-8 is not known to,
+#     and the candidate loop tries `en_US.UTF-8` precisely because macOS has
+#     it. So the branch would be taken and `fixture_discriminates` would fail
+#     -- a false failure, not a real one.
+# Widening to darwin therefore needs `fixture_discriminates` turned from an
+# assertion into a skip-guard first, and confirming on a real macOS host.
+# `normalize_root` is deliberately absent from the test: the sibling
+# test-downstream-matrix.sh carries it because a bare `if sh.found()` really
+# does run it on Windows, and this gate does not.
 if host_machine.system() == 'linux' and sh.found()
   test('owned_sonames', sh,
        args: [meson.project_source_root() / 'scripts/ci/test-derive-owned-sonames.sh',
