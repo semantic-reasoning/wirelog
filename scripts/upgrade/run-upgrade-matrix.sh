@@ -61,24 +61,63 @@ build_tree() {
     # plus the subproject libraries it carries as DT_NEEDED.  The closure
     # check in compile_and_run uses these basenames to tell "loaded from the
     # release prefix" apart from "loaded from whatever the host had lying
-    # around"; see scripts/ci/check-shared-library-closure.sh.  No -maxdepth:
-    # a subproject that relocates its build output must not drop silently out
-    # of the set.  ! -type d keeps meson's libwirelog.so.N.p object
-    # directories, which match *.so.*, from being mistaken for libraries.
-    # The grep keeps the match to real library names: '*.so.*' also catches
-    # build by-products such as libnanoarrow.so.symbols.
+    # around"; see scripts/ci/check-shared-library-closure.sh for the consumer
+    # and scripts/release/derive-owned-sonames.sh for what counts as owned.
+    # build_tree runs inside a command substitution and this script does not
+    # set inherit_errexit, so a failing *external* command does not abort it
+    # the way the previous inline `exit` did -- and the redirection truncates
+    # $owned regardless. Without the explicit `|| exit 1` the derivation could
+    # fail, leave an empty set, and have every installed library reported
+    # missing below: a real failure reported as the wrong one.
     local owned="$tmp/owned-$name.txt"
-    find "$build" ! -type d \
-        \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print |
-        sed 's|.*/||' |
-        { grep -E '\.(so|dylib)(\.[0-9]+)*$' || true; } |
-        LC_ALL=C sort -u >"$owned"
+    "$root/scripts/release/derive-owned-sonames.sh" "$build" >"$owned" || exit 1
     [[ -s "$owned" ]] || {
-        echo "upgrade matrix: $name built no shared libraries to verify" >&2
+        echo "upgrade matrix: $name derived an empty owned-soname set" >&2
         exit 1
     }
     cp "$owned" "$log_dir/$name-owned-sonames.txt"
-    printf '%s\n' "$prefix|$(dirname "$lib")"
+
+    # The closure check is only as good as this set: a library that drops out
+    # of it stops being checked, silently, and the gate keeps reporting PASS
+    # while the consumer loads a host copy (#1285).  Anything installed into
+    # the prefix but missing from the set is a derivation bug, so say so here
+    # rather than letting the closure check pass vacuously later.
+    #
+    # Only that direction is checked.  The reverse -- a name in the set that
+    # the prefix does not install -- is not a derivation bug, because the build
+    # tree legitimately holds more than the prefix.  It is not harmless either:
+    # check-shared-library-closure.sh classifies an owned basename resolving
+    # outside the prefix as FOREIGN, so such a name would fail the gate for a
+    # library this release does not ship.  That case is empty today, since the
+    # matrix builds with -Dtests=false and every library it produces is
+    # installed -- but nothing here proves it: the check below is comm -13,
+    # which establishes installed-subset-of-owned, and the reverse would need
+    # comm -23.
+    local libdir installed missing
+    libdir=$(dirname "$lib")
+    installed=$(find "$libdir" -maxdepth 1 ! -type d \
+        \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print |
+        sed 's|.*/||' |
+        { grep -E '\.(so|dylib)(\.[0-9]+)*$' || true; } |
+        LC_ALL=C sort -u)
+    # LC_ALL=C on comm as well as on the sorts: comm respects LC_COLLATE, so
+    # with C-sorted inputs and an en_US comparison it reports spurious
+    # differences and warns "file 2 is not in sorted order" -- accusing the
+    # derivation of a bug that does not exist. Latent while every library
+    # basename here is collation-invariant, live the day a hyphenated one
+    # appears (#1291, #1294).
+    missing=$(LC_ALL=C comm -13 "$owned" <(printf '%s\n' "$installed") || true)
+    if [[ -n "$missing" ]]; then
+        {
+            echo "upgrade matrix: $name installs shared libraries the owned-soname set does not name:"
+            sed 's/^/  /' <<<"$missing"
+            echo 'The closure check would not verify these, so a host copy could be'
+            echo 'loaded instead and the gate would still pass.'
+        } >&2
+        exit 1
+    fi
+
+    printf '%s\n' "$prefix|$libdir"
 }
 
 compile_and_run() {

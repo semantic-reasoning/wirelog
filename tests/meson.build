@@ -791,6 +791,21 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1285: the closure gate below can only verify libraries the
+# owned-soname set names, and the derivation of that set only ever ran on a
+# release tag.  Extracted to scripts/release/derive-owned-sonames.sh so its
+# edge cases -- symlink chains, .p object directories, .symbols by-products,
+# an empty tree -- are exercised on every PR.
+# Linux-gated: the fixture builds a symlink chain with `ln -s`, which on
+# MSYS/Git-Bash copies instead of linking, so the symlink assertions would pass
+# for a different reason there rather than exercising what they name.
+if host_machine.system() == 'linux' and sh.found()
+  test('owned_sonames', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-derive-owned-sonames.sh',
+              meson.project_source_root()],
+       suite: 'abi')
+endif
+
 # Issue #1272: the release upgrade matrix must prove the consumer loaded the
 # libraries this release installs, not whatever the host had installed.  The
 # matrix itself only runs on a release tag, so this self-test is the only
