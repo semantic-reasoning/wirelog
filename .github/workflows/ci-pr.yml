@@ -152,7 +152,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools
+          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools b3sum
 
       - name: Configure
         run: meson setup builddir -Dtests=true -DmbedTLS=disabled
@@ -291,7 +291,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools
+          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools b3sum
 
       - name: Configure
         run: meson setup builddir -Dtests=true -DmbedTLS=disabled
@@ -342,7 +342,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools
+          sudo apt-get install -y meson ninja-build libmbedtls-dev uncrustify abigail-tools b3sum
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
