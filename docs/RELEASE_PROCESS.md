@@ -286,9 +286,9 @@ When cutting a release tag:
    pair therefore needs a live Rekor lookup for as long as it exists. The
    published `.cosign.bundle` carries that entry inline, so
    `cosign verify-blob --bundle <file> ...` is the recipe that still works
-   months later. The bundle is cosign's legacy format; it is read by both
-   cosign 2.x and 3.x (checked against 2.6.5 and 3.1.3), but not by
-   non-cosign Sigstore SDKs, which expect the protobuf bundle.
+   months later — cosign's legacy bundle format, read by cosign only. Full
+   recipes, the rotation policy, and what has and has not been exercised are in
+   `docs/SIGNING.md`.
 
 7. **Retain the GA downstream evidence.** The tag workflow's
    `Tag / six-workload downstream matrix` job is a release-blocking check for
