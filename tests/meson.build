@@ -953,6 +953,23 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #1297: the perf gate's dataset manifest embedded the directory the
+# operator passed, so relative, absolute and trailing-slash spellings of one
+# directory produced three different hashes -- reported as if the dataset had
+# been substituted.  It also asserts that the perf gate and
+# run-downstream-matrix's manifest_for_doop agree ON A CANONICAL PATH, and pins
+# the shapes where they do not (trailing slash, dotfiles, symlinks), so a
+# shared-helper refactor has to address those deliberately.
+# linux-gated for the same reason as manifest_collation below: the fixture
+# relies on glibc's en_US collation ordering Method-Modifier.facts differently
+# from C, and on macOS/BSD/musl that collation is codepoint order, so the
+# fixture check would fail on a correct tree.
+if host_machine.system() == 'linux' and sh.found()
+  test('doop_manifest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-doop-manifest.sh'],
+       suite: 'abi')
+endif
+
 # Issue #1294: two release gates hash a sorted file list and compare it against
 # a pinned or committed value.  Unpinned collation made a non-C runner produce a
 # different manifest, failing with a message that accuses the dataset.

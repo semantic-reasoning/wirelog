@@ -8,6 +8,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **`WIRELOG_DOOP_DATASET_MANIFEST_SHA256` must be re-pinned.** The DOOP perf
+  gate's dataset manifest no longer embeds the directory path it is given, so
+  relative, absolute and trailing-slash spellings of one directory no longer
+  produce three different hashes (#1297). The value is set out-of-band, so
+  nothing in this repository changes — but an operator holding a pin recorded
+  under the old formula will see a mismatch on the first run after this. The
+  gate's failure message now says so; for the zxing dataset the correct value
+  is the `files:` field of `scripts/release/downstream-matrix-oracles.tsv`.
+
 ### Deprecated
 
 ### Removed
