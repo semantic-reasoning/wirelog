@@ -755,6 +755,17 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1312: make-tarball.sh read the project version through a pipe whose
+# consumer exits early, so once sed crossed its first stdout flush it took
+# SIGPIPE and pipefail turned the release build into a bare exit 141.  The
+# fixture is sized past both that threshold (~14 KB) and the 64 KiB pipe buffer,
+# because the two rejected forms fail at different ones.
+if sh.found()
+  test('version_extraction', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-version-extraction.sh'],
+       suite: 'abi')
+endif
+
 # Issue #747 B18: RC changelog selftest for changelog-freeze checker.
 # Shell gate uses the same shared `sh` handle to keep skip behavior
 # consistent on platforms without bash.
