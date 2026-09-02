@@ -764,6 +764,23 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1295: make-tarball.sh and verify-release.sh had no coverage at all.
+# verify-release.sh is the only script here that third parties run -- docs
+# publish it as the release-verification recipe -- so a break in it is found by
+# consumers rather than by CI.  A round-trip (build, verify, corrupt, verify
+# again) covers the core of both, and pins #1292's `sha256sum is required`
+# guard, which landed untested because there was no harness for it.
+#
+# Needs b3sum, which ubuntu-latest does not ship.  It is installed alongside
+# abigail-tools in the jobs that run this suite (ci-pr.yml's build matrix and
+# release-tag.yml's Tag / ABI job); without it the test SKIPs rather than
+# fails, but then it asserts nothing, which is the state #1295 exists to end.
+if sh.found()
+  test('release_roundtrip', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-release-roundtrip.sh'],
+       suite: 'abi')
+endif
+
 # Issue #734/#1173: docs/THREADING.md atomics audit rows must resolve to
 # logical atomic_* source lines, and the count must match production sources.
 # Static shell checks; no build-tree input required.
