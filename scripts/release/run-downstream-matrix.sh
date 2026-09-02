@@ -135,9 +135,17 @@ actual_oracle_sha256=$(sha256sum "$oracle_file" | awk '{print $1}')
     exit 1
 }
 
+# LC_ALL=C on both manifest sorts: the committed oracles in
+# downstream-matrix-oracles.tsv were computed under C collation, and the DOOP
+# file set genuinely discriminates -- en_US ignores the hyphen in
+# Method-Modifier.facts, moving it after MethodHandleConstant.facts and
+# yielding a different manifest. Unpinned, a runner with a non-C locale fails
+# with a manifest mismatch that reads as dataset tampering. Verified against
+# the real zxing dataset: C order reproduces the committed oracle, en_US does
+# not. See #1294.
 manifest_for_dir() {
     local dir=$1
-    find "$dir" -type f -print0 | sort -z \
+    find "$dir" -type f -print0 | LC_ALL=C sort -z \
         | while IFS= read -r -d '' path; do
             sha256sum "$path" | sed "s#  $dir/#  #"
         done | sha256sum | awk '{print $1}'
@@ -145,7 +153,7 @@ manifest_for_dir() {
 
 manifest_for_doop() {
     local dir=$1
-    find "$dir" -maxdepth 1 -type f -name '*.facts' -print0 | sort -z \
+    find "$dir" -maxdepth 1 -type f -name '*.facts' -print0 | LC_ALL=C sort -z \
         | while IFS= read -r -d '' path; do
             sha256sum "$path" | sed "s#  $dir/#  #"
         done | sha256sum | awk '{print $1}'

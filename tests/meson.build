@@ -913,6 +913,15 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #1294: two release gates hash a sorted file list and compare it against
+# a pinned or committed value.  Unpinned collation made a non-C runner produce a
+# different manifest, failing with a message that accuses the dataset.
+if host_machine.system() == 'linux' and sh.found()
+  test('manifest_collation', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-manifest-collation.sh'],
+       suite: 'abi')
+endif
+
 # Issue #1100: clang-tidy ratchet (suite 'tidy').  No CI job has run
 # clang-tidy since efbde27 removed it, and wirelog/ir/program.c regressed
 # after f1d2a2c with nothing failing.  The gate re-analyses every file in
