@@ -131,7 +131,20 @@ fi
 #
 # Bit 2 (decimal 4) is the "incompatible" flag.  We fail if it's set.
 set +e
-abidiff "${abidiff_args[@]}" "$baseline" "$lib" 2>&1
+# ${arr[@]+"${arr[@]}"}, not "${arr[@]}": abi/libwirelog-1.0.suppr does not
+# exist in this repository, so abidiff_args is empty in the DEFAULT
+# configuration -- not an edge case. Expanding an empty array under `set -u` is
+# an unbound-variable error on bash 3.2, which the macOS runners ship and which
+# this suite has no platform gate against. macOS never reaches this line at all,
+# and NOT because abidiff is missing: meson builds libwirelog.dylib there
+# (darwin_versions, meson.build:490), so the `libwirelog.so not found` SKIP above
+# fires first -- verified with abidiff present on PATH. macos-latest is also
+# arm64, which the x86_64 guard stops independently. So this is a defensive fix
+# for a Linux x86_64 host running bash 3.2, not a latent CI break; do not read
+# it as one brew install away from firing.
+# Verified on bash 3.2.57 and 5.3: empty passes ZERO extra arguments (not one
+# empty string), populated passes --suppr and the path as two words. (#1324)
+abidiff ${abidiff_args[@]+"${abidiff_args[@]}"} "$baseline" "$lib" 2>&1
 rc=$?
 set -e
 
