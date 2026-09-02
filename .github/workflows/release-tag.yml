@@ -61,7 +61,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build
+          sudo apt-get install -y meson ninja-build b3sum
       - name: Build and test default suite
         run: |
           meson setup build-default -Dtests=true --buildtype=debug
@@ -82,7 +82,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build abigail-tools
+          sudo apt-get install -y meson ninja-build abigail-tools b3sum
       - name: Build and test ABI suite
         run: |
           meson setup build-abi -Dtests=true --buildtype=debug
