@@ -16,10 +16,20 @@ on:
         required: true
         type: string
 
+# contents: read ONLY. The minting scopes -- id-token: write and
+# attestations: write -- are declared on release-artifacts alone, because a
+# workflow-level grant reaches every job that does not re-declare, and
+# job_workflow_ref names the WORKFLOW FILE rather than the job. The certificate
+# carries no job discriminator, so a SAN minted by any other job here is
+# indistinguishable from the signing job's and no
+# --certificate-identity-regexp can tell them apart (#1287). This block is the
+# only thing IN THIS FILE that can bound it -- a protected environment on the
+# signing job, or the tag protection tracked in #1318, constrain the same attack
+# from other directions. Do not add id-token or attestations here; put them on
+# the job that needs them. scripts/ci/test-release-signing.sh fails if you do
+# (#1319).
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 env:
   EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
@@ -302,6 +312,13 @@ jobs:
     # complete test graph in ASan/UBSan and TSan-configured build directories.
     # This is the repository's equivalent of the issue's --suite asan/tsan
     # requirement and keeps sanitizer coverage from silently narrowing.
+    # Explicit, though the called workflow declares contents: read itself: the
+    # docs are ambiguous about whether a calling job with no permissions block
+    # inherits the caller's workflow-level mapping or the repository default,
+    # and a called workflow can only DOWNGRADE what it is passed. Stating it
+    # here makes the ceiling independent of that ambiguity (#1319).
+    permissions:
+      contents: read
     uses: ./.github/workflows/tier1-sanitizers.yml
     with:
       ref: ${{ inputs.tag_ref || github.ref_name }}

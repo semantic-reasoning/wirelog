@@ -38,16 +38,19 @@ set -euo pipefail
 # owner nor repo can contain a slash, so this was never a cross-repository
 # weakness -- the exposure is within-repository workflow confusion: any workflow
 # granted `id-token: write` could mint a certificate this accepts as a release
-# signature.  release-tag.yml is the only such workflow today, but that bounds
-# the impact far less than it sounds: job_workflow_ref names the WORKFLOW FILE,
-# not the job, and release-tag.yml grants id-token: write at workflow level, so
-# every job that does not re-declare permissions: inherits it.  No identity
-# pattern can separate them -- the certificate carries no job discriminator at
-# all -- so this is bounded by workflow permissions or not at all.  The one
-# exception is instructive: the sanitizers job is `uses:` a reusable workflow,
-# which declares its own contents: read AND would mint a SAN naming the CALLED
-# file, so the anchor already excludes it.  Tracked in #1319, the higher
-# priority of the two residuals here because it is a four-line YAML edit.
+# signature.  release-tag.yml is the only such workflow today.  Note what does
+# NOT bound this: job_workflow_ref names the WORKFLOW FILE, not the job, and the
+# certificate carries no job discriminator at all, so no identity pattern can
+# separate one job in that workflow from another.  What bounds it is the
+# permissions block -- id-token: write and attestations: write are declared on
+# release-artifacts alone rather than workflow-wide (#1319), so no other job
+# holds a token that can mint this identity.  Keep it that way; a scope added
+# back at workflow level re-opens this, and nothing in the PATTERN could notice
+# -- the contract test in scripts/ci/test-release-signing.sh is what does, and
+# it is the reason this is not silent.  The sanitizers job is excluded twice
+# over and is instructive: it is `uses:` a reusable workflow, which declares its
+# own contents: read AND would mint a SAN naming the CALLED file, so the anchor
+# excludes it too.
 #
 # The ref is constrained, but not to tags alone.  release-tag.yml is reachable
 # by workflow_dispatch as well as by a tag push, and a dispatch's OIDC ref

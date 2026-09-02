@@ -58,6 +58,26 @@ assert() {
     "$@" || status=1
     check "$name" "$status"
 }
+# The negative form. Same shape, so a refuted condition is recorded rather than
+# tripping `set -e` and truncating the suite at the first one.
+#
+# Unlike `assert`, this one has to check that the condition can RUN. `assert`
+# reads a missing command as a failure, which is correct. `refute` would read
+# the same 127 as "successfully refuted" and print ok -- so a renamed or
+# misspelled helper would silently turn every refutation in this file into a
+# pass, which is the failure mode these refutations exist to prevent.
+refute() {
+    local name=$1 status=0
+    shift
+    if ! declare -F "$1" >/dev/null 2>&1 && ! command -v "$1" >/dev/null 2>&1; then
+        printf 'release signing: FAIL %s (refute: no such command: %s)\n' \
+            "$name" "$1" >&2
+        failures=$((failures + 1))
+        return 0
+    fi
+    "$@" && status=1
+    check "$name" "$status"
+}
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/wirelog-signing-selftest.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
@@ -178,6 +198,71 @@ for scope in 'contents: write' 'id-token: write' 'attestations: write'; do
 done
 
 assert 'release-artifacts signs the archive' in_block 'sign-artifacts.sh'
+# --- #1319: the minting scopes must NOT be granted workflow-wide --------------
+#
+# job_workflow_ref names the WORKFLOW FILE, not the job, and the certificate
+# carries no job discriminator at all -- so every job holding id-token: write
+# mints a SAN indistinguishable from the signing job's, and no
+# --certificate-identity-regexp can separate them (#1287). The only thing that
+# can bound it is this permissions block. Granting the scopes at workflow level
+# hands them to every job that does not re-declare, which is what #1319 removes.
+#
+# Extracted from the top-level mapping specifically: the job-level block is a
+# different mapping at a deeper indent, and comments are stripped first because
+# this workflow discusses both scope names in prose.
+wf_nocomment="$tmp/workflow.nocomment.yml"
+sed 's/^[[:space:]]*#.*$//' "$workflow" >"$wf_nocomment"
+workflow_permissions() {
+    awk '/^permissions:$/ { inside = 1; next }
+         inside && /^[^ ]/ { exit }
+         inside { print }' "$wf_nocomment"
+}
+# A vacuous extraction would satisfy every refutation below, so require the
+# mapping to have been found before believing anything about its contents.
+wf_block_found() { [[ "$(workflow_permissions | grep -c .)" -ge 1 ]]; }
+assert 'the workflow-level permissions mapping was extracted' wf_block_found
+# Match the SCOPE, not one byte-spelling of it. `id-token: 'write'`,
+# `id-token:  write`, `attestations: "write"` and the flow form
+# `permissions: {contents: read, id-token: write}` all parse to exactly the same
+# grant, and a fixed-string match on `id-token: write` misses every one of them
+# -- so a re-added scope would sail past a green gate. The leading
+# (^|[{,[:space:]]) keeps `not-id-token:` and similar suffixes from matching.
+wf_grants() { workflow_permissions | grep -Eq -- "$1"; }
+scope_re() { printf "(^|[{,[:space:]])%s:[[:space:]]*['\"]?%s" "$1" "$2"; }
+for scope in id-token attestations; do
+    refute "workflow-level permissions does NOT grant $scope: write" \
+        wf_grants "$(scope_re "$scope" write)"
+done
+# It must still grant the read scope every job relies on, or removing the two
+# above would have been achieved by deleting the mapping and breaking checkout.
+assert 'workflow-level permissions still grants contents: read' \
+    wf_grants "$(scope_re contents read)"
+
+# The scopes have to live SOMEWHERE, and that somewhere is the signing job --
+# already asserted above. This pins the pairing: exactly one permissions mapping
+# in the file may grant id-token, so a future job cannot quietly re-add it.
+# No ^[[:space:]]+ anchor: that would miss the flow form, which is not at line
+# start. The trade is that a TRAILING comment naming the scope (sed strips only
+# whole-line comments) pushes the count to 2 and fails -- the safe direction.
+# The trailing (…|$) also catches the value on the CONTINUATION line --
+#     id-token:
+#       write
+# -- which YAML reads as an ordinary grant and which both line-based guards
+# would otherwise miss. Deliberately NOT added to scope_re: the positive
+# assertion wf_grants "$(scope_re contents read)" would then be satisfied by a
+# bare valueless `contents:`, which is the one place a loose match runs in the
+# UNSAFE direction. Loose here, strict there, for opposite reasons.
+sole_grant() {
+    [[ "$(grep -cE -- "$1:[[:space:]]*(['\"]?write|\$)" "$wf_nocomment")" -eq 1 ]]
+}
+# Both scopes, not just id-token: the workflow comment forbids adding either at
+# workflow level, and a guard that pins one while the comment names two is the
+# asymmetry this whole issue is about. attestations: write alone cannot obtain a
+# Fulcio certificate, so it is the lesser of the two -- but "lesser" is not a
+# reason for the assertion to be absent.
+assert 'exactly one permissions mapping grants id-token: write' sole_grant id-token
+assert 'exactly one permissions mapping grants attestations: write' \
+    sole_grant attestations
 
 ordered() {
     local sign_line publish_line upload_line
