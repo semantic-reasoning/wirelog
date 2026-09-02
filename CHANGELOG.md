@@ -27,6 +27,19 @@ All notable changes to wirelog are documented in this file.
 
 ### Security
 
+- **Only the signing job in `release-tag.yml` now holds the certificate-minting
+  scopes.** That workflow granted `id-token: write` at workflow level, so every
+  job that did not re-declare `permissions:` inherited it. The certificate
+  names the workflow file, not the job — there is no job discriminator in the
+  SAN or in the OID extensions — so any of those jobs could mint a certificate
+  indistinguishable from the signing job's, over an artifact of its choosing,
+  which a consumer following `docs/SIGNING.md` would verify as genuine. The
+  minting scopes are now declared on the `release-artifacts` job alone, and a
+  contract test asserts exactly one permissions mapping in the file grants each
+  of them. This bounds the workflow as committed, not an actor with repository
+  write access, who can still push a tag carrying their own copy of it — see the
+  next bullet, and #1318 for the remedy (#1319).
+
 - **Release signature verification now names the release workflow.** cosign
   matches `--certificate-identity-regexp` unanchored, and the pattern was a bare
   prefix, so it accepted a certificate minted by any workflow in this repository
@@ -36,11 +49,10 @@ All notable changes to wirelog are documented in this file.
   let anyone with write access run a modified `release-tag.yml` and mint an
   accepted certificate. Both refs are admitted deliberately: the manual
   immutable-rerun path dispatches from `main` while checking out the tag.
-  Two residuals are documented rather than closed, because no identity pattern
-  can close either: the certificate names the workflow file and not the job
-  (#1319), and `refs/tags/` accepts any tag name (#1318). No published artifact
-  is affected — signing landed after v0.60.0, so no release certificate has been
-  minted yet (#1287).
+  One residual is documented rather than closed, because no identity pattern can
+  close it: `refs/tags/` accepts any tag name, and the attacker chooses the name
+  (#1318). No published artifact is affected — signing landed after v0.60.0, so
+  no release certificate has been minted yet (#1287).
 
 - **Sigstore keyless signing of release artifacts** (#750): the release-tag
   workflow now signs the source archive with `cosign sign-blob`, emitting a

@@ -138,16 +138,19 @@ what this signature is worth rather than assume:
 
 - **Which job minted it.** The certificate identifies the workflow file, not the
   job — there is no job discriminator in the SAN or in the GitHub OID extensions
-  — and `release-tag.yml` currently grants `id-token: write` to all of its jobs.
-  No identity pattern can separate them; only the workflow's `permissions:` block
-  can ([#1319](https://github.com/semantic-reasoning/wirelog/issues/1319)).
+  — so no identity pattern can separate one job in `release-tag.yml` from
+  another. This is bounded by the workflow's `permissions:` block instead:
+  `id-token: write` is declared on the signing job alone, so no other job holds
+  a token that can mint this identity
+  ([#1319](https://github.com/semantic-reasoning/wirelog/issues/1319)).
 - **Which tag.** `refs/tags/` accepts any tag name, and the attacker picks the
   name, so no regex closes this. It needs tag protection or a protected Actions
   environment ([#1318](https://github.com/semantic-reasoning/wirelog/issues/1318)).
 
-Both require repository write access. Neither affects any published artifact
+Both require repository write access, and neither affects any published artifact
 today: signing landed after `v0.60.0`, so no release certificate has been minted
-in this repository yet.
+in this repository yet. The first is now bounded by the workflow's permissions
+block; the second remains open.
 
 ### With the bundle — the recipe that keeps working
 
