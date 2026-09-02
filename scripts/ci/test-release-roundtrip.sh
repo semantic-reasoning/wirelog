@@ -251,6 +251,54 @@ no_b3() { PATH="$tmp/nob3" "$BASH" "$vr" "$archive"; }
 expect_status 'a missing b3sum is an error' 1 no_b3
 expect_says   'the missing b3sum is named' 'b3sum is required'
 
+# --- paths that make coreutils escape its output (#1311) --------------------
+# GNU sha256sum prefixes the whole line with a literal backslash when the
+# filename contains one, so passing a full path yielded "\<hash>" and the
+# comparison reported a mismatch on a byte-perfect archive. The fixture puts
+# the backslash in a PARENT directory with a plain archive name: that is the
+# shape the published recipe produces, and it is what distinguishes "the path
+# was escaped" from "the name was escaped".
+bs_dir="$tmp/bs/back\\slash"
+mkdir -p "$bs_dir"
+cp "$archive" "$archive.sha256" "$archive.blake3" "$bs_dir/"
+bs_archive="$bs_dir/wirelog-9.9.9.tar.gz"
+expect_status 'an archive under a backslash path verifies' 0 "$vr" "$bs_archive"
+expect_says   'and reports verification, not a mismatch' 'verified checksums for'
+
+# The same path must still reject a genuinely corrupt archive -- otherwise the
+# fix would have turned a false failure into a false pass.
+bs_bad="$tmp/bsbad/back\\slash"
+mkdir -p "$bs_bad"
+cp "$archive" "$archive.sha256" "$archive.blake3" "$bs_bad/"
+printf 'corruption' >> "$bs_bad/wirelog-9.9.9.tar.gz"
+expect_status 'a corrupt archive under a backslash path still fails' 1 \
+    "$vr" "$bs_bad/wirelog-9.9.9.tar.gz"
+expect_says   'and names the mismatch' 'SHA256 mismatch'
+
+# A symlinked parent followed by `..`: bash's `cd` resolves that LOGICALLY,
+# while the kernel -- and every other stage of verify-release.sh -- opens the
+# physical target. Hashing the logical path made the checksum describe a
+# different file than the one being verified, and reported success on a path
+# whose real target was tampered. This is the fail-OPEN direction, so it is
+# pinned in both directions.
+sym="$tmp/sym"; mkdir -p "$sym/a" "$sym/b"
+cp "$archive" "$sym/good.tar.gz"
+sed 's/wirelog-9\.9\.9\.tar\.gz/good.tar.gz/' "$archive.sha256" > "$sym/good.tar.gz.sha256"
+sed 's/wirelog-9\.9\.9\.tar\.gz/good.tar.gz/' "$archive.blake3" > "$sym/good.tar.gz.blake3"
+ln -s "$sym/b" "$sym/a/link"
+cp "$sym/good.tar.gz" "$sym/good.tar.gz.sha256" "$sym/good.tar.gz.blake3" "$sym/a/"
+logical_path="$sym/a/link/../good.tar.gz"
+
+expect_status 'a good archive reached through a symlinked parent verifies' 0 \
+    "$vr" "$logical_path"
+
+# Now tamper ONLY the physical target. The logical sibling stays good, so a
+# logical resolution would hash the good copy and report success.
+printf 'TAMPERED' >> "$sym/good.tar.gz"
+expect_status 'a tampered physical target is rejected, not masked by the logical path' 1 \
+    "$vr" "$logical_path"
+expect_says   'and the rejection names the mismatch' 'SHA256 mismatch'
+
 # --- argument handling ------------------------------------------------------
 expect_status 'no arguments is a usage error' 2 "$vr"
 expect_status '--signature without --certificate is a usage error' 2 \
