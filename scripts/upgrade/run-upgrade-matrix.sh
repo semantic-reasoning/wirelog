@@ -57,23 +57,60 @@ build_tree() {
         echo "upgrade matrix: installed libwirelog not found for $name" >&2
         exit 1
     }
+    # Record the shared libraries this tree builds for itself -- libwirelog
+    # plus the subproject libraries it carries as DT_NEEDED.  The closure
+    # check in compile_and_run uses these basenames to tell "loaded from the
+    # release prefix" apart from "loaded from whatever the host had lying
+    # around"; see scripts/ci/check-shared-library-closure.sh.  No -maxdepth:
+    # a subproject that relocates its build output must not drop silently out
+    # of the set.  ! -type d keeps meson's libwirelog.so.N.p object
+    # directories, which match *.so.*, from being mistaken for libraries.
+    # The grep keeps the match to real library names: '*.so.*' also catches
+    # build by-products such as libnanoarrow.so.symbols.
+    local owned="$tmp/owned-$name.txt"
+    find "$build" ! -type d \
+        \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print |
+        sed 's|.*/||' |
+        { grep -E '\.(so|dylib)(\.[0-9]+)*$' || true; } |
+        LC_ALL=C sort -u >"$owned"
+    [[ -s "$owned" ]] || {
+        echo "upgrade matrix: $name built no shared libraries to verify" >&2
+        exit 1
+    }
+    cp "$owned" "$log_dir/$name-owned-sonames.txt"
     printf '%s\n' "$prefix|$(dirname "$lib")"
 }
 
 compile_and_run() {
-    local label=$1 prefix=$2 libdir=$3 source=$4 program=$5 output=$6
+    local label=$1 prefix=$2 libdir=$3 source=$4 program=$5 output=$6 owned=$7
     local exe="$tmp/$label"
     local runtime_log="$log_dir/$label-runtime.log"
+    local trace="$tmp/$label-loader.trace"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I"$prefix/include" \
         "$source" -L"$libdir" -lwirelog -Wl,-rpath,"$libdir" -o "$exe" \
         >"$log_dir/$label-compile.log" 2>&1
+    # Ask the loader to record what it opens during the real run.  A separate
+    # ldd pass would re-resolve in its own environment and could describe a
+    # different closure than the one that actually executed.
     if [[ "$(uname -s)" == Darwin ]]; then
         DYLD_LIBRARY_PATH="$libdir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-            "$exe" "$program" >"$output" 2>"$runtime_log"
+            DYLD_PRINT_LIBRARIES=1 \
+            "$exe" "$program" >"$output" 2>"$trace"
+        # dyld shares stderr with the program, so keep the consumer's own
+        # diagnostics readable in the evidence artifact.
+        grep -v '^dyld' "$trace" >"$runtime_log" || true
     else
+        # glibc appends .PID to LD_DEBUG_OUTPUT; without it the trace would go
+        # to stderr and bury the consumer's diagnostics.
+        local trace_prefix="$tmp/$label-loader"
+        rm -f "$trace_prefix".[0-9]*
         LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            LD_DEBUG=libs LD_DEBUG_OUTPUT="$trace_prefix" \
             "$exe" "$program" >"$output" 2>"$runtime_log"
+        cat "$trace_prefix".[0-9]* >"$trace" 2>/dev/null || : >"$trace"
     fi
+    "$root/scripts/ci/check-shared-library-closure.sh" \
+        "$trace" "$prefix" "$owned" "$log_dir/$label-closure.txt"
     [[ -s "$output" ]] || {
         echo "upgrade matrix: $label produced no output" >&2
         exit 1
@@ -90,14 +127,16 @@ old_prefix=${old_install%%|*}
 old_libdir=${old_install#*|}
 candidate_prefix=${candidate_install%%|*}
 candidate_libdir=${candidate_install#*|}
+old_owned=$tmp/owned-old.txt
+candidate_owned=$tmp/owned-candidate.txt
 
 run_case() {
     local name=$1 old_program=$2 candidate_program=$3 old_consumer=$4 candidate_consumer=$5
     local old_out="$log_dir/$name-old.out" candidate_out="$log_dir/$name-candidate.out"
     compile_and_run "$name-old" "$old_prefix" "$old_libdir" \
-        "$old_consumer" "$old_program" "$old_out"
+        "$old_consumer" "$old_program" "$old_out" "$old_owned"
     compile_and_run "$name-candidate" "$candidate_prefix" "$candidate_libdir" \
-        "$candidate_consumer" "$candidate_program" "$candidate_out"
+        "$candidate_consumer" "$candidate_program" "$candidate_out" "$candidate_owned"
     cmp -s "$old_out" "$candidate_out" || {
         echo "upgrade matrix: $name output mismatch" >&2
         diff -u "$old_out" "$candidate_out" >&2 || true
@@ -110,7 +149,7 @@ run_executor_case() {
     local program=$1 consumer=$2 probe=$3 old_lib candidate_out old_lib_symbols
     candidate_out="$log_dir/executor-candidate.out"
     compile_and_run executor-candidate "$candidate_prefix" "$candidate_libdir" \
-        "$consumer" "$program" "$candidate_out"
+        "$consumer" "$program" "$candidate_out" "$candidate_owned"
 
     old_lib=$(find -L "$old_libdir" -maxdepth 1 -name 'libwirelog.so' -print -quit)
     [[ -n "$old_lib" ]] || { echo 'upgrade matrix: old library missing' >&2; exit 1; }
