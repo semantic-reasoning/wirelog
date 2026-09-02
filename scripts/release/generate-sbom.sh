@@ -40,10 +40,14 @@ echo "generate-sbom: Generating CycloneDX 1.5..."
 syft dir:"$repo_root" -o cyclonedx-json@1.5="${output_prefix}.cdx.json"
 
 echo "generate-sbom: Updating snapshot baseline..."
-# Extract normalized dependency list: name@version:license
+# Extract normalized dependency list: name@version:license.
+# LC_ALL=C so the committed baseline has one canonical order regardless of the
+# operator's locale: glibc's en_US collation ignores leading punctuation, so
+# regenerating under it reorders the "./.github/workflows/..." entries and
+# buries the real dependency change in unrelated diff noise.
 syft dir:"$repo_root" -o syft-json 2>/dev/null \
   | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' \
-  | sort > "$repo_root/sbom/snapshot.txt"
+  | LC_ALL=C sort > "$repo_root/sbom/snapshot.txt"
 
 # Append the resolved nanoarrow commit SHA as a comment for provenance.
 nanoarrow_sha=$(git -C "$repo_root/subprojects/nanoarrow" rev-parse HEAD 2>/dev/null || true)
