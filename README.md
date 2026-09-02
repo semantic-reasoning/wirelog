@@ -396,6 +396,7 @@ external-consumer audit.
 - [docs/ERROR_MODEL.md](docs/ERROR_MODEL.md) -- error reporting, logging safety, fork/signal constraints, and restart handoff
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- development workflow, CI/CD, PR requirements
 - [SECURITY.md](SECURITY.md) -- vulnerability disclosure
+- [docs/SIGNING.md](docs/SIGNING.md) -- verifying a release: checksums, Sigstore signatures, and provenance
 - [docs/SUPPORT_POLICY.md](docs/SUPPORT_POLICY.md) -- supported-version lifecycle and 1.x support window
 - [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) -- threat model, mbedTLS license stack, and export-control self-classification
 - [CLA.md](CLA.md) -- Contributor License Agreement (required for dual licensing)

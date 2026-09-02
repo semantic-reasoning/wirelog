@@ -115,6 +115,20 @@ Unsupported old versions may receive public mitigation notes, but users should
 upgrade to a supported version or to `main` when directed during the pre-1.0
 period.
 
+## Verifying a Release
+
+`docs/SIGNING.md` documents how to verify a wirelog release archive: checksum
+verification, Sigstore keyless signature verification, and the SLSA provenance
+attestation. It also records which parts of that pipeline have been exercised
+and which have not.
+
+If a release archive fails verification cryptographically — a checksum
+mismatch, a certificate identity or issuer mismatch, or a signature that does
+not verify — treat it as a possible substituted artifact and report it through
+[Reporting Vulnerabilities](#reporting-vulnerabilities) rather than as a public
+issue. Missing tools or an unreachable Sigstore endpoint are environmental and
+are not security reports; `docs/SIGNING.md` has the full routing.
+
 ## Security Model
 
 The threat model, optional crypto posture, mbedTLS build-option implications,

@@ -28,6 +28,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+- **`docs/SIGNING.md`** (#750): how to verify a wirelog release, why keyless
+  verification always needs a live Rekor lookup, what the published checksum
+  files do and do not attest, key-rotation policy for keyless signing, and an
+  explicit account of which parts of the signing matrix have been exercised and
+  which are reasoned from cosign's source.
+
 ## [0.60.0] - 2026-08-30
 
 ### Added
