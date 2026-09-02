@@ -81,4 +81,5 @@ r-lib/actions/setup-r-dependencies@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-r@v2:NOASSERTION
 r-lib/actions/setup-tinytex@v2:NOASSERTION
+sigstore/cosign-installer@v4.1.2:NOASSERTION
 # nanoarrow-resolved-sha: 3f824063f59848e05692ab520de8ab4d9ebb1880
