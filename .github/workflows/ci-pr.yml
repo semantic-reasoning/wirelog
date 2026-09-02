@@ -415,6 +415,16 @@ jobs:
           $env:CXX = 'cl'
           meson compile -C builddir
 
+      # Record which bash meson will use. The suite's portability floor is the
+      # macOS runner's bash 3.2.57, and scripts have broken against it before
+      # (#1320, #1324). meson resolves the interpreter with
+      # find_program('bash') -- PATH, not /bin/bash -- so if the image ever adds
+      # a Homebrew bash 5 ahead of it, that runtime coverage disappears silently
+      # and nothing else would say so. One line, printed every run.
+      - name: Record bash version
+        if: runner.os != 'Windows'
+        run: bash --version | head -1
+
       - name: Test (Linux / macOS)
         if: runner.os != 'Windows'
         run: meson test -C builddir --print-errorlogs
@@ -550,6 +560,16 @@ jobs:
 
       - name: Build with sanitizers
         run: meson compile -C builddir-san
+
+      # See the note in build-matrix: this job also runs the abi suite on macOS.
+      # These are the two macOS jobs in THIS workflow; ci-main.yml and
+      # tier1-sanitizers.yml have four more that lack the probe. Those are
+      # ungated while these two are gated on build-required, but a PR that skips
+      # the build also skips the abi suite, so there is nothing to observe then.
+      # One observation point on the workflow that runs per-PR is enough for a
+      # diagnostic that fails nothing; six copies would be noise.
+      - name: Record bash version
+        run: bash --version | head -1
 
       - name: Test with sanitizers
         run: meson test -C builddir-san --print-errorlogs
