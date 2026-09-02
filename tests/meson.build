@@ -846,6 +846,18 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #750: the release workflow's signing and publication steps and the
+# published verifier must agree on identity, issuer and artifact naming, and
+# the signing step must stay behind the verification gate. The release workflow
+# only runs on a tag, so without this the contract is first exercised on tag
+# day.
+if sh.found()
+  test('release_signing_contract', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-release-signing.sh',
+              meson.project_source_root()],
+       suite: 'abi')
+endif
+
 # Issue #913: keep the weighted/semiring design proposal explicit about its
 # current Z-set baseline, future-only ABI, retraction contract, and links.
 test('weighted_semiring_design', py3,

@@ -18,6 +18,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Security
 
+- **Sigstore keyless signing of release artifacts** (#750): the release-tag
+  workflow now signs the source archive with `cosign sign-blob`, emitting a
+  detached signature, the Fulcio certificate, and a bundle carrying the Rekor
+  entry, then verifies its own output with `scripts/release/verify-release.sh`.
+  Signatures and checksums are attached to the GitHub Release, which the
+  workflow creates as a draft if the maintainer has not already. GPG tag
+  signing is not established and is tracked in #1154.
+
 ### Documentation
 
 ## [0.60.0] - 2026-08-30
