@@ -199,7 +199,26 @@ validate_acquisition() {
     esac
 }
 
-declare -A seen_workloads=()
+# A newline-delimited string, not an associative array: `declare -A` is bash
+# 4.0+, and this script is reachable from scripts/ci/test-downstream-matrix.sh,
+# which meson registers as `downstream_matrix_contract` in suite abi
+# (tests/meson.build:788) -- ungated, so it runs on the macOS runners under
+# bash 3.2.57.
+#
+# No macOS invocation reaches this line today: every call the contract test
+# makes exits at or before archive validation, so that suite is green on 3.2.57
+# with or without this change. The hazard is latent, not active, and it is what
+# happens when some future call DOES reach here -- bash 3.2 aborts with
+# `declare: -A: invalid option` and status 2, which is also this script's status
+# for bad usage (line 41) and exactly what test-downstream-matrix.sh:42 asserts.
+# The abort would read as a normal usage exit rather than a failure: a green
+# contract test whose oracle loop never ran.
+#
+# The workload field arrives via IFS=$'\t' read, so it cannot contain a newline,
+# which makes newline a safe delimiter. A quoted needle in [[ ]] is literal in
+# 3.2, so a workload named `a*b` matches literally rather than as a pattern.
+# (#1321)
+seen_workloads=$'\n'
 workload_count=0
 while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path expected_manifest provenance acquisition extra; do
     [[ -z "$workload" || "$workload" == \#* ]] && continue
@@ -219,8 +238,8 @@ while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path e
     validate_provenance "$provenance"
     validate_provenance_path "$provenance" "$data_path"
     validate_acquisition "$acquisition"
-    [[ -z "${seen_workloads[$workload]+x}" ]] || { echo "duplicate workload: $workload" >&2; exit 1; }
-    seen_workloads[$workload]=1
+    [[ "$seen_workloads" != *$'\n'"$workload"$'\n'* ]] || { echo "duplicate workload: $workload" >&2; exit 1; }
+    seen_workloads="$seen_workloads$workload"$'\n'
     workload_count=$((workload_count + 1))
     data_dir=$(realpath -e -- "$candidate_root/$data_path") || {
         echo "missing data path: $data_path" >&2
