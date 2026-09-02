@@ -329,6 +329,7 @@ jobs:
     if: ${{ needs.release-verification.result == 'success' }}
     needs: [release-verification]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -347,6 +348,11 @@ jobs:
         with:
           subject-path: dist/wirelog-*.tar.gz
       - name: Download provenance attestation bundle
+        # An authenticated API call: without a token `gh` has no hosts.yml on a
+        # runner and refuses outright. Scoped to this step so the token is not
+        # placed in the environment of the actions around it.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           (cd dist && gh attestation download "wirelog-"*.tar.gz \
             --repo "$GITHUB_REPOSITORY" --limit 1)
