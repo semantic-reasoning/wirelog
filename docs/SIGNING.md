@@ -72,8 +72,7 @@ forms below have no such requirement.
 
 `b3sum` is packaged separately on most systems and `sha256sum` is GNU
 coreutils, so on macOS both usually need installing (`brew install coreutils
-b3sum`). `verify-release.sh` reports a missing `b3sum` clearly; a missing
-`sha256sum` currently fails with a bare `command not found`.
+b3sum`).
 
 Three of the recipes below use `scripts/release/verify-release.sh`, which is
 itself something you need. Take it from a git checkout at the tag, or from
