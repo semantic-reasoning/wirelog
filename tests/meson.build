@@ -766,6 +766,18 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1290: the release job attested the archive and downloaded the bundle
+# back to back with no retry.  Those are separate API operations, so replication
+# lag killed the job on a bare `test -n` -- after every verification job had
+# passed, on a tag that cannot be rebuilt.  The retry now lives in a script so
+# it can be exercised without cutting a release, which is the point: the path it
+# guards runs for the first time on a real one.
+if sh.found()
+  test('attestation_download', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-attestation-download.sh'],
+       suite: 'abi')
+endif
+
 # Issue #747 B18: RC changelog selftest for changelog-freeze checker.
 # Shell gate uses the same shared `sh` handle to keep skip behavior
 # consistent on platforms without bash.

@@ -363,11 +363,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          (cd dist && gh attestation download "wirelog-"*.tar.gz \
-            --repo "$GITHUB_REPOSITORY" --limit 1)
-          attestation=$(find dist -maxdepth 1 -type f -name 'sha256*.jsonl' -print -quit)
-          test -n "$attestation"
-          mv "$attestation" "dist/wirelog-${TAG_REF#v}.intoto.jsonl"
+          scripts/release/download-attestation.sh dist "${TAG_REF#v}"
       - name: Install cosign
         # Pinned to a commit rather than a floating major, deliberately against
         # the convention used elsewhere in this repository: this is the only job
