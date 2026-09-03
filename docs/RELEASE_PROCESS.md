@@ -213,7 +213,7 @@ When cutting a release tag:
    force-move a published tag to replay verification; the workflow checks out
    the supplied tag and verifies that it resolves to the supplied SHA.
    The [release-tag verification workflow](../.github/workflows/release-tag.yml)
-   runs the default and ABI suites, the dedicated `wirelog-perf` runner
+   runs the default, ABI and SBOM suites, the dedicated `wirelog-perf` runner
    with `WIRELOG_PERF_REQUIRE=1`, mbedTLS-enabled crypto validation, and
    a 60-second-per-target fuzz seed campaign on the tagged commit. It
    calls the reusable Tier-1 sanitizer workflow, which verifies the
@@ -229,7 +229,12 @@ When cutting a release tag:
    `scripts/release/generate-sbom.sh` and
    `scripts/release/regenerate-abi-manifest.sh`, and drift against the
    committed baselines is CI-gated — `meson test --suite sbom` for the SBOM
-   snapshot, `--suite abi`'s `abi_manifest` for the ABI manifest. Attaching
+   snapshot, `--suite abi`'s `abi_manifest` for the ABI manifest. Both gates
+   run on the tag with their `WIRELOG_*_REQUIRED` variable set, so a missing
+   prerequisite fails the release rather than skipping (#1303, #1337). That
+   distinction matters: before the dedicated `Tag / SBOM` job, the SBOM tests
+   did run on every tag as part of the unfiltered default suite, but syft was
+   not installed there, so the gate skipped and the job stayed green. Attaching
    either to the GitHub Release is not automated, and no implementation issue
    owns it — it remains an open exit condition on the GA epic #687.
 5. **Review and publish the GitHub Release.** The tag workflow creates it as

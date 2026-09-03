@@ -235,10 +235,12 @@ jobs:
             "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
             | tar -xz -C /usr/local/bin syft
 
-      # WIRELOG_SBOM_REQUIRED=1: syft is installed by the step above, and this
-      # is the ONLY place it is. Everywhere else check-sbom-snapshot.sh skips
-      # because syft is absent, which is correct there and useless here -- a
-      # gate that skips on every run asserts nothing.
+      # WIRELOG_SBOM_REQUIRED=1: syft is installed by the step above. The only
+      # other place it is installed is release-tag.yml's Tag / SBOM job, which
+      # sets the same variable for the same reason (#1337). Everywhere else
+      # check-sbom-snapshot.sh skips because syft is absent, which is correct
+      # there and useless here -- a gate that skips on every run asserts
+      # nothing.
       # scripts/ci/test-required-gates.sh asserts this line still exists (#1303).
       - name: SBOM snapshot gate
         env:

@@ -127,6 +127,55 @@ assert 'release-tag.yml Tag/ABI sets WIRELOG_ABI_REQUIRED' \
     sets_in_step release-tag.yml 'Build and test ABI suite' WIRELOG_ABI_REQUIRED
 assert 'ci-pr.yml SBOM step sets WIRELOG_SBOM_REQUIRED' \
     sets_in_step ci-pr.yml 'SBOM snapshot gate' WIRELOG_SBOM_REQUIRED
+assert 'release-tag.yml Tag/SBOM sets WIRELOG_SBOM_REQUIRED' \
+    sets_in_step release-tag.yml 'Build and test SBOM suite' WIRELOG_SBOM_REQUIRED
+
+# release-verification asserts a hardcoded job count against its own `needs:`
+# list. The two must agree: `join(needs.*.result)` silently yields fewer entries
+# when a job is dropped, and every remaining one could still be success -- so
+# the gate would pass having checked less than it names. That is the same
+# defect class the escalation above exists to close, one level up, and adding
+# the Tag/SBOM job to `needs:` without touching the count would have caused it.
+verification_count_matches_needs() {
+    local wf="$root/.github/workflows/release-tag.yml" needs_n asserted_n
+    needs_n=$(awk '
+        /^  release-verification:/ { inside = 1 }
+        inside && /^    needs: \[/ {
+            line = $0
+            sub(/.*\[/, "", line); sub(/\].*/, "", line)
+            n = split(line, parts, /,/)
+            print n
+            exit
+        }' "$wf")
+    asserted_n=$(awk '
+        /^  release-verification:/ { inside = 1 }
+        inside && /\$\{#statuses\[@\]}" -eq / {
+            match($0, /-eq [0-9]+/)
+            print substr($0, RSTART + 4, RLENGTH - 4)
+            exit
+        }' "$wf")
+    [ -n "$needs_n" ] && [ -n "$asserted_n" ] && [ "$needs_n" = "$asserted_n" ]
+}
+assert 'release-verification job count matches its needs list' \
+    verification_count_matches_needs
+
+# sbom/snapshot.txt is sensitive to syft's cataloger set, so the PR gate and the
+# GA gate must scan with the same version or they disagree about the committed
+# baseline. Bumping one alone fails closed -- the tag goes red -- but that is
+# the drift this file exists to catch, and it is one assertion.
+syft_pins_agree() {
+    local a b
+    a=$(awk -F'"' '/SYFT_VERSION=/ { print $2; exit }' \
+        "$root/.github/workflows/ci-pr.yml")
+    b=$(awk -F'"' '/SYFT_VERSION=/ { print $2; exit }' \
+        "$root/.github/workflows/release-tag.yml")
+    # Each file must yield a pin AND they must match. Comparing a deduplicated
+    # set instead was satisfied by one file having no pin at all -- the
+    # remaining pin still made the set unique. Absence has to be checked
+    # separately from disagreement.
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" = "$b" ]
+}
+assert 'ci-pr.yml and release-tag.yml pin the same syft version' syft_pins_agree
 
 if ((failures)); then
     printf 'test-required-gates: %d case(s) failed\n' "$failures" >&2
