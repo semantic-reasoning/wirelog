@@ -127,6 +127,17 @@ provenance_of() {
         }'
 }
 
+# Symbols matching the emitter pattern, WHETHER OR NOT they carry a location.
+# provenance_of answers "where is it defined"; this answers "is it defined at
+# all", and #1305 turns on the difference.
+emitter_symbols() {
+    awk -F'\t' '
+        {
+            split($1, f, /[ \t]+/)
+            if (f[3] ~ /^_?wl_log_emit(\.[A-Za-z0-9_.]+)?$/) { print f[3] }
+        }'
+}
+
 check_provenance() {
     local nm_out prov
     if ! nm_out=$(nm --line-numbers --defined-only "$LIB" 2>/dev/null); then
@@ -150,8 +161,92 @@ check_provenance() {
     # output, the piped form exits 141.
     prov=$(provenance_of <<<"$nm_out")
     if [ -z "$prov" ]; then
-        echo "SKIP: no line-number information for wl_log_emit in $LIB (stripped or non-debug build); cannot verify provenance" >&2
-        return "$SKIP_EXIT"
+        # Three causes, and they are not equally benign. Distinguishing them is
+        # the whole of #1305: before this, all three printed the stripped-build
+        # message, so a library with 1,261 lines of line-number information and
+        # wl_log_emit renamed away was byte-identical to a genuinely stripped
+        # build.
+        local any_loc emitter_syms
+        any_loc=$(grep -cE ':[0-9]+$' <<<"$nm_out" || true)
+        emitter_syms=$(emitter_symbols <<<"$nm_out")
+
+        if [ "$any_loc" -eq 0 ]; then
+            # (1) No locations anywhere: the build cannot answer. Unchanged.
+            echo "SKIP: no line-number information for wl_log_emit in $LIB (stripped or non-debug build); cannot verify provenance" >&2
+            return "$SKIP_EXIT"
+        fi
+        if [ -n "$emitter_syms" ]; then
+            # (2a) The emitter IS defined; this listing gives it no location.
+            # That is all that is observable -- deliberately not narrated as
+            # "the library is intact", because a substituted log_testhook.c
+            # compiled without -g produces exactly this shape, and a comment
+            # telling the maintainer to stop looking would be the same sin this
+            # change removes from the branch above. Skip because there is
+            # nothing to verify against, not because nothing is wrong.
+            echo "SKIP: $LIB defines wl_log_emit but this listing carries no location for it; cannot verify provenance" >&2
+            echo "  symbol(s) found: $(tr '\n' ' ' <<<"$emitter_syms")" >&2
+            return "$SKIP_EXIT"
+        fi
+        # No emitter symbol at all. Whether that is evidence depends on
+        # whether the LOCAL symbol table survived, because wl_log_emit is a
+        # local ('t') symbol in this library.
+        local locals_present
+        # /^[tdbrns]$/, not any lowercase: nm prints ELF IFUNC as 'i' and
+        # unique-global as 'u' REGARDLESS of binding, so a GLOBAL ifunc survives
+        # strip -x and would read as a surviving local -- re-arming the false
+        # failure this branch exists to remove. Measured on a two-line ifunc
+        # library: after strip -x the only lowercase symbol left is 'i'. This
+        # project already builds with -mavx2/-msse4.2, so a CPU-dispatch ifunc
+        # is a plausible addition rather than a hypothetical.
+        locals_present=$(awk '$2 ~ /^[tdbrns]$/ { n++ } END { print n + 0 }' <<<"$nm_out")
+        if [ "$locals_present" -eq 0 ]; then
+            # (2c) No local symbols anywhere: the local symbol table was
+            # discarded, so a missing LOCAL wl_log_emit is not evidence of
+            # anything. This is reachable legitimately -- `strip -x` followed by
+            # `objcopy --add-gnu-debuglink` yields exactly this, because GNU nm
+            # takes the symbol list from the stripped file while resolving line
+            # numbers through the separate debug file. Measured: 96 symbols, 96
+            # locations, no locals, no emitter. Calling that tampering would be
+            # a false failure in the one gate that must not cry wolf.
+            # Accepted detection boundary, stated so nobody "tightens" it back
+            # into the false failure: an attacker who strips locals from a
+            # tampered library gets a skip rather than a failure. That is
+            # unavoidable -- a local symbol's absence genuinely proves nothing
+            # here -- and it is no weaker than branch (1) or the nm-empty exit
+            # above. The gate declines to answer instead of answering wrongly.
+            echo "SKIP: $LIB carries line-number information but no local symbols (locals stripped, e.g. strip -x with a separate debug file); wl_log_emit is local, so its absence is not evidence" >&2
+            return "$SKIP_EXIT"
+        fi
+        # (2b) Locations present, local symbols present, and still no emitter.
+        # The local table survived and the emitter is not in it, so something
+        # removed it specifically: a rename, a relink against a different
+        # translation unit, or a substitution. All three are what this gate
+        # exists to catch and all three need a human -- the same condition the
+        # unrecognized-provenance branch below answers with 1.
+        #
+        # This verdict does not rest on line-number quality. "No symbol matches
+        # the pattern, and locals are present" is a statement about the SYMBOL
+        # TABLE, which every nm vintage reports alike; the line table only
+        # establishes that the build could have answered, and misreading it
+        # under-detects DWARF, which downgrades this to a skip -- the safe
+        # direction.
+        echo "FAIL: $LIB carries line-number information but defines no wl_log_emit; the emitter has been renamed, relinked or removed" >&2
+        # At 2am the next question is "then what IS in there", so answer it.
+        # One awk, no pipeline. `grep | sort -u | head -8` fails two independent
+        # ways, both measured on this host: grep exits 1 when nothing matches
+        # (the common case here -- most libraries have no stray wl_log symbol),
+        # and sort is SIGPIPE-killed at 141 once head stops reading a large
+        # listing. pipefail surfaces either, and set -e then aborts before this
+        # message is printed -- silently costing the diagnostic this branch
+        # exists to give. Two mechanisms and a status that varies by tool is
+        # why the fix is removing the pipeline, not tolerating a code.
+        local nearby
+        nearby=$(awk '
+            { for (i = 1; i <= NF; i++)
+                  if ($i ~ /wl_log/ && !seen[$i]++ && n < 8) { out = out " " $i; n++ } }
+            END { print out }' <<<"$nm_out")
+        echo "  wl_log-like symbols present:${nearby:- (none)}" >&2
+        return 1
     fi
     case "$prov" in
         *log_testhook.c*)
