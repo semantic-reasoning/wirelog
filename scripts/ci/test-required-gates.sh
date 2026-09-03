@@ -130,21 +130,110 @@ assert 'ci-pr.yml SBOM step sets WIRELOG_SBOM_REQUIRED' \
 assert 'release-tag.yml Tag/SBOM sets WIRELOG_SBOM_REQUIRED' \
     sets_in_step release-tag.yml 'Build and test SBOM suite' WIRELOG_SBOM_REQUIRED
 
-# release-verification asserts a hardcoded job count against its own `needs:`
-# list. The two must agree: `join(needs.*.result)` silently yields fewer entries
-# when a job is dropped, and every remaining one could still be success -- so
-# the gate would pass having checked less than it names. That is the same
-# defect class the escalation above exists to close, one level up, and adding
-# the Tag/SBOM job to `needs:` without touching the count would have caused it.
+# release-verification must WAIT ON every verification job, not merely agree
+# with itself about how many there are. Comparing counts caught drift between
+# the `needs:` list and the hardcoded `-eq N`, but not the defect one level up:
+# a job never added to `needs:` at all. Reproduced -- a tenth job left out
+# entirely kept the whole suite green, and the release gate then passes without
+# ever consulting that job's result. Set equality kills that.
+#
+# It does NOT kill a trailing comma, despite an earlier version of this comment
+# claiming so: YAML reads `[a, b,]` as two elements, and both parsers below drop
+# the empty before comparing, so the two sets are identical. The trailing comma
+# is caught by the COUNT check instead, whose filter counts only non-empty
+# elements. Do not collapse the two assertions on the strength of the wrong
+# claim.
+#
+# awk, not a YAML parser -- see the note above `sets_in_step`: installing one
+# would skip this whole wiring half in CI, which is this file's own defect class.
+#
+# The job pattern is anchored at both ends. A substring match is not safe here:
+# an early draft of this very check enumerated jobs with `grep -v 'on:'` and
+# silently dropped `release-verification`, because its name ends in "on:". The
+# optional quotes accept both `"job":` and the single-quoted form (written
+# \047 because the awk program is itself single-quoted), which YAML admits on
+# the same footing; an unquoted-only
+# pattern would silently omit from the expected set -- the same silent-drop
+# shape one spelling over.
+#
+# The `on:` block is excluded by the in_jobs gate, not by appearing before
+# `jobs:`: any column-0 line clears it, so the exclusion is order-independent.
+release_tag_jobs() {
+    awk '
+        /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+        in_jobs && /^[^[:space:]]/ { in_jobs = 0 }
+        in_jobs && /^  ["\047]?[A-Za-z0-9_-]+["\047]?:[[:space:]]*$/ {
+            name = $0
+            sub(/^  /, "", name); sub(/:[[:space:]]*$/, "", name)
+            gsub(/["\047]/, "", name)
+            print name
+        }
+    ' "$root/.github/workflows/release-tag.yml"
+}
+
+# The three jobs that are legitimately absent from `needs:`, each for its own
+# reason -- listed by name so a future verification job cannot be exempted by a
+# pattern that happens to match it.
+#   validate-input       runs BEFORE the others; they all need it.
+#   release-verification is the gate itself.
+#   release-artifacts    runs AFTER the gate, gated on its result.
+needs_covers_every_verification_job() {
+    local expected actual
+    expected=$(release_tag_jobs \
+        | grep -vxE 'validate-input|release-verification|release-artifacts' \
+        | sort)
+    actual=$(awk '
+        /^  ["\047]?[A-Za-z0-9_-]+["\047]?:[[:space:]]*$/ { inside = 0 }
+        /^  release-verification:/ { inside = 1; next }
+        inside && /^    needs: \[/ {
+            line = $0
+            sub(/.*\[/, "", line); sub(/\].*/, "", line)
+            n = split(line, parts, /,/)
+            for (i = 1; i <= n; i++) {
+                gsub(/[[:space:]]/, "", parts[i])
+                if (parts[i] != "") print parts[i]
+            }
+            exit
+        }' "$root/.github/workflows/release-tag.yml" | sort)
+    if [ -z "$expected" ] || [ -z "$actual" ]; then
+        echo "  neither side may be empty: expected='$expected' actual='$actual'" >&2
+        return 1
+    fi
+    if [ "$expected" != "$actual" ]; then
+        local missing extra
+        missing=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+        extra=$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+        if [ -n "$missing" ]; then
+            echo "  jobs not gated by release-verification:" >&2
+            printf '%s\n' "$missing" | sed 's/^/    /' >&2
+            echo "  add them to its needs:, or to the exempt list in this file" \
+                 "if they are genuinely not verification jobs" >&2
+        fi
+        if [ -n "$extra" ]; then
+            echo "  in needs but not a job:" >&2
+            printf '%s\n' "$extra" | sed 's/^/    /' >&2
+        fi
+        return 1
+    fi
+}
+assert 'release-verification needs every verification job' \
+    needs_covers_every_verification_job
+
+# The hardcoded count must still track the list it counts.
 verification_count_matches_needs() {
-    local wf="$root/.github/workflows/release-tag.yml" needs_n asserted_n
+    local needs_n asserted_n wf="$root/.github/workflows/release-tag.yml"
     needs_n=$(awk '
         /^  release-verification:/ { inside = 1 }
         inside && /^    needs: \[/ {
             line = $0
             sub(/.*\[/, "", line); sub(/\].*/, "", line)
             n = split(line, parts, /,/)
-            print n
+            c = 0
+            for (i = 1; i <= n; i++) {
+                gsub(/[[:space:]]/, "", parts[i])
+                if (parts[i] != "") c++
+            }
+            print c
             exit
         }' "$wf")
     asserted_n=$(awk '
