@@ -47,6 +47,18 @@ expect_status() {
         failures=$((failures + 1))
     fi
 }
+# The negative form. Without it, asserting only that a message IS present
+# cannot rule out a second, contradictory message alongside it.
+refute_says() {
+    local name=$1 needle=$2
+    if grep -qF -e "$needle" "$tmp/out" "$tmp/err"; then
+        printf 'test-check-no-testhook: FAIL %s (unexpected %q in output)\n' "$name" "$needle" >&2
+        failures=$((failures + 1))
+    else
+        printf 'test-check-no-testhook: ok %s\n' "$name"
+    fi
+}
+
 expect_says() {
     local name=$1 needle=$2
     if grep -qF -e "$needle" "$tmp/out" "$tmp/err"; then
@@ -148,9 +160,22 @@ printf '0000000000001119 T wl_log_emit\t/build dir/wirelog/util/log_emit.c:42\n'
 expect_status 'a path containing spaces still resolves' 0 run "$clean_syms" "$spaced" --check=provenance
 
 # A longer symbol that merely starts with the name must not be mistaken for it.
+# This is shape 2b under #1305 -- the listing carries a location, and no symbol
+# matching the emitter pattern is defined -- so the verdict is 1, not the 77 it
+# was before. Assert the MESSAGE as well: after the flip the exit code alone no
+# longer distinguishes "the pattern correctly rejected _v2" from "the pattern
+# wrongly matched _v2 and found testhook provenance", which is what this case
+# exists to rule out.
 prefix="$tmp/prefix.txt"
-printf '0000000000001119 T wl_log_emit_v2\t/x/log_testhook.c:1\n' > "$prefix"
-expect_status 'a prefix symbol is not mistaken for wl_log_emit' 77 run "$clean_syms" "$prefix" --check=provenance
+# A local symbol is present so this is shape 2b (the local table survived and
+# the emitter is not in it), not 2c (locals stripped, absence proves nothing).
+# Real libraries have locals; without one this fixture would take the 2c skip
+# and stop testing what it names.
+printf '0000000000001119 T wl_log_emit_v2\t/x/log_testhook.c:1\n0000000000002220 t a_local\t/x/o.c:2\n' > "$prefix"
+expect_status 'a prefix symbol is not mistaken for wl_log_emit' 1 run "$clean_syms" "$prefix" --check=provenance
+expect_says 'and is reported as a missing emitter, not as testhook provenance' \
+    'defines no wl_log_emit'
+refute_says 'and does not claim provenance in log_testhook.c' 'originates from log_testhook.c'
 
 # --- independence (criterion 5) ---------------------------------------------
 # A provenance skip must not hide the leak check's real result, and a leak must
@@ -211,10 +236,116 @@ expect_status 'a GCC clone suffix resolves' 0 run "$clean_syms" "$clone" --check
 
 # ...but a different symbol that merely shares the prefix must not. The dot is
 # what separates a clone from an unrelated function.
+# Shape 2b as above, so 1 rather than 77, with the message carrying the proof.
 notclone="$tmp/notclone.txt"
-printf '0000000000001119 t wl_log_emit_v2\t/x/wirelog/util/log_testhook.c:1\n' > "$notclone"
-expect_status 'a prefix symbol is still not mistaken for a clone' 77 \
+printf '0000000000001119 t wl_log_emit_v2\t/x/wirelog/util/log_testhook.c:1\n0000000000002220 t a_local\t/x/o.c:2\n' > "$notclone"
+expect_status 'a prefix symbol is still not mistaken for a clone' 1 \
     run "$clean_syms" "$notclone" --check=provenance
+expect_says 'and reports a missing emitter' 'defines no wl_log_emit'
+refute_says 'and the clone rule did not match _v2 either' 'originates from log_testhook.c'
+
+# --- #1305: the three no-provenance shapes are distinguished --------------
+#
+# Before #1305 all three printed the stripped-build message, so a library with
+# 1,261 lines of line-number information and wl_log_emit renamed away was
+# byte-identical to a genuinely stripped build.
+#
+# (1) no locations anywhere -- the build cannot answer. SKIP 77.
+nodwarf="$tmp/nodwarf.txt"
+printf '0000000000001119 t wl_log_emit\n0000000000002220 T other_symbol\n' > "$nodwarf"
+expect_status 'no locations anywhere is the stripped-build skip' 77 \
+    run "$clean_syms" "$nodwarf" --check=provenance
+expect_says 'and names a stripped or non-debug build' 'stripped or non-debug build'
+
+# (2a) locations present, and the emitter IS defined but carries none. The
+# library is intact; the debug info is incomplete for one symbol. SKIP 77, but
+# it must not blame a strip that did not happen.
+partial="$tmp/partial.txt"
+printf '0000000000001119 t wl_log_emit\n0000000000002220 T other_symbol\t/x/other.c:9\n' > "$partial"
+expect_status 'emitter present without a location is a distinct skip' 77 \
+    run "$clean_syms" "$partial" --check=provenance
+expect_says 'and names the missing location, not a strip' 'carries no location for it'
+refute_says 'and does not blame a stripped build' 'stripped or non-debug build'
+
+# (2b) locations present, LOCAL SYMBOLS PRESENT, and still no symbol matching
+# the emitter pattern. The local table survived and the emitter is not in it, so
+# it was renamed, relinked or removed. FAIL 1. The locals precondition is what
+# separates this from (2c) below -- without it, a legitimately `strip -x`ed
+# library with a separate debug file would be failed as tampered.
+gone="$tmp/gone.txt"
+printf '0000000000002220 T other_symbol\t/x/other.c:9\n0000000000003330 t a_local\t/x/o.c:2\n' > "$gone"
+expect_status 'DWARF present with no emitter at all is a failure' 1 \
+    run "$clean_syms" "$gone" --check=provenance
+expect_says 'and says the emitter was renamed, relinked or removed' 'defines no wl_log_emit'
+refute_says 'and does not report it as a stripped build' 'stripped or non-debug build'
+
+# (2c) Locations present, but NO local symbols at all. wl_log_emit is local, so
+# its absence is not evidence. Reachable legitimately: `strip -x` plus
+# `objcopy --add-gnu-debuglink` produces exactly this under GNU nm -- measured
+# on a real library at 96 symbols, 96 locations, zero locals, no emitter. This
+# case is why (2b) is not simply "DWARF present and no emitter".
+nolocals="$tmp/nolocals.txt"
+printf '0000000000002220 T other_symbol\t/x/other.c:9\n0000000000003330 T third\t/x/third.c:4\n' > "$nolocals"
+expect_status 'no local symbols is a skip, not a missing emitter' 77 \
+    run "$clean_syms" "$nolocals" --check=provenance
+expect_says 'and says why the absence is not evidence' 'not evidence'
+refute_says 'and does not accuse a rename' 'renamed, relinked or removed'
+
+# A GLOBAL ifunc must not be counted as a surviving local. GNU nm prints ELF
+# IFUNC as 'i' and unique-global as 'u' regardless of binding, and a global
+# ifunc survives `strip -x` -- measured on a real two-line ifunc library, where
+# 'i' is the ONLY lowercase symbol left after stripping. Counting it as a local
+# would re-arm the false failure (2c) exists to remove, on a project that
+# already builds with -mavx2/-msse4.2 and could plausibly add CPU dispatch.
+ifunc="$tmp/ifunc.txt"
+printf '0000000000002220 T other_symbol\t/x/other.c:9\n0000000000003330 i dispatched\t/x/i.c:2\n' > "$ifunc"
+expect_status 'a global ifunc does not count as a surviving local' 77 \
+    run "$clean_syms" "$ifunc" --check=provenance
+expect_says 'and is reported as locals stripped' 'no local symbols'
+
+# emitter_symbols must recognise the same shapes provenance_of does, or a
+# legitimate build flips from skip to failure. /tmp/b-err in this repo defines
+# ONLY wl_log_emit.constprop.0 and no plain wl_log_emit, so the clone
+# alternation is load-bearing, not decorative.
+clone_noloc="$tmp/clone_noloc.txt"
+printf '0000000000001119 t wl_log_emit.constprop.0\n0000000000002220 T other\t/x/other.c:9\n' > "$clone_noloc"
+expect_status 'an unlocated clone is 2a, not a missing emitter' 77 \
+    run "$clean_syms" "$clone_noloc" --check=provenance
+refute_says 'and the clone is not reported as removed' 'renamed, relinked or removed'
+
+macho_noloc="$tmp/macho_noloc.txt"
+printf '0000000000001119 t _wl_log_emit\n0000000000002220 T other\t/x/other.c:9\n' > "$macho_noloc"
+expect_status 'an unlocated Mach-O _wl_log_emit is 2a' 77 \
+    run "$clean_syms" "$macho_noloc" --check=provenance
+refute_says 'and the Mach-O form is not reported as removed' 'renamed, relinked or removed'
+
+# The 2b diagnostic must survive a large listing. Without this the `nearby`
+# computation could regress to a pipeline -- which fails on exactly this input
+# and prints nothing -- and no case would notice.
+bigb="$tmp/bigb.txt"
+{
+    printf '0000000000002220 T other_symbol\t/x/other.c:9\n'
+    i=0
+    while [ "$i" -lt 9000 ]; do
+        printf '00000000000%05d t wl_log_filler_%d\t/x/f.c:%d\n' "$i" "$i" "$i"
+        i=$((i + 1))
+    done
+} > "$bigb"
+# The point is sort's OUTPUT exceeding the 64 KB pipe buffer, not the fixture's
+# size, so guard it: shortening the filler names would make this pass vacuously
+# while no longer exercising the regression it exists to catch.
+bigb_sorted_bytes=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /wl_log/) n += length($i) + 1 } END { print n + 0 }' "$bigb")
+if [ "$bigb_sorted_bytes" -lt 100000 ]; then
+    printf 'test-check-no-testhook: FAIL 2b fixture too small (%s bytes of matches; need >100000 to clear the pipe buffer)\n' \
+        "$bigb_sorted_bytes" >&2
+    failures=$((failures + 1))
+else
+    printf 'test-check-no-testhook: ok the 2b fixture is large enough to exercise the pipe buffer\n'
+fi
+expect_status 'a large listing with no emitter still fails' 1 \
+    run "$clean_syms" "$bigb" --check=provenance
+expect_says 'and still lists the wl_log-like symbols it did find' \
+    'wl_log-like symbols present'
 
 # A tab-separated trailing field that is not a file:line must not be taken as a
 # location; without the :<line> guard this would be reported as provenance.
