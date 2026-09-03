@@ -331,10 +331,56 @@ jobs:
       ref: ${{ inputs.tag_ref || github.ref_name }}
       expected_sha: ${{ inputs.expected_sha || github.sha }}
 
+  sbom:
+    name: Tag / SBOM
+    needs: [validate-input]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG_REF }}
+          fetch-depth: 0
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build jq
+          # Must match ci-pr.yml's pin: sbom/snapshot.txt is sensitive to the
+          # syft cataloger set, so two versions would disagree about the
+          # baseline. test-required-gates.sh asserts they are equal.
+          SYFT_VERSION="1.50.0"
+          curl -sSfL \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin syft
+      # WIRELOG_SBOM_REQUIRED=1 for the same reason the ABI job sets its own:
+      # syft is installed directly above, so a skip here means something is
+      # wrong rather than unavailable, and a gate that skips asserts nothing.
+      #
+      # What was actually broken, stated precisely because #1337 got it wrong:
+      # the sbom tests DID run on every tag -- `Tag / default` invokes
+      # `meson test` with no --suite filter -- but syft is not installed there,
+      # so check-sbom-snapshot.sh took its skip route, exited 77, and the job
+      # stayed green. The gate was invoked and asserted nothing. So the
+      # published artifact's dependency claim rested on whichever PR last ran
+      # the gate for real, not on the tag.
+      #
+      # A smaller fix existed: install syft and set the variable on the
+      # existing `default` job. A dedicated job is preferred anyway -- it
+      # mirrors Tag / ABI, gives the release a named check that can be read
+      # off the run list, and keeps a 29 MB fetch off the full-build job.
+      # scripts/ci/test-required-gates.sh asserts this line still exists.
+      - name: Build and test SBOM suite
+        env:
+          WIRELOG_SBOM_REQUIRED: '1'
+        run: |
+          meson setup build-sbom -Dtests=true --buildtype=debug
+          meson test -C build-sbom --suite sbom --print-errorlogs
+
   release-verification:
     name: Tag / release verification gate
     if: ${{ always() }}
-    needs: [default, abi, perf, fuzz, mbedtls, sanitizers, upgrade, downstream]
+    needs: [default, abi, sbom, perf, fuzz, mbedtls, sanitizers, upgrade, downstream]
     runs-on: ubuntu-latest
     steps:
       - name: Require every tagged verification job
@@ -343,7 +389,11 @@ jobs:
         run: |
           echo "verification results: $RESULTS"
           IFS=',' read -ra statuses <<< "$RESULTS"
-          test "${#statuses[@]}" -eq 8
+          # Count must track `needs:` above. It is asserted rather than derived
+          # because `join(needs.*.result)` silently yields fewer entries if a
+          # job is removed, and every remaining one could still be success --
+          # the gate would pass having checked less than it names.
+          test "${#statuses[@]}" -eq 9
           for result in "${statuses[@]}"; do
             test "$result" = success
           done
