@@ -66,7 +66,13 @@ done
 snapshot_shas=$(sed -n 's/^# nanoarrow-resolved-sha:[[:space:]]*\([0-9a-fA-F]\{7,\}\).*/\1/p' \
     "$snapshot")
 wrap_shas=$(awk '
-    /^[[:space:]]*\[/ { in_git = ($0 ~ /^[[:space:]]*\[wrap-git\][[:space:]]*$/) ; next }
+    # No end anchor on the header: configparser matches section headers by
+    # PREFIX, so `[wrap-git]  # the pin` is a legal header meson resolves. An
+    # anchored pattern rejected it and hard-failed with "no hex revision under
+    # [wrap-git]" when one was plainly there. check-wrap-revisions.sh had the
+    # mirror-image bug for the same spelling and passed VACUOUSLY; the two gates
+    # must agree on what a section header is (#1343).
+    /^[[:space:]]*\[/ { in_git = ($0 ~ /^[[:space:]]*\[wrap-git\]/) ; next }
     in_git && /^[[:space:]]*revision[[:space:]]*=/ {
         line = $0
         sub(/^[[:space:]]*revision[[:space:]]*=[[:space:]]*/, "", line)
