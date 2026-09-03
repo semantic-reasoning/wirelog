@@ -16,14 +16,35 @@ set -euo pipefail
 # where 77 fails the job.  Do not invoke this from one.
 SKIP_EXIT=77
 
+# A skip is visible but not fatal: a gate that skips on every run asserts
+# nothing, it is merely yellow instead of green. WIRELOG_SBOM_REQUIRED=1 turns
+# every MISSING-PREREQUISITE skip route into a failure, for the one job where
+# this gate must actually enforce. This gate has exactly one skip route --
+# syft absent -- and it is escalated; the ABI gates additionally carry
+# platform- and policy-scope skips that are deliberately excluded there.
+# Default unset, so the gate stays advisory everywhere else. Same shape as
+# WIRELOG_TIDY_REQUIRED in check-clang-tidy-backlog-monotonic.sh. (#1303)
+# Routed through one helper rather than escalating each site: a later skip
+# added straight to `exit "$SKIP_EXIT"` would silently opt out of the
+# escalation, which is the defect class this issue exists to close.
+#
+skip() {
+    if [ "${WIRELOG_SBOM_REQUIRED:-0}" = "1" ]; then
+        echo "check-sbom-snapshot: FAIL: $*" \
+             "(WIRELOG_SBOM_REQUIRED=1 forbids skipping)" >&2
+        exit 1
+    fi
+    echo "check-sbom-snapshot: SKIP: $*"
+    exit "$SKIP_EXIT"
+}
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 baseline="$repo_root/sbom/snapshot.txt"
 
 # SKIP if syft not available
 if ! command -v syft >/dev/null 2>&1; then
-    echo "check-sbom-snapshot: SKIP: syft not on PATH" >&2
-    exit "$SKIP_EXIT"
+    skip "syft not on PATH"
 fi
 
 # NOT a skip: the baseline is committed, so its absence means deletion.
