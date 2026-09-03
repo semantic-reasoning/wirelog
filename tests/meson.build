@@ -1053,6 +1053,20 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #1339: the snapshot records which nanoarrow commit it described, and
+# the wrap declares which one the build resolves. Nothing compared them, and the
+# snapshot's own diff structurally cannot -- nanoarrow@0.9.0.9000 is a
+# development version constant across the window, so a wrap bump leaves the
+# package line byte-identical. Registered separately from sbom_snapshot because
+# it needs no syft: folding it in would make it skip whenever syft is absent,
+# for a reason that does not apply to comparing two committed files.
+if sh.found()
+  test('sbom_wrap_pin', sh,
+       args: [meson.project_source_root() / 'scripts/ci/check-sbom-wrap-pin.sh',
+              meson.project_source_root()],
+       suite: 'sbom')
+endif
+
 # Issue #1297: the perf gate's dataset manifest embedded the directory the
 # operator passed, so relative, absolute and trailing-slash spellings of one
 # directory produced three different hashes -- reported as if the dataset had
