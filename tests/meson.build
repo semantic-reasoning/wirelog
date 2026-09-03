@@ -907,6 +907,18 @@ if host_machine.system() == 'linux' and sh.found()
        suite: 'abi')
 endif
 
+# Issue #1303: the WIRELOG_*_REQUIRED escalation. Half of this asserts gate
+# behaviour, half asserts the workflows still set the variable -- without the
+# second half the escalation can be deleted from a workflow while every
+# behavioural assertion keeps passing, which is the silent downgrade the issue
+# exists to close.
+if sh.found()
+  test('required_gates', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-required-gates.sh',
+              meson.project_source_root()],
+       suite: 'abi')
+endif
+
 # Issue #1272: the release upgrade matrix must prove the consumer loaded the
 # libraries this release installs, not whatever the host had installed.  The
 # matrix itself only runs on a release tag, so this self-test is the only

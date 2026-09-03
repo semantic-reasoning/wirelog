@@ -235,7 +235,14 @@ jobs:
             "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
             | tar -xz -C /usr/local/bin syft
 
+      # WIRELOG_SBOM_REQUIRED=1: syft is installed by the step above, and this
+      # is the ONLY place it is. Everywhere else check-sbom-snapshot.sh skips
+      # because syft is absent, which is correct there and useless here -- a
+      # gate that skips on every run asserts nothing.
+      # scripts/ci/test-required-gates.sh asserts this line still exists (#1303).
       - name: SBOM snapshot gate
+        env:
+          WIRELOG_SBOM_REQUIRED: '1'
         run: |
           meson test -C builddir --suite sbom --print-errorlogs || {
             echo "=== SBOM gate failed. Generating debug info..."

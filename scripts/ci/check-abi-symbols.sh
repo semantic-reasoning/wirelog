@@ -48,6 +48,28 @@ set -euo pipefail
 # where 77 fails the job.  Do not invoke this from one.
 SKIP_EXIT=77
 
+# A skip is visible but not fatal: a gate that skips on every run asserts
+# nothing, it is merely yellow instead of green. WIRELOG_ABI_REQUIRED=1 turns
+# every MISSING-PREREQUISITE skip route into a failure, for the one job where
+# this gate must actually enforce. Platform- and policy-scope skips are
+# deliberately excluded and annotated at their sites: escalating those would
+# assert "this job must not run here", a different claim. Default unset, so
+# the gate stays advisory everywhere else. Same shape as WIRELOG_TIDY_REQUIRED
+# in check-clang-tidy-backlog-monotonic.sh. (#1303) Routed through one helper
+# rather than escalating each site: a later skip added straight to `exit
+# "$SKIP_EXIT"` would silently opt out of the escalation, which is the defect
+# class this issue exists to close.
+#
+skip() {
+    if [ "${WIRELOG_ABI_REQUIRED:-0}" = "1" ]; then
+        echo "check-abi-symbols: FAIL: $*" \
+             "(WIRELOG_ABI_REQUIRED=1 forbids skipping)" >&2
+        exit 1
+    fi
+    echo "check-abi-symbols: SKIP: $*"
+    exit "$SKIP_EXIT"
+}
+
 if [ $# -lt 1 ]; then
     echo "usage: $0 <build_root>" >&2
     exit 1
@@ -60,6 +82,12 @@ allowlist="$repo_root/abi/libwirelog-1.0.symbols"
 
 case "$(uname -s)" in
   MSYS*|MINGW*|CYGWIN*)
+    # Deliberately NOT routed through skip(): this is a PLATFORM SCOPE
+    # decision, not a missing prerequisite. WIRELOG_ABI_REQUIRED exists to say
+    # "this job must actually check the ABI", and escalating here would instead
+    # say "this job must not run on Windows" -- a different claim, and a false
+    # failure if the required job ever moves. The job that sets it is
+    # ubuntu-latest, so this branch cannot fire there today either way. (#1303)
     echo "check-abi-symbols: SKIP: Windows POSIX layer ($(uname -s)) detected" >&2
     exit "$SKIP_EXIT"
     ;;
@@ -80,9 +108,8 @@ for candidate in \
 done
 
 if [ -z "$lib" ]; then
-    echo "check-abi-symbols: SKIP: libwirelog.so not found in $build_root" >&2
-    echo "  (expected on Windows / static-only / cross builds)" >&2
-    exit "$SKIP_EXIT"
+    skip "libwirelog.so not found in $build_root" \
+         "(expected on Windows / static-only / cross builds)"
 fi
 
 if [ ! -f "$allowlist" ]; then

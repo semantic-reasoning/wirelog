@@ -32,7 +32,16 @@ expect_status() {
     local name=$1 want=$2 got=0
     shift 2
     last_case=$name
-    "$@" >"$tmp/out" 2>"$tmp/err" || got=$?
+    # Unset the #1303 escalation variables. This file asserts that gates SKIP
+    # (77) where they cannot check, and release-tag.yml sets
+    # WIRELOG_ABI_REQUIRED=1 for a whole STEP that runs `meson test --suite abi`
+    # -- which is this test as well as the two gates the variable is aimed at.
+    # Without this, the Tag / ABI job goes red on every release tag: measured,
+    # both abi assertions below returned 1 instead of 77. The escalation's own
+    # behaviour is covered by test-required-gates.sh, which sets the variables
+    # deliberately rather than inheriting them.
+    ( unset WIRELOG_ABI_REQUIRED WIRELOG_SBOM_REQUIRED
+      "$@" ) >"$tmp/out" 2>"$tmp/err" || got=$?
     if [[ "$got" == "$want" ]]; then
         printf 'test-gate-skip-exit-codes: ok %s\n' "$name"
     else

@@ -83,7 +83,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y meson ninja-build abigail-tools b3sum
+      # WIRELOG_ABI_REQUIRED=1: this is the GA ABI gate, and a gate that skips
+      # asserts nothing. abigail-tools is installed above, so abidiff is present
+      # here and a skip means something is wrong rather than unavailable.
+      # Advisory (unset) everywhere else, where abidiff genuinely is absent.
+      # scripts/ci/test-required-gates.sh asserts this line still exists (#1303).
       - name: Build and test ABI suite
+        env:
+          WIRELOG_ABI_REQUIRED: '1'
         run: |
           meson setup build-abi -Dtests=true --buildtype=debug
           meson compile -C build-abi

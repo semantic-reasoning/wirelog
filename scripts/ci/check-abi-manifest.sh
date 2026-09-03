@@ -51,6 +51,28 @@ set -euo pipefail
 # where 77 fails the job.  Do not invoke this from one.
 SKIP_EXIT=77
 
+# A skip is visible but not fatal: a gate that skips on every run asserts
+# nothing, it is merely yellow instead of green. WIRELOG_ABI_REQUIRED=1 turns
+# every MISSING-PREREQUISITE skip route into a failure, for the one job where
+# this gate must actually enforce. Platform- and policy-scope skips are
+# deliberately excluded and annotated at their sites: escalating those would
+# assert "this job must not run here", a different claim. Default unset, so
+# the gate stays advisory everywhere else. Same shape as WIRELOG_TIDY_REQUIRED
+# in check-clang-tidy-backlog-monotonic.sh. (#1303) Routed through one helper
+# rather than escalating each site: a later skip added straight to `exit
+# "$SKIP_EXIT"` would silently opt out of the escalation, which is the defect
+# class this issue exists to close.
+#
+skip() {
+    if [ "${WIRELOG_ABI_REQUIRED:-0}" = "1" ]; then
+        echo "check-abi-manifest: FAIL: $*" \
+             "(WIRELOG_ABI_REQUIRED=1 forbids skipping)" >&2
+        exit 1
+    fi
+    echo "check-abi-manifest: SKIP: $*"
+    exit "$SKIP_EXIT"
+}
+
 if [ $# -lt 1 ]; then
     echo "usage: $0 <build_root>" >&2
     exit 1
@@ -73,15 +95,13 @@ for candidate in \
 done
 
 if [ -z "$lib" ]; then
-    echo "check-abi-manifest: SKIP: libwirelog.so not found in $build_root" >&2
-    echo "  (expected on Windows / static-only / cross builds)" >&2
-    exit "$SKIP_EXIT"
+    skip "libwirelog.so not found in $build_root" \
+         "(expected on Windows / static-only / cross builds)"
 fi
 
 if ! command -v abidiff >/dev/null 2>&1; then
-    echo "check-abi-manifest: SKIP: abidiff not on PATH" >&2
-    echo "  install libabigail (Ubuntu: apt-get install -y abigail-tools)" >&2
-    exit "$SKIP_EXIT"
+    skip "abidiff not on PATH;" \
+         "install libabigail (Ubuntu: apt-get install -y abigail-tools)"
 fi
 
 # Not a skip: abi/libwirelog-1.0.abi.json is committed, so its absence means
@@ -110,6 +130,11 @@ if [ "$host_arch" != "x86_64" ]; then
     echo "  issue #824 scopes v1.0 Linux arm64 ABI coverage to" >&2
     echo "  abi/libwirelog-1.0.symbols; per-arch libabigail baselines" >&2
     echo "  require a separate post-v1.0 policy and regeneration flow." >&2
+    # Deliberately NOT routed through skip(): #824 scopes v1.0 arm64 coverage
+    # out on purpose, so this is a policy decision rather than a missing
+    # prerequisite. Escalating it under WIRELOG_ABI_REQUIRED would turn "check
+    # the ABI" into "do not run on arm64" and fail a legitimately out-of-scope
+    # architecture. The job that sets the variable is ubuntu-latest. (#1303)
     exit "$SKIP_EXIT"
 fi
 
