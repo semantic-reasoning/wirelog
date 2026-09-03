@@ -77,7 +77,14 @@ check() {
 # that is already clean. Listing the clean ones is the point: the backstop then
 # guards them against acquiring the defect, which a list of only the broken ones
 # could not do.
+# check-sbom-wrap-pin.sh (#1339) is listed here although it has no skip route
+# today. Exempting it was the first instinct and it inverts this file's own
+# rule: EXEMPT is for gates where exit 77 would be WRONG, not for gates that
+# merely do not skip. Listing an already-clean gate is exactly the point --
+# the backstop then guards it against ACQUIRING the defect. Measured with a
+# `SKIP ...; exit 0` injected into it: EXEMPT passed, COVERED failed by name.
 COVERED="
+check-sbom-wrap-pin.sh
 check-abi-manifest.sh
 check-abi-symbols.sh
 check-abi-symbols-locale.sh
