@@ -66,9 +66,12 @@ build_tree() {
     # build_tree runs inside a command substitution and this script does not
     # set inherit_errexit, so a failing *external* command does not abort it
     # the way the previous inline `exit` did -- and the redirection truncates
-    # $owned regardless. Without the explicit `|| exit 1` the derivation could
-    # fail, leave an empty set, and have every installed library reported
-    # missing below: a real failure reported as the wrong one.
+    # $owned regardless. The `|| exit 1` makes the derivation's own diagnostic
+    # the one that surfaces. It is belt-and-braces, not load-bearing: the
+    # `-s` guard on the next line already catches an empty set, so the
+    # every-library-reported-missing outcome is unreachable while that guard
+    # sits there. Keep both -- the first names the cause, the second is the
+    # backstop if the first is ever relaxed.
     local owned="$tmp/owned-$name.txt"
     "$root/scripts/release/derive-owned-sonames.sh" "$build" >"$owned" || exit 1
     [[ -s "$owned" ]] || {
@@ -93,20 +96,43 @@ build_tree() {
     # installed -- but nothing here proves it: the check below is comm -13,
     # which establishes installed-subset-of-owned, and the reverse would need
     # comm -23.
-    local libdir installed missing
+    local libdir missing
     libdir=$(dirname "$lib")
-    installed=$(find "$libdir" -maxdepth 1 ! -type d \
-        \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print |
-        sed 's|.*/||' |
-        { grep -E '\.(so|dylib)(\.[0-9]+)*$' || true; } |
-        LC_ALL=C sort -u)
+    # Call the extracted derivation rather than re-inlining its classifier.
+    # This scan and derive-owned-sonames.sh must agree on what counts as a
+    # library, and a second copy here would be exactly the untested,
+    # release-only duplicate that #1285 exists to remove -- if the two drifted,
+    # the cross-check below would raise false accusations on a path that runs
+    # only at release time.
+    #
+    # No -maxdepth, matching the derivation's own rule for the same reason: a
+    # library installed under a subdirectory of libdir would otherwise be
+    # invisible here, which is the silent-drop shape this cross-check exists to
+    # catch.
+    #
+    # `|| exit 1`, not `|| true`: an empty result here is not tolerable, it is
+    # IMPOSSIBLE. libdir is dirname("$lib") and $lib is the installed
+    # libwirelog located above, so the directory provably holds at least one
+    # shared library. The only way this yields nothing is a real failure, and
+    # swallowing it would add a silent-pass route to the check whose whole job
+    # is to prevent silent passes. Nothing guards an empty `installed` -- the
+    # `-s` guard above is on $owned, the build side.
+    #
+    # Materialized to a file rather than a variable so comm reads it directly:
+    # `printf '%s\n' "$installed"` on an empty value feeds comm a blank line,
+    # which it reports as only-in-file-2 and the substitution then strips --
+    # right by accident rather than by design. And `|| exit 1` on comm rather
+    # than `|| true`: comm fails only on error or unsorted input here, never on
+    # a legitimate difference, so it cannot cause a false failure.
+    local installed_file="$tmp/installed-$name.txt"
+    "$root/scripts/release/derive-owned-sonames.sh" "$libdir" >"$installed_file" || exit 1
     # LC_ALL=C on comm as well as on the sorts: comm respects LC_COLLATE, so
     # with C-sorted inputs and an en_US comparison it reports spurious
     # differences and warns "file 2 is not in sorted order" -- accusing the
     # derivation of a bug that does not exist. Latent while every library
     # basename here is collation-invariant, live the day a hyphenated one
     # appears (#1291, #1294).
-    missing=$(LC_ALL=C comm -13 "$owned" <(printf '%s\n' "$installed") || true)
+    missing=$(LC_ALL=C comm -13 "$owned" "$installed_file") || exit 1
     if [[ -n "$missing" ]]; then
         {
             echo "upgrade matrix: $name installs shared libraries the owned-soname set does not name:"

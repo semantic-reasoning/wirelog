@@ -10,8 +10,11 @@
 # usage: derive-owned-sonames.sh BUILD_DIR
 #
 # Prints one basename per line, LC_ALL=C sorted and de-duplicated. Exits 1 if
-# the tree yields none -- an empty set would make the closure check vacuous,
-# since no loaded library could ever match it.
+# the tree yields none. Not because that would otherwise go unnoticed --
+# check-shared-library-closure.sh and run-upgrade-matrix.sh each carry their own
+# `-s` guard, both predating this script -- but because failing at the point of
+# derivation names the real cause, where the downstream guards can only report
+# that the set was empty by the time they saw it.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then

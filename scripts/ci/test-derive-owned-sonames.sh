@@ -9,29 +9,10 @@
 # milliseconds.
 set -euo pipefail
 
-# meson hands this script a native path; on Windows that is a drive-letter path
-# bash cannot use. See bb4ca712 for the same fix on the downstream self-test.
-normalize_root() {
-    local supplied=$1
-    case "$supplied" in
-        [[:alpha:]]:[\\/]* )
-            if ! command -v cygpath >/dev/null 2>&1; then
-                echo "derive-owned-sonames self-test: cygpath is required to normalize Windows root: $supplied" >&2
-                return 2
-            fi
-            if ! supplied=$(cygpath -u -- "$supplied"); then
-                echo "derive-owned-sonames self-test: cygpath could not normalize Windows root: $supplied" >&2
-                return 2
-            fi
-            ;;
-    esac
-    printf '%s\n' "$supplied"
-}
-
+# No Windows path normalization: tests/meson.build gates this test to Linux
+# (see the two reasons recorded there), so the drive-letter form the sibling
+# test-downstream-matrix.sh handles cannot reach here.
 root=${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
-if (($#)); then
-    root=$(normalize_root "$root")
-fi
 derive="$root/scripts/release/derive-owned-sonames.sh"
 [[ -x "$derive" ]] || {
     echo "derive-owned-sonames self-test: not executable: $derive" >&2
@@ -86,9 +67,17 @@ mkdir -p "$build/subprojects/other"
 expected=$'libnanoarrow.so\nlibwirelog.1.dylib\nlibwirelog.so\nlibwirelog.so.0\nlibwirelog.so.0.60.0'
 actual=$("$derive" "$build")
 
-[[ "$actual" == "$expected" ]]
-check "derives exactly the library names, sorted" $?
-if [[ "$actual" != "$expected" ]]; then
+# `status=...; check` rather than a bare `[[ ]]` followed by `check $?`: under
+# errexit a standalone `[[ ]]` aborts the script on failure, so the FAIL line
+# and the diagnostic below it never printed and the remaining cases never ran.
+# Measured -- with the derivation mutated, this file exited 1 having produced
+# NO output at all. Worse on the platform that matters: bash 3.2 does not apply
+# errexit there, and tests/meson.build gates this test to Linux, so the
+# diagnostics were dead exactly where they run.
+headline_status=0
+[[ "$actual" == "$expected" ]] || headline_status=1
+check "derives exactly the library names, sorted" "$headline_status"
+if [[ "$headline_status" != 0 ]]; then
     printf 'expected:\n%s\ngot:\n%s\n' "$expected" "$actual" >&2
 fi
 
@@ -109,8 +98,9 @@ dedupes() { [[ "$(printf '%s\n' "$actual" | grep -cx 'libnanoarrow.so')" == 1 ]]
 assert 'a basename appearing twice is emitted once' dedupes
 
 # A tree with no shared libraries must fail rather than emit an empty set: an
-# empty set makes the closure check vacuous, because no loaded library can
-# match it.
+# empty set is also caught by the `-s` guards in
+# check-shared-library-closure.sh and run-upgrade-matrix.sh, so this asserts the
+# derivation names the cause itself rather than deferring to them.
 empty="$tmp/empty"
 mkdir -p "$empty/subprojects"
 : >"$empty/README"
@@ -128,11 +118,19 @@ assert 'a tree of only by-products fails' byproducts_fail
 # Locale independence: the output feeds a comparison, so its order must not
 # depend on the operator (#1291).
 locale_name=""
+# Read the list once, then test membership without a pipeline. `locale -a |
+# grep -Fxq` would be a SIGPIPE-under-pipefail hazard, and the failure mode is
+# the bad one: this is an `if` CONDITION, so errexit does not apply and a
+# SIGPIPE would merely make it false -- silently taking the else branch and
+# printing `ok locale (en_US absent, skipped)` while dropping both locale
+# assertions. Stopping-to-assert-while-reporting-PASS is the exact shape this
+# whole change exists to prevent. Measured threshold is far above any real
+# locale list, so this is prevention, not a live fix.
+available_locales=$(locale -a 2>/dev/null || true)
 for candidate in en_US.utf8 en_US.UTF-8; do
-    if locale -a 2>/dev/null | grep -Fxq "$candidate"; then
-        locale_name=$candidate
-        break
-    fi
+    case $'\n'"$available_locales"$'\n' in
+        *$'\n'"$candidate"$'\n'*) locale_name=$candidate; break ;;
+    esac
 done
 if [[ -n "$locale_name" ]]; then
     # A colliding pair: en_US ignores the hyphen, so libmethod-modifier sorts
@@ -157,10 +155,22 @@ else
     printf 'derive-owned-sonames self-test: ok locale (en_US absent, skipped)\n'
 fi
 
-missing_arg() { ! "$derive" >/dev/null 2>&1; }
-assert 'no argument exits non-zero' missing_arg
-bad_dir() { ! "$derive" "$tmp/does-not-exist" >/dev/null 2>&1; }
-assert 'a missing build directory exits non-zero' bad_dir
+# Assert the SPECIFIC outcome, not merely non-zero. `! "$derive"` passed even
+# with the argument check or the -d check deleted, because `set -u` and the
+# empty-set guard produce a non-zero exit by other routes -- the cases held
+# while pinning nothing they named.
+usage_exit_2() { local st=0; "$derive" >/dev/null 2>&1 || st=$?; [[ "$st" == 2 ]]; }
+assert 'no argument exits 2 (usage), distinct from a derivation failure' usage_exit_2
+
+# Deliberately not `"$derive" ... | grep -q`: derive exits 1 by design here, and
+# pipefail would make the function fail even when grep matched -- the same trap
+# as the locale probe above.
+bad_dir_names_itself() {
+    local msg
+    msg=$("$derive" "$tmp/does-not-exist" 2>&1 || true)
+    [[ "$msg" == *'not a directory'* ]]
+}
+assert 'a missing build directory names itself, not an empty tree' bad_dir_names_itself
 
 if ((failures)); then
     printf 'derive-owned-sonames self-test: %d case(s) failed\n' "$failures" >&2
