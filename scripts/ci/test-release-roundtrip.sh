@@ -346,6 +346,20 @@ assert 'an archive whose name contains a space verifies' \
 assert 'a name containing a literal backslash-n verifies' \
     verifies_awkward_name 'a\nb.tar.gz' backslash_n
 
+# A terminal newline is the one basename shape command substitution cannot
+# preserve. Generate both manifests with the real coreutils so this exercises
+# the complete reader path rather than a hand-written name.
+terminal_newline_name() {
+    local name=$'trailing\n' dir="$escaping_dir/terminal-newline"
+    mkdir -p "$dir"
+    printf 'payload' >"$dir/$name"
+    ( cd "$dir" && sha256sum -- "$name" >"$name.sha256" &&
+      b3sum -- "$name" >"$name.blake3" )
+    "$vr" "$dir/$name" "$dir/$name.sha256" "$dir/$name.blake3" \
+        >/dev/null 2>&1
+}
+assert 'an archive whose name ends in a newline verifies' terminal_newline_name
+
 # --- #1316: make-tarball.sh's manifest-writing hardening ----------------------
 #
 # Three hardenings, each with its own fixture, because a fixture that passes

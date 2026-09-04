@@ -133,7 +133,9 @@ command -v b3sum >/dev/null || { echo 'b3sum is required' >&2; exit 1; }
 # whose real target was tampered. Measured. In the only script third parties
 # run to detect tampering, that is the wrong direction to be wrong in.
 archive_dir=$(CDPATH= cd -P -- "$(dirname -- "$archive")" && pwd -P)
-archive_name=$(basename -- "$archive")
+# Parameter expansion preserves a terminal newline; command substitution around
+# basename would strip it before the manifest-name comparison.
+archive_name=${archive##*/}
 # Compare against the ESCAPED form of the expected name rather than unescaping
 # the manifest's. GNU coreutils escapes exactly three characters in a name --
 # backslash as `\\`, newline as `\n`, carriage return as `\r` -- and marks the
