@@ -66,7 +66,21 @@ done
 snapshot_shas=$(sed -n 's/^# nanoarrow-resolved-sha:[[:space:]]*\([0-9a-fA-F]\{7,\}\).*/\1/p' \
     "$snapshot")
 wrap_shas=$(awk '
-    /^[[:space:]]*\[/ { in_git = ($0 ~ /^[[:space:]]*\[wrap-git\][[:space:]]*$/) ; next }
+    # Derive the section name through the last `]`, as ConfigParser greedy
+    # SECTCRE does. This accepts `[wrap-git]  # the pin` but does not mistake
+    # `[wrap-git] [other]` for the `wrap-git` section. The two gates must agree
+    # on the parser section-name semantics (#1343).
+    function section_name(line, i, last) {
+        sub(/^[[:space:]]*/, "", line)
+        if (substr(line, 1, 1) != "[") return ""
+        last = 0
+        for (i = length(line); i > 0; i--) {
+            if (substr(line, i, 1) == "]") { last = i; break }
+        }
+        if (last < 3) return ""
+        return substr(line, 2, last - 2)
+    }
+    /^[[:space:]]*\[/ { in_git = (section_name($0) == "wrap-git") ; next }
     in_git && /^[[:space:]]*revision[[:space:]]*=/ {
         line = $0
         sub(/^[[:space:]]*revision[[:space:]]*=[[:space:]]*/, "", line)

@@ -82,7 +82,19 @@ check_wrap() {
         [ -z "$line" ] && continue
         [[ "$line" == \#* ]] && continue
 
-        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+        # No `$` anchor: Python's configparser applies SECTCRE with .match, so
+        # text after `]` is ignored and `[wrap-git]  # the pin` resolves
+        # normally -- meson builds that wrap. Requiring `]` at end of line made
+        # this loop not recognise the header at all, so `section` stayed empty,
+        # the `wrap-git:revision` case never fired, and the gate reported
+        # "OK; release dependency wraps are reproducible" having checked
+        # nothing. Measured: a wrap with that header and `revision = notahex`
+        # passed. The literal `]` is still required, so this cannot over-match.
+        # Use a greedy capture, matching ConfigParser's greedy SECTCRE: the
+        # section name extends through the last `]` on the line. This keeps
+        # `[wrap-git]  # the pin` legal while refusing to misread
+        # `[wrap-git] [other]` as the `wrap-git` section. (#1343)
+        if [[ "$line" =~ ^\[(.*)\] ]]; then
             local new_section=${BASH_REMATCH[1]}
             finish_section
             section=$new_section

@@ -837,6 +837,18 @@ if sh.found()
        suite: 'abi')
 endif
 
+# Issue #1343: the two wrap-reading gates must agree on what a section header
+# is. They did not -- `[wrap-git]  # the pin` is legal (configparser matches
+# headers by prefix, so meson builds it), and check-wrap-revisions.sh reported
+# OK having never found the section while check-sbom-wrap-pin.sh hard-failed on
+# the same input. A silent pass and a false failure from one disagreement.
+if sh.found()
+  test('wrap_section_syntax', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-wrap-section-syntax.sh',
+              meson.project_source_root()],
+       suite: 'abi')
+endif
+
 # Issue #737: forbid new unanchored "Phase NX" labels in wirelog/ source.
 # Each Phase NX label must either carry an explicit issue cross-reference
 # on the same line ("#N", "Issue N", "US-N-NNN"), or be present in the
