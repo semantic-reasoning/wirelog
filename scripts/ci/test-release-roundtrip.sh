@@ -395,6 +395,51 @@ assert 'an out_dir reached through a symlink and .. writes beside its archive' \
 assert 'an out_dir beginning with a dash is not parsed as options' \
     builds_manifest_naming_archive -outdir "$repo" ''
 
+# --- #1331: make-tarball.sh's ref resolution must stop Git option parsing ---
+# Use a git shim so this assertion checks the exact argument vector rather than
+# relying on a version-specific diagnostic for an invalid ref. The shim still
+# delegates every other Git operation to the real executable, and rejects the
+# candidate if the protected rev-parse call lacks --end-of-options.
+real_git=$(command -v git)
+git_shim_dir="$tmp/git-shim"
+mkdir -p "$git_shim_dir"
+cat >"$git_shim_dir/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real_git=${WIRELOG_REAL_GIT:?}
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == rev-parse && $((i + 1)) -lt ${#args[@]} &&
+          "${args[$((i + 1))]}" == --verify ]]; then
+        # The script probes support with `HEAD` before resolving the caller's
+        # ref. Only enforce the exact argument vector for the dash-leading ref
+        # call; the probe itself is delegated to the real Git.
+        if [[ "${args[$((i + 3))]-}" == '-not-a-ref^{commit}' ]]; then
+            if [[ $((i + 4)) -ne ${#args[@]} ||
+                  "${args[$((i + 2))]}" != --end-of-options ]]; then
+                echo 'test-release-roundtrip: rev-parse arguments are not safely ordered' >&2
+                exit 97
+            fi
+        fi
+    fi
+done
+exec "$real_git" "$@"
+EOF
+chmod +x "$git_shim_dir/git"
+dash_ref_fails_closed() {
+    local out="$tmp/dash-ref-dist"
+    (
+        PATH="$git_shim_dir:$PATH"
+        export PATH WIRELOG_REAL_GIT="$real_git"
+        CDPATH= cd -- "$repo"
+        "$mt" "$out" '-not-a-ref'
+    )
+}
+expect_status 'a dash-leading ref is passed after Git end-of-options' 128 \
+    dash_ref_fails_closed
+refute 'the dash-leading ref failure is not the shim regression' \
+    grep -qF 'omitted --end-of-options' "$tmp/out" "$tmp/err"
+
 if ((failures)); then
     printf 'test-release-roundtrip: %d case(s) failed\n' "$failures" >&2
     exit 1

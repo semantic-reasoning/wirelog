@@ -5,7 +5,11 @@ set -euo pipefail
 repo_root=$(git rev-parse --show-toplevel)
 out_dir=${1:-"$repo_root/dist"}
 ref=${2:-HEAD}
-commit=$(git -C "$repo_root" rev-parse --verify "$ref^{commit}")
+if ! git -C "$repo_root" rev-parse --verify --end-of-options HEAD >/dev/null 2>&1; then
+  echo 'make-tarball: Git must support rev-parse --end-of-options' >&2
+  exit 1
+fi
+commit=$(git -C "$repo_root" rev-parse --verify --end-of-options "$ref^{commit}")
 # Read the file into a variable, then match it: no pipeline, so nothing can
 # stop reading early and SIGPIPE its producer.
 #
