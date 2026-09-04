@@ -414,7 +414,8 @@ for ((i = 0; i < ${#args[@]}; i++)); do
         # The script probes support with `HEAD` before resolving the caller's
         # ref. Only enforce the exact argument vector for the dash-leading ref
         # call; the probe itself is delegated to the real Git.
-        if [[ "${args[$((i + 3))]-}" == '-not-a-ref^{commit}' ]]; then
+        if [[ "${args[$((i + 2))]-}" == '-not-a-ref^{commit}' ||
+              "${args[$((i + 3))]-}" == '-not-a-ref^{commit}' ]]; then
             if [[ $((i + 4)) -ne ${#args[@]} ||
                   "${args[$((i + 2))]}" != --end-of-options ]]; then
                 echo 'test-release-roundtrip: rev-parse arguments are not safely ordered' >&2
