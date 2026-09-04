@@ -266,9 +266,9 @@ printf '%s\n' '[{"cmd":["/bin/bash","'"$root"'/ci/seed.sh"]}]' >"$build/meson-in
 printf '%s\n' 'linux nope' 'darwin 30' >"$tmp/bash-tier1-minimum.txt"
 expect_status 1 python3 "$analyzer_copy" "$build" "$root"
 grep -Fq 'invalid floor record' "$tmp/out" "$tmp/err"
-printf '%s\n' 'darwin 30' >"$tmp/bash-tier1-minimum.txt"
+printf '%s\n' 'linux 999999' 'darwin 999999' >"$tmp/bash-tier1-minimum.txt"
 expect_status 1 python3 "$analyzer_copy" "$build" "$root"
-grep -Fq 'invalid' "$tmp/out" "$tmp/err"
+grep -Fq 'minimum is 999999' "$tmp/out" "$tmp/err"
 
 write_fixture ci/seed.sh 'source "$DYNAMIC_SCRIPT"'
 expect_status 77 python3 -c \
