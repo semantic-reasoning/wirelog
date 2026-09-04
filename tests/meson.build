@@ -738,6 +738,16 @@ sh = find_program('bash', required: false)
 # before the release is published.  No open PR changes either; see the
 # script header.  Until then this gate enforces nothing anywhere.
 if sh.found()
+  # Issue #1327: maintain a zero-violation Bash-4 construct ratchet over the
+  # comment-stripped transitive closure of Meson's introspected shell tests.
+  test('bash_construct_ratchet', py3,
+       args: [meson.project_source_root() / 'scripts/ci/check-bash-constructs.py',
+              meson.project_build_root(), meson.project_source_root()],
+       suite: 'abi')
+  test('bash_construct_ratchet_selftest', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-check-bash-constructs.sh'],
+       suite: 'abi')
+
   test('release_template', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-release-template.sh'],
        suite: 'abi')
