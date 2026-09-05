@@ -655,6 +655,13 @@ endif
 # Windows runners too.  Pass the build directory that actually contains
 # the generated header (see wirelog/meson.build's configure_file()).
 py3 = find_program('python3', 'python', required: true)
+
+# The nightly MSVC job must not silently select MinGW when hosted images
+# change Visual Studio versions. Native Windows CI verifies execution.
+test('perf_nightly_windows_contract', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-perf-nightly-windows.py'],
+     suite: 'abi')
+
 test('version_sync', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-version-sync.py',
             meson.project_build_root() / 'wirelog'],

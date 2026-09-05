@@ -108,9 +108,13 @@ jobs:
       - name: Configure release + trace ceiling (Windows)
         if: runner.os == 'Windows'
         shell: cmd
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cc }}
+        # Force MSVC even when the image also exposes MinGW. Meson discovers
+        # Visual Studio and restores its environment in compile/test steps.
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson setup build-perf --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
+          meson setup build-perf --vsenv --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
@@ -120,7 +124,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           meson compile -C build-perf
 
       # Linux: taskset pins the meson test harness to CPU 0. The test
@@ -142,7 +145,6 @@ jobs:
         env:
           WIRELOG_PERF_GATE: '1'
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           meson test -C build-perf --suite perf --print-errorlogs --num-processes 1
 
       - name: Collect flowlog portfolio (Linux)
