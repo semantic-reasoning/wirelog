@@ -8,6 +8,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.61.0] - 2026-09-05
+
+### Added
+
+### Changed
+
 - **`WIRELOG_DOOP_DATASET_MANIFEST_SHA256` must be re-pinned.** The DOOP perf
   gate's dataset manifest no longer embeds the directory path it is given, so
   relative, absolute and trailing-slash spellings of one directory no longer

@@ -7,6 +7,16 @@ steps for each significant Wirelog release. Entries are ordered newest first.
 
 ---
 
+## 0.60 -> 0.61
+
+Version `0.61.0` corrects arithmetic operator precedence. Multiplication,
+division, and remainder now bind more tightly than addition and subtraction,
+with left associativity within each precedence level. Expressions such as
+`8 + 3 * 2` therefore evaluate to `14`, not `22`. Programs that relied on
+the previous incorrect grouping must be reviewed.
+
+---
+
 ## 0.54 -> 0.60
 
 Version `0.60.0` adds a public parser-metadata query for hosts that need to
