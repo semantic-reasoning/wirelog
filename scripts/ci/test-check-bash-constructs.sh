@@ -3,7 +3,7 @@
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-analyzer=$script_dir/check-bash-constructs.py
+production_analyzer=$script_dir/check-bash-constructs.py
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 root=$tmp/root
@@ -50,11 +50,28 @@ expect_status() {
     }
 }
 
+# Exercise the real floor once, propagating unsupported-platform SKIP (77).
+# Missing fixture inputs must fail here, not become an analyzer SKIP.
+[ -d "$build" ]
+[ -f "$build/meson-info/intro-tests.json" ]
+python3 "$production_analyzer" "$build" "$root"
+
+# The mutations exercise parsing and traversal, not the production count floor.
+# Avoid rechecking 30 padding scripts with bash -n for every mutation. Retain
+# the production-floor rejection check before using a byte-identical analyzer
+# copy with private fixture floors; checked-in policy remains unchanged.
+sed '/^source "\$script_dir\/floor01\.sh"$/d' "$root/ci/seed.sh" >"$tmp/seed.good"
+cp "$tmp/seed.good" "$root/ci/seed.sh"
+expect_status 1 python3 "$production_analyzer" "$build" "$root"
+grep -Fq 'tier-1 closure has 3 files; minimum is 30' "$tmp/out" "$tmp/err"
+mkdir "$tmp/mutations"
+analyzer=$tmp/mutations/check-bash-constructs.py
+cp "$production_analyzer" "$analyzer"
+printf '%s\n' 'linux 1' 'darwin 1' >"$tmp/mutations/bash-tier1-minimum.txt"
 expect_status 0 python3 "$analyzer" "$build" "$root"
 printf '%s\n' '[{"cmd":["'"$root"'/ci/seed.sh"]}]' >"$build/meson-info/intro-tests.json"
 expect_status 0 python3 "$analyzer" "$build" "$root"
 printf '%s\n' '[{"cmd":["/bin/bash","'"$root"'/ci/seed.sh"]}]' >"$build/meson-info/intro-tests.json"
-cp "$root/ci/seed.sh" "$tmp/seed.good"
 write_fixture ci/bad.sh 'if true; then'
 printf '%s\n' 'source "$script_dir/bad.sh"' >>"$root/ci/seed.sh"
 expect_status 1 python3 "$analyzer" "$build" "$root"
@@ -243,7 +260,8 @@ write_fixture ci/helper.sh 'printf "%s\\n" ok'
 printf '%s\n' '[{"cmd":["/bin/bash","'"$root"'/ci/seed.sh"]}]' >"$build/meson-info/intro-tests.json"
 expect_status 0 python3 "$analyzer" "$build" "$root"
 printf '%s\n' '[{"cmd":["/bin/bash","'"$root"'/tier2/ignored.sh"]}]' >"$build/meson-info/intro-tests.json"
-expect_status 1 python3 "$analyzer" "$build" "$root"
+expect_status 1 python3 "$production_analyzer" "$build" "$root"
+grep -Fq 'tier-1 closure has 1 files; minimum is 30' "$tmp/out" "$tmp/err"
 
 write_fixture ci/seed.sh 'source "$script_dir/missing.sh"'
 printf '%s\n' '[{"cmd":["/bin/bash","'"$root"'/ci/seed.sh"]}]' >"$build/meson-info/intro-tests.json"
@@ -274,6 +292,15 @@ write_fixture ci/seed.sh 'source "$DYNAMIC_SCRIPT"'
 expect_status 77 python3 -c \
     'import importlib.util, sys; spec = importlib.util.spec_from_file_location("gate", sys.argv[1]); gate = importlib.util.module_from_spec(spec); sys.modules["gate"] = gate; spec.loader.exec_module(gate); gate.sys.platform = "win32"; sys.exit(gate.main([sys.argv[1], sys.argv[2], sys.argv[3]]))' \
     "$analyzer" "$analyzer" "$build" "$root"
+
+# A child stops at its first analyzer call, before reaching these assertions.
+# Preserve both unsupported-platform skips and genuine analyzer failures.
+expect_status 77 bash -c \
+    'python3() { return 77; }; export -f python3; bash "$1"' \
+    bash "$script_dir/test-check-bash-constructs.sh"
+expect_status 1 bash -c \
+    'python3() { return 1; }; export -f python3; bash "$1"' \
+    bash "$script_dir/test-check-bash-constructs.sh"
 
 bash -n "$script_dir/test-check-bash-constructs.sh"
 echo "test-check-bash-constructs: OK"

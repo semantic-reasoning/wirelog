@@ -746,7 +746,9 @@ if sh.found()
        suite: 'abi')
   test('bash_construct_ratchet_selftest', sh,
        args: [meson.project_source_root() / 'scripts/ci/test-check-bash-constructs.sh'],
-       suite: 'abi')
+       suite: 'abi',
+       # Mutation subprocesses need headroom under macOS sanitizer scheduling.
+       timeout: 120)
 
   test('release_template', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-release-template.sh'],
