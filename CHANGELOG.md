@@ -23,6 +23,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- Correct arithmetic operator precedence in rule heads, comparisons, and
+  function/aggregate arguments (#1353). `*`, `/`, and `%` now bind more
+  tightly than `+` and `-`, with left associativity within each level.
+  For example, `8 + 3 * 2` now yields `14`, correcting the previous silent
+  wrong result of `22`. Example 14 and its golden output reflect the fix.
+
 ### Performance
 
 ### Security

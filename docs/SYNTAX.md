@@ -530,6 +530,27 @@ aggregates.
 
 `+`, `-`, `*`, `/`, `%` (modulo)
 
+`*`, `/`, and `%` have higher precedence than `+` and `-`. Operators within
+each level associate left-to-right. For example, `8 + 3 * 2` yields `14`,
+`20 - 5 - 3` yields `12`, and `24 / 3 * 2` yields `16`.
+These rules apply to rule-head expressions, both sides of comparisons,
+and arithmetic expressions passed to aggregate and built-in functions.
+
+The arithmetic grammar is:
+
+```text
+arithmetic_expr = product (("+" | "-") product)*
+product         = factor (("*" | "/" | "%") factor)*
+```
+
+Factors include variables, supported literals, and supported built-in calls.
+General arithmetic grouping parentheses and unary negation of variables or
+expressions are not supported. A minus sign on a numeric literal is supported
+subject to the literal syntax rules above. Call parentheses, such as those in
+`min(A + B * C)` and `band(A + B * C, 15)`, remain supported; they are not
+general grouping parentheses. Use an intermediate relation when a different
+arithmetic grouping is needed.
+
 ### Bitwise Operators
 
 `band(x, y)`, `bor(x, y)`, `bxor(x, y)`, `bnot(x)`, `bshl(x, y)`, `bshr(x, y)`

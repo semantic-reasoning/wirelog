@@ -2171,20 +2171,181 @@ test_parse_error_invalid_type(void)
 static void
 test_parse_chained_arithmetic(void)
 {
-    TEST("chained arithmetic: a + b * c");
-    /* FlowLog arithmetic is left-associative flat: factor (op factor)* */
+    TEST("chained addition: (x + y) + z");
     PARSE("r(x + y + z) :- a(x, y, z).");
     ASSERT_PARSED();
     const wl_parser_ast_node_t *rule = child(program, 0);
     const wl_parser_ast_node_t *head = child(rule, 0);
     const wl_parser_ast_node_t *expr = child(head, 0);
     /* Should be binary tree: (x + y) + z */
-    if (expr->type != WL_PARSER_AST_NODE_BINARY_EXPR) {
+    if (expr->type != WL_PARSER_AST_NODE_BINARY_EXPR
+        || expr->arith_op != WIRELOG_ARITH_ADD || expr->child_count != 2
+        || child(expr, 0)->type != WL_PARSER_AST_NODE_BINARY_EXPR
+        || child(expr, 0)->arith_op != WIRELOG_ARITH_ADD
+        || child(expr, 0)->child_count != 2
+        || strcmp(child(child(expr, 0), 0)->name, "x") != 0
+        || strcmp(child(child(expr, 0), 1)->name, "y") != 0
+        || strcmp(child(expr, 1)->name, "z") != 0) {
         CLEANUP();
         FAIL("expected BINARY_EXPR");
         return;
     }
     CLEANUP();
+    PASS();
+}
+
+static bool
+is_binary(const wl_parser_ast_node_t *node, wirelog_arith_op_t op)
+{
+    return node && node->type == WL_PARSER_AST_NODE_BINARY_EXPR
+           && node->arith_op == op && node->child_count == 2;
+}
+
+static bool
+is_variable(const wl_parser_ast_node_t *node, const char *name)
+{
+    return node && node->type == WL_PARSER_AST_NODE_VARIABLE
+           && node->child_count == 0 && node->name
+           && strcmp(node->name, name) == 0;
+}
+
+static void
+test_parse_arithmetic_precedence(void)
+{
+    static const struct {
+        const char *expression;
+        wirelog_arith_op_t root;
+        wirelog_arith_op_t nested;
+        bool nested_right;
+    } cases[] = {
+        { "x + y * z", WIRELOG_ARITH_ADD, WIRELOG_ARITH_MUL, true },
+        { "x - y * z", WIRELOG_ARITH_SUB, WIRELOG_ARITH_MUL, true },
+        { "x + y / z", WIRELOG_ARITH_ADD, WIRELOG_ARITH_DIV, true },
+        { "x - y / z", WIRELOG_ARITH_SUB, WIRELOG_ARITH_DIV, true },
+        { "x + y % z", WIRELOG_ARITH_ADD, WIRELOG_ARITH_MOD, true },
+        { "x - y % z", WIRELOG_ARITH_SUB, WIRELOG_ARITH_MOD, true },
+        { "x * y + z", WIRELOG_ARITH_ADD, WIRELOG_ARITH_MUL, false },
+        { "x / y - z", WIRELOG_ARITH_SUB, WIRELOG_ARITH_DIV, false },
+        { "x % y + z", WIRELOG_ARITH_ADD, WIRELOG_ARITH_MOD, false },
+        { "x - y - z", WIRELOG_ARITH_SUB, WIRELOG_ARITH_SUB, false },
+        { "x + y - z", WIRELOG_ARITH_SUB, WIRELOG_ARITH_ADD, false },
+        { "x / y / z", WIRELOG_ARITH_DIV, WIRELOG_ARITH_DIV, false },
+        { "x / y * z", WIRELOG_ARITH_MUL, WIRELOG_ARITH_DIV, false },
+        { "x % y * z", WIRELOG_ARITH_MUL, WIRELOG_ARITH_MOD, false },
+        { "x * y % z", WIRELOG_ARITH_MOD, WIRELOG_ARITH_MUL, false },
+    };
+    static const char *contexts[] = {
+        "r(%s) :- a(x, y, z).",
+        "r(x) :- a(x, y, z), %s = 14.",
+        "r(x) :- a(x, y, z), 14 = %s.",
+        "r(sum(%s)) :- a(x, y, z).",
+        "r(band(%s, 1)) :- a(x, y, z).",
+        "r(substr(\"abc\", %s, 1)) :- a(x, y, z).",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (size_t j = 0; j < sizeof(contexts) / sizeof(contexts[0]); j++) {
+            char source[256];
+            snprintf(source, sizeof(source), contexts[j], cases[i].expression);
+            TEST(source);
+            PARSE(source);
+            if (!program) {
+                FAIL(errbuf);
+                continue;
+            }
+            const wl_parser_ast_node_t *rule = child(program, 0);
+            const wl_parser_ast_node_t *expr = child(child(rule, 0), 0);
+            if (j == 1 || j == 2)
+                expr = child(child(rule, 2), (uint32_t)(j - 1));
+            else if (j >= 3)
+                expr = child(expr, j == 5 ? 1 : 0);
+            const wl_parser_ast_node_t *nested
+                = child(expr, cases[i].nested_right ? 1 : 0);
+            bool matches = is_binary(expr, cases[i].root)
+                && is_binary(nested, cases[i].nested)
+                && is_variable(cases[i].nested_right ? child(expr, 0)
+                                                    : child(nested, 0), "x")
+                && is_variable(child(nested, cases[i].nested_right ? 0 : 1),
+                    "y")
+                && is_variable(cases[i].nested_right ? child(nested, 1)
+                                                    : child(expr, 1), "z");
+            CLEANUP();
+            if (!matches) {
+                FAIL("wrong precedence, associativity, or ordered operands");
+                continue;
+            }
+            PASS();
+        }
+    }
+}
+
+static void
+test_parse_arithmetic_transitions(void)
+{
+    TEST("x + y * z - u / v % w: multiple precedence transitions");
+    PARSE("r(x + y * z - u / v % w) :- a(x, y, z, u, v, w).");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *expr = child(child(child(program, 0), 0), 0);
+    const wl_parser_ast_node_t *add = child(expr, 0);
+    const wl_parser_ast_node_t *mul = child(add, 1);
+    const wl_parser_ast_node_t *mod = child(expr, 1);
+    const wl_parser_ast_node_t *div = child(mod, 0);
+    bool matches = is_binary(expr, WIRELOG_ARITH_SUB)
+        && is_binary(add, WIRELOG_ARITH_ADD)
+        && is_binary(mul, WIRELOG_ARITH_MUL)
+        && is_binary(mod, WIRELOG_ARITH_MOD)
+        && is_binary(div, WIRELOG_ARITH_DIV)
+        && is_variable(child(add, 0), "x")
+        && is_variable(child(mul, 0), "y")
+        && is_variable(child(mul, 1), "z")
+        && is_variable(child(div, 0), "u")
+        && is_variable(child(div, 1), "v")
+        && is_variable(child(mod, 1), "w");
+    CLEANUP();
+    if (!matches) {
+        FAIL("wrong mixed-precedence tree");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_parse_arithmetic_invalid_and_lookahead(void)
+{
+    static const char *invalid[] = {
+        "r(x +) :- a(x).", "r(x + y *) :- a(x, y).",
+        "r(x + * y) :- a(x, y).", "r(x) :- a(x), x + = 1.",
+        "r(x) :- a(x), 1 = x + 2 /.",
+        "r((x + 1) * 2) :- a(x).", "r(-x) :- a(x).",
+        "r(x) :- a @ (x).", "r(x) :- a(x), x @ = 1.",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        TEST(invalid[i]);
+        PARSE(invalid[i]);
+        bool rejected = !program && errbuf[0] != '\0';
+        CLEANUP();
+        if (!rejected) {
+            FAIL("malformed or unsupported expression accepted");
+            continue;
+        }
+        PASS();
+    }
+    TEST("relation call lookahead preserves whitespace and comments");
+    PARSE("r(x) :- a // relation comment\n (x, y), x // expression\n + y > 0.");
+    ASSERT_PARSED();
+    const wl_parser_ast_node_t *rule = child(program, 0);
+    const wl_parser_ast_node_t *atom = child(rule, 1);
+    const wl_parser_ast_node_t *cmp = child(rule, 2);
+    bool matches = atom && atom->type == WL_PARSER_AST_NODE_ATOM
+        && atom->name && strcmp(atom->name, "a") == 0
+        && atom->child_count == 2 && is_variable(child(atom, 0), "x")
+        && is_variable(child(atom, 1), "y")
+        && cmp && cmp->type == WL_PARSER_AST_NODE_COMPARISON
+        && is_binary(child(cmp, 0), WIRELOG_ARITH_ADD);
+    CLEANUP();
+    if (!matches) {
+        FAIL("relation/expression lookahead changed the AST");
+        return;
+    }
     PASS();
 }
 
@@ -2264,6 +2425,9 @@ main(void)
     test_parse_arithmetic_comparison();
     test_parse_arithmetic_head();
     test_parse_chained_arithmetic();
+    test_parse_arithmetic_precedence();
+    test_parse_arithmetic_transitions();
+    test_parse_arithmetic_invalid_and_lookahead();
     test_parse_all_arithmetic_ops();
 
     printf("\n--- Aggregation ---\n");

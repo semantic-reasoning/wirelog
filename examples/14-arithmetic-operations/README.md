@@ -20,11 +20,13 @@ result(Label, A + B, A - B, A * B, A / B, A % B, A + B * C)
     :- sample(Label, A, B, C), B != 0.
 ```
 
-Arithmetic expressions are parsed left-associatively: `A + B * C` means
-`(A + B) * C` in this language, not conventional multiplication-first
-precedence. The `precedence` input row makes that behavior visible (`22`, not
-`14`). Use explicit intermediate relations when conventional grouping is
-needed.
+Multiplication, division, and remainder bind more tightly than addition and
+subtraction. `A + B * C` therefore adds `A` to the product of `B` and `C`.
+The `precedence` input row uses `8 + 3 * 2` and produces `14`, not `22`.
+Operators at the same precedence level associate left-to-right: `A - B - C`
+subtracts `B` and then `C`. General arithmetic grouping parentheses are not
+currently supported; use an intermediate relation to request a different
+grouping, such as adding `A` and `B` before multiplying by `C`.
 
 Each aggregate is in its own rule because a rule head accepts at most one
 aggregate. `min` and `max` operate on the integer column, `average` requires a
@@ -64,9 +66,9 @@ Example 14: Arithmetic Operations
 average_value(2.500000)
 maximum(17)
 minimum(-17)
-result("negative", -12, -22, -85, -3, -2, -24)
-result("positive", 22, 12, 85, 3, 2, 44)
-result("precedence", 11, 5, 24, 2, 2, 22)
+result("negative", -12, -22, -85, -3, -2, -7)
+result("positive", 22, 12, 85, 3, 2, 27)
+result("precedence", 11, 5, 24, 2, 2, 14)
 sample_count(3)
 zero_observed(+0.0)
 

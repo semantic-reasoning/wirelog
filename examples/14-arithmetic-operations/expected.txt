@@ -4,9 +4,9 @@ Example 14: Arithmetic Operations
 average_value(2.500000)
 maximum(17)
 minimum(-17)
-result("negative", -12, -22, -85, -3, -2, -24)
-result("positive", 22, 12, 85, 3, 2, 44)
-result("precedence", 11, 5, 24, 2, 2, 22)
+result("negative", -12, -22, -85, -3, -2, -7)
+result("positive", 22, 12, 85, 3, 2, 27)
+result("precedence", 11, 5, 24, 2, 2, 14)
 sample_count(3)
 zero_observed(+0.0)
 
