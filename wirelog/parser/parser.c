@@ -10,7 +10,7 @@
  * License as published by the Free Software Foundation; either
  * version 3 of the License, or (at your option) any later version.
  *
- * Grammar (FlowLog-compatible):
+ * Grammar (core forms):
  *
  *   program     = (declaration | input_dir | output_dir | printsize_dir | rule | fact)*
  *   declaration = ".decl" IDENT "(" attributes? ")"
@@ -27,7 +27,8 @@
  *   negative    = "!" atom
  *   atom_args   = atom_arg ("," atom_arg)*
  *   atom_arg    = IDENT | signed_number | STRING | "_"
- *   arith_expr  = factor (arith_op factor)*
+ *   arith_expr  = product (("+" | "-") product)*
+ *   product     = factor (("*" | "/" | "%") factor)*
  *   factor      = IDENT | signed_number | STRING
  *   signed_int  = INTEGER | "-" INTEGER  (no whitespace between '-' and INTEGER)
  *   signed_number = signed_int | FLOAT | "-" FLOAT
@@ -902,10 +903,9 @@ token_to_arith_op(wl_parser_lexer_token_type_t type)
 }
 
 static bool
-is_arith_op(wl_parser_lexer_token_type_t type)
+is_multiplicative_op(wl_parser_lexer_token_type_t type)
 {
-    return type == WL_PARSER_LEXER_TOK_PLUS || type == WL_PARSER_LEXER_TOK_MINUS
-           || type == WL_PARSER_LEXER_TOK_STAR
+    return type == WL_PARSER_LEXER_TOK_STAR
            || type == WL_PARSER_LEXER_TOK_SLASH
            || type == WL_PARSER_LEXER_TOK_PERCENT;
 }
@@ -930,34 +930,61 @@ is_bitwise_token(wl_parser_lexer_token_type_t type)
            || type == WL_PARSER_LEXER_TOK_CRC32_CAST;
 }
 
+/* Each level folds left. The additive level consumes whole products, while
+ * the multiplicative level consumes factors; recursion adds only one level. */
 static wl_parser_ast_node_t *
-parse_arithmetic_expr(wl_parser_t *parser)
+parse_arithmetic_level(wl_parser_t *parser, bool multiplicative)
 {
-    wl_parser_ast_node_t *left = parse_factor(parser);
-    if (!left || parser->had_error)
-        return left;
+    wl_parser_ast_node_t *left = multiplicative
+        ? parse_factor(parser) : parse_arithmetic_level(parser, true);
+    if (!left || parser->had_error) {
+        wl_parser_ast_node_free(left);
+        return NULL;
+    }
 
-    while (is_arith_op(parser->current.type)) {
+    while (multiplicative ? is_multiplicative_op(parser->current.type)
+                          : parser_check(parser, WL_PARSER_LEXER_TOK_PLUS)
+        || parser_check(parser, WL_PARSER_LEXER_TOK_MINUS)) {
         uint32_t line = parser->current.line;
         uint32_t col = parser->current.col;
         wirelog_arith_op_t op = token_to_arith_op(parser->current.type);
         parser_advance(parser);
 
-        wl_parser_ast_node_t *right = parse_factor(parser);
-        if (!right) {
+        wl_parser_ast_node_t *right = multiplicative
+            ? parse_factor(parser) : parse_arithmetic_level(parser, true);
+        if (!right || parser->had_error) {
             wl_parser_ast_node_free(left);
+            wl_parser_ast_node_free(right);
             return NULL;
         }
 
         wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
             WL_PARSER_AST_NODE_BINARY_EXPR, line, col);
+        if (!bin) {
+            parser_error(parser,
+                "out of memory while creating arithmetic expression");
+            wl_parser_ast_node_free(left);
+            wl_parser_ast_node_free(right);
+            return NULL;
+        }
         bin->arith_op = op;
-        PARSER_ADD_CHILD_OR_RETURN(bin, left);
+        if (!parser_add_child(parser, bin, left)) {
+            /* parser_add_child freed left; right is not owned by bin yet. */
+            wl_parser_ast_node_free(right);
+            wl_parser_ast_node_free(bin);
+            return NULL;
+        }
         PARSER_ADD_CHILD_OR_RETURN(bin, right);
         left = bin;
     }
 
     return left;
+}
+
+static wl_parser_ast_node_t *
+parse_arithmetic_expr(wl_parser_t *parser)
+{
+    return parse_arithmetic_level(parser, false);
 }
 
 static wirelog_agg_fn_t
@@ -1445,38 +1472,19 @@ parse_predicate(wl_parser_t *parser)
     }
 
     /* Atom or comparison (both start with IDENT) */
-    if (parser_match(parser, WL_PARSER_LEXER_TOK_IDENT)) {
+    if (parser_check(parser, WL_PARSER_LEXER_TOK_IDENT)) {
         /* Check if followed by '(' => atom */
-        if (parser_check(parser, WL_PARSER_LEXER_TOK_LPAREN)) {
+        wl_parser_lexer_token_t next =
+            wl_parser_lexer_peek_token(&parser->lexer);
+        if (next.type == WL_PARSER_LEXER_TOK_LPAREN) {
+            parser_advance(parser); /* parse_atom expects the consumed name. */
             return parse_atom(parser);
         }
 
-        /* Otherwise it's a comparison: arith_expr compare_op arith_expr
-        * We already consumed the identifier, so build the left side. */
-        wl_parser_ast_node_t *left_var = wl_parser_ast_node_create(
-            WL_PARSER_AST_NODE_VARIABLE, parser->previous.line,
-            parser->previous.col);
-        left_var->name = token_to_name(&parser->previous);
-
-        /* Build left arithmetic expression */
-        wl_parser_ast_node_t *left = left_var;
-        while (is_arith_op(parser->current.type)) {
-            uint32_t op_line = parser->current.line;
-            uint32_t op_col = parser->current.col;
-            wirelog_arith_op_t op = token_to_arith_op(parser->current.type);
-            parser_advance(parser);
-            wl_parser_ast_node_t *right_factor = parse_factor(parser);
-            if (!right_factor) {
-                wl_parser_ast_node_free(left);
-                return NULL;
-            }
-            wl_parser_ast_node_t *bin = wl_parser_ast_node_create(
-                WL_PARSER_AST_NODE_BINARY_EXPR, op_line, op_col);
-            bin->arith_op = op;
-            PARSER_ADD_CHILD_OR_RETURN(bin, left);
-            PARSER_ADD_CHILD_OR_RETURN(bin, right_factor);
-            left = bin;
-        }
+        /* Leave the identifier for the shared expression parser. */
+        wl_parser_ast_node_t *left = parse_arithmetic_expr(parser);
+        if (!left)
+            return NULL;
 
         if (!is_compare_op(parser->current.type)) {
             parser_error(parser, "expected comparison operator");

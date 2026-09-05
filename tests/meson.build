@@ -108,6 +108,19 @@ test_program_exe = executable(
 )
 
 if host_machine.system() == 'linux'
+  test_parser_arithmetic_oom_exe = executable(
+    'test_parser_arithmetic_oom',
+    files('test_parser_arithmetic_oom.c'),
+    parser_src,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    link_args: [
+      '-Wl,--wrap=wl_parser_ast_node_create',
+      '-Wl,--wrap=wl_parser_ast_node_add_child',
+    ],
+    override_options: ['b_lto=false'],
+  )
+  test('parser_arithmetic_oom', test_parser_arithmetic_oom_exe, suite: 'unit')
+
   test_column_names_oom_exe = executable(
     'test_column_names_oom',
     files('test_column_names_oom.c'),

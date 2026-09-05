@@ -462,6 +462,92 @@ test_filter_multiple_arithmetic(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+static void
+test_arithmetic_precedence_results(void)
+{
+    static const struct {
+        const char *expression;
+        int64_t expected;
+    } cases[] = {
+        { "x + y * z", 14 }, { "x - y * z", 2 },
+        { "x + y / z", 9 }, { "x - y / z", 7 },
+        { "x + y % z", 9 }, { "x - y % z", 7 },
+        { "x * y + z", 26 }, { "x / y - z", 0 },
+        { "x % y + z", 4 }, { "x - y - z", 3 },
+        { "24 / y / z", 4 }, { "24 / y * z", 16 },
+        { "x % y * z", 4 }, { "x * y % z", 0 },
+        { "20 - y * 4 + 18 / y % 4", 10 },
+        { "x + -3 * z", 2 }, { "-8 + y * z", -2 },
+        { "band(x + y * z, 15)", 14 },
+        { "min(x + y * z)", 14 },
+        { "sum(x + y * z)", 14 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST(cases[i].expression);
+        char source[256];
+        snprintf(source, sizeof(source),
+            ".decl a(x: int64, y: int64, z: int64)\n"
+            "a(8, 3, 2).\n.decl r(value: int64)\n"
+            "r(%s) :- a(x, y, z).\n", cases[i].expression);
+        struct result_ctx out;
+        int n = run_program(source, "r", &out);
+        if (n != 1 || out.ncols[0] != 1
+            || out.rows[0][0] != cases[i].expected) {
+            FAIL("wrong arithmetic result");
+            continue;
+        }
+        PASS();
+    }
+}
+
+static void
+test_arithmetic_precedence_filters(void)
+{
+    static const char *conditions[] = {
+        "x + y * z = 14", "14 = x + y * z",
+        "x + y * z < 20", "20 > x + y * z",
+        "8 + y * z = 14", "band(x, 15) + y * z = 14",
+        "strlen(\"12345678\") + y * z = 14",
+    };
+    for (size_t i = 0; i < sizeof(conditions) / sizeof(conditions[0]); i++) {
+        TEST(conditions[i]);
+        char source[320];
+        snprintf(source, sizeof(source),
+            ".decl a(id: int64, x: int64, y: int64, z: int64)\n"
+            "a(1, 8, 3, 2). a(2, 8, 3, 4).\n"
+            ".decl r(id: int64)\nr(id) :- a(id, x, y, z), %s.\n",
+            conditions[i]);
+        struct result_ctx out;
+        int n = run_program(source, "r", &out);
+        if (n != 1 || out.ncols[0] != 1 || out.rows[0][0] != 1) {
+            FAIL("expected only row id 1, not id 2");
+            continue;
+        }
+        PASS();
+    }
+}
+
+static void
+test_float_arithmetic_precedence(void)
+{
+    TEST("float MAP and FILTER use multiplicative precedence");
+    const char *source =
+        ".decl a(x: float, y: float, z: float)\n"
+        "a(8.0, 3.0, 2.0). a(8.0, 3.0, 4.0).\n"
+        ".decl r(value: float)\n"
+        "r(x + y * z) :- a(x, y, z), x + y * z = 14.0.\n";
+    struct result_ctx out;
+    int n = run_program(source, "r", &out);
+    double value = 0.0;
+    if (n == 1)
+        memcpy(&value, &out.rows[0][0], sizeof(value));
+    if (n != 1 || out.ncols[0] != 1 || value != 14.0) {
+        FAIL("expected the single float result 14.0");
+        return;
+    }
+    PASS();
+}
+
 int
 main(void)
 {
@@ -480,6 +566,11 @@ main(void)
     printf("\n--- FILTER: complex arithmetic (CRDT patterns) ---\n");
     test_filter_crdt_double_arithmetic();
     test_filter_multiple_arithmetic();
+
+    printf("\n--- Arithmetic precedence (Issue #1353) ---\n");
+    test_arithmetic_precedence_results();
+    test_arithmetic_precedence_filters();
+    test_float_arithmetic_precedence();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)
