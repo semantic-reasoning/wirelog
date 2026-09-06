@@ -4977,6 +4977,13 @@ test_tdd_decision_stats_seq_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 test('tdd_decision_stats_nofusion', test_tdd_decision_stats_seq_exe)
+test('tdd_execution_audit', bench_flowlog_json_py3,
+     args: [files('test_tdd_execution_audit.py')[0],
+            '--runtime-bin', test_tdd_decision_stats_exe.full_path(),
+            '--runtime-bin', test_tdd_decision_stats_seq_exe.full_path()],
+     depends: [test_tdd_decision_stats_exe, test_tdd_decision_stats_seq_exe],
+     suite: 'bench',
+     timeout: 90)
 
 test_tdd_single_key_owner_exe = executable(
   'test_tdd_single_key_owner',
