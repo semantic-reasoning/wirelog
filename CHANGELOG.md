@@ -20,6 +20,29 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+## [0.61.3] - 2026-09-06
+
+### Added
+
+### Changed
+
+- **DOOP is deferred from the hosted release downstream matrix to
+  perf-nightly** (#1365), where the required high-memory runner is available.
+  The release matrix continues to validate the five workloads that fit on
+  standard hosted runners and records the DOOP deferral explicitly.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
 ## [0.61.2] - 2026-09-06
 
 ### Added
