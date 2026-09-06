@@ -188,7 +188,7 @@ jobs:
           retention-days: 35
 
   downstream:
-    name: Tag / six-workload downstream matrix
+    name: Tag / five-workload downstream matrix (DOOP in perf-nightly)
     needs: [validate-input]
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -223,14 +223,15 @@ jobs:
         run: |
           mkdir -p downstream-dist
           scripts/release/make-tarball.sh downstream-dist "$TAG_REF"
-      - name: Execute pinned six-workload matrix
+      - name: Execute pinned five-workload matrix
         run: |
           archive=$(find downstream-dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
           test -n "$archive"
           scripts/release/run-downstream-matrix.sh \
             --tarball "$archive" --candidate-sha "$EXPECTED_SHA" \
             --oracle-sha256 4029e35d72e91f83700592d6dddc4f528e5a4400fa9eb822723b3955146df62d \
-            --output-dir downstream-evidence
+            --output-dir downstream-evidence \
+            --skip-workload doop
       - name: Upload downstream evidence
         if: always()
         uses: actions/upload-artifact@v7

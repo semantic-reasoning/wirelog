@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Build and execute the six-workload GA matrix from an exact candidate tarball.
+# Build and execute the hosted five-workload GA matrix from an exact candidate
+# tarball. DOOP may be explicitly deferred to the high-memory perf-nightly job.
 # Issue #1163 / #1156.
 set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
 usage: run-downstream-matrix.sh --tarball ARCHIVE --candidate-sha SHA \
-    --oracle-sha256 SHA --output-dir DIR
+    --oracle-sha256 SHA --output-dir DIR [--skip-workload NAME]
 
 The archive must be a deterministic wirelog source tarball.  The script
 extracts it into an isolated directory, verifies the candidate SHA and every
-tracked dataset manifest, downloads the pinned DOOP archive, builds the
-candidate, and fails on any missing workload, non-zero exit, or oracle drift.
+tracked dataset manifest for enabled workloads, builds the candidate, and
+fails on any missing workload, non-zero exit, or oracle drift. A skipped
+workload is recorded explicitly in the evidence and is not silently omitted.
 EOF
 }
 
@@ -19,6 +21,7 @@ tarball=""
 candidate_sha=""
 oracle_sha256=""
 output_dir=""
+skip_workload=""
 MATRIX_WORKERS=1
 MATRIX_REPEAT=1
 MATRIX_DOWNLOAD_TIMEOUT_SECONDS=${MATRIX_DOWNLOAD_TIMEOUT_SECONDS:-1800}
@@ -34,9 +37,14 @@ while [[ $# -gt 0 ]]; do
         --candidate-sha) candidate_sha=${2:-}; shift 2 ;;
         --oracle-sha256) oracle_sha256=${2:-}; shift 2 ;;
         --output-dir) output_dir=${2:-}; shift 2 ;;
+        --skip-workload) skip_workload=${2:-}; shift 2 ;;
         *) usage; exit 2 ;;
     esac
 done
+[[ -z "$skip_workload" || "$skip_workload" == doop ]] || {
+    echo "only doop may be deferred from the hosted matrix" >&2
+    exit 2
+}
 [[ -n "$tarball" && -f "$tarball" && "$candidate_sha" =~ ^[0-9a-f]{40}$ \
     && "$oracle_sha256" =~ ^[0-9a-f]{64}$ && -n "$output_dir" ]] || { usage; exit 2; }
 for phase_timeout in "$MATRIX_DOWNLOAD_TIMEOUT_SECONDS" "$MATRIX_EXTRACTION_TIMEOUT_SECONDS" \
@@ -266,6 +274,11 @@ while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path e
         [[ "$acquisition" == tracked-in-tarball ]] || { echo "$workload must use tracked-in-tarball" >&2; exit 1; }
     fi
     resolved_provenance=${provenance/candidate-commit:/candidate-commit:$candidate_sha:}
+    if [[ "$workload" == "$skip_workload" ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$workload" "$provenance" "deferred-to-perf-nightly" "deferred-to-perf-nightly" >> "$output_dir/data-provenance.tsv"
+        printf '%s\t%s\t%s\n' "$workload" "$expected_manifest" "deferred-to-perf-nightly" >> "$output_dir/data-manifests.tsv"
+        continue
+    fi
     printf '%s\t%s\t%s\t%s\n' "$workload" "$provenance" "$acquisition" "$resolved_provenance" >> "$output_dir/data-provenance.tsv"
     if [[ "$expected_manifest" == archive:* ]]; then
         archive_sha=${expected_manifest#archive:}
@@ -347,6 +360,12 @@ run_workload() {
 while IFS=$'\t' read -r workload expected_tuples expected_iterations data_path _ provenance acquisition extra; do
     [[ -z "$workload" || "$workload" == \#* ]] && continue
     [[ -z "$extra" && -n "$provenance" && -n "$acquisition" ]] || { echo "invalid oracle row for $workload" >&2; exit 1; }
+    if [[ "$workload" == "$skip_workload" ]]; then
+        printf '%s\tSKIP\t%s\t%s\t%s\t0\t\t\t%s\t%s\t\tdeferred-to-perf-nightly\n' \
+            "$workload" "$MATRIX_WORKERS" "$MATRIX_REPEAT" "2400" \
+            "$expected_tuples" "$expected_iterations" >> "$output_dir/results.tsv"
+        continue
+    fi
     case "$workload" in
         cspa-fast) run_workload "$workload" --data-cspa "$candidate_root/$data_path" "$expected_tuples" "$expected_iterations" ;;
         galen) run_workload "$workload" --data-galen "$candidate_root/$data_path" "$expected_tuples" "$expected_iterations" ;;
