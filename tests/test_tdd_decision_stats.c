@@ -99,6 +99,88 @@ static void
 count_cb(const char *relation, const int64_t *row, uint32_t ncols,
     void *user_data);
 
+static void
+frame_delta_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)diff;
+    (void)user_data;
+}
+
+static int
+run_snapshot_frames(void)
+{
+    const char *source =
+        ".decl a(x:int32,y:int32)\n.decl b(x:int32,y:int32)\n"
+        ".decl r(x:int32,y:int32)\n.decl s(x:int32,y:int32)\n"
+        ".decl t(x:int32,y:int32)\n"
+        "r(x,y) :- a(x,y).\nr(x,z) :- r(x,y),r(y,z).\n"
+        "s(x,y) :- b(x,y).\ns(x,z) :- s(x,y),s(y,z).\n"
+        "t(x,y) :- a(x,y).\nt(x,z) :- t(x,y),t(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *prog = wirelog_parse_string(source, &error);
+    if (!prog)
+        return 1;
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    wirelog_program_free(prog);
+    if (rc != 0)
+        return 1;
+    if (plan->stratum_count != 3) {
+        wl_plan_free(plan);
+        return 1;
+    }
+    /* These independent SCCs can execute in any order. Choose r,s,t to
+     * deliberately exercise a hole in the affected mask (indices 0 and 2). */
+    const char *names[] = { "r", "s", "t" };
+    wl_plan_stratum_t *strata = (wl_plan_stratum_t *)plan->strata;
+    for (uint32_t i = 0; i < 3; i++) {
+        for (uint32_t j = i; j < 3; j++) {
+            if (strcmp(plan->strata[j].relations[0].name, names[i]) == 0) {
+                wl_plan_stratum_t temporary = plan->strata[i];
+                strata[i] = plan->strata[j];
+                strata[j] = temporary;
+                break;
+            }
+        }
+    }
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 8, &sess);
+    if (rc != 0) {
+        wl_plan_free(plan);
+        return 1;
+    }
+    int64_t first[] = { 1, 2 };
+    int64_t second[] = { 2, 3 };
+    count_ctx_t ctx = { 0 };
+    rc = wl_session_insert(sess, "a", first, 1, 2);
+    if (rc == 0)
+        rc = wl_session_insert(sess, "b", first, 1, 2);
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+    /* Use the incremental insert route, then unregister the callback so
+     * snapshot's callback-specific full-evaluation fallback does not apply. */
+    wl_session_set_delta_cb(sess, frame_delta_cb, NULL);
+    if (rc == 0)
+        rc = wl_session_insert(sess, "a", second, 1, 2);
+    wl_session_set_delta_cb(sess, NULL, NULL);
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+    if (rc == 0 && ctx.count != 17) /* three rows, then seven twice */
+        rc = 1;
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    return rc == 0 ? 0 : 1;
+}
+
 /* Exercise real evaluator paths, without diagnostic-only fault injection.
  * mode 0: long linear owner closure triggers tiny-frontier serial replay.
  * mode 1: wrapper rejects the very first submission; mode 3 rejects fifth.
@@ -418,12 +500,21 @@ expect(const char *name, int ok)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
     int failed = 0;
     decision_stats_t stats;
     setenv("WIRELOG_TDD_STRATUM_PROFILE", "1", 1);
     setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+    if (argc == 2) {
+        if (strcmp(argv[1], "--audit-error") == 0)
+            return run_audit_boundary(1);
+        if (strcmp(argv[1], "--audit-partial") == 0)
+            return run_audit_boundary(3);
+        if (strcmp(argv[1], "--audit-frames-off") == 0)
+            unsetenv("WIRELOG_TDD_STRATUM_PROFILE");
+        return run_snapshot_frames();
+    }
     failed += expect("post-dispatch serial replay retains history",
             run_audit_boundary(0) == 0);
     failed += expect("first submission error is not execution",
