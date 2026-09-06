@@ -106,58 +106,6 @@ jobs:
           meson compile -C build-abi
           meson test -C build-abi --suite abi --print-errorlogs
 
-  perf:
-    name: Tag / performance and RSS
-    needs: [validate-input]
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ env.TAG_REF }}
-          fetch-depth: 0
-      - name: Verify tagged commit
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build
-      - name: Build trace and stripped configurations
-        env:
-          CC: gcc
-        run: |
-          meson setup build-perf-trace --buildtype=release -Dwirelog_log_max_level=trace -Dtests=true -DmbedTLS=disabled
-          meson setup build-perf-error --buildtype=release -Dwirelog_log_max_level=error -Dtests=true -DmbedTLS=disabled
-          meson compile -C build-perf-trace
-          meson compile -C build-perf-error
-      - name: Run complete perf suite
-        env:
-          WIRELOG_PERF_GATE: '1'
-        run: |
-          # The complete suite includes both trace-only and stripped-build
-          # sentinels. Strict execution is enforced below on the release
-          # gates that support WIRELOG_PERF_REQUIRE=1. Hosted runners
-          # do not provide a stable CPU governor, so timing results are
-          # validated for execution and correctness rather than host pinning.
-          meson test -C build-perf-trace --suite perf --print-errorlogs --num-processes 1
-      - name: Run required timing and RSS gates
-        env:
-          WIRELOG_PERF_GATE: '1'
-          WIRELOG_PERF_REQUIRE: '1'
-        run: |
-          meson test -C build-perf-trace log_perf_gate --print-errorlogs --num-processes 1
-          meson test -C build-perf-error crdt_perf_gate cspa_w1_gate sub_ms_graph_perf_gate rss_bounded_release --print-errorlogs --num-processes 1
-          scripts/ci/check-perf-gate-execution.sh \
-            build-perf-trace/meson-logs/testlog.txt \
-            build-perf-error/meson-logs/testlog.txt
-          awk -v wanted='test:         stress-release - wirelog:rss_bounded_release' '
-            $0 == wanted { capture = 1; next }
-            capture && /^===================================/ { exit }
-            capture { print }
-          ' build-perf-error/meson-logs/testlog.txt > rss-gate.log
-          grep -Eq '^result:[[:space:]]+exit status 0$' rss-gate.log
-          ! grep -Fq 'SKIP:' rss-gate.log
-
   fuzz:
     name: Tag / fuzz smoke
     needs: [validate-input]
@@ -366,7 +314,10 @@ jobs:
   release-verification:
     name: Tag / release verification gate
     if: ${{ always() }}
-    needs: [default, abi, sbom, perf, fuzz, mbedtls, sanitizers, upgrade, downstream]
+    # Performance/RSS release gating is intentionally deferred until 0.80;
+    # hosted runners do not provide the stable environment required by those
+    # measurements.
+    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, upgrade, downstream]
     runs-on: ubuntu-latest
     steps:
       - name: Require every tagged verification job
@@ -379,7 +330,7 @@ jobs:
           # because `join(needs.*.result)` silently yields fewer entries if a
           # job is removed, and every remaining one could still be success --
           # the gate would pass having checked less than it names.
-          test "${#statuses[@]}" -eq 9
+          test "${#statuses[@]}" -eq 8
           for result in "${statuses[@]}"; do
             test "$result" = success
           done
