@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TDD_OWNER_FALLBACK_MIN_ITER 31u
+#define TDD_OWNER_FALLBACK_MIN_ITER 8u
 #define TDD_OWNER_FALLBACK_DELTA_ROWS 512u
 
 /* Only the standalone decision regression targets enable this wrapper. */

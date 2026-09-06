@@ -1649,6 +1649,21 @@ col_worker_session_destroy(wl_col_session_t *worker)
     /* Free owned relations (partition data) */
     for (uint32_t i = 0; i < worker->nrels; i++) {
         if (worker->rels[i]) {
+            /* A failed TDD setup can leave the same relation pointer in more
+             * than one slot while ownership is being transferred.  Only the
+             * first slot owns the relation; later aliases must not free it a
+             * second time. */
+            bool duplicate = false;
+            for (uint32_t j = 0; j < i; j++) {
+                if (worker->rels[j] == worker->rels[i]) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                worker->rels[i] = NULL;
+                continue;
+            }
             col_rel_free_contents(worker->rels[i]);
             free(worker->rels[i]);
         }
