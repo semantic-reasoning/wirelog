@@ -91,7 +91,10 @@ expected_archive_sha256=$(awk 'NF { print $1; exit }' "$checksum_file")
     echo "archive checksum $archive_sha256 != sidecar $expected_archive_sha256" >&2
     exit 1
 }
-archive_commit=$(gzip -dc "$tarball" | git get-tar-commit-id)
+# git get-tar-commit-id only consumes the tar header.  With pipefail enabled,
+# the producer otherwise sees SIGPIPE when it writes the rest of the archive
+# and turns an otherwise valid candidate into a false failure.
+archive_commit=$(git get-tar-commit-id < <(gzip -dc "$tarball"))
 [[ "$archive_commit" == "$candidate_sha" ]] || {
     echo "archive commit $archive_commit != candidate $candidate_sha" >&2
     exit 1
