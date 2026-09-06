@@ -6,6 +6,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Per-stratum TDD execution diagnostics** distinguish admission, selected
+  worker width, submitted work, completed barriers, and serial replay. Exact
+  result controls cover fused and unfused execution (#1378).
+
 ### Changed
 
 ### Deprecated

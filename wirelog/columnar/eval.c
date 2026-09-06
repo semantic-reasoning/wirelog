@@ -23,8 +23,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TDD_OWNER_FALLBACK_MIN_ITER 31u
+#define TDD_OWNER_FALLBACK_MIN_ITER 8u
 #define TDD_OWNER_FALLBACK_DELTA_ROWS 512u
+
+/* Only the standalone decision regression targets enable this wrapper. */
+#ifdef WL_COLUMNAR_EVAL_TEST_SUBMISSION
+extern int
+wl_columnar_eval_test_submit(wl_work_queue_t *wq,
+    void (*fn)(void *), void *ctx);
+#define WL_COLUMNAR_EVAL_SUBMIT wl_columnar_eval_test_submit
+#else
+#define WL_COLUMNAR_EVAL_SUBMIT wl_workqueue_submit
+#endif
 
 static void
 tdd_destroy_delta_payload(void *payload)
@@ -4030,6 +4040,13 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         if (W > cap)
             W = cap;
     }
+    if (coord->tdd_audit.enabled) {
+        coord->tdd_audit.strategy = owner_exchange_mode ? "owner"
+            : global_read_mode ? "global_read"
+            : replicate_mode ? "replicate"
+            : bdx_mode ? "bdx" : "aligned";
+        coord->tdd_audit.selected_workers = W;
+    }
     if (W <= 1) {
         tdd_record_active_workers(coord, 1);
         if (coord->tdd_decision_tracking_active) {
@@ -4377,12 +4394,14 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             bool submit_ok = true;
             uint64_t dispatch_t0 = now_ns();
             for (uint32_t w = 0; w < W; w++) {
-                if (wl_workqueue_submit(coord->wq, tdd_worker_subpass_fn,
+                if (WL_COLUMNAR_EVAL_SUBMIT(coord->wq, tdd_worker_subpass_fn,
                     &ctxs[w]) != 0) {
                     wl_workqueue_drain(coord->wq);
                     submit_ok = false;
                     break;
                 }
+                if (coord->tdd_audit.enabled)
+                    coord->tdd_audit.submitted_tasks++;
             }
             uint64_t submit_ns = now_ns() - dispatch_t0;
             coord->tdd_submit_loop_ns += submit_ns;
@@ -4400,6 +4419,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             /* BARRIER */
             uint64_t wait_t0 = now_ns();
             wl_workqueue_wait_all(coord->wq);
+            if (coord->tdd_audit.enabled)
+                coord->tdd_audit.completed_rounds++;
             uint64_t wait_ns = now_ns() - wait_t0;
             coord->tdd_wait_barrier_ns += wait_ns;
             coord->tdd_dispatch_wait_ns += submit_ns + wait_ns;
@@ -4409,6 +4430,15 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 worker_sum_ns += ctxs[w].runtime_ns;
                 if (ctxs[w].runtime_ns > worker_max_ns)
                     worker_max_ns = ctxs[w].runtime_ns;
+                if (coord->tdd_audit.enabled) {
+                    uint64_t runtime = ctxs[w].runtime_ns;
+                    if ((coord->tdd_audit.completed_rounds == 1 && w == 0)
+                        || runtime < coord->tdd_audit.worker_min_ns)
+                        coord->tdd_audit.worker_min_ns = runtime;
+                    if (runtime > coord->tdd_audit.worker_max_ns)
+                        coord->tdd_audit.worker_max_ns = runtime;
+                    coord->tdd_audit.worker_sum_ns += runtime;
+                }
             }
             coord->tdd_worker_sum_ns += worker_sum_ns;
             coord->tdd_worker_max_ns += worker_max_ns;
@@ -4475,6 +4505,17 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 coord->tdd_queue_drain_ns += now_ns() - queue_t0;
             }
 
+            /* Queue mode transfers ownership out of ctxs in the worker.
+             * Count only after its delta matrix has been reconstructed. */
+            if (coord->tdd_audit.enabled) {
+                for (uint32_t w = 0; w < W; w++) {
+                    for (uint32_t ri = 0; ri < nrels; ri++) {
+                        const col_rel_t *delta = ctxs[w].delta_rels[ri];
+                        if (delta)
+                            coord->tdd_audit.worker_delta_rows += delta->nrows;
+                    }
+                }
+            }
             uint64_t convergence_t0 = now_ns();
 
             /* Stratum-level early exit: all workers have all_empty_delta */
@@ -4607,6 +4648,8 @@ done:
     coord->diff_operators_active = saved_diff;
 
     if (owner_adaptive_fallback && rc == 0) {
+        if (coord->tdd_audit.enabled)
+            coord->tdd_audit.replay = "owner_tiny_frontier";
         rc = tdd_restore_coord_idb(sp, coord, owner_fallback_saved);
         tdd_cleanup_workers(coord);
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);
@@ -4619,6 +4662,10 @@ done:
         return col_eval_stratum(sp, coord, stratum_idx);
     }
     if (global_read_mode && rc == EOVERFLOW) {
+        if (coord->tdd_audit.enabled) {
+            coord->tdd_audit.replay = "global_read_overflow";
+            coord->tdd_audit.replay_rc = rc;
+        }
         int restore_rc = tdd_restore_coord_idb(sp, coord, global_read_saved);
         tdd_cleanup_workers(coord);
         tdd_free_saved_coord_idb(sp, owner_fallback_saved);

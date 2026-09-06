@@ -15,6 +15,7 @@
 #include "../wirelog-internal.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1669,6 +1670,21 @@ col_worker_session_destroy(wl_col_session_t *worker)
     /* Free owned relations (partition data) */
     for (uint32_t i = 0; i < worker->nrels; i++) {
         if (worker->rels[i]) {
+            /* A failed TDD setup can leave the same relation pointer in more
+             * than one slot while ownership is being transferred.  Only the
+             * first slot owns the relation; later aliases must not free it a
+             * second time. */
+            bool duplicate = false;
+            for (uint32_t j = 0; j < i; j++) {
+                if (worker->rels[j] == worker->rels[i]) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                worker->rels[i] = NULL;
+                continue;
+            }
             col_rel_free_contents(worker->rels[i]);
             free(worker->rels[i]);
         }
@@ -2295,6 +2311,7 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
 static void
 col_session_reset_snapshot_profile(wl_col_session_t *sess)
 {
+    memset(&sess->tdd_audit, 0, sizeof(sess->tdd_audit));
     sess->consolidation_ns = 0;
     sess->kfusion_ns = 0;
     sess->kfusion_alloc_ns = 0;
@@ -2370,6 +2387,25 @@ col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
     col_mat_cache_clear(&sess->mat_cache);
 }
 
+static void
+wl_columnar_session_profile_begin(const wl_plan_t *plan, uint64_t affected_mask,
+    uint32_t workers, bool stable)
+{
+    uint32_t expected = 0;
+    if (!stable) {
+        for (uint32_t si = 0; si < plan->stratum_count; si++) {
+            if (col_affected_mask_contains(affected_mask, si))
+                expected++;
+        }
+    }
+    fprintf(stderr,
+        "TDD snapshot begin plan_count=%u expected_count=%u scope=%s "
+        "affected_mask=%016" PRIx64 " requested_workers=%u\n",
+        plan->stratum_count, expected,
+        stable ? "stable" : affected_mask == UINT64_MAX ? "full" : "affected",
+        affected_mask, workers);
+}
+
 /*
  * col_session_snapshot: Evaluate all strata and emit current IDB tuples
  *
@@ -2399,6 +2435,10 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     wl_col_session_t *sess = COL_SESSION(session);
     const wl_plan_t *plan = sess->plan;
     sess->extension_expr_status = 0;
+    const char *tdd_profile = getenv("WIRELOG_TDD_STRATUM_PROFILE");
+    bool tdd_profile_active = tdd_profile && tdd_profile[0] != '\0'
+        && tdd_profile[0] != '0';
+    uint32_t tdd_profile_evaluated = 0;
 
     /* K-fusion's pre-seeded delta expansion is designed for step-style
      * outbound evaluation.  On the snapshot route it can suppress the EDB
@@ -2420,7 +2460,12 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         && sess->last_removed_relation == NULL
         && !sess->delta_seeded
         && !sess->retraction_seeded) {
-        return col_session_emit_snapshot(plan, sess, callback, user_data);
+        if (tdd_profile_active)
+            wl_columnar_session_profile_begin(plan, 0, sess->num_workers, true);
+        int rc = col_session_emit_snapshot(plan, sess, callback, user_data);
+        if (tdd_profile_active && rc == 0)
+            fprintf(stderr, "TDD snapshot complete evaluated_count=0 rc=0\n");
+        return rc;
     }
 
     if (sess->has_evaluated
@@ -2571,6 +2616,9 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         && sess->last_inserted_relation != NULL)
         || !sess->has_evaluated));
     sess->tdd_decision_tracking_active = true;
+    if (tdd_profile_active)
+        wl_columnar_session_profile_begin(plan, affected_mask,
+            sess->num_workers, false);
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         if (!col_affected_mask_contains(affected_mask, si))
             continue;
@@ -2628,26 +2676,33 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
             }
         }
 
-        const char *tdd_profile = getenv("WIRELOG_TDD_STRATUM_PROFILE");
-        bool tdd_profile_active = tdd_profile && tdd_profile[0] != '\0'
-            && tdd_profile[0] != '0';
         uint64_t stratum_t0 = tdd_profile_active ? now_ns() : 0;
         uint64_t kfusion_base = sess->kfusion_ns;
         uint64_t exchange_base = sess->exchange_time_ns;
         uint64_t tdd_base = sess->tdd_total_ns;
+        uint64_t wait_base = sess->tdd_wait_barrier_ns;
+        uint64_t merge_base = sess->tdd_final_merge_ns;
+        memset(&sess->tdd_audit, 0, sizeof(sess->tdd_audit));
+        sess->tdd_audit.enabled = tdd_profile_active;
 
         int rc = use_tdd
             ? col_eval_stratum_tdd(&plan->strata[si], sess, si)
             : col_eval_stratum(&plan->strata[si], sess, si);
+        sess->tdd_audit.enabled = false;
 
         if (tdd_profile_active) {
+            tdd_profile_evaluated++;
             const char *first_rel = plan->strata[si].relation_count > 0
                 ? plan->strata[si].relations[0].name : "(none)";
             fprintf(stderr,
                 "TDD stratum idx=%u rel=%s recursive=%d use_tdd=%d "
                 "fallback=%s "
                 "total_ms=%.3f kfusion_ms=%.3f exchange_ms=%.3f "
-                "tdd_ms=%.3f\n",
+                "tdd_ms=%.3f requested_workers=%u strategy=%s "
+                "selected_workers=%u submitted_tasks=%" PRIu64 " "
+                "completed_rounds=%" PRIu64 " replay=%s replay_rc=%d rc=%d "
+                "worker_min_ms=%.3f worker_max_ms=%.3f worker_sum_ms=%.3f "
+                "worker_delta_rows=%" PRIu64 " wait_ms=%.3f merge_ms=%.3f\n",
                 si, first_rel ? first_rel : "(null)",
                 (int)plan->strata[si].is_recursive, (int)use_tdd,
                 wl_columnar_session_tdd_fallback_reason_name(
@@ -2655,7 +2710,20 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
                 (double)(now_ns() - stratum_t0) / 1e6,
                 (double)(sess->kfusion_ns - kfusion_base) / 1e6,
                 (double)(sess->exchange_time_ns - exchange_base) / 1e6,
-                (double)(sess->tdd_total_ns - tdd_base) / 1e6);
+                (double)(sess->tdd_total_ns - tdd_base) / 1e6,
+                sess->num_workers,
+                sess->tdd_audit.strategy ? sess->tdd_audit.strategy : "none",
+                sess->tdd_audit.selected_workers,
+                sess->tdd_audit.submitted_tasks,
+                sess->tdd_audit.completed_rounds,
+                sess->tdd_audit.replay ? sess->tdd_audit.replay : "none",
+                sess->tdd_audit.replay_rc, rc,
+                (double)sess->tdd_audit.worker_min_ns / 1e6,
+                (double)sess->tdd_audit.worker_max_ns / 1e6,
+                (double)sess->tdd_audit.worker_sum_ns / 1e6,
+                sess->tdd_audit.worker_delta_rows,
+                (double)(sess->tdd_wait_barrier_ns - wait_base) / 1e6,
+                (double)(sess->tdd_final_merge_ns - merge_base) / 1e6);
         }
 
         if (tdd_cc_active && rc == 0 && pre_saved) {
@@ -2795,7 +2863,12 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
             col_rel_compact(r);
     }
 
-    return col_session_emit_snapshot(plan, sess, callback, user_data);
+    int snapshot_rc = col_session_emit_snapshot(plan, sess, callback,
+            user_data);
+    if (tdd_profile_active && snapshot_rc == 0)
+        fprintf(stderr, "TDD snapshot complete evaluated_count=%u rc=0\n",
+            tdd_profile_evaluated);
+    return snapshot_rc;
 }
 
 /* Affected strata/rules detection moved to columnar/frontier.c;

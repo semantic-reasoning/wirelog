@@ -7,6 +7,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -15,6 +16,7 @@
 #include "../wirelog/wirelog.h"
 
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,8 +61,202 @@ typedef struct count_ctx {
     int64_t count;
 } count_ctx_t;
 
+static int submission_allowance = -1;
+
+int
+wl_columnar_eval_test_submit(wl_work_queue_t *wq,
+    void (*fn)(void *), void *ctx)
+{
+    if (submission_allowance == 0)
+        return -1;
+    if (submission_allowance > 0)
+        submission_allowance--;
+    return wl_workqueue_submit(wq, fn, ctx);
+}
+
+/* Verify every tuple and uniqueness, not just a cardinality that a wrong
+* relation could accidentally satisfy. The inline chain has 100 edges. */
+static int
+exact_chain(wl_session_t *sess)
+{
+    col_rel_t *r = session_find_rel(COL_SESSION(sess), "r");
+    bool seen[101][101] = { { false } };
+    if (!r || r->ncols != 2 || r->nrows != 5050)
+        return 0;
+    for (uint32_t i = 0; i < r->nrows; i++) {
+        int64_t x = r->columns[0][i];
+        int64_t y = r->columns[1][i];
+        if (x < 0 || y > 100 || x >= y || seen[x][y])
+            return 0;
+        seen[x][y] = true;
+    }
+    return 1;
+}
+
 static int
 run_bdx_mode(decision_stats_t *stats, int use_step);
+static void
+count_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data);
+
+static void
+frame_delta_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)diff;
+    (void)user_data;
+}
+
+static int
+run_snapshot_frames(void)
+{
+    const char *source =
+        ".decl a(x:int32,y:int32)\n.decl b(x:int32,y:int32)\n"
+        ".decl r(x:int32,y:int32)\n.decl s(x:int32,y:int32)\n"
+        ".decl t(x:int32,y:int32)\n"
+        "r(x,y) :- a(x,y).\nr(x,z) :- r(x,y),r(y,z).\n"
+        "s(x,y) :- b(x,y).\ns(x,z) :- s(x,y),s(y,z).\n"
+        "t(x,y) :- a(x,y).\nt(x,z) :- t(x,y),t(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *prog = wirelog_parse_string(source, &error);
+    if (!prog)
+        return 1;
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    wirelog_program_free(prog);
+    if (rc != 0)
+        return 1;
+    if (plan->stratum_count != 3) {
+        wl_plan_free(plan);
+        return 1;
+    }
+    /* These independent SCCs can execute in any order. Choose r,s,t to
+     * deliberately exercise a hole in the affected mask (indices 0 and 2). */
+    const char *names[] = { "r", "s", "t" };
+    wl_plan_stratum_t *strata = (wl_plan_stratum_t *)plan->strata;
+    for (uint32_t i = 0; i < 3; i++) {
+        for (uint32_t j = i; j < 3; j++) {
+            if (strcmp(plan->strata[j].relations[0].name, names[i]) == 0) {
+                wl_plan_stratum_t temporary = plan->strata[i];
+                strata[i] = plan->strata[j];
+                strata[j] = temporary;
+                break;
+            }
+        }
+    }
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 8, &sess);
+    if (rc != 0) {
+        wl_plan_free(plan);
+        return 1;
+    }
+    int64_t first[] = { 1, 2 };
+    int64_t second[] = { 2, 3 };
+    count_ctx_t ctx = { 0 };
+    rc = wl_session_insert(sess, "a", first, 1, 2);
+    if (rc == 0)
+        rc = wl_session_insert(sess, "b", first, 1, 2);
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+    /* Use the incremental insert route, then unregister the callback so
+     * snapshot's callback-specific full-evaluation fallback does not apply. */
+    wl_session_set_delta_cb(sess, frame_delta_cb, NULL);
+    if (rc == 0)
+        rc = wl_session_insert(sess, "a", second, 1, 2);
+    wl_session_set_delta_cb(sess, NULL, NULL);
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+    if (rc == 0 && ctx.count != 17) /* three rows, then seven twice */
+        rc = 1;
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    return rc == 0 ? 0 : 1;
+}
+
+/* Exercise real evaluator paths, without diagnostic-only fault injection.
+ * mode 0: long linear owner closure triggers tiny-frontier serial replay.
+ * mode 1: wrapper rejects the very first submission; mode 3 rejects fifth.
+ * mode 2: an earlier BDX stratum is followed by a rejected three-IDB SCC. */
+static int
+run_audit_boundary(int mode)
+{
+    const char *source = mode == 0
+        ? ".decl edge(x:int32,y:int32)\n.decl r(x:int32,y:int32)\n"
+        "r(x,y) :- edge(x,y).\nr(x,z) :- r(x,y), edge(y,z).\n"
+        : mode == 1 || mode == 3
+        ? ".decl edge(x:int32,y:int32)\n.decl r(x:int32,y:int32)\n"
+        "r(x,y) :- edge(x,y).\nr(x,z) :- r(x,y), r(y,z).\n"
+        : ".decl edge(x:int32,y:int32)\n.decl r(x:int32,y:int32)\n"
+        ".decl s(x:int32,y:int32)\n"
+        "r(x,y) :- edge(x,y).\nr(x,z) :- r(x,y), r(y,z).\n"
+        "s(x,y) :- r(x,y).\ns(x,w) :- s(x,y),s(y,z),s(z,w).\n";
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(source, &err);
+    if (!prog)
+        return 1;
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+    wl_plan_t *plan = NULL;
+    int rc = wl_plan_from_program(prog, &plan);
+    wirelog_program_free(prog);
+    if (rc != 0)
+        return 1;
+    wl_session_t *sess = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 8, &sess);
+    if (rc != 0) {
+        wl_plan_free(plan);
+        return 1;
+    }
+    int64_t rows[200];
+    for (uint32_t i = 0; i < 100; i++) {
+        rows[2 * i] = i;
+        rows[2 * i + 1] = i + 1;
+    }
+    wl_col_session_t *col = COL_SESSION(sess);
+    submission_allowance = mode == 1 ? 0 : mode == 3 ? 4 : -1;
+    rc = wl_session_insert(sess, "edge", rows, 100, 2);
+    count_ctx_t ctx = { 0 };
+    if (rc == 0) {
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+    }
+    submission_allowance = -1;
+    int ok;
+    if (mode == 1 || mode == 3) {
+        ok = rc == ENOMEM && col->tdd_audit.selected_workers == 8
+            && col->tdd_audit.submitted_tasks == (mode == 1 ? 0u : 4u)
+            && col->tdd_audit.completed_rounds == 0;
+    } else if (mode == 0) {
+        ok = rc == 0 && exact_chain(sess)
+            && col->tdd_audit.completed_rounds > 0
+            && col->tdd_audit.replay
+            && strcmp(col->tdd_audit.replay, "owner_tiny_frontier") == 0;
+    } else {
+        ok = rc == 0 && exact_chain(sess)
+            && col->tdd_executed_strata == 1
+            && col->tdd_last_fallback_reason
+            == WL_COLUMNAR_INTERNAL_TDD_FALLBACK_UNSAFE_PLAN
+            && col->tdd_audit.selected_workers == 0
+            && col->tdd_audit.submitted_tasks == 0
+            && col->tdd_audit.strategy == NULL;
+    }
+    if (rc == 0) {
+        rc = wl_session_snapshot(sess, count_cb, &ctx);
+        ok = ok && rc == 0 && col->tdd_audit.submitted_tasks == 0
+            && col->tdd_audit.replay == NULL;
+    }
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    return ok ? 0 : 1;
+}
 static int
 run_bdx_repeated_snapshot(decision_stats_t *first, decision_stats_t *second,
     int64_t *first_count, int64_t *second_count);
@@ -133,6 +329,17 @@ run_bdx_mode(decision_stats_t *stats, int use_step)
     } else if (rc == 0) {
         count_ctx_t ctx = { 0 };
         rc = wl_session_snapshot(sess, count_cb, &ctx);
+        if (rc == 0 && !exact_chain(sess))
+            rc = 1;
+        if (rc == 0) {
+            wl_col_session_t *col = COL_SESSION(sess);
+            bool adaptive = strcmp(getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER"),
+                    "1000000000") == 0;
+            if (col->tdd_audit.selected_workers != (adaptive ? 1u : 8u)
+                || (adaptive ? col->tdd_audit.submitted_tasks != 0
+                    : col->tdd_audit.completed_rounds == 0))
+                rc = 1;
+        }
     }
     if (rc == 0) {
         wl_columnar_session_get_tdd_decision_stats(sess,
@@ -293,10 +500,29 @@ expect(const char *name, int ok)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
     int failed = 0;
     decision_stats_t stats;
+    setenv("WIRELOG_TDD_STRATUM_PROFILE", "1", 1);
+    setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+    if (argc == 2) {
+        if (strcmp(argv[1], "--audit-error") == 0)
+            return run_audit_boundary(1);
+        if (strcmp(argv[1], "--audit-partial") == 0)
+            return run_audit_boundary(3);
+        if (strcmp(argv[1], "--audit-frames-off") == 0)
+            unsetenv("WIRELOG_TDD_STRATUM_PROFILE");
+        return run_snapshot_frames();
+    }
+    failed += expect("post-dispatch serial replay retains history",
+            run_audit_boundary(0) == 0);
+    failed += expect("first submission error is not execution",
+            run_audit_boundary(1) == 0);
+    failed += expect("partial submission and drain is not a complete round",
+            run_audit_boundary(3) == 0);
+    failed += expect("later rejected stratum has no stale width",
+            run_audit_boundary(2) == 0);
 
     memset(&stats, 0, sizeof(stats));
     setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);

@@ -19,7 +19,12 @@ def main():
         return 2
 
     env = os.environ.copy()
+    for key in list(env):
+        if key.startswith("WIRELOG_TDD_"):
+            del env[key]
     env.pop("WIRELOG_RADIX_BENCH_LOG", None)
+    env["WIRELOG_TDD_MIN_ROWS_PER_WORKER"] = "1"
+    env["WIRELOG_TDD_STRATUM_PROFILE"] = "1"
 
     proc = subprocess.run(
         [
@@ -29,7 +34,7 @@ def main():
             "--data",
             sys.argv[2],
             "--workers",
-            "4",
+            "8",
             "--repeat",
             "1",
             "--format",
@@ -40,6 +45,7 @@ def main():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
+        timeout=20,
     )
     if proc.returncode != 0:
         print(proc.stdout, end="")
@@ -50,6 +56,33 @@ def main():
         raise AssertionError("radix benchmark logs should be opt-in")
 
     row = extract_json(proc.stdout)
+    assert row["tuples"] == 4950, row
+    records = [dict(token.split("=", 1) for token in line.split()[2:])
+               for line in proc.stderr.splitlines()
+               if line.startswith("TDD stratum ")]
+    recursive = [r for r in records if r["recursive"] == "1"]
+    assert len(recursive) == 1, records
+    record = recursive[0]
+    assert record.get("strategy") == "bdx", record
+    assert record["selected_workers"] == "8", record
+    assert int(record["completed_rounds"]) > 0, record
+    assert int(record["submitted_tasks"]) == 8 * int(record["completed_rounds"]), record
+    assert record["replay"] == "none" and record["rc"] == "0", record
+
+    # The ordinary benchmark must keep identical results without diagnostics.
+    quiet_env = env.copy()
+    del quiet_env["WIRELOG_TDD_STRATUM_PROFILE"]
+    quiet = subprocess.run(proc.args, capture_output=True, text=True,
+                           env=quiet_env, timeout=20, check=True)
+    assert "TDD stratum " not in quiet.stderr, quiet.stderr
+    assert extract_json(quiet.stdout)["tuples"] == 4950
+
+    adaptive_env = env.copy()
+    adaptive_env["WIRELOG_TDD_MIN_ROWS_PER_WORKER"] = "1000000000"
+    adaptive = subprocess.run(proc.args, capture_output=True, text=True,
+                              env=adaptive_env, timeout=20, check=True)
+    assert extract_json(adaptive.stdout)["tuples"] == 4950
+    assert "selected_workers=1 submitted_tasks=0 completed_rounds=0" in adaptive.stderr
     tdd_phase = row.get("tdd_phase_ms")
     exchange_phase = row.get("tdd_exchange_phase_ms")
     if not isinstance(tdd_phase, dict):
