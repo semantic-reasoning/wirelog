@@ -1306,6 +1306,17 @@ col_session_destroy(wl_session_t *session)
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_delta_events_clear(sess);
 
+    /* Issue #1380: emit the memory baseline before teardown when explicitly
+     * requested.  The ledger is session-owned, so this is the last point at
+     * which current and peak values for relations, arenas, caches,
+     * arrangements, and timestamps are all available.  Keep the report
+     * opt-in so normal runs and their stderr remain unchanged. */
+    if (getenv("WL_MEM_REPORT")) {
+        fprintf(stderr, "[wirelog mem] scope=coordinator workers=%u\n",
+            sess->num_workers);
+        wl_mem_ledger_report(&sess->mem_ledger);
+    }
+
     /* Issue #959: report the join-output high-water mark before teardown.
      *
      * The open question is whether dividing the row cap by W is right --
@@ -1629,6 +1640,16 @@ col_worker_session_destroy(wl_col_session_t *worker)
     if (!worker)
         return;
     wl_columnar_delta_events_clear(worker);
+
+    /* Issue #1380: worker ledgers are independent copies with their own
+     * allocations and peaks.  Report them before freeing worker-owned
+     * relations, pools, and arenas so bounded-memory runs can compare worker
+     * peaks instead of seeing only the coordinator baseline. */
+    if (getenv("WL_MEM_REPORT")) {
+        fprintf(stderr, "[wirelog mem] scope=worker id=%u workers=%u\n",
+            worker->worker_id, worker->num_workers);
+        wl_mem_ledger_report(&worker->mem_ledger);
+    }
 
     /* Free mat_cache entries (all worker-owned since zeroed at create) */
     col_mat_cache_clear(&worker->mat_cache);
