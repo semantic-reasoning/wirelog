@@ -94,7 +94,7 @@ expected_archive_sha256=$(awk 'NF { print $1; exit }' "$checksum_file")
 # git get-tar-commit-id only consumes the tar header.  With pipefail enabled,
 # the producer otherwise sees SIGPIPE when it writes the rest of the archive
 # and turns an otherwise valid candidate into a false failure.
-archive_commit=$(git get-tar-commit-id < <(gzip -dc "$tarball"))
+archive_commit=$(git get-tar-commit-id < <(gzip -dc "$tarball" 2>/dev/null))
 [[ "$archive_commit" == "$candidate_sha" ]] || {
     echo "archive commit $archive_commit != candidate $candidate_sha" >&2
     exit 1
@@ -308,7 +308,11 @@ printf 'workload\tstatus\tworkers\trepeat\ttimeout_seconds\treturn_code\ttuples\
 
 run_workload() {
     local workload=$1 data_option=$2 data_dir=$3 expected_tuples=$4 expected_iterations=$5
-    local log="$output_dir/$workload.log" row tuples iterations status median timeout_seconds
+    local log="$output_dir/$workload.log" row tuples iterations status median timeout_seconds row_name
+    row_name=$workload
+    case "$workload" in
+        cspa-fast) row_name=cspa ;;
+    esac
     if [[ "$workload" == doop ]]; then timeout_seconds=2400; else timeout_seconds=600; fi
     if timeout --signal=TERM --kill-after=30s "${timeout_seconds}s" \
         "$bench" --workload "$workload" "$data_option" "$data_dir" \
@@ -322,12 +326,12 @@ run_workload() {
         echo "$workload failed; see $log" >&2
         return 1
     fi
-    row_count=$(awk -F '\t' -v wanted="$workload" '$1 == wanted { count++ } END { print count + 0 }' "$log")
+    row_count=$(awk -F '\t' -v wanted="$row_name" '$1 == wanted { count++ } END { print count + 0 }' "$log")
     [[ "$row_count" == 1 ]] || {
         echo "$workload produced $row_count result rows; expected exactly one" >&2
         return 1
     }
-    row=$(awk -F '\t' -v wanted="$workload" '$1 == wanted { line=$0 } END { print line }' "$log")
+    row=$(awk -F '\t' -v wanted="$row_name" '$1 == wanted { line=$0 } END { print line }' "$log")
     median=$(awk -F '\t' '{print $7}' <<<"$row")
     tuples=$(awk -F '\t' '{print $10}' <<<"$row")
     iterations=$(awk -F '\t' '{print $11}' <<<"$row")

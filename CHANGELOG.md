@@ -20,6 +20,28 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+## [0.61.2] - 2026-09-06
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **The downstream matrix now validates `cspa-fast` correctly** (#1363):
+  the benchmark's output row is named `cspa`, so the matrix maps the oracle
+  workload name to the emitted row before checking its result.
+
+### Performance
+
+### Security
+
+### Documentation
+
 ## [0.61.1] - 2026-09-06
 
 ### Added
