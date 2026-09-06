@@ -1268,6 +1268,24 @@ typedef struct wl_col_session_t {
         WL_COLUMNAR_INTERNAL_TDD_FALLBACK_REASON_COUNT];
     wl_columnar_internal_tdd_fallback_reason_t tdd_last_fallback_reason;
     bool tdd_decision_tracking_active;
+    /* Opt-in snapshot diagnostics; reset at snapshot entry and before each
+     * stratum. Only the coordinator writes this, never worker tasks.
+     * A completed round means all W submissions reached the barrier, not
+     * successful exchange or distinct OS-thread execution. Runtime extrema
+     * are individual worker sub-pass extrema, not per-worker lifetime sums. */
+    struct {
+        bool enabled;
+        const char *strategy;
+        uint32_t selected_workers;
+        uint64_t submitted_tasks;
+        uint64_t completed_rounds;
+        uint64_t worker_min_ns;
+        uint64_t worker_max_ns;
+        uint64_t worker_sum_ns;
+        uint64_t worker_delta_rows;
+        const char *replay;
+        int replay_rc;
+    } tdd_audit;
     /* Phase 4: tracks which relation was just inserted via
      * col_session_insert_incremental, enables affected-stratum skip
      * optimization. Session-owned canonical relation name; base and
