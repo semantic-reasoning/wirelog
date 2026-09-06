@@ -490,6 +490,13 @@ test('bench_flowlog_tdd_bdx_json', bench_flowlog_json_py3,
      suite: 'bench',
      timeout: 30)
 
+test('bench_flowlog_tdd_bdx_json_nofusion', bench_flowlog_json_py3,
+     args: [bench_flowlog_tdd_json_validator[0], bench_flowlog_seq.full_path(),
+            meson.project_source_root() / 'bench/data/graph_100.csv'],
+     depends: bench_flowlog_seq,
+     suite: 'bench',
+     timeout: 90)
+
 # Issue #287: logger env parser tests (pure function; no env mutation).
 test_log_parse_exe = executable(
   'test_log_parse',
@@ -4953,11 +4960,23 @@ test_tdd_decision_stats_exe = executable(
   io_src,
   thread_src,
   workqueue_src,
+  c_args: ['-DWL_COLUMNAR_EVAL_TEST_SUBMISSION'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 
 test('tdd_decision_stats', test_tdd_decision_stats_exe)
+
+test_tdd_decision_stats_seq_exe = executable(
+  'test_tdd_decision_stats_nofusion',
+  files('test_tdd_decision_stats.c'),
+  backend_src, parser_src, ir_src, optimizer_src, arena_src,
+  io_src, thread_src, workqueue_src,
+  c_args: ['-DENABLE_K_FUSION=0', '-DWL_COLUMNAR_EVAL_TEST_SUBMISSION'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+test('tdd_decision_stats_nofusion', test_tdd_decision_stats_seq_exe)
 
 test_tdd_single_key_owner_exe = executable(
   'test_tdd_single_key_owner',

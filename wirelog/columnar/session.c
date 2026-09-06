@@ -15,6 +15,7 @@
 #include "../wirelog-internal.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2274,6 +2275,7 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
 static void
 col_session_reset_snapshot_profile(wl_col_session_t *sess)
 {
+    memset(&sess->tdd_audit, 0, sizeof(sess->tdd_audit));
     sess->consolidation_ns = 0;
     sess->kfusion_ns = 0;
     sess->kfusion_alloc_ns = 0;
@@ -2614,10 +2616,15 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         uint64_t kfusion_base = sess->kfusion_ns;
         uint64_t exchange_base = sess->exchange_time_ns;
         uint64_t tdd_base = sess->tdd_total_ns;
+        uint64_t wait_base = sess->tdd_wait_barrier_ns;
+        uint64_t merge_base = sess->tdd_final_merge_ns;
+        memset(&sess->tdd_audit, 0, sizeof(sess->tdd_audit));
+        sess->tdd_audit.enabled = tdd_profile_active;
 
         int rc = use_tdd
             ? col_eval_stratum_tdd(&plan->strata[si], sess, si)
             : col_eval_stratum(&plan->strata[si], sess, si);
+        sess->tdd_audit.enabled = false;
 
         if (tdd_profile_active) {
             const char *first_rel = plan->strata[si].relation_count > 0
@@ -2626,7 +2633,11 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
                 "TDD stratum idx=%u rel=%s recursive=%d use_tdd=%d "
                 "fallback=%s "
                 "total_ms=%.3f kfusion_ms=%.3f exchange_ms=%.3f "
-                "tdd_ms=%.3f\n",
+                "tdd_ms=%.3f requested_workers=%u strategy=%s "
+                "selected_workers=%u submitted_tasks=%" PRIu64 " "
+                "completed_rounds=%" PRIu64 " replay=%s replay_rc=%d rc=%d "
+                "worker_min_ms=%.3f worker_max_ms=%.3f worker_sum_ms=%.3f "
+                "worker_delta_rows=%" PRIu64 " wait_ms=%.3f merge_ms=%.3f\n",
                 si, first_rel ? first_rel : "(null)",
                 (int)plan->strata[si].is_recursive, (int)use_tdd,
                 wl_columnar_session_tdd_fallback_reason_name(
@@ -2634,7 +2645,20 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
                 (double)(now_ns() - stratum_t0) / 1e6,
                 (double)(sess->kfusion_ns - kfusion_base) / 1e6,
                 (double)(sess->exchange_time_ns - exchange_base) / 1e6,
-                (double)(sess->tdd_total_ns - tdd_base) / 1e6);
+                (double)(sess->tdd_total_ns - tdd_base) / 1e6,
+                sess->num_workers,
+                sess->tdd_audit.strategy ? sess->tdd_audit.strategy : "none",
+                sess->tdd_audit.selected_workers,
+                sess->tdd_audit.submitted_tasks,
+                sess->tdd_audit.completed_rounds,
+                sess->tdd_audit.replay ? sess->tdd_audit.replay : "none",
+                sess->tdd_audit.replay_rc, rc,
+                (double)sess->tdd_audit.worker_min_ns / 1e6,
+                (double)sess->tdd_audit.worker_max_ns / 1e6,
+                (double)sess->tdd_audit.worker_sum_ns / 1e6,
+                sess->tdd_audit.worker_delta_rows,
+                (double)(sess->tdd_wait_barrier_ns - wait_base) / 1e6,
+                (double)(sess->tdd_final_merge_ns - merge_base) / 1e6);
         }
 
         if (tdd_cc_active && rc == 0 && pre_saved) {
