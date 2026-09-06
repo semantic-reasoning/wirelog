@@ -20,6 +20,28 @@ All notable changes to wirelog are documented in this file.
 
 ### Documentation
 
+## [0.61.1] - 2026-09-06
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **Downstream release archive verification no longer fails with SIGPIPE**
+  (#1358): the tar commit check now avoids a `gzip` producer pipe being
+  terminated early by `git get-tar-commit-id` under `pipefail`.
+
+### Performance
+
+### Security
+
+### Documentation
+
 ## [0.61.0] - 2026-09-05
 
 ### Added
