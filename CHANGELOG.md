@@ -14,6 +14,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Unfused recursive SCCs no longer terminate with incomplete results**
+  (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
+  to normal evaluation instead of treating one empty input as an empty union.
+  Regression tests cover both fusion configurations, multiple worker counts,
+  and the existing shared-SCC recursive-aggregate rejection contract.
+  The newly exercised empty-delta differential JOIN path also retains its
+  left input until output column types have been copied, preventing invalid
+  memory access and spurious allocation errors.
+
 ### Performance
 
 ### Security

@@ -1925,15 +1925,21 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         } else if (sess->current_iteration > 0 || sess->delta_seeded
             || sess->retraction_seeded) {
             uint32_t ocols = col_join_output_width(left_e.rel, right, op);
-            if (left_e.owned)
-                col_rel_destroy(left_e.rel);
             col_rel_t *empty = col_rel_new_auto("$join_diff_empty", ocols);
-            if (!empty)
-                return ENOMEM;
-            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
-                col_rel_destroy(empty);
+            if (!empty) {
+                if (left_e.owned)
+                    col_rel_destroy(left_e.rel);
                 return ENOMEM;
             }
+            /* The schema copy still reads the left input (#1376). */
+            if (col_join_set_output_types(empty, left_e.rel, right, op) != 0) {
+                col_rel_destroy(empty);
+                if (left_e.owned)
+                    col_rel_destroy(left_e.rel);
+                return ENOMEM;
+            }
+            if (left_e.owned)
+                col_rel_destroy(left_e.rel);
             int push_rc = eval_stack_push(stack, empty, true);
             if (push_rc != 0)
                 col_rel_destroy(empty);

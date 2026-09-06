@@ -923,6 +923,69 @@ test_same_stratum_consumer_rejected(void)
     PASS();
 }
 
+/* #1376: run all #1135 fixtures in BOTH build configurations. These pin
+ * today's shared-SCC rejection, not #1135's future aggregate readmission.
+ * REPRO_UNFUSED and REPRO_FUSED above are F3 and C1 respectively. */
+static void
+test_1135_fixtures_rejected(void)
+{
+    static const char edge[] =
+        ".decl Edge(x: int64, y: int64)\n"
+        "Edge(1,2). Edge(2,3). Edge(3,4).\n";
+    static const struct {
+        const char *name;
+        const char *rules;
+    } fixtures[] = {
+        { "F1: mutual min propagation",
+          ".decl A(x: int64, v: int64)\n.decl B(x: int64, v: int64)\n"
+          "A(x, min(x)) :- Edge(x, y).\n"
+          "A(y, min(y)) :- Edge(x, y).\n"
+          "B(x, min(v)) :- A(x, v).\n"
+          "A(x, min(v)) :- B(y, v), Edge(y, x).\n" },
+        { "F2: bipartite propagation",
+          ".decl L(x: int64, v: int64)\n.decl R(x: int64, v: int64)\n"
+          "Edge(4,5).\n"
+          "L(x, min(x)) :- Edge(x, y).\n"
+          "R(y, min(v)) :- L(x, v), Edge(x, y).\n"
+          "L(y, min(v)) :- R(x, v), Edge(y, x).\n" },
+        { "F4: mutual max propagation",
+          ".decl A(x: int64, v: int64)\n.decl B(x: int64, v: int64)\n"
+          "A(x, max(x)) :- Edge(x, y).\n"
+          "A(y, max(y)) :- Edge(x, y).\n"
+          "B(x, max(v)) :- A(x, v).\n"
+          "A(x, max(v)) :- B(y, v), Edge(y, x).\n" },
+        { "F5: key-determined aggregate",
+          ".decl M(x: int64, v: int64)\n.decl Root(x: int64)\n"
+          "Edge(4,5).\n"
+          "M(x, min(x)) :- Edge(x, _).\n"
+          "Root(x) :- M(x, v).\n"
+          "M(x, min(x)) :- Root(x).\n" },
+        { "C2: consumer without aggregate predicate",
+          ".decl Label(x: int64, l: int64)\n.decl Seen(x: int64)\n"
+          "Label(x, min(x)) :- Edge(x, y).\n"
+          "Label(y, min(y)) :- Edge(x, y).\n"
+          "Label(x, min(l)) :- Label(y, l), Edge(y, x).\n"
+          "Seen(x) :- Label(x, l).\n"
+          "Label(x, min(9)) :- Seen(x).\n" },
+        { "C3: aggregate consumer with predicate",
+          ".decl a(x: int64, v: int64)\n.decl b(x: int64, v: int64)\n"
+          "a(x, min(x)) :- Edge(x, y).\n"
+          "a(y, min(y)) :- Edge(x, y).\n"
+          "a(x, min(v)) :- a(y, v), Edge(y, x).\n"
+          "b(x, min(v)) :- a(x, v), v > 2.\n"
+          "a(x, min(9)) :- b(x, v).\n" },
+    };
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
+        char src[1024];
+        TEST(fixtures[i].name);
+        int n = snprintf(src, sizeof(src), "%s%s", edge, fixtures[i].rules);
+        ASSERT(n > 0 && (size_t)n < sizeof(src), "fixture truncated");
+        ASSERT(plan_generation_rejected(src),
+            "expected valid parsing/optimization followed by plan rejection");
+        PASS();
+    }
+}
+
 /*
  * The control the rejection has to leave alone, and the workaround the
  * diagnostic names: drop the rule that feeds Big back into Label, and Big
@@ -1010,6 +1073,7 @@ main(void)
     test_operand_type_is_order_independent();
     test_operand_domain_conflict_is_vetoed();
     test_same_stratum_consumer_rejected();
+    test_1135_fixtures_rejected();
     test_stratified_consumer_control();
     test_single_relation_aggregate_control();
 

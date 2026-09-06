@@ -203,9 +203,9 @@ retraction_rel_name(const char *rel, char *buf, size_t sz)
  * On iteration 0, no deltas exist yet; FORCE_DELTA ops fall back to the
  * full relation (base-case seeding), so we always return false.
  *
- * On iteration > 0, if any FORCE_DELTA VARIABLE or JOIN op references a
- * delta that is empty/absent, the entire plan would produce 0 rows, so
- * we can safely skip evaluation.
+ * For a conjunctive plan, an empty/absent forced-delta input proves the
+ * output empty. CONCAT alternatives require normal evaluation instead:
+ * an empty input in one branch says nothing about the other branches.
  *
  * Returns true if the plan can be skipped (empty forced-delta found).
  *
@@ -248,6 +248,16 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
 {
     if (iteration == 0 && !sess->delta_seeded && !sess->retraction_seeded)
         return false; /* Base case: no deltas exist yet (non-incremental) */
+
+    /* CONCAT joins independent rule/delta alternatives, not conjunctive
+     * inputs. One empty input cannot prove that their union is empty (#1376).
+     * Scan the WHOLE plan first: an empty input may precede the CONCAT.
+     * Let normal evaluation handle these plans, including fused inner lists.
+     */
+    for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+        if (rp->ops[oi].op == WL_PLAN_OP_CONCAT)
+            return false;
+    }
 
     for (uint32_t oi = 0; oi < rp->op_count; oi++) {
         const wl_plan_op_t *op = &rp->ops[oi];

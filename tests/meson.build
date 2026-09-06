@@ -1700,6 +1700,23 @@ test_recursive_agg_kfusion_nofusion_exe = executable(
 test('recursive_agg_kfusion_nofusion', test_recursive_agg_kfusion_nofusion_exe,
      suite: 'semantics', timeout: 120)
 
+# Issue #1376: the same multi-relation SCC must reach its complete fixpoint
+# with and without K-Fusion. Compile the planner AND evaluator in each mode.
+foreach configuration : ['default', 'nofusion']
+  scc_args = configuration == 'nofusion' ? ['-DENABLE_K_FUSION=0'] : []
+  scc_test = executable(
+    'test_recursive_scc_' + configuration,
+    files('test_recursive_scc.c'),
+    parser_src, ir_src, optimizer_src, backend_src, io_src,
+    arena_src, thread_src, workqueue_src,
+    c_args: scc_args,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  )
+  test('recursive_scc_' + configuration, scc_test,
+       suite: 'semantics', timeout: 120)
+endforeach
+
 # Issue #978: average() was never implemented -- col_op_reduce() had no AVG
 # arm, so each group kept the first operand the scan happened to reach.  The
 # legacy int64 executor has no float lane to return a mean in, so it is
