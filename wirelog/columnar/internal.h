@@ -504,6 +504,12 @@ extern wl_columnar_append_transition_hook_t
     wl_columnar_append_transition_hook;
 #endif
 
+#ifdef WL_TEST_SET_HOOK
+/* Test-only seam for the checked-set COW transition window. */
+typedef void (*wl_columnar_set_transition_hook_t)(col_rel_t *);
+extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
+#endif
+
 /* MSVC in its default C mode neither defines __STDC_VERSION__ >= 201112L
  * nor accepts offsetof() inside _Static_assert (C2059); mirror the guard
  * used by diff_trace.c so the layout contract is still checked everywhere
@@ -703,30 +709,6 @@ static inline int64_t
 col_rel_get(const col_rel_t *r, uint32_t row, uint32_t col)
 {
     return r->columns[col][row];
-}
-
-/** Write a single cell value at (row, col). */
-static inline int
-col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
-{
-    if (!r || !r->columns || row >= r->capacity || col >= r->ncols
-        || !r->columns[col])
-        return EINVAL;
-    if (r->column_types && r->column_types[col] == WIRELOG_TYPE_FLOAT) {
-        if (!wl_columnar_float_bits_valid(val))
-            return EINVAL;
-        if (wl_columnar_float_bits_zero(val))
-            val = 0;
-    }
-    /* A shared view is a borrowed storage view.  Detach it before the first
-     * write so the source relation and its generations remain untouched.
-     * col_rel_cow_unshare() advances storage_generation once; this logical
-     * cell mutation advances view_generation below. */
-    if (r->col_shared && col_rel_cow_unshare(r, 0) != 0)
-        return ENOMEM;
-    r->columns[col][row] = val;
-    wl_columnar_relation_touch_view(r);
-    return 0;
 }
 
 /** Write a single cell value at (row, col) WITHOUT publishing a generation
@@ -2135,6 +2117,10 @@ int col_rel_storage_owner_destroy_status(const col_rel_t *owner);
 int col_rel_source_reader_acquire(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
 int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
+
+/* Checked single-cell mutation.  The implementation lives in relation.c so
+ * it can hold canonical-owner source admission across COW and publication. */
+int col_rel_set(col_rel_t *, uint32_t row, uint32_t col, int64_t val);
 
 /* Test seam for the non-wrapping relation identity allocator. */
 int

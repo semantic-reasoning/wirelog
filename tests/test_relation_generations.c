@@ -102,6 +102,46 @@ append_transition_probe(col_rel_t *rel)
 }
 #endif
 
+#ifdef WL_TEST_SET_HOOK
+static col_rel_t *set_hook_expected;
+static col_rel_t *set_hook_owner;
+static int set_hook_reader_rc;
+static int set_hook_writer_rc;
+static bool set_hook_state_ok;
+static int64_t set_hook_source_value;
+static uint64_t set_hook_source_view_generation;
+static uint64_t set_hook_source_storage_generation;
+static uint64_t set_hook_view_generation;
+static uint64_t set_hook_storage_generation;
+
+static void
+set_transition_probe(col_rel_t *rel)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+
+    if (rel != set_hook_expected)
+        return;
+    set_hook_state_ok = set_hook_owner->columns[0][0]
+        == set_hook_source_value
+        && set_hook_owner->view_generation == set_hook_source_view_generation
+        && set_hook_owner->storage_generation
+        == set_hook_source_storage_generation
+        && rel->storage_owner == set_hook_owner
+        && rel->storage_generation != set_hook_storage_generation
+        && rel->view_generation == set_hook_view_generation
+        && rel->col_shared == NULL
+        && set_hook_owner->storage_alias_borrows == 1;
+    set_hook_reader_rc = col_rel_source_reader_acquire(rel, &reader);
+    if (set_hook_reader_rc == 0)
+        (void)col_rel_source_reader_release(&reader);
+    set_hook_writer_rc = wl_columnar_source_access_writer_acquire(
+        &set_hook_owner->source_access, &writer);
+    if (set_hook_writer_rc == 0)
+        (void)wl_columnar_source_access_writer_release(&writer);
+}
+#endif
+
 static void
 cleanup_relations(void)
 {
@@ -959,6 +999,201 @@ test_canonical_owner_resize_with_live_alias(void)
         && alias->timestamps[alias->nrows - 1u].multiplicity == 5,
         "canonical-owner append-all growth is blocked transactionally");
     cleanup_relations();
+}
+
+static void
+test_checked_set_source_exclusion(void)
+{
+    col_rel_t *rel = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int64_t initial = 17;
+    int64_t **columns;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint32_t aliases;
+
+    CHECK(rel != NULL, "checked set reader relation");
+    CHECK(col_rel_append_row(rel, &initial) == 0,
+        "checked set reader seed");
+    columns = rel->columns;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    aliases = rel->storage_alias_borrows;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "checked set reader acquire");
+    CHECK(col_rel_set(rel, 0, 0, 23) == EBUSY
+        && rel->columns == columns
+        && rel->columns[0][0] == initial
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->storage_alias_borrows == aliases,
+        "checked set reader denial is transactional");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "checked set reader release");
+    CHECK(col_rel_set(rel, 0, 0, 23) == 0
+        && rel->columns[0][0] == 23
+        && rel->view_generation != view_generation,
+        "checked set succeeds after reader release");
+    cleanup_relations();
+}
+
+static void
+test_checked_set_alias_exclusion_and_cow(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int64_t initial = 31;
+    int64_t **view_columns;
+    uint64_t source_view;
+    uint64_t source_storage;
+    uint64_t view_view;
+    uint64_t view_storage;
+    uint32_t source_aliases;
+
+    CHECK(source && view, "checked set alias relations");
+    CHECK(col_rel_append_row(source, &initial) == 0
+        && col_rel_install_shared_view(view, source) == 0,
+        "checked set alias setup");
+    view_columns = view->columns;
+    source_view = source->view_generation;
+    source_storage = source->storage_generation;
+    view_view = view->view_generation;
+    view_storage = view->storage_generation;
+    source_aliases = source->storage_alias_borrows;
+
+    CHECK(col_rel_source_reader_acquire(source, &reader) == 0,
+        "checked set source reader acquire");
+    CHECK(col_rel_set(view, 0, 0, 41) == EBUSY
+        && view->columns == view_columns
+        && view->col_shared != NULL
+        && view->columns[0][0] == initial
+        && source->columns[0][0] == initial
+        && source->view_generation == source_view
+        && source->storage_generation == source_storage
+        && view->view_generation == view_view
+        && view->storage_generation == view_storage
+        && source->storage_alias_borrows == source_aliases,
+        "source reader blocks alias set transactionally");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "checked set source reader release");
+
+#ifdef WL_TEST_SET_HOOK
+    set_hook_expected = view;
+    set_hook_owner = source;
+    set_hook_reader_rc = 0;
+    set_hook_writer_rc = 0;
+    set_hook_state_ok = false;
+    set_hook_source_value = initial;
+    set_hook_source_view_generation = source->view_generation;
+    set_hook_source_storage_generation = source->storage_generation;
+    set_hook_view_generation = view->view_generation;
+    set_hook_storage_generation = view->storage_generation;
+    wl_columnar_set_transition_hook = set_transition_probe;
+#endif
+    CHECK(col_rel_set(view, 0, 0, 41) == 0,
+        "checked set alias COW succeeds");
+#ifdef WL_TEST_SET_HOOK
+    wl_columnar_set_transition_hook = NULL;
+    set_hook_expected = NULL;
+    CHECK(set_hook_state_ok && set_hook_reader_rc == EBUSY
+        && set_hook_writer_rc == EBUSY,
+        "checked set keeps reader admission closed through COW");
+#endif
+    CHECK(source->columns[0][0] == initial
+        && source->view_generation == source_view
+        && source->storage_generation == source_storage
+        && view->columns[0][0] == 41
+        && view->col_shared == NULL
+        && view->storage_owner == view
+        && source->storage_alias_borrows == source_aliases - 1u
+        && view->view_generation == view_view + 1u
+        && view->storage_generation == view_storage + 1u,
+        "checked set COW publishes after the write");
+    cleanup_relations();
+}
+
+static void
+test_checked_set_owner_alias_rejection(void)
+{
+    col_rel_t *owner = new_relation();
+    col_rel_t *alias = new_relation();
+    int64_t initial = 53;
+    int64_t **owner_columns;
+    uint64_t owner_view;
+    uint64_t owner_storage;
+    uint32_t owner_aliases;
+
+    CHECK(owner && alias, "checked set owner alias relations");
+    CHECK(col_rel_append_row(owner, &initial) == 0
+        && col_rel_install_shared_view(alias, owner) == 0,
+        "checked set owner alias setup");
+    owner_columns = owner->columns;
+    owner_view = owner->view_generation;
+    owner_storage = owner->storage_generation;
+    owner_aliases = owner->storage_alias_borrows;
+    CHECK(col_rel_set(owner, 0, 0, 59) == EBUSY
+        && owner->columns == owner_columns
+        && owner->columns[0][0] == initial
+        && alias->columns[0][0] == initial
+        && owner->view_generation == owner_view
+        && owner->storage_generation == owner_storage
+        && owner->storage_alias_borrows == owner_aliases
+        && alias->storage_owner == owner,
+        "checked set owner with live alias is transactional");
+    cleanup_relations();
+}
+
+static void
+test_checked_set_allocation_atomicity(void)
+{
+#ifdef WL_TEST_ALLOC_WRAP
+    bool completed = false;
+    for (long fail_at = 0; fail_at < 32 && !completed; fail_at++) {
+        col_rel_t *source = new_relation();
+        col_rel_t *view = new_relation();
+        int64_t initial = 67;
+        int64_t **old_columns;
+        bool *old_shared;
+        uint64_t old_view;
+        uint64_t old_storage;
+        uint32_t old_aliases;
+
+        CHECK(source && view, "checked set OOM relations");
+        CHECK(col_rel_append_row(source, &initial) == 0
+            && col_rel_install_shared_view(view, source) == 0,
+            "checked set OOM setup");
+        old_columns = view->columns;
+        old_shared = view->col_shared;
+        old_view = view->view_generation;
+        old_storage = view->storage_generation;
+        old_aliases = source->storage_alias_borrows;
+        allocation_calls = 0;
+        allocation_fail_at = fail_at;
+        int rc = col_rel_set(view, 0, 0, 71);
+        allocation_fail_at = -1;
+        if (rc == 0) {
+            CHECK(view->columns[0][0] == 71 && view->col_shared == NULL,
+                "checked set OOM sweep success");
+            completed = true;
+        } else {
+            CHECK(rc == ENOMEM
+                && view->columns == old_columns
+                && view->col_shared == old_shared
+                && view->view_generation == old_view
+                && view->storage_generation == old_storage
+                && view->columns[0][0] == initial
+                && source->storage_alias_borrows == old_aliases
+                && source->columns[0][0] == initial,
+                "checked set allocation failure is transactional");
+        }
+        cleanup_relations();
+    }
+    allocation_fail_at = -1;
+    CHECK(completed, "checked set OOM sweep reaches success");
+#else
+    /* The normal build still exercises the successful COW path above. */
+#endif
 }
 
 static void
@@ -1911,6 +2146,10 @@ main(void)
     test_source_reader_blocks_append_row();
     test_source_reader_blocks_append_all();
     test_canonical_owner_resize_with_live_alias();
+    test_checked_set_source_exclusion();
+    test_checked_set_alias_exclusion_and_cow();
+    test_checked_set_owner_alias_rejection();
+    test_checked_set_allocation_atomicity();
     test_copy_and_shared_semantics();
     test_rollback_fresh_generation();
     test_overflow_boundary();

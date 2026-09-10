@@ -359,7 +359,9 @@ wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
      * dst is per-worker owned; no cross-worker writes occur here. */
     for (uint32_t k = 0; k < src_width; k++) {
         int64_t v = col_rel_get(src, src_row, src_offset + k);
-        col_rel_set(dst, dst_row, dst_offset + k, v);
+        rc = col_rel_set(dst, dst_row, dst_offset + k, v);
+        if (rc != 0)
+            return rc;
     }
     WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_TRACE,
         "event=project path=inline dst=%s src=%s logical_col=%u width=%u "
