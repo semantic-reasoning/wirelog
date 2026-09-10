@@ -118,6 +118,27 @@ session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
     col_mat_cache_clear(&sess->mat_cache);
     assert(sess->mat_cache.active_pins == 0);
 
+    if (sess->filt_cache_active_pins > 0) {
+        /* Issue #1435: leases hold entry pointers, so nothing may move.
+         * A pinned entry for the relation is hidden and destroyed by its
+         * last release; an unpinned one is emptied in place and rebuilt
+         * by the next lookup of its filter. */
+        for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
+            col_filt_cache_entry_t *e = &sess->filt_cache[i];
+            if (!e->rel_name || strcmp(e->rel_name, name) != 0)
+                continue;
+            if (e->pin_count > 0) {
+                e->evict_deferred = true;
+                continue;
+            }
+            if (e->filtered)
+                col_rel_destroy(e->filtered);
+            e->filtered = NULL;
+            e->source_nrows = 0;
+            e->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+        }
+        return;
+    }
     uint32_t out = 0;
     for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
         col_filt_cache_entry_t *e = &sess->filt_cache[i];
@@ -1989,6 +2010,7 @@ col_session_destroy(wl_session_t *session)
      * so this is safe to call on both coordinator and worker sessions. */
     wl_frontier_progress_destroy(&sess->progress);
     /* Issue #386: Free filtered relation cache */
+    assert(sess->filt_cache_active_pins == 0);
     for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
         free(sess->filt_cache[i].rel_name);
         free(sess->filt_cache[i].filter_data);
@@ -2106,6 +2128,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->filt_cache = NULL;
     out_worker->filt_cache_count = 0;
     out_worker->filt_cache_cap = 0;
+    out_worker->filt_cache_active_pins = 0;
     /* Issue #579 / R-5: workers BORROW the coordinator's frozen arena.
      * Worker destroy must NOT free this pointer (see
      * col_worker_session_destroy).  The K-Fusion freeze contract
@@ -2342,6 +2365,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
         (void)wl_compound_arena_borrow_release(&worker->compound_borrow);
 
     /* Issue #386: Free filtered relation cache (workers own their own copy) */
+    assert(worker->filt_cache_active_pins == 0);
     for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
         free(worker->filt_cache[i].rel_name);
         free(worker->filt_cache[i].filter_data);

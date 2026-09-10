@@ -936,70 +936,107 @@ wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len)
 }
 
 /**
- * wl_columnar_filter_apply_right_filter_cached: session-level cached variant of wl_columnar_filter_apply_right_filter.
+ * Session-level cached variants of wl_columnar_filter_apply_right_filter.
  *
- * Looks up (rel_name, filter_hash) in sess->filt_cache.  On hash match a
- * full memcmp of filter bytes is performed to guard against hash collisions.
- * If found and the source relation has not grown since the entry was built,
- * returns the cached filtered relation (owned by the cache; caller must NOT
- * destroy it).
+ * Both look up (rel_name, filter_hash) in sess->filt_cache; on a hash match
+ * the filter bytes are compared in full to guard against collisions.  A
+ * fresh entry (source token and row count unchanged since it was built)
+ * yields the cached filtered relation, owned by the cache; the caller must
+ * NOT destroy it.  A stale entry is rebuilt in place unless a lease holds
+ * it (Issue #1435): then it is marked deferred, hidden until its last
+ * release destroys it, and the lookup reports the cache unavailable.  A
+ * miss creates an entry, except that the entry array is not grown while
+ * any lease is active.  Allocation failure also yields NULL; callers use
+ * an owned filtered relation for that op.  Unlike the uncached variant,
+ * @rel must be non-NULL: it is dereferenced here before any constructor
+ * sees it, so the Issue #1140 rejection in col_rel_pool_new_like() does not
+ * cover it.
  *
- * If the source grew, the stale entry is rebuilt in-place.  If no entry
- * exists, one is created.  On any allocation failure the function returns
- * NULL (caller handles ENOMEM).  Unlike the uncached variant, @rel must be
- * non-NULL: it is dereferenced here before any constructor sees it, so the
- * Issue #1140 rejection in col_rel_pool_new_like() does not cover it.
- *
- * The returned pointer is valid until the cache entry is evicted (i.e., until
- * source_nrows changes or the session is destroyed).  Callers that hold it
- * across iterations should re-call each iteration (cheap: cache hit = O(N)
- * linear scan over filt_cache, typically 1-2 entries per session).
+ * The _pin variant returns the relation under a lease that keeps it valid
+ * until col_filt_cache_pin_release().  The unleased variant takes and
+ * releases a lease around the lookup, so its pointer is valid only until
+ * the next lookup, invalidation or release; callers that hold it across
+ * iterations re-call each iteration (cheap: a linear scan over filt_cache,
+ * typically 1-2 entries per session).
  */
-col_rel_t *
-wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
-    const wl_plan_expr_buffer_t *fexpr, const char *rel_name,
-    col_rel_t *rel)
+static void
+filt_cache_pin_take(wl_col_session_t *sess, col_filt_cache_entry_t *e,
+    col_filt_cache_pin_t *pin)
 {
+    e->pin_count++;
+    sess->filt_cache_active_pins++;
+    pin->session = sess;
+    pin->entry = e;
+    pin->rel = e->filtered;
+    pin->active = true;
+}
+
+col_rel_t *
+wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
+    const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel,
+    col_filt_cache_pin_t *pin)
+{
+    if (!pin)
+        return NULL;
+    memset(pin, 0, sizeof(*pin));
+    if (!sess || !fexpr || !rel_name || !rel)
+        return NULL;
     uint64_t fhash = wl_columnar_filter_fnv1a_hash(fexpr->data, fexpr->size);
 
     /* Linear scan: filt_cache is tiny (one entry per unique filter predicate) */
     for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
-        if (sess->filt_cache[i].filter_hash != fhash)
+        col_filt_cache_entry_t *e = &sess->filt_cache[i];
+        if (e->filter_hash != fhash)
             continue;
-        if (strcmp(sess->filt_cache[i].rel_name, rel_name) != 0)
+        if (!e->rel_name || strcmp(e->rel_name, rel_name) != 0)
             continue;
         /* Full content comparison to guard against hash collisions */
-        if (sess->filt_cache[i].filter_size != fexpr->size
-            || memcmp(sess->filt_cache[i].filter_data, fexpr->data,
-            fexpr->size) != 0)
+        if (e->filter_size != fexpr->size
+            || memcmp(e->filter_data, fexpr->data, fexpr->size) != 0)
             continue;
+        /* A deferred entry is hidden until its last reader releases it;
+         * the caller uses an owned filtered relation meanwhile (#1435). */
+        if (e->evict_deferred)
+            return NULL;
         /* Cache hit: the freshness token is the contract (Issue #1438);
          * the row count is kept as a cheap second guard. */
-        if (wl_columnar_relation_snapshot_equal(
-                sess->filt_cache[i].source_snapshot,
+        bool fresh = e->filtered
+            && wl_columnar_relation_snapshot_equal(e->source_snapshot,
                 wl_columnar_relation_snapshot(rel))
-            && sess->filt_cache[i].source_nrows == rel->nrows)
-            return sess->filt_cache[i].filtered; /* still valid */
-        /* Source grew — rebuild in-place */
-        if (sess->filt_cache[i].filtered)
-            col_rel_destroy(sess->filt_cache[i].filtered);
-        sess->filt_cache[i].filtered = col_rel_new_like("$rfilter_cache", rel);
-        if (!sess->filt_cache[i].filtered)
-            return NULL;
-        if (fill_filtered_rel(fexpr->data, fexpr->size, rel,
-            sess->filt_cache[i].filtered, sess->intern) != 0) {
-            col_rel_destroy(sess->filt_cache[i].filtered);
-            sess->filt_cache[i].filtered = NULL;
-            return NULL;
+            && e->source_nrows == rel->nrows;
+        if (!fresh) {
+            /* Never replace a filtered relation under its readers: defer
+             * until the last release and report it unavailable. */
+            if (e->pin_count > 0) {
+                e->evict_deferred = true;
+                return NULL;
+            }
+            /* Source changed and nobody reads the old copy: rebuild in place */
+            if (e->filtered)
+                col_rel_destroy(e->filtered);
+            e->filtered = col_rel_new_like("$rfilter_cache", rel);
+            if (!e->filtered)
+                return NULL;
+            if (fill_filtered_rel(fexpr->data, fexpr->size, rel, e->filtered,
+                sess->intern) != 0) {
+                col_rel_destroy(e->filtered);
+                e->filtered = NULL;
+                return NULL;
+            }
+            e->source_nrows = rel->nrows;
+            e->source_snapshot = wl_columnar_relation_snapshot(rel);
         }
-        sess->filt_cache[i].source_nrows = rel->nrows;
-        sess->filt_cache[i].source_snapshot
-            = wl_columnar_relation_snapshot(rel);
-        return sess->filt_cache[i].filtered;
+        filt_cache_pin_take(sess, e, pin);
+        return e->filtered;
     }
 
     /* Cache miss — build a new entry */
     if (sess->filt_cache_count == sess->filt_cache_cap) {
+        /* Growth moves every entry; refuse it while a lease points into
+         * the array (Issue #1435).  The caller falls back to an owned
+         * filtered relation for this op. */
+        if (sess->filt_cache_active_pins > 0)
+            return NULL;
         uint32_t new_cap = sess->filt_cache_cap == 0 ? 4
                                                       : sess->filt_cache_cap *
             2;
@@ -1010,8 +1047,8 @@ wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
         sess->filt_cache = tmp;
         sess->filt_cache_cap = new_cap;
     }
-
     uint32_t idx = sess->filt_cache_count;
+    memset(&sess->filt_cache[idx], 0, sizeof(sess->filt_cache[idx]));
     sess->filt_cache[idx].rel_name = strdup(rel_name);
     if (!sess->filt_cache[idx].rel_name)
         return NULL;
@@ -1047,5 +1084,49 @@ wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
     sess->filt_cache[idx].source_nrows = rel->nrows;
     sess->filt_cache[idx].source_snapshot
         = wl_columnar_relation_snapshot(rel);
+    filt_cache_pin_take(sess, &sess->filt_cache[idx], pin);
     return out;
+}
+
+/* Unleased lookup: take and immediately release a lease.  Pin and release
+ * are adjacent, so no growth, compaction or deferral can observe the
+ * lease; the result is exactly the pre-#1435 behaviour. */
+col_rel_t *
+wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
+    const wl_plan_expr_buffer_t *fexpr, const char *rel_name,
+    col_rel_t *rel)
+{
+    col_filt_cache_pin_t pin;
+    col_rel_t *out = wl_columnar_filter_apply_right_filter_cached_pin(sess,
+            fexpr, rel_name, rel, &pin);
+    col_filt_cache_pin_release(&pin);
+    return out;
+}
+
+void
+col_filt_cache_pin_release(col_filt_cache_pin_t *pin)
+{
+    col_filt_cache_entry_t *e;
+    wl_col_session_t *sess;
+
+    if (!pin || !pin->active || !pin->entry)
+        return;
+    e = pin->entry;
+    sess = pin->session;
+    if (e->pin_count > 0)
+        e->pin_count--;
+    if (sess && sess->filt_cache_active_pins > 0)
+        sess->filt_cache_active_pins--;
+    if (e->pin_count == 0 && e->evict_deferred) {
+        /* Last reader gone: destroy the stale copy now and let the next
+         * lookup rebuild it against whatever source it is given (the
+         * source may have been replaced by session_add_rel meanwhile). */
+        if (e->filtered)
+            col_rel_destroy(e->filtered);
+        e->filtered = NULL;
+        e->source_nrows = 0;
+        e->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+        e->evict_deferred = false;
+    }
+    memset(pin, 0, sizeof(*pin));
 }

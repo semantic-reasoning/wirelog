@@ -613,6 +613,36 @@ Checked teardown drains queued work and rejects destruction while a live source
 lease remains. The delegated #1435/#1507 work and non-primary materialization
 cache semantics are not claimed by this contract.
 
+### Filtered-relation cache leases (#1435)
+
+The filtered-relation cache (`filt_cache`, #386) carries the same lease shape.
+`wl_columnar_filter_apply_right_filter_cached_pin()` returns the cached
+filtered relation under a lease released exactly once by
+`col_filt_cache_pin_release()`; the unleased lookup is a wrapper that takes and
+immediately releases a lease, so with no other lease active its behaviour is
+unchanged, and with one active it can report the cache unavailable exactly as
+the leased lookup does. Leases hold entry pointers, so while any lease is
+active the entry array is neither grown nor compacted: a miss that would need
+growth reports the cache unavailable, and an invalidation empties unpinned
+entries for the relation in place instead of compacting. The counter is
+asserted zero at session and worker teardown (an `assert`, active unless the
+build disables assertions).
+
+| Event | Pinned entry | Unpinned entry |
+|---|---|---|
+| lookup with a stale token | mark deferred; keep the old relation readable; report unavailable | rebuild in place |
+| relation invalidation (`session_add_rel`) | mark deferred; keep the old relation readable | destroy (emptied in place while any lease is active) |
+| cache growth on a miss | refused while any lease is active | grow |
+| final lease release | destroy the deferred relation; next lookup rebuilds | no action |
+
+A caller that receives NULL uses an owned filtered relation for that
+operation. The keyed join is wired to the lease variant in a later unit.
+
+The filtered-cache lease is likewise an internal coordinator/worker-session
+contract, not a public API or a general concurrent-reader mechanism.
+Differential, sorted and materialization-cache lifetimes, plus
+relation-generation validation, remain tracked separately in issue #1435.
+
 ## 10a. Bounded join sub-batches (#1446)
 
 `WIRELOG_JOIN_BATCH_BYTES=N` (strict decimal, default unset = off) makes an
