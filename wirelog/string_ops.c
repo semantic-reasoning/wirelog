@@ -152,22 +152,26 @@ string_ops_strlen(int64_t intern_id, wl_intern_t *intern)
  * Concatenate two interned strings and return a new intern ID.
  * Returns -1 on error.
  */
-int64_t
-string_ops_cat(int64_t id1, int64_t id2, wl_intern_t *intern)
+int
+wl_string_ops_cat_checked(int64_t id1, int64_t id2, wl_intern_t *intern,
+    int64_t *out)
 {
+    if (!out)
+        return EINVAL;
+    *out = 0;
     if (!intern)
-        return -1;
+        return EINVAL;
 
     const char *s1 = wl_intern_reverse(intern, id1);
     const char *s2 = wl_intern_reverse(intern, id2);
     if (!s1 || !s2)
-        return -1;
+        return EINVAL;
 
     size_t len1 = strlen(s1);
     size_t len2 = strlen(s2);
     char *buf = (char *)malloc(len1 + len2 + 1);
     if (!buf)
-        return -1;
+        return ENOMEM;
 
     memcpy(buf, s1, len1);
     memcpy(buf + len1, s2, len2);
@@ -175,7 +179,18 @@ string_ops_cat(int64_t id1, int64_t id2, wl_intern_t *intern)
 
     int64_t result = wl_intern_put(intern, buf);
     free(buf);
-    return result;
+    if (result < 0)
+        return ENOMEM;
+    *out = result;
+    return 0;
+}
+
+int64_t
+string_ops_cat(int64_t id1, int64_t id2, wl_intern_t *intern)
+{
+    int64_t value;
+    return wl_string_ops_cat_checked(id1, id2, intern,
+               &value) == 0 ? value : -1;
 }
 
 /**
@@ -185,19 +200,23 @@ string_ops_cat(int64_t id1, int64_t id2, wl_intern_t *intern)
  * @len:   number of codepoints to extract.
  * Returns new intern ID, or -1 on error/out-of-bounds.
  */
-int64_t
-string_ops_substr(int64_t id, int64_t start, int64_t len, wl_intern_t *intern)
+int
+wl_string_ops_substr_checked(int64_t id, int64_t start, int64_t len,
+    wl_intern_t *intern, int64_t *out)
 {
+    if (!out)
+        return EINVAL;
+    *out = 0;
     if (!intern || start < 0 || len < 0)
-        return -1;
+        return EINVAL;
 
     const char *str = wl_intern_reverse(intern, id);
     if (!str)
-        return -1;
+        return EINVAL;
 
     size_t byte_start = utf8_byte_offset(str, start);
     if (byte_start == (size_t)-1)
-        return -1;
+        return EINVAL;
 
     /* Walk len codepoints from the start position to find end byte offset */
     const char *p = str + byte_start;
@@ -213,14 +232,25 @@ string_ops_substr(int64_t id, int64_t start, int64_t len, wl_intern_t *intern)
 
     char *buf = (char *)malloc(byte_len + 1);
     if (!buf)
-        return -1;
+        return ENOMEM;
 
     memcpy(buf, str + byte_start, byte_len);
     buf[byte_len] = '\0';
 
     int64_t result = wl_intern_put(intern, buf);
     free(buf);
-    return result;
+    if (result < 0)
+        return ENOMEM;
+    *out = result;
+    return 0;
+}
+
+int64_t
+string_ops_substr(int64_t id, int64_t start, int64_t len, wl_intern_t *intern)
+{
+    int64_t value;
+    return wl_string_ops_substr_checked(id, start, len, intern,
+               &value) == 0 ? value : -1;
 }
 
 /**
@@ -308,20 +338,23 @@ string_ops_str_ord(int64_t id, wl_intern_t *intern)
  * Return a new intern ID for the uppercased version of @id.
  * Phase 1: ASCII-only (a-z -> A-Z; non-ASCII bytes are copied unchanged).
  */
-int64_t
-string_ops_to_upper(int64_t id, wl_intern_t *intern)
+int
+wl_string_ops_to_upper_checked(int64_t id, wl_intern_t *intern, int64_t *out)
 {
+    if (!out)
+        return EINVAL;
+    *out = 0;
     if (!intern)
-        return -1;
+        return EINVAL;
 
     const char *str = wl_intern_reverse(intern, id);
     if (!str)
-        return -1;
+        return EINVAL;
 
     size_t len = strlen(str);
     char *buf = (char *)malloc(len + 1);
     if (!buf)
-        return -1;
+        return ENOMEM;
 
     for (size_t i = 0; i <= len; i++) {
         unsigned char c = (unsigned char)str[i];
@@ -330,7 +363,17 @@ string_ops_to_upper(int64_t id, wl_intern_t *intern)
 
     int64_t result = wl_intern_put(intern, buf);
     free(buf);
-    return result;
+    if (result < 0)
+        return ENOMEM;
+    *out = result;
+    return 0;
+}
+
+int64_t
+string_ops_to_upper(int64_t id, wl_intern_t *intern)
+{
+    int64_t value;
+    return wl_string_ops_to_upper_checked(id, intern, &value) == 0 ? value : -1;
 }
 
 /**
@@ -338,20 +381,23 @@ string_ops_to_upper(int64_t id, wl_intern_t *intern)
  * Return a new intern ID for the lowercased version of @id.
  * Phase 1: ASCII-only (A-Z -> a-z; non-ASCII bytes are copied unchanged).
  */
-int64_t
-string_ops_to_lower(int64_t id, wl_intern_t *intern)
+int
+wl_string_ops_to_lower_checked(int64_t id, wl_intern_t *intern, int64_t *out)
 {
+    if (!out)
+        return EINVAL;
+    *out = 0;
     if (!intern)
-        return -1;
+        return EINVAL;
 
     const char *str = wl_intern_reverse(intern, id);
     if (!str)
-        return -1;
+        return EINVAL;
 
     size_t len = strlen(str);
     char *buf = (char *)malloc(len + 1);
     if (!buf)
-        return -1;
+        return ENOMEM;
 
     for (size_t i = 0; i <= len; i++) {
         unsigned char c = (unsigned char)str[i];
@@ -360,7 +406,17 @@ string_ops_to_lower(int64_t id, wl_intern_t *intern)
 
     int64_t result = wl_intern_put(intern, buf);
     free(buf);
-    return result;
+    if (result < 0)
+        return ENOMEM;
+    *out = result;
+    return 0;
+}
+
+int64_t
+string_ops_to_lower(int64_t id, wl_intern_t *intern)
+{
+    int64_t value;
+    return wl_string_ops_to_lower_checked(id, intern, &value) == 0 ? value : -1;
 }
 
 /**
@@ -369,22 +425,28 @@ string_ops_to_lower(int64_t id, wl_intern_t *intern)
  * Returns a new intern ID, or -1 on error.
  * If @old_id is the empty string, returns @id unchanged.
  */
-int64_t
-string_ops_str_replace(int64_t id, int64_t old_id, int64_t new_id,
-    wl_intern_t *intern)
+int
+wl_string_ops_str_replace_checked(int64_t id, int64_t old_id, int64_t new_id,
+    wl_intern_t *intern, int64_t *out)
 {
+    if (!out)
+        return EINVAL;
+    *out = 0;
     if (!intern)
-        return -1;
+        return EINVAL;
 
     const char *str = wl_intern_reverse(intern, id);
     const char *old_str = wl_intern_reverse(intern, old_id);
     const char *new_str = wl_intern_reverse(intern, new_id);
     if (!str || !old_str || !new_str)
-        return -1;
+        return EINVAL;
 
     size_t old_len = strlen(old_str);
-    if (old_len == 0)
-        return id; /* empty pattern: return original to avoid infinite loop */
+    if (old_len == 0) {
+        /* Empty pattern: return the original to avoid an infinite loop. */
+        *out = id;
+        return 0;
+    }
 
     size_t new_len = strlen(new_str);
     size_t str_len = strlen(str);
@@ -397,8 +459,10 @@ string_ops_str_replace(int64_t id, int64_t old_id, int64_t new_id,
         p += old_len;
     }
 
-    if (count == 0)
-        return id;
+    if (count == 0){
+        *out = id;
+        return 0;
+    }
 
     /* Compute result buffer size (careful with signed arithmetic) */
     size_t result_size;
@@ -410,7 +474,7 @@ string_ops_str_replace(int64_t id, int64_t old_id, int64_t new_id,
 
     char *buf = (char *)malloc(result_size);
     if (!buf)
-        return -1;
+        return ENOMEM;
 
     char *dst = buf;
     p = str;
@@ -429,22 +493,37 @@ string_ops_str_replace(int64_t id, int64_t old_id, int64_t new_id,
 
     int64_t result = wl_intern_put(intern, buf);
     free(buf);
-    return result;
+    if (result < 0)
+        return ENOMEM;
+    *out = result;
+    return 0;
+}
+
+int64_t
+string_ops_str_replace(int64_t id, int64_t old_id, int64_t new_id,
+    wl_intern_t *intern)
+{
+    int64_t value;
+    return wl_string_ops_str_replace_checked(id, old_id, new_id, intern,
+               &value) == 0 ? value : -1;
 }
 
 /**
  * string_ops_trim:
  * Return a new intern ID for @id with leading and trailing ASCII whitespace removed.
  */
-int64_t
-string_ops_trim(int64_t id, wl_intern_t *intern)
+int
+wl_string_ops_trim_checked(int64_t id, wl_intern_t *intern, int64_t *out)
 {
+    if (!out)
+        return EINVAL;
+    *out = 0;
     if (!intern)
-        return -1;
+        return EINVAL;
 
     const char *str = wl_intern_reverse(intern, id);
     if (!str)
-        return -1;
+        return EINVAL;
 
     /* Find first non-whitespace byte */
     const char *start = str;
@@ -459,14 +538,24 @@ string_ops_trim(int64_t id, wl_intern_t *intern)
     size_t len = (size_t)(end - start);
     char *buf = (char *)malloc(len + 1);
     if (!buf)
-        return -1;
+        return ENOMEM;
 
     memcpy(buf, start, len);
     buf[len] = '\0';
 
     int64_t result = wl_intern_put(intern, buf);
     free(buf);
-    return result;
+    if (result < 0)
+        return ENOMEM;
+    *out = result;
+    return 0;
+}
+
+int64_t
+string_ops_trim(int64_t id, wl_intern_t *intern)
+{
+    int64_t value;
+    return wl_string_ops_trim_checked(id, intern, &value) == 0 ? value : -1;
 }
 
 /**
@@ -474,19 +563,36 @@ string_ops_trim(int64_t id, wl_intern_t *intern)
  * Convert integer @num to its decimal string representation and intern it.
  * Returns new intern ID, or -1 on error.
  */
-int64_t
-string_ops_to_string(int64_t num, wl_intern_t *intern)
+int
+wl_string_ops_to_string_checked(int64_t num, wl_intern_t *intern, int64_t *out)
 {
+    if (!out)
+        return EINVAL;
+    *out = 0;
     if (!intern)
-        return -1;
+        return EINVAL;
 
     /* INT64_MIN in decimal is at most 20 digits + sign + NUL */
     char buf[24];
     int written = snprintf(buf, sizeof(buf), "%" PRId64, num);
     if (written < 0 || (size_t)written >= sizeof(buf))
-        return -1;
+        return EINVAL;
 
-    return wl_intern_put(intern, buf);
+    {
+        int64_t result = wl_intern_put(intern, buf);
+        if (result < 0)
+            return ENOMEM;
+        *out = result;
+        return 0;
+    }
+}
+
+int64_t
+string_ops_to_string(int64_t num, wl_intern_t *intern)
+{
+    int64_t value;
+    return wl_string_ops_to_string_checked(num, intern,
+               &value) == 0 ? value : -1;
 }
 
 /**

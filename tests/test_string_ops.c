@@ -11,6 +11,7 @@
 
 #include "../wirelog/string_ops.h"
 #include "../wirelog/intern.h"
+#include "../wirelog/columnar/memory_governor.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -1738,6 +1739,144 @@ test_null_intern_all_functions(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+/* Issue #1470: the checked variants tell a denied or failed interning
+ * (ENOMEM) apart from an invalid operand (EINVAL), and the int64_t forms
+ * keep returning -1 for both. */
+static wl_columnar_memory_governor_ref_t *
+denial_governor(uint64_t usable_bytes)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = usable_bytes,
+        .headroom_bytes = 0,
+        .usable_bytes = usable_bytes,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+        .status = WL_COLUMNAR_MEMORY_OK,
+    };
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static void
+test_checked_denial_is_enomem(void)
+{
+    TEST("checked builtins: governor denial reports ENOMEM, table unchanged");
+    wl_intern_t *intern = wl_intern_create();
+    wl_columnar_memory_governor_ref_t *probe = denial_governor(1u << 20);
+    wl_columnar_memory_governor_ref_t *exact = NULL;
+    uint64_t footprint;
+    uint32_t count;
+    int64_t hello, world, ell, out;
+    int step = 0;
+    if (!intern || !probe) {
+        FAIL("create failed");
+        return;
+    }
+    hello = wl_intern_put(intern, "hello");
+    world = wl_intern_put(intern, " world");
+    ell = wl_intern_put(intern, "l");
+    /* Learn the exact footprint, then attach a governor that admits it
+     * and nothing more: the next unique string is denied. */
+    if (hello < 0 || world < 0 || ell < 0
+        || wl_intern_attach_memory_governor(intern, probe) != 0) {
+        FAIL("probe attach failed");
+        wl_intern_free(intern);
+        wl_columnar_memory_governor_ref_release(probe);
+        return;
+    }
+    footprint = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(probe));
+    if (wl_intern_detach_memory_governor(intern, probe) != 0)
+        step = 1;
+    wl_columnar_memory_governor_ref_release(probe);
+    exact = denial_governor(footprint);
+    if (!step && (!exact
+        || wl_intern_attach_memory_governor(intern, exact) != 0))
+        step = 2;
+    count = wl_intern_count(intern);
+    out = 7;
+    /* Every unique result needs growth and is denied. */
+    if (!step && !(wl_string_ops_cat_checked(hello, world, intern, &out)
+        == ENOMEM && out == 0))
+        step = 3;
+    if (!step && wl_string_ops_to_upper_checked(hello, intern, &out) != ENOMEM)
+        step = 4;
+    if (!step && wl_string_ops_substr_checked(hello, 1, 3, intern, &out)
+        != ENOMEM)
+        step = 5;
+    if (!step && wl_string_ops_trim_checked(world, intern, &out) != ENOMEM)
+        step = 6;
+    if (!step && wl_string_ops_to_string_checked(12345, intern, &out)
+        != ENOMEM)
+        step = 7;
+    if (!step && wl_string_ops_str_replace_checked(hello, ell, world, intern,
+        &out) != ENOMEM)
+        step = 8;
+    if (!step && string_ops_cat(hello, world, intern) != -1)
+        step = 9;
+    if (!step && (wl_intern_count(intern) != count
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(exact)) != footprint))
+        step = 10;
+    /* Duplicates and no-op replaces need no growth and still succeed. */
+    if (!step && !(wl_string_ops_to_lower_checked(hello, intern, &out) == 0
+        && out == hello))
+        step = 11;
+    if (!step && !(wl_string_ops_str_replace_checked(hello, world, world,
+        intern, &out) == 0 && out == hello))
+        step = 12;
+    if (!step && wl_intern_count(intern) != count)
+        step = 13;
+    wl_intern_free(intern);
+    if (exact)
+        wl_columnar_memory_governor_ref_release(exact);
+    if (step) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "denial contract broken at step %d", step);
+        FAIL(buf);
+        return;
+    }
+    PASS();
+}
+
+static void
+test_checked_invalid_operand_is_einval(void)
+{
+    TEST("checked builtins: invalid operands report EINVAL, forms return -1");
+    wl_intern_t *intern = wl_intern_create();
+    int64_t out = 7;
+    int ok;
+    if (!intern) {
+        FAIL("create failed");
+        return;
+    }
+    int64_t id = wl_intern_put(intern, "abc");
+    ok = id >= 0
+        && wl_string_ops_cat_checked(id, 99, intern, &out) == EINVAL
+        && out == 0
+        && wl_string_ops_cat_checked(id, id, NULL, &out) == EINVAL
+        && wl_string_ops_substr_checked(id, -1, 1, intern, &out) == EINVAL
+        && wl_string_ops_substr_checked(id, 5, 1, intern, &out) == EINVAL
+        && wl_string_ops_to_upper_checked(99, intern, &out) == EINVAL
+        && wl_string_ops_str_replace_checked(id, 99, id, intern, &out)
+        == EINVAL
+        && wl_string_ops_trim_checked(99, intern, &out) == EINVAL
+        && wl_string_ops_to_string_checked(1, NULL, &out) == EINVAL
+        && wl_string_ops_cat_checked(id, id, intern, NULL) == EINVAL
+        && string_ops_cat(id, 99, intern) == -1
+        && string_ops_substr(id, 5, 1, intern) == -1
+        && string_ops_to_upper(99, intern) == -1;
+    /* A successful checked call hands back the interned result. */
+    ok = ok && wl_string_ops_cat_checked(id, id, intern, &out) == 0
+        && out >= 0 && strcmp(wl_intern_reverse(intern, out), "abcabc") == 0
+        && string_ops_cat(id, id, intern) == out;
+    wl_intern_free(intern);
+    if (!ok) {
+        FAIL("invalid operands were not reported as EINVAL");
+        return;
+    }
+    PASS();
+}
+
 int
 main(void)
 {
@@ -1771,6 +1910,8 @@ main(void)
     test_cat_both_empty();
     test_cat_result_length();
     test_cat_null_intern();
+    test_checked_denial_is_enomem();
+    test_checked_invalid_operand_is_einval();
 
     printf("\n--- substr ---\n");
     test_substr_full_string();
