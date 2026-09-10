@@ -837,6 +837,14 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
         /* A token mismatch invalidates the complete index. */
         bool snapshot_match = wl_columnar_relation_snapshot_equal(
             e->source_snapshot, wl_columnar_relation_snapshot(rel));
+        /* Even a same-capacity rebuild rewrites bucket generations/chains.
+         * Keep every index mutation behind the last reader's release. */
+        if (e->pin_count > 0
+            && (!snapshot_match || e->arr.indexed_rows == 0
+            || e->arr.indexed_rows < rel->nrows || e->rebuild_deferred)) {
+            e->rebuild_deferred = true;
+            return NULL;
+        }
         if (!snapshot_match || e->arr.indexed_rows == 0) {
             /* Deduct stale bytes before rebuild; restore on failure. */
             cs->arr_total_bytes -= e->mem_bytes;
@@ -886,7 +894,8 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
     uint32_t slot = cs->arr_count; /* default: append */
     for (uint32_t i = 0; i < cs->arr_count; i++) {
         if (cs->arr_entries[i].arr.indexed_rows == 0
-            && cs->arr_entries[i].mem_bytes == 0) {
+            && cs->arr_entries[i].mem_bytes == 0
+            && cs->arr_entries[i].pin_count == 0) {
             slot = i;
             break;
         }

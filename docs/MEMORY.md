@@ -582,9 +582,15 @@ exactly once, including on allocation and join-error paths.
 |---|---|---|
 | LRU eviction | skip and defer reclamation | reclaim normally |
 | relation invalidation | mark rebuild deferred; keep the old index readable | invalidate immediately |
-| final lease release | apply deferred invalidation | no action |
+| stale generation, row growth, or pending invalidation on lookup | defer rebuild and return unavailable; preserve hash buffers and chains | rebuild before returning |
+| final lease release | apply deferred invalidation, without rebuilding; next lookup rebuilds lazily | no action |
 
 This is an internal coordinator/worker-session contract, not a public API or a
-general concurrent-reader mechanism. Filtered, differential, sorted and
+general concurrent-reader mechanism. Release all leases before session teardown.
+The lease protects index buffers and entry identity, not source column values,
+row positions or compound storage: a reader must not probe an old index against
+a mutated source. Source-reader protection is tracked in #1485; generation
+checks on subsequent lookups are not a substitute for that protection.
+Filtered, differential, sorted and
 materialization-cache lifetimes, plus relation-generation validation, remain
 tracked separately in issue #1435.

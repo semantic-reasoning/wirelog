@@ -270,10 +270,14 @@ typedef struct {
  * col_session_get_arrangement:
  *
  * Return (or lazily create) an arrangement for `rel_name` keyed on
- * `key_cols[0..key_count)`.  If the arrangement exists but is stale
- * (rel->nrows > indexed_rows), it is updated incrementally before return.
+ * `key_cols[0..key_count)`. Stale source generations require a full rebuild;
+ * a matching generation with additional rows uses an incremental update.
+ * If an active lease prevents either operation, mark rebuilding deferred
+ * and return NULL. Final lease release invalidates the index; the next
+ * lookup rebuilds lazily. A lease protects index storage, not source columns.
  *
- * Returns NULL on allocation failure or if the relation is not found.
+ * Returns NULL on allocation failure, invalid input, a missing relation,
+ * or when an active lease prevents returning a fresh index.
  *
  * @param sess       A wl_session_t* backed by the columnar backend.
  * @param rel_name   Relation to index.

@@ -403,6 +403,156 @@ test_pinned_invalidation(void)
     PASS();
 }
 
+/* No probe is performed against changed source columns until all old leases
+ * end. These cases test index storage, not source-reader isolation. */
+static void
+test_pinned_rebuild(unsigned scenario)
+{
+    const char *names[] = {
+        "same-count mutation", "append within capacity", "append with growth",
+        "synthetic incremental append", "synthetic incremental growth",
+        "explicit invalidation", "empty index", "deferred eviction",
+    };
+    TEST(names[scenario]);
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+        "edge(10, 1). edge(20, 2). edge(30, 3).\n"
+        ".decl path(x: int32, y: int32)\n"
+        "path(x, y) :- edge(x, y).\n";
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    col_arrangement_pin_t first = { 0 }, second = { 0 }, denied = { 0 };
+    uint64_t *heads = NULL;
+    uint32_t *chains = NULL;
+    const char *failure = NULL;
+#define PIN_CHECK(condition, message) do { \
+            if (!(condition)) { failure = message; goto cleanup; } \
+} while (0)
+    PIN_CHECK(make_session(src, &sess, &plan, &prog) == 0, "session setup");
+    wl_col_session_t *cs = COL_SESSION(sess);
+    col_rel_t *rel = session_find_rel(cs, "edge");
+    uint32_t key[1] = { 0 };
+    PIN_CHECK(rel != NULL, "source relation missing");
+    if (scenario == 6) {
+        rel->nrows = 0;
+        wl_columnar_relation_touch_view(rel);
+    }
+    PIN_CHECK(col_session_pin_arrangement(sess, "edge", key, 1, &first) == 0,
+        "first pin");
+    /* Empty indexes always need a build, so a nested acquisition may defer. */
+    if (scenario != 6)
+        PIN_CHECK(col_session_pin_arrangement(sess, "edge", key, 1,
+            &second) == 0,
+            "fresh nested pin");
+    col_arr_entry_t *entry = first.entry;
+    col_arrangement_t *arr = first.arr;
+    if (scenario == 0 || scenario == 7)
+        PIN_CHECK(col_rel_set(rel, 0, 0, 11) == 0, "same-count mutation");
+    if (scenario >= 1 && scenario <= 4) {
+        unsigned count = (scenario == 2 || scenario == 4) ? 40 : 1;
+        for (unsigned i = 0; i < count; i++) {
+            int64_t row[2] = { 100 + i, 1000 + i };
+            PIN_CHECK(col_rel_append_row(rel, row) == 0, "source append");
+        }
+        if (scenario >= 3) {
+            /* Defensive incremental branch: real appends change the token. */
+            entry->source_snapshot = wl_columnar_relation_snapshot(rel);
+        }
+    }
+    if (scenario == 5)
+        col_session_invalidate_arrangements(sess, "edge");
+    if (scenario == 7) {
+        uint32_t alternate[1] = { 1 };
+        cs->arr_cache_limit_bytes = 0;
+        cs->arr_cap = cs->arr_count;
+        PIN_CHECK(col_session_get_arrangement(sess, "edge", alternate, 1)
+            == NULL && entry->evict_deferred,
+            "pressure must defer eviction and registry growth");
+    }
+    /* Capture after source allocation; only arrangement accounting is fixed. */
+    col_arrangement_t saved = *arr;
+    col_relation_snapshot_t snapshot = entry->source_snapshot;
+    size_t bytes = entry->mem_bytes, total = cs->arr_total_bytes;
+    heads = malloc(arr->nbuckets * sizeof(*heads));
+    chains = malloc((arr->indexed_rows + 1u) * sizeof(*chains));
+    PIN_CHECK(heads && chains, "snapshot allocation");
+    memcpy(heads, arr->ht_head, arr->nbuckets * sizeof(*heads));
+    if (arr->indexed_rows)
+        memcpy(chains, arr->ht_next, arr->indexed_rows * sizeof(*chains));
+    PIN_CHECK(col_session_get_arrangement(sess, "edge", key, 1) == NULL,
+        "lookup rebuilt or returned a stale pinned index");
+    PIN_CHECK(col_session_pin_arrangement(sess, "edge", key, 1, &denied) != 0
+        && !denied.active, "stale acquisition must remain inactive");
+    PIN_CHECK(entry->pin_count == (scenario == 6 ? 1u : 2u)
+        && entry->rebuild_deferred, "deferred lease count");
+    PIN_CHECK(arr->ht_head == saved.ht_head && arr->ht_next == saved.ht_next
+        && arr->nbuckets == saved.nbuckets && arr->ht_cap == saved.ht_cap
+        && arr->generation == saved.generation
+        && arr->indexed_rows == saved.indexed_rows
+        && entry->mem_bytes == bytes && cs->arr_total_bytes == total
+        && arr->reservation.bytes == saved.reservation.bytes
+        && wl_columnar_relation_snapshot_equal(entry->source_snapshot, snapshot)
+        && memcmp(heads, arr->ht_head, arr->nbuckets * sizeof(*heads)) == 0
+        && (!arr->indexed_rows || memcmp(chains, arr->ht_next,
+        arr->indexed_rows * sizeof(*chains)) == 0),
+        "denied lookup changed index storage, token or accounting");
+    col_arrangement_pin_release(&second);
+    PIN_CHECK(entry->pin_count == 1 && entry->rebuild_deferred
+        && arr->indexed_rows == saved.indexed_rows,
+        "nonfinal release invalidated the index");
+    col_arrangement_pin_release(&first);
+    PIN_CHECK(entry->pin_count == 0 && !entry->rebuild_deferred
+        && arr->indexed_rows == 0
+        && (scenario == 7 ? entry->mem_bytes == 0
+            : arr->generation == saved.generation),
+        "final release must invalidate without rebuilding");
+    arr = col_session_get_arrangement(sess, "edge", key, 1);
+    PIN_CHECK(arr && arr->indexed_rows == rel->nrows
+        && wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        wl_columnar_relation_snapshot(rel)), "lazy rebuild freshness");
+    for (uint32_t i = 0; i < rel->nrows; i++) {
+        int64_t row[2] = { rel->columns[0][i], rel->columns[1][i] };
+        uint32_t found = col_arrangement_find_first(arr, rel->columns, 2, row);
+        PIN_CHECK(found == i, "rebuilt key mismatch");
+        unsigned matches = 0, visited = 0;
+        while (found != UINT32_MAX && visited++ < rel->nrows) {
+            PIN_CHECK(found < rel->nrows, "rebuilt chain out of bounds");
+            if (rel->columns[0][found] == row[0])
+                matches++;
+            found = col_arrangement_find_next(arr, found);
+        }
+        PIN_CHECK(found == UINT32_MAX && matches == 1,
+            "rebuilt key multiplicity or cycle mismatch");
+    }
+    if (scenario == 0 || scenario == 7) {
+        int64_t old[2] = { 10, 1 };
+        PIN_CHECK(col_arrangement_find_first(arr, rel->columns, 2, old)
+            == UINT32_MAX, "removed key still indexed");
+    }
+    size_t sum = 0;
+    for (uint32_t i = 0; i < cs->arr_count; i++)
+        sum += cs->arr_entries[i].mem_bytes;
+    PIN_CHECK(sum == cs->arr_total_bytes, "rebuild accounting sum");
+    if (scenario != 6) {
+        uint32_t generation = arr->generation;
+        PIN_CHECK(col_session_get_arrangement(sess, "edge", key, 1) == arr
+            && arr->generation == generation,
+            "fresh lookup rebuilt unnecessarily");
+    }
+cleanup:
+    col_arrangement_pin_release(&denied);
+    col_arrangement_pin_release(&second);
+    col_arrangement_pin_release(&first);
+    free(heads);
+    free(chains);
+    if (sess)
+        free_session(sess, plan, prog);
+    if (failure)
+        FAIL(failure);
+    PASS();
+#undef PIN_CHECK
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -416,6 +566,8 @@ main(void)
     test_tombstone_rebuild();
     test_total_bytes_accounting();
     test_pinned_invalidation();
+    for (unsigned scenario = 0; scenario < 8; scenario++)
+        test_pinned_rebuild(scenario);
 
     printf("\n%d/%d tests passed", pass_count, test_count);
     if (fail_count > 0)

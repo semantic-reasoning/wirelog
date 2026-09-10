@@ -1830,6 +1830,10 @@ col_rel_set_column_types(col_rel_t *r,
 uint32_t
 col_arrangement_find_first_typed(const col_arrangement_t *arr,
     const col_rel_t *rel, const int64_t *key_row);
+/* Acquire only a fresh index. Stale pinned entries defer rebuild and reject
+ * new leases. Protects index storage, not source mutation or destruction;
+ * release every lease before session teardown. Final release invalidates
+ * deferred indexes; rebuilding is lazy on the next lookup. */
 int
 col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count,
