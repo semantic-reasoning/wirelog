@@ -31,6 +31,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Join operators release their owned right filter on every early exit**
+  (#1505). When the right-side constant filter is applied outside the session
+  cache, the pool-allocated filtered relation is now destroyed on the
+  allocation-failure, key-type and ledger-backpressure exits of the keyed,
+  differential, semi and anti joins, closing a heap leak reachable through the
+  delta path of a filtered recursive rule.
 - **Unfused recursive SCCs no longer terminate with incomplete results**
   (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
   to normal evaluation instead of treating one empty input as an empty union.
