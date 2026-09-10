@@ -861,11 +861,12 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
                 free(e.seg_boundaries);
             return ENOMEM;
         }
-        if (col_rel_append_all(work, in, NULL) != 0) {
+        int append_rc = col_rel_append_all(work, in, NULL);
+        if (append_rc != 0) {
             col_rel_destroy(work);
             if (e.seg_boundaries)
                 free(e.seg_boundaries);
-            return ENOMEM;
+            return append_rc;
         }
         work_owned = true;
     }
