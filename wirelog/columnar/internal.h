@@ -1942,6 +1942,11 @@ col_arrangement_probe_release(col_arrangement_probe_t *probe);
 void
 col_arrangement_probe_bundle_init(col_arrangement_probe_bundle_t *bundle);
 int
+col_arrangement_probe_bundle_acquire_primary(
+    col_arrangement_probe_bundle_t *bundle, wl_session_t *sess,
+    const col_rel_t *source, const uint32_t *key_cols, uint32_t key_count,
+    col_arrangement_probe_t **out_probe);
+int
 col_arrangement_probe_bundle_acquire(col_arrangement_probe_bundle_t *bundle,
     wl_session_t *sess, col_arrangement_t *arr, const col_rel_t *source,
     col_arrangement_probe_t **out_probe);

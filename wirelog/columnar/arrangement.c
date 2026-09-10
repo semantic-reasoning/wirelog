@@ -1559,6 +1559,46 @@ col_arrangement_probe_bundle_init(col_arrangement_probe_bundle_t *bundle)
 }
 
 int
+col_arrangement_probe_bundle_acquire_primary(
+    col_arrangement_probe_bundle_t *bundle, wl_session_t *sess,
+    const col_rel_t *source, const uint32_t *key_cols, uint32_t key_count,
+    col_arrangement_probe_t **out_probe)
+{
+    col_arrangement_probe_t acquired = { 0 };
+    col_arrangement_probe_bundle_slot_t *slot;
+    int rc;
+
+    if (!bundle || !sess || !source || !key_cols || key_count == 0
+        || !out_probe || bundle->identity != (uintptr_t)bundle
+        || !bundle->active)
+        return EINVAL;
+    *out_probe = NULL;
+    if (bundle->count >= COL_ARRANGEMENT_PROBE_BUNDLE_MAX) {
+        rc = col_arrangement_probe_bundle_release(bundle);
+        if (rc != 0)
+            return rc;
+        col_arrangement_probe_bundle_init(bundle);
+        return EOVERFLOW;
+    }
+    rc = col_session_acquire_primary_arrangement_probe(sess, source,
+        key_cols, key_count, &acquired);
+    if (rc != 0)
+        return rc;
+    slot = &bundle->slots[bundle->count];
+    slot->probe = acquired;
+    /* The primary helper binds address-sensitive tokens to its caller's
+     * stack object. Rebase both identities after moving the lease into the
+     * operation-owned bundle slot. */
+    slot->probe.identity = (uintptr_t)&slot->probe;
+    slot->probe.source_reader.identity
+        = (uintptr_t)&slot->probe.source_reader;
+    slot->ref_count = 1;
+    bundle->count++;
+    *out_probe = &slot->probe;
+    return 0;
+}
+
+int
 col_arrangement_probe_bundle_acquire(col_arrangement_probe_bundle_t *bundle,
     wl_session_t *sess, col_arrangement_t *arr, const col_rel_t *source,
     col_arrangement_probe_t **out_probe)
