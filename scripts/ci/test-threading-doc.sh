@@ -66,6 +66,26 @@ run_checker >/dev/null
 grep -q '3 audit rows' <(WIRELOG_THREADING_DOC_ROOT="$fixture" \
     WIRELOG_THREADING_EXPECTED_ROWS=3 "$BASH" "$checker" 2>/dev/null) || exit 1
 
+# Issue #1464: a CRLF helper inventory (Windows text-mode stdout) must pass.
+# The checker resolves the helper beside itself, so a copy of the checker in
+# a scratch directory next to a stub helper that runs the real one and
+# rewrites LF to CRLF exercises the inventory path exactly.  The rows path
+# already discards a CR in its extraction, so only the inventory can fail.
+crlf_dir=$(mktemp -d)
+cp "$checker" "$crlf_dir/check-threading-doc.sh"
+printf '%s\n' \
+    '#!/usr/bin/env python3' \
+    'import subprocess, sys' \
+    "real = '$script_dir/threading_doc_anchors.py'" \
+    'out = subprocess.run([sys.executable, real] + sys.argv[1:], check=True,' \
+    '                     capture_output=True).stdout' \
+    "sys.stdout.buffer.write(out.replace(b'\\n', b'\\r\\n'))" \
+    >"$crlf_dir/threading_doc_anchors.py"
+WIRELOG_THREADING_DOC_ROOT="$fixture" WIRELOG_THREADING_EXPECTED_ROWS=3 \
+    "$BASH" "$crlf_dir/check-threading-doc.sh" \
+    || { echo 'test-threading-doc: FAIL CRLF helper inventory must pass' >&2; rm -rf "$crlf_dir"; exit 1; }
+rm -rf "$crlf_dir"
+
 # A duplicated anchor cannot hide an omitted source site.
 sed 's/intern.c:LOAD/foo.c:foo/' "$fixture/docs/THREADING.md" \
     >"$fixture/docs/THREADING.md.tmp" && mv "$fixture/docs/THREADING.md.tmp" "$fixture/docs/THREADING.md"

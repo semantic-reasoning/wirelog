@@ -52,6 +52,14 @@ audit="$tmp_dir/audit"
 # regular-file stderr redirection the selftest uses is appended to, not
 # truncated.
 awk -F '\t' '
+# Issue #1464: strip a trailing CR before splitting either input.  On Windows
+# the helper prints its --dump inventory through a text-mode stdout, so every
+# inventory line ends in CRLF and a CR left on the anchor field would make
+# every row report "does not resolve uniquely" at once; the row extraction
+# above already discards a CR through its trailing `.*`, and the strip is
+# applied to both inputs anyway so neither depends on the shape of the other.
+# sub() on $0 re-splits the fields, so $5 and $2 below are CR-free.
+{ sub(/\r$/, "") }
 FILENAME == ARGV[1] {
     count[$5]++
     resolved[$5] = $4

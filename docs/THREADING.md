@@ -432,6 +432,16 @@ row resolves to a unique `file:function[#N]` or macro anchor, checks the
 documented operation, and is compared against the complete source inventory.
 A mismatch or stale anchor fails `meson test --suite abi:threading_doc`.
 
+The checker strips a trailing carriage return from every inventory and
+row line before splitting fields (Issue #1464). On Windows the helper's
+`--dump` output goes through a text-mode stdout and ends every line in
+CRLF; without the strip a CR on the anchor field would make every row
+report `does not resolve uniquely` at once. The row extraction already
+discards a CR from a CRLF copy of this document, and the strip is applied
+to both inputs so neither depends on the other's shape.
+`scripts/ci/test-threading-doc.sh` covers the CRLF inventory case through
+a stub helper.
+
 ---
 
 ## 6. Lock-free SPSC delta queue
