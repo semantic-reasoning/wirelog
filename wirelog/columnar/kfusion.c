@@ -629,6 +629,7 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].filt_cache = NULL;
         worker_sess[d].filt_cache_count = 0;
         worker_sess[d].filt_cache_cap = 0;
+        worker_sess[d].filt_cache_active_pins = 0; /* Issue #1435 */
         /* Issue #196: Workers start with empty mat_cache.  Divergent rule
          * copies have ~0% cache hit rate, so inheriting parent entries
          * wastes memory without benefit. */
@@ -882,6 +883,7 @@ cleanup_wq:
         col_session_free_diff_arrangements(&worker_sess[d]);
         /* Free worker's private filtered arrangement cache (filt_arr_*). */
         col_session_free_filt_arrangements(&worker_sess[d]);
+        assert(worker_sess[d].filt_cache_active_pins == 0);
         for (uint32_t i = 0; i < worker_sess[d].filt_cache_count; i++) {
             free(worker_sess[d].filt_cache[i].rel_name);
             free(worker_sess[d].filt_cache[i].filter_data);

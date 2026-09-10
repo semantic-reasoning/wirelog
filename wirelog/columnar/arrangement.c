@@ -1998,7 +1998,8 @@ col_session_get_darr_count(wl_session_t *sess)
  *
  * Stale detection: if `e->arr.indexed_rows != filtered_rel->nrows`, the
  * arrangement is rebuilt.  This handles the case where filt_cache rebuilt
- * the filtered relation because the source EDB grew.
+ * the filtered relation because its source token changed (Issue #1438;
+ * the row-count check is the second guard, not the contract).
  *
  * Returns NULL on allocation failure or if key_count == 0.
  */

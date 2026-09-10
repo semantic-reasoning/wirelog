@@ -1407,7 +1407,21 @@ typedef struct col_filt_cache_entry {
     uint32_t source_nrows;   /* nrows of source rel when entry was built */
     col_relation_snapshot_t source_snapshot;
     col_rel_t *filtered;     /* owned: the filtered relation */
+    uint32_t pin_count;      /* active reader leases (Issue #1435) */
+    bool evict_deferred;     /* replacement or destruction waits for readers */
 } col_filt_cache_entry_t;
+
+/* Non-public lease for a filtered relation borrowed from filt_cache
+ * (Issue #1435).  While active, the entry is neither replaced nor moved:
+ * a stale token or an invalidation marks it deferred and lookups report it
+ * unavailable, and the last release destroys it so the next lookup
+ * rebuilds.  Release exactly once. */
+typedef struct {
+    struct wl_col_session_t *session;
+    col_filt_cache_entry_t *entry;
+    col_rel_t *rel;
+    bool active;
+} col_filt_cache_pin_t;
 
 /*
  * col_filt_arr_entry_t: one entry in the filtered arrangement cache (Issue #433).
@@ -1848,6 +1862,10 @@ typedef struct wl_col_session_t {
     col_filt_cache_entry_t *filt_cache;
     uint32_t filt_cache_count;
     uint32_t filt_cache_cap;
+    /* Issue #1435: active filtered-cache leases.  While non-zero the entry
+     * array is neither grown nor compacted, so lease pointers stay valid;
+     * asserted zero at session and worker teardown in debug builds. */
+    uint32_t filt_cache_active_pins;
 } wl_col_session_t;
 
 /*
@@ -2577,6 +2595,18 @@ wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len);
 col_rel_t *
 wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
     const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel);
+/* Lease-taking variant (Issue #1435): on success *pin is active and the
+ * returned relation stays valid until col_filt_cache_pin_release(); NULL
+ * when the entry is leased and stale (replacement deferred), hidden by a
+ * deferred invalidation, or when the cache cannot grow while leases are
+ * active, as well as on allocation failure.  Callers fall back to the
+ * owned wl_columnar_filter_apply_right_filter path on NULL. */
+col_rel_t *
+wl_columnar_filter_apply_right_filter_cached_pin(wl_col_session_t *sess,
+    const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel,
+    col_filt_cache_pin_t *pin);
+void
+col_filt_cache_pin_release(col_filt_cache_pin_t *pin);
 
 void
 eval_stack_init(eval_stack_t *s);

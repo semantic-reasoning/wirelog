@@ -1453,6 +1453,67 @@ test_session_add_rel_invalidates_filter_cache(void)
     return 0;
 }
 
+/*
+ * Issue #1435: a worker whose filtered cache was populated through the
+ * lease-taking lookup, then fully released, tears down with the lease
+ * counter at zero and frees its entries (LSan-clean under ASan).
+ */
+static int
+test_worker_populated_filter_cache_destroy(void)
+{
+    TEST("worker with populated filtered cache destroys cleanly");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    if (!coord) {
+        FAIL("coordinator creation");
+        return 1;
+    }
+
+    int64_t rows[] = { 1, 2, 1, 3, 1, 4 };
+    insert_edges(coord, rows, 3);
+
+    col_rel_t **parts = NULL;
+    partition_rel(coord, "edge", 1, &parts);
+
+    wl_col_session_t worker;
+    memset(&worker, 0, sizeof(worker));
+    col_worker_session_create(coord, 0, parts, 1, &worker);
+    free(parts);
+
+    /* VAR("col1") CONST_INT(2) CMP_GT */
+    uint8_t expression[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+        WL_PLAN_EXPR_CONST_INT, 2, 0, 0, 0, 0, 0, 0, 0,
+        WL_PLAN_EXPR_CMP_GT
+    };
+    wl_plan_expr_buffer_t filter = { expression, sizeof(expression) };
+    col_rel_t *edge = session_find_rel(&worker, "edge");
+    col_filt_cache_pin_t pin;
+    col_rel_t *filtered = wl_columnar_filter_apply_right_filter_cached_pin(
+        &worker, &filter, "edge", edge, &pin);
+    int ok = edge != NULL && filtered != NULL && filtered->nrows == 2
+        && worker.filt_cache_count == 1 && worker.filt_cache_active_pins == 1
+        && coord->filt_cache_active_pins == 0;
+    col_filt_cache_pin_release(&pin);
+    if (ok)
+        ok = worker.filt_cache_active_pins == 0
+            && worker.filt_cache_count == 1;
+
+    col_worker_session_destroy(&worker);
+    if (ok)
+        ok = worker.filt_cache == NULL && worker.filt_cache_count == 0;
+    cleanup_coordinator(coord, plan, prog);
+
+    if (!ok) {
+        FAIL("worker filtered cache lease state");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Issue #535: RDF Named-Graph column propagation tests                     */
 /* ======================================================================== */
@@ -1827,6 +1888,7 @@ main(void)
     test_session_add_rel_replaces_by_name();
     test_session_add_rel_reuses_removed_slot();
     test_session_add_rel_invalidates_filter_cache();
+    test_worker_populated_filter_cache_destroy();
     test_join_output_limit_scaling();
     test_rdf_graph_column_propagates_to_col_rel();
     test_rdf_no_graph_column_defaults_to_false();
