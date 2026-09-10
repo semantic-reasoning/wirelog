@@ -1895,6 +1895,11 @@ col_session_destroy(wl_session_t *session)
      * etc.) before any of the other teardown frees them. NULL-safe. */
     if (sess->rotation_ops && sess->rotation_ops->destroy)
         sess->rotation_ops->destroy(sess);
+    /* Admission is closed and all backend operations are quiescent before
+     * this vtable entry is called.  Finish any submit-only or in-flight batch
+     * while its worker/view/relation/allocator contexts are still alive. */
+    if (sess->wq)
+        (void)wl_workqueue_drain(sess->wq);
     /* Worker views may borrow coordinator relation storage.  Drain workers
      * before coordinator relations so their owner borrows are released before
      * the coordinator root is destroyed. */
@@ -2042,6 +2047,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Prevent accidental wl_session_destroy on stack-allocated worker */
     out_worker->base.backend = NULL;
     out_worker->base.owns_extension_snapshot = false;
+    out_worker->base.operation_admission = NULL;
+    out_worker->base.owns_operation_admission = false;
 
     /* Step 3: NULL all owned pointers (safe for cleanup on early abort) */
     out_worker->wq = NULL;
