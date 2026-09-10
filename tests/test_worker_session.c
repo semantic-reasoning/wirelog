@@ -1661,6 +1661,113 @@ test_rdf_graph_metadata_absent_when_no_graph_column(void)
     return 0;
 }
 
+/*
+ * A worker-to-worker shared-view chain must retain the coordinator storage
+ * owner exactly once per live alias.  Teardown must release the chain in
+ * reverse order, after which the coordinator can reuse the relation.
+ */
+static int
+test_worker_alias_chain_checked_teardown(void)
+{
+    TEST("worker alias chain blocks checked teardown and permits reuse");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    wl_col_session_t worker_a = { 0 };
+    wl_col_session_t worker_b = { 0 };
+    col_rel_t *view_a = NULL;
+    col_rel_t *view_b = NULL;
+    int64_t initial[] = { 1, 2, 2, 3 };
+    int64_t followup[] = { 3, 4 };
+    int ok = 1;
+
+    if (!coord) {
+        FAIL("coordinator creation");
+        return 1;
+    }
+    if (insert_edges(coord, initial, 2) != 0) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("coordinator source insert");
+        return 1;
+    }
+
+    col_rel_t *source = session_find_rel(coord, "edge");
+    if (!source) {
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("coordinator source lookup");
+        return 1;
+    }
+    view_a = col_rel_new_auto("edge", source->ncols);
+    view_b = col_rel_new_auto("edge", source->ncols);
+    if (!view_a || !view_b
+        || col_rel_install_shared_view(view_a, source) != 0
+        || col_rel_install_shared_view(view_b, view_a) != 0) {
+        col_rel_destroy(view_b);
+        col_rel_destroy(view_a);
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("shared-view chain setup");
+        return 1;
+    }
+
+    col_rel_t *parts_a[] = { view_a };
+    col_rel_t *parts_b[] = { view_b };
+    view_a = NULL;
+    view_b = NULL;
+    if (col_worker_session_create(coord, 0, parts_a, 1, &worker_a) != 0
+        || col_worker_session_create(coord, 1, parts_b, 1, &worker_b) != 0) {
+        col_worker_session_destroy(&worker_b);
+        col_worker_session_destroy(&worker_a);
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("worker alias chain creation");
+        return 1;
+    }
+
+    col_rel_t *worker_a_rel = session_find_rel(&worker_a, "edge");
+    col_rel_t *worker_b_rel = session_find_rel(&worker_b, "edge");
+    int destroy_with_both = col_rel_destroy_checked(source);
+    if (destroy_with_both != EBUSY) {
+        fprintf(stderr,
+            "alias chain: source destroy with live aliases returned %d\n",
+            destroy_with_both);
+        return 1;
+    }
+    ok = worker_a_rel != NULL && worker_b_rel != NULL
+        && worker_a_rel->storage_owner == source
+        && worker_b_rel->storage_owner == source
+        && source->storage_alias_borrows == 2
+        && atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire) == 2;
+
+    col_worker_session_destroy(&worker_b);
+    int destroy_with_a = col_rel_destroy_checked(source);
+    if (destroy_with_a != EBUSY) {
+        fprintf(stderr,
+            "alias chain: source destroy with worker A returned %d\n",
+            destroy_with_a);
+        return 1;
+    }
+    ok = ok && source->storage_alias_borrows == 1
+        && atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire) == 1;
+
+    col_worker_session_destroy(&worker_a);
+    int followup_rc = wl_session_insert(&coord->base, "edge", followup, 1, 2);
+    ok = ok && source->storage_alias_borrows == 0
+        && atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire) == 0
+        && followup_rc == 0
+        && source->nrows == 3;
+
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("alias chain teardown or coordinator reuse");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1693,6 +1800,7 @@ main(void)
     test_rdf_no_graph_column_defaults_to_false();
     test_rdf_graph_metadata_auto_created_when_any_graph_column();
     test_rdf_graph_metadata_absent_when_no_graph_column();
+    test_worker_alias_chain_checked_teardown();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);
