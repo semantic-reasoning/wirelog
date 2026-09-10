@@ -114,6 +114,13 @@ insert_edges(wl_col_session_t *sess, const int64_t *rows, uint32_t nrows)
     return wl_session_insert(&sess->base, "edge", rows, nrows, 2);
 }
 
+static int
+insert_filtered_edges(wl_col_session_t *sess, const int64_t *rows,
+    uint32_t nrows)
+{
+    return wl_session_insert(&sess->base, "edge", rows, nrows, 3);
+}
+
 static uint32_t
 count_rows(wl_col_session_t *sess, const char *name)
 {
@@ -770,14 +777,16 @@ test_bdx_selfjoin_w4_shuffled_duplicates(void)
 
 /*
  * make_filtered_tc_session:
- * Build a TC session with a constant filter on the right-side EDB:
- *   tc(x, y) :- edge(x, y), y > 0.
- *   tc(x, z) :- tc(x, y), edge(y, z), z > 0.
+ * Build a TC session with a constant filter in the right-side EDB atom:
+ *   tc(x, y) :- edge(x, y, 1).
+ *   tc(x, z) :- tc(x, y), edge(y, z, 1).
  *
- * The filter "y > 0" / "z > 0" is pushed to right_filter_expr by JPP,
- * triggering the filt_cache path in col_op_join.  With the filt_arr
- * optimization (Issue #433), the arrangement for the filtered edge
- * relation is cached across sub-passes rather than rebuilt each time.
+ * Explicit comparisons such as y > 0 and z > 0 are lowered as FILTER
+ * operators above the join; JPP does not move them into right_filter_expr.
+ * Constants inside a right-side atom are collected as scan-local filters,
+ * which triggers the filt_cache path in col_op_join.  With the filt_arr
+ * optimization (Issue #433), the arrangement for the filtered edge relation
+ * is cached across sub-passes rather than rebuilt each time.
  */
 static wl_col_session_t *
 make_filtered_tc_session(uint32_t num_workers, wl_plan_t **plan_out,
@@ -785,10 +794,10 @@ make_filtered_tc_session(uint32_t num_workers, wl_plan_t **plan_out,
 {
     wirelog_error_t err;
     wirelog_program_t *prog = wirelog_parse_string(
-        ".decl edge(x: int32, y: int32)\n"
+        ".decl edge(x: int32, y: int32, tag: int32)\n"
         ".decl tc(x: int32, y: int32)\n"
-        "tc(x, y) :- edge(x, y), y > 0.\n"
-        "tc(x, z) :- tc(x, y), edge(y, z), z > 0.\n",
+        "tc(x, y) :- edge(x, y, 1).\n"
+        "tc(x, z) :- tc(x, y), edge(y, z, 1).\n",
         &err);
     if (!prog)
         return NULL;
@@ -839,12 +848,15 @@ test_filt_arr_bench_w1(void)
         return 1;
     }
 
-    /* 10-node chain: edge(1,2)..edge(9,10) */
+    /* 10-node chain: tag=1 edges (1,2)..(9,10). */
     int64_t edges[] = {
-        1, 2,  2, 3,  3, 4,  4, 5,  5, 6,
-        6, 7,  7, 8,  8, 9,  9, 10
+        1, 2, 1,  2, 3, 1,  3, 4, 1,  4, 5, 1,
+        5, 6, 1,  6, 7, 1,  7, 8, 1,  8, 9, 1,
+        9, 10, 1,
+        /* This edge must be rejected by the atom filter. */
+        10, 11, 0
     };
-    if (insert_edges(sess, edges, 9) != 0) {
+    if (insert_filtered_edges(sess, edges, 10) != 0) {
         cleanup_session(sess, plan, prog);
         FAIL("insert_edges failed");
         return 1;
@@ -855,6 +867,7 @@ test_filt_arr_bench_w1(void)
     uint64_t elapsed_ms = (now_ns() - t0) / 1000000ULL;
 
     uint32_t nrows = count_rows(sess, "tc");
+    uint32_t filt_cache_count = sess->filt_cache_count;
     cleanup_session(sess, plan, prog);
 
     if (rc != 0) {
@@ -863,6 +876,10 @@ test_filt_arr_bench_w1(void)
     }
     if (nrows != 45) {
         FAIL("expected 45 tc tuples");
+        return 1;
+    }
+    if (filt_cache_count == 0) {
+        FAIL("expected filtered edge cache to be populated");
         return 1;
     }
     printf(" [%llu ms]", (unsigned long long)elapsed_ms);
@@ -892,11 +909,18 @@ test_filt_arr_bench_w4(void)
     }
 
     int64_t edges[] = {
-        1, 2,  2, 3,  3, 4,  4, 5,  5, 6,
-        6, 7,  7, 8,  8, 9,  9, 10
+        1, 2, 1,  2, 3, 1,  3, 4, 1,  4, 5, 1,
+        5, 6, 1,  6, 7, 1,  7, 8, 1,  8, 9, 1,
+        9, 10, 1,
+        10, 11, 0
     };
-    insert_edges(s1, edges, 9);
-    insert_edges(s4, edges, 9);
+    if (insert_filtered_edges(s1, edges, 10) != 0
+        || insert_filtered_edges(s4, edges, 10) != 0) {
+        cleanup_session(s1, p1, pr1);
+        cleanup_session(s4, p4, pr4);
+        FAIL("insert_edges failed");
+        return 1;
+    }
 
     int rc1 = wl_session_step(&s1->base);
     int rc4 = wl_session_step(&s4->base);
