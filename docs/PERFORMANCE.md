@@ -3,6 +3,8 @@
 **Last Updated:** 2026-04-24
 **Baseline SHA:** `7010d9bf531f41e62dff201db6641f06c67c634b`
 **Issue:** #536 (documentation), benchmarks from #530/#531/#532/#533
+**See also:** `docs/INTERN_PERF.md` for the intern write-path baseline
+(`bench_intern`, Issue #1472), kept separate from this compound-term document.
 
 ---
 

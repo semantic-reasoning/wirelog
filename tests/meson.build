@@ -6282,3 +6282,22 @@ test('bench_compound_smoke', test_bench_compound_smoke_exe,
   args: [bench_compound_exe.full_path()],
   depends: [bench_compound_exe],
 )
+
+# ======================================================================
+# bench_intern smoke test (Issue #1472)
+# Execs bench/bench_intern over every scenario with a small put count and
+# asserts the metric tokens, a zero governor delta for duplicates, and no
+# error token.  bench_intern_exe is defined in bench/meson.build.
+# ======================================================================
+
+test_bench_intern_smoke_exe = executable(
+  'test_bench_intern_smoke',
+  files('test_bench_intern.c'),
+  include_directories: [],
+  install: false,
+)
+
+test('bench_intern_smoke', test_bench_intern_smoke_exe,
+  args: [bench_intern_exe.full_path()],
+  depends: [bench_intern_exe],
+)
