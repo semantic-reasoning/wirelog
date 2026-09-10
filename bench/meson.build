@@ -167,6 +167,23 @@ bench_compound_exe = executable(
   install: false,
 )
 
+# Intern write-path microbenchmark (Issue #1472).
+# Unique vs duplicate wl_intern_put() at 1/4/8 writers, with and without an
+# enforcing memory governor.  bench_intern_exe is referenced by
+# tests/meson.build (bench_intern_smoke).
+bench_intern_exe = executable(
+  'bench_intern',
+  files('bench_intern.c'),
+  bench_backend_src,
+  files(subdir_wirelog / 'intern.c'),
+  bench_arena_src,
+  bench_thread_src,
+  bench_workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  install: false,
+)
+
 # Filter scan microbenchmark (fused vs split vs scan-only).
 #
 # Built twice so the AVX2 and scalar bodies of col_filter_select_rows can be

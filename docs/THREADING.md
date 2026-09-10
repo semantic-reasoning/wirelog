@@ -427,7 +427,10 @@ The intern table is shared, unsynchronized, by every parallel worker
 because reverse lookup runs once or twice per row in the string
 operations and a lock there costs more than the parallelism is worth.
 The three sites are the macro bodies; the call sites they serve are
-named in the justification.
+named in the justification. The cost of the locked write path per put,
+with and without a memory governor and at 1, 4 and 8 writers, is
+measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
+(Issue #1472).
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
