@@ -4,6 +4,7 @@
 #include "wirelog/thread.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int failures;
 
@@ -89,6 +90,20 @@ test_invalid_and_cross_thread(void)
         "owning thread release");
     CHECK(wl_columnar_source_access_reader_release(&reader) == EINVAL,
         "duplicate release rejected");
+
+    memset(&reader, 0, sizeof(reader));
+    arg.result = EINVAL;
+    CHECK(wl_columnar_source_access_reader_acquire_transferable(&gate,
+        &reader) == 0, "transferable reader acquire");
+    copy = reader;
+    CHECK(wl_columnar_source_access_reader_release(&copy) == EINVAL,
+        "copied transferable reader release rejected");
+    CHECK(thread_create(&thread, cross_thread_release, &arg) == 0,
+        "transferable cross-thread setup");
+    CHECK(thread_join(&thread) == 0 && arg.result == 0,
+        "transferable cross-thread release");
+    CHECK(atomic_load_explicit(&gate.state, memory_order_relaxed) == 0
+        && reader.owner == NULL, "transferable release balanced gate");
 }
 
 static void

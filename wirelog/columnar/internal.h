@@ -1414,6 +1414,18 @@ typedef struct {
     int32_t diff;
 } wl_col_delta_event_t;
 
+/* Stable session-owned source-reader lease.  The reader token's identity is
+* its address, so entries are individually allocated and never moved.  A
+* lease is keyed by the worker relation whose columns borrow owner storage;
+* this lets refresh and relation retirement update the gate exactly once. */
+typedef struct wl_columnar_session_source_lease {
+    col_rel_t *borrower;
+    col_rel_t *owner;
+    uint64_t owner_identity;
+    wl_columnar_source_access_reader_t reader;
+    struct wl_columnar_session_source_lease *next;
+} wl_columnar_session_source_lease_t;
+
 typedef struct wl_col_session_t {
     wl_session_t base;         /* MUST be first field (vtable dispatch)  */
     /* base.extension_snapshot is borrowed from the coordinator in workers;
@@ -1729,6 +1741,10 @@ typedef struct wl_col_session_t {
      *               resources (plan, frontier_ops) in worker destroy. */
     uint32_t worker_id;
     struct wl_col_session_t *coordinator;
+    /* Worker/session-owned registry for persistent shared-view source
+     * readers.  Membership is confined to the coordinator thread between
+     * worker barriers; worker tasks only read the published relations. */
+    wl_columnar_session_source_lease_t *source_leases;
     /* Exchange operator state (Issue #316): W x W partition buffer matrix.
      * Allocated by coordinator before exchange scatter dispatch.
      * exchange_bufs[src_worker][dst_worker] holds rows src sends to dst.
@@ -2700,6 +2716,19 @@ col_worker_session_create(wl_col_session_t *coordinator,
  */
 void
 col_worker_session_destroy(wl_col_session_t *worker);
+
+/* Publish a shared view owned by sess and retain its source for exactly the
+ * borrower's registered lifetime.  Repeated publication from the same source
+ * reuses the stable lease; changing source replaces it transactionally. */
+int
+wl_columnar_session_install_shared_view(wl_col_session_t *sess,
+    col_rel_t *dst, const col_rel_t *src);
+int
+wl_columnar_session_adopt_shared_view(wl_col_session_t *sess,
+    col_rel_t *borrower);
+int
+wl_columnar_session_retire_source_lease(wl_col_session_t *sess,
+    col_rel_t *borrower);
 
 /*
  * col_detect_physical_memory: Detect total physical RAM in bytes (Issue #221).

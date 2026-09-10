@@ -590,6 +590,9 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].tdd_workers = NULL;
         worker_sess[d].tdd_workers_cap = 0;
         worker_sess[d].tdd_workers_count = 0;
+        /* The shallow branch wrapper does not own the parent worker's
+         * persistent source-reader registry. */
+        worker_sess[d].source_leases = NULL;
         /* The shallow session copy must not retain coordinator reclaimer
          * callbacks after the worker cache is replaced below. */
         memset(worker_sess[d].mem_ledger.reclaimers, 0,
