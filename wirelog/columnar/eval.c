@@ -205,6 +205,7 @@ record_worker_expr_status(wl_col_session_t *coord,
     if (worker && worker->extension_expr_status != 0)
         coord->extension_expr_status = worker->extension_expr_status;
     else if (rc >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+        && rc != WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
         && rc <= WL_COLUMNAR_EXPR_CALLBACK_REENTRANT)
         coord->extension_expr_status = rc;
 }
@@ -406,8 +407,9 @@ tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
     if (rc == 0 && release_rc != 0)
         rc = release_rc;
     if (rc == 0 && sess) {
-        /* append_all also detaches an empty shared destination before it
-         * returns, so a successful fallback must retire the old lease. */
+        /* append_all also detaches an empty shared destination
+         * before it returns, so a successful fallback must retire the
+         * old lease. */
         int retire_rc
             = wl_columnar_session_retire_source_lease(sess, dst);
         if (retire_rc != 0)

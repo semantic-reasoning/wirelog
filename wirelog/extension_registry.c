@@ -1,5 +1,8 @@
 #include "wirelog/wirelog-extension.h"
+#include "wirelog/wirelog-internal.h"
+#include "wirelog/wirelog.h"
 #include "wirelog/thread.h"
+#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +75,19 @@ wl_extension_error_set_expr_status(int status)
         break;
     default: break;
     }
+}
+
+int
+wl_facade_session_error_code(int rc, int expr_status)
+{
+    if (rc == ENOMEM || expr_status == 8) {
+        if (expr_status == 8)
+            wl_extension_error_set(NULL);
+        return WIRELOG_ERR_MEMORY;
+    }
+    if (rc != 0)
+        wl_extension_error_set_expr_status(expr_status);
+    return rc == 0 ? WIRELOG_OK : WIRELOG_ERR_EXEC;
 }
 
 static char *

@@ -2436,6 +2436,120 @@ out:
     return ok ? 0 : -1;
 }
 
+/* ======================================================================== */
+/* Issue #1521: an evaluation-time interning denial is a memory verdict     */
+/* ======================================================================== */
+
+static int denied_eval_rows;
+
+static void
+count_denied_eval_rows(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)user_data;
+    denied_eval_rows++;
+}
+
+/* A governor sized to the create-time floor plus a slack that admits the
+ * fact relations but not the cat() results denies the interning of the
+ * derived strings (#1470 makes the step return ENOMEM).  The public
+ * facades must report that as WIRELOG_ERR_MEMORY, and must not leave a
+ * scalar-extension diagnostic behind for a program that uses no
+ * extension.  1024 bytes of slack is enough for the two one-row fact
+ * relations and short of the derived strings; the same program with more
+ * slack derives both rows, which keeps the sizing honest -- a test that
+ * only ever saw a denial could be passing for the wrong reason.
+ *
+ * Before this fix the denial surfaced as WIRELOG_ERR_EXEC with
+ * "scalar extension allocation failed" in wirelog_extension_last_error(),
+ * and that message stayed set for later successful runs. */
+static int
+test_denied_eval_interning_maps_to_memory(void)
+{
+    static const char *SRC =
+        ".decl a(x: symbol)\n"
+        "a(\"alpha\"). a(\"beta\").\n"
+        ".decl r(y: symbol)\n"
+        "r(cat(x, \"-suffix\")) :- a(x).\n";
+    static const uint64_t DENY_SLACK = 1024u;
+    static const uint64_t ALLOW_SLACK = 65536u;
+    const uint64_t slacks[2] = { DENY_SLACK, ALLOW_SLACK };
+    int rc = 1;
+
+    for (size_t i = 0; i < 2; i++) {
+        wirelog_program_t *prog = parse_or_die(SRC, "T-1521");
+        wirelog_session_t *session = NULL;
+        wl_session_options_t options;
+        wl_columnar_memory_governor_ref_t *ref = NULL;
+        wirelog_error_t create_err;
+        wirelog_error_t snap_err;
+        const char *ext;
+        uint64_t intern_bytes = 0;
+        uint64_t compound_bytes = 0;
+        bool denying = slacks[i] == DENY_SLACK;
+
+        if (!prog)
+            return 1;
+        if (measure_create_floor(prog, &intern_bytes, &compound_bytes) != 0) {
+            fprintf(stderr, "T-1521: could not measure the create floor\n");
+            wirelog_program_free(prog);
+            return 1;
+        }
+        wl_session_options_init(&options);
+        ref = enforcing_governor(intern_bytes + compound_bytes + slacks[i]);
+        if (!ref) {
+            wirelog_program_free(prog);
+            return 1;
+        }
+        options.memory_governor = ref;
+        wl_session_testhook_set_default_options(&options);
+        create_err = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
+                &session);
+        wl_session_testhook_set_default_options(NULL);
+        if (create_err != WIRELOG_OK || !session) {
+            fprintf(stderr, "T-1521: create err=%d slack=%llu\n", create_err,
+                (unsigned long long)slacks[i]);
+            goto next;
+        }
+        denied_eval_rows = 0;
+        snap_err = wirelog_session_snapshot(session, count_denied_eval_rows,
+                NULL);
+        ext = wirelog_extension_last_error();
+        if (denying) {
+            /* The denial is a memory verdict with no row published and no
+             * extension diagnostic. */
+            if (snap_err != WIRELOG_ERR_MEMORY || denied_eval_rows != 0
+                || (ext && ext[0] != '\0')) {
+                fprintf(stderr,
+                    "T-1521: denial err=%d rows=%d ext='%s'\n", snap_err,
+                    denied_eval_rows, ext ? ext : "");
+                goto next;
+            }
+        } else {
+            /* With room to intern, the same program derives both rows. */
+            if (snap_err != WIRELOG_OK || denied_eval_rows != 2
+                || (ext && ext[0] != '\0')) {
+                fprintf(stderr,
+                    "T-1521: allowed err=%d rows=%d ext='%s'\n", snap_err,
+                    denied_eval_rows, ext ? ext : "");
+                goto next;
+            }
+            rc = 0;
+        }
+next:
+        if (session)
+            wirelog_session_destroy(session);
+        wirelog_program_free(prog);
+        wl_columnar_memory_governor_ref_release(ref);
+        if (rc != 0 && !denying)
+            return 1;
+    }
+    return rc;
+}
+
 static int
 test_injected_governor_denial_maps_to_memory(void)
 {
@@ -2657,6 +2771,7 @@ main(void)
     failures += test_invalid_memory_budget();
     failures += test_injected_governor_denial_maps_to_memory();
     failures += test_injected_governor_overflow_maps_to_memory();
+    failures += test_denied_eval_interning_maps_to_memory();
     failures += test_typed_float_ingress();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
