@@ -282,6 +282,12 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         if (sess && expr_status
                             >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED)
                             sess->extension_expr_status = expr_status;
+                        /* A refused string allocation fails the step as a
+                         * memory error (Issue #1470); the partial output
+                         * was destroyed above. */
+                        if (expr_status
+                            == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
+                            return ENOMEM;
                         return expr_status
                                >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
                             ? expr_status : ERANGE;

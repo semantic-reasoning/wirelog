@@ -78,6 +78,13 @@ All notable changes to wirelog are documented in this file.
   allocation-failure, key-type and ledger-backpressure exits of the keyed,
   differential, semi and anti joins, closing a heap leak reachable through the
   delta path of a filtered recursive rule.
+
+- **Denied string interning fails the evaluation step** (#1470). When the
+  memory governor refuses the growth a string builtin, `uuid5_rfc` or a
+  non-pre-interned literal needs, the step now fails with `ENOMEM` and
+  publishes no row, instead of emitting a tuple carrying string id `-1`.
+  The checked builtin variants distinguish that denial from an invalid
+  operand, which still yields `-1`.
 - **Unfused recursive SCCs no longer terminate with incomplete results**
   (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
   to normal evaluation instead of treating one empty input as an empty union.
