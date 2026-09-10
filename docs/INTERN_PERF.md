@@ -1,6 +1,6 @@
 # Intern Write-Path Performance
 
-**Last Updated:** 2026-09-10
+**Last Updated:** 2026-09-11
 **Baseline SHA:** `ec48d48d` (main at the time of measurement)
 **Issue:** #1472 (benchmark and baseline); measures the write path from #958,
 #961 and #1431
@@ -73,7 +73,10 @@ be mistaken for a fast one. Timing values are never asserted.
 The host was not pinned or isolated; the numbers carry run-to-run noise of
 a few percent on the single-writer rows and more on the contended rows. The
 bench deliberately does not call `bench_stability_prep()`: on Windows that
-helper pins the process to one CPU, which would serialize the writers.
+helper pins the process to one CPU, which would serialize the writers. Before
+the first reported row, the bench now runs one full-size untimed scenario to
+pre-fault the allocator path; subsequent scenarios retain their tenth-size
+untimed warm-up.
 
 ## Results: default configuration
 
@@ -146,16 +149,11 @@ Clock pair cost (median of the three runs): 23 ns per bracketed put.
   rehash). Small early resizes and segment opens stay below the threshold.
   The share is reported as a share of summed per-put latency, not of wall
   time.
-- **Scenario order.** The grid runs its scenarios in one process, and the
-  first scenario pays the first-touch page faults of the heap the table
-  grows into (the tenth-size warm-up table does not pre-fault it). The p99
-  and `grow_events` of the first row (`unique`, one writer, governor off)
-  are therefore higher than the same scenario shows when it runs later in
-  the grid, and a scenario run alone is itself in first position and pays
-  the same cost. Tail metrics are only comparable between rows measured in
-  the same position: run each side of a comparison alone (`--mode`,
-  `--writers`, `--governor`) so both sit in first position. `grow_share`
-  is stable across positions; `agg_ns_put` moves by under ten percent.
+- **Scenario order.** The first full-size untimed scenario pre-faults the
+  allocator path before any reported row. Tail metrics can still vary with
+  scheduler and allocator state, so compare medians of three runs, but the
+  first-position page-fault penalty is no longer part of the first reported
+  row.
 
 ## Reproducing these results
 

@@ -443,6 +443,7 @@ main(int argc, char **argv)
     int writers_list[3];
     int nwriters = 0;
     bool run_unique, run_dup, run_off, run_on;
+    bool full_size_warmup_done = false;
     wl_perf_ns_t clock_ns;
 
     bench_argv_state_t st = BENCH_ARGV_INIT;
@@ -510,6 +511,15 @@ main(int argc, char **argv)
                 uint32_t warm = iters / 10u;
                 if ((governed && !run_on) || (!governed && !run_off))
                     continue;
+                /* Pre-fault a full-size throwaway table before the first
+                 * reported row.  Later scenarios retain the lightweight
+                 * warm-up so their setup cost stays bounded. */
+                if (!full_size_warmup_done) {
+                    if (run_scenario(mode, writers_list[wi], governed, iters,
+                        false, clock_ns) != 0)
+                        return 1;
+                    full_size_warmup_done = true;
+                }
                 if (warm > 0
                     && run_scenario(mode, writers_list[wi], governed, warm,
                     false, clock_ns) != 0)
