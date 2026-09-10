@@ -15,6 +15,7 @@ jobs:
     env:
       CLA_CONTEXT: license/cla
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
       REPOSITORY: ${{ github.repository }}
     steps:
       - name: Verify hosted CLA status
@@ -34,6 +35,15 @@ jobs:
           status_url="https://api.github.com/repos/${REPOSITORY}/commits/${HEAD_SHA}/status"
 
           echo "Checking ${CLA_CONTEXT} on PR head SHA ${HEAD_SHA}."
+
+          # Repository owners are trusted maintainers and do not need an
+          # external CLA Assistant status. This keeps the gate fail-closed
+          # for all external contributors while avoiding a deadlock when the
+          # hosted provider has not published a status for an owner PR.
+          if [ "${PR_AUTHOR_ASSOCIATION}" = "OWNER" ]; then
+            echo "${PR_AUTHOR_ASSOCIATION} PR: hosted CLA status is not required."
+            exit 0
+          fi
 
           for attempt in $(seq 1 "$attempts"); do
             remaining=$((deadline - SECONDS))
