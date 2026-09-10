@@ -1558,8 +1558,24 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     (void)arena;
     if (!dst || !src || dst->ncols != src->ncols)
         return EINVAL;
-    if (src->nrows == 0)
+    if (src->nrows == 0) {
+        /* An empty source still completes a destination ownership
+         * transition.  In particular, a reused TDD destination may be a
+         * shared view whose old source lease must not survive a successful
+         * fallback merely because there are no rows to copy. */
+        if (dst->col_shared) {
+            wl_columnar_source_access_writer_t writer = { 0 };
+            rc = col_rel_source_writer_acquire(dst, &writer);
+            if (rc != 0)
+                return rc;
+            rc = col_rel_cow_unshare(dst, 0);
+            if (wl_columnar_source_access_writer_release(&writer) != 0
+                && rc == 0)
+                rc = EINVAL;
+            return rc;
+        }
         return 0;
+    }
 
     /* Preserve the historical zero-initialized, zero-column arithmetic path.
      * These stack relations have no generation or owner metadata, so owner
