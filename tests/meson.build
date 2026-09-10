@@ -5407,6 +5407,24 @@ test_workers_as_cap_exe = executable(
 
 test('workers_as_cap', test_workers_as_cap_exe)
 
+test_columnar_teardown_exe = executable(
+  'test_columnar_teardown',
+  files('test_columnar_teardown.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('columnar_teardown', test_columnar_teardown_exe,
+     suite: 'unit', timeout: 60)
+
 # ============================================================================
 # Queue Transport Equivalence and Stress Tests (Issue #410)
 # ============================================================================
@@ -5786,6 +5804,20 @@ test_session_options_exe = executable(
   install: false,
 )
 test('session_options', test_session_options_exe)
+
+# Internal operation admission closes synchronously around backend teardown.
+test_session_admission_exe = executable(
+  'test_session_admission',
+  files('test_session_admission.c', '../wirelog/session.c',
+        '../wirelog/extension_registry.c'),
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  c_args: ['-DWIRELOG_BUILDING'],
+  dependencies: [threads_dep],
+  install: false,
+)
+test('session_admission', test_session_admission_exe,
+     suite: 'unit', timeout: 60)
 
 test_extension_filter_exe = executable(
   'test_extension_filter',

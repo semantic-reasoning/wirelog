@@ -30,6 +30,8 @@ extern "C" {
 #include "backend.h"
 #include "wirelog/wirelog-extension.h"
 
+typedef struct wl_session_admission wl_session_admission_t;
+
 /*
  * Note: concrete session types embed wl_session_t as their first field,
  * or allocate a struct where the backend pointer is tracked. For our purposes,
@@ -47,6 +49,13 @@ struct wl_session {
      * destroyed; otherwise a later snapshot could evaluate truncated facts.
      */
     bool input_load_failed;
+    /*
+     * Heap-owned because columnar worker sessions begin as bitwise copies of
+     * the coordinator.  Workers clear both fields and never close or destroy
+     * the coordinator's admission state.
+     */
+    wl_session_admission_t *operation_admission;
+    bool owns_operation_admission;
 };
 
 /* Wrapper functions that delegate to the backend vtable */
@@ -114,6 +123,10 @@ wl_session_testhook_default_options(void);
  * @session:  The session to destroy (NULL-safe).
  *
  * Destroy an active execution session and release all associated resources.
+ * Callers must not invoke this function from a session operation or from a
+ * tuple/delta callback; such reentrant destruction is unsupported.  The
+ * operation admission guard waits for admitted work to finish before backend
+ * teardown and therefore cannot safely wait for the operation that called it.
  */
 void
 wl_session_destroy(wl_session_t *session);
