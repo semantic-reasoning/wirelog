@@ -1349,7 +1349,11 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             for (uint32_t k = 0; k < d_unique; k++) {
                 for (uint32_t c = 0; c < nc; c++)
                     dr[c] = rel->columns[c][old_nrows + k];
-                col_rel_append_row(delta_out, dr);
+                int rc = col_rel_append_row(delta_out, dr);
+                if (rc != 0) {
+                    col_row_buf_release(&drb);
+                    return rc;
+                }
             }
             col_row_buf_release(&drb);
         }
@@ -1424,8 +1428,10 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                         return ENOMEM;
                     for (uint32_t c = 0; c < nc; c++)
                         dr[c] = rel->columns[c][old_nrows + novel_count];
-                    col_rel_append_row(delta_out, dr);
+                    int rc = col_rel_append_row(delta_out, dr);
                     col_row_buf_release(&drb);
+                    if (rc != 0)
+                        return rc;
                 }
                 novel_count++;
             }
@@ -1480,7 +1486,9 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                                : rel->merge_buf_cap * 2;
         if (new_cap < max_rows)
             new_cap = max_rows;
-        if (rel->merge_columns) {
+        if (nc == 0) {
+            rel->merge_buf_cap = new_cap;
+        } else if (rel->merge_columns) {
             if (col_columns_realloc(rel->merge_columns, nc, new_cap) != 0)
                 return ENOMEM;
         } else {
@@ -1535,7 +1543,11 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             if (delta_out) {
                 for (uint32_t c = 0; c < nc; c++)
                     delta_row[c] = merged_cols[c][out];
-                col_rel_append_row(delta_out, delta_row);
+                int rc = col_rel_append_row(delta_out, delta_row);
+                if (rc != 0) {
+                    col_row_buf_release(&delta_rb);
+                    return rc;
+                }
             }
             di++;
         }
@@ -1552,7 +1564,11 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         if (delta_out) {
             for (uint32_t c = 0; c < nc; c++)
                 delta_row[c] = merged_cols[c][out];
-            col_rel_append_row(delta_out, delta_row);
+            int rc = col_rel_append_row(delta_out, delta_row);
+            if (rc != 0) {
+                col_row_buf_release(&delta_rb);
+                return rc;
+            }
         }
         di++;
         out++;

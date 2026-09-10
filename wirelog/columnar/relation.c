@@ -1185,6 +1185,10 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
      * relation must fail without consuming capacity or a generation epoch. */
     /* Zero-arity relations are valid empty-tuple relations.  A relation with
      * physical columns, however, must have every column buffer present. */
+    if (r->ncols == 0
+        && (r->relation_identity == 0 || r->view_generation == 0
+        || r->storage_generation == 0))
+        return EINVAL;
     bool empty_unallocated = r->nrows == 0 && r->capacity == 0;
     if (r->ncols > 0 && !r->columns && !empty_unallocated)
         return EINVAL;
