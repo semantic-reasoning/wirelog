@@ -26,7 +26,7 @@
 /* ======================================================================== */
 
 /*
- * C11 thrd_create expects int(*)(void*), but wirelog's thread_create
+ * C11 thrd_create expects int(*)(void*), but wirelog's wl_thread_create
  * uses void*(*)(void*) (matching the pthread signature).  We use a
  * thin trampoline to bridge the two.
  */
@@ -49,7 +49,7 @@ trampoline(void *raw)
 /* ======================================================================== */
 
 int
-thread_create(thread_t *tid, void *(*fn)(void *arg), void *arg)
+wl_thread_create(wl_thread_t *tid, void *(*fn)(void *arg), void *arg)
 {
     if (!tid || !fn)
         return -1;
@@ -70,7 +70,7 @@ thread_create(thread_t *tid, void *(*fn)(void *arg), void *arg)
 }
 
 int
-thread_join(thread_t *tid)
+wl_thread_join(wl_thread_t *tid)
 {
     if (!tid)
         return -1;
@@ -84,7 +84,7 @@ thread_join(thread_t *tid)
 /* ======================================================================== */
 
 int
-mutex_init(mutex_t *m)
+wl_mutex_init(wl_mutex_t *m)
 {
     if (!m)
         return -1;
@@ -94,7 +94,7 @@ mutex_init(mutex_t *m)
 }
 
 int
-mutex_lock(mutex_t *m)
+wl_mutex_lock(wl_mutex_t *m)
 {
     if (!m)
         return -1;
@@ -104,7 +104,7 @@ mutex_lock(mutex_t *m)
 }
 
 int
-mutex_unlock(mutex_t *m)
+wl_mutex_unlock(wl_mutex_t *m)
 {
     if (!m)
         return -1;
@@ -114,7 +114,7 @@ mutex_unlock(mutex_t *m)
 }
 
 void
-mutex_destroy(mutex_t *m)
+wl_mutex_destroy(wl_mutex_t *m)
 {
     if (!m)
         return;
@@ -127,7 +127,7 @@ mutex_destroy(mutex_t *m)
 /* ======================================================================== */
 
 int
-cond_init(cond_t *c)
+wl_cond_init(wl_cond_t *c)
 {
     if (!c)
         return -1;
@@ -137,7 +137,7 @@ cond_init(cond_t *c)
 }
 
 int
-cond_wait(cond_t *c, mutex_t *m)
+wl_cond_wait(wl_cond_t *c, wl_mutex_t *m)
 {
     if (!c || !m)
         return -1;
@@ -147,7 +147,7 @@ cond_wait(cond_t *c, mutex_t *m)
 }
 
 int
-cond_signal(cond_t *c)
+wl_cond_signal(wl_cond_t *c)
 {
     if (!c)
         return -1;
@@ -157,7 +157,7 @@ cond_signal(cond_t *c)
 }
 
 int
-cond_broadcast(cond_t *c)
+wl_cond_broadcast(wl_cond_t *c)
 {
     if (!c)
         return -1;
@@ -167,7 +167,7 @@ cond_broadcast(cond_t *c)
 }
 
 void
-cond_destroy(cond_t *c)
+wl_cond_destroy(wl_cond_t *c)
 {
     if (!c)
         return;

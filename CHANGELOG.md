@@ -38,6 +38,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Internal threading namespace collision** (#1531): namespace Wirelog's
+  thread, mutex, and condition-variable types and functions with `wl_` so
+  Darwin Mach headers cannot collide with the abstraction used by benchmarks
+  and tests.
+
 - **Unfused recursive SCCs no longer terminate with incomplete results**
   (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
   to normal evaluation instead of treating one empty input as an empty union.

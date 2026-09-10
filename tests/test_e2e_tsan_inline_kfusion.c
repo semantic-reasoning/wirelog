@@ -222,7 +222,7 @@ test_e2e_tsan_inline_kfusion(void)
     TEST("TSan: K=4 concurrent readers, 10k iters, nested inline/4 compound");
 
     col_rel_t    *rel = NULL;
-    thread_t threads[K_WORKERS];
+    wl_thread_t threads[K_WORKERS];
     tsan_reader_t workers[K_WORKERS];
     bool thread_created[K_WORKERS];
     memset(thread_created, 0, sizeof(thread_created));
@@ -243,14 +243,14 @@ test_e2e_tsan_inline_kfusion(void)
         workers[w].worker_id = (uint32_t)(w + 1);
         workers[w].iters = STRESS_ITERS;
         workers[w].errors = 0u;
-        int trc = thread_create(&threads[w], tsan_reader_main, &workers[w]);
-        ASSERT(trc == 0, "thread_create failed");
+        int trc = wl_thread_create(&threads[w], tsan_reader_main, &workers[w]);
+        ASSERT(trc == 0, "wl_thread_create failed");
         thread_created[w] = true;
     }
 
     for (int w = 0; w < K_WORKERS; w++) {
         if (thread_created[w]) {
-            thread_join(&threads[w]);
+            wl_thread_join(&threads[w]);
             thread_created[w] = false;
         }
     }
@@ -273,7 +273,7 @@ cleanup:
      * happy-path join loop completes). */
     for (int w = 0; w < K_WORKERS; w++) {
         if (thread_created[w])
-            thread_join(&threads[w]);
+            wl_thread_join(&threads[w]);
     }
     col_rel_destroy(rel);
 }
@@ -338,7 +338,7 @@ test_e2e_tsan_concurrent_insert_delete(void)
         }
 
         /* --- READ EPOCH (K=4 concurrent workers, relation frozen) --- */
-        thread_t threads[K_WORKERS];
+        wl_thread_t threads[K_WORKERS];
         cycle_reader_t readers[K_WORKERS];
         bool created[K_WORKERS];
         memset(created, 0, sizeof(created));
@@ -348,13 +348,13 @@ test_e2e_tsan_concurrent_insert_delete(void)
             readers[w].nrows = CYCLE_NROWS;
             readers[w].cycle = cycle;
             readers[w].errors = 0u;
-            int trc = thread_create(&threads[w], cycle_reader_main,
+            int trc = wl_thread_create(&threads[w], cycle_reader_main,
                     &readers[w]);
             if (trc != 0) {
                 /* Thread creation failure: clean up what we have. */
                 for (int j = 0; j < w; j++) {
                     if (created[j])
-                        thread_join(&threads[j]);
+                        wl_thread_join(&threads[j]);
                 }
                 col_rel_destroy(rel);
                 failed_creates++;
@@ -365,7 +365,7 @@ test_e2e_tsan_concurrent_insert_delete(void)
 
         for (int w = 0; w < K_WORKERS; w++) {
             if (created[w])
-                thread_join(&threads[w]);
+                wl_thread_join(&threads[w]);
         }
         for (int w = 0; w < K_WORKERS; w++)
             total_errors += readers[w].errors;

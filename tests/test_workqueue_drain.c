@@ -22,19 +22,19 @@
             }                                                                    \
         } while (0)
 
-static int observed_cond_wait(cond_t *cond, mutex_t *mutex);
-static int delayed_thread_create(thread_t *thread, void *(*fn)(void *),
+static int observed_cond_wait(wl_cond_t *cond, wl_mutex_t *mutex);
+static int delayed_thread_create(wl_thread_t *thread, void *(*fn)(void *),
     void *arg);
 
-#define cond_wait observed_cond_wait
-#define thread_create delayed_thread_create
+#define wl_cond_wait observed_cond_wait
+#define wl_thread_create delayed_thread_create
 #include "../wirelog/workqueue.c"
-#undef thread_create
-#undef cond_wait
+#undef wl_thread_create
+#undef wl_cond_wait
 
 static struct {
-    mutex_t mutex;
-    cond_t changed;
+    wl_mutex_t mutex;
+    wl_cond_t changed;
     wl_work_queue_t *queue;
     void *(*worker_fn)(void *);
     void *worker_arg;
@@ -68,19 +68,19 @@ check(bool condition, const char *message)
 }
 
 static int
-observed_cond_wait(cond_t *cond, mutex_t *mutex)
+observed_cond_wait(wl_cond_t *cond, wl_mutex_t *mutex)
 {
     /* Queue mutex is held, preventing lost wakes before the real wait. */
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     if (cond == &observer.queue->work_avail) {
         observer.work_waits++;
     } else if (cond == &observer.queue->all_done && is_drain_thread) {
         observer.drain_waiting = true;
         observer.drain_gate_closed = !observer.queue->dispatch_enabled;
     }
-    REQUIRE(cond_broadcast(&observer.changed) == 0);
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
-    int result = cond_wait(cond, mutex);
+    REQUIRE(wl_cond_broadcast(&observer.changed) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
+    int result = wl_cond_wait(cond, mutex);
     REQUIRE(result == 0);
     return result;
 }
@@ -89,45 +89,45 @@ static void *
 delayed_worker(void *unused)
 {
     (void)unused;
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     while (!observer.start_worker)
-        REQUIRE(cond_wait(&observer.changed, &observer.mutex) == 0);
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
     void *(*fn)(void *) = observer.worker_fn;
     void *arg = observer.worker_arg;
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
     return fn(arg);
 }
 
 static int
-delayed_thread_create(thread_t *thread, void *(*fn)(void *), void *arg)
+delayed_thread_create(wl_thread_t *thread, void *(*fn)(void *), void *arg)
 {
     /* All cases use exactly one worker and one live queue. */
     observer.worker_fn = fn;
     observer.worker_arg = arg;
-    return thread_create(thread, delayed_worker, NULL);
+    return wl_thread_create(thread, delayed_worker, NULL);
 }
 
 static wl_work_queue_t *
 new_queue(void)
 {
     memset(&observer, 0, sizeof(observer));
-    REQUIRE(mutex_init(&observer.mutex) == 0);
-    REQUIRE(cond_init(&observer.changed) == 0);
+    REQUIRE(wl_mutex_init(&observer.mutex) == 0);
+    REQUIRE(wl_cond_init(&observer.changed) == 0);
     wl_work_queue_t *queue = wl_workqueue_create(1);
     REQUIRE(queue != NULL);
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     observer.queue = queue;
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
     return queue;
 }
 
 static void
 start_worker(void)
 {
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     observer.start_worker = true;
-    REQUIRE(cond_broadcast(&observer.changed) == 0);
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_cond_broadcast(&observer.changed) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
 }
 
 static void
@@ -135,8 +135,8 @@ delete_queue(wl_work_queue_t *queue)
 {
     start_worker();
     wl_workqueue_destroy(queue);
-    cond_destroy(&observer.changed);
-    mutex_destroy(&observer.mutex);
+    wl_cond_destroy(&observer.changed);
+    wl_mutex_destroy(&observer.mutex);
 }
 
 typedef struct {
@@ -149,32 +149,32 @@ static void
 count_item(void *arg)
 {
     item_t *item = arg;
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     item->calls++;
     item->wrong_thread |= is_drain_thread != item->expect_drain;
     observer.calls++;
-    REQUIRE(cond_broadcast(&observer.changed) == 0);
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_cond_broadcast(&observer.changed) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
 }
 
 static void
 check_items(item_t *items, unsigned count)
 {
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     for (unsigned i = 0; i < count; i++) {
         check(items[i].calls == 1, "callback executes exactly once");
         check(!items[i].wrong_thread, "callback executes on expected thread");
     }
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
 }
 
 static bool
 batch_reset(wl_work_queue_t *queue)
 {
-    REQUIRE(mutex_lock(&queue->mutex) == 0);
+    REQUIRE(wl_mutex_lock(&queue->mutex) == 0);
     bool reset = queue->count == 0 && queue->submitted == 0
         && queue->completed == 0 && !queue->dispatch_enabled;
-    REQUIRE(mutex_unlock(&queue->mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&queue->mutex) == 0);
     check(reset, "batch resets counters and closes dispatch");
     return reset;
 }
@@ -209,27 +209,27 @@ test_disabled_dispatch(bool at_startup)
     item_t item = { .expect_drain = true };
     if (!at_startup) {
         start_worker();
-        REQUIRE(mutex_lock(&observer.mutex) == 0);
+        REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
         while (observer.work_waits == 0)
-            REQUIRE(cond_wait(&observer.changed, &observer.mutex) == 0);
-        REQUIRE(mutex_unlock(&observer.mutex) == 0);
+            REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
+        REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
     }
     REQUIRE(wl_workqueue_submit(queue, count_item, &item) == 0);
-    REQUIRE(mutex_lock(&queue->mutex) == 0);
+    REQUIRE(wl_mutex_lock(&queue->mutex) == 0);
     check(!queue->dispatch_enabled, "submit leaves dispatch disabled");
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     unsigned before = observer.work_waits;
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
     if (!at_startup)
-        REQUIRE(cond_broadcast(&queue->work_avail) == 0);
-    REQUIRE(mutex_unlock(&queue->mutex) == 0);
+        REQUIRE(wl_cond_broadcast(&queue->work_avail) == 0);
+    REQUIRE(wl_mutex_unlock(&queue->mutex) == 0);
     start_worker();
 
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     while (observer.work_waits == before && observer.calls == 0)
-        REQUIRE(cond_wait(&observer.changed, &observer.mutex) == 0);
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
     bool held = observer.calls == 0;
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
     check(held, at_startup ? "startup respects disabled dispatch"
                           : "spurious wake rechecks disabled dispatch");
     if (held) {
@@ -247,13 +247,13 @@ static void
 blocked_item(void *unused)
 {
     (void)unused;
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     observer.active_calls++;
     observer.active_started = true;
-    REQUIRE(cond_broadcast(&observer.changed) == 0);
+    REQUIRE(wl_cond_broadcast(&observer.changed) == 0);
     while (!observer.release_active)
-        REQUIRE(cond_wait(&observer.changed, &observer.mutex) == 0);
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
 }
 
 static void *
@@ -261,11 +261,11 @@ drain_thread(void *arg)
 {
     is_drain_thread = true;
     int result = wl_workqueue_drain(arg);
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     observer.drain_result = result;
     observer.drain_returned = true;
-    REQUIRE(cond_broadcast(&observer.changed) == 0);
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_cond_broadcast(&observer.changed) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
     return NULL;
 }
 
@@ -276,34 +276,34 @@ test_active_and_pending(unsigned pending)
     item_t *items = calloc(pending ? pending : 1, sizeof(*items));
     REQUIRE(items != NULL);
     REQUIRE(wl_workqueue_submit(queue, blocked_item, NULL) == 0);
-    REQUIRE(mutex_lock(&queue->mutex) == 0);
+    REQUIRE(wl_mutex_lock(&queue->mutex) == 0);
     queue->dispatch_enabled = true;
-    REQUIRE(cond_broadcast(&queue->work_avail) == 0);
-    REQUIRE(mutex_unlock(&queue->mutex) == 0);
+    REQUIRE(wl_cond_broadcast(&queue->work_avail) == 0);
+    REQUIRE(wl_mutex_unlock(&queue->mutex) == 0);
     start_worker();
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     while (!observer.active_started)
-        REQUIRE(cond_wait(&observer.changed, &observer.mutex) == 0);
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
 
     /* The sole worker is blocked and cannot steal pending items. */
     for (unsigned i = 0; i < pending; i++) {
         items[i].expect_drain = true;
         REQUIRE(wl_workqueue_submit(queue, count_item, &items[i]) == 0);
     }
-    thread_t drainer;
-    REQUIRE(thread_create(&drainer, drain_thread, queue) == 0);
-    REQUIRE(mutex_lock(&observer.mutex) == 0);
+    wl_thread_t drainer;
+    REQUIRE(wl_thread_create(&drainer, drain_thread, queue) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     while (!observer.drain_waiting && !observer.drain_returned)
-        REQUIRE(cond_wait(&observer.changed, &observer.mutex) == 0);
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
     bool early = observer.drain_returned;
     bool closed = observer.drain_gate_closed;
     /* Release even on RED. Old drain corrupts batch counters, so skip reuse
      * after early return: a subsequent wait_all could hang forever. */
     observer.release_active = true;
-    REQUIRE(cond_broadcast(&observer.changed) == 0);
-    REQUIRE(mutex_unlock(&observer.mutex) == 0);
-    REQUIRE(thread_join(&drainer) == 0);
+    REQUIRE(wl_cond_broadcast(&observer.changed) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_thread_join(&drainer) == 0);
     check(!early, "drain must wait for the active worker");
     check(closed, "drain closes dispatch before waiting for active work");
     check(observer.drain_result == 0, "drain succeeds");

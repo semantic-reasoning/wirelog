@@ -73,8 +73,8 @@ typedef enum {
 
 /* Start barrier: writers park until main releases them together. */
 typedef struct {
-    mutex_t lock;
-    cond_t cond;
+    wl_mutex_t lock;
+    wl_cond_t cond;
     int ready;
     int go;
 } bench_barrier_t;
@@ -134,12 +134,12 @@ writer_main(void *arg)
     wl_perf_ns_t *lat = w->lat;
     int failed = 0;
 
-    mutex_lock(&w->barrier->lock);
+    wl_mutex_lock(&w->barrier->lock);
     w->barrier->ready++;
-    cond_broadcast(&w->barrier->cond);
+    wl_cond_broadcast(&w->barrier->cond);
     while (!w->barrier->go)
-        cond_wait(&w->barrier->cond, &w->barrier->lock);
-    mutex_unlock(&w->barrier->lock);
+        wl_cond_wait(&w->barrier->cond, &w->barrier->lock);
+    wl_mutex_unlock(&w->barrier->lock);
 
     w->t_start = wl_perf_now_ns();
     for (uint32_t i = 0; i < puts; i++) {
@@ -225,7 +225,7 @@ run_scenario(bench_mode_t mode, int writers, bool governed, uint32_t iters,
     wl_columnar_memory_governor_ref_t *ref = NULL;
     wl_intern_t *intern = NULL;
     bench_writer_t *ws = NULL;
-    thread_t threads[BENCH_MAX_WRITERS];
+    wl_thread_t threads[BENCH_MAX_WRITERS];
     char *dup_keys = NULL;
     wl_perf_ns_t *lat = NULL;
     bench_barrier_t barrier;
@@ -238,10 +238,10 @@ run_scenario(bench_mode_t mode, int writers, bool governed, uint32_t iters,
     int rc = -1;
 
     memset(&barrier, 0, sizeof(barrier));
-    if (mutex_init(&barrier.lock) != 0)
+    if (wl_mutex_init(&barrier.lock) != 0)
         return -1;
-    if (cond_init(&barrier.cond) != 0) {
-        mutex_destroy(&barrier.lock);
+    if (wl_cond_init(&barrier.cond) != 0) {
+        wl_mutex_destroy(&barrier.lock);
         return -1;
     }
 
@@ -297,20 +297,20 @@ run_scenario(bench_mode_t mode, int writers, bool governed, uint32_t iters,
     reserved_before = governor_reserved(ref);
 
     for (started = 0; started < writers; started++) {
-        if (thread_create(&threads[started], writer_main, &ws[started])
+        if (wl_thread_create(&threads[started], writer_main, &ws[started])
             != 0)
             break;
     }
-    mutex_lock(&barrier.lock);
+    wl_mutex_lock(&barrier.lock);
     while (barrier.ready < started)
-        cond_wait(&barrier.cond, &barrier.lock);
+        wl_cond_wait(&barrier.cond, &barrier.lock);
     barrier.go = 1;
-    cond_broadcast(&barrier.cond);
-    mutex_unlock(&barrier.lock);
+    wl_cond_broadcast(&barrier.cond);
+    wl_mutex_unlock(&barrier.lock);
     for (int t = 0; t < started; t++)
-        thread_join(&threads[t]);
+        wl_thread_join(&threads[t]);
     if (started != writers) {
-        printf("mode=%s writers=%d governor=%s error=thread_create\n",
+        printf("mode=%s writers=%d governor=%s error=wl_thread_create\n",
             mode_name(mode), writers, governed ? "on" : "off");
         goto out;
     }
@@ -411,8 +411,8 @@ out:
         wl_intern_free(intern);
     if (ref)
         wl_columnar_memory_governor_ref_release(ref);
-    cond_destroy(&barrier.cond);
-    mutex_destroy(&barrier.lock);
+    wl_cond_destroy(&barrier.cond);
+    wl_mutex_destroy(&barrier.lock);
     return rc;
 }
 

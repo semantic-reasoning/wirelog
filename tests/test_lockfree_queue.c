@@ -394,15 +394,15 @@ test_concurrent(void)
     ASSERT(q != NULL, "create failed");
 
     struct producer_ctx ctxs[CONCURRENT_WORKERS];
-    thread_t threads[CONCURRENT_WORKERS];
+    wl_thread_t threads[CONCURRENT_WORKERS];
 
     for (int w = 0; w < CONCURRENT_WORKERS; w++) {
         ctxs[w].q = q;
         ctxs[w].worker_id = (uint32_t)w;
         ctxs[w].enqueued = 0;
-        int rc = thread_create(&threads[w], producer_fn, &ctxs[w]);
+        int rc = wl_thread_create(&threads[w], producer_fn, &ctxs[w]);
         char msg[64];
-        snprintf(msg, sizeof(msg), "thread_create failed for worker %d", w);
+        snprintf(msg, sizeof(msg), "wl_thread_create failed for worker %d", w);
         ASSERT(rc == 0, msg);
     }
 
@@ -413,7 +413,7 @@ test_concurrent(void)
 
     /* Join workers first so we know all items have been enqueued. */
     for (int w = 0; w < CONCURRENT_WORKERS; w++)
-        thread_join(&threads[w]);
+        wl_thread_join(&threads[w]);
 
     /* Drain what's left after all producers finished. */
     uint32_t n = wl_mpsc_dequeue_all(q, buf, QUEUE_CAPACITY);

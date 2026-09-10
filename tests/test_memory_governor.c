@@ -223,7 +223,7 @@ test_concurrent_admission(void)
     wl_columnar_memory_governor_t governor;
     wl_columnar_memory_reservation_t reservations[THREADS];
     struct reserve_thread_arg args[THREADS];
-    thread_t threads[THREADS];
+    wl_thread_t threads[THREADS];
     int admitted = 0;
     int i;
 
@@ -236,13 +236,13 @@ test_concurrent_admission(void)
         args[i].governor = &governor;
         args[i].reservation = &reservations[i];
         args[i].admitted = false;
-        if (thread_create(&threads[i], reserve_thread, &args[i]) != 0) {
+        if (wl_thread_create(&threads[i], reserve_thread, &args[i]) != 0) {
             FAIL("thread creation failed");
             return 1;
         }
     }
     for (i = 0; i < THREADS; i++)
-        thread_join(&threads[i]);
+        wl_thread_join(&threads[i]);
     for (i = 0; i < THREADS; i++)
         admitted += args[i].admitted ? 1 : 0;
     if (admitted > 4 || wl_columnar_memory_reserved(&governor) > 900) {
@@ -571,7 +571,7 @@ test_downsize_races(void)
         wl_columnar_memory_governor_t governor;
         wl_columnar_memory_reservation_t token, other;
         wl_atomic_u64 start;
-        thread_t threads[3];
+        wl_thread_t threads[3];
         struct downsize_arg args[3];
         unsigned created = 0;
         make_resolution(&resolution, 1000, 900);
@@ -590,13 +590,13 @@ test_downsize_races(void)
                                              i ==
                                              0 ? 0 : (round % 4 ==
                                              3 ? 1 : round % 3), false };
-            if (thread_create(&threads[i], downsize_thread, &args[i]) != 0)
+            if (wl_thread_create(&threads[i], downsize_thread, &args[i]) != 0)
                 break;
             created++;
         }
         atomic_store_explicit(&start, 1, memory_order_release);
         for (unsigned i = 0; i < created; i++)
-            thread_join(&threads[i]);
+            wl_thread_join(&threads[i]);
         bool released = atomic_load_explicit(&token.state, memory_order_acquire)
             == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
         bool downsize_succeeded = false;
