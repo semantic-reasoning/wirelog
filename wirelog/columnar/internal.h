@@ -2386,10 +2386,30 @@ void
 col_session_free_filt_arrangements(wl_col_session_t *cs);
 
 /* Differential arrangement registry (Issue #263) */
+typedef struct wl_columnar_arrangement_diff_txn {
+    wl_col_session_t *session;
+    col_diff_arr_entry_t *entry;
+    col_diff_arrangement_t **slot;
+    col_diff_arrangement_t *persistent;
+    col_diff_arrangement_t *working;
+    bool pending_entry;
+} wl_columnar_arrangement_diff_txn_t;
+
 col_diff_arrangement_t *
 col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel,
     const uint32_t *key_cols, uint32_t key_count);
+int
+wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
+    const char *rel_name, const col_rel_t *source_rel,
+    const uint32_t *key_cols, uint32_t key_count,
+    wl_columnar_arrangement_diff_txn_t *txn);
+void
+wl_columnar_arrangement_diff_txn_commit(
+    wl_columnar_arrangement_diff_txn_t *txn);
+void
+wl_columnar_arrangement_diff_txn_abort(
+    wl_columnar_arrangement_diff_txn_t *txn);
 void
 col_session_free_diff_arrangements(wl_col_session_t *cs);
 /* Issue #260: Deep-copy arrangement entries for K-fusion worker isolation. */
