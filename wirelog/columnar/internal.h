@@ -21,6 +21,7 @@
 #include "columnar/diff_trace.h"
 #include "columnar/delta_pool.h"
 #include "columnar/mem_ledger.h"
+#include "columnar/source_access.h"
 #include "columnar/memory_governor.h"
 #include "columnar/continuation.h"
 #include "columnar/kfusion_adaptive.h"
@@ -488,6 +489,11 @@ typedef struct col_rel {
     uint64_t storage_owner_identity;
     uint64_t storage_owner_generation;
     uint32_t storage_alias_borrows;
+
+    /* Operation-scoped readers protect the ultimate storage owner from
+     * checked destruction.  Production read paths are wired in later
+     * lifecycle units. */
+    wl_columnar_source_access_gate_t source_access;
 } col_rel_t;
 
 /* MSVC in its default C mode neither defines __STDC_VERSION__ >= 201112L
@@ -2102,6 +2108,9 @@ int col_rel_storage_owner_resolve(const col_rel_t *src,
     col_rel_t **out_owner);
 int col_rel_storage_alias_release(col_rel_t *alias);
 int col_rel_storage_owner_destroy_status(const col_rel_t *owner);
+int col_rel_source_reader_acquire(const col_rel_t *,
+    wl_columnar_source_access_reader_t *);
+int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
 
 /* Test seam for the non-wrapping relation identity allocator. */
 int

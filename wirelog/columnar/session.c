@@ -184,6 +184,13 @@ session_destroy_relation_array(col_rel_t **relations, uint32_t count)
 int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 {
+    if (!r)
+        return EINVAL;
+    /* Promotion copies the descriptor and clears the source slot.  Do not
+     * perform that destructive transition while an operation-scoped reader
+     * still points at the pool/arena relation. */
+    if (wl_columnar_source_access_gate_busy(&r->source_access))
+        return EBUSY;
     /* Pool-owned structs must be promoted to heap before storing in the
      * session, because col_session_destroy calls free() on each entry. */
     col_rel_t *pool_src = NULL;

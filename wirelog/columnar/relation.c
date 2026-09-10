@@ -117,6 +117,7 @@ col_rel_storage_owner_init(col_rel_t *r)
     r->storage_owner_identity = r->relation_identity;
     r->storage_owner_generation = r->storage_generation;
     r->storage_alias_borrows = 0;
+    wl_columnar_source_access_gate_init(&r->source_access);
 }
 
 int
@@ -131,6 +132,7 @@ col_rel_storage_owner_resolve(const col_rel_t *src, col_rel_t **out_owner)
         owner->storage_owner = owner;
         owner->storage_owner_identity = owner->relation_identity;
         owner->storage_owner_generation = owner->storage_generation;
+        wl_columnar_source_access_gate_init(&owner->source_access);
     }
     if (owner->storage_owner != owner
         || owner->storage_owner_identity != owner->relation_identity
@@ -169,7 +171,31 @@ col_rel_storage_owner_destroy_status(const col_rel_t *owner)
     if (!owner || owner->storage_owner != owner
         || owner->storage_owner_identity != owner->relation_identity)
         return EINVAL;
-    return owner->storage_alias_borrows == 0 ? 0 : EBUSY;
+    if (owner->storage_alias_borrows != 0
+        || wl_columnar_source_access_gate_busy(&owner->source_access))
+        return EBUSY;
+    return 0;
+}
+
+int
+col_rel_source_reader_acquire(const col_rel_t *rel,
+    wl_columnar_source_access_reader_t *token)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+    if (!rel || !token)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0)
+        return rc;
+    return wl_columnar_source_access_reader_acquire(
+        &owner->source_access, token);
+}
+
+int
+col_rel_source_reader_release(wl_columnar_source_access_reader_t *token)
+{
+    return wl_columnar_source_access_reader_release(token);
 }
 
 /* Prepare a complete private replacement for a relation resize.  This is
@@ -765,9 +791,14 @@ col_rel_free_contents(col_rel_t *r)
 int
 col_rel_destroy_checked(col_rel_t *r)
 {
+    int owner_status;
     if (!r)
         return 0;
-    if (col_rel_storage_owner_destroy_status(r) == EBUSY)
+    owner_status = col_rel_storage_owner_destroy_status(r);
+    if (owner_status == EBUSY)
+        return EBUSY;
+    if (owner_status == 0
+        && wl_columnar_source_access_writer_claim(&r->source_access) != 0)
         return EBUSY;
     bool from_pool = r->pool_owned;
     col_rel_free_contents(r); /* memset zeroes pool_owned */
@@ -1722,8 +1753,8 @@ free_merge_buf:
  * Issue #396: used by tdd_broadcast_deltas to eliminate O(|delta|) deep
  * copies when broadcasting the union delta to worker sessions.
  */
-int
-col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
+static int
+col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
 {
     col_rel_t *source_owner = NULL;
     col_rel_t *old_owner = NULL;
@@ -1986,6 +2017,27 @@ prepare_fail:
         free((void *)shared_names);
     }
     return prepare_rc;
+}
+
+int
+col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!dst || !src)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(src, &owner);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_source_reader_acquire(owner, &reader);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_install_shared_view_unprotected(dst, src);
+    if (col_rel_source_reader_release(&reader) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 /* ---- column name lookup ------------------------------------------------- */
