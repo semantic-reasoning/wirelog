@@ -29,6 +29,10 @@ static wl_atomic_u64 wl_next_relation_identity = 1u;
 wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
 #endif
 
+#ifdef WL_TEST_SET_HOOK
+wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
+#endif
+
 static int
 col_rel_new_identity(uint64_t *out)
 {
@@ -225,6 +229,64 @@ col_rel_source_writer_acquire(const col_rel_t *rel,
         return rc;
     return wl_columnar_source_access_writer_acquire(
         &owner->source_access, token);
+}
+
+int
+col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool alias_release_pending = false;
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!r || !r->columns || row >= r->capacity || col >= r->ncols
+        || !r->columns[col])
+        return EINVAL;
+    if (r->column_types && r->column_types[col] == WIRELOG_TYPE_FLOAT) {
+        if (!wl_columnar_float_bits_valid(val))
+            return EINVAL;
+        if (wl_columnar_float_bits_zero(val))
+            val = 0;
+    }
+
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_source_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    if (r == owner && owner->storage_alias_borrows > 0) {
+        rc = EBUSY;
+        goto release_writer;
+    }
+
+    /* Keep the canonical owner writer admission held through the detach,
+     * cell write, and logical generation publication.  The deferred alias
+     * release prevents a new reader from entering through the detached view
+     * before this mutation is complete. */
+    if (r->col_shared) {
+        rc = col_rel_cow_unshare_impl(r, 0, true);
+        if (rc != 0)
+            goto release_writer;
+        alias_release_pending = true;
+    }
+#ifdef WL_TEST_SET_HOOK
+    if (alias_release_pending && wl_columnar_set_transition_hook)
+        wl_columnar_set_transition_hook(r);
+#endif
+    r->columns[col][row] = val;
+    wl_columnar_relation_touch_view(r);
+    rc = 0;
+
+release_writer:
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(r);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 /* Prepare a complete private replacement for a relation resize.  This is

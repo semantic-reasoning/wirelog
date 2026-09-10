@@ -445,6 +445,7 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         return ENOMEM;
     }
     uint32_t map_mask = map_cap - 1;
+    int set_rc = 0;
 
     /* Index groups by their key so reduction remains linear in the number of
      * input rows rather than scanning every output group. */
@@ -542,7 +543,9 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
             int64_t cur = col_rel_get(out, group_row, agg_index);
             switch (op->agg_fn) {
             case WIRELOG_AGG_COUNT:
-                col_rel_set(out, group_row, agg_index, cur + 1);
+                set_rc = col_rel_set(out, group_row, agg_index, cur + 1);
+                if (set_rc != 0)
+                    goto set_failure;
                 break;
             case WIRELOG_AGG_SUM:
             {
@@ -558,9 +561,11 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                         return ERANGE;
                     }
                     sums[slot] = next_value;
-                    (void)col_rel_set(out, group_row, agg_index,
-                        (int64_t)wl_columnar_float_canonical_bits(
-                            wl_columnar_float_to_bits(next_value)));
+                    set_rc = col_rel_set(out, group_row, agg_index,
+                            (int64_t)wl_columnar_float_canonical_bits(
+                                wl_columnar_float_to_bits(next_value)));
+                    if (set_rc != 0)
+                        goto set_failure;
                     break;
                 }
                 int64_t next;
@@ -577,7 +582,9 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                         col_rel_destroy(in);
                     return ERANGE;
                 }
-                col_rel_set(out, group_row, agg_index, next);
+                set_rc = col_rel_set(out, group_row, agg_index, next);
+                if (set_rc != 0)
+                    goto set_failure;
             }
             break;
             case WIRELOG_AGG_MIN:
@@ -589,11 +596,17 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     int cmp = wl_columnar_float_compare_bits(agg_val, cur);
                     if ((op->agg_fn == WIRELOG_AGG_MIN && cmp < 0)
                         || (op->agg_fn == WIRELOG_AGG_MAX && cmp > 0))
-                        (void)col_rel_set(out, group_row, agg_index,
-                            (int64_t)wl_columnar_float_canonical_bits(agg_val));
+                        set_rc = col_rel_set(out, group_row, agg_index,
+                                (int64_t)wl_columnar_float_canonical_bits(
+                                    agg_val));
+                    if (set_rc != 0)
+                        goto set_failure;
                 } else if (col_agg_better(op->agg_fn, op->agg_operand_type,
-                    sess->intern, agg_val, cur))
-                    col_rel_set(out, group_row, agg_index, agg_val);
+                    sess->intern, agg_val, cur)) {
+                    set_rc = col_rel_set(out, group_row, agg_index, agg_val);
+                    if (set_rc != 0)
+                        goto set_failure;
+                }
                 break;
             case WIRELOG_AGG_AVG:
                 if (!float_agg)
@@ -608,10 +621,12 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
                     if (e.owned) col_rel_destroy(in);
                     return ERANGE;
                 }
-                (void)col_rel_set(out, group_row, agg_index,
-                    (int64_t)wl_columnar_float_canonical_bits(
-                        wl_columnar_float_to_bits(sums[slot]
-                        / (double)counts[slot])));
+                set_rc = col_rel_set(out, group_row, agg_index,
+                        (int64_t)wl_columnar_float_canonical_bits(
+                            wl_columnar_float_to_bits(sums[slot]
+                            / (double)counts[slot])));
+                if (set_rc != 0)
+                    goto set_failure;
                 break;
             default:
                 break;
@@ -662,6 +677,18 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
     if (e.owned)
         col_rel_destroy(in);
     return eval_stack_push(stack, out, true);
+
+set_failure:
+    col_row_buf_release(&row_rb);
+    wl_columnar_expr_compiled_free(agg_ce);
+    free(groups);
+    free(sums);
+    free(counts);
+    free(tmp);
+    col_rel_destroy(out);
+    if (e.owned)
+        col_rel_destroy(in);
+    return set_rc;
 }
 
 /* --- REDUCE WEIGHTED (Z-set / Mobius COUNT) ------------------------------ */
