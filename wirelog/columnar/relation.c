@@ -1370,6 +1370,14 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
 
     bool needs_resize = r->nrows >= r->capacity;
     if (needs_resize) {
+        /* Canonical-owner storage replacement frees the old buffers.  Live
+         * shared views still point at those buffers, so refuse growth until
+         * the aliases are released.  A shared-view destination is allowed
+         * to COW/grow because it replaces its own alias safely. */
+        if (r->storage_owner == r && r->storage_alias_borrows > 0) {
+            rc = EBUSY;
+            goto release_writer;
+        }
         uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
         uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
         if (new_cap <= r->capacity) /* overflow guard */
@@ -1581,6 +1589,15 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 
     uint32_t dst_base = dst->nrows;
     uint32_t new_nrows = dst->nrows + src->nrows;
+
+    /* Replacing canonical-owner storage frees buffers still referenced by
+     * live aliases.  Keep the raw-pointer alias model safe by refusing only
+     * owner growth; alias destinations may still detach and grow privately. */
+    if (dst == dst_owner && dst_owner->storage_alias_borrows > 0
+        && new_nrows > dst->capacity) {
+        rc = EBUSY;
+        goto cleanup;
+    }
 
     /* Type metadata is part of the append transaction.  Prepare its owned
      * copy and complete Arrow schema before resizing or changing dst. */
