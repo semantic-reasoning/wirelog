@@ -73,6 +73,18 @@ noop_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
     (void)user_data;
 }
 
+static void
+count_result_tuple_cb(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user_data)
+{
+    uint32_t *count = user_data;
+    (void)row;
+    (void)ncols;
+    if (relation != NULL && count != NULL && relation[0] == 'r'
+        && relation[1] == '\0')
+        (*count)++;
+}
+
 static int
 create_session_from_source(const char *src, uint32_t workers,
     wirelog_program_t **out_prog, wl_plan_t **out_plan, wl_session_t **out_sess)
@@ -188,6 +200,55 @@ test_keyed_join_overflow(void)
 }
 
 static int
+test_retry_after_join_overflow(void)
+{
+    TEST("join overflow cleanup permits same-session retry");
+
+    const char *src = ".decl a(x: int32, y: int32)\n"
+        ".decl b(x: int32, z: int32)\n"
+        ".decl r(x: int32, z: int32)\n"
+        "a(1, 100). a(1, 101).\n"
+        "b(1, 10). b(1, 11).\n"
+        "r(x, z) :- a(x, _), b(x, z).\n";
+    wirelog_program_t *prog = NULL;
+    wl_plan_t *plan = NULL;
+    wl_session_t *sess = NULL;
+    uint32_t result_count = 0;
+    int rc;
+
+    setenv("WIRELOG_JOIN_OUTPUT_LIMIT", "1", 1);
+    rc = create_session_from_source(src, 1, &prog, &plan, &sess);
+    if (rc == 0)
+        rc = wl_session_load_facts(sess, prog);
+    if (rc == 0)
+        rc = wl_session_snapshot(sess, count_result_tuple_cb,
+            &result_count);
+    if (rc != EOVERFLOW || result_count != 0) {
+        if (sess)
+            wl_session_destroy(sess);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+        FAIL("overflow did not fail closed before retry");
+        return 1;
+    }
+
+    ((wl_col_session_t *)sess)->join_output_limit = 0;
+    result_count = 0;
+    rc = wl_session_snapshot(sess, count_result_tuple_cb, &result_count);
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
+    if (rc != 0 || result_count != 2) {
+        FAIL("same-session retry did not restore exact join output");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
 test_filter_next_pow2_overflow_contract(void)
 {
     TEST("filter next_pow2 returns zero only on overflow");
@@ -272,6 +333,7 @@ main(void)
     printf("=== test_join_overflow ===\n");
 
     test_keyed_join_overflow();
+    test_retry_after_join_overflow();
     test_filter_next_pow2_overflow_contract();
     test_unary_join_overflow();
     test_diff_join_overflow();
