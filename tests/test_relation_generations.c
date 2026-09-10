@@ -883,6 +883,85 @@ test_source_reader_blocks_append_all(void)
 }
 
 static void
+test_canonical_owner_resize_with_live_alias(void)
+{
+    col_rel_t *owner = new_relation();
+    col_rel_t *alias = new_relation();
+    int64_t extra = 777;
+    int64_t **owner_columns;
+    col_delta_timestamp_t *owner_timestamps;
+    int64_t **alias_columns;
+    uint32_t owner_rows;
+    uint32_t owner_capacity;
+    uint64_t owner_view_generation;
+    uint64_t owner_storage_generation;
+    uint64_t owner_generation;
+    uint32_t owner_aliases;
+    int64_t last_value;
+
+    CHECK(owner && alias, "canonical-owner alias resize relations");
+    CHECK(col_rel_enable_timestamps(owner) == 0,
+        "canonical-owner alias timestamps");
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++) {
+        int64_t value = (int64_t)i;
+        CHECK(col_rel_append_row(owner, &value) == 0,
+            "canonical-owner alias fill");
+    }
+    owner->timestamps[COL_REL_INIT_CAP - 1u].iteration = 37;
+    owner->timestamps[COL_REL_INIT_CAP - 1u].multiplicity = 5;
+    CHECK(col_rel_install_shared_view(alias, owner) == 0,
+        "canonical-owner alias install");
+
+    owner_columns = owner->columns;
+    owner_timestamps = owner->timestamps;
+    alias_columns = alias->columns;
+    owner_rows = owner->nrows;
+    owner_capacity = owner->capacity;
+    owner_view_generation = owner->view_generation;
+    owner_storage_generation = owner->storage_generation;
+    owner_generation = owner->storage_owner_generation;
+    owner_aliases = owner->storage_alias_borrows;
+    last_value = alias->columns[0][alias->nrows - 1u];
+
+    CHECK(col_rel_append_row(owner, &extra) == EBUSY
+        && owner->columns == owner_columns
+        && owner->timestamps == owner_timestamps
+        && owner->nrows == owner_rows
+        && owner->capacity == owner_capacity
+        && owner->view_generation == owner_view_generation
+        && owner->storage_generation == owner_storage_generation
+        && owner->storage_owner == owner
+        && owner->storage_owner_generation == owner_generation
+        && owner->storage_alias_borrows == owner_aliases
+        && alias->columns == alias_columns
+        && alias->storage_owner == owner
+        && alias->nrows == owner_rows
+        && alias->columns[0][alias->nrows - 1u] == last_value
+        && alias->timestamps[alias->nrows - 1u].iteration == 37
+        && alias->timestamps[alias->nrows - 1u].multiplicity == 5,
+        "canonical-owner append-row growth is blocked transactionally");
+
+    CHECK(col_rel_append_all(owner, alias, NULL) == EBUSY
+        && owner->columns == owner_columns
+        && owner->timestamps == owner_timestamps
+        && owner->nrows == owner_rows
+        && owner->capacity == owner_capacity
+        && owner->view_generation == owner_view_generation
+        && owner->storage_generation == owner_storage_generation
+        && owner->storage_owner == owner
+        && owner->storage_owner_generation == owner_generation
+        && owner->storage_alias_borrows == owner_aliases
+        && alias->columns == alias_columns
+        && alias->storage_owner == owner
+        && alias->nrows == owner_rows
+        && alias->columns[0][alias->nrows - 1u] == last_value
+        && alias->timestamps[alias->nrows - 1u].iteration == 37
+        && alias->timestamps[alias->nrows - 1u].multiplicity == 5,
+        "canonical-owner append-all growth is blocked transactionally");
+    cleanup_relations();
+}
+
+static void
 test_rollback_fresh_generation(void)
 {
     col_rel_t *rel = new_relation();
@@ -1831,6 +1910,7 @@ main(void)
     test_source_reader_blocks_direct_append_row();
     test_source_reader_blocks_append_row();
     test_source_reader_blocks_append_all();
+    test_canonical_owner_resize_with_live_alias();
     test_copy_and_shared_semantics();
     test_rollback_fresh_generation();
     test_overflow_boundary();
