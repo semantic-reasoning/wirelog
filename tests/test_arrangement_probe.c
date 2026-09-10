@@ -256,9 +256,9 @@ main(void)
     CHECK(second_arr != NULL, "second arrangement setup");
     col_arrangement_probe_bundle_init(&bundle);
     CHECK(bundle.active, "bundle init activates scope");
-    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
-        &bundle_probe) == 0 && bundle_probe != NULL,
-        "bundle acquires primary probe");
+    CHECK(col_arrangement_probe_bundle_acquire_primary(&bundle, session,
+        source, key_cols, 1, &bundle_probe) == 0 && bundle_probe != NULL,
+        "bundle acquires primary probe through operation helper");
     CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
         &nested_probe) == 0 && nested_probe == bundle_probe
         && bundle.count == 1 && bundle.slots[0].ref_count == 2,

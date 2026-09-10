@@ -1229,7 +1229,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
          * errors and must not silently change execution mode. */
         col_arrangement_t *arr = NULL;
         col_arrangement_pin_t arr_pin = { 0 };
-        col_arrangement_probe_t arr_probe = { 0 };
+        col_arrangement_probe_bundle_t arr_bundle = { 0 };
+        col_arrangement_probe_t *arr_probe = NULL;
         uint32_t nbuckets_ep = 0;
         uint32_t *ht_head_ep = NULL;
         uint32_t *ht_next_ep = NULL;
@@ -1240,11 +1241,12 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
         if (!used_right_delta && op->right_relation && kc > 0) {
             if (op->right_filter_expr.size == 0) {
-                int probe_rc = col_session_acquire_primary_arrangement_probe(
-                    &sess->base, right, rk, kc, &arr_probe);
+                col_arrangement_probe_bundle_init(&arr_bundle);
+                int probe_rc = col_arrangement_probe_bundle_acquire_primary(
+                    &arr_bundle, &sess->base, right, rk, kc, &arr_probe);
                 if (probe_rc == 0) {
-                    right = (col_rel_t *)arr_probe.source;
-                    arr = arr_probe.arr;
+                    right = (col_rel_t *)arr_probe->source;
+                    arr = arr_probe->arr;
                 } else if (probe_rc != ENOENT) {
                     free(tmp);
                     col_rel_destroy(out);
@@ -1333,8 +1335,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 sizeof(int64_t) * (right->ncols > 0 ? right->ncols : 1));
             if (!key_row) {
                 int release_rc = 0;
-                if (arr_probe.active)
-                    release_rc = col_arrangement_probe_release(&arr_probe);
+                if (arr_bundle.active)
+                    release_rc = col_arrangement_probe_bundle_release(
+                        &arr_bundle);
                 col_arrangement_pin_release(&arr_pin);
                 free(ht_head_ep);
                 free(ht_next_ep);
@@ -1445,8 +1448,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(right_filtered);
             if (left_e.owned)
                 col_rel_destroy(left);
-            if (arr_probe.active)
-                release_rc = col_arrangement_probe_release(&arr_probe);
+            if (arr_bundle.active)
+                release_rc = col_arrangement_probe_bundle_release(
+                    &arr_bundle);
             col_arrangement_pin_release(&arr_pin);
             if (release_rc != 0)
                 return release_rc;
@@ -1454,8 +1458,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
         WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG, "Merge-join succeeded");
         int release_rc = 0;
-        if (arr_probe.active)
-            release_rc = col_arrangement_probe_release(&arr_probe);
+        if (arr_bundle.active)
+            release_rc = col_arrangement_probe_bundle_release(&arr_bundle);
         col_arrangement_pin_release(&arr_pin);
         if (release_rc != 0) {
             free(tmp);
