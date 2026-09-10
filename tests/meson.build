@@ -792,6 +792,18 @@ test('changelog_format', py3,
             meson.project_source_root() / 'CHANGELOG.md'],
      suite: 'abi')
 
+# Issue #1471: plan-building helpers under tests/ and bench/ must keep the
+# program alive (plan_fixture_hold) instead of freeing it while the plan is
+# still live; a text scan, no build-tree input.  Python gates are outside
+# the #1462 shell timeout rule.
+test('program_lifetime', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-program-lifetime.py',
+            meson.project_source_root()],
+     suite: 'abi')
+test('program_lifetime_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-check-program-lifetime.py'],
+     suite: 'abi')
+
 # Shell interpreter for the abi-suite shell scripts below.  Resolved
 # once and reused; tests that depend on `sh.found()` are gated on
 # the same handle so platforms without bash (e.g. some Windows
