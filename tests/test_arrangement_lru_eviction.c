@@ -556,6 +556,199 @@ cleanup:
 /* ================================================================
  * main
  * ================================================================ */
+/* ================================================================
+ * Issue #1515: a failed tombstone-slot reuse must leave the registry
+ * scannable and the slot a well-formed tombstone.
+ * ================================================================ */
+
+/* An enforcing governor that denies every arrangement build: a 16-bucket
+ * table needs far more than one byte. */
+static wl_columnar_memory_governor_ref_t *
+tight_governor(void)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1u;
+    resolution.usable_bytes = 1u;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static int
+find_entry_index(const wl_col_session_t *cs, const char *rel_name,
+    uint32_t key_col)
+{
+    for (uint32_t i = 0; i < cs->arr_count; i++) {
+        const col_arr_entry_t *e = &cs->arr_entries[i];
+        if (e->rel_name && strcmp(e->rel_name, rel_name) == 0
+            && e->key_count == 1u && e->key_cols[0] == key_col)
+            return (int)i;
+    }
+    return -1;
+}
+
+static const char *REUSE_FAILURE_SRC = ".decl edge(x: int32, y: int32)\n"
+    "edge(10, 1). edge(20, 2). edge(30, 3).\n"
+    ".decl node(x: int32)\n"
+    "node(1). node(2).\n"
+    ".decl pathA(x: int32, y: int32)\n"
+    "pathA(x, y) :- edge(x, y).\n"
+    ".decl n(x: int32)\n"
+    "n(x) :- node(x).\n";
+
+/* @tombstone_last selects where the tombstone sits: index 0 (a following
+ * scan must walk past the failed slot) or the last index (the failure
+ * tail must not mistake a reused last slot for an appended one). */
+static void
+test_tombstone_reuse_failure(bool tombstone_last)
+{
+    TEST(tombstone_last
+        ? "Failed tombstone reuse (last slot) keeps a rebuildable tombstone"
+        : "Failed tombstone reuse (first slot) keeps the registry scannable");
+
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    ASSERT(make_session(REUSE_FAILURE_SRC, &sess, &plan, &prog) == 0,
+        "session creation failed");
+
+    wl_col_session_t *cs = COL_SESSION(sess);
+    uint32_t key0[1] = { 0 };
+    uint32_t key1[1] = { 1 };
+    col_arrangement_t *a_edge = NULL;
+    col_arrangement_t *a_node = NULL;
+    if (tombstone_last) {
+        a_node = col_session_get_arrangement(sess, "node", key0, 1);
+        a_edge = col_session_get_arrangement(sess, "edge", key0, 1);
+    } else {
+        a_edge = col_session_get_arrangement(sess, "edge", key0, 1);
+        a_node = col_session_get_arrangement(sess, "node", key0, 1);
+    }
+    ASSERT(a_edge != NULL && a_node != NULL, "initial builds must succeed");
+    int edge_idx = find_entry_index(cs, "edge", 0);
+    ASSERT(edge_idx == (tombstone_last ? 1 : 0), "unexpected edge slot");
+
+    /* Manufacture an eviction tombstone on the edge entry. */
+    col_arr_entry_t *entry = &cs->arr_entries[edge_idx];
+    cs->arr_total_bytes -= entry->mem_bytes;
+    arr_free_contents(&entry->arr);
+    entry->mem_bytes = 0;
+    uint32_t count_before = cs->arr_count;
+    size_t total_before = cs->arr_total_bytes;
+
+    /* Only later attaches see the swapped session governor; every existing
+     * holder keeps its own retained reference. */
+    wl_columnar_memory_governor_ref_t *tight = tight_governor();
+    ASSERT(tight != NULL, "tight governor allocation failed");
+    wl_columnar_memory_governor_ref_t *orig = cs->memory_governor;
+    cs->memory_governor = tight;
+
+    /* A miss on a new key reuses the tombstone; the build is denied. */
+    ASSERT(col_session_get_arrangement(sess, "edge", key1, 1) == NULL,
+        "denied build must fail the lookup");
+    ASSERT(cs->arr_count == count_before, "failure must not change arr_count");
+    ASSERT(cs->arr_total_bytes == total_before,
+        "failure must not change arr_total_bytes");
+    entry = &cs->arr_entries[edge_idx];
+    /* The registry stays scannable: lookup, pin and invalidation walk past
+     * the failed slot. */
+    ASSERT(col_session_get_arrangement(sess, "node", key0, 1) == a_node,
+        "lookup of another relation must still hit");
+    col_arrangement_pin_t pin;
+    ASSERT(col_session_pin_arrangement(sess, "node", key0, 1, &pin) == 0,
+        "pin of another relation must succeed");
+    col_arrangement_pin_release(&pin);
+    col_session_invalidate_arrangements(sess, "edge");
+
+    ASSERT(entry->rel_name != NULL && strcmp(entry->rel_name, "edge") == 0,
+        "failed slot must keep a name");
+    ASSERT(entry->key_count == 1u && entry->key_cols != NULL
+        && entry->key_cols[0] == 1u, "failed slot must keep the new key");
+    ASSERT(entry->arr.indexed_rows == 0 && entry->mem_bytes == 0
+        && entry->arr.ht_head == NULL && entry->arr.reserved_bytes == 0
+        && entry->pin_count == 0, "failed slot must be a tombstone");
+    ASSERT(entry->arr.memory_governor == tight,
+        "failed slot must keep the governor it attached");
+    col_session_invalidate_arrangements(sess, "edge");
+    ASSERT(entry->arr.indexed_rows == 0, "tombstone stays invalidated");
+    ASSERT(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(tight)) == 0,
+        "denied build must not leave a reservation");
+
+    /* A same-key retry takes the hit path; the slot's own governor still
+     * denies, and the tombstone is unchanged. */
+    ASSERT(col_session_get_arrangement(sess, "edge", key1, 1) == NULL,
+        "same-key retry must still be denied");
+    ASSERT(cs->arr_count == count_before
+        && cs->arr_total_bytes == total_before
+        && entry->rel_name != NULL && entry->key_cols[0] == 1u
+        && entry->mem_bytes == 0, "denied retry must leave the tombstone");
+
+    /* Restore the session governor; the tombstone keeps its own reference
+     * until it is reused. */
+    cs->memory_governor = orig;
+    wl_columnar_memory_governor_ref_release(tight);
+
+    /* A later miss reuses the failed slot with the session governor. */
+    col_arrangement_t *a_again
+        = col_session_get_arrangement(sess, "edge", key0, 1);
+    ASSERT(a_again != NULL, "reuse after restore must build");
+    ASSERT(a_again->indexed_rows == 3, "rebuilt arrangement must index rows");
+    ASSERT(cs->arr_count == count_before, "reuse must not grow arr_count");
+    entry = &cs->arr_entries[edge_idx];
+    ASSERT(a_again == &entry->arr && entry->key_cols[0] == 0u,
+        "reuse must take the failed slot");
+    ASSERT(entry->arr.memory_governor == orig,
+        "reused slot must attach the session governor");
+    ASSERT(cs->arr_total_bytes == total_before + entry->mem_bytes,
+        "arr_total_bytes must account the rebuilt entry only");
+
+    free_session(sess, plan, prog);
+    PASS();
+}
+
+/* The appended case keeps today's rollback: a denied first build on a
+ * fresh registry leaves nothing behind. */
+static void
+test_append_failure_rolls_back(void)
+{
+    TEST("Denied first build on an appended slot rolls back");
+
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    ASSERT(make_session(REUSE_FAILURE_SRC, &sess, &plan, &prog) == 0,
+        "session creation failed");
+
+    wl_col_session_t *cs = COL_SESSION(sess);
+    uint32_t key0[1] = { 0 };
+    uint32_t count_before = cs->arr_count;
+    size_t total_before = cs->arr_total_bytes;
+    wl_columnar_memory_governor_ref_t *tight = tight_governor();
+    ASSERT(tight != NULL, "tight governor allocation failed");
+    wl_columnar_memory_governor_ref_t *orig = cs->memory_governor;
+    cs->memory_governor = tight;
+
+    ASSERT(col_session_get_arrangement(sess, "edge", key0, 1) == NULL,
+        "denied build must fail the lookup");
+    ASSERT(cs->arr_count == count_before && cs->arr_total_bytes == total_before,
+        "appended failure must roll back");
+    ASSERT(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(tight)) == 0,
+        "denied build must not leave a reservation");
+
+    cs->memory_governor = orig;
+    wl_columnar_memory_governor_ref_release(tight);
+    col_arrangement_t *arr = col_session_get_arrangement(sess, "edge", key0, 1);
+    ASSERT(arr != NULL && arr->indexed_rows == 3,
+        "build after restore must succeed");
+    ASSERT(cs->arr_count == count_before + 1u, "append must add one entry");
+
+    free_session(sess, plan, prog);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -564,6 +757,9 @@ main(void)
     test_lru_clock_and_mem_bytes();
     test_env_var_limit();
     test_tombstone_rebuild();
+    test_tombstone_reuse_failure(false);
+    test_tombstone_reuse_failure(true);
+    test_append_failure_rolls_back();
     test_total_bytes_accounting();
     test_pinned_invalidation();
     for (unsigned scenario = 0; scenario < 8; scenario++)
