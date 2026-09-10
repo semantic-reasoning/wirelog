@@ -533,6 +533,102 @@ test_arena_append_all_admission_boundary(void)
         wl_columnar_memory_governor_ref_release(ref);
 }
 
+static col_rel_t *
+make_full_heap_relation(const char *name, int64_t value, bool timestamps)
+{
+    col_rel_t *relation = col_rel_new_auto(name, 1);
+    if (!relation)
+        return NULL;
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++) {
+        if (col_rel_append_row(relation, &value) != 0)
+            goto fail;
+    }
+    if (timestamps && col_rel_enable_timestamps(relation) != 0)
+        goto fail;
+    return relation;
+
+fail:
+    col_rel_destroy(relation);
+    return NULL;
+}
+
+static void
+test_heap_append_all_admission_boundary(void)
+{
+    const uint64_t exact_bytes = (uint64_t)(COL_REL_INIT_CAP * 2u)
+        * (sizeof(int64_t) + sizeof(col_delta_timestamp_t));
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_ref_t *ref;
+    col_rel_t *dst;
+    col_rel_t *src;
+    int64_t value = 61;
+
+    make_resolution(&resolution, exact_bytes);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    dst = ref ? make_full_heap_relation("heap-append-exact", value, true)
+              : NULL;
+    src = col_rel_new_auto("heap-append-source", 1);
+    CHECK(dst && src, "heap append_all exact-fit setup");
+    if (dst && src) {
+        uint64_t old_storage = dst->storage_generation;
+        CHECK(col_rel_enable_timestamps(src) == 0
+            && col_rel_append_row(src, &value) == 0,
+            "heap append_all timestamp source");
+        src->timestamps[0].iteration = 77;
+        CHECK(col_rel_attach_memory_governor(dst, ref) == 0,
+            "heap append_all exact-fit governor");
+        CHECK(col_rel_append_all(dst, src, NULL) == 0,
+            "heap append_all exact-fit admission");
+        CHECK(dst->capacity == COL_REL_INIT_CAP * 2u
+            && dst->nrows == COL_REL_INIT_CAP + 1u
+            && dst->timestamps[COL_REL_INIT_CAP].iteration == 77,
+            "heap append_all exact-fit state");
+        CHECK(dst->storage_generation == old_storage + 1u,
+            "heap append_all advanced storage generation once");
+        CHECK(dst->retained_reserved_bytes == exact_bytes
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == exact_bytes,
+            "heap append_all exact-fit reservation");
+    }
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+
+    make_resolution(&resolution, exact_bytes - 1u);
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    dst = ref ? make_full_heap_relation("heap-append-denied", value, true)
+              : NULL;
+    src = col_rel_new_auto("heap-append-denied-source", 1);
+    CHECK(dst && src, "heap append_all denial setup");
+    if (dst && src) {
+        int64_t *old_columns = dst->columns[0];
+        col_delta_timestamp_t *old_timestamps = dst->timestamps;
+        uint32_t old_capacity = dst->capacity;
+        uint32_t old_rows = dst->nrows;
+        uint64_t old_storage = dst->storage_generation;
+        CHECK(col_rel_enable_timestamps(src) == 0
+            && col_rel_append_row(src, &value) == 0,
+            "heap append_all denial timestamp source");
+        CHECK(col_rel_attach_memory_governor(dst, ref) == 0,
+            "heap append_all denial governor");
+        CHECK(col_rel_append_all(dst, src, NULL) == ENOMEM,
+            "heap append_all one-byte denial");
+        CHECK(dst->columns[0] == old_columns
+            && dst->timestamps == old_timestamps
+            && dst->capacity == old_capacity && dst->nrows == old_rows
+            && dst->storage_generation == old_storage,
+            "heap append_all denial changed state");
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "heap append_all denial left reservation");
+    }
+    col_rel_destroy(src);
+    col_rel_destroy(dst);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+}
+
 static void
 test_cow_capacity_denial_preserves_state(void)
 {
@@ -618,6 +714,7 @@ main(void)
     test_unmanaged_arena_append_all_preserves_ownership();
     test_unmanaged_arena_append_all_reconciles_timestamps();
     test_arena_append_all_admission_boundary();
+    test_heap_append_all_admission_boundary();
     test_cow_capacity_denial_preserves_state();
     test_cow_ledger_reconcile_is_exact_once();
     if (failures != 0)

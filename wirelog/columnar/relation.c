@@ -1481,40 +1481,12 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                 goto fail_prepared;
             transitioned = true;
         } else {
-            /* Heap-owned growth: admit (retained relations), prepare, commit,
-             * publish -- see col_rel_append_row. */
-            wl_columnar_memory_reservation_t pending;
-            int pending_rc = 0;
-            uint64_t new_bytes = 0;
-            bool admitted = dst->memory_governor != NULL;
-            if (admitted) {
-                pending_rc = col_rel_reserve_retained(dst, new_cap, &pending);
-                if (pending_rc < 0)
-                    goto fail_prepared;
-                if (!col_rel_retained_bytes(dst->ncols, new_cap,
-                    dst->timestamps != NULL, &new_bytes)) {
-                    col_rel_reservation_rollback(&pending);
-                    goto fail_prepared;
-                }
-            }
-            int64_t **new_cols = NULL;
-            col_delta_timestamp_t *new_ts = NULL;
-            if (col_rel_prepare_resize(dst, new_cap, &new_cols, &new_ts)
-                != 0) {
-                if (admitted)
-                    col_rel_reservation_rollback(&pending);
+            /* Heap-owned growth uses the same admission transaction as
+             * append_row.  The helper reconciles the ledger and advances
+             * storage generation exactly once. */
+            if (col_rel_reserve_capacity_admitted(dst, new_cap, NULL) != 0)
                 goto fail_prepared;
-            }
-            if (admitted && pending_rc > 0
-                && col_rel_publish_retained_reservation(dst, &pending,
-                new_bytes) != 0) {
-                col_rel_reservation_rollback(&pending);
-                col_columns_free(new_cols, dst->ncols);
-                free(new_ts);
-                goto fail_prepared;
-            }
-            col_rel_publish_resize(dst, new_cols, new_ts, new_cap);
-            transitioned = false;
+            transitioned = true;
         }
         if (!transitioned) {
             col_rel_ledger_reconcile(dst, ledger_before);
