@@ -585,6 +585,26 @@ def references(path: Path, root: Path) -> tuple[list[Path], list[str]]:
     return found, errors
 
 
+def shell_seed_from_cmd(command: object) -> str | None:
+    """Return the shell script an introspected test command runs, or None.
+
+    A test is shell-seeded when its argv[0] is a ``.sh`` file (registered
+    through ``find_program``) or when argv[0] is ``bash``/``sh`` and argv[1]
+    is a ``.sh`` file (registered as ``sh, args: [...]``).  Shared with
+    check-shell-gate-timeouts.py (#1464) so both gates classify the same set
+    of registrations."""
+    if not isinstance(command, list) or not command:
+        return None
+    first = str(command[0])
+    if first.lower().endswith((".sh", ".sh.exe")):
+        return first
+    if re.split(r"[\\/]", first)[-1].lower() in ("bash", "bash.exe", "sh", "sh.exe") and len(command) > 1:
+        second = str(command[1])
+        if second.lower().endswith((".sh", ".sh.exe")):
+            return second
+    return None
+
+
 def seeds_from_intro(intro: Path, root: Path) -> list[Path]:
     try:
         data = json.loads(intro.read_text(encoding="utf-8"))
@@ -593,16 +613,7 @@ def seeds_from_intro(intro: Path, root: Path) -> list[Path]:
     seeds: list[Path] = []
     for item in data:
         command = item.get("cmd") if isinstance(item, dict) else None
-        if not isinstance(command, list) or not command:
-            continue
-        first = str(command[0])
-        candidate: str | None = None
-        if first.lower().endswith((".sh", ".sh.exe")):
-            candidate = first
-        elif re.split(r"[\\/]", first)[-1].lower() in ("bash", "bash.exe", "sh", "sh.exe") and len(command) > 1:
-            second = str(command[1])
-            if second.lower().endswith((".sh", ".sh.exe")):
-                candidate = second
+        candidate = shell_seed_from_cmd(command)
         if candidate is None:
             continue
         path = Path(candidate)
