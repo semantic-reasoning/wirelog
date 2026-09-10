@@ -953,7 +953,14 @@ borrower's lifetime. The flat registry refuses `realloc()` while any lease is
 active; callers that cannot obtain a new cache slot must use their ephemeral
 fallback until the lease is released.
 
-The lease is internal and must not be copied or released twice. It does not
-cover filtered/differential/sorted/materialization caches or relation
-generation checks; those extensions are tracked by issue #1435. No claim of
-general multi-threaded access is made by this contract.
+The lease is internal and must not be copied or released twice. The source
+reader is acquired with the arrangement pin in the operation-local bundle and
+is released before the public operation boundary returns. Compound/side
+relations coalesce by ultimate storage owner; dependency failure rolls back
+every earlier pin and reader. Mutation takes the same source gate and returns
+`EBUSY` while a reader is active, so callers retry after release. Worker
+aliases and checked teardown follow the same rule: no queued task or borrowed
+source may outlive the operation/session boundary.
+
+This is not a general concurrent-reader API. Filtered/materialization-cache
+extensions and the delegated #1435/#1507 work remain separate contracts.
