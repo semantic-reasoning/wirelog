@@ -79,20 +79,20 @@ static uint32_t s_count;
  *               See Issue #459 for background. */
 #if defined(WL_HAVE_C11_THREADS)
 #include <stdatomic.h>
-static mutex_t s_mutex;
+static wl_mutex_t s_mutex;
 static once_flag s_mutex_once = ONCE_FLAG_INIT;
 static atomic_int s_mutex_init_ok;
 static void
 init_mutex(void)
 {
-    atomic_store(&s_mutex_init_ok, (mutex_init(&s_mutex) == 0) ? 1 : 0);
+    atomic_store(&s_mutex_init_ok, (wl_mutex_init(&s_mutex) == 0) ? 1 : 0);
 }
 #elif defined(_WIN32) || defined(_WIN64)
-static mutex_t s_mutex;
+static wl_mutex_t s_mutex;
 /* 0 = uninitialised, 1 = initialisation in progress, 2 = ready */
 static volatile long s_mutex_init;
 #else
-static mutex_t s_mutex = { PTHREAD_MUTEX_INITIALIZER };
+static wl_mutex_t s_mutex = { PTHREAD_MUTEX_INITIALIZER };
 #endif
 static bool s_initialized;
 
@@ -116,22 +116,22 @@ ensure_builtins(void)
 #elif defined(_WIN32) || defined(_WIN64)
     /* Two-phase flag protocol (Issue #459):
      *   0 -> 1: winning thread claims init (ICS); all others spin.
-     *   1 -> 2: winning thread sets "done" only after mutex_init returns.
-     * This prevents a competing thread from calling mutex_lock on a
+     *   1 -> 2: winning thread sets "done" only after wl_mutex_init returns.
+     * This prevents a competing thread from calling wl_mutex_lock on a
      * CRITICAL_SECTION that has not yet been initialised. */
     if (InterlockedCompareExchange(&s_mutex_init, 2, 2) != 2) {
         if (InterlockedCompareExchange(&s_mutex_init, 1, 0) == 0) {
-            mutex_init(&s_mutex);
+            wl_mutex_init(&s_mutex);
             InterlockedExchange(&s_mutex_init, 2);
         }
-        /* Spin until the winning thread completes mutex_init. */
+        /* Spin until the winning thread completes wl_mutex_init. */
         while (InterlockedCompareExchange(&s_mutex_init, 2, 2) != 2)
             SwitchToThread();
     }
 #endif
     /* Use the mutex (statically initialized on POSIX, dynamically on
      * Windows) to guard the one-shot builtin registration. */
-    mutex_lock(&s_mutex);
+    wl_mutex_lock(&s_mutex);
     if (!s_initialized) {
         s_registry[0].adapter = &wl_csv_adapter;
         strncpy(s_registry[0].scheme, "csv", SCHEME_MAX_LEN - 1);
@@ -139,7 +139,7 @@ ensure_builtins(void)
         s_count = 1;
         s_initialized = true;
     }
-    mutex_unlock(&s_mutex);
+    wl_mutex_unlock(&s_mutex);
 }
 
 /* ======================================================================== */
@@ -164,12 +164,12 @@ wirelog_io_register_adapter(const wirelog_io_adapter_t *adapter)
         return -1;
     }
 
-    mutex_lock(&s_mutex);
+    wl_mutex_lock(&s_mutex);
 
     /* Check for duplicate scheme */
     for (uint32_t i = 0; i < s_count; i++) {
         if (strcmp(s_registry[i].scheme, adapter->scheme) == 0) {
-            mutex_unlock(&s_mutex);
+            wl_mutex_unlock(&s_mutex);
             set_error("duplicate scheme");
             return -1;
         }
@@ -177,7 +177,7 @@ wirelog_io_register_adapter(const wirelog_io_adapter_t *adapter)
 
     /* Check capacity */
     if (s_count >= WIRELOG_IO_MAX_ADAPTERS) {
-        mutex_unlock(&s_mutex);
+        wl_mutex_unlock(&s_mutex);
         set_error("registry full");
         return -1;
     }
@@ -188,7 +188,7 @@ wirelog_io_register_adapter(const wirelog_io_adapter_t *adapter)
     s_registry[s_count].scheme[SCHEME_MAX_LEN - 1] = '\0';
     s_count++;
 
-    mutex_unlock(&s_mutex);
+    wl_mutex_unlock(&s_mutex);
     set_error(NULL);
     return 0;
 }
@@ -203,7 +203,7 @@ wirelog_io_unregister_adapter(const char *scheme)
         return -1;
     }
 
-    mutex_lock(&s_mutex);
+    wl_mutex_lock(&s_mutex);
 
     for (uint32_t i = 0; i < s_count; i++) {
         if (strcmp(s_registry[i].scheme, scheme) == 0) {
@@ -213,13 +213,13 @@ wirelog_io_unregister_adapter(const char *scheme)
             }
             s_count--;
             memset(&s_registry[s_count], 0, sizeof(registry_entry_t));
-            mutex_unlock(&s_mutex);
+            wl_mutex_unlock(&s_mutex);
             set_error(NULL);
             return 0;
         }
     }
 
-    mutex_unlock(&s_mutex);
+    wl_mutex_unlock(&s_mutex);
     set_error("scheme not found");
     return -1;
 }
@@ -234,18 +234,18 @@ wirelog_io_find_adapter(const char *scheme)
         return NULL;
     }
 
-    mutex_lock(&s_mutex);
+    wl_mutex_lock(&s_mutex);
 
     for (uint32_t i = 0; i < s_count; i++) {
         if (strcmp(s_registry[i].scheme, scheme) == 0) {
             const wirelog_io_adapter_t *found = s_registry[i].adapter;
-            mutex_unlock(&s_mutex);
+            wl_mutex_unlock(&s_mutex);
             set_error(NULL);
             return found;
         }
     }
 
-    mutex_unlock(&s_mutex);
+    wl_mutex_unlock(&s_mutex);
     set_error(NULL);
     return NULL;
 }

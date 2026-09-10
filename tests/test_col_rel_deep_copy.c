@@ -1004,14 +1004,14 @@ cleanup:
 /* Concurrent reads safety (Issue #556)                                     */
 /* ======================================================================== */
 
-/* Portable barrier built on the wirelog thread layer (mutex_t + cond_t).
+/* Portable barrier built on the wirelog thread layer (wl_mutex_t + wl_cond_t).
  * pthread_barrier_t is a POSIX optional XSI feature and is unavailable
  * on Apple platforms; raw pthread_t is unavailable on Windows MSVC.
  * Going through wirelog/thread.h keeps the test buildable on the C11,
  * POSIX, and Win32 backends meson selects from at configure time. */
 typedef struct {
-    mutex_t mtx;
-    cond_t cond;
+    wl_mutex_t mtx;
+    wl_cond_t cond;
     unsigned count;         /* threads still waiting to arrive */
     unsigned total;         /* initial count (reset each generation) */
     unsigned phase;         /* generation counter, prevents lost wakeups */
@@ -1020,10 +1020,10 @@ typedef struct {
 static int
 simple_barrier_init(simple_barrier_t *b, unsigned n)
 {
-    if (mutex_init(&b->mtx) != 0)
+    if (wl_mutex_init(&b->mtx) != 0)
         return -1;
-    if (cond_init(&b->cond) != 0) {
-        mutex_destroy(&b->mtx);
+    if (wl_cond_init(&b->cond) != 0) {
+        wl_mutex_destroy(&b->mtx);
         return -1;
     }
     b->count = n;
@@ -1035,24 +1035,24 @@ simple_barrier_init(simple_barrier_t *b, unsigned n)
 static void
 simple_barrier_wait(simple_barrier_t *b)
 {
-    mutex_lock(&b->mtx);
+    wl_mutex_lock(&b->mtx);
     unsigned my_phase = b->phase;
     if (--b->count == 0) {
         b->count = b->total;
         b->phase++;
-        cond_broadcast(&b->cond);
+        wl_cond_broadcast(&b->cond);
     } else {
         while (b->phase == my_phase)
-            cond_wait(&b->cond, &b->mtx);
+            wl_cond_wait(&b->cond, &b->mtx);
     }
-    mutex_unlock(&b->mtx);
+    wl_mutex_unlock(&b->mtx);
 }
 
 static void
 simple_barrier_destroy(simple_barrier_t *b)
 {
-    mutex_destroy(&b->mtx);
-    cond_destroy(&b->cond);
+    wl_mutex_destroy(&b->mtx);
+    wl_cond_destroy(&b->cond);
 }
 
 #define DEEP_COPY_CONCURRENT_NREADERS 4u
@@ -1136,7 +1136,7 @@ test_concurrent_reads_race_free(void)
     ASSERT(simple_barrier_init(&barrier, DEEP_COPY_CONCURRENT_NREADERS) == 0,
         "simple_barrier_init failed");
 
-    thread_t readers[DEEP_COPY_CONCURRENT_NREADERS];
+    wl_thread_t readers[DEEP_COPY_CONCURRENT_NREADERS];
     concurrent_reader_args_t args[DEEP_COPY_CONCURRENT_NREADERS];
     for (uint32_t i = 0; i < DEEP_COPY_CONCURRENT_NREADERS; i++) {
         args[i].dst = dst;
@@ -1145,11 +1145,11 @@ test_concurrent_reads_race_free(void)
         args[i].fx_nrows = fx_nrows;
         args[i].reader_id = i;
         args[i].mismatch = 0;
-        int crc = thread_create(&readers[i], concurrent_reader_fn, &args[i]);
-        ASSERT(crc == 0, "thread_create failed");
+        int crc = wl_thread_create(&readers[i], concurrent_reader_fn, &args[i]);
+        ASSERT(crc == 0, "wl_thread_create failed");
     }
     for (uint32_t i = 0; i < DEEP_COPY_CONCURRENT_NREADERS; i++) {
-        thread_join(&readers[i]);
+        wl_thread_join(&readers[i]);
     }
     simple_barrier_destroy(&barrier);
 

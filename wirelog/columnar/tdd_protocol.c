@@ -21,9 +21,9 @@ typedef struct {
 } wl_columnar_tdd_entry_t;
 
 struct wl_columnar_tdd_protocol {
-    mutex_t mutex;
-    cond_t can_submit;
-    cond_t state_changed;
+    wl_mutex_t mutex;
+    wl_cond_t can_submit;
+    wl_cond_t state_changed;
     size_t capacity;
     size_t count;
     size_t head;
@@ -68,7 +68,7 @@ wl_columnar_tdd_deadline_from_now(unsigned timeout_ms)
 #endif
 
 static int
-wl_columnar_tdd_cond_timedwait(cond_t *cond, mutex_t *mutex,
+wl_columnar_tdd_cond_timedwait(wl_cond_t *cond, wl_mutex_t *mutex,
     unsigned timeout_ms)
 {
 #if defined(WL_HAVE_C11_THREADS)
@@ -136,20 +136,20 @@ wl_columnar_tdd_protocol_create(size_t capacity)
         return NULL;
     }
     protocol->capacity = capacity;
-    if (mutex_init(&protocol->mutex) != 0) {
+    if (wl_mutex_init(&protocol->mutex) != 0) {
         free(protocol->entries);
         free(protocol);
         return NULL;
     }
-    if (cond_init(&protocol->can_submit) != 0) {
-        mutex_destroy(&protocol->mutex);
+    if (wl_cond_init(&protocol->can_submit) != 0) {
+        wl_mutex_destroy(&protocol->mutex);
         free(protocol->entries);
         free(protocol);
         return NULL;
     }
-    if (cond_init(&protocol->state_changed) != 0) {
-        cond_destroy(&protocol->can_submit);
-        mutex_destroy(&protocol->mutex);
+    if (wl_cond_init(&protocol->state_changed) != 0) {
+        wl_cond_destroy(&protocol->can_submit);
+        wl_mutex_destroy(&protocol->mutex);
         free(protocol->entries);
         free(protocol);
         return NULL;
@@ -162,7 +162,7 @@ wl_columnar_tdd_protocol_cancel(wl_columnar_tdd_protocol_t *protocol)
 {
     if (protocol == NULL)
         return;
-    mutex_lock(&protocol->mutex);
+    wl_mutex_lock(&protocol->mutex);
     if (!protocol->cancelled) {
         protocol->cancelled = true;
         while (protocol->count != 0) {
@@ -172,10 +172,10 @@ wl_columnar_tdd_protocol_cancel(wl_columnar_tdd_protocol_t *protocol)
             protocol->head = (protocol->head + 1) % protocol->capacity;
             protocol->count--;
         }
-        cond_broadcast(&protocol->can_submit);
-        cond_broadcast(&protocol->state_changed);
+        wl_cond_broadcast(&protocol->can_submit);
+        wl_cond_broadcast(&protocol->state_changed);
     }
-    mutex_unlock(&protocol->mutex);
+    wl_mutex_unlock(&protocol->mutex);
 }
 
 void
@@ -184,9 +184,9 @@ wl_columnar_tdd_protocol_destroy(wl_columnar_tdd_protocol_t *protocol)
     if (protocol == NULL)
         return;
     wl_columnar_tdd_protocol_cancel(protocol);
-    cond_destroy(&protocol->state_changed);
-    cond_destroy(&protocol->can_submit);
-    mutex_destroy(&protocol->mutex);
+    wl_cond_destroy(&protocol->state_changed);
+    wl_cond_destroy(&protocol->can_submit);
+    wl_mutex_destroy(&protocol->mutex);
     free(protocol->entries);
     free(protocol);
 }
@@ -197,29 +197,29 @@ wl_columnar_tdd_protocol_submit(wl_columnar_tdd_protocol_t *protocol,
 {
     if (protocol == NULL || payload == NULL || payload->reservation == NULL)
         return WL_COLUMNAR_TDD_DUPLICATE;
-    mutex_lock(&protocol->mutex);
+    wl_mutex_lock(&protocol->mutex);
     if (wl_columnar_tdd_queue_contains(protocol, payload)) {
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return WL_COLUMNAR_TDD_DUPLICATE;
     }
     while (protocol->count == protocol->capacity && !protocol->cancelled &&
         !protocol->complete_requested) {
         protocol->blocked_submitters++;
-        cond_broadcast(&protocol->state_changed);
-        cond_wait(&protocol->can_submit, &protocol->mutex);
+        wl_cond_broadcast(&protocol->state_changed);
+        wl_cond_wait(&protocol->can_submit, &protocol->mutex);
         protocol->blocked_submitters--;
-        cond_broadcast(&protocol->state_changed);
+        wl_cond_broadcast(&protocol->state_changed);
     }
     if (protocol->cancelled) {
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return WL_COLUMNAR_TDD_SUBMIT_CANCELLED;
     }
     if (protocol->complete_requested) {
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return WL_COLUMNAR_TDD_ALREADY_COMPLETE;
     }
     if (wl_columnar_tdd_queue_contains(protocol, payload)) {
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return WL_COLUMNAR_TDD_DUPLICATE;
     }
     payload->reservation->transfer_count++;
@@ -228,9 +228,9 @@ wl_columnar_tdd_protocol_submit(wl_columnar_tdd_protocol_t *protocol,
     };
     protocol->tail = (protocol->tail + 1) % protocol->capacity;
     protocol->count++;
-    cond_broadcast(&protocol->can_submit);
-    cond_broadcast(&protocol->state_changed);
-    mutex_unlock(&protocol->mutex);
+    wl_cond_broadcast(&protocol->can_submit);
+    wl_cond_broadcast(&protocol->state_changed);
+    wl_mutex_unlock(&protocol->mutex);
     return WL_COLUMNAR_TDD_SUBMITTED;
 }
 
@@ -240,29 +240,29 @@ wl_columnar_tdd_protocol_complete(wl_columnar_tdd_protocol_t *protocol)
     wl_columnar_tdd_submit_result_t result;
     if (protocol == NULL)
         return WL_COLUMNAR_TDD_SUBMIT_CANCELLED;
-    mutex_lock(&protocol->mutex);
+    wl_mutex_lock(&protocol->mutex);
     if (protocol->cancelled) {
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return WL_COLUMNAR_TDD_SUBMIT_CANCELLED;
     }
     if (protocol->complete_requested) {
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return WL_COLUMNAR_TDD_ALREADY_COMPLETE;
     }
     protocol->complete_requested = true;
     while (protocol->count == protocol->capacity && !protocol->cancelled)
-        cond_wait(&protocol->can_submit, &protocol->mutex);
+        wl_cond_wait(&protocol->can_submit, &protocol->mutex);
     if (!protocol->cancelled) {
         protocol->entries[protocol->tail] =
             (wl_columnar_tdd_entry_t){WL_COLUMNAR_TDD_COMPLETE, NULL};
         protocol->tail = (protocol->tail + 1) % protocol->capacity;
         protocol->count++;
     }
-    cond_broadcast(&protocol->can_submit);
-    cond_broadcast(&protocol->state_changed);
+    wl_cond_broadcast(&protocol->can_submit);
+    wl_cond_broadcast(&protocol->state_changed);
     result = protocol->cancelled ? WL_COLUMNAR_TDD_SUBMIT_CANCELLED
                                  : WL_COLUMNAR_TDD_SUBMITTED;
-    mutex_unlock(&protocol->mutex);
+    wl_mutex_unlock(&protocol->mutex);
     return result;
 }
 
@@ -275,24 +275,24 @@ wl_columnar_tdd_protocol_pump(wl_columnar_tdd_protocol_t *protocol,
         *message = (wl_columnar_tdd_message_t){WL_COLUMNAR_TDD_EMPTY, NULL};
     if (protocol == NULL)
         return WL_COLUMNAR_TDD_CANCELLED;
-    mutex_lock(&protocol->mutex);
+    wl_mutex_lock(&protocol->mutex);
     if (protocol->count == 0) {
         wl_columnar_tdd_pump_result_t result =
             protocol->cancelled ? WL_COLUMNAR_TDD_CANCELLED :
             WL_COLUMNAR_TDD_EMPTY;
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return result;
     }
     entry = protocol->entries[protocol->head];
     if (message == NULL && entry.kind == WL_COLUMNAR_TDD_DATA) {
-        mutex_unlock(&protocol->mutex);
+        wl_mutex_unlock(&protocol->mutex);
         return WL_COLUMNAR_TDD_DATA;
     }
     protocol->head = (protocol->head + 1) % protocol->capacity;
     protocol->count--;
-    cond_broadcast(&protocol->can_submit);
-    cond_broadcast(&protocol->state_changed);
-    mutex_unlock(&protocol->mutex);
+    wl_cond_broadcast(&protocol->can_submit);
+    wl_cond_broadcast(&protocol->state_changed);
+    wl_mutex_unlock(&protocol->mutex);
     if (message != NULL)
         *message = (wl_columnar_tdd_message_t){entry.kind, entry.payload};
     return entry.kind;
@@ -308,7 +308,7 @@ wl_columnar_tdd_protocol_wait_full_with_blocked_submitter(
     if (protocol == NULL)
         return false;
     deadline = wl_columnar_tdd_now_ms() + timeout_ms;
-    mutex_lock(&protocol->mutex);
+    wl_mutex_lock(&protocol->mutex);
     while (!wl_columnar_tdd_full_with_blocked_submitter(protocol) &&
         !protocol->cancelled && !protocol->complete_requested) {
         uint64_t now = wl_columnar_tdd_now_ms();
@@ -323,7 +323,7 @@ wl_columnar_tdd_protocol_wait_full_with_blocked_submitter(
             break;
     }
     observed = wl_columnar_tdd_full_with_blocked_submitter(protocol);
-    mutex_unlock(&protocol->mutex);
+    wl_mutex_unlock(&protocol->mutex);
     return observed;
 }
 

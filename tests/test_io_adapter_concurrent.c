@@ -60,11 +60,11 @@ test_concurrent_find(void)
 {
     TEST("concurrent find (csv built-in, 8 threads x 2000 iters)");
 
-    thread_t threads[NTHREADS];
+    wl_thread_t threads[NTHREADS];
     for (int i = 0; i < NTHREADS; i++)
-        thread_create(&threads[i], find_worker, NULL);
+        wl_thread_create(&threads[i], find_worker, NULL);
     for (int i = 0; i < NTHREADS; i++)
-        thread_join(&threads[i]);
+        wl_thread_join(&threads[i]);
 
     /* After concurrent reads, csv must still be findable */
     const wirelog_io_adapter_t *a = wirelog_io_find_adapter("csv");
@@ -109,7 +109,7 @@ test_concurrent_register_unregister(void)
 {
     TEST("concurrent register/unregister (8 threads x 2000 iters each)");
 
-    thread_t threads[NTHREADS];
+    wl_thread_t threads[NTHREADS];
     reg_arg_t args[NTHREADS];
 
     for (int i = 0; i < NTHREADS; i++) {
@@ -118,10 +118,10 @@ test_concurrent_register_unregister(void)
         args[i].adapter.scheme = args[i].scheme;
         args[i].adapter.abi_version = WIRELOG_IO_ABI_VERSION;
         args[i].result = 0;
-        thread_create(&threads[i], reg_unreg_worker, &args[i]);
+        wl_thread_create(&threads[i], reg_unreg_worker, &args[i]);
     }
     for (int i = 0; i < NTHREADS; i++)
-        thread_join(&threads[i]);
+        wl_thread_join(&threads[i]);
 
     int any_failed = 0;
     for (int i = 0; i < NTHREADS; i++) {
@@ -165,8 +165,8 @@ test_mixed_readers_writers(void)
 {
     TEST("mixed readers + writers (4 find + 4 reg/unreg threads)");
 
-    thread_t readers[4];
-    thread_t writers[4];
+    wl_thread_t readers[4];
+    wl_thread_t writers[4];
     reg_arg_t wargs[4];
 
     for (int i = 0; i < 4; i++) {
@@ -174,12 +174,12 @@ test_mixed_readers_writers(void)
         memset(&wargs[i].adapter, 0, sizeof(wargs[i].adapter));
         wargs[i].adapter.scheme = wargs[i].scheme;
         wargs[i].adapter.abi_version = WIRELOG_IO_ABI_VERSION;
-        thread_create(&readers[i], mixed_find_worker, NULL);
-        thread_create(&writers[i], mixed_reg_worker, &wargs[i]);
+        wl_thread_create(&readers[i], mixed_find_worker, NULL);
+        wl_thread_create(&writers[i], mixed_reg_worker, &wargs[i]);
     }
     for (int i = 0; i < 4; i++) {
-        thread_join(&readers[i]);
-        thread_join(&writers[i]);
+        wl_thread_join(&readers[i]);
+        wl_thread_join(&writers[i]);
     }
 
     /* Registry must still be consistent: csv findable, no dangling entries */

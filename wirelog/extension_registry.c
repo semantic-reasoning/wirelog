@@ -25,7 +25,7 @@ typedef struct wl_extension_entry {
 } wl_extension_entry_t;
 
 struct wirelog_extension_registry {
-    mutex_t mutex;
+    wl_mutex_t mutex;
     wl_extension_entry_t **entries;
     size_t count;
     size_t capacity;
@@ -230,7 +230,7 @@ wirelog_extension_registry_create(void)
     if (!registry) {
         wl_extension_error_set("allocation failed"); return NULL;
     }
-    if (mutex_init(&registry->mutex) != 0) {
+    if (wl_mutex_init(&registry->mutex) != 0) {
         free(registry); wl_extension_error_set("mutex initialization failed");
         return NULL;
     }
@@ -244,15 +244,15 @@ wirelog_extension_registry_destroy(wirelog_extension_registry_t *registry)
     if (!registry) {
         wl_extension_error_set("registry is NULL"); return -1;
     }
-    mutex_lock(&registry->mutex);
+    wl_mutex_lock(&registry->mutex);
     if (registry->count != 0 || registry->active_snapshots != 0
         || registry->active_leases != 0) {
-        mutex_unlock(&registry->mutex);
+        wl_mutex_unlock(&registry->mutex);
         wl_extension_error_set("registry is not empty"); return -1;
     }
     free((void *)registry->entries);
-    mutex_unlock(&registry->mutex);
-    mutex_destroy(&registry->mutex);
+    wl_mutex_unlock(&registry->mutex);
+    wl_mutex_destroy(&registry->mutex);
     free(registry);
     wl_extension_error_set(NULL);
     return 0;
@@ -297,10 +297,11 @@ wirelog_extension_register(wirelog_extension_registry_t *registry,
         return -1;
     }
     entry->registry = registry;
-    mutex_lock(&registry->mutex);
+    wl_mutex_lock(&registry->mutex);
     for (i = 0; i < registry->count; i++) {
         if (strcmp(registry->entries[i]->name, entry->name) == 0) {
-            mutex_unlock(&registry->mutex); wl_extension_entry_discard(entry);
+            wl_mutex_unlock(&registry->mutex);
+            wl_extension_entry_discard(entry);
             wl_extension_error_set("duplicate extension name"); return -1;
         }
     }
@@ -310,13 +311,14 @@ wirelog_extension_register(wirelog_extension_registry_t *registry,
             (void *)registry->entries,
             capacity * sizeof(*grown));
         if (!grown) {
-            mutex_unlock(&registry->mutex); wl_extension_entry_discard(entry);
+            wl_mutex_unlock(&registry->mutex);
+            wl_extension_entry_discard(entry);
             wl_extension_error_set("allocation failed"); return -1;
         }
         registry->entries = grown; registry->capacity = capacity;
     }
     registry->entries[registry->count++] = entry;
-    mutex_unlock(&registry->mutex);
+    wl_mutex_unlock(&registry->mutex);
     wl_extension_error_set(NULL);
     return 0;
 }
@@ -334,16 +336,16 @@ wirelog_extension_unregister(wirelog_extension_registry_t *registry,
     if (!normalized) {
         wl_extension_error_set("invalid extension name"); return -1;
     }
-    mutex_lock(&registry->mutex);
+    wl_mutex_lock(&registry->mutex);
     for (i = 0; i < registry->count;
         i++) if (strcmp(registry->entries[i]->name, normalized) == 0) break;
     free(normalized);
     if (i == registry->count) {
-        mutex_unlock(&registry->mutex);
+        wl_mutex_unlock(&registry->mutex);
         wl_extension_error_set("extension not found"); return -1;
     }
     if (registry->entries[i]->pins != 0) {
-        mutex_unlock(&registry->mutex);
+        wl_mutex_unlock(&registry->mutex);
         wl_extension_error_set("extension is pinned"); return -1;
     }
     { wl_extension_entry_t *entry = registry->entries[i];
@@ -353,7 +355,7 @@ wirelog_extension_unregister(wirelog_extension_registry_t *registry,
           (registry->count - i - 1) * sizeof(*registry->entries));
       registry->count--; entry->registered = false;
       destroy = wl_extension_entry_release_locked(entry);
-      mutex_unlock(&registry->mutex);
+      wl_mutex_unlock(&registry->mutex);
       if (destroy) wl_extension_entry_destroy(entry);
       wl_extension_error_set(NULL); return 0; }
 }
@@ -370,24 +372,24 @@ wirelog_extension_snapshot_acquire(wirelog_extension_registry_t *registry)
     if (!snapshot) {
         wl_extension_error_set("allocation failed"); return NULL;
     }
-    mutex_lock(&registry->mutex);
+    wl_mutex_lock(&registry->mutex);
     snapshot->entries = (wl_extension_entry_t **)calloc(registry->count,
             sizeof(*snapshot->entries));
     if (registry->count && !snapshot->entries) {
-        mutex_unlock(&registry->mutex); free((void *)snapshot);
+        wl_mutex_unlock(&registry->mutex); free((void *)snapshot);
         wl_extension_error_set("allocation failed"); return NULL;
     }
     snapshot->pins = (size_t *)calloc(registry->count,
             sizeof(*snapshot->pins));
     if (registry->count && !snapshot->pins) {
-        mutex_unlock(&registry->mutex);
+        wl_mutex_unlock(&registry->mutex);
         free((void *)snapshot->entries); free((void *)snapshot);
         wl_extension_error_set("allocation failed"); return NULL;
     }
     snapshot->destroy_entries = (bool *)calloc(registry->count,
             sizeof(*snapshot->destroy_entries));
     if (registry->count && !snapshot->destroy_entries) {
-        mutex_unlock(&registry->mutex);
+        wl_mutex_unlock(&registry->mutex);
         free((void *)snapshot->pins);
         free((void *)snapshot->entries);
         free((void *)snapshot);
@@ -401,7 +403,7 @@ wirelog_extension_snapshot_acquire(wirelog_extension_registry_t *registry)
         snapshot->entries[i] = registry->entries[i];
         snapshot->entries[i]->references++;
     }
-    mutex_unlock(&registry->mutex); wl_extension_error_set(NULL);
+    wl_mutex_unlock(&registry->mutex); wl_extension_error_set(NULL);
     return snapshot;
 }
 
@@ -410,9 +412,9 @@ wirelog_extension_snapshot_retain(wirelog_extension_snapshot_t *snapshot)
 {
     if (!snapshot)
         return;
-    mutex_lock(&snapshot->registry->mutex);
+    wl_mutex_lock(&snapshot->registry->mutex);
     snapshot->references++;
-    mutex_unlock(&snapshot->registry->mutex);
+    wl_mutex_unlock(&snapshot->registry->mutex);
 }
 
 void
@@ -421,15 +423,15 @@ wirelog_extension_snapshot_release(wirelog_extension_snapshot_t *snapshot)
     size_t i;
     bool destroy_snapshot;
     if (!snapshot) return;
-    mutex_lock(&snapshot->registry->mutex);
+    wl_mutex_lock(&snapshot->registry->mutex);
     if (snapshot->references == 0) {
-        mutex_unlock(&snapshot->registry->mutex);
+        wl_mutex_unlock(&snapshot->registry->mutex);
         return;
     }
     snapshot->references--;
     destroy_snapshot = snapshot->references == 0;
     if (!destroy_snapshot) {
-        mutex_unlock(&snapshot->registry->mutex);
+        wl_mutex_unlock(&snapshot->registry->mutex);
         return;
     }
     for (i = 0; i < snapshot->count; i++) {
@@ -441,7 +443,7 @@ wirelog_extension_snapshot_release(wirelog_extension_snapshot_t *snapshot)
             wl_extension_entry_release_locked(snapshot->entries[i]);
     }
     snapshot->registry->active_snapshots--;
-    mutex_unlock(&snapshot->registry->mutex);
+    wl_mutex_unlock(&snapshot->registry->mutex);
     for (i = 0; i < snapshot->count; i++)
         if (snapshot->destroy_entries[i])
             wl_extension_entry_destroy(snapshot->entries[i]);
@@ -485,7 +487,7 @@ wl_extension_callback_lease_acquire(
     wl_extension_entry_t *entry = NULL;
     if (!snapshot || !descriptor)
         return NULL;
-    mutex_lock(&snapshot->registry->mutex);
+    wl_mutex_lock(&snapshot->registry->mutex);
     for (i = 0; i < snapshot->count; i++) {
         if (&snapshot->entries[i]->descriptor == descriptor) {
             entry = snapshot->entries[i];
@@ -494,7 +496,7 @@ wl_extension_callback_lease_acquire(
             break;
         }
     }
-    mutex_unlock(&snapshot->registry->mutex);
+    wl_mutex_unlock(&snapshot->registry->mutex);
     return entry;
 }
 
@@ -505,11 +507,11 @@ wl_extension_callback_lease_release(void *lease)
     bool destroy;
     if (!entry || !entry->registry)
         return;
-    mutex_lock(&entry->registry->mutex);
+    wl_mutex_lock(&entry->registry->mutex);
     if (entry->registry->active_leases != 0)
         entry->registry->active_leases--;
     destroy = wl_extension_entry_release_locked(entry);
-    mutex_unlock(&entry->registry->mutex);
+    wl_mutex_unlock(&entry->registry->mutex);
     if (destroy)
         wl_extension_entry_destroy(entry);
 }
@@ -522,15 +524,15 @@ wirelog_extension_snapshot_pin(wirelog_extension_snapshot_t *snapshot,
         wirelog_extension_snapshot_find(snapshot, name);
     size_t i;
     if (!descriptor) return -1;
-    mutex_lock(&snapshot->registry->mutex);
+    wl_mutex_lock(&snapshot->registry->mutex);
     for (i = 0; i < snapshot->count;
         i++) if (&snapshot->entries[i]->descriptor == descriptor) {
             snapshot->entries[i]->pins++; snapshot->pins[i]++;
             if (out) *out = descriptor;
-            mutex_unlock(&snapshot->registry->mutex);
+            wl_mutex_unlock(&snapshot->registry->mutex);
             wl_extension_error_set(NULL); return 0;
         }
-    mutex_unlock(&snapshot->registry->mutex);
+    wl_mutex_unlock(&snapshot->registry->mutex);
     wl_extension_error_set("descriptor is not in snapshot"); return -1;
 }
 
@@ -542,19 +544,19 @@ wirelog_extension_snapshot_unpin(wirelog_extension_snapshot_t *snapshot,
     if (!snapshot || !descriptor) {
         wl_extension_error_set("snapshot or descriptor is NULL"); return -1;
     }
-    mutex_lock(&snapshot->registry->mutex);
+    wl_mutex_lock(&snapshot->registry->mutex);
     for (i = 0; i < snapshot->count;
         i++) if (&snapshot->entries[i]->descriptor == descriptor) {
             if (!snapshot->pins[i]) {
-                mutex_unlock(&snapshot->registry->mutex);
+                wl_mutex_unlock(&snapshot->registry->mutex);
                 wl_extension_error_set(
                     "descriptor is not pinned by this snapshot"); return -1;
             }
             snapshot->pins[i]--; snapshot->entries[i]->pins--;
-            mutex_unlock(&snapshot->registry->mutex);
+            wl_mutex_unlock(&snapshot->registry->mutex);
             wl_extension_error_set(NULL); return 0;
         }
-    mutex_unlock(&snapshot->registry->mutex);
+    wl_mutex_unlock(&snapshot->registry->mutex);
     wl_extension_error_set("descriptor is not in snapshot"); return -1;
 }
 

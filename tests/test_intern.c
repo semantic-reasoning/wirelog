@@ -392,19 +392,19 @@ test_concurrent_put(void)
         return;
     }
 
-    thread_t threads[CONCURRENT_THREADS];
+    wl_thread_t threads[CONCURRENT_THREADS];
     int started = 0;
     for (int t = 0; t < CONCURRENT_THREADS; t++) {
         ctx[t].intern = intern;
-        if (thread_create(&threads[t], concurrent_put_worker, &ctx[t]) != 0)
+        if (wl_thread_create(&threads[t], concurrent_put_worker, &ctx[t]) != 0)
             break;
         started++;
     }
     for (int t = 0; t < started; t++)
-        thread_join(&threads[t]);
+        wl_thread_join(&threads[t]);
 
     if (started != CONCURRENT_THREADS) {
-        FAIL("thread_create failed");
+        FAIL("wl_thread_create failed");
         free(ctx);
         wl_intern_free(intern);
         return;

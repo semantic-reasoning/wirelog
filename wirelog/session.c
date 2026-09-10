@@ -27,8 +27,8 @@
 #include <stdlib.h>
 
 struct wl_session_admission {
-    mutex_t mutex;
-    cond_t idle;
+    wl_mutex_t mutex;
+    wl_cond_t idle;
     size_t active_operations;
     bool closing;
 };
@@ -40,12 +40,12 @@ wl_session_admission_create(void)
         (wl_session_admission_t *)calloc(1, sizeof(*admission));
     if (!admission)
         return NULL;
-    if (mutex_init(&admission->mutex) != 0) {
+    if (wl_mutex_init(&admission->mutex) != 0) {
         free(admission);
         return NULL;
     }
-    if (cond_init(&admission->idle) != 0) {
-        mutex_destroy(&admission->mutex);
+    if (wl_cond_init(&admission->idle) != 0) {
+        wl_mutex_destroy(&admission->mutex);
         free(admission);
         return NULL;
     }
@@ -57,8 +57,8 @@ wl_session_admission_destroy(wl_session_admission_t *admission)
 {
     if (!admission)
         return;
-    cond_destroy(&admission->idle);
-    mutex_destroy(&admission->mutex);
+    wl_cond_destroy(&admission->idle);
+    wl_mutex_destroy(&admission->mutex);
     free(admission);
 }
 
@@ -69,13 +69,13 @@ wl_session_operation_begin(wl_session_t *session)
     if (!admission)
         return 0;
 
-    mutex_lock(&admission->mutex);
+    wl_mutex_lock(&admission->mutex);
     if (admission->closing) {
-        mutex_unlock(&admission->mutex);
+        wl_mutex_unlock(&admission->mutex);
         return EBUSY;
     }
     admission->active_operations++;
-    mutex_unlock(&admission->mutex);
+    wl_mutex_unlock(&admission->mutex);
     return 0;
 }
 
@@ -86,21 +86,21 @@ wl_session_operation_end(wl_session_t *session)
     if (!admission)
         return;
 
-    mutex_lock(&admission->mutex);
+    wl_mutex_lock(&admission->mutex);
     admission->active_operations--;
     if (admission->closing && admission->active_operations == 0)
-        cond_signal(&admission->idle);
-    mutex_unlock(&admission->mutex);
+        wl_cond_signal(&admission->idle);
+    wl_mutex_unlock(&admission->mutex);
 }
 
 static void
 wl_session_admission_close_and_wait(wl_session_admission_t *admission)
 {
-    mutex_lock(&admission->mutex);
+    wl_mutex_lock(&admission->mutex);
     admission->closing = true;
     while (admission->active_operations != 0)
-        cond_wait(&admission->idle, &admission->mutex);
-    mutex_unlock(&admission->mutex);
+        wl_cond_wait(&admission->idle, &admission->mutex);
+    wl_mutex_unlock(&admission->mutex);
 }
 
 void
