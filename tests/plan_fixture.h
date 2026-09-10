@@ -25,6 +25,12 @@
  * main() returns and after every session and plan has been destroyed.
  * plan_fixture_release() may also be called explicitly; it is idempotent.
  *
+ * The pattern is enforced by scripts/ci/check-program-lifetime.py (meson
+ * test program_lifetime, suite abi, Issue #1471): an unconditional
+ * wirelog_program_free() after wl_plan_from_program() in a helper under
+ * tests/ or bench/ whose plan is still live (returned, stored, or handed to
+ * a session) fails CI unless the helper calls plan_fixture_hold().
+ *
  * Header-only, no dependencies beyond wirelog.h.
  */
 #ifndef WIRELOG_TESTS_PLAN_FIXTURE_H
