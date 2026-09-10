@@ -73,13 +73,22 @@ grep -q '3 audit rows' <(WIRELOG_THREADING_DOC_ROOT="$fixture" \
 # already discards a CR in its extraction, so only the inventory can fail.
 crlf_dir=$(mktemp -d)
 cp "$checker" "$crlf_dir/check-threading-doc.sh"
+# The stub hands the real helper's path to a native Python, which cannot
+# open an MSYS POSIX path on the Windows runner; cygpath gives the mixed
+# form (D:/...) that both bash and Python accept.  The helper's text-mode
+# stdout already ends lines with CRLF on Windows, so the stub normalises
+# to LF before rewriting: every host then emits exactly one CR per line.
+real_helper=$script_dir/threading_doc_anchors.py
+if command -v cygpath >/dev/null 2>&1; then
+    real_helper=$(cygpath -m "$real_helper")
+fi
 printf '%s\n' \
     '#!/usr/bin/env python3' \
     'import subprocess, sys' \
-    "real = '$script_dir/threading_doc_anchors.py'" \
+    "real = '$real_helper'" \
     'out = subprocess.run([sys.executable, real] + sys.argv[1:], check=True,' \
     '                     capture_output=True).stdout' \
-    "sys.stdout.buffer.write(out.replace(b'\\n', b'\\r\\n'))" \
+    "sys.stdout.buffer.write(out.replace(b'\\r\\n', b'\\n').replace(b'\\n', b'\\r\\n'))" \
     >"$crlf_dir/threading_doc_anchors.py"
 WIRELOG_THREADING_DOC_ROOT="$fixture" WIRELOG_THREADING_EXPECTED_ROWS=3 \
     "$BASH" "$crlf_dir/check-threading-doc.sh" \
