@@ -343,11 +343,13 @@ col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst,
 
     memset(dst, 0, sizeof(*dst));
 
-    dst->rel_name = wl_strdup(src->rel_name);
-    if (!dst->rel_name)
+    /* A registry slot may carry no name or keys (defence in depth, #1515);
+     * it clones to an equally empty slot. */
+    dst->rel_name = src->rel_name ? wl_strdup(src->rel_name) : NULL;
+    if (src->rel_name && !dst->rel_name)
         return ENOMEM;
 
-    if (src->key_count > 0) {
+    if (src->key_count > 0 && src->key_cols) {
         dst->key_cols = (uint32_t *)malloc(src->key_count * sizeof(uint32_t));
         if (!dst->key_cols) {
             free(dst->rel_name);
@@ -822,7 +824,7 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
         col_arr_entry_t *e = &cs->arr_entries[i];
         if (e->key_count != key_count)
             continue;
-        if (strcmp(e->rel_name, rel_name) != 0)
+        if (!e->rel_name || strcmp(e->rel_name, rel_name) != 0)
             continue;
         bool match = true;
         for (uint32_t k = 0; k < key_count; k++) {
@@ -901,24 +903,39 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
         }
     }
 
-    if (slot == cs->arr_count) {
-        /* No tombstone available: grow the registry. */
-        if (cs->arr_count >= cs->arr_cap) {
-            /* A lease contains pointers into this flat registry.  Do not
-            * move it underneath an active borrower; callers can fall back
-            * to an ephemeral arrangement until the lease is released. */
-            for (uint32_t i = 0; i < cs->arr_count; i++) {
-                if (cs->arr_entries[i].pin_count > 0)
-                    return NULL;
-            }
-            uint32_t new_cap = cs->arr_cap ? cs->arr_cap * 2u : 8u;
-            col_arr_entry_t *ne = (col_arr_entry_t *)realloc(
-                cs->arr_entries, new_cap * sizeof(col_arr_entry_t));
-            if (!ne)
+    const bool appended = slot == cs->arr_count;
+
+    if (appended && cs->arr_count >= cs->arr_cap) {
+        /* No tombstone available: grow the registry.  A lease contains
+         * pointers into this flat registry.  Do not move it underneath an
+         * active borrower; callers can fall back to an ephemeral
+         * arrangement until the lease is released. */
+        for (uint32_t i = 0; i < cs->arr_count; i++) {
+            if (cs->arr_entries[i].pin_count > 0)
                 return NULL;
-            cs->arr_entries = ne;
-            cs->arr_cap = new_cap;
         }
+        uint32_t new_cap = cs->arr_cap ? cs->arr_cap * 2u : 8u;
+        col_arr_entry_t *ne = (col_arr_entry_t *)realloc(
+            cs->arr_entries, new_cap * sizeof(col_arr_entry_t));
+        if (!ne)
+            return NULL;
+        cs->arr_entries = ne;
+        cs->arr_cap = new_cap;
+    }
+
+    /* Issue #1515: take every allocation that can fail before disturbing
+     * the registry, so a failure leaves an appended count untouched and a
+     * reused tombstone exactly as it was. */
+    char *new_name = wl_strdup(rel_name);
+    if (!new_name)
+        return NULL;
+    uint32_t *new_keys = (uint32_t *)malloc(key_count * sizeof(uint32_t));
+    if (!new_keys) {
+        free(new_name);
+        return NULL;
+    }
+
+    if (appended) {
         cs->arr_count++;
     } else {
         /* Reuse tombstone: free its old ownership before overwriting. */
@@ -930,22 +947,8 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
     col_arr_entry_t *e = &cs->arr_entries[slot];
     memset(e, 0, sizeof(*e));
     wl_columnar_memory_reservation_init(&e->arr.reservation);
-
-    e->rel_name = wl_strdup(rel_name);
-    if (!e->rel_name) {
-        if (slot == cs->arr_count - 1)
-            cs->arr_count--; /* roll back append */
-        return NULL;
-    }
-
-    e->key_cols = (uint32_t *)malloc(key_count * sizeof(uint32_t));
-    if (!e->key_cols) {
-        free(e->rel_name);
-        memset(e, 0, sizeof(*e));
-        if (slot == cs->arr_count - 1)
-            cs->arr_count--;
-        return NULL;
-    }
+    e->rel_name = new_name;
+    e->key_cols = new_keys;
     memcpy(e->key_cols, key_cols, key_count * sizeof(uint32_t));
     e->key_count = key_count;
     e->arr.key_cols = e->key_cols; /* shared view; key_cols owned by entry */
@@ -954,27 +957,28 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
     col_arr_attach_memory_governor(&e->arr, cs->memory_governor);
 
     /* Initial build. */
-    if (arr_build_full(&e->arr, rel) != 0) {
+    if (arr_build_full(&e->arr, rel) != 0
+        || !arr_memory_bytes(&e->arr, &e->mem_bytes)) {
         arr_free_contents(&e->arr);
-        col_arr_detach_memory_governor(&e->arr);
-        free(e->rel_name);
-        free(e->key_cols);
-        memset(e, 0, sizeof(*e));
-        if (slot == cs->arr_count - 1)
-            cs->arr_count--;
+        e->mem_bytes = 0;
+        if (appended) {
+            col_arr_detach_memory_governor(&e->arr);
+            free(e->rel_name);
+            free(e->key_cols);
+            memset(e, 0, sizeof(*e));
+            cs->arr_count--; /* roll back append */
+        } else {
+            /* Issue #1515: a reused slot stays a well-formed tombstone
+             * keyed on the new (rel_name, key_cols), shaped exactly like an
+             * evicted entry: name, keys, ledger and the attached governor
+             * remain, and an invalid token forces a rebuild on the next
+             * hit.  Every registry scan keeps working and the next miss
+             * can reuse the slot again. */
+            e->source_snapshot = wl_columnar_relation_snapshot(NULL);
+        }
         return NULL;
     }
     e->source_snapshot = wl_columnar_relation_snapshot(rel);
-    if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
-        arr_free_contents(&e->arr);
-        col_arr_detach_memory_governor(&e->arr);
-        free(e->rel_name);
-        free(e->key_cols);
-        memset(e, 0, sizeof(*e));
-        if (slot == cs->arr_count - 1)
-            cs->arr_count--;
-        return NULL;
-    }
     cs->arr_total_bytes += e->mem_bytes;
     e->lru_clock = ++cs->arr_clock;
     return &e->arr;
@@ -1108,7 +1112,8 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
         return;
     wl_col_session_t *cs = COL_SESSION(sess);
     for (uint32_t i = 0; i < cs->arr_count; i++) {
-        if (strcmp(cs->arr_entries[i].rel_name, rel_name) == 0) {
+        if (cs->arr_entries[i].rel_name
+            && strcmp(cs->arr_entries[i].rel_name, rel_name) == 0) {
             if (cs->arr_entries[i].pin_count > 0)
                 cs->arr_entries[i].rebuild_deferred = true;
             else

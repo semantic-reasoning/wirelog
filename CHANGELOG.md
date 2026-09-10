@@ -31,6 +31,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Arrangement registry stays scannable after a failed tombstone reuse**
+  (#1515). The name and key allocations for a new `(relation, key columns)`
+  entry now precede any change to the reused slot, and a first build denied
+  by the memory governor leaves a rebuildable tombstone keyed on the new
+  entry (`arr_total_bytes` unchanged) instead of a nameless slot inside
+  `arr_count`; a failed reuse of the last slot now keeps that tombstone
+  rather than dropping it. Registry lookups, invalidation and worker
+  cloning tolerate a slot without a name.
+
 - **Unfused recursive SCCs no longer terminate with incomplete results**
   (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
   to normal evaluation instead of treating one empty input as an empty union.
