@@ -1497,14 +1497,32 @@ col_arrangement_pin_release(col_arrangement_pin_t *pin)
     }
 }
 
+static int
+col_arrangement_probe_release_ready(const col_arrangement_probe_t *probe);
+
 int
 col_arrangement_probe_release(col_arrangement_probe_t *probe)
 {
-    wl_columnar_source_access_reader_t *reader;
+    int rc;
+
+    rc = col_arrangement_probe_release_ready(probe);
+    if (rc != 0)
+        return rc;
+    col_arrangement_pin_release(&probe->arrangement_pin);
+    rc = col_rel_source_reader_release(&probe->source_reader);
+    if (rc != 0)
+        return rc;
+    memset(probe, 0, sizeof(*probe));
+    return 0;
+}
+
+static int
+col_arrangement_probe_release_ready(const col_arrangement_probe_t *probe)
+{
+    const wl_columnar_source_access_reader_t *reader;
     col_rel_t *storage_owner = NULL;
     uint64_t storage_owner_identity = 0;
     uint64_t storage_owner_generation = 0;
-    int rc;
 
     if (!probe || !probe->active || probe->identity != (uintptr_t)probe
         || !probe->arr || !probe->source || !probe->storage_owner)
@@ -1527,11 +1545,102 @@ col_arrangement_probe_release(col_arrangement_probe_t *probe)
         || (reader->transferable && reader->thread_valid)
         || !wl_columnar_source_access_gate_busy(reader->owner))
         return EINVAL;
-    col_arrangement_pin_release(&probe->arrangement_pin);
-    rc = col_rel_source_reader_release(reader);
-    if (rc != 0)
+    return 0;
+}
+
+void
+col_arrangement_probe_bundle_init(col_arrangement_probe_bundle_t *bundle)
+{
+    if (!bundle)
+        return;
+    memset(bundle, 0, sizeof(*bundle));
+    bundle->identity = (uintptr_t)bundle;
+    bundle->active = true;
+}
+
+int
+col_arrangement_probe_bundle_acquire(col_arrangement_probe_bundle_t *bundle,
+    wl_session_t *sess, col_arrangement_t *arr, const col_rel_t *source,
+    col_arrangement_probe_t **out_probe)
+{
+    col_arrangement_probe_bundle_slot_t *slot;
+    int rc;
+
+    if (out_probe)
+        *out_probe = NULL;
+    if (!bundle || bundle->identity != (uintptr_t)bundle || !bundle->active
+        || !sess || !arr || !source)
+        return EINVAL;
+    for (uint32_t i = 0; i < bundle->count; i++) {
+        slot = &bundle->slots[i];
+        if (slot->probe.active && slot->probe.arr == arr
+            && slot->probe.source == source) {
+            if (slot->ref_count == UINT32_MAX)
+                return EOVERFLOW;
+            slot->ref_count++;
+            if (out_probe)
+                *out_probe = &slot->probe;
+            return 0;
+        }
+    }
+    if (bundle->count >= COL_ARRANGEMENT_PROBE_BUNDLE_MAX) {
+        int rollback_rc = col_arrangement_probe_bundle_release(bundle);
+        if (rollback_rc != 0)
+            return rollback_rc;
+        col_arrangement_probe_bundle_init(bundle);
+        return EOVERFLOW;
+    }
+
+    slot = &bundle->slots[bundle->count];
+    memset(slot, 0, sizeof(*slot));
+    rc = col_session_acquire_arrangement_probe(sess, arr, source,
+            &slot->probe);
+    if (rc != 0) {
+        if (slot->probe.active)
+            (void)col_arrangement_probe_release(&slot->probe);
+        memset(slot, 0, sizeof(*slot));
+        /* Bundle acquisition is transactional: a later dependency failure
+         * must not leave earlier operation leases live. */
+        if (bundle->count > 0) {
+            int rollback_rc = col_arrangement_probe_bundle_release(bundle);
+            if (rollback_rc != 0)
+                return rollback_rc;
+            col_arrangement_probe_bundle_init(bundle);
+        }
         return rc;
-    memset(probe, 0, sizeof(*probe));
+    }
+    slot->ref_count = 1;
+    bundle->count++;
+    if (out_probe)
+        *out_probe = &slot->probe;
+    return 0;
+}
+
+int
+col_arrangement_probe_bundle_release(col_arrangement_probe_bundle_t *bundle)
+{
+    int rc;
+
+    if (!bundle || bundle->identity != (uintptr_t)bundle || !bundle->active)
+        return EINVAL;
+    for (uint32_t i = bundle->count; i > 0; i--) {
+        col_arrangement_probe_bundle_slot_t *slot = &bundle->slots[i - 1u];
+        if (slot->ref_count == 0 || !slot->probe.active)
+            continue;
+        rc = col_arrangement_probe_release_ready(&slot->probe);
+        if (rc != 0)
+            return rc;
+    }
+    for (uint32_t i = bundle->count; i > 0; i--) {
+        col_arrangement_probe_bundle_slot_t *slot = &bundle->slots[i - 1u];
+        if (slot->ref_count == 0 || !slot->probe.active)
+            continue;
+        rc = col_arrangement_probe_release(&slot->probe);
+        if (rc != 0)
+            return rc;
+        memset(slot, 0, sizeof(*slot));
+    }
+    memset(bundle, 0, sizeof(*bundle));
     return 0;
 }
 

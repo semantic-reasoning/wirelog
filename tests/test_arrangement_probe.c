@@ -195,7 +195,12 @@ main(void)
     wirelog_program_t *program = NULL;
     col_rel_t *same_name = NULL;
     col_arrangement_probe_t probe = { 0 };
+    col_arrangement_probe_bundle_t bundle = { 0 };
+    col_arrangement_probe_t *bundle_probe = NULL;
+    col_arrangement_probe_t *nested_probe = NULL;
+    col_arrangement_probe_t *second_probe = NULL;
     wl_columnar_source_access_writer_t writer = { 0 };
+    wl_columnar_source_access_writer_t dependency_writer = { 0 };
     struct release_probe_arg release_arg = { &probe, 0 };
     thread_t release_thread;
     uint32_t key_cols[] = { 0 };
@@ -246,6 +251,85 @@ main(void)
     CHECK(col_arrangement_probe_release(&probe) == EINVAL,
         "double release is rejected");
 
+    col_arrangement_t *second_arr = col_session_get_arrangement(session,
+            "edge", (uint32_t[]){ 1 }, 1);
+    CHECK(second_arr != NULL, "second arrangement setup");
+    col_arrangement_probe_bundle_init(&bundle);
+    CHECK(bundle.active, "bundle init activates scope");
+    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
+        &bundle_probe) == 0 && bundle_probe != NULL,
+        "bundle acquires primary probe");
+    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
+        &nested_probe) == 0 && nested_probe == bundle_probe
+        && bundle.count == 1 && bundle.slots[0].ref_count == 2,
+        "nested same-source lease is coalesced and counted");
+    if (second_arr)
+        CHECK(col_arrangement_probe_bundle_acquire(&bundle, session,
+            second_arr, source, &second_probe) == 0
+            && second_probe != bundle_probe && bundle.count == 2,
+            "bundle acquires a second arrangement dependency");
+    CHECK(atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) == 2,
+        "bundle holds one reader per distinct arrangement dependency");
+    CHECK(col_arrangement_probe_bundle_release(&bundle) == 0
+        && !bundle.active && bundle.count == 0
+        && atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) == 0,
+        "bundle releases dependencies in reverse order");
+
+    col_rel_t *dependency = session_find_rel(col_session, "path");
+    col_arrangement_t *dependency_arr = dependency
+        ? col_session_get_arrangement(session, "path", key_cols, 1) : NULL;
+    CHECK(dependency && dependency_arr, "dependency arrangement setup");
+    col_arrangement_probe_bundle_init(&bundle);
+    CHECK(bundle.active, "partial rollback bundle init activates scope");
+    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
+        &bundle_probe) == 0, "partial rollback acquires first dependency");
+    if (dependency && dependency_arr) {
+        CHECK(wl_columnar_source_access_writer_acquire(
+            &dependency->source_access, &dependency_writer) == 0,
+            "partial rollback dependency writer setup");
+        CHECK(col_arrangement_probe_bundle_acquire(&bundle, session,
+            dependency_arr, dependency, &second_probe) == EBUSY
+            && bundle.count == 0 && !bundle.slots[0].probe.active
+            && atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire) == 0 && entry->pin_count == 0,
+            "later dependency failure rolls back earlier leases");
+        CHECK(wl_columnar_source_access_writer_release(&dependency_writer)
+            == 0, "partial rollback dependency writer release");
+    }
+    CHECK(col_arrangement_probe_bundle_release(&bundle) == 0,
+        "partial rollback leaves an empty releasable bundle");
+
+    col_arrangement_probe_bundle_init(&bundle);
+    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
+        &bundle_probe) == 0, "capacity rollback acquires first dependency");
+    if (second_arr) {
+        /* Fill the bounded scope marker to exercise the full-capacity path;
+         * the active slot remains a real lease and must be unwound. */
+        bundle.count = COL_ARRANGEMENT_PROBE_BUNDLE_MAX;
+        CHECK(col_arrangement_probe_bundle_acquire(&bundle, session,
+            second_arr, source, &second_probe) == EOVERFLOW
+            && bundle.count == 0
+            && atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire) == 0 && entry->pin_count == 0,
+            "capacity failure rolls back earlier leases");
+    }
+    CHECK(col_arrangement_probe_bundle_release(&bundle) == 0,
+        "capacity rollback leaves an empty releasable bundle");
+
+    col_arrangement_probe_bundle_init(&bundle);
+    CHECK(bundle.active, "bundle rollback init activates scope");
+    CHECK(wl_columnar_source_access_writer_acquire(&source->source_access,
+        &writer) == 0, "bundle rollback writer setup");
+    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
+        &bundle_probe) == EBUSY && bundle.count == 0
+        && !bundle_probe, "failed bundle acquire rolls back cleanly");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "bundle rollback writer release");
+    CHECK(col_arrangement_probe_bundle_release(&bundle) == 0,
+        "empty bundle release");
+
     CHECK(col_rel_alloc(&same_name, "edge") == 0,
         "same-name relation setup");
     CHECK(col_session_acquire_arrangement_probe(session, arr, same_name,
@@ -275,10 +359,14 @@ main(void)
         "source writer release");
 
 cleanup:
+    if (bundle.active)
+        (void)col_arrangement_probe_bundle_release(&bundle);
     if (probe.active)
         (void)col_arrangement_probe_release(&probe);
     if (writer.owner)
         (void)wl_columnar_source_access_writer_release(&writer);
+    if (dependency_writer.owner)
+        (void)wl_columnar_source_access_writer_release(&dependency_writer);
     if (same_name)
         (void)col_rel_destroy_checked(same_name);
     wl_session_destroy(session);
