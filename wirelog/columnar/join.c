@@ -1235,13 +1235,14 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         uint32_t *ht_head_ep = NULL;
         uint32_t *ht_next_ep = NULL;
 
+        col_arrangement_probe_bundle_init(&arr_bundle);
+
         WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
             "Standard merge-join starting - left=%u rows, right=%u rows, kc=%u",
             left->nrows, right->nrows, kc);
 
         if (!used_right_delta && op->right_relation && kc > 0) {
             if (op->right_filter_expr.size == 0) {
-                col_arrangement_probe_bundle_init(&arr_bundle);
                 int probe_rc = col_arrangement_probe_bundle_acquire_primary(
                     &arr_bundle, &sess->base, right, rk, kc, &arr_probe);
                 if (probe_rc == 0) {
@@ -1264,6 +1265,22 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                  * filt_arr persists across sub-passes to avoid ephemeral
                  * hash table rebuild on every semi-naive iteration. */
                 if (!sess->coordinator) {
+                    int dependency_rc
+                        = col_arrangement_probe_bundle_acquire_dependency(
+                        &arr_bundle, right);
+                    if (dependency_rc != 0) {
+                        free(tmp);
+                        col_rel_destroy(out);
+                        free(lk);
+                        free(rk);
+                        if (right_filtered)
+                            col_rel_destroy(right_filtered);
+                        if (left_e.owned)
+                            col_rel_destroy(left);
+                        (void)col_arrangement_probe_bundle_release(
+                            &arr_bundle);
+                        return dependency_rc;
+                    }
                     uint64_t fhash =
                         wl_columnar_filter_fnv1a_hash(
                         op->right_filter_expr.data,
@@ -1286,6 +1303,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (!arr) {
             /* Ephemeral hash table (delta path or arrangement unavailable). */
             if (col_join_bucket_count(right->nrows, &nbuckets_ep) != 0) {
+                (void)col_arrangement_probe_bundle_release(&arr_bundle);
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
@@ -1306,6 +1324,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     nbuckets_ep);
                 free(ht_head_ep);
                 free(ht_next_ep);
+                (void)col_arrangement_probe_bundle_release(&arr_bundle);
                 free(tmp);
                 col_rel_destroy(out);
                 free(lk);
