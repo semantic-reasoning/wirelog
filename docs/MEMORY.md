@@ -601,10 +601,14 @@ succeeds.
 
 This is an internal coordinator/worker-session contract, not a public API or a
 general concurrent-reader mechanism. Release all leases before session teardown.
-The lease protects index buffers and entry identity, not source column values,
-row positions or compound storage: a reader must not probe an old index against
-a mutated source. Source-reader protection is tracked in #1485; generation
-checks on subsequent lookups are not a substitute for that protection.
-Filtered, differential, sorted and
-materialization-cache lifetimes, plus relation-generation validation, remain
-tracked separately in issue #1435.
+Primary probes, compound/side-relation dependencies, and differential working
+arrangements are acquired as one operation-scoped transactional bundle. The
+bound source reader and ultimate storage-owner generation protect source
+columns, row positions, aliases, metadata, and compound storage for that
+operation. Mutation is denied with `EBUSY` while the bundle is live and may be
+retried after release; aborted differential work leaves the persistent index
+and accounting unchanged.
+
+Checked teardown drains queued work and rejects destruction while a live source
+lease remains. The delegated #1435/#1507 work and non-primary materialization
+cache semantics are not claimed by this contract.

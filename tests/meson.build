@@ -2626,6 +2626,31 @@ test_arrangement_probe_exe = executable(
 
 test('arrangement_probe', test_arrangement_probe_exe)
 
+# Public source-reader lifetime qualification (Issue #1497).  The test uses
+# the pthread-capable public session path with two workers and is also part of
+# the canonical TSan suite; it does not claim coverage for delegated #1435.
+test_arrangement_source_lifetime_tsan_exe = executable(
+  'test_arrangement_source_lifetime_tsan',
+  files('test_arrangement_source_lifetime_tsan.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  '../wirelog/wirelog-easy.c',
+  '../wirelog/api_facade.c',
+  '../wirelog/wirelog_advanced.c',
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('arrangement_source_lifetime_tsan',
+     test_arrangement_source_lifetime_tsan_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 # ============================================================================
 # Pin-safe Materialization Cache Reclaimer Tests (Issue #1371)
 # ============================================================================
