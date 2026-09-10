@@ -32,7 +32,34 @@ wl_session_options_init(wl_session_options_t *options)
     options->size = (uint32_t)sizeof(*options);
     options->version = WL_SESSION_OPTIONS_VERSION;
     options->windows_job_handle = NULL;
+    options->memory_governor = NULL;
 }
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Only compiled into direct-source test executables (never libwirelog):
+ * a per-thread default substituted when a creator passes no options, so
+ * facade paths without an options parameter can run under an injected
+ * governor. */
+#if defined(_MSC_VER)
+#define WL_SESSION_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_SESSION_THREAD_LOCAL _Thread_local
+#endif
+static WL_SESSION_THREAD_LOCAL const wl_session_options_t *testhook_options;
+#undef WL_SESSION_THREAD_LOCAL
+
+void
+wl_session_testhook_set_default_options(const wl_session_options_t *options)
+{
+    testhook_options = options;
+}
+
+const wl_session_options_t *
+wl_session_testhook_default_options(void)
+{
+    return testhook_options;
+}
+#endif
 
 static int
 wl_session_options_valid(const wl_session_options_t *options)
@@ -76,6 +103,10 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     const wl_session_options_t *options, wl_session_t **out)
 {
     int rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!options)
+        options = testhook_options;
+#endif
     if (!backend || !backend->session_create || !out
         || !wl_session_options_valid(options))
         return -1;

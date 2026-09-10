@@ -18,6 +18,10 @@
 #include "wirelog/wirelog-extension.h"
 #include "wirelog/wirelog.h"
 #include "wirelog/intern.h"
+#include "wirelog/arena/compound_arena.h"
+#include "wirelog/columnar/memory_governor.h"
+#include "wirelog/exec_plan_gen.h"
+#include "wirelog/session.h"
 #include "wirelog/passes/fusion.h"
 #include "wirelog/passes/jpp.h"
 #include "wirelog/passes/sip.h"
@@ -2364,6 +2368,164 @@ test_issue_665_partial_conjunction_multi_worker(void)
     return run_issue_665_partial_conjunction(4, "issue 665 multi-worker");
 }
 
+/* ======================================================================== */
+/* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY      */
+/* ======================================================================== */
+
+static wl_columnar_memory_governor_ref_t *
+enforcing_governor(uint64_t usable)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = usable;
+    resolution.usable_bytes = usable;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static uint64_t
+reserved_on(wl_columnar_memory_governor_ref_t *ref)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+}
+
+/* The create-time floor of a fact-free program: the bytes its intern table
+ * admits when a session attaches it (#1431) plus the session's fixed
+ * compound arena (probed with the library-default epoch count, so like the
+ * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset); the delta pool and eval arena degrade to malloc when
+ * denied.  Plan generation is run once first so the table measured is the
+ * one the facade's own plan generation will attach. */
+static int
+measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
+    uint64_t *compound_bytes)
+{
+    wl_columnar_memory_governor_ref_t *probe
+        = enforcing_governor(UINT64_MAX / 4u);
+    wl_compound_arena_t *arena = NULL;
+    wl_plan_t *warm = NULL;
+    /* The public accessor is read-only; the probe attaches and detaches
+     * the program-owned table exactly as session creation does. */
+    wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+    int ok = 0;
+
+    if (!probe || !intern)
+        goto out;
+    if (wl_plan_from_program(prog, &warm) != 0 || !warm)
+        goto out;
+    wl_plan_free(warm);
+    if (wl_intern_attach_memory_governor(intern, probe) != 0)
+        goto out;
+    *intern_bytes = reserved_on(probe);
+    if (wl_intern_detach_memory_governor(intern, probe) != 0
+        || reserved_on(probe) != 0)
+        goto out;
+    arena = wl_compound_arena_create_managed(0x53455353u, 4096u, 0u,
+            wl_columnar_memory_governor_ref_get(probe));
+    if (!arena)
+        goto out;
+    *compound_bytes = reserved_on(probe);
+    wl_compound_arena_free(arena);
+    ok = reserved_on(probe) == 0 && *intern_bytes > 0
+        && *compound_bytes > 0;
+out:
+    if (probe)
+        wl_columnar_memory_governor_ref_release(probe);
+    return ok ? 0 : -1;
+}
+
+static int
+test_injected_governor_denial_maps_to_memory(void)
+{
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T-1473");
+    wirelog_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wirelog_error_t error;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+    int rc = 1;
+
+    if (!prog)
+        return 1;
+    if (measure_create_floor(prog, &intern_bytes, &compound_bytes) != 0) {
+        fprintf(stderr, "T-1473: could not measure the create-time floor\n");
+        goto out;
+    }
+    wl_session_options_init(&options);
+
+    /* One byte short of the intern table: creation is denied at attach
+     * time and both public creators report the memory verdict. */
+    ref = enforcing_governor(intern_bytes - 1u);
+    if (!ref)
+        goto out;
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY || session != NULL
+        || reserved_on(ref) != 0) {
+        fprintf(stderr, "T-1473: create denial err=%d s=%p\n", error,
+            (void *)session);
+        goto out;
+    }
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_session_create_with_snapshot(prog,
+            WIRELOG_BACKEND_COLUMNAR, 1, NULL, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY || session != NULL
+        || reserved_on(ref) != 0) {
+        fprintf(stderr, "T-1473: create_with_snapshot denial err=%d s=%p\n",
+            error, (void *)session);
+        goto out;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+
+    /* Exact floor: creation succeeds, destroy leaves the program-owned
+     * intern reservation, and freeing the program releases it. */
+    ref = enforcing_governor(intern_bytes + compound_bytes);
+    if (!ref)
+        goto out;
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_OK || !session
+        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        fprintf(stderr, "T-1473: exact-fit create err=%d reserved=%llu\n",
+            error, (unsigned long long)reserved_on(ref));
+        goto out;
+    }
+    wirelog_session_destroy(session);
+    session = NULL;
+    if (reserved_on(ref) != intern_bytes) {
+        fprintf(stderr, "T-1473: destroy left %llu bytes, expected %llu\n",
+            (unsigned long long)reserved_on(ref),
+            (unsigned long long)intern_bytes);
+        goto out;
+    }
+    wirelog_program_free(prog);
+    prog = NULL;
+    if (reserved_on(ref) != 0) {
+        fprintf(stderr, "T-1473: program free left %llu bytes\n",
+            (unsigned long long)reserved_on(ref));
+        goto out;
+    }
+    rc = 0;
+
+out:
+    if (session)
+        wirelog_session_destroy(session);
+    if (prog)
+        wirelog_program_free(prog);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
 static int
 test_invalid_memory_budget(void)
 {
@@ -2430,6 +2592,7 @@ main(void)
     failures += test_issue_665_partial_conjunction_default_workers();
     failures += test_issue_665_partial_conjunction_multi_worker();
     failures += test_invalid_memory_budget();
+    failures += test_injected_governor_denial_maps_to_memory();
     failures += test_typed_float_ingress();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");

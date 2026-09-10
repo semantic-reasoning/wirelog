@@ -83,6 +83,12 @@ the resolved byte limit and provenance in the governor, and never duplicates
 or closes the host handle. Missing, unsupported, or invalid handles clear the
 provider and leave automatic resolution advisory unless another finite source
 is available. `WIRELOG_MEMORY_BUDGET` remains higher precedence.
+Options version 2 (#1473) adds `memory_governor`: a caller-retained governor
+reference the session retains for its own lifetime in place of any resolved
+source, so create-time admission can be driven deterministically from tests;
+`windows_job_handle` and `WIRELOG_MEMORY_BUDGET` are ignored when it is set.
+The program-owned intern table attached at creation keeps its own reference
+until `wirelog_program_free()`, so the governor can outlive the session.
 
 An unlimited cgroup value, an absent optional source, and an unsupported
 platform are different observations. The resolver records which source was

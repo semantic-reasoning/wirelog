@@ -3684,6 +3684,7 @@ test_session_exe = executable(
   arena_src,
   thread_src,
   workqueue_src,
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
@@ -5508,6 +5509,7 @@ test_wirelog_easy_exe = executable(
   workqueue_src,
   '../wirelog/wirelog-easy.c',
   '../wirelog/api_facade.c',
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
@@ -5568,6 +5570,7 @@ test_wirelog_advanced_exe = executable(
   '../wirelog/wirelog-easy.c',
   '../wirelog/api_facade.c',
   '../wirelog/wirelog_advanced.c',
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )

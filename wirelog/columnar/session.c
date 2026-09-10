@@ -1019,27 +1019,38 @@ static int
 col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     const wl_session_options_t *options, wl_session_t **out)
 {
-    wl_columnar_memory_resolution_t memory_resolution;
-    wl_columnar_memory_sources_t memory_sources;
     wl_columnar_memory_governor_ref_t *memory_governor;
+    const wl_columnar_memory_governor_t *governor;
     bool intern_attached_here = false;
-    const char *memory_budget = getenv("WIRELOG_MEMORY_BUDGET");
 
     if (!plan || !out)
         return EINVAL;
-    if (wl_columnar_memory_probe_sources(&memory_sources) != 0)
-        return EINVAL;
-    if (options && options->windows_job_handle)
-        (void)wl_columnar_memory_probe_windows_job(
-            options->windows_job_handle, &memory_sources);
-    if (wl_columnar_memory_resolve(memory_budget, &memory_sources,
-        &memory_resolution)
-        != WL_COLUMNAR_MEMORY_OK)
-        return EINVAL;
-    memory_governor = wl_columnar_memory_governor_ref_create(
-        &memory_resolution);
-    if (!memory_governor)
-        return ENOMEM;
+    if (options && options->memory_governor) {
+        /* #1473: an injected governor replaces environment and host
+         * resolution.  The session holds its own reference; the caller's
+         * reference stays with the caller. */
+        memory_governor = options->memory_governor;
+        wl_columnar_memory_governor_ref_retain(memory_governor);
+    } else {
+        wl_columnar_memory_resolution_t memory_resolution;
+        wl_columnar_memory_sources_t memory_sources;
+        const char *memory_budget = getenv("WIRELOG_MEMORY_BUDGET");
+
+        if (wl_columnar_memory_probe_sources(&memory_sources) != 0)
+            return EINVAL;
+        if (options && options->windows_job_handle)
+            (void)wl_columnar_memory_probe_windows_job(
+                options->windows_job_handle, &memory_sources);
+        if (wl_columnar_memory_resolve(memory_budget, &memory_sources,
+            &memory_resolution)
+            != WL_COLUMNAR_MEMORY_OK)
+            return EINVAL;
+        memory_governor = wl_columnar_memory_governor_ref_create(
+            &memory_resolution);
+        if (!memory_governor)
+            return ENOMEM;
+    }
+    governor = wl_columnar_memory_governor_ref_get(memory_governor);
 
     wl_col_session_t *sess
         = (wl_col_session_t *)calloc(1, sizeof(wl_col_session_t));
@@ -1285,8 +1296,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     /* The ledger remains attribution-only. The shared governor owns admission
      * policy; workers must not receive divided ledger budgets. */
     wl_mem_ledger_init(&sess->mem_ledger,
-        memory_resolution.mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING
-            ? memory_resolution.budget_bytes : 0);
+        governor->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            ? governor->budget_bytes : 0);
 
     /* Issue #1380: memory instrumentation wiring.  The delta pool and eval
      * arena above were created before the ledger existed, so charge their

@@ -18,6 +18,8 @@
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
 #include "../wirelog/columnar/memory_governor.h"
+#include "../wirelog/arena/compound_arena.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
@@ -496,6 +498,285 @@ test_session_create_with_options(void)
     }
     wl_session_destroy(session);
     wl_plan_free(ffi);
+    PASS();
+}
+
+/* ======================================================================== */
+/* Issue #1473: injected governor and create-time admission                 */
+/* ======================================================================== */
+
+static wl_columnar_memory_governor_ref_t *
+enforcing_governor(uint64_t usable)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = usable;
+    resolution.usable_bytes = usable;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static uint64_t
+reserved_on(wl_columnar_memory_governor_ref_t *ref)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+}
+
+/* Bytes a session admits for the program's intern table when it attaches
+ * the table (#1431), measured with a throwaway governor and detached again
+ * so the table is free for the session under test. */
+static int
+probe_intern_bytes(wl_intern_t *intern, uint64_t *out)
+{
+    wl_columnar_memory_governor_ref_t *probe
+        = enforcing_governor(UINT64_MAX / 4u);
+    int rc;
+    if (!probe)
+        return -1;
+    rc = wl_intern_attach_memory_governor(intern, probe);
+    if (rc == 0) {
+        *out = reserved_on(probe);
+        rc = wl_intern_detach_memory_governor(intern, probe);
+        if (rc == 0 && reserved_on(probe) != 0)
+            rc = -1;
+    }
+    wl_columnar_memory_governor_ref_release(probe);
+    return rc;
+}
+
+/* Bytes the session's fixed compound arena admits at creation, using the
+ * same shape col_session_create_internal builds (seed, default_gen_cap and
+ * the library-default epoch count; like the budget tests this assumes
+ * WIRELOG_COMPOUND_MAX_EPOCHS is unset in the test environment). */
+static int
+probe_compound_bytes(uint64_t *out)
+{
+    wl_columnar_memory_governor_ref_t *probe
+        = enforcing_governor(UINT64_MAX / 4u);
+    wl_compound_arena_t *arena;
+    int rc = 0;
+    if (!probe)
+        return -1;
+    arena = wl_compound_arena_create_managed(0x53455353u, 4096u, 0u,
+            wl_columnar_memory_governor_ref_get(probe));
+    if (!arena) {
+        rc = -1;
+    } else {
+        *out = reserved_on(probe);
+        wl_compound_arena_free(arena);
+        if (reserved_on(probe) != 0)
+            rc = -1;
+    }
+    wl_columnar_memory_governor_ref_release(probe);
+    return rc;
+}
+
+/* A fact-free program: nothing but the create-time floor (intern table plus
+ * fixed compound arena; the delta pool and eval arena degrade to malloc) is
+ * admitted at session creation. */
+static const char *INJECTED_GOVERNOR_SRC
+    = ".decl edge(x: int64, y: int64)\n"
+    ".decl path(x: int64, y: int64)\n"
+    "path(x, y) :- edge(x, y).\n";
+
+static void
+test_session_injected_governor_admission(void)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = NULL;
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_reservation_t token;
+    wl_mem_ledger_snapshot_t ledger;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+    int rc;
+
+    TEST("session(#1473): injected governor denies below the intern floor");
+    prog = wirelog_parse_string(INJECTED_GOVERNOR_SRC, &err);
+    if (!prog || wl_plan_from_program(prog, &plan) != 0 || !plan) {
+        if (prog)
+            wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+    /* The overflow case below needs more than 16 intern bytes so that the
+     * pre-reserved total overflows instead of being merely denied. */
+    if (probe_intern_bytes(plan->intern, &intern_bytes) != 0
+        || intern_bytes <= 16u || probe_compound_bytes(&compound_bytes) != 0
+        || compound_bytes == 0) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("could not measure the create-time floor");
+        return;
+    }
+
+    /* The whole intern table is admitted transactionally; one byte short
+     * fails creation before anything else is charged and leaves the
+     * caller's reference untouched (LSan proves the refcount). */
+    ref = enforcing_governor(intern_bytes - 1u);
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    session = NULL;
+    rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session) : -1;
+    if (!ref || rc != ENOMEM || session != NULL || reserved_on(ref) != 0) {
+        if (session)
+            wl_session_destroy(session);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("intern-floor denial did not fail creation with ENOMEM");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    /* The intern table fits but the compound arena does not: creation fails
+     * and the oom path detaches the table it attached. */
+    TEST("session(#1473): injected governor denies below the compound floor");
+    ref = enforcing_governor(intern_bytes + compound_bytes - 1u);
+    options.memory_governor = ref;
+    session = NULL;
+    rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session) : -1;
+    if (!ref || rc != ENOMEM || session != NULL || reserved_on(ref) != 0) {
+        if (session)
+            wl_session_destroy(session);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("compound-floor denial did not fail creation with ENOMEM");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    /* Exact fit: creation succeeds on the injected governor itself, charges
+     * exactly the floor, and destroy releases everything but the
+     * program-owned intern reservation. */
+    TEST("session(#1473): injected governor admits the exact floor");
+    ref = enforcing_governor(intern_bytes + compound_bytes);
+    options.memory_governor = ref;
+    session = NULL;
+    rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session) : -1;
+    if (rc == 0 && session)
+        wl_mem_ledger_snapshot(&COL_SESSION(session)->mem_ledger, &ledger);
+    if (!ref || rc != 0 || !session
+        || COL_SESSION(session)->memory_governor != ref
+        || wl_session_memory_governor(session)
+        != wl_columnar_memory_governor_ref_get(ref)
+        || reserved_on(ref) != intern_bytes + compound_bytes
+        || ledger.total_budget != intern_bytes + compound_bytes) {
+        if (session)
+            wl_session_destroy(session);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("exact-fit creation did not use the injected governor");
+        return;
+    }
+    wl_session_destroy(session);
+    if (reserved_on(ref) != intern_bytes) {
+        wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("destroy did not leave exactly the intern reservation");
+        return;
+    }
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    prog = NULL;
+    plan = NULL;
+    if (reserved_on(ref) != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("program free did not release the intern reservation");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    /* Arithmetic overflow of the governor total is EOVERFLOW, not ENOMEM. */
+    TEST("session(#1473): injected governor overflow fails with EOVERFLOW");
+    prog = wirelog_parse_string(INJECTED_GOVERNOR_SRC, &err);
+    if (!prog || wl_plan_from_program(prog, &plan) != 0 || !plan) {
+        if (prog)
+            wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+    ref = enforcing_governor(UINT64_MAX);
+    wl_columnar_memory_reservation_init(&token);
+    if (!ref || wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(ref), UINT64_MAX - 16u,
+            &token) != WL_COLUMNAR_MEMORY_ADMISSION_OK) {
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("overflow fixture setup failed");
+        return;
+    }
+    options.memory_governor = ref;
+    session = NULL;
+    rc = wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session);
+    if (rc != EOVERFLOW || session != NULL
+        || reserved_on(ref) != UINT64_MAX - 16u) {
+        if (session)
+            wl_session_destroy(session);
+        (void)wl_columnar_memory_release(&token);
+        wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("governor overflow did not fail creation with EOVERFLOW");
+        return;
+    }
+    (void)wl_columnar_memory_release(&token);
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    /* The test-only per-thread default stands in for options on the
+     * option-less creators used by the public facades. */
+    TEST("session(#1473): thread default options reach option-less create");
+    ref = enforcing_governor(intern_bytes - 1u);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    session = NULL;
+    rc = ref ? wl_session_create(wl_backend_columnar(), plan, 1, &session)
+        : -1;
+    wl_session_testhook_set_default_options(NULL);
+    if (!ref || rc != ENOMEM || session != NULL || reserved_on(ref) != 0
+        || wl_session_testhook_default_options() != NULL) {
+        if (session)
+            wl_session_destroy(session);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("thread default options were not applied");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    session = NULL;
+    rc = wl_session_create(wl_backend_columnar(), plan, 1, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("clearing the thread default did not restore resolution");
+        return;
+    }
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
     PASS();
 }
 
@@ -1317,6 +1598,7 @@ main(void)
     test_session_create_destroy();
     test_session_create_destroy_columnar();
     test_session_create_with_options();
+    test_session_injected_governor_admission();
 #ifdef _WIN32
     test_session_windows_job_options();
 #endif
