@@ -612,3 +612,52 @@ and accounting unchanged.
 Checked teardown drains queued work and rejects destruction while a live source
 lease remains. The delegated #1435/#1507 work and non-primary materialization
 cache semantics are not claimed by this contract.
+
+## 10a. Bounded join sub-batches (#1446)
+
+`WIRELOG_JOIN_BATCH_BYTES=N` (strict decimal, default unset = off) makes an
+eligible keyed join run the resumable sub-batch producer in
+`wirelog/columnar/join_batch.c` instead of the one-shot probe loop.
+Eligible means: `key_count > 0`, a persistent primary arrangement on the
+right relation, no right-side delta, no right filter expression, and a
+coordinator or single session (TDD workers are excluded, so the shared
+row counter never applies).  Every other shape falls back to the one-shot
+join; the session records the fallback count and last reason and logs one
+`JOIN` warning per reason.  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless
+the bytes knob is set) turns a fallback into an `ENOTSUP` failure, which is
+the explicit bounded-mode result for unsupported shapes.  Differential
+keyed joins are tracked separately in #1453; pipeline consumption of
+batches on the eval stack (JOIN -> FILTER* -> MAP) is a follow-up.
+
+Ownership and admission:
+
+- The producer holds one arrangement lease for its whole lifetime and
+  one governed scratch relation of `rows_per_batch = N / row_bytes` rows
+  (at least the 64 rows a fresh relation pre-allocates), admitted once at
+  create; `N` smaller than one output row, or a zero-width output, is a
+  recorded fallback (`row-too-large`).
+- The output relation is heap allocated (never from the delta pool, whose
+  reset frees nothing) and attached to the session governor.  Its retained
+  token owns every visible output byte: the sink admits the capacity the
+  relation already owns at attach, grows it to exactly the rows the next
+  batch needs (`col_rel_reserve_capacity_admitted`, no doubling), and holds
+  no token of its own.  Exact fit therefore means the governor admits the
+  retained footprint formula of `relation.c` for the new capacity while the
+  old buffers are still live.
+- A batch becomes visible only when the sink commits it; the cursor
+  advances only after commit.  A sink failure before commit rewinds
+  `nrows` and retries the same batch without a new reservation; the
+  capacity admitted for it is retained, as after a failed bulk append.
+  Any mutation of either input or a rebuild of the arrangement between
+  batches is reported as stale rather than resumed.
+- Per-producer bound: scratch (`rows_per_batch * row_bytes` plus the key
+  row) plus the sink's growth increment for the next batch, transiently
+  up to twice `rows_per_batch * row_bytes` during the exact-fit resize.
+  The full join result is still materialized into the output relation:
+  this unit bounds producer memory and admits output growth, it does not
+  bound the output itself.
+- The legacy row cap `WIRELOG_JOIN_OUTPUT_LIMIT` stays distinct and is
+  checked once per committed batch, so it may be overshot by at most
+  `rows_per_batch - 1` rows in bounded mode.  The ledger backpressure
+  heuristic of the one-shot loop is not consulted per row in bounded mode;
+  admission is the bound.

@@ -120,6 +120,13 @@ const wl_columnar_continuation_cursor_t *
 wl_columnar_continuation_cursor(
     const wl_columnar_continuation_t *continuation);
 
+/* The producer context handed to wl_columnar_continuation_create; owned by
+ * the producer, valid until destroy.  Lets a producer module reach its own
+ * state through the continuation it created (Issue #1446). */
+void *
+wl_columnar_continuation_producer_context(
+    const wl_columnar_continuation_t *continuation);
+
 bool
 wl_columnar_continuation_is_done(
     const wl_columnar_continuation_t *continuation);
