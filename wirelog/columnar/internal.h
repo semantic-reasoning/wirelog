@@ -1228,6 +1228,9 @@ typedef struct {
     col_arrangement_t *arr;
     const col_rel_t *source;
     col_relation_snapshot_t source_snapshot;
+    const col_rel_t *storage_owner;
+    uint64_t storage_owner_identity;
+    uint64_t storage_owner_generation;
     wl_columnar_source_access_reader_t source_reader;
     uintptr_t identity;
     bool active;

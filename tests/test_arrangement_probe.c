@@ -93,6 +93,100 @@ release_probe_from_other_thread(void *opaque)
     return NULL;
 }
 
+static void
+test_alias_storage_owner_probe(void)
+{
+    wl_session_t *session = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    col_rel_t *owner = NULL;
+    col_arrangement_probe_t probe = { 0 };
+    wl_columnar_source_access_writer_t owner_writer = { 0 };
+    uint32_t key_cols[] = { 0 };
+
+    CHECK(make_session(&session, &plan, &program) == 0,
+        "alias session setup");
+    if (!session)
+        goto cleanup;
+
+    wl_col_session_t *col_session = COL_SESSION(session);
+    col_rel_t *source = session_find_rel(col_session, "edge");
+    CHECK(source != NULL, "alias source lookup");
+    if (!source)
+        goto cleanup;
+
+    CHECK(col_rel_deep_copy(source, &owner, NULL) == 0,
+        "alias owner setup");
+    if (!owner)
+        goto cleanup;
+    uint64_t owner_identity = owner->relation_identity;
+    uint64_t owner_generation = owner->storage_owner_generation;
+    CHECK(col_rel_install_shared_view(source, owner) == 0,
+        "install alias shared view");
+    CHECK(source->storage_owner == owner
+        && source->storage_owner_identity == owner_identity
+        && source->storage_owner_generation == owner_generation
+        && owner->storage_alias_borrows == 1,
+        "source is bound to ultimate storage owner");
+
+    col_arrangement_t *arr = col_session_get_arrangement(session, "edge",
+            key_cols, 1);
+    col_arr_entry_t *entry = find_entry(col_session, arr);
+    CHECK(arr && entry, "alias arrangement setup");
+    if (!arr || !entry)
+        goto cleanup;
+
+    CHECK(col_session_acquire_arrangement_probe(session, arr, source,
+        &probe) == 0, "alias probe acquire");
+    CHECK(probe.active && probe.source == source && probe.storage_owner == owner
+        && probe.storage_owner_identity == owner_identity
+        && probe.storage_owner_generation == owner_generation
+        && probe.arrangement_pin.active && entry->pin_count == 1
+        && wl_columnar_relation_snapshot_equal(probe.source_snapshot,
+        wl_columnar_relation_snapshot(source)),
+        "probe captures exact source and ultimate owner generation");
+    CHECK(atomic_load_explicit(&owner->source_access.state,
+        memory_order_acquire) == 1,
+        "alias probe holds owner source reader");
+    CHECK(wl_columnar_source_access_writer_acquire(&owner->source_access,
+        &owner_writer) == EBUSY,
+        "active alias probe blocks owner writer");
+    CHECK(col_rel_destroy_checked(owner) == EBUSY,
+        "active alias probe blocks owner destroy");
+
+    CHECK(col_arrangement_probe_release(&probe) == 0,
+        "alias probe release");
+    CHECK(!probe.active && entry->pin_count == 0
+        && atomic_load_explicit(&owner->source_access.state,
+        memory_order_acquire) == 0,
+        "alias release balances owner reader and arrangement pin");
+    CHECK(wl_columnar_source_access_writer_acquire(&owner->source_access,
+        &owner_writer) == 0,
+        "owner writer succeeds after alias probe release");
+    CHECK(wl_columnar_source_access_writer_release(&owner_writer) == 0,
+        "owner writer release after alias probe release");
+    CHECK(col_rel_destroy_checked(owner) == EBUSY,
+        "source alias still blocks owner destroy after probe release");
+
+    wl_session_destroy(session);
+    session = NULL;
+    CHECK(col_rel_destroy_checked(owner) == 0,
+        "owner destroy succeeds after alias teardown");
+    owner = NULL;
+
+cleanup:
+    if (probe.active)
+        (void)col_arrangement_probe_release(&probe);
+    if (owner_writer.owner)
+        (void)wl_columnar_source_access_writer_release(&owner_writer);
+    if (session)
+        wl_session_destroy(session);
+    if (owner)
+        (void)col_rel_destroy_checked(owner);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
 int
 main(void)
 {
@@ -105,6 +199,8 @@ main(void)
     struct release_probe_arg release_arg = { &probe, 0 };
     thread_t release_thread;
     uint32_t key_cols[] = { 0 };
+
+    test_alias_storage_owner_probe();
 
     CHECK(make_session(&session, &plan, &program) == 0,
         "session setup");
