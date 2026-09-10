@@ -94,6 +94,14 @@ wl_columnar_memory_governor_t *
 wl_columnar_memory_governor_ref_get(
     wl_columnar_memory_governor_ref_t *ref);
 
+/* True when @ref is held by exactly one owner.  Used by the program-owned
+ * intern table (Issue #1469): once the table is the only holder of a
+ * session's governor, no live session, worker or result can retain it
+ * again, so the table may rebind to the next managed session. */
+bool
+wl_columnar_memory_governor_ref_is_sole(
+    const wl_columnar_memory_governor_ref_t *ref);
+
 typedef enum {
     WL_COLUMNAR_MEMORY_RESERVATION_EMPTY = 0,
     WL_COLUMNAR_MEMORY_RESERVATION_RESERVED = 1,

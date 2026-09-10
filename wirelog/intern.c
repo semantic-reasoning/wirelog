@@ -412,14 +412,32 @@ wl_intern_attach_memory_governor(
         return EINVAL;
 
     mutex_lock(&intern->lock);
-    if (intern->memory_governor) {
-        int rc = intern->memory_governor == governor_ref ? EALREADY : EBUSY;
+    if (intern->memory_governor == governor_ref) {
         mutex_unlock(&intern->lock);
-        return rc;
+        return EALREADY;
+    }
+    /* Issue #1469: an owner that no live session, worker or result holds
+     * any more (the table is its only reference) is orphaned; rebind the
+     * table to the caller's governor.  A held owner stays in charge. */
+    bool rebind = intern->memory_governor != NULL;
+    if (rebind
+        && !wl_columnar_memory_governor_ref_is_sole(intern->memory_governor)) {
+        mutex_unlock(&intern->lock);
+        return EBUSY;
     }
 
     governor = wl_columnar_memory_governor_ref_get(governor_ref);
-    bytes = intern_retained_bytes_locked(intern);
+    if (rebind) {
+        /* The retained footprint is exact by the #1431 invariant; an
+         * attached table never holds zero reserved bytes. */
+        if (intern->reserved_bytes == 0) {
+            mutex_unlock(&intern->lock);
+            return EINVAL;
+        }
+        bytes = intern->reserved_bytes;
+    } else {
+        bytes = intern_retained_bytes_locked(intern);
+    }
     if (!governor || bytes == UINT64_MAX) {
         mutex_unlock(&intern->lock);
         return ENOMEM;
@@ -431,6 +449,28 @@ wl_intern_attach_memory_governor(
         mutex_unlock(&intern->lock);
         return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
             ? ENOMEM : EOVERFLOW;
+    }
+    if (rebind) {
+        /* Admit under the new governor first: publish commits @pending,
+         * installs it, and credits the orphaned owner's reservation (the
+         * owner is still alive because the table holds its reference).
+         * Any failure leaves the old token installed and releases the
+         * new one; the rollback below is a no-op when publish has
+         * already released the token. */
+        int rc = intern_publish_reservation(intern, &pending, bytes);
+        if (rc != 0) {
+            (void)wl_columnar_memory_rollback(&pending);
+            mutex_unlock(&intern->lock);
+            return rc;
+        }
+        wl_columnar_memory_governor_ref_t *old = intern->memory_governor;
+        wl_columnar_memory_governor_ref_retain(governor_ref);
+        intern->memory_governor = governor_ref;
+        /* Last touch of the orphaned owner: this drops its final
+         * reference and frees it. */
+        wl_columnar_memory_governor_ref_release(old);
+        mutex_unlock(&intern->lock);
+        return 0;
     }
     if (!wl_columnar_memory_commit(&pending, intern)) {
         (void)wl_columnar_memory_release(&pending);
