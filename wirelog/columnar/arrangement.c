@@ -837,6 +837,21 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
         /* A token mismatch invalidates the complete index. */
         bool snapshot_match = wl_columnar_relation_snapshot_equal(
             e->source_snapshot, wl_columnar_relation_snapshot(rel));
+        /* A leased entry is never rebuilt or grown in place (Issue #1435):
+         * arr_build_full and arr_update_incremental may reallocate ht_head
+         * and ht_next under a reader.  Defer exactly as invalidation does
+         * and report the index unavailable; every production caller then
+         * falls back to an ephemeral hash table, and the last release
+         * clears the index so the next lookup rebuilds it.  A pinned,
+         * token-fresh, empty index is fine to hand out: an empty relation
+         * legitimately has nothing indexed.  The clock is not bumped
+         * because the caller received nothing. */
+        if (e->pin_count > 0
+            && (!snapshot_match || e->rebuild_deferred
+            || e->arr.indexed_rows < rel->nrows)) {
+            e->rebuild_deferred = true;
+            return NULL;
+        }
         if (!snapshot_match || e->arr.indexed_rows == 0) {
             /* Deduct stale bytes before rebuild; restore on failure. */
             cs->arr_total_bytes -= e->mem_bytes;
@@ -982,8 +997,22 @@ col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
         return EINVAL;
     memset(pin, 0, sizeof(*pin));
     arr = col_session_get_arrangement(sess, rel_name, key_cols, key_count);
-    if (!arr)
+    if (!arr) {
+        /* Distinguish a leased, stale entry (Issue #1435) from a build or
+         * admission failure: the former is a transient EBUSY that a caller
+         * may satisfy with an ephemeral arrangement. */
+        wl_col_session_t *cs = COL_SESSION(sess);
+        for (uint32_t i = 0; i < cs->arr_count; i++) {
+            const col_arr_entry_t *e = &cs->arr_entries[i];
+            if (e->pin_count > 0 && e->rebuild_deferred
+                && e->key_count == key_count
+                && strcmp(e->rel_name, rel_name) == 0
+                && memcmp(e->key_cols, key_cols,
+                (size_t)key_count * sizeof(*key_cols)) == 0)
+                return EBUSY;
+        }
         return ENOMEM;
+    }
     entry = col_arr_entry_for_arr(COL_SESSION(sess), arr);
     if (!entry)
         return EINVAL;

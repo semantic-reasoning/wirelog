@@ -404,6 +404,159 @@ test_pinned_invalidation(void)
 }
 
 /* ================================================================
+ * Test 6: token mismatch under a lease defers the rebuild (#1435)
+ * ================================================================ */
+static void
+test_pinned_rebuild_deferred(void)
+{
+    TEST("pinned arrangement is never rebuilt in place on a stale token");
+
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+        "edge(10, 1). edge(20, 2). edge(30, 3).\n"
+        ".decl path(x: int32, y: int32)\n"
+        "path(x, y) :- edge(x, y).\n";
+
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    ASSERT(make_session(src, &sess, &plan, &prog) == 0,
+        "session creation failed");
+
+    wl_col_session_t *cs = COL_SESSION(sess);
+    col_rel_t *edge = session_find_rel(cs, "edge");
+    uint32_t key_cols[1] = { 0 };
+    col_arrangement_pin_t pin;
+    col_arrangement_pin_t second;
+    ASSERT(edge != NULL && edge->nrows == 3, "edge must hold three rows");
+    ASSERT(col_session_pin_arrangement(sess, "edge", key_cols, 1, &pin) == 0,
+        "arrangement pin must succeed");
+    col_arr_entry_t *entry = pin.entry;
+    const uint64_t *head_before = entry->arr.ht_head;
+    const uint32_t *next_before = entry->arr.ht_next;
+    uint32_t generation_before = entry->arr.generation;
+    uint32_t nbuckets_before = entry->arr.nbuckets;
+    uint32_t ht_cap_before = entry->arr.ht_cap;
+    size_t mem_bytes_before = entry->mem_bytes;
+    size_t total_before = cs->arr_total_bytes;
+    uint64_t clock_before = entry->lru_clock;
+    ASSERT(entry->arr.indexed_rows == 3, "index must cover the three rows");
+
+    /* Same-row-count mutation: key 20 becomes 40.  The token no longer
+     * matches, but the reader holds a lease, so the index must stay
+     * exactly as it is and the lookup must report it unavailable. */
+    ASSERT(col_rel_set(edge, 1, 0, 40) == 0, "in-place set failed");
+    ASSERT(col_session_get_arrangement(sess, "edge", key_cols, 1) == NULL,
+        "stale leased entry must be reported unavailable");
+    ASSERT(entry->rebuild_deferred && entry->pin_count == 1,
+        "rebuild must be deferred while pinned");
+    ASSERT(entry->arr.ht_head == head_before &&
+        entry->arr.ht_next == next_before
+        && entry->arr.generation == generation_before
+        && entry->arr.nbuckets == nbuckets_before
+        && entry->arr.ht_cap == ht_cap_before
+        && entry->arr.indexed_rows == 3
+        && entry->mem_bytes == mem_bytes_before
+        && cs->arr_total_bytes == total_before
+        && entry->lru_clock == clock_before,
+        "deferral must leave buffers, accounting and clock untouched");
+    ASSERT(col_session_pin_arrangement(sess, "edge", key_cols, 1, &second)
+        == EBUSY && entry->pin_count == 1 && !second.active,
+        "a second lease on a stale entry must report EBUSY");
+
+    /* Growth without a token change cannot happen through the relation
+     * API on main (an append publishes a new view generation), so the
+     * incremental clause is exercised white-box: refresh the token after
+     * an append to simulate a consumer that refreshed it without
+     * rebuilding.  indexed_rows < nrows must defer just like a mismatch. */
+    int64_t row[2] = { 50, 5 };
+    ASSERT(col_rel_append_row(edge, row) == 0, "append failed");
+    entry->rebuild_deferred = false;
+    entry->source_snapshot = wl_columnar_relation_snapshot(edge);
+    ASSERT(col_session_get_arrangement(sess, "edge", key_cols, 1) == NULL
+        && entry->rebuild_deferred && entry->arr.indexed_rows == 3
+        && entry->arr.ht_head == head_before,
+        "growth under a lease must defer the incremental update");
+
+    col_arrangement_pin_release(&pin);
+    ASSERT(!pin.active && entry->pin_count == 0
+        && entry->arr.indexed_rows == 0,
+        "last release must apply the deferred invalidation");
+    col_arrangement_t *arr = col_session_get_arrangement(sess, "edge",
+            key_cols, 1);
+    ASSERT(arr != NULL && arr->indexed_rows == 4,
+        "next lookup after release must rebuild over four rows");
+    int64_t probe_new[2] = { 40, 0 };
+    int64_t probe_old[2] = { 20, 0 };
+    ASSERT(col_arrangement_find_first_typed(arr, edge, probe_new)
+        != UINT32_MAX,
+        "rebuilt index must find the new key");
+    ASSERT(col_arrangement_find_first_typed(arr, edge, probe_old)
+        == UINT32_MAX,
+        "rebuilt index must not find the replaced key");
+
+    free_session(sess, plan, prog);
+    PASS();
+}
+
+/* ================================================================
+ * Test 7: a pinned, token-fresh, empty index is still handed out
+ * ================================================================ */
+static void
+test_pinned_empty_index_available(void)
+{
+    TEST("pinned empty arrangement stays available to a second lease");
+
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+        ".decl seed(x: int32, y: int32)\n"
+        "seed(1, 2).\n"
+        ".decl path(x: int32, y: int32)\n"
+        "path(x, y) :- seed(x, z), edge(z, y).\n";
+
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    ASSERT(make_session(src, &sess, &plan, &prog) == 0,
+        "session creation failed");
+
+    wl_col_session_t *cs = COL_SESSION(sess);
+    col_rel_t *edge = session_find_rel(cs, "edge");
+    uint32_t key_cols[1] = { 0 };
+    col_arrangement_pin_t first;
+    col_arrangement_pin_t second;
+    ASSERT(edge != NULL && edge->nrows == 0, "edge must be empty");
+    /* A session relation gets its column layout at the first insert; give
+     * the empty relation its schema so the lookup validates the key column
+     * and indexes zero rows, which is the shape a bounded join sees for an
+     * empty right relation. */
+    ASSERT(col_rel_set_schema(edge, 2, NULL) == 0, "schema failed");
+    ASSERT(col_session_pin_arrangement(sess, "edge", key_cols, 1, &first) == 0
+        && first.entry->arr.indexed_rows == 0,
+        "an empty relation must still get a lease");
+    const uint64_t *empty_head = first.entry->arr.ht_head;
+    uint32_t empty_buckets = first.entry->arr.nbuckets;
+    size_t empty_mem = first.entry->mem_bytes;
+    ASSERT(col_session_get_arrangement(sess, "edge", key_cols, 1)
+        == first.arr && !first.entry->rebuild_deferred,
+        "a pinned, fresh, empty index must be returned, not deferred");
+    /* The empty index is handed out through the same-size rebuild path
+     * today; it must never reallocate the buffers under the lease. */
+    ASSERT(first.entry->arr.ht_head == empty_head
+        && first.entry->arr.nbuckets == empty_buckets
+        && first.entry->mem_bytes == empty_mem,
+        "looking up a pinned empty index must not touch its buffers");
+    ASSERT(col_session_pin_arrangement(sess, "edge", key_cols, 1, &second)
+        == 0 && first.entry->pin_count == 2,
+        "a second lease on a fresh empty index must succeed");
+    col_arrangement_pin_release(&second);
+    col_arrangement_pin_release(&first);
+    ASSERT(first.entry == NULL && cs->arr_count > 0,
+        "both leases must be released");
+
+    free_session(sess, plan, prog);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 int
@@ -416,6 +569,8 @@ main(void)
     test_tombstone_rebuild();
     test_total_bytes_accounting();
     test_pinned_invalidation();
+    test_pinned_rebuild_deferred();
+    test_pinned_empty_index_available();
 
     printf("\n%d/%d tests passed", pass_count, test_count);
     if (fail_count > 0)

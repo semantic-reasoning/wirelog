@@ -273,7 +273,10 @@ typedef struct {
  * `key_cols[0..key_count)`.  If the arrangement exists but is stale
  * (rel->nrows > indexed_rows), it is updated incrementally before return.
  *
- * Returns NULL on allocation failure or if the relation is not found.
+ * Returns NULL on allocation failure, if the relation is not found, or when
+ * the entry is leased by a reader and stale: the rebuild is then deferred
+ * until the last release and the caller must use an ephemeral arrangement
+ * (Issue #1435).
  *
  * @param sess       A wl_session_t* backed by the columnar backend.
  * @param rel_name   Relation to index.

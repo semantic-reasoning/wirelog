@@ -582,7 +582,14 @@ exactly once, including on allocation and join-error paths.
 |---|---|---|
 | LRU eviction | skip and defer reclamation | reclaim normally |
 | relation invalidation | mark rebuild deferred; keep the old index readable | invalidate immediately |
+| token mismatch or growth while leased | defer rebuild; return unavailable (callers fall back to ephemeral) | rebuild in place |
 | final lease release | apply deferred invalidation | no action |
+
+A deferred rebuild is applied at the last release, which clears the index,
+and executed on the next lookup after that release; a lookup that finds a
+leased, stale entry returns nothing rather than reallocating the hash-table
+buffers under the reader (Issue #1435). A pinned, token-fresh, empty index is
+still handed out, since an empty relation legitimately has nothing indexed.
 
 This is an internal coordinator/worker-session contract, not a public API or a
 general concurrent-reader mechanism. Filtered, differential, sorted and

@@ -1830,6 +1830,12 @@ col_rel_set_column_types(col_rel_t *r,
 uint32_t
 col_arrangement_find_first_typed(const col_arrangement_t *arr,
     const col_rel_t *rel, const int64_t *key_row);
+/* Take a reader lease on the (rel_name, key_cols) primary arrangement,
+ * building it first when needed.  Returns 0 with *pin active; EBUSY when
+ * the entry is leased by another reader and stale, so it cannot be rebuilt
+ * until that lease is released (use an ephemeral arrangement; Issue #1435);
+ * ENOMEM when the index cannot be built or admitted.  No production caller
+ * distinguishes EBUSY from ENOMEM today; both fall back. */
 int
 col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count,
