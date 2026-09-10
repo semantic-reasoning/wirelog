@@ -1442,6 +1442,7 @@ backend_src = files(
   '../wirelog/columnar/delta_pool.c',
   '../wirelog/columnar/delta_pool_admission.c',
   '../wirelog/columnar/continuation.c',
+  '../wirelog/columnar/join_batch.c',
   '../wirelog/columnar/lftj.c',
   '../wirelog/columnar/mem_ledger.c',
   '../wirelog/columnar/memory_governor.c',
@@ -4070,6 +4071,24 @@ test_diff_join_exe = executable(
 )
 
 test('diff_join', test_diff_join_exe)
+
+# Issue #1446: bounded keyed-join sub-batches over persistent arrangements.
+test_join_batch_resume_exe = executable(
+  'test_join_batch_resume',
+  files('test_join_batch_resume.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('join_batch_resume', test_join_batch_resume_exe)
 
 # ============================================================================
 # Differential Consolidate Operator Tests (Issue #263)

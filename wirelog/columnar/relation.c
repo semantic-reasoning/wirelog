@@ -1175,6 +1175,119 @@ col_rel_apply_compound_schema(col_rel_t *r,
     return 0;
 }
 
+bool
+col_rel_retained_bytes_for(const col_rel_t *r, uint32_t capacity,
+    uint64_t *out)
+{
+    if (!r || !out)
+        return false;
+    return col_rel_retained_bytes(r->ncols, capacity, r->timestamps != NULL,
+               out);
+}
+
+/* Admit and grow the physical capacity of @r to at least @new_cap as one
+* transaction (Issue #1446).  Shared and arena-backed relations take the
+* ownership-transition path; heap-owned relations admit the new footprint
+* (retained relations only), prepare private buffers, commit the token and
+* publish.  A call with @new_cap <= capacity admits the buffers the
+* relation already owns when its retained token does not cover them yet,
+* without reallocating: a fresh heap relation starts with unadmitted
+* capacity and bulk writers must not publish rows into it unadmitted.
+* Nothing observable changes on failure.  ENOMEM with *@denied set means
+* the governor (or its size arithmetic) refused the reservation; ENOMEM
+* with *@denied clear is an allocation failure.  The transition path
+* cannot distinguish the two and always reports an allocation failure. */
+int
+col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
+    bool *denied)
+{
+    uint32_t target;
+    wl_columnar_memory_reservation_t pending;
+    int pending_rc;
+    uint64_t bytes = 0;
+
+    if (denied)
+        *denied = false;
+    if (!r)
+        return EINVAL;
+    target = new_cap > r->capacity ? new_cap : r->capacity;
+    if (target == 0)
+        return 0;
+    if (target > r->capacity) {
+        if (r->col_shared || r->arena_owned) {
+            /* Ownership transitions stage columns and timestamps together;
+             * admission happens before any source buffer is copied and the
+             * helper publishes the storage generation on success. */
+            return col_rel_grow_owned_transition(r, target) != 0 ? ENOMEM : 0;
+        }
+        uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
+        bool admitted = r->memory_governor != NULL;
+        int64_t **new_cols = NULL;
+        col_delta_timestamp_t *new_ts = NULL;
+        int prepare_rc;
+
+        pending_rc = 0;
+        if (admitted) {
+            pending_rc = col_rel_reserve_retained(r, target, &pending);
+            if (pending_rc < 0) {
+                if (denied)
+                    *denied = true;
+                return ENOMEM;
+            }
+            if (!col_rel_retained_bytes(r->ncols, target,
+                r->timestamps != NULL, &bytes)) {
+                col_rel_reservation_rollback(&pending);
+                if (denied)
+                    *denied = true;
+                return ENOMEM;
+            }
+        }
+        prepare_rc = col_rel_prepare_resize(r, target, &new_cols, &new_ts);
+        if (prepare_rc != 0) {
+            if (admitted)
+                col_rel_reservation_rollback(&pending);
+            return prepare_rc;
+        }
+        if (admitted && pending_rc > 0
+            && col_rel_publish_retained_reservation(r, &pending, bytes) != 0) {
+            col_rel_reservation_rollback(&pending);
+            col_columns_free(new_cols, r->ncols);
+            free(new_ts);
+            return ENOMEM;
+        }
+        col_rel_publish_resize(r, new_cols, new_ts, target);
+        col_rel_ledger_reconcile(r, ledger_before);
+        wl_columnar_relation_touch_storage(r);
+        return 0;
+    }
+    /* No reallocation: admit the heap buffers the relation already owns when
+     * the retained token does not cover them yet.  A nullary relation owns
+     * no column buffers. */
+    if (!r->memory_governor || r->col_shared || r->arena_owned
+        || r->ncols == 0)
+        return 0;
+    if (!col_rel_retained_bytes(r->ncols, target, r->timestamps != NULL,
+        &bytes)) {
+        if (denied)
+            *denied = true;
+        return ENOMEM;
+    }
+    if (bytes <= r->retained_reserved_bytes)
+        return 0;
+    pending_rc = col_rel_reserve_retained(r, target, &pending);
+    if (pending_rc < 0) {
+        if (denied)
+            *denied = true;
+        return ENOMEM;
+    }
+    if (pending_rc > 0
+        && col_rel_publish_retained_reservation(r, &pending, bytes) != 0) {
+        col_rel_reservation_rollback(&pending);
+        return ENOMEM;
+    }
+    return 0;
+}
+
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
@@ -1200,55 +1313,12 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
     }
     bool needs_resize = r->nrows >= r->capacity;
     if (needs_resize) {
-        uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
         uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
         if (new_cap <= r->capacity) /* overflow guard */
             return ENOMEM;
-        if (r->col_shared || r->arena_owned) {
-            /* Ownership transitions stage columns and timestamps together;
-             * admission happens before any source buffer is copied and the
-             * helper publishes the storage generation on success. */
-            if (col_rel_grow_owned_transition(r, new_cap) != 0)
-                return ENOMEM;
-        } else {
-            /* Heap-owned growth is one transaction: admit the new footprint
-             * (retained relations only), prepare private buffers, commit the
-             * token, then publish.  Nothing observable changes on failure. */
-            wl_columnar_memory_reservation_t pending;
-            int pending_rc = 0;
-            uint64_t new_bytes = 0;
-            bool admitted = r->memory_governor != NULL;
-            if (admitted) {
-                pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
-                if (pending_rc < 0)
-                    return ENOMEM;
-                if (!col_rel_retained_bytes(r->ncols, new_cap,
-                    r->timestamps != NULL, &new_bytes)) {
-                    col_rel_reservation_rollback(&pending);
-                    return ENOMEM;
-                }
-            }
-            int64_t **new_cols = NULL;
-            col_delta_timestamp_t *new_ts = NULL;
-            int prepare_rc = col_rel_prepare_resize(r, new_cap, &new_cols,
-                    &new_ts);
-            if (prepare_rc != 0) {
-                if (admitted)
-                    col_rel_reservation_rollback(&pending);
-                return prepare_rc;
-            }
-            if (admitted && pending_rc > 0
-                && col_rel_publish_retained_reservation(r, &pending,
-                new_bytes) != 0) {
-                col_rel_reservation_rollback(&pending);
-                col_columns_free(new_cols, r->ncols);
-                free(new_ts);
-                return ENOMEM;
-            }
-            col_rel_publish_resize(r, new_cols, new_ts, new_cap);
-            col_rel_ledger_reconcile(r, ledger_before);
-            wl_columnar_relation_touch_storage(r);
-        }
+        int grow_rc = col_rel_reserve_capacity_admitted(r, new_cap, NULL);
+        if (grow_rc != 0)
+            return grow_rc;
     }
     /* A shared view can still have spare capacity.  Privatize it before the
      * in-place row write even when no capacity growth is needed. */
