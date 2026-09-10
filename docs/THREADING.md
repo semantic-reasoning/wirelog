@@ -421,9 +421,33 @@ named in the justification.
 | `intern.c:WL_INTERN_LOAD_RELAXED` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize_prepare`, `intern_retained_bytes_locked` and `wl_intern_free`. Every caller holds `intern->lock` (`wl_intern_free` takes it to release the governor reservation, Issue #1431), so no edge is needed |
 | `intern.c:WL_INTERN_STORE_RELEASE` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by `wl_intern_put` after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
 
-### 5.11 Total
+### 5.11 Existing inventory total
 
-21 + 4 + 2 + 3 + 19 + 1 + 1 + 1 + 3 + 36 + 5 = **96 atomic call sites**.
+21 + 4 + 2 + 3 + 19 + 1 + 1 + 1 + 3 + 36 + 5 = **96 atomic call sites**
+before the inactive source-access contract below.
+
+### 5.12 `wirelog/columnar/source_access.h` — inactive source gate (8 rows)
+
+This header-only gate is a testable internal contract and is not linked into
+the production library. Its state is zero-initialized; reader and writer
+tokens are caller-owned, address-bound and thread-confined. Acquire operations
+use acquire semantics before consuming protected state; release operations use
+release semantics after protected payload publication. The containing owner
+must outlive all active tokens. `EBUSY`, `EINVAL` and `EOVERFLOW` leave the
+gate and token state unchanged.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `source_access.h:wl_columnar_source_access_gate_init` | `gate->state` | `atomic_store_explicit` | relaxed | Establish inactive zero state before publication |
+| `source_access.h:wl_columnar_source_access_reader_acquire` | `gate->state` | `atomic_load_explicit` | acquire | Observe writer release before admitting a reader |
+| `source_access.h:wl_columnar_source_access_reader_acquire#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize reader admission without overflowing the writer sentinel |
+| `source_access.h:wl_columnar_source_access_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Observe the active gate before releasing this reader |
+| `source_access.h:wl_columnar_source_access_reader_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish reader payload completion and decrement atomically |
+| `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
+| `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
+| `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
+
+21 + 4 + 2 + 3 + 19 + 1 + 1 + 1 + 3 + 36 + 5 + 8 = **104 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
