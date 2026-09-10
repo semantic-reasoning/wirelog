@@ -1474,14 +1474,64 @@ release_writer:
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 {
+    col_rel_t *src_owner = NULL;
+    col_rel_t *dst_owner = NULL;
+    wl_columnar_source_access_reader_t source_reader = { 0 };
+    wl_columnar_source_access_writer_t destination_writer = { 0 };
+    bool source_reader_acquired = false;
+    bool destination_writer_acquired = false;
+    bool alias_release_pending = false;
     wirelog_column_type_t *prepared_types = NULL;
     struct ArrowSchema prepared_schema;
     bool prepared_schema_ok = false;
+    int rc;
     (void)arena;
     if (!dst || !src || dst->ncols != src->ncols)
         return EINVAL;
     if (src->nrows == 0)
         return 0;
+
+    /* Preserve the historical zero-initialized, zero-column arithmetic path.
+     * These stack relations have no generation or owner metadata, so owner
+     * resolution would turn a formerly valid row-count operation into EINVAL.
+     * Initialized zero-column relations have an owner and use the normal
+     * source-access gate below. */
+    if (dst->ncols == 0 && src->ncols == 0
+        && !dst->storage_owner && !src->storage_owner) {
+        if (src->nrows > UINT32_MAX - dst->nrows)
+            return EOVERFLOW;
+        dst->nrows += src->nrows;
+        wl_columnar_relation_touch_view(dst);
+        return 0;
+    }
+
+    /* Resolve canonical owners before reading mutable source or destination
+     * state.  A same-owner append uses one writer token: the source reader
+     * and destination writer cannot coexist on one gate. */
+    rc = col_rel_storage_owner_resolve(src, &src_owner);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_storage_owner_resolve(dst, &dst_owner);
+    if (rc != 0)
+        return rc;
+    if (src_owner == dst_owner) {
+        rc = wl_columnar_source_access_writer_acquire(
+            &dst_owner->source_access, &destination_writer);
+        if (rc != 0)
+            return rc;
+        destination_writer_acquired = true;
+    } else {
+        rc = wl_columnar_source_access_reader_acquire(
+            &src_owner->source_access, &source_reader);
+        if (rc != 0)
+            return rc;
+        source_reader_acquired = true;
+        rc = wl_columnar_source_access_writer_acquire(
+            &dst_owner->source_access, &destination_writer);
+        if (rc != 0)
+            goto cleanup;
+        destination_writer_acquired = true;
+    }
 
     /* A typed relation must never receive lanes whose physical meaning is
      * unknown or differs from its own.  Legacy untyped relations are treated
@@ -1499,10 +1549,10 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             if ((dst_type == WIRELOG_TYPE_FLOAT
                 || src_type == WIRELOG_TYPE_FLOAT)
                 && dst_type != src_type)
-                return EINVAL;
+                goto invalid;
             if (!dst->column_types && src->column_types
                 && src_type == WIRELOG_TYPE_FLOAT && dst->nrows > 0)
-                return EINVAL;
+                goto invalid;
         }
     }
 
@@ -1511,7 +1561,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             for (uint32_t c = 0; c < src->ncols; c++) {
                 if (src->column_types[c] == WIRELOG_TYPE_FLOAT
                     && !wl_columnar_float_bits_valid(src->columns[c][row]))
-                    return EINVAL;
+                    goto invalid;
             }
         }
         if (!dst->column_types) {
@@ -1520,14 +1570,14 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                     if (src->column_types[c] == WIRELOG_TYPE_FLOAT
                         && !wl_columnar_float_bits_valid(
                             dst->columns[c][row]))
-                        return EINVAL;
+                        goto invalid;
                 }
             }
         }
     }
 
     if (src->nrows > UINT32_MAX - dst->nrows)
-        return EOVERFLOW;
+        goto overflow;
 
     uint32_t dst_base = dst->nrows;
     uint32_t new_nrows = dst->nrows + src->nrows;
@@ -1537,8 +1587,10 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     if (!dst->column_types && src->column_types) {
         int type_rc = col_rel_prepare_column_types(dst, src->column_types,
                 dst->ncols, &prepared_types, &prepared_schema);
-        if (type_rc != 0)
-            return type_rc;
+        if (type_rc != 0) {
+            rc = type_rc;
+            goto cleanup;
+        }
         prepared_schema_ok = true;
     }
 
@@ -1549,12 +1601,8 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
         uint32_t new_cap = dst->capacity ? dst->capacity * 2 : COL_REL_INIT_CAP;
         while (new_cap < new_nrows) {
             uint32_t next_cap = new_cap * 2;
-            if (next_cap <= new_cap) { /* overflow guard */
-                free(prepared_types);
-                if (prepared_schema_ok)
-                    ArrowSchemaRelease(&prepared_schema);
-                return ENOMEM;
-            }
+            if (next_cap <= new_cap) /* overflow guard */
+                goto overflow;
             new_cap = next_cap;
         }
 
@@ -1567,14 +1615,17 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             int64_t **new_columns = (int64_t **)calloc(dst->ncols,
                     sizeof(*new_columns));
             col_delta_timestamp_t *new_timestamps = NULL;
-            if (!new_columns)
-                goto fail_prepared;
+            if (!new_columns) {
+                rc = ENOMEM;
+                goto cleanup;
+            }
             for (uint32_t c = 0; c < dst->ncols; c++) {
                 new_columns[c] = (int64_t *)wl_arena_alloc(arena,
                         (size_t)new_cap * sizeof(int64_t));
                 if (!new_columns[c]) {
                     free((void *)new_columns);
-                    goto fail_prepared;
+                    rc = ENOMEM;
+                    goto cleanup;
                 }
                 memcpy(new_columns[c], dst->columns[c],
                     (size_t)dst->nrows * sizeof(int64_t));
@@ -1584,7 +1635,8 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                     (size_t)new_cap * sizeof(*new_timestamps));
                 if (!new_timestamps) {
                     free((void *)new_columns);
-                    goto fail_prepared;
+                    rc = ENOMEM;
+                    goto cleanup;
                 }
                 memcpy(new_timestamps, dst->timestamps,
                     (size_t)dst->nrows * sizeof(*new_timestamps));
@@ -1602,9 +1654,11 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             wl_columnar_relation_touch_storage(dst);
             transitioned = true;
         } else if (dst->col_shared || dst->arena_owned) {
-            if (col_rel_grow_owned_transition(dst, new_cap) != 0)
-                goto fail_prepared;
+            rc = col_rel_grow_owned_transition_impl(dst, new_cap, true);
+            if (rc != 0)
+                goto cleanup;
             transitioned = true;
+            alias_release_pending = true;
         } else {
             /* Heap-owned growth: admit (retained relations), prepare, commit,
              * publish -- see col_rel_append_row. */
@@ -1615,20 +1669,22 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             if (admitted) {
                 pending_rc = col_rel_reserve_retained(dst, new_cap, &pending);
                 if (pending_rc < 0)
-                    goto fail_prepared;
+                    goto allocation_failure;
                 if (!col_rel_retained_bytes(dst->ncols, new_cap,
                     dst->timestamps != NULL, &new_bytes)) {
                     col_rel_reservation_rollback(&pending);
-                    goto fail_prepared;
+                    goto allocation_failure;
                 }
             }
             int64_t **new_cols = NULL;
             col_delta_timestamp_t *new_ts = NULL;
-            if (col_rel_prepare_resize(dst, new_cap, &new_cols, &new_ts)
-                != 0) {
+            int prepare_rc = col_rel_prepare_resize(dst, new_cap,
+                    &new_cols, &new_ts);
+            if (prepare_rc != 0) {
                 if (admitted)
                     col_rel_reservation_rollback(&pending);
-                goto fail_prepared;
+                rc = prepare_rc;
+                goto cleanup;
             }
             if (admitted && pending_rc > 0
                 && col_rel_publish_retained_reservation(dst, &pending,
@@ -1636,7 +1692,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
                 col_rel_reservation_rollback(&pending);
                 col_columns_free(new_cols, dst->ncols);
                 free(new_ts);
-                goto fail_prepared;
+                goto allocation_failure;
             }
             col_rel_publish_resize(dst, new_cols, new_ts, new_cap);
             transitioned = false;
@@ -1649,8 +1705,17 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 
     /* Bulk append also mutates spare capacity, so a shared view must be
      * privatized even when the destination does not grow. */
-    if (dst->col_shared && col_rel_cow_unshare(dst, 0) != 0)
-        goto fail_prepared;
+    if (dst->col_shared) {
+        rc = col_rel_cow_unshare_impl(dst, 0, true);
+        if (rc != 0)
+            goto cleanup;
+        alias_release_pending = true;
+    }
+
+#ifdef WL_TEST_APPEND_HOOK
+    if (alias_release_pending && wl_columnar_append_transition_hook)
+        wl_columnar_append_transition_hook(dst);
+#endif
 
     /* Install the prepared type metadata only after all potentially failing
      * destination growth has completed.  A rejected append therefore cannot
@@ -1663,6 +1728,7 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
         dst->schema = prepared_schema;
         dst->schema_ok = true;
         prepared_types = NULL;
+        prepared_schema_ok = false;
     }
 
     /* Bulk copy all rows per-column.  All fallible preparation is complete. */
@@ -1688,13 +1754,35 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
 
     wl_columnar_relation_touch_view(dst);
 
-    return 0;
+    rc = 0;
+    goto cleanup;
 
-fail_prepared:
+invalid:
+    rc = EINVAL;
+    goto cleanup;
+overflow:
+    rc = EOVERFLOW;
+    goto cleanup;
+allocation_failure:
+    rc = ENOMEM;
+cleanup:
     free(prepared_types);
     if (prepared_schema_ok)
         ArrowSchemaRelease(&prepared_schema);
-    return ENOMEM;
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(dst);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+    if (destination_writer_acquired
+        && wl_columnar_source_access_writer_release(&destination_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (source_reader_acquired
+        && wl_columnar_source_access_reader_release(&source_reader) != 0
+        && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 /* ---- compaction ---------------------------------------------------------- */
