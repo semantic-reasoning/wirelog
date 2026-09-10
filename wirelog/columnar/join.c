@@ -1294,7 +1294,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 if (!sess->coordinator) {
                     int dependency_rc
                         = col_arrangement_probe_bundle_acquire_dependency(
-                        &arr_bundle, right);
+                            &arr_bundle, right);
                     if (dependency_rc != 0) {
                         free(tmp);
                         col_rel_destroy(out);
@@ -1319,7 +1319,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         } else if (used_right_delta && op->right_relation && kc > 0) {
             int dependency_rc
                 = col_arrangement_probe_bundle_acquire_dependency(
-                &arr_bundle, right);
+                    &arr_bundle, right);
             if (dependency_rc != 0) {
                 free(tmp);
                 col_rel_destroy(out);
@@ -1668,6 +1668,8 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!lk || !rk) {
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -1694,6 +1696,8 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!out) {
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -1720,6 +1724,8 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_destroy(out);
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -1760,6 +1766,8 @@ antijoin_done:
         col_rel_destroy(out);
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return aj_rc;
@@ -1815,6 +1823,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!lk || !rk) {
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -1830,6 +1840,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return EINVAL;
@@ -1843,6 +1855,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (!out) {
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -1851,6 +1865,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_destroy(out);
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -1861,6 +1877,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_destroy(out);
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -1889,6 +1907,8 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_destroy(out);
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return ENOMEM;
@@ -2025,6 +2045,8 @@ semijoin_done:
         col_rel_destroy(out);
         free(lk);
         free(rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (left_e.owned)
             col_rel_destroy(left);
         return sj_rc;
