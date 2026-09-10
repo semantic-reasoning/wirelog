@@ -2226,6 +2226,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     int join_rc = 0;
     col_arrangement_probe_bundle_t diff_bundle = { 0 };
+    wl_columnar_arrangement_diff_txn_t diff_txn = { 0 };
 
     /* DIFFERENTIAL PATH: persistent diff_arrangement for non-delta right.
      * The arrangement persists across iterations, only indexing new rows. */
@@ -2247,14 +2248,17 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
             return dependency_rc;
         }
-        darr = col_session_get_diff_arrangement(sess, op->right_relation,
-                right, rk, kc);
-        if (!darr)
+        int txn_rc = wl_columnar_arrangement_diff_txn_begin(sess,
+                op->right_relation, right, rk, kc, &diff_txn);
+        if (txn_rc == 0)
+            darr = diff_txn.working;
+        else
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
     }
 
     if (darr
         && col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0) {
+        wl_columnar_arrangement_diff_txn_abort(&diff_txn);
         darr = NULL; /* capacity grow failed; fall through to ephemeral */
         (void)col_arrangement_probe_bundle_release(&diff_bundle);
     }
@@ -2289,6 +2293,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_destroy(right_filtered);
                 if (left_e.owned)
                     col_rel_destroy(left);
+                wl_columnar_arrangement_diff_txn_abort(&diff_txn);
                 (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return ensure_rc;
             }
@@ -2310,6 +2315,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_destroy(right_filtered);
                 if (left_e.owned)
                     col_rel_destroy(left);
+                wl_columnar_arrangement_diff_txn_abort(&diff_txn);
                 (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return ENOMEM;
             }
@@ -2425,6 +2431,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_destroy(right_filtered);
                 if (left_e.owned)
                     col_rel_destroy(left);
+                wl_columnar_arrangement_diff_txn_abort(&diff_txn);
                 (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return prc;
             }
@@ -2465,10 +2472,14 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(right_filtered);
             if (left_e.owned)
                 col_rel_destroy(left);
+            wl_columnar_arrangement_diff_txn_abort(&diff_txn);
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
             return join_rc;
         }
     } else {
+        /* Every fallback owns no transaction state, including capacity and
+         * preparation failures that arrived here after an explicit abort. */
+        wl_columnar_arrangement_diff_txn_abort(&diff_txn);
         /* Ephemeral hash table fallback (same as col_op_join) */
         uint32_t nbuckets_ep;
         if (col_join_bucket_count(right->nrows, &nbuckets_ep) != 0) {
@@ -2559,22 +2570,39 @@ join_success:
                 col_rel_destroy(left);
             if (right_filtered)
                 col_rel_destroy(right_filtered);
+            int push_rc = eval_stack_push_delta(stack, out, true,
+                    result_is_delta);
+            if (push_rc == 0)
+                wl_columnar_arrangement_diff_txn_commit(&diff_txn);
+            else {
+                wl_columnar_arrangement_diff_txn_abort(&diff_txn);
+                col_rel_destroy(out);
+            }
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
-            return eval_stack_push_delta(stack, out, true, result_is_delta);
+            return push_rc;
         }
         int cache_rc = col_mat_cache_insert(&sess->mat_cache, left, right, out);
         if (left_e.owned)
             col_rel_destroy(left);
         if (right_filtered)
             col_rel_destroy(right_filtered);
+        int push_rc;
         if (cache_rc != 0) {
             col_rel_destroy(copy);
-            (void)col_arrangement_probe_bundle_release(&diff_bundle);
-            return eval_stack_push_delta(stack, out, true, result_is_delta);
+            push_rc = eval_stack_push_delta(stack, out, true,
+                    result_is_delta);
+            if (push_rc != 0)
+                col_rel_destroy(out);
+        } else {
+            push_rc = eval_stack_push_delta(stack, copy, true,
+                    result_is_delta);
+            if (push_rc != 0)
+                col_rel_destroy(copy);
         }
-        int push_rc = eval_stack_push_delta(stack, copy, true, result_is_delta);
-        if (push_rc != 0)
-            col_rel_destroy(copy);
+        if (push_rc == 0)
+            wl_columnar_arrangement_diff_txn_commit(&diff_txn);
+        else
+            wl_columnar_arrangement_diff_txn_abort(&diff_txn);
         (void)col_arrangement_probe_bundle_release(&diff_bundle);
         return push_rc;
     }
@@ -2582,8 +2610,15 @@ join_success:
         col_rel_destroy(left);
     if (right_filtered)
         col_rel_destroy(right_filtered);
+    int push_rc = eval_stack_push_delta(stack, out, true, result_is_delta);
+    if (push_rc == 0)
+        wl_columnar_arrangement_diff_txn_commit(&diff_txn);
+    else {
+        wl_columnar_arrangement_diff_txn_abort(&diff_txn);
+        col_rel_destroy(out);
+    }
     (void)col_arrangement_probe_bundle_release(&diff_bundle);
-    return eval_stack_push_delta(stack, out, true, result_is_delta);
+    return push_rc;
 }
 
 /* Compatibility entry points used by internal test fixtures and downstream

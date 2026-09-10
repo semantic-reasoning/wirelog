@@ -2443,6 +2443,134 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     return e->diff_arr;
 }
 
+int
+wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
+    const char *rel_name, const col_rel_t *source_rel,
+    const uint32_t *key_cols, uint32_t key_count,
+    wl_columnar_arrangement_diff_txn_t *txn)
+{
+    col_diff_arrangement_t **slot = NULL;
+
+    if (!cs || !rel_name || !source_rel || !key_cols || key_count == 0
+        || !txn)
+        return EINVAL;
+    memset(txn, 0, sizeof(*txn));
+
+    for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
+        col_diff_arr_entry_t *entry = &cs->diff_arr_entries[i];
+        if (entry->key_count != key_count
+            || strcmp(entry->rel_name, rel_name) != 0)
+            continue;
+        bool match = true;
+        for (uint32_t k = 0; k < key_count; k++) {
+            if (entry->key_cols[k] != key_cols[k]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            slot = &entry->diff_arr;
+            break;
+        }
+    }
+
+    if (!slot) {
+        if (cs->diff_arr_count >= cs->diff_arr_cap) {
+            uint32_t new_cap = cs->diff_arr_cap ? cs->diff_arr_cap * 2u : 4u;
+            col_diff_arr_entry_t *entries = (col_diff_arr_entry_t *)realloc(
+                cs->diff_arr_entries, new_cap * sizeof(*entries));
+            if (!entries)
+                return ENOMEM;
+            cs->diff_arr_entries = entries;
+            cs->diff_arr_cap = new_cap;
+        }
+        col_diff_arr_entry_t *entry
+            = &cs->diff_arr_entries[cs->diff_arr_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->rel_name = wl_strdup(rel_name);
+        entry->key_cols = (uint32_t *)malloc(
+            (size_t)key_count * sizeof(*entry->key_cols));
+        if (!entry->rel_name || !entry->key_cols) {
+            free(entry->rel_name);
+            free(entry->key_cols);
+            memset(entry, 0, sizeof(*entry));
+            return ENOMEM;
+        }
+        memcpy(entry->key_cols, key_cols,
+            (size_t)key_count * sizeof(*entry->key_cols));
+        entry->key_count = key_count;
+        entry->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
+        if (!entry->diff_arr) {
+            free(entry->rel_name);
+            free(entry->key_cols);
+            memset(entry, 0, sizeof(*entry));
+            return ENOMEM;
+        }
+        txn->entry = entry;
+        txn->pending_entry = true;
+        slot = &entry->diff_arr;
+    }
+
+    txn->session = cs;
+    txn->persistent = *slot;
+    txn->working = col_diff_arrangement_deep_copy(txn->persistent);
+    if (!txn->working) {
+        if (txn->pending_entry) {
+            free(txn->entry->rel_name);
+            free(txn->entry->key_cols);
+            col_diff_arrangement_destroy(txn->persistent);
+            memset(txn->entry, 0, sizeof(*txn->entry));
+        }
+        memset(txn, 0, sizeof(*txn));
+        return ENOMEM;
+    }
+    col_diff_arrangement_attach_ledger(txn->working,
+        txn->pending_entry ? &cs->mem_ledger : txn->persistent->ledger);
+    txn->slot = slot;
+
+    if (!wl_columnar_relation_snapshot_equal(txn->working->source_snapshot,
+        wl_columnar_relation_snapshot(source_rel))) {
+        memset(txn->working->ht_head, 0,
+            (size_t)txn->working->nbuckets * sizeof(*txn->working->ht_head));
+        memset(txn->working->ht_next, 0,
+            (size_t)txn->working->ht_cap * sizeof(*txn->working->ht_next));
+        txn->working->base_nrows = 0;
+        txn->working->current_nrows = 0;
+        txn->working->indexed_rows = 0;
+        txn->working->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+    }
+    return 0;
+}
+
+void
+wl_columnar_arrangement_diff_txn_commit(
+    wl_columnar_arrangement_diff_txn_t *txn)
+{
+    if (!txn || !txn->slot || !txn->persistent || !txn->working)
+        return;
+    *txn->slot = txn->working;
+    col_diff_arrangement_destroy(txn->persistent);
+    if (txn->pending_entry)
+        txn->session->diff_arr_count++;
+    memset(txn, 0, sizeof(*txn));
+}
+
+void
+wl_columnar_arrangement_diff_txn_abort(
+    wl_columnar_arrangement_diff_txn_t *txn)
+{
+    if (!txn)
+        return;
+    col_diff_arrangement_destroy(txn->working);
+    if (txn->pending_entry && txn->entry) {
+        free(txn->entry->rel_name);
+        free(txn->entry->key_cols);
+        col_diff_arrangement_destroy(txn->persistent);
+        memset(txn->entry, 0, sizeof(*txn->entry));
+    }
+    memset(txn, 0, sizeof(*txn));
+}
+
 /*
  * col_session_free_diff_arrangements:
  *
