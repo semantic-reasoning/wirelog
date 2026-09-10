@@ -1730,6 +1730,7 @@ test_worker_alias_chain_checked_teardown(void)
         fprintf(stderr,
             "alias chain: source destroy with live aliases returned %d\n",
             destroy_with_both);
+        FAIL("checked destroy unexpectedly freed a live source");
         return 1;
     }
     ok = worker_a_rel != NULL && worker_b_rel != NULL
@@ -1745,6 +1746,7 @@ test_worker_alias_chain_checked_teardown(void)
         fprintf(stderr,
             "alias chain: source destroy with worker A returned %d\n",
             destroy_with_a);
+        FAIL("checked destroy unexpectedly freed an aliased source");
         return 1;
     }
     ok = ok && source->storage_alias_borrows == 1
