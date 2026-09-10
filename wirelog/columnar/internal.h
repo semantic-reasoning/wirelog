@@ -1236,6 +1236,21 @@ typedef struct {
     bool active;
 } col_arrangement_probe_t;
 
+#define COL_ARRANGEMENT_PROBE_BUNDLE_MAX 4u
+
+typedef struct {
+    col_arrangement_probe_t probe;
+    uint32_t ref_count;
+} col_arrangement_probe_bundle_slot_t;
+
+typedef struct {
+    col_arrangement_probe_bundle_slot_t
+        slots[COL_ARRANGEMENT_PROBE_BUNDLE_MAX];
+    uint32_t count;
+    uintptr_t identity;
+    bool active;
+} col_arrangement_probe_bundle_t;
+
 /*
  * col_sorted_arr_t: cached sorted copy of a relation by a single key column.
  *
@@ -1911,6 +1926,14 @@ col_session_acquire_primary_arrangement_probe(wl_session_t *sess,
     col_arrangement_probe_t *probe);
 int
 col_arrangement_probe_release(col_arrangement_probe_t *probe);
+void
+col_arrangement_probe_bundle_init(col_arrangement_probe_bundle_t *bundle);
+int
+col_arrangement_probe_bundle_acquire(col_arrangement_probe_bundle_t *bundle,
+    wl_session_t *sess, col_arrangement_t *arr, const col_rel_t *source,
+    col_arrangement_probe_t **out_probe);
+int
+col_arrangement_probe_bundle_release(col_arrangement_probe_bundle_t *bundle);
 int
 col_rel_alloc(col_rel_t **out, const char *name);
 int
