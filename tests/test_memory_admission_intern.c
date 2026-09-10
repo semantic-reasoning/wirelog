@@ -521,7 +521,7 @@ test_denied_rebind_leaves_both_unchanged(void)
     wl_intern_t *intern = wl_intern_create();
     wl_columnar_memory_governor_ref_t *owner = test_governor(UINT64_MAX / 4);
     wl_columnar_memory_governor_t *owner_governor;
-    wl_columnar_memory_governor_ref_t *small = NULL;
+    wl_columnar_memory_governor_ref_t *tight = NULL;
     wl_columnar_memory_governor_ref_t *enough = NULL;
     uint64_t footprint;
     uint64_t sum;
@@ -534,17 +534,17 @@ test_denied_rebind_leaves_both_unchanged(void)
         || fill_symbols(intern, 10, &sum) != 0)
         return 1;
     footprint = wl_columnar_memory_reserved(owner_governor);
-    small = test_governor(footprint - 1u);
+    tight = test_governor(footprint - 1u);
     enough = test_governor(footprint);
-    if (!small || !enough)
+    if (!tight || !enough)
         return 1;
     wl_columnar_memory_governor_ref_release(owner);
     owner = NULL;
     /* Reading the orphaned owner is valid here only because the denied
      * rebind did not free it: the table still holds its reference. */
-    ok = wl_intern_attach_memory_governor(intern, small) == ENOMEM
+    ok = wl_intern_attach_memory_governor(intern, tight) == ENOMEM
         && wl_columnar_memory_reserved(
-        wl_columnar_memory_governor_ref_get(small)) == 0
+        wl_columnar_memory_governor_ref_get(tight)) == 0
         && wl_columnar_memory_reserved(owner_governor) == footprint
         && symbols_intact(intern, 10);
     owner_governor = NULL;
@@ -555,7 +555,7 @@ test_denied_rebind_leaves_both_unchanged(void)
     wl_intern_free(intern);
     ok = ok && wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(enough)) == 0;
-    wl_columnar_memory_governor_ref_release(small);
+    wl_columnar_memory_governor_ref_release(tight);
     wl_columnar_memory_governor_ref_release(enough);
     return ok ? 0 : 1;
 }
