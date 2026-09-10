@@ -1616,6 +1616,93 @@ col_arrangement_probe_bundle_acquire(col_arrangement_probe_bundle_t *bundle,
     return 0;
 }
 
+static int
+col_arrangement_probe_dependency_release_ready(
+    const col_arrangement_probe_dependency_t *dependency)
+{
+    col_rel_t *owner = NULL;
+    if (!dependency || dependency->ref_count == 0 || !dependency->relation
+        || !dependency->storage_owner
+        || col_rel_storage_owner_resolve(dependency->relation, &owner) != 0
+        || owner != dependency->storage_owner
+        || owner->relation_identity != dependency->storage_owner_identity
+        || owner->storage_generation
+            != dependency->storage_owner_generation)
+        return EINVAL;
+    if (dependency->reader.identity != (uintptr_t)&dependency->reader
+        || dependency->reader.owner != &owner->source_access
+        || (!dependency->reader.transferable
+        && !wl_columnar_source_access_reader_thread_equal(
+            &dependency->reader))
+        || (dependency->reader.transferable && dependency->reader.thread_valid)
+        || !wl_columnar_source_access_gate_busy(dependency->reader.owner))
+        return EINVAL;
+    return 0;
+}
+
+int
+col_arrangement_probe_bundle_acquire_dependency(
+    col_arrangement_probe_bundle_t *bundle, const col_rel_t *relation)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!bundle || bundle->identity != (uintptr_t)bundle || !bundle->active
+        || !relation)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(relation, &owner);
+    if (rc != 0)
+        return rc;
+    for (uint32_t i = 0; i < bundle->dependency_count; i++) {
+        col_arrangement_probe_dependency_t *dependency
+            = &bundle->dependencies[i];
+        if (dependency->ref_count > 0
+            && dependency->storage_owner == owner) {
+            if (dependency->ref_count == UINT32_MAX)
+                return EOVERFLOW;
+            dependency->ref_count++;
+            return 0;
+        }
+    }
+    if (bundle->dependency_count >= COL_ARRANGEMENT_PROBE_DEPENDENCY_MAX) {
+        rc = col_arrangement_probe_bundle_release(bundle);
+        if (rc != 0)
+            return rc;
+        col_arrangement_probe_bundle_init(bundle);
+        return EOVERFLOW;
+    }
+    col_arrangement_probe_dependency_t *dependency
+        = &bundle->dependencies[bundle->dependency_count];
+    memset(dependency, 0, sizeof(*dependency));
+    rc = col_rel_source_reader_acquire(relation, &dependency->reader);
+    if (rc != 0)
+        goto rollback;
+    if (col_rel_storage_owner_resolve(relation, &owner) != 0
+        || owner->relation_identity == 0
+        || owner->storage_generation == 0) {
+        rc = EBUSY;
+        (void)col_rel_source_reader_release(&dependency->reader);
+        goto rollback;
+    }
+    dependency->relation = relation;
+    dependency->storage_owner = owner;
+    dependency->storage_owner_identity = owner->relation_identity;
+    dependency->storage_owner_generation = owner->storage_generation;
+    dependency->ref_count = 1;
+    bundle->dependency_count++;
+    return 0;
+
+rollback:
+    memset(dependency, 0, sizeof(*dependency));
+    if (bundle->count > 0 || bundle->dependency_count > 0) {
+        int rollback_rc = col_arrangement_probe_bundle_release(bundle);
+        if (rollback_rc != 0)
+            return rollback_rc;
+        col_arrangement_probe_bundle_init(bundle);
+    }
+    return rc;
+}
+
 int
 col_arrangement_probe_bundle_release(col_arrangement_probe_bundle_t *bundle)
 {
@@ -1631,6 +1718,14 @@ col_arrangement_probe_bundle_release(col_arrangement_probe_bundle_t *bundle)
         if (rc != 0)
             return rc;
     }
+    for (uint32_t i = bundle->dependency_count; i > 0; i--) {
+        if (bundle->dependencies[i - 1u].ref_count == 0)
+            continue;
+        rc = col_arrangement_probe_dependency_release_ready(
+            &bundle->dependencies[i - 1u]);
+        if (rc != 0)
+            return rc;
+    }
     for (uint32_t i = bundle->count; i > 0; i--) {
         col_arrangement_probe_bundle_slot_t *slot = &bundle->slots[i - 1u];
         if (slot->ref_count == 0 || !slot->probe.active)
@@ -1639,6 +1734,16 @@ col_arrangement_probe_bundle_release(col_arrangement_probe_bundle_t *bundle)
         if (rc != 0)
             return rc;
         memset(slot, 0, sizeof(*slot));
+    }
+    for (uint32_t i = bundle->dependency_count; i > 0; i--) {
+        col_arrangement_probe_dependency_t *dependency
+            = &bundle->dependencies[i - 1u];
+        if (dependency->ref_count == 0)
+            continue;
+        rc = col_rel_source_reader_release(&dependency->reader);
+        if (rc != 0)
+            return rc;
+        memset(dependency, 0, sizeof(*dependency));
     }
     memset(bundle, 0, sizeof(*bundle));
     return 0;
