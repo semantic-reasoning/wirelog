@@ -339,6 +339,10 @@ nonrec_copy_relation_slice(const col_rel_t *src, const char *name,
 }
 
 static int
+tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
+    const col_rel_t *src, int shared_view_rc);
+
+static int
 nonrec_make_shared_relation_view(const col_rel_t *src, col_rel_t **out)
 {
     if (!src || !out)
@@ -348,7 +352,7 @@ nonrec_make_shared_relation_view(const col_rel_t *src, col_rel_t **out)
         return ENOMEM;
     int rc = col_rel_install_shared_view(view, src);
     if (rc != 0) {
-        rc = col_rel_append_all(view, src, NULL);
+        rc = tdd_shared_view_deep_copy_fallback(NULL, view, src, rc);
         if (rc != 0) {
             col_rel_destroy(view);
             return rc;
@@ -356,6 +360,40 @@ nonrec_make_shared_relation_view(const col_rel_t *src, col_rel_t **out)
     }
     *out = view;
     return 0;
+}
+
+static int
+tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
+    const col_rel_t *src, int shared_view_rc)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int rc;
+
+    /* EBUSY can mean terminal source destruction already claimed the gate.
+     * Never turn that exclusion result into an unprotected source read. */
+    if (shared_view_rc != ENOMEM && shared_view_rc != EINVAL
+        && shared_view_rc != EOVERFLOW)
+        return shared_view_rc;
+    rc = col_rel_source_reader_acquire(src, &reader);
+    if (rc != 0)
+        return rc;
+    if (sess) {
+        dst->nrows = 0;
+        wl_columnar_relation_touch_view(dst);
+    }
+    rc = col_rel_append_all(dst, src, NULL);
+    int release_rc = col_rel_source_reader_release(&reader);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    if (rc == 0 && sess) {
+        /* append_all COW-detaches a non-empty shared destination before it
+         * returns.  Empty copies may remain aliases and retain their lease. */
+        int retire_rc
+            = wl_columnar_session_retire_source_lease(sess, dst);
+        if (retire_rc != 0 && retire_rc != EBUSY)
+            rc = retire_rc;
+    }
+    return rc;
 }
 
 int
@@ -964,21 +1002,39 @@ tdd_refresh_global_read_relation(const wl_plan_stratum_t *sp,
             continue;
         if (src->ncols > 0) {
             if (dst->ncols != src->ncols) {
-                col_rel_t *view = NULL;
-                int rc = nonrec_make_shared_relation_view(src, &view);
-                if (rc != 0)
-                    return rc;
+                col_rel_t *view = col_rel_new_like(src->name, src);
+                if (!view)
+                    return ENOMEM;
+                int rc = col_rel_install_shared_view(view, src);
+                bool shared = rc == 0;
+                if (!shared) {
+                    rc = tdd_shared_view_deep_copy_fallback(NULL, view,
+                            src, rc);
+                    if (rc != 0) {
+                        col_rel_destroy(view);
+                        return rc;
+                    }
+                }
                 rc = session_add_rel(&coord->tdd_workers[w], view);
                 if (rc != 0) {
                     col_rel_destroy(view);
                     return rc;
                 }
+                if (shared) {
+                    rc = wl_columnar_session_adopt_shared_view(
+                        &coord->tdd_workers[w], view);
+                    if (rc != 0) {
+                        (void)session_remove_rel(&coord->tdd_workers[w],
+                            view->name);
+                        return rc;
+                    }
+                }
             } else {
-                int rc = col_rel_install_shared_view(dst, src);
+                int rc = wl_columnar_session_install_shared_view(
+                    &coord->tdd_workers[w], dst, src);
                 if (rc != 0) {
-                    dst->nrows = 0;
-                    wl_columnar_relation_touch_view(dst);
-                    rc = col_rel_append_all(dst, src, NULL);
+                    rc = tdd_shared_view_deep_copy_fallback(
+                        &coord->tdd_workers[w], dst, src, rc);
                 }
                 if (rc != 0)
                     return rc;
@@ -2057,9 +2113,11 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
         if (!view)
             return ENOMEM;
         rc = col_rel_install_shared_view(view, union_d);
-        if (rc != 0) {
+        bool shared = rc == 0;
+        if (!shared) {
             /* Fallback: deep copy on shared-view alloc failure */
-            rc = col_rel_append_all(view, union_d, NULL);
+            rc = tdd_shared_view_deep_copy_fallback(NULL, view, union_d,
+                    rc);
             if (rc != 0) {
                 col_rel_destroy(view);
                 return rc;
@@ -2069,6 +2127,14 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
         if (rc != 0) {
             col_rel_destroy(view);
             return rc;
+        }
+        if (shared) {
+            rc = wl_columnar_session_adopt_shared_view(
+                &coord->tdd_workers[dst], view);
+            if (rc != 0) {
+                (void)session_remove_rel(&coord->tdd_workers[dst], dname);
+                return rc;
+            }
         }
     }
     return 0;
@@ -2696,7 +2762,8 @@ tdd_init_workers_hybrid(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
                 if (rc != 0) {
                     /* Preserve the pre-existing deep-copy fallback when
                      * the shared-view bookkeeping allocation is rejected. */
-                    rc = col_rel_append_all(view, rel, NULL);
+                    rc = tdd_shared_view_deep_copy_fallback(NULL, view,
+                            rel, rc);
                     if (rc != 0) {
                         col_rel_destroy(view);
                         break;
@@ -2845,12 +2912,12 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
                 &coord->tdd_workers[w], dname);
             if (worker_d && worker_d->ncols == ncols) {
                 /* Reuse: install shared view (O(ncols) pointer setup) */
-                int rc = col_rel_install_shared_view(worker_d, union_d);
+                int rc = wl_columnar_session_install_shared_view(
+                    &coord->tdd_workers[w], worker_d, union_d);
                 if (rc != 0) {
                     /* Fallback: deep copy on shared-view alloc failure */
-                    worker_d->nrows = 0;
-                    wl_columnar_relation_touch_view(worker_d);
-                    rc = col_rel_append_all(worker_d, union_d, NULL);
+                    rc = tdd_shared_view_deep_copy_fallback(
+                        &coord->tdd_workers[w], worker_d, union_d, rc);
                     if (rc != 0)
                         return rc;
                 }
@@ -2860,9 +2927,11 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
                 if (!new_d)
                     return ENOMEM;
                 int rc = col_rel_install_shared_view(new_d, union_d);
-                if (rc != 0) {
+                bool shared = rc == 0;
+                if (!shared) {
                     /* Fallback: deep copy on shared-view alloc failure */
-                    rc = col_rel_append_all(new_d, union_d, NULL);
+                    rc = tdd_shared_view_deep_copy_fallback(NULL, new_d,
+                            union_d, rc);
                     if (rc != 0) {
                         col_rel_destroy(new_d);
                         return rc;
@@ -2872,6 +2941,15 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
                 if (rc != 0) {
                     col_rel_destroy(new_d);
                     return rc;
+                }
+                if (shared) {
+                    rc = wl_columnar_session_adopt_shared_view(
+                        &coord->tdd_workers[w], new_d);
+                    if (rc != 0) {
+                        (void)session_remove_rel(&coord->tdd_workers[w],
+                            dname);
+                        return rc;
+                    }
                 }
             }
         }
@@ -3530,8 +3608,10 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             if (!view)
                 return ENOMEM;
             rc = col_rel_install_shared_view(view, combined);
-            if (rc != 0) {
-                rc = col_rel_append_all(view, combined, NULL);
+            bool shared = rc == 0;
+            if (!shared) {
+                rc = tdd_shared_view_deep_copy_fallback(NULL, view,
+                        combined, rc);
                 if (rc != 0) {
                     col_rel_destroy(view);
                     return rc;
@@ -3541,6 +3621,15 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
             if (rc != 0) {
                 col_rel_destroy(view);
                 return rc;
+            }
+            if (shared) {
+                rc = wl_columnar_session_adopt_shared_view(
+                    &coord->tdd_workers[dst], view);
+                if (rc != 0) {
+                    (void)session_remove_rel(&coord->tdd_workers[dst],
+                        dname);
+                    return rc;
+                }
             }
         }
         coord->tdd_exchange_broadcast_ns += now_ns() - broadcast_t0;
@@ -4365,11 +4454,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 col_rel_t *dw = session_find_rel(
                     &coord->tdd_workers[w], dname);
                 if (dw && dw->ncols == ncols) {
-                    rc = col_rel_install_shared_view(dw, d0);
+                    rc = wl_columnar_session_install_shared_view(
+                        &coord->tdd_workers[w], dw, d0);
                     if (rc != 0) {
-                        dw->nrows = 0;
-                        wl_columnar_relation_touch_view(dw);
-                        rc = col_rel_append_all(dw, d0, NULL);
+                        rc = tdd_shared_view_deep_copy_fallback(
+                            &coord->tdd_workers[w], dw, d0, rc);
                     }
                 } else {
                     dw = col_rel_new_auto(dname, ncols);
@@ -4377,12 +4466,21 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                         rc = ENOMEM; break;
                     }
                     int vrc = col_rel_install_shared_view(dw, d0);
+                    bool shared = vrc == 0;
                     if (vrc != 0)
-                        rc = col_rel_append_all(dw, d0, NULL);
+                        rc = tdd_shared_view_deep_copy_fallback(NULL, dw,
+                                d0, vrc);
                     if (rc == 0)
                         rc = session_add_rel(&coord->tdd_workers[w], dw);
-                    else
+                    if (rc != 0) {
                         col_rel_destroy(dw);
+                    } else if (shared) {
+                        rc = wl_columnar_session_adopt_shared_view(
+                            &coord->tdd_workers[w], dw);
+                        if (rc != 0)
+                            (void)session_remove_rel(
+                                &coord->tdd_workers[w], dname);
+                    }
                 }
             }
             if (rc != 0)

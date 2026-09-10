@@ -60,6 +60,7 @@ typedef struct wl_columnar_source_access_reader {
     pthread_t owner_thread;
 #endif
     bool thread_valid;
+    bool transferable;
 } wl_columnar_source_access_reader_t;
 
 typedef struct wl_columnar_source_access_writer {
@@ -121,7 +122,7 @@ wl_columnar_source_access_reader_acquire(
 {
     uint64_t observed;
     if (!gate || !token || token->owner || token->identity != 0
-        || token->thread_valid)
+        || token->thread_valid || token->transferable)
         return EINVAL;
     observed = atomic_load_explicit(&gate->state, memory_order_acquire);
     for (;;) {
@@ -143,6 +144,37 @@ wl_columnar_source_access_reader_acquire(
     token->owner_thread = pthread_self();
 #endif
     token->thread_valid = true;
+    token->transferable = false;
+    return 0;
+}
+
+/* Session-owned readers have stable token addresses but may be retired by a
+ * later, externally serialized teardown thread.  Identity validation still
+ * rejects copied tokens; the atomic gate makes sequential cross-thread
+ * transfer safe without weakening ordinary operation-token affinity. */
+static inline int
+wl_columnar_source_access_reader_acquire_transferable(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token)
+{
+    uint64_t observed;
+    if (!gate || !token || token->owner || token->identity != 0
+        || token->thread_valid || token->transferable)
+        return EINVAL;
+    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
+    for (;;) {
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EBUSY;
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
+            return EOVERFLOW;
+        if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
+            observed + 1u, memory_order_acquire, memory_order_relaxed))
+            break;
+    }
+    token->owner = gate;
+    token->identity = (uintptr_t)token;
+    token->thread_valid = false;
+    token->transferable = true;
     return 0;
 }
 
@@ -153,7 +185,9 @@ wl_columnar_source_access_reader_release(
     wl_columnar_source_access_gate_t *gate;
     uint64_t observed;
     if (!token || token->identity != (uintptr_t)token || !token->owner
-        || !wl_columnar_source_access_reader_thread_equal(token))
+        || (!token->transferable
+        && !wl_columnar_source_access_reader_thread_equal(token))
+        || (token->transferable && token->thread_valid))
         return EINVAL;
     gate = token->owner;
     observed = atomic_load_explicit(&gate->state, memory_order_acquire);
@@ -167,6 +201,7 @@ wl_columnar_source_access_reader_release(
     token->owner = NULL;
     token->identity = 0;
     token->thread_valid = false;
+    token->transferable = false;
     return 0;
 }
 

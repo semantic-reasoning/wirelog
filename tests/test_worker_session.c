@@ -1050,7 +1050,7 @@ test_hash_table_independent(void)
 static int
 test_shared_view_relation_destroy(void)
 {
-    TEST("worker shared-view relation destroy does not free coordinator data");
+    TEST("worker shared-view lease blocks source destroy until cleanup");
 
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
@@ -1061,27 +1061,27 @@ test_shared_view_relation_destroy(void)
     }
 
     int64_t rows[] = { 1, 2, 2, 3, 3, 4, 4, 5 };
-    if (insert_edges(coord, rows, 4) != 0) {
+    col_rel_t *src = col_rel_new_auto("borrowed", 2);
+    int source_rc = src ? 0 : ENOMEM;
+    for (uint32_t i = 0; i < 4 && source_rc == 0; i++)
+        source_rc = col_rel_append_row(src, &rows[i * 2]);
+    if (source_rc != 0) {
+        col_rel_destroy(src);
         cleanup_coordinator(coord, plan, prog);
-        FAIL("insert edges");
+        FAIL("standalone source creation");
         return 1;
     }
 
-    col_rel_t *src = session_find_rel(coord, "edge");
-    if (!src) {
-        cleanup_coordinator(coord, plan, prog);
-        FAIL("source relation missing");
-        return 1;
-    }
-
-    col_rel_t *view = col_rel_new_auto("edge", src->ncols);
+    col_rel_t *view = col_rel_new_auto("borrowed", src->ncols);
     if (!view) {
+        col_rel_destroy(src);
         cleanup_coordinator(coord, plan, prog);
         FAIL("view allocation");
         return 1;
     }
     if (col_rel_install_shared_view(view, src) != 0) {
         col_rel_destroy(view);
+        col_rel_destroy(src);
         cleanup_coordinator(coord, plan, prog);
         FAIL("shared view install");
         return 1;
@@ -1092,39 +1092,123 @@ test_shared_view_relation_destroy(void)
     memset(&worker, 0, sizeof(worker));
     if (col_worker_session_create(coord, 0, parts, 1, &worker) != 0) {
         col_rel_destroy(view);
+        col_rel_destroy(src);
         cleanup_coordinator(coord, plan, prog);
         FAIL("worker create");
         return 1;
     }
 
-    col_rel_t *worker_rel = session_find_rel(&worker, "edge");
+    col_rel_t *worker_rel = session_find_rel(&worker, "borrowed");
     if (!worker_rel || worker_rel->columns[0] != src->columns[0]) {
         col_worker_session_destroy(&worker);
+        col_rel_destroy(src);
         cleanup_coordinator(coord, plan, prog);
         FAIL("worker relation is not a shared view");
         return 1;
     }
 
+    int ok = atomic_load_explicit(&src->source_access.state,
+            memory_order_acquire) == 1
+        && src->storage_alias_borrows == 1;
     for (int i = 0; i < 16; i++) {
-        if (col_rel_install_shared_view(worker_rel, src) != 0) {
+        if (wl_columnar_session_install_shared_view(&worker, worker_rel,
+            src) != 0) {
             col_worker_session_destroy(&worker);
+            col_rel_destroy(src);
             cleanup_coordinator(coord, plan, prog);
             FAIL("shared view refresh");
             return 1;
         }
+        if (atomic_load_explicit(&src->source_access.state,
+            memory_order_acquire) != 1
+            || src->storage_alias_borrows != 1)
+            ok = 0;
     }
 
-    col_worker_session_destroy(&worker);
+    char *source_name = src->name;
+    uint64_t source_identity = src->relation_identity;
+    if (col_rel_destroy_checked(src) != EBUSY
+        || src->name != source_name
+        || src->relation_identity != source_identity)
+        ok = 0;
 
-    col_rel_t *coord_rel = session_find_rel(coord, "edge");
-    int ok = coord_rel && coord_rel->nrows == 4
-        && coord_rel->columns[0][0] == 1
-        && coord_rel->columns[1][3] == 5;
+    col_rel_t *next_src = col_rel_new_auto("replacement", 2);
+    int next_source_rc = next_src ? 0 : ENOMEM;
+    for (uint32_t i = 0; i < 4 && next_source_rc == 0; i++)
+        next_source_rc = col_rel_append_row(next_src, &rows[i * 2]);
+    if (next_source_rc != 0) {
+        col_rel_destroy(next_src);
+        col_worker_session_destroy(&worker);
+        col_rel_destroy(src);
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("replacement source creation");
+        return 1;
+    }
+
+    wl_columnar_source_access_writer_t writer = { 0 };
+    if (wl_columnar_source_access_writer_acquire(&next_src->source_access,
+        &writer) != 0) {
+        col_rel_destroy(next_src);
+        col_worker_session_destroy(&worker);
+        col_rel_destroy(src);
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("source writer claim");
+        return 1;
+    }
+    int64_t *old_column = worker_rel->columns[0];
+    uint32_t old_nrows = worker_rel->nrows;
+    uint64_t old_view_generation = worker_rel->view_generation;
+    if (wl_columnar_session_install_shared_view(&worker, worker_rel,
+        next_src) != EBUSY
+        || worker_rel->columns[0] != old_column
+        || worker_rel->nrows != old_nrows
+        || worker_rel->view_generation != old_view_generation
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 1
+        || src->storage_alias_borrows != 1)
+        ok = 0;
+    if (wl_columnar_source_access_writer_release(&writer) != 0)
+        ok = 0;
+
+    if (wl_columnar_session_install_shared_view(&worker, worker_rel,
+        next_src) != 0) {
+        col_worker_session_destroy(&worker);
+        col_rel_destroy(next_src);
+        col_rel_destroy(src);
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("transactional source refresh");
+        return 1;
+    }
+    if (worker_rel->columns[0] != next_src->columns[0]
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 0
+        || src->storage_alias_borrows != 0
+        || atomic_load_explicit(&next_src->source_access.state,
+        memory_order_acquire) != 1
+        || next_src->storage_alias_borrows != 1)
+        ok = 0;
+    if (col_rel_destroy_checked(src) != 0)
+        ok = 0;
+    src = NULL;
+
+    source_name = next_src->name;
+    source_identity = next_src->relation_identity;
+    if (col_rel_destroy_checked(next_src) != EBUSY
+        || next_src->name != source_name
+        || next_src->relation_identity != source_identity)
+        ok = 0;
+
+    col_worker_session_destroy(&worker);
+    if (atomic_load_explicit(&next_src->source_access.state,
+        memory_order_acquire) != 0
+        || next_src->storage_alias_borrows != 0
+        || col_rel_destroy_checked(next_src) != 0)
+        ok = 0;
 
     cleanup_coordinator(coord, plan, prog);
 
     if (!ok) {
-        FAIL("coordinator relation corrupted");
+        FAIL("source lease lifetime or retry contract");
         return 1;
     }
     PASS();
