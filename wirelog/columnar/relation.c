@@ -25,6 +25,10 @@
  * sufficient: the counter only has to hand out distinct values. */
 static wl_atomic_u64 wl_next_relation_identity = 1u;
 
+#ifdef WL_TEST_APPEND_HOOK
+wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
+#endif
+
 static int
 col_rel_new_identity(uint64_t *out)
 {
@@ -106,7 +110,16 @@ wl_columnar_relation_radix_bench_enabled(void)
 
 /* ---- COW helpers --------------------------------------------------------- */
 
-static int col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap);
+static int col_rel_grow_owned_transition_impl(col_rel_t *r,
+    uint32_t new_cap, bool defer_alias_release);
+static int col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
+    bool defer_alias_release);
+
+static int
+col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap)
+{
+    return col_rel_grow_owned_transition_impl(r, new_cap, false);
+}
 
 static void
 col_rel_storage_owner_init(col_rel_t *r)
@@ -196,6 +209,22 @@ int
 col_rel_source_reader_release(wl_columnar_source_access_reader_t *token)
 {
     return wl_columnar_source_access_reader_release(token);
+}
+
+static int
+col_rel_source_writer_acquire(const col_rel_t *rel,
+    wl_columnar_source_access_writer_t *token)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!rel || !token)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0)
+        return rc;
+    return wl_columnar_source_access_writer_acquire(
+        &owner->source_access, token);
 }
 
 /* Prepare a complete private replacement for a relation resize.  This is
@@ -455,7 +484,8 @@ col_rel_reserve_transition(const col_rel_t *r, uint32_t capacity,
  * prepared before the relation is changed, so admission or allocation
  * failure leaves the old ownership and reservation untouched. */
 static int
-col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap)
+col_rel_grow_owned_transition_impl(col_rel_t *r, uint32_t new_cap,
+    bool defer_alias_release)
 {
     wl_columnar_memory_reservation_t pending;
     int pending_rc;
@@ -513,7 +543,8 @@ col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap)
     free(old_shared_flags);
     free(old_timestamps);
     col_rel_ledger_reconcile(r, ledger_before);
-    (void)col_rel_storage_alias_release(r);
+    if (!defer_alias_release)
+        (void)col_rel_storage_alias_release(r);
     wl_columnar_relation_touch_storage(r);
     return 0;
 
@@ -538,6 +569,13 @@ col_rel_promote_arena_admitted(col_rel_t *r)
 int
 col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
 {
+    return col_rel_cow_unshare_impl(r, new_cap, false);
+}
+
+static int
+col_rel_cow_unshare_impl(col_rel_t *r, uint32_t new_cap,
+    bool defer_alias_release)
+{
     wl_columnar_memory_reservation_t pending;
     int pending_rc;
     uint64_t new_bytes;
@@ -550,7 +588,8 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
     capacity = new_cap ? new_cap : (r->capacity ? r->capacity
                                                     : COL_REL_INIT_CAP);
     if (capacity > r->capacity)
-        return col_rel_grow_owned_transition(r, capacity);
+        return col_rel_grow_owned_transition_impl(r, capacity,
+                   defer_alias_release);
     pending_rc = col_rel_reserve_transition(r, capacity, &pending,
             &new_bytes);
     if (pending_rc < 0)
@@ -596,7 +635,8 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
     }
     col_rel_ledger_reconcile(r, ledger_before);
     /* Private columns replaced the borrowed view: one storage epoch. */
-    (void)col_rel_storage_alias_release(r);
+    if (!defer_alias_release)
+        (void)col_rel_storage_alias_release(r);
     wl_columnar_relation_touch_storage(r);
     return 0;
 
@@ -1291,6 +1331,10 @@ col_rel_apply_compound_schema(col_rel_t *r,
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row)
 {
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool alias_release_pending = false;
+    int rc;
+
     if (!r || !row)
         return EINVAL;
     /* Do all structural validation before any resize, COW, or timestamp
@@ -1315,18 +1359,28 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
                 return EINVAL;
         }
     }
+
+    /* Resolve and admit the canonical storage owner only after validation,
+     * but before any resize, COW, timestamp, value, or generation mutation.
+     * A reader on an alias therefore excludes append on every view of the
+     * same backing storage. */
+    rc = col_rel_source_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+
     bool needs_resize = r->nrows >= r->capacity;
     if (needs_resize) {
         uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
         uint32_t new_cap = r->capacity ? r->capacity * 2 : COL_REL_INIT_CAP;
         if (new_cap <= r->capacity) /* overflow guard */
-            return ENOMEM;
+            goto enomem;
         if (r->col_shared || r->arena_owned) {
             /* Ownership transitions stage columns and timestamps together;
              * admission happens before any source buffer is copied and the
              * helper publishes the storage generation on success. */
-            if (col_rel_grow_owned_transition(r, new_cap) != 0)
-                return ENOMEM;
+            if (col_rel_grow_owned_transition_impl(r, new_cap, true) != 0)
+                goto enomem;
+            alias_release_pending = true;
         } else {
             /* Heap-owned growth is one transaction: admit the new footprint
              * (retained relations only), prepare private buffers, commit the
@@ -1338,11 +1392,11 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
             if (admitted) {
                 pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
                 if (pending_rc < 0)
-                    return ENOMEM;
+                    goto enomem;
                 if (!col_rel_retained_bytes(r->ncols, new_cap,
                     r->timestamps != NULL, &new_bytes)) {
                     col_rel_reservation_rollback(&pending);
-                    return ENOMEM;
+                    goto enomem;
                 }
             }
             int64_t **new_cols = NULL;
@@ -1352,7 +1406,8 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
             if (prepare_rc != 0) {
                 if (admitted)
                     col_rel_reservation_rollback(&pending);
-                return prepare_rc;
+                rc = prepare_rc;
+                goto release_writer;
             }
             if (admitted && pending_rc > 0
                 && col_rel_publish_retained_reservation(r, &pending,
@@ -1360,7 +1415,7 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
                 col_rel_reservation_rollback(&pending);
                 col_columns_free(new_cols, r->ncols);
                 free(new_ts);
-                return ENOMEM;
+                goto enomem;
             }
             col_rel_publish_resize(r, new_cols, new_ts, new_cap);
             col_rel_ledger_reconcile(r, ledger_before);
@@ -1369,14 +1424,21 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
     }
     /* A shared view can still have spare capacity.  Privatize it before the
      * in-place row write even when no capacity growth is needed. */
-    if (r->col_shared && col_rel_cow_unshare(r, 0) != 0)
-        return ENOMEM;
+    if (r->col_shared) {
+        if (col_rel_cow_unshare_impl(r, 0, true) != 0)
+            goto enomem;
+        alias_release_pending = true;
+    }
+#ifdef WL_TEST_APPEND_HOOK
+    if (alias_release_pending && wl_columnar_append_transition_hook)
+        wl_columnar_append_transition_hook(r);
+#endif
     if (r->timestamps)
         memset(&r->timestamps[r->nrows], 0, sizeof(col_delta_timestamp_t));
     /* Structural and value validation above makes this raw copy
     * non-failing; retain the check as a defensive invariant. */
     if (col_rel_row_copy_in_raw(r, r->nrows, row) != 0)
-        return EINVAL;
+        goto einval;
     if (r->column_types) {
         for (uint32_t c = 0; c < r->ncols; c++) {
             if (r->column_types[c] == WIRELOG_TYPE_FLOAT
@@ -1386,7 +1448,23 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
     }
     r->nrows++;
     wl_columnar_relation_touch_view(r);
-    return 0;
+    rc = 0;
+    goto release_writer;
+
+enomem:
+    rc = ENOMEM;
+    goto release_writer;
+einval:
+    rc = EINVAL;
+release_writer:
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(r);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 /* Copy all rows from src into dst (must have same ncols).
