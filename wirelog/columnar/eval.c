@@ -173,10 +173,12 @@ tdd_destroy_delta_slots(col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
 static void
 tdd_cleanup_workers(wl_col_session_t *coord)
 {
-    for (uint32_t w = 0; w < coord->tdd_workers_count; w++) {
-        if (coord->tdd_workers[w].coordinator != NULL)
-            col_worker_session_destroy(&coord->tdd_workers[w]);
-        memset(&coord->tdd_workers[w], 0, sizeof(wl_col_session_t));
+    for (uint32_t w = coord->tdd_workers_count; w > 0; w--) {
+        uint32_t worker_index = w - 1;
+        if (coord->tdd_workers[worker_index].coordinator != NULL)
+            col_worker_session_destroy(&coord->tdd_workers[worker_index]);
+        memset(&coord->tdd_workers[worker_index], 0,
+            sizeof(wl_col_session_t));
     }
     coord->tdd_workers_count = 0;
     coord->tdd_active_workers = 0;
@@ -1000,7 +1002,7 @@ tdd_seed_global_read_initial_deltas(const wl_plan_stratum_t *sp,
         const char *rel_name = sp->relations[ri].name;
         col_rel_t *src = session_find_rel(coord, rel_name);
 
-        for (uint32_t w = 0; w < W; w++)
+        for (uint32_t w = W; w-- > 0; )
             session_remove_rel(&coord->tdd_workers[w], dname);
 
         if (!src || src->nrows == 0)
@@ -1991,7 +1993,7 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
 {
     const char *dname = sp->relations[ri].delta_name;
 
-    for (uint32_t w = 0; w < W; w++)
+    for (uint32_t w = W; w-- > 0; )
         session_remove_rel(&coord->tdd_workers[w], dname);
 
     uint32_t total = 0, ncols = 0;
@@ -2284,7 +2286,7 @@ tdd_exchange_deltas(const wl_plan_stratum_t *sp,
         }
 
         /* Remove stale $d$ from every worker before scatter. */
-        for (uint32_t w = 0; w < W; w++)
+        for (uint32_t w = W; w-- > 0; )
             session_remove_rel(&coord->tdd_workers[w], dname);
 
         /* Issue #361: Relations without EXCHANGE ops use default col0
@@ -3356,7 +3358,7 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
         uint64_t prepare_t0 = now_ns();
 
         /* Remove stale $d$ from workers */
-        for (uint32_t w = 0; w < W; w++)
+        for (uint32_t w = W; w-- > 0; )
             session_remove_rel(&coord->tdd_workers[w], dname);
 
         /* Step 1: Union all worker deltas */
@@ -3564,7 +3566,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         const char *rel_name = sp->relations[ri].name;
         uint64_t prepare_t0 = now_ns();
 
-        for (uint32_t w = 0; w < W; w++)
+        for (uint32_t w = W; w-- > 0; )
             session_remove_rel(&coord->tdd_workers[w], dname);
 
         uint32_t total = 0, ncols = 0;
@@ -3766,7 +3768,7 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
         const char *dname = sp->relations[ri].delta_name;
         const char *rel_name = sp->relations[ri].name;
 
-        for (uint32_t w = 0; w < W; w++)
+        for (uint32_t w = W; w-- > 0; )
             session_remove_rel(&coord->tdd_workers[w], dname);
 
         uint32_t total = 0;

@@ -108,6 +108,70 @@ wl_columnar_relation_radix_bench_enabled(void)
 
 static int col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap);
 
+static void
+col_rel_storage_owner_init(col_rel_t *r)
+{
+    if (!r)
+        return;
+    r->storage_owner = r;
+    r->storage_owner_identity = r->relation_identity;
+    r->storage_owner_generation = r->storage_generation;
+    r->storage_alias_borrows = 0;
+}
+
+int
+col_rel_storage_owner_resolve(const col_rel_t *src, col_rel_t **out_owner)
+{
+    col_rel_t *owner;
+    if (!src || !out_owner)
+        return EINVAL;
+    owner = src->storage_owner;
+    if (!owner) {
+        owner = (col_rel_t *)src; /* legacy zero-initialized relation */
+        owner->storage_owner = owner;
+        owner->storage_owner_identity = owner->relation_identity;
+        owner->storage_owner_generation = owner->storage_generation;
+    }
+    if (owner->storage_owner != owner
+        || owner->storage_owner_identity != owner->relation_identity
+        || owner->storage_owner_generation == 0
+        || !wl_columnar_relation_generation_valid(
+            owner->storage_owner_generation))
+        return EINVAL;
+    if (owner != src && src->storage_owner != owner)
+        return EINVAL;
+    *out_owner = owner;
+    return 0;
+}
+
+int
+col_rel_storage_alias_release(col_rel_t *alias)
+{
+    col_rel_t *owner;
+    if (!alias || !alias->storage_owner)
+        return 0;
+    if (alias->storage_owner == alias)
+        return 0;
+    owner = alias->storage_owner;
+    if (owner->storage_owner != owner
+        || owner->storage_owner_identity != owner->relation_identity
+        || owner->storage_alias_borrows == 0
+        || alias->storage_owner_identity != owner->relation_identity)
+        return EINVAL;
+    owner->storage_alias_borrows--;
+    col_rel_storage_owner_init(alias);
+    return 0;
+}
+
+int
+col_rel_storage_owner_destroy_status(const col_rel_t *owner)
+{
+    if (!owner || owner->storage_owner != owner
+        || owner->storage_owner_identity != owner->relation_identity)
+        return EINVAL;
+    return owner->storage_alias_borrows == 0 ? 0 : EBUSY;
+}
+
 /* Prepare a complete private replacement for a relation resize.  This is
  * deliberately independent of the current ownership mode: a shared or arena
  * relation is copied into heap storage and is not changed until the caller
@@ -423,6 +487,7 @@ col_rel_grow_owned_transition(col_rel_t *r, uint32_t new_cap)
     free(old_shared_flags);
     free(old_timestamps);
     col_rel_ledger_reconcile(r, ledger_before);
+    (void)col_rel_storage_alias_release(r);
     wl_columnar_relation_touch_storage(r);
     return 0;
 
@@ -505,6 +570,7 @@ col_rel_cow_unshare(col_rel_t *r, uint32_t new_cap)
     }
     col_rel_ledger_reconcile(r, ledger_before);
     /* Private columns replaced the borrowed view: one storage epoch. */
+    (void)col_rel_storage_alias_release(r);
     wl_columnar_relation_touch_storage(r);
     return 0;
 
@@ -641,6 +707,12 @@ col_rel_free_contents(col_rel_t *r)
 {
     if (!r)
         return;
+    if (r->storage_owner == r && r->storage_alias_borrows > 0)
+        return;
+    /* Alias bookkeeping is released before the relation is zeroed.  The
+     * owner itself is not denied destruction here; #1494 wires this status
+     * into the synchronous teardown transaction. */
+    (void)col_rel_storage_alias_release(r);
     if (r->memory_governor) {
         if (r->retained_reserved_bytes > 0)
             (void)wl_columnar_memory_release(&r->retained_reservation);
@@ -690,16 +762,25 @@ col_rel_free_contents(col_rel_t *r)
  * itself.  Pool-owned structs have their memory reclaimed on pool_reset();
  * calling free() on them would corrupt the pool allocator.
  */
-void
-col_rel_destroy(col_rel_t *r)
+int
+col_rel_destroy_checked(col_rel_t *r)
 {
     if (!r)
-        return;
+        return 0;
+    if (col_rel_storage_owner_destroy_status(r) == EBUSY)
+        return EBUSY;
     bool from_pool = r->pool_owned;
     col_rel_free_contents(r); /* memset zeroes pool_owned */
     if (!from_pool)
         free(r);
     /* If pool_owned: struct memory freed on pool_reset(), skip free(). */
+    return 0;
+}
+
+void
+col_rel_destroy(col_rel_t *r)
+{
+    (void)col_rel_destroy_checked(r);
 }
 
 /*
@@ -1001,6 +1082,7 @@ col_rel_alloc(col_rel_t **out, const char *name)
     r->view_generation = 1u;
     r->storage_generation = 1u;
     r->pool_owned = false;
+    col_rel_storage_owner_init(r);
     *out = r;
     return 0;
 }
@@ -1643,6 +1725,8 @@ free_merge_buf:
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
+    col_rel_t *source_owner = NULL;
+    col_rel_t *old_owner = NULL;
     wirelog_column_type_t *shared_types = NULL;
     int64_t **shared_columns = NULL;
     bool *shared_flags = NULL;
@@ -1661,6 +1745,23 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
     bool prepared_schema_ok = false;
     int prepare_rc = ENOMEM;
     if (!dst || !src || dst == src || dst->ncols != src->ncols)
+        return EINVAL;
+    if (!dst->storage_owner)
+        col_rel_storage_owner_init(dst);
+    if (col_rel_storage_owner_resolve(src, &source_owner) != 0
+        || col_rel_storage_owner_resolve(dst, &old_owner) != 0)
+        return EINVAL;
+    /* Pool and arena owners can outlive their relation descriptors through
+     * allocator reset, so they cannot be represented by a raw owner pointer
+     * until the later allocator-lifetime unit adds a stable control block. */
+    if (source_owner->pool_owned || source_owner->arena_owned)
+        return EINVAL;
+    /* A relation with live flattened aliases cannot itself become an alias:
+     * doing so would invalidate the children's canonical owner. */
+    if (dst->storage_alias_borrows > 0 || source_owner == dst
+        || source_owner->storage_alias_borrows == UINT32_MAX)
+        return source_owner == dst ? EINVAL : EBUSY;
+    if (old_owner != dst && old_owner->storage_alias_borrows == 0)
         return EINVAL;
     /* A shared-view publication is a new epoch on the destination.  Reserve
      * the next values before replacing any buffers so exhaustion cannot leave
@@ -1793,6 +1894,12 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
         bool old_arena_owned = dst->arena_owned;
         uint64_t ledger_before = col_rel_owned_ledger_bytes(dst);
 
+        /* Ownership metadata is committed with the borrowed columns. Both
+        * counters were validated before any destination state changed. */
+        if (old_owner != dst)
+            old_owner->storage_alias_borrows--;
+        source_owner->storage_alias_borrows++;
+
         /* Commit point: all allocations and schema preparation succeeded. */
         if (!old_arena_owned && old_columns) {
             for (uint32_t c = 0; c < dst->ncols; c++)
@@ -1849,6 +1956,10 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
         memcpy(dst->run_ends, src->run_ends, sizeof(dst->run_ends));
         dst->schema = prepared_schema;
         dst->schema_ok = prepared_schema_ok;
+        dst->storage_owner = source_owner;
+        dst->storage_owner_identity = source_owner->relation_identity;
+        dst->storage_owner_generation = source_owner->storage_generation;
+        dst->storage_alias_borrows = 0;
         dst->view_generation++;
         dst->storage_generation++;
         col_rel_ledger_reconcile(dst, ledger_before);
@@ -2063,6 +2174,7 @@ col_rel_pool_new_like(delta_pool_t *pool, const char *name,
         r->relation_identity = identity;
         r->view_generation = 1u;
         r->storage_generation = 1u;
+        col_rel_storage_owner_init(r);
         r->name = wl_strdup(name);
         if (!r->name) {
             return col_rel_pool_fallback_like(pool, r, name, like);
@@ -2123,6 +2235,7 @@ col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
         r->relation_identity = identity;
         r->view_generation = 1u;
         r->storage_generation = 1u;
+        col_rel_storage_owner_init(r);
         r->name = wl_strdup(name);
         if (!r->name) {
             return col_rel_pool_fallback_auto(pool, r, name, ncols);
@@ -2274,6 +2387,7 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
     }
     dst->view_generation = src->view_generation;
     dst->storage_generation = src->storage_generation;
+    col_rel_storage_owner_init(dst);
     dst->ncols = src->ncols;
     dst->nrows = src->nrows;
     dst->capacity = src->capacity;

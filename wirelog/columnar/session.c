@@ -155,6 +155,32 @@ session_note_inserted_input(wl_col_session_t *sess, const col_rel_t *relation,
     sess->snapshot_stable_valid = false;
 }
 
+/* Shared views borrow a root relation's columns. Teardown must release the
+ * aliases before their root; otherwise the root's owner metadata would point
+ * at freed storage. A root owned by another session is left for that owner
+ * to retry after its aliases have drained. */
+static void
+session_destroy_relation_array(col_rel_t **relations, uint32_t count)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t i = 0; i < count; i++) {
+            col_rel_t *relation = relations[i];
+            bool is_alias;
+            if (!relation)
+                continue;
+            is_alias = relation->storage_owner
+                && relation->storage_owner != relation;
+            if ((pass == 0) != is_alias)
+                continue;
+            if (!is_alias
+                && col_rel_storage_owner_destroy_status(relation) == EBUSY)
+                continue;
+            col_rel_destroy(relation);
+            relations[i] = NULL;
+        }
+    }
+}
+
 int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 {
@@ -167,6 +193,10 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
             return ENOMEM;
         *heap = *r;
         heap->pool_owned = false;
+        heap->storage_owner = heap;
+        heap->storage_owner_identity = heap->relation_identity;
+        heap->storage_owner_generation = heap->storage_generation;
+        heap->storage_alias_borrows = 0;
         /* Zero out source slot so pool_reset doesn't double-free contents */
         memset(r, 0, sizeof(*r));
         pool_src = r;
@@ -187,7 +217,9 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
             if (sess->rels[i] == r)
                 return 0;
             session_invalidate_relation_caches(sess, r->name);
-            col_rel_destroy(sess->rels[i]);
+            int destroy_rc = col_rel_destroy_checked(sess->rels[i]);
+            if (destroy_rc != 0)
+                goto busy;
             sess->rels[i] = r;
             return 0;
         }
@@ -227,6 +259,18 @@ session_add_rel(wl_col_session_t *sess, col_rel_t *r)
 
     return 0;
 
+busy:
+    if (pool_src) {
+        *pool_src = *r;
+        pool_src->pool_owned = true;
+        pool_src->storage_owner = pool_src;
+        pool_src->storage_owner_identity = pool_src->relation_identity;
+        pool_src->storage_owner_generation = pool_src->storage_generation;
+        pool_src->storage_alias_borrows = 0;
+        free(r);
+    }
+    return EBUSY;
+
 oom:
     /* Undo the pool-to-heap promotion.  A failed session_add_rel leaves the
      * relation with the caller, which destroys it via col_rel_destroy(), so
@@ -241,23 +285,29 @@ oom:
     if (pool_src) {
         *pool_src = *r;
         pool_src->pool_owned = true;
+        pool_src->storage_owner = pool_src;
+        pool_src->storage_owner_identity = pool_src->relation_identity;
+        pool_src->storage_owner_generation = pool_src->storage_generation;
+        pool_src->storage_alias_borrows = 0;
         free(r);
     }
     return ENOMEM;
 }
 
-void
+int
 session_remove_rel(wl_col_session_t *sess, const char *name)
 {
     for (uint32_t i = 0; i < sess->nrels; i++) {
         if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0) {
             session_invalidate_relation_caches(sess, name);
-            col_rel_destroy(sess->rels[i]);
+            if (col_rel_destroy_checked(sess->rels[i]) != 0)
+                return EBUSY;
             sess->rels[i] = NULL;
             session_rel_free_hash(sess);
-            return;
+            return 0;
         }
     }
+    return ENOENT;
 }
 
 typedef struct wl_columnar_session_tdd_decision {
@@ -1529,10 +1579,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     return 0;
 
 oom:
-    for (uint32_t i = 0; i < sess->nrels; i++) {
-        col_rel_free_contents(sess->rels[i]);
-        free(sess->rels[i]);
-    }
+    session_destroy_relation_array(sess->rels, sess->nrels);
     free((void *)sess->rels);
     wl_workqueue_destroy(sess->wq);       /* NULL-safe */
     delta_pool_destroy(sess->delta_pool); /* NULL-safe */
@@ -1617,10 +1664,17 @@ col_session_destroy(wl_session_t *session)
      * etc.) before any of the other teardown frees them. NULL-safe. */
     if (sess->rotation_ops && sess->rotation_ops->destroy)
         sess->rotation_ops->destroy(sess);
-    for (uint32_t i = 0; i < sess->nrels; i++) {
-        col_rel_free_contents(sess->rels[i]);
-        free(sess->rels[i]);
+    /* Worker views may borrow coordinator relation storage.  Drain workers
+     * before coordinator relations so their owner borrows are released before
+     * the coordinator root is destroyed. */
+    if (sess->tdd_workers) {
+        for (uint32_t w = sess->tdd_workers_count; w > 0; w--)
+            col_worker_session_destroy(&sess->tdd_workers[w - 1]);
+        free(sess->tdd_workers);
+        sess->tdd_workers = NULL;
+        sess->tdd_workers_count = 0;
     }
+    session_destroy_relation_array(sess->rels, sess->nrels);
     free((void *)sess->rels);
     /* Free relation name hash table (Issue #281) */
     session_rel_free_hash(sess);
@@ -1674,15 +1728,6 @@ col_session_destroy(wl_session_t *session)
      * Worker sessions have progress.entries == NULL (set in col_worker_session_create)
      * so this is safe to call on both coordinator and worker sessions. */
     wl_frontier_progress_destroy(&sess->progress);
-    /* Issue #318: Free TDD worker sessions array.
-     * Workers that have been initialized (w < tdd_workers_count) are destroyed
-     * first, then the array itself is freed.  Worker sessions that were
-     * initialized via col_worker_session_create own their own arena/pool/rels. */
-    if (sess->tdd_workers) {
-        for (uint32_t w = 0; w < sess->tdd_workers_count; w++)
-            col_worker_session_destroy(&sess->tdd_workers[w]);
-        free(sess->tdd_workers);
-    }
     /* Issue #386: Free filtered relation cache */
     for (uint32_t i = 0; i < sess->filt_cache_count; i++) {
         free(sess->filt_cache[i].rel_name);
@@ -1988,12 +2033,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
     col_session_free_filt_arrangements(worker);
 
     /* Free owned relations (partition data) */
-    for (uint32_t i = 0; i < worker->nrels; i++) {
-        if (worker->rels[i]) {
-            col_rel_free_contents(worker->rels[i]);
-            free(worker->rels[i]);
-        }
-    }
+    session_destroy_relation_array(worker->rels, worker->nrels);
     free((void *)worker->rels);
 
     /* Free hash table (may have been lazily built) */
@@ -2589,8 +2629,9 @@ col_session_step(wl_session_t *session)
     for (uint32_t i = 0; i < sess->nrels;) {
         col_rel_t *r = sess->rels[i];
         if (r && strncmp(r->name, "$r$", 3) == 0) {
-            session_remove_rel(sess, r->name);
-            /* session_remove_rel shifts array, so don't increment i */
+            if (session_remove_rel(sess, r->name) != 0)
+                i++;
+            /* A successful removal leaves the same index for the next slot. */
         } else {
             i++;
         }

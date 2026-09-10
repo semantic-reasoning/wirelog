@@ -300,7 +300,7 @@ col_columns_copy_row(int64_t **dst_cols, uint32_t dst_row,
  *   - mem_ledger is also NULL on the copy (Issue #554, R-1)
  *   See wirelog/columnar/ownership_flags_design.md for the full rationale.
  */
-typedef struct {
+typedef struct col_rel {
     char *name;                /* owned, null-terminated                */
     uint32_t ncols;            /* columns per tuple (0 = unset)         */
     int64_t **columns;         /* owned, column-major: columns[col][row] */
@@ -477,6 +477,17 @@ typedef struct {
     uint64_t relation_identity;
     uint64_t view_generation;
     uint64_t storage_generation;
+
+    /* Source-storage ownership for zero-copy shared views (Issue #1493).
+     * Shared views canonicalize this pointer to the ultimate relation that
+     * owns the borrowed column buffers.  Alias chains are never persisted:
+     * an alias has storage_alias_borrows == 0, while the root counts its
+     * direct and flattened aliases.  The gate is intentionally not wired to
+     * production mutation/teardown until the later lifecycle units. */
+    struct col_rel *storage_owner;
+    uint64_t storage_owner_identity;
+    uint64_t storage_owner_generation;
+    uint32_t storage_alias_borrows;
 } col_rel_t;
 
 /* MSVC in its default C mode neither defines __STDC_VERSION__ >= 201112L
@@ -568,9 +579,12 @@ wl_columnar_relation_touch_view(col_rel_t *rel)
 static inline void
 wl_columnar_relation_touch_storage(col_rel_t *rel)
 {
-    if (rel)
+    if (rel) {
         (void)wl_columnar_relation_generation_advance(
             &rel->storage_generation);
+        if (!rel->storage_owner || rel->storage_owner == rel)
+            rel->storage_owner_generation = rel->storage_generation;
+    }
 }
 
 static inline void
@@ -1836,6 +1850,8 @@ col_rel_ledger_release(col_rel_t *r);
 void
 col_rel_destroy(col_rel_t *r);
 int
+col_rel_destroy_checked(col_rel_t *r);
+int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names);
 int
 col_rel_set_column_types(col_rel_t *r,
@@ -2079,6 +2095,14 @@ col_rel_compact(col_rel_t *r);
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src);
 
+/* Source-storage ownership helpers (Issue #1493).  These are internal
+ * bookkeeping operations; caller exclusion and public teardown remain the
+ * responsibility of the follow-up lifecycle units. */
+int col_rel_storage_owner_resolve(const col_rel_t *src,
+    col_rel_t **out_owner);
+int col_rel_storage_alias_release(col_rel_t *alias);
+int col_rel_storage_owner_destroy_status(const col_rel_t *owner);
+
 /* Test seam for the non-wrapping relation identity allocator. */
 int
 col_rel_test_set_next_identity(uint64_t next);
@@ -2214,7 +2238,7 @@ col_rel_t *
 session_find_rel(wl_col_session_t *sess, const char *name);
 int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r);
-void
+int
 session_remove_rel(wl_col_session_t *sess, const char *name);
 
 /* ======================================================================== */
