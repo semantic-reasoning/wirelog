@@ -344,7 +344,83 @@ test_total_bytes_accounting(void)
 }
 
 /* ================================================================
- * Test 5: pinned arrangements defer invalidation until the lease ends
+ * Test 5: registry growth moves live governor reservations
+ * ================================================================ */
+static void
+test_registry_growth_moves_reservations(void)
+{
+    TEST("registry growth preserves reservation identity and accounting");
+
+    const char *src = ".decl edge(a:int32,b:int32,c:int32,d:int32,"
+        "e:int32,f:int32,g:int32,h:int32,i:int32,j:int32)\n"
+        "edge(1,2,3,4,5,6,7,8,9,10).\n"
+        ".decl path(a:int32,b:int32)\n"
+        "path(a,b) :- edge(a,b).\n";
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *cs;
+    wl_columnar_memory_governor_t *governor;
+    wl_columnar_memory_governor_ref_t *governor_ref;
+    col_rel_t *rel;
+
+    setenv("WIRELOG_MEMORY_BUDGET", "268435456", 1);
+    ASSERT(make_session(src, &sess, &plan, &prog) == 0,
+        "session setup failed");
+    cs = COL_SESSION(sess);
+    governor_ref = cs->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor_ref);
+    governor = wl_columnar_memory_governor_ref_get(cs->memory_governor);
+    rel = session_find_rel(cs, "edge");
+    ASSERT(rel != NULL, "source relation missing");
+    for (uint32_t key = 0; key < 9; key++) {
+        uint32_t key_col = key;
+        ASSERT(col_session_get_arrangement(sess, "edge", &key_col, 1)
+            != NULL, "arrangement build failed");
+    }
+    ASSERT(cs->arr_cap >= 16 && cs->arr_count == 9,
+        "primary registry did not grow");
+    for (uint32_t i = 0; i < cs->arr_count; i++) {
+        wl_columnar_memory_reservation_t *reservation
+            = &cs->arr_entries[i].arr.reservation;
+        uint64_t state = atomic_load_explicit(&reservation->state,
+                memory_order_acquire);
+        ASSERT(reservation->identity == reservation,
+            "grown entry has stale reservation identity");
+        ASSERT(state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+            "grown entry lost committed reservation");
+    }
+    ASSERT(wl_columnar_memory_reserved(governor) > 0,
+        "governor lost arrangement reservation");
+    for (uint32_t key = 0; key < 5; key++) {
+        uint32_t key_col = key;
+        ASSERT(col_session_get_delta_arrangement(cs, "edge", rel,
+            &key_col, 1) != NULL, "delta arrangement build failed");
+        ASSERT(col_session_get_filt_arrangement(cs, "edge", key + 1, rel,
+            &key_col, 1) != NULL, "filtered arrangement build failed");
+    }
+    ASSERT(cs->darr_cap >= 8 && cs->darr_count == 5,
+        "delta registry did not grow");
+    ASSERT(cs->filt_arr_cap >= 8 && cs->filt_arr_count == 5,
+        "filtered registry did not grow");
+    for (uint32_t i = 0; i < cs->darr_count; i++)
+        ASSERT(cs->darr_entries[i].arr.reservation.identity
+            == &cs->darr_entries[i].arr.reservation,
+            "grown delta entry has stale reservation identity");
+    for (uint32_t i = 0; i < cs->filt_arr_count; i++)
+        ASSERT(cs->filt_arr_entries[i].arr.reservation.identity
+            == &cs->filt_arr_entries[i].arr.reservation,
+            "grown filtered entry has stale reservation identity");
+    free_session(sess, plan, prog);
+    ASSERT(wl_columnar_memory_reserved(governor) == 0,
+        "session destruction leaked registry reservations");
+    wl_columnar_memory_governor_ref_release(governor_ref);
+    unsetenv("WIRELOG_MEMORY_BUDGET");
+    PASS();
+}
+
+/* ================================================================
+ * Test 6: pinned arrangements defer invalidation until the lease ends
  * ================================================================ */
 static void
 test_pinned_invalidation(void)
@@ -761,6 +837,7 @@ main(void)
     test_tombstone_reuse_failure(true);
     test_append_failure_rolls_back();
     test_total_bytes_accounting();
+    test_registry_growth_moves_reservations();
     test_pinned_invalidation();
     for (unsigned scenario = 0; scenario < 8; scenario++)
         test_pinned_rebuild(scenario);

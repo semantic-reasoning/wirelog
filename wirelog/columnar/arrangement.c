@@ -240,19 +240,167 @@ arr_reserve_bytes(col_arrangement_t *arr, uint64_t bytes,
     return true;
 }
 
-static void
+static bool
 arr_publish_reservation(col_arrangement_t *arr,
     wl_columnar_memory_reservation_t *pending, uint64_t bytes)
 {
     if (!arr || !arr->memory_governor)
-        return;
+        return true;
     if (bytes == arr->reserved_bytes) {
-        (void)wl_columnar_memory_release(pending);
-        return;
+        return wl_columnar_memory_release(pending);
     }
-    (void)wl_columnar_memory_release(&arr->reservation);
-    (void)wl_columnar_memory_reservation_move(&arr->reservation, pending);
+    wl_columnar_memory_reservation_t previous;
+    wl_columnar_memory_reservation_init(&previous);
+    uint64_t old_state = atomic_load_explicit(&arr->reservation.state,
+            memory_order_acquire);
+    bool old_active = old_state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || old_state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
+    if (old_active
+        && !wl_columnar_memory_reservation_move(&previous,
+        &arr->reservation)) {
+        (void)wl_columnar_memory_release(pending);
+        return false;
+    }
+    if (!wl_columnar_memory_reservation_move(&arr->reservation, pending)) {
+        (void)wl_columnar_memory_release(pending);
+        if (old_active)
+            (void)wl_columnar_memory_reservation_move(&arr->reservation,
+                &previous);
+        return false;
+    }
+    if (old_active && !wl_columnar_memory_release(&previous)) {
+        wl_columnar_memory_reservation_t replacement;
+        wl_columnar_memory_reservation_init(&replacement);
+        (void)wl_columnar_memory_reservation_move(&replacement,
+            &arr->reservation);
+        (void)wl_columnar_memory_reservation_move(&arr->reservation,
+            &previous);
+        (void)wl_columnar_memory_release(&replacement);
+        return false;
+    }
     arr->reserved_bytes = bytes;
+    return true;
+}
+
+/* Registry entries embed non-copyable reservation tokens.  A flat-array
+ * relocation must move each token deliberately; realloc would leave identity
+ * pointing into the old array and lose accounting. */
+static bool
+arr_entry_relocate(col_arr_entry_t *dst, col_arr_entry_t *src)
+{
+    uint64_t state = atomic_load_explicit(&src->arr.reservation.state,
+            memory_order_acquire);
+    if (src->arr.reservation.identity != &src->arr.reservation)
+        return false;
+    memcpy(dst, src, sizeof(*dst));
+    wl_columnar_memory_reservation_init(&dst->arr.reservation);
+    dst->arr.key_cols = dst->key_cols;
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+        return true;
+    if (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        return false;
+    if (!wl_columnar_memory_reservation_move(&dst->arr.reservation,
+        &src->arr.reservation))
+        return false;
+    state = atomic_load_explicit(&dst->arr.reservation.state,
+            memory_order_acquire);
+    if ((state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        && !wl_columnar_memory_transfer(&dst->arr.reservation, &dst->arr)) {
+        (void)wl_columnar_memory_reservation_move(
+            &src->arr.reservation, &dst->arr.reservation);
+        return false;
+    }
+    return true;
+}
+
+static bool
+filt_arr_entry_relocate(col_filt_arr_entry_t *dst, col_filt_arr_entry_t *src)
+{
+    uint64_t state = atomic_load_explicit(&src->arr.reservation.state,
+            memory_order_acquire);
+    if (src->arr.reservation.identity != &src->arr.reservation)
+        return false;
+    memcpy(dst, src, sizeof(*dst));
+    wl_columnar_memory_reservation_init(&dst->arr.reservation);
+    dst->arr.key_cols = dst->key_cols;
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+        return true;
+    if (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        return false;
+    if (!wl_columnar_memory_reservation_move(&dst->arr.reservation,
+        &src->arr.reservation))
+        return false;
+    state = atomic_load_explicit(&dst->arr.reservation.state,
+            memory_order_acquire);
+    if ((state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        && !wl_columnar_memory_transfer(&dst->arr.reservation, &dst->arr)) {
+        (void)wl_columnar_memory_reservation_move(
+            &src->arr.reservation, &dst->arr.reservation);
+        return false;
+    }
+    return true;
+}
+
+static bool
+arr_entries_grow(col_arr_entry_t **entries, uint32_t *capacity,
+    uint32_t count, uint32_t new_capacity)
+{
+    col_arr_entry_t *old = *entries;
+    col_arr_entry_t *grown = (col_arr_entry_t *)calloc(new_capacity,
+            sizeof(*grown));
+    if (!grown)
+        return false;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!arr_entry_relocate(&grown[i], &old[i])) {
+            for (uint32_t j = 0; j < i; j++) {
+                if (wl_columnar_memory_reservation_move(
+                        &old[j].arr.reservation,
+                        &grown[j].arr.reservation))
+                    (void)wl_columnar_memory_transfer(
+                        &old[j].arr.reservation, &old[j].arr);
+            }
+            free(grown);
+            return false;
+        }
+    }
+    free(old);
+    *entries = grown;
+    *capacity = new_capacity;
+    return true;
+}
+
+static bool
+filt_arr_entries_grow(col_filt_arr_entry_t **entries, uint32_t *capacity,
+    uint32_t count, uint32_t new_capacity)
+{
+    col_filt_arr_entry_t *old = *entries;
+    col_filt_arr_entry_t *grown = (col_filt_arr_entry_t *)calloc(new_capacity,
+            sizeof(*grown));
+    if (!grown)
+        return false;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!filt_arr_entry_relocate(&grown[i], &old[i])) {
+            for (uint32_t j = 0; j < i; j++) {
+                if (wl_columnar_memory_reservation_move(
+                        &old[j].arr.reservation,
+                        &grown[j].arr.reservation))
+                    (void)wl_columnar_memory_transfer(
+                        &old[j].arr.reservation, &old[j].arr);
+            }
+            free(grown);
+            return false;
+        }
+    }
+    free(old);
+    *entries = grown;
+    *capacity = new_capacity;
+    return true;
 }
 
 /*
@@ -602,8 +750,11 @@ arr_build_full_impl(col_arrangement_t *arr, const col_rel_t *rel)
         arr->ht_next = new_next;
         arr->ht_cap = new_cap;
     }
-    if (pending_valid)
-        arr_publish_reservation(arr, &pending, prospective_bytes);
+    if (pending_valid
+        && !arr_publish_reservation(arr, &pending, prospective_bytes)) {
+        arr_free_contents(arr);
+        return ENOMEM;
+    }
 
     /* Start a new epoch.  Only wraparound needs a full clear; normal rebuilds
      * lazily replace each bucket head as that bucket receives its first row. */
@@ -697,8 +848,11 @@ arr_update_incremental_impl(col_arrangement_t *arr, const col_rel_t *rel,
         free(arr->ht_next);
         arr->ht_next = nxt;
         arr->ht_cap = new_cap;
-        if (pending_valid)
-            arr_publish_reservation(arr, &pending, target_bytes);
+        if (pending_valid
+            && !arr_publish_reservation(arr, &pending, target_bytes)) {
+            arr_free_contents(arr);
+            return ENOMEM;
+        }
     }
 
     uint32_t nb = arr->nbuckets;
@@ -915,12 +1069,9 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
                 return NULL;
         }
         uint32_t new_cap = cs->arr_cap ? cs->arr_cap * 2u : 8u;
-        col_arr_entry_t *ne = (col_arr_entry_t *)realloc(
-            cs->arr_entries, new_cap * sizeof(col_arr_entry_t));
-        if (!ne)
+        if (!arr_entries_grow(&cs->arr_entries, &cs->arr_cap,
+            cs->arr_count, new_cap))
             return NULL;
-        cs->arr_entries = ne;
-        cs->arr_cap = new_cap;
     }
 
     /* Issue #1515: take every allocation that can fail before disturbing
@@ -1235,12 +1386,9 @@ col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
     /* Not found: grow cache and create new entry. */
     if (cs->darr_count >= cs->darr_cap) {
         uint32_t new_cap = cs->darr_cap ? cs->darr_cap * 2u : 4u;
-        col_arr_entry_t *ne = (col_arr_entry_t *)realloc(
-            cs->darr_entries, new_cap * sizeof(col_arr_entry_t));
-        if (!ne)
+        if (!arr_entries_grow(&cs->darr_entries, &cs->darr_cap,
+            cs->darr_count, new_cap))
             return NULL;
-        cs->darr_entries = ne;
-        cs->darr_cap = new_cap;
     }
 
     col_arr_entry_t *e = &cs->darr_entries[cs->darr_count];
@@ -1357,12 +1505,9 @@ col_session_get_filt_arrangement(wl_col_session_t *cs, const char *rel_name,
     /* Not found: grow cache and create new entry. */
     if (cs->filt_arr_count >= cs->filt_arr_cap) {
         uint32_t new_cap = cs->filt_arr_cap ? cs->filt_arr_cap * 2u : 4u;
-        col_filt_arr_entry_t *ne = (col_filt_arr_entry_t *)realloc(
-            cs->filt_arr_entries, new_cap * sizeof(col_filt_arr_entry_t));
-        if (!ne)
+        if (!filt_arr_entries_grow(&cs->filt_arr_entries,
+            &cs->filt_arr_cap, cs->filt_arr_count, new_cap))
             return NULL;
-        cs->filt_arr_entries = ne;
-        cs->filt_arr_cap = new_cap;
     }
 
     col_filt_arr_entry_t *e = &cs->filt_arr_entries[cs->filt_arr_count];
