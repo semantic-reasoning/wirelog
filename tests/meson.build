@@ -772,6 +772,13 @@ test('shell_gate_timeouts_selftest', py3,
      env: ['WIRELOG_SHELL_GATE_BUILD=' + meson.project_build_root()],
      suite: 'abi')
 
+# Issue #1464: the pre-commit hook installer must never leave an empty,
+# non-executable hook behind on a console whose locale cannot encode its
+# output; meson.build runs it with check: false, so only a test can see that.
+test('uncrustify_hook_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-setup-uncrustify-hook.py'],
+     suite: 'abi')
+
 test('version_sync', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-version-sync.py',
             meson.project_build_root() / 'wirelog'],

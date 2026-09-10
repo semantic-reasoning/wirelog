@@ -86,13 +86,13 @@ for file in $STAGED_FILES; do
         if ! diff -q "$file" /tmp/uncrustify_formatted.tmp > /dev/null 2>&1; then
             # Apply formatted version
             cp /tmp/uncrustify_formatted.tmp "$file"
-            echo "  ✓ $file - formatted and re-staged"
+            echo "  ok $file - formatted and re-staged"
 
             # Re-stage the formatted file
             git add "$file"
             FORMATTED_FILES=$((FORMATTED_FILES + 1))
         else
-            echo "  ✓ $file"
+            echo "  ok $file"
         fi
     fi
 done
@@ -119,7 +119,7 @@ def setup_pre_commit_hook(git_root):
 
     # Check if hook already exists
     if pre_commit_hook.exists():
-        with open(pre_commit_hook, "r") as f:
+        with open(pre_commit_hook, "r", encoding="utf-8") as f:
             existing_content = f.read()
 
         # Check if uncrustify check is already present
@@ -128,7 +128,11 @@ def setup_pre_commit_hook(git_root):
 
     # Write or overwrite hook
     try:
-        with open(pre_commit_hook, "w") as f:
+        # Issue #1464: the hook body is written with an explicit encoding.
+        # Without it a console whose locale codec cannot encode the body
+        # (cp949 on Windows) truncated the file to zero bytes and left a
+        # non-executable hook that broke every commit.
+        with open(pre_commit_hook, "w", encoding="utf-8") as f:
             f.write(hook_content)
 
         # Make executable
@@ -150,14 +154,14 @@ def install_uncrustify():
     try:
         if system == "Darwin":  # macOS
             subprocess.run(["brew", "install", "uncrustify"], check=True)
-            print("✓ uncrustify installed via Homebrew")
+            print("OK: uncrustify installed via Homebrew")
             return True
 
         elif system == "Windows":
             # Try Chocolatey first
             try:
                 subprocess.run(["choco", "install", "-y", "uncrustify"], check=True, timeout=60)
-                print("✓ uncrustify installed via Chocolatey")
+                print("OK: uncrustify installed via Chocolatey")
                 return True
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
@@ -165,12 +169,12 @@ def install_uncrustify():
             # Try Scoop
             try:
                 subprocess.run(["scoop", "install", "uncrustify"], check=True, timeout=60)
-                print("✓ uncrustify installed via Scoop")
+                print("OK: uncrustify installed via Scoop")
                 return True
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
 
-            print("✗ Could not auto-install on Windows. Please install manually:")
+            print("FAIL: Could not auto-install on Windows. Please install manually:")
             print("  Chocolatey: choco install uncrustify")
             print("  Scoop:      scoop install uncrustify")
             print("  Or download from: https://sourceforge.net/projects/uncrustify/files/")
@@ -181,7 +185,7 @@ def install_uncrustify():
             try:
                 subprocess.run(["sudo", "apt-get", "update"], check=True, timeout=30)
                 subprocess.run(["sudo", "apt-get", "install", "-y", "uncrustify"], check=True, timeout=60)
-                print("✓ uncrustify installed via apt")
+                print("OK: uncrustify installed via apt")
                 return True
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
@@ -189,7 +193,7 @@ def install_uncrustify():
             # Try pacman (Arch)
             try:
                 subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "uncrustify"], check=True, timeout=60)
-                print("✓ uncrustify installed via pacman")
+                print("OK: uncrustify installed via pacman")
                 return True
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
@@ -197,7 +201,7 @@ def install_uncrustify():
             # Try dnf (Fedora/RHEL)
             try:
                 subprocess.run(["sudo", "dnf", "install", "-y", "uncrustify"], check=True, timeout=60)
-                print("✓ uncrustify installed via dnf")
+                print("OK: uncrustify installed via dnf")
                 return True
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
@@ -205,12 +209,12 @@ def install_uncrustify():
             # Try apk (Alpine)
             try:
                 subprocess.run(["sudo", "apk", "add", "uncrustify"], check=True, timeout=60)
-                print("✓ uncrustify installed via apk")
+                print("OK: uncrustify installed via apk")
                 return True
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
 
-            print("✗ Could not auto-install on Linux. Please install manually:")
+            print("FAIL: Could not auto-install on Linux. Please install manually:")
             print("  Debian/Ubuntu: sudo apt-get install uncrustify")
             print("  Arch:          sudo pacman -S uncrustify")
             print("  Fedora/RHEL:   sudo dnf install uncrustify")
@@ -218,12 +222,12 @@ def install_uncrustify():
             return False
 
         else:
-            print(f"✗ Unsupported platform: {system}")
+            print(f"FAIL: Unsupported platform: {system}")
             print("Please install uncrustify manually for your platform")
             return False
 
     except Exception as e:
-        print(f"✗ Failed to install uncrustify: {str(e)}")
+        print(f"FAIL: Failed to install uncrustify: {str(e)}")
         return False
 
 
@@ -238,7 +242,7 @@ def main():
     # Check if uncrustify is installed
     print("Checking for uncrustify installation...")
     if not check_uncrustify_installed():
-        print("✗ uncrustify is NOT installed\n")
+        print("FAIL: uncrustify is NOT installed\n")
 
         # Try to install
         if not install_uncrustify():
@@ -253,19 +257,19 @@ def main():
 
         # Verify installation
         if not check_uncrustify_installed():
-            print("✗ Installation verification failed. Please try manual installation.")
+            print("FAIL: Installation verification failed. Please try manual installation.")
             return 1
 
-    print("✓ uncrustify is installed")
+    print("OK: uncrustify is installed")
 
     # Setup pre-commit hook
     success, message = setup_pre_commit_hook(git_root)
-    print(f"{'✓' if success else '✗'} {message}")
+    print(f"{'OK' if success else 'FAIL'} {message}")
 
     if not success:
         return 1
 
-    print("\n✓ Setup complete!")
+    print("\nOK: Setup complete!")
     print("The pre-commit hook will automatically format C files on commit.")
 
     return 0
