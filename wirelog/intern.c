@@ -48,6 +48,11 @@
  * wl_intern_create() and wl_intern_free() are not concurrent with
  * anything: the table is created before workers start and destroyed
  * after they join.
+ *
+ * The per-put cost of the writer lock and of the governor admission
+ * (Issue #1431) is measured by bench/bench_intern.c; the baseline numbers
+ * live in docs/INTERN_PERF.md (Issue #1472).  Re-run the bench before
+ * moving work into or out of the locked region.
  */
 
 #include "intern.h"
