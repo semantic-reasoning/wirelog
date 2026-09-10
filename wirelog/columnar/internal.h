@@ -1219,6 +1219,20 @@ typedef struct {
     bool active;
 } col_arrangement_pin_t;
 
+/* Allocation-free, address-bound lease for probing one primary arrangement
+ * against the exact source relation used to validate it.  This primitive is
+ * intentionally not wired into JOIN yet; #1496 activates consumers only
+ * after their complete dependency set can be acquired transactionally. */
+typedef struct {
+    col_arrangement_pin_t arrangement_pin;
+    col_arrangement_t *arr;
+    const col_rel_t *source;
+    col_relation_snapshot_t source_snapshot;
+    wl_columnar_source_access_reader_t source_reader;
+    uintptr_t identity;
+    bool active;
+} col_arrangement_probe_t;
+
 /*
  * col_sorted_arr_t: cached sorted copy of a relation by a single key column.
  *
@@ -1881,6 +1895,15 @@ col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     col_arrangement_pin_t *pin);
 void
 col_arrangement_pin_release(col_arrangement_pin_t *pin);
+/* Bind an already-built primary arrangement to its exact current source.
+ * EBUSY means the source is write-locked, replaced, or generation-stale;
+ * callers may retry after the conflicting operation finishes. */
+int
+col_session_acquire_arrangement_probe(wl_session_t *sess,
+    col_arrangement_t *arr, const col_rel_t *source,
+    col_arrangement_probe_t *probe);
+int
+col_arrangement_probe_release(col_arrangement_probe_t *probe);
 int
 col_rel_alloc(col_rel_t **out, const char *name);
 int

@@ -1,0 +1,195 @@
+/* Bound primary-arrangement probe lease contract tests (Issue #1496). */
+
+#include "../wirelog/columnar/columnar_nanoarrow.h"
+#include "../wirelog/columnar/internal.h"
+#include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/passes/fusion.h"
+#include "../wirelog/passes/jpp.h"
+#include "../wirelog/passes/sip.h"
+#include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
+#include "../wirelog/thread.h"
+#include "../wirelog/wirelog.h"
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static int failures;
+
+#define CHECK(condition, message) do { \
+            if (!(condition)) { \
+                fprintf(stderr, "FAIL: %s\n", (message)); \
+                failures++; \
+            } \
+} while (0)
+
+static void
+noop_cb(const char *relation, const int64_t *row, uint32_t ncols, void *user)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)user;
+}
+
+static int
+make_session(wl_session_t **out_session, wl_plan_t **out_plan,
+    wirelog_program_t **out_program)
+{
+    static const char source[] =
+        ".decl edge(x: int32, y: int32)\n"
+        "edge(1, 2). edge(3, 4).\n"
+        ".decl path(x: int32, y: int32)\n"
+        "path(x, y) :- edge(x, y).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+
+    if (!program)
+        return EINVAL;
+    wl_fusion_apply(program, NULL);
+    wl_jpp_apply(program, NULL);
+    wl_sip_apply(program, NULL);
+    if (wl_plan_from_program(program, &plan) != 0
+        || wl_session_create(wl_backend_columnar(), plan, 1, &session) != 0
+        || wl_session_load_facts(session, program) != 0
+        || wl_session_snapshot(session, noop_cb, NULL) != 0) {
+        if (session)
+            wl_session_destroy(session);
+        if (plan)
+            wl_plan_free(plan);
+        wirelog_program_free(program);
+        return EINVAL;
+    }
+    *out_session = session;
+    *out_plan = plan;
+    *out_program = program;
+    return 0;
+}
+
+static col_arr_entry_t *
+find_entry(wl_col_session_t *session, const col_arrangement_t *arr)
+{
+    for (uint32_t i = 0; i < session->arr_count; i++) {
+        if (&session->arr_entries[i].arr == arr)
+            return &session->arr_entries[i];
+    }
+    return NULL;
+}
+
+struct release_probe_arg {
+    col_arrangement_probe_t *probe;
+    int rc;
+};
+
+static void *
+release_probe_from_other_thread(void *opaque)
+{
+    struct release_probe_arg *arg = opaque;
+    arg->rc = col_arrangement_probe_release(arg->probe);
+    return NULL;
+}
+
+int
+main(void)
+{
+    wl_session_t *session = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    col_rel_t *same_name = NULL;
+    col_arrangement_probe_t probe = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    struct release_probe_arg release_arg = { &probe, 0 };
+    thread_t release_thread;
+    uint32_t key_cols[] = { 0 };
+
+    CHECK(make_session(&session, &plan, &program) == 0,
+        "session setup");
+    if (!session)
+        return 1;
+
+    wl_col_session_t *col_session = COL_SESSION(session);
+    col_rel_t *source = session_find_rel(col_session, "edge");
+    col_arrangement_t *arr = col_session_get_arrangement(session, "edge",
+            key_cols, 1);
+    col_arr_entry_t *entry = find_entry(col_session, arr);
+    CHECK(source && arr && entry, "source arrangement setup");
+    if (!source || !arr || !entry)
+        goto cleanup;
+
+    uint64_t acquire_clock = entry->lru_clock;
+    CHECK(col_session_acquire_arrangement_probe(session, arr, source,
+        &probe) == 0, "successful probe acquire");
+    CHECK(probe.active && probe.identity == (uintptr_t)&probe
+        && probe.arr == arr && probe.source == source
+        && probe.arrangement_pin.active && entry->pin_count == 1
+        && wl_columnar_relation_snapshot_equal(probe.source_snapshot,
+        wl_columnar_relation_snapshot(source)),
+        "probe binds exact arrangement, source, and generation");
+    CHECK(entry->lru_clock == acquire_clock,
+        "exact-entry acquire does not re-enter name-based getter");
+    CHECK(atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) == 1, "probe holds one source reader");
+    CHECK(thread_create(&release_thread, release_probe_from_other_thread,
+        &release_arg) == 0, "wrong-thread release setup");
+    CHECK(thread_join(&release_thread) == 0 && release_arg.rc == EINVAL,
+        "wrong-thread release is rejected");
+    CHECK(probe.active && probe.arrangement_pin.active
+        && entry->pin_count == 1
+        && atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) == 1,
+        "wrong-thread release retains both leases");
+    CHECK(col_arrangement_probe_release(&probe) == 0,
+        "successful probe release");
+    CHECK(!probe.active && entry->pin_count == 0
+        && atomic_load_explicit(&source->source_access.state,
+        memory_order_acquire) == 0, "release balances both leases");
+    CHECK(col_arrangement_probe_release(&probe) == EINVAL,
+        "double release is rejected");
+
+    CHECK(col_rel_alloc(&same_name, "edge") == 0,
+        "same-name relation setup");
+    CHECK(col_session_acquire_arrangement_probe(session, arr, same_name,
+        &probe) == EBUSY, "same-name relation cannot replace exact source");
+    CHECK(!probe.active && entry->pin_count == 0
+        && atomic_load_explicit(&same_name->source_access.state,
+        memory_order_acquire) == 0,
+        "identity rejection leaves both sources unleased");
+
+    col_arrangement_t saved_arr = *arr;
+    col_relation_snapshot_t saved_snapshot = entry->source_snapshot;
+    uint64_t saved_clock = entry->lru_clock;
+    CHECK(wl_columnar_source_access_writer_acquire(&source->source_access,
+        &writer) == 0, "source writer setup");
+    CHECK(col_session_acquire_arrangement_probe(session, arr, source,
+        &probe) == EBUSY, "source writer EBUSY is propagated");
+    CHECK(!probe.active && entry->pin_count == 0
+        && entry->lru_clock == saved_clock
+        && arr->ht_head == saved_arr.ht_head
+        && arr->ht_next == saved_arr.ht_next
+        && arr->nbuckets == saved_arr.nbuckets
+        && arr->indexed_rows == saved_arr.indexed_rows
+        && arr->generation == saved_arr.generation
+        && wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        saved_snapshot), "EBUSY preserves arrangement and lease state");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "source writer release");
+
+cleanup:
+    if (probe.active)
+        (void)col_arrangement_probe_release(&probe);
+    if (writer.owner)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    if (same_name)
+        (void)col_rel_destroy_checked(same_name);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    if (failures != 0)
+        return 1;
+    puts("arrangement_probe: OK");
+    return 0;
+}

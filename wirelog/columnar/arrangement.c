@@ -1163,6 +1163,23 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
     return &e->arr;
 }
 
+static int
+col_arrangement_pin_entry(wl_col_session_t *session, col_arr_entry_t *entry,
+    col_arrangement_t *arr, col_arrangement_pin_t *pin)
+{
+    if (!session || !entry || !arr || !pin || &entry->arr != arr)
+        return EINVAL;
+    memset(pin, 0, sizeof(*pin));
+    if (entry->pin_count == UINT32_MAX)
+        return EOVERFLOW;
+    entry->pin_count++;
+    pin->entry = entry;
+    pin->arr = arr;
+    pin->session = session;
+    pin->active = true;
+    return 0;
+}
+
 int
 col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count, col_arrangement_pin_t *pin)
@@ -1179,11 +1196,92 @@ col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     entry = col_arr_entry_for_arr(COL_SESSION(sess), arr);
     if (!entry)
         return EINVAL;
-    entry->pin_count++;
-    pin->entry = entry;
-    pin->arr = arr;
-    pin->session = COL_SESSION(sess);
-    pin->active = true;
+    return col_arrangement_pin_entry(COL_SESSION(sess), entry, arr, pin);
+}
+
+static bool
+col_session_has_exact_relation(const wl_col_session_t *session,
+    const col_rel_t *source, const char *name)
+{
+    if (!session || !source || !name)
+        return false;
+    for (uint32_t i = 0; i < session->nrels; i++) {
+        const col_rel_t *candidate = session->rels[i];
+        if (candidate && candidate->name
+            && strcmp(candidate->name, name) == 0)
+            return candidate == source;
+    }
+    return false;
+}
+
+int
+col_session_acquire_arrangement_probe(wl_session_t *sess,
+    col_arrangement_t *arr, const col_rel_t *source,
+    col_arrangement_probe_t *probe)
+{
+    col_relation_snapshot_t snapshot;
+    col_arr_entry_t *entry;
+    wl_col_session_t *session;
+    int rc;
+
+    if (!sess || !arr || !source || !probe || probe->active
+        || probe->identity != 0 || probe->arr || probe->source
+        || probe->arrangement_pin.active || probe->source_reader.owner)
+        return EINVAL;
+    session = COL_SESSION(sess);
+    entry = col_arr_entry_for_arr(session, arr);
+    snapshot = wl_columnar_relation_snapshot(source);
+    if (!entry || !source->name || !entry->rel_name
+        || strcmp(entry->rel_name, source->name) != 0)
+        return EINVAL;
+    if (!col_session_has_exact_relation(session, source, entry->rel_name)
+        || !wl_columnar_relation_snapshot_valid(snapshot)
+        || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        snapshot) || arr_entry_unbuilt(entry) || entry->rebuild_deferred)
+        return EBUSY;
+
+    rc = col_rel_source_reader_acquire(source, &probe->source_reader);
+    if (rc != 0)
+        return rc;
+
+    /* Admission freezes source storage, but identity and registry membership
+     * are checked again so a future concurrent session registry cannot turn
+     * this exact-source API back into a name-only lookup. */
+    if (!col_session_has_exact_relation(session, source, entry->rel_name)
+        || col_arr_entry_for_arr(session, arr) != entry
+        || !wl_columnar_relation_snapshot_equal(
+            wl_columnar_relation_snapshot(source), snapshot)
+        || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        snapshot)) {
+        rc = col_rel_source_reader_release(&probe->source_reader);
+        return rc == 0 ? EBUSY : rc;
+    }
+
+    /* Pin the exact entry already validated under source admission.  Calling
+     * the name-based getter here could rebuild, relocate, or otherwise mutate
+     * registry state before a replacement race is rejected. */
+    rc = col_arrangement_pin_entry(session, entry, arr,
+            &probe->arrangement_pin);
+    if (rc != 0) {
+        int release_rc
+            = col_rel_source_reader_release(&probe->source_reader);
+        return release_rc == 0 ? rc : release_rc;
+    }
+    if (probe->arrangement_pin.arr != arr
+        || probe->arrangement_pin.entry != entry
+        || !col_session_has_exact_relation(session, source, entry->rel_name)
+        || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        snapshot)) {
+        col_arrangement_pin_release(&probe->arrangement_pin);
+        rc = col_rel_source_reader_release(&probe->source_reader);
+        return rc == 0 ? EBUSY : rc;
+    }
+
+    probe->arr = arr;
+    probe->source = source;
+    probe->source_snapshot = snapshot;
+    probe->identity = (uintptr_t)probe;
+    probe->active = true;
     return 0;
 }
 
@@ -1214,6 +1312,34 @@ col_arrangement_pin_release(col_arrangement_pin_t *pin)
         size_t target = (cs->arr_cache_limit_bytes / 4u) * 3u;
         col_arr_cache_evict_lru(cs, target);
     }
+}
+
+int
+col_arrangement_probe_release(col_arrangement_probe_t *probe)
+{
+    wl_columnar_source_access_reader_t *reader;
+    int rc;
+
+    if (!probe || !probe->active || probe->identity != (uintptr_t)probe
+        || !probe->arr || !probe->source)
+        return EINVAL;
+    reader = &probe->source_reader;
+    /* Validate every source-reader precondition before changing the index
+     * pin.  The reader itself keeps the gate nonzero between this check and
+     * release, so a successful precheck makes the two releases atomic with
+     * respect to all supported token states. */
+    if (reader->identity != (uintptr_t)reader || !reader->owner
+        || (!reader->transferable
+        && !wl_columnar_source_access_reader_thread_equal(reader))
+        || (reader->transferable && reader->thread_valid)
+        || !wl_columnar_source_access_gate_busy(reader->owner))
+        return EINVAL;
+    col_arrangement_pin_release(&probe->arrangement_pin);
+    rc = col_rel_source_reader_release(reader);
+    if (rc != 0)
+        return rc;
+    memset(probe, 0, sizeof(*probe));
+    return 0;
 }
 
 uint32_t
