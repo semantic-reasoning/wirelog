@@ -1289,9 +1289,25 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                             op->right_relation, fhash, right, rk, kc);
                 }
             }
-        } else if (used_right_delta && op->right_relation && kc > 0)
+        } else if (used_right_delta && op->right_relation && kc > 0) {
+            int dependency_rc
+                = col_arrangement_probe_bundle_acquire_dependency(
+                &arr_bundle, right);
+            if (dependency_rc != 0) {
+                free(tmp);
+                col_rel_destroy(out);
+                free(lk);
+                free(rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                if (left_e.owned)
+                    col_rel_destroy(left);
+                (void)col_arrangement_probe_bundle_release(&arr_bundle);
+                return dependency_rc;
+            }
             arr = col_session_get_delta_arrangement(sess, op->right_relation,
                     right, rk, kc);
+        }
 
         if (arr)
             WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
