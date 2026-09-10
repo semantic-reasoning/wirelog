@@ -4209,6 +4209,24 @@ test_join_batch_resume_exe = executable(
 
 test('join_batch_resume', test_join_batch_resume_exe)
 
+# Issue #1505: owned right-filter cleanup on early join exits.
+test_join_right_filter_cleanup_exe = executable(
+  'test_join_right_filter_cleanup',
+  files('test_join_right_filter_cleanup.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('join_right_filter_cleanup', test_join_right_filter_cleanup_exe)
+
 # ============================================================================
 # Differential Consolidate Operator Tests (Issue #263)
 # ============================================================================
