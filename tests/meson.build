@@ -68,6 +68,24 @@ io_src = files(
 # to subdir builds via the parent scope.
 thread_src = wirelog_thread_src
 
+source_access_exe = executable(
+  'test_source_access',
+  files('test_source_access.c'),
+  thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+)
+test('source_access', source_access_exe, suite: ['unit', 'tsan'], timeout: 60)
+
+source_access_shell = find_program('bash', required: false)
+if source_access_shell.found()
+  source_access_contract = find_program(
+    join_paths(meson.project_source_root(),
+      'scripts/ci/check-source-access-contract.sh'))
+  test('source_access_contract', source_access_shell,
+       args: [source_access_contract], suite: 'abi', timeout: 60)
+endif
+
 # ============================================================================
 # Test Executables
 # ============================================================================
