@@ -595,10 +595,6 @@ wl_columnar_relation_float_values_valid(const col_rel_t *rel)
         return false;
     if (rel->nrows == 0)
         return true;
-    if (rel->ncols == 0)
-        return rel->relation_identity != 0
-               && rel->view_generation != 0
-               && rel->storage_generation != 0;
     if (!rel->columns)
         return false;
     if (!rel->column_types)
@@ -753,19 +749,7 @@ col_rel_row_copy_out(const col_rel_t *r, uint32_t row, int64_t *dst)
 static inline int
 col_rel_row_copy_in_raw(col_rel_t *r, uint32_t row, const int64_t *src)
 {
-    if (!r || !src)
-        return EINVAL;
-    if (r->ncols == 0) {
-        /* Production-created zero-arity relations have no column storage.
-         * Require their initialized ownership identity so an arbitrary
-         * zeroed col_rel_t does not become appendable by accident. */
-        return r->relation_identity != 0
-               && r->view_generation != 0
-               && r->storage_generation != 0
-            ? 0
-            : EINVAL;
-    }
-    if (!r->columns)
+    if (!r || !r->columns || !src)
         return EINVAL;
     for (uint32_t c = 0; c < r->ncols; c++) {
         if (r->columns[c] == NULL)
@@ -2091,4 +2075,797 @@ col_rel_radix_sort_int64(col_rel_t *r);
 /** Stable LSD radix sort of a row-major int64_t buffer by a single key
  *  column.  Used by arrangement.c (sarr_build) and lftj.c
  *  (lftj_iter_init) to replace the platform-specific qsort_r path --
- *  the cal
+ *  the call site only needs a sort by one column, which radix can do
+ *  in one pass over 8 key bytes without any comparator callback.
+ *  Returns 0 on success, -1 on allocation failure (data is unchanged).
+ *  No-op when key_col >= ncols or nrows < 2.  (#465). */
+int
+col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
+    uint32_t key_col);
+int
+wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
+    uint32_t nrows,
+    uint32_t ncols, uint32_t key_col, wirelog_column_type_t key_type);
+
+/** Index-permutation radix sort on sub-range [start_row, start_row+nrows).
+ *  Uses col_rel_get() for key extraction -- layout independent.
+ *  Phase C: permutation-apply uses col_rel_row_copy_out/in. */
+int
+col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows);
+
+/* ======================================================================== */
+/* Cache & Materialized Join (columnar/cache.c)                             */
+/* ======================================================================== */
+
+col_materialized_join_t *
+col_materialized_join_create(uint32_t ncols, uint32_t memory_limit);
+int
+col_materialized_join_append(col_materialized_join_t *mj, const int64_t *row);
+void
+col_materialized_join_free(col_materialized_join_t *mj);
+void
+col_materialized_join_invalidate(col_materialized_join_t *mj);
+uint64_t
+col_mat_cache_key_content(const col_rel_t *rel);
+void
+col_mat_cache_clear(col_mat_cache_t *cache);
+void
+col_mat_cache_evict_until(col_mat_cache_t *cache, size_t target_bytes);
+col_rel_t *
+col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right);
+/* Legacy diagnostic lookup.  The returned relation is an unpinned borrowed
+ * pointer and must not outlive the immediate cache operation.  Production
+ * callers that need a stable result must use lookup_pin(), deep-copy while
+ * pinned, and release the pin before retaining the copy. */
+int
+col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, col_rel_t *result);
+/* Insert takes ownership of result only on success.  On failure, the caller
+ * retains ownership and must destroy result or push it as owned. */
+int
+col_mat_cache_insert_pin(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, col_rel_t *result, col_mat_cache_pin_t *pin);
+col_rel_t *
+col_mat_cache_lookup_pin(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, col_mat_cache_pin_t *pin);
+void
+col_mat_cache_pin_release(col_mat_cache_pin_t *pin);
+/* Release only implicit epoch pins from the legacy lookup path.  Explicit
+ * col_mat_cache_pin_t handles remain owned by their callers. */
+void
+col_mat_cache_release_pins(col_mat_cache_t *cache);
+/*
+ * col_mat_cache_truncate: keep_count is the visible-prefix target.  Destroy
+ * entries [keep_count, count) when they are unpinned and keep total_bytes and
+ * the ledger in step.  Pinned suffix entries may keep the physical count above
+ * keep_count; they are deferred, remain charged and hidden from lookup, and
+ * are removed only when their final pin is released.  Used to roll back
+ * branch-added entries after serial K-fusion.
+ */
+void
+col_mat_cache_truncate(col_mat_cache_t *cache, uint32_t keep_count);
+
+/* Internal pin/generation-safe cache reclaim contract. */
+int
+col_mat_cache_attach_reclaimer(col_mat_cache_t *cache);
+void
+col_mat_cache_detach_reclaimer(col_mat_cache_t *cache);
+wl_mem_reclaim_result_t
+col_mat_cache_reclaim_entry(col_mat_cache_t *cache, uint32_t index,
+    uint64_t expected_generation);
+
+/* ======================================================================== */
+/* Memory instrumentation (Issue #1380, columnar/session.c)                 */
+/* ======================================================================== */
+
+/*
+ * col_session_mem_sample:
+ * Re-measure the enumerable allocation classes of @sess and publish them
+ * as gauges: STORED (sess->rels[] column buffers and timestamps) and
+ * TEMPORARY (heap-backed delta_pool temporaries).  Called at iteration
+ * boundaries, before delta_pool_reset(), and at the end of a snapshot.
+ * O(nrels + pool slots); no allocation.
+ */
+void
+col_session_mem_sample(wl_col_session_t *sess);
+
+/*
+ * col_session_mem_note_worker:
+ * Fold a TDD worker's ledger peak into the coordinator aggregates before
+ * the worker is torn down.  Coordinator-thread only.
+ */
+void
+col_session_mem_note_worker(wl_col_session_t *coordinator,
+    const wl_col_session_t *worker);
+
+/*
+ * col_session_mem_report_level:
+ * Parsed WL_MEM_REPORT (0 = off, 1 = summary, 2 = verbose).
+ */
+int
+col_session_mem_report_level(void);
+
+/*
+ * col_session_peak_rss_bytes:
+ * Process-wide peak resident set size (ru_maxrss), 0 when unavailable.
+ */
+uint64_t
+col_session_peak_rss_bytes(void);
+
+/* ======================================================================== */
+/* Session Helpers (backend/columnar_nanoarrow.c)                           */
+/* ======================================================================== */
+
+col_rel_t *
+session_find_rel(wl_col_session_t *sess, const char *name);
+int
+session_add_rel(wl_col_session_t *sess, col_rel_t *r);
+void
+session_remove_rel(wl_col_session_t *sess, const char *name);
+
+/* ======================================================================== */
+/* Session Hash Table Helpers (columnar/session_hash.c - Issue #281)       */
+/* ======================================================================== */
+
+int
+session_rel_build_hash(wl_col_session_t *sess);
+col_rel_t *
+session_rel_hash_lookup(wl_col_session_t *sess, const char *name);
+int
+session_rel_hash_insert(wl_col_session_t *sess, uint32_t idx);
+int
+session_rel_hash_remove(wl_col_session_t *sess, uint32_t idx);
+void
+session_rel_free_hash(wl_col_session_t *sess);
+
+/* ======================================================================== */
+/* Arrangement Layer (columnar/arrangement.c)                               */
+/* ======================================================================== */
+
+void
+arr_free_contents(col_arrangement_t *arr);
+/*
+ * col_arr_attach_ledger: start charging @arr's hash-table bytes to @ledger
+ * under WL_MEM_SUBSYS_ARRANGEMENT (Issue #1380).  Charges the current
+ * footprint immediately; no-op when already attached.  Used for cloned
+ * worker registries, whose entries are copied outside the build path.
+ */
+void
+col_arr_attach_ledger(col_arrangement_t *arr, wl_mem_ledger_t *ledger);
+
+void
+col_arr_attach_memory_governor(col_arrangement_t *arr,
+    wl_columnar_memory_governor_ref_t *memory_governor);
+
+void
+col_arr_detach_memory_governor(col_arrangement_t *arr);
+col_arrangement_t *
+col_session_get_delta_arrangement(wl_col_session_t *cs, const char *rel_name,
+    const col_rel_t *delta_rel,
+    const uint32_t *key_cols, uint32_t key_count);
+void
+col_session_free_delta_arrangements(wl_col_session_t *cs);
+
+/* Filtered arrangement cache (Issue #433) */
+col_arrangement_t *
+col_session_get_filt_arrangement(wl_col_session_t *cs, const char *rel_name,
+    uint64_t filter_hash, const col_rel_t *filtered_rel,
+    const uint32_t *key_cols, uint32_t key_count);
+void
+col_session_free_filt_arrangements(wl_col_session_t *cs);
+
+/* Differential arrangement registry (Issue #263) */
+col_diff_arrangement_t *
+col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
+    const col_rel_t *source_rel,
+    const uint32_t *key_cols, uint32_t key_count);
+void
+col_session_free_diff_arrangements(wl_col_session_t *cs);
+/* Issue #260: Deep-copy arrangement entries for K-fusion worker isolation. */
+int
+col_arr_entries_clone(const col_arr_entry_t *src, uint32_t count,
+    col_arr_entry_t **out_entries, uint32_t *out_cap,
+    wl_columnar_memory_governor_ref_t *memory_governor);
+/* Issue #274: Deep-copy differential arrangement entries for K-fusion worker isolation. */
+int
+col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
+    col_diff_arr_entry_t **out_entries, uint32_t *out_cap);
+col_sorted_arr_t *
+col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
+    uint32_t key_col);
+void
+col_session_free_sorted_arrangements(wl_col_session_t *cs);
+
+/* ======================================================================== */
+/* Mobius / Z-set (columnar/mobius.c)                                        */
+/* ======================================================================== */
+
+int
+col_compute_delta_mobius(const col_rel_t *prev_collection,
+    const col_rel_t *curr_collection,
+    col_rel_t *out_delta);
+
+/* ======================================================================== */
+/* Eval Stack (columnar/eval_stack.c) and operators (columnar/ops.c)         */
+/* ======================================================================== */
+
+/* Checked expression arithmetic (columnar/arithmetic.c). */
+typedef struct wl_columnar_expr_compiled wl_columnar_expr_compiled_t;
+
+typedef struct {
+    wl_intern_t *intern;
+    const wirelog_extension_snapshot_t *extensions; /* borrowed */
+    bool allow_extension_scalar_result;
+    uint32_t configured_worker_count;
+    uint32_t active_worker_count;
+    bool parallel_execution;
+    const void *session_key;
+} wl_columnar_expr_context_t;
+
+typedef enum {
+    WL_COLUMNAR_EXPR_OK = 0,
+    WL_COLUMNAR_EXPR_MALFORMED = 1,
+    WL_COLUMNAR_EXPR_EXTENSION_MALFORMED,
+    WL_COLUMNAR_EXPR_MISSING_EXTENSION,
+    WL_COLUMNAR_EXPR_ARITY_MISMATCH,
+    WL_COLUMNAR_EXPR_TYPE_MISMATCH,
+    WL_COLUMNAR_EXPR_CALLBACK_FAILURE,
+    WL_COLUMNAR_EXPR_INVALID_RESULT,
+    WL_COLUMNAR_EXPR_ALLOCATION_FAILURE,
+    WL_COLUMNAR_EXPR_EXTENSION_ABI_MISMATCH,
+    WL_COLUMNAR_EXPR_CALLBACK_POLICY,
+    WL_COLUMNAR_EXPR_CALLBACK_REENTRANT
+} wl_columnar_expr_status_t;
+
+wl_columnar_expr_compiled_t *
+wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
+    const wl_intern_t *intern);
+void
+wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c);
+int
+wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
+    const int64_t *row, uint32_t ncols, int64_t *out_val);
+int
+wl_columnar_expr_eval_run(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, int64_t *out_val,
+    wl_intern_t *intern);
+int
+wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, int64_t *out_val,
+    const wl_columnar_expr_context_t *ctx,
+    wl_columnar_expr_status_t *status);
+int
+wl_columnar_expr_filter_row(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, wl_intern_t *intern);
+int
+wl_columnar_expr_eval_i64(const uint8_t *buf, uint32_t size,
+    const int64_t *row, uint32_t ncols, int64_t *out_val,
+    wl_intern_t *intern);
+bool
+wl_columnar_expr_parse_var_col(const uint8_t *buf, uint32_t size,
+    uint32_t *pos, uint32_t *col_out);
+
+int
+wl_columnar_arithmetic_checked_add_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_sub_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_mul_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_div_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_mod_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_shl_int64(int64_t a, int64_t b, int64_t *out);
+int
+wl_columnar_arithmetic_checked_shr_int64(int64_t a, int64_t b, int64_t *out);
+uint32_t
+wl_columnar_filter_next_pow2(uint32_t n);
+col_rel_t *
+wl_columnar_filter_apply_right_filter(const wl_plan_expr_buffer_t *fexpr,
+    col_rel_t *rel, delta_pool_t *pool, wl_intern_t *intern);
+uint64_t
+wl_columnar_filter_fnv1a_hash(const uint8_t *buf, uint32_t len);
+col_rel_t *
+wl_columnar_filter_apply_right_filter_cached(wl_col_session_t *sess,
+    const wl_plan_expr_buffer_t *fexpr, const char *rel_name, col_rel_t *rel);
+
+void
+eval_stack_init(eval_stack_t *s);
+int
+eval_stack_push(eval_stack_t *s, col_rel_t *r, bool owned);
+int
+eval_stack_push_delta(eval_stack_t *s, col_rel_t *r, bool owned, bool is_delta);
+int
+eval_stack_push_continuation(eval_stack_t *s,
+    wl_columnar_continuation_t *continuation);
+eval_entry_t
+eval_stack_pop(eval_stack_t *s);
+void
+eval_entry_dispose(eval_entry_t *entry);
+int
+eval_stack_pop_relation(eval_stack_t *s, eval_entry_t *out);
+void
+eval_stack_drain(eval_stack_t *s);
+int
+col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess);
+int
+row_cmp_dispatch(const int64_t *a, const int64_t *b, uint32_t ncols);
+int
+col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
+    uint32_t seg_count);
+int
+col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
+    col_rel_t *delta_out, int *out_fast_path);
+int
+col_op_reduce_weighted(const col_rel_t *src, col_rel_t *dst);
+int
+col_op_join_weighted(const col_rel_t *lhs, const col_rel_t *rhs,
+    uint32_t key_col, col_rel_t *dst);
+
+/* Individual operator functions (columnar/ops.c, called by eval.c) */
+int
+col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess);
+int
+wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_concat(eval_stack_t *stack, wl_col_session_t *sess);
+int
+wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_k_fusion(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_exchange(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+
+/* Differential operator variants (Issue #263) */
+int
+wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_join(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_antijoin(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_semijoin(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess);
+
+/* ======================================================================== */
+/* Evaluator deduplication (columnar/eval_dedup.c)                           */
+/* ======================================================================== */
+
+uint64_t
+wl_columnar_eval_dedup_row_hash(const col_rel_t *r, uint32_t row);
+bool
+wl_columnar_eval_dedup_set_insert(col_rel_t *r, uint64_t h);
+bool
+wl_columnar_eval_dedup_set_contains(const col_rel_t *r, uint64_t h);
+int
+wl_columnar_eval_dedup_set_init_from_rel(col_rel_t *r);
+
+/* ======================================================================== */
+/* Evaluator (columnar/eval.c)                                              */
+/* ======================================================================== */
+
+int
+col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
+    wl_col_session_t *sess);
+int
+retraction_rel_name(const char *rel, char *buf, size_t sz);
+bool
+has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
+    uint32_t iteration);
+int
+col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
+    uint32_t stratum_idx);
+int
+col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t stratum_idx,
+    wl_col_session_t *workers, uint32_t num_workers);
+int
+col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, uint32_t stratum_idx);
+int
+wl_columnar_session_ensure_workqueue(wl_col_session_t *sess,
+    uint32_t active_workers);
+int
+wl_columnar_session_ensure_tdd_worker_slots(wl_col_session_t *sess,
+    uint32_t active_workers);
+bool
+tdd_stratum_has_idb_self_join(const wl_plan_stratum_t *sp);
+bool
+tdd_stratum_has_unsupported_lftj(const wl_plan_stratum_t *sp);
+uint32_t
+stratum_max_idb_body_atoms(const wl_plan_stratum_t *sp);
+bool
+tdd_stratum_idb_self_join_exchange_aligned(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord);
+bool
+tdd_stratum_single_idb_join_keys_exchange_aligned(
+    const wl_plan_stratum_t *sp);
+bool
+tdd_stratum_global_read_candidate(const wl_plan_stratum_t *sp);
+typedef struct {
+    uint32_t total_segments;
+    uint32_t seed_only_segments;
+    uint32_t global_read_segments;
+    uint32_t unsafe_segments;
+    uint32_t max_segment_idb_atoms;
+    uint32_t max_segment_join_like;
+} wl_tdd_segment_stats_t;
+void
+tdd_stratum_segment_stats(const wl_plan_stratum_t *sp,
+    wl_tdd_segment_stats_t *stats);
+bool
+tdd_stratum_mixed_slice_candidate(const wl_plan_stratum_t *sp);
+int
+col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
+    uint32_t stratum_idx);
+void
+wl_columnar_delta_events_clear(wl_col_session_t *sess);
+void
+wl_columnar_delta_events_publish(wl_col_session_t *sess);
+bool
+stratum_has_preseeded_delta(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess);
+uint32_t
+rule_index_to_stratum_index(const wl_plan_t *plan, uint32_t rule_id);
+/* Defined in columnar/eval_serial.c; also called from the TDD final-merge
+ * path in columnar/eval.c. */
+int
+wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
+    wl_col_session_t *sess);
+/* Defined in columnar/eval.c; called from the serial stratum evaluator in
+ * columnar/eval_serial.c. */
+int
+wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
+    wl_col_session_t *coord);
+int
+wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
+int
+wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
+    size_t element_size, size_t *out);
+int
+wl_columnar_eval_checked_size_mul(size_t count, size_t element_size,
+    size_t *out);
+int
+wl_columnar_eval_checked_count_inc(uint32_t count, size_t *out);
+int
+wl_columnar_eval_checked_row_add(uint32_t total, uint32_t addend,
+    uint32_t *out);
+int
+wl_columnar_eval_checked_hash_capacity(uint32_t nrows, uint32_t *out);
+int
+tdd_sorted_merge_append(col_rel_t *dst, col_rel_t *src);
+
+/* ======================================================================== */
+/* Relation Partitioning (columnar/partition.c)                             */
+/* ======================================================================== */
+
+/*
+ * col_rel_partition_by_key:
+ * Partition src into num_workers disjoint sub-relations by hashing
+ * the specified key columns with XXH3_64bits.
+ *
+ * Two-pass algorithm: count rows per bucket, allocate exact-sized
+ * partitions, then scatter.  out_parts must point to an array of
+ * num_workers col_rel_t* slots (caller-provided).  On success each
+ * slot holds a newly allocated relation; caller owns all.
+ *
+ * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
+ */
+int
+col_rel_partition_by_key(const col_rel_t *src,
+    const uint32_t *key_cols, uint32_t key_count,
+    uint32_t num_workers, col_rel_t **out_parts);
+
+/*
+ * col_rel_merge_partitions:
+ * Concatenate num_workers partition relations into a single output.
+ * Rows are appended in partition order.  Schema copied from parts[0].
+ * Input partitions are NOT destroyed (caller retains ownership).
+ *
+ * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
+ */
+int
+col_rel_merge_partitions(col_rel_t **parts, uint32_t num_workers,
+    col_rel_t **out);
+
+/*
+ * col_rel_exchange_partition:
+ * Graph-aware EXCHANGE partitioning wrapper for col_rel_partition_by_key.
+ *
+ * When src->has_graph_column == true AND num_workers > 1, this function
+ * partitions by src->graph_col_idx (a single-column key), ignoring
+ * fallback_key_cols entirely.  This ensures that all rows belonging to
+ * the same named graph land on the same worker, which is required for
+ * correct graph-scoped join and aggregation semantics.
+ *
+ * When src->has_graph_column == false OR num_workers == 1, the call
+ * forwards unchanged to col_rel_partition_by_key with fallback_key_cols.
+ *
+ * Co-partitioning correctness: each relation is routed based on its OWN
+ * has_graph_column flag.  If both sides of a join carry the flag, both
+ * route by graph_id and co-partitioning is preserved.  If only one side
+ * carries the flag the fallback key is used for that side, matching the
+ * existing join-key co-partitioning contract.
+ *
+ * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
+ */
+int
+col_rel_exchange_partition(const col_rel_t *src,
+    const uint32_t *fallback_key_cols, uint32_t fallback_key_count,
+    uint32_t num_workers, col_rel_t **out_parts);
+
+/* ======================================================================== */
+/* Per-Worker Session State (columnar/session.c, Issue #315)                */
+/* ======================================================================== */
+
+/*
+ * col_worker_session_create:
+ * Create an isolated worker session from a coordinator session.
+ * The worker owns independent rels[] (populated with partitions),
+ * eval_arena, delta_pool, arrangement clones, and mat_cache.
+ * Borrowed fields (plan, frontier_ops) are shared read-only.
+ *
+ * out_worker must be caller-allocated (e.g., from calloc'd array).
+ * partitions[] ownership transfers to the worker on success;
+ * on failure, partitions[] are NOT consumed (caller must free).
+ *
+ * Returns 0 on success, EINVAL for bad arguments, ENOMEM on failure.
+ */
+int
+col_worker_session_create(wl_col_session_t *coordinator,
+    uint32_t worker_id, col_rel_t **partitions,
+    uint32_t num_partitions, wl_col_session_t *out_worker);
+
+/*
+ * col_worker_session_destroy:
+ * Free all resources owned by a worker session.  Does NOT free borrowed
+ * resources (plan, frontier_ops) or the out_worker struct itself.
+ * Safe to call on a partially-initialized worker (all owned pointers
+ * are pre-NULLed during create).  Zeroes the struct on completion.
+ */
+void
+col_worker_session_destroy(wl_col_session_t *worker);
+
+/*
+ * col_detect_physical_memory: Detect total physical RAM in bytes (Issue #221).
+ * Returns 0 if the platform is not supported or detection fails.
+ */
+uint64_t
+col_detect_physical_memory(void);
+
+/*
+ * col_compute_worker_cap: RAM-aware worker cap formula (Issue #409).
+ *
+ * Returns the maximum safe number of workers for a system with ram_bytes of
+ * physical RAM, using the formula:
+ *
+ *   cap = min((uint32_t)sqrt(ram_bytes / 8), ram_bytes / 40MB, 4096)
+ *
+ * Rationale:
+ *   - sqrt(RAM/8): keeps W^2 * 8B exchange matrix below RAM/8.
+ *   - RAM/40MB:    keeps per-worker linear cost (20MB arena + overhead) below
+ *                  half of RAM, leaving headroom for data.
+ *   - 4096:        absolute ceiling (W^2 * 8B = 128MB at W=4096; manageable).
+ *
+ * Returns 1 when ram_bytes == 0 (undetected RAM; caller falls back to env or
+ * default).
+ *
+ * This function is pure (no side effects) and intended for unit testing.
+ * col_session_create calls it internally via col_detect_physical_memory().
+ */
+uint32_t
+col_compute_worker_cap(uint64_t ram_bytes);
+
+/* ======================================================================== */
+/* TDD Distributed Evaluator (Issue #410)                                   */
+/* ======================================================================== */
+
+/*
+ * col_eval_tdd_worker_ctx_t:
+ * Per-worker context for one sub-pass of distributed stratum evaluation.
+ *
+ * For non-recursive workers (tdd_worker_nonrecursive_fn): only sp,
+ * worker_sess, stratum_idx, and rc are used.
+ *
+ * For recursive sub-pass workers (tdd_worker_subpass_fn): all fields.
+ * The coordinator allocates delta_rels[nrels] before dispatch; the worker
+ * fills in entries for each relation that produced new tuples.  Ownership
+ * of each delta_rels[ri] (heap-allocated via col_rel_new_like) transfers
+ * to the coordinator after the workqueue barrier.
+ */
+typedef struct {
+    uint32_t relation_index;       /* target relation in stratum      */
+    const wl_plan_op_t *ops;       /* borrowed executable rule slice  */
+    uint32_t op_count;
+    bool tdd_safe;                 /* true: worker TDD, false: fallback */
+} wl_tdd_rule_slice_t;
+
+typedef struct {
+    const wl_plan_stratum_t *sp;   /* borrowed: stratum plan          */
+    wl_col_session_t *worker_sess; /* borrowed: isolated worker       */
+    const wl_tdd_rule_slice_t *rule_slices; /* optional mixed TDD slices */
+    uint32_t rule_slice_count;
+    uint32_t stratum_idx;
+    uint32_t eff_iter;             /* effective sub-pass index (set by coord) */
+    bool any_new;                  /* OUT: produced >=1 new tuple     */
+    bool all_empty_delta;          /* OUT: all FORCE_DELTA empty, skipped */
+    bool force_diff;               /* IN: enable diff from eff_iter 0 (BDX) */
+    bool outbound_only;            /* IN: emit deltas without local IDB append */
+    col_rel_t **delta_rels;        /* OUT: produced deltas [nrels], coord frees */
+    uint64_t runtime_ns;           /* OUT: worker sub-pass wall runtime */
+    int rc;                        /* OUT: return code                */
+} col_eval_tdd_worker_ctx_t;
+
+/*
+ * wl_columnar_eval_tdd_queue_reconstruct_delta_matrix:
+ * Convert flat delta message buffer from MPSC queue drain into the
+ * ctxs[w].delta_rels[ri] matrix used by existing exchange functions.
+ *
+ * For each message in msgs[0..count), places msg.delta into
+ * ctxs[msg.worker_id].delta_rels[msg.rel_idx].
+ *
+ * Precondition: ctxs[w].delta_rels[ri] == NULL for all w,ri (freshly reset).
+ * Postcondition: ctxs[msg.worker_id].delta_rels[msg.rel_idx] holds the
+ *                last valid, non-aliased delta for each pair.  Distinct
+ *                duplicates are destroyed; repeated pointer aliases are
+ *                retained under one slot owner.  Invalid messages are
+ *                destroyed exactly once unless the same pointer also has a
+ *                valid occurrence, in which case that valid occurrence
+ *                retains the sole ownership token.
+ *
+ * No allocations or atomics are performed.  The matrix is mutated and
+ * rejected/replaced payloads are destroyed.  The bounded malformed-input
+ * checks use O(count * (num_workers * nrels + count)) time and O(1) space.
+ */
+void
+wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
+    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
+    uint32_t count, uint32_t num_workers, uint32_t nrels);
+
+void
+wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
+    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
+    uint32_t count, uint32_t num_workers, uint32_t nrels,
+    wl_mpsc_payload_destroy_fn destroy_payload);
+
+void
+wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
+    uint32_t W, uint32_t nrels);
+
+/* Drain and destroy every queued delta, crediting each payload's bytes to
+ * @ledger under WL_MEM_SUBSYS_CHANNEL (Issue #1380).  @ledger may be NULL. */
+void
+wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(wl_mpsc_queue_t *queue,
+    wl_mem_ledger_t *ledger);
+
+/* Allocation-free ownership-test seam; drains every live message. */
+void
+wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
+    wl_mpsc_queue_t *queue, wl_mpsc_payload_destroy_fn destroy_payload);
+
+int
+wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
+    wl_col_session_t *sess, col_rel_t *delta, uint32_t rel_idx,
+    uint32_t eff_iter);
+
+/*
+ * COL_FILTER_SEL_SLACK:
+ * Spare uint32_t slots the caller must add to a col_filter_select_rows()
+ * selection buffer.  The AVX2 left-pack writes a full 8-lane vector even
+ * when fewer lanes are selected, so the buffer needs room for one whole
+ * vector past the largest possible selection count.
+ */
+#define COL_FILTER_SEL_SLACK 8u
+
+/*
+ * COL_FILTER_TILE:
+ * Rows scanned per selection pass before the passing ones are materialized.
+ *
+ * Tiling exists because scanning the whole column first and materializing
+ * afterwards measured slower than the fused loop on wide relations: by the
+ * time materialization reached a row it had been evicted.
+ *
+ * The exact value matters far less than having one.  Sweeping 256 / 1024 /
+ * 4096 / 16384 over 100k- and 1M-row relations barely moved scan throughput,
+ * so the win comes from separating the vectorizable scan from the
+ * materialize, not from fitting any particular cache level.  1024 is chosen
+ * because larger tiles cost more on 8-column relations at moderate
+ * selectivity: measured at 1M rows and 25% selectivity, 0.94x of the fused
+ * loop at 4096 and 0.92x at 16384, against ~0.96x here.  It halves that
+ * regression rather than removing it; smaller tiles recover no more of it
+ * and give up throughput on narrow relations.
+ */
+#define COL_FILTER_TILE 1024u
+
+/*
+ * col_filter_select_rows:
+ * Scan a contiguous int64_t column and record the indices of passing rows.
+ *
+ * @col_a    left operand column, @nrows entries (required)
+ * @col_b    right operand column when comparing two columns, else NULL
+ * @const_b  right operand value when @col_b is NULL
+ * @nrows    number of rows to scan
+ * @cmp_op   WL_PLAN_EXPR_CMP_* opcode; an unrecognized opcode selects nothing
+ * @out_sel  receives the passing row indices in ascending order; must have
+ *           capacity @nrows + COL_FILTER_SEL_SLACK
+ *
+ * Returns the number of indices written to @out_sel.
+ *
+ * Exposed (rather than static) so tests and benchmarks can drive the kernel
+ * directly.  It is not part of the public API and is not exported: the
+ * project builds with hidden symbol visibility.
+ */
+uint32_t
+col_filter_select_rows(const int64_t *col_a, const int64_t *col_b,
+    int64_t const_b, uint32_t nrows, wl_plan_expr_tag_t cmp_op,
+    uint32_t *out_sel);
+
+/*
+ * ARR_HASH_TILE:
+ * Rows hashed per arr_hash_rows_batch() call when a caller tiles a large
+ * range.  Bounds the scratch buffer an arrangement build needs.
+ */
+#define ARR_HASH_TILE 1024u
+
+/*
+ * arr_hash_rows_batch:
+ * Hash rows [@row_begin, @row_end) of @rel over @key_count key columns,
+ * writing @row_end - @row_begin results to @out_hashes, indexed RELATIVE to
+ * @row_begin.
+ *
+ * Returns the low 32 bits of the arrangement's FNV-1a chain, UNMASKED.  A
+ * caller reproduces the arrangement bucket with `out_hashes[j] & (nbuckets -
+ * 1)`, which must equal what arr_hash_key() computes on the probe side for
+ * the same key values.
+ *
+ * Only the low 32 bits are needed because nbuckets is a uint32_t, so the
+ * mask can never expose more; and those low bits are exactly reproducible in
+ * 32-bit arithmetic, since multiplication modulo 2^32 depends only on its
+ * operands modulo 2^32.  See the definition for the full argument.
+ *
+ * Bucket equality is load-bearing, not incidental: arr_update_incremental()
+ * extends a cached arrangement in place, so rows indexed by one code path are
+ * probed against rows indexed by another.  A divergence would leave earlier
+ * rows in buckets the probe never visits and silently drop join matches.
+ *
+ * @row_end must not exceed rel->nrows; row_begin >= row_end is a no-op.  No
+ * slack is required in @out_hashes: the vector loop runs only while eight
+ * whole rows remain and writes exactly eight lanes for them.
+ *
+ * Exposed (not static) so tests and benchmarks can drive it directly.  Not
+ * public API and not exported: the library builds with hidden visibility.
+ */
+void
+arr_hash_rows_batch(const col_rel_t *rel, uint32_t row_begin, uint32_t row_end,
+    const uint32_t *key_cols, uint32_t key_count, uint32_t *out_hashes);
+
+#endif /* WL_COLUMNAR_INTERNAL_H */

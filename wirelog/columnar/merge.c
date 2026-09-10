@@ -1349,11 +1349,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             for (uint32_t k = 0; k < d_unique; k++) {
                 for (uint32_t c = 0; c < nc; c++)
                     dr[c] = rel->columns[c][old_nrows + k];
-                int rc = col_rel_append_row(delta_out, dr);
-                if (rc != 0) {
-                    col_row_buf_release(&drb);
-                    return rc;
-                }
+                col_rel_append_row(delta_out, dr);
             }
             col_row_buf_release(&drb);
         }
@@ -1428,10 +1424,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                         return ENOMEM;
                     for (uint32_t c = 0; c < nc; c++)
                         dr[c] = rel->columns[c][old_nrows + novel_count];
-                    int rc = col_rel_append_row(delta_out, dr);
+                    col_rel_append_row(delta_out, dr);
                     col_row_buf_release(&drb);
-                    if (rc != 0)
-                        return rc;
                 }
                 novel_count++;
             }
@@ -1486,12 +1480,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                                : rel->merge_buf_cap * 2;
         if (new_cap < max_rows)
             new_cap = max_rows;
-        if (nc == 0) {
-            /* Empty tuples have no physical column buffers.  Capacity still
-             * tracks the merge workspace's row bound, but NULL is the valid
-             * zero-arity representation rather than an allocation failure. */
-            rel->merge_buf_cap = new_cap;
-        } else if (rel->merge_columns) {
+        if (rel->merge_columns) {
             if (col_columns_realloc(rel->merge_columns, nc, new_cap) != 0)
                 return ENOMEM;
         } else {
@@ -1546,11 +1535,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             if (delta_out) {
                 for (uint32_t c = 0; c < nc; c++)
                     delta_row[c] = merged_cols[c][out];
-                int rc = col_rel_append_row(delta_out, delta_row);
-                if (rc != 0) {
-                    col_row_buf_release(&delta_rb);
-                    return rc;
-                }
+                col_rel_append_row(delta_out, delta_row);
             }
             di++;
         }
@@ -1567,11 +1552,7 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         if (delta_out) {
             for (uint32_t c = 0; c < nc; c++)
                 delta_row[c] = merged_cols[c][out];
-            int rc = col_rel_append_row(delta_out, delta_row);
-            if (rc != 0) {
-                col_row_buf_release(&delta_rb);
-                return rc;
-            }
+            col_rel_append_row(delta_out, delta_row);
         }
         di++;
         out++;
