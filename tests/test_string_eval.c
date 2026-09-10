@@ -28,6 +28,11 @@
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_facts.h"
+#include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/memory_governor.h"
+#include "../wirelog/ir/program.h"
+
+#include <errno.h>
 #include "../wirelog/wirelog.h"
 
 #include <inttypes.h>
@@ -136,6 +141,244 @@ run_string_program(const char *src, int64_t *out_values, int max_values)
     wl_plan_free(plan);
     wirelog_program_free(prog);
     return n;
+}
+
+/* ======================================================================== */
+/* Issue #1470: a denied interning fails the step, never emits id -1        */
+/* ======================================================================== */
+
+static wl_columnar_memory_governor_ref_t *
+denial_governor(uint64_t usable_bytes)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = usable_bytes,
+        .headroom_bytes = 0,
+        .usable_bytes = usable_bytes,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+        .status = WL_COLUMNAR_MEMORY_OK,
+    };
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+/* Attach @intern to a governor that admits exactly its current footprint,
+ * so the next unique string is denied.  Returns the retained governor
+ * reference (caller releases) or NULL. */
+static wl_columnar_memory_governor_ref_t *
+attach_exact_governor(wl_intern_t *intern)
+{
+    wl_columnar_memory_governor_ref_t *probe = denial_governor(1u << 20);
+    wl_columnar_memory_governor_ref_t *exact = NULL;
+    uint64_t footprint;
+    if (!probe)
+        return NULL;
+    if (wl_intern_attach_memory_governor(intern, probe) != 0) {
+        wl_columnar_memory_governor_ref_release(probe);
+        return NULL;
+    }
+    footprint = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(probe));
+    if (wl_intern_detach_memory_governor(intern, probe) != 0) {
+        wl_columnar_memory_governor_ref_release(probe);
+        return NULL;
+    }
+    wl_columnar_memory_governor_ref_release(probe);
+    exact = denial_governor(footprint);
+    if (exact && wl_intern_attach_memory_governor(intern, exact) != 0) {
+        wl_columnar_memory_governor_ref_release(exact);
+        return NULL;
+    }
+    return exact;
+}
+
+static uint32_t
+put_bytes(uint8_t *buf, uint32_t at, const uint8_t *src, uint32_t n)
+{
+    memcpy(buf + at, src, n);
+    return at + n;
+}
+
+/* Evaluator level: VAR col0, CONST_STR "-suffix", STR_FN_CAT over a row
+ * whose result is unique fails with ALLOCATION_FAILURE and out_val 0; a
+ * CONST_STR that itself needs interning fails the same way.  On the
+ * previous code both returned OK with out_val -1. */
+static void
+test_eval_denied_put_fails_evaluation(void)
+{
+    TEST("denied interning fails the expression with ALLOCATION_FAILURE");
+    wl_intern_t *intern = wl_intern_create();
+    wl_columnar_memory_governor_ref_t *exact = NULL;
+    uint8_t buf[64];
+    uint32_t size = 0;
+    int64_t alpha, out_val = 7;
+    int64_t row[1];
+    uint32_t count;
+    wl_columnar_expr_status_t status = WL_COLUMNAR_EXPR_OK;
+    wl_columnar_expr_context_t ctx;
+    int rc, ok;
+    if (!intern) {
+        FAIL("intern create failed");
+        return;
+    }
+    alpha = wl_intern_put(intern, "alpha");
+    /* The literal is interned ahead of time, as the planner does. */
+    if (alpha < 0 || wl_intern_put(intern, "-suffix") < 0
+        || !(exact = attach_exact_governor(intern))) {
+        FAIL("fixture: exact governor attach failed");
+        wl_intern_free(intern);
+        return;
+    }
+    count = wl_intern_count(intern);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.intern = intern;
+    ctx.configured_worker_count = 1;
+    ctx.active_worker_count = 1;
+    /* VAR "col0"; CONST_STR "-suffix"; STR_FN_CAT */
+    {
+        const uint8_t var[] = { WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0' };
+        const uint8_t lit[] = { WL_PLAN_EXPR_CONST_STR, 7, 0,
+                                '-', 's', 'u', 'f', 'f', 'i', 'x' };
+        const uint8_t cat[] = { WL_PLAN_EXPR_STR_FN_CAT };
+        size = put_bytes(buf, size, var, sizeof(var));
+        size = put_bytes(buf, size, lit, sizeof(lit));
+        size = put_bytes(buf, size, cat, sizeof(cat));
+    }
+    row[0] = alpha;
+    rc = wl_columnar_expr_eval_run_ctx(buf, size, row, 1, &out_val, &ctx,
+            &status);
+    ok = rc == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
+        && status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE && out_val == 0
+        && wl_intern_count(intern) == count;
+    /* A literal that is not pre-interned is refused the same way. */
+    {
+        const uint8_t lit[] = { WL_PLAN_EXPR_CONST_STR, 9, 0,
+                                'b', 'r', 'a', 'n', 'd', '-', 'n', 'e', 'w' };
+        size = put_bytes(buf, 0, lit, sizeof(lit));
+    }
+    status = WL_COLUMNAR_EXPR_OK;
+    out_val = 7;
+    rc = wl_columnar_expr_eval_run_ctx(buf, size, row, 1, &out_val, &ctx,
+            &status);
+    ok = ok && rc == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
+        && status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE && out_val == 0
+        && wl_intern_count(intern) == count;
+    /* An invalid operand is still an ordinary -1 result, not a failure. */
+    {
+        const uint8_t var[] = { WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0' };
+        const uint8_t lit[] = { WL_PLAN_EXPR_CONST_STR, 7, 0,
+                                '-', 's', 'u', 'f', 'f', 'i', 'x' };
+        const uint8_t cat[] = { WL_PLAN_EXPR_STR_FN_CAT };
+        size = put_bytes(buf, 0, var, sizeof(var));
+        size = put_bytes(buf, size, lit, sizeof(lit));
+        size = put_bytes(buf, size, cat, sizeof(cat));
+    }
+    row[0] = 12345; /* not an interned id */
+    status = WL_COLUMNAR_EXPR_OK;
+    rc = wl_columnar_expr_eval_run_ctx(buf, size, row, 1, &out_val, &ctx,
+            &status);
+    ok = ok && rc == WL_COLUMNAR_EXPR_OK && status == WL_COLUMNAR_EXPR_OK
+        && out_val == -1;
+    wl_intern_free(intern);
+    wl_columnar_memory_governor_ref_release(exact);
+    if (!ok) {
+        FAIL("denied interning did not fail the evaluation cleanly");
+        return;
+    }
+    PASS();
+}
+
+/* Session level: r(cat(x, "-suffix")) :- a(x) with the program's intern
+ * table attached to a governor that admits exactly its footprint.  The
+ * snapshot must fail with ENOMEM, emit no row (in particular none with a
+ * negative id), and leave the table and its reservation unchanged; the
+ * same program under a normal budget yields the two suffixed strings.
+ * On the previous code the snapshot returned 0 with rows carrying id -1. */
+static void
+test_session_denied_put_fails_step(uint32_t workers)
+{
+    char name[96];
+    snprintf(name, sizeof(name),
+        "denied interning fails the step with ENOMEM (%u worker%s)",
+        workers, workers == 1 ? "" : "s");
+    TEST(name);
+    const char *src =
+        ".decl a(x: symbol)\n"
+        "a(\"alpha\"). a(\"beta\").\n"
+        ".decl r(y: symbol)\n"
+        "r(cat(x, \"-suffix\")) :- a(x).\n";
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    wl_plan_t *plan = NULL;
+    wl_session_t *sess = NULL;
+    wl_columnar_memory_governor_ref_t *exact = NULL;
+    struct result_ctx ctx = { .count = 0, .error = 0 };
+    uint32_t count;
+    uint64_t reserved;
+    int rc, ok;
+    if (!prog) {
+        FAIL("parse failed");
+        return;
+    }
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+    /* The plan is built first: it pre-interns the "-suffix" literal, so
+     * the first charged put is the builtin's result.  The test keeps its
+     * own reference to the exact governor until the program is freed;
+     * under the #1469 rebind an unreferenced governor would otherwise be
+     * taken over by the session's governor and the denial would vanish. */
+    if (wl_plan_from_program(prog, &plan) != 0
+        || !(exact = attach_exact_governor(prog->intern))) {
+        if (plan)
+            wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("fixture: plan or exact governor attach failed");
+        return;
+    }
+    count = wl_intern_count(prog->intern);
+    reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(exact));
+    if (wl_session_create(wl_backend_columnar(), plan, workers, &sess) != 0
+        || wl_session_load_facts(sess, prog) != 0) {
+        if (sess)
+            wl_session_destroy(sess);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        wl_columnar_memory_governor_ref_release(exact);
+        FAIL("fixture: session create or fact load failed");
+        return;
+    }
+    rc = wl_session_snapshot(sess, capture_cb, &ctx);
+    ok = rc == ENOMEM && ctx.count == 0
+        && wl_intern_count(prog->intern) == count
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(exact)) == reserved;
+    for (uint32_t i = 0; i < ctx.count; i++)
+        if (ctx.values[i] < 0)
+            ok = 0;
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    wirelog_program_free(prog);
+    wl_columnar_memory_governor_ref_release(exact);
+    if (!ok) {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+            "snapshot rc=%d rows=%u (expected ENOMEM and no rows)", rc,
+            ctx.count);
+        FAIL(msg);
+        return;
+    }
+    /* The same program under a normal budget produces both strings. */
+    {
+        int64_t values[4];
+        int n = run_string_program(src, values, 4);
+        if (n != 2 || values[0] < 0 || values[1] < 0
+            || values[0] == values[1]) {
+            FAIL("rerun under a normal budget did not yield two strings");
+            return;
+        }
+    }
+    PASS();
 }
 
 #ifdef WL_MBEDTLS_ENABLED
@@ -747,6 +990,9 @@ main(void)
 
     printf("\n--- multiple input tuples ---\n");
     test_eval_strlen_multiple_inputs();
+    test_eval_denied_put_fails_evaluation();
+    test_session_denied_put_fails_step(1);
+    test_session_denied_put_fails_step(2);
 
 #ifdef WL_MBEDTLS_ENABLED
     printf("\n--- uuid5_rfc ---\n");

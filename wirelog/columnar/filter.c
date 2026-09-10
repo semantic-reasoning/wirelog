@@ -779,7 +779,10 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(out);
                 if (e.owned)
                     col_rel_destroy(e.rel);
-                return err;
+                /* A refused string allocation fails the step as a memory
+                 * error (Issue #1470). */
+                return status == WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
+                       ? ENOMEM : err;
             }
             pass = err == WL_COLUMNAR_EXPR_OK && val != 0;
         }

@@ -538,6 +538,10 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                 tmp[slen] = '\0';
                 value = wl_intern_put(intern, tmp);
                 free(tmp);
+                /* Literals are pre-interned by the planner, so a failed
+                 * put here is a refused growth (Issue #1470). */
+                if (value < 0)
+                    goto denied;
             }
             expr_push_string(&s, value, buf + i, slen);
             i += slen;
@@ -1094,12 +1098,22 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
         }
         case WL_PLAN_EXPR_STR_FN_CAT: {
             int64_t b = expr_pop(&s), a = expr_pop(&s);
-            expr_push(&s, intern ? string_ops_cat(a, b, intern) : 0);
+            int64_t v = 0;
+            int rc = intern ? wl_string_ops_cat_checked(a, b, intern,
+                    &v) : EINVAL;
+            if (intern && rc == ENOMEM)
+                goto denied;
+            expr_push(&s, intern ? (rc == 0 ? v : -1) : 0);
             break;
         }
         case WL_PLAN_EXPR_STR_FN_SUBSTR: {
             int64_t c = expr_pop(&s), b = expr_pop(&s), a = expr_pop(&s);
-            expr_push(&s, intern ? string_ops_substr(a, b, c, intern) : 0);
+            int64_t v = 0;
+            int rc = intern ? wl_string_ops_substr_checked(a, b, c, intern,
+                    &v) : EINVAL;
+            if (intern && rc == ENOMEM)
+                goto denied;
+            expr_push(&s, intern ? (rc == 0 ? v : -1) : 0);
             break;
         }
         case WL_PLAN_EXPR_STR_FN_CONTAINS: {
@@ -1127,27 +1141,52 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
         }
         case WL_PLAN_EXPR_STR_FN_TO_UPPER: {
             int64_t a = expr_pop(&s);
-            expr_push(&s, intern ? string_ops_to_upper(a, intern) : a);
+            int64_t v = 0;
+            int rc = intern ? wl_string_ops_to_upper_checked(a, intern,
+                    &v) : EINVAL;
+            if (intern && rc == ENOMEM)
+                goto denied;
+            expr_push(&s, intern ? (rc == 0 ? v : -1) : a);
             break;
         }
         case WL_PLAN_EXPR_STR_FN_TO_LOWER: {
             int64_t a = expr_pop(&s);
-            expr_push(&s, intern ? string_ops_to_lower(a, intern) : a);
+            int64_t v = 0;
+            int rc = intern ? wl_string_ops_to_lower_checked(a, intern,
+                    &v) : EINVAL;
+            if (intern && rc == ENOMEM)
+                goto denied;
+            expr_push(&s, intern ? (rc == 0 ? v : -1) : a);
             break;
         }
         case WL_PLAN_EXPR_STR_FN_STR_REPLACE: {
             int64_t c = expr_pop(&s), b = expr_pop(&s), a = expr_pop(&s);
-            expr_push(&s, intern ? string_ops_str_replace(a, b, c, intern) : a);
+            int64_t v = 0;
+            int rc = intern ? wl_string_ops_str_replace_checked(a, b, c, intern,
+                    &v) : EINVAL;
+            if (intern && rc == ENOMEM)
+                goto denied;
+            expr_push(&s, intern ? (rc == 0 ? v : -1) : a);
             break;
         }
         case WL_PLAN_EXPR_STR_FN_TRIM: {
             int64_t a = expr_pop(&s);
-            expr_push(&s, intern ? string_ops_trim(a, intern) : a);
+            int64_t v = 0;
+            int rc = intern ? wl_string_ops_trim_checked(a, intern,
+                    &v) : EINVAL;
+            if (intern && rc == ENOMEM)
+                goto denied;
+            expr_push(&s, intern ? (rc == 0 ? v : -1) : a);
             break;
         }
         case WL_PLAN_EXPR_STR_FN_TO_STRING: {
             int64_t a = expr_pop(&s);
-            expr_push(&s, intern ? string_ops_to_string(a, intern) : 0);
+            int64_t v = 0;
+            int rc = intern ? wl_string_ops_to_string_checked(a, intern,
+                    &v) : EINVAL;
+            if (intern && rc == ENOMEM)
+                goto denied;
+            expr_push(&s, intern ? (rc == 0 ? v : -1) : 0);
             break;
         }
         case WL_PLAN_EXPR_STR_FN_TO_NUMBER: {
@@ -1183,7 +1222,7 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             digest[8] = (digest[8] & 0x3F) | 0x80;
             int64_t result = wl_columnar_expr_format_uuid(digest, intern);
             if (result < 0)
-                goto bad;
+                goto denied; /* only interning can fail here */
             expr_push(&s, result);
 #else
             (void)expr_pop(&s);
@@ -1246,6 +1285,12 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
     *out_val = s.top > 0 ? s.vals[s.top - 1] : 0;
     return 0;
 
+denied:
+    /* A string result could not be interned (growth refused by the memory
+     * governor or allocation failed): the row must not carry a bad id, so
+     * the evaluation fails with an allocation status (Issue #1470). */
+    if (status)
+        *status = WL_COLUMNAR_EXPR_ALLOCATION_FAILURE;
 bad:
     *out_val = 0;
     if (status && *status == WL_COLUMNAR_EXPR_OK)
