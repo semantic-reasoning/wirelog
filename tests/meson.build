@@ -83,6 +83,10 @@ if source_access_shell.found()
        args: [meson.project_source_root() /
               'scripts/ci/check-source-access-contract.sh'],
        suite: 'abi', timeout: 60)
+  test('source_access_contract_selftest', source_access_shell,
+       args: [meson.project_source_root() /
+              'scripts/ci/test-source-access-contract.sh'],
+       suite: 'abi', timeout: 60)
 endif
 
 # ============================================================================
