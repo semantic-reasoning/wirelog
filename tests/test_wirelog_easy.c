@@ -11,6 +11,11 @@
 #include "../wirelog/wirelog-easy.h"
 #include "../wirelog/wirelog-extension.h"
 #include "../wirelog/util/log.h"
+#include "../wirelog/arena/compound_arena.h"
+#include "../wirelog/columnar/memory_governor.h"
+#include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/intern.h"
+#include "../wirelog/session.h"
 
 #include <fcntl.h>
 #include <stddef.h>
@@ -2499,6 +2504,325 @@ test_snapshot_rebuilds_idb_after_query_mode_input_changes(void)
 }
 
 /* ======================================================================== */
+/* Issue #1473: create-time governor denial maps to WIRELOG_ERR_MEMORY      */
+/* ======================================================================== */
+
+static wl_columnar_memory_governor_ref_t *
+enforcing_governor(uint64_t usable)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = usable;
+    resolution.usable_bytes = usable;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static uint64_t
+reserved_on(wl_columnar_memory_governor_ref_t *ref)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(ref));
+}
+
+/* The create-time floor of a fact-free program: the bytes its intern table
+ * admits when a session attaches it (#1431) plus the session's fixed
+ * compound arena (probed with the library-default epoch count, so like the
+ * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset).  The delta pool and eval arena degrade to malloc when
+ * denied, so an exact-fit budget admits precisely these two. */
+static int
+measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
+    uint64_t *compound_bytes)
+{
+    wl_columnar_memory_governor_ref_t *probe
+        = enforcing_governor(UINT64_MAX / 4u);
+    wl_compound_arena_t *arena = NULL;
+    /* The public accessor is read-only; the probe attaches and detaches
+     * the program-owned table exactly as session creation does. */
+    wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
+    int ok = 0;
+
+    if (!probe || !intern)
+        goto out;
+    if (wl_intern_attach_memory_governor(intern, probe) != 0)
+        goto out;
+    *intern_bytes = reserved_on(probe);
+    if (wl_intern_detach_memory_governor(intern, probe) != 0
+        || reserved_on(probe) != 0)
+        goto out;
+    arena = wl_compound_arena_create_managed(0x53455353u, 4096u, 0u,
+            wl_columnar_memory_governor_ref_get(probe));
+    if (!arena)
+        goto out;
+    *compound_bytes = reserved_on(probe);
+    wl_compound_arena_free(arena);
+    ok = reserved_on(probe) == 0 && *intern_bytes > 0
+        && *compound_bytes > 0;
+out:
+    if (probe)
+        wl_columnar_memory_governor_ref_release(probe);
+    return ok ? 0 : -1;
+}
+
+/* Parse and plan the source the way the easy facade does, so the intern
+ * table measured here matches the one the facade's session will attach. */
+static int
+measure_easy_floor(const char *src, uint64_t *intern_bytes,
+    uint64_t *compound_bytes)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    wl_plan_t *plan = NULL;
+    int rc = -1;
+    if (!prog)
+        return -1;
+    if (wirelog_optimize(prog, &err)
+        && wl_plan_from_program(prog, &plan) == 0 && plan)
+        rc = measure_create_floor(prog, intern_bytes, compound_bytes);
+    if (plan)
+        wl_plan_free(plan);
+    wirelog_program_free(prog);
+    return rc;
+}
+
+/* PARITY: the advanced facade has no eager/lazy split; both easy paths and
+ * the executor pair with test_injected_governor_denial_maps_to_memory. */
+static void
+test_injected_governor_easy_eager(void)
+{
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wirelog_error_t error;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+
+    TEST("#1473 easy eager: governor denial maps to WIRELOG_ERR_MEMORY");
+    if (measure_easy_floor(RELATION_NAME_LIFETIME_SRC, &intern_bytes,
+        &compound_bytes) != 0) {
+        FAIL("could not measure the create-time floor");
+        return;
+    }
+    opts.eager_build = true;
+    wl_session_options_init(&options);
+
+    ref = enforcing_governor(intern_bytes - 1u);
+    if (!ref) {
+        FAIL("governor allocation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_easy_open_opts(RELATION_NAME_LIFETIME_SRC, &opts,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY || session != NULL
+        || reserved_on(ref) != 0) {
+        wirelog_easy_close(session);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("eager denial did not map to WIRELOG_ERR_MEMORY");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    TEST("#1473 easy eager: exact floor budget opens and is released");
+    ref = enforcing_governor(intern_bytes + compound_bytes);
+    if (!ref) {
+        FAIL("governor allocation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_easy_open_opts(RELATION_NAME_LIFETIME_SRC, &opts,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_OK || !session
+        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        wirelog_easy_close(session);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("exact-fit eager open did not admit the floor");
+        return;
+    }
+    /* Close frees the session and the program, so the intern reservation
+     * goes with it. */
+    wirelog_easy_close(session);
+    if (reserved_on(ref) != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("close did not release the create-time floor");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+/* PARITY: lazy build is an easy-facade-only surface; see the eager test. */
+static void
+test_injected_governor_easy_lazy(void)
+{
+    wirelog_easy_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wirelog_error_t error;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+
+    TEST("#1473 easy lazy: governor denial maps to WIRELOG_ERR_MEMORY");
+    if (measure_easy_floor(RELATION_NAME_LIFETIME_SRC, &intern_bytes,
+        &compound_bytes) != 0) {
+        FAIL("could not measure the create-time floor");
+        return;
+    }
+    if (wirelog_easy_open(RELATION_NAME_LIFETIME_SRC, &session)
+        != WIRELOG_OK || !session) {
+        FAIL("lazy open failed");
+        return;
+    }
+    wl_session_options_init(&options);
+    ref = enforcing_governor(intern_bytes - 1u);
+    if (!ref) {
+        wirelog_easy_close(session);
+        FAIL("governor allocation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_easy_step(session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY || reserved_on(ref) != 0) {
+        wirelog_easy_close(session);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("lazy denial did not map to WIRELOG_ERR_MEMORY");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    /* The same handle retries its build; the exact floor admits it.  The
+     * delta-callback registration builds the session without stepping, so
+     * only creation is measured. */
+    TEST("#1473 easy lazy: exact floor budget builds on retry");
+    ref = enforcing_governor(intern_bytes + compound_bytes);
+    if (!ref) {
+        wirelog_easy_close(session);
+        FAIL("governor allocation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_easy_set_delta_cb(session, NULL, NULL);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_OK
+        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        wirelog_easy_close(session);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("exact-fit lazy build did not admit the floor");
+        return;
+    }
+    wirelog_easy_close(session);
+    if (reserved_on(ref) != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("close did not release the create-time floor");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+/* The batch executor builds its session from the caller's program, so the
+ * floor is measured on that very intern table. */
+/* PARITY: the batch executor (api_facade.c) is compiled into this binary
+ * only; the advanced facade has no executor. */
+static void
+test_injected_governor_executor(void)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog;
+    wirelog_executor_t *executor = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_plan_t *warm = NULL;
+    uint64_t intern_bytes = 0;
+    uint64_t compound_bytes = 0;
+
+    TEST("#1473 executor: governor denial maps to WIRELOG_ERR_MEMORY");
+    prog = wirelog_parse_string(RELATION_NAME_LIFETIME_SRC, &err);
+    /* Plan generation may intern; run it once so the measurement sees the
+     * table the executor's own plan generation will attach. */
+    if (!prog || wl_plan_from_program(prog, &warm) != 0 || !warm) {
+        if (prog)
+            wirelog_program_free(prog);
+        FAIL("could not parse the fixture");
+        return;
+    }
+    wl_plan_free(warm);
+    if (measure_create_floor(prog, &intern_bytes, &compound_bytes) != 0) {
+        wirelog_program_free(prog);
+        FAIL("could not measure the create-time floor");
+        return;
+    }
+    wl_session_options_init(&options);
+    ref = enforcing_governor(intern_bytes - 1u);
+    if (!ref) {
+        wirelog_program_free(prog);
+        FAIL("governor allocation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    err = WIRELOG_OK;
+    executor = wirelog_executor_create(prog, &err);
+    wl_session_testhook_set_default_options(NULL);
+    if (executor || err != WIRELOG_ERR_MEMORY || reserved_on(ref) != 0) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(prog);
+        FAIL("executor denial did not map to WIRELOG_ERR_MEMORY");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    TEST("#1473 executor: exact floor budget creates and is released");
+    ref = enforcing_governor(intern_bytes + compound_bytes);
+    if (!ref) {
+        wirelog_program_free(prog);
+        FAIL("governor allocation failed");
+        return;
+    }
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    err = WIRELOG_OK;
+    executor = wirelog_executor_create(prog, &err);
+    wl_session_testhook_set_default_options(NULL);
+    if (!executor || err != WIRELOG_OK
+        || reserved_on(ref) != intern_bytes + compound_bytes) {
+        wirelog_executor_free(executor);
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(prog);
+        FAIL("exact-fit executor create did not admit the floor");
+        return;
+    }
+    wirelog_executor_free(executor);
+    if (reserved_on(ref) != intern_bytes) {
+        wl_columnar_memory_governor_ref_release(ref);
+        wirelog_program_free(prog);
+        FAIL("executor free did not leave exactly the intern reservation");
+        return;
+    }
+    wirelog_program_free(prog);
+    if (reserved_on(ref) != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("program free did not release the intern reservation");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -2538,6 +2862,9 @@ main(void)
     printf("==========================\n\n");
 
     test_invalid_memory_budget();
+    test_injected_governor_easy_eager();
+    test_injected_governor_easy_lazy();
+    test_injected_governor_executor();
 
     test_open_close_null_safe();
     test_open_parse_error();

@@ -70,7 +70,7 @@ nm_defined() {
     nm "$1" 2>/dev/null | awk '$2 != "U" && $2 != "u"'
 }
 
-TESTHOOK_RE='wl_log_test_last|wl_log_test_count|wl_log_testhook|__log_testhook'
+TESTHOOK_RE='wl_log_test_last|wl_log_test_count|wl_log_testhook|__log_testhook|wl_session_testhook'
 
 # Capture once, then match the variable.  `nm_defined "$LIB" | grep -q ...` is
 # not equivalent: grep -q exits at the first match, nm takes SIGPIPE and exits

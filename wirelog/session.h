@@ -99,6 +99,16 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     wirelog_extension_snapshot_t *snapshot,
     const wl_session_options_t *options, wl_session_t **out);
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Test-only, per-thread default options substituted when a creator passes
+ * NULL options.  Borrowed for as long as it stays installed; install NULL
+ * to clear.  Never compiled into libwirelog. */
+void
+wl_session_testhook_set_default_options(const wl_session_options_t *options);
+const wl_session_options_t *
+wl_session_testhook_default_options(void);
+#endif
+
 /**
  * wl_session_destroy:
  * @session:  The session to destroy (NULL-safe).
