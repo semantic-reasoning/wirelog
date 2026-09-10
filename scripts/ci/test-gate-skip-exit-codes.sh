@@ -85,6 +85,7 @@ check() {
 # `SKIP ...; exit 0` injected into it: EXEMPT passed, COVERED failed by name.
 COVERED="
 check-sbom-wrap-pin.sh
+check-source-access-contract.sh
 check-abi-manifest.sh
 check-abi-symbols.sh
 check-abi-symbols-locale.sh
