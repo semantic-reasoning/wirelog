@@ -79,11 +79,10 @@ test('source_access', source_access_exe, suite: ['unit', 'tsan'], timeout: 60)
 
 source_access_shell = find_program('bash', required: false)
 if source_access_shell.found()
-  source_access_contract = find_program(
-    join_paths(meson.project_source_root(),
-      'scripts/ci/check-source-access-contract.sh'))
   test('source_access_contract', source_access_shell,
-       args: [source_access_contract], suite: 'abi', timeout: 60)
+       args: [meson.project_source_root() /
+              'scripts/ci/check-source-access-contract.sh'],
+       suite: 'abi', timeout: 60)
 endif
 
 # ============================================================================
