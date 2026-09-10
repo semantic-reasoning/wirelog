@@ -131,6 +131,41 @@ test_storage_only_cow_and_compaction(void)
 }
 
 static void
+test_flattened_storage_ownership(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *alias = new_relation();
+    col_rel_t *flattened = new_relation();
+    int64_t row = 41;
+    CHECK(source && alias && flattened, "storage ownership relations");
+    CHECK(col_rel_append_row(source, &row) == 0, "storage ownership seed");
+    CHECK(col_rel_install_shared_view(alias, source) == 0,
+        "owner to alias publication");
+    CHECK(alias->storage_owner == source
+        && alias->storage_owner_identity == source->relation_identity
+        && source->storage_alias_borrows == 1,
+        "alias records its ultimate owner");
+    CHECK(col_rel_storage_owner_destroy_status(source) == EBUSY,
+        "owner reports active alias borrow");
+
+    CHECK(col_rel_install_shared_view(flattened, alias) == 0,
+        "alias-of-alias publication");
+    CHECK(flattened->storage_owner == source
+        && flattened->storage_owner != alias
+        && source->storage_alias_borrows == 2,
+        "alias-of-alias is flattened to the root");
+
+    CHECK(col_rel_set(flattened, 0, 0, 99) == 0,
+        "flattened alias COW");
+    CHECK(flattened->storage_owner == flattened
+        && source->storage_alias_borrows == 1
+        && col_rel_get(source, 0, 0) == row
+        && col_rel_get(flattened, 0, 0) == 99,
+        "COW releases only the flattened alias borrow");
+    cleanup_relations();
+}
+
+static void
 test_copy_and_shared_semantics(void)
 {
     col_rel_t *src = new_relation();
@@ -1128,6 +1163,7 @@ main(void)
 {
     test_same_row_count_mutation();
     test_storage_only_cow_and_compaction();
+    test_flattened_storage_ownership();
     test_copy_and_shared_semantics();
     test_rollback_fresh_generation();
     test_overflow_boundary();
