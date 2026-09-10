@@ -974,44 +974,35 @@ col_arr_entry_for_arr(wl_col_session_t *cs, const col_arrangement_t *arr)
 /* Arrangement Accessors (Phase 3C)                                         */
 /* ======================================================================== */
 
-col_arrangement_t *
-col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
+static bool
+col_arr_entry_key_match(const col_arr_entry_t *e, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count)
 {
-    if (!sess || !rel_name || !key_cols || key_count == 0)
-        return NULL;
-
-    wl_col_session_t *cs = COL_SESSION(sess);
-
-    /* Look up the relation. */
-    col_rel_t *rel = NULL;
-    for (uint32_t i = 0; i < cs->nrels; i++) {
-        if (cs->rels[i] && cs->rels[i]->name
-            && strcmp(cs->rels[i]->name, rel_name) == 0) {
-            rel = cs->rels[i];
-            break;
-        }
+    if (!e || !rel_name || !key_cols || e->key_count != key_count
+        || !e->rel_name || strcmp(e->rel_name, rel_name) != 0)
+        return false;
+    for (uint32_t k = 0; k < key_count; k++) {
+        if (e->key_cols[k] != key_cols[k])
+            return false;
     }
-    if (!rel)
-        return NULL;
+    return true;
+}
+
+static int
+col_session_get_arrangement_for_source(wl_col_session_t *cs, col_rel_t *rel,
+    const char *rel_name, const uint32_t *key_cols, uint32_t key_count,
+    col_arrangement_t **out_arr)
+{
+    if (!cs || !rel || !rel_name || !key_cols || key_count == 0 || !out_arr)
+        return EINVAL;
+    *out_arr = NULL;
     if (!arr_key_cols_valid(rel, key_cols, key_count))
-        return NULL;
+        return ENOENT;
 
     /* Search registry for matching (rel_name, key_cols) entry. */
     for (uint32_t i = 0; i < cs->arr_count; i++) {
         col_arr_entry_t *e = &cs->arr_entries[i];
-        if (e->key_count != key_count)
-            continue;
-        if (!e->rel_name || strcmp(e->rel_name, rel_name) != 0)
-            continue;
-        bool match = true;
-        for (uint32_t k = 0; k < key_count; k++) {
-            if (e->key_cols[k] != key_cols[k]) {
-                match = false;
-                break;
-            }
-        }
-        if (!match)
+        if (!col_arr_entry_key_match(e, rel_name, key_cols, key_count))
             continue;
 
         /* A token mismatch invalidates the complete index. */
@@ -1026,20 +1017,20 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
             && (!snapshot_match || arr_entry_unbuilt(e)
             || e->arr.indexed_rows < rel->nrows || e->rebuild_deferred)) {
             e->rebuild_deferred = true;
-            return NULL;
+            return EBUSY;
         }
         if (!snapshot_match || arr_entry_unbuilt(e)) {
             /* Deduct stale bytes before rebuild; restore on failure. */
             cs->arr_total_bytes -= e->mem_bytes;
             if (arr_build_full(&e->arr, rel) != 0) {
                 cs->arr_total_bytes += e->mem_bytes;
-                return NULL;
+                return ENOMEM;
             }
             if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
                 arr_free_contents(&e->arr);
                 arr_entry_mark_unbuilt(e);
                 e->mem_bytes = 0;
-                return NULL;
+                return ENOMEM;
             }
             cs->arr_total_bytes += e->mem_bytes;
             e->source_snapshot = wl_columnar_relation_snapshot(rel);
@@ -1048,20 +1039,21 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
             cs->arr_total_bytes -= e->mem_bytes;
             if (arr_update_incremental(&e->arr, rel, old) != 0) {
                 cs->arr_total_bytes += e->mem_bytes; /* restore on failure */
-                return NULL;
+                return ENOMEM;
             }
             if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
                 arr_free_contents(&e->arr);
                 arr_entry_mark_unbuilt(e);
                 e->mem_bytes = 0;
-                return NULL;
+                return ENOMEM;
             }
             cs->arr_total_bytes += e->mem_bytes;
             e->source_snapshot = wl_columnar_relation_snapshot(rel);
         }
         /* Bump LRU clock on every access. */
         e->lru_clock = ++cs->arr_clock;
-        return &e->arr;
+        *out_arr = &e->arr;
+        return 0;
     }
 
     /* Not found: evict if count or byte limits exceeded. */
@@ -1094,12 +1086,12 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
          * arrangement until the lease is released. */
         for (uint32_t i = 0; i < cs->arr_count; i++) {
             if (cs->arr_entries[i].pin_count > 0)
-                return NULL;
+                return EBUSY;
         }
         uint32_t new_cap = cs->arr_cap ? cs->arr_cap * 2u : 8u;
         if (!arr_entries_grow(&cs->arr_entries, &cs->arr_cap,
             cs->arr_count, new_cap))
-            return NULL;
+            return ENOMEM;
     }
 
     /* Issue #1515: take every allocation that can fail before disturbing
@@ -1107,11 +1099,11 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
      * reused tombstone exactly as it was. */
     char *new_name = wl_strdup(rel_name);
     if (!new_name)
-        return NULL;
+        return ENOMEM;
     uint32_t *new_keys = (uint32_t *)malloc(key_count * sizeof(uint32_t));
     if (!new_keys) {
         free(new_name);
-        return NULL;
+        return ENOMEM;
     }
 
     if (appended) {
@@ -1155,12 +1147,41 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
              * can reuse the slot again. */
             e->source_snapshot = wl_columnar_relation_snapshot(NULL);
         }
-        return NULL;
+        return ENOMEM;
     }
     e->source_snapshot = wl_columnar_relation_snapshot(rel);
     cs->arr_total_bytes += e->mem_bytes;
     e->lru_clock = ++cs->arr_clock;
-    return &e->arr;
+    *out_arr = &e->arr;
+    return 0;
+}
+
+col_arrangement_t *
+col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
+    const uint32_t *key_cols, uint32_t key_count)
+{
+    wl_col_session_t *cs;
+    col_rel_t *rel = NULL;
+    col_arrangement_t *arr = NULL;
+
+    if (!sess || !rel_name || !key_cols || key_count == 0)
+        return NULL;
+
+    cs = COL_SESSION(sess);
+    for (uint32_t i = 0; i < cs->nrels; i++) {
+        if (cs->rels[i] && cs->rels[i]->name
+            && strcmp(cs->rels[i]->name, rel_name) == 0) {
+            rel = cs->rels[i];
+            break;
+        }
+    }
+    if (!rel)
+        return NULL;
+    if (col_session_get_arrangement_for_source(cs, rel, rel_name, key_cols,
+        key_count, &arr)
+        != 0)
+        return NULL;
+    return arr;
 }
 
 static int
@@ -1318,6 +1339,110 @@ col_session_acquire_arrangement_probe(wl_session_t *sess,
     if (probe->arrangement_pin.arr != arr
         || probe->arrangement_pin.entry != entry
         || !col_session_has_exact_relation(session, source, entry->rel_name)
+        || col_arrangement_probe_storage_owner_resolve(source,
+        &post_storage_owner, &post_storage_owner_identity,
+        &post_storage_owner_generation)
+        != 0
+        || post_storage_owner != storage_owner
+        || post_storage_owner_identity != storage_owner_identity
+        || post_storage_owner_generation != storage_owner_generation
+        || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        snapshot)) {
+        col_arrangement_pin_release(&probe->arrangement_pin);
+        rc = col_rel_source_reader_release(&probe->source_reader);
+        return rc == 0 ? EBUSY : rc;
+    }
+
+    probe->arr = arr;
+    probe->source = source;
+    probe->source_snapshot = snapshot;
+    probe->storage_owner = storage_owner;
+    probe->storage_owner_identity = storage_owner_identity;
+    probe->storage_owner_generation = storage_owner_generation;
+    probe->identity = (uintptr_t)probe;
+    probe->active = true;
+    return 0;
+}
+
+int
+col_session_acquire_primary_arrangement_probe(wl_session_t *sess,
+    const col_rel_t *source, const uint32_t *key_cols, uint32_t key_count,
+    col_arrangement_probe_t *probe)
+{
+    col_relation_snapshot_t snapshot;
+    col_arrangement_t *arr = NULL;
+    col_arr_entry_t *entry;
+    col_rel_t *storage_owner = NULL;
+    col_rel_t *post_storage_owner = NULL;
+    wl_col_session_t *session;
+    uint64_t storage_owner_identity = 0;
+    uint64_t storage_owner_generation = 0;
+    uint64_t post_storage_owner_identity = 0;
+    uint64_t post_storage_owner_generation = 0;
+    int rc;
+
+    if (!sess || !source || !source->name || !key_cols || key_count == 0
+        || !probe || probe->active || probe->identity != 0 || probe->arr
+        || probe->source || probe->storage_owner
+        || probe->storage_owner_identity != 0
+        || probe->storage_owner_generation != 0
+        || probe->arrangement_pin.active || probe->source_reader.owner)
+        return EINVAL;
+    session = COL_SESSION(sess);
+    if (!col_session_has_exact_relation(session, source, source->name))
+        return EBUSY;
+
+    rc = col_arrangement_probe_storage_owner_resolve(source, &storage_owner,
+            &storage_owner_identity, &storage_owner_generation);
+    if (rc != 0)
+        return rc;
+
+    rc = col_rel_source_reader_acquire(source, &probe->source_reader);
+    if (rc != 0)
+        return rc;
+
+    snapshot = wl_columnar_relation_snapshot(source);
+    if (!wl_columnar_relation_snapshot_valid(snapshot)
+        || !col_session_has_exact_relation(session, source, source->name)) {
+        rc = col_rel_source_reader_release(&probe->source_reader);
+        return rc == 0 ? EBUSY : rc;
+    }
+
+    rc = col_session_get_arrangement_for_source(session, (col_rel_t *)source,
+            source->name, key_cols, key_count, &arr);
+    if (rc != 0) {
+        int release_rc = col_rel_source_reader_release(&probe->source_reader);
+        return release_rc == 0 ? rc : release_rc;
+    }
+    entry = col_arr_entry_for_arr(session, arr);
+    if (!entry) {
+        rc = col_rel_source_reader_release(&probe->source_reader);
+        return rc == 0 ? EINVAL : rc;
+    }
+    if (col_arrangement_probe_storage_owner_resolve(source,
+        &post_storage_owner, &post_storage_owner_identity,
+        &post_storage_owner_generation)
+        != 0
+        || post_storage_owner != storage_owner
+        || post_storage_owner_identity != storage_owner_identity
+        || post_storage_owner_generation != storage_owner_generation
+        || !col_session_has_exact_relation(session, source, entry->rel_name)
+        || !wl_columnar_relation_snapshot_equal(
+        wl_columnar_relation_snapshot(source), snapshot)
+        || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        snapshot)) {
+        rc = col_rel_source_reader_release(&probe->source_reader);
+        return rc == 0 ? EBUSY : rc;
+    }
+
+    rc = col_arrangement_pin_entry(session, entry, arr,
+            &probe->arrangement_pin);
+    if (rc != 0) {
+        int release_rc = col_rel_source_reader_release(&probe->source_reader);
+        return release_rc == 0 ? rc : release_rc;
+    }
+    if (probe->arrangement_pin.arr != arr
+        || probe->arrangement_pin.entry != entry
         || col_arrangement_probe_storage_owner_resolve(source,
         &post_storage_owner, &post_storage_owner_identity,
         &post_storage_owner_generation)
