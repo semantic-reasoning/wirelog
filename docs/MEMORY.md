@@ -580,10 +580,16 @@ exactly once, including on allocation and join-error paths.
 
 | Event | Pinned entry | Unpinned entry |
 |---|---|---|
-| LRU eviction | skip and defer reclamation | reclaim normally |
-| relation invalidation | mark rebuild deferred; keep the old index readable | invalidate immediately |
-| stale generation, row growth, or pending invalidation on lookup | defer rebuild and return unavailable; preserve hash buffers and chains | rebuild before returning |
-| final lease release | apply deferred invalidation, without rebuilding; next lookup rebuilds lazily | no action |
+| LRU eviction | skip and defer reclamation | reclaim and clear the token |
+| relation invalidation | mark rebuild deferred; keep the old index readable | clear the token immediately |
+| stale or cleared token, row growth, or pending invalidation on lookup | defer rebuild and return unavailable; preserve hash buffers and chains | rebuild before returning |
+| final lease release | apply deferred invalidation by clearing the token, without rebuilding; next lookup rebuilds lazily | no action |
+
+An index is unbuilt exactly when its buffers are freed or its source token is
+invalid; invalidation, deferred release and eviction clear the token (#1500).
+An empty relation's index is built (16 buckets, no chain array) and is not
+stale: it is handed out as is, leased or not, and a second lease on it
+succeeds.
 
 This is an internal coordinator/worker-session contract, not a public API or a
 general concurrent-reader mechanism. Release all leases before session teardown.

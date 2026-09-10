@@ -326,6 +326,27 @@ arr_free_contents(col_arrangement_t *arr)
     arr->generation = 0;
 }
 
+/* A primary registry entry is unbuilt exactly when its buffers are freed
+ * (arr_free_contents zeroes nbuckets) or its source token was cleared by
+ * invalidation, deferred release or eviction (Issue #1500).  A built empty
+ * index (16 buckets, no chain array, fresh token) is not unbuilt: it is
+ * handed out as is, leased or not.  indexed_rows == 0 is therefore no
+ * longer the primary registry's "unbuilt" marker; the delta, filtered,
+ * sorted and differential arrangements keep it as theirs. */
+static inline bool
+arr_entry_unbuilt(const col_arr_entry_t *e)
+{
+    return e->arr.nbuckets == 0
+           || !wl_columnar_relation_snapshot_valid(e->source_snapshot);
+}
+
+static inline void
+arr_entry_mark_unbuilt(col_arr_entry_t *e)
+{
+    e->arr.indexed_rows = 0;
+    e->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+}
+
 /**
  * col_arr_entry_clone - Deep-copy one arrangement registry entry (#260).
  *
@@ -729,12 +750,14 @@ arr_update_incremental(col_arrangement_t *arr, const col_rel_t *rel,
  * drops below target_bytes, or until no more evictable entries remain.
  *
  * Priority:
- *   1. indexed_rows == 0 (already tombstoned — zero memory cost, but frees slot)
+ *   1. unbuilt entries (token cleared by invalidation) that still hold
+ *      buffers: nothing readable is lost
  *   2. smallest lru_clock (least recently used)
  *
- * Eviction is a tombstone: arr_free_contents clears ht_head/ht_next and resets
- * indexed_rows to 0.  The slot (rel_name, key_cols) is retained so the next
- * access can rebuild without re-allocating the entry.
+ * Eviction is a tombstone: arr_free_contents clears ht_head/ht_next and the
+ * entry's source token is cleared, so the entry reads as unbuilt.  The slot
+ * (rel_name, key_cols) is retained so the next access can rebuild without
+ * re-allocating the entry.
  */
 static void
 col_arr_cache_evict_lru(wl_col_session_t *cs, size_t target_bytes)
@@ -757,8 +780,8 @@ col_arr_cache_evict_lru(wl_col_session_t *cs, size_t target_bytes)
                 continue;
             }
 
-            /* Prefer indexed_rows == 0 (invalidated) entries first. */
-            if (e->arr.indexed_rows == 0) {
+            /* Prefer invalidated (unbuilt) entries first. */
+            if (arr_entry_unbuilt(e)) {
                 victim = (int)i;
                 break;
             }
@@ -775,6 +798,7 @@ col_arr_cache_evict_lru(wl_col_session_t *cs, size_t target_bytes)
         col_arr_entry_t *e = &cs->arr_entries[victim];
         cs->arr_total_bytes -= e->mem_bytes;
         arr_free_contents(&e->arr);
+        arr_entry_mark_unbuilt(e);
         e->mem_bytes = 0;
         e->evict_deferred = false;
     }
@@ -840,14 +864,17 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
         bool snapshot_match = wl_columnar_relation_snapshot_equal(
             e->source_snapshot, wl_columnar_relation_snapshot(rel));
         /* Even a same-capacity rebuild rewrites bucket generations/chains.
-         * Keep every index mutation behind the last reader's release. */
+         * Keep every index mutation behind the last reader's release.  A
+         * built empty index (Issue #1500) is fresh and is returned below;
+         * the unbuilt term mirrors the rebuild clause for symmetry, since
+         * no path frees a leased entry's buffers. */
         if (e->pin_count > 0
-            && (!snapshot_match || e->arr.indexed_rows == 0
+            && (!snapshot_match || arr_entry_unbuilt(e)
             || e->arr.indexed_rows < rel->nrows || e->rebuild_deferred)) {
             e->rebuild_deferred = true;
             return NULL;
         }
-        if (!snapshot_match || e->arr.indexed_rows == 0) {
+        if (!snapshot_match || arr_entry_unbuilt(e)) {
             /* Deduct stale bytes before rebuild; restore on failure. */
             cs->arr_total_bytes -= e->mem_bytes;
             if (arr_build_full(&e->arr, rel) != 0) {
@@ -856,6 +883,7 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
             }
             if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
                 arr_free_contents(&e->arr);
+                arr_entry_mark_unbuilt(e);
                 e->mem_bytes = 0;
                 return NULL;
             }
@@ -870,6 +898,7 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
             }
             if (!arr_memory_bytes(&e->arr, &e->mem_bytes)) {
                 arr_free_contents(&e->arr);
+                arr_entry_mark_unbuilt(e);
                 e->mem_bytes = 0;
                 return NULL;
             }
@@ -890,13 +919,12 @@ col_session_get_arrangement(wl_session_t *sess, const char *rel_name,
     }
 
     /* Prefer reusing a tombstone slot to keep arr_count bounded at
-     * COL_ARR_CACHE_MAX.  A tombstone has indexed_rows == 0 and mem_bytes == 0
-     * (hash tables freed); rel_name/key_cols are still valid and must be
-     * replaced below. */
+     * COL_ARR_CACHE_MAX.  A tombstone has mem_bytes == 0 (hash tables
+     * freed; a build never yields zero bytes); rel_name/key_cols are still
+     * valid and must be replaced below. */
     uint32_t slot = cs->arr_count; /* default: append */
     for (uint32_t i = 0; i < cs->arr_count; i++) {
-        if (cs->arr_entries[i].arr.indexed_rows == 0
-            && cs->arr_entries[i].mem_bytes == 0
+        if (cs->arr_entries[i].mem_bytes == 0
             && cs->arr_entries[i].pin_count == 0) {
             slot = i;
             break;
@@ -1022,7 +1050,9 @@ col_arrangement_pin_release(col_arrangement_pin_t *pin)
     if (entry->pin_count > 0)
         entry->pin_count--;
     if (entry->pin_count == 0 && entry->rebuild_deferred) {
-        entry->arr.indexed_rows = 0;
+        /* Apply the deferred invalidation without rebuilding: the next
+         * lookup sees an unbuilt entry and rebuilds lazily. */
+        arr_entry_mark_unbuilt(entry);
         entry->rebuild_deferred = false;
     }
     evict_deferred = entry->pin_count == 0 && entry->evict_deferred;
@@ -1117,7 +1147,7 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
             if (cs->arr_entries[i].pin_count > 0)
                 cs->arr_entries[i].rebuild_deferred = true;
             else
-                cs->arr_entries[i].arr.indexed_rows = 0;
+                arr_entry_mark_unbuilt(&cs->arr_entries[i]);
         }
     }
 

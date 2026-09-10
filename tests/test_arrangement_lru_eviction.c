@@ -246,7 +246,8 @@ test_env_var_limit(void)
 static void
 test_tombstone_rebuild(void)
 {
-    TEST("Tombstoned entry (indexed_rows=0) rebuilds on re-access");
+    TEST(
+        "Tombstoned entry (buffers freed, token cleared) rebuilds on re-access");
 
     const char *src = ".decl edge(x: int32, y: int32)\n"
         "edge(10, 1). edge(20, 2). edge(30, 3).\n"
@@ -293,6 +294,25 @@ test_tombstone_rebuild(void)
     ASSERT(entry->mem_bytes > 0, "mem_bytes must be restored after rebuild");
     ASSERT(cs->arr_total_bytes >= entry->mem_bytes,
         "arr_total_bytes must include rebuilt entry");
+    ASSERT(wl_columnar_relation_snapshot_valid(entry->source_snapshot),
+        "rebuild must leave a valid source token");
+    /* Issue #1500: a real LRU eviction clears the token as well, so the
+     * tombstone reads as unbuilt by token and by freed buffers.  Lease the
+     * entry through the pressured lookup so it is deferred rather than
+     * reused as the new entry's slot; the release then performs the
+     * deferred eviction with no lookup to reuse the tombstone. */
+    col_arrangement_pin_t pin = { 0 };
+    ASSERT(col_session_pin_arrangement(sess, "edge", key_cols, 1, &pin) == 0
+        && pin.entry == entry, "pin before pressure");
+    uint32_t alternate[1] = { 1 };
+    cs->arr_cache_limit_bytes = 0;
+    (void)col_session_get_arrangement(sess, "edge", alternate, 1);
+    ASSERT(entry->evict_deferred && entry->mem_bytes > 0,
+        "pressure must defer eviction of the leased entry");
+    col_arrangement_pin_release(&pin);
+    ASSERT(entry->mem_bytes == 0 && entry->arr.nbuckets == 0
+        && !wl_columnar_relation_snapshot_valid(entry->source_snapshot),
+        "deferred eviction must free the buffers and clear the source token");
 
     free_session(sess, plan, prog);
     PASS();
@@ -390,14 +410,21 @@ test_pinned_invalidation(void)
     ASSERT(arr->indexed_rows == 3,
         "pinned arrangement must remain readable until release");
 
+    col_arr_entry_t *pinned_entry = pin.entry;
     col_arrangement_pin_release(&pin);
     ASSERT(pin.active == false, "release must deactivate the lease");
     ASSERT(arr->indexed_rows == 0,
         "deferred invalidation must take effect on final release");
+    /* Issue #1500: the deferred invalidation clears the token, which is
+     * what makes the entry unbuilt for the next lookup. */
+    ASSERT(!wl_columnar_relation_snapshot_valid(pinned_entry->source_snapshot),
+        "deferred release must clear the source token");
 
     arr = col_session_get_arrangement(sess, "edge", key_cols, 1);
     ASSERT(arr != NULL && arr->indexed_rows == 3,
         "next access must rebuild the invalidated arrangement");
+    ASSERT(wl_columnar_relation_snapshot_valid(pinned_entry->source_snapshot),
+        "rebuild must restore a valid source token");
 
     free_session(sess, plan, prog);
     PASS();
@@ -411,7 +438,7 @@ test_pinned_rebuild(unsigned scenario)
     const char *names[] = {
         "same-count mutation", "append within capacity", "append with growth",
         "synthetic incremental append", "synthetic incremental growth",
-        "explicit invalidation", "empty index", "deferred eviction",
+        "explicit invalidation", "deferred eviction",
     };
     TEST(names[scenario]);
     const char *src = ".decl edge(x: int32, y: int32)\n"
@@ -433,20 +460,14 @@ test_pinned_rebuild(unsigned scenario)
     col_rel_t *rel = session_find_rel(cs, "edge");
     uint32_t key[1] = { 0 };
     PIN_CHECK(rel != NULL, "source relation missing");
-    if (scenario == 6) {
-        rel->nrows = 0;
-        wl_columnar_relation_touch_view(rel);
-    }
     PIN_CHECK(col_session_pin_arrangement(sess, "edge", key, 1, &first) == 0,
         "first pin");
-    /* Empty indexes always need a build, so a nested acquisition may defer. */
-    if (scenario != 6)
-        PIN_CHECK(col_session_pin_arrangement(sess, "edge", key, 1,
-            &second) == 0,
-            "fresh nested pin");
+    PIN_CHECK(col_session_pin_arrangement(sess, "edge", key, 1,
+        &second) == 0,
+        "fresh nested pin");
     col_arr_entry_t *entry = first.entry;
     col_arrangement_t *arr = first.arr;
-    if (scenario == 0 || scenario == 7)
+    if (scenario == 0 || scenario == 6)
         PIN_CHECK(col_rel_set(rel, 0, 0, 11) == 0, "same-count mutation");
     if (scenario >= 1 && scenario <= 4) {
         unsigned count = (scenario == 2 || scenario == 4) ? 40 : 1;
@@ -461,7 +482,7 @@ test_pinned_rebuild(unsigned scenario)
     }
     if (scenario == 5)
         col_session_invalidate_arrangements(sess, "edge");
-    if (scenario == 7) {
+    if (scenario == 6) {
         uint32_t alternate[1] = { 1 };
         cs->arr_cache_limit_bytes = 0;
         cs->arr_cap = cs->arr_count;
@@ -483,7 +504,7 @@ test_pinned_rebuild(unsigned scenario)
         "lookup rebuilt or returned a stale pinned index");
     PIN_CHECK(col_session_pin_arrangement(sess, "edge", key, 1, &denied) != 0
         && !denied.active, "stale acquisition must remain inactive");
-    PIN_CHECK(entry->pin_count == (scenario == 6 ? 1u : 2u)
+    PIN_CHECK(entry->pin_count == 2u
         && entry->rebuild_deferred, "deferred lease count");
     PIN_CHECK(arr->ht_head == saved.ht_head && arr->ht_next == saved.ht_next
         && arr->nbuckets == saved.nbuckets && arr->ht_cap == saved.ht_cap
@@ -503,7 +524,7 @@ test_pinned_rebuild(unsigned scenario)
     col_arrangement_pin_release(&first);
     PIN_CHECK(entry->pin_count == 0 && !entry->rebuild_deferred
         && arr->indexed_rows == 0
-        && (scenario == 7 ? entry->mem_bytes == 0
+        && (scenario == 6 ? entry->mem_bytes == 0
             : arr->generation == saved.generation),
         "final release must invalidate without rebuilding");
     arr = col_session_get_arrangement(sess, "edge", key, 1);
@@ -524,7 +545,7 @@ test_pinned_rebuild(unsigned scenario)
         PIN_CHECK(found == UINT32_MAX && matches == 1,
             "rebuilt key multiplicity or cycle mismatch");
     }
-    if (scenario == 0 || scenario == 7) {
+    if (scenario == 0 || scenario == 6) {
         int64_t old[2] = { 10, 1 };
         PIN_CHECK(col_arrangement_find_first(arr, rel->columns, 2, old)
             == UINT32_MAX, "removed key still indexed");
@@ -533,7 +554,7 @@ test_pinned_rebuild(unsigned scenario)
     for (uint32_t i = 0; i < cs->arr_count; i++)
         sum += cs->arr_entries[i].mem_bytes;
     PIN_CHECK(sum == cs->arr_total_bytes, "rebuild accounting sum");
-    if (scenario != 6) {
+    {
         uint32_t generation = arr->generation;
         PIN_CHECK(col_session_get_arrangement(sess, "edge", key, 1) == arr
             && arr->generation == generation,
@@ -551,6 +572,135 @@ cleanup:
         FAIL(failure);
     PASS();
 #undef PIN_CHECK
+}
+
+/* ================================================================
+ * Issue #1500: a built empty index is fresh, not unbuilt.
+ *
+ * Fixture: a declared EDB with no facts.  Session creation registers it
+ * with its schema and a valid token; the fallback below covers a build
+ * that leaves ncols at 0 (as seen for int-only EDBs elsewhere).
+ * ================================================================ */
+static int
+make_empty_edge_session(wl_session_t **sess, wl_plan_t **plan,
+    wirelog_program_t **prog, col_rel_t **edge_out)
+{
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+        ".decl path(x: int32, y: int32)\n"
+        "path(x, y) :- edge(x, y).\n";
+    if (make_session(src, sess, plan, prog) != 0)
+        return -1;
+    col_rel_t *edge = session_find_rel(COL_SESSION(*sess), "edge");
+    if (!edge)
+        return -1;
+    if (edge->ncols == 0 && col_rel_set_schema(edge, 2, NULL) != 0)
+        return -1;
+    if (edge->ncols != 2 || edge->nrows != 0
+        || !wl_columnar_relation_snapshot_valid(
+            wl_columnar_relation_snapshot(edge)))
+        return -1;
+    *edge_out = edge;
+    return 0;
+}
+
+static col_arr_entry_t *
+find_entry(wl_col_session_t *cs, const char *name)
+{
+    for (uint32_t i = 0; i < cs->arr_count; i++) {
+        if (cs->arr_entries[i].rel_name
+            && strcmp(cs->arr_entries[i].rel_name, name) == 0)
+            return &cs->arr_entries[i];
+    }
+    return NULL;
+}
+
+/* A leased empty index is returned as is by a later lookup, admits a
+ * second lease, and is neither deferred nor invalidated by the releases.
+ * On the previous clause the lookup returned NULL and the second lease
+ * failed. */
+static void
+test_pinned_empty_index(void)
+{
+    TEST("pinned empty index stays available and admits a second lease");
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    col_rel_t *edge = NULL;
+    ASSERT(make_empty_edge_session(&sess, &plan, &prog, &edge) == 0,
+        "empty-relation fixture");
+    wl_col_session_t *cs = COL_SESSION(sess);
+    uint32_t key[1] = { 0 };
+    col_arrangement_pin_t first = { 0 }, second = { 0 };
+    int ok = col_session_pin_arrangement(sess, "edge", key, 1, &first) == 0;
+    col_arr_entry_t *entry = ok ? first.entry : NULL;
+    col_arrangement_t *arr = ok ? first.arr : NULL;
+    if (ok)
+        ok = entry && arr && arr->indexed_rows == 0 && arr->nbuckets == 16
+            && arr->ht_cap == 0 && entry->mem_bytes == 128
+            && wl_columnar_relation_snapshot_valid(entry->source_snapshot);
+    uint64_t *heads = ok ? arr->ht_head : NULL;
+    uint32_t generation = ok ? arr->generation : 0;
+    size_t bytes = ok ? entry->mem_bytes : 0, total = cs->arr_total_bytes;
+    if (ok)
+        ok = col_session_get_arrangement(sess, "edge", key, 1) == arr
+            && !entry->rebuild_deferred && arr->ht_head == heads
+            && arr->generation == generation && arr->nbuckets == 16
+            && entry->mem_bytes == bytes && cs->arr_total_bytes == total;
+    if (ok)
+        ok = col_session_pin_arrangement(sess, "edge", key, 1, &second) == 0
+            && second.arr == arr && entry->pin_count == 2;
+    col_arrangement_pin_release(&second);
+    col_arrangement_pin_release(&first);
+    if (ok)
+        ok = entry->pin_count == 0 && !entry->rebuild_deferred
+            && arr->indexed_rows == 0 && arr->generation == generation
+            && wl_columnar_relation_snapshot_valid(entry->source_snapshot);
+    free_session(sess, plan, prog);
+    ASSERT(ok, "pinned empty index was deferred, rebuilt or refused a lease");
+    PASS();
+}
+
+/* An unpinned empty index is not rebuilt on every lookup; invalidation
+ * clears its token and the next lookup rebuilds.  On the previous clause
+ * the second lookup re-entered the full build (generation bumped). */
+static void
+test_unpinned_empty_index_no_rebuild(void)
+{
+    TEST("unpinned empty index is not rebuilt on every lookup");
+    wl_session_t *sess = NULL;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    col_rel_t *edge = NULL;
+    ASSERT(make_empty_edge_session(&sess, &plan, &prog, &edge) == 0,
+        "empty-relation fixture");
+    wl_col_session_t *cs = COL_SESSION(sess);
+    uint32_t key[1] = { 0 };
+    col_arrangement_t *arr = col_session_get_arrangement(sess, "edge", key, 1);
+    col_arr_entry_t *entry = find_entry(cs, "edge");
+    int ok = arr && entry && &entry->arr == arr && arr->indexed_rows == 0
+        && arr->nbuckets == 16 && entry->mem_bytes == 128
+        && wl_columnar_relation_snapshot_valid(entry->source_snapshot);
+    uint64_t *heads = ok ? arr->ht_head : NULL;
+    uint32_t generation = ok ? arr->generation : 0;
+    size_t total = cs->arr_total_bytes;
+    if (ok)
+        ok = col_session_get_arrangement(sess, "edge", key, 1) == arr
+            && arr->generation == generation && arr->ht_head == heads
+            && entry->mem_bytes == 128 && cs->arr_total_bytes == total;
+    if (ok) {
+        col_session_invalidate_arrangements(sess, "edge");
+        ok = !wl_columnar_relation_snapshot_valid(entry->source_snapshot)
+            && arr->indexed_rows == 0;
+    }
+    if (ok)
+        ok = col_session_get_arrangement(sess, "edge", key, 1) == arr
+            && arr->generation == generation + 1
+            && wl_columnar_relation_snapshot_valid(entry->source_snapshot)
+            && cs->arr_total_bytes == total;
+    free_session(sess, plan, prog);
+    ASSERT(ok,
+        "unpinned empty index was rebuilt needlessly or not after invalidation");
+    PASS();
 }
 
 /* ================================================================
@@ -762,8 +912,10 @@ main(void)
     test_append_failure_rolls_back();
     test_total_bytes_accounting();
     test_pinned_invalidation();
-    for (unsigned scenario = 0; scenario < 8; scenario++)
+    for (unsigned scenario = 0; scenario < 7; scenario++)
         test_pinned_rebuild(scenario);
+    test_pinned_empty_index();
+    test_unpinned_empty_index_no_rebuild();
 
     printf("\n%d/%d tests passed", pass_count, test_count);
     if (fail_count > 0)
