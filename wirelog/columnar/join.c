@@ -1049,6 +1049,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     col_join_batch_eligibility_t batch_elig = col_join_batch_eligibility(sess,
             kc, used_right_delta, op->right_filter_expr.size != 0);
     bool bounded = batch_elig == COL_JOIN_BATCH_ELIGIBLE;
+    if (sess->join_batch_bytes > 0)
+        sess->join_batch_last_rows_per_batch = 0;
     if (sess->join_batch_bytes > 0 && !bounded) {
         if (sess->join_batch_strict) {
             free(lk);
@@ -1359,6 +1361,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             } else if (create_rc != 0) {
                 join_rc = create_rc;
             } else {
+                sess->join_batch_last_rows_per_batch =
+                    col_join_batch_rows_per_batch(cont);
                 join_rc = col_join_batch_run_to_relation(cont, sess, out);
                 wl_columnar_continuation_destroy(cont);
                 if (join_rc != 0)

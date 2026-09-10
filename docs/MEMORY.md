@@ -389,7 +389,8 @@ workloads:
 | `1` | At `col_session_destroy()` print the coordinator summary: one header line with `rss_peak`, the ledger table, and one aggregate line for TDD workers. |
 | `2` | Additionally print the full ledger of every TDD worker when it is torn down (after every TDD stratum, so this is verbose). |
 
-Example (`W=8`, the 100-edge closure fixture, level 2, one worker shown):
+Example (`W=8`, the 100-edge closure fixture, level 2, one worker shown;
+`WIRELOG_JOIN_BATCH_BYTES` is enabled):
 
 ```
 [wirelog mem] scope=coordinator workers=8 rss_peak=9.0MB
@@ -403,6 +404,7 @@ Example (`W=8`, the 100-edge closure fixture, level 2, one worker shown):
   STORED       current=100.6KB    peak=248.6KB    cap=4.7GB
   TEMPORARY    current=0B         peak=80.0KB     cap=4.7GB
 [wirelog mem] tdd_workers reports=8 peak_max=12.5MB peak_sum=98.8MB
+[wirelog mem] join_batch fallback_count=0 last_reason=none rows_per_batch=128
 [wirelog mem] scope=worker id=0 workers=8
 [wirelog mem] budget=10.5GB current=12.3MB peak=12.5MB
   RELATION     current=0B         peak=128.0KB    cap=5.2GB
@@ -414,6 +416,26 @@ Example (`W=8`, the 100-edge closure fixture, level 2, one worker shown):
 largest single worker peak and `peak_sum` the sum of all worker peaks (an
 upper bound on their concurrent footprint, since the same worker slot is
 recreated per stratum).
+
+When `WIRELOG_JOIN_BATCH_BYTES` is enabled, the coordinator report appends a
+session-local bounded-join line:
+
+```text
+[wirelog mem] join_batch fallback_count=N last_reason=NAME rows_per_batch=N
+```
+
+`fallback_count` counts bounded-mode shapes that fell back to the one-shot
+join. `last_reason` is the final recorded reason (`none` when the count is
+zero); the vocabulary is the stable names returned by the bounded-join
+eligibility contract, such as `cross-join`, `delta-right`, `filtered-right`,
+`no-arrangement`, and `row-too-large`. `rows_per_batch` is the batch size
+chosen by the most recently successful producer in that session, or zero when
+the most recent bounded attempt made no producer decision. It is not an
+aggregate across joins and is diagnostic only. The line is omitted when
+`WIRELOG_JOIN_BATCH_BYTES` is unset, invalid, or zero, preserving the report
+when bounded joins are disabled. With `WL_MEM_REPORT=2`, the same fields are
+printed for each worker session; worker values are not folded into the
+coordinator line.
 
 The report is not async-signal-safe and goes to `stderr` unconditionally;
 it does not use `WL_LOG`.

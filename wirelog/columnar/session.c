@@ -10,6 +10,7 @@
 
 #include "columnar/compound_side.h"
 #include "columnar/internal.h"
+#include "columnar/join_batch.h"
 #include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
@@ -973,6 +974,26 @@ mem_report_bytes(uint64_t bytes, char *buf, size_t len)
     return buf;
 }
 
+/* Bounded-join diagnostics are session-local rather than ledger fields.
+ * Keep them in an appended line so existing WL_MEM_REPORT consumers retain
+ * their ordering and byte-valued fields. */
+static void
+col_session_mem_report_join_batch(const wl_col_session_t *sess)
+{
+    const char *reason = "none";
+
+    if (!sess || sess->join_batch_bytes == 0)
+        return;
+    if (sess->join_batch_fallback_count > 0)
+        reason = col_join_batch_eligibility_name(
+            (col_join_batch_eligibility_t)sess->join_batch_last_reason);
+    fprintf(stderr,
+        "[wirelog mem] join_batch fallback_count=%u last_reason=%s "
+        "rows_per_batch=%u\n",
+        sess->join_batch_fallback_count, reason,
+        sess->join_batch_last_rows_per_batch);
+}
+
 /*
  * col_compute_worker_cap: RAM-aware worker cap formula (Issue #409).
  * See declaration in internal.h for full rationale and examples.
@@ -1586,6 +1607,7 @@ col_session_destroy(wl_session_t *session)
             (unsigned long long)sess->mem_worker_reports,
             mem_report_bytes(sess->mem_worker_peak_max, b2, sizeof(b2)),
             mem_report_bytes(sess->mem_worker_peak_sum, b3, sizeof(b3)));
+        col_session_mem_report_join_batch(sess);
     }
 
     /* Issue #959: report the join-output high-water mark before teardown.
@@ -1762,6 +1784,13 @@ col_worker_session_create(wl_col_session_t *coordinator,
     wl_columnar_memory_governor_ref_retain(out_worker->memory_governor);
     out_worker->extension_expr_status = 0;
     out_worker->callback_session_key = coordinator->callback_session_key;
+    /* Diagnostic counters describe this worker's session, not the
+     * coordinator that was copied above.  Keep the batch configuration but
+     * start worker-local observations from an empty state. */
+    out_worker->join_batch_fallback_count = 0;
+    out_worker->join_batch_last_reason = 0;
+    out_worker->join_batch_warned_reasons = 0;
+    out_worker->join_batch_last_rows_per_batch = 0;
     out_worker->delta_events = NULL;
     out_worker->delta_event_count = 0;
     out_worker->delta_event_capacity = 0;
@@ -1971,6 +2000,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
         fprintf(stderr, "[wirelog mem] scope=worker id=%u workers=%u\n",
             worker->worker_id, worker->num_workers);
         wl_mem_ledger_report(&worker->mem_ledger);
+        col_session_mem_report_join_batch(worker);
     }
 
     /* Free mat_cache entries (all worker-owned since zeroed at create) */

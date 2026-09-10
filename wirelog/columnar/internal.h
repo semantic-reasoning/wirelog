@@ -1604,6 +1604,9 @@ typedef struct wl_col_session_t {
     uint32_t join_batch_fallback_count;
     uint8_t join_batch_last_reason;
     uint8_t join_batch_warned_reasons; /* one WL_LOG warning per reason */
+    /* Rows selected by the most recently successful bounded producer in this
+     * session. Zero means the latest bounded attempt made no decision. */
+    uint32_t join_batch_last_rows_per_batch;
     /* Issue #959: high-water mark of a single join's output, per session.
      * Workers are separate sessions, so each carries its own -- which is the
      * number needed to decide whether dividing the row cap by W is right:

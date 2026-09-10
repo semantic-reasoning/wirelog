@@ -1002,6 +1002,46 @@ test_join_output_limit_scaling(void)
 }
 
 static int
+test_worker_join_batch_diagnostics_are_local(void)
+{
+    TEST("worker bounded-join diagnostics do not inherit coordinator state");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    if (!coord) {
+        FAIL("coordinator creation");
+        return 1;
+    }
+    coord->join_batch_bytes = 4096;
+    coord->join_batch_strict = true;
+    coord->join_batch_fallback_count = 7;
+    coord->join_batch_last_reason = 6;
+    coord->join_batch_warned_reasons = 0x40;
+    coord->join_batch_last_rows_per_batch = 128;
+
+    wl_col_session_t worker;
+    memset(&worker, 0, sizeof(worker));
+    int rc = col_worker_session_create(coord, 0, NULL, 0, &worker);
+    int ok = rc == 0
+        && worker.join_batch_bytes == coord->join_batch_bytes
+        && worker.join_batch_strict == coord->join_batch_strict
+        && worker.join_batch_fallback_count == 0
+        && worker.join_batch_last_reason == 0
+        && worker.join_batch_warned_reasons == 0
+        && worker.join_batch_last_rows_per_batch == 0;
+    if (rc == 0)
+        col_worker_session_destroy(&worker);
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("worker inherited coordinator bounded-join diagnostics");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
 test_hash_table_independent(void)
 {
     TEST("worker hash table is independent (lazy rebuild)");
@@ -1605,6 +1645,7 @@ main(void)
     test_session_add_rel_reuses_removed_slot();
     test_session_add_rel_invalidates_filter_cache();
     test_join_output_limit_scaling();
+    test_worker_join_batch_diagnostics_are_local();
     test_rdf_graph_column_propagates_to_col_rel();
     test_rdf_no_graph_column_defaults_to_false();
     test_rdf_graph_metadata_auto_created_when_any_graph_column();
