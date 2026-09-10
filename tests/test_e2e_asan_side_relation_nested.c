@@ -261,7 +261,7 @@ test_e2e_asan_side_relation_nested(void)
 {
     TEST("ASan: K=4 workers, 2500 cycles each, nested inline + arena GC");
 
-    thread_t threads[K_WORKERS];
+    wl_thread_t threads[K_WORKERS];
     asan_worker_t workers[K_WORKERS];
     bool thread_created[K_WORKERS];
     memset(thread_created, 0, sizeof(thread_created));
@@ -271,14 +271,14 @@ test_e2e_asan_side_relation_nested(void)
         workers[w].cycles = CYCLES_PER_WORKER;
         workers[w].errors = 0u;
         workers[w].setup_rc = 0;
-        int trc = thread_create(&threads[w], asan_worker_main, &workers[w]);
-        ASSERT(trc == 0, "thread_create failed");
+        int trc = wl_thread_create(&threads[w], asan_worker_main, &workers[w]);
+        ASSERT(trc == 0, "wl_thread_create failed");
         thread_created[w] = true;
     }
 
     for (int w = 0; w < K_WORKERS; w++) {
         if (thread_created[w]) {
-            thread_join(&threads[w]);
+            wl_thread_join(&threads[w]);
             thread_created[w] = false;
         }
     }
@@ -309,7 +309,7 @@ test_e2e_asan_side_relation_nested(void)
 cleanup:
     for (int w = 0; w < K_WORKERS; w++) {
         if (thread_created[w])
-            thread_join(&threads[w]);
+            wl_thread_join(&threads[w]);
     }
 }
 

@@ -269,16 +269,16 @@ test_concurrent_consistency(void)
     wl_mem_ledger_t ledger;
     wl_mem_ledger_init(&ledger, 0);
 
-    thread_t threads[CONC_THREADS];
+    wl_thread_t threads[CONC_THREADS];
     conc_arg_t args[CONC_THREADS];
 
     for (int i = 0; i < CONC_THREADS; i++) {
         args[i].ledger = &ledger;
         args[i].subsys = i % WL_MEM_SUBSYS_COUNT;
-        thread_create(&threads[i], conc_worker, &args[i]);
+        wl_thread_create(&threads[i], conc_worker, &args[i]);
     }
     for (int i = 0; i < CONC_THREADS; i++) {
-        thread_join(&threads[i]);
+        wl_thread_join(&threads[i]);
     }
 
     /* After equal alloc/free cycles, current_bytes must be 0 */

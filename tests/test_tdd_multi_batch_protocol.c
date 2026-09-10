@@ -133,15 +133,15 @@ static void test_progress_with_blocked_producer(void)
     wl_columnar_tdd_payload_t *items = payloads(6, reservations);
     wl_columnar_tdd_protocol_t *protocol = wl_columnar_tdd_protocol_create(2);
     producer_arg_t arg = {protocol, items, 0, 6, 0, 0, 0};
-    thread_t thread;
+    wl_thread_t thread;
     wl_columnar_tdd_message_t message;
     size_t expected;
-    assert(thread_create(&thread, producer, &arg) == 0);
+    assert(wl_thread_create(&thread, producer, &arg) == 0);
 
     if (!wl_columnar_tdd_protocol_wait_full_with_blocked_submitter(protocol,
         BLOCKED_TIMEOUT_MS)) {
         wl_columnar_tdd_protocol_cancel(protocol);
-        assert(thread_join(&thread) == 0);
+        assert(wl_thread_join(&thread) == 0);
         wl_columnar_tdd_protocol_destroy(protocol);
         free(items);
         fprintf(stderr,
@@ -161,7 +161,7 @@ static void test_progress_with_blocked_producer(void)
         if (!wl_columnar_tdd_protocol_wait_full_with_blocked_submitter(
                 protocol, BLOCKED_TIMEOUT_MS)) {
             wl_columnar_tdd_protocol_cancel(protocol);
-            assert(thread_join(&thread) == 0);
+            assert(wl_thread_join(&thread) == 0);
             wl_columnar_tdd_protocol_destroy(protocol);
             free(items);
             fprintf(stderr,
@@ -179,7 +179,7 @@ static void test_progress_with_blocked_producer(void)
     assert(wl_columnar_tdd_protocol_pump(protocol,
         &message) == WL_COLUMNAR_TDD_DATA);
     consume(&message);
-    assert(thread_join(&thread) == 0);
+    assert(wl_thread_join(&thread) == 0);
     assert(submitted_load(&arg.submitted) == 6);
     assert(submitted_load(&arg.started) == 6);
     assert(submitted_load(&arg.finished) == 6);
@@ -204,7 +204,7 @@ static void test_cancel_partial_and_alias(void)
     wl_columnar_tdd_payload_t *items = payloads(3, reservations);
     wl_columnar_tdd_protocol_t *protocol = wl_columnar_tdd_protocol_create(2);
     producer_arg_t arg = {protocol, items, 2, 1, 0, 0, 0};
-    thread_t thread;
+    wl_thread_t thread;
     assert(wl_columnar_tdd_protocol_submit(protocol,
         &items[0]) == WL_COLUMNAR_TDD_SUBMITTED);
     assert(wl_columnar_tdd_protocol_submit(protocol,
@@ -215,11 +215,11 @@ static void test_cancel_partial_and_alias(void)
     assert(wl_columnar_tdd_protocol_submit(protocol,
         &items[2]) == WL_COLUMNAR_TDD_DUPLICATE);
     items[2].reservation = &reservations[2];
-    assert(thread_create(&thread, producer, &arg) == 0);
+    assert(wl_thread_create(&thread, producer, &arg) == 0);
     if (!wl_columnar_tdd_protocol_wait_full_with_blocked_submitter(protocol,
         BLOCKED_TIMEOUT_MS)) {
         wl_columnar_tdd_protocol_cancel(protocol);
-        assert(thread_join(&thread) == 0);
+        assert(wl_thread_join(&thread) == 0);
         wl_columnar_tdd_protocol_destroy(protocol);
         free(items);
         fprintf(stderr,
@@ -231,7 +231,7 @@ static void test_cancel_partial_and_alias(void)
     assert(submitted_load(&arg.started) == 1);
     assert(submitted_load(&arg.finished) == 0);
     wl_columnar_tdd_protocol_cancel(protocol);
-    assert(thread_join(&thread) == 0);
+    assert(wl_thread_join(&thread) == 0);
     assert(submitted_load(&arg.finished) == 1);
     assert(submitted_load(&arg.submitted) == 0);
     assert(items[0].release_count == 1);
