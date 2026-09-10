@@ -1,7 +1,8 @@
 /*
  * columnar/source_access.h - allocation-free source reader/writer gate
  *
- * Internal, inactive until the source-lifetime integration units enable it.
+ * Internal relation source-reader/writer gate.  Broader operation-scope and
+ * public teardown integration is completed by the subsequent lifecycle units.
  */
 
 #ifndef WL_COLUMNAR_SOURCE_ACCESS_H
@@ -19,6 +20,34 @@
 typedef struct wl_columnar_source_access_gate {
     wl_atomic_u64 state;
 } wl_columnar_source_access_gate_t;
+
+static inline bool
+wl_columnar_source_access_gate_busy(
+    const wl_columnar_source_access_gate_t *gate)
+{
+    return gate
+           && atomic_load_explicit(&gate->state, memory_order_acquire) != 0;
+}
+
+/* Claim the writer state for terminal destruction.  The claim is intentionally
+ * not released: the owning relation is destroyed while it is held. */
+static inline int
+wl_columnar_source_access_writer_claim(
+    wl_columnar_source_access_gate_t *gate)
+{
+    uint64_t expected;
+    if (!gate)
+        return EINVAL;
+    for (;;) {
+        expected = 0;
+        if (atomic_compare_exchange_weak_explicit(&gate->state, &expected,
+            WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed))
+            return 0;
+        if (expected != 0)
+            return EBUSY;
+    }
+}
 
 typedef struct wl_columnar_source_access_reader {
     wl_columnar_source_access_gate_t *owner;

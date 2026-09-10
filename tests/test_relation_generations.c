@@ -220,6 +220,35 @@ test_copy_and_shared_semantics(void)
 }
 
 static void
+test_source_reader_blocks_checked_destroy(void)
+{
+    col_rel_t *rel = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    char *name;
+    uint64_t identity;
+    uint64_t generation;
+    uint32_t rows;
+
+    CHECK(rel != NULL, "source reader relation allocation");
+    name = rel->name;
+    identity = rel->relation_identity;
+    generation = rel->storage_generation;
+    rows = rel->nrows;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "source reader acquisition");
+    CHECK(col_rel_destroy_checked(rel) == EBUSY,
+        "active source reader blocks checked destroy");
+    CHECK(rel->name == name && rel->relation_identity == identity
+        && rel->storage_generation == generation && rel->nrows == rows,
+        "busy destroy changed relation state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "source reader release");
+    CHECK(col_rel_destroy_checked(rel) == 0,
+        "destroy retry after reader release");
+    owned_relation_count--;
+}
+
+static void
 test_rollback_fresh_generation(void)
 {
     col_rel_t *rel = new_relation();
@@ -1164,6 +1193,7 @@ main(void)
     test_same_row_count_mutation();
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
+    test_source_reader_blocks_checked_destroy();
     test_copy_and_shared_semantics();
     test_rollback_fresh_generation();
     test_overflow_boundary();
