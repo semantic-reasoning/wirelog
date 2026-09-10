@@ -538,6 +538,11 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
                 tmp[slen] = '\0';
                 value = wl_intern_put(intern, tmp);
                 free(tmp);
+                if (value < 0) {
+                    if (status)
+                        *status = WL_COLUMNAR_EXPR_ALLOCATION_FAILURE;
+                    goto bad;
+                }
             }
             expr_push_string(&s, value, buf + i, slen);
             i += slen;
@@ -1182,8 +1187,11 @@ wl_columnar_expr_eval_run_ctx(const uint8_t *buf, uint32_t size,
             digest[6] = (digest[6] & 0x0F) | 0x50;
             digest[8] = (digest[8] & 0x3F) | 0x80;
             int64_t result = wl_columnar_expr_format_uuid(digest, intern);
-            if (result < 0)
+            if (result < 0) {
+                if (status)
+                    *status = WL_COLUMNAR_EXPR_ALLOCATION_FAILURE;
                 goto bad;
+            }
             expr_push(&s, result);
 #else
             (void)expr_pop(&s);

@@ -333,6 +333,10 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name);
 uint32_t
 col_session_get_iteration_count(wl_session_t *sess);
 
+/* Return the last scalar-expression status recorded by evaluation. */
+int
+col_session_get_expression_status(wl_session_t *sess);
+
 /**
  * col_session_get_perf_stats:
  *

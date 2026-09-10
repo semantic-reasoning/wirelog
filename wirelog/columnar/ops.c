@@ -280,7 +280,9 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                         if (e.owned)
                             col_rel_destroy(e.rel);
                         if (sess && expr_status
-                            >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED)
+                            >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+                            && expr_status
+                            != WL_COLUMNAR_EXPR_ALLOCATION_FAILURE)
                             sess->extension_expr_status = expr_status;
                         return expr_status
                                >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED

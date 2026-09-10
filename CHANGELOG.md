@@ -31,6 +31,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Governed string evaluation error mapping** (#1521): map evaluation-time
+  string interning denials to `WIRELOG_ERR_MEMORY` across the easy, advanced,
+  and legacy facades, without misreporting built-in allocation failures as
+  scalar extension errors.
+
 - **Arrangement registry stays scannable after a failed tombstone reuse**
   (#1515). The name and key allocations for a new `(relation, key columns)`
   entry now precede any change to the reused slot, and a first build denied
