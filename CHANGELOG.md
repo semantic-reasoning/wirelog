@@ -56,6 +56,13 @@ All notable changes to wirelog are documented in this file.
   back, so a denied rebind fails session creation and leaves both governors
   unchanged, and later sessions' budgets bound the table again.
 
+- **A built arrangement over an empty relation is fresh, not unbuilt**
+  (#1500). The primary arrangement registry no longer treats zero indexed
+  rows as "needs a build": unbuilt now means freed buffers or a cleared
+  source token, which invalidation, deferred release and eviction set. An
+  empty index is returned as is and admits a second lease instead of being
+  rebuilt on every lookup or deferred under a lease.
+
 - **Unfused recursive SCCs no longer terminate with incomplete results**
   (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
   to normal evaluation instead of treating one empty input as an empty union.
