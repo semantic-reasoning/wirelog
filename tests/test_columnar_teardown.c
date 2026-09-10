@@ -44,6 +44,7 @@ build_plan(wirelog_program_t **program_out)
 {
     const char *source =
         ".decl edge(x: int32, y: int32)\n"
+        ".decl meta(x: int32, y: int32)\n"
         ".decl reach(x: int32, y: int32)\n"
         "reach(x, y) :- edge(x, y).\n";
     wirelog_error_t error;
@@ -73,6 +74,7 @@ main(void)
     wl_col_session_t worker = { 0 };
     queued_check_t check = { 0 };
     int64_t edge[] = { 1, 2 };
+    int64_t meta[] = { 1, 3 };
     int failures = 0;
     int rc;
 
@@ -102,8 +104,77 @@ main(void)
 
     rc = wl_session_insert(base, "edge", edge, 1, 2);
     failures += expect(rc == 0, "edge insertion succeeds");
+    rc = wl_session_insert(base, "meta", meta, 1, 2);
+    failures += expect(rc == 0, "meta insertion succeeds");
     check.relation = session_find_rel(session, "edge");
     failures += expect(check.relation != NULL, "edge relation exists");
+
+    /* Qualify the operation-local bundle's nested failure and teardown
+     * contract on real session-owned relations.  A dependency denial must
+     * unwind the primary arrangement probe before the caller can retry. */
+    col_rel_t *meta_rel = session_find_rel(session, "meta");
+    uint32_t key_cols[] = { 0 };
+    col_arrangement_t *edge_arr = col_session_get_arrangement(
+        base, "edge", key_cols, 1);
+    col_arr_entry_t *edge_entry = NULL;
+    if (edge_arr) {
+        for (uint32_t i = 0; i < session->arr_count; i++) {
+            if (&session->arr_entries[i].arr == edge_arr) {
+                edge_entry = &session->arr_entries[i];
+                break;
+            }
+        }
+    }
+    failures += expect(meta_rel != NULL && edge_arr != NULL
+            && edge_entry != NULL, "nested bundle setup");
+    if (meta_rel && edge_arr && edge_entry) {
+        col_arrangement_probe_bundle_t bundle = { 0 };
+        col_arrangement_probe_t *primary = NULL;
+        wl_columnar_source_access_writer_t meta_writer = { 0 };
+        col_arrangement_probe_bundle_init(&bundle);
+        rc = col_arrangement_probe_bundle_acquire_primary(
+            &bundle, base, check.relation, key_cols, 1, &primary);
+        failures += expect(rc == 0 && primary != NULL,
+                "primary bundle probe acquires");
+        rc = wl_columnar_source_access_writer_acquire(
+            &meta_rel->source_access, &meta_writer);
+        failures += expect(rc == 0, "dependency writer setup");
+        if (rc == 0) {
+            rc = col_arrangement_probe_bundle_acquire_dependency(
+                &bundle, meta_rel);
+            failures += expect(rc == EBUSY && bundle.count == 0
+                    && bundle.dependency_count == 0
+                    && primary != NULL && !primary->active
+                    && atomic_load_explicit(&check.relation->source_access.state,
+                        memory_order_acquire) == 0
+                    && edge_entry->pin_count == 0,
+                "nested dependency denial rolls back primary");
+            failures += expect(wl_columnar_source_access_writer_release(
+                &meta_writer) == 0, "dependency writer release");
+        }
+        failures += expect(col_arrangement_probe_bundle_release(&bundle) == 0,
+                "rolled-back bundle remains releasable");
+
+        col_arrangement_probe_bundle_init(&bundle);
+        rc = col_arrangement_probe_bundle_acquire_primary(
+            &bundle, base, check.relation, key_cols, 1, &primary);
+        failures += expect(rc == 0, "primary retry acquires");
+        rc = col_arrangement_probe_bundle_acquire_dependency(&bundle,
+            meta_rel);
+        failures += expect(rc == 0 && bundle.dependency_count == 1,
+                "dependency retry acquires");
+        failures += expect(wl_session_insert(base, "edge", edge, 1, 2)
+                == EBUSY, "session mutation is excluded by active bundle");
+        failures += expect(col_arrangement_probe_bundle_release(&bundle) == 0,
+                "nested bundle release succeeds");
+        wl_columnar_source_access_writer_t edge_writer = { 0 };
+        failures += expect(wl_columnar_source_access_writer_acquire(
+            &check.relation->source_access, &edge_writer) == 0,
+            "edge writer succeeds after bundle release");
+        failures += expect(wl_columnar_source_access_writer_release(
+            &edge_writer) == 0, "edge writer release after bundle");
+    }
+
     rc = wl_columnar_session_ensure_workqueue(session, 2);
     failures += expect(rc == 0 && session->wq != NULL,
             "workqueue creates");
