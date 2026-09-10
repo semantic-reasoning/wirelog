@@ -953,30 +953,37 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Apply constant filter on right child (from FILTER wrappers collected
      * during plan generation).  Use session-level cache (Issue #386): the
      * filtered relation is owned by sess->filt_cache and must NOT be
-     * destroyed here.  right_filtered remains NULL for the cached path. */
-    if (op->right_filter_expr.size > 0 && op->right_relation
-        && !used_right_delta) {
-        col_rel_t *filtered = wl_columnar_filter_apply_right_filter_cached(sess,
-                &op->right_filter_expr, op->right_relation, right);
-        if (!filtered) {
-            if (left_e.owned)
-                col_rel_destroy(left_e.rel);
-            return ENOMEM;
+     * destroyed here.  right_filtered remains NULL for the cached path.
+     * The cache reports itself unavailable while a lease defers a rebuild
+     * or blocks growth (Issue #1435), and on allocation failure; either
+     * way this op continues on an owned filtered relation. */
+    if (op->right_filter_expr.size > 0) {
+        col_rel_t *filtered = NULL;
+        if (op->right_relation && !used_right_delta) {
+            filtered = wl_columnar_filter_apply_right_filter_cached(sess,
+                    &op->right_filter_expr, op->right_relation, right);
+            if (!filtered)
+                WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                    "filtered cache unavailable for %s, using owned filter",
+                    op->right_relation);
         }
-        right = filtered;
-        /* right_filtered stays NULL: cache owns the relation */
-    } else if (op->right_filter_expr.size > 0) {
-        /* Delta path or no relation name: fall back to pool-allocated filter */
-        col_rel_t *filtered =
-            wl_columnar_filter_apply_right_filter(&op->right_filter_expr, right,
-                sess->delta_pool, sess->intern);
-        if (!filtered) {
-            if (left_e.owned)
-                col_rel_destroy(left_e.rel);
-            return ENOMEM;
+        if (filtered) {
+            right = filtered;
+            /* right_filtered stays NULL: cache owns the relation */
+        } else {
+            /* Delta path, no relation name, or cache unavailable:
+             * pool-allocated filter owned by this op */
+            filtered = wl_columnar_filter_apply_right_filter(
+                &op->right_filter_expr, right, sess->delta_pool,
+                sess->intern);
+            if (!filtered) {
+                if (left_e.owned)
+                    col_rel_destroy(left_e.rel);
+                return ENOMEM;
+            }
+            right = filtered;
+            right_filtered = filtered;
         }
-        right = filtered;
-        right_filtered = filtered;
     }
 
     /* Materialization cache: reuse previous join result when available.
@@ -2184,30 +2191,37 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Apply constant filter on right child (from FILTER wrappers collected
      * during plan generation).  Use session-level cache (Issue #386): the
      * filtered relation is owned by sess->filt_cache and must NOT be
-     * destroyed here.  right_filtered remains NULL for the cached path. */
-    if (op->right_filter_expr.size > 0 && op->right_relation
-        && !used_right_delta) {
-        col_rel_t *filtered = wl_columnar_filter_apply_right_filter_cached(sess,
-                &op->right_filter_expr, op->right_relation, right);
-        if (!filtered) {
-            if (left_e.owned)
-                col_rel_destroy(left_e.rel);
-            return ENOMEM;
+     * destroyed here.  right_filtered remains NULL for the cached path.
+     * The cache reports itself unavailable while a lease defers a rebuild
+     * or blocks growth (Issue #1435), and on allocation failure; either
+     * way this op continues on an owned filtered relation. */
+    if (op->right_filter_expr.size > 0) {
+        col_rel_t *filtered = NULL;
+        if (op->right_relation && !used_right_delta) {
+            filtered = wl_columnar_filter_apply_right_filter_cached(sess,
+                    &op->right_filter_expr, op->right_relation, right);
+            if (!filtered)
+                WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                    "filtered cache unavailable for %s, using owned filter",
+                    op->right_relation);
         }
-        right = filtered;
-        /* right_filtered stays NULL: cache owns the relation */
-    } else if (op->right_filter_expr.size > 0) {
-        /* Delta path or no relation name: fall back to pool-allocated filter */
-        col_rel_t *filtered =
-            wl_columnar_filter_apply_right_filter(&op->right_filter_expr, right,
-                sess->delta_pool, sess->intern);
-        if (!filtered) {
-            if (left_e.owned)
-                col_rel_destroy(left_e.rel);
-            return ENOMEM;
+        if (filtered) {
+            right = filtered;
+            /* right_filtered stays NULL: cache owns the relation */
+        } else {
+            /* Delta path, no relation name, or cache unavailable:
+             * pool-allocated filter owned by this op */
+            filtered = wl_columnar_filter_apply_right_filter(
+                &op->right_filter_expr, right, sess->delta_pool,
+                sess->intern);
+            if (!filtered) {
+                if (left_e.owned)
+                    col_rel_destroy(left_e.rel);
+                return ENOMEM;
+            }
+            right = filtered;
+            right_filtered = filtered;
         }
-        right = filtered;
-        right_filtered = filtered;
     }
 
     /* Materialization cache check */
