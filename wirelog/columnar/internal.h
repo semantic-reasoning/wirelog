@@ -1594,6 +1594,16 @@ typedef struct wl_col_session_t {
      * based on available physical memory, num_workers, and estimated row width.
      * 0 = disabled (no limit). Overridable via WIRELOG_JOIN_OUTPUT_LIMIT env var. */
     uint64_t join_output_limit;
+    /* Bounded keyed-join sub-batches (Issue #1446).  join_batch_bytes is
+     * the per-producer batch payload budget from WIRELOG_JOIN_BATCH_BYTES;
+     * zero keeps the one-shot join.  join_batch_strict makes an excluded
+     * shape fail with ENOTSUP instead of falling back; the fallback counter
+     * and last reason record every silent fallback for diagnostics. */
+    uint64_t join_batch_bytes;
+    bool join_batch_strict;
+    uint32_t join_batch_fallback_count;
+    uint8_t join_batch_last_reason;
+    uint8_t join_batch_warned_reasons; /* one WL_LOG warning per reason */
     /* Issue #959: high-water mark of a single join's output, per session.
      * Workers are separate sessions, so each carries its own -- which is the
      * number needed to decide whether dividing the row cap by W is right:
@@ -1830,6 +1840,41 @@ col_rel_set_column_types(col_rel_t *r,
 uint32_t
 col_arrangement_find_first_typed(const col_arrangement_t *arr,
     const col_rel_t *rel, const int64_t *key_row);
+
+/* join.c helpers shared with join_batch.c (Issue #1446).  Internal only:
+ * hidden visibility keeps them out of the library's export map. */
+uint32_t
+col_join_output_width(const col_rel_t *left, const col_rel_t *right,
+    const wl_plan_op_t *op);
+int
+col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
+    const col_rel_t *right, const wl_plan_op_t *op);
+/* Writes one joined row at @out_row with col_rel_set_raw; the caller
+ * publishes nrows and the view generation once per batch. */
+int
+col_join_write_pair_at(col_rel_t *out, uint64_t out_row,
+    const col_rel_t *left, uint32_t lr, const col_rel_t *right, uint32_t rr,
+    const uint32_t *project_indices, uint32_t project_count);
+/* Legacy row cap (WIRELOG_JOIN_OUTPUT_LIMIT): true once @out holds at
+ * least the session's limit; the shared TDD counter is consulted when a
+ * worker session installed one. */
+bool
+col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out);
+/* Type-aware key equality for a candidate pair; arrangement chains may
+ * return collision rows, so every probe verifies the keys. */
+static inline bool
+col_join_keys_match_rel(const col_rel_t *left, uint32_t lr,
+    const uint32_t *lk, const col_rel_t *right, uint32_t rr,
+    const uint32_t *rk, uint32_t kc)
+{
+    for (uint32_t k = 0; k < kc; k++) {
+        if (!wl_columnar_value_equal(left, lk[k], left->columns[lk[k]][lr],
+            right, rk[k], right->columns[rk[k]][rr]))
+            return false;
+    }
+    return true;
+}
+
 /* Acquire only a fresh index. Stale pinned entries defer rebuild and reject
  * new leases. Protects index storage, not source mutation or destruction;
  * release every lease before session teardown. Final release invalidates
@@ -1845,6 +1890,18 @@ col_rel_alloc(col_rel_t **out, const char *name);
 int
 col_rel_attach_memory_governor(col_rel_t *rel,
     wl_columnar_memory_governor_ref_t *memory_governor);
+/* Retained-admission footprint of @r at @capacity rows (columns plus
+ * timestamps when enabled).  False on size-arithmetic overflow. */
+bool
+col_rel_retained_bytes_for(const col_rel_t *r, uint32_t capacity,
+    uint64_t *out);
+/* Admit and grow @r to at least @new_cap rows as one transaction; with
+ * @new_cap <= capacity it admits the buffers the relation already owns.
+ * ENOMEM with *@denied set is a governor verdict, clear is an allocation
+ * failure (Issue #1446). */
+int
+col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
+    bool *denied);
 int
 col_rel_enable_timestamps(col_rel_t *rel);
 /* Promote arena-backed relation columns to private heap storage.  Admission

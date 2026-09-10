@@ -20,6 +20,7 @@
 #endif
 
 #include "columnar/internal.h"
+#include "columnar/join_batch.h"
 #include "columnar/lftj.h"
 #include "wirelog/util/log.h"
 
@@ -130,7 +131,7 @@ col_join_attach_ledger(wl_col_session_t *sess, col_rel_t *rel)
     col_rel_ledger_reconcile(rel, 0);
 }
 
-static bool
+bool
 col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
 {
     if (!sess)
@@ -280,12 +281,7 @@ static WL_OPS_ALWAYS_INLINE uint32_t
 col_join_hash_rel_keys(const col_rel_t *rel, uint32_t row,
     const uint32_t *key_cols, uint32_t kc);
 
-static WL_OPS_ALWAYS_INLINE bool
-col_join_keys_match_rel(const col_rel_t *left, uint32_t lr,
-    const uint32_t *lk, const col_rel_t *right, uint32_t rr,
-    const uint32_t *rk, uint32_t kc);
-
-static uint32_t
+uint32_t
 col_join_output_width(const col_rel_t *left, const col_rel_t *right,
     const wl_plan_op_t *op)
 {
@@ -293,7 +289,7 @@ col_join_output_width(const col_rel_t *left, const col_rel_t *right,
         ? op->project_count : left->ncols + right->ncols;
 }
 
-static int
+int
 col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
     const col_rel_t *right, const wl_plan_op_t *op)
 {
@@ -363,7 +359,7 @@ col_join_key_types_compatible(const col_rel_t *left, const uint32_t *lk,
 /* Parallel-fill writer: called from keyed fill workers on disjoint row
  * ranges of a fresh output, so it uses col_rel_set_raw and leaves the
  * single view-generation publication to the coordinator. */
-static int
+int
 col_join_write_pair_at(col_rel_t *out, uint64_t out_row,
     const col_rel_t *left, uint32_t lr, const col_rel_t *right, uint32_t rr,
     const uint32_t *project_indices, uint32_t project_count)
@@ -779,19 +775,6 @@ col_join_hash_rel_keys(const col_rel_t *rel, uint32_t row,
     return h;
 }
 
-static WL_OPS_ALWAYS_INLINE bool
-col_join_keys_match_rel(const col_rel_t *left, uint32_t lr,
-    const uint32_t *lk, const col_rel_t *right, uint32_t rr,
-    const uint32_t *rk, uint32_t kc)
-{
-    for (uint32_t k = 0; k < kc; k++) {
-        if (!wl_columnar_value_equal(left, lk[k], left->columns[lk[k]][lr],
-            right, rk[k], right->columns[rk[k]][rr]))
-            return false;
-    }
-    return true;
-}
-
 static int
 col_join_append_pair(col_rel_t *out, const col_rel_t *left, uint32_t lr,
     const col_rel_t *right, uint32_t rr, const uint32_t *project_indices,
@@ -1059,9 +1042,41 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);
+    /* Bounded keyed-join sub-batches (Issue #1446): opt-in through
+     * WIRELOG_JOIN_BATCH_BYTES.  Eligible shapes run the resumable producer
+     * over the pinned arrangement; excluded shapes fall back to the one-shot
+     * join with the reason recorded, or fail with ENOTSUP in strict mode. */
+    col_join_batch_eligibility_t batch_elig = col_join_batch_eligibility(sess,
+            kc, used_right_delta, op->right_filter_expr.size != 0);
+    bool bounded = batch_elig == COL_JOIN_BATCH_ELIGIBLE;
+    if (sess->join_batch_bytes > 0 && !bounded) {
+        if (sess->join_batch_strict) {
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            return ENOTSUP;
+        }
+        col_join_batch_record_fallback(sess, batch_elig);
+    }
+    /* An empty right side has nothing to bound: the ordinary probe yields
+     * zero rows in one pass, so do not dispatch the producer.  This also
+     * keeps the producer's lease from being a second lease on the window
+     * pin's entry: the registry reports a pinned index with indexed_rows == 0
+     * unavailable (arrangement.c deferral clause, tracked in #1500), which
+     * would turn an empty relation into ENOENT.  Decided after the strict
+     * and fallback handling above: it is neither a fallback nor a strict-mode
+     * failure, and the eligibility verdict stands. */
+    if (bounded && right->nrows == 0)
+        bounded = false;
     /* Materialized results outlive the current delta-pool reset while they
-     * remain in mat_cache, so cache-owned joins must be heap allocated. */
-    col_rel_t *out = (op->materialized && !projected_join)
+    * remain in mat_cache, so cache-owned joins must be heap allocated.  A
+    * bounded-mode output is governed by the session's memory governor and
+    * must be heap allocated too: delta_pool_reset() never frees slot
+    * contents, so a governor reference on a pooled relation would leak. */
+    col_rel_t *out = (bounded || (op->materialized && !projected_join))
         ? col_rel_new_auto("$join", ocols)
         : col_rel_pool_new_auto(sess->delta_pool, sess->eval_arena,
             "$join", ocols);
@@ -1121,10 +1136,10 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     bool right_is_unary = (right->ncols == 1);
     bool left_is_unary = (left->ncols == 1);
 #ifdef WL_PROFILE
-    if ((right_is_unary || left_is_unary) && kc == 1)
+    if ((right_is_unary || left_is_unary) && kc == 1 && !bounded)
         sess->profile.join_unary++;
 #endif
-    if ((right_is_unary || left_is_unary) && kc == 1) {
+    if ((right_is_unary || left_is_unary) && kc == 1 && !bounded) {
         /* build: unary side as hash set; probe: non-unary side iterated.
          * When both are unary, right is preferred as build side. */
         col_rel_t *build = right_is_unary ? right : left;
@@ -1331,6 +1346,37 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
         int join_rc = 0;
         int join_overflow = 0;
+        bool run_bounded = bounded && arr != NULL;
+        if (bounded && !arr) {
+            /* Eligible shape without a persistent arrangement: the ephemeral
+             * hash path cannot be resumed, so it is a recorded fallback. */
+            if (sess->join_batch_strict)
+                join_rc = ENOTSUP;
+            else
+                col_join_batch_record_fallback(sess,
+                    COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT);
+        }
+        if (run_bounded && join_rc == 0) {
+            wl_columnar_continuation_t *cont = NULL;
+            int create_rc = col_join_batch_producer_create(sess, op, left,
+                    left_e.is_delta, lk, rk, kc, sess->join_batch_bytes,
+                    &cont);
+            if (create_rc == ENOTSUP && !sess->join_batch_strict) {
+                /* One output row does not fit the batch budget. */
+                col_join_batch_record_fallback(sess,
+                    COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE);
+                run_bounded = false;
+            } else if (create_rc != 0) {
+                join_rc = create_rc;
+            } else {
+                join_rc = col_join_batch_run_to_relation(cont, sess, out);
+                wl_columnar_continuation_destroy(cont);
+                if (join_rc != 0)
+                    WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
+                        "Bounded join failed with rc=%d after %u rows",
+                        join_rc, out->nrows);
+            }
+        }
         if (kc == 0 && col_join_should_parallelize_cross(sess, left, right)) {
             join_rc = col_join_parallel_cross(sess, left, right, op, &out,
                     &join_overflow);
@@ -1338,7 +1384,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 join_rc = 0;
             else if (join_rc == 0 && join_overflow)
                 join_rc = EOVERFLOW;
-        } else for (uint32_t lr = 0; lr < left->nrows && join_rc == 0; lr++) {
+        } else if (!run_bounded) for (uint32_t lr = 0;
+                lr < left->nrows && join_rc == 0; lr++) {
                 if (arr) {
                     /* Arrangement probe: fill key_row at right-side positions. */
                     for (uint32_t k = 0; k < kc; k++)
