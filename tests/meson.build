@@ -266,7 +266,9 @@ if get_option('enable_fuzz')
           '-max_total_time=1',
         ],
         suite: 'fuzz',
-        timeout: 30,
+        # -runs=1 -max_total_time=1 smoke; 60 is ample and not Meson's
+        # default, which the shell-gate timeout rule forbids (#1464).
+        timeout: 60,
       )
 
       csv_reader_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/csv_reader'
@@ -298,7 +300,9 @@ if get_option('enable_fuzz')
           '-max_total_time=1',
         ],
         suite: 'fuzz',
-        timeout: 30,
+        # -runs=1 -max_total_time=1 smoke; 60 is ample and not Meson's
+        # default, which the shell-gate timeout rule forbids (#1464).
+        timeout: 60,
       )
 
       intern_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/intern'
@@ -325,7 +329,9 @@ if get_option('enable_fuzz')
           '-max_total_time=1',
         ],
         suite: 'fuzz',
-        timeout: 30,
+        # -runs=1 -max_total_time=1 smoke; 60 is ample and not Meson's
+        # default, which the shell-gate timeout rule forbids (#1464).
+        timeout: 60,
       )
 
       compound_arena_fuzz_corpus = meson.current_source_dir() / 'fuzz/corpus/compound_arena'
@@ -353,7 +359,9 @@ if get_option('enable_fuzz')
           '-max_total_time=1',
         ],
         suite: 'fuzz',
-        timeout: 30,
+        # -runs=1 -max_total_time=1 smoke; 60 is ample and not Meson's
+        # default, which the shell-gate timeout rule forbids (#1464).
+        timeout: 60,
       )
     endif
   else
@@ -744,6 +752,26 @@ test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
 
+# Issue #1464: every shell-seeded test registered in this file must carry an
+# explicit positive timeout that is not Meson's 30s default (see the rule
+# above `sh = find_program('bash', ...)`).  Registered outside `if sh.found()`
+# on purpose: the gate needs only python3 and the build introspection, so on a
+# runner without bash it still reports its SKIP instead of vanishing.  It
+# skips off Linux/macOS; between them the Linux and macOS introspections see
+# every shell registration in this file (the Windows-only abi_symbols_windows
+# is PowerShell and outside the rule).  Python-seeded tests, including this
+# one, are outside the rule by construction.  Being a .py gate it is outside
+# test-gate-skip-exit-codes.sh's coverage scan (which lists .sh basenames),
+# by design.
+test('shell_gate_timeouts', py3,
+     args: [meson.project_source_root() / 'scripts/ci/check-shell-gate-timeouts.py',
+            meson.project_build_root()],
+     suite: 'abi')
+test('shell_gate_timeouts_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-check-shell-gate-timeouts.py'],
+     env: ['WIRELOG_SHELL_GATE_BUILD=' + meson.project_build_root()],
+     suite: 'abi')
+
 test('version_sync', py3,
      args: [meson.project_source_root() / 'scripts/ci/check-version-sync.py',
             meson.project_build_root() / 'wirelog'],
@@ -819,24 +847,33 @@ test('changelog_format', py3,
 # runners) silently skip both gates instead of failing
 # inconsistently.
 #
-# Issue #1462: every shell-script gate in suite 'abi' carries an explicit
-# timeout, here and in the `if not is_windows` block above.  Without one they
-# inherit meson's 30s default, which had become an unowned performance budget
-# rather than a hang detector: these gates are process-spawn bound, Windows
-# process creation costs far more than Linux, and threading_doc timed out at
-# 30.09s on the Windows msvc runner while downstream_matrix_contract sat at
-# 27.24s in the same job.  A timeout is a hang detector, so these are set well
-# clear of the worst measured runtime and are deliberately useless for
-# detecting performance drift.  Nothing measures shell-gate wall time today;
-# that gap is tracked in #1462 and is not what this kwarg is for.
+# Issue #1462: every shell-script gate registered in this file, whatever its
+# suite, carries an explicit timeout, here and in the `if not is_windows`
+# block above.  Without one they inherit meson's 30s default, which had
+# become an unowned performance budget rather than a hang detector: these
+# gates are process-spawn bound, Windows process creation costs far more than
+# Linux, and threading_doc timed out at 30.09s on the Windows msvc runner
+# while downstream_matrix_contract sat at 27.24s in the same job.  A timeout
+# is a hang detector, so these are set well clear of the worst measured
+# runtime and are deliberately useless for detecting performance drift.
+# Nothing measures shell-gate wall time today; that gap is tracked separately
+# and is not what this kwarg is for.
 #
-# Every shell gate in the suite carries a timeout, but not all carry the same
-# one: log_abi_compile_erasure keeps 180 because it rebuilds libwirelog, and
+# Every shell gate carries a timeout, but not all carry the same one:
+# log_abi_compile_erasure keeps 180 because it rebuilds libwirelog, and
 # doop_validation keeps the 90 chosen under #1410.  The rule is that the value
 # is explicit and justified, not that it is uniform.  Gates that never run on
 # Windows are included anyway, so a reviewer checks the rule once instead of
 # re-deriving per-gate platform exposure -- which is how the 30s default
 # became invisible in the first place.
+#
+# Issue #1464: the rule is enforced by shell_gate_timeouts below over Meson's
+# introspection.  Introspection exposes only the effective value and cannot
+# tell an inherited 30 from a written one, so the gate asserts a bright line:
+# never write `timeout: 30` on a shell gate (pick another value and justify
+# it) and never disable the timeout with a non-positive value.  Suite
+# membership is not a proxy for platform exposure -- sbom_wrap_pin runs on
+# the Windows runner -- so the rule covers every suite.
 sh = find_program('bash', required: false)
 
 # Issue #772: release-template gate.  Asserts that the GitHub Releases
@@ -876,7 +913,8 @@ if sh.found()
   test('memory_pressure_contract', sh,
        args: [meson.project_source_root() /
               'scripts/ci/test-run-memory-pressure.sh'],
-       suite: 'abi')
+       suite: 'abi',
+       timeout: 120)
 
   test('release_template_selftest', sh,
        args: [meson.project_source_root() /
@@ -1107,7 +1145,8 @@ endif
 if host_machine.system() == 'linux' and sh.found()
   test('sbom_snapshot_locale', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-sbom-snapshot-locale.sh'],
-       suite: 'sbom')
+       suite: 'sbom',
+       timeout: 120)
 endif
 
 # Issue #1293: generate-sbom.sh hardcoded its output to repo_root/sbom, so the
@@ -1118,7 +1157,8 @@ endif
 if host_machine.system() == 'linux' and sh.found()
   test('generate_sbom_selftest', sh,
        args: [meson.project_source_root() / 'scripts/ci/test-generate-sbom.sh'],
-       suite: 'sbom')
+       suite: 'sbom',
+       timeout: 120)
 endif
 
 # Issue #788: warning-only platform ABI surface advisory checks.
@@ -1129,7 +1169,8 @@ if host_machine.system() == 'darwin' and sh.found()
   test('abi_symbols_macos', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-abi-symbols-macos.sh',
               meson.project_build_root()],
-       suite: 'abi_advisory')
+       suite: 'abi_advisory',
+       timeout: 120)
 endif
 
 powershell = find_program('pwsh', 'powershell', required: false)
@@ -1185,7 +1226,8 @@ if sh.found()
   test('sbom_wrap_pin', sh,
        args: [meson.project_source_root() / 'scripts/ci/check-sbom-wrap-pin.sh',
               meson.project_source_root()],
-       suite: 'sbom')
+       suite: 'sbom',
+       timeout: 120)
 endif
 
 # Issue #1297: the perf gate's dataset manifest embedded the directory the
@@ -1295,7 +1337,8 @@ if not is_windows
   if sh.found()
     test('clang_tidy_backlog_monotonic', sh,
          args: [meson.project_source_root() / 'scripts/ci/check-clang-tidy-backlog-monotonic.sh'],
-         suite: 'tidy')
+         suite: 'tidy',
+         timeout: 120)
   endif
 endif
 
