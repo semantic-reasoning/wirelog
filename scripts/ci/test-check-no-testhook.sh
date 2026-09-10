@@ -110,6 +110,14 @@ EOF
 expect_status 'a testhook symbol is a leak' 1 run "$leaky" "$clean_syms" --check=leak
 expect_says   'the leak names the symbol' 'wl_log_test_last'
 expect_status 'a clean library passes the leak check' 0 run "$clean_syms" "$clean_syms" --check=leak
+# #1473: the session-options test hook shares the gate with the log hooks.
+leaky_session="$tmp/leaky-session.txt"
+cat > "$leaky_session" <<'EOF'
+0000000000001100 T wl_log_init
+0000000000001190 T wl_session_testhook_default_options
+EOF
+expect_status 'a session testhook symbol is a leak' 1 run "$leaky_session" "$clean_syms" --check=leak
+expect_says   'the session leak names the symbol' 'wl_session_testhook_default_options'
 
 # --- (b) the provenance check ------------------------------------------------
 # The regression itself: with line info present the check must reach a verdict.

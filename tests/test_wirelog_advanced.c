@@ -2394,9 +2394,10 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
 /* The create-time floor of a fact-free program: the bytes its intern table
  * admits when a session attaches it (#1431) plus the session's fixed
  * compound arena (probed with the library-default epoch count, so like the
- * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset); the delta pool and eval arena degrade to malloc when
- * denied.  Plan generation is run once first so the table measured is the
- * one the facade's own plan generation will attach. */
+ * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset); the delta
+ * pool and eval arena degrade to malloc when denied.  Plan generation is run
+ * once first so the table measured is the one the facade's own plan
+ * generation will attach. */
 static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     uint64_t *compound_bytes)
@@ -2526,6 +2527,68 @@ out:
     return rc;
 }
 
+/* Governor arithmetic overflow is EOVERFLOW at the session layer; the
+ * advanced facade must report it as the memory verdict, not ERR_EXEC. */
+static int
+test_injected_governor_overflow_maps_to_memory(void)
+{
+    wirelog_program_t *prog = parse_or_die(PROG_SRC, "T-1473-overflow");
+    wirelog_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_reservation_t token;
+    wirelog_error_t error;
+    int rc = 1;
+
+    if (!prog)
+        return 1;
+    /* Leave 16 bytes of headroom: the fixture's intern table holds more,
+     * so attaching it overflows the governor total instead of being
+     * denied within the budget. */
+    wl_columnar_memory_reservation_init(&token);
+    ref = enforcing_governor(UINT64_MAX);
+    if (!ref || wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(ref), UINT64_MAX - 16u,
+            &token) != WL_COLUMNAR_MEMORY_ADMISSION_OK) {
+        fprintf(stderr, "T-1473-overflow: fixture setup failed\n");
+        wirelog_program_free(prog);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        return 1;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY || session != NULL
+        || reserved_on(ref) != UINT64_MAX - 16u) {
+        fprintf(stderr, "T-1473-overflow: create err=%d s=%p\n", error,
+            (void *)session);
+        goto out;
+    }
+    wl_session_testhook_set_default_options(&options);
+    error = wirelog_session_create_with_snapshot(prog,
+            WIRELOG_BACKEND_COLUMNAR, 1, NULL, &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (error != WIRELOG_ERR_MEMORY || session != NULL
+        || reserved_on(ref) != UINT64_MAX - 16u) {
+        fprintf(stderr, "T-1473-overflow: create_with_snapshot err=%d s=%p\n",
+            error, (void *)session);
+        goto out;
+    }
+    rc = 0;
+
+out:
+    if (session)
+        wirelog_session_destroy(session);
+    (void)wl_columnar_memory_release(&token);
+    wl_columnar_memory_governor_ref_release(ref);
+    wirelog_program_free(prog);
+    return rc;
+}
+
 static int
 test_invalid_memory_budget(void)
 {
@@ -2593,6 +2656,7 @@ main(void)
     failures += test_issue_665_partial_conjunction_multi_worker();
     failures += test_invalid_memory_budget();
     failures += test_injected_governor_denial_maps_to_memory();
+    failures += test_injected_governor_overflow_maps_to_memory();
     failures += test_typed_float_ingress();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
