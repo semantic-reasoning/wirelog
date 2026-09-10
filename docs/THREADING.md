@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **96**).
+match the script's count (currently **110**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -392,7 +392,21 @@ and direct non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_reservation_move#6` | `source->owner_bits` | `atomic_store_explicit` | `relaxed` | Clear the source owner after ownership has moved |
 | `memory_governor.c:wl_columnar_memory_reservation_move#7` | `source->state` | `atomic_store_explicit` | `release` | Publish the empty source state after clearing its ownership |
 
-### 5.9 `wirelog/arena/compound_arena.c` — mutation gate (5 rows)
+### 5.9 `wirelog/columnar/arrangement.c` — reservation relocation (5 rows)
+
+Arrangement registry entries embed non-copyable memory reservations. These
+loads validate the reservation state before moving or publishing a token;
+the relocation paths preserve identity and transfer ownership explicitly.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `arrangement.c:arr_publish_reservation` | `arr->reservation.state` | `atomic_load_explicit` | `acquire` | Observe the prior reservation state before moving or releasing it |
+| `arrangement.c:arr_entry_relocate` | `src->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the source token before relocating the registry entry |
+| `arrangement.c:arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved token before transferring its owner |
+| `arrangement.c:filt_arr_entry_relocate` | `src->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the filtered source token before relocation |
+| `arrangement.c:filt_arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved filtered token before owner transfer |
+
+### 5.10 `wirelog/arena/compound_arena.c` — mutation gate (5 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -405,7 +419,7 @@ and direct non-atomic payload reads require external synchronization.
 On MSVC the helper load/store use interlocked intrinsics because the shared
 `wl_atomic_u64` compatibility type cannot use C11 atomic operations directly.
 
-### 5.10 `wirelog/intern.c` — shared symbol table (3 rows)
+### 5.11 `wirelog/intern.c` — shared symbol table (3 rows)
 
 The intern table is shared, unsynchronized, by every parallel worker
 (Issue #958). Writers (`wl_intern_put`, `wl_intern_get`) serialize on
@@ -421,12 +435,12 @@ named in the justification.
 | `intern.c:WL_INTERN_LOAD_RELAXED` | `intern->count` | `atomic_load_explicit` | `relaxed` | `WL_INTERN_LOAD_RELAXED`, used by `wl_intern_put`, `intern_resize_prepare`, `intern_retained_bytes_locked` and `wl_intern_free`. Every caller holds `intern->lock` (`wl_intern_free` takes it to release the governor reservation, Issue #1431), so no edge is needed |
 | `intern.c:WL_INTERN_STORE_RELEASE` | `intern->count` | `atomic_store_explicit` | `release` | `WL_INTERN_STORE_RELEASE`, used by `wl_intern_put` after the string and its segment pointer are written. Publishing the count first would let a lock-free reader dereference an unwritten slot |
 
-### 5.11 Existing inventory total
+### 5.12 Existing inventory total
 
-21 + 4 + 2 + 3 + 19 + 1 + 1 + 1 + 3 + 36 + 5 = **96 atomic call sites**
+21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 = **102 atomic call sites**
 before the inactive source-access contract below.
 
-### 5.12 `wirelog/columnar/source_access.h` — inactive source gate (8 rows)
+### 5.13 `wirelog/columnar/source_access.h` — inactive source gate (8 rows)
 
 This header-only gate is a testable internal contract and is not linked into
 the production library. Its state is zero-initialized; reader and writer
@@ -447,7 +461,7 @@ gate and token state unchanged.
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 
-21 + 4 + 2 + 3 + 19 + 1 + 1 + 1 + 3 + 36 + 5 + 8 = **104 atomic call sites**.
+21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 + 8 = **110 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
