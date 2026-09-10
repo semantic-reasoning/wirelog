@@ -2225,18 +2225,39 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     int join_rc = 0;
+    col_arrangement_probe_bundle_t diff_bundle = { 0 };
 
     /* DIFFERENTIAL PATH: persistent diff_arrangement for non-delta right.
      * The arrangement persists across iterations, only indexing new rows. */
     col_diff_arrangement_t *darr = NULL;
     if (kc > 0 && op->right_relation && !used_right_delta
-        && op->right_filter_expr.size == 0)
+        && op->right_filter_expr.size == 0) {
+        col_arrangement_probe_bundle_init(&diff_bundle);
+        int dependency_rc = col_arrangement_probe_bundle_acquire_dependency(
+            &diff_bundle, right);
+        if (dependency_rc != 0) {
+            free(tmp);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            (void)col_arrangement_probe_bundle_release(&diff_bundle);
+            return dependency_rc;
+        }
         darr = col_session_get_diff_arrangement(sess, op->right_relation,
                 right, rk, kc);
+        if (!darr)
+            (void)col_arrangement_probe_bundle_release(&diff_bundle);
+    }
 
     if (darr
-        && col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0)
+        && col_diff_arrangement_ensure_ht_capacity(darr, right->nrows) != 0) {
         darr = NULL; /* capacity grow failed; fall through to ephemeral */
+        (void)col_arrangement_probe_bundle_release(&diff_bundle);
+    }
 
     if (darr) {
         /* Incrementally add new rows [indexed_rows, right->nrows) to hash */
@@ -2268,6 +2289,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_destroy(right_filtered);
                 if (left_e.owned)
                     col_rel_destroy(left);
+                (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return ensure_rc;
             }
             col_join_keyed_ctx_t *ctxs = (col_join_keyed_ctx_t *)calloc(
@@ -2288,6 +2310,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_destroy(right_filtered);
                 if (left_e.owned)
                     col_rel_destroy(left);
+                (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return ENOMEM;
             }
             uint32_t chunk = (left->nrows + W - 1u) / W;
@@ -2402,6 +2425,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     col_rel_destroy(right_filtered);
                 if (left_e.owned)
                     col_rel_destroy(left);
+                (void)col_arrangement_probe_bundle_release(&diff_bundle);
                 return prc;
             }
             goto join_success;
@@ -2441,6 +2465,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(right_filtered);
             if (left_e.owned)
                 col_rel_destroy(left);
+            (void)col_arrangement_probe_bundle_release(&diff_bundle);
             return join_rc;
         }
     } else {
@@ -2534,6 +2559,7 @@ join_success:
                 col_rel_destroy(left);
             if (right_filtered)
                 col_rel_destroy(right_filtered);
+            (void)col_arrangement_probe_bundle_release(&diff_bundle);
             return eval_stack_push_delta(stack, out, true, result_is_delta);
         }
         int cache_rc = col_mat_cache_insert(&sess->mat_cache, left, right, out);
@@ -2543,17 +2569,20 @@ join_success:
             col_rel_destroy(right_filtered);
         if (cache_rc != 0) {
             col_rel_destroy(copy);
+            (void)col_arrangement_probe_bundle_release(&diff_bundle);
             return eval_stack_push_delta(stack, out, true, result_is_delta);
         }
         int push_rc = eval_stack_push_delta(stack, copy, true, result_is_delta);
         if (push_rc != 0)
             col_rel_destroy(copy);
+        (void)col_arrangement_probe_bundle_release(&diff_bundle);
         return push_rc;
     }
     if (left_e.owned)
         col_rel_destroy(left);
     if (right_filtered)
         col_rel_destroy(right_filtered);
+    (void)col_arrangement_probe_bundle_release(&diff_bundle);
     return eval_stack_push_delta(stack, out, true, result_is_delta);
 }
 
