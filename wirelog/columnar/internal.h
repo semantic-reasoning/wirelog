@@ -595,6 +595,10 @@ wl_columnar_relation_float_values_valid(const col_rel_t *rel)
         return false;
     if (rel->nrows == 0)
         return true;
+    if (rel->ncols == 0)
+        return rel->relation_identity != 0
+               && rel->view_generation != 0
+               && rel->storage_generation != 0;
     if (!rel->columns)
         return false;
     if (!rel->column_types)
@@ -749,7 +753,16 @@ col_rel_row_copy_out(const col_rel_t *r, uint32_t row, int64_t *dst)
 static inline int
 col_rel_row_copy_in_raw(col_rel_t *r, uint32_t row, const int64_t *src)
 {
-    if (!r || !r->columns || !src)
+    if (!r || !src)
+        return EINVAL;
+    if (r->ncols == 0) {
+        return r->relation_identity != 0
+               && r->view_generation != 0
+               && r->storage_generation != 0
+            ? 0
+            : EINVAL;
+    }
+    if (!r->columns)
         return EINVAL;
     for (uint32_t c = 0; c < r->ncols; c++) {
         if (r->columns[c] == NULL)
