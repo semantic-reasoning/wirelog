@@ -1214,6 +1214,34 @@ col_session_has_exact_relation(const wl_col_session_t *session,
     return false;
 }
 
+static int
+col_arrangement_probe_storage_owner_resolve(const col_rel_t *source,
+    col_rel_t **out_owner, uint64_t *out_identity, uint64_t *out_generation)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!source || !out_owner || !out_identity || !out_generation)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(source, &owner);
+    if (rc != 0)
+        return rc;
+    if (!owner || owner->storage_owner != owner
+        || owner->storage_owner_identity != owner->relation_identity
+        || owner->storage_owner_generation != owner->storage_generation
+        || !wl_columnar_relation_generation_valid(
+            owner->storage_owner_generation))
+        return EINVAL;
+    if (source->storage_owner != owner
+        || source->storage_owner_identity != owner->relation_identity
+        || source->storage_owner_generation != owner->storage_generation)
+        return EBUSY;
+    *out_owner = owner;
+    *out_identity = owner->relation_identity;
+    *out_generation = owner->storage_owner_generation;
+    return 0;
+}
+
 int
 col_session_acquire_arrangement_probe(wl_session_t *sess,
     col_arrangement_t *arr, const col_rel_t *source,
@@ -1221,11 +1249,19 @@ col_session_acquire_arrangement_probe(wl_session_t *sess,
 {
     col_relation_snapshot_t snapshot;
     col_arr_entry_t *entry;
+    col_rel_t *storage_owner = NULL;
+    col_rel_t *post_storage_owner = NULL;
     wl_col_session_t *session;
+    uint64_t storage_owner_identity = 0;
+    uint64_t storage_owner_generation = 0;
+    uint64_t post_storage_owner_identity = 0;
+    uint64_t post_storage_owner_generation = 0;
     int rc;
 
     if (!sess || !arr || !source || !probe || probe->active
         || probe->identity != 0 || probe->arr || probe->source
+        || probe->storage_owner || probe->storage_owner_identity != 0
+        || probe->storage_owner_generation != 0
         || probe->arrangement_pin.active || probe->source_reader.owner)
         return EINVAL;
     session = COL_SESSION(sess);
@@ -1240,6 +1276,11 @@ col_session_acquire_arrangement_probe(wl_session_t *sess,
         snapshot) || arr_entry_unbuilt(entry) || entry->rebuild_deferred)
         return EBUSY;
 
+    rc = col_arrangement_probe_storage_owner_resolve(source, &storage_owner,
+            &storage_owner_identity, &storage_owner_generation);
+    if (rc != 0)
+        return rc;
+
     rc = col_rel_source_reader_acquire(source, &probe->source_reader);
     if (rc != 0)
         return rc;
@@ -1249,6 +1290,13 @@ col_session_acquire_arrangement_probe(wl_session_t *sess,
      * this exact-source API back into a name-only lookup. */
     if (!col_session_has_exact_relation(session, source, entry->rel_name)
         || col_arr_entry_for_arr(session, arr) != entry
+        || col_arrangement_probe_storage_owner_resolve(source,
+        &post_storage_owner, &post_storage_owner_identity,
+        &post_storage_owner_generation)
+        != 0
+        || post_storage_owner != storage_owner
+        || post_storage_owner_identity != storage_owner_identity
+        || post_storage_owner_generation != storage_owner_generation
         || !wl_columnar_relation_snapshot_equal(
             wl_columnar_relation_snapshot(source), snapshot)
         || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
@@ -1270,6 +1318,13 @@ col_session_acquire_arrangement_probe(wl_session_t *sess,
     if (probe->arrangement_pin.arr != arr
         || probe->arrangement_pin.entry != entry
         || !col_session_has_exact_relation(session, source, entry->rel_name)
+        || col_arrangement_probe_storage_owner_resolve(source,
+        &post_storage_owner, &post_storage_owner_identity,
+        &post_storage_owner_generation)
+        != 0
+        || post_storage_owner != storage_owner
+        || post_storage_owner_identity != storage_owner_identity
+        || post_storage_owner_generation != storage_owner_generation
         || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
         snapshot)) {
         col_arrangement_pin_release(&probe->arrangement_pin);
@@ -1280,6 +1335,9 @@ col_session_acquire_arrangement_probe(wl_session_t *sess,
     probe->arr = arr;
     probe->source = source;
     probe->source_snapshot = snapshot;
+    probe->storage_owner = storage_owner;
+    probe->storage_owner_identity = storage_owner_identity;
+    probe->storage_owner_generation = storage_owner_generation;
     probe->identity = (uintptr_t)probe;
     probe->active = true;
     return 0;
@@ -1318,17 +1376,27 @@ int
 col_arrangement_probe_release(col_arrangement_probe_t *probe)
 {
     wl_columnar_source_access_reader_t *reader;
+    col_rel_t *storage_owner = NULL;
+    uint64_t storage_owner_identity = 0;
+    uint64_t storage_owner_generation = 0;
     int rc;
 
     if (!probe || !probe->active || probe->identity != (uintptr_t)probe
-        || !probe->arr || !probe->source)
+        || !probe->arr || !probe->source || !probe->storage_owner)
         return EINVAL;
     reader = &probe->source_reader;
     /* Validate every source-reader precondition before changing the index
      * pin.  The reader itself keeps the gate nonzero between this check and
      * release, so a successful precheck makes the two releases atomic with
      * respect to all supported token states. */
-    if (reader->identity != (uintptr_t)reader || !reader->owner
+    if (col_arrangement_probe_storage_owner_resolve(probe->source,
+        &storage_owner, &storage_owner_identity, &storage_owner_generation)
+        != 0
+        || storage_owner != probe->storage_owner
+        || storage_owner_identity != probe->storage_owner_identity
+        || storage_owner_generation != probe->storage_owner_generation
+        || reader->owner != &storage_owner->source_access
+        || reader->identity != (uintptr_t)reader || !reader->owner
         || (!reader->transferable
         && !wl_columnar_source_access_reader_thread_equal(reader))
         || (reader->transferable && reader->thread_valid)
