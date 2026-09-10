@@ -83,36 +83,13 @@ static int fail_count = 0;
         } while (0)
 
 /* ----------------------------------------------------------------
- * Helper: allocate col_rel_t with ncols columns and no rows.
- * col_names is populated; data starts NULL.
+ * Helpers: construct, append to, and destroy relations through production
+ * lifecycle APIs so fixtures carry normal ownership/generation metadata.
  * ---------------------------------------------------------------- */
 static col_rel_t *
 test_rel_alloc(uint32_t ncols)
 {
-    col_rel_t *r = (col_rel_t *)calloc(1, sizeof(col_rel_t));
-    if (!r)
-        return NULL;
-    r->ncols = ncols;
-    if (ncols > 0) {
-        r->col_names = (char **)calloc(ncols, sizeof(char *));
-        if (!r->col_names) {
-            free(r);
-            return NULL;
-        }
-        for (uint32_t i = 0; i < ncols; i++) {
-            char buf[16];
-            snprintf(buf, sizeof(buf), "col%u", i);
-            r->col_names[i] = strdup(buf);
-            if (!r->col_names[i]) {
-                for (uint32_t j = 0; j < i; j++)
-                    free(r->col_names[j]);
-                free((void *)r->col_names);
-                free(r);
-                return NULL;
-            }
-        }
-    }
-    return r;
+    return col_rel_new_auto("test_rel", ncols);
 }
 
 static int test_row_match(const col_rel_t *r, uint32_t row,
@@ -122,47 +99,16 @@ static int test_row_match(const col_rel_t *r, uint32_t row,
         c++) if (col_rel_get(r, row, c) != target[c]) return 0; return 1;
 }
 
-/* ----------------------------------------------------------------
- * Helper: free col_rel_t (handles data replaced by the function).
- * ---------------------------------------------------------------- */
 static void
 test_rel_free(col_rel_t *r)
 {
-    if (!r)
-        return;
-    free(r->name);
-    col_columns_free(r->columns, r->ncols);
-    col_columns_free(r->merge_columns, r->ncols);
-    free(r->row_scratch);
-    if (r->col_names) {
-        for (uint32_t i = 0; i < r->ncols; i++)
-            free(r->col_names[i]);
-        free((void *)r->col_names);
-    }
-    free(r);
+    col_rel_destroy(r);
 }
 
-/* ----------------------------------------------------------------
- * Helper: append one row, growing buffer as needed.
- * Returns 0 on success, -1 on ENOMEM.
- * ---------------------------------------------------------------- */
 static int
 test_rel_append_row(col_rel_t *r, const int64_t *row)
 {
-    if (r->nrows >= r->capacity) {
-        uint32_t cap = r->capacity == 0 ? 16 : r->capacity * 2;
-        if (r->columns) {
-            if (col_columns_realloc(r->columns, r->ncols, cap) != 0)
-                return -1;
-        } else {
-            r->columns = col_columns_alloc(r->ncols, cap);
-            if (!r->columns) return -1;
-        }
-        r->capacity = cap;
-    }
-    col_rel_row_copy_in(r, r->nrows, row);
-    r->nrows++;
-    return 0;
+    return col_rel_append_row(r, row);
 }
 
 /* ----------------------------------------------------------------
@@ -254,18 +200,33 @@ test_rel_contains_row(const col_rel_t *r, const int64_t *row)
 }
 
 static void
-test_empty_relation_float_validation(void)
+test_initialized_zero_column_relation(void)
 {
-    TEST("empty relation without columns is valid for float validation");
+    TEST("initialized zero-column relation supports the empty tuple");
 
-    col_rel_t *empty = test_rel_alloc(2);
+    col_rel_t *empty = test_rel_alloc(0);
     ASSERT(empty, "test_rel_alloc failed");
+    ASSERT(empty->schema_ok, "zero-column relation has initialized schema");
+    ASSERT(empty->relation_identity != 0,
+        "zero-column relation has initialized identity");
     ASSERT(wl_columnar_relation_float_values_valid(empty),
         "empty relation should be valid without column storage");
 
-    empty->nrows = 1;
-    ASSERT(!wl_columnar_relation_float_values_valid(empty),
-        "non-empty relation must have column storage");
+    int64_t empty_tuple = 0;
+    ASSERT(test_rel_append_row(empty, &empty_tuple) == 0,
+        "append zero-column tuple");
+    ASSERT(empty->nrows == 1, "zero-column relation has one empty tuple");
+    ASSERT(wl_columnar_relation_float_values_valid(empty),
+        "zero-column tuple remains valid without column storage");
+    ASSERT(test_rel_append_row(empty, &empty_tuple) == 0,
+        "append duplicate zero-column tuple");
+    col_rel_t *delta_out = test_rel_alloc(0);
+    ASSERT(delta_out, "test_rel_alloc delta_out failed");
+    ASSERT(col_op_consolidate_incremental_delta(empty, 1, delta_out, NULL) == 0,
+        "consolidate duplicate zero-column tuple");
+    ASSERT(empty->nrows == 1, "duplicate empty tuple is consolidated");
+    ASSERT(delta_out->nrows == 0, "duplicate empty tuple is not emitted");
+    test_rel_free(delta_out);
 
     test_rel_free(empty);
     PASS();
@@ -968,7 +929,7 @@ main(void)
     test_fastpath_counter_sorted_after();
     test_fastpath_counter_interleaved();
     test_fastpath_counter_null_safe();
-    test_empty_relation_float_validation();
+    test_initialized_zero_column_relation();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);
