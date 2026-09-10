@@ -31,6 +31,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Allocation-free source access gate** (#1492). Add an address-bound,
+  multiple-reader/exclusive-writer gate with deterministic contention,
+  overflow, token-validation, and real-thread exclusion tests for the
+  columnar source-reader work.
+
 - **Arrangement registry stays scannable after a failed tombstone reuse**
   (#1515). The name and key allocations for a new `(relation, key columns)`
   entry now precede any change to the reused slot, and a first build denied

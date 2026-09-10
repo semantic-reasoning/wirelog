@@ -1360,6 +1360,15 @@ test_mem_ledger_exe = executable(
 )
 test('mem_ledger_contract', test_mem_ledger_exe, suite: 'unit')
 
+test_source_access_exe = executable(
+  'test_source_access',
+  files('test_source_access.c', '../wirelog/columnar/source_access.c')
+    + thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+)
+test('source_access', test_source_access_exe, suite: 'unit')
+
 test_memory_governor_exe = executable(
   'test_memory_governor',
   files('test_memory_governor.c', '../wirelog/columnar/memory_governor.c')
