@@ -367,6 +367,8 @@ tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
     const col_rel_t *src, int shared_view_rc)
 {
     wl_columnar_source_access_reader_t reader = { 0 };
+    col_rel_t *source_owner = NULL;
+    col_rel_t *destination_owner = NULL;
     int rc;
 
     /* EBUSY can mean terminal source destruction already claimed the gate.
@@ -374,23 +376,41 @@ tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
     if (shared_view_rc != ENOMEM && shared_view_rc != EINVAL
         && shared_view_rc != EOVERFLOW)
         return shared_view_rc;
+    rc = col_rel_storage_owner_resolve(src, &source_owner);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_storage_owner_resolve(dst, &destination_owner);
+    if (rc != 0)
+        return rc;
     rc = col_rel_source_reader_acquire(src, &reader);
     if (rc != 0)
         return rc;
+    bool reader_acquired = true;
+    /* An empty source has no mutable column data to read.  When the source
+     * and reused destination share one gate, release the reader before COW
+     * so the destination writer cannot self-conflict.  The live destination
+     * alias still keeps that owner alive through the transition. */
+    if (src->nrows == 0 && source_owner == destination_owner) {
+        rc = col_rel_source_reader_release(&reader);
+        reader_acquired = false;
+        if (rc != 0)
+            return rc;
+    }
     if (sess) {
         dst->nrows = 0;
         wl_columnar_relation_touch_view(dst);
     }
     rc = col_rel_append_all(dst, src, NULL);
-    int release_rc = col_rel_source_reader_release(&reader);
+    int release_rc = reader_acquired
+        ? col_rel_source_reader_release(&reader) : 0;
     if (rc == 0 && release_rc != 0)
         rc = release_rc;
     if (rc == 0 && sess) {
-        /* append_all COW-detaches a non-empty shared destination before it
-         * returns.  Empty copies may remain aliases and retain their lease. */
+        /* append_all also detaches an empty shared destination before it
+         * returns, so a successful fallback must retire the old lease. */
         int retire_rc
             = wl_columnar_session_retire_source_lease(sess, dst);
-        if (retire_rc != 0 && retire_rc != EBUSY)
+        if (retire_rc != 0)
             rc = retire_rc;
     }
     return rc;

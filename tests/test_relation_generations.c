@@ -2135,6 +2135,34 @@ test_shared_view_relation_metadata(void)
     cleanup_relations();
 }
 
+static void
+test_empty_append_detaches_shared_destination(void)
+{
+    col_rel_t *src = new_relation();
+    col_rel_t *dst = new_relation();
+
+    CHECK(src != NULL, "empty source allocation");
+    CHECK(dst != NULL, "empty destination allocation");
+    CHECK(col_rel_install_shared_view(dst, src) == 0,
+        "empty source shared view");
+    CHECK(src->nrows == 0 && src->storage_alias_borrows == 1
+        && dst->col_shared != NULL,
+        "empty source installs shared destination");
+    CHECK(col_rel_destroy_checked(src) == EBUSY,
+        "shared empty destination blocks source destroy");
+    CHECK(col_rel_append_all(dst, src, NULL) == 0,
+        "empty append detaches shared destination");
+    CHECK(dst->storage_owner == dst && dst->col_shared == NULL
+        && src->storage_alias_borrows == 0,
+        "empty append retires old shared ownership");
+    CHECK(col_rel_destroy_checked(src) == 0,
+        "source destroy succeeds after empty detach");
+    src = NULL;
+    col_rel_destroy(dst);
+    dst = NULL;
+    owned_relation_count = 0;
+}
+
 int
 main(void)
 {
@@ -2163,6 +2191,7 @@ main(void)
     test_failure_atomicity();
     test_resize_failure_atomicity();
     test_shared_view_relation_metadata();
+    test_empty_append_detaches_shared_destination();
     test_identity_exhaustion();
     if (failures != 0)
         return EXIT_FAILURE;
