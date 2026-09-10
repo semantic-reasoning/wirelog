@@ -31,6 +31,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Fixed
 
+- **Added the allocation-free source access contract** (#1492). The internal
+  gate supports concurrent readers, an exclusive nonrecursive writer,
+  address-bound tokens, deterministic contention errors, and reader-count
+  overflow handling without allocating.
+
 - **Arrangement registry stays scannable after a failed tombstone reuse**
   (#1515). The name and key allocations for a new `(relation, key columns)`
   entry now precede any change to the reused slot, and a first build denied
