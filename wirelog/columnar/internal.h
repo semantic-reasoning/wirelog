@@ -1604,6 +1604,9 @@ typedef struct wl_col_session_t {
     uint32_t join_batch_fallback_count;
     uint8_t join_batch_last_reason;
     uint8_t join_batch_warned_reasons; /* one WL_LOG warning per reason */
+    /* Test-visible diagnostic for proving strict rejection does not build an
+     * ephemeral hash table.  Incremented only when that path is entered. */
+    uint32_t join_batch_ephemeral_build_count;
     /* Issue #959: high-water mark of a single join's output, per session.
      * Workers are separate sessions, so each carries its own -- which is the
      * number needed to decide whether dividing the row cap by W is right:

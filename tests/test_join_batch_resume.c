@@ -1131,6 +1131,102 @@ out:
     fixture_fini(&f);
 }
 
+/* (11a) A strict eligible join must reject before building an ephemeral hash
+ * table when arrangement admission is denied.  Non-strict mode keeps the
+ * one-shot result and records the explicit no-arrangement fallback. */
+static void
+test_strict_no_arrangement_rejects_before_ephemeral_build(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    col_rel_t *oracle = NULL;
+    wl_columnar_memory_governor_t *governor;
+    wl_columnar_memory_reservation_t blocker;
+    uint64_t usable;
+    uint64_t reserved_before;
+    eval_stack_t stack;
+    eval_entry_t result;
+    int rc;
+
+    TEST("strict no-arrangement rejection avoids ephemeral hash build");
+    wl_columnar_memory_reservation_init(&blocker);
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 1)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (!oracle) {
+        FAIL("oracle");
+        goto out;
+    }
+
+    /* Grow the right relation substantially so rebuilding its invalidated
+     * arrangement needs more than the small headroom left below.  The added
+     * rows use unrelated keys and do not change the oracle result. */
+    for (uint32_t i = 0; i < 5000; i++) {
+        int64_t row[] = { (int64_t)(100 + i), (int64_t)i };
+        if (col_rel_append_row(f.right, row) != 0) {
+            FAIL("right relation growth");
+            goto out;
+        }
+    }
+    col_session_invalidate_arrangements(&f.sess->base, "right");
+    governor = wl_columnar_memory_governor_ref_get(f.sess->memory_governor);
+    usable = atomic_load_explicit(&governor->usable_bytes,
+            memory_order_relaxed);
+    reserved_before = reserved_of(f.sess);
+    if (usable <= reserved_before + 16384
+        || !wl_columnar_memory_reserve(governor,
+        usable - reserved_before - 16384, &blocker)) {
+        FAIL("arrangement admission blocker");
+        goto out;
+    }
+
+    f.sess->join_batch_bytes = 9u * 32u;
+    f.sess->join_batch_strict = true;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f.left, false);
+    rc = col_op_join(&f.op, &stack, f.sess);
+    if (rc != ENOTSUP || f.sess->join_batch_fallback_count != 0u
+        || f.sess->join_batch_ephemeral_build_count != 0u
+        || reserved_of(f.sess) != reserved_before + blocker.bytes) {
+        FAIL("strict rejection allocated, fell back, or changed reservations");
+        if (rc == 0) {
+            result = eval_stack_pop(&stack);
+            if (result.owned)
+                col_rel_destroy(result.rel);
+        }
+        goto out;
+    }
+
+    f.sess->join_batch_strict = false;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f.left, false);
+    rc = col_op_join(&f.op, &stack, f.sess);
+    if (rc != 0) {
+        FAIL("non-strict no-arrangement fallback failed");
+        goto out;
+    }
+    result = eval_stack_pop(&stack);
+    if (!result.owned || !same_rows(oracle, result.rel)
+        || f.sess->join_batch_fallback_count != 1u
+        || f.sess->join_batch_last_reason
+        != COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT
+        || f.sess->join_batch_ephemeral_build_count != 1u)
+        FAIL("non-strict fallback result or diagnostics are incorrect");
+    else
+        PASS();
+    if (result.owned)
+        col_rel_destroy(result.rel);
+out:
+    if (blocker.bytes)
+        (void)wl_columnar_memory_release(&blocker);
+    if (oracle)
+        col_rel_destroy(oracle);
+    fixture_fini(&f);
+}
+
 /* (11c) An empty right relation produces zero rows in bounded mode, not a
  * stale verdict; a sub-row budget through the operator falls back with
  * the row-too-large reason and still equals the oracle. */
@@ -1286,6 +1382,7 @@ main(void)
     test_unsupported_budget_and_pooled_output();
     test_row_cap_trips_after_a_committed_batch();
     test_operator_dispatch_and_eligibility();
+    test_strict_no_arrangement_rejects_before_ephemeral_build();
     test_operator_empty_right_and_row_too_large();
     test_env_parse();
     printf("\n  %d tests: %d passed, %d failed\n", tests_run, tests_passed,

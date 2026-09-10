@@ -1235,6 +1235,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         uint32_t nbuckets_ep = 0;
         uint32_t *ht_head_ep = NULL;
         uint32_t *ht_next_ep = NULL;
+        int join_rc = 0;
+        int join_overflow = 0;
 
         WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
             "Standard merge-join starting - left=%u rows, right=%u rows, kc=%u",
@@ -1263,6 +1265,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             arr = col_session_get_delta_arrangement(sess, op->right_relation,
                     right, rk, kc);
 
+        /* A cached entry with no indexed rows is not a usable persistent
+         * arrangement for a non-empty right relation. Treat it like a
+         * failed pin, releasing the lease before strict-mode admission
+         * decides whether the ephemeral path is allowed. */
+        if (arr && right->nrows > 0 && arr->indexed_rows == 0) {
+            col_arrangement_pin_release(&arr_pin);
+            arr = NULL;
+        }
+
         if (arr)
             WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
                 "Using persistent arrangement");
@@ -1270,8 +1281,19 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
                 "No arrangement available, will use ephemeral hash table");
 
-        if (!arr) {
+        bool run_bounded = bounded && arr != NULL;
+        if (bounded && !arr) {
+            /* An eligible bounded join cannot resume through an ephemeral
+            * hash table. Strict mode must reject before allocating it. */
+            if (sess->join_batch_strict)
+                join_rc = ENOTSUP;
+            else
+                col_join_batch_record_fallback(sess,
+                    COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT);
+        }
+        if (!arr && join_rc == 0) {
             /* Ephemeral hash table (delta path or arrangement unavailable). */
+            sess->join_batch_ephemeral_build_count++;
             if (col_join_bucket_count(right->nrows, &nbuckets_ep) != 0) {
                 free(tmp);
                 col_rel_destroy(out);
@@ -1334,18 +1356,6 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             }
         }
 
-        int join_rc = 0;
-        int join_overflow = 0;
-        bool run_bounded = bounded && arr != NULL;
-        if (bounded && !arr) {
-            /* Eligible shape without a persistent arrangement: the ephemeral
-             * hash path cannot be resumed, so it is a recorded fallback. */
-            if (sess->join_batch_strict)
-                join_rc = ENOTSUP;
-            else
-                col_join_batch_record_fallback(sess,
-                    COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT);
-        }
         if (run_bounded && join_rc == 0) {
             wl_columnar_continuation_t *cont = NULL;
             int create_rc = col_join_batch_producer_create(sess, op, left,
