@@ -793,6 +793,108 @@ test_growth_refused_while_leased(void)
     PASS();
 }
 
+/* Test i (Issue #1435, Unit B2): when the cached lookup reports the
+ * cache unavailable (here: a lease holds the join's entry while the source
+ * changes), the keyed join continues on an owned filtered relation, still
+ * derives the correct tuples, and leaves the cache untouched. */
+static void
+test_join_falls_through(void)
+{
+    TEST("Join: falls through to an owned filter while the cache is leased");
+
+    /* A constant inside the join's right atom (tag = 7) is collected into
+     * right_filter_expr, so the keyed join goes through filt_cache. */
+    const char *src =
+        ".decl a(x: int32, y: int32)\n"
+        ".decl edge(y: int32, z: int32, tag: int32)\n"
+        ".decl out(x: int32, z: int32)\n"
+        "a(1, 1).\n"
+        "edge(1, 2, 0). edge(1, 3, 7).\n"
+        "out(x, z) :- a(x, y), edge(y, z, 7).\n";
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    ASSERT(prog != NULL, "parse failed");
+    wl_fusion_apply(prog, NULL);
+    wl_jpp_apply(prog, NULL);
+    wl_sip_apply(prog, NULL);
+    wl_plan_t *plan = NULL;
+    ASSERT(wl_plan_from_program(prog, &plan) == 0, "plan gen failed");
+    wl_session_t *sess = NULL;
+    ASSERT(wl_session_create(wl_backend_columnar(), plan, 1, &sess) == 0,
+        "session create failed");
+    ASSERT(wl_session_load_facts(sess, prog) == 0, "load facts failed");
+    ASSERT(wl_session_snapshot(sess, noop_cb, NULL) == 0,
+        "initial snapshot failed");
+
+    wl_col_session_t *cs = COL_SESSION(sess);
+    col_rel_t *edge = find_relation(sess, "edge");
+    col_filt_cache_entry_t *entry = NULL;
+    for (uint32_t i = 0; i < cs->filt_cache_count; i++) {
+        if (strcmp(cs->filt_cache[i].rel_name, "edge") == 0)
+            entry = &cs->filt_cache[i];
+    }
+    if (!edge || !entry || !entry->filtered) {
+        destroy_lease_session(sess, plan, prog);
+        FAIL("join did not populate the filtered cache for edge");
+    }
+    uint32_t count_before = cs->filt_cache_count;
+
+    /* Lease the join's own entry, then change the source under it and
+     * add a left-side fact so the rule is evaluated again: the lookup
+     * finds the entry stale and leased, and the join must continue on an
+     * owned filter over the current edge relation. */
+    wl_plan_expr_buffer_t fexpr = { entry->filter_data, entry->filter_size };
+    col_filt_cache_pin_t pin;
+    col_rel_t *leased = wl_columnar_filter_apply_right_filter_cached_pin(
+        cs, &fexpr, "edge", edge, &pin);
+    int ok = leased == entry->filtered && leased->nrows == 1
+        && cs->filt_cache_active_pins == 1;
+
+    int64_t new_edge[] = { 1, 4, 7 };
+    int64_t new_a[] = { 2, 1 };
+    if (ok)
+        ok = wl_session_insert(sess, "edge", new_edge, 1, 3) == 0
+            && wl_session_insert(sess, "a", new_a, 1, 2) == 0;
+    collect_t got;
+    memset(&got, 0, sizeof(got));
+    got.tracked_rel = "out";
+    if (ok)
+        ok = wl_session_snapshot(sess, collect_cb, &got) == 0;
+
+    /* x = 2 joins the current edge relation through the owned filter:
+     * (2,3) and (2,4) both appear and nothing with tag 0 (z = 2) does.
+     * (2,4) cannot come from the stale leased copy, which has one row. */
+    if (ok) {
+        int saw23 = 0;
+        int saw24 = 0;
+        int bad = 0;
+        for (uint32_t i = 0; i < got.count; i++) {
+            if (got.rows[i][1] == 2)
+                bad++;
+            if (got.rows[i][0] == 2 && got.rows[i][1] == 3)
+                saw23++;
+            if (got.rows[i][0] == 2 && got.rows[i][1] == 4)
+                saw24++;
+        }
+        ok = saw23 == 1 && saw24 == 1 && bad == 0;
+    }
+    /* The leased entry was neither replaced nor moved, the array did not
+     * change shape, and the lease is still the only one. */
+    if (ok)
+        ok = cs->filt_cache_count == count_before
+            && entry->filtered == leased && leased->nrows == 1
+            && entry->evict_deferred && entry->pin_count == 1
+            && cs->filt_cache_active_pins == 1;
+
+    col_filt_cache_pin_release(&pin);
+    if (ok)
+        ok = cs->filt_cache_active_pins == 0 && entry->filtered == NULL;
+
+    destroy_lease_session(sess, plan, prog);
+    ASSERT(ok, "join did not fall through to an owned filter under a lease");
+    PASS();
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -810,6 +912,7 @@ main(void)
     test_lease_survives_session_add_rel();
     test_two_leases_release_either_order();
     test_growth_refused_while_leased();
+    test_join_falls_through();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)
