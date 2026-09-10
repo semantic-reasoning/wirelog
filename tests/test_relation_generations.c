@@ -46,6 +46,50 @@ static int failures;
 static col_rel_t *owned_relations[32];
 static size_t owned_relation_count;
 
+#ifdef WL_TEST_APPEND_HOOK
+static col_rel_t *append_hook_expected;
+static col_rel_t *append_hook_source;
+static bool append_hook_called;
+static bool append_hook_state_ok;
+static bool append_hook_expect_growth;
+static uint32_t append_hook_expected_rows;
+static uint32_t append_hook_expected_capacity;
+static int64_t **append_hook_source_columns;
+static uint32_t append_hook_source_aliases;
+static uint64_t append_hook_view_generation;
+static uint64_t append_hook_storage_generation;
+static int append_hook_reader_rc;
+
+static void
+append_transition_probe(col_rel_t *rel)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+
+    if (rel != append_hook_expected)
+        return;
+    append_hook_called = true;
+    append_hook_state_ok = rel->storage_owner == append_hook_source
+        && rel->storage_owner_identity == append_hook_source->relation_identity
+        && rel->storage_owner_generation
+        == append_hook_source->storage_generation
+        && rel->nrows == append_hook_expected_rows
+        && (append_hook_expect_growth
+            ? rel->capacity > append_hook_expected_capacity
+            : rel->capacity == append_hook_expected_capacity)
+        && rel->view_generation == append_hook_view_generation
+        && rel->storage_generation != append_hook_storage_generation
+        && rel->col_shared == NULL
+        && rel->storage_alias_borrows == 0
+        && append_hook_source->columns == append_hook_source_columns
+        && append_hook_source->nrows == append_hook_expected_rows
+        && append_hook_source->storage_alias_borrows
+        == append_hook_source_aliases;
+    append_hook_reader_rc = col_rel_source_reader_acquire(rel, &reader);
+    if (append_hook_reader_rc == 0)
+        (void)col_rel_source_reader_release(&reader);
+}
+#endif
+
 static void
 cleanup_relations(void)
 {
@@ -246,6 +290,326 @@ test_source_reader_blocks_checked_destroy(void)
     CHECK(col_rel_destroy_checked(rel) == 0,
         "destroy retry after reader release");
     owned_relation_count--;
+}
+
+static void
+test_source_reader_blocks_direct_append_row(void)
+{
+    col_rel_t *rel = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int64_t first = 17;
+    int64_t extra = 23;
+    int64_t **columns;
+    col_delta_timestamp_t *timestamps;
+    uint32_t rows;
+    uint32_t capacity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t owner_generation;
+    uint64_t reserved_bytes;
+    uint32_t aliases;
+
+    CHECK(rel != NULL, "direct append reader exclusion relation");
+    CHECK(col_rel_append_row(rel, &first) == 0,
+        "direct append reader exclusion seed");
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "direct append reader exclusion timestamps");
+    rel->timestamps[0].iteration = 41;
+    rel->timestamps[0].multiplicity = 7;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "direct spare append reader");
+    columns = rel->columns;
+    timestamps = rel->timestamps;
+    rows = rel->nrows;
+    capacity = rel->capacity;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    owner_generation = rel->storage_owner_generation;
+    reserved_bytes = rel->retained_reserved_bytes;
+    aliases = rel->storage_alias_borrows;
+    int blocked_rc = col_rel_append_row(rel, &extra);
+    int release_rc = col_rel_source_reader_release(&reader);
+    CHECK(blocked_rc == EBUSY && release_rc == 0
+        && rel->columns == columns
+        && rel->columns[0][0] == first
+        && rel->timestamps == timestamps
+        && rel->timestamps[0].iteration == 41
+        && rel->timestamps[0].multiplicity == 7
+        && rel->nrows == rows
+        && rel->capacity == capacity
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->storage_owner == rel
+        && rel->storage_owner_identity == rel->relation_identity
+        && rel->storage_owner_generation == owner_generation
+        && rel->retained_reserved_bytes == reserved_bytes
+        && rel->storage_alias_borrows == aliases,
+        "reader-blocked spare append is transactional");
+    CHECK(col_rel_append_row(rel, &extra) == 0
+        && rel->nrows == rows + 1u
+        && rel->columns[0][rows] == extra,
+        "direct spare append succeeds after release");
+    cleanup_relations();
+
+    rel = new_relation();
+    CHECK(rel != NULL, "direct resize reader exclusion relation");
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++) {
+        int64_t value = (int64_t)i;
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "direct resize reader exclusion seed");
+    }
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "direct resize reader exclusion timestamps");
+    rel->timestamps[COL_REL_INIT_CAP - 1u].stratum = 9;
+    rel->timestamps[COL_REL_INIT_CAP - 1u].multiplicity = 11;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "direct resize append reader");
+    columns = rel->columns;
+    timestamps = rel->timestamps;
+    rows = rel->nrows;
+    capacity = rel->capacity;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    owner_generation = rel->storage_owner_generation;
+    reserved_bytes = rel->retained_reserved_bytes;
+    aliases = rel->storage_alias_borrows;
+    blocked_rc = col_rel_append_row(rel, &extra);
+    release_rc = col_rel_source_reader_release(&reader);
+    CHECK(blocked_rc == EBUSY && release_rc == 0
+        && rel->columns == columns
+        && rel->columns[0][COL_REL_INIT_CAP - 1u]
+        == (int64_t)(COL_REL_INIT_CAP - 1u)
+        && rel->timestamps == timestamps
+        && rel->timestamps[COL_REL_INIT_CAP - 1u].stratum == 9
+        && rel->timestamps[COL_REL_INIT_CAP - 1u].multiplicity == 11
+        && rel->nrows == rows
+        && rel->capacity == capacity
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->storage_owner == rel
+        && rel->storage_owner_identity == rel->relation_identity
+        && rel->storage_owner_generation == owner_generation
+        && rel->retained_reserved_bytes == reserved_bytes
+        && rel->storage_alias_borrows == aliases,
+        "reader-blocked resize append is transactional");
+    CHECK(col_rel_append_row(rel, &extra) == 0
+        && rel->nrows == rows + 1u
+        && rel->capacity > capacity
+        && rel->columns[0][rows] == extra,
+        "direct resize append succeeds after release");
+    cleanup_relations();
+}
+
+static void
+test_source_reader_blocks_append_row(void)
+{
+    col_rel_t *source = new_relation();
+    col_rel_t *view = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int64_t first = 17;
+    int64_t extra = 23;
+    int64_t **source_columns;
+    int64_t **view_columns;
+    int64_t *view_column0;
+    col_delta_timestamp_t *source_timestamps;
+    col_delta_timestamp_t *view_timestamps;
+    uint32_t source_rows;
+    uint32_t source_capacity;
+    uint32_t view_rows;
+    uint32_t view_capacity;
+    uint64_t source_view;
+    uint64_t source_storage;
+    uint64_t source_owner_identity;
+    uint64_t view_view;
+    uint64_t view_storage;
+    uint64_t source_owner_generation;
+    uint64_t source_reserved;
+    uint64_t view_reserved;
+    uint32_t source_aliases;
+    uint32_t view_aliases;
+
+    CHECK(source && view, "append reader exclusion relations");
+    CHECK(col_rel_append_row(source, &first) == 0,
+        "append reader exclusion seed");
+    CHECK(col_rel_enable_timestamps(source) == 0,
+        "append reader exclusion timestamps");
+    source->timestamps[0].iteration = 41;
+    source->timestamps[0].multiplicity = 7;
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "append reader exclusion shared view");
+    source_columns = source->columns;
+    source_timestamps = source->timestamps;
+    source_rows = source->nrows;
+    source_capacity = source->capacity;
+    source_view = source->view_generation;
+    source_storage = source->storage_generation;
+    source_owner_identity = source->storage_owner_identity;
+    source_owner_generation = source->storage_owner_generation;
+    source_reserved = source->retained_reserved_bytes;
+    source_aliases = source->storage_alias_borrows;
+    view_columns = view->columns;
+    view_column0 = view->columns[0];
+    view_timestamps = view->timestamps;
+    view_rows = view->nrows;
+    view_capacity = view->capacity;
+    view_view = view->view_generation;
+    view_storage = view->storage_generation;
+    view_reserved = view->retained_reserved_bytes;
+    view_aliases = view->storage_alias_borrows;
+#ifdef WL_TEST_APPEND_HOOK
+    append_hook_source = source;
+    append_hook_expected = view;
+    append_hook_called = false;
+    append_hook_state_ok = false;
+    append_hook_expect_growth = false;
+    append_hook_expected_rows = view_rows;
+    append_hook_expected_capacity = view_capacity;
+    append_hook_source_columns = source_columns;
+    append_hook_source_aliases = source_aliases;
+    append_hook_view_generation = view_view;
+    append_hook_storage_generation = view_storage;
+    append_hook_reader_rc = 0;
+    wl_columnar_append_transition_hook = append_transition_probe;
+#endif
+    CHECK(col_rel_append_row(view, &extra) == 0,
+        "spare-capacity alias append");
+#ifdef WL_TEST_APPEND_HOOK
+    wl_columnar_append_transition_hook = NULL;
+    append_hook_expected = NULL;
+#endif
+    CHECK(append_hook_called && append_hook_state_ok
+        && append_hook_reader_rc == EBUSY,
+        "reader blocks spare-capacity alias append transition");
+    CHECK(source->columns == source_columns
+        && source->columns[0][0] == first
+        && source->timestamps == source_timestamps
+        && source->timestamps[0].iteration == 41
+        && source->timestamps[0].multiplicity == 7
+        && source->nrows == source_rows
+        && source->capacity == source_capacity
+        && source->view_generation == source_view
+        && source->storage_generation == source_storage
+        && source->storage_owner == source
+        && source->storage_owner_identity == source_owner_identity
+        && source->storage_owner_generation == source_owner_generation
+        && source->retained_reserved_bytes == source_reserved
+        && source->storage_alias_borrows == source_aliases - 1u
+        && view->columns[0] != view_column0
+        && view->columns[0][0] == first
+        && view->timestamps == view_timestamps
+        && view->timestamps[0].iteration == 41
+        && view->timestamps[0].multiplicity == 7
+        && view->nrows == view_rows + 1u
+        && view->columns[0][view_rows] == extra
+        && view->capacity == view_capacity
+        && view->view_generation != view_view
+        && view->storage_generation != view_storage
+        && view->storage_owner == view
+        && view->storage_owner_identity == view->relation_identity
+        && view->retained_reserved_bytes == view_reserved
+        && view->storage_alias_borrows == view_aliases
+        && view->col_shared == NULL
+        && source->storage_alias_borrows == source_aliases - 1u,
+        "spare-capacity alias append commits after transition");
+    CHECK(col_rel_source_reader_acquire(view, &reader) == 0
+        && col_rel_source_reader_release(&reader) == 0,
+        "view reader succeeds after spare-capacity append");
+    cleanup_relations();
+
+    source = new_relation();
+    view = new_relation();
+    CHECK(source && view, "resize reader exclusion relations");
+    for (uint32_t i = 0; i < COL_REL_INIT_CAP; i++) {
+        int64_t value = (int64_t)i;
+        CHECK(col_rel_append_row(source, &value) == 0,
+            "resize reader exclusion seed");
+    }
+    CHECK(col_rel_enable_timestamps(source) == 0,
+        "resize reader exclusion timestamps");
+    source->timestamps[COL_REL_INIT_CAP - 1u].stratum = 9;
+    source->timestamps[COL_REL_INIT_CAP - 1u].multiplicity = 11;
+    CHECK(col_rel_install_shared_view(view, source) == 0,
+        "resize reader exclusion shared view");
+    source_columns = source->columns;
+    source_timestamps = source->timestamps;
+    source_rows = source->nrows;
+    source_capacity = source->capacity;
+    source_view = source->view_generation;
+    source_storage = source->storage_generation;
+    source_owner_identity = source->storage_owner_identity;
+    source_owner_generation = source->storage_owner_generation;
+    source_reserved = source->retained_reserved_bytes;
+    source_aliases = source->storage_alias_borrows;
+    view_columns = view->columns;
+    view_column0 = view->columns[0];
+    view_timestamps = view->timestamps;
+    view_rows = view->nrows;
+    view_capacity = view->capacity;
+    view_view = view->view_generation;
+    view_storage = view->storage_generation;
+    view_reserved = view->retained_reserved_bytes;
+    view_aliases = view->storage_alias_borrows;
+#ifdef WL_TEST_APPEND_HOOK
+    append_hook_source = source;
+    append_hook_expected = view;
+    append_hook_called = false;
+    append_hook_state_ok = false;
+    append_hook_expect_growth = true;
+    append_hook_expected_rows = view_rows;
+    append_hook_expected_capacity = view_capacity;
+    append_hook_source_columns = source_columns;
+    append_hook_source_aliases = source_aliases;
+    append_hook_view_generation = view_view;
+    append_hook_storage_generation = view_storage;
+    append_hook_reader_rc = 0;
+    wl_columnar_append_transition_hook = append_transition_probe;
+#endif
+    CHECK(col_rel_append_row(view, &extra) == 0,
+        "resize alias append");
+#ifdef WL_TEST_APPEND_HOOK
+    wl_columnar_append_transition_hook = NULL;
+    append_hook_expected = NULL;
+#endif
+    CHECK(append_hook_called && append_hook_state_ok
+        && append_hook_reader_rc == EBUSY,
+        "reader blocks resize alias append transition");
+    CHECK(source->columns == source_columns
+        && source->columns[0][COL_REL_INIT_CAP - 1u]
+        == (int64_t)(COL_REL_INIT_CAP - 1u)
+        && source->timestamps == source_timestamps
+        && source->timestamps[COL_REL_INIT_CAP - 1u].stratum == 9
+        && source->timestamps[COL_REL_INIT_CAP - 1u].multiplicity == 11
+        && source->nrows == source_rows
+        && source->capacity == source_capacity
+        && source->view_generation == source_view
+        && source->storage_generation == source_storage
+        && source->storage_owner == source
+        && source->storage_owner_identity == source_owner_identity
+        && source->storage_owner_generation == source_owner_generation
+        && source->retained_reserved_bytes == source_reserved
+        && source->storage_alias_borrows == source_aliases - 1u
+        && view->columns != view_columns
+        && view->columns[0][COL_REL_INIT_CAP - 1u]
+        == (int64_t)(COL_REL_INIT_CAP - 1u)
+        && view->timestamps != view_timestamps
+        && view->timestamps[COL_REL_INIT_CAP - 1u].stratum == 9
+        && view->timestamps[COL_REL_INIT_CAP - 1u].multiplicity == 11
+        && view->nrows == view_rows + 1u
+        && view->capacity > view_capacity
+        && view->view_generation != view_view
+        && view->storage_generation != view_storage
+        && view->storage_owner == view
+        && view->storage_owner_identity == view->relation_identity
+        && view->retained_reserved_bytes == view_reserved
+        && view->storage_alias_borrows == view_aliases
+        && view->columns[0][view_rows] == extra
+        && view->col_shared == NULL
+        && source->storage_alias_borrows == source_aliases - 1u,
+        "resize alias append commits after transition");
+    CHECK(col_rel_source_reader_acquire(view, &reader) == 0
+        && col_rel_source_reader_release(&reader) == 0,
+        "view reader succeeds after resize append");
+    cleanup_relations();
 }
 
 static void
@@ -1194,6 +1558,8 @@ main(void)
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
+    test_source_reader_blocks_direct_append_row();
+    test_source_reader_blocks_append_row();
     test_copy_and_shared_semantics();
     test_rollback_fresh_generation();
     test_overflow_boundary();

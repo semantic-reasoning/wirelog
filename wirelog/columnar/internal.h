@@ -496,6 +496,14 @@ typedef struct col_rel {
     wl_columnar_source_access_gate_t source_access;
 } col_rel_t;
 
+#ifdef WL_TEST_APPEND_HOOK
+/* Test-only seam for the append ownership-transition window.  This is not
+ * part of the installed/public header surface. */
+typedef void (*wl_columnar_append_transition_hook_t)(col_rel_t *);
+extern wl_columnar_append_transition_hook_t
+    wl_columnar_append_transition_hook;
+#endif
+
 /* MSVC in its default C mode neither defines __STDC_VERSION__ >= 201112L
  * nor accepts offsetof() inside _Static_assert (C2059); mirror the guard
  * used by diff_trace.c so the layout contract is still checked everywhere
