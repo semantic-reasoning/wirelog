@@ -23,6 +23,13 @@
 
 #define WL_MEMORY_PATH_MAX 4096
 
+#ifdef WL_COLUMNAR_MEMORY_TEST_HOOKS
+#define WL_MEMORY_TEST_POINT(token, phase) wl_columnar_memory_test_hook(token, \
+            phase)
+#else
+#define WL_MEMORY_TEST_POINT(token, phase) ((void)0)
+#endif
+
 static uint64_t
 headroom_for(uint64_t budget)
 {
@@ -653,7 +660,7 @@ transition_reservation(wl_columnar_memory_reservation_t *reservation,
         return false;
     for (;;) {
         if (atomic_compare_exchange_weak_explicit(&reservation->state,
-            &observed, to, memory_order_release, memory_order_acquire))
+            &observed, to, memory_order_acq_rel, memory_order_acquire))
             return true;
         if (observed != from)
             return false;
@@ -671,7 +678,7 @@ claim_reservation_state(wl_columnar_memory_reservation_t *reservation,
         return false;
     for (;;) {
         if (atomic_compare_exchange_weak_explicit(&reservation->state,
-            &observed, to, memory_order_release, memory_order_acquire))
+            &observed, to, memory_order_acq_rel, memory_order_acquire))
             return true;
         if (observed != from)
             return false;
@@ -709,42 +716,18 @@ wl_columnar_memory_transfer(wl_columnar_memory_reservation_t *reservation,
     if (!claim_reservation_state(reservation, state,
         WL_COLUMNAR_MEMORY_RESERVATION_TRANSFERRING))
         return false;
+    WL_MEMORY_TEST_POINT(reservation, WL_COLUMNAR_MEMORY_TEST_TRANSFER_CLAIMED);
     atomic_store_explicit(&reservation->owner_bits,
         (uint64_t)(uintptr_t)owner, memory_order_release);
     atomic_store_explicit(&reservation->state, state, memory_order_release);
     return true;
 }
 
+/* Called only while the token is exclusively claimed. */
 static bool
-finish_reservation(wl_columnar_memory_reservation_t *reservation,
-    bool rollback)
+credit_reservation(wl_columnar_memory_governor_t *governor, uint64_t bytes)
 {
-    uint64_t expected;
-    wl_columnar_memory_governor_t *governor;
-    uint64_t bytes;
     uint64_t old;
-
-    if (!reservation_identity_valid(reservation))
-        return false;
-    governor = reservation->governor;
-    bytes = reservation->bytes;
-    if (!governor || bytes == 0)
-        return false;
-    if (rollback) {
-        if (!transition_reservation(reservation,
-            WL_COLUMNAR_MEMORY_RESERVATION_RESERVED,
-            WL_COLUMNAR_MEMORY_RESERVATION_RELEASED))
-            return false;
-    } else {
-        expected = atomic_load_explicit(&reservation->state,
-                memory_order_acquire);
-        if (expected != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
-            && expected != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
-            return false;
-        if (!transition_reservation(reservation, expected,
-            WL_COLUMNAR_MEMORY_RESERVATION_RELEASED))
-            return false;
-    }
     old = atomic_load_explicit(&governor->reserved_bytes, memory_order_relaxed);
     for (;;) {
         uint64_t next;
@@ -760,6 +743,57 @@ finish_reservation(wl_columnar_memory_reservation_t *reservation,
 }
 
 bool
+wl_columnar_memory_reservation_downsize(
+    wl_columnar_memory_reservation_t *reservation, uint64_t bytes)
+{
+    bool ok = false;
+    if (bytes == 0 || !claim_reservation_state(reservation,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+        WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING))
+        return false;
+    WL_MEMORY_TEST_POINT(reservation, WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CLAIMED);
+    if (reservation->governor && bytes <= reservation->bytes
+        && credit_reservation(reservation->governor,
+        reservation->bytes - bytes)) {
+        reservation->bytes = bytes;
+        ok = true;
+        WL_MEMORY_TEST_POINT(reservation,
+            WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED);
+    }
+    atomic_store_explicit(&reservation->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    return ok;
+}
+
+static bool
+finish_reservation(wl_columnar_memory_reservation_t *reservation,
+    bool rollback)
+{
+    uint64_t state;
+    bool ok;
+    if (!reservation_identity_valid(reservation))
+        return false;
+    state = atomic_load_explicit(&reservation->state, memory_order_acquire);
+    if (state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && (rollback || state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED))
+        return false;
+    WL_MEMORY_TEST_POINT(reservation,
+        WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM);
+    if (!claim_reservation_state(reservation, state,
+        WL_COLUMNAR_MEMORY_RESERVATION_RELEASING))
+        return false;
+    WL_MEMORY_TEST_POINT(reservation, WL_COLUMNAR_MEMORY_TEST_RELEASE_CLAIMED);
+    /* Payload cannot change until accounting is complete and state published. */
+    ok = reservation->governor && reservation->bytes != 0
+        && credit_reservation(reservation->governor, reservation->bytes);
+    WL_MEMORY_TEST_POINT(reservation, WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED);
+    atomic_store_explicit(&reservation->state,
+        ok ? WL_COLUMNAR_MEMORY_RESERVATION_RELEASED : state,
+        memory_order_release);
+    return ok;
+}
+
+bool
 wl_columnar_memory_rollback(
     wl_columnar_memory_reservation_t *reservation)
 {
@@ -769,11 +803,7 @@ wl_columnar_memory_rollback(
 bool
 wl_columnar_memory_release(wl_columnar_memory_reservation_t *reservation)
 {
-    if (!reservation_identity_valid(reservation))
-        return false;
-    if (finish_reservation(reservation, false))
-        return true;
-    return finish_reservation(reservation, true);
+    return finish_reservation(reservation, false);
 }
 
 uint64_t

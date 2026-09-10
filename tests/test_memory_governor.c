@@ -357,6 +357,280 @@ test_checked_admission(void)
     return 0;
 }
 
+static int
+test_downsize(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token, other, copy, moved;
+    int owner;
+    TEST("committed reservation downsizing and invalid states");
+    make_resolution(&resolution, 1000, 900);
+    wl_columnar_memory_governor_init(&governor, &resolution);
+    wl_columnar_memory_reservation_init(&token);
+    wl_columnar_memory_reservation_init(&other);
+    wl_columnar_memory_reservation_init(&moved);
+    if (wl_columnar_memory_reservation_downsize(NULL, 1)
+        || wl_columnar_memory_reservation_downsize(&token, 1)
+        || !wl_columnar_memory_reserve(&governor, 600, &token)
+        || !wl_columnar_memory_reserve(&governor, 100, &other)
+        || wl_columnar_memory_reservation_downsize(&token, 300)
+        || !wl_columnar_memory_commit(&token, &owner)) {
+        FAIL("setup or noncommitted rejection");
+        return 1;
+    }
+    memcpy(&copy, &token, sizeof(copy));
+    if (wl_columnar_memory_reservation_downsize(&copy, 300)
+        || wl_columnar_memory_reservation_downsize(&token, 0)
+        || wl_columnar_memory_reservation_downsize(&token, 601)
+        || !wl_columnar_memory_reservation_downsize(&token, 600)
+        || wl_columnar_memory_reserved(&governor) != 700
+        || !wl_columnar_memory_reservation_downsize(&token, 300)
+        || !wl_columnar_memory_reservation_downsize(&token, 200)
+        || token.bytes != 200
+        || atomic_load_explicit(&token.owner_bits, memory_order_acquire)
+        != (uint64_t)(uintptr_t)&owner
+        || wl_columnar_memory_reserved(&governor) != 300) {
+        FAIL("downsize changed identity/owner or credited wrong amount");
+        return 1;
+    }
+    /* Exercise busy rejection without scheduling assumptions. */
+    atomic_store_explicit(&token.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING, memory_order_release);
+    if (wl_columnar_memory_reservation_downsize(&token, 100)
+        || wl_columnar_memory_release(&token)
+        || wl_columnar_memory_transfer(&token, &other)) {
+        FAIL("busy token accepted an operation");
+        return 1;
+    }
+    atomic_store_explicit(&token.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    /* Inject corrupt aggregate accounting to verify failure is reversible. */
+    atomic_store_explicit(&governor.reserved_bytes, 1, memory_order_relaxed);
+    if (wl_columnar_memory_reservation_downsize(&token, 100)
+        || wl_columnar_memory_release(&token) || token.bytes != 200
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
+        FAIL("accounting failure changed token");
+        return 1;
+    }
+    atomic_store_explicit(&governor.reserved_bytes, 300, memory_order_relaxed);
+    if (!wl_columnar_memory_transfer(&token, &other)
+        || atomic_load_explicit(&token.owner_bits, memory_order_acquire)
+        != (uint64_t)(uintptr_t)&other
+        || !wl_columnar_memory_reservation_move(&moved, &token)
+        || wl_columnar_memory_reservation_downsize(&token, 100)
+        || !wl_columnar_memory_reservation_downsize(&moved, 100)
+        || atomic_load_explicit(&moved.owner_bits, memory_order_acquire)
+        != (uint64_t)(uintptr_t)&other
+        || !wl_columnar_memory_release(&moved)
+        || wl_columnar_memory_reservation_downsize(&moved, 1)
+        || wl_columnar_memory_reserved(&governor) != 100
+        || !wl_columnar_memory_release(&other)
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("move or residual release accounting");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static struct {
+    wl_columnar_memory_reservation_t *token;
+    unsigned phase;
+    unsigned hits;
+    bool armed;
+    bool valid;
+} schedule;
+
+void
+wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *token,
+    unsigned phase)
+{
+    if (!schedule.armed || token != schedule.token || phase != schedule.phase)
+        return;
+    /* One-shot nesting models a competing operation while this call is paused. */
+    schedule.armed = false;
+    schedule.hits++;
+    if (phase == WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM) {
+        schedule.valid = wl_columnar_memory_reservation_downsize(token, 200)
+            && wl_columnar_memory_reserved(token->governor) == 1200;
+        return;
+    }
+    uint64_t state = WL_COLUMNAR_MEMORY_RESERVATION_RELEASING;
+    uint64_t total = 1600;
+    if (phase == WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CLAIMED
+        || phase == WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED)
+        state = WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING;
+    if (phase == WL_COLUMNAR_MEMORY_TEST_TRANSFER_CLAIMED)
+        state = WL_COLUMNAR_MEMORY_RESERVATION_TRANSFERRING;
+    if (phase == WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED)
+        total = 1000;
+    if (phase == WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED)
+        total = 1200;
+    schedule.valid = atomic_load_explicit(&token->state, memory_order_acquire)
+        == state && wl_columnar_memory_reserved(token->governor) == total;
+    bool release = wl_columnar_memory_release(token);
+    bool downsize = wl_columnar_memory_reservation_downsize(token, 100);
+    bool transfer = wl_columnar_memory_transfer(token, &schedule);
+    bool reserve = wl_columnar_memory_reserve(token->governor, 50, token);
+    schedule.valid = schedule.valid && !release && !downsize && !transfer
+        && !reserve && wl_columnar_memory_reserved(token->governor) == total
+        && atomic_load_explicit(&token->owner_bits, memory_order_acquire)
+        == (uint64_t)(uintptr_t)token->governor;
+}
+
+static int
+test_downsize_interleavings(void)
+{
+    TEST("controlled claim, credit, and publication interleavings");
+    for (unsigned phase = WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM;
+        phase <= WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED; phase++) {
+        wl_columnar_memory_resolution_t resolution;
+        wl_columnar_memory_governor_t governor;
+        wl_columnar_memory_reservation_t token, other;
+        make_resolution(&resolution, 5000, 4500);
+        wl_columnar_memory_governor_init(&governor, &resolution);
+        wl_columnar_memory_reservation_init(&token);
+        wl_columnar_memory_reservation_init(&other);
+        if (!wl_columnar_memory_reserve(&governor, 600, &token)
+            || !wl_columnar_memory_reserve(&governor, 1000, &other)
+            || !wl_columnar_memory_commit(&token, &governor)) {
+            FAIL("controlled schedule setup");
+            return 1;
+        }
+        schedule.token = &token;
+        schedule.phase = phase;
+        schedule.hits = 0;
+        schedule.armed = true;
+        schedule.valid = false;
+        bool is_downsize = phase == WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CLAIMED
+            || phase == WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED;
+        bool is_transfer = phase == WL_COLUMNAR_MEMORY_TEST_TRANSFER_CLAIMED;
+        bool ok;
+        if (is_downsize)
+            ok = wl_columnar_memory_reservation_downsize(&token, 200);
+        else if (is_transfer)
+            ok = wl_columnar_memory_transfer(&token, &other);
+        else
+            ok = wl_columnar_memory_release(&token);
+        schedule.armed = false;
+        uint64_t expected = 1000 + (is_downsize ? 200 : is_transfer ? 600 : 0);
+        bool valid = ok && schedule.valid && schedule.hits == 1
+            && wl_columnar_memory_reserved(&governor) == expected
+            && atomic_load_explicit(&token.owner_bits, memory_order_acquire)
+            == (uint64_t)(uintptr_t)(is_transfer
+                ? (void *)&other : (void *)&governor);
+        if (!is_downsize && !is_transfer) {
+            valid = valid && atomic_load_explicit(&token.state,
+                    memory_order_acquire)
+                == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
+            valid = wl_columnar_memory_reserve(&governor, 50, &token) && valid;
+        }
+        valid = wl_columnar_memory_release(&token) && valid;
+        valid = valid && wl_columnar_memory_reserved(&governor) == 1000;
+        valid = wl_columnar_memory_release(&other) && valid;
+        if (!valid || wl_columnar_memory_reserved(&governor) != 0) {
+            FAIL("controlled schedule violated accounting or publication");
+            return 1;
+        }
+    }
+    PASS();
+    return 0;
+}
+
+struct downsize_arg {
+    wl_columnar_memory_reservation_t *token;
+    wl_atomic_u64 *start;
+    unsigned op;
+    bool success;
+};
+
+static void *
+downsize_thread(void *ptr)
+{
+    struct downsize_arg *arg = ptr;
+    while (!atomic_load_explicit(arg->start, memory_order_acquire)) {
+    }
+    if (arg->op == 0)
+        arg->success = wl_columnar_memory_reservation_downsize(arg->token, 200);
+    else if (arg->op == 1)
+        arg->success = wl_columnar_memory_release(arg->token);
+    else
+        arg->success = wl_columnar_memory_transfer(arg->token, arg->start);
+    return NULL;
+}
+
+static int
+test_downsize_races(void)
+{
+    TEST(
+        "downsize/release/transfer contention conserves unrelated reservations");
+    for (unsigned round = 0; round < 100; round++) {
+        wl_columnar_memory_resolution_t resolution;
+        wl_columnar_memory_governor_t governor;
+        wl_columnar_memory_reservation_t token, other;
+        wl_atomic_u64 start;
+        thread_t threads[3];
+        struct downsize_arg args[3];
+        unsigned created = 0;
+        make_resolution(&resolution, 1000, 900);
+        wl_columnar_memory_governor_init(&governor, &resolution);
+        wl_columnar_memory_reservation_init(&token);
+        wl_columnar_memory_reservation_init(&other);
+        if (!wl_columnar_memory_reserve(&governor, 600, &token)
+            || !wl_columnar_memory_reserve(&governor, 100, &other)
+            || !wl_columnar_memory_commit(&token, &governor)) {
+            FAIL("race setup");
+            return 1;
+        }
+        atomic_store_explicit(&start, 0, memory_order_relaxed);
+        for (unsigned i = 0; i < 3; i++) {
+            args[i] = (struct downsize_arg){ &token, &start,
+                                             i ==
+                                             0 ? 0 : (round % 4 ==
+                                             3 ? 1 : round % 3), false };
+            if (thread_create(&threads[i], downsize_thread, &args[i]) != 0)
+                break;
+            created++;
+        }
+        atomic_store_explicit(&start, 1, memory_order_release);
+        for (unsigned i = 0; i < created; i++)
+            thread_join(&threads[i]);
+        bool released = atomic_load_explicit(&token.state, memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
+        bool downsize_succeeded = false;
+        bool transfer_succeeded = false;
+        unsigned releases = 0;
+        for (unsigned i = 0; i < created; i++) {
+            if (args[i].success && args[i].op == 0)
+                downsize_succeeded = true;
+            if (args[i].success && args[i].op == 1)
+                releases++;
+            if (args[i].success && args[i].op == 2)
+                transfer_succeeded = true;
+        }
+        uint64_t expected = 100 + (released ? 0 : token.bytes);
+        bool valid = wl_columnar_memory_reserved(&governor) == expected
+            && releases == (released ? 1u : 0u)
+            && token.bytes == (downsize_succeeded ? 200u : 600u)
+            && atomic_load_explicit(&token.owner_bits, memory_order_acquire)
+            == (uint64_t)(uintptr_t)(transfer_succeeded
+                ? (void *)&start : (void *)&governor);
+        if (!released)
+            valid = wl_columnar_memory_release(&token) && valid;
+        valid = valid && wl_columnar_memory_reserved(&governor) == 100;
+        valid = wl_columnar_memory_release(&other) && valid;
+        if (created != 3 || !valid
+            || wl_columnar_memory_reserved(&governor) != 0) {
+            FAIL("concurrent lifecycle leaked or double credited capacity");
+            return 1;
+        }
+    }
+    PASS();
+    return 0;
+}
+
 int
 main(void)
 {
@@ -368,6 +642,9 @@ main(void)
     test_reservation_lifecycle();
     test_concurrent_admission();
     test_checked_admission();
+    test_downsize();
+    test_downsize_interleavings();
+    test_downsize_races();
     printf("\nPassed %d/%d; Failed %d\n",
         tests_run - tests_failed, tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

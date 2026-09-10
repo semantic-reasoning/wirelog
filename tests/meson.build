@@ -1366,6 +1366,7 @@ test_memory_governor_exe = executable(
     + thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
+  c_args: ['-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
 )
 test('memory_governor', test_memory_governor_exe, suite: 'unit')
 

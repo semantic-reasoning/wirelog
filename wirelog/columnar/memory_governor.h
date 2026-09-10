@@ -102,6 +102,8 @@ typedef enum {
     WL_COLUMNAR_MEMORY_RESERVATION_CLAIMED = 4,
     WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING = 5,
     WL_COLUMNAR_MEMORY_RESERVATION_TRANSFERRING = 6,
+    WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING = 7,
+    WL_COLUMNAR_MEMORY_RESERVATION_RELEASING = 8,
 } wl_columnar_memory_reservation_state_t;
 
 typedef enum {
@@ -123,7 +125,24 @@ typedef struct {
     const void *identity;
 } wl_columnar_memory_reservation_t;
 
-/* Initialize a caller-owned token before its first reserve or reuse. */
+#ifdef WL_COLUMNAR_MEMORY_TEST_HOOKS
+/* Only compiled into the direct-source governor test executable. */
+enum {
+    WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM = 1,
+    WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CLAIMED,
+    WL_COLUMNAR_MEMORY_TEST_RELEASE_CLAIMED,
+    WL_COLUMNAR_MEMORY_TEST_TRANSFER_CLAIMED,
+    WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED,
+    WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED,
+};
+void
+wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *reservation,
+    unsigned phase);
+#endif
+
+/* Initialize a caller-owned token before its first reserve or reuse.
+ * Initialization and move require exclusive access to both token objects.
+ * Direct reads of non-atomic token payload require external synchronization. */
 void
 wl_columnar_memory_reservation_init(
     wl_columnar_memory_reservation_t *reservation);
@@ -205,6 +224,16 @@ wl_columnar_memory_commit(wl_columnar_memory_reservation_t *reservation,
 bool
 wl_columnar_memory_transfer(wl_columnar_memory_reservation_t *reservation,
     const void *owner);
+
+/* Credit storage already released by the owner of a committed token.
+ * Only positive sizes <= the current size are accepted; equality is a no-op.
+ * Zero requires explicit release after freeing the remaining storage.
+ * Serialized with release/transfer/downsize; busy or invalid tokens return
+ * false without mutation. This does not establish storage-reader safety or
+ * admit overlapping replacement allocations. Owner and identity are retained. */
+bool
+wl_columnar_memory_reservation_downsize(
+    wl_columnar_memory_reservation_t *reservation, uint64_t bytes);
 
 bool
 wl_columnar_memory_rollback(

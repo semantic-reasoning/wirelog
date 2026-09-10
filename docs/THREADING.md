@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **94**).
+match the script's count (currently **96**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -341,12 +341,16 @@ and the wasted work is bounded.
 |---|---|---|---|---|
 | `session.c:col_worker_session_create` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
 
-### 5.8 `wirelog/columnar/memory_governor.c` — reservation state (27 rows)
+### 5.8 `wirelog/columnar/memory_governor.c` — reservation state (36 rows)
 
 The governor uses one atomic counter for the shared reservation limit and
 token state transitions. The CAS admission loop is overflow-safe and a token
 reaches released exactly once; owner identity is stored as an atomic pointer
 representation so transfer cannot race a release with a data race.
+Downsize, release, and transfer claim the token before accessing mutable payload;
+contending operations return false when the token is busy. Accounting completes
+before publishing the updated committed or released state. Move, reinitialization,
+and direct non-atomic payload reads require external synchronization.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -365,16 +369,18 @@ representation so transfer cannot race a release with a data race.
 | `memory_governor.c:reserve_internal#6` | `reservation->state` | `atomic_store_explicit` | `release` | Abandon a token that exceeded the usable limit |
 | `memory_governor.c:reserve_internal#7` | `reserved_bytes` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Atomically admit without exceeding the shared limit |
 | `memory_governor.c:reserve_internal#8` | `reservation->state` | `atomic_store_explicit` | `release` | Publish the fully initialized reserved token |
-| `memory_governor.c:transition_reservation` | `reservation->state` | `atomic_compare_exchange_weak_explicit` | `release`/`acquire` | Retry spurious weak-CAS failures while enforcing a legal state transition |
-| `memory_governor.c:claim_reservation_state` | `reservation->state` | `atomic_compare_exchange_weak_explicit` | `release`/`acquire` | Claim a token or transfer state without relying on an MSVC-only strong-CAS shim |
+| `memory_governor.c:transition_reservation` | `reservation->state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Acquire prior payload publication while enforcing a legal state transition and retrying spurious failure |
+| `memory_governor.c:claim_reservation_state` | `reservation->state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Acquire exclusive access to token payload before downsize, release, or transfer |
 | `memory_governor.c:wl_columnar_memory_commit` | `reservation->owner_bits` | `atomic_store_explicit` | `release` | Publish committed ownership before the commit state |
 | `memory_governor.c:wl_columnar_memory_commit#2` | `reservation->state` | `atomic_store_explicit` | `release` | Publish the committed state after owner initialization |
 | `memory_governor.c:wl_columnar_memory_transfer` | `reservation->state` | `atomic_load_explicit` | `acquire` | Read the active state before claiming transfer |
 | `memory_governor.c:wl_columnar_memory_transfer#2` | `reservation->owner_bits` | `atomic_store_explicit` | `release` | Publish the new logical owner |
 | `memory_governor.c:wl_columnar_memory_transfer#3` | `reservation->state` | `atomic_store_explicit` | `release` | Restore the active state after owner transfer |
-| `memory_governor.c:finish_reservation` | `reservation->state` | `atomic_load_explicit` | `acquire` | Wait for an in-flight commit or transfer to publish a stable state |
-| `memory_governor.c:finish_reservation#2` | `reserved_bytes` | `atomic_load_explicit` | `relaxed` | Read current total before returning token capacity |
-| `memory_governor.c:finish_reservation#3` | `reserved_bytes` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Return exactly this token's bytes without underflow |
+| `memory_governor.c:credit_reservation` | `reserved_bytes` | `atomic_load_explicit` | `relaxed` | Read current total while holding the token claim |
+| `memory_governor.c:credit_reservation#2` | `reserved_bytes` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Return the claimed token's capacity or shrink delta without underflow |
+| `memory_governor.c:wl_columnar_memory_reservation_downsize` | `reservation->state` | `atomic_store_explicit` | `release` | Publish updated bytes after crediting the delta, or restore committed state on failure |
+| `memory_governor.c:finish_reservation` | `reservation->state` | `atomic_load_explicit` | `acquire` | Observe an eligible stable state before claiming release; reject a busy token |
+| `memory_governor.c:finish_reservation#2` | `reservation->state` | `atomic_store_explicit` | `release` | Publish released state only after accounting, or restore the prior state on failure |
 | `memory_governor.c:wl_columnar_memory_reserve_growth` | `reservation->state` | `atomic_load_explicit` | `acquire` | Validate the source token before creating a distinct growth reservation |
 | `memory_governor.c:wl_columnar_memory_reserved` | `reserved_bytes` | `atomic_load_explicit` | `acquire` | Read a coherent observable reservation total |
 | `memory_governor.c:wl_columnar_memory_reservation_move` | `destination->state` | `atomic_load_explicit` | `acquire` | Validate the destination token before moving ownership |
@@ -416,7 +422,7 @@ named in the justification.
 
 ### 5.11 Total
 
-21 + 4 + 2 + 3 + 19 + 1 + 1 + 1 + 3 + 27 + 7 + 5 = **94 atomic call sites**.
+21 + 4 + 2 + 3 + 19 + 1 + 1 + 1 + 3 + 36 + 5 = **96 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
