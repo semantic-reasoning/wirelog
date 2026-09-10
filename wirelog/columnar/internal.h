@@ -1237,6 +1237,7 @@ typedef struct {
 } col_arrangement_probe_t;
 
 #define COL_ARRANGEMENT_PROBE_BUNDLE_MAX 4u
+#define COL_ARRANGEMENT_PROBE_DEPENDENCY_MAX 4u
 
 typedef struct {
     col_arrangement_probe_t probe;
@@ -1244,9 +1245,21 @@ typedef struct {
 } col_arrangement_probe_bundle_slot_t;
 
 typedef struct {
+    const col_rel_t *relation;
+    const col_rel_t *storage_owner;
+    uint64_t storage_owner_identity;
+    uint64_t storage_owner_generation;
+    wl_columnar_source_access_reader_t reader;
+    uint32_t ref_count;
+} col_arrangement_probe_dependency_t;
+
+typedef struct {
     col_arrangement_probe_bundle_slot_t
         slots[COL_ARRANGEMENT_PROBE_BUNDLE_MAX];
+    col_arrangement_probe_dependency_t
+        dependencies[COL_ARRANGEMENT_PROBE_DEPENDENCY_MAX];
     uint32_t count;
+    uint32_t dependency_count;
     uintptr_t identity;
     bool active;
 } col_arrangement_probe_bundle_t;
@@ -1932,6 +1945,9 @@ int
 col_arrangement_probe_bundle_acquire(col_arrangement_probe_bundle_t *bundle,
     wl_session_t *sess, col_arrangement_t *arr, const col_rel_t *source,
     col_arrangement_probe_t **out_probe);
+int
+col_arrangement_probe_bundle_acquire_dependency(
+    col_arrangement_probe_bundle_t *bundle, const col_rel_t *relation);
 int
 col_arrangement_probe_bundle_release(col_arrangement_probe_bundle_t *bundle);
 int

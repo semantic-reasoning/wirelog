@@ -281,6 +281,58 @@ main(void)
     col_arrangement_t *dependency_arr = dependency
         ? col_session_get_arrangement(session, "path", key_cols, 1) : NULL;
     CHECK(dependency && dependency_arr, "dependency arrangement setup");
+
+    col_arrangement_probe_bundle_init(&bundle);
+    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
+        &bundle_probe) == 0, "compound bundle acquires primary probe");
+    if (dependency) {
+        CHECK(col_arrangement_probe_bundle_acquire_dependency(&bundle,
+            dependency) == 0 && bundle.dependency_count == 1
+            && bundle.dependencies[0].relation == dependency
+            && bundle.dependencies[0].ref_count == 1,
+            "compound bundle acquires source dependency");
+        CHECK(col_arrangement_probe_bundle_acquire_dependency(&bundle,
+            dependency) == 0 && bundle.dependency_count == 1
+            && bundle.dependencies[0].ref_count == 2
+            && atomic_load_explicit(&dependency->source_access.state,
+            memory_order_acquire) == 1,
+            "compound dependency leases coalesce by storage owner");
+        CHECK(wl_columnar_source_access_writer_acquire(
+            &dependency->source_access, &dependency_writer) == EBUSY,
+            "compound dependency blocks its source writer");
+        CHECK(col_arrangement_probe_bundle_release(&bundle) == 0
+            && !bundle.active && bundle.dependency_count == 0
+            && atomic_load_explicit(&dependency->source_access.state,
+            memory_order_acquire) == 0,
+            "compound dependency release balances source reader");
+        CHECK(wl_columnar_source_access_writer_acquire(
+            &dependency->source_access, &dependency_writer) == 0,
+            "compound dependency writer succeeds after release");
+        CHECK(wl_columnar_source_access_writer_release(&dependency_writer)
+            == 0, "compound dependency writer release");
+    } else {
+        CHECK(0, "compound dependency relation lookup");
+    }
+
+    col_arrangement_probe_bundle_init(&bundle);
+    CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
+        &bundle_probe) == 0, "compound rollback acquires primary probe");
+    if (dependency) {
+        CHECK(wl_columnar_source_access_writer_acquire(
+            &dependency->source_access, &dependency_writer) == 0,
+            "compound rollback dependency writer setup");
+        CHECK(col_arrangement_probe_bundle_acquire_dependency(&bundle,
+            dependency) == EBUSY && bundle.count == 0
+            && bundle.dependency_count == 0 && !bundle_probe->active
+            && atomic_load_explicit(&source->source_access.state,
+            memory_order_acquire) == 0 && entry->pin_count == 0,
+            "compound dependency failure rolls back primary probe");
+        CHECK(wl_columnar_source_access_writer_release(&dependency_writer)
+            == 0, "compound rollback dependency writer release");
+    }
+    CHECK(col_arrangement_probe_bundle_release(&bundle) == 0,
+        "compound rollback leaves an empty releasable bundle");
+
     col_arrangement_probe_bundle_init(&bundle);
     CHECK(bundle.active, "partial rollback bundle init activates scope");
     CHECK(col_arrangement_probe_bundle_acquire(&bundle, session, arr, source,
