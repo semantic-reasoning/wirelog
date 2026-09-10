@@ -454,6 +454,112 @@ test_attach_denied_when_existing_bytes_exceed_budget(void)
     return ok ? 0 : 1;
 }
 
+/* Issue #1469: once the owning governor is held only by the table (the
+ * session that owned it is gone), the next attach rebinds the table.  The
+ * footprint moves to the new governor exactly and growth is bounded by the
+ * new budget; while the owner is still held the attach stays EBUSY.  On
+ * the previous code every later attach returned EBUSY. */
+static int
+test_rebind_after_owner_released(void)
+{
+    wl_intern_t *intern = wl_intern_create();
+    wl_columnar_memory_governor_ref_t *owner = test_governor(UINT64_MAX / 4);
+    wl_columnar_memory_governor_ref_t *next = NULL;
+    uint64_t footprint;
+    uint64_t sum;
+    int ok;
+
+    if (!intern || !owner)
+        return 1;
+    if (wl_intern_attach_memory_governor(intern, owner) != 0
+        || fill_symbols(intern, 10, &sum) != 0)
+        return 1;
+    footprint = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(owner));
+    next = test_governor(footprint);
+    if (!next)
+        return 1;
+    /* Owner still held (by this test, as a live session or result would):
+     * the attach must refuse and leave both governors untouched. */
+    ok = wl_intern_attach_memory_governor(intern, next) == EBUSY
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(owner)) == footprint
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(next)) == 0
+        && wl_intern_attach_memory_governor(intern, owner) == EALREADY;
+    /* Release the test's reference: the table is now the sole holder.
+     * The owner is never read again below, the rebind frees it. */
+    wl_columnar_memory_governor_ref_release(owner);
+    owner = NULL;
+    ok = ok && wl_intern_attach_memory_governor(intern, next) == 0
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(next)) == footprint
+        && wl_intern_attach_memory_governor(intern, next) == EALREADY
+        && symbols_intact(intern, 10);
+    /* Growth is now bounded by the new budget, which is exactly full. */
+    ok = ok && wl_intern_put(intern, "one-too-many") == -1
+        && wl_intern_get(intern, "one-too-many") == -1
+        && symbols_intact(intern, 10)
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(next)) == footprint;
+    /* Free releases from the governor that owns the table now, exactly
+     * once (a second release of the old owner would be a use after free
+     * under ASan). */
+    wl_intern_free(intern);
+    ok = ok && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(next)) == 0;
+    wl_columnar_memory_governor_ref_release(next);
+    return ok ? 0 : 1;
+}
+
+/* Issue #1469: a denied rebind leaves the orphaned owner's reservation and
+ * the new governor unchanged, and a later attach with enough budget still
+ * rebinds.  On the previous code the first attach returned EBUSY. */
+static int
+test_denied_rebind_leaves_both_unchanged(void)
+{
+    wl_intern_t *intern = wl_intern_create();
+    wl_columnar_memory_governor_ref_t *owner = test_governor(UINT64_MAX / 4);
+    wl_columnar_memory_governor_t *owner_governor;
+    wl_columnar_memory_governor_ref_t *small = NULL;
+    wl_columnar_memory_governor_ref_t *enough = NULL;
+    uint64_t footprint;
+    uint64_t sum;
+    int ok;
+
+    if (!intern || !owner)
+        return 1;
+    owner_governor = wl_columnar_memory_governor_ref_get(owner);
+    if (wl_intern_attach_memory_governor(intern, owner) != 0
+        || fill_symbols(intern, 10, &sum) != 0)
+        return 1;
+    footprint = wl_columnar_memory_reserved(owner_governor);
+    small = test_governor(footprint - 1u);
+    enough = test_governor(footprint);
+    if (!small || !enough)
+        return 1;
+    wl_columnar_memory_governor_ref_release(owner);
+    owner = NULL;
+    /* Reading the orphaned owner is valid here only because the denied
+     * rebind did not free it: the table still holds its reference. */
+    ok = wl_intern_attach_memory_governor(intern, small) == ENOMEM
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(small)) == 0
+        && wl_columnar_memory_reserved(owner_governor) == footprint
+        && symbols_intact(intern, 10);
+    owner_governor = NULL;
+    ok = ok && wl_intern_attach_memory_governor(intern, enough) == 0
+        && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(enough)) == footprint
+        && symbols_intact(intern, 10);
+    wl_intern_free(intern);
+    ok = ok && wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(enough)) == 0;
+    wl_columnar_memory_governor_ref_release(small);
+    wl_columnar_memory_governor_ref_release(enough);
+    return ok ? 0 : 1;
+}
+
 int
 main(void)
 {
@@ -470,6 +576,8 @@ main(void)
     failures += test_three_resizes_exact_footprint();
     failures += test_denied_growth_on_populated_table();
     failures += test_attach_denied_when_existing_bytes_exceed_budget();
+    failures += test_rebind_after_owner_released();
+    failures += test_denied_rebind_leaves_both_unchanged();
     if (failures != 0) {
         fprintf(stderr, "memory admission intern tests failed: %d\n",
             failures);

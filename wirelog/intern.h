@@ -38,8 +38,15 @@ typedef struct wl_columnar_memory_governor_ref
     wl_columnar_memory_governor_ref_t;
 
 /* Attach program-owned intern storage to a retained governor.  Existing
- * bytes are admitted transactionally; EBUSY means another governor already
- * owns the table and the caller must continue using that owner. */
+ * bytes are admitted transactionally.  EBUSY means a live session, worker
+ * or result still holds the owning governor and the caller must continue
+ * using that owner; once the table is the only holder of that governor,
+ * the next attach rebinds it (Issue #1469): the retained footprint is
+ * admitted under the new governor first and only then credited back to
+ * the orphaned one, so a denied rebind (ENOMEM/EOVERFLOW) leaves both
+ * unchanged; EINVAL reports an attached table with no retained bytes,
+ * which the #1431 invariant rules out.  EALREADY means @governor already
+ * owns the table. */
 int
 wl_intern_attach_memory_governor(
     wl_intern_t *intern,

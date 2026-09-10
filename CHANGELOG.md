@@ -40,6 +40,13 @@ All notable changes to wirelog are documented in this file.
   rather than dropping it. Registry lookups, invalidation and worker
   cloning tolerate a slot without a name.
 
+- **The intern table follows the next live session** (#1469). Session
+  creation now rebinds the program-owned intern table when no live session,
+  worker or result still holds the governor it was charged to: the retained
+  footprint is admitted under the new governor first and only then credited
+  back, so a denied rebind fails session creation and leaves both governors
+  unchanged, and later sessions' budgets bound the table again.
+
 - **Unfused recursive SCCs no longer terminate with incomplete results**
   (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
   to normal evaluation instead of treating one empty input as an empty union.

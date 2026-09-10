@@ -430,6 +430,173 @@ test_intern_reservation_program_lifetime(void)
     PASS();
 }
 
+/* Issue #1469: once no live session, worker or result holds the first
+ * session's governor, the next session created from the same plan rebinds
+ * the program-owned intern table to its own governor with the exact
+ * retained footprint, and wirelog_program_free() releases it from there.
+ * On the previous code the second governor never owned the table, so its
+ * reservation read 0 after the session was destroyed. */
+static void
+test_intern_rebinds_to_next_session(void)
+{
+    TEST("session: orphaned intern reservation rebinds to the next session");
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        "edge(1, 2).\n"
+        "path(x, y) :- edge(x, y).\n", &err);
+    wl_plan_t *plan = NULL;
+    wl_session_t *first = NULL;
+    wl_session_t *second = NULL;
+    wl_columnar_memory_governor_ref_t *owner = NULL;
+    wl_columnar_memory_governor_ref_t *next = NULL;
+    uint64_t retained;
+    if (!prog || wl_plan_from_program(prog, &plan) != 0 || !plan) {
+        if (prog)
+            wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+    if (wl_session_create(wl_backend_columnar(), plan, 1, &first) != 0
+        || !first) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("first session create failed");
+        return;
+    }
+    owner = COL_SESSION(first)->memory_governor;
+    wl_columnar_memory_governor_ref_retain(owner);
+    wl_session_destroy(first);
+    retained = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(owner));
+    /* Drop this test's reference so the table is the only holder.  The
+     * owner must not be touched after this point: the rebind frees it. */
+    wl_columnar_memory_governor_ref_release(owner);
+    owner = NULL;
+    if (retained == 0
+        || wl_session_create(wl_backend_columnar(), plan, 1, &second) != 0
+        || !second) {
+        if (second)
+            wl_session_destroy(second);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("second session create failed after the owner was released");
+        return;
+    }
+    next = COL_SESSION(second)->memory_governor;
+    wl_columnar_memory_governor_ref_retain(next);
+    wl_session_destroy(second);
+    wl_plan_free(plan);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(next)) != retained) {
+        wirelog_program_free(prog);
+        wl_columnar_memory_governor_ref_release(next);
+        FAIL("intern table was not rebound to the next session's governor");
+        return;
+    }
+    wirelog_program_free(prog);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(next)) != 0) {
+        wl_columnar_memory_governor_ref_release(next);
+        FAIL("wirelog_program_free did not release the rebound reservation");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(next);
+    PASS();
+}
+
+/* Issue #1469: a governor reference that outlives its session, as a live
+ * wirelog_result_t holds one, keeps the table with that governor: the next
+ * session gets EBUSY and does not take the bytes; once that reference is
+ * released the following session rebinds. */
+static void
+test_intern_rebind_waits_for_last_holder(void)
+{
+    TEST("session: a surviving governor holder keeps the intern table");
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(
+        "edge(1, 2).\n"
+        "path(x, y) :- edge(x, y).\n", &err);
+    wl_plan_t *plan = NULL;
+    wl_session_t *sess = NULL;
+    wl_columnar_memory_governor_ref_t *holder = NULL;
+    wl_columnar_memory_governor_ref_t *next = NULL;
+    uint64_t retained;
+    if (!prog || wl_plan_from_program(prog, &plan) != 0 || !plan) {
+        if (prog)
+            wirelog_program_free(prog);
+        FAIL("plan generation failed");
+        return;
+    }
+    if (wl_session_create(wl_backend_columnar(), plan, 1, &sess) != 0
+        || !sess) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("first session create failed");
+        return;
+    }
+    /* Stand-in for a result handle: retains the session's governor and
+     * survives the session. */
+    holder = COL_SESSION(sess)->memory_governor;
+    wl_columnar_memory_governor_ref_retain(holder);
+    wl_session_destroy(sess);
+    sess = NULL;
+    retained = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(holder));
+    if (retained == 0
+        || wl_session_create(wl_backend_columnar(), plan, 1, &sess) != 0
+        || !sess) {
+        if (sess)
+            wl_session_destroy(sess);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        wl_columnar_memory_governor_ref_release(holder);
+        FAIL("second session create failed while the holder survived");
+        return;
+    }
+    next = COL_SESSION(sess)->memory_governor;
+    wl_columnar_memory_governor_ref_retain(next);
+    wl_session_destroy(sess);
+    sess = NULL;
+    /* The held governor kept the table; the new one never took it. */
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(holder)) != retained
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(next)) != 0) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        wl_columnar_memory_governor_ref_release(holder);
+        wl_columnar_memory_governor_ref_release(next);
+        FAIL("a surviving holder did not keep the intern table");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(next);
+    next = NULL;
+    /* The holder goes away: the following session rebinds. */
+    wl_columnar_memory_governor_ref_release(holder);
+    holder = NULL;
+    if (wl_session_create(wl_backend_columnar(), plan, 1, &sess) != 0
+        || !sess) {
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+        FAIL("third session create failed after the holder was released");
+        return;
+    }
+    next = COL_SESSION(sess)->memory_governor;
+    wl_columnar_memory_governor_ref_retain(next);
+    wl_session_destroy(sess);
+    wl_plan_free(plan);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(next)) != retained) {
+        wirelog_program_free(prog);
+        wl_columnar_memory_governor_ref_release(next);
+        FAIL("the session after the last holder did not rebind the table");
+        return;
+    }
+    wirelog_program_free(prog);
+    wl_columnar_memory_governor_ref_release(next);
+    PASS();
+}
+
 /*
  * Test: create a session and destroy it without crash.
  */
@@ -1314,6 +1481,8 @@ main(void)
     test_session_hash_overflow_rejected();
     test_retained_relation_admission();
     test_intern_reservation_program_lifetime();
+    test_intern_rebinds_to_next_session();
+    test_intern_rebind_waits_for_last_holder();
     test_session_create_destroy();
     test_session_create_destroy_columnar();
     test_session_create_with_options();

@@ -478,6 +478,17 @@ wl_columnar_memory_governor_ref_get(
     return ref ? &ref->governor : NULL;
 }
 
+bool
+wl_columnar_memory_governor_ref_is_sole(
+    const wl_columnar_memory_governor_ref_t *ref)
+{
+    /* Acquire pairs with the release decrement in ref_release: a reader
+     * that observes the count at one sees every earlier release. */
+    return ref
+           && atomic_load_explicit(&ref->references, memory_order_acquire)
+           == 1;
+}
+
 static bool
 claim_reservation_state(wl_columnar_memory_reservation_t *reservation,
     uint64_t from, uint64_t to);

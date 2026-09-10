@@ -341,7 +341,7 @@ and the wasted work is bounded.
 |---|---|---|---|---|
 | `session.c:col_worker_session_create` | per-worker view of `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Worker session reads coordinator's budget snapshot; advisory, no edge required |
 
-### 5.8 `wirelog/columnar/memory_governor.c` — reservation state (36 rows)
+### 5.8 `wirelog/columnar/memory_governor.c` — reservation state (37 rows)
 
 The governor uses one atomic counter for the shared reservation limit and
 token state transitions. The CAS admission loop is overflow-safe and a token
@@ -361,6 +361,7 @@ and direct non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_governor_ref_retain` | `references` | `atomic_fetch_add_explicit` | `relaxed` | Retain the shared governor for a worker |
 | `memory_governor.c:wl_columnar_memory_governor_ref_release` | `references` | `atomic_fetch_sub_explicit` | `release` | Release one coordinator or worker ownership reference |
 | `memory_governor.c:wl_columnar_memory_governor_ref_release#2` | `references` | `atomic_load_explicit` | `acquire` | Synchronize final reference destruction |
+| `memory_governor.c:wl_columnar_memory_governor_ref_is_sole` | `references` | `atomic_load_explicit` | `acquire` | Observe that only the intern table still holds the governor before rebinding it |
 | `memory_governor.c:reserve_internal` | `reservation->owner_bits` | `atomic_store_explicit` | `relaxed` | Initialize the caller identity before admission |
 | `memory_governor.c:reserve_internal#2` | `reserved_bytes` | `atomic_load_explicit` | `relaxed` | Read current shared admission total for the CAS loop |
 | `memory_governor.c:reserve_internal#3` | `usable_bytes` | `atomic_load_explicit` | `relaxed` | Read the immutable ordinary-admission limit |

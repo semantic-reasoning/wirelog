@@ -1102,9 +1102,14 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         int intern_rc = wl_intern_attach_memory_governor(
             sess->intern, sess->memory_governor);
         /* A program-owned table may already be attached to the governor of
-        * an earlier session.  Its reservation must remain with the program;
-        * this session continues with its own governor for session-owned
-        * storage and must not rebind or double-charge the intern table. */
+         * an earlier session.  While a live session, worker or result still
+         * holds that governor the attach reports EBUSY and this session
+         * continues with its own governor for session-owned storage; once
+         * the table is the only holder, the attach rebinds it here
+         * transactionally (Issue #1469) and a denied rebind fails session
+         * creation like a denied first attach.  A later failure of this
+         * create detaches the table again (the orphaned owner is gone by
+         * then), and the next session re-attaches it from a scan. */
         intern_attached_here = intern_rc == 0;
         if (intern_rc != 0 && intern_rc != EALREADY && intern_rc != EBUSY) {
             /* Attach failed before taking ownership, so there is nothing
