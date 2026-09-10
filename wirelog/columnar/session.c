@@ -1245,6 +1245,29 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         if (sess->join_output_limit > UINT32_MAX)
             sess->join_output_limit = UINT32_MAX;
     }
+    /* Bounded keyed-join sub-batches (Issue #1446): strict decimals like
+     * the siblings above; anything else leaves the mode off. */
+    {
+        const char *batch_env = getenv("WIRELOG_JOIN_BATCH_BYTES");
+        const char *strict_env = getenv("WIRELOG_JOIN_BATCH_STRICT");
+        sess->join_batch_bytes = 0;
+        sess->join_batch_strict = false;
+        if (batch_env && batch_env[0] != '\0') {
+            char *endp = NULL;
+            errno = 0;
+            uint64_t val = strtoull(batch_env, &endp, 10);
+            if (endp != batch_env && *endp == '\0' && errno != ERANGE)
+                sess->join_batch_bytes = val;
+        }
+        if (sess->join_batch_bytes > 0 && strict_env
+            && strict_env[0] != '\0') {
+            char *endp = NULL;
+            errno = 0;
+            uint64_t val = strtoull(strict_env, &endp, 10);
+            if (endp != strict_env && *endp == '\0' && errno != ERANGE)
+                sess->join_batch_strict = val != 0;
+        }
+    }
 
     sess->rel_cap = 16;
     sess->pending_input_change = true;

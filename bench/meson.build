@@ -55,6 +55,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/delta_pool.c',
   subdir_wirelog / 'columnar/delta_pool_admission.c',
   subdir_wirelog / 'columnar/continuation.c',
+  subdir_wirelog / 'columnar/join_batch.c',
   subdir_wirelog / 'columnar/lftj.c',
   subdir_wirelog / 'columnar/mem_ledger.c',
   subdir_wirelog / 'columnar/memory_governor.c',

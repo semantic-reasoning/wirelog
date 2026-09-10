@@ -133,6 +133,13 @@ wl_columnar_continuation_cursor(
     return continuation ? &continuation->cursor : NULL;
 }
 
+void *
+wl_columnar_continuation_producer_context(
+    const wl_columnar_continuation_t *continuation)
+{
+    return continuation ? continuation->producer.context : NULL;
+}
+
 bool
 wl_columnar_continuation_is_done(
     const wl_columnar_continuation_t *continuation)
