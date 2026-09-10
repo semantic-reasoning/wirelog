@@ -1011,6 +1011,8 @@ col_compute_worker_cap(uint64_t ram_bytes)
  *   5. Set *out = &sess->base  (session.c:38 then sets base.backend)
  *
  * @return 0 on success, EINVAL if plan/out is NULL, ENOMEM on alloc failure
+ *         or governor denial, EOVERFLOW when admitting the intern table would
+ *         overflow the governor total (#1431)
  *
  * @see wl_session_create in session.c for vtable dispatch context
  * @see wl_col_session_t memory layout documentation above

@@ -5,12 +5,36 @@
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
+/* setenv/unsetenv for the invalid-budget case (#1473). */
+#define _POSIX_C_SOURCE 200809L
+
 #include "wirelog/wirelog.h"
 
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+/* MSVC's CRT lacks POSIX setenv / unsetenv; route through _putenv_s, as
+ * tests/test_wirelog_easy.c and tests/test_wirelog_advanced.c do. */
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#  define setenv   wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
+#endif
 
 static int metadata_probe_reads;
 
@@ -361,6 +385,38 @@ test_result_outlives_executor(void)
     return 0;
 }
 
+/* Issue #1473: an invalid WIRELOG_MEMORY_BUDGET is a configuration error
+ * (EINVAL at session creation), reported by the executor facade as
+ * WIRELOG_ERR_EXEC rather than the memory verdict, matching the easy and
+ * advanced facades. */
+static int
+test_executor_invalid_memory_budget_is_exec_error(void)
+{
+    const char *src =
+        ".decl edge(x:int32,y:int32)\n"
+        ".decl path(x:int32,y:int32)\n"
+        "path(X,Y) :- edge(X,Y).\n";
+    wirelog_error_t err = WIRELOG_OK;
+    wirelog_program_t *program = wirelog_parse_string(src, &err);
+    wirelog_executor_t *executor;
+    if (!program || err != WIRELOG_OK) {
+        fprintf(stderr, "invalid budget: parse failed err=%d\n", err);
+        return 1;
+    }
+    setenv("WIRELOG_MEMORY_BUDGET", "0", 1);
+    executor = wirelog_executor_create(program, &err);
+    unsetenv("WIRELOG_MEMORY_BUDGET");
+    wirelog_executor_free(executor);
+    wirelog_program_free(program);
+    if (executor || err != WIRELOG_ERR_EXEC) {
+        fprintf(stderr,
+            "invalid budget: expected NULL executor and ERR_EXEC, got %p err=%d\n",
+            (void *)executor, err);
+        return 1;
+    }
+    return 0;
+}
+
 int
 main(void)
 {
@@ -372,6 +428,7 @@ main(void)
     failures += test_bound_query_without_seed_preserves_answers();
     failures += test_executor_result_api();
     failures += test_result_outlives_executor();
+    failures += test_executor_invalid_memory_budget_is_exec_error();
     if (failures == 0)
         printf("test_wirelog_public_api: OK\n");
     return failures == 0 ? 0 : 1;

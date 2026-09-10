@@ -2529,8 +2529,9 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
 /* The create-time floor of a fact-free program: the bytes its intern table
  * admits when a session attaches it (#1431) plus the session's fixed
  * compound arena (probed with the library-default epoch count, so like the
- * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset).  The delta pool and eval arena degrade to malloc when
- * denied, so an exact-fit budget admits precisely these two. */
+ * budget tests this assumes WIRELOG_COMPOUND_MAX_EPOCHS is unset).  The
+ * delta pool and eval arena degrade to malloc when denied, so an exact-fit
+ * budget admits precisely these two. */
 static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     uint64_t *compound_bytes)
@@ -2733,8 +2734,8 @@ test_injected_governor_easy_lazy(void)
 
 /* The batch executor builds its session from the caller's program, so the
  * floor is measured on that very intern table. */
-/* PARITY: the batch executor (api_facade.c) is compiled into this binary
- * only; the advanced facade has no executor. */
+/* PARITY: the batch executor (api_facade.c) has no advanced-facade
+ * counterpart; the advanced session API exposes no executor. */
 static void
 test_injected_governor_executor(void)
 {
@@ -2822,6 +2823,70 @@ test_injected_governor_executor(void)
     PASS();
 }
 
+/* Governor arithmetic overflow is EOVERFLOW at the session layer; every
+ * facade reports it as the memory verdict. */
+static void
+test_injected_governor_overflow_maps_to_memory(void)
+{
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *session = NULL;
+    wirelog_executor_t *executor = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *ref;
+    wl_columnar_memory_reservation_t token;
+    wirelog_error_t err;
+
+    TEST("#1473 easy/executor: governor overflow maps to WIRELOG_ERR_MEMORY");
+    /* Leave 16 bytes of headroom: the fixture's intern table holds more,
+     * so attaching it overflows the governor total instead of being
+     * denied within the budget. */
+    wl_columnar_memory_reservation_init(&token);
+    ref = enforcing_governor(UINT64_MAX);
+    if (!ref || wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(ref), UINT64_MAX - 16u,
+            &token) != WL_COLUMNAR_MEMORY_ADMISSION_OK) {
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        FAIL("overflow fixture setup failed");
+        return;
+    }
+    wl_session_options_init(&options);
+    options.memory_governor = ref;
+    opts.eager_build = true;
+    wl_session_testhook_set_default_options(&options);
+    err = wirelog_easy_open_opts(RELATION_NAME_LIFETIME_SRC, &opts,
+            &session);
+    wl_session_testhook_set_default_options(NULL);
+    if (err != WIRELOG_ERR_MEMORY || session != NULL
+        || reserved_on(ref) != UINT64_MAX - 16u) {
+        wirelog_easy_close(session);
+        (void)wl_columnar_memory_release(&token);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("easy eager overflow did not map to WIRELOG_ERR_MEMORY");
+        return;
+    }
+    prog = wirelog_parse_string(RELATION_NAME_LIFETIME_SRC, &err);
+    if (!prog) {
+        (void)wl_columnar_memory_release(&token);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("could not parse the fixture");
+        return;
+    }
+    wl_session_testhook_set_default_options(&options);
+    err = WIRELOG_OK;
+    executor = wirelog_executor_create(prog, &err);
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_executor_free(executor);
+    wirelog_program_free(prog);
+    (void)wl_columnar_memory_release(&token);
+    wl_columnar_memory_governor_ref_release(ref);
+    if (executor || err != WIRELOG_ERR_MEMORY)
+        FAIL("executor overflow did not map to WIRELOG_ERR_MEMORY");
+    else
+        PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -2865,6 +2930,7 @@ main(void)
     test_injected_governor_easy_eager();
     test_injected_governor_easy_lazy();
     test_injected_governor_executor();
+    test_injected_governor_overflow_maps_to_memory();
 
     test_open_close_null_safe();
     test_open_parse_error();

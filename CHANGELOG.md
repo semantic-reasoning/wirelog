@@ -39,6 +39,15 @@ All notable changes to wirelog are documented in this file.
   `arr_count`; a failed reuse of the last slot now keeps that tombstone
   rather than dropping it. Registry lookups, invalidation and worker
   cloning tolerate a slot without a name.
+- **Advanced API reports memory-governor overflow as a memory error**
+  (#1473). `wirelog_session_create()` and
+  `wirelog_session_create_with_snapshot()` now map `EOVERFLOW` from session
+  creation to `WIRELOG_ERR_MEMORY`, as the easy and executor facades already
+  did, instead of `WIRELOG_ERR_EXEC`. Session options carry an injected
+  memory governor so the create-time admission floor and its denial are
+  covered deterministically through the easy, executor and advanced
+  facades, and the overflow verdict through the advanced, eager easy and
+  executor paths.
 
 - **Unfused recursive SCCs no longer terminate with incomplete results**
   (#1376). The forced-delta pre-scan now leaves concatenated rule alternatives
