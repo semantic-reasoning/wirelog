@@ -203,6 +203,7 @@ record_worker_expr_status(wl_col_session_t *coord,
     if (worker && worker->extension_expr_status != 0)
         coord->extension_expr_status = worker->extension_expr_status;
     else if (rc >= WL_COLUMNAR_EXPR_EXTENSION_MALFORMED
+        && rc != WL_COLUMNAR_EXPR_ALLOCATION_FAILURE
         && rc <= WL_COLUMNAR_EXPR_CALLBACK_REENTRANT)
         coord->extension_expr_status = rc;
 }

@@ -30,6 +30,8 @@
 
 #define WIRELOG_EXECUTOR_MAGIC UINT64_C(0x574c455845433831)
 
+int wl_facade_session_error_code(int rc, int expr_status);
+
 struct wirelog_executor {
     uint64_t magic;
     wirelog_program_t *program;
@@ -804,10 +806,16 @@ wirelog_evaluate(wirelog_executor_t *executor, wirelog_error_t *error)
         .result = result,
         .failed = false,
     };
-    if (wl_session_snapshot(executor->session, collect_tuple, &ctx) != 0
-        || ctx.failed) {
+    int snapshot_rc = wl_session_snapshot(executor->session, collect_tuple,
+            &ctx);
+    if (snapshot_rc != 0 || ctx.failed) {
         wirelog_result_free(result);
-        set_error(error, ctx.failed ? WIRELOG_ERR_MEMORY : WIRELOG_ERR_EXEC);
+        set_error(error, ctx.failed ? WIRELOG_ERR_MEMORY
+                                    : (wirelog_error_t)
+            wl_facade_session_error_code(
+                snapshot_rc,
+                col_session_get_expression_status(
+                    executor->session)));
         return NULL;
     }
     if (!result_set_types_from_program(result, executor->program)) {

@@ -24,6 +24,12 @@ wl_extension_error_set(const char *message);
 void
 wl_extension_error_set_expr_status(int status);
 
+/* Expression allocation failures are memory verdicts, not extension
+ * diagnostics.  Keep this mapping at the facade boundary so all public
+ * session entry points agree on the result of a governed evaluation. */
+int
+wl_facade_session_error_code(int rc, int expr_status);
+
 /* Internal callback lifetime lease. The lease token is valid until released,
  * even if the originating snapshot is released or the entry is unregistered
  * while the callback is running. */

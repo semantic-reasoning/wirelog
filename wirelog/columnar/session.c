@@ -138,6 +138,12 @@ session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
     sess->filt_cache_count = out;
 }
 
+int
+col_session_get_expression_status(wl_session_t *session)
+{
+    return session ? COL_SESSION(session)->extension_expr_status : 0;
+}
+
 static void
 session_note_inserted_input(wl_col_session_t *sess, const col_rel_t *relation,
     bool advance_epoch)
