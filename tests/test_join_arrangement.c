@@ -15,6 +15,7 @@
  */
 
 #include "../wirelog/columnar/columnar_nanoarrow.h"
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -24,6 +25,7 @@
 #include "../wirelog/wirelog.h"
 
 #include <inttypes.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +144,76 @@ run_program(const char *src, const char *rel, int64_t *out_count,
         wirelog_program_free(prog);
     }
     return 0;
+}
+
+static col_rel_t *
+make_join_left(void)
+{
+    col_rel_t *left = NULL;
+    const char *cols[] = { "x", "payload" };
+    wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_INT32,
+        WIRELOG_TYPE_INT32,
+    };
+    int64_t row1[] = { 1, 10 };
+    int64_t row2[] = { 2, 20 };
+
+    if (col_rel_alloc(&left, "left") != 0)
+        return NULL;
+    if (col_rel_set_schema(left, 2, cols) != 0
+        || col_rel_set_column_types(left, types, 2) != 0
+        || col_rel_append_row(left, row1) != 0
+        || col_rel_append_row(left, row2) != 0) {
+        col_rel_destroy(left);
+        return NULL;
+    }
+    return left;
+}
+
+static int
+run_direct_join(wl_col_session_t *col_session, col_rel_t *left,
+    eval_entry_t *out_entry)
+{
+    wl_plan_op_t op = { 0 };
+    const char *left_keys[] = { "x" };
+    const char *right_keys[] = { "x" };
+    eval_stack_t stack;
+
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "edge";
+    op.key_count = 1;
+    op.left_keys = left_keys;
+    op.right_keys = right_keys;
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, left, false) != 0)
+        return ENOMEM;
+    int rc = col_op_join(&op, &stack, col_session);
+    if (rc != 0) {
+        eval_stack_drain(&stack);
+        return rc;
+    }
+    if (out_entry)
+        *out_entry = eval_stack_pop(&stack);
+    else
+        eval_stack_drain(&stack);
+    return 0;
+}
+
+/* An enforcing governor that admits no arrangement hash table.  Existing
+ * relations stay on their original governor; swapping this into a session
+ * only affects subsequently attached arrangement entries. */
+static wl_columnar_memory_governor_ref_t *
+tight_arrangement_governor(void)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = 1u;
+    resolution.usable_bytes = 1u;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
 }
 
 /* ================================================================
@@ -412,6 +484,159 @@ test_join_arr_large_chain_delta(void)
 }
 
 /* ================================================================
+ * Test 10: Primary full-right JOIN honors exact-source probe leases
+ *
+ * The unfiltered, non-delta primary arrangement path must acquire the exact
+ * right source before any cold build or stale rebuild.  A right writer must
+ * therefore return EBUSY instead of falling back to an ephemeral hash table.
+ * ================================================================ */
+static void
+test_join_arr_primary_probe_writer_retry(void)
+{
+    TEST("Primary arrangement JOIN admits source before build/rebuild");
+
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+                      "edge(1, 100). edge(2, 200).\n";
+    wl_session_t *sess = NULL;
+    int64_t count = 0;
+    int rc = run_program(src, "edge", &count, NULL, &sess);
+    ASSERT(rc == 0, "edge fixture setup failed");
+    ASSERT(sess != NULL, "session kept for direct join");
+
+    wl_col_session_t *col_session = COL_SESSION(sess);
+    col_rel_t *right = session_find_rel(col_session, "edge");
+    ASSERT(right != NULL, "right relation lookup");
+
+    uint32_t key_cols[] = { 0 };
+    ASSERT(col_session->arr_count == 0, "right arrangement starts cold");
+
+    wl_columnar_source_access_writer_t writer = { 0 };
+    ASSERT(wl_columnar_source_access_writer_acquire(&right->source_access,
+        &writer) == 0, "cold right writer acquire");
+
+    col_rel_t *cold_busy_left = make_join_left();
+    ASSERT(cold_busy_left != NULL, "cold busy left fixture");
+    rc = run_direct_join(col_session, cold_busy_left, NULL);
+    col_rel_destroy(cold_busy_left);
+    ASSERT(rc == EBUSY, "cold active right writer must propagate EBUSY");
+    ASSERT(col_session->arr_count == 0,
+        "cold writer must not build arrangement before admission");
+    ASSERT(wl_columnar_source_access_writer_release(&writer) == 0,
+        "cold right writer release");
+
+    col_rel_t *cold_retry_left = make_join_left();
+    eval_entry_t cold_out = { 0 };
+    ASSERT(cold_retry_left != NULL, "cold retry left fixture");
+    rc = run_direct_join(col_session, cold_retry_left, &cold_out);
+    col_rel_destroy(cold_retry_left);
+    ASSERT(rc == 0, "cold join retry after writer release");
+    ASSERT(cold_out.rel != NULL, "cold retry join produces a relation");
+    col_rel_destroy(cold_out.rel);
+
+    col_arrangement_t *arr = col_session_get_arrangement(sess, "edge",
+            key_cols, 1);
+    ASSERT(arr != NULL && arr->indexed_rows == right->nrows,
+           "right arrangement built after admitted retry");
+
+    ASSERT(wl_columnar_source_access_writer_acquire(&right->source_access,
+        &writer) == 0, "prebuilt right writer acquire");
+
+    col_rel_t *busy_left = make_join_left();
+    ASSERT(busy_left != NULL, "busy left fixture");
+    rc = run_direct_join(col_session, busy_left, NULL);
+    col_rel_destroy(busy_left);
+    ASSERT(rc == EBUSY, "prebuilt active right writer must propagate EBUSY");
+    ASSERT(wl_columnar_source_access_writer_release(&writer) == 0,
+        "prebuilt right writer release");
+
+    col_rel_t *retry_left = make_join_left();
+    eval_entry_t out = { 0 };
+    ASSERT(retry_left != NULL, "retry left fixture");
+    rc = run_direct_join(col_session, retry_left, &out);
+    col_rel_destroy(retry_left);
+    ASSERT(rc == 0, "join retry after writer release");
+    ASSERT(out.rel != NULL, "retry join produces a relation");
+    col_rel_destroy(out.rel);
+
+    ASSERT(wl_columnar_source_access_writer_acquire(&right->source_access,
+        &writer) == 0, "right writer reacquire after retry");
+    ASSERT(wl_columnar_source_access_writer_release(&writer) == 0,
+        "right writer release after retry");
+
+    int64_t stale_row[] = { 3, 300 };
+    ASSERT(col_rel_append_row(right, stale_row) == 0,
+        "append makes arrangement stale");
+    ASSERT(wl_columnar_source_access_writer_acquire(&right->source_access,
+        &writer) == 0, "stale right writer acquire");
+
+    col_rel_t *stale_busy_left = make_join_left();
+    ASSERT(stale_busy_left != NULL, "stale busy left fixture");
+    rc = run_direct_join(col_session, stale_busy_left, NULL);
+    col_rel_destroy(stale_busy_left);
+    ASSERT(rc == EBUSY, "stale active right writer must propagate EBUSY");
+    ASSERT(wl_columnar_source_access_writer_release(&writer) == 0,
+        "stale right writer release");
+
+    col_rel_t *stale_retry_left = make_join_left();
+    eval_entry_t stale_out = { 0 };
+    ASSERT(stale_retry_left != NULL, "stale retry left fixture");
+    rc = run_direct_join(col_session, stale_retry_left, &stale_out);
+    col_rel_destroy(stale_retry_left);
+    ASSERT(rc == 0, "stale join retry after writer release");
+    ASSERT(stale_out.rel != NULL, "stale retry join produces a relation");
+    col_rel_destroy(stale_out.rel);
+
+    wl_session_destroy(sess);
+    PASS();
+}
+
+/* ================================================================
+ * Test 11: Primary full-right JOIN propagates arrangement build ENOMEM
+ *
+ * ENOENT is the only primary probe miss that may use the old ephemeral
+ * fallback.  Once the probe has admitted the exact source, allocation failure
+ * during cold build or stale rebuild must remain visible to the caller.
+ * ================================================================ */
+static void
+test_join_arr_primary_probe_enomem_propagates(void)
+{
+    TEST("Primary arrangement JOIN propagates build ENOMEM");
+
+    const char *src = ".decl edge(x: int32, y: int32)\n"
+                      "edge(1, 100). edge(2, 200).\n";
+    wl_session_t *sess = NULL;
+    int64_t count = 0;
+    int rc = run_program(src, "edge", &count, NULL, &sess);
+    ASSERT(rc == 0, "edge fixture setup failed");
+    ASSERT(sess != NULL, "session kept for direct join");
+
+    wl_col_session_t *col_session = COL_SESSION(sess);
+    ASSERT(col_session->arr_count == 0, "right arrangement starts cold");
+
+    wl_columnar_memory_governor_ref_t *tight
+        = tight_arrangement_governor();
+    ASSERT(tight != NULL, "tight arrangement governor allocation failed");
+    wl_columnar_memory_governor_ref_t *orig_governor
+        = col_session->memory_governor;
+    col_session->memory_governor = tight;
+
+    col_rel_t *left = make_join_left();
+    ASSERT(left != NULL, "ENOMEM left fixture");
+    rc = run_direct_join(col_session, left, NULL);
+    col_rel_destroy(left);
+
+    col_session->memory_governor = orig_governor;
+    wl_columnar_memory_governor_ref_release(tight);
+
+    ASSERT(rc == ENOMEM, "primary build ENOMEM must not fall back");
+    ASSERT(col_session->arr_count == 0,
+        "failed primary build must not publish an arrangement");
+
+    wl_session_destroy(sess);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -430,6 +655,8 @@ main(void)
     test_join_arr_populated_after_join();
     test_join_arr_darr_cleared_after_kfusion();
     test_join_arr_large_chain_delta();
+    test_join_arr_primary_probe_writer_retry();
+    test_join_arr_primary_probe_enomem_propagates();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)

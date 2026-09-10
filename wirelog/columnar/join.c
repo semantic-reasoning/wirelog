@@ -1222,11 +1222,14 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             out->nrows);
     } else {
         /* Standard merge-join for non-unary relations. */
-        /* Hash join: use persistent arrangement for the full right relation;
-         * fall back to an ephemeral hash table for delta substitution or when
-         * the arrangement cannot be allocated. */
+        /* Hash join: use persistent arrangement for the full right relation.
+         * Delta substitution and true "no arrangement" misses retain the
+         * existing ephemeral hash table path.  Once the protected primary
+         * probe admits the exact source, build/rebuild failures are real
+         * errors and must not silently change execution mode. */
         col_arrangement_t *arr = NULL;
         col_arrangement_pin_t arr_pin = { 0 };
+        col_arrangement_probe_t arr_probe = { 0 };
         uint32_t nbuckets_ep = 0;
         uint32_t *ht_head_ep = NULL;
         uint32_t *ht_next_ep = NULL;
@@ -1237,9 +1240,22 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
         if (!used_right_delta && op->right_relation && kc > 0) {
             if (op->right_filter_expr.size == 0) {
-                if (col_session_pin_arrangement(&sess->base,
-                    op->right_relation, rk, kc, &arr_pin) == 0)
-                    arr = arr_pin.arr;
+                int probe_rc = col_session_acquire_primary_arrangement_probe(
+                    &sess->base, right, rk, kc, &arr_probe);
+                if (probe_rc == 0) {
+                    right = (col_rel_t *)arr_probe.source;
+                    arr = arr_probe.arr;
+                } else if (probe_rc != ENOENT) {
+                    free(tmp);
+                    col_rel_destroy(out);
+                    free(lk);
+                    free(rk);
+                    if (right_filtered)
+                        col_rel_destroy(right_filtered);
+                    if (left_e.owned)
+                        col_rel_destroy(left);
+                    return probe_rc;
+                }
             } else {
                 /* Issue #433: filtered right arrangement cache.
                  * `right` is the cached filtered relation from filt_cache;
@@ -1316,6 +1332,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             key_row = (int64_t *)malloc(
                 sizeof(int64_t) * (right->ncols > 0 ? right->ncols : 1));
             if (!key_row) {
+                int release_rc = 0;
+                if (arr_probe.active)
+                    release_rc = col_arrangement_probe_release(&arr_probe);
                 col_arrangement_pin_release(&arr_pin);
                 free(ht_head_ep);
                 free(ht_next_ep);
@@ -1325,7 +1344,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 free(rk);
                 if (left_e.owned)
                     col_rel_destroy(left);
-                return ENOMEM;
+                return release_rc != 0 ? release_rc : ENOMEM;
             }
         }
 
@@ -1414,6 +1433,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         free(ht_head_ep);
         free(ht_next_ep);
         if (join_rc != 0) {
+            int release_rc = 0;
             WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
                 "Merge-join failed with rc=%d, out->nrows=%u",
                 join_rc, out->nrows);
@@ -1425,11 +1445,29 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(right_filtered);
             if (left_e.owned)
                 col_rel_destroy(left);
+            if (arr_probe.active)
+                release_rc = col_arrangement_probe_release(&arr_probe);
             col_arrangement_pin_release(&arr_pin);
+            if (release_rc != 0)
+                return release_rc;
             return join_rc;
         }
         WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG, "Merge-join succeeded");
+        int release_rc = 0;
+        if (arr_probe.active)
+            release_rc = col_arrangement_probe_release(&arr_probe);
         col_arrangement_pin_release(&arr_pin);
+        if (release_rc != 0) {
+            free(tmp);
+            col_rel_destroy(out);
+            free(lk);
+            free(rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            if (left_e.owned)
+                col_rel_destroy(left);
+            return release_rc;
+        }
     }
 
     free(tmp);
