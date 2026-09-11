@@ -197,6 +197,10 @@ test_generation_consumers(void)
     uint32_t arr_clone_cap = 0;
     col_diff_arr_entry_t *diff_clone = NULL;
     uint32_t diff_clone_cap = 0;
+    col_rel_t *worker_rel = NULL;
+    wl_mem_ledger_t worker_ledger;
+    wl_mem_ledger_init(&worker_ledger, 0);
+    wl_columnar_arrangement_diff_txn_t worker_txn = { 0 };
     int result = 0;
     CHECK(make_session(&session, &plan, &program) == 0,
         "session creation failed");
@@ -291,15 +295,58 @@ test_generation_consumers(void)
         &arr_clone, &arr_clone_cap, NULL) == 0 && arr_clone_cap > 0,
         "primary arrangement worker clone failed");
     CHECK(arr_clone[0].source_snapshot.relation_identity == 0
-        && arr_clone[0].arr.indexed_rows == 0,
+        && arr_clone[0].arr.indexed_rows == 0
+        && arr_clone[0].arr.ht_head == NULL
+        && arr_clone[0].arr.ht_next == NULL
+        && arr_clone[0].mem_bytes == 0
+        && arr_clone[0].arr.reserved_bytes == 0,
         "worker clone reused coordinator primary snapshot");
 
     CHECK(col_diff_arr_entries_clone(cs->diff_arr_entries, cs->diff_arr_count,
         &diff_clone, &diff_clone_cap) == 0 && diff_clone_cap > 0,
         "differential arrangement worker clone failed");
     CHECK(diff_clone[0].diff_arr->source_snapshot.relation_identity == 0
-        && diff_clone[0].diff_arr->indexed_rows == 0,
+        && diff_clone[0].diff_arr->indexed_rows == 0
+        && diff_clone[0].diff_arr->ht_head == NULL
+        && diff_clone[0].diff_arr->ht_next == NULL
+        && diff_clone[0].diff_arr->ht_cap == 0
+        && diff_clone[0].diff_arr->nbuckets == 0
+        && diff_clone[0].diff_arr->ledger == NULL,
         "worker clone reused coordinator differential snapshot");
+    CHECK(col_rel_deep_copy(rel, &worker_rel, NULL) == 0,
+        "worker relation copy failed");
+    CHECK(col_rel_set(worker_rel, 0, key_col, 123456) == 0,
+        "worker relation mutation failed");
+    wl_col_session_t worker = { 0 };
+    worker.diff_arr_entries = diff_clone;
+    worker.diff_arr_count = cs->diff_arr_count;
+    worker.diff_arr_cap = diff_clone_cap;
+    col_diff_arrangement_attach_ledger(diff_clone[0].diff_arr, &worker_ledger);
+    CHECK(atomic_load_explicit(&worker_ledger.current_bytes,
+        memory_order_relaxed)
+        == sizeof(col_diff_arrangement_t) + sizeof(uint32_t),
+        "cold differential clone charged copied hash storage");
+    col_diff_arrangement_t *worker_diff = col_session_get_diff_arrangement(
+        &worker, "edge", worker_rel, &key_col, 1);
+    CHECK(worker_diff && wl_columnar_arrangement_diff_txn_begin(&worker,
+        "edge", worker_rel, &key_col, 1, &worker_txn) == 0,
+        "cold differential transaction failed");
+    worker_diff = worker_txn.working;
+    CHECK(index_diff_arrangement(worker_diff, worker_rel,
+        &key_col, 1) == 0, "cold differential first access failed");
+    worker_diff->source_snapshot = wl_columnar_relation_snapshot(worker_rel);
+    wl_columnar_arrangement_diff_txn_commit(&worker_txn);
+    CHECK(worker_diff->ledger == &worker_ledger
+        && atomic_load_explicit(&worker_ledger.current_bytes,
+        memory_order_relaxed)
+        == col_diff_arrangement_bytes(worker_diff),
+        "private differential rebuild ledger mismatch");
+    CHECK(worker_diff->ht_head != diff->ht_head
+        && worker_diff->ht_next != diff->ht_next
+        && diff_contains_key(worker_diff, worker_rel, key_col, 123456)
+        && !diff_contains_key(diff, rel, key_col, 123456)
+        && diff->indexed_rows == rel->nrows,
+        "differential worker rebuild changed coordinator");
     arr_clone[0].arr.indexed_rows = 7;
     diff_clone[0].diff_arr->indexed_rows = 7;
     CHECK(cs->arr_entries[0].arr.indexed_rows != 7
@@ -309,8 +356,18 @@ test_generation_consumers(void)
     result = 1;
 
 cleanup:
+    wl_columnar_arrangement_diff_txn_abort(&worker_txn);
+    if (worker_rel)
+        col_rel_destroy(worker_rel);
     free_arrangement_clones(arr_clone, arr_clone_cap);
     free_diff_clones(diff_clone, diff_clone_cap);
+    if (atomic_load_explicit(&worker_ledger.current_bytes,
+        memory_order_relaxed) != 0) {
+        fprintf(stderr,
+            "FAIL: differential clone cleanup leaked ledger bytes\n");
+        failures++;
+        result = 0;
+    }
     free(filter.data);
     if (session)
         destroy_session(session, plan, program);
