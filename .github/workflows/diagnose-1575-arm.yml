@@ -1,0 +1,87 @@
+name: Diagnose 1575 ARM sanitizer timeouts
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/diagnose-1575-arm.yml'
+      - 'scripts/ci/diagnose-arm-sanitizer-timeouts.py'
+      - 'scripts/ci/test-diagnose-arm-sanitizer-timeouts.py'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Record checkout and host
+        run: |
+          mkdir -p diagnostics-1575
+          {
+            git rev-parse HEAD
+            uname -a
+            cat /etc/os-release
+          } > diagnostics-1575/host.log 2>&1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: false
+      - name: Install tools
+        run: |
+          set -o pipefail
+          {
+            sudo apt-get update
+            sudo apt-get install -y meson ninja-build gdb procps libmbedtls-dev
+            uv venv .venv-diagnose
+          } 2>&1 | tee diagnostics-1575/setup.log
+      - name: Record tool versions
+        run: |
+          {
+            gcc --version
+            meson --version
+            ninja --version
+            gdb --version
+            ps --version
+            uv --version
+            .venv-diagnose/bin/python --version
+          } > diagnostics-1575/versions.log 2>&1
+      - name: Selftest runner
+        run: |
+          set -o pipefail
+          .venv-diagnose/bin/python scripts/ci/test-diagnose-arm-sanitizer-timeouts.py -v \
+            2>&1 | tee diagnostics-1575/selftest.log
+      - name: Configure sanitizer build
+        env:
+          CC: gcc
+        run: |
+          set -o pipefail
+          meson setup builddir-san -Db_sanitize=address,undefined \
+            -Db_lundef=false -Dtests=true --buildtype=debugoptimized \
+            2>&1 | tee diagnostics-1575/configure.log
+          meson configure builddir-san > diagnostics-1575/config.log
+      - name: Compile five reproducers
+        run: |
+          set -o pipefail
+          ninja -C builddir-san tests/test_compaction tests/test_diff_join \
+            tests/test_col_rel_deep_copy tests/test_tdd_decision_stats \
+            tests/test_tdd_decision_stats_nofusion \
+            2>&1 | tee diagnostics-1575/build.log
+      - name: Run bounded diagnostics
+        run: |
+          set -o pipefail
+          .venv-diagnose/bin/python scripts/ci/diagnose-arm-sanitizer-timeouts.py \
+            --build builddir-san --output diagnostics-1575 \
+            2>&1 | tee diagnostics-1575/harness.log
+      - name: Upload all available evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnose-1575-arm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            diagnostics-1575/
+            builddir-san/meson-logs/
+          if-no-files-found: warn
