@@ -20,6 +20,11 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
     const wl_handle_remap_t *remap,
     uint64_t *out_rewrites)
 {
+    col_rel_t *owner = NULL;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool writer_acquired = false;
+    int rc;
+
     if (out_rewrites)
         *out_rewrites = 0;
     if (!rel || !remap)
@@ -34,6 +39,26 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
     }
     if (handle_col_count == 0 || rel->nrows == 0)
         return 0;
+
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_source_access_writer_acquire(
+        &owner->source_access, &writer);
+    if (rc != 0)
+        return rc;
+    writer_acquired = true;
+    if (rel == owner && owner->storage_alias_borrows > 0) {
+        rc = EBUSY;
+        goto cleanup;
+    }
+    /* Remap is an in-place handle rewrite.  A borrowed view cannot publish
+     * that rewrite without mutating its canonical owner's storage, so reject
+     * it until the alias is retired. */
+    if (rel->col_shared) {
+        rc = EBUSY;
+        goto cleanup;
+    }
 
     uint64_t rewrites = 0;
     /* Outer loop is by column so the linear-probe cache footprint
@@ -60,7 +85,8 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
                     (uint64_t)old_h);
                 if (out_rewrites)
                     *out_rewrites = rewrites;
-                return EIO;
+                rc = EIO;
+                goto cleanup;
             }
             col[r] = new_h;
             rewrites++;
@@ -76,5 +102,11 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
         PRIu64,
         rel->name ? rel->name : "(anon)", handle_col_count, rel->nrows,
         rewrites);
-    return 0;
+    rc = 0;
+cleanup:
+    if (writer_acquired
+        && wl_columnar_source_access_writer_release(&writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
