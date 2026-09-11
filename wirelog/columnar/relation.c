@@ -1619,6 +1619,37 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     return 0;
 }
 
+int
+col_rel_reset_rows_locked(col_rel_t *r,
+    wl_columnar_source_access_writer_t *writer)
+{
+    col_rel_t *owner = NULL;
+    if (!r || !writer || !writer->owner
+        || writer->identity != (uintptr_t)writer
+        || !writer->thread_valid
+        || !wl_columnar_source_access_writer_thread_equal(writer)
+        || col_rel_storage_owner_resolve(r, &owner) != 0
+        || writer->owner != &owner->source_access)
+        return EINVAL;
+    if (owner->storage_alias_borrows > 0)
+        return EBUSY;
+    r->nrows = 0;
+    r->sorted_nrows = 0;
+    r->base_nrows = 0;
+    r->run_count = 0;
+    memset(r->run_ends, 0, sizeof(r->run_ends));
+    uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
+    free(r->timestamps);
+    r->timestamps = NULL;
+    free(r->dedup_slots);
+    r->dedup_slots = NULL;
+    r->dedup_cap = 0;
+    r->dedup_count = 0;
+    col_rel_ledger_reconcile(r, ledger_before);
+    wl_columnar_relation_touch_replacement(r);
+    return 0;
+}
+
 /* Copy all rows from src into dst (must have same ncols).
  * If src has timestamps and dst has timestamp tracking enabled, the source
  * timestamps are propagated to the newly appended rows.

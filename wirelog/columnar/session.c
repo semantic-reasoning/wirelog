@@ -3000,27 +3000,105 @@ col_session_emit_snapshot(const wl_plan_t *plan, wl_col_session_t *sess,
     return 0;
 }
 
-static void
+static int
 col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
 {
+    col_rel_t **targets = NULL;
+    col_rel_t **owners = NULL;
+    wl_columnar_source_access_writer_t *writers = NULL;
+    uint32_t target_count = 0;
+    uint32_t owner_count = 0;
+    int rc = 0;
+
+    if (!plan || !sess)
+        return EINVAL;
+    targets = (col_rel_t **)calloc(sess->nrels ? sess->nrels : 1,
+        sizeof(*targets));
+    owners = (col_rel_t **)calloc(sess->nrels ? sess->nrels : 1,
+        sizeof(*owners));
+    writers = (wl_columnar_source_access_writer_t *)calloc(
+        sess->nrels ? sess->nrels : 1, sizeof(*writers));
+    if (!targets || !owners || !writers) {
+        free(targets);
+        free(owners);
+        free(writers);
+        return ENOMEM;
+    }
+
+    /* Collect each relation once and resolve all owners before mutation. */
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         const wl_plan_stratum_t *sp = &plan->strata[si];
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
             if (!r)
                 continue;
-            r->nrows = 0;
-            r->sorted_nrows = 0;
-            r->run_count = 0;
-            r->base_nrows = 0;
-            wl_columnar_relation_touch_view(r);
-            col_session_invalidate_arrangements(&sess->base, r->name);
+            bool known_target = false;
+            for (uint32_t i = 0; i < target_count; i++)
+                if (targets[i] == r)
+                    known_target = true;
+            if (known_target)
+                continue;
+            col_rel_t *owner = NULL;
+            rc = col_rel_storage_owner_resolve(r, &owner);
+            if (rc != 0 || owner->storage_alias_borrows > 0) {
+                rc = rc != 0 ? rc : EBUSY;
+                goto cleanup;
+            }
+            targets[target_count++] = r;
+            bool known_owner = false;
+            for (uint32_t i = 0; i < owner_count; i++)
+                if (owners[i] == owner)
+                    known_owner = true;
+            if (!known_owner)
+                owners[owner_count++] = owner;
         }
     }
+
+    for (uint32_t i = 1; i < owner_count; i++) {
+        col_rel_t *key = owners[i];
+        uint32_t j = i;
+        while (j > 0 && (uintptr_t)owners[j - 1] > (uintptr_t)key) {
+            owners[j] = owners[j - 1];
+            j--;
+        }
+        owners[j] = key;
+    }
+    for (uint32_t i = 0; i < owner_count; i++) {
+        rc = wl_columnar_source_access_writer_acquire(
+            &owners[i]->source_access, &writers[i]);
+        if (rc != 0)
+            goto cleanup;
+    }
+
+    /* Every writer is held: all logical resets below are non-fallible. */
+    for (uint32_t i = 0; i < target_count; i++) {
+        col_rel_t *owner = NULL;
+        rc = col_rel_storage_owner_resolve(targets[i], &owner);
+        if (rc != 0)
+            goto cleanup;
+        wl_columnar_source_access_writer_t *writer = NULL;
+        for (uint32_t j = 0; j < owner_count; j++)
+            if (owners[j] == owner)
+                writer = &writers[j];
+        rc = col_rel_reset_rows_locked(targets[i], writer);
+        if (rc != 0)
+            goto cleanup;
+        col_session_invalidate_arrangements(&sess->base, targets[i]->name);
+    }
+
     col_mat_cache_release_pins(&sess->mat_cache);
     assert(sess->mat_cache.active_pins == 0);
     col_mat_cache_clear(&sess->mat_cache);
     assert(sess->mat_cache.active_pins == 0);
+
+cleanup:
+    for (uint32_t i = owner_count; i > 0; i--)
+        if (writers[i - 1].owner)
+            (void)wl_columnar_source_access_writer_release(&writers[i - 1]);
+    free(targets);
+    free(owners);
+    free(writers);
+    return rc;
 }
 
 /* Snapshot/step completion is the coordinator's quiescent boundary.  Explicit
@@ -3127,7 +3205,9 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         && (sess->pending_full_input_eval
         || (sess->pending_input_change
         && sess->last_inserted_relation == NULL))) {
-        col_session_clear_idb_rows(plan, sess);
+        int clear_rc = col_session_clear_idb_rows(plan, sess);
+        if (clear_rc != 0)
+            return clear_rc;
     }
 
     /* Phase 4 incremental skip: when last_inserted_relation is set, only
