@@ -1379,8 +1379,8 @@ col_rel_compute_physical_layout(const col_rel_logical_col_t *logical_cols,
     return 0;
 }
 
-int
-col_rel_apply_compound_schema(col_rel_t *r,
+static int
+col_rel_apply_compound_schema_impl(col_rel_t *r,
     const col_rel_logical_col_t *logical_cols,
     uint32_t logical_ncols)
 {
@@ -1395,10 +1395,16 @@ col_rel_apply_compound_schema(col_rel_t *r,
      * here, but the prefix sum walks every column exactly once. */
     uint32_t compound_count = 0u;
     uint32_t inline_offset = 0u;
+    uint32_t physical_ncols = 0u;
     int rc = col_rel_compute_physical_layout(logical_cols, logical_ncols,
-            NULL, NULL, &inline_offset, &compound_count);
+            &physical_ncols, NULL, &inline_offset, &compound_count);
     if (rc != 0)
         return rc;
+    if (r->ncols != 0 && physical_ncols != r->ncols)
+        return EINVAL;
+    if (!wl_columnar_relation_generation_valid(r->view_generation)
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
 
     uint32_t *arity_map
         = (uint32_t *)malloc((size_t)logical_ncols * sizeof(uint32_t));
@@ -1442,6 +1448,27 @@ col_rel_apply_compound_schema(col_rel_t *r,
         compound_count, inline_offset);
     wl_columnar_relation_touch_view(r);
     return 0;
+}
+
+int
+col_rel_apply_compound_schema(col_rel_t *r,
+    const col_rel_logical_col_t *logical_cols,
+    uint32_t logical_ncols)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_apply_compound_schema_impl(r, logical_cols, logical_ncols);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 static int
@@ -2450,8 +2477,12 @@ prepare_fail:
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
-    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_reader_t source_reader = { 0 };
+    wl_columnar_source_access_reader_t destination_reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
+    col_rel_t *destination_owner = NULL;
+    bool same_owner;
     int rc;
 
     if (!dst || !src)
@@ -2459,11 +2490,51 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
     rc = col_rel_storage_owner_resolve(src, &owner);
     if (rc != 0)
         return rc;
-    rc = col_rel_source_reader_acquire(owner, &reader);
+    rc = col_rel_storage_owner_resolve(dst, &destination_owner);
     if (rc != 0)
         return rc;
+    same_owner = owner == destination_owner;
+    if (same_owner) {
+        /* Rebinding an existing alias is a descriptor refresh, not a source
+         * storage mutation.  Keep the source reader lease across the refresh;
+         * session-owned aliases already retain this lease for their lifetime,
+         * and attempting a writer here would deadlock those callers. */
+        rc = col_rel_source_reader_acquire(owner, &source_reader);
+        if (rc != 0)
+            return rc;
+    } else {
+        rc = col_rel_source_reader_acquire(owner, &source_reader);
+        if (rc != 0)
+            return rc;
+        if (destination_owner->storage_alias_borrows > 0) {
+            /* Replacing an alias must coexist with the session lease that
+             * protects the old owner.  A writer cannot be admitted while
+             * that lease is live; a second reader pins the old owner until
+             * the descriptor transition has committed. */
+            rc = col_rel_source_reader_acquire(destination_owner,
+                    &destination_reader);
+            if (rc != 0) {
+                (void)col_rel_source_reader_release(&source_reader);
+                return rc;
+            }
+        } else {
+            rc = col_rel_published_writer_acquire(dst, &writer);
+            if (rc != 0) {
+                (void)col_rel_source_reader_release(&source_reader);
+                return rc;
+            }
+        }
+    }
     rc = col_rel_install_shared_view_unprotected(dst, src);
-    if (col_rel_source_reader_release(&reader) != 0 && rc == 0)
+    if (writer.owner
+        && wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    if (destination_reader.owner
+        && col_rel_source_reader_release(&destination_reader) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (source_reader.owner
+        && col_rel_source_reader_release(&source_reader) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
 }
