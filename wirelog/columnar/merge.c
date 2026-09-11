@@ -1281,13 +1281,28 @@ col_rel_compact_runs(col_rel_t *rel)
  *           O(D log D + N + D) fallback merge walk (D ~ N)
  *   - Space: O(N + D) for merge buffer (fallback) or O(D) (binary-search path)
  */
-int
-col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
-    col_rel_t *delta_out, int *out_fast_path)
+static int
+col_op_consolidate_incremental_delta_fail(col_rel_t *delta_out,
+    uint32_t initial_nrows, int rc)
+{
+    if (delta_out && delta_out->nrows != initial_nrows) {
+        delta_out->nrows = initial_nrows;
+        wl_columnar_relation_touch_view(delta_out);
+    }
+    return rc;
+}
+
+static int
+col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
+    col_rel_t *delta_out, int *out_fast_path,
+    wl_columnar_source_access_writer_t *delta_writer)
 {
     if (!wl_columnar_relation_float_values_valid(rel)
         || (delta_out && !wl_columnar_relation_float_values_valid(delta_out)))
         return EINVAL;
+    if (delta_out == rel)
+        return EINVAL;
+    uint32_t delta_initial_nrows = delta_out ? delta_out->nrows : 0;
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
 
@@ -1299,8 +1314,13 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
 
     uint32_t delta_count = nr - old_nrows;
 
-    /* Phase 1: sort only the new delta rows using radix sort */
-    col_rel_radix_sort(rel, old_nrows, delta_count);
+    /* Phase 1: sort only the new delta rows using radix sort.  Sorting can
+     * allocate permutation buffers, so do not continue with an unsorted
+     * source if admission fails. */
+    int sort_rc = col_rel_radix_sort(rel, old_nrows, delta_count);
+    if (sort_rc != 0)
+        return col_op_consolidate_incremental_delta_fail(delta_out,
+                   delta_initial_nrows, sort_rc);
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
@@ -1346,14 +1366,17 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             col_row_buf_t drb;
             int64_t *const dr = col_row_buf_init(&drb, nc);
             if (!dr)
-                return ENOMEM;
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, ENOMEM);
             for (uint32_t k = 0; k < d_unique; k++) {
                 for (uint32_t c = 0; c < nc; c++)
                     dr[c] = rel->columns[c][old_nrows + k];
-                int rc = col_rel_append_row(delta_out, dr);
+                int rc = col_rel_append_row_locked(delta_out, dr,
+                        delta_writer);
                 if (rc != 0) {
                     col_row_buf_release(&drb);
-                    return rc;
+                    return col_op_consolidate_incremental_delta_fail(
+                        delta_out, delta_initial_nrows, rc);
                 }
             }
             col_row_buf_release(&drb);
@@ -1371,7 +1394,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             rel->run_ends[rel->run_count - 1] = rel->nrows;
             int rc = col_rel_compact_runs(rel);
             if (rc != 0)
-                return rc;
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, rc);
         }
 
         if (rel->timestamps) {
@@ -1389,6 +1413,11 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     if (d_unique <= old_nrows / 16 && rel->run_count > 0) {
         /* Binary-search dedup path: O(D * K * log(N/K)) */
         uint32_t novel_count = 0;
+        col_row_buf_t drb = { 0 };
+        int64_t *const dr = delta_out ? col_row_buf_init(&drb, nc) : NULL;
+        if (delta_out && !dr)
+            return col_op_consolidate_incremental_delta_fail(delta_out,
+                       delta_initial_nrows, ENOMEM);
 
         for (uint32_t i = 0; i < d_unique; i++) {
             uint32_t row_idx = old_nrows + i;
@@ -1408,35 +1437,20 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                 if (novel_count != i)
                     col_rel_row_move_raw(rel, old_nrows + novel_count, row_idx);
                 if (delta_out) {
-                    /* Issue #1000: the one converted site that is NOT
-                     * covered by a test, and the one that inits inside a
-                     * per-row loop rather than above it.
-                     *
-                     * Reaching it needs a >32-column relation *and*
-                     * d_unique <= old_nrows/16 && rel->run_count > 0, i.e.
-                     * the binary-search dedup branch on a large existing
-                     * relation with few novel rows.  Mutating this guard to
-                     * the old fixed width survives the whole suite, so the
-                     * bound here rests on inspection, not on a test.
-                     *
-                     * The per-row init is the pre-existing shape and is not
-                     * a regression -- the base code allocated here too --
-                     * but it does contradict the hoisting rule this helper
-                     * documents.  Both are tracked in #1003. */
-                    col_row_buf_t drb;
-                    int64_t *const dr = col_row_buf_init(&drb, nc);
-                    if (!dr)
-                        return ENOMEM;
                     for (uint32_t c = 0; c < nc; c++)
                         dr[c] = rel->columns[c][old_nrows + novel_count];
-                    int rc = col_rel_append_row(delta_out, dr);
-                    col_row_buf_release(&drb);
-                    if (rc != 0)
-                        return rc;
+                    int rc = col_rel_append_row_locked(delta_out, dr,
+                            delta_writer);
+                    if (rc != 0) {
+                        col_row_buf_release(&drb);
+                        return col_op_consolidate_incremental_delta_fail(
+                            delta_out, delta_initial_nrows, rc);
+                    }
                 }
                 novel_count++;
             }
         }
+        col_row_buf_release(&drb);
 
         if (novel_count > 0) {
             rel->nrows = old_nrows + novel_count;
@@ -1453,7 +1467,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
                  * them adjacent to the compacted prefix afterwards. */
                 int rc = col_rel_compact_runs(rel);
                 if (rc != 0)
-                    return rc;
+                    return col_op_consolidate_incremental_delta_fail(
+                        delta_out, delta_initial_nrows, rc);
                 uint32_t compacted = rel->nrows;
                 for (uint32_t j = 0; j < novel_count; j++)
                     col_rel_row_move_raw(rel, compacted + j, old_nrows + j);
@@ -1491,11 +1506,13 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             rel->merge_buf_cap = new_cap;
         } else if (rel->merge_columns) {
             if (col_columns_realloc(rel->merge_columns, nc, new_cap) != 0)
-                return ENOMEM;
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, ENOMEM);
         } else {
             rel->merge_columns = col_columns_alloc(nc, new_cap);
             if (!rel->merge_columns)
-                return ENOMEM;
+                return col_op_consolidate_incremental_delta_fail(delta_out,
+                           delta_initial_nrows, ENOMEM);
         }
         rel->merge_buf_cap = new_cap;
     }
@@ -1503,7 +1520,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
 
     col_row_buf_t delta_rb;
     if (!col_row_buf_init(&delta_rb, nc))
-        return ENOMEM;
+        return col_op_consolidate_incremental_delta_fail(delta_out,
+                   delta_initial_nrows, ENOMEM);
     int64_t *delta_row = delta_rb.ptr;
 
     /* For fallback merge, we need a single sorted prefix.
@@ -1516,7 +1534,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         int rc = col_rel_compact_runs(rel);
         if (rc != 0) {
             col_row_buf_release(&delta_rb);
-            return rc;
+            return col_op_consolidate_incremental_delta_fail(delta_out,
+                       delta_initial_nrows, rc);
         }
         uint32_t compacted = rel->nrows;
         for (uint32_t j = 0; j < d_unique; j++)
@@ -1544,10 +1563,12 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
             if (delta_out) {
                 for (uint32_t c = 0; c < nc; c++)
                     delta_row[c] = merged_cols[c][out];
-                int rc = col_rel_append_row(delta_out, delta_row);
+                int rc = col_rel_append_row_locked(delta_out, delta_row,
+                        delta_writer);
                 if (rc != 0) {
                     col_row_buf_release(&delta_rb);
-                    return rc;
+                    return col_op_consolidate_incremental_delta_fail(
+                        delta_out, delta_initial_nrows, rc);
                 }
             }
             di++;
@@ -1565,10 +1586,12 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         if (delta_out) {
             for (uint32_t c = 0; c < nc; c++)
                 delta_row[c] = merged_cols[c][out];
-            int rc = col_rel_append_row(delta_out, delta_row);
+            int rc = col_rel_append_row_locked(delta_out, delta_row,
+                    delta_writer);
             if (rc != 0) {
                 col_row_buf_release(&delta_rb);
-                return rc;
+                return col_op_consolidate_incremental_delta_fail(
+                    delta_out, delta_initial_nrows, rc);
             }
         }
         di++;
@@ -1611,4 +1634,95 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     if (out_fast_path)
         *out_fast_path = 0;
     return 0;
+}
+
+int
+col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
+    col_rel_t *delta_out, int *out_fast_path)
+{
+    col_rel_t *rel_owner = NULL;
+    col_rel_t *delta_owner = NULL;
+    wl_columnar_source_access_writer_t rel_writer = { 0 };
+    wl_columnar_source_access_writer_t delta_writer = { 0 };
+    wl_columnar_source_access_writer_t *delta_writer_ptr = NULL;
+    bool rel_acquired = false;
+    bool delta_acquired = false;
+    int rc;
+
+    if (!wl_columnar_relation_float_values_valid(rel)
+        || (delta_out && !wl_columnar_relation_float_values_valid(delta_out)))
+        return EINVAL;
+    if (delta_out == rel
+        || (delta_out && delta_out->ncols != rel->ncols))
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(rel, &rel_owner);
+    if (rc != 0)
+        return rc;
+    if (rel_owner == rel && rel->storage_alias_borrows > 0)
+        return EBUSY;
+    if (delta_out) {
+        rc = col_rel_storage_owner_resolve(delta_out, &delta_owner);
+        if (rc != 0)
+            return rc;
+        if (delta_owner == delta_out && delta_out->storage_alias_borrows > 0)
+            return EBUSY;
+    }
+
+    /* Acquire the two canonical owners in address order.  The same owner is
+     * acquired only once when rel and delta_out alias the same relation. */
+    if (!delta_owner || rel_owner == delta_owner) {
+        rc = wl_columnar_source_access_writer_acquire(
+            &rel_owner->source_access, &rel_writer);
+        if (rc != 0)
+            return rc;
+        rel_acquired = true;
+        delta_writer_ptr = delta_out ? &rel_writer : NULL;
+    } else if ((uintptr_t)rel_owner < (uintptr_t)delta_owner) {
+        rc = wl_columnar_source_access_writer_acquire(
+            &rel_owner->source_access, &rel_writer);
+        if (rc != 0)
+            return rc;
+        rel_acquired = true;
+        rc = wl_columnar_source_access_writer_acquire(
+            &delta_owner->source_access, &delta_writer);
+        if (rc != 0)
+            goto cleanup;
+        delta_acquired = true;
+        delta_writer_ptr = &delta_writer;
+    } else {
+        rc = wl_columnar_source_access_writer_acquire(
+            &delta_owner->source_access, &delta_writer);
+        if (rc != 0)
+            return rc;
+        delta_acquired = true;
+        rc = wl_columnar_source_access_writer_acquire(
+            &rel_owner->source_access, &rel_writer);
+        if (rc != 0)
+            goto cleanup;
+        rel_acquired = true;
+        delta_writer_ptr = &delta_writer;
+    }
+
+    if (delta_out) {
+        uint32_t delta_count = rel->nrows > old_nrows
+            ? rel->nrows - old_nrows : 0;
+        rc = col_rel_reserve_rows_locked(delta_out, delta_count,
+                delta_writer_ptr);
+        if (rc != 0)
+            goto cleanup;
+    }
+
+    rc = col_op_consolidate_incremental_delta_impl(rel, old_nrows,
+            delta_out, out_fast_path, delta_writer_ptr);
+
+cleanup:
+    if (delta_acquired
+        && wl_columnar_source_access_writer_release(&delta_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (rel_acquired
+        && wl_columnar_source_access_writer_release(&rel_writer) != 0
+        && rc == 0)
+        rc = EINVAL;
+    return rc;
 }

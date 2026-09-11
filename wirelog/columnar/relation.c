@@ -1390,14 +1390,14 @@ col_rel_apply_compound_schema(col_rel_t *r,
     return 0;
 }
 
-int
-col_rel_append_row(col_rel_t *r, const int64_t *row)
+static int
+col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
+    wl_columnar_source_access_writer_t *writer, bool writer_held)
 {
-    wl_columnar_source_access_writer_t writer = { 0 };
     bool alias_release_pending = false;
     int rc;
 
-    if (!r || !row)
+    if (!r || !row || !writer)
         return EINVAL;
     /* Do all structural validation before any resize, COW, or timestamp
      * publication.  In particular, a zero-column or partially initialized
@@ -1426,9 +1426,11 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
      * but before any resize, COW, timestamp, value, or generation mutation.
      * A reader on an alias therefore excludes append on every view of the
      * same backing storage. */
-    rc = col_rel_source_writer_acquire(r, &writer);
-    if (rc != 0)
-        return rc;
+    if (!writer_held) {
+        rc = col_rel_source_writer_acquire(r, writer);
+        if (rc != 0)
+            return rc;
+    }
 
     bool needs_resize = r->nrows >= r->capacity;
     if (needs_resize) {
@@ -1532,9 +1534,89 @@ release_writer:
         if (alias_rc != 0 && rc == 0)
             rc = alias_rc;
     }
-    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+    if (!writer_held
+        && wl_columnar_source_access_writer_release(writer) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
+}
+
+int
+col_rel_append_row(col_rel_t *r, const int64_t *row)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    return col_rel_append_row_impl(r, row, &writer, false);
+}
+
+int
+col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
+    wl_columnar_source_access_writer_t *writer)
+{
+    return col_rel_append_row_impl(r, row, writer, true);
+}
+
+/* Reserve the complete destination shape before a multi-row operation starts.
+ * The caller holds the destination writer.  This keeps subsequent locked
+ * appends allocation-free, so a destination admission failure cannot leave
+ * a partially emitted delta after the source has been transformed. */
+int
+col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
+    wl_columnar_source_access_writer_t *writer)
+{
+    if (!r || !writer || additional > UINT32_MAX - r->nrows)
+        return EINVAL;
+    uint32_t required = r->nrows + additional;
+    /* A shared view can have spare capacity but still needs COW before the
+     * first locked append.  Perform that fallible transition up front. */
+    if (r->col_shared && required <= r->capacity)
+        return col_rel_cow_unshare_impl(r, 0, false);
+    if (required <= r->capacity)
+        return 0;
+    if (r->storage_owner == r && r->storage_alias_borrows > 0)
+        return EBUSY;
+
+    uint32_t new_cap = r->capacity ? r->capacity : COL_REL_INIT_CAP;
+    while (new_cap < required) {
+        if (new_cap > UINT32_MAX / 2u)
+            return ENOMEM;
+        new_cap *= 2u;
+    }
+    if (r->col_shared || r->arena_owned)
+        return col_rel_grow_owned_transition_impl(r, new_cap, false);
+
+    uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
+    wl_columnar_memory_reservation_t pending;
+    int pending_rc = 0;
+    uint64_t new_bytes = 0;
+    bool admitted = r->memory_governor != NULL;
+    if (admitted) {
+        pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
+        if (pending_rc < 0
+            || !col_rel_retained_bytes(r->ncols, new_cap,
+            r->timestamps != NULL, &new_bytes)) {
+            if (pending_rc > 0)
+                col_rel_reservation_rollback(&pending);
+            return ENOMEM;
+        }
+    }
+    int64_t **new_cols = NULL;
+    col_delta_timestamp_t *new_ts = NULL;
+    int rc = col_rel_prepare_resize(r, new_cap, &new_cols, &new_ts);
+    if (rc != 0) {
+        if (admitted)
+            col_rel_reservation_rollback(&pending);
+        return rc;
+    }
+    if (admitted && pending_rc > 0
+        && col_rel_publish_retained_reservation(r, &pending, new_bytes) != 0) {
+        col_rel_reservation_rollback(&pending);
+        col_columns_free(new_cols, r->ncols);
+        free(new_ts);
+        return ENOMEM;
+    }
+    col_rel_publish_resize(r, new_cols, new_ts, new_cap);
+    col_rel_ledger_reconcile(r, ledger_before);
+    wl_columnar_relation_touch_storage(r);
+    return 0;
 }
 
 /* Copy all rows from src into dst (must have same ncols).
