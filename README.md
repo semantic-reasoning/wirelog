@@ -396,6 +396,7 @@ external-consumer audit.
 - [docs/INTERNALS.md](docs/INTERNALS.md) -- maintainer map of internal subsystems and public/private boundaries
 - [docs/ERROR_MODEL.md](docs/ERROR_MODEL.md) -- error reporting, logging safety, fork/signal constraints, and restart handoff
 - [docs/MEMORY.md](docs/MEMORY.md) -- memory ledger subsystems, `WL_MEM_REPORT`, measurement overhead, and DOOP/fixture baselines
+- [docs/CI_TELEMETRY.md](docs/CI_TELEMETRY.md) -- PR CI queue delay, per-phase attribution, critical-path measurement, and the measured baseline
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- development workflow, CI/CD, PR requirements
 - [SECURITY.md](SECURITY.md) -- vulnerability disclosure
 - [docs/SIGNING.md](docs/SIGNING.md) -- verifying a release: checksums, Sigstore signatures, and provenance
