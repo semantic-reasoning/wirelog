@@ -504,7 +504,25 @@ preparing the replacement fails.
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Upgrade exactly the session's sole transferable destination-owner reader; retry spurious failure and reject additional readers before replacing descriptors |
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_exchange_explicit` | release | Atomically restore the session lifetime reader after publication or preparation failure; MSVC requires an interlocked operation under `/volatile:iso` |
 
-The complete source audit now contains **116 atomic call sites**.
+### 5.15 `wirelog/columnar/relation.c` — canonical staged replacement (3 rows)
+
+Staged replacement builds a candidate descriptor beside the destination and
+publishes it in one step, under a source writer the caller already holds. Two
+pieces of state have to cross that swap intact. The destination's retained
+memory reservation is validated before anything is staged, so a replacement
+never plans to release accounting that is no longer committed. The source
+gate's own state is captured from the outgoing descriptor and restored onto
+the committed one, because `*dst = *staged` overwrites the gate along with
+every other field: without the capture the writer lease held across
+prepare/commit would be discarded by the publication it is protecting.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:col_rel_replacement_old_reservation_valid` | `dst->retained_reservation.state` | `atomic_load_explicit` | acquire | Confirm the destination's retained reservation is still committed before staging over it; acquire pairs with the release that published the reservation, so the bytes it accounts are visible before the replacement plans their release |
+| `relation.c:col_rel_commit_replacement_locked` | `old.source_access.state` | `atomic_load_explicit` | acquire | Capture the outgoing descriptor's admission state before `*dst = *staged` overwrites it, so the writer lease the caller holds across prepare and commit survives the swap |
+| `relation.c:col_rel_commit_replacement_locked#2` | `dst->source_access.state` | `atomic_store_explicit` | release | Republish the captured admission state onto the committed descriptor; the release orders every field written above it before another thread can observe the gate |
+
+The complete source audit now contains **119 atomic call sites**.
 
 ---
 
