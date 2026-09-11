@@ -2119,6 +2119,19 @@ test_tdd_merge_schema_mismatch_rollback(void)
     PASS();
     return 0;
 }
+
+static int
+test_tdd_owner_registration_rollback(void)
+{
+    TEST(
+        "owner exchange removes an earlier delta registration on later-worker failure");
+    if (wl_columnar_eval_test_tdd_owner_registration_rollback() != 0) {
+        FAIL("owner delta registration rollback");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
 #endif
 
 /* ======================================================================== */
@@ -4520,6 +4533,7 @@ main(void)
 #ifdef WL_TEST_TDD_MERGE
     test_tdd_merge_transactional_publication();
     test_tdd_merge_schema_mismatch_rollback();
+    test_tdd_owner_registration_rollback();
 #endif
 #ifdef WL_TEST_OWNER_PUBLICATION
     TEST("owner publication preserves populated hashless registries");
