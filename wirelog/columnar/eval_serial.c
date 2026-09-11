@@ -755,9 +755,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     /* Phase 4: Enable timestamp tracking on target relation to
                      * preserve provenance through consolidation.  This enables
                      * frontier computation to determine convergence. */
-                    if (col_rel_enable_timestamps(r) != 0) {
+                    int timestamp_rc = col_rel_enable_timestamps(r);
+                    if (timestamp_rc != 0) {
                         col_rel_destroy(delta);
-                        outer_rc = ENOMEM;
+                        outer_rc = timestamp_rc;
                         goto stride_error;
                     }
 
