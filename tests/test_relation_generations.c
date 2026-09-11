@@ -194,6 +194,40 @@ test_same_row_count_mutation(void)
 }
 
 static void
+test_source_reader_blocks_column_type_publication(void)
+{
+    col_rel_t *rel = new_relation();
+    int64_t value = 17;
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t view_before;
+    wirelog_column_type_t *types_before;
+    int64_t **columns_before;
+
+    CHECK(rel != NULL, "typed publication relation");
+    CHECK(col_rel_append_row(rel, &value) == 0,
+        "typed publication source row");
+    view_before = rel->view_generation;
+    types_before = rel->column_types;
+    columns_before = rel->columns;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "typed publication source reader");
+    CHECK(col_rel_set_column_types(rel, &type, 1) == EBUSY,
+        "typed publication denied by source reader");
+    CHECK(rel->column_types == types_before && rel->columns == columns_before
+        && rel->view_generation == view_before,
+        "typed publication denial preserves relation state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "typed publication source reader release");
+    CHECK(col_rel_set_column_types(rel, &type, 1) == 0,
+        "typed publication retry succeeds");
+    CHECK(rel->column_types && rel->column_types[0] == type
+        && rel->view_generation == view_before + 1u,
+        "typed publication retry publishes one view epoch");
+    cleanup_relations();
+}
+
+static void
 test_storage_only_cow_and_compaction(void)
 {
     col_rel_t *src = new_relation();
@@ -2184,7 +2218,7 @@ test_checked_reset_rows_locked(void)
     uint64_t old_storage = rel->storage_generation;
     wl_columnar_source_access_writer_t writer = { 0 };
     CHECK(wl_columnar_source_access_writer_acquire(
-        &rel->source_access, &writer) == 0,
+            &rel->source_access, &writer) == 0,
         "checked reset writer admission");
     CHECK(col_rel_reset_rows_locked(rel, &writer) == 0,
         "checked reset succeeds under writer");
@@ -2206,6 +2240,7 @@ int
 main(void)
 {
     test_same_row_count_mutation();
+    test_source_reader_blocks_column_type_publication();
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();

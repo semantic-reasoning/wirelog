@@ -231,6 +231,27 @@ col_rel_source_writer_acquire(const col_rel_t *rel,
         &owner->source_access, token);
 }
 
+/* Metadata/type publication rewrites the canonical relation descriptor and,
+ * for types, may reinterpret existing row lanes.  A live storage alias must
+ * therefore be denied rather than allowed to observe a mixed descriptor. */
+static int
+col_rel_published_writer_acquire(const col_rel_t *rel,
+    wl_columnar_source_access_writer_t *token)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!rel || !token)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0)
+        return rc;
+    if (owner->storage_alias_borrows > 0)
+        return EBUSY;
+    return wl_columnar_source_access_writer_acquire(
+        &owner->source_access, token);
+}
+
 int
 col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
 {
@@ -922,8 +943,9 @@ col_rel_destroy(col_rel_t *r)
  * Called lazily on first insert (EDB) or when relation is first produced.
  * Returns 0 on success, ENOMEM/EINVAL on failure.
  */
-int
-col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
+static int
+col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
+    const char *const *col_names)
 {
     wl_columnar_memory_reservation_t pending;
     int pending_rc;
@@ -1028,6 +1050,25 @@ fail:
     r->capacity = 0;
     r->ncols = 0;
     return failure_rc;
+}
+
+int
+col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_set_schema_impl(r, ncols, col_names);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 static int
@@ -1193,7 +1234,20 @@ int
 col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
     uint32_t ncols)
 {
-    return col_rel_set_column_types_impl(r, types, ncols, true);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_set_column_types_impl(r, types, ncols, true);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 int
