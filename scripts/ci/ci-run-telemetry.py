@@ -343,7 +343,6 @@ def no_run_label(conclusion) -> str:
     return NO_RUN_LABELS.get(conclusion, str(conclusion))
 
 
-
 def did_not_run(job: dict) -> bool:
     """Whether the runner never executed this job, so it has no durations to
     report and anything derived from its stamps would be bookkeeping.
@@ -932,12 +931,12 @@ KNOWN_JOB_STATUSES = IN_FLIGHT_STATUSES + ("completed",)
 KNOWN_RUN_STATUSES = KNOWN_JOB_STATUSES
 
 
-
 def absent_by_design(entry: dict) -> bool:
     """True when this job has none of its own durations because the runner
     never executed it, rather than because the run lost them.  Its release
-    latency is not one of these: that ends at the job's creation.  The table caption excuses
-    exactly these jobs, so this has to mean exactly what the caption says.
+    latency is not one of these: that ends at the job's creation.  The table
+    caption excuses exactly these jobs, so this has to mean exactly what the
+    caption says.
 
     It reads the answer `analyze_job` recorded rather than re-deriving one.
     Every re-derivation tried here was wrong on some reachable job: the
@@ -1649,9 +1648,9 @@ def job_count_phrase(counts: dict) -> str:
     breakdown = counts.get("did_not_run_by_conclusion") or {}
     # Sorted by the term the reader sees, so the phrase neither reorders
     # with the order the API happened to return the jobs in nor lists its
-    # words out of alphabetical order.  Every term, skipped included, is named from
-    # this one table; a second spelling elsewhere would be a second thing to
-    # keep in step.
+    # words out of alphabetical order.  Every term, skipped included, is
+    # named from this one table; a second spelling elsewhere would be a
+    # second thing to keep in step.
     for conclusion, count in sorted(breakdown.items(),
                                     key=lambda item: no_run_label(item[0])):
         parts.append(f"{count} {no_run_label(conclusion)}")
