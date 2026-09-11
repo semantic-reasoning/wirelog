@@ -1,0 +1,84 @@
+{
+  "jobs": [
+    {
+      "completed_at": "2026-09-10T10:01:11Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T10:00:01Z",
+      "id": 301,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Detect build-triggering changes",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1",
+      "started_at": "2026-09-10T10:00:11Z",
+      "status": "completed",
+      "steps": []
+    },
+    {
+      "completed_at": "2026-09-10T10:02:00Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T10:00:11Z",
+      "id": 302,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Build / ubuntu-latest / gcc",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1",
+      "started_at": null,
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": null,
+          "conclusion": null,
+          "name": "Set up job",
+          "number": 1,
+          "started_at": null,
+          "status": "queued"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T10:03:00Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T10:02:00Z",
+      "id": 303,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "TSan / ubuntu-latest / gcc",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1",
+      "started_at": "2026-09-10T10:02:05Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T10:02:07Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T10:02:05Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T10:02:58Z",
+          "conclusion": "success",
+          "name": "Test with TSan",
+          "number": 2,
+          "started_at": "2026-09-10T10:02:07Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T10:03:00Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 3,
+          "started_at": "2026-09-10T10:02:58Z",
+          "status": "completed"
+        }
+      ]
+    }
+  ],
+  "total_count": 3
+}

@@ -1,0 +1,12 @@
+{
+  "conclusion": null,
+  "created_at": "2026-09-11T08:33:36Z",
+  "event": "pull_request",
+  "head_branch": "fix/1531-thread-namespace",
+  "head_sha": "941d1dac0aba4c7d8cdf0c3bdb2789a67d134d56",
+  "id": 34579784069,
+  "name": "CI PR",
+  "run_attempt": 1,
+  "run_started_at": "2026-09-11T08:33:36Z",
+  "status": "in_progress"
+}

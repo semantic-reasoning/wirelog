@@ -1,0 +1,1845 @@
+{
+  "jobs": [
+    {
+      "completed_at": "2026-09-10T18:35:28Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:27:12Z",
+      "id": 102996159107,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Detect build-triggering changes",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054606",
+      "started_at": "2026-09-10T18:35:21Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T18:35:23Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T18:35:22Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:35:25Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T18:35:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:35:25Z",
+          "conclusion": "success",
+          "name": "Detect source and build-definition changes",
+          "number": 3,
+          "started_at": "2026-09-10T18:35:25Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:35:25Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 6,
+          "started_at": "2026-09-10T18:35:25Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:35:25Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 7,
+          "started_at": "2026-09-10T18:35:25Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T18:36:39Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:27:12Z",
+      "id": 102996159417,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "RC changelog freeze gate",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054608",
+      "started_at": "2026-09-10T18:36:33Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T18:36:34Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T18:36:34Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:36:36Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T18:36:34Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:36:36Z",
+          "conclusion": "success",
+          "name": "Enforce RC changelog freeze policy",
+          "number": 3,
+          "started_at": "2026-09-10T18:36:36Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:36:37Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 6,
+          "started_at": "2026-09-10T18:36:36Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:36:37Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 7,
+          "started_at": "2026-09-10T18:36:37Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T18:37:39Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:27:12Z",
+      "id": 102996159476,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Docs / policy validation",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054614",
+      "started_at": "2026-09-10T18:37:32Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T18:37:34Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T18:37:33Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:37:37Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T18:37:34Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:37:37Z",
+          "conclusion": "success",
+          "name": "Validate support policy",
+          "number": 3,
+          "started_at": "2026-09-10T18:37:37Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:37:37Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 6,
+          "started_at": "2026-09-10T18:37:37Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:37:37Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 7,
+          "started_at": "2026-09-10T18:37:37Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T18:50:56Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:36:40Z",
+      "id": 102999400767,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "lint / EditorConfig check",
+      "runner_group_name": "default",
+      "runner_name": "semantic-reasoning-i401-6-2",
+      "started_at": "2026-09-10T18:50:34Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T18:50:32Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T18:50:25Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:50:33Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T18:50:32Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:50:34Z",
+          "conclusion": "success",
+          "name": "Install editorconfig-checker",
+          "number": 3,
+          "started_at": "2026-09-10T18:50:33Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:50:39Z",
+          "conclusion": "success",
+          "name": "Run editorconfig-checker",
+          "number": 4,
+          "started_at": "2026-09-10T18:50:34Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:50:39Z",
+          "conclusion": "success",
+          "name": "Publish results",
+          "number": 5,
+          "started_at": "2026-09-10T18:50:39Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:50:40Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 10,
+          "started_at": "2026-09-10T18:50:39Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:50:40Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 11,
+          "started_at": "2026-09-10T18:50:40Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T18:59:49Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:50:56Z",
+      "id": 103004228926,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "lint / uncrustify check",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054660",
+      "started_at": "2026-09-10T18:59:34Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T18:59:35Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T18:59:35Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:59:37Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T18:59:35Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:59:47Z",
+          "conclusion": "success",
+          "name": "Install uncrustify",
+          "number": 3,
+          "started_at": "2026-09-10T18:59:37Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:59:47Z",
+          "conclusion": "success",
+          "name": "Verify tool version",
+          "number": 4,
+          "started_at": "2026-09-10T18:59:47Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:59:47Z",
+          "conclusion": "success",
+          "name": "Run uncrustify (hard gate)",
+          "number": 5,
+          "started_at": "2026-09-10T18:59:47Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:59:47Z",
+          "conclusion": "success",
+          "name": "Publish results",
+          "number": 6,
+          "started_at": "2026-09-10T18:59:47Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:59:47Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 12,
+          "started_at": "2026-09-10T18:59:47Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T18:59:47Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 13,
+          "started_at": "2026-09-10T18:59:47Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T19:42:53Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:59:50Z",
+      "id": 103007248983,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Build / ubuntu-latest / gcc",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054702",
+      "started_at": "2026-09-10T19:22:16Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T19:22:18Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T19:22:17Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:22:22Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T19:22:18Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:22:23Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T19:22:22Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:22:42Z",
+          "conclusion": "success",
+          "name": "Install dependencies",
+          "number": 4,
+          "started_at": "2026-09-10T19:22:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:22:54Z",
+          "conclusion": "success",
+          "name": "Configure",
+          "number": 5,
+          "started_at": "2026-09-10T19:22:42Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:40:11Z",
+          "conclusion": "success",
+          "name": "Build",
+          "number": 6,
+          "started_at": "2026-09-10T19:22:54Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:41:01Z",
+          "conclusion": "success",
+          "name": "Test",
+          "number": 7,
+          "started_at": "2026-09-10T19:40:11Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:41:23Z",
+          "conclusion": "success",
+          "name": "Install clang-tidy (pinned major)",
+          "number": 8,
+          "started_at": "2026-09-10T19:41:01Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:46Z",
+          "conclusion": "success",
+          "name": "clang-tidy ratchet gate",
+          "number": 9,
+          "started_at": "2026-09-10T19:41:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:47Z",
+          "conclusion": "success",
+          "name": "Install syft",
+          "number": 10,
+          "started_at": "2026-09-10T19:42:46Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:49Z",
+          "conclusion": "success",
+          "name": "SBOM snapshot gate",
+          "number": 11,
+          "started_at": "2026-09-10T19:42:47Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:49Z",
+          "conclusion": "success",
+          "name": "Check binary size",
+          "number": 12,
+          "started_at": "2026-09-10T19:42:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:50Z",
+          "conclusion": "success",
+          "name": "Path A example compile-check",
+          "number": 13,
+          "started_at": "2026-09-10T19:42:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:50Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 25,
+          "started_at": "2026-09-10T19:42:50Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:50Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 26,
+          "started_at": "2026-09-10T19:42:50Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:42:51Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 27,
+          "started_at": "2026-09-10T19:42:50Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T19:36:59Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:59:50Z",
+      "id": 103007249006,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Sanitizers / ubuntu-latest / gcc",
+      "runner_group_name": "default",
+      "runner_name": "i406-d2",
+      "started_at": "2026-09-10T19:19:52Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T19:19:55Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T19:19:53Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:19:56Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T19:19:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:19:56Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T19:19:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:19:59Z",
+          "conclusion": "success",
+          "name": "Install dependencies (Linux)",
+          "number": 4,
+          "started_at": "2026-09-10T19:19:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:19:59Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (macOS)",
+          "number": 5,
+          "started_at": "2026-09-10T19:19:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:20:10Z",
+          "conclusion": "success",
+          "name": "Configure with sanitizers",
+          "number": 6,
+          "started_at": "2026-09-10T19:19:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:35:56Z",
+          "conclusion": "success",
+          "name": "Build with sanitizers",
+          "number": 7,
+          "started_at": "2026-09-10T19:20:10Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:35:56Z",
+          "conclusion": "success",
+          "name": "Record bash version",
+          "number": 8,
+          "started_at": "2026-09-10T19:35:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:36:51Z",
+          "conclusion": "success",
+          "name": "Test with sanitizers",
+          "number": 9,
+          "started_at": "2026-09-10T19:35:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:36:51Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 17,
+          "started_at": "2026-09-10T19:36:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:36:51Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 18,
+          "started_at": "2026-09-10T19:36:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:36:51Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 19,
+          "started_at": "2026-09-10T19:36:51Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T19:51:34Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:59:50Z",
+      "id": 103007249042,
+      "labels": [
+        "ubuntu-24.04-arm"
+      ],
+      "name": "Sanitizers / ubuntu-24.04-arm / gcc",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054683",
+      "started_at": "2026-09-10T19:14:42Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T19:14:43Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T19:14:42Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:14:45Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T19:14:43Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:14:46Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T19:14:45Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:15:01Z",
+          "conclusion": "success",
+          "name": "Install dependencies (Linux)",
+          "number": 4,
+          "started_at": "2026-09-10T19:14:46Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:15:01Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (macOS)",
+          "number": 5,
+          "started_at": "2026-09-10T19:15:01Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:15:18Z",
+          "conclusion": "success",
+          "name": "Configure with sanitizers",
+          "number": 6,
+          "started_at": "2026-09-10T19:15:01Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:46:05Z",
+          "conclusion": "success",
+          "name": "Build with sanitizers",
+          "number": 7,
+          "started_at": "2026-09-10T19:15:18Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:46:05Z",
+          "conclusion": "success",
+          "name": "Record bash version",
+          "number": 8,
+          "started_at": "2026-09-10T19:46:05Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:51:31Z",
+          "conclusion": "success",
+          "name": "Test with sanitizers",
+          "number": 9,
+          "started_at": "2026-09-10T19:46:05Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:51:32Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 17,
+          "started_at": "2026-09-10T19:51:31Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:51:32Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 18,
+          "started_at": "2026-09-10T19:51:32Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:51:32Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 19,
+          "started_at": "2026-09-10T19:51:32Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T20:05:15Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:59:50Z",
+      "id": 103007249058,
+      "labels": [
+        "macos-latest"
+      ],
+      "name": "Sanitizers / macos-latest / clang",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054690",
+      "started_at": "2026-09-10T19:18:55Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T19:18:56Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T19:18:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:18:58Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T19:18:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:18:59Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T19:18:58Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:18:59Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (Linux)",
+          "number": 4,
+          "started_at": "2026-09-10T19:18:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:19:04Z",
+          "conclusion": "success",
+          "name": "Install dependencies (macOS)",
+          "number": 5,
+          "started_at": "2026-09-10T19:18:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:19:17Z",
+          "conclusion": "success",
+          "name": "Configure with sanitizers",
+          "number": 6,
+          "started_at": "2026-09-10T19:19:04Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:03:21Z",
+          "conclusion": "success",
+          "name": "Build with sanitizers",
+          "number": 7,
+          "started_at": "2026-09-10T19:19:17Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:03:22Z",
+          "conclusion": "success",
+          "name": "Record bash version",
+          "number": 8,
+          "started_at": "2026-09-10T20:03:21Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:05:08Z",
+          "conclusion": "success",
+          "name": "Test with sanitizers",
+          "number": 9,
+          "started_at": "2026-09-10T20:03:22Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:05:08Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 17,
+          "started_at": "2026-09-10T20:05:08Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:05:09Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 18,
+          "started_at": "2026-09-10T20:05:08Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:05:12Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 19,
+          "started_at": "2026-09-10T20:05:09Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T20:25:46Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T18:59:50Z",
+      "id": 103007249070,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Sanitizers / ubuntu-latest / clang",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054699",
+      "started_at": "2026-09-10T19:21:25Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T19:21:27Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T19:21:26Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:21:28Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T19:21:27Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:21:29Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T19:21:28Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:21:43Z",
+          "conclusion": "success",
+          "name": "Install dependencies (Linux)",
+          "number": 4,
+          "started_at": "2026-09-10T19:21:29Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:21:43Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (macOS)",
+          "number": 5,
+          "started_at": "2026-09-10T19:21:43Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:22:07Z",
+          "conclusion": "success",
+          "name": "Configure with sanitizers",
+          "number": 6,
+          "started_at": "2026-09-10T19:21:43Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:24:19Z",
+          "conclusion": "success",
+          "name": "Build with sanitizers",
+          "number": 7,
+          "started_at": "2026-09-10T19:22:07Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:24:19Z",
+          "conclusion": "success",
+          "name": "Record bash version",
+          "number": 8,
+          "started_at": "2026-09-10T20:24:19Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:25:44Z",
+          "conclusion": "success",
+          "name": "Test with sanitizers",
+          "number": 9,
+          "started_at": "2026-09-10T20:24:19Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:25:44Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 17,
+          "started_at": "2026-09-10T20:25:44Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:25:44Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 18,
+          "started_at": "2026-09-10T20:25:44Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:25:44Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 19,
+          "started_at": "2026-09-10T20:25:44Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T19:56:53Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T19:42:53Z",
+      "id": 103021643946,
+      "labels": [
+        "ubuntu-24.04-arm"
+      ],
+      "name": "Build / ubuntu-24.04-arm / gcc",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054763",
+      "started_at": "2026-09-10T19:45:59Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T19:46:01Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T19:46:00Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:46:02Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T19:46:01Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:46:03Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T19:46:02Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:46:17Z",
+          "conclusion": "success",
+          "name": "Install dependencies",
+          "number": 4,
+          "started_at": "2026-09-10T19:46:03Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:46:25Z",
+          "conclusion": "success",
+          "name": "Configure",
+          "number": 5,
+          "started_at": "2026-09-10T19:46:17Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:55:59Z",
+          "conclusion": "success",
+          "name": "Build",
+          "number": 6,
+          "started_at": "2026-09-10T19:46:25Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:56:51Z",
+          "conclusion": "success",
+          "name": "Test",
+          "number": 7,
+          "started_at": "2026-09-10T19:55:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:56:51Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 13,
+          "started_at": "2026-09-10T19:56:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:56:51Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 14,
+          "started_at": "2026-09-10T19:56:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:56:51Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 15,
+          "started_at": "2026-09-10T19:56:51Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T19:59:58Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T19:42:53Z",
+      "id": 103021644050,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "mbedtls-enabled / ubuntu-latest / gcc",
+      "runner_group_name": "default",
+      "runner_name": "semantic-reasoning-i401-6-2",
+      "started_at": "2026-09-10T19:49:48Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T19:49:51Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T19:49:39Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:49:52Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T19:49:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:49:52Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T19:49:52Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:49:56Z",
+          "conclusion": "success",
+          "name": "Install dependencies",
+          "number": 4,
+          "started_at": "2026-09-10T19:49:52Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:50:28Z",
+          "conclusion": "success",
+          "name": "Configure with mbedTLS enabled",
+          "number": 5,
+          "started_at": "2026-09-10T19:49:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:55:41Z",
+          "conclusion": "success",
+          "name": "Build with mbedTLS enabled",
+          "number": 6,
+          "started_at": "2026-09-10T19:50:28Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:55:47Z",
+          "conclusion": "success",
+          "name": "Verify enabled compile flag",
+          "number": 7,
+          "started_at": "2026-09-10T19:55:41Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:55:49Z",
+          "conclusion": "success",
+          "name": "Test mbedTLS crypto built-ins",
+          "number": 8,
+          "started_at": "2026-09-10T19:55:47Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:59:40Z",
+          "conclusion": "success",
+          "name": "Test metadata-free mbedTLS prefix discovery",
+          "number": 9,
+          "started_at": "2026-09-10T19:55:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:59:40Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 17,
+          "started_at": "2026-09-10T19:59:40Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:59:41Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 18,
+          "started_at": "2026-09-10T19:59:40Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T19:59:41Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 19,
+          "started_at": "2026-09-10T19:59:41Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T20:23:02Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T19:59:58Z",
+      "id": 103027282661,
+      "labels": [
+        "windows-latest"
+      ],
+      "name": "Build / windows-latest / msvc",
+      "runner_group_name": "default",
+      "runner_name": "B2A1",
+      "started_at": "2026-09-10T20:00:00Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T20:00:06Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T20:00:03Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:12Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T20:00:06Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:12Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T20:00:12Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:12Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (Linux)",
+          "number": 4,
+          "started_at": "2026-09-10T20:00:12Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:12Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (macOS)",
+          "number": 5,
+          "started_at": "2026-09-10T20:00:12Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:15Z",
+          "conclusion": "success",
+          "name": "Install dependencies (Windows)",
+          "number": 6,
+          "started_at": "2026-09-10T20:00:12Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:15Z",
+          "conclusion": "skipped",
+          "name": "Configure (Linux / macOS)",
+          "number": 7,
+          "started_at": "2026-09-10T20:00:15Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:34Z",
+          "conclusion": "success",
+          "name": "Configure (Windows / MSVC)",
+          "number": 8,
+          "started_at": "2026-09-10T20:00:15Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:00:34Z",
+          "conclusion": "skipped",
+          "name": "Build (Linux / macOS)",
+          "number": 9,
+          "started_at": "2026-09-10T20:00:34Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:22:23Z",
+          "conclusion": "success",
+          "name": "Build (Windows / MSVC)",
+          "number": 10,
+          "started_at": "2026-09-10T20:00:34Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:22:23Z",
+          "conclusion": "skipped",
+          "name": "Record bash version",
+          "number": 11,
+          "started_at": "2026-09-10T20:22:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:22:23Z",
+          "conclusion": "skipped",
+          "name": "Test (Linux / macOS)",
+          "number": 12,
+          "started_at": "2026-09-10T20:22:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:22:56Z",
+          "conclusion": "success",
+          "name": "Test (Windows / MSVC)",
+          "number": 13,
+          "started_at": "2026-09-10T20:22:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:22:56Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 25,
+          "started_at": "2026-09-10T20:22:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:22:58Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 26,
+          "started_at": "2026-09-10T20:22:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:22:59Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 27,
+          "started_at": "2026-09-10T20:22:58Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T20:30:56Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T19:59:58Z",
+      "id": 103027282776,
+      "labels": [
+        "macos-latest"
+      ],
+      "name": "Build / macos-latest / clang",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054833",
+      "started_at": "2026-09-10T20:11:11Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T20:11:13Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T20:11:12Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:11:16Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T20:11:13Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:11:18Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T20:11:16Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:11:18Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (Linux)",
+          "number": 4,
+          "started_at": "2026-09-10T20:11:18Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:11:23Z",
+          "conclusion": "success",
+          "name": "Install dependencies (macOS)",
+          "number": 5,
+          "started_at": "2026-09-10T20:11:18Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:11:23Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (Windows)",
+          "number": 6,
+          "started_at": "2026-09-10T20:11:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:11:36Z",
+          "conclusion": "success",
+          "name": "Configure (Linux / macOS)",
+          "number": 7,
+          "started_at": "2026-09-10T20:11:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:11:36Z",
+          "conclusion": "skipped",
+          "name": "Configure (Windows / MSVC)",
+          "number": 8,
+          "started_at": "2026-09-10T20:11:36Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:29:59Z",
+          "conclusion": "success",
+          "name": "Build (Linux / macOS)",
+          "number": 9,
+          "started_at": "2026-09-10T20:11:36Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:29:59Z",
+          "conclusion": "skipped",
+          "name": "Build (Windows / MSVC)",
+          "number": 10,
+          "started_at": "2026-09-10T20:29:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:30:00Z",
+          "conclusion": "success",
+          "name": "Record bash version",
+          "number": 11,
+          "started_at": "2026-09-10T20:29:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:30:49Z",
+          "conclusion": "success",
+          "name": "Test (Linux / macOS)",
+          "number": 12,
+          "started_at": "2026-09-10T20:30:00Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:30:49Z",
+          "conclusion": "skipped",
+          "name": "Test (Windows / MSVC)",
+          "number": 13,
+          "started_at": "2026-09-10T20:30:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:30:49Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 25,
+          "started_at": "2026-09-10T20:30:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:30:50Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 26,
+          "started_at": "2026-09-10T20:30:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:30:54Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 27,
+          "started_at": "2026-09-10T20:30:50Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T20:39:02Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T19:59:58Z",
+      "id": 103027282864,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Build / ubuntu-latest / clang",
+      "runner_group_name": "default",
+      "runner_name": "semantic-reasoning-i401-6",
+      "started_at": "2026-09-10T20:31:06Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T20:30:59Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T20:30:57Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:31:00Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T20:30:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:31:01Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T20:31:00Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:31:09Z",
+          "conclusion": "success",
+          "name": "Install dependencies (Linux)",
+          "number": 4,
+          "started_at": "2026-09-10T20:31:01Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:31:09Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (macOS)",
+          "number": 5,
+          "started_at": "2026-09-10T20:31:09Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:31:09Z",
+          "conclusion": "skipped",
+          "name": "Install dependencies (Windows)",
+          "number": 6,
+          "started_at": "2026-09-10T20:31:09Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:31:43Z",
+          "conclusion": "success",
+          "name": "Configure (Linux / macOS)",
+          "number": 7,
+          "started_at": "2026-09-10T20:31:09Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:31:43Z",
+          "conclusion": "skipped",
+          "name": "Configure (Windows / MSVC)",
+          "number": 8,
+          "started_at": "2026-09-10T20:31:43Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:37:16Z",
+          "conclusion": "success",
+          "name": "Build (Linux / macOS)",
+          "number": 9,
+          "started_at": "2026-09-10T20:31:43Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:37:16Z",
+          "conclusion": "skipped",
+          "name": "Build (Windows / MSVC)",
+          "number": 10,
+          "started_at": "2026-09-10T20:37:16Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:37:16Z",
+          "conclusion": "success",
+          "name": "Record bash version",
+          "number": 11,
+          "started_at": "2026-09-10T20:37:16Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:38:42Z",
+          "conclusion": "success",
+          "name": "Test (Linux / macOS)",
+          "number": 12,
+          "started_at": "2026-09-10T20:37:16Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:38:42Z",
+          "conclusion": "skipped",
+          "name": "Test (Windows / MSVC)",
+          "number": 13,
+          "started_at": "2026-09-10T20:38:42Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:38:43Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 25,
+          "started_at": "2026-09-10T20:38:42Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:38:43Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 26,
+          "started_at": "2026-09-10T20:38:43Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:38:43Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 27,
+          "started_at": "2026-09-10T20:38:43Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T21:16:53Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T20:25:47Z",
+      "id": 103035976181,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "TSan / ubuntu-latest / gcc",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054867",
+      "started_at": "2026-09-10T20:52:56Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T20:52:57Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T20:52:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:52:58Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T20:52:57Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:52:59Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T20:52:58Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:53:10Z",
+          "conclusion": "success",
+          "name": "Install dependencies",
+          "number": 4,
+          "started_at": "2026-09-10T20:52:59Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:53:25Z",
+          "conclusion": "success",
+          "name": "Configure with TSan",
+          "number": 5,
+          "started_at": "2026-09-10T20:53:10Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:13:30Z",
+          "conclusion": "success",
+          "name": "Build with TSan",
+          "number": 6,
+          "started_at": "2026-09-10T20:53:25Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:16:51Z",
+          "conclusion": "success",
+          "name": "Test with TSan",
+          "number": 7,
+          "started_at": "2026-09-10T21:13:30Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:16:51Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 13,
+          "started_at": "2026-09-10T21:16:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:16:51Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 14,
+          "started_at": "2026-09-10T21:16:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:16:51Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 15,
+          "started_at": "2026-09-10T21:16:51Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T21:05:59Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T20:25:47Z",
+      "id": 103035976299,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "TSan-native / ubuntu-latest / gcc",
+      "runner_group_name": "default",
+      "runner_name": "i406-d2",
+      "started_at": "2026-09-10T20:58:46Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T20:58:49Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T20:58:48Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:58:51Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T20:58:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:58:51Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T20:58:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:58:56Z",
+          "conclusion": "success",
+          "name": "Install dependencies",
+          "number": 4,
+          "started_at": "2026-09-10T20:58:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:59:08Z",
+          "conclusion": "success",
+          "name": "Configure with TSan (native threads)",
+          "number": 5,
+          "started_at": "2026-09-10T20:58:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:05:49Z",
+          "conclusion": "success",
+          "name": "Build with TSan (native threads)",
+          "number": 6,
+          "started_at": "2026-09-10T20:59:08Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:05:51Z",
+          "conclusion": "success",
+          "name": "Policy smoke (native threads under TSan)",
+          "number": 7,
+          "started_at": "2026-09-10T21:05:49Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:05:51Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 13,
+          "started_at": "2026-09-10T21:05:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:05:51Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 14,
+          "started_at": "2026-09-10T21:05:51Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:05:51Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 15,
+          "started_at": "2026-09-10T21:05:51Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-10T21:19:57Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T20:25:47Z",
+      "id": 103035976439,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "TSan / ubuntu-latest / clang",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000054868",
+      "started_at": "2026-09-10T20:53:12Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T20:53:14Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T20:53:13Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:53:16Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T20:53:14Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:53:17Z",
+          "conclusion": "success",
+          "name": "Setup sccache",
+          "number": 3,
+          "started_at": "2026-09-10T20:53:16Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:53:39Z",
+          "conclusion": "success",
+          "name": "Install dependencies",
+          "number": 4,
+          "started_at": "2026-09-10T20:53:17Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T20:54:04Z",
+          "conclusion": "success",
+          "name": "Configure with TSan",
+          "number": 5,
+          "started_at": "2026-09-10T20:53:39Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:17:26Z",
+          "conclusion": "success",
+          "name": "Build with TSan",
+          "number": 6,
+          "started_at": "2026-09-10T20:54:04Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:19:54Z",
+          "conclusion": "success",
+          "name": "Test with TSan",
+          "number": 7,
+          "started_at": "2026-09-10T21:17:26Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:19:55Z",
+          "conclusion": "success",
+          "name": "Post Setup sccache",
+          "number": 13,
+          "started_at": "2026-09-10T21:19:54Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:19:55Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 14,
+          "started_at": "2026-09-10T21:19:55Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T21:19:55Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 15,
+          "started_at": "2026-09-10T21:19:55Z",
+          "status": "completed"
+        }
+      ]
+    }
+  ],
+  "total_count": 18
+}

@@ -1,0 +1,317 @@
+{
+  "jobs": [
+    {
+      "completed_at": "2026-09-11T08:35:14Z",
+      "conclusion": "success",
+      "created_at": "2026-09-11T08:33:37Z",
+      "id": 103200409721,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "RC changelog freeze gate",
+      "runner_group_name": "default",
+      "runner_name": "semantic-reasoning-i401-6",
+      "started_at": "2026-09-11T08:35:04Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-11T08:34:56Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-11T08:34:54Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:34:58Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-11T08:34:56Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:34:58Z",
+          "conclusion": "success",
+          "name": "Enforce RC changelog freeze policy",
+          "number": 3,
+          "started_at": "2026-09-11T08:34:58Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:34:58Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 6,
+          "started_at": "2026-09-11T08:34:58Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:34:58Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 7,
+          "started_at": "2026-09-11T08:34:58Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-11T08:43:06Z",
+      "conclusion": "success",
+      "created_at": "2026-09-11T08:33:37Z",
+      "id": 103200409951,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Detect build-triggering changes",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000055818",
+      "started_at": "2026-09-11T08:43:01Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-11T08:43:02Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-11T08:43:02Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:04Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-11T08:43:02Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:04Z",
+          "conclusion": "success",
+          "name": "Detect source and build-definition changes",
+          "number": 3,
+          "started_at": "2026-09-11T08:43:04Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:04Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 6,
+          "started_at": "2026-09-11T08:43:04Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:04Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 7,
+          "started_at": "2026-09-11T08:43:04Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-11T08:42:30Z",
+      "conclusion": "success",
+      "created_at": "2026-09-11T08:33:37Z",
+      "id": 103200409955,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Docs / policy validation",
+      "runner_group_name": "default",
+      "runner_name": "i406-d2",
+      "started_at": "2026-09-11T08:42:20Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-11T08:42:23Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-11T08:42:22Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:42:24Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-11T08:42:23Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:42:24Z",
+          "conclusion": "success",
+          "name": "Validate support policy",
+          "number": 3,
+          "started_at": "2026-09-11T08:42:24Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:42:24Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 6,
+          "started_at": "2026-09-11T08:42:24Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:42:24Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 7,
+          "started_at": "2026-09-11T08:42:24Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": "2026-09-11T08:43:10Z",
+      "conclusion": "success",
+      "created_at": "2026-09-11T08:35:15Z",
+      "id": 103200838630,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "lint / EditorConfig check",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1000055821",
+      "started_at": "2026-09-11T08:43:04Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-11T08:43:05Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-11T08:43:04Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:07Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-11T08:43:05Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:07Z",
+          "conclusion": "success",
+          "name": "Install editorconfig-checker",
+          "number": 3,
+          "started_at": "2026-09-11T08:43:07Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:09Z",
+          "conclusion": "success",
+          "name": "Run editorconfig-checker",
+          "number": 4,
+          "started_at": "2026-09-11T08:43:07Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:09Z",
+          "conclusion": "success",
+          "name": "Publish results",
+          "number": 5,
+          "started_at": "2026-09-11T08:43:09Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:09Z",
+          "conclusion": "success",
+          "name": "Post Run actions/checkout@v5",
+          "number": 10,
+          "started_at": "2026-09-11T08:43:09Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:09Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 11,
+          "started_at": "2026-09-11T08:43:09Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": null,
+      "conclusion": null,
+      "created_at": "2026-09-11T08:43:11Z",
+      "id": 103202876645,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "lint / uncrustify check",
+      "runner_group_name": "default",
+      "runner_name": "semantic-reasoning-i401-6-2",
+      "started_at": "2026-09-11T08:43:14Z",
+      "status": "in_progress",
+      "steps": [
+        {
+          "completed_at": "2026-09-11T08:43:06Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-11T08:43:04Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-11T08:43:08Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-11T08:43:06Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": null,
+          "conclusion": null,
+          "name": "Install uncrustify",
+          "number": 3,
+          "started_at": "2026-09-11T08:43:08Z",
+          "status": "in_progress"
+        },
+        {
+          "completed_at": null,
+          "conclusion": null,
+          "name": "Verify tool version",
+          "number": 4,
+          "started_at": null,
+          "status": "pending"
+        },
+        {
+          "completed_at": null,
+          "conclusion": null,
+          "name": "Run uncrustify (hard gate)",
+          "number": 5,
+          "started_at": null,
+          "status": "pending"
+        },
+        {
+          "completed_at": null,
+          "conclusion": null,
+          "name": "Publish results",
+          "number": 6,
+          "started_at": null,
+          "status": "pending"
+        },
+        {
+          "completed_at": null,
+          "conclusion": null,
+          "name": "Post Run actions/checkout@v5",
+          "number": 12,
+          "started_at": null,
+          "status": "pending"
+        }
+      ]
+    }
+  ],
+  "total_count": 5
+}
