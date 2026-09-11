@@ -4598,8 +4598,9 @@ test_tdd_recursive_exe = executable(
   # sources compiled with its own -D flags, which a prebuilt static library
   # cannot carry.  Same shape as test_relation_generations_oom above.
   c_args: host_machine.system() == 'linux' ?
-    ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_ALLOC_WRAP=1'] :
-    ['-DWL_TEST_BDX_SEED=1'],
+    ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_TDD_MERGE=1',
+     '-DWL_TEST_ALLOC_WRAP=1'] :
+    ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_TDD_MERGE=1'],
   link_args: host_machine.system() == 'linux' ? [
     '-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc',
   ] : [],
