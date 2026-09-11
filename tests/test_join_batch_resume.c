@@ -1251,16 +1251,11 @@ test_operator_empty_right_and_row_too_large(void)
         FAIL("second right");
         goto out;
     }
-    {
-        col_rel_t *slot = session_find_rel(sess, "right");
-        col_rel_free_contents(slot);
-        /* Keep the session's slot: move the populated contents into it. */
-        memcpy(slot, big_right, sizeof(*slot));
-        free(big_right);
-        big_right = NULL;
-        col_session_invalidate_arrangements(&sess->base, "right");
-        session_rel_free_hash(sess);
+    if (session_add_rel(sess, big_right) != 0) {
+        FAIL("replace right relation");
+        goto out;
     }
+    big_right = NULL;
     oracle = run_oracle(sess, left, &op);
     sess->join_batch_bytes = 1u;
     eval_stack_init(&stack);
