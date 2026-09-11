@@ -23,6 +23,7 @@
 
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -909,6 +910,64 @@ test_fastpath_counter_null_safe(void)
     PASS();
 }
 
+/* Issue #1495: consolidation must admit both the source and delta output
+ * owners before sorting or appending any rows. */
+static void
+test_source_exclusion_is_transactional(void)
+{
+    TEST("consolidation excludes readers before mutation");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(rel && delta_out, "test_rel_alloc failed");
+    int64_t old_row[] = { 10 };
+    int64_t new_row[] = { 20 };
+    ASSERT(test_rel_append_row(rel, old_row) == 0, "append old row");
+    ASSERT(test_rel_append_row(rel, new_row) == 0, "append new row");
+
+    int64_t *columns_before = rel->columns[0];
+    uint32_t rows_before = rel->nrows;
+    uint32_t delta_rows_before = delta_out->nrows;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    ASSERT(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "acquire source reader");
+    int rc = col_op_consolidate_incremental_delta(rel, 1, delta_out, NULL);
+    ASSERT(rc == EBUSY, "source reader blocks consolidation");
+    ASSERT(rel->columns[0] == columns_before
+        && rel->nrows == rows_before
+        && delta_out->nrows == delta_rows_before,
+        "source-blocked consolidation changed state");
+    ASSERT(col_rel_source_reader_release(&reader) == 0,
+        "release source reader");
+    ASSERT(col_op_consolidate_incremental_delta(rel, 1, delta_out, NULL) == 0,
+        "retry after source reader release");
+    ASSERT(delta_out->nrows == 1, "retry produced delta output");
+    test_rel_free(rel);
+    test_rel_free(delta_out);
+
+    rel = test_rel_alloc(1);
+    delta_out = test_rel_alloc(1);
+    ASSERT(rel && delta_out, "test_rel_alloc failed (delta reader)");
+    ASSERT(test_rel_append_row(rel, old_row) == 0, "append old row (delta)");
+    ASSERT(test_rel_append_row(rel, new_row) == 0, "append new row (delta)");
+    columns_before = rel->columns[0];
+    rows_before = rel->nrows;
+    ASSERT(col_rel_source_reader_acquire(delta_out, &reader) == 0,
+        "acquire delta reader");
+    rc = col_op_consolidate_incremental_delta(rel, 1, delta_out, NULL);
+    ASSERT(rc == EBUSY, "delta reader blocks consolidation");
+    ASSERT(rel->columns[0] == columns_before && rel->nrows == rows_before
+        && delta_out->nrows == 0,
+        "delta-blocked consolidation changed state");
+    ASSERT(col_rel_source_reader_release(&reader) == 0,
+        "release delta reader");
+    ASSERT(col_op_consolidate_incremental_delta(rel, 1, rel, NULL) == EINVAL,
+        "reject source/output alias");
+    test_rel_free(rel);
+    test_rel_free(delta_out);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -937,6 +996,7 @@ main(void)
     test_fastpath_counter_interleaved();
     test_fastpath_counter_null_safe();
     test_initialized_zero_column_relation();
+    test_source_exclusion_is_transactional();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);
