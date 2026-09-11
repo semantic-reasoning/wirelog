@@ -327,6 +327,43 @@ cleanup:
     col_rel_destroy(rel);
 }
 
+static void
+test_apply_reader_exclusion(void)
+{
+    TEST("#1495: reader blocks handle remap until explicit retry");
+
+    col_rel_t *rel = build_relation(40u, 1u);
+    wl_handle_remap_t *remap = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t handle_col = 0u;
+    uint64_t rewrites = 99u;
+    ASSERT(rel != NULL, "build_relation");
+    ASSERT(wl_handle_remap_create(40u, &remap) == 0,
+        "remap create");
+    for (uint32_t row = 0; row < 40u; row++)
+        ASSERT(wl_handle_remap_insert(remap, mk_old_handle(row, 0u),
+            mk_new_handle(row, 0u)) == 0, "remap insert");
+    int64_t before = rel->columns[0][0];
+    uint64_t generation = rel->view_generation;
+    ASSERT(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "reader acquire");
+    ASSERT(wl_handle_remap_apply_columns(rel, &handle_col, 1u, remap,
+        &rewrites) == EBUSY, "reader must block remap");
+    ASSERT(rewrites == 0u && rel->columns[0][0] == before
+        && rel->view_generation == generation,
+        "blocked remap must be transactional");
+    ASSERT(col_rel_source_reader_release(&reader) == 0,
+        "reader release");
+    rewrites = 0u;
+    ASSERT(wl_handle_remap_apply_columns(rel, &handle_col, 1u, remap,
+        &rewrites) == 0 && rewrites == 40u,
+        "remap retry must succeed");
+    PASS();
+cleanup:
+    wl_handle_remap_free(remap);
+    col_rel_destroy(rel);
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -341,6 +378,7 @@ main(void)
     test_apply_zero_handles_unchanged();
     test_apply_missing_handle_returns_eio();
     test_apply_invalid_args_einval();
+    test_apply_reader_exclusion();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);
