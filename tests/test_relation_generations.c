@@ -772,6 +772,7 @@ test_copy_and_shared_semantics(void)
     uint64_t old_view;
     uint64_t old_storage;
     CHECK(col_rel_append_row(src, &row) == 0, "copy seed");
+    src->declared_ncols = 7u;
     source_view = src->view_generation;
     source_storage = src->storage_generation;
     old_view = view->view_generation;
@@ -780,6 +781,8 @@ test_copy_and_shared_semantics(void)
     track_relation(copy);
     CHECK(copy->relation_identity != src->relation_identity,
         "deep copy receives a fresh identity");
+    CHECK(copy->declared_ncols == src->declared_ncols,
+        "deep copy preserves the declared column count");
     CHECK(copy->view_generation == src->view_generation
         && copy->storage_generation == src->storage_generation,
         "deep copy preserves the source snapshot generations");
@@ -2819,6 +2822,7 @@ test_staged_replacement_contract(void)
     int64_t *old_columns;
     char *old_name;
     col_rel_replacement_t replacement;
+    wl_columnar_source_access_writer_t writer = { 0 };
 
     CHECK(dst && candidate, "replacement setup");
     CHECK(col_rel_append_row(dst, &old_value) == 0
@@ -2841,8 +2845,12 @@ test_staged_replacement_contract(void)
         && dst->storage_generation == storage_before
         && dst->retained_reserved_bytes == reserved_before,
         "replacement preparation leaves destination unchanged");
-    CHECK(col_rel_commit_replacement_locked(dst, &replacement) == 0,
-        "replacement commit succeeds");
+    col_rel_commit_replacement_locked(dst, &replacement);
+    CHECK(wl_columnar_source_access_writer_acquire(
+            &dst->source_access, &writer) == 0,
+        "replacement commit releases its writer");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "replacement commit writer can be released");
     CHECK(dst->relation_identity == identity && dst->name == old_name
         && strcmp(dst->name, "generation_test") == 0
         && dst->columns[0] != old_columns
@@ -2883,9 +2891,9 @@ test_staged_replacement_contract(void)
             && col_rel_append_row(dst, &old_value) == 0
             && col_rel_append_row(candidate, &new_value) == 0,
             "replacement admission rows");
-        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
-            && col_rel_commit_replacement_locked(dst, &replacement) == 0,
-            "replacement admission commit");
+        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+            "replacement admission prepare");
+        col_rel_commit_replacement_locked(dst, &replacement);
         reserved_after = col_rel_transport_bytes(dst);
         CHECK(dst->retained_reserved_bytes == reserved_after
             && wl_columnar_memory_reserved(
@@ -2917,87 +2925,10 @@ test_staged_replacement_contract(void)
         "replacement reader denial preserves state");
     CHECK(col_rel_source_reader_release(&reader) == 0,
         "replacement reader release");
-    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
-        && col_rel_commit_replacement_locked(dst, &replacement) == 0,
-        "replacement retries after reader release");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "replacement retries after reader release prepare");
+    col_rel_commit_replacement_locked(dst, &replacement);
     cleanup_relations();
-
-#ifdef WL_TEST_REPLACEMENT_HOOK
-    {
-        wl_columnar_memory_resolution_t resolution = { 0 };
-        wl_columnar_memory_governor_ref_t *ref;
-        wl_columnar_source_access_reader_t reader = { 0 };
-        uint64_t reserved_before;
-        uint64_t view_before_failure;
-        uint64_t storage_before_failure;
-        uint64_t retained_before;
-        uint64_t reservation_state_before;
-        int64_t **columns_before;
-        int64_t value_before;
-
-        resolution.budget_bytes = 4096u;
-        resolution.usable_bytes = 4096u;
-        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
-        resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
-        resolution.status = WL_COLUMNAR_MEMORY_OK;
-        ref = wl_columnar_memory_governor_ref_create(&resolution);
-        dst = new_relation();
-        candidate = new_relation();
-        CHECK(ref && dst && candidate, "replacement commit failure setup");
-        CHECK(col_rel_attach_memory_governor(dst, ref) == 0
-            && col_rel_append_row(dst, &old_value) == 0
-            && col_rel_append_row(candidate, &new_value) == 0,
-            "replacement commit failure rows");
-        reserved_before = wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(ref));
-        retained_before = dst->retained_reserved_bytes;
-        reservation_state_before = atomic_load_explicit(
-            &dst->retained_reservation.state, memory_order_acquire);
-        columns_before = dst->columns;
-        value_before = dst->columns[0][0];
-        identity = dst->relation_identity;
-        view_before_failure = dst->view_generation;
-        storage_before_failure = dst->storage_generation;
-        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
-            "replacement commit failure prepare");
-        CHECK(wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) > reserved_before,
-            "replacement preparation holds staged reservation");
-        col_rel_test_fail_next_replacement_commit();
-        CHECK(col_rel_commit_replacement_locked(dst, &replacement) == EIO,
-            "injected replacement commit failure");
-        CHECK(dst->relation_identity == identity
-            && dst->columns == columns_before
-            && dst->columns[0][0] == value_before
-            && dst->view_generation == view_before_failure
-            && dst->storage_generation == storage_before_failure,
-            "injected commit failure preserves destination payload");
-        CHECK(dst->storage_owner == dst
-            && dst->storage_owner_generation == storage_before_failure,
-            "injected commit failure preserves destination ownership");
-        CHECK(dst->retained_reserved_bytes == retained_before,
-            "injected commit failure preserves destination reservation bytes");
-        CHECK(dst->retained_reservation.identity
-            == &dst->retained_reservation,
-            "injected commit failure preserves destination token identity");
-        CHECK(atomic_load_explicit(&dst->retained_reservation.state,
-            memory_order_acquire) == reservation_state_before,
-            "injected commit failure preserves destination token state");
-        CHECK(wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(ref)) == reserved_before,
-            "injected commit failure releases staged reservation");
-        CHECK(!replacement.staged && !replacement.writer_acquired
-            && !replacement.reservation_active,
-            "injected commit failure discards staged state and writer");
-        CHECK(col_rel_source_reader_acquire(dst, &reader) == 0,
-            "injected commit failure releases writer gate");
-        CHECK(col_rel_source_reader_release(&reader) == 0,
-            "injected commit failure reader release");
-        cleanup_relations();
-        if (ref)
-            wl_columnar_memory_governor_ref_release(ref);
-    }
-#endif
 
     dst = new_relation();
     candidate = new_relation();
