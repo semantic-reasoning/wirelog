@@ -228,6 +228,78 @@ test_source_reader_blocks_column_type_publication(void)
 }
 
 static void
+test_source_reader_blocks_compound_publication(void)
+{
+    col_rel_t *rel = new_relation();
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 3u, 1u
+    };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t *map_before;
+    wirelog_compound_kind_t kind_before;
+    uint32_t count_before;
+    uint32_t offset_before;
+    uint64_t view_before;
+
+    CHECK(rel != NULL, "compound publication relation");
+    map_before = rel->compound_arity_map;
+    kind_before = rel->compound_kind;
+    count_before = rel->compound_count;
+    offset_before = rel->inline_physical_offset;
+    view_before = rel->view_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "compound publication source reader");
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == EBUSY,
+        "compound publication denied by source reader");
+    CHECK(rel->compound_arity_map == map_before
+        && rel->compound_kind == kind_before
+        && rel->compound_count == count_before
+        && rel->inline_physical_offset == offset_before
+        && rel->view_generation == view_before,
+        "compound denial preserves metadata and generation");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "compound publication source reader release");
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == 0,
+        "compound publication retry succeeds");
+    CHECK(rel->compound_kind == WIRELOG_COMPOUND_KIND_SIDE
+        && rel->compound_arity_map && rel->compound_arity_map[0] == 1u
+        && rel->view_generation == view_before + 1u,
+        "compound retry publishes one view epoch");
+    cleanup_relations();
+}
+
+static void
+test_destination_reader_blocks_shared_view_publication(void)
+{
+    col_rel_t *src = new_relation();
+    col_rel_t *dst = new_relation();
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t view_before;
+
+    CHECK(src && dst, "shared-view compound relations");
+    CHECK(col_rel_apply_compound_schema(src, &logical, 1u) == 0,
+        "shared-view source compound metadata");
+    view_before = dst->view_generation;
+    CHECK(col_rel_source_reader_acquire(dst, &reader) == 0,
+        "shared-view destination reader");
+    CHECK(col_rel_install_shared_view(dst, src) == EBUSY,
+        "shared-view publication denied by destination reader");
+    CHECK(dst->view_generation == view_before && dst->storage_owner == dst,
+        "shared-view denial preserves destination state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "shared-view destination reader release");
+    CHECK(col_rel_install_shared_view(dst, src) == 0,
+        "shared-view publication retry succeeds");
+    CHECK(dst->view_generation != view_before
+        && dst->compound_kind == WIRELOG_COMPOUND_KIND_SIDE,
+        "shared-view retry publishes compound metadata");
+    cleanup_relations();
+}
+
+static void
 test_storage_only_cow_and_compaction(void)
 {
     col_rel_t *src = new_relation();
@@ -2241,6 +2313,8 @@ main(void)
 {
     test_same_row_count_mutation();
     test_source_reader_blocks_column_type_publication();
+    test_source_reader_blocks_compound_publication();
+    test_destination_reader_blocks_shared_view_publication();
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
