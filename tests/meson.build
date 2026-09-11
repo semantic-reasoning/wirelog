@@ -5398,6 +5398,9 @@ test_tdd_decision_stats_seq_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )
 test('tdd_decision_stats_nofusion', test_tdd_decision_stats_seq_exe, timeout: 300)
+test('mem_report_contract_selftest', bench_flowlog_json_py3,
+     args: [files('test_mem_report_contract_selftest.py')[0]],
+     suite: 'bench')
 test('mem_report_contract', bench_flowlog_json_py3,
      args: [files('test_mem_report_contract.py')[0],
             test_tdd_decision_stats_exe.full_path(),
