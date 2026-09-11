@@ -93,7 +93,7 @@ option('threads', type: 'combo', choices: ['native', 'posix'],
 ### Public API
 
 Every thread/sync primitive that wirelog uses internally is wrapped
-behind `thread_t`, `mutex_t`, `cond_t` defined in
+behind `wl_thread_t`, `wl_mutex_t`, `wl_cond_t` defined in
 `wirelog/thread.h:82-130`. These typedefs are **internal**; they are
 not part of the installed public surface, and downstream embedders
 must use the threading primitives of their own host process to drive
@@ -101,7 +101,7 @@ the library's `wirelog_session_*` calls.
 
 ### Mutex semantics
 
-All `mutex_t` instances are **non-recursive** (`wirelog/thread.h:104`).
+All `wl_mutex_t` instances are **non-recursive** (`wirelog/thread.h:104`).
 Windows `CRITICAL_SECTION` is recursive by default; wirelog code
 nevertheless must not rely on self-reentrance — the C11 and POSIX
 backends would deadlock.
@@ -110,23 +110,23 @@ backends would deadlock.
 
 ## 3. Thread abstraction surface
 
-The 9 public functions in `wirelog/thread.h` (which is an internal
+The 11 internal functions in `wirelog/thread.h` (which is an internal
 header, despite the qualifier "public" appearing in the doc comment):
 
 ```
-int  thread_create(thread_t *t, int (*start)(void *), void *arg);
-int  thread_join(thread_t *t, int *result);
+int  wl_thread_create(wl_thread_t *t, void *(*fn)(void *), void *arg);
+int  wl_thread_join(wl_thread_t *t);
 
-int  mutex_init(mutex_t *m);
-void mutex_destroy(mutex_t *m);
-int  mutex_lock(mutex_t *m);
-int  mutex_unlock(mutex_t *m);
+int  wl_mutex_init(wl_mutex_t *m);
+void wl_mutex_destroy(wl_mutex_t *m);
+int  wl_mutex_lock(wl_mutex_t *m);
+int  wl_mutex_unlock(wl_mutex_t *m);
 
-int  cond_init(cond_t *c);
-void cond_destroy(cond_t *c);
-int  cond_wait(cond_t *c, mutex_t *m);
-int  cond_signal(cond_t *c);
-int  cond_broadcast(cond_t *c);
+int  wl_cond_init(wl_cond_t *c);
+void wl_cond_destroy(wl_cond_t *c);
+int  wl_cond_wait(wl_cond_t *c, wl_mutex_t *m);
+int  wl_cond_signal(wl_cond_t *c);
+int  wl_cond_broadcast(wl_cond_t *c);
 ```
 
 The return-code contract follows pthread conventions: `0` on success,
@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **110**).
+match the script's count (currently **114**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -321,7 +321,7 @@ only used to exercise allocator exhaustion.
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `kfusion.c:col_op_k_fusion_dispatch` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `thread_create()` |
+| `kfusion.c:col_op_k_fusion_dispatch` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Issue #959: zeroed before branch tasks are submitted, so the happens-before edge comes from task submission itself -- same argument as `eval.c:399`, which resets the TDD counter before `wl_thread_create()` |
 
 The `stop` flag's `memory_order_relaxed` store is deliberate:
 cancellation is **cooperative**, not preemptive. A worker may observe
@@ -333,7 +333,7 @@ and the wasted work is bounded.
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `eval.c:wl_columnar_eval_nonrec_relation_parallel` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `thread_create()` itself |
+| `eval.c:wl_columnar_eval_nonrec_relation_parallel` | `shared_join_count` | `atomic_store_explicit` | `relaxed` | Reset before workers spawn; happens-before edge is provided by `wl_thread_create()` itself |
 
 ### 5.7 `wirelog/columnar/session.c` — worker budget snapshot (1 row)
 
@@ -440,7 +440,7 @@ named in the justification.
 21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 = **102 atomic call sites**
 before the inactive source-access contract below.
 
-### 5.13 `wirelog/columnar/source_access.h` — inactive source gate (8 rows)
+### 5.13 `wirelog/columnar/source_access.h` — inactive source gate (12 rows)
 
 This header-only gate is a testable internal contract and is not linked into
 the production library. Its state is zero-initialized; reader and writer
@@ -452,16 +452,20 @@ gate and token state unchanged.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
+| `source_access.h:wl_columnar_source_access_gate_busy` | `gate->state` | `atomic_load_explicit` | acquire | Check whether a reader or writer currently owns the source gate |
+| `source_access.h:wl_columnar_source_access_writer_claim` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Claim the terminal writer sentinel without racing active readers |
 | `source_access.h:wl_columnar_source_access_gate_init` | `gate->state` | `atomic_store_explicit` | relaxed | Establish inactive zero state before publication |
 | `source_access.h:wl_columnar_source_access_reader_acquire` | `gate->state` | `atomic_load_explicit` | acquire | Observe writer release before admitting a reader |
 | `source_access.h:wl_columnar_source_access_reader_acquire#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize reader admission without overflowing the writer sentinel |
+| `source_access.h:wl_columnar_source_access_reader_acquire_transferable` | `gate->state` | `atomic_load_explicit` | acquire | Observe writer release before admitting a transferable reader |
+| `source_access.h:wl_columnar_source_access_reader_acquire_transferable#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize transferable-reader admission without overflowing the writer sentinel |
 | `source_access.h:wl_columnar_source_access_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Observe the active gate before releasing this reader |
 | `source_access.h:wl_columnar_source_access_reader_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish reader payload completion and decrement atomically |
 | `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 
-21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 + 8 = **110 atomic call sites**.
+21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 + 12 = **114 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses

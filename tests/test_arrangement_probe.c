@@ -202,7 +202,7 @@ main(void)
     wl_columnar_source_access_writer_t writer = { 0 };
     wl_columnar_source_access_writer_t dependency_writer = { 0 };
     struct release_probe_arg release_arg = { &probe, 0 };
-    thread_t release_thread;
+    wl_thread_t release_thread;
     uint32_t key_cols[] = { 0 };
 
     test_alias_storage_owner_probe();
@@ -234,9 +234,9 @@ main(void)
         "exact-entry acquire does not re-enter name-based getter");
     CHECK(atomic_load_explicit(&source->source_access.state,
         memory_order_acquire) == 1, "probe holds one source reader");
-    CHECK(thread_create(&release_thread, release_probe_from_other_thread,
+    CHECK(wl_thread_create(&release_thread, release_probe_from_other_thread,
         &release_arg) == 0, "wrong-thread release setup");
-    CHECK(thread_join(&release_thread) == 0 && release_arg.rc == EINVAL,
+    CHECK(wl_thread_join(&release_thread) == 0 && release_arg.rc == EINVAL,
         "wrong-thread release is rejected");
     CHECK(probe.active && probe.arrangement_pin.active
         && entry->pin_count == 1
@@ -298,7 +298,7 @@ main(void)
             memory_order_acquire) == 1,
             "compound dependency leases coalesce by storage owner");
         CHECK(wl_columnar_source_access_writer_acquire(
-            &dependency->source_access, &dependency_writer) == EBUSY,
+                &dependency->source_access, &dependency_writer) == EBUSY,
             "compound dependency blocks its source writer");
         CHECK(col_arrangement_probe_bundle_release(&bundle) == 0
             && !bundle.active && bundle.dependency_count == 0
@@ -306,7 +306,7 @@ main(void)
             memory_order_acquire) == 0,
             "compound dependency release balances source reader");
         CHECK(wl_columnar_source_access_writer_acquire(
-            &dependency->source_access, &dependency_writer) == 0,
+                &dependency->source_access, &dependency_writer) == 0,
             "compound dependency writer succeeds after release");
         CHECK(wl_columnar_source_access_writer_release(&dependency_writer)
             == 0, "compound dependency writer release");
@@ -319,7 +319,7 @@ main(void)
         &bundle_probe) == 0, "compound rollback acquires primary probe");
     if (dependency) {
         CHECK(wl_columnar_source_access_writer_acquire(
-            &dependency->source_access, &dependency_writer) == 0,
+                &dependency->source_access, &dependency_writer) == 0,
             "compound rollback dependency writer setup");
         CHECK(col_arrangement_probe_bundle_acquire_dependency(&bundle,
             dependency) == EBUSY && bundle.count == 0
@@ -339,7 +339,7 @@ main(void)
         &bundle_probe) == 0, "partial rollback acquires first dependency");
     if (dependency && dependency_arr) {
         CHECK(wl_columnar_source_access_writer_acquire(
-            &dependency->source_access, &dependency_writer) == 0,
+                &dependency->source_access, &dependency_writer) == 0,
             "partial rollback dependency writer setup");
         CHECK(col_arrangement_probe_bundle_acquire(&bundle, session,
             dependency_arr, dependency, &second_probe) == EBUSY

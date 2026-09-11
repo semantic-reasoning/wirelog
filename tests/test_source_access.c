@@ -68,7 +68,7 @@ test_invalid_and_cross_thread(void)
     wl_columnar_source_access_gate_t gate = { 0 };
     wl_columnar_source_access_reader_t reader = { 0 }, copy;
     struct cross_thread_arg arg = { &reader, 0 };
-    thread_t thread;
+    wl_thread_t thread;
     wl_columnar_source_access_gate_init(&gate);
     CHECK(wl_columnar_source_access_reader_acquire(NULL, &reader) == EINVAL,
         "null gate rejected");
@@ -79,9 +79,9 @@ test_invalid_and_cross_thread(void)
     copy = reader;
     CHECK(wl_columnar_source_access_reader_release(&copy) == EINVAL,
         "copy rejected");
-    CHECK(thread_create(&thread, cross_thread_release, &arg) == 0,
+    CHECK(wl_thread_create(&thread, cross_thread_release, &arg) == 0,
         "cross-thread setup");
-    CHECK(thread_join(&thread) == 0 && arg.result == EINVAL,
+    CHECK(wl_thread_join(&thread) == 0 && arg.result == EINVAL,
         "cross-thread release rejected");
     CHECK(reader.owner == &gate
         && atomic_load_explicit(&gate.state, memory_order_relaxed) == 1,
@@ -98,9 +98,9 @@ test_invalid_and_cross_thread(void)
     copy = reader;
     CHECK(wl_columnar_source_access_reader_release(&copy) == EINVAL,
         "copied transferable reader release rejected");
-    CHECK(thread_create(&thread, cross_thread_release, &arg) == 0,
+    CHECK(wl_thread_create(&thread, cross_thread_release, &arg) == 0,
         "transferable cross-thread setup");
-    CHECK(thread_join(&thread) == 0 && arg.result == 0,
+    CHECK(wl_thread_join(&thread) == 0 && arg.result == 0,
         "transferable cross-thread release");
     CHECK(atomic_load_explicit(&gate.state, memory_order_relaxed) == 0
         && reader.owner == NULL, "transferable release balanced gate");
@@ -154,15 +154,15 @@ test_concurrent_readers(void)
     enum { THREADS = 4 };
     wl_columnar_source_access_gate_t gate = { 0 };
     struct stress_arg args[THREADS];
-    thread_t threads[THREADS];
+    wl_thread_t threads[THREADS];
     wl_columnar_source_access_gate_init(&gate);
     for (unsigned i = 0; i < THREADS; i++) {
         args[i] = (struct stress_arg){ &gate, 1000, 0 };
-        CHECK(thread_create(&threads[i], reader_stress, &args[i]) == 0,
+        CHECK(wl_thread_create(&threads[i], reader_stress, &args[i]) == 0,
             "reader stress create");
     }
     for (unsigned i = 0; i < THREADS; i++)
-        CHECK(thread_join(&threads[i]) == 0, "reader stress join");
+        CHECK(wl_thread_join(&threads[i]) == 0, "reader stress join");
     unsigned total = 0;
     for (unsigned i = 0; i < THREADS; i++)
         total += args[i].successes;
@@ -244,17 +244,17 @@ test_writer_publication(void)
     wl_columnar_source_access_gate_t gate = { 0 };
     atomic_int payload = 0;
     struct publication_arg arg = { &gate, &payload, 1 };
-    thread_t writer, reader;
+    wl_thread_t writer, reader;
     wl_columnar_source_access_gate_init(&gate);
     atomic_store_explicit(&arg.failed, 0, memory_order_relaxed);
     atomic_store_explicit(&arg.writer_active, 0, memory_order_relaxed);
     atomic_store_explicit(&arg.writer_successes, 0, memory_order_relaxed);
     atomic_store_explicit(&arg.reader_successes, 0, memory_order_relaxed);
-    CHECK(thread_create(&writer, publication_writer, &arg) == 0,
+    CHECK(wl_thread_create(&writer, publication_writer, &arg) == 0,
         "writer publication create");
-    CHECK(thread_create(&reader, publication_reader, &arg) == 0,
+    CHECK(wl_thread_create(&reader, publication_reader, &arg) == 0,
         "reader publication create");
-    CHECK(thread_join(&writer) == 0 && thread_join(&reader) == 0
+    CHECK(wl_thread_join(&writer) == 0 && wl_thread_join(&reader) == 0
         && atomic_load_explicit(&arg.failed, memory_order_relaxed) == 0
         && atomic_load_explicit(&arg.writer_successes, memory_order_relaxed) > 0
         && atomic_load_explicit(&arg.reader_successes, memory_order_relaxed) > 0
