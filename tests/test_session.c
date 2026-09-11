@@ -1309,6 +1309,62 @@ test_session_step_no_change(void)
 /* ======================================================================== */
 
 /*
+ * Test: direct removal admits a writer before reading or compacting storage.
+ */
+static void
+test_session_remove_admission(void)
+{
+    TEST("session: direct removal is admission-safe");
+
+    wl_plan_t *ffi = build_plan(".decl a(x: int32)\n");
+    if (!ffi) {
+        FAIL("could not generate FFI plan");
+        return;
+    }
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    int64_t value[] = { 1 };
+    if (rc != 0 || !session
+        || wl_session_insert(session, "a", value, 1, 1) != 0) {
+        if (session)
+            wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("session setup failed");
+        return;
+    }
+
+    col_rel_t *source = NULL;
+    for (uint32_t i = 0; i < COL_SESSION(session)->nrels; i++) {
+        if (strcmp(COL_SESSION(session)->rels[i]->name, "a") == 0) {
+            source = COL_SESSION(session)->rels[i];
+            break;
+        }
+    }
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t generation = source ? source->view_generation : 0;
+    uint32_t rows = source ? source->nrows : 0;
+    if (!source
+        || wl_columnar_source_access_reader_acquire(
+            &source->source_access, &reader) != 0
+        || wl_session_remove(session, "a", value, 1, 1) != EBUSY
+        || source->nrows != rows
+        || source->view_generation != generation
+        || wl_columnar_source_access_reader_release(&reader) != 0
+        || wl_session_remove(session, "a", value, 1, 1) != 0
+        || source->nrows != 0) {
+        if (reader.owner)
+            (void)wl_columnar_source_access_reader_release(&reader);
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("direct removal was not admission-safe");
+        return;
+    }
+    wl_session_destroy(session);
+    wl_plan_free(ffi);
+    PASS();
+}
+
+/*
  * Test: remove a tuple and step produces diff=-1 delta.
  *
  * RED: currently fails because dd_session_remove returns -1 (not implemented).
@@ -1358,6 +1414,28 @@ test_session_remove_single_delta(void)
 
     /* Reset and remove a=(1) */
     memset(&deltas, 0, sizeof(deltas));
+    col_rel_t *source = NULL;
+    for (uint32_t i = 0; i < COL_SESSION(session)->nrels; i++) {
+        if (strcmp(COL_SESSION(session)->rels[i]->name, "a") == 0) {
+            source = COL_SESSION(session)->rels[i];
+            break;
+        }
+    }
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t rows_before = source ? source->nrows : 0;
+    if (!source
+        || wl_columnar_source_access_reader_acquire(
+            &source->source_access, &reader) != 0
+        || wl_session_remove(session, "a", a_data, 1, 1) != EBUSY
+        || source->nrows != rows_before
+        || wl_columnar_source_access_reader_release(&reader) != 0) {
+        if (reader.owner)
+            (void)wl_columnar_source_access_reader_release(&reader);
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("incremental removal was not admission-safe");
+        return;
+    }
     rc = wl_session_remove(session, "a", a_data, 1, 1);
     if (rc != 0) {
         char msg[64];
@@ -1774,6 +1852,7 @@ main(void)
     test_session_create_multi_worker_rejected();
     test_session_step_initial_delta();
     test_session_step_incremental_delta();
+    test_session_remove_admission();
     test_session_step_no_change();
 
     /* GREEN: diff=-1 retraction deltas now implemented */
