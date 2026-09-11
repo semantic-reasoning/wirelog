@@ -521,6 +521,18 @@ typedef struct col_rel {
     wl_columnar_source_access_gate_t source_access;
 } col_rel_t;
 
+/* A private, fully staged publication for a canonical relation.  The staged
+ * relation owns every buffer until commit or discard; the writer token keeps
+ * the destination's canonical owner stable across that interval. */
+typedef struct col_rel_replacement {
+    col_rel_t *staged;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_source_access_writer_t writer;
+    uint64_t reserved_bytes;
+    bool reservation_active;
+    bool writer_acquired;
+} col_rel_replacement_t;
+
 #ifdef WL_TEST_APPEND_HOOK
 /* Test-only seam for the append ownership-transition window.  This is not
  * part of the installed/public header surface. */
@@ -1973,6 +1985,26 @@ void
 col_rel_destroy(col_rel_t *r);
 int
 col_rel_destroy_checked(col_rel_t *r);
+/* Prepare a private replacement without changing @dst.  @candidate must stay
+ * alive and immutable for the duration of this call; any borrowed/arena-backed
+ * storage it references must also remain stable.  The canonical writer
+ * remains held in @replacement until commit or discard. */
+int
+col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
+    col_rel_replacement_t *replacement);
+/* Publish a prepared replacement while its canonical writer is held.  This
+* path performs no allocation, schema construction, or memory admission. */
+int
+col_rel_commit_replacement_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement);
+/* Release a prepared replacement and its writer; safe after any prepare error
+ * and idempotent after commit. */
+void
+col_rel_discard_replacement(col_rel_replacement_t *replacement);
+#ifdef WL_TEST_REPLACEMENT_HOOK
+void
+col_rel_test_fail_next_replacement_commit(void);
+#endif
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names);
 int

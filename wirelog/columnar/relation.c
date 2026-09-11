@@ -3545,6 +3545,402 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
     return 0;
 }
 
+static int
+col_rel_replacement_compound_entries(const col_rel_t *candidate,
+    uint32_t *out_entries)
+{
+    uint32_t entries = 0;
+    uint32_t physical_count = 0;
+
+    if (!candidate || !out_entries)
+        return EINVAL;
+    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
+        *out_entries = 0;
+        return 0;
+    }
+    if (!candidate->compound_arity_map || candidate->ncols == 0)
+        return EINVAL;
+    while (physical_count < candidate->ncols) {
+        uint32_t arity = candidate->compound_arity_map[entries];
+        if (arity == 0 || arity > candidate->ncols - physical_count)
+            return EINVAL;
+        physical_count += arity;
+        entries++;
+    }
+    *out_entries = entries;
+    return 0;
+}
+
+static int
+col_rel_replacement_validate_candidate(const col_rel_t *candidate)
+{
+    uint64_t ignored_bytes;
+    uint32_t compound_entries;
+
+    if (!candidate || candidate->nrows > candidate->capacity
+        || !wl_columnar_relation_generation_valid(
+            candidate->view_generation)
+        || !wl_columnar_relation_generation_valid(
+            candidate->storage_generation))
+        return EINVAL;
+    if (candidate->view_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || candidate->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
+        candidate->timestamps != NULL, &ignored_bytes))
+        return EOVERFLOW;
+    if (candidate->ncols > 0 && candidate->capacity > 0) {
+        if (!candidate->columns)
+            return EINVAL;
+        for (uint32_t c = 0; c < candidate->ncols; c++)
+            if (!candidate->columns[c])
+                return EINVAL;
+    }
+    if (candidate->has_graph_column
+        && candidate->graph_col_idx >= candidate->ncols)
+        return EINVAL;
+    if (candidate->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && candidate->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+        && candidate->compound_kind != WIRELOG_COMPOUND_KIND_SIDE)
+        return EINVAL;
+    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
+        if (candidate->compound_arity_map || candidate->compound_count != 0
+            || candidate->inline_physical_offset != 0)
+            return EINVAL;
+    }
+    if (col_rel_replacement_compound_entries(candidate, &compound_entries)
+        != 0)
+        return EINVAL;
+    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+        if (candidate->compound_count == 0
+            || candidate->compound_count > compound_entries
+            || candidate->inline_physical_offset >= candidate->ncols)
+            return EINVAL;
+    } else if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_SIDE
+        && (candidate->compound_count != 0
+        || candidate->inline_physical_offset != 0)) {
+        return EINVAL;
+    }
+    return 0;
+}
+
+static bool
+col_rel_replacement_old_reservation_valid(const col_rel_t *dst)
+{
+    uint64_t state;
+
+    if (!dst || dst->retained_reserved_bytes == 0)
+        return true;
+    if (dst->retained_reservation.identity != &dst->retained_reservation)
+        return false;
+    state = atomic_load_explicit(&dst->retained_reservation.state,
+            memory_order_acquire);
+    return state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
+}
+
+int
+col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
+    col_rel_replacement_t *replacement)
+{
+    uint64_t planned_bytes;
+    uint64_t staged_bytes;
+    uint32_t compound_entries;
+    int rc;
+
+    if (!dst || !candidate || !replacement || dst == candidate)
+        return EINVAL;
+    memset(replacement, 0, sizeof(*replacement));
+    wl_columnar_memory_reservation_init(&replacement->reservation);
+
+    rc = col_rel_replacement_validate_candidate(candidate);
+    if (rc != 0)
+        return rc;
+    if (dst->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || dst->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    if (!col_rel_replacement_old_reservation_valid(dst))
+        return EINVAL;
+    if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
+        candidate->timestamps != NULL, &planned_bytes))
+        return EOVERFLOW;
+
+    rc = col_rel_published_writer_acquire(dst, &replacement->writer);
+    if (rc != 0)
+        return rc;
+    replacement->writer_acquired = true;
+
+    /* Reserve the complete private shape before deep_copy allocates it.  The
+     * candidate may borrow arena/shared storage, but publication always owns
+     * its replacement, so admission is based on the full retained shape. */
+    replacement->reserved_bytes = planned_bytes;
+    if (dst->memory_governor && planned_bytes > 0) {
+        wl_columnar_memory_admission_status_t status;
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(dst->memory_governor);
+
+        status = wl_columnar_memory_reserve_checked(governor, planned_bytes,
+                &replacement->reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            goto allocation_failure;
+        if (!wl_columnar_memory_commit(&replacement->reservation, dst))
+            goto allocation_failure;
+        replacement->reservation_active = true;
+    }
+
+    rc = col_rel_deep_copy(candidate, &replacement->staged, NULL);
+    if (rc != 0)
+        goto fail;
+    replacement->staged->declared_ncols = candidate->declared_ncols;
+    /* col_rel_deep_copy historically degrades malformed compound metadata to
+     * NONE.  A publication primitive must reject that loss instead of
+     * silently publishing a different schema. */
+    if (replacement->staged->compound_kind != candidate->compound_kind
+        || replacement->staged->compound_count != candidate->compound_count
+        || replacement->staged->inline_physical_offset
+        != candidate->inline_physical_offset)
+        goto invalid;
+    if (candidate->compound_arity_map) {
+        if (col_rel_replacement_compound_entries(candidate,
+            &compound_entries) != 0
+            || !replacement->staged->compound_arity_map
+            || memcmp(replacement->staged->compound_arity_map,
+            candidate->compound_arity_map,
+            (size_t)compound_entries * sizeof(uint32_t)) != 0)
+            goto invalid;
+    }
+
+    staged_bytes = col_rel_transport_bytes(replacement->staged);
+    if (staged_bytes == UINT64_MAX || staged_bytes != planned_bytes)
+        goto overflow;
+    return 0;
+
+invalid:
+    rc = EINVAL;
+    goto fail;
+overflow:
+    rc = EOVERFLOW;
+    goto fail;
+allocation_failure:
+    rc = ENOMEM;
+fail:
+    col_rel_discard_replacement(replacement);
+    return rc;
+}
+
+#ifdef WL_TEST_REPLACEMENT_HOOK
+static bool col_rel_fail_next_replacement_commit;
+
+void
+col_rel_test_fail_next_replacement_commit(void)
+{
+    col_rel_fail_next_replacement_commit = true;
+}
+#endif
+
+int
+col_rel_commit_replacement_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement)
+{
+    col_rel_t old;
+    col_rel_t *staged;
+    wl_columnar_memory_reservation_t old_reservation;
+    char *name;
+    char *staged_name;
+    wl_mem_ledger_t *ledger;
+    wl_columnar_memory_governor_ref_t *governor;
+    uint64_t identity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t ledger_before;
+    uint64_t ledger_ts_bytes;
+    uint64_t gate_state;
+    uint64_t reserved_bytes;
+    bool old_reservation_moved = false;
+    bool has_new_reservation;
+    int rc = EINVAL;
+
+    if (!dst || !replacement || !replacement->staged
+        || !replacement->writer_acquired
+        || replacement->writer.owner != &dst->source_access
+        || !wl_columnar_source_access_writer_thread_equal(
+            &replacement->writer))
+        return EINVAL;
+    staged = replacement->staged;
+    if (staged->nrows > staged->capacity
+        || dst->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || dst->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || !col_rel_replacement_old_reservation_valid(dst))
+        goto fail;
+
+#ifdef WL_TEST_REPLACEMENT_HOOK
+    if (col_rel_fail_next_replacement_commit) {
+        col_rel_fail_next_replacement_commit = false;
+        rc = EIO;
+        goto fail;
+    }
+#endif
+
+    has_new_reservation = replacement->reservation_active;
+    wl_columnar_memory_reservation_init(&old_reservation);
+    if (dst->retained_reserved_bytes > 0) {
+        if (!wl_columnar_memory_reservation_move(&old_reservation,
+            &dst->retained_reservation))
+            goto fail;
+        old_reservation_moved = true;
+    }
+    if (has_new_reservation
+        && !wl_columnar_memory_reservation_move(
+            &dst->retained_reservation, &replacement->reservation)) {
+        if (old_reservation_moved) {
+            bool restored = wl_columnar_memory_reservation_move(
+                &dst->retained_reservation, &old_reservation);
+            if (!restored)
+                abort();
+        }
+        goto fail;
+    }
+    if (old_reservation_moved
+        && !wl_columnar_memory_release(&old_reservation)) {
+        if (has_new_reservation) {
+            bool restored_new = wl_columnar_memory_reservation_move(
+                &replacement->reservation, &dst->retained_reservation);
+            if (!restored_new)
+                abort();
+        }
+        {
+            bool restored_old = wl_columnar_memory_reservation_move(
+                &dst->retained_reservation, &old_reservation);
+            if (!restored_old)
+                abort();
+        }
+        goto fail;
+    }
+
+    /* All fallible admission/token operations are complete.  From here to
+     * publication there are no allocations or reservation moves. */
+    old = *dst;
+    name = old.name;
+    staged_name = staged->name;
+    ledger = old.mem_ledger;
+    governor = old.memory_governor;
+    identity = old.relation_identity;
+    view_generation = old.view_generation;
+    storage_generation = old.storage_generation;
+    ledger_before = col_rel_owned_ledger_bytes(&old);
+    ledger_ts_bytes = old.ledger_ts_bytes;
+    gate_state = atomic_load_explicit(&old.source_access.state,
+            memory_order_acquire);
+    reserved_bytes = has_new_reservation ? replacement->reserved_bytes : 0;
+
+#define COL_REL_REPLACEMENT_COPY(field) dst->field = staged->field
+    COL_REL_REPLACEMENT_COPY(ncols);
+    COL_REL_REPLACEMENT_COPY(columns);
+    COL_REL_REPLACEMENT_COPY(column_types);
+    COL_REL_REPLACEMENT_COPY(nrows);
+    COL_REL_REPLACEMENT_COPY(capacity);
+    COL_REL_REPLACEMENT_COPY(col_names);
+    COL_REL_REPLACEMENT_COPY(schema);
+    COL_REL_REPLACEMENT_COPY(schema_ok);
+    COL_REL_REPLACEMENT_COPY(sorted_nrows);
+    COL_REL_REPLACEMENT_COPY(merge_columns);
+    COL_REL_REPLACEMENT_COPY(merge_buf_cap);
+    COL_REL_REPLACEMENT_COPY(base_nrows);
+    COL_REL_REPLACEMENT_COPY(timestamps);
+    COL_REL_REPLACEMENT_COPY(arena_owned);
+    COL_REL_REPLACEMENT_COPY(row_scratch);
+    COL_REL_REPLACEMENT_COPY(retract_backup_columns);
+    COL_REL_REPLACEMENT_COPY(retract_backup_nrows);
+    COL_REL_REPLACEMENT_COPY(retract_backup_capacity);
+    COL_REL_REPLACEMENT_COPY(retract_backup_sorted_nrows);
+    COL_REL_REPLACEMENT_COPY(col_shared);
+    COL_REL_REPLACEMENT_COPY(run_count);
+    memcpy(dst->run_ends, staged->run_ends, sizeof(dst->run_ends));
+    COL_REL_REPLACEMENT_COPY(retract_backup_run_count);
+    memcpy(dst->retract_backup_run_ends, staged->retract_backup_run_ends,
+        sizeof(dst->retract_backup_run_ends));
+    COL_REL_REPLACEMENT_COPY(dedup_slots);
+    COL_REL_REPLACEMENT_COPY(dedup_cap);
+    COL_REL_REPLACEMENT_COPY(dedup_count);
+    COL_REL_REPLACEMENT_COPY(has_graph_column);
+    COL_REL_REPLACEMENT_COPY(graph_col_idx);
+    COL_REL_REPLACEMENT_COPY(compound_kind);
+    COL_REL_REPLACEMENT_COPY(compound_count);
+    COL_REL_REPLACEMENT_COPY(compound_arity_map);
+    COL_REL_REPLACEMENT_COPY(inline_physical_offset);
+    COL_REL_REPLACEMENT_COPY(declared_ncols);
+#undef COL_REL_REPLACEMENT_COPY
+
+    dst->name = name;
+    dst->pool_owned = old.pool_owned;
+    dst->mem_ledger = ledger;
+    dst->memory_governor = governor;
+    dst->retained_reserved_bytes = reserved_bytes;
+    dst->ledger_ts_bytes = ledger_ts_bytes;
+    dst->relation_identity = identity;
+    dst->view_generation = view_generation;
+    dst->storage_generation = storage_generation;
+    dst->storage_owner = dst;
+    dst->storage_owner_identity = identity;
+    dst->storage_owner_generation = storage_generation;
+    dst->storage_alias_borrows = 0;
+    atomic_store_explicit(&dst->source_access.state, gate_state,
+        memory_order_release);
+
+    staged->name = NULL;
+    free(staged_name);
+    free(staged);
+    replacement->staged = NULL;
+    replacement->reservation_active = false;
+    replacement->reserved_bytes = 0;
+
+    col_rel_ledger_reconcile(dst, ledger_before);
+    wl_columnar_relation_touch_replacement(dst);
+
+    old.name = NULL;
+    old.mem_ledger = NULL;
+    old.memory_governor = NULL;
+    old.retained_reserved_bytes = 0;
+    old.ledger_ts_bytes = 0;
+    old.storage_owner = &old;
+    old.storage_owner_identity = old.relation_identity;
+    old.storage_alias_borrows = 0;
+    col_rel_storage_owner_init(&old);
+    col_rel_free_contents(&old);
+
+    rc = wl_columnar_source_access_writer_release(&replacement->writer);
+    replacement->writer_acquired = false;
+    return rc == 0 ? 0 : EINVAL;
+
+fail:
+    col_rel_discard_replacement(replacement);
+    return rc;
+}
+
+void
+col_rel_discard_replacement(col_rel_replacement_t *replacement)
+{
+    if (!replacement)
+        return;
+    if (replacement->staged) {
+        col_rel_destroy(replacement->staged);
+        replacement->staged = NULL;
+    }
+    if (replacement->reservation_active) {
+        (void)wl_columnar_memory_release(&replacement->reservation);
+        replacement->reservation_active = false;
+    }
+    if (replacement->writer_acquired) {
+        (void)wl_columnar_source_access_writer_release(
+            &replacement->writer);
+        replacement->writer_acquired = false;
+    }
+    replacement->reserved_bytes = 0;
+}
+
 /* ---- radix sort by single key column ----------------------------------- */
 
 /*
