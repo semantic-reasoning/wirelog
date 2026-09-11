@@ -782,8 +782,8 @@ col_rel_attach_memory_governor(col_rel_t *r,
     return 0;
 }
 
-int
-col_rel_enable_timestamps(col_rel_t *r)
+static int
+col_rel_enable_timestamps_locked(col_rel_t *r)
 {
     wl_columnar_memory_reservation_t pending;
     int reserve_rc;
@@ -826,6 +826,54 @@ col_rel_enable_timestamps(col_rel_t *r)
 fail:
     col_rel_reservation_rollback(&pending);
     return ENOMEM;
+}
+
+int
+col_rel_enable_timestamps(col_rel_t *r)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+
+    /* Read the no-op state only under a lease. This preserves idempotent
+     * calls while excluding a concurrent timestamp publisher. */
+    rc = col_rel_source_reader_acquire(r, &reader);
+    if (rc != 0)
+        return rc;
+    if (r->timestamps || r->capacity == 0) {
+        rc = 0;
+        release_rc = col_rel_source_reader_release(&reader);
+        return release_rc != 0 ? release_rc : rc;
+    }
+    rc = col_rel_source_reader_release(&reader);
+    if (rc != 0)
+        return rc;
+
+    /* Recheck after exclusive admission: the initial reader check may have
+     * raced with another publisher. Alias policy applies only if storage
+     * still needs to be published. */
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_source_access_writer_acquire(
+        &owner->source_access, &writer);
+    if (rc != 0)
+        return rc;
+    if (r->timestamps || r->capacity == 0)
+        rc = 0;
+    else if (r == owner && owner->storage_alias_borrows > 0)
+        rc = EBUSY;
+    else
+        rc = col_rel_enable_timestamps_locked(r);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 /*
