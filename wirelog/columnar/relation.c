@@ -1871,8 +1871,9 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
             /* Heap-owned growth uses the same admission transaction as
              * append_row.  The helper reconciles the ledger and advances
              * storage generation exactly once. */
-            if (col_rel_reserve_capacity_admitted(dst, new_cap, NULL) != 0)
-                goto fail_prepared;
+            rc = col_rel_reserve_capacity_admitted(dst, new_cap, NULL);
+            if (rc != 0)
+                goto cleanup;
             transitioned = true;
         }
         if (!transitioned) {
@@ -1941,8 +1942,6 @@ invalid:
 overflow:
     rc = EOVERFLOW;
     goto cleanup;
-allocation_failure:
-    rc = ENOMEM;
 cleanup:
     free(prepared_types);
     if (prepared_schema_ok)
