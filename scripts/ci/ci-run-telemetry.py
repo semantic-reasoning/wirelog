@@ -869,7 +869,8 @@ def match_graph_to_jobs(graph: dict, job_names: list) -> tuple:
     the names the API actually reported.  Returns (edges by job name, drift)."""
     # Most specific first: a matrix node such as `Build / .+ / .+` would
     # otherwise shadow the literal `Build / ubuntu-latest / gcc` whenever it
-    # happened to be declared earlier, and #1574 reorders jobs.
+    # happened to be declared earlier, and the workflow's job order is not
+    # something any issue has promised to hold still.
     # R7: placeholder text adds length without adding specificity, so measure
     # the literal part only.
     ordered = sorted(graph, key=lambda node: (node.count("${{"),
@@ -1196,7 +1197,7 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
 
     jobs_by_name = {j.get("name"): j for j in jobs}
     # Until the run is known to have ended, every run-level figure is a lower
-    # bound: a check that has not reported cannot raise it, and #1574 would
+    # bound: a check that has not reported cannot raise it, and a reader would
     # quote it as final.  A status this tool cannot read counts as not known
     # to have ended, while the walkers treat it as stopped -- each errs in
     # the direction that cannot overstate.
