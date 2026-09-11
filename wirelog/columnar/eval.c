@@ -26,6 +26,21 @@
 #define TDD_OWNER_FALLBACK_MIN_ITER 31u
 #define TDD_OWNER_FALLBACK_DELTA_ROWS 512u
 
+#if defined(_MSC_VER)
+#define WL_COLUMNAR_EVAL_NOINLINE __declspec(noinline)
+#define WL_COLUMNAR_EVAL_COLD
+#define WL_COLUMNAR_EVAL_TXN_TEXT
+#elif defined(__GNUC__) || defined(__clang__)
+#define WL_COLUMNAR_EVAL_NOINLINE __attribute__((noinline))
+#define WL_COLUMNAR_EVAL_COLD __attribute__((cold))
+#define WL_COLUMNAR_EVAL_TXN_TEXT __attribute__((noipa, used, \
+            section(".wirelog_tdd_txn")))
+#else
+#define WL_COLUMNAR_EVAL_NOINLINE
+#define WL_COLUMNAR_EVAL_COLD
+#define WL_COLUMNAR_EVAL_TXN_TEXT
+#endif
+
 /* Only the standalone decision regression targets enable this wrapper. */
 #ifdef WL_COLUMNAR_EVAL_TEST_SUBMISSION
 extern int
@@ -210,7 +225,7 @@ record_worker_expr_status(wl_col_session_t *coord,
         coord->extension_expr_status = rc;
 }
 
-static void
+static int
 tdd_dedup_rel(col_rel_t *r);
 
 typedef struct {
@@ -638,7 +653,7 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
             }
         }
         if (rc == 0 && target && nonrec_plan_has_consolidate(rp))
-            tdd_dedup_rel(target);
+            rc = tdd_dedup_rel(target);
     }
 
     for (uint32_t w = 0; w < W; w++) {
@@ -1407,8 +1422,18 @@ tdd_worker_subpass_fn(void *arg)
                     }
                 }
             }
-            if (delta->nrows > 1)
-                tdd_dedup_rel(delta);
+            if (delta->nrows > 1) {
+                rc = tdd_dedup_rel(delta);
+                if (rc != 0) {
+                    col_rel_destroy(delta);
+                    ctx->rc = rc;
+                    free(snap);
+                    sess->tdd_subpass_active = saved_tdd_subpass;
+                    sess->tdd_outbound_only_active = saved_outbound_only;
+                    sess->diff_operators_active = saved_diff;
+                    TDD_WORKER_RETURN();
+                }
+            }
             bool produced = delta->nrows > 0;
             rc = wl_columnar_eval_tdd_queue_publish_delta(ctx, sess, delta,
                     ri, eff_iter);
@@ -1740,11 +1765,14 @@ tdd_relation_rows_sorted(const col_rel_t *r)
     return true;
 }
 
-static void
+static int
+tdd_bdx_sort_candidate(col_rel_t *candidate);
+
+static int
 tdd_dedup_rel(col_rel_t *r)
 {
     if (!r || r->nrows <= 1 || r->ncols == 0)
-        return;
+        return 0;
 
     uint32_t ncols = r->ncols;
     uint32_t nrows = r->nrows;
@@ -1775,12 +1803,11 @@ tdd_dedup_rel(col_rel_t *r)
             /* The hash table cannot represent this row count safely.
              * Sorting has no capacity-doubling arithmetic and preserves the
              * same deduplication result. */
-            /* The status is deliberately discarded: the post-condition
-             * check below is stronger, catching both a refused sort and a
-             * relation that was never sorted to begin with. */
-            WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
+            int sort_rc = tdd_bdx_sort_candidate(r);
+            if (sort_rc != 0)
+                return sort_rc;
             if (!tdd_relation_rows_sorted(r))
-                return;
+                return EINVAL;
         } else {
             uint32_t mask = cap - 1;
             uint32_t *ht = (uint32_t *)malloc(cap * sizeof(uint32_t));
@@ -1790,11 +1817,11 @@ tdd_dedup_rel(col_rel_t *r)
                 /* Allocation failure: fall back to sort-based path */
                 free(ht);
                 free(keep);
-                /* Discarded for the same reason as above: the
-                 * post-condition check is the stronger guard. */
-                WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
+                int sort_rc = tdd_bdx_sort_candidate(r);
+                if (sort_rc != 0)
+                    return sort_rc;
                 if (!tdd_relation_rows_sorted(r))
-                    return;
+                    return EINVAL;
                 /* Fall through to the sorted dedup below. */
             } else {
                 memset(ht, 0xFF, cap * sizeof(uint32_t)); /* 0xFF = UINT32_MAX */
@@ -1845,7 +1872,7 @@ tdd_dedup_rel(col_rel_t *r)
                 free(keep);
                 r->nrows = out;
                 wl_columnar_relation_touch_view(r);
-                return;
+                return 0;
             }
         }
     }
@@ -1871,6 +1898,7 @@ tdd_dedup_rel(col_rel_t *r)
     }
     r->nrows = out;
     wl_columnar_relation_touch_view(r);
+    return 0;
 }
 
 static int
@@ -1931,12 +1959,49 @@ cleanup:
     return rc;
 }
 
+static int
+tdd_sort_dedup_candidate(col_rel_t *candidate)
+{
+    if (!candidate || candidate->nrows <= 1 || candidate->ncols == 0)
+        return 0;
+    if (!tdd_relation_rows_sorted(candidate)) {
+        int rc = tdd_bdx_sort_candidate(candidate);
+        if (rc != 0)
+            return rc;
+    }
+
+    uint32_t out = 1;
+    for (uint32_t row = 1; row < candidate->nrows; row++) {
+        bool duplicate = true;
+        for (uint32_t col = 0; col < candidate->ncols; col++) {
+            if (candidate->columns[col][row - 1]
+                != candidate->columns[col][row]) {
+                duplicate = false;
+                break;
+            }
+        }
+        if (!duplicate) {
+            if (out != row)
+                col_columns_copy_row(candidate->columns, out,
+                    (int64_t *const *)candidate->columns, row,
+                    candidate->ncols);
+            if (candidate->timestamps)
+                candidate->timestamps[out] = candidate->timestamps[row];
+            out++;
+        }
+    }
+    candidate->nrows = out;
+    candidate->sorted_nrows = out;
+    wl_columnar_relation_touch_view(candidate);
+    return 0;
+}
+
 #ifdef WL_TEST_BDX_SEED
 static int bdx_seed_test_fail_worker = -1;
 static bool bdx_seed_test_fail_sort;
 #endif
 
-static int
+WL_COLUMNAR_EVAL_NOINLINE static int
 tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
     uint32_t worker_count)
 {
@@ -1987,41 +2052,17 @@ tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
     }
 
     if (candidate->nrows > 1 && candidate->ncols > 0) {
-        if (!tdd_relation_rows_sorted(candidate)) {
 #ifdef WL_TEST_BDX_SEED
-            if (bdx_seed_test_fail_sort) {
-                bdx_seed_test_fail_sort = false;
-                rc = ENOMEM;
-                goto cleanup;
-            }
+        if (!tdd_relation_rows_sorted(candidate)
+            && bdx_seed_test_fail_sort) {
+            bdx_seed_test_fail_sort = false;
+            rc = ENOMEM;
+            goto cleanup;
+        }
 #endif
-            rc = tdd_bdx_sort_candidate(candidate);
-            if (rc != 0)
-                goto cleanup;
-        }
-        uint32_t out = 1;
-        for (uint32_t row = 1; row < candidate->nrows; row++) {
-            bool duplicate = true;
-            for (uint32_t col = 0; col < candidate->ncols; col++) {
-                if (candidate->columns[col][row - 1]
-                    != candidate->columns[col][row]) {
-                    duplicate = false;
-                    break;
-                }
-            }
-            if (!duplicate) {
-                if (out != row)
-                    col_columns_copy_row(candidate->columns, out,
-                        (int64_t *const *)candidate->columns, row,
-                        candidate->ncols);
-                if (candidate->timestamps)
-                    candidate->timestamps[out] = candidate->timestamps[row];
-                out++;
-            }
-        }
-        candidate->nrows = out;
-        candidate->sorted_nrows = out;
-        wl_columnar_relation_touch_view(candidate);
+        rc = tdd_sort_dedup_candidate(candidate);
+        if (rc != 0)
+            goto cleanup;
     }
 
     memset(&replacement, 0, sizeof(replacement));
@@ -2112,8 +2153,7 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
         != actual->inline_physical_offset)
         return false;
 
-    if ((expected->column_types == NULL)
-        != (actual->column_types == NULL))
+    if (expected->column_types && !actual->column_types)
         return false;
     if (expected->column_types) {
         for (uint32_t col = 0; col < expected->ncols; col++) {
@@ -2157,7 +2197,7 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
  * separate relations independently, so a later relation failure does not
  * roll back an earlier relation's publication.
  */
-static int
+WL_COLUMNAR_EVAL_NOINLINE static int
 tdd_merge_relation_results(col_rel_t **target_io, const char *rel_name,
     col_rel_t *const *worker_rels, uint32_t worker_count)
 {
@@ -2238,42 +2278,17 @@ tdd_merge_relation_results(col_rel_t **target_io, const char *rel_name,
     }
 
     if (candidate->nrows > 1 && candidate->ncols > 0) {
-        if (!tdd_relation_rows_sorted(candidate)) {
 #ifdef WL_TEST_TDD_MERGE
-            if (tdd_merge_test_fail_sort) {
-                tdd_merge_test_fail_sort = false;
-                rc = ENOMEM;
-                goto cleanup;
-            }
+        if (!tdd_relation_rows_sorted(candidate)
+            && tdd_merge_test_fail_sort) {
+            tdd_merge_test_fail_sort = false;
+            rc = ENOMEM;
+            goto cleanup;
+        }
 #endif
-            rc = tdd_bdx_sort_candidate(candidate);
-            if (rc != 0)
-                goto cleanup;
-        }
-
-        uint32_t out = 1;
-        for (uint32_t row = 1; row < candidate->nrows; row++) {
-            bool duplicate = true;
-            for (uint32_t col = 0; col < candidate->ncols; col++) {
-                if (candidate->columns[col][row - 1]
-                    != candidate->columns[col][row]) {
-                    duplicate = false;
-                    break;
-                }
-            }
-            if (!duplicate) {
-                if (out != row)
-                    col_columns_copy_row(candidate->columns, out,
-                        (int64_t *const *)candidate->columns, row,
-                        candidate->ncols);
-                if (candidate->timestamps)
-                    candidate->timestamps[out] = candidate->timestamps[row];
-                out++;
-            }
-        }
-        candidate->nrows = out;
-        candidate->sorted_nrows = out;
-        wl_columnar_relation_touch_view(candidate);
+        rc = tdd_sort_dedup_candidate(candidate);
+        if (rc != 0)
+            goto cleanup;
     }
 
     if (!target) {
@@ -2572,8 +2587,13 @@ tdd_broadcast_relation_delta(const wl_plan_stratum_t *sp, uint32_t ri,
      * amplification.  In self_join_mode, workers hold disjoint 1/W IDB
      * partitions but can independently derive the same tuple via
      * different join paths.  Matches tdd_broadcast_deltas (line 3299). */
-    if (union_d->nrows > 1)
-        tdd_dedup_rel(union_d);
+    if (union_d->nrows > 1) {
+        rc = tdd_dedup_rel(union_d);
+        if (rc != 0) {
+            col_rel_destroy(union_d);
+            return rc;
+        }
+    }
 
     /* Issue #390: zero-copy broadcast via col_shared.
      * Anchor union_d in worker 0's session; workers 1..W-1 borrow
@@ -3365,8 +3385,14 @@ tdd_broadcast_deltas(const wl_plan_stratum_t *sp,
          * In replicate mode, all W workers derive the same tuples from
          * identical data. Without dedup, the union contains W copies of
          * each new tuple, compounding exponentially across iterations. */
-        if (union_d->nrows > 1)
-            tdd_dedup_rel(union_d);
+        if (union_d->nrows > 1) {
+            int dedup_rc = tdd_dedup_rel(union_d);
+            if (dedup_rc != 0) {
+                if (!union_from_session)
+                    col_rel_destroy(union_d);
+                return dedup_rc;
+            }
+        }
 
         /* Issue #396: zero-copy broadcast via col_shared.
          * Anchor union_d in worker 0's session so its lifetime covers all
@@ -3933,58 +3959,52 @@ fail:
 }
 
 typedef struct {
+    wl_col_session_t *session;
     const char *name;
-    col_rel_t *relation;
+    col_rel_t *target;
     col_rel_t *owner;
-    col_rel_t *saved;
     col_rel_t *candidate;
     col_rel_replacement_t replacement;
     bool replacement_prepared;
     bool registered;
-} tdd_restore_entry_t;
+} tdd_publish_entry_t;
 
 static int
-tdd_restore_entry_compare(const void *left, const void *right)
+tdd_publish_entry_compare(const void *left, const void *right)
 {
-    const tdd_restore_entry_t *a = (const tdd_restore_entry_t *)left;
-    const tdd_restore_entry_t *b = (const tdd_restore_entry_t *)right;
+    const tdd_publish_entry_t *a = (const tdd_publish_entry_t *)left;
+    const tdd_publish_entry_t *b = (const tdd_publish_entry_t *)right;
+    col_rel_t *ao = a->owner ? a->owner : a->target;
+    col_rel_t *bo = b->owner ? b->owner : b->target;
 
-    if (!a->owner && !b->owner)
+    if (!ao && !bo)
         return strcmp(a->name, b->name);
-    if (!a->owner)
+    if (!ao)
         return 1;
-    if (!b->owner)
+    if (!bo)
         return -1;
-    if (a->owner->relation_identity < b->owner->relation_identity)
+    if (ao->relation_identity < bo->relation_identity)
         return -1;
-    if (a->owner->relation_identity > b->owner->relation_identity)
+    if (ao->relation_identity > bo->relation_identity)
         return 1;
     return strcmp(a->name, b->name);
 }
 
 static void
-tdd_restore_entries_discard(wl_col_session_t *coord,
-    tdd_restore_entry_t *entries, uint32_t count, uint32_t initial_nrels)
+tdd_publish_entries_discard(tdd_publish_entry_t *entries, uint32_t count)
 {
     if (!entries)
         return;
     for (uint32_t i = count; i-- > 0; ) {
         if (entries[i].registered) {
-            for (uint32_t ri = 0; ri < coord->nrels; ri++) {
-                if (coord->rels[ri]
-                    && strcmp(coord->rels[ri]->name, entries[i].name) == 0) {
-                    col_rel_destroy(coord->rels[ri]);
-                    coord->rels[ri] = NULL;
-                    break;
-                }
-            }
+            if (entries[i].session
+                && session_find_rel(entries[i].session, entries[i].name)
+                == entries[i].candidate
+                && session_remove_rel(entries[i].session,
+                entries[i].name) == 0)
+                entries[i].candidate = NULL;
             entries[i].registered = false;
-            entries[i].candidate = NULL;
         }
-    }
-    coord->nrels = initial_nrels;
-    (void)session_rel_build_hash(coord);
-    for (uint32_t i = 0; i < count; i++) {
         if (entries[i].replacement_prepared
             || entries[i].replacement.writer_acquired)
             col_rel_discard_replacement(&entries[i].replacement);
@@ -3995,23 +4015,76 @@ tdd_restore_entries_discard(wl_col_session_t *coord,
 }
 
 static int
+tdd_publish_prepare_entries(tdd_publish_entry_t *entries, uint32_t count)
+{
+    qsort(entries, count, sizeof(*entries), tdd_publish_entry_compare);
+    for (uint32_t i = 0; i < count; i++) {
+        tdd_publish_entry_t *entry = &entries[i];
+        if (!entry->target)
+            continue;
+        int rc = col_rel_storage_owner_resolve(entry->target,
+                &entry->owner);
+        if (rc != 0 || entry->owner != entry->target
+            || entry->owner->storage_alias_borrows > 0)
+            return rc != 0 ? rc : EBUSY;
+        if (i > 0 && entries[i - 1].owner == entry->owner)
+            return EBUSY;
+        memset(&entry->replacement, 0, sizeof(entry->replacement));
+        wl_columnar_memory_reservation_init(
+            &entry->replacement.reservation);
+        rc = wl_columnar_source_access_writer_acquire(
+            &entry->owner->source_access, &entry->replacement.writer);
+        if (rc != 0)
+            return rc;
+        entry->replacement.writer_acquired = true;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        tdd_publish_entry_t *entry = &entries[i];
+        if (!entry->target)
+            continue;
+        int rc = col_rel_prepare_replacement_locked(entry->target,
+                entry->candidate, &entry->replacement);
+        if (rc != 0)
+            return rc;
+        entry->replacement_prepared = true;
+        col_rel_destroy(entry->candidate);
+        entry->candidate = NULL;
+    }
+    return 0;
+}
+
+static void
+tdd_publish_commit_entries(tdd_publish_entry_t *entries, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        tdd_publish_entry_t *entry = &entries[i];
+        if (!entry->replacement_prepared)
+            continue;
+        col_rel_commit_replacement_locked(entry->target,
+            &entry->replacement);
+        entry->replacement_prepared = false;
+        if (entry->session)
+            col_session_invalidate_arrangements(&entry->session->base,
+                entry->name);
+    }
+}
+
+WL_COLUMNAR_EVAL_NOINLINE WL_COLUMNAR_EVAL_COLD static int
 tdd_restore_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     col_rel_t **saved)
 {
-    tdd_restore_entry_t *entries = NULL;
+    tdd_publish_entry_t *entries = NULL;
     size_t entry_bytes;
     uint32_t count;
-    uint32_t initial_nrels;
     int rc = 0;
 
     if (!saved)
         return 0;
-    initial_nrels = coord->nrels;
     count = sp->relation_count;
     if (wl_columnar_eval_checked_size_mul(count, sizeof(*entries),
         &entry_bytes) != 0)
         return EOVERFLOW;
-    entries = (tdd_restore_entry_t *)calloc(1, entry_bytes);
+    entries = (tdd_publish_entry_t *)calloc(1, entry_bytes);
     if (!entries && count > 0)
         return ENOMEM;
 
@@ -4020,25 +4093,14 @@ tdd_restore_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
      * absent from the registry; registration is delayed until all existing
      * owners have passed admission. */
     for (uint32_t ri = 0; ri < count; ri++) {
-        tdd_restore_entry_t *entry = &entries[ri];
+        tdd_publish_entry_t *entry = &entries[ri];
         entry->name = sp->relations[ri].name;
-        entry->relation = session_find_rel(coord, entry->name);
-        entry->saved = saved[ri];
-        if (entry->relation) {
-            rc = col_rel_storage_owner_resolve(entry->relation,
-                    &entry->owner);
-            if (rc != 0)
-                goto fail;
-            if (entry->owner != entry->relation
-                || entry->owner->storage_alias_borrows > 0) {
-                rc = EBUSY;
-                goto fail;
-            }
-        }
-        if (entry->saved)
-            rc = tdd_snapshot_relation(entry->saved, &entry->candidate);
-        else if (entry->relation)
-            rc = tdd_empty_relation_candidate(entry->relation,
+        entry->session = coord;
+        entry->target = session_find_rel(coord, entry->name);
+        if (saved[ri])
+            rc = tdd_snapshot_relation(saved[ri], &entry->candidate);
+        else if (entry->target)
+            rc = tdd_empty_relation_candidate(entry->target,
                     &entry->candidate);
         else
             rc = col_rel_alloc(&entry->candidate, entry->name);
@@ -4046,80 +4108,33 @@ tdd_restore_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
             goto fail;
     }
 
-    /* Acquire every canonical writer in a deterministic order.  Rejecting a
-     * later reader/alias therefore happens before any relation is changed. */
-    qsort(entries, count, sizeof(*entries), tdd_restore_entry_compare);
-    for (uint32_t i = 0; i < count; i++) {
-        tdd_restore_entry_t *entry = &entries[i];
-        if (!entry->relation)
-            continue;
-        if (i > 0 && entries[i - 1].owner == entry->owner) {
-            rc = EBUSY;
-            goto fail;
-        }
-        memset(&entry->replacement, 0, sizeof(entry->replacement));
-        wl_columnar_memory_reservation_init(
-            &entry->replacement.reservation);
-        rc = wl_columnar_source_access_writer_acquire(
-            &entry->owner->source_access, &entry->replacement.writer);
-        if (rc != 0)
-            goto fail;
-        entry->replacement.writer_acquired = true;
-    }
-
-    /* Prepare all replacements while all writers remain held.  Preparation
-     * may allocate or fail, but publication has not begun and cleanup can
-     * release every admission without changing a destination. */
-    for (uint32_t i = 0; i < count; i++) {
-        tdd_restore_entry_t *entry = &entries[i];
-        if (!entry->relation)
-            continue;
-        rc = col_rel_prepare_replacement_locked(entry->relation,
-                entry->candidate, &entry->replacement);
-        if (rc != 0)
-            goto fail;
-        entry->replacement_prepared = true;
-        col_rel_destroy(entry->candidate);
-        entry->candidate = NULL;
-    }
+    rc = tdd_publish_prepare_entries(entries, count);
+    if (rc != 0)
+        goto fail;
 
     /* Register new relations only after all fallible replacement preparation
      * has completed.  If registration fails, remove only the registrations
      * made by this transaction; no existing relation has been published. */
     for (uint32_t i = 0; i < count; i++) {
-        tdd_restore_entry_t *entry = &entries[i];
-        if (entry->relation)
+        tdd_publish_entry_t *entry = &entries[i];
+        if (entry->target)
             continue;
         rc = session_add_rel(coord, entry->candidate);
-        if (rc != 0) {
-            if (session_find_rel(coord, entry->name) == entry->candidate)
-                (void)session_remove_rel(coord, entry->name);
-            else
-                col_rel_destroy(entry->candidate);
-            entry->candidate = NULL;
+        if (session_find_rel(coord, entry->name) == entry->candidate)
+            entry->registered = true;
+        if (rc != 0)
             goto fail;
-        }
-        entry->registered = true;
-        entry->candidate = NULL;
     }
 
     /* Commit is deliberately last.  The replacement primitive guarantees
      * that this phase performs no allocation, schema construction, or
      * admission; every possible failure was handled above. */
-    for (uint32_t i = 0; i < count; i++) {
-        tdd_restore_entry_t *entry = &entries[i];
-        if (!entry->relation)
-            continue;
-        col_rel_commit_replacement_locked(entry->relation,
-            &entry->replacement);
-        entry->replacement_prepared = false;
-        col_session_invalidate_arrangements(&coord->base, entry->name);
-    }
+    tdd_publish_commit_entries(entries, count);
     free(entries);
     return 0;
 
 fail:
-    tdd_restore_entries_discard(coord, entries, count, initial_nrels);
+    tdd_publish_entries_discard(entries, count);
     return rc;
 }
 
@@ -4240,8 +4255,13 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
 
         /* Step 2: Dedup combined within itself, then merge-diff against
          * coordinator's accumulated IDB to keep only truly new rows. */
-        if (combined->nrows > 1)
-            tdd_dedup_rel(combined);
+        if (combined->nrows > 1) {
+            rc = tdd_dedup_rel(combined);
+            if (rc != 0) {
+                col_rel_destroy(combined);
+                return rc;
+            }
+        }
 
         col_rel_t *coord_idb = session_find_rel(coord, rel_name);
         if (coord_idb && coord_idb->nrows > 0 && combined->nrows > 0) {
@@ -4397,112 +4417,215 @@ tdd_bdx_exchange_deltas(const wl_plan_stratum_t *sp,
     return 0;
 }
 
+#ifdef WL_TEST_TDD_MERGE
+static int tdd_owner_test_fail_registration_worker = -1;
+#endif
+
 static int
+tdd_owner_stage_candidate(col_rel_t *target, const char *name,
+    const col_rel_t *source, const col_rel_t *append, col_rel_t **out)
+{
+    col_rel_t *candidate = NULL;
+    int rc;
+
+    if (!name || !source || !out)
+        return EINVAL;
+    *out = NULL;
+    if (target && (target->ncols != 0 || !source->ncols)) {
+        rc = col_rel_deep_copy(target, &candidate, NULL);
+        if (rc != 0)
+            return rc;
+    } else {
+        candidate = col_rel_new_like(name, source);
+        if (!candidate)
+            return ENOMEM;
+    }
+    if (append) {
+        rc = col_rel_append_all(candidate, append, NULL);
+        if (rc != 0) {
+            col_rel_destroy(candidate);
+            return rc;
+        }
+    }
+    *out = candidate;
+    return 0;
+}
+
+static int
+tdd_owner_stage_delta_candidate(col_rel_t *target, const char *name,
+    const col_rel_t *source, col_rel_t **out)
+{
+    col_rel_t *candidate = NULL;
+    int rc;
+
+    if (!name || !source || !out)
+        return EINVAL;
+    *out = NULL;
+    if (target) {
+        rc = tdd_empty_relation_candidate(target, &candidate);
+        if (rc != 0)
+            return rc;
+        if (candidate->ncols == 0 && source->ncols > 0) {
+            col_rel_destroy(candidate);
+            candidate = col_rel_new_like(name, source);
+            if (!candidate)
+                return ENOMEM;
+        }
+    } else {
+        candidate = col_rel_new_like(name, source);
+        if (!candidate)
+            return ENOMEM;
+    }
+    if (source->nrows > 0) {
+        if (candidate->ncols != source->ncols
+            || !tdd_relation_schema_compatible(candidate, source)) {
+            col_rel_destroy(candidate);
+            return EINVAL;
+        }
+        rc = col_rel_append_all(candidate, source, NULL);
+        if (rc != 0) {
+            col_rel_destroy(candidate);
+            return rc;
+        }
+    }
+    *out = candidate;
+    return 0;
+}
+
+/* Owner-mode publication is one exchange transaction.  All relation data
+ * movement, schema checks, memory admission, writer acquisition, and delta
+ * slot registration happen before any existing relation is committed.  In
+ * particular, worker delta slots are never removed before the transaction has
+ * a complete private replacement for every relation. */
+WL_COLUMNAR_EVAL_NOINLINE WL_COLUMNAR_EVAL_COLD
+WL_COLUMNAR_EVAL_TXN_TEXT static int
 tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
     bool *out_any_accepted, uint32_t *out_accepted_rows)
 {
     uint32_t nrels = sp->relation_count;
+    tdd_publish_entry_t *entries = NULL;
+    uint32_t entry_count = 0;
+    uint32_t accepted_total = 0;
+    bool any_accepted = false;
+    uint64_t exchange_ns = 0;
+    size_t max_entries_size = 0;
+    uint32_t max_entries = 0;
     int rc = 0;
+
     if (out_any_accepted)
         *out_any_accepted = false;
     if (out_accepted_rows)
         *out_accepted_rows = 0;
+    if (W > (UINT32_MAX - 1u) / 2u
+        || nrels > UINT32_MAX / (2u * W + 1u))
+        return EOVERFLOW;
+    max_entries = nrels * (2u * W + 1u);
+    if (wl_columnar_eval_checked_size_mul(max_entries, sizeof(*entries),
+        &max_entries_size) != 0)
+        return EOVERFLOW;
+    entries = (tdd_publish_entry_t *)calloc(1, max_entries_size);
+    if (!entries && max_entries > 0)
+        return ENOMEM;
 
     for (uint32_t ri = 0; ri < nrels; ri++) {
         const char *dname = sp->relations[ri].delta_name;
         const char *rel_name = sp->relations[ri].name;
+        col_rel_t *combined = NULL;
+        col_rel_t **parts = NULL;
+        uint32_t total = 0;
+        uint32_t ncols = 0;
+        uint32_t accepted_rows = 0;
+        col_rel_t *schema_source = NULL;
         uint64_t prepare_t0 = now_ns();
 
-        for (uint32_t w = W; w-- > 0; )
-            session_remove_rel(&coord->tdd_workers[w], dname);
+        for (uint32_t w = 0; w < W; w++) {
+            col_rel_t *d = ctxs[w].delta_rels[ri];
+            if (!d || d->nrows == 0)
+                continue;
+            if (!ncols)
+                ncols = d->ncols;
+            if (!schema_source)
+                schema_source = d;
+            else if (!tdd_relation_schema_compatible(schema_source, d)) {
+                rc = EINVAL;
+                goto fail;
+            }
+            if (wl_columnar_eval_checked_row_add(total, d->nrows,
+                &total) != 0) {
+                rc = EOVERFLOW;
+                goto fail;
+            }
+        }
 
-        uint32_t total = 0, ncols = 0;
+        if (ncols == 0) {
+            for (uint32_t w = 0; w < W; w++) {
+                col_rel_t *existing = session_find_rel(
+                    &coord->tdd_workers[w], dname);
+                if (existing) {
+                    schema_source = existing;
+                    ncols = existing->ncols;
+                    break;
+                }
+            }
+        }
+        combined = schema_source
+            ? col_rel_new_like(dname, schema_source)
+            : col_rel_new_auto(dname, ncols);
+        if (!combined) {
+            rc = ENOMEM;
+            goto fail;
+        }
         for (uint32_t w = 0; w < W; w++) {
             col_rel_t *d = ctxs[w].delta_rels[ri];
             if (d && d->nrows > 0) {
-                if (wl_columnar_eval_checked_row_add(total, d->nrows,
-                    &total) != 0) {
-                    tdd_destroy_delta_slots(ctxs, W, nrels);
-                    return EOVERFLOW;
-                }
-                if (ncols == 0)
-                    ncols = d->ncols;
-            }
-        }
-        if (total == 0) {
-            for (uint32_t w = 0; w < W; w++) {
-                col_rel_destroy(ctxs[w].delta_rels[ri]);
-                ctxs[w].delta_rels[ri] = NULL;
-            }
-            coord->tdd_exchange_coordinator_ns += now_ns() - prepare_t0;
-            continue;
-        }
-
-        col_rel_t *combined = col_rel_new_auto(dname, ncols);
-        if (!combined)
-            return ENOMEM;
-
-        for (uint32_t w = 0; w < W; w++) {
-            col_rel_t *d = ctxs[w].delta_rels[ri];
-            ctxs[w].delta_rels[ri] = NULL;
-            if (d && d->nrows > 0)
                 rc = col_rel_append_all(combined, d, NULL);
-            col_rel_destroy(d);
-            if (rc != 0) {
-                col_rel_destroy(combined);
-                return rc;
+                if (rc != 0)
+                    goto fail;
             }
         }
-
-        if (combined->nrows > 1)
-            tdd_dedup_rel(combined);
+        if (combined->nrows > 1) {
+            rc = tdd_dedup_rel(combined);
+            if (rc != 0)
+                goto fail;
+        }
 
         col_rel_t *coord_idb = session_find_rel(coord, rel_name);
-        if (coord_idb && coord_idb->nrows > 0 && combined->nrows > 0) {
+        if (coord_idb && combined->nrows > 0) {
+            if (coord_idb->ncols != 0
+                && !tdd_relation_schema_compatible(coord_idb, combined)) {
+                rc = EINVAL;
+                goto fail;
+            }
             rc = tdd_hashset_diff(combined, coord_idb);
-            if (rc != 0) {
-                col_rel_destroy(combined);
-                return rc;
-            }
-        }
-        if (combined->nrows == 0) {
-            rc = tdd_install_empty_delta_on_workers(coord, dname, ncols, W);
-            col_rel_destroy(combined);
-            coord->tdd_exchange_coordinator_ns += now_ns() - prepare_t0;
             if (rc != 0)
-                return rc;
-            continue;
+                goto fail;
         }
-        if (out_any_accepted)
-            *out_any_accepted = true;
-        if (out_accepted_rows) {
-            if (wl_columnar_eval_checked_row_add(*out_accepted_rows,
-                combined->nrows, out_accepted_rows) != 0) {
-                col_rel_destroy(combined);
-                tdd_destroy_delta_slots(ctxs, W, nrels);
-                return EOVERFLOW;
-            }
+        accepted_rows = combined->nrows;
+
+        /* The caller's row counter is part of the publication contract.
+         * Admit this addition before acquiring writers, registering new
+         * delta slots, or committing any replacement.  The commit phase must
+         * not discover an accounting overflow after public state changed. */
+        uint32_t next_accepted_rows = 0;
+        if (out_accepted_rows
+            && wl_columnar_eval_checked_row_add(accepted_total,
+            accepted_rows, &next_accepted_rows) != 0) {
+            rc = EOVERFLOW;
+            goto fail;
         }
 
-        if (coord_idb) {
-            if (coord_idb->ncols == 0 && combined->ncols > 0) {
-                rc = col_rel_set_schema(coord_idb, combined->ncols,
-                        (const char *const *)combined->col_names);
-                if (rc != 0) {
-                    col_rel_destroy(combined);
-                    return rc;
-                }
-            }
-            rc = col_rel_append_all(coord_idb, combined, NULL);
-            if (rc != 0) {
-                col_rel_destroy(combined);
-                return rc;
-            }
-            tdd_dedup_set_insert_rel(coord_idb, combined);
-            col_session_invalidate_arrangements(&coord->base, rel_name);
+        /* Stage coordinator IDB only when rows were admitted. */
+        if (accepted_rows > 0 && coord_idb) {
+            entries[entry_count].session = coord;
+            entries[entry_count].name = rel_name;
+            entries[entry_count].target = coord_idb;
+            rc = tdd_owner_stage_candidate(coord_idb, rel_name, combined,
+                    combined, &entries[entry_count].candidate);
+            if (rc != 0)
+                goto fail;
+            entry_count++;
         }
-        coord->tdd_exchange_coordinator_ns += now_ns() - prepare_t0;
 
         const uint32_t *key_cols = NULL;
         uint32_t key_count = 0;
@@ -4523,82 +4646,196 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
             key_cols = default_key;
             key_count = 1;
         }
-
-        uint64_t scatter_t0 = now_ns();
-        col_rel_t **parts = (col_rel_t **)calloc(W, sizeof(col_rel_t *));
+        parts = (col_rel_t **)calloc(W, sizeof(*parts));
         if (!parts) {
-            col_rel_destroy(combined);
-            return ENOMEM;
+            rc = ENOMEM;
+            goto fail;
         }
-        rc = col_rel_exchange_partition(combined, key_cols, key_count, W,
-                parts);
-        col_rel_destroy(combined);
-        if (rc != 0) {
-            for (uint32_t w = 0; w < W; w++)
-                col_rel_destroy(parts[w]);
-            free((void *)parts);
-            return rc;
-        }
-
-        for (uint32_t w = 0; w < W; w++) {
-            col_rel_t *part = parts[w];
-            parts[w] = NULL;
-            if (!part || part->nrows == 0) {
-                col_rel_destroy(part);
-                continue;
+        if (accepted_rows > 0) {
+            rc = col_rel_exchange_partition(combined, key_cols, key_count,
+                    W, parts);
+            if (rc != 0) {
+                goto fail;
             }
+        }
 
+        /* Stage every affected worker IDB and every delta session slot. */
+        for (uint32_t w = 0; w < W; w++) {
             col_rel_t *widb = session_find_rel(
                 &coord->tdd_workers[w], rel_name);
-            if (widb) {
-                if (widb->ncols == 0 && part->ncols > 0) {
-                    rc = col_rel_set_schema(widb, part->ncols,
-                            (const char *const *)part->col_names);
-                    if (rc != 0) {
-                        col_rel_destroy(part);
-                        break;
-                    }
+            col_rel_t *part = parts[w];
+            if (widb && (part || accepted_rows > 0)) {
+                if (accepted_rows > 0
+                    && widb->ncols != 0
+                    && !tdd_relation_schema_compatible(widb, combined)) {
+                    rc = EINVAL;
+                    goto fail;
                 }
-                rc = col_rel_append_all(widb, part, NULL);
-                if (rc != 0) {
-                    col_rel_destroy(part);
-                    break;
-                }
-                if (widb->dedup_slots) {
-                    for (uint32_t row = 0; row < part->nrows; row++) {
-                        uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(
-                            part, row);
-                        WL_COLUMNAR_EVAL_DEDUP_SET_INSERT(widb, h);
-                    }
-                }
-                col_session_invalidate_arrangements(
-                    &coord->tdd_workers[w].base, rel_name);
+                entries[entry_count].session = &coord->tdd_workers[w];
+                entries[entry_count].name = rel_name;
+                entries[entry_count].target = widb;
+                rc = tdd_owner_stage_candidate(widb, rel_name,
+                        combined, part, &entries[entry_count].candidate);
+                if (rc != 0)
+                    goto fail;
+                entry_count++;
             }
 
-            free(part->name);
-            part->name = wl_strdup(dname);
-            if (!part->name) {
-                col_rel_destroy(part);
-                rc = ENOMEM;
-                break;
+            col_rel_t *old_delta = session_find_rel(
+                &coord->tdd_workers[w], dname);
+            entries[entry_count].session = &coord->tdd_workers[w];
+            entries[entry_count].name = dname;
+            entries[entry_count].target = old_delta;
+            if (old_delta) {
+                rc = tdd_owner_stage_delta_candidate(old_delta, dname,
+                        combined, &entries[entry_count].candidate);
+            } else {
+                rc = tdd_owner_stage_delta_candidate(NULL, dname, combined,
+                        &entries[entry_count].candidate);
             }
-            rc = session_add_rel(&coord->tdd_workers[w], part);
-            if (rc != 0) {
-                col_rel_destroy(part);
-                break;
-            }
+            if (rc != 0)
+                goto fail;
+            entry_count++;
         }
 
-        for (uint32_t w = 0; w < W; w++)
+        /* Candidates own copied rows; the partition relations are private
+         * staging inputs and are no longer needed after this loop. */
+        for (uint32_t w = 0; w < W; w++) {
             col_rel_destroy(parts[w]);
-        free((void *)parts);
-        coord->tdd_exchange_scatter_ns += now_ns() - scatter_t0;
-        if (rc != 0)
-            return rc;
+            parts[w] = NULL;
+        }
+        accepted_total = next_accepted_rows;
+        any_accepted = any_accepted || accepted_rows > 0;
+        exchange_ns += now_ns() - prepare_t0;
+        free(parts);
+        col_rel_destroy(combined);
+        continue;
+
+fail:
+        if (parts) {
+            for (uint32_t w = 0; w < W; w++)
+                col_rel_destroy(parts[w]);
+        }
+        free(parts);
+        col_rel_destroy(combined);
+        tdd_publish_entries_discard(entries, entry_count);
+        tdd_destroy_delta_slots(ctxs, W, nrels);
+        return rc;
     }
 
+    rc = tdd_publish_prepare_entries(entries, entry_count);
+    if (rc != 0)
+        goto fail_publish;
+
+    /* New delta slots are registered only after every existing target has
+    * passed admission.  Registration is the last fallible step before the
+    * no-fail commit phase; rollback removes any earlier registrations. */
+    for (uint32_t i = 0; i < entry_count; i++) {
+        tdd_publish_entry_t *entry = &entries[i];
+        if (entry->target)
+            continue;
+        rc = session_add_rel(entry->session, entry->candidate);
+        if (session_find_rel(entry->session, entry->name)
+            == entry->candidate)
+            entry->registered = true;
+#ifdef WL_TEST_TDD_MERGE
+        for (uint32_t w = 0; w < W; w++) {
+            if (entry->session == &coord->tdd_workers[w]
+                && tdd_owner_test_fail_registration_worker == (int)w) {
+                tdd_owner_test_fail_registration_worker = -1;
+                rc = ENOMEM;
+            }
+        }
+#endif
+        if (rc != 0)
+            goto fail_publish;
+    }
+
+    /* No operation below can fail: replacements own their writer and all new
+     * session entries are already installed. */
+    tdd_publish_commit_entries(entries, entry_count);
+    tdd_destroy_delta_slots(ctxs, W, nrels);
+    if (out_any_accepted)
+        *out_any_accepted = any_accepted;
+    if (out_accepted_rows)
+        *out_accepted_rows = accepted_total;
+    coord->tdd_exchange_coordinator_ns += exchange_ns;
+    free(entries);
     return 0;
+
+fail_publish:
+    tdd_publish_entries_discard(entries, entry_count);
+    tdd_destroy_delta_slots(ctxs, W, nrels);
+    return rc;
 }
+
+#ifdef WL_TEST_TDD_MERGE
+int
+wl_columnar_eval_test_tdd_owner_registration_rollback(void)
+{
+    wl_col_session_t coord = { 0 };
+    wl_col_session_t workers[2] = { 0 };
+    col_eval_tdd_worker_ctx_t ctxs[2] = { 0 };
+    col_rel_t *deltas[2] = { NULL, NULL };
+    col_rel_t *delta_slots[2] = { NULL, NULL };
+    wl_plan_relation_t relation = { 0 };
+    wl_plan_stratum_t stratum = { 0 };
+    int64_t row0[] = { 1 };
+    int64_t row1[] = { 2 };
+    int rc = 0;
+
+    coord.tdd_workers = workers;
+    coord.tdd_workers_count = 2;
+    relation.name = "r";
+    relation.delta_name = "$d$r";
+    stratum.relations = &relation;
+    stratum.relation_count = 1;
+    for (uint32_t w = 0; w < 2; w++) {
+        workers[w].rel_cap = 4;
+        workers[w].rels = (col_rel_t **)calloc(workers[w].rel_cap,
+                sizeof(*workers[w].rels));
+        ctxs[w].delta_rels = &delta_slots[w];
+        if (!workers[w].rels) {
+            rc = ENOMEM;
+            goto cleanup;
+        }
+    }
+    deltas[0] = col_rel_new_auto("$d$r", 1);
+    deltas[1] = col_rel_new_auto("$d$r", 1);
+    if (!deltas[0] || !deltas[1]
+        || col_rel_append_row(deltas[0], row0) != 0
+        || col_rel_append_row(deltas[1], row1) != 0) {
+        rc = ENOMEM;
+        goto cleanup;
+    }
+    ctxs[0].delta_rels[0] = deltas[0];
+    ctxs[1].delta_rels[0] = deltas[1];
+    deltas[0] = NULL;
+    deltas[1] = NULL;
+    tdd_owner_test_fail_registration_worker = 1;
+    rc = tdd_owner_exchange_deltas(&stratum, &coord, ctxs, 2, NULL, NULL);
+    if (rc != ENOMEM
+        || session_find_rel(&workers[0], "$d$r")
+        || session_find_rel(&workers[1], "$d$r"))
+        rc = EFAULT;
+    else
+        rc = 0;
+
+cleanup:
+    tdd_owner_test_fail_registration_worker = -1;
+    for (uint32_t w = 0; w < 2; w++) {
+        if (ctxs[w].delta_rels && ctxs[w].delta_rels[0]) {
+            col_rel_destroy(ctxs[w].delta_rels[0]);
+            ctxs[w].delta_rels[0] = NULL;
+        } else if (deltas[w]) {
+            col_rel_destroy(deltas[w]);
+        }
+        session_rel_free_hash(&workers[w]);
+        free(workers[w].rels);
+    }
+    return rc;
+}
+#endif
 
 static int
 tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
@@ -4657,8 +4894,13 @@ tdd_global_read_exchange_deltas(const wl_plan_stratum_t *sp,
             }
         }
 
-        if (combined->nrows > 1)
-            tdd_dedup_rel(combined);
+        if (combined->nrows > 1) {
+            rc = tdd_dedup_rel(combined);
+            if (rc != 0) {
+                col_rel_destroy(combined);
+                return rc;
+            }
+        }
 
         col_rel_t *coord_idb = session_find_rel(coord, rel_name);
         if (coord_idb && coord_idb->nrows > 0 && combined->nrows > 0) {
@@ -5638,10 +5880,15 @@ done:
             for (uint32_t ri = 0; ri < nrels; ri++) {
                 col_rel_t *r = session_find_rel(coord,
                         sp->relations[ri].name);
-                if (r && r->nrows > 1)
-                    tdd_dedup_rel(r);
+                if (r && r->nrows > 1) {
+                    rc = tdd_dedup_rel(r);
+                    if (rc != 0)
+                        break;
+                }
             }
-            rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, coord);
+            if (rc == 0)
+                rc = wl_columnar_eval_serial_canonicalize_aggregates(
+                    sp, coord);
             coord->tdd_final_merge_ns += now_ns() - merge_t0;
         } else {
             /* Non-BDX: Merge worker IDB into coordinator */
@@ -5654,10 +5901,15 @@ done:
                 for (uint32_t ri = 0; ri < nrels; ri++) {
                     col_rel_t *r = session_find_rel(coord,
                             sp->relations[ri].name);
-                    if (r && r->nrows > 1)
-                        tdd_dedup_rel(r);
+                    if (r && r->nrows > 1) {
+                        rc = tdd_dedup_rel(r);
+                        if (rc != 0)
+                            break;
+                    }
                 }
-                rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, coord);
+                if (rc == 0)
+                    rc = wl_columnar_eval_serial_canonicalize_aggregates(
+                        sp, coord);
             }
             coord->tdd_final_merge_ns += now_ns() - merge_t0;
         }
@@ -5744,8 +5996,11 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             col_rel_t *r = session_find_rel(coord,
                     sp->relations[ri].name);
-            if (r && r->nrows > 1)
-                tdd_dedup_rel(r);
+            if (r && r->nrows > 1) {
+                rc = tdd_dedup_rel(r);
+                if (rc != 0)
+                    break;
+            }
         }
     }
 

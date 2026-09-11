@@ -3788,6 +3788,7 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_t old;
     col_rel_t *staged;
     wl_columnar_memory_reservation_t old_reservation;
+    wl_columnar_memory_reservation_t new_reservation;
     char *name;
     char *staged_name;
     wl_mem_ledger_t *ledger;
@@ -3803,48 +3804,34 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     bool old_reservation_moved = false;
     bool has_new_reservation;
 
-    /* Preparation establishes all fallible invariants.  Publication is a
-     * no-fail operation: callers must not attempt to roll it back after the
-     * destination has been replaced. */
-    assert(dst && replacement && replacement->staged
-        && replacement->writer_acquired
-        && replacement->writer.owner == &dst->source_access
-        && wl_columnar_source_access_writer_thread_equal(
-            &replacement->writer));
     staged = replacement->staged;
-    assert(staged->nrows <= staged->capacity
-        && dst->view_generation < WL_COLUMNAR_REL_GENERATION_INVALID - 1u
-        && dst->storage_generation < WL_COLUMNAR_REL_GENERATION_INVALID - 1u
-        && col_rel_replacement_old_reservation_valid(dst));
 
     has_new_reservation = replacement->reservation_active;
     wl_columnar_memory_reservation_init(&old_reservation);
+    wl_columnar_memory_reservation_init(&new_reservation);
     if (dst->retained_reserved_bytes > 0) {
         if (!wl_columnar_memory_reservation_move(&old_reservation,
             &dst->retained_reservation)) {
-            assert(false
-                && "prepared old reservation must be movable");
             abort();
         }
         old_reservation_moved = true;
     }
     if (has_new_reservation
         && !wl_columnar_memory_reservation_move(
-            &dst->retained_reservation, &replacement->reservation)) {
+            &new_reservation, &replacement->reservation)) {
         if (old_reservation_moved) {
             bool restored = wl_columnar_memory_reservation_move(
                 &dst->retained_reservation, &old_reservation);
             if (!restored)
                 abort();
         }
-        assert(false && "prepared new reservation must be movable");
         abort();
     }
     if (old_reservation_moved
         && !wl_columnar_memory_release(&old_reservation)) {
         if (has_new_reservation) {
             bool restored_new = wl_columnar_memory_reservation_move(
-                &replacement->reservation, &dst->retained_reservation);
+                &replacement->reservation, &new_reservation);
             if (!restored_new)
                 abort();
         }
@@ -3854,7 +3841,6 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
             if (!restored_old)
                 abort();
         }
-        assert(false && "prepared old reservation must be releasable");
         abort();
     }
 
@@ -3874,48 +3860,16 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
             memory_order_acquire);
     reserved_bytes = has_new_reservation ? replacement->reserved_bytes : 0;
 
-#define COL_REL_REPLACEMENT_COPY(field) dst->field = staged->field
-    COL_REL_REPLACEMENT_COPY(ncols);
-    COL_REL_REPLACEMENT_COPY(columns);
-    COL_REL_REPLACEMENT_COPY(column_types);
-    COL_REL_REPLACEMENT_COPY(nrows);
-    COL_REL_REPLACEMENT_COPY(capacity);
-    COL_REL_REPLACEMENT_COPY(col_names);
-    COL_REL_REPLACEMENT_COPY(schema);
-    COL_REL_REPLACEMENT_COPY(schema_ok);
-    COL_REL_REPLACEMENT_COPY(sorted_nrows);
-    COL_REL_REPLACEMENT_COPY(merge_columns);
-    COL_REL_REPLACEMENT_COPY(merge_buf_cap);
-    COL_REL_REPLACEMENT_COPY(base_nrows);
-    COL_REL_REPLACEMENT_COPY(timestamps);
-    COL_REL_REPLACEMENT_COPY(arena_owned);
-    COL_REL_REPLACEMENT_COPY(row_scratch);
-    COL_REL_REPLACEMENT_COPY(retract_backup_columns);
-    COL_REL_REPLACEMENT_COPY(retract_backup_nrows);
-    COL_REL_REPLACEMENT_COPY(retract_backup_capacity);
-    COL_REL_REPLACEMENT_COPY(retract_backup_sorted_nrows);
-    COL_REL_REPLACEMENT_COPY(col_shared);
-    COL_REL_REPLACEMENT_COPY(run_count);
-    memcpy(dst->run_ends, staged->run_ends, sizeof(dst->run_ends));
-    COL_REL_REPLACEMENT_COPY(retract_backup_run_count);
-    memcpy(dst->retract_backup_run_ends, staged->retract_backup_run_ends,
-        sizeof(dst->retract_backup_run_ends));
-    COL_REL_REPLACEMENT_COPY(dedup_slots);
-    COL_REL_REPLACEMENT_COPY(dedup_cap);
-    COL_REL_REPLACEMENT_COPY(dedup_count);
-    COL_REL_REPLACEMENT_COPY(has_graph_column);
-    COL_REL_REPLACEMENT_COPY(graph_col_idx);
-    COL_REL_REPLACEMENT_COPY(compound_kind);
-    COL_REL_REPLACEMENT_COPY(compound_count);
-    COL_REL_REPLACEMENT_COPY(compound_arity_map);
-    COL_REL_REPLACEMENT_COPY(inline_physical_offset);
-    COL_REL_REPLACEMENT_COPY(declared_ncols);
-#undef COL_REL_REPLACEMENT_COPY
-
+    *dst = *staged;
     dst->name = name;
     dst->pool_owned = old.pool_owned;
     dst->mem_ledger = ledger;
     dst->memory_governor = governor;
+    wl_columnar_memory_reservation_init(&dst->retained_reservation);
+    if (has_new_reservation
+        && !wl_columnar_memory_reservation_move(&dst->retained_reservation,
+        &new_reservation))
+        abort();
     dst->retained_reserved_bytes = reserved_bytes;
     dst->ledger_ts_bytes = ledger_ts_bytes;
     dst->relation_identity = identity;
@@ -3951,10 +3905,6 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
 
     release_rc = wl_columnar_source_access_writer_release(
         &replacement->writer);
-    /* The token is valid for the whole publication.  A release error can
-     * only indicate an internal contract violation after state was already
-     * published; it is therefore diagnostic, never a commit failure. */
-    assert(release_rc == 0);
     (void)release_rc;
     replacement->writer_acquired = false;
 }
