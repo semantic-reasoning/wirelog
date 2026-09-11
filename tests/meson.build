@@ -5160,6 +5160,11 @@ test_tdd_recursive_exe = executable(
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_ALLOC_WRAP=1'],
+  link_args: [
+    '-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc',
+  ],
+  override_options: ['b_lto=false'],
 )
 
 test('tdd_recursive', test_tdd_recursive_exe)
