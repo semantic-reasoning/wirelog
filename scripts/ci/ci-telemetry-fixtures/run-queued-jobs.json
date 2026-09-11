@@ -1,0 +1,108 @@
+{
+  "jobs": [
+    {
+      "completed_at": "2026-09-10T10:00:18Z",
+      "conclusion": "success",
+      "created_at": "2026-09-10T10:00:01Z",
+      "id": 201,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Detect build-triggering changes",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1",
+      "started_at": "2026-09-10T10:00:11Z",
+      "status": "completed",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T10:00:13Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T10:00:11Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T10:00:16Z",
+          "conclusion": "success",
+          "name": "Run actions/checkout@v5",
+          "number": 2,
+          "started_at": "2026-09-10T10:00:13Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T10:00:17Z",
+          "conclusion": "success",
+          "name": "Detect source and build-definition changes",
+          "number": 3,
+          "started_at": "2026-09-10T10:00:16Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T10:00:18Z",
+          "conclusion": "success",
+          "name": "Complete job",
+          "number": 4,
+          "started_at": "2026-09-10T10:00:17Z",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "completed_at": null,
+      "conclusion": null,
+      "created_at": "2026-09-10T10:00:18Z",
+      "id": 202,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "Build / ubuntu-latest / gcc",
+      "runner_group_name": "GitHub Actions",
+      "runner_name": "GitHub Actions 1",
+      "started_at": "2026-09-10T10:00:30Z",
+      "status": "in_progress",
+      "steps": [
+        {
+          "completed_at": "2026-09-10T10:00:33Z",
+          "conclusion": "success",
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-09-10T10:00:30Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": "2026-09-10T10:00:50Z",
+          "conclusion": "success",
+          "name": "Configure",
+          "number": 2,
+          "started_at": "2026-09-10T10:00:33Z",
+          "status": "completed"
+        },
+        {
+          "completed_at": null,
+          "conclusion": null,
+          "name": "Build",
+          "number": 3,
+          "started_at": "2026-09-10T10:00:50Z",
+          "status": "in_progress"
+        }
+      ]
+    },
+    {
+      "completed_at": null,
+      "conclusion": null,
+      "created_at": "2026-09-10T10:00:18Z",
+      "id": 203,
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "TSan / ubuntu-latest / gcc",
+      "runner_group_name": null,
+      "runner_name": null,
+      "started_at": null,
+      "status": "queued",
+      "steps": []
+    }
+  ],
+  "total_count": 3
+}

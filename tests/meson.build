@@ -776,6 +776,18 @@ test('shell_gate_timeouts_selftest', py3,
      env: ['WIRELOG_SHELL_GATE_BUILD=' + meson.project_build_root()],
      suite: 'abi')
 
+# Issue #1570: self-test for scripts/ci/ci-run-telemetry.py, the offline
+# analyzer that separates CI queue delay from execution time.  Only the
+# self-test is registered: the analyzer itself is a measurement instrument, not
+# a gate, and never runs in CI.  It drives committed fixtures, so it needs no
+# network, no `gh`, no token and no build directory.  Python-seeded, so outside
+# the #1464 shell-gate timeout rule by construction; the explicit timeout
+# anticipates #1488 and costs nothing.
+test('ci_run_telemetry_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-ci-run-telemetry.py'],
+     suite: 'abi',
+     timeout: 60)
+
 # Issue #1464: the pre-commit hook installer must never leave an empty,
 # non-executable hook behind on a console whose locale cannot encode its
 # output; meson.build runs it with check: false, so only a test can see that.

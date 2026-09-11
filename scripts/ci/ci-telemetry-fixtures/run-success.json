@@ -1,0 +1,12 @@
+{
+  "conclusion": "success",
+  "created_at": "2026-09-10T18:27:11Z",
+  "event": "pull_request",
+  "head_branch": "issue-1500-empty-index-lease",
+  "head_sha": "d6b217c29e83e3813a9d138ae3eab4fe81106ead",
+  "id": 34514413925,
+  "name": "CI PR",
+  "run_attempt": 1,
+  "run_started_at": "2026-09-10T18:27:11Z",
+  "status": "completed"
+}

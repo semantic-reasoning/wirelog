@@ -72,3 +72,7 @@ subprojects/packagecache/
 # SBOM generation artifacts (timestamped, regenerated per release; only snapshot.txt committed)
 sbom/*.spdx.json
 sbom/*.cdx.json
+
+# Issue #1570: ci-run-telemetry.py writes saved API responses and generated
+# reports here.  Measurement output, never source.
+/ci-telemetry/
