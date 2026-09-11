@@ -2468,6 +2468,185 @@ test_checked_reset_rows_locked(void)
     cleanup_relations();
 }
 
+static void
+test_staged_replacement_contract(void)
+{
+    col_rel_t *dst = new_relation();
+    col_rel_t *candidate = new_relation();
+    const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    int64_t old_value = 11;
+    int64_t new_value = 29;
+    uint64_t identity;
+    uint64_t view_before;
+    uint64_t storage_before;
+    uint64_t reserved_before;
+    uint64_t ledger_before;
+    int64_t *old_columns;
+    char *old_name;
+    col_rel_replacement_t replacement;
+
+    CHECK(dst && candidate, "replacement setup");
+    CHECK(col_rel_append_row(dst, &old_value) == 0
+        && col_rel_set_column_types(candidate, &type, 1u) == 0
+        && col_rel_append_row(candidate, &new_value) == 0
+        && col_rel_enable_timestamps(candidate) == 0
+        && col_rel_apply_compound_schema(candidate, &logical, 1u) == 0,
+        "replacement candidate publication data");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    reserved_before = dst->retained_reserved_bytes;
+    ledger_before = col_rel_owned_ledger_bytes(dst);
+    old_columns = dst->columns[0];
+    old_name = dst->name;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "replacement prepare succeeds");
+    CHECK(dst->relation_identity == identity && dst->columns[0] == old_columns
+        && dst->nrows == 1 && dst->view_generation == view_before
+        && dst->storage_generation == storage_before
+        && dst->retained_reserved_bytes == reserved_before,
+        "replacement preparation leaves destination unchanged");
+    CHECK(col_rel_commit_replacement_locked(dst, &replacement) == 0,
+        "replacement commit succeeds");
+    CHECK(dst->relation_identity == identity && dst->name == old_name
+        && strcmp(dst->name, "generation_test") == 0
+        && dst->columns[0] != old_columns
+        && dst->nrows == 1 && dst->columns[0][0] == new_value
+        && dst->timestamps != NULL
+        && dst->compound_kind == WIRELOG_COMPOUND_KIND_SIDE
+        && dst->view_generation == view_before + 1u
+        && dst->storage_generation == storage_before + 1u
+        && col_rel_owned_ledger_bytes(dst) == ledger_before
+        && dst->retained_reserved_bytes == reserved_before,
+        "replacement preserves identity and publishes one epoch");
+    cleanup_relations();
+
+    {
+        wl_columnar_memory_resolution_t resolution = { 0 };
+        wl_columnar_memory_governor_ref_t *ref;
+        uint64_t reserved_after;
+
+        resolution.budget_bytes = 4096u;
+        resolution.usable_bytes = 4096u;
+        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+        resolution.status = WL_COLUMNAR_MEMORY_OK;
+        ref = wl_columnar_memory_governor_ref_create(&resolution);
+        dst = new_relation();
+        candidate = new_relation();
+        CHECK(ref && dst && candidate, "replacement admission setup");
+        CHECK(col_rel_attach_memory_governor(dst, ref) == 0
+            && col_rel_append_row(dst, &old_value) == 0
+            && col_rel_append_row(candidate, &new_value) == 0,
+            "replacement admission rows");
+        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
+            && col_rel_commit_replacement_locked(dst, &replacement) == 0,
+            "replacement admission commit");
+        reserved_after = col_rel_transport_bytes(dst);
+        CHECK(dst->retained_reserved_bytes == reserved_after
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == reserved_after,
+            "replacement preserves memory admission accounting");
+        cleanup_relations();
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+    }
+
+    dst = new_relation();
+    candidate = new_relation();
+    CHECK(dst && candidate, "replacement reader setup");
+    CHECK(col_rel_append_row(dst, &old_value) == 0
+        && col_rel_append_row(candidate, &new_value) == 0,
+        "replacement reader rows");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    old_columns = dst->columns[0];
+    wl_columnar_source_access_reader_t reader = { 0 };
+    CHECK(col_rel_source_reader_acquire(dst, &reader) == 0,
+        "replacement reader acquire");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EBUSY,
+        "replacement reader denied");
+    CHECK(dst->relation_identity == identity && dst->columns[0] == old_columns
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement reader denial preserves state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "replacement reader release");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
+        && col_rel_commit_replacement_locked(dst, &replacement) == 0,
+        "replacement retries after reader release");
+    cleanup_relations();
+
+    dst = new_relation();
+    candidate = new_relation();
+    CHECK(dst && candidate, "replacement alias setup");
+    CHECK(col_rel_append_row(dst, &old_value) == 0
+        && col_rel_install_shared_view(candidate, dst) == 0,
+        "replacement live alias setup");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EBUSY,
+        "replacement live alias denied");
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement alias denial preserves state");
+    CHECK(col_rel_storage_alias_release(candidate) == 0,
+        "replacement alias release");
+    cleanup_relations();
+
+    dst = new_relation();
+    candidate = new_relation();
+    CHECK(dst && candidate, "replacement rollback setup");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    candidate->nrows = candidate->capacity + 1u;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EINVAL,
+        "replacement row overflow rejected");
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement overflow preserves state");
+    candidate->nrows = 0;
+    candidate->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+    candidate->compound_count = 1u;
+    candidate->compound_arity_map = (uint32_t *)calloc(1u, sizeof(uint32_t));
+    CHECK(candidate->compound_arity_map != NULL,
+        "replacement malformed schema map allocation");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EINVAL,
+        "replacement schema failure rejected");
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement schema failure preserves state");
+    free(candidate->compound_arity_map);
+    candidate->compound_arity_map = NULL;
+    candidate->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+    candidate->compound_count = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+    allocation_calls = 0;
+    allocation_fail_at = 0;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == ENOMEM,
+        "replacement allocation failure rejected");
+    allocation_fail_at = -1;
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement allocation failure preserves state");
+#endif
+    dst->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement)
+        == EOVERFLOW,
+        "replacement generation overflow rejected");
+    cleanup_relations();
+}
+
 int
 main(void)
 {
@@ -2502,6 +2681,7 @@ main(void)
     test_shared_view_relation_metadata();
     test_empty_append_detaches_shared_destination();
     test_checked_reset_rows_locked();
+    test_staged_replacement_contract();
     test_identity_exhaustion();
     if (failures != 0)
         return EXIT_FAILURE;
