@@ -2074,6 +2074,9 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     bool *denied);
 int
 col_rel_enable_timestamps(col_rel_t *rel);
+/* Enable timestamp storage while the canonical owner writer is held. */
+int
+col_rel_enable_timestamps_locked(col_rel_t *rel);
 /* Promote arena-backed relation columns to private heap storage.  Admission
  * and copying are transactional; ENOMEM leaves the relation unchanged. */
 int
