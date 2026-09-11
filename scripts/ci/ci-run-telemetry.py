@@ -240,18 +240,27 @@ def additive(metric: dict) -> dict:
     return metric
 
 
-def provisional(metric: dict, in_flight: bool) -> dict:
-    """Downgrade a measurement taken while the run is still going.  The value
-    is real but it is a lower bound, and saying so is the difference between a
-    baseline and a number that quietly understates."""
-    if in_flight and metric["status"] == "measured":
+def provisional(metric: dict, run_status: str | None) -> dict:
+    """Downgrade a measurement taken before the run is known to have ended.
+    The value is real but it is a lower bound, and saying so is the difference
+    between a baseline and a number that quietly understates.
+
+    A status this tool cannot read is downgraded too, since it might mean the
+    run is unfinished -- but the reason says which of the two it is, because
+    `run_is_running` declines to call such a run going and the report should
+    not claim it two lines later."""
+    if run_status != "completed" and metric["status"] == "measured":
         metric["status"] = "partial"
-        metric["reason"] = "run still in progress; value is a lower bound"
+        metric["reason"] = (
+            "run still in progress; value is a lower bound"
+            if run_is_running(run_status)
+            else f"run status {run_status!r} is not one this tool "
+                 f"recognises; value may not be final")
     return metric
 
 
 def interval(start_iso, end_iso, missing_reason: str,
-             no_start_reason: str = None) -> dict:
+             no_start_reason: str | None = None) -> dict:
     """Seconds between two server-clock timestamps, or why they do not yield
     one.  A negative interval is reported as anomalous, never clamped to 0.
 
@@ -294,6 +303,58 @@ def population_of(job: dict) -> str:
 
 def is_skipped(job: dict) -> bool:
     return job.get("conclusion") == "skipped"
+
+
+def did_not_run(job: dict) -> bool:
+    """Whether the runner never executed this job, so it has no durations to
+    report and anything derived from its stamps would be bookkeeping.
+
+    The stamps cannot answer this.  The skip cascade captured in this repo's
+    own fixtures shows GitHub giving a job that did not run
+    `started_at == created_at`, with a completion either equal to them or one
+    second earlier, so a start stamp is not evidence of work and the zero or
+    negative interval derived from it would read as a job that ran instantly.
+
+    No single stamp settles it, because each one is absent on some job that
+    ran and present on some job that did not.  Steps are missing from a
+    successful sixty-second job in this repo's own `run-missing-data`
+    capture, and present-but-unstamped on a job that never started.  A start
+    stamp proves nothing on its own, since a job that did not run is stamped
+    as starting the moment it was created.  And a span of zero is the
+    bookkeeping shape twice over: a skipped job carries it, and so does a job
+    cancelled while it was still queued.
+
+    So ask in order.  A step of its own that ran is conclusive.  Failing
+    that, a span between the job's own stamps settles it, and only a positive
+    one is work.  Failing that, with no completion to judge by, the question
+    is whether the runner ever picked the job up, and a start later than the
+    creation is the only trace of that.  With none of the three, it never
+    ran.
+
+    A skip needs no such check.  A skipped job never dispatches, whatever it
+    is stamped with."""
+    conclusion = job.get("conclusion")
+    if conclusion == "skipped":
+        return True
+    if conclusion != "cancelled":
+        return False
+    # A cancellation lands either side of the runner picking the job up.
+    if first_step_start(job):
+        return False                       # a step of its own ran
+    created = parse_ts(job.get("created_at"))
+    started = parse_ts(job.get("started_at"))
+    ended = parse_ts(job.get("completed_at"))
+    if started and ended:
+        # Its own span settles it.  Zero or negative is the bookkeeping
+        # shape; a job cancelled while still queued carries start ==
+        # completion, and calling that execution would print a measured zero.
+        return ended <= started
+    if started and created:
+        # No completion to judge by, so the question is whether the runner
+        # ever picked it up.  A job that did not run is stamped as starting
+        # the moment it was created; a later start is a real dispatch.
+        return started <= created
+    return True
 
 
 def job_phases(job: dict) -> tuple:
@@ -358,10 +419,130 @@ def job_phases(job: dict) -> tuple:
     return phases, unmapped, unusable, skipped, accounted
 
 
-def analyze_job(job: dict, t0_iso: str, completed_by_name: dict) -> dict:
-    """One job's timing.  Skipped jobs get no durations at all: GitHub stamps
-    them with a completion one second before their own start, and a zero there
-    would read as a job that ran instantly."""
+def first_step_start(job: dict):
+    """When this job's earliest step that shows signs of running began, or
+    None.  Evidence that the runner picked the job up even where the
+    job-level stamps are gone.
+
+    A start stamp is what proves that, and a completion is not required: a
+    step cancelled or still running mid-flight has none, and that is exactly
+    the case worth catching.  Two kinds are excluded.  A skipped step is
+    stamped `started == completed` and never ran, which is why `job_phases`
+    excludes it too.  And a step whose completion precedes its start has
+    stamps the report already calls unusable, so citing its start as a time
+    would publish a figure the same report disowns."""
+    starts = []
+    for step in job.get("steps") or []:
+        if step.get("conclusion") == "skipped":
+            continue
+        started = parse_ts(step.get("started_at"))
+        if not started:
+            continue
+        ended = parse_ts(step.get("completed_at"))
+        if ended and ended < started:
+            continue
+        starts.append(step.get("started_at"))
+    return min(starts, key=ts_key) if starts else None
+
+
+def run_is_running(run_status: str | None) -> bool:
+    """The run is known to be going.  An unrecognised status is not."""
+    return run_status in IN_FLIGHT_STATUSES
+
+
+def run_is_readable(run_status: str | None) -> bool:
+    """The run's status is one this tool understands.  When it is not, the
+    run is neither known to be going nor known to be over, and no sentence
+    about a job's future in it can be settled."""
+    return run_status in KNOWN_RUN_STATUSES
+
+
+def job_may_still_move(job: dict,
+                       run_status: str | None) -> bool:
+    """Whether this job could still acquire a start stamp.
+
+    A status that means not-done-yet only means that while the run itself is
+    still going.  The same status in a run the API calls finished describes a
+    job that stopped without saying so, and telling the reader it may still
+    start promises a number that is never coming."""
+    return run_is_running(run_status) and job.get("status") in IN_FLIGHT_STATUSES
+
+
+def no_start_reason(job: dict, run_status: str | None) -> str:
+    """Why this job has no start stamp.  `never` is a claim about the future
+    and is only safe once the future is settled -- which needs the run's
+    state as well as the job's, because an unreadable run status leaves the
+    job's future open however the job itself is stamped."""
+    status = job.get("status")
+    if status not in KNOWN_JOB_STATUSES:
+        return f"job status {status!r} is not one this tool recognises"
+    first_step = first_step_start(job)
+    if first_step:
+        # Its steps ran, so it started; the run simply did not record when.
+        return ("job reported no start stamp; its first step ran at "
+                f"{first_step}")
+    conclusion = job.get("conclusion")
+    if conclusion in CONCLUSIONS_THAT_RAN:
+        # Reaching this conclusion took execution, so "never started" would
+        # be refuted by the job's own outcome.
+        return f"job reported no start stamp; it concluded {conclusion!r}"
+    if status == "completed":
+        return "job never started"     # the job itself is settled
+    if job_may_still_move(job, run_status):
+        return "job has not started yet"
+    if run_is_readable(run_status):
+        return "job never started"     # the run is over; so is the question
+    return (f"job has no start stamp, and run status {run_status!r} is not "
+            f"one this tool recognises")
+
+
+def wall_absence_reasons(job: dict,
+                         run_status: str | None) -> tuple:
+    """(no-end reason, no-start reason) for one job's wall time, chosen from
+    the state the job is actually in.
+
+    One sentence cannot serve every state without being false in some of
+    them.  A job still in the queue has not started *yet*; a job that
+    finished without a start stamp never started at all; and a job the API
+    calls completed while giving no completion stamp has not "not completed"
+    -- it completed and did not say when."""
+    missing_start = no_start_reason(job, run_status)
+    status = job.get("status")
+    if status == "completed":
+        return "job reported no completion time", missing_start
+    if status in IN_FLIGHT_STATUSES:
+        if run_is_running(run_status):
+            return "job has not completed", missing_start
+        if run_is_readable(run_status):
+            return ("job stopped without reporting a completion time",
+                    missing_start)
+        # The end is what is absent here, and `interval` reaches this string
+        # only when the start is present, so a sentence about the missing
+        # start would be false beside the stamp that carries it.
+        return (f"job reported no completion time, and run status "
+                f"{run_status!r} is not one this tool recognises",
+                missing_start)
+    # An unreadable job status.  The same sentence serves both ends: it
+    # claims nothing about either stamp.
+    return missing_start, missing_start
+
+
+def queue_absence_reasons(job: dict,
+                          run_status: str | None) -> tuple:
+    """(no-end reason, no-start reason) for one job's queue delay.  The end
+    of that interval is the job starting, so the absent-end sentence is the
+    same one the wall time uses for an absent start.  Saying `never started`
+    beside `has not started yet` for one job, which is what a single fixed
+    sentence here produced, is a contradiction a reader can see."""
+    return no_start_reason(job, run_status), "job has no creation time"
+
+
+def analyze_job(job: dict, t0_iso: str, completed_by_name: dict,
+                run_status: str | None) -> dict:
+    """One job's timing.  A job that did not run gets no durations at all:
+    GitHub stamps such a job as though it had started and finished at the
+    moment it was created, and a zero there would read as a job that ran
+    instantly.  `did_not_run` decides which jobs those are."""
     name = job.get("name") or ""
     entry = {
         "name": name,
@@ -375,8 +556,9 @@ def analyze_job(job: dict, t0_iso: str, completed_by_name: dict) -> dict:
         "completed_at": job.get("completed_at"),
     }
 
-    if is_skipped(job):
-        reason = "job skipped; no execution"
+    if did_not_run(job):
+        reason = ("job skipped; no execution" if is_skipped(job)
+                  else "job cancelled before it ran; no execution")
         entry["metrics"] = {
             "upstream_elapsed": non_additive(unavailable(reason)),
             "queue_delay": additive(unavailable(reason)),
@@ -392,8 +574,10 @@ def analyze_job(job: dict, t0_iso: str, completed_by_name: dict) -> dict:
             "evidence": {},
         }
         entry["runner_first_step_at"] = None
+        entry["ran"] = False
         return entry
 
+    entry["ran"] = True
     entry["metrics"] = {
         # Everything upstream of this job, including every upstream job's own
         # queueing.  Useful for ordering jobs, but NOT additive along a path.
@@ -403,10 +587,10 @@ def analyze_job(job: dict, t0_iso: str, completed_by_name: dict) -> dict:
         # Summable along a path, and the critical path does sum them.
         "queue_delay": additive(
             interval(job.get("created_at"), job.get("started_at"),
-                     "job never started", "job has no creation time")),
+                     *queue_absence_reasons(job, run_status))),
         "job_wall": additive(
             interval(job.get("started_at"), job.get("completed_at"),
-                     "job has not completed", "job never started")),
+                     *wall_absence_reasons(job, run_status))),
     }
 
     phases, unmapped, unusable, skipped, accounted = job_phases(job)
@@ -681,21 +865,49 @@ def _seconds(metric: dict):
                                                          "partial") else None
 
 
-# A job with one of these conclusions has no duration because it did not run,
-# not because the run lost the data.  Reporting it as missing data is the same
-# false alarm as reporting a job that is merely still going.
-NO_DURATION_BY_DESIGN = ("skipped", "cancelled")
-
 # The job statuses that mean the job may still produce a duration.  GitHub
-# uses exactly these two before `completed`.
-IN_FLIGHT_STATUSES = ("queued", "in_progress")
+# documents all of these alongside `completed`; `waiting` in particular is an
+# ordinary job held at an environment protection rule, and calling it missing
+# data would raise a false alarm on every run with an approval gate.  A status
+# outside this list is one this tool cannot read, which is a different thing
+# from a job that is merely not done, so it takes the loud branch.
+IN_FLIGHT_STATUSES = ("queued", "in_progress", "waiting", "requested",
+                      "pending")
+
+# Every status this tool knows how to describe, for a job and for a run.
+# Anything else is data it cannot read, and it says so rather than guessing.
+KNOWN_JOB_STATUSES = IN_FLIGHT_STATUSES + ("completed",)
+KNOWN_RUN_STATUSES = KNOWN_JOB_STATUSES
+
+# Conclusions only a job that executed can reach.  A job reported successful
+# ran, whatever its stamps say, so the report must not tell the reader it
+# never started.
+CONCLUSIONS_THAT_RAN = ("success", "failure", "timed_out")
 
 
-def untimed_executed_jobs(analyzed: list) -> tuple:
+def absent_by_design(entry: dict) -> bool:
+    """True when this job has no durations because the runner never executed
+    it, rather than because the run lost them.  The table caption excuses
+    exactly these jobs, so this has to mean exactly what the caption says.
+
+    It reads the answer `analyze_job` recorded rather than re-deriving one.
+    Every re-derivation tried here was wrong on some reachable job: the
+    conclusion alone excuses a job cancelled after it ran; the absence of a
+    start stamp excuses nothing, because GitHub stamps a job that did not run
+    as though it started when it was created; the wall time alone is equally
+    the signature of a job that ran and lost a stamp; and even "no duration
+    measured anywhere" excuses a job that ran and lost every stamp.  One
+    decision, made once, from the evidence that actually distinguishes the
+    two -- see `did_not_run`."""
+    return entry.get("ran") is False
+
+
+def untimed_executed_jobs(analyzed: list,
+                          run_status: str | None) -> tuple:
     """Jobs that ran, or may still run, and that the run did not time, split
-    into the ones that have not finished and the ones that finished anyway.
-    A job that was skipped or cancelled before it started has no duration by
-    design and is in neither list.
+    into the ones that may still produce one and the ones that will not.  A
+    job that did not run has no duration by design and is in neither list;
+    `absent_by_design` decides which those are.
 
     The split is what the caller needs to say something true.  A job still
     running is ordinary and makes the answer a lower bound; a job that
@@ -713,21 +925,23 @@ def untimed_executed_jobs(analyzed: list) -> tuple:
     chain."""
     running, untimed = [], []
     for entry in analyzed:
-        if entry.get("conclusion") in NO_DURATION_BY_DESIGN:
-            continue
         if _seconds(entry["metrics"]["job_wall"]) is not None:
             continue
-        # Only the two statuses that actually mean "not done yet" take the
-        # quiet branch.  A status this tool does not recognise is data it
-        # cannot read, which belongs with missing data rather than with an
-        # ordinary live job.
-        target = running if entry.get("status") in IN_FLIGHT_STATUSES \
-            else untimed
-        target.append(entry["name"])
+        if absent_by_design(entry):
+            continue
+        # Only a status that actually means "not done yet" takes the quiet
+        # branch, and only while the run is still going.  The same status in
+        # a run the API calls completed describes a job that stopped without
+        # saying so, which is missing data rather than work in progress.  A
+        # status this tool does not recognise is data it cannot read and goes
+        # the same way.
+        still_going = job_may_still_move(entry, run_status)
+        (running if still_going else untimed).append(entry["name"])
     return sorted(running), sorted(untimed)
 
 
-def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
+def observed_path(analyzed: list, edges: dict, drift: dict,
+                  run_status: str | None) -> dict:
     """Walk back from the last job to finish, hop by hop, through its actual
     dependencies.  Taking the nearest earlier finisher instead would be wrong
     and quietly so: on a real run it picks a macOS matrix build as the
@@ -750,10 +964,11 @@ def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
             break
         candidates = [by_name[name] for name in edges[current["name"]]
                       if name in by_name and name not in seen]
-        # A skipped job has a completion stamp but no duration, and walking
-        # through it at zero weight would drop the very gap it represents.
-        candidates = [c for c in candidates if c.get("completed_at")
-                      and c["conclusion"] != "skipped"]
+        # A job that never ran has a completion stamp but no duration, and
+        # walking through it at zero weight would drop the very gap it
+        # represents.
+        candidates = [c for c in candidates
+                      if c.get("completed_at") and not absent_by_design(c)]
         if not candidates:
             if edges[current["name"]]:
                 truncated = (f"{current['name']}'s dependencies did not run")
@@ -786,7 +1001,7 @@ def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
     # so an untimed job that finished later is skipped over silently and the
     # chain below it is reported as if it were the whole path.
     on_chain = set(chain)
-    running, untimed = untimed_executed_jobs(analyzed)
+    running, untimed = untimed_executed_jobs(analyzed, run_status)
     off_running = [name for name in running if name not in on_chain]
     off_untimed = [name for name in untimed if name not in on_chain]
     if off_running:
@@ -802,8 +1017,8 @@ def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
                        f"not finished, so the walk started below the end of "
                        f"the path and the total is a lower bound")
     if off_untimed:
-        reasons.append(f"{len(off_untimed)} finished job(s) elsewhere in the "
-                       f"run were not timed, so the walk may have started "
+        reasons.append(f"{len(off_untimed)} job(s) elsewhere in the run "
+                       f"reported no duration, so the walk may have started "
                        f"below the true end of the path, or one of them may "
                        f"lie on a longer branch it never entered")
     if truncated:
@@ -820,7 +1035,8 @@ def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
     return metric
 
 
-def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
+def graph_path(analyzed: list, edges: dict, drift: dict,
+               run_status: str | None) -> dict:
     """Longest path over the declared graph, weighting each node by its wall
     time and each edge by the wait between the dependency finishing and the
     dependent being created.  Inside a skip cascade every edge weight is
@@ -885,7 +1101,7 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
     # be routed around it and come back clean.  The hole is off the chain
     # precisely because it was scored as free.
     on_chain = set(chain)
-    running, untimed = untimed_executed_jobs(analyzed)
+    running, untimed = untimed_executed_jobs(analyzed, run_status)
     off_running = [name for name in running if name not in on_chain]
     off_untimed = [name for name in untimed if name not in on_chain]
     if off_running:
@@ -894,9 +1110,9 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
                        f"path may move once they do")
         metric["evidence"]["unfinished_jobs_off_chain"] = off_running
     if off_untimed:
-        reasons.append(f"{len(off_untimed)} finished job(s) off this chain "
-                       f"were not timed, so the longest path may have been "
-                       f"routed around them")
+        reasons.append(f"{len(off_untimed)} job(s) off this chain reported no "
+                       f"duration, so the longest path may have been routed "
+                       f"around them")
         metric["evidence"]["untimed_jobs_off_chain"] = off_untimed
     if unusable_edges:
         reasons.append("edge weights unavailable on this chain; node weights "
@@ -931,7 +1147,14 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
     t0_source = "run_started_at" if run.get("run_started_at") else "created_at"
 
     jobs_by_name = {j.get("name"): j for j in jobs}
-    analyzed = [analyze_job(j, t0_iso, jobs_by_name) for j in jobs]
+    # Until the run is known to have ended, every run-level figure is a lower
+    # bound: a check that has not reported cannot raise it, and #1574 would
+    # quote it as final.  A status this tool cannot read counts as not known
+    # to have ended, while the walkers treat it as stopped -- each errs in
+    # the direction that cannot overstate.
+    run_status = run.get("status")
+    analyzed = [analyze_job(j, t0_iso, jobs_by_name, run_status)
+                for j in jobs]
     for entry, job in zip(analyzed, jobs):
         if is_skipped(job):
             entry["metrics"]["scheduler_release_latency"] = additive(
@@ -942,15 +1165,12 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
 
     executed = [j for j in jobs if not is_skipped(j)]
     skipped = [j for j in jobs if is_skipped(j)]
-    # Until the run ends, every run-level figure is a lower bound: a check that
-    # has not reported cannot raise it, and #1574 would quote it as final.
-    in_flight = run.get("status") != "completed"
-
     ends = [j.get("completed_at") for j in executed if j.get("completed_at")]
     if ends:
         last = max(ends, key=ts_key)
         run_wall = provisional(
-            interval(t0_iso, last, "no executed job has completed"), in_flight)
+            interval(t0_iso, last, "no executed job has completed"),
+            run_status)
     else:
         run_wall = unavailable("no executed job has completed")
 
@@ -977,8 +1197,12 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
                 s.get("name") for s in (first.get("steps") or [])
                 if s.get("conclusion") in ("failure", "timed_out")]
             first_failure["evidence"]["conclusion"] = first.get("conclusion")
-    elif in_flight:
+    elif run_is_running(run_status):
         first_failure = unavailable("run still in progress; no failure yet")
+    elif run_status != "completed":
+        first_failure = unavailable(
+            f"run status {run_status!r} is not one this tool recognises; "
+            f"no failure seen")
     elif any(j.get("conclusion") == "cancelled" for j in executed):
         first_failure = unavailable(
             "no job failed; cancelled jobs were seen and excluded")
@@ -991,7 +1215,7 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
         last_pinned = max(pinned_ends, key=ts_key)
         pr_feedback = provisional(
             interval(t0_iso, last_pinned, "no pinned check completed"),
-            in_flight)
+            run_status)
         if pr_feedback["status"] in ("measured", "partial"):
             pr_feedback["evidence"]["source"] = "pinned-list"
             # When every executed job is a pinned check this equals
@@ -1042,8 +1266,8 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
     if graph_supplied:
         drift = drift or {"jobs_without_node": [], "nodes_without_job": []}
         critical_path = {
-            "observed": observed_path(analyzed, needs, drift),
-            "graph": graph_path(analyzed, needs, drift),
+            "observed": observed_path(analyzed, needs, drift, run_status),
+            "graph": graph_path(analyzed, needs, drift, run_status),
             "graph_drift": drift,
         }
     else:
@@ -1207,8 +1431,8 @@ def render_aggregate_markdown(doc: dict) -> str:
         f"never pooled",
         f"- excluded: {len(doc['excluded'])}",
         "",
-        "Seconds. `n` is per metric: a skipped job contributes to none, and a "
-        "failed run truncates some.",
+        "Seconds. `n` is per metric: a job that did not run contributes "
+        "to none, and a "        "failed run truncates some.",
         "",
         "| conclusion | job | population | queue n | queue med | queue p95 | "
         "wall n | wall med | wall p95 | mixed machines |",
@@ -1289,14 +1513,16 @@ def degradation_block(report: dict, path: dict) -> list:
     skip, and the caveat the two walkers raise is worth nothing once that has
     happened.
 
+    A job that did not run is left out, for the same reason the walkers leave
+    it out: its durations are absent by design and the table caption says so
+    once.  `absent_by_design` decides which jobs those are.
+
     Two things would defeat it on their own.  Explaining a metric that has no
     column tells the reader about a number they cannot see while leaving the
     ones they can see bare, so the selection is exactly `cell()`'s output:
     the run-level table, both critical paths, and each job's six columns.  And
     one reason repeated once per job buries every line that is not repeated,
-    so identical reasons collapse into a single line carrying the count.  A
-    skipped job is left out for the same reason: its durations are absent by
-    design and the table header says so once."""
+    so identical reasons collapse into a single line carrying the count."""
     def wanted(metric):
         # Deliberately not `and metric.get("reason")`: a degraded metric that
         # carries no reason is the bare `(partial)` this block exists to
@@ -1308,7 +1534,13 @@ def degradation_block(report: dict, path: dict) -> list:
     qualified += [(f"critical_path.{key}", path[key])
                   for key in ("observed", "graph") if wanted(path[key])]
     for job in report["jobs"]:
-        if job["conclusion"] == "skipped":
+        # The same test the walkers use.  A job that did not run has no
+        # durations by design, the table caption says so once, and six
+        # bullets per such job would be six true sentences crowding out the
+        # ones that are not by design.  A job cancelled after it started is
+        # not one of these: it has real durations, so its degraded cells are
+        # explained like any other job's.
+        if absent_by_design(job):
             continue
         qualified += [(f"{job['name']} / {column}", metric)
                       for column, metric in job_cells(job) if wanted(metric)]
@@ -1393,7 +1625,8 @@ def render_markdown(report: dict) -> str:
             lines.append(f"- node with no job: {name}")
     lines += [
         "",
-        "Per job, seconds. A skipped job has no durations at all.",
+        "Per job, seconds. A job that was skipped, or cancelled before it "
+        "ran, has no durations at all.",
         "",
         "| job | population | "
         + " | ".join(heading for _, _, heading in JOB_COLUMNS) + " |",
