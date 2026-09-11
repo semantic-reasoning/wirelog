@@ -1411,8 +1411,8 @@ col_rel_compute_physical_layout(const col_rel_logical_col_t *logical_cols,
     return 0;
 }
 
-int
-col_rel_apply_compound_schema(col_rel_t *r,
+static int
+col_rel_apply_compound_schema_impl(col_rel_t *r,
     const col_rel_logical_col_t *logical_cols,
     uint32_t logical_ncols)
 {
@@ -1427,10 +1427,16 @@ col_rel_apply_compound_schema(col_rel_t *r,
      * here, but the prefix sum walks every column exactly once. */
     uint32_t compound_count = 0u;
     uint32_t inline_offset = 0u;
+    uint32_t physical_ncols = 0u;
     int rc = col_rel_compute_physical_layout(logical_cols, logical_ncols,
-            NULL, NULL, &inline_offset, &compound_count);
+            &physical_ncols, NULL, &inline_offset, &compound_count);
     if (rc != 0)
         return rc;
+    if (r->ncols != 0 && physical_ncols != r->ncols)
+        return EINVAL;
+    if (!wl_columnar_relation_generation_valid(r->view_generation)
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
 
     uint32_t *arity_map
         = (uint32_t *)malloc((size_t)logical_ncols * sizeof(uint32_t));
@@ -1587,6 +1593,27 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
         return ENOMEM;
     }
     return 0;
+}
+
+int
+col_rel_apply_compound_schema(col_rel_t *r,
+    const col_rel_logical_col_t *logical_cols,
+    uint32_t logical_ncols)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_apply_compound_schema_impl(r, logical_cols, logical_ncols);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 static int
@@ -2708,10 +2735,16 @@ prepare_fail:
 }
 
 int
-col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
+wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
+    const col_rel_t *src,
+    wl_columnar_source_access_reader_t *destination_lease)
 {
-    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_reader_t source_reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
+    col_rel_t *destination_owner = NULL;
+    bool same_owner;
+    bool lease_upgraded = false;
     int rc;
 
     if (!dst || !src)
@@ -2719,13 +2752,62 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
     rc = col_rel_storage_owner_resolve(src, &owner);
     if (rc != 0)
         return rc;
-    rc = col_rel_source_reader_acquire(owner, &reader);
+    rc = col_rel_storage_owner_resolve(dst, &destination_owner);
     if (rc != 0)
         return rc;
+    same_owner = owner == destination_owner;
+    if (destination_lease
+        && (destination_lease->owner != &destination_owner->source_access
+        || destination_lease->identity != (uintptr_t)destination_lease
+        || !destination_lease->transferable
+        || destination_lease->thread_valid))
+        return EINVAL;
+    if (!same_owner) {
+        rc = col_rel_source_reader_acquire(owner, &source_reader);
+        if (rc != 0)
+            return rc;
+    }
+    if (destination_lease) {
+        /* The session is externally serialized and lends its own lifetime
+         * lease for this call.  Upgrade only its sole reader atomically:
+         * external readers deny publication, and the owner stays protected
+         * even on preparation failure.  Keep the token intact for restoration
+         * before the session either reuses or retires the old lease. */
+        uint64_t expected = 1u;
+        lease_upgraded = atomic_compare_exchange_strong_explicit(
+            &destination_owner->source_access.state, &expected,
+            WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed);
+        rc = lease_upgraded ? 0 : EBUSY;
+    } else {
+        /* Alias readers use the canonical owner's gate too.  Refreshing the
+         * destination frees its descriptors, so exclude those readers even
+         * though the borrowed column buffers themselves stay unchanged.
+         * One writer also protects the source when both owners coincide. */
+        rc = col_rel_source_writer_acquire(dst, &writer);
+    }
+    if (rc != 0) {
+        if (source_reader.owner)
+            (void)col_rel_source_reader_release(&source_reader);
+        return rc;
+    }
     rc = col_rel_install_shared_view_unprotected(dst, src);
-    if (col_rel_source_reader_release(&reader) != 0 && rc == 0)
+    if (lease_upgraded)
+        atomic_store_explicit(&destination_owner->source_access.state, 1u,
+            memory_order_release);
+    if (writer.owner
+        && wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    if (source_reader.owner
+        && col_rel_source_reader_release(&source_reader) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
+}
+
+int
+col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
+{
+    return wl_columnar_relation_install_shared_view_with_lease(dst, src, NULL);
 }
 
 /* ---- column name lookup ------------------------------------------------- */

@@ -1140,6 +1140,32 @@ test_shared_view_relation_destroy(void)
     int ok = atomic_load_explicit(&src->source_access.state,
             memory_order_acquire) == 1
         && src->storage_alias_borrows == 1;
+    wl_columnar_source_access_reader_t alias_reader = { 0 };
+    int64_t **saved_columns = worker_rel->columns;
+    struct ArrowSchema **saved_children = worker_rel->schema.children;
+    uint64_t saved_view = worker_rel->view_generation;
+    if (col_rel_source_reader_acquire(worker_rel, &alias_reader) != 0)
+        ok = 0;
+    if (wl_columnar_session_install_shared_view(&worker, worker_rel, src)
+        != EBUSY || worker_rel->columns != saved_columns
+        || worker_rel->schema.children != saved_children
+        || worker_rel->view_generation != saved_view
+        || src->storage_alias_borrows != 1
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 2)
+        ok = 0;
+    if (col_rel_source_reader_release(&alias_reader) != 0)
+        ok = 0;
+    /* A failure after the lease upgrade must restore the original lease. */
+    worker_rel->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    if (wl_columnar_session_install_shared_view(&worker, worker_rel, src)
+        != EOVERFLOW || worker_rel->columns != saved_columns
+        || worker_rel->schema.children != saved_children
+        || src->storage_alias_borrows != 1
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 1)
+        ok = 0;
+    worker_rel->view_generation = saved_view;
     for (int i = 0; i < 16; i++) {
         if (wl_columnar_session_install_shared_view(&worker, worker_rel,
             src) != 0) {
@@ -1200,6 +1226,35 @@ test_shared_view_relation_destroy(void)
     if (wl_columnar_source_access_writer_release(&writer) != 0)
         ok = 0;
 
+    saved_columns = worker_rel->columns;
+    saved_children = worker_rel->schema.children;
+    if (col_rel_source_reader_acquire(worker_rel, &alias_reader) != 0)
+        ok = 0;
+    if (wl_columnar_session_install_shared_view(&worker, worker_rel, next_src)
+        != EBUSY || worker_rel->columns != saved_columns
+        || worker_rel->schema.children != saved_children
+        || worker_rel->view_generation != old_view_generation
+        || src->storage_alias_borrows != 1
+        || next_src->storage_alias_borrows != 0
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 2
+        || atomic_load_explicit(&next_src->source_access.state,
+        memory_order_acquire) != 0)
+        ok = 0;
+    if (col_rel_source_reader_release(&alias_reader) != 0)
+        ok = 0;
+    worker_rel->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    if (wl_columnar_session_install_shared_view(&worker, worker_rel, next_src)
+        != EOVERFLOW || worker_rel->columns != saved_columns
+        || worker_rel->schema.children != saved_children
+        || src->storage_alias_borrows != 1
+        || next_src->storage_alias_borrows != 0
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 1
+        || atomic_load_explicit(&next_src->source_access.state,
+        memory_order_acquire) != 0)
+        ok = 0;
+    worker_rel->view_generation = old_view_generation;
     if (wl_columnar_session_install_shared_view(&worker, worker_rel,
         next_src) != 0) {
         col_worker_session_destroy(&worker);

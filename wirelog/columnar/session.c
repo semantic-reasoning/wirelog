@@ -415,7 +415,15 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
             return rc;
     }
 
-    rc = col_rel_install_shared_view(dst, src);
+    /* A refresh replaces alias descriptors under the old owner's writer.
+     * Lend only this session's lifetime lease to the atomic upgrade; a new
+     * lease can serve this role when adopting an alias of the same owner. */
+    wl_columnar_source_access_reader_t *destination_lease = old_lease
+        ? &old_lease->reader
+        : (new_lease && dst->storage_owner == owner
+            ? &new_lease->reader : NULL);
+    rc = wl_columnar_relation_install_shared_view_with_lease(dst, src,
+            destination_lease);
     if (rc != 0) {
         if (new_lease) {
             int release_rc

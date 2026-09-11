@@ -2304,6 +2304,13 @@ int
 col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels);
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src);
+/* Externally serialized session publication may temporarily upgrade its own
+ * transferable destination-owner lease.  Additional readers still deny it;
+ * the lease is restored on both success and failure before returning. */
+int
+wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
+    const col_rel_t *src,
+    wl_columnar_source_access_reader_t *destination_lease);
 
 /* Source-storage ownership helpers (Issue #1493).  These are internal
  * bookkeeping operations; caller exclusion and public teardown remain the
