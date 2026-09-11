@@ -2186,6 +2186,15 @@ col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
+#ifdef WL_TEST_BDX_SEED
+int
+wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
+    col_rel_t *const *worker_idbs, uint32_t worker_count);
+void
+wl_columnar_eval_test_bdx_seed_fail_worker(uint32_t worker_index);
+void
+wl_columnar_eval_test_bdx_seed_fail_sort_once(void);
+#endif
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like);

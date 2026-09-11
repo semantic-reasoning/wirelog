@@ -1933,6 +1933,195 @@ tdd_dedup_rel(col_rel_t *r)
     wl_columnar_relation_touch_view(r);
 }
 
+/* Build one BDX coordinator seed privately, then publish it as a single
+ * relation replacement.  The worker partitions are read-only inputs; in
+ * particular, cidb is not reset until every append, sort, and dedup step has
+ * succeeded.  This is deliberately relation-scoped: callers must sequence
+ * separate coordinator relations independently. */
+#ifdef WL_TEST_BDX_SEED
+static int bdx_seed_test_fail_worker = -1;
+static bool bdx_seed_test_fail_sort;
+#endif
+
+static int
+tdd_bdx_sort_candidate(col_rel_t *candidate)
+{
+    int64_t **original_columns = NULL;
+    col_delta_timestamp_t *original_timestamps = NULL;
+    bool *used = NULL;
+    int rc;
+
+    if (!candidate || candidate->nrows <= 1)
+        return 0;
+    if (!candidate->timestamps)
+        return col_rel_radix_sort(candidate, 0, candidate->nrows);
+
+    original_columns = col_columns_alloc(candidate->ncols,
+            candidate->nrows);
+    original_timestamps = (col_delta_timestamp_t *)malloc(
+        (size_t)candidate->nrows * sizeof(*original_timestamps));
+    used = (bool *)calloc(candidate->nrows, sizeof(*used));
+    if (!original_columns || !original_timestamps || !used) {
+        col_columns_free(original_columns, candidate->ncols);
+        free(original_timestamps);
+        free(used);
+        return ENOMEM;
+    }
+    for (uint32_t col = 0; col < candidate->ncols; col++)
+        memcpy(original_columns[col], candidate->columns[col],
+            (size_t)candidate->nrows * sizeof(**original_columns));
+    memcpy(original_timestamps, candidate->timestamps,
+        (size_t)candidate->nrows * sizeof(*original_timestamps));
+
+    rc = col_rel_radix_sort(candidate, 0, candidate->nrows);
+    if (rc != 0)
+        goto cleanup;
+    for (uint32_t row = 0; row < candidate->nrows; row++) {
+        uint32_t source = 0;
+        for (; source < candidate->nrows; source++) {
+            bool match = !used[source];
+            for (uint32_t col = 0; match && col < candidate->ncols; col++)
+                match = candidate->columns[col][row]
+                    == original_columns[col][source];
+            if (match)
+                break;
+        }
+        if (source == candidate->nrows) {
+            rc = EINVAL;
+            goto cleanup;
+        }
+        used[source] = true;
+        candidate->timestamps[row] = original_timestamps[source];
+    }
+
+cleanup:
+    col_columns_free(original_columns, candidate->ncols);
+    free(original_timestamps);
+    free(used);
+    return rc;
+}
+
+static int
+tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
+    uint32_t worker_count)
+{
+    col_rel_t *schema_source = cidb;
+    col_rel_t *candidate = NULL;
+    col_rel_replacement_t replacement;
+    int rc = 0;
+
+    if (!cidb || (!worker_idbs && worker_count > 0))
+        return EINVAL;
+    for (uint32_t w = 0; w < worker_count; w++) {
+        col_rel_t *worker = worker_idbs[w];
+        if (!worker || worker->nrows == 0)
+            continue;
+        if (schema_source->ncols == 0)
+            schema_source = worker;
+        else if (worker->ncols != schema_source->ncols)
+            return EINVAL;
+    }
+
+    candidate = col_rel_new_like(cidb->name, schema_source);
+    if (!candidate)
+        return ENOMEM;
+    candidate->nrows = 0;
+    candidate->base_nrows = 0;
+    candidate->sorted_nrows = 0;
+    candidate->run_count = 0;
+    if (cidb->timestamps) {
+        rc = col_rel_enable_timestamps(candidate);
+        if (rc != 0)
+            goto cleanup;
+    }
+
+    for (uint32_t w = 0; w < worker_count; w++) {
+        col_rel_t *worker = worker_idbs[w];
+        if (!worker || worker->nrows == 0)
+            continue;
+#ifdef WL_TEST_BDX_SEED
+        if (bdx_seed_test_fail_worker == (int)w) {
+            bdx_seed_test_fail_worker = -1;
+            rc = ENOMEM;
+            goto cleanup;
+        }
+#endif
+        rc = col_rel_append_all(candidate, worker, NULL);
+        if (rc != 0)
+            goto cleanup;
+    }
+
+    if (candidate->nrows > 1 && candidate->ncols > 0) {
+        if (!tdd_relation_rows_sorted(candidate)) {
+#ifdef WL_TEST_BDX_SEED
+            if (bdx_seed_test_fail_sort) {
+                bdx_seed_test_fail_sort = false;
+                rc = ENOMEM;
+                goto cleanup;
+            }
+#endif
+            rc = tdd_bdx_sort_candidate(candidate);
+            if (rc != 0)
+                goto cleanup;
+        }
+        uint32_t out = 1;
+        for (uint32_t row = 1; row < candidate->nrows; row++) {
+            bool duplicate = true;
+            for (uint32_t col = 0; col < candidate->ncols; col++) {
+                if (candidate->columns[col][row - 1]
+                    != candidate->columns[col][row]) {
+                    duplicate = false;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                if (out != row)
+                    col_columns_copy_row(candidate->columns, out,
+                        (int64_t *const *)candidate->columns, row,
+                        candidate->ncols);
+                if (candidate->timestamps)
+                    candidate->timestamps[out] = candidate->timestamps[row];
+                out++;
+            }
+        }
+        candidate->nrows = out;
+        candidate->sorted_nrows = out;
+        wl_columnar_relation_touch_view(candidate);
+    }
+
+    memset(&replacement, 0, sizeof(replacement));
+    rc = col_rel_prepare_replacement(cidb, candidate, &replacement);
+    if (rc == 0)
+        rc = col_rel_commit_replacement_locked(cidb, &replacement);
+    if (rc != 0)
+        col_rel_discard_replacement(&replacement);
+
+cleanup:
+    col_rel_destroy(candidate);
+    return rc;
+}
+
+#ifdef WL_TEST_BDX_SEED
+void
+wl_columnar_eval_test_bdx_seed_fail_worker(uint32_t worker_index)
+{
+    bdx_seed_test_fail_worker = (int)worker_index;
+}
+
+void
+wl_columnar_eval_test_bdx_seed_fail_sort_once(void)
+{
+    bdx_seed_test_fail_sort = true;
+}
+
+int
+wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
+    col_rel_t *const *worker_idbs, uint32_t worker_count)
+{
+    return tdd_seed_bdx_coordinator_idb(cidb, worker_idbs, worker_count);
+}
+#endif
+
 /*
  * tdd_sorted_merge_append:
  * Merge src (sorted, no overlap with dst) into dst (sorted), maintaining
@@ -4416,33 +4605,35 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *cidb = session_find_rel(coord,
                     sp->relations[ri].name);
+            col_rel_t **worker_idbs = NULL;
             if (cidb) {
-                cidb->nrows = 0;
-                wl_columnar_relation_touch_view(cidb);
-            }
-            for (uint32_t w = 0; w < W; w++) {
-                col_rel_t *widb = session_find_rel(
-                    &coord->tdd_workers[w], sp->relations[ri].name);
-                if (widb && widb->nrows > 0 && cidb) {
-                    if (cidb->ncols == 0 && widb->ncols > 0) {
-                        rc = col_rel_set_schema(cidb, widb->ncols,
-                                (const char *const *)widb->col_names);
-                        if (rc != 0) {
-                            free(bdx_snap);
-                            bdx_snap = NULL;
-                            goto done;
-                        }
-                    }
-                    rc = col_rel_append_all(cidb, widb, NULL);
-                    if (rc != 0) {
-                        free(bdx_snap);
-                        bdx_snap = NULL;
-                        goto done;
-                    }
+                size_t worker_idb_bytes = 0;
+                if (wl_columnar_eval_checked_size_mul(W, sizeof(*worker_idbs),
+                    &worker_idb_bytes) != 0) {
+                    free(bdx_snap);
+                    bdx_snap = NULL;
+                    rc = EOVERFLOW;
+                    goto done;
+                }
+                worker_idbs = (col_rel_t **)calloc(1,
+                        worker_idb_bytes);
+                if (!worker_idbs) {
+                    free(bdx_snap);
+                    bdx_snap = NULL;
+                    rc = ENOMEM;
+                    goto done;
+                }
+                for (uint32_t w = 0; w < W; w++)
+                    worker_idbs[w] = session_find_rel(
+                        &coord->tdd_workers[w], sp->relations[ri].name);
+                rc = tdd_seed_bdx_coordinator_idb(cidb, worker_idbs, W);
+                free(worker_idbs);
+                if (rc != 0) {
+                    free(bdx_snap);
+                    bdx_snap = NULL;
+                    goto done;
                 }
             }
-            if (cidb && cidb->nrows > 1)
-                tdd_dedup_rel(cidb);
         }
         /* Pre-seed $d$ with full initial IDB on all workers.
          * BDX forces diff from eff_iter 0, so K_FUSION uses the broadcast
