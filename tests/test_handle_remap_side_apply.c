@@ -460,6 +460,42 @@ cleanup:
     col_rel_destroy(non_side);
 }
 
+static void
+test_apply_side_reader_exclusion(void)
+{
+    TEST("#1495: side-relation reader blocks remap until retry");
+
+    col_rel_t *rel = build_side_relation("reader", 1u, 40u, flat_old, NULL);
+    wl_handle_remap_t *remap = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t rewrites = 99u;
+    ASSERT(rel != NULL, "side relation build");
+    ASSERT(wl_handle_remap_create(40u, &remap) == 0,
+        "remap create");
+    for (uint32_t row = 0; row < 40u; row++)
+        ASSERT(wl_handle_remap_insert(remap, flat_old(row, 0u, NULL),
+            flat_new(row, 0u)) == 0, "remap insert");
+    int64_t before = rel->columns[0][0];
+    uint64_t generation = rel->view_generation;
+    ASSERT(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "reader acquire");
+    ASSERT(wl_handle_remap_apply_side_relation(rel, NULL, 0u, remap,
+        &rewrites) == EBUSY, "reader must block side remap");
+    ASSERT(rewrites == 0u && rel->columns[0][0] == before
+        && rel->view_generation == generation,
+        "blocked side remap must be transactional");
+    ASSERT(col_rel_source_reader_release(&reader) == 0,
+        "reader release");
+    rewrites = 0u;
+    ASSERT(wl_handle_remap_apply_side_relation(rel, NULL, 0u, remap,
+        &rewrites) == 0 && rewrites == 40u,
+        "side remap retry must succeed");
+    PASS();
+cleanup:
+    wl_handle_remap_free(remap);
+    col_rel_destroy(rel);
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -474,6 +510,7 @@ main(void)
     test_apply_session_100_nested();
     test_apply_eio_partial_rewrite();
     test_apply_einval_coverage();
+    test_apply_side_reader_exclusion();
 
     printf("\nResults: %d/%d passed, %d failed\n",
         tests_passed, tests_run, tests_failed);
