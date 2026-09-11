@@ -53,8 +53,9 @@ tool = load_tool()
 
 
 def fixture(name: str):
-    run = json.loads((FIXTURES / f"{name}.json").read_text())
-    jobs = json.loads((FIXTURES / f"{name}-jobs.json").read_text())
+    run = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+    jobs = json.loads(
+        (FIXTURES / f"{name}-jobs.json").read_text(encoding="utf-8"))
     return run, jobs
 
 
@@ -550,8 +551,10 @@ class ReportPairing(unittest.TestCase):
             (out / "raw").mkdir()
             run, _ = fixture("run-success")
             _, other_jobs = fixture("run-clock-skew")
-            (out / "raw" / "run-999.json").write_text(json.dumps(run))
-            (out / "raw" / "run-999-jobs.json").write_text(json.dumps(other_jobs))
+            (out / "raw" / "run-999.json").write_text(json.dumps(run),
+                                                      encoding="utf-8")
+            (out / "raw" / "run-999-jobs.json").write_text(
+                json.dumps(other_jobs), encoding="utf-8")
             # Without the guard this published a confident 14-hour run wall.
             self.assertEqual(
                 tool.main(["report", "--run-id", "999", "--out", tmp]), 1)
@@ -716,12 +719,14 @@ class DependencyGraph(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".github" / "workflows").mkdir(parents=True)
-            source = self.WORKFLOW.read_text().replace(
+            source = self.WORKFLOW.read_text(encoding="utf-8").replace(
                 "    needs: [sanitizer-matrix, build-scope]",
                 "    needs:\n      - sanitizer-matrix\n      - build-scope", 1)
-            (root / ".github" / "workflows" / "ci-pr.yml").write_text(source)
+            (root / ".github" / "workflows" / "ci-pr.yml").write_text(
+                source, encoding="utf-8")
             (root / ".github" / "workflows" / "lint-pr.yml").write_text(
-                (self.WORKFLOW.parent / "lint-pr.yml").read_text())
+                (self.WORKFLOW.parent / "lint-pr.yml").read_text(
+                    encoding="utf-8"), encoding="utf-8")
             with self.assertRaises(tool.WorkflowParseError) as caught:
                 tool.extract_graph(root / ".github" / "workflows" / "ci-pr.yml")
             self.assertIn("sever", str(caught.exception))
@@ -973,6 +978,143 @@ class CriticalPath(unittest.TestCase):
         self.assertEqual(len(path["graph_drift"]["jobs_without_node"]),
                          len(mutated["jobs"]))
 
+    def test_an_untimed_job_on_the_chain_is_not_also_called_off_chain(self):
+        # The two keys mean different things: one says the total is short by
+        # this hop, the other says the chain itself may be wrong.  Collapsing
+        # them would make the second unreadable.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == "lint / uncrustify check":
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        paths = tool.analyze(run, mutated, edges, drift)["critical_path"]
+        for key in ("observed", "graph"):
+            metric = paths[key]
+            self.assertIn("lint / uncrustify check", metric["evidence"]["chain"])
+            self.assertNotIn("untimed_jobs_off_chain", metric["evidence"])
+
+    def test_a_run_with_no_jobs_still_distinguishes_drift_from_no_graph(self):
+        # Only `nodes_without_job` is populated here, so the empty-edges
+        # branch cannot lean on `jobs_without_node` alone.
+        run, _ = fixture("run-success")
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(graph, [])
+        self.assertEqual(drift["jobs_without_node"], [])
+        self.assertTrue(drift["nodes_without_job"])
+        path = tool.analyze(run, {"jobs": []}, edges, drift)["critical_path"]
+        self.assertIn("see drift", path["graph"]["reason"])
+
+    def test_a_job_still_running_is_not_reported_as_missing_data(self):
+        # Every unfinished job in a live run is untimed by definition.
+        # Calling that missing data makes the caveat fire on every live run
+        # with an alarm it does not deserve, which is how a reader learns to
+        # skip it.
+        run, jobs = fixture("run-queued")
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in jobs["jobs"]])
+        paths = tool.analyze(run, jobs, edges, drift)["critical_path"]
+        for key in ("observed", "graph"):
+            metric = paths[key]
+            self.assertEqual(metric["status"], "partial")
+            self.assertIn("have not finished", metric["reason"])
+            self.assertNotIn("were not timed", metric["reason"])
+            self.assertTrue(metric["evidence"]["unfinished_jobs_off_chain"])
+            self.assertNotIn("untimed_jobs_off_chain", metric["evidence"])
+
+    def test_a_job_that_completed_without_a_start_is_not_called_unfinished(self):
+        # run-missing-data ships exactly this shape: status completed, a
+        # completion stamp, no start.  Saying it has not completed puts two
+        # contradictory sentences in one report, and the reader who checks
+        # finds the tool wrong, which costs more than saying nothing.
+        run, jobs = fixture("run-missing-data")
+        report = tool.analyze(run, jobs)
+        victim = next(job for job in report["jobs"]
+                      if job["started_at"] is None)
+        self.assertEqual(victim["status"], "completed")
+        self.assertEqual(victim["metrics"]["job_wall"]["reason"],
+                         "job never started")
+        self.assertNotIn("job has not completed", tool.render_markdown(report))
+
+    def test_a_job_cancelled_before_it_started_is_not_missing_data(self):
+        # It has no duration because it never ran, like a skipped job, and it
+        # will never acquire one.  Both alarms would be false.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                job["status"] = "completed"
+                job["conclusion"] = "cancelled"
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        paths = tool.analyze(run, mutated, edges, drift)["critical_path"]
+        for key in ("observed", "graph"):
+            evidence = paths[key]["evidence"]
+            self.assertNotIn("untimed_jobs_off_chain", evidence)
+            self.assertNotIn("unfinished_jobs_off_chain", evidence)
+
+    def test_a_status_the_tool_does_not_know_takes_the_loud_branch(self):
+        # An unreadable status is data the tool cannot interpret.  Presenting
+        # it as an ordinary running job would be a guess in the quiet
+        # direction, which is the one that understates.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                job["status"] = "something-new"
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        path = tool.analyze(run, mutated, edges, drift)["critical_path"]["graph"]
+        self.assertIn("Sanitizers / ubuntu-latest / clang",
+                      path["evidence"]["untimed_jobs_off_chain"])
+
+    def test_a_finished_job_with_no_duration_is_still_missing_data(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                job["started_at"] = None    # completed, never started
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        path = tool.analyze(run, mutated, edges, drift)["critical_path"]["graph"]
+        self.assertIn("were not timed", path["reason"])
+        self.assertNotIn("have not finished", path["reason"])
+
+    def test_the_observed_reason_names_both_ways_it_can_be_wrong(self):
+        # The walk selects by completion timestamp, so an untimed job can
+        # either sit above the start it chose or sit on a branch it never
+        # entered.  Naming only one leaves the other unstated.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == "TSan / ubuntu-latest / clang":
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        reason = tool.analyze(run, mutated, edges,
+                              drift)["critical_path"]["observed"]["reason"]
+        self.assertIn("below the true end of the path", reason)
+        self.assertIn("longer branch it never entered", reason)
+
+    def test_a_job_is_not_told_the_critical_path_cannot_be_walked(self):
+        # Read against one job, that sentence reverses cause and effect: the
+        # latency is unknown because the job's dependencies are, not because
+        # a path elsewhere could not be walked.
+        report = tool.analyze(*fixture("run-success"))
+        metric = report["jobs"][0]["metrics"]["scheduler_release_latency"]
+        self.assertEqual(metric["status"], "unavailable")
+        self.assertIn("dependencies are unknown", metric["reason"])
+        self.assertNotIn("critical path", metric["reason"])
+
     def test_the_observed_total_says_what_it_omits(self):
         path = self._analyze("run-success")["critical_path"]["observed"]
         self.assertIn("lower bound", path["evidence"]["note"])
@@ -1190,9 +1332,10 @@ class Rendering(unittest.TestCase):
             out = Path(tmp)
             (out / "raw").mkdir()
             run, jobs = fixture("run-success")
-            (out / "raw" / f"run-{run['id']}.json").write_text(json.dumps(run))
+            (out / "raw" / f"run-{run['id']}.json").write_text(
+                json.dumps(run), encoding="utf-8")
             (out / "raw" / f"run-{run['id']}-jobs.json").write_text(
-                json.dumps(jobs))
+                json.dumps(jobs), encoding="utf-8")
             captured = io.StringIO()
             with contextlib.redirect_stderr(captured):
                 self.assertEqual(tool.main(
@@ -1205,13 +1348,226 @@ class Rendering(unittest.TestCase):
             self.assertIn("no dependency graph", text)
             self.assertNotIn("declares no jobs", text)
 
+    def test_the_markdown_says_why_a_number_is_not_final(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        text = tool.render_markdown(
+            tool.analyze(run, mutated, edges, drift))
+        # A "(partial)" cell with no reason beside it is a flag a reader
+        # learns to ignore.  The whole point of the degradation is the cause.
+        self.assertIn("Why a number above is not final", text)
+        self.assertIn("routed around", text)
+        self.assertIn("critical_path.graph", text)
+
+    @staticmethod
+    def _row_values(text, job_name):
+        """One job's printed cells, read back out of the rendered table."""
+        table = text.split("Per job, seconds")[1]
+        headings = [part.strip() for part in
+                    table.splitlines()[2].strip().strip("|").split("|")][2:]
+        for line in table.splitlines():
+            if line.startswith(f"| {job_name} |"):
+                cells = [part.strip() for part in
+                         line.strip().strip("|").split("|")][2:]
+                # zip would silently drop a column the header does not
+                # declare, which is the drift this whole reading exists to
+                # catch.
+                if len(cells) != len(headings):
+                    raise AssertionError(
+                        f"{job_name}: {len(cells)} cells under "
+                        f"{len(headings)} headings")
+                return dict(zip(headings, cells))
+        raise AssertionError(f"no row for {job_name}")
+
+    def _degraded_cells(self, report, text):
+        """Every per-job cell the rendered table shows as not a measurement.
+
+        Read out of the markdown rather than out of `job_cells`, because
+        `job_cells` is what is under test: deriving the expectation from it
+        would prove only that the block covers itself."""
+        found = []
+        for job in report["jobs"]:
+            if job["conclusion"] == "skipped":
+                continue
+            for heading, value in self._row_values(text, job["name"]).items():
+                if not value.isdigit():
+                    found.append((job["name"], heading))
+        return found
+
+    def test_every_degraded_cell_in_the_table_is_explained(self):
+        # The block exists to stop `(partial)` being a flag with no cause.
+        # Explaining a metric that has no column while leaving the printed
+        # ones bare would be the same failure wearing a longer report.
+        graph = tool.extract_graph(self.WORKFLOW)
+        for name in ("run-success", "run-skip-cascade", "run-clock-skew",
+                     "run-queued", "run-missing-data", "run-rerun"):
+            run, jobs = fixture(name)
+            edges, drift = tool.match_graph_to_jobs(
+                graph, [j["name"] for j in jobs["jobs"]])
+            for arguments in ((run, jobs), (run, jobs, edges, drift)):
+                report = tool.analyze(*arguments)
+                text = tool.render_markdown(report)
+                block = text.split("Why a number above is not final")[-1]
+                for job_name, heading in self._degraded_cells(report, text):
+                    column = dict((head, key) for key, _, head
+                                  in tool.JOB_COLUMNS)[heading]
+                    self.assertTrue(
+                        f"{job_name} / {column}" in block
+                        or f"`{column}` on " in block,
+                        f"{name}: nothing explains {job_name} / {heading}")
+
+    def test_the_printed_row_is_exactly_what_the_block_reasons_about(self):
+        # The table and the block are built from one declaration precisely so
+        # they cannot drift.  Pin that against the rendered text: add a
+        # seventh cell to the row by hand and this fails, which is the only
+        # way the block can silently stop covering a column.
+        run, jobs = fixture("run-success")
+        report = tool.analyze(run, jobs)
+        text = tool.render_markdown(report)
+        for job in report["jobs"]:
+            printed = self._row_values(text, job["name"])
+            expected = {heading: tool.cell(metric)
+                        for (_, _, heading), (_, metric)
+                        in zip(tool.JOB_COLUMNS, tool.job_cells(job))}
+            self.assertEqual(printed, expected)
+        self.assertEqual(len(tool.JOB_COLUMNS), len(tool.job_cells(
+            report["jobs"][0])))
+
+    def test_a_reason_spanning_more_than_one_column_is_not_collapsed(self):
+        # "4 values are anomalous" names neither a job nor a number.  Four
+        # specific lines are longer and worth more.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"][:2]:
+            job["created_at"] = "2025-01-01T00:01:00Z"
+            job["started_at"] = "2025-01-01T00:00:00Z"
+            job["completed_at"] = "2024-12-31T23:59:00Z"
+        text = tool.render_markdown(tool.analyze(run, mutated))
+        block = text.split("Why a number above is not final")[-1]
+        self.assertNotIn("values are anomalous", block)
+        for name in (job["name"] for job in mutated["jobs"][:2]):
+            self.assertIn(f"`{name} / queue_delay` is anomalous", block)
+            self.assertIn(f"`{name} / job_wall` is anomalous", block)
+
+    def test_a_degraded_number_with_no_recorded_cause_still_appears(self):
+        # The block's whole purpose is that no degraded cell is bare.  A
+        # metric whose reason went missing must say that, not vanish.
+        run, jobs = fixture("run-success")
+        report = tool.analyze(run, jobs)
+        report["jobs"][0]["metrics"]["job_wall"] = {
+            "seconds": 3, "status": "partial", "reason": None, "evidence": {}}
+        text = tool.render_markdown(report)
+        self.assertIn("no cause was recorded", text)
+
+    def test_a_small_group_is_named_job_by_job_not_counted(self):
+        # The collapse threshold is a legibility tradeoff, not an invariant.
+        # Pin both sides of it so it cannot be retuned unnoticed.
+        run, jobs = fixture("run-missing-data")
+        text = tool.render_markdown(tool.analyze(run, jobs))
+        # Three jobs share the configure reason, which is the threshold, so
+        # each is still named.  Five would collapse; run-clock-skew shows it.
+        self.assertEqual(text.count("no step matched phase configure"), 3)
+        self.assertNotIn("on 3 jobs is", text)
+        skewed, skewed_jobs = fixture("run-clock-skew")
+        wide = tool.render_markdown(tool.analyze(skewed, skewed_jobs))
+        self.assertIn("`configure` on 5 jobs is", wide)
+        self.assertEqual(wide.count("no step matched phase configure"), 1)
+
+    def test_the_block_never_explains_a_metric_with_no_column(self):
+        # scheduler_release_latency and upstream_elapsed are computed and
+        # published in the JSON, but the markdown prints neither, so a line
+        # about them explains a number the reader cannot see.
+        run, jobs = fixture("run-success")
+        report = tool.analyze(run, jobs)
+        block = "\n".join(
+            tool.degradation_block(report, report["critical_path"]))
+        for hidden in ("scheduler_release_latency", "upstream_elapsed"):
+            self.assertNotIn(hidden, block)
+
+    def test_the_block_follows_the_table_it_explains(self):
+        text = tool.render_markdown(tool.analyze(*fixture("run-success")))
+        self.assertLess(text.index("Per job, seconds"),
+                        text.index("Why a number above is not final"))
+
+    def test_one_reason_repeated_across_jobs_collapses_to_one_line(self):
+        run, jobs = fixture("run-success")
+        text = tool.render_markdown(tool.analyze(run, jobs))
+        # Eighteen jobs, five without a configure step.  Five identical
+        # sentences would bury every line that is not repeated.
+        self.assertIn("`configure` on 5 jobs is unavailable", text)
+        self.assertEqual(text.count("no step matched phase configure"), 1)
+
+    def test_the_block_carries_the_run_level_rows_too(self):
+        run, jobs = fixture("run-success")
+        text = tool.render_markdown(tool.analyze(run, jobs))
+        self.assertIn("`total_required_check_completion` is unavailable", text)
+        self.assertIn("`first_failure_latency` is unavailable", text)
+
+    def test_the_markdown_does_not_repeat_itself_once_per_skipped_job(self):
+        text = tool.render_markdown(tool.analyze(*fixture("run-skip-cascade")))
+        self.assertEqual(text.count("job skipped; no execution"), 0)
+
+    def test_every_file_the_tool_reads_or_writes_names_its_encoding(self):
+        # Job names come straight from the API and are not ASCII by rule, so
+        # a text call that takes the locale encoding decodes correctly on the
+        # developer's machine and raises on a runner with a different one.
+        # Asserting the discipline is deterministic; asserting the symptom
+        # would need a non-UTF-8 locale the test host may not have.
+        import pathlib
+        read_text, write_text = pathlib.Path.read_text, pathlib.Path.write_text
+        fetch_run = tool.fetch_run
+        seen = []
+
+        def record(kind, original):
+            def wrapper(self, *args, **kwargs):
+                seen.append((kind, str(self), kwargs.get("encoding")))
+                return original(self, *args, **kwargs)
+            return wrapper
+
+        run, jobs = fixture("run-success")
+        jobs = copy.deepcopy(jobs)
+        jobs["jobs"][0]["name"] = "Docs / política ✔ validation"
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                pathlib.Path.read_text = record("read", read_text)
+                pathlib.Path.write_text = record("write", write_text)
+                tool.fetch_run = lambda *a, **k: (run, jobs)
+                # `fetch` writes the raw API payloads, which is where a
+                # non-ASCII job name first reaches the disk.  A test that
+                # skips it does not assert what it claims to.
+                self.assertEqual(tool.main(
+                    ["fetch", "--run-id", str(run["id"]), "--out", tmp,
+                     "--repo", "o/r"]), 0)
+                self.assertEqual(tool.main(
+                    ["report", "--run-id", str(run["id"]), "--out", tmp]), 0)
+                self.assertEqual(tool.main(
+                    ["aggregate", "--out", tmp, "--label", "b"]), 0)
+            finally:
+                pathlib.Path.read_text = read_text
+                pathlib.Path.write_text = write_text
+                tool.fetch_run = fetch_run
+        kinds = {kind for kind, _, _ in seen}
+        self.assertEqual(kinds, {"read", "write"}, seen)
+        written = {name for kind, name, _ in seen if kind == "write"}
+        self.assertTrue(any(name.endswith(".md") for name in written), written)
+        self.assertTrue(any("raw" in name for name in written), written)
+        self.assertEqual([entry for entry in seen if entry[2] != "utf-8"], [])
+
     def test_report_command_writes_both_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             (out / "raw").mkdir()
             run, jobs = fixture("run-success")
-            (out / "raw" / f"run-{run['id']}.json").write_text(json.dumps(run))
-            (out / "raw" / f"run-{run['id']}-jobs.json").write_text(json.dumps(jobs))
+            (out / "raw" / f"run-{run['id']}.json").write_text(
+                json.dumps(run), encoding="utf-8")
+            (out / "raw" / f"run-{run['id']}-jobs.json").write_text(
+                json.dumps(jobs), encoding="utf-8")
             self.assertEqual(
                 tool.main(["report", "--run-id", str(run["id"]), "--out", tmp]), 0)
             self.assertTrue((out / f"run-{run['id']}.json").exists())
