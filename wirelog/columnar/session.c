@@ -2090,6 +2090,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
+    out_worker->arr_total_bytes = 0; /* cloned registries start without storage */
     out_worker->diff_arr_entries = NULL;
     out_worker->diff_arr_count = 0;
     out_worker->diff_arr_cap = 0;

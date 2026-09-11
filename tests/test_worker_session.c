@@ -562,7 +562,7 @@ test_mat_cache_empty(void)
 static int
 test_arrangement_clone_ownership(void)
 {
-    TEST("worker arrangement clone owns arrays and preserves metadata");
+    TEST("worker arrangement clone starts cold and rebuilds privately");
 
     wl_plan_t *plan = NULL;
     wirelog_program_t *prog = NULL;
@@ -624,23 +624,53 @@ test_arrangement_clone_ownership(void)
         && dst->arr.key_cols == dst->key_cols
         && dst->arr.key_cols != src->arr.key_cols
         && dst->arr.key_count == src->arr.key_count
-        /* Issue #1438: a clone is a cold entry -- the buckets are copied
-        * but the freshness token and indexed_rows are reset so the first
-        * lookup rebuilds against the worker's own partition relation. */
+        /* Cold clones own key metadata, but no coordinator index storage. */
         && dst->arr.indexed_rows == 0
         && dst->source_snapshot.relation_identity == 0
-        && dst->arr.content_hash == src->arr.content_hash
-        && dst->arr.nbuckets == src->arr.nbuckets
-        && dst->arr.ht_cap == src->arr.ht_cap
-        && dst->arr.generation == src->arr.generation
-        && dst->arr.ht_head != src->arr.ht_head
-        && dst->arr.ht_next != src->arr.ht_next
-        && memcmp(dst->arr.ht_head, src->arr.ht_head, head_bytes) == 0
-        && memcmp(dst->arr.ht_next, src->arr.ht_next, next_bytes) == 0
+        && dst->arr.content_hash == 0
+        && dst->arr.nbuckets == 0
+        && dst->arr.ht_cap == 0
+        && dst->arr.generation == 0
+        && dst->arr.ht_head == NULL
+        && dst->arr.ht_next == NULL
         && dst->lru_clock == src->lru_clock
-        && dst->mem_bytes == src->mem_bytes
+        && dst->mem_bytes == 0
+        && worker.arr_total_bytes == 0
         && dst->arr.memory_governor == worker.memory_governor
-        && dst->arr.reserved_bytes == src->mem_bytes;
+        && dst->arr.reserved_bytes == 0;
+
+    uint64_t *saved_head = malloc(head_bytes);
+    if (!ok)
+        fprintf(stderr, "cold clone metadata/storage check failed\n");
+    uint32_t *saved_next = malloc(next_bytes);
+    if (saved_head && saved_next) {
+        memcpy(saved_head, src->arr.ht_head, head_bytes);
+        memcpy(saved_next, src->arr.ht_next, next_bytes);
+        col_rel_t *worker_rel = session_find_rel(&worker, "edge");
+        int set_rc = worker_rel ? col_rel_set(worker_rel, 0, 0, 99) : EINVAL;
+        if (set_rc != 0) {
+            fprintf(stderr, "worker mutation failed: %d\n", set_rc);
+            ok = 0;
+        }
+        col_arrangement_t *rebuilt = col_session_get_arrangement(
+            &worker.base, "edge", key_cols, 1);
+        int64_t key = 99;
+        ok = ok && rebuilt && rebuilt->ht_head != src->arr.ht_head
+            && rebuilt->ht_next != src->arr.ht_next
+            && rebuilt->indexed_rows == worker_rel->nrows
+            && dst->mem_bytes > 0 && dst->arr.reserved_bytes == dst->mem_bytes
+            && dst->source_snapshot.relation_identity ==
+            worker_rel->relation_identity
+            && col_arrangement_find_first_typed(rebuilt, worker_rel,
+                &key) != UINT32_MAX
+            && memcmp(saved_head, src->arr.ht_head, head_bytes) == 0
+            && memcmp(saved_next, src->arr.ht_next, next_bytes) == 0
+            && session_find_rel(coord, "edge")->columns[0][0] == 1;
+    } else {
+        ok = 0;
+    }
+    free(saved_head);
+    free(saved_next);
 
     col_worker_session_destroy(&worker);
     cleanup_coordinator(coord, plan, prog);

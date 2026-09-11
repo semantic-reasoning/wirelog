@@ -498,8 +498,8 @@ arr_entry_mark_unbuilt(col_arr_entry_t *e)
 /**
  * col_arr_entry_clone - Deep-copy one arrangement registry entry (#260).
  *
- * All owned memory (rel_name, key_cols, ht_head, ht_next) is freshly
- * allocated.  arr.key_cols is set to the new entry's key_cols (shared alias,
+ * Only rel_name and key_cols are copied; hash storage is built lazily.
+ * arr.key_cols is set to the new entry's key_cols (shared alias,
  * not a separate allocation — matches arrangement.c creation convention).
  * Returns 0 on success; dst is memset-zeroed before returning on failure.
  */
@@ -507,9 +507,6 @@ static int
 col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst,
     wl_columnar_memory_governor_ref_t *memory_governor)
 {
-    size_t head_bytes = 0;
-    size_t next_bytes = 0;
-
     memset(dst, 0, sizeof(*dst));
 
     /* A registry slot may carry no name or keys (defence in depth, #1515);
@@ -533,72 +530,12 @@ col_arr_entry_clone(const col_arr_entry_t *src, col_arr_entry_t *dst,
     * Mirrors the convention in col_session_get_arrangement (arrangement.c). */
     dst->arr.key_cols = dst->key_cols;
     dst->arr.key_count = src->arr.key_count;
-    dst->arr.indexed_rows = src->arr.indexed_rows;
-    dst->arr.content_hash = src->arr.content_hash;
-    dst->arr.nbuckets = src->arr.nbuckets;
-    dst->arr.ht_cap = src->arr.ht_cap;
-    dst->arr.generation = src->arr.generation;
-    /* A worker's relation is a partition with its own identity, and the
-     * differential join walks [indexed_rows, nrows) of its arrangement
-     * directly.  The clone therefore arrives cold: the freshness token is
-     * zeroed so the first lookup rebuilds against the worker's relation
-     * instead of trusting the coordinator's index (Issue #1438). */
-    dst->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
-    dst->arr.indexed_rows = 0;
+    /* Only schema metadata crosses into the worker. Storage, progress,
+     * freshness and byte accounting stay zero until its first rebuild. */
+    wl_columnar_memory_reservation_init(&dst->arr.reservation);
     col_arr_attach_memory_governor(&dst->arr, memory_governor);
-    if (dst->arr.memory_governor && src->mem_bytes > 0) {
-        wl_columnar_memory_governor_t *governor
-            = wl_columnar_memory_governor_ref_get(memory_governor);
-        wl_columnar_memory_reservation_init(&dst->arr.reservation);
-        if (!wl_columnar_memory_reserve(governor, src->mem_bytes,
-            &dst->arr.reservation)
-            || !wl_columnar_memory_commit(&dst->arr.reservation, dst)) {
-            (void)wl_columnar_memory_release(&dst->arr.reservation);
-            col_arr_detach_memory_governor(&dst->arr);
-            free(dst->key_cols);
-            free(dst->rel_name);
-            memset(dst, 0, sizeof(*dst));
-            return ENOMEM;
-        }
-        dst->arr.reserved_bytes = src->mem_bytes;
-    }
-    /* Issue #216: copy LRU metadata so worker clones inherit access state. */
     dst->lru_clock = src->lru_clock;
-    dst->mem_bytes = src->mem_bytes;
-
-    if (src->arr.nbuckets > 0 && src->arr.ht_head) {
-        head_bytes = (size_t)src->arr.nbuckets * sizeof(uint64_t);
-        if (head_bytes / sizeof(uint64_t) != src->arr.nbuckets)
-            goto fail;
-        dst->arr.ht_head
-            = (uint64_t *)malloc(head_bytes);
-        if (!dst->arr.ht_head)
-            goto fail;
-        memcpy(dst->arr.ht_head, src->arr.ht_head,
-            head_bytes);
-    }
-
-    if (src->arr.ht_cap > 0 && src->arr.ht_next) {
-        next_bytes = (size_t)src->arr.ht_cap * sizeof(uint32_t);
-        if (next_bytes / sizeof(uint32_t) != src->arr.ht_cap)
-            goto fail;
-        dst->arr.ht_next
-            = (uint32_t *)malloc(next_bytes);
-        if (!dst->arr.ht_next)
-            goto fail;
-        memcpy(dst->arr.ht_next, src->arr.ht_next,
-            next_bytes);
-    }
-
     return 0;
-
-fail:
-    arr_free_contents(&dst->arr);
-    col_arr_detach_memory_governor(&dst->arr);
-    free(dst->key_cols);
-    free(dst->rel_name);
-    memset(dst, 0, sizeof(*dst));
-    return ENOMEM;
 }
 
 /**
@@ -1428,7 +1365,7 @@ col_session_acquire_primary_arrangement_probe(wl_session_t *sess,
         || post_storage_owner_generation != storage_owner_generation
         || !col_session_has_exact_relation(session, source, entry->rel_name)
         || !wl_columnar_relation_snapshot_equal(
-        wl_columnar_relation_snapshot(source), snapshot)
+            wl_columnar_relation_snapshot(source), snapshot)
         || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
         snapshot)) {
         rc = col_rel_source_reader_release(&probe->source_reader);
@@ -1581,7 +1518,7 @@ col_arrangement_probe_bundle_acquire_primary(
         return EOVERFLOW;
     }
     rc = col_session_acquire_primary_arrangement_probe(sess, source,
-        key_cols, key_count, &acquired);
+            key_cols, key_count, &acquired);
     if (rc != 0)
         return rc;
     slot = &bundle->slots[bundle->count];
@@ -1667,7 +1604,7 @@ col_arrangement_probe_dependency_release_ready(
         || owner != dependency->storage_owner
         || owner->relation_identity != dependency->storage_owner_identity
         || owner->storage_generation
-            != dependency->storage_owner_generation)
+        != dependency->storage_owner_generation)
         return EINVAL;
     if (dependency->reader.identity != (uintptr_t)&dependency->reader
         || dependency->reader.owner != &owner->source_access
@@ -2390,10 +2327,12 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
             if (!wl_columnar_relation_snapshot_equal(
                     arr->source_snapshot,
                     wl_columnar_relation_snapshot(source_rel))) {
-                memset(arr->ht_head, 0,
-                    (size_t)arr->nbuckets * sizeof(*arr->ht_head));
-                memset(arr->ht_next, 0,
-                    (size_t)arr->ht_cap * sizeof(*arr->ht_next));
+                if (arr->ht_head)
+                    memset(arr->ht_head, 0,
+                        (size_t)arr->nbuckets * sizeof(*arr->ht_head));
+                if (arr->ht_next)
+                    memset(arr->ht_next, 0,
+                        (size_t)arr->ht_cap * sizeof(*arr->ht_next));
                 arr->base_nrows = 0;
                 arr->current_nrows = 0;
                 arr->indexed_rows = 0;
@@ -2530,10 +2469,13 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
 
     if (!wl_columnar_relation_snapshot_equal(txn->working->source_snapshot,
         wl_columnar_relation_snapshot(source_rel))) {
-        memset(txn->working->ht_head, 0,
-            (size_t)txn->working->nbuckets * sizeof(*txn->working->ht_head));
-        memset(txn->working->ht_next, 0,
-            (size_t)txn->working->ht_cap * sizeof(*txn->working->ht_next));
+        if (txn->working->ht_head)
+            memset(txn->working->ht_head, 0,
+                (size_t)txn->working->nbuckets *
+                sizeof(*txn->working->ht_head));
+        if (txn->working->ht_next)
+            memset(txn->working->ht_next, 0,
+                (size_t)txn->working->ht_cap * sizeof(*txn->working->ht_next));
         txn->working->base_nrows = 0;
         txn->working->current_nrows = 0;
         txn->working->indexed_rows = 0;
@@ -2626,7 +2568,11 @@ col_diff_arr_entry_clone(const col_diff_arr_entry_t *src,
     dst->key_count = src->key_count;
 
     if (src->diff_arr) {
-        dst->diff_arr = col_diff_arrangement_deep_copy(src->diff_arr);
+        col_diff_arrangement_t cold = { 0 };
+        cold.key_cols = src->diff_arr->key_cols;
+        cold.key_count = src->diff_arr->key_count;
+        cold.worker_id = src->diff_arr->worker_id;
+        dst->diff_arr = col_diff_arrangement_deep_copy(&cold);
         if (!dst->diff_arr) {
             free(dst->key_cols);
             free(dst->rel_name);

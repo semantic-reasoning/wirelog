@@ -141,10 +141,13 @@ col_diff_arrangement_deep_copy(const col_diff_arrangement_t *arr)
         return NULL;
 
     copy->key_cols = malloc(arr->key_count * sizeof(uint32_t));
-    copy->ht_head = malloc(arr->nbuckets * sizeof(uint32_t));
-    copy->ht_next = malloc(arr->ht_cap * sizeof(uint32_t));
+    copy->ht_head = arr->nbuckets
+        ? malloc(arr->nbuckets * sizeof(uint32_t)) : NULL;
+    copy->ht_next = arr->ht_cap
+        ? malloc(arr->ht_cap * sizeof(uint32_t)) : NULL;
 
-    if (!copy->key_cols || !copy->ht_head || !copy->ht_next) {
+    if (!copy->key_cols || (arr->nbuckets && !copy->ht_head)
+        || (arr->ht_cap && !copy->ht_next)) {
         free(copy->key_cols);
         free(copy->ht_head);
         free(copy->ht_next);
@@ -153,8 +156,10 @@ col_diff_arrangement_deep_copy(const col_diff_arrangement_t *arr)
     }
 
     memcpy(copy->key_cols, arr->key_cols, arr->key_count * sizeof(uint32_t));
-    memcpy(copy->ht_head, arr->ht_head, arr->nbuckets * sizeof(uint32_t));
-    memcpy(copy->ht_next, arr->ht_next, arr->ht_cap * sizeof(uint32_t));
+    if (arr->nbuckets)
+        memcpy(copy->ht_head, arr->ht_head, arr->nbuckets * sizeof(uint32_t));
+    if (arr->ht_cap)
+        memcpy(copy->ht_next, arr->ht_next, arr->ht_cap * sizeof(uint32_t));
 
     copy->key_count = arr->key_count;
     copy->base_nrows = arr->base_nrows;
@@ -181,14 +186,16 @@ int
 col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
     uint32_t nrows)
 {
-    if (nrows <= arr->ht_cap && nrows <= arr->nbuckets * 3 / 4)
+    if (arr->ht_head && arr->ht_next
+        && nrows <= arr->ht_cap && nrows <= arr->nbuckets * 3 / 4)
         return 0;
 
     uint64_t before = arr->ledger ? col_diff_arrangement_bytes(arr) : 0;
 
     /* Grow ht_next capacity if needed */
-    if (nrows > arr->ht_cap) {
-        uint32_t new_cap = arr->ht_cap;
+    if (!arr->ht_next || nrows > arr->ht_cap) {
+        uint32_t new_cap = arr->ht_cap ? arr->ht_cap
+            : DIFF_ARRANGEMENT_INITIAL_BUCKETS;
         while (new_cap < nrows)
             new_cap *= 2;
         uint32_t *new_next = realloc(arr->ht_next,
@@ -202,8 +209,9 @@ col_diff_arrangement_ensure_ht_capacity(col_diff_arrangement_t *arr,
     }
 
     /* Grow bucket array if load factor > 75% */
-    if (nrows > arr->nbuckets * 3 / 4) {
-        uint32_t new_nbuckets = arr->nbuckets;
+    if (!arr->ht_head || nrows > arr->nbuckets * 3 / 4) {
+        uint32_t new_nbuckets = arr->nbuckets ? arr->nbuckets
+            : DIFF_ARRANGEMENT_INITIAL_BUCKETS;
         while (nrows > new_nbuckets * 3 / 4)
             new_nbuckets *= 2;
         uint32_t *new_head = calloc(new_nbuckets, sizeof(uint32_t));
