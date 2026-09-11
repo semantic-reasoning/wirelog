@@ -27,8 +27,10 @@ no step reporting zero seconds, which reads as a phase that ran instantly.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -899,6 +901,78 @@ class CriticalPath(unittest.TestCase):
         self.assertIn("lint / uncrustify check",
                       path["evidence"]["unmeasured_nodes"])
 
+    def test_an_untimed_job_off_the_graph_chain_still_qualifies_the_total(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            # A leaf the longest path legitimately routes around.  Weighted at
+            # zero during selection, it is precisely the node that ends up off
+            # the winning chain, so a caveat scoped to the chain never fires.
+            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        path = tool.analyze(run, mutated, edges, drift)["critical_path"]["graph"]
+        # Previously measured 4431 on a chain that had quietly substituted a
+        # different sanitizer job for the untimed one.
+        self.assertEqual(path["status"], "partial")
+        self.assertIn("routed around", path["reason"])
+        self.assertEqual(path["evidence"]["untimed_jobs_off_chain"],
+                         ["Sanitizers / ubuntu-latest / clang"])
+        self.assertNotIn("Sanitizers / ubuntu-latest / clang",
+                         path["evidence"]["chain"])
+
+    def test_an_untimed_last_finisher_is_not_walked_past_in_silence(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            # The observed walk starts at the last job to finish that was
+            # timed, so untiming the actual last finisher moves the start
+            # down one branch and the job never appears on the result.
+            if job["name"] == "TSan / ubuntu-latest / clang":
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        path = tool.analyze(run, mutated, edges,
+                            drift)["critical_path"]["observed"]
+        self.assertEqual(path["status"], "partial")
+        self.assertEqual(path["evidence"]["untimed_jobs_off_chain"],
+                         ["TSan / ubuntu-latest / clang"])
+        self.assertNotIn("TSan / ubuntu-latest / clang",
+                         path["evidence"]["chain"])
+
+    def test_a_skipped_job_is_never_counted_as_untimed(self):
+        # A skipped job has no duration and that is the right answer, so the
+        # run-wide caveat must not fire on the skip cascade and turn every
+        # such run into a qualified number.
+        report = self._analyze("run-skip-cascade")
+        self.assertGreater(report["job_counts"]["skipped"], 0)
+        for key in ("observed", "graph"):
+            path = report["critical_path"][key]
+            self.assertEqual(path["status"], "measured")
+            self.assertNotIn("untimed_jobs_off_chain", path["evidence"])
+
+    def test_a_graph_that_resolved_to_nothing_is_not_called_a_missing_graph(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            job["name"] = "renamed: " + job["name"]
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        self.assertEqual(edges, {})
+        path = tool.analyze(run, mutated, edges, drift)["critical_path"]
+        # A wholesale rename is the loudest possible drift signal.  Reporting
+        # it as "no graph was supplied" would read as a missing argument.
+        self.assertIn("see drift", path["graph"]["reason"])
+        self.assertNotIn("was supplied", path["graph"]["reason"])
+        self.assertIn("absent from this run", path["observed"]["reason"])
+        self.assertIsNotNone(path["graph_drift"])
+        self.assertEqual(len(path["graph_drift"]["jobs_without_node"]),
+                         len(mutated["jobs"]))
+
     def test_the_observed_total_says_what_it_omits(self):
         path = self._analyze("run-success")["critical_path"]["observed"]
         self.assertIn("lower bound", path["evidence"]["note"])
@@ -1110,6 +1184,26 @@ class Rendering(unittest.TestCase):
         self.assertIn("not three independent measurements", text)
         self.assertIn("by construction", text)
         self.assertIn("lower bound", text)
+
+    def test_an_unreadable_workflow_is_diagnosed_once_not_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "raw").mkdir()
+            run, jobs = fixture("run-success")
+            (out / "raw" / f"run-{run['id']}.json").write_text(json.dumps(run))
+            (out / "raw" / f"run-{run['id']}-jobs.json").write_text(
+                json.dumps(jobs))
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                self.assertEqual(tool.main(
+                    ["report", "--run-id", str(run["id"]), "--out", tmp,
+                     "--workflow", str(out / "absent.yml")]), 0)
+            text = captured.getvalue()
+            # The file could not be read, so nothing is known about how many
+            # jobs it declares.  Saying it declares none is a second claim,
+            # and a false one.
+            self.assertIn("no dependency graph", text)
+            self.assertNotIn("declares no jobs", text)
 
     def test_report_command_writes_both_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
