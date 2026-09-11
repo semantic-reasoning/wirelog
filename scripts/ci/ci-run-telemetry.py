@@ -305,6 +305,45 @@ def is_skipped(job: dict) -> bool:
     return job.get("conclusion") == "skipped"
 
 
+# A skipped job never dispatches, whatever it is stamped with.  It is the
+# only conclusion that settles the question on its own.
+NEVER_DISPATCHED = ("skipped",)
+
+# Conclusions only a job that executed can reach.  A job reported successful
+# ran, whatever its stamps say, so the report must not tell the reader it
+# never started.
+CONCLUSIONS_THAT_RAN = ("success", "failure", "timed_out")
+
+# Sentences and labels for the conclusions worth naming precisely.  Both fall
+# back to the conclusion itself, which is always true and is what a
+# conclusion this tool has not met before gets.
+NO_EXECUTION_REASONS = {
+    "skipped": "job skipped; no execution",
+    "cancelled": "job cancelled before it ran; no execution",
+    "stale": "job stale; no execution",
+    "startup_failure": "job failed to start; no execution",
+    "action_required": "job awaiting approval; no execution",
+}
+NO_RUN_LABELS = {
+    "skipped": "skipped",
+    "cancelled": "cancelled before running",
+    "stale": "stale",
+    "startup_failure": "failed to start",
+    "action_required": "awaiting approval",
+}
+
+
+def no_execution_reason(conclusion) -> str:
+    return NO_EXECUTION_REASONS.get(
+        conclusion, f"job concluded {conclusion!r} without running; "
+                    f"no execution")
+
+
+def no_run_label(conclusion) -> str:
+    return NO_RUN_LABELS.get(conclusion, str(conclusion))
+
+
+
 def did_not_run(job: dict) -> bool:
     """Whether the runner never executed this job, so it has no durations to
     report and anything derived from its stamps would be bookkeeping.
@@ -331,14 +370,23 @@ def did_not_run(job: dict) -> bool:
     creation is the only trace of that.  With none of the three, it never
     ran.
 
-    A skip needs no such check.  A skipped job never dispatches, whatever it
-    is stamped with."""
+    Only two kinds of conclusion skip the evidence.  A skipped job never
+    dispatches, whatever it is stamped with.  And an outcome only execution
+    reaches -- success, failure, a timeout -- proves the job ran, so asking
+    the stamps could only erase real seconds from the run's wall clock.
+
+    Everything else goes through the evidence, which is the direction that
+    stays correct as GitHub's vocabulary grows: `cancelled` and
+    `action_required` can land either side of a dispatch, `neutral` can, and
+    a conclusion added after this was written would otherwise mean "ran" by
+    default and publish a zero for a job that never started."""
     conclusion = job.get("conclusion")
-    if conclusion == "skipped":
+    if conclusion in NEVER_DISPATCHED:
         return True
-    if conclusion != "cancelled":
+    if conclusion is None or conclusion in CONCLUSIONS_THAT_RAN:
+        # Still going, or an outcome only execution reaches.
         return False
-    # A cancellation lands either side of the runner picking the job up.
+    # It can have landed either side of the runner picking the job up.
     if first_step_start(job):
         return False                       # a step of its own ran
     created = parse_ts(job.get("created_at"))
@@ -461,6 +509,9 @@ def job_may_still_move(job: dict,
                        run_status: str | None) -> bool:
     """Whether this job could still acquire a start stamp.
 
+    Takes either a raw API job or an analyzed entry; it reads only `status`,
+    which both carry.
+
     A status that means not-done-yet only means that while the run itself is
     still going.  The same status in a run the API calls finished describes a
     job that stopped without saying so, and telling the reader it may still
@@ -539,7 +590,9 @@ def queue_absence_reasons(job: dict,
 
 def analyze_job(job: dict, t0_iso: str, completed_by_name: dict,
                 run_status: str | None) -> dict:
-    """One job's timing.  A job that did not run gets no durations at all:
+    """One job's timing.  A job that did not run gets no durations of its
+    own -- its release latency is added later and survives, because it ends
+    at the job's creation rather than at anything the job did:
     GitHub stamps such a job as though it had started and finished at the
     moment it was created, and a zero there would read as a job that ran
     instantly.  `did_not_run` decides which jobs those are."""
@@ -557,8 +610,7 @@ def analyze_job(job: dict, t0_iso: str, completed_by_name: dict,
     }
 
     if did_not_run(job):
-        reason = ("job skipped; no execution" if is_skipped(job)
-                  else "job cancelled before it ran; no execution")
+        reason = no_execution_reason(job.get("conclusion"))
         entry["metrics"] = {
             "upstream_elapsed": non_additive(unavailable(reason)),
             "queue_delay": additive(unavailable(reason)),
@@ -879,15 +931,12 @@ IN_FLIGHT_STATUSES = ("queued", "in_progress", "waiting", "requested",
 KNOWN_JOB_STATUSES = IN_FLIGHT_STATUSES + ("completed",)
 KNOWN_RUN_STATUSES = KNOWN_JOB_STATUSES
 
-# Conclusions only a job that executed can reach.  A job reported successful
-# ran, whatever its stamps say, so the report must not tell the reader it
-# never started.
-CONCLUSIONS_THAT_RAN = ("success", "failure", "timed_out")
 
 
 def absent_by_design(entry: dict) -> bool:
-    """True when this job has no durations because the runner never executed
-    it, rather than because the run lost them.  The table caption excuses
+    """True when this job has none of its own durations because the runner
+    never executed it, rather than because the run lost them.  Its release
+    latency is not one of these: that ends at the job's creation.  The table caption excuses
     exactly these jobs, so this has to mean exactly what the caption says.
 
     It reads the answer `analyze_job` recorded rather than re-deriving one.
@@ -1156,6 +1205,11 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
     analyzed = [analyze_job(j, t0_iso, jobs_by_name, run_status)
                 for j in jobs]
     for entry, job in zip(analyzed, jobs):
+        # Deliberately `is_skipped`, not `did_not_run`: this metric ends at
+        # the job's *creation*, which happens whether or not the job then
+        # dispatches, so a job that never ran still has one.  The skip carve-
+        # out is different -- GitHub materializes a whole skip cascade in one
+        # second, so its creation stamps carry no ordering at all.
         if is_skipped(job):
             entry["metrics"]["scheduler_release_latency"] = additive(
                 unavailable("job skipped; no execution"))
@@ -1163,8 +1217,20 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
             entry["metrics"]["scheduler_release_latency"] = additive(
                 release_latency(job, jobs_by_name, needs))
 
-    executed = [j for j in jobs if not is_skipped(j)]
+    # The same test the table caption uses, and the one the walkers use to
+    # qualify a total.  Counting a job that did not run as executed put "18
+    # executed" directly above a caption excusing it, and a row of six blanks
+    # directly below.  Note the graph walk still routes *through* such a job,
+    # qualifying the total rather than skipping the node.
+    executed = [j for j in jobs if not did_not_run(j)]
     skipped = [j for j in jobs if is_skipped(j)]
+    never_ran = [j for j in jobs if did_not_run(j) and not is_skipped(j)]
+    by_conclusion: dict = {}
+    for job in jobs:
+        if not did_not_run(job):
+            continue
+        conclusion = job.get("conclusion")
+        by_conclusion[conclusion] = by_conclusion.get(conclusion, 0) + 1
     ends = [j.get("completed_at") for j in executed if j.get("completed_at")]
     if ends:
         last = max(ends, key=ts_key)
@@ -1203,7 +1269,7 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
         first_failure = unavailable(
             f"run status {run_status!r} is not one this tool recognises; "
             f"no failure seen")
-    elif any(j.get("conclusion") == "cancelled" for j in executed):
+    elif any(j.get("conclusion") == "cancelled" for j in jobs):
         first_failure = unavailable(
             "no job failed; cancelled jobs were seen and excluded")
     else:
@@ -1299,7 +1365,9 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
         "t0": t0_iso,
         "t0_source": t0_source,
         "job_counts": {"total": len(jobs), "executed": len(executed),
-                       "skipped": len(skipped)},
+                       "skipped": len(skipped),
+                       "never_ran": len(never_ran),
+                       "did_not_run_by_conclusion": by_conclusion},
         "populations": {k: sorted(v) for k, v in sorted(populations.items())},
         "jobs": analyzed,
         "metrics": {
@@ -1400,8 +1468,9 @@ def aggregate_reports(reports: list) -> dict:
             "runner_names": sorted(cell["runner_names"]),
             "mixed_machines": len(cell["runner_names"]) > 1
                               and cell["population"] == "self-hosted",
-            # n is per metric, not per cell: a skipped job contributes to
-            # neither, and a failed run truncates some metrics and not others.
+            # n is per metric, not per cell: a job that did not run
+            # contributes to none, and a failed run truncates some metrics
+            # and not others.
             "metrics": {name: summarize(values)
                         for name, values in cell["samples"].items()},
         })
@@ -1431,8 +1500,8 @@ def render_aggregate_markdown(doc: dict) -> str:
         f"never pooled",
         f"- excluded: {len(doc['excluded'])}",
         "",
-        "Seconds. `n` is per metric: a job that did not run contributes "
-        "to none, and a "        "failed run truncates some.",
+        "Seconds. `n` is per metric: a job that did not run contributes to "
+        "none, and a failed run truncates some.",
         "",
         "| conclusion | job | population | queue n | queue med | queue p95 | "
         "wall n | wall med | wall p95 | mixed machines |",
@@ -1570,6 +1639,25 @@ def degradation_block(report: dict, path: dict) -> list:
     return lines
 
 
+def job_count_phrase(counts: dict) -> str:
+    """How the run's jobs divide.  A job that did not run is named by what
+    kept it from running, from its own conclusion: skipped, stale, failed to
+    start and cancelled before running are different things to a reader
+    asking whether a gate covered the change, and a term naming the wrong one
+    contradicts the table three rows below it."""
+    parts = [f"{counts.get('executed', 0)} executed"]
+    breakdown = counts.get("did_not_run_by_conclusion") or {}
+    # Sorted by the term the reader sees, so the phrase neither reorders
+    # with the order the API happened to return the jobs in nor lists its
+    # words out of alphabetical order.  Every term, skipped included, is named from
+    # this one table; a second spelling elsewhere would be a second thing to
+    # keep in step.
+    for conclusion, count in sorted(breakdown.items(),
+                                    key=lambda item: no_run_label(item[0])):
+        parts.append(f"{count} {no_run_label(conclusion)}")
+    return ", ".join(parts)
+
+
 def render_markdown(report: dict) -> str:
     counts = report["job_counts"]
     lines = [
@@ -1578,8 +1666,7 @@ def render_markdown(report: dict) -> str:
         f"- head `{report['head_sha']}` on `{report['head_branch']}`, "
         f"attempt {report['run_attempt']}, conclusion `{report['conclusion']}`",
         f"- t0 `{report['t0']}` (from `{report['t0_source']}`)",
-        f"- jobs: {counts['total']} ({counts['executed']} executed, "
-        f"{counts['skipped']} skipped)",
+        f"- jobs: {counts['total']} ({job_count_phrase(counts)})",
         "",
         "Run-level, seconds:",
         "",
@@ -1625,8 +1712,9 @@ def render_markdown(report: dict) -> str:
             lines.append(f"- node with no job: {name}")
     lines += [
         "",
-        "Per job, seconds. A job that was skipped, or cancelled before it "
-        "ran, has no durations at all.",
+        "Per job, seconds. A job that did not run has no durations in this "
+        "table, and the run summary above says what kept each one from "
+        "running.",
         "",
         "| job | population | "
         + " | ".join(heading for _, _, heading in JOB_COLUMNS) + " |",
@@ -1803,8 +1891,8 @@ def cmd_report(args) -> int:
         (out / f"run-{run_id}.md").write_text(render_markdown(report),
                                               encoding="utf-8")
         counts = report["job_counts"]
-        print(f"ci-run-telemetry: run {run_id}: {counts['executed']} executed, "
-              f"{counts['skipped']} skipped, "
+        print(f"ci-run-telemetry: run {run_id}: "
+              f"{job_count_phrase(counts)}, "
               f"{len(report['anomalies'])} anomalies")
     return 0
 

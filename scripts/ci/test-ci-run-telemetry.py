@@ -135,9 +135,297 @@ class SkipCascade(unittest.TestCase):
     def setUp(self):
         self.report = tool.analyze(*fixture("run-skip-cascade"))
 
+    def _did_not_run_as(self, conclusion, name=None):
+        """A run-success job restamped the way a job that never ran is."""
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = name or "Sanitizers / ubuntu-latest / clang"
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = conclusion
+                job["started_at"] = job["created_at"]
+                job["completed_at"] = job["created_at"]
+                job["steps"] = []
+        return victim, tool.analyze(run, mutated)
+
+    def test_the_cli_line_names_the_same_division_as_the_report(self):
+        # Two renderings of one fact.  The CLI line is what an operator sees
+        # without opening the artefact, so it cannot be the stale one.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "raw").mkdir()
+            run, jobs = fixture("run-success")
+            mutated = copy.deepcopy(jobs)
+            for job in mutated["jobs"]:
+                if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                    job["conclusion"] = "startup_failure"
+                    job["started_at"] = job["created_at"]
+                    job["completed_at"] = job["created_at"]
+                    job["steps"] = []
+            (out / "raw" / f"run-{run['id']}.json").write_text(
+                json.dumps(run), encoding="utf-8")
+            (out / "raw" / f"run-{run['id']}-jobs.json").write_text(
+                json.dumps(mutated), encoding="utf-8")
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                self.assertEqual(tool.main(
+                    ["report", "--run-id", str(run["id"]), "--out", tmp]), 0)
+        self.assertIn("17 executed, 1 failed to start", captured.getvalue())
+
+    def test_a_run_where_nothing_ran_still_reads_correctly(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            job["conclusion"] = "cancelled"
+            job["started_at"] = job["created_at"]
+            job["completed_at"] = job["created_at"]
+            job["steps"] = []
+        report = tool.analyze(run, mutated)
+        text = tool.render_markdown(report)
+        self.assertIn(f"0 executed, {len(mutated['jobs'])} cancelled before "
+                      f"running", text)
+        self.assertEqual(report["metrics"]["run_wall_clock"]["status"],
+                         "unavailable")
+
+    def test_the_summary_names_the_conclusion_the_job_actually_had(self):
+        # A runner image that failed to boot means a gate never covered the
+        # change.  Reporting it as somebody hitting cancel sends the reader
+        # to the wrong question, and the table below carries no conclusion
+        # at all, so this line is their only signal.
+        for conclusion, label in (("cancelled", "cancelled before running"),
+                                  ("stale", "stale"),
+                                  ("startup_failure", "failed to start")):
+            with self.subTest(conclusion=conclusion):
+                _, report = self._did_not_run_as(conclusion)
+                text = tool.render_markdown(report)
+                self.assertIn(f"1 {label}", text)
+                # The caption has to cover this conclusion too: the table
+                # row carries six blanks and no conclusion at all.
+                # Scoped to the table it sits under, because the JSON does
+                # carry one duration for such a job: its release latency
+                # ends at the job's creation, not at anything the job did.
+                self.assertIn("has no durations in this table", text)
+                self.assertNotIn("no durations at all", text)
+                self.assertNotIn("A job that was skipped, or cancelled", text)
+                for other in ("cancelled before running", "stale",
+                              "failed to start"):
+                    if other != label:
+                        self.assertNotIn(f"1 {other}", text)
+
+    def test_a_conclusion_with_no_label_is_named_as_itself(self):
+        counts = {"executed": 2, "skipped": 0,
+                  "did_not_run_by_conclusion": {"brand_new": 1}}
+        self.assertEqual(tool.job_count_phrase(counts),
+                         "2 executed, 1 brand_new")
+
+    def test_every_no_run_conclusion_has_a_reason_and_a_label(self):
+        # Adding a conclusion to one table and not the other would fall
+        # silently back to the generic sentence or to the raw key.
+        self.assertEqual(set(tool.NO_EXECUTION_REASONS),
+                         set(tool.NO_RUN_LABELS))
+        # And a conclusion neither table has met still gets a true sentence
+        # and a term naming itself, rather than borrowing another's.
+        self.assertEqual(tool.no_run_label("a_conclusion_from_the_future"),
+                         "a_conclusion_from_the_future")
+        self.assertIn("a_conclusion_from_the_future",
+                      tool.no_execution_reason("a_conclusion_from_the_future"))
+        self.assertIn("no execution",
+                      tool.no_execution_reason("a_conclusion_from_the_future"))
+
+    def test_each_no_run_conclusion_says_what_happened_in_its_own_words(self):
+        sentences = list(tool.NO_EXECUTION_REASONS.values())
+        self.assertEqual(len(set(sentences)), len(sentences), sentences)
+        self.assertEqual(tool.NO_EXECUTION_REASONS["stale"],
+                         "job stale; no execution")
+        self.assertEqual(tool.NO_EXECUTION_REASONS["startup_failure"],
+                         "job failed to start; no execution")
+
+    def test_a_cancellation_still_reaches_the_first_failure_sentence(self):
+        # Once a job that did not run leaves the executed list, scanning
+        # that list for cancellations stops finding them and the reader is
+        # told the run simply had no failure.
+        _, report = self._did_not_run_as("cancelled")
+        metric = report["metrics"]["first_failure_latency"]
+        self.assertEqual(metric["status"], "unavailable")
+        self.assertIn("cancelled jobs were seen", metric["reason"])
+
+    def test_a_job_that_did_not_run_cannot_stretch_the_pr_feedback(self):
+        # Both run-level spans end at the last job that actually ran; a
+        # never-run job's completion stamp is bookkeeping.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = "Sanitizers / ubuntu-latest / clang"
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "cancelled"
+                job["created_at"] = "2030-01-01T00:00:00Z"
+                job["started_at"] = "2030-01-01T00:00:00Z"
+                job["completed_at"] = "2030-01-01T00:00:00Z"
+                job["steps"] = []
+        metrics = tool.analyze(run, mutated)["metrics"]
+        self.assertEqual(metrics["run_wall_clock"]["seconds"], 10366)
+        self.assertEqual(metrics["pr_feedback"]["seconds"], 10366)
+
+    def test_a_job_that_did_not_run_keeps_its_release_latency(self):
+        # Deliberate: that metric ends at the job's *creation*, which
+        # happens whether or not the job then dispatches.  Only the skip
+        # cascade is carved out, because GitHub batches its creation stamps.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = "Sanitizers / ubuntu-latest / clang"
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "cancelled"
+                job["started_at"] = job["created_at"]
+                job["completed_at"] = job["created_at"]
+                job["steps"] = []
+        workflow = SCRIPT_DIR.parent.parent / ".github" / "workflows" / \
+            "ci-pr.yml"
+        graph = tool.extract_graph(workflow)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        entry = next(job for job in tool.analyze(run, mutated, edges,
+                                                 drift)["jobs"]
+                     if job["name"] == victim)
+        self.assertFalse(entry["ran"])
+        self.assertEqual(
+            entry["metrics"]["scheduler_release_latency"]["status"],
+            "measured")
+
+    def test_a_job_level_conclusion_that_may_precede_dispatch_is_weighed(self):
+        # `neutral` and `action_required` are the two GitHub documents on the
+        # job itself, and approval is by definition something that happens
+        # before a dispatch.  Stamped the never-run way they used to publish
+        # queue 0 and wall 0 and count as executed.
+        run, jobs = fixture("run-success")
+        for conclusion in ("neutral", "action_required"):
+            with self.subTest(conclusion=conclusion):
+                mutated = copy.deepcopy(jobs)
+                victim = "Sanitizers / ubuntu-latest / clang"
+                for job in mutated["jobs"]:
+                    if job["name"] == victim:
+                        job["conclusion"] = conclusion
+                        job["started_at"] = job["created_at"]
+                        job["completed_at"] = job["created_at"]
+                        job["steps"] = []
+                report = tool.analyze(run, mutated)
+                entry = next(job for job in report["jobs"]
+                             if job["name"] == victim)
+                self.assertFalse(entry["ran"])
+                self.assertIsNone(entry["metrics"]["job_wall"]["seconds"])
+                self.assertEqual(report["job_counts"]["never_ran"], 1)
+
+    def test_a_conclusion_this_tool_has_not_met_is_weighed_not_assumed(self):
+        # The rule is closed the other way round: only an outcome that proves
+        # execution skips the evidence.  A conclusion GitHub adds after this
+        # was written must not default to "ran" and publish a zero.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = "Sanitizers / ubuntu-latest / clang"
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "a_conclusion_from_the_future"
+                job["started_at"] = job["created_at"]
+                job["completed_at"] = job["created_at"]
+                job["steps"] = []
+        report = tool.analyze(run, mutated)
+        entry = next(job for job in report["jobs"] if job["name"] == victim)
+        self.assertFalse(entry["ran"])
+        self.assertIn("a_conclusion_from_the_future",
+                      entry["metrics"]["job_wall"]["reason"])
+        self.assertIn("1 a_conclusion_from_the_future",
+                      tool.render_markdown(report))
+
+    def test_an_outcome_only_execution_reaches_is_never_weighed(self):
+        # A successful job ran, whatever its stamps say.  Asking the evidence
+        # there could only erase real seconds.
+        run, jobs = fixture("run-success")
+        for conclusion in tool.CONCLUSIONS_THAT_RAN:
+            with self.subTest(conclusion=conclusion):
+                mutated = copy.deepcopy(jobs)
+                victim = "Sanitizers / ubuntu-latest / clang"
+                for job in mutated["jobs"]:
+                    if job["name"] == victim:
+                        job["conclusion"] = conclusion
+                        job["started_at"] = job["created_at"]
+                        job["completed_at"] = job["created_at"]
+                        job["steps"] = []
+                entry = next(job for job in tool.analyze(run, mutated)["jobs"]
+                             if job["name"] == victim)
+                self.assertTrue(entry["ran"])
+
+    def test_the_summary_terms_do_not_reorder_with_the_job_list(self):
+        # Three distinct no-run conclusions in one run.  Without a sort the
+        # phrase follows whatever order the API returned the jobs in.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victims = ["Sanitizers / ubuntu-latest / clang",
+                   "Sanitizers / ubuntu-latest / gcc",
+                   "Sanitizers / macos-latest / clang"]
+        for name, conclusion in zip(victims, ("startup_failure", "stale",
+                                              "cancelled")):
+            for job in mutated["jobs"]:
+                if job["name"] == name:
+                    job["conclusion"] = conclusion
+                    job["started_at"] = job["created_at"]
+                    job["completed_at"] = job["created_at"]
+                    job["steps"] = []
+        forward = tool.job_count_phrase(
+            tool.analyze(run, mutated)["job_counts"])
+        reversed_jobs = {"jobs": list(reversed(mutated["jobs"]))}
+        backward = tool.job_count_phrase(
+            tool.analyze(run, reversed_jobs)["job_counts"])
+        self.assertEqual(forward, backward)
+        self.assertEqual(
+            forward,
+            "15 executed, 1 cancelled before running, 1 failed to start, "
+            "1 stale")
+        # Alphabetical by the term printed, not by GitHub's conclusion name,
+        # which would read as arbitrary order to anyone looking at the line.
+
+    def test_an_evidence_decided_conclusion_keeps_its_evidence(self):
+        # `stale` and `startup_failure` are documented on the run, not the
+        # job.  If one lands on a job that really ran, deciding it from the
+        # conclusion alone would erase its seconds from the run wall clock
+        # with nothing saying so.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = "TSan / ubuntu-latest / clang"      # the last to finish
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "stale"
+                self.assertTrue(job["steps"])
+        report = tool.analyze(run, mutated)
+        entry = next(job for job in report["jobs"] if job["name"] == victim)
+        self.assertTrue(entry["ran"])
+        self.assertEqual(report["metrics"]["run_wall_clock"]["seconds"], 10366)
+
+    def test_a_job_that_did_not_run_is_not_counted_as_executed(self):
+        # The header sat directly above a caption excusing the job and a row
+        # of six blanks below it.  One test decides all three.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = "Sanitizers / ubuntu-latest / clang"
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "cancelled"
+                job["started_at"] = job["created_at"]
+                job["completed_at"] = job["created_at"]
+                job["steps"] = []
+        report = tool.analyze(run, mutated)
+        counts = report["job_counts"]
+        self.assertEqual(counts["executed"], len(mutated["jobs"]) - 1)
+        self.assertEqual(counts["never_ran"], 1)
+        self.assertEqual(counts["skipped"], 0)
+        text = tool.render_markdown(report)
+        self.assertIn("17 executed, 1 cancelled before running", text)
+        self.assertNotIn("0 skipped", text)
+
     def test_counts_lead_with_what_actually_ran(self):
         self.assertEqual(self.report["job_counts"],
-                         {"total": 15, "executed": 10, "skipped": 5})
+                         {"total": 15, "executed": 10, "skipped": 5,
+                          "never_ran": 0,
+                          "did_not_run_by_conclusion": {"skipped": 5}})
 
     def test_skipped_jobs_have_no_durations(self):
         skipped = [j for j in self.report["jobs"] if j["conclusion"] == "skipped"]
@@ -1175,6 +1463,84 @@ class CriticalPath(unittest.TestCase):
         self.assertTrue(entry["ran"])
         self.assertFalse(tool.absent_by_design(entry))
         self.assertEqual(entry["metrics"]["job_wall"]["seconds"], 60)
+
+    def test_a_step_that_ran_outranks_a_span_that_says_otherwise(self):
+        # A job cancelled inside its dispatch second is stamped start ==
+        # completion at GitHub's one-second resolution, which the span rule
+        # reads as never-run.  Its step is the only thing that tells the two
+        # apart, so the step has to be asked first.  The zero wall time it
+        # then reports is true: the step evidence establishes it ran.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = "Sanitizers / ubuntu-latest / clang"
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "cancelled"
+                job["completed_at"] = job["started_at"]
+                step = job["steps"][0]
+                job["steps"] = [dict(step,
+                                     completed_at=step["started_at"])]
+        entry = next(job for job in tool.analyze(run, mutated)["jobs"]
+                     if job["name"] == victim)
+        self.assertTrue(entry["ran"])
+        self.assertFalse(tool.absent_by_design(entry))
+
+    def test_a_step_of_no_duration_is_still_evidence(self):
+        # Most steps finish inside a second: 100 of the 299 non-skipped steps
+        # in the shipped captures are stamped started == completed.  Reading
+        # those as unusable would discard the commonest shape there is.
+        _, jobs = fixture("run-success")
+        template = next(job["steps"][0] for job in jobs["jobs"]
+                        if job["name"] == "Sanitizers / ubuntu-latest / clang")
+        instant = dict(template, completed_at=template["started_at"])
+        self.assertEqual(tool.first_step_start({"steps": [instant]}),
+                         template["started_at"])
+
+    def test_a_start_stamped_at_creation_is_not_a_dispatch(self):
+        # The equality is the bookkeeping signature itself: a job that never
+        # ran is stamped as starting the moment it was created.  Reading it
+        # as a dispatch publishes queue_delay 0 for a job that never waited
+        # on a runner, and lists it as missing data besides.
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        victim = "Sanitizers / ubuntu-latest / clang"
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "cancelled"
+                job["started_at"] = job["created_at"]
+                job["completed_at"] = None
+                job["steps"] = []
+        entry = next(job for job in tool.analyze(run, mutated)["jobs"]
+                     if job["name"] == victim)
+        self.assertFalse(entry["ran"])
+        self.assertIsNone(entry["metrics"]["queue_delay"]["seconds"])
+
+    def test_a_conclusion_that_never_dispatches_needs_no_stamps(self):
+        # `stale` and `startup_failure` are jobs GitHub never ran.  Stamped
+        # the never-run way they used to report queue 0 and wall 0.
+        run, jobs = fixture("run-success")
+        # Named rather than looped over the constant, which would shrink
+        # with it and prove nothing.
+        self.assertEqual(tool.NEVER_DISPATCHED, ("skipped",))
+        self.assertEqual(tool.CONCLUSIONS_THAT_RAN,
+                         ("success", "failure", "timed_out"))
+        for conclusion in ("skipped", "stale", "startup_failure",
+                           "cancelled", "neutral", "action_required",
+                           "a_conclusion_from_the_future"):
+            with self.subTest(conclusion=conclusion):
+                mutated = copy.deepcopy(jobs)
+                victim = "Sanitizers / ubuntu-latest / clang"
+                for job in mutated["jobs"]:
+                    if job["name"] == victim:
+                        job["conclusion"] = conclusion
+                        job["started_at"] = job["created_at"]
+                        job["completed_at"] = job["created_at"]
+                        job["steps"] = []
+                entry = next(job for job in tool.analyze(run, mutated)["jobs"]
+                             if job["name"] == victim)
+                self.assertFalse(entry["ran"])
+                self.assertIn("no execution",
+                              entry["metrics"]["job_wall"]["reason"])
 
     def test_a_positive_span_alone_proves_the_job_ran(self):
         # Picked up with no queue delay, cancelled, no steps: the span
@@ -2229,7 +2595,7 @@ class Rendering(unittest.TestCase):
         text = tool.render_markdown(tool.analyze(run, mutated))
         block = text.split("Why a number above is not final")[-1]
         self.assertNotIn(victim, block)
-        self.assertIn("cancelled before it", text)
+        self.assertIn("1 cancelled before running", text)
 
     def test_the_block_follows_the_table_it_explains(self):
         text = tool.render_markdown(tool.analyze(*fixture("run-success")))
