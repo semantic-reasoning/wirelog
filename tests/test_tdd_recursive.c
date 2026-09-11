@@ -1216,6 +1216,310 @@ test_bdx_seed_success_preserves_timestamps(void)
     return 0;
 }
 
+#ifdef WL_TEST_TDD_MERGE
+static int
+test_tdd_merge_transactional_publication(void)
+{
+    TEST("TDD merge stages worker results before relation publication");
+
+    const int64_t initial[] = { 9, 9 };
+    const int64_t worker0_rows[] = { 2, 3, 1, 2 };
+    const int64_t worker1_rows[] = { 4, 5, 4, 5 };
+    int rc;
+
+    /* A live reader denies publication, then the same transaction retries. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *workers[] = { worker };
+        wl_columnar_source_access_reader_t reader = { 0 };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker
+            || col_rel_source_reader_acquire(target, &reader) != 0) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge reader setup");
+            return 1;
+        }
+        capture_bdx_seed_snapshot(target, &snapshot);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EBUSY || !bdx_seed_snapshot_unchanged(target, &snapshot)
+            || col_rel_source_reader_release(&reader) != 0) {
+            col_rel_source_reader_release(&reader);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge reader denial or retry");
+            return 1;
+        }
+        if (wl_columnar_eval_test_tdd_merge(&target, workers, 1) != 0
+            || target->nrows != 3 || target->columns[0][0] != 1
+            || target->columns[1][0] != 2) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge reader retry");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+    }
+
+    /* A live alias is also denied without changing rows or metadata. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *alias = col_rel_new_auto("alias", 2);
+        col_rel_t *workers[] = { worker };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker || !alias
+            || col_rel_install_shared_view(alias, target) != 0) {
+            col_rel_destroy(alias);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge alias setup");
+            return 1;
+        }
+        capture_bdx_seed_snapshot(target, &snapshot);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EBUSY || !bdx_seed_snapshot_unchanged(target, &snapshot)
+            || col_rel_storage_alias_release(alias) != 0) {
+            col_rel_storage_alias_release(alias);
+            col_rel_destroy(alias);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge alias denial or retry");
+            return 1;
+        }
+        if (wl_columnar_eval_test_tdd_merge(&target, workers, 1) != 0) {
+            col_rel_destroy(alias);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge alias retry");
+            return 1;
+        }
+        col_rel_destroy(alias);
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+    }
+
+    /* Failure in the second worker must not publish the first worker. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker0 = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *worker1 = make_seed_relation("r", worker1_rows, 2, 2);
+        col_rel_t *workers[] = { worker0, worker1 };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker0 || !worker1) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker0);
+            col_rel_destroy(worker1);
+            FAIL("merge failure setup");
+            return 1;
+        }
+        prepare_bdx_seed_metadata(target);
+        capture_bdx_seed_snapshot(target, &snapshot);
+        wl_columnar_eval_test_tdd_merge_fail_worker(1);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 2);
+        if (rc != ENOMEM || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker0);
+            col_rel_destroy(worker1);
+            FAIL("second worker failure changed target");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(worker0);
+        col_rel_destroy(worker1);
+    }
+
+    /* Schema, overflow, and sort errors all preserve the target. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        const int64_t bad_schema_rows[] = { 1, 2, 3, 4, 5, 6 };
+        col_rel_t *bad_schema = make_seed_relation("r", bad_schema_rows, 2,
+                3);
+        col_rel_t *valid_worker = make_seed_relation("r", worker0_rows, 2,
+                2);
+        col_rel_t *workers[] = { bad_schema };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !bad_schema || !valid_worker) {
+            col_rel_destroy(target);
+            col_rel_destroy(bad_schema);
+            col_rel_destroy(valid_worker);
+            FAIL("merge schema setup");
+            return 1;
+        }
+        capture_bdx_seed_snapshot(target, &snapshot);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(bad_schema);
+            col_rel_destroy(valid_worker);
+            FAIL("schema failure changed target");
+            return 1;
+        }
+        workers[0] = valid_worker;
+        wl_columnar_eval_test_tdd_merge_fail_overflow_once();
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EOVERFLOW || !bdx_seed_snapshot_unchanged(target,
+            &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(bad_schema);
+            col_rel_destroy(valid_worker);
+            FAIL("overflow failure changed target");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(bad_schema);
+        col_rel_destroy(valid_worker);
+    }
+
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *workers[] = { worker };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge sort setup");
+            return 1;
+        }
+        prepare_bdx_seed_metadata(target);
+        capture_bdx_seed_snapshot(target, &snapshot);
+        wl_columnar_eval_test_tdd_merge_fail_sort_once();
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != ENOMEM || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("sort failure changed target");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+    }
+
+    PASS();
+    return 0;
+}
+
+static int
+test_tdd_merge_schema_mismatch_rollback(void)
+{
+    TEST("TDD merge rejects complete schema mismatches before staging");
+
+    const int64_t initial[] = { 9, 9 };
+    const int64_t worker_rows[] = { 2, 3 };
+    col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *worker = make_seed_relation("r", worker_rows, 1, 2);
+    col_rel_t *workers[] = { worker };
+    bdx_seed_snapshot_t snapshot;
+    int rc;
+
+    if (!target || !worker) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("schema mismatch setup");
+        return 1;
+    }
+    prepare_bdx_seed_metadata(target);
+    capture_bdx_seed_snapshot(target, &snapshot);
+
+    worker->declared_ncols = target->declared_ncols + 1;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("declared width mismatch changed target");
+        return 1;
+    }
+    worker->declared_ncols = target->declared_ncols;
+
+    worker->schema_ok = false;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("schema state mismatch changed target");
+        return 1;
+    }
+    worker->schema_ok = target->schema_ok;
+
+    free(worker->column_types);
+    worker->column_types = (wirelog_column_type_t *)malloc(
+        worker->ncols * sizeof(*worker->column_types));
+    if (!worker->column_types) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column type mismatch setup");
+        return 1;
+    }
+    for (uint32_t col = 0; col < worker->ncols; col++)
+        worker->column_types[col] = WIRELOG_TYPE_FLOAT;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column type mismatch changed target");
+        return 1;
+    }
+    free(worker->column_types);
+    worker->column_types = NULL;
+
+    free(worker->col_names[0]);
+    worker->col_names[0] = strdup("different");
+    if (!worker->col_names[0]) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column name mismatch setup");
+        return 1;
+    }
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column name mismatch changed target");
+        return 1;
+    }
+    free(worker->col_names[0]);
+    worker->col_names[0] = strdup(target->col_names[0]);
+    if (!worker->col_names[0]) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("compound mismatch setup");
+        return 1;
+    }
+
+    worker->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    worker->compound_count = 1;
+    worker->compound_arity_map = (uint32_t *)malloc(2 * sizeof(uint32_t));
+    if (!worker->compound_arity_map) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("compound map mismatch setup");
+        return 1;
+    }
+    worker->compound_arity_map[0] = 1;
+    worker->compound_arity_map[1] = 1;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("compound schema mismatch changed target");
+        return 1;
+    }
+
+    col_rel_destroy(target);
+    col_rel_destroy(worker);
+    PASS();
+    return 0;
+}
+#endif
+
 /* ======================================================================== */
 /* Microbenchmark: Filtered-join arrangement cache (Issue #433)             */
 /* ======================================================================== */
@@ -1420,6 +1724,10 @@ main(void)
     test_bdx_seed_sort_failure_is_atomic();
     test_bdx_seed_allocation_failure_is_atomic();
     test_bdx_seed_success_preserves_timestamps();
+#ifdef WL_TEST_TDD_MERGE
+    test_tdd_merge_transactional_publication();
+    test_tdd_merge_schema_mismatch_rollback();
+#endif
     test_filt_arr_bench_w1();
     test_filt_arr_bench_w4();
 
