@@ -2163,6 +2163,45 @@ test_empty_append_detaches_shared_destination(void)
     owned_relation_count = 0;
 }
 
+static void
+test_checked_reset_rows_locked(void)
+{
+    col_rel_t *rel = new_relation();
+    CHECK(rel != NULL, "checked reset relation allocation");
+    int64_t row = 7;
+    CHECK(col_rel_append_row(rel, &row) == 0,
+        "checked reset first row");
+    row = 8;
+    CHECK(col_rel_append_row(rel, &row) == 0,
+        "checked reset second row");
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "checked reset timestamps");
+    rel->dedup_slots = (uint64_t *)calloc(4u, sizeof(uint64_t));
+    CHECK(rel->dedup_slots != NULL, "checked reset dedup slots");
+    rel->dedup_cap = 4u;
+    rel->dedup_count = 2u;
+    uint64_t old_view = rel->view_generation;
+    uint64_t old_storage = rel->storage_generation;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    CHECK(wl_columnar_source_access_writer_acquire(
+        &rel->source_access, &writer) == 0,
+        "checked reset writer admission");
+    CHECK(col_rel_reset_rows_locked(rel, &writer) == 0,
+        "checked reset succeeds under writer");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "checked reset writer release");
+    CHECK(rel->nrows == 0 && rel->sorted_nrows == 0
+        && rel->base_nrows == 0 && rel->run_count == 0,
+        "checked reset clears row metadata");
+    CHECK(rel->timestamps == NULL && rel->dedup_slots == NULL
+        && rel->dedup_cap == 0 && rel->dedup_count == 0,
+        "checked reset clears derived row state");
+    CHECK(rel->view_generation != old_view
+        && rel->storage_generation != old_storage,
+        "checked reset publishes both generations");
+    cleanup_relations();
+}
+
 int
 main(void)
 {
@@ -2192,6 +2231,7 @@ main(void)
     test_resize_failure_atomicity();
     test_shared_view_relation_metadata();
     test_empty_append_detaches_shared_destination();
+    test_checked_reset_rows_locked();
     test_identity_exhaustion();
     if (failures != 0)
         return EXIT_FAILURE;
