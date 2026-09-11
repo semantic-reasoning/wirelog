@@ -4584,9 +4584,26 @@ test('tdd_nonrecursive', test_tdd_nonrecursive_exe)
 test_tdd_recursive_exe = executable(
   'test_tdd_recursive',
   files('test_tdd_recursive.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  link_with: [testlib_prod],
+  # This target cannot share testlib_prod (#1572): it needs the library
+  # sources compiled with its own -D flags, which a prebuilt static library
+  # cannot carry.  Same shape as test_relation_generations_oom above.
+  c_args: host_machine.system() == 'linux' ?
+    ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_ALLOC_WRAP=1'] :
+    ['-DWL_TEST_BDX_SEED=1'],
+  link_args: host_machine.system() == 'linux' ? [
+    '-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc',
+  ] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
 )
 
 test('tdd_recursive', test_tdd_recursive_exe)
