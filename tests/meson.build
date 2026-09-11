@@ -740,6 +740,10 @@ endif
 # the generated header (see wirelog/meson.build's configure_file()).
 py3 = find_program('python3', 'python', required: true)
 
+test('arm_asan_strict_align_selection', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-arm-asan-strict-align-selection.py'],
+     suite: 'abi', timeout: 120)
+
 # The nightly MSVC job must not silently select MinGW when hosted images
 # change Visual Studio versions. Native Windows CI verifies execution.
 test('perf_nightly_windows_contract', py3,

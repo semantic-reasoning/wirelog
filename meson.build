@@ -29,6 +29,23 @@ crc32_variant_option = get_option('crc32_variant')
 #Compiler settings
 cc = meson.get_compiler('c')
 
+# BEGIN ARM ASan strict-align workaround
+# GCC can omit FakeStack allocation-flag cleanup on AArch64, exhausting the
+# fake stack and making every later allocation scan all occupied slots.
+# -mstrict-align selects code generation that retains the cleanup. Keep it
+# on the link invocation too: this project enables LTO by default.
+# GCC 14.2 is affected; the fix is included in 14.3:
+# https://gcc.gnu.org/pipermail/gcc-cvs/2025-January/416553.html
+if cc.get_id() == 'gcc' and host_machine.cpu_family() == 'aarch64' and get_option('b_sanitize').contains('address') and cc.version().version_compare('<14.3.0')
+  if not cc.has_argument('-mstrict-align') or not cc.has_link_argument('-mstrict-align')
+    error('ARM GCC ASan requires compiler and linker support for -mstrict-align')
+  endif
+  add_project_arguments('-mstrict-align', language: 'c')
+  add_project_link_arguments('-mstrict-align', language: 'c')
+  message('Applying ARM GCC ASan FakeStack workaround: -mstrict-align (compile and LTO link)')
+endif
+# END ARM ASan strict-align workaround
+
 # CRC-32 variant define
 crc32_defines = []
 if crc32_variant_option == 'ethernet'
