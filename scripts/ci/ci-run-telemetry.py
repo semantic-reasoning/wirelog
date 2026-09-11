@@ -250,10 +250,19 @@ def provisional(metric: dict, in_flight: bool) -> dict:
     return metric
 
 
-def interval(start_iso, end_iso, missing_reason: str) -> dict:
+def interval(start_iso, end_iso, missing_reason: str,
+             no_start_reason: str = None) -> dict:
     """Seconds between two server-clock timestamps, or why they do not yield
-    one.  A negative interval is reported as anomalous, never clamped to 0."""
+    one.  A negative interval is reported as anomalous, never clamped to 0.
+
+    @missing_reason names the absent end.  @no_start_reason names the absent
+    start where the two are different facts, and they usually are: a job that
+    completed without a start stamp is not a job that has not completed, and
+    telling the reader the second is worse than telling them nothing, because
+    they can check it and find it false."""
     start, end = parse_ts(start_iso), parse_ts(end_iso)
+    if start is None and no_start_reason:
+        return unavailable(no_start_reason)
     if start is None or end is None:
         return unavailable(missing_reason)
     seconds = math.floor((end - start).total_seconds())
@@ -394,10 +403,10 @@ def analyze_job(job: dict, t0_iso: str, completed_by_name: dict) -> dict:
         # Summable along a path, and the critical path does sum them.
         "queue_delay": additive(
             interval(job.get("created_at"), job.get("started_at"),
-                     "job never started")),
+                     "job never started", "job has no creation time")),
         "job_wall": additive(
             interval(job.get("started_at"), job.get("completed_at"),
-                     "job has not completed")),
+                     "job has not completed", "job never started")),
     }
 
     phases, unmapped, unusable, skipped, accounted = job_phases(job)
@@ -452,7 +461,11 @@ def release_latency(job: dict, jobs_by_name: dict, needs: dict) -> dict:
     the only per-job wait that may be summed along a path."""
     name = job.get("name") or ""
     if not needs:
-        return unavailable(GRAPH_NOT_SUPPLIED)
+        # Not GRAPH_NOT_SUPPLIED: that sentence explains why a critical path
+        # cannot be walked, and read against a job it reverses cause and
+        # effect.  What is missing here is the job's own dependencies.
+        return unavailable("no dependency graph was supplied, so this job's "
+                           "dependencies are unknown")
     if name not in needs:
         # Not the same as having no dependencies: the extractor may simply
         # have missed this job, and calling that a root would hide the gap.
@@ -668,19 +681,50 @@ def _seconds(metric: dict):
                                                          "partial") else None
 
 
-def untimed_executed_jobs(analyzed: list) -> list:
-    """Jobs that were not skipped and that the run did not time.  A skipped
-    job's absent duration is correct and is not reported here.
+# A job with one of these conclusions has no duration because it did not run,
+# not because the run lost the data.  Reporting it as missing data is the same
+# false alarm as reporting a job that is merely still going.
+NO_DURATION_BY_DESIGN = ("skipped", "cancelled")
 
-    Both walkers pick a chain by comparing weights, so a job like this can
-    decide which chain wins without ever appearing on the winner: the walk
-    routes around the hole and the survivor carries no trace of it.  Naming
-    them run-wide is deliberately over-inclusive.  A total that may have been
-    routed around missing data says so, rather than being right only when the
-    gap happens to fall on the chain that was reported."""
-    return sorted(entry["name"] for entry in analyzed
-                  if entry.get("conclusion") != "skipped"
-                  and _seconds(entry["metrics"]["job_wall"]) is None)
+# The job statuses that mean the job may still produce a duration.  GitHub
+# uses exactly these two before `completed`.
+IN_FLIGHT_STATUSES = ("queued", "in_progress")
+
+
+def untimed_executed_jobs(analyzed: list) -> tuple:
+    """Jobs that ran, or may still run, and that the run did not time, split
+    into the ones that have not finished and the ones that finished anyway.
+    A job that was skipped or cancelled before it started has no duration by
+    design and is in neither list.
+
+    The split is what the caller needs to say something true.  A job still
+    running is ordinary and makes the answer a lower bound; a job that
+    finished without a usable duration is missing data.  Calling the first
+    the second turns every live run into an alarm, which is how a caveat
+    stops being read.
+
+    Both walkers can pick a chain that excludes such a job, for different
+    reasons.  The graph walk compares weights and an untimed node weighs
+    zero, so the longest path routes around it.  The observed walk compares
+    completion timestamps and starts at the last job it could time, so an
+    untimed later finisher is stepped over and a hole on an unvisited branch
+    is never seen.  Either way the surviving chain carries no trace of it,
+    which is why both lists are collected run-wide rather than along the
+    chain."""
+    running, untimed = [], []
+    for entry in analyzed:
+        if entry.get("conclusion") in NO_DURATION_BY_DESIGN:
+            continue
+        if _seconds(entry["metrics"]["job_wall"]) is not None:
+            continue
+        # Only the two statuses that actually mean "not done yet" take the
+        # quiet branch.  A status this tool does not recognise is data it
+        # cannot read, which belongs with missing data rather than with an
+        # ordinary live job.
+        target = running if entry.get("status") in IN_FLIGHT_STATUSES \
+            else untimed
+        target.append(entry["name"])
+    return sorted(running), sorted(untimed)
 
 
 def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
@@ -741,18 +785,27 @@ def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
     # The walk starts at the last job to finish that the run actually timed,
     # so an untimed job that finished later is skipped over silently and the
     # chain below it is reported as if it were the whole path.
-    off_chain = [name for name in untimed_executed_jobs(analyzed)
-                 if name not in set(chain)]
-    if off_chain:
-        metric["evidence"]["untimed_jobs_off_chain"] = off_chain
+    on_chain = set(chain)
+    running, untimed = untimed_executed_jobs(analyzed)
+    off_running = [name for name in running if name not in on_chain]
+    off_untimed = [name for name in untimed if name not in on_chain]
+    if off_running:
+        metric["evidence"]["unfinished_jobs_off_chain"] = off_running
+    if off_untimed:
+        metric["evidence"]["untimed_jobs_off_chain"] = off_untimed
     reasons = []
     if unmeasured:
         reasons.append(f"{len(unmeasured)} hop(s) on this chain were not "
                        f"timed and contribute nothing to the total")
-    if off_chain:
-        reasons.append(f"{len(off_chain)} executed job(s) elsewhere in the "
-                       f"run were not timed, so this chain may not be the "
-                       f"longest one")
+    if off_running:
+        reasons.append(f"{len(off_running)} job(s) elsewhere in the run have "
+                       f"not finished, so the walk started below the end of "
+                       f"the path and the total is a lower bound")
+    if off_untimed:
+        reasons.append(f"{len(off_untimed)} finished job(s) elsewhere in the "
+                       f"run were not timed, so the walk may have started "
+                       f"below the true end of the path, or one of them may "
+                       f"lie on a longer branch it never entered")
     if truncated:
         reasons.append(f"walk stopped: {truncated}")
     if drift.get("nodes_without_job"):
@@ -791,8 +844,9 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
         if name in stack:            # a cycle cannot occur in a needs DAG,
             return 0, [name]         # but never spin if the data says one does
         stack = stack | {name}
-        entry = by_name.get(name)
-        node_weight = _seconds(entry["metrics"]["job_wall"]) or 0 if entry else 0
+        # Every name reaching here is a by_name key: the seeds are its keys
+        # and the recursion below skips a dep that is not one.
+        node_weight = _seconds(by_name[name]["metrics"]["job_wall"]) or 0
         best_total, best_chain = node_weight, [name]
         for dep in edges.get(name, []):
             if dep not in by_name:
@@ -813,8 +867,7 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
         return unavailable("no job to walk")
     total, chain = max(results, key=lambda pair: pair[0])
     unmeasured_nodes = [name for name in chain
-                        if name not in by_name
-                        or _seconds(by_name[name]["metrics"]["job_wall"])
+                        if _seconds(by_name[name]["metrics"]["job_wall"])
                         is None]
     # Only the edges on the chain being reported can qualify this number.
     for index, name in enumerate(chain[1:], start=1):
@@ -831,13 +884,20 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
     # An untimed node weighs zero during selection, so the longest path can
     # be routed around it and come back clean.  The hole is off the chain
     # precisely because it was scored as free.
-    off_chain = [name for name in untimed_executed_jobs(analyzed)
-                 if name not in set(chain)]
-    if off_chain:
-        reasons.append(f"{len(off_chain)} executed job(s) off this chain were "
-                       f"not timed, so the longest path may have been routed "
-                       f"around them")
-        metric["evidence"]["untimed_jobs_off_chain"] = off_chain
+    on_chain = set(chain)
+    running, untimed = untimed_executed_jobs(analyzed)
+    off_running = [name for name in running if name not in on_chain]
+    off_untimed = [name for name in untimed if name not in on_chain]
+    if off_running:
+        reasons.append(f"{len(off_running)} job(s) off this chain have not "
+                       f"finished, so they weigh nothing yet and the longest "
+                       f"path may move once they do")
+        metric["evidence"]["unfinished_jobs_off_chain"] = off_running
+    if off_untimed:
+        reasons.append(f"{len(off_untimed)} finished job(s) off this chain "
+                       f"were not timed, so the longest path may have been "
+                       f"routed around them")
+        metric["evidence"]["untimed_jobs_off_chain"] = off_untimed
     if unusable_edges:
         reasons.append("edge weights unavailable on this chain; node weights "
                        "only (a skip cascade batches job creation)")
@@ -1195,6 +1255,89 @@ def cell(metric: dict) -> str:
     return metric.get("status", "unavailable")
 
 
+# The per-job table, declared once: (metric name, where it lives on the job
+# entry, column heading).  Both the table and the block that explains it are
+# built from this, because they have to agree.  A reason printed for a metric
+# with no column explains a number the reader cannot see, and a column with no
+# reason is the bare `(partial)` the block exists to defeat; either happens the
+# moment the two lists are written out separately.
+JOB_COLUMNS = (
+    ("queue_delay", "metrics", "queue"),
+    ("job_wall", "metrics", "wall"),
+    ("configure", "phases", "configure"),
+    ("compile", "phases", "compile"),
+    ("tests", "phases", "tests"),
+    ("unaccounted", None, "unaccounted"),
+)
+
+# How many entries sharing one reason are still worth naming one by one.  The
+# threshold keys on group size, so it does nothing on a run with fewer jobs
+# than this, where the block is at its longest relative to its table.
+COLLAPSE_AT = 3
+
+
+def job_cells(job: dict) -> list:
+    """The (column, metric) pairs this job contributes to the per-job table,
+    in the order the table prints them."""
+    return [(name, job[source][name] if source else job[name])
+            for name, source, _ in JOB_COLUMNS]
+
+
+def degradation_block(report: dict, path: dict) -> list:
+    """Why any number printed above is not final.  A cell reading `partial`
+    or `unavailable` with nothing saying why is a flag a reader learns to
+    skip, and the caveat the two walkers raise is worth nothing once that has
+    happened.
+
+    Two things would defeat it on their own.  Explaining a metric that has no
+    column tells the reader about a number they cannot see while leaving the
+    ones they can see bare, so the selection is exactly `cell()`'s output:
+    the run-level table, both critical paths, and each job's six columns.  And
+    one reason repeated once per job buries every line that is not repeated,
+    so identical reasons collapse into a single line carrying the count.  A
+    skipped job is left out for the same reason: its durations are absent by
+    design and the table header says so once."""
+    def wanted(metric):
+        # Deliberately not `and metric.get("reason")`: a degraded metric that
+        # carries no reason is the bare `(partial)` this block exists to
+        # defeat, so it must appear and say that its cause was not recorded.
+        return metric.get("status") != "measured"
+
+    qualified = [(key, metric) for key, metric in report["metrics"].items()
+                 if wanted(metric)]
+    qualified += [(f"critical_path.{key}", path[key])
+                  for key in ("observed", "graph") if wanted(path[key])]
+    for job in report["jobs"]:
+        if job["conclusion"] == "skipped":
+            continue
+        qualified += [(f"{job['name']} / {column}", metric)
+                      for column, metric in job_cells(job) if wanted(metric)]
+    if not qualified:
+        return []
+
+    groups: dict = {}
+    for key, metric in qualified:
+        reason = metric.get("reason") or "no cause was recorded"
+        groups.setdefault((metric["status"], reason), []).append(key)
+    lines = ["", "Why a number above is not final:", ""]
+    for (status, reason), keys in groups.items():
+        # A handful is worth naming individually; a wall of them is not.
+        if len(keys) <= COLLAPSE_AT:
+            lines += [f"- `{key}` is {status}: {reason}" for key in keys]
+            continue
+        # Collapse only what can still be named.  Entries sharing a reason
+        # across different columns have no shared subject, and "4 values are
+        # anomalous" tells the reader neither which jobs nor which numbers,
+        # which is worse than four specific lines.
+        columns = {key.rsplit(" / ", 1)[-1] for key in keys}
+        if len(columns) != 1:
+            lines += [f"- `{key}` is {status}: {reason}" for key in keys]
+            continue
+        lines.append(f"- `{columns.pop()}` on {len(keys)} jobs is "
+                     f"{status}: {reason}")
+    return lines
+
+
 def render_markdown(report: dict) -> str:
     counts = report["job_counts"]
     lines = [
@@ -1252,17 +1395,14 @@ def render_markdown(report: dict) -> str:
         "",
         "Per job, seconds. A skipped job has no durations at all.",
         "",
-        "| job | population | queue | wall | configure | compile | tests | "
-        "unaccounted |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| job | population | "
+        + " | ".join(heading for _, _, heading in JOB_COLUMNS) + " |",
+        "| --- | --- | " + " | ".join("---" for _ in JOB_COLUMNS) + " |",
     ]
     for job in report["jobs"]:
-        m, p = job["metrics"], job["phases"]
-        lines.append(
-            f"| {job['name']} | {job['population']} | {cell(m['queue_delay'])} "
-            f"| {cell(m['job_wall'])} | {cell(p['configure'])} "
-            f"| {cell(p['compile'])} | {cell(p['tests'])} "
-            f"| {cell(job['unaccounted'])} |")
+        values = " | ".join(cell(metric) for _, metric in job_cells(job))
+        lines.append(f"| {job['name']} | {job['population']} | {values} |")
+    lines += degradation_block(report, path)
     if report["anomalies"]:
         lines += ["", "Anomalies:", ""]
         for item in report["anomalies"]:
@@ -1380,8 +1520,10 @@ def cmd_fetch(args) -> int:
         except (RuntimeError, OSError) as exc:
             return die(str(exc))
         run_path, jobs_path = raw_paths(out, run_id)
-        run_path.write_text(json.dumps(run, indent=2, sort_keys=True) + "\n")
-        jobs_path.write_text(json.dumps(jobs, indent=2, sort_keys=True) + "\n")
+        run_path.write_text(json.dumps(run, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8")
+        jobs_path.write_text(json.dumps(jobs, indent=2, sort_keys=True)
+                             + "\n", encoding="utf-8")
         print(f"ci-run-telemetry: saved run {run_id} "
               f"({jobs['total_count']} jobs, {budget.used} requests so far)")
     return 0
@@ -1394,11 +1536,11 @@ def cmd_report(args) -> int:
         if not run_path.exists() or not jobs_path.exists():
             return die(f"no saved responses for run {run_id} under {out}/raw "
                        f"(run `fetch` first)")
-        run = json.loads(run_path.read_text())
+        run = json.loads(run_path.read_text(encoding="utf-8"))
         if run.get("id") is not None and run.get("id") != run_id:
             return die(f"{run_path} holds run {run.get('id')}, not {run_id}; "
                        f"the saved pair does not belong together")
-        jobs_doc = json.loads(jobs_path.read_text())
+        jobs_doc = json.loads(jobs_path.read_text(encoding="utf-8"))
         edges, drift = None, None
         if args.workflow:
             try:
@@ -1423,8 +1565,10 @@ def cmd_report(args) -> int:
                 edges, drift = match_graph_to_jobs(graph, names)
         report = analyze(run, jobs_doc, edges, drift)
         (out / f"run-{run_id}.json").write_text(
-            json.dumps(report, indent=2, sort_keys=True) + "\n")
-        (out / f"run-{run_id}.md").write_text(render_markdown(report))
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+        (out / f"run-{run_id}.md").write_text(render_markdown(report),
+                                              encoding="utf-8")
         counts = report["job_counts"]
         print(f"ci-run-telemetry: run {run_id}: {counts['executed']} executed, "
               f"{counts['skipped']} skipped, "
@@ -1444,11 +1588,13 @@ def cmd_aggregate(args) -> int:
                        if path.name != f"{args.label}.json")
     if not paths:
         return die(f"no reports under {out} (run `report` first)")
-    reports = [json.loads(path.read_text()) for path in paths]
+    reports = [json.loads(path.read_text(encoding="utf-8"))
+               for path in paths]
     doc = aggregate_reports(reports)
     (out / f"{args.label}.json").write_text(
-        json.dumps(doc, indent=2, sort_keys=True) + "\n")
-    (out / f"{args.label}.md").write_text(render_aggregate_markdown(doc))
+        json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out / f"{args.label}.md").write_text(render_aggregate_markdown(doc),
+                                          encoding="utf-8")
     print(f"ci-run-telemetry: {args.label}: {len(doc['runs'])} runs, "
           f"{len(doc['cells'])} cells, populations "
           f"{', '.join(doc['populations']) or 'none'}")
