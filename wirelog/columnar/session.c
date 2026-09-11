@@ -364,6 +364,32 @@ wl_columnar_session_source_leases_release_all(wl_col_session_t *sess)
     }
 }
 
+/* Row removal rewrites the canonical relation storage in place.  Admit the
+ * operation before the first source read so a competing reader, writer, or
+ * live storage alias cannot observe a partially compacted relation. */
+static int
+session_relation_writer_acquire(col_rel_t *relation, col_rel_t **owner_out,
+    wl_columnar_source_access_writer_t *writer)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!relation || !owner_out || !writer)
+        return EINVAL;
+    *owner_out = NULL;
+    rc = col_rel_storage_owner_resolve(relation, &owner);
+    if (rc != 0)
+        return rc;
+    if (owner->storage_alias_borrows > 0)
+        return EBUSY;
+    rc = wl_columnar_source_access_writer_acquire(
+        &owner->source_access, writer);
+    if (rc != 0)
+        return rc;
+    *owner_out = owner;
+    return 0;
+}
+
 int
 wl_columnar_session_install_shared_view(wl_col_session_t *sess,
     col_rel_t *dst, const col_rel_t *src)
@@ -2629,25 +2655,22 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (r->ncols != num_cols)
         return EINVAL;
 
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    int writer_rc = session_relation_writer_acquire(r, &owner, &writer);
+    (void)owner;
+    if (writer_rc != 0)
+        return writer_rc;
+
     int64_t row_stack[COL_STACK_MAX];
     int64_t *row_buf = row_stack;
     if (num_cols > COL_STACK_MAX) {
         row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
         if (!row_buf)
-            return ENOMEM;
+            writer_rc = ENOMEM;
     }
-
-    col_rel_t *owner = NULL;
-    wl_columnar_source_access_writer_t writer = { 0 };
-    int writer_rc = col_rel_storage_owner_resolve(r, &owner);
-    if (writer_rc == 0)
-        writer_rc = wl_columnar_source_access_writer_acquire(
-            &owner->source_access, &writer);
-    if (writer_rc != 0) {
-        if (row_buf != row_stack)
-            free(row_buf);
-        return writer_rc;
-    }
+    if (writer_rc != 0)
+        goto remove_release;
 
     /* Compact: remove matching rows */
     for (uint32_t di = 0; di < num_rows; di++) {
@@ -2674,13 +2697,19 @@ next_del:;
         if (r->nrows != old_nrows)
             wl_columnar_relation_touch_view(r);
     }
-    if (row_buf != row_stack)
-        free(row_buf);
     session_invalidate_relation_caches(sess, r->name);
     sess->pending_input_change = true;
     sess->snapshot_stable_valid = false;
-    writer_rc = wl_columnar_source_access_writer_release(&writer);
-    return writer_rc == 0 ? 0 : EINVAL;
+
+remove_release:
+    if (row_buf != row_stack)
+        free(row_buf);
+    if (writer.owner) {
+        int release_rc = wl_columnar_source_access_writer_release(&writer);
+        if (writer_rc == 0 && release_rc != 0)
+            writer_rc = release_rc;
+    }
+    return writer_rc;
 }
 
 /*
@@ -2715,12 +2744,10 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     if (r->ncols != num_cols)
         return EINVAL;
 
-    col_rel_t *owner = NULL;
     wl_columnar_source_access_writer_t writer = { 0 };
-    int writer_rc = col_rel_storage_owner_resolve(r, &owner);
-    if (writer_rc == 0)
-        writer_rc = wl_columnar_source_access_writer_acquire(
-            &owner->source_access, &writer);
+    col_rel_t *owner = NULL;
+    int writer_rc = session_relation_writer_acquire(r, &owner, &writer);
+    (void)owner;
     if (writer_rc != 0)
         return writer_rc;
 
@@ -2730,8 +2757,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
 
     col_rel_t *rdelta = col_rel_new_auto(rname, num_cols);
     if (!rdelta) {
-        (void)wl_columnar_source_access_writer_release(&writer);
-        return ENOMEM;
+        writer_rc = ENOMEM;
+        goto incremental_release_no_buf;
     }
 
     /* Append each removed row to the delta relation.
@@ -2748,8 +2775,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
                 rc = col_rel_append_row(rdelta, del);
                 if (rc != 0) {
                     col_rel_destroy(rdelta);
-                    (void)wl_columnar_source_access_writer_release(&writer);
-                    return rc;
+                    writer_rc = rc;
+                    goto incremental_release_no_buf;
                 }
                 break; /* Only one copy per removal request */
             }
@@ -2762,8 +2789,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
         if (!row_buf) {
             col_rel_destroy(rdelta);
-            (void)wl_columnar_source_access_writer_release(&writer);
-            return ENOMEM;
+            writer_rc = ENOMEM;
+            goto incremental_release;
         }
     }
 
@@ -2774,10 +2801,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     rc = session_add_rel(sess, rdelta);
     if (rc != 0) {
         col_rel_destroy(rdelta);
-        if (row_buf != row_stack)
-            free(row_buf);
-        (void)wl_columnar_source_access_writer_release(&writer);
-        return rc;
+        writer_rc = rc;
+        goto incremental_release;
     }
 
     /* Remove rows from the EDB using existing compact logic */
@@ -2805,9 +2830,6 @@ next_del_incr:;
         if (r->nrows != old_nrows)
             wl_columnar_relation_touch_view(r);
     }
-    if (row_buf != row_stack)
-        free(row_buf);
-
     /* Clamp base_nrows to current row count */
     if (r->base_nrows > r->nrows)
         r->base_nrows = r->nrows;
@@ -2823,8 +2845,18 @@ next_del_incr:;
     sess->outer_epoch++;
     sess->pending_input_change = true;
 
-    writer_rc = wl_columnar_source_access_writer_release(&writer);
-    return writer_rc == 0 ? 0 : EINVAL;
+    writer_rc = 0;
+
+incremental_release:
+    if (row_buf != row_stack)
+        free(row_buf);
+incremental_release_no_buf:
+    if (writer.owner) {
+        int release_rc = wl_columnar_source_access_writer_release(&writer);
+        if (writer_rc == 0 && release_rc != 0)
+            writer_rc = release_rc;
+    }
+    return writer_rc;
 }
 
 /*
