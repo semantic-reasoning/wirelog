@@ -1447,6 +1447,145 @@ test_session_remove_nonexistent(void)
     PASS();
 }
 
+static col_rel_t *
+test_session_relation(wl_session_t *session, const char *name)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        if (sess->rels[i] && sess->rels[i]->name
+            && strcmp(sess->rels[i]->name, name) == 0)
+            return sess->rels[i];
+    }
+    return NULL;
+}
+
+static void
+test_session_remove_reader_exclusion(void)
+{
+    TEST("session: removal is excluded while a source reader is active");
+
+    wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    if (!ffi) {
+        FAIL("could not generate FFI plan");
+        return;
+    }
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(ffi);
+        FAIL("session_create failed");
+        return;
+    }
+    int64_t a_data[] = { 1, 2, 3 };
+    rc = wl_session_insert(session, "a", a_data, 3, 1);
+    if (rc == 0)
+        rc = wl_session_step(session);
+    col_rel_t *rel = test_session_relation(session, "a");
+    if (rc != 0 || !rel) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("insert or relation lookup failed");
+        return;
+    }
+    uint32_t before_rows = rel->nrows;
+    uint64_t before_view = rel->view_generation;
+    int64_t before_value = rel->columns[0][1];
+    wl_columnar_source_access_reader_t reader = { 0 };
+    if (col_rel_source_reader_acquire(rel, &reader) != 0) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("reader acquisition failed");
+        return;
+    }
+    rc = wl_session_remove(session, "a", &a_data[1], 1, 1);
+    int release_rc = col_rel_source_reader_release(&reader);
+    if (rc != EBUSY || release_rc != 0
+        || rel->nrows != before_rows
+        || rel->view_generation != before_view
+        || rel->columns[0][1] != before_value) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("reader-blocked plain removal was not transactional");
+        return;
+    }
+    rc = wl_session_remove(session, "a", &a_data[1], 1, 1);
+    if (rc != 0 || rel->nrows != before_rows - 1u
+        || rel->columns[0][1] != 3) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("plain removal retry failed");
+        return;
+    }
+    wl_session_destroy(session);
+    wl_plan_free(ffi);
+    PASS();
+}
+
+static void
+test_session_remove_incremental_reader_exclusion(void)
+{
+    TEST("session: incremental removal is excluded while a source reader is active");
+
+    wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    if (!ffi) {
+        FAIL("could not generate FFI plan");
+        return;
+    }
+    wl_session_t *session = NULL;
+    int rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    if (rc != 0 || !session) {
+        wl_plan_free(ffi);
+        FAIL("session_create failed");
+        return;
+    }
+    delta_collector_t deltas;
+    memset(&deltas, 0, sizeof(deltas));
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    int64_t value = 7;
+    rc = wl_session_insert(session, "a", &value, 1, 1);
+    col_rel_t *rel = test_session_relation(session, "a");
+    if (rc != 0 || !rel) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("insert or relation lookup failed");
+        return;
+    }
+    uint32_t before_rows = rel->nrows;
+    uint32_t before_nrels = COL_SESSION(session)->nrels;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    if (col_rel_source_reader_acquire(rel, &reader) != 0) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("reader acquisition failed");
+        return;
+    }
+    rc = wl_session_remove(session, "a", &value, 1, 1);
+    int release_rc = col_rel_source_reader_release(&reader);
+    if (rc != EBUSY || release_rc != 0 || rel->nrows != before_rows
+        || COL_SESSION(session)->nrels != before_nrels
+        || test_session_relation(session, "$r$a") != NULL) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("reader-blocked incremental removal changed session state");
+        return;
+    }
+    rc = wl_session_remove(session, "a", &value, 1, 1);
+    if (rc != 0 || rel->nrows != 0
+        || test_session_relation(session, "$r$a") == NULL) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("incremental removal retry failed");
+        return;
+    }
+    wl_session_destroy(session);
+    wl_plan_free(ffi);
+    PASS();
+}
+
 /*
  * Test: snapshot on empty session returns 0 tuples with rc=0.
  */
@@ -1779,6 +1918,8 @@ main(void)
     /* GREEN: diff=-1 retraction deltas now implemented */
     test_session_remove_single_delta();
     test_session_remove_nonexistent();
+    test_session_remove_reader_exclusion();
+    test_session_remove_incremental_reader_exclusion();
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */

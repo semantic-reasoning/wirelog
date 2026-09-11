@@ -2583,6 +2583,18 @@ col_session_remove(wl_session_t *session, const char *relation,
             return ENOMEM;
     }
 
+    col_rel_t *owner = NULL;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int writer_rc = col_rel_storage_owner_resolve(r, &owner);
+    if (writer_rc == 0)
+        writer_rc = wl_columnar_source_access_writer_acquire(
+            &owner->source_access, &writer);
+    if (writer_rc != 0) {
+        if (row_buf != row_stack)
+            free(row_buf);
+        return writer_rc;
+    }
+
     /* Compact: remove matching rows */
     for (uint32_t di = 0; di < num_rows; di++) {
         const int64_t *del = data + (size_t)di * num_cols;
@@ -2613,7 +2625,8 @@ next_del:;
     session_invalidate_relation_caches(sess, r->name);
     sess->pending_input_change = true;
     sess->snapshot_stable_valid = false;
-    return 0;
+    writer_rc = wl_columnar_source_access_writer_release(&writer);
+    return writer_rc == 0 ? 0 : EINVAL;
 }
 
 /*
@@ -2648,13 +2661,24 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     if (r->ncols != num_cols)
         return EINVAL;
 
+    col_rel_t *owner = NULL;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int writer_rc = col_rel_storage_owner_resolve(r, &owner);
+    if (writer_rc == 0)
+        writer_rc = wl_columnar_source_access_writer_acquire(
+            &owner->source_access, &writer);
+    if (writer_rc != 0)
+        return writer_rc;
+
     /* Allocate $r$<name> delta relation to collect removed rows */
     char rname[256];
     snprintf(rname, sizeof(rname), "$r$%s", r->name);
 
     col_rel_t *rdelta = col_rel_new_auto(rname, num_cols);
-    if (!rdelta)
+    if (!rdelta) {
+        (void)wl_columnar_source_access_writer_release(&writer);
         return ENOMEM;
+    }
 
     /* Append each removed row to the delta relation.
      * We need to track which rows are actually being removed from the EDB,
@@ -2670,6 +2694,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
                 rc = col_rel_append_row(rdelta, del);
                 if (rc != 0) {
                     col_rel_destroy(rdelta);
+                    (void)wl_columnar_source_access_writer_release(&writer);
                     return rc;
                 }
                 break; /* Only one copy per removal request */
@@ -2683,17 +2708,21 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
         if (!row_buf) {
             col_rel_destroy(rdelta);
+            (void)wl_columnar_source_access_writer_release(&writer);
             return ENOMEM;
         }
     }
 
-    /* Register $r$<name> in session (replacing any prior) */
-    session_remove_rel(sess, rname);
+    /* Register $r$<name> in session.  session_add_rel performs replacement
+     * transactionally: it prepares/promotes the new relation before
+     * destroying an existing delta, so an allocation or lease failure does
+     * not discard the previous bookkeeping. */
     rc = session_add_rel(sess, rdelta);
     if (rc != 0) {
         col_rel_destroy(rdelta);
         if (row_buf != row_stack)
             free(row_buf);
+        (void)wl_columnar_source_access_writer_release(&writer);
         return rc;
     }
 
@@ -2740,7 +2769,8 @@ next_del_incr:;
     sess->outer_epoch++;
     sess->pending_input_change = true;
 
-    return 0;
+    writer_rc = wl_columnar_source_access_writer_release(&writer);
+    return writer_rc == 0 ? 0 : EINVAL;
 }
 
 /*
