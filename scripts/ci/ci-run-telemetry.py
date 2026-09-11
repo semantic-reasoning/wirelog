@@ -668,6 +668,21 @@ def _seconds(metric: dict):
                                                          "partial") else None
 
 
+def untimed_executed_jobs(analyzed: list) -> list:
+    """Jobs that were not skipped and that the run did not time.  A skipped
+    job's absent duration is correct and is not reported here.
+
+    Both walkers pick a chain by comparing weights, so a job like this can
+    decide which chain wins without ever appearing on the winner: the walk
+    routes around the hole and the survivor carries no trace of it.  Naming
+    them run-wide is deliberately over-inclusive.  A total that may have been
+    routed around missing data says so, rather than being right only when the
+    gap happens to fall on the chain that was reported."""
+    return sorted(entry["name"] for entry in analyzed
+                  if entry.get("conclusion") != "skipped"
+                  and _seconds(entry["metrics"]["job_wall"]) is None)
+
+
 def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
     """Walk back from the last job to finish, hop by hop, through its actual
     dependencies.  Taking the nearest earlier finisher instead would be wrong
@@ -723,10 +738,21 @@ def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
     })
     if unmeasured:
         metric["evidence"]["unmeasured_hops"] = unmeasured
+    # The walk starts at the last job to finish that the run actually timed,
+    # so an untimed job that finished later is skipped over silently and the
+    # chain below it is reported as if it were the whole path.
+    off_chain = [name for name in untimed_executed_jobs(analyzed)
+                 if name not in set(chain)]
+    if off_chain:
+        metric["evidence"]["untimed_jobs_off_chain"] = off_chain
     reasons = []
     if unmeasured:
         reasons.append(f"{len(unmeasured)} hop(s) on this chain were not "
                        f"timed and contribute nothing to the total")
+    if off_chain:
+        reasons.append(f"{len(off_chain)} executed job(s) elsewhere in the "
+                       f"run were not timed, so this chain may not be the "
+                       f"longest one")
     if truncated:
         reasons.append(f"walk stopped: {truncated}")
     if drift.get("nodes_without_job"):
@@ -749,6 +775,12 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
     rather than disappearing."""
     by_name = {entry["name"]: entry for entry in analyzed}
     if not edges:
+        # A graph that resolved to nothing is not the same as no graph, and
+        # saying the latter hides a rename that matched none of the run.
+        if drift and (drift.get("jobs_without_node")
+                      or drift.get("nodes_without_job")):
+            return unavailable("the declared graph resolved to none of this "
+                               "run's jobs; see drift")
         return unavailable(GRAPH_NOT_SUPPLIED)
     best: dict = {}
     unusable_edges: set = set()
@@ -781,7 +813,8 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
         return unavailable("no job to walk")
     total, chain = max(results, key=lambda pair: pair[0])
     unmeasured_nodes = [name for name in chain
-                        if _seconds(by_name[name]["metrics"]["job_wall"])
+                        if name not in by_name
+                        or _seconds(by_name[name]["metrics"]["job_wall"])
                         is None]
     # Only the edges on the chain being reported can qualify this number.
     for index, name in enumerate(chain[1:], start=1):
@@ -795,6 +828,16 @@ def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
         reasons.append(f"{len(unmeasured_nodes)} job(s) on this chain were "
                        f"not timed and contribute nothing to the total")
         metric["evidence"]["unmeasured_nodes"] = unmeasured_nodes
+    # An untimed node weighs zero during selection, so the longest path can
+    # be routed around it and come back clean.  The hole is off the chain
+    # precisely because it was scored as free.
+    off_chain = [name for name in untimed_executed_jobs(analyzed)
+                 if name not in set(chain)]
+    if off_chain:
+        reasons.append(f"{len(off_chain)} executed job(s) off this chain were "
+                       f"not timed, so the longest path may have been routed "
+                       f"around them")
+        metric["evidence"]["untimed_jobs_off_chain"] = off_chain
     if unusable_edges:
         reasons.append("edge weights unavailable on this chain; node weights "
                        "only (a skip cascade batches job creation)")
@@ -819,6 +862,9 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
             drift: dict | None = None) -> dict:
     """@needs is the resolved per-job dependency map and @drift is where it and
     the run disagree; both come from match_graph_to_jobs."""
+    # None means no graph was offered.  An empty mapping means one was and it
+    # resolved to nothing, which is a finding rather than an absence.
+    graph_supplied = needs is not None
     needs = needs or {}
     jobs = jobs_doc.get("jobs") or []
     t0_iso = run.get("run_started_at") or run.get("created_at")
@@ -933,7 +979,7 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
                 "step": item.get("step"), "reason": item.get("reason"),
             })
 
-    if needs:
+    if graph_supplied:
         drift = drift or {"jobs_without_node": [], "nodes_without_job": []}
         critical_path = {
             "observed": observed_path(analyzed, needs, drift),
@@ -1365,10 +1411,14 @@ def cmd_report(args) -> int:
                       f"({exc}); the critical path will say so",
                       file=sys.stderr)
                 graph = None
-            if not graph:
-                print("ci-run-telemetry: the workflow declares no jobs; the "
-                      "critical path will say so", file=sys.stderr)
             else:
+                if not graph:
+                    # Only reachable when the file parsed: an unreadable
+                    # workflow has already said why, and saying it declares
+                    # no jobs on top of that would be a second, false claim.
+                    print("ci-run-telemetry: the workflow declares no jobs; "
+                          "the critical path will say so", file=sys.stderr)
+            if graph:
                 names = [j.get("name") for j in jobs_doc.get("jobs") or []]
                 edges, drift = match_graph_to_jobs(graph, names)
         report = analyze(run, jobs_doc, edges, drift)
