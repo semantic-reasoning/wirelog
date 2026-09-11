@@ -2176,8 +2176,10 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena);
 col_rel_t *
 col_rel_pool_new_auto(delta_pool_t *pool, wl_arena_t *arena,
     const char *name, uint32_t ncols);
-void
+int
 col_rel_compact(col_rel_t *r);
+int
+col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels);
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src);
 
