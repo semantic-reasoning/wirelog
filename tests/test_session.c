@@ -1749,6 +1749,130 @@ test_session_remove_incremental_reader_exclusion(void)
     PASS();
 }
 
+static void
+test_session_full_idb_clear_reader_exclusion(void)
+{
+    TEST("session: full IDB clear is transactional across source owners");
+
+    wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
+            ".decl r(x: int32)\n"
+            ".decl s(x: int32)\n"
+            "r(x) :- a(x).\n"
+            "s(x) :- b(x).\n");
+    wl_session_t *session = NULL;
+    tuple_collector_t tuples = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_active = false;
+    col_rel_t *earlier = NULL;
+    col_rel_t *earlier_owner = NULL;
+    uint32_t before_rows = 0;
+    int64_t before_value = 0;
+    uint64_t before_view_generation = 0;
+    uint64_t before_storage_generation = 0;
+    int rc = 0;
+    const char *failure = NULL;
+
+    if (!ffi) {
+        failure = "could not generate FFI plan";
+        goto cleanup;
+    }
+    rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    if (rc != 0 || !session) {
+        failure = "session_create failed";
+        goto cleanup;
+    }
+
+    int64_t a_initial = 1;
+    int64_t b_initial = 2;
+    rc = wl_session_insert(session, "a", &a_initial, 1, 1);
+    if (rc == 0)
+        rc = wl_session_insert(session, "b", &b_initial, 1, 1);
+    if (rc == 0)
+        rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    if (rc != 0) {
+        failure = "initial IDB snapshot failed";
+        goto cleanup;
+    }
+
+    col_rel_t *r = test_session_relation(session, "r");
+    col_rel_t *s = test_session_relation(session, "s");
+    col_rel_t *r_owner = NULL;
+    col_rel_t *s_owner = NULL;
+    if (!r || !s || col_rel_storage_owner_resolve(r, &r_owner) != 0
+        || col_rel_storage_owner_resolve(s, &s_owner) != 0
+        || r_owner == s_owner) {
+        failure = "could not resolve two distinct IDB storage owners";
+        goto cleanup;
+    }
+
+    col_rel_t *later = (uintptr_t)r_owner < (uintptr_t)s_owner ? s : r;
+    earlier = later == r ? s : r;
+    if (col_rel_storage_owner_resolve(earlier, &earlier_owner) != 0) {
+        failure = "could not resolve earlier IDB owner";
+        goto cleanup;
+    }
+    before_rows = earlier->nrows;
+    if (before_rows != 1u || earlier->ncols != 1u) {
+        failure = "initial IDB target did not contain the expected row";
+        goto cleanup;
+    }
+    before_value = earlier->columns[0][0];
+    before_view_generation = earlier->view_generation;
+    before_storage_generation = earlier->storage_generation;
+
+    rc = col_rel_source_reader_acquire(later, &reader);
+    if (rc != 0) {
+        failure = "reader acquisition on later IDB owner failed";
+        goto cleanup;
+    }
+    reader_active = true;
+
+    /* Changes to two inputs request the full clear path on the next snapshot. */
+    int64_t a_next = 3;
+    int64_t b_next = 4;
+    rc = wl_session_insert(session, "a", &a_next, 1, 1);
+    if (rc == 0)
+        rc = wl_session_insert(session, "b", &b_next, 1, 1);
+    if (rc == 0)
+        rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    if (rc != EBUSY) {
+        failure =
+            "full IDB clear did not return EBUSY for a later-owner reader";
+        goto cleanup;
+    }
+    if (earlier->nrows != before_rows
+        || earlier->columns[0][0] != before_value
+        || earlier->view_generation != before_view_generation
+        || earlier->storage_generation != before_storage_generation
+        || earlier_owner->storage_generation != before_storage_generation) {
+        failure = "reader-blocked full clear changed the earlier IDB";
+        goto cleanup;
+    }
+
+cleanup:
+    if (reader_active) {
+        int release_rc = col_rel_source_reader_release(&reader);
+        reader_active = false;
+        if (!failure && release_rc != 0)
+            failure = "source reader release failed";
+    }
+    if (!failure && session) {
+        rc = wl_session_snapshot(session, collect_tuple, &tuples);
+        if (rc != 0)
+            failure = "full IDB snapshot retry failed after reader release";
+    }
+    if (session)
+        wl_session_destroy(session);
+    if (ffi)
+        wl_plan_free(ffi);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+}
+
 /*
  * Test: snapshot on empty session returns 0 tuples with rc=0.
  */
@@ -2086,6 +2210,7 @@ main(void)
     test_session_remove_nonexistent();
     test_session_remove_reader_exclusion();
     test_session_remove_incremental_reader_exclusion();
+    test_session_full_idb_clear_reader_exclusion();
     /* GREEN: col_session_remove returns 0 for uninitialized schema */
     /* test_session_snapshot_empty(); */
     /* test_session_snapshot_after_insert(); */
