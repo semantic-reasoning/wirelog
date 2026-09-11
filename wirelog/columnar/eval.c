@@ -2019,8 +2019,10 @@ tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
 
     memset(&replacement, 0, sizeof(replacement));
     rc = col_rel_prepare_replacement(cidb, candidate, &replacement);
-    if (rc == 0)
-        rc = col_rel_commit_replacement_locked(cidb, &replacement);
+    if (rc == 0) {
+        col_rel_commit_replacement_locked(cidb, &replacement);
+        rc = 0;
+    }
     if (rc != 0)
         col_rel_discard_replacement(&replacement);
 
@@ -2260,8 +2262,10 @@ tdd_merge_relation_results(col_rel_t **target_io, const char *rel_name,
 
     memset(&replacement, 0, sizeof(replacement));
     rc = col_rel_prepare_replacement(target, candidate, &replacement);
-    if (rc == 0)
-        rc = col_rel_commit_replacement_locked(target, &replacement);
+    if (rc == 0) {
+        col_rel_commit_replacement_locked(target, &replacement);
+        rc = 0;
+    }
     if (rc != 0)
         col_rel_discard_replacement(&replacement);
 
@@ -3764,6 +3768,111 @@ tdd_clear_relation_dedup_set(col_rel_t *r)
     r->dedup_count = 0;
 }
 
+/* Snapshot a published relation without carrying over its session-owned
+ * accounting or source-storage leases.  col_rel_deep_copy deliberately
+ * treats the dedup table as a rebuildable cache; coordinator fallback needs a
+ * lossless snapshot instead, so copy it explicitly and reject any metadata
+ * degradation from the deep-copy helper. */
+static int
+tdd_snapshot_relation(const col_rel_t *source, col_rel_t **out)
+{
+    col_rel_t *snapshot = NULL;
+    uint32_t compound_entries = 0;
+    int rc;
+
+    if (!source || !out)
+        return EINVAL;
+    *out = NULL;
+    rc = col_rel_deep_copy(source, &snapshot, NULL);
+    if (rc != 0)
+        return rc;
+    if (snapshot->compound_kind != source->compound_kind
+        || snapshot->compound_count != source->compound_count
+        || snapshot->inline_physical_offset
+        != source->inline_physical_offset
+        || snapshot->declared_ncols != source->declared_ncols
+        || snapshot->has_graph_column != source->has_graph_column
+        || snapshot->graph_col_idx != source->graph_col_idx) {
+        col_rel_destroy(snapshot);
+        return EINVAL;
+    }
+    if (source->compound_arity_map) {
+        if (!tdd_compound_map_entries(source, &compound_entries)
+            || !snapshot->compound_arity_map
+            || memcmp(snapshot->compound_arity_map,
+            source->compound_arity_map,
+            (size_t)compound_entries * sizeof(uint32_t)) != 0) {
+            col_rel_destroy(snapshot);
+            return EINVAL;
+        }
+    }
+    if (source->dedup_cap > 0) {
+        if (!source->dedup_slots)
+            goto invalid;
+        snapshot->dedup_slots = (uint64_t *)malloc(
+            (size_t)source->dedup_cap * sizeof(*snapshot->dedup_slots));
+        if (!snapshot->dedup_slots) {
+            col_rel_destroy(snapshot);
+            return ENOMEM;
+        }
+        memcpy(snapshot->dedup_slots, source->dedup_slots,
+            (size_t)source->dedup_cap * sizeof(*snapshot->dedup_slots));
+        snapshot->dedup_cap = source->dedup_cap;
+        snapshot->dedup_count = source->dedup_count;
+    }
+    *out = snapshot;
+    return 0;
+
+invalid:
+    col_rel_destroy(snapshot);
+    return EINVAL;
+}
+
+static int
+tdd_empty_relation_candidate(const col_rel_t *source, col_rel_t **out)
+{
+    int rc = tdd_snapshot_relation(source, out);
+    col_rel_t *candidate;
+
+    if (rc != 0)
+        return rc;
+    candidate = *out;
+    candidate->nrows = 0;
+    candidate->sorted_nrows = 0;
+    candidate->base_nrows = 0;
+    candidate->run_count = 0;
+    memset(candidate->run_ends, 0, sizeof(candidate->run_ends));
+    free(candidate->timestamps);
+    candidate->timestamps = NULL;
+    candidate->ledger_ts_bytes = 0;
+    tdd_clear_relation_dedup_set(candidate);
+    return 0;
+}
+
+static int
+tdd_reset_coord_relation(col_rel_t *relation)
+{
+    col_rel_t *candidate = NULL;
+    col_rel_replacement_t replacement;
+    int rc;
+
+    if (!relation)
+        return EINVAL;
+    rc = tdd_empty_relation_candidate(relation, &candidate);
+    if (rc != 0)
+        return rc;
+    memset(&replacement, 0, sizeof(replacement));
+    rc = col_rel_prepare_replacement(relation, candidate, &replacement);
+    if (rc == 0) {
+        col_rel_commit_replacement_locked(relation, &replacement);
+        rc = 0;
+    }
+    if (rc != 0)
+        col_rel_discard_replacement(&replacement);
+    col_rel_destroy(candidate);
+    return rc;
+}
+
 static int
 tdd_save_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     col_rel_t ***out_saved)
@@ -3777,16 +3886,15 @@ tdd_save_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
         return EOVERFLOW;
     col_rel_t **saved = (col_rel_t **)calloc(
         sp->relation_count, sizeof(col_rel_t *));
+    int rc = 0;
     if (!saved)
         return ENOMEM;
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
         if (!r || r->ncols == 0)
             continue;
-        saved[ri] = col_rel_new_auto(r->name, r->ncols);
-        if (!saved[ri])
-            goto fail;
-        if (r->nrows > 0 && col_rel_append_all(saved[ri], r, NULL) != 0)
+        rc = tdd_snapshot_relation(r, &saved[ri]);
+        if (rc != 0)
             goto fail;
     }
     *out_saved = saved;
@@ -3796,50 +3904,198 @@ fail:
     for (uint32_t ri = 0; ri < sp->relation_count; ri++)
         col_rel_destroy(saved[ri]);
     free((void *)saved);
-    return ENOMEM;
+    return rc;
+}
+
+typedef struct {
+    const char *name;
+    col_rel_t *relation;
+    col_rel_t *owner;
+    col_rel_t *saved;
+    col_rel_t *candidate;
+    col_rel_replacement_t replacement;
+    bool replacement_prepared;
+    bool registered;
+} tdd_restore_entry_t;
+
+static int
+tdd_restore_entry_compare(const void *left, const void *right)
+{
+    const tdd_restore_entry_t *a = (const tdd_restore_entry_t *)left;
+    const tdd_restore_entry_t *b = (const tdd_restore_entry_t *)right;
+
+    if (!a->owner && !b->owner)
+        return strcmp(a->name, b->name);
+    if (!a->owner)
+        return 1;
+    if (!b->owner)
+        return -1;
+    if (a->owner->relation_identity < b->owner->relation_identity)
+        return -1;
+    if (a->owner->relation_identity > b->owner->relation_identity)
+        return 1;
+    return strcmp(a->name, b->name);
+}
+
+static void
+tdd_restore_entries_discard(wl_col_session_t *coord,
+    tdd_restore_entry_t *entries, uint32_t count, uint32_t initial_nrels)
+{
+    if (!entries)
+        return;
+    for (uint32_t i = count; i-- > 0; ) {
+        if (entries[i].registered) {
+            for (uint32_t ri = 0; ri < coord->nrels; ri++) {
+                if (coord->rels[ri]
+                    && strcmp(coord->rels[ri]->name, entries[i].name) == 0) {
+                    col_rel_destroy(coord->rels[ri]);
+                    coord->rels[ri] = NULL;
+                    break;
+                }
+            }
+            entries[i].registered = false;
+            entries[i].candidate = NULL;
+        }
+    }
+    coord->nrels = initial_nrels;
+    (void)session_rel_build_hash(coord);
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].replacement_prepared
+            || entries[i].replacement.writer_acquired)
+            col_rel_discard_replacement(&entries[i].replacement);
+        if (entries[i].candidate)
+            col_rel_destroy(entries[i].candidate);
+    }
+    free(entries);
 }
 
 static int
 tdd_restore_coord_idb(const wl_plan_stratum_t *sp, wl_col_session_t *coord,
     col_rel_t **saved)
 {
+    tdd_restore_entry_t *entries = NULL;
+    size_t entry_bytes;
+    uint32_t count;
+    uint32_t initial_nrels;
+    int rc = 0;
+
     if (!saved)
         return 0;
-    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-        const char *name = sp->relations[ri].name;
-        col_rel_t *r = session_find_rel(coord, name);
-        if (!r) {
-            int alloc_rc = col_rel_alloc(&r, name);
-            if (alloc_rc != 0)
-                return alloc_rc;
-            alloc_rc = session_add_rel(coord, r);
-            if (alloc_rc != 0) {
-                col_rel_destroy(r);
-                return alloc_rc;
-            }
-        }
-        r->nrows = 0;
-        r->sorted_nrows = 0;
-        r->run_count = 0;
-        memset(r->run_ends, 0, sizeof(r->run_ends));
-        free(r->timestamps);
-        r->timestamps = NULL;
-        wl_columnar_relation_touch_replacement(r);
-        tdd_clear_relation_dedup_set(r);
-        if (saved[ri] && saved[ri]->ncols > 0) {
-            if (r->ncols == 0) {
-                int rc = col_rel_set_schema(r, saved[ri]->ncols,
-                        (const char *const *)saved[ri]->col_names);
-                if (rc != 0)
-                    return rc;
-            }
-            int rc = col_rel_append_all(r, saved[ri], NULL);
+    initial_nrels = coord->nrels;
+    count = sp->relation_count;
+    if (wl_columnar_eval_checked_size_mul(count, sizeof(*entries),
+        &entry_bytes) != 0)
+        return EOVERFLOW;
+    entries = (tdd_restore_entry_t *)calloc(1, entry_bytes);
+    if (!entries && count > 0)
+        return ENOMEM;
+
+    /* Build every private candidate before touching a published relation or
+     * the session registry.  This includes candidates for relations that are
+     * absent from the registry; registration is delayed until all existing
+     * owners have passed admission. */
+    for (uint32_t ri = 0; ri < count; ri++) {
+        tdd_restore_entry_t *entry = &entries[ri];
+        entry->name = sp->relations[ri].name;
+        entry->relation = session_find_rel(coord, entry->name);
+        entry->saved = saved[ri];
+        if (entry->relation) {
+            rc = col_rel_storage_owner_resolve(entry->relation,
+                    &entry->owner);
             if (rc != 0)
-                return rc;
+                goto fail;
+            if (entry->owner != entry->relation
+                || entry->owner->storage_alias_borrows > 0) {
+                rc = EBUSY;
+                goto fail;
+            }
         }
-        col_session_invalidate_arrangements(&coord->base, name);
+        if (entry->saved)
+            rc = tdd_snapshot_relation(entry->saved, &entry->candidate);
+        else if (entry->relation)
+            rc = tdd_empty_relation_candidate(entry->relation,
+                    &entry->candidate);
+        else
+            rc = col_rel_alloc(&entry->candidate, entry->name);
+        if (rc != 0)
+            goto fail;
     }
+
+    /* Acquire every canonical writer in a deterministic order.  Rejecting a
+     * later reader/alias therefore happens before any relation is changed. */
+    qsort(entries, count, sizeof(*entries), tdd_restore_entry_compare);
+    for (uint32_t i = 0; i < count; i++) {
+        tdd_restore_entry_t *entry = &entries[i];
+        if (!entry->relation)
+            continue;
+        if (i > 0 && entries[i - 1].owner == entry->owner) {
+            rc = EBUSY;
+            goto fail;
+        }
+        memset(&entry->replacement, 0, sizeof(entry->replacement));
+        wl_columnar_memory_reservation_init(
+            &entry->replacement.reservation);
+        rc = wl_columnar_source_access_writer_acquire(
+            &entry->owner->source_access, &entry->replacement.writer);
+        if (rc != 0)
+            goto fail;
+        entry->replacement.writer_acquired = true;
+    }
+
+    /* Prepare all replacements while all writers remain held.  Preparation
+     * may allocate or fail, but publication has not begun and cleanup can
+     * release every admission without changing a destination. */
+    for (uint32_t i = 0; i < count; i++) {
+        tdd_restore_entry_t *entry = &entries[i];
+        if (!entry->relation)
+            continue;
+        rc = col_rel_prepare_replacement_locked(entry->relation,
+                entry->candidate, &entry->replacement);
+        if (rc != 0)
+            goto fail;
+        entry->replacement_prepared = true;
+        col_rel_destroy(entry->candidate);
+        entry->candidate = NULL;
+    }
+
+    /* Register new relations only after all fallible replacement preparation
+     * has completed.  If registration fails, remove only the registrations
+     * made by this transaction; no existing relation has been published. */
+    for (uint32_t i = 0; i < count; i++) {
+        tdd_restore_entry_t *entry = &entries[i];
+        if (entry->relation)
+            continue;
+        rc = session_add_rel(coord, entry->candidate);
+        if (rc != 0) {
+            if (session_find_rel(coord, entry->name) == entry->candidate)
+                (void)session_remove_rel(coord, entry->name);
+            else
+                col_rel_destroy(entry->candidate);
+            entry->candidate = NULL;
+            goto fail;
+        }
+        entry->registered = true;
+        entry->candidate = NULL;
+    }
+
+    /* Commit is deliberately last.  The replacement primitive guarantees
+     * that this phase performs no allocation, schema construction, or
+     * admission; every possible failure was handled above. */
+    for (uint32_t i = 0; i < count; i++) {
+        tdd_restore_entry_t *entry = &entries[i];
+        if (!entry->relation)
+            continue;
+        col_rel_commit_replacement_locked(entry->relation,
+            &entry->replacement);
+        entry->replacement_prepared = false;
+        col_session_invalidate_arrangements(&coord->base, entry->name);
+    }
+    free(entries);
     return 0;
+
+fail:
+    tdd_restore_entries_discard(coord, entries, count, initial_nrels);
+    return rc;
 }
 
 static void
@@ -3851,6 +4107,35 @@ tdd_free_saved_coord_idb(const wl_plan_stratum_t *sp, col_rel_t **saved)
         col_rel_destroy(saved[ri]);
     free((void *)saved);
 }
+
+#ifdef WL_TEST_TDD_RESET_RESTORE
+int
+wl_columnar_eval_test_tdd_reset(col_rel_t *relation)
+{
+    return tdd_reset_coord_relation(relation);
+}
+
+int
+wl_columnar_eval_test_tdd_save(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_rel_t ***out_saved)
+{
+    return tdd_save_coord_idb(sp, coord, out_saved);
+}
+
+int
+wl_columnar_eval_test_tdd_restore(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_rel_t **saved)
+{
+    return tdd_restore_coord_idb(sp, coord, saved);
+}
+
+void
+wl_columnar_eval_test_tdd_free_saved(const wl_plan_stratum_t *sp,
+    col_rel_t **saved)
+{
+    tdd_free_saved_coord_idb(sp, saved);
+}
+#endif
 
 /*
  * tdd_bdx_exchange_deltas:
@@ -4556,8 +4841,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(coord, sp->relations[ri].name);
             if (r && r->nrows > 0) {
-                r->nrows = 0;
-                wl_columnar_relation_touch_view(r);
+                rc = tdd_reset_coord_relation(r);
+                if (rc != 0) {
+                    coord->tdd_total_ns += now_ns() - tdd_total_t0;
+                    return rc;
+                }
                 col_session_invalidate_arrangements(&coord->base,
                     sp->relations[ri].name);
             }

@@ -1925,9 +1925,18 @@ col_rel_destroy_checked(col_rel_t *r);
 int
 col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
     col_rel_replacement_t *replacement);
-/* Publish a prepared replacement while its canonical writer is held.  This
-* path performs no allocation, schema construction, or memory admission. */
+/* Prepare a replacement after the caller has already admitted the
+ * destination's canonical writer into replacement->writer.  This is used by
+ * multi-relation transactions so all writers can be acquired before any
+ * candidate is prepared or published. */
 int
+col_rel_prepare_replacement_locked(col_rel_t *dst,
+    const col_rel_t *candidate, col_rel_replacement_t *replacement);
+/* Publish a prepared replacement while its canonical writer is held.  The
+ * preparation contract makes this path no-fail: it performs no allocation,
+ * schema construction, or memory admission, and writer release is diagnostic
+ * only because publication has already completed. */
+void
 col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_replacement_t *replacement);
 /* Release a prepared replacement and its writer; safe after any prepare error
@@ -2205,6 +2214,19 @@ void
 wl_columnar_eval_test_tdd_merge_fail_sort_once(void);
 void
 wl_columnar_eval_test_tdd_merge_fail_overflow_once(void);
+#endif
+#ifdef WL_TEST_TDD_RESET_RESTORE
+int
+wl_columnar_eval_test_tdd_reset(col_rel_t *relation);
+int
+wl_columnar_eval_test_tdd_save(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_rel_t ***out_saved);
+int
+wl_columnar_eval_test_tdd_restore(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_rel_t **saved);
+void
+wl_columnar_eval_test_tdd_free_saved(const wl_plan_stratum_t *sp,
+    col_rel_t **saved);
 #endif
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
