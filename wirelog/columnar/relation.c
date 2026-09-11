@@ -1893,14 +1893,21 @@ cleanup:
  *
  * On success the capacity is reduced to max(nrows*2, COL_REL_INIT_CAP).
  * merge_buf is always freed (it will be re-allocated on next consolidation).
- * Allocation failures are non-fatal: the relation remains valid.
+ * Allocation failures are non-fatal: the relation remains valid.  EBUSY is
+ * returned when an active source reader or live owner alias excludes the
+ * mutation; in that case the relation is untouched.
  * sorted_nrows is clamped to nrows if it drifted above.
  */
-void
-col_rel_compact(col_rel_t *r)
+static int
+col_rel_compact_impl(col_rel_t *r,
+    wl_columnar_source_access_writer_t *writer)
 {
-    if (!r || r->ncols == 0)
-        return;
+    bool alias_release_pending = false;
+    int rc;
+
+    if (!r || !writer || r->ncols == 0)
+        return 0;
+    rc = 0;
     uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
 
     if (r->nrows == 0) {
@@ -1946,7 +1953,8 @@ col_rel_compact(col_rel_t *r)
         r->base_nrows = 0;
         if (storage_changed)
             wl_columnar_relation_touch_storage(r);
-        return;
+        alias_release_pending = r->storage_owner != r;
+        goto free_merge_buf;
     }
 
     /* Only compact when buffer is more than 4x oversized.
@@ -1981,6 +1989,7 @@ col_rel_compact(col_rel_t *r)
         col_rel_publish_resize(r, new_cols, new_ts, tight);
         col_rel_ledger_reconcile(r, ledger_before);
         wl_columnar_relation_touch_storage(r);
+        alias_release_pending = r->storage_owner != r;
     }
 
 free_merge_buf:
@@ -1992,6 +2001,114 @@ free_merge_buf:
         r->sorted_nrows = r->nrows;
     if (r->base_nrows > r->nrows)
         r->base_nrows = r->nrows;
+
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(r);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+    return rc;
+}
+
+int
+col_rel_compact(col_rel_t *r)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!r || r->ncols == 0)
+        return 0;
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    /* A canonical owner cannot replace or discard storage while a shared
+     * alias still points at it.  An alias itself may compact through the
+     * transactional COW path below. */
+    if (owner == r && r->storage_alias_borrows > 0)
+        return EBUSY;
+    rc = col_rel_source_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_compact_impl(r, &writer);
+    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
+}
+
+int
+col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
+{
+    col_rel_t **owners = NULL;
+    wl_columnar_source_access_writer_t *writers = NULL;
+    uint32_t owner_count = 0;
+    int rc = 0;
+
+    if (!rels && nrels != 0)
+        return EINVAL;
+    if (nrels == 0)
+        return 0;
+    owners = (col_rel_t **)calloc(nrels, sizeof(*owners));
+    writers = (wl_columnar_source_access_writer_t *)calloc(nrels,
+        sizeof(*writers));
+    if (!owners || !writers) {
+        free(owners);
+        free(writers);
+        return ENOMEM;
+    }
+
+    /* Resolve and validate every owner before acquiring any writer. */
+    for (uint32_t i = 0; i < nrels; i++) {
+        col_rel_t *owner = NULL;
+        if (!rels[i] || rels[i]->ncols == 0)
+            continue;
+        rc = col_rel_storage_owner_resolve(rels[i], &owner);
+        if (rc != 0 || (owner == rels[i]
+            && owner->storage_alias_borrows > 0)) {
+            rc = rc != 0 ? rc : EBUSY;
+            goto cleanup;
+        }
+        bool seen = false;
+        for (uint32_t j = 0; j < owner_count; j++) {
+            if (owners[j] == owner) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen)
+            owners[owner_count++] = owner;
+    }
+
+    /* Hold every owner writer through every compaction. */
+    for (uint32_t i = 0; i < owner_count; i++) {
+        rc = wl_columnar_source_access_writer_acquire(
+            &owners[i]->source_access, &writers[i]);
+        if (rc != 0)
+            goto cleanup;
+    }
+    for (uint32_t i = 0; i < nrels; i++) {
+        if (!rels[i] || rels[i]->ncols == 0)
+            continue;
+        col_rel_t *owner = NULL;
+        (void)col_rel_storage_owner_resolve(rels[i], &owner);
+        uint32_t owner_idx = 0;
+        while (owners[owner_idx] != owner)
+            owner_idx++;
+        rc = col_rel_compact_impl(rels[i], &writers[owner_idx]);
+        if (rc != 0)
+            goto cleanup;
+    }
+
+cleanup:
+    for (uint32_t i = 0; i < owner_count; i++) {
+        if (writers[i].owner
+            && wl_columnar_source_access_writer_release(&writers[i]) != 0
+            && rc == 0)
+            rc = EINVAL;
+    }
+    free(writers);
+    free(owners);
+    return rc;
 }
 
 /*

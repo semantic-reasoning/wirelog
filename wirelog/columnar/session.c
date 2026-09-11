@@ -2871,6 +2871,16 @@ col_session_step(wl_session_t *session)
             return rc;
         }
     }
+    /* Compaction is a source mutation.  Perform it before clearing the
+     * pending operation state or removing temporary retraction relations so
+     * EBUSY can be retried without committing session bookkeeping or
+     * publishing duplicate delta events. */
+    int compact_rc = col_rel_compact_many(sess->rels, sess->nrels);
+    if (compact_rc != 0) {
+        col_session_reclaim_quiescent(sess);
+        return compact_rc;
+    }
+
     if (sess->delta_cb) {
         sess->delta_event_transaction = false;
         wl_columnar_delta_events_publish(sess);
@@ -2890,15 +2900,6 @@ col_session_step(wl_session_t *session)
         } else {
             i++;
         }
-    }
-
-    /* Issue #217: Compact relation buffers after retraction cleanup.
-     * Releases oversized data/timestamps buffers and merge_buf when
-     * bulk retractions have left capacity >> nrows. */
-    for (uint32_t i = 0; i < sess->nrels; i++) {
-        col_rel_t *r = sess->rels[i];
-        if (r)
-            col_rel_compact(r);
     }
 
     /* Reset after successful eval so next plain session_step runs all strata */
@@ -3497,7 +3498,15 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     }
     sess->tdd_decision_tracking_active = false;
 
-    /* Reset after successful eval so next plain snapshot runs all strata */
+    /* Compaction is a source mutation.  Do it before publishing the stable
+     * snapshot bookkeeping so EBUSY leaves all retry state intact. */
+    int compact_rc = col_rel_compact_many(sess->rels, sess->nrels);
+    if (compact_rc != 0) {
+        col_session_reclaim_quiescent(sess);
+        return compact_rc;
+    }
+
+    /* Reset after successful eval so next plain snapshot runs all strata. */
     sess->last_inserted_relation = NULL;
     sess->delta_seeded = false;
     sess->pending_input_change = false;
@@ -3512,15 +3521,6 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         col_rel_t *r = sess->rels[i];
         if (r)
             r->base_nrows = r->nrows;
-    }
-
-    /* Issue #217: Compact relation buffers after convergence.
-     * Releases oversized data/timestamps buffers and merge_buf when
-     * bulk retractions have left capacity >> nrows. */
-    for (uint32_t i = 0; i < sess->nrels; i++) {
-        col_rel_t *r = sess->rels[i];
-        if (r)
-            col_rel_compact(r);
     }
 
     /* Issue #1380: final STORED/TEMPORARY gauge sample for this pass. */
