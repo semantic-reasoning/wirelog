@@ -345,6 +345,45 @@ test_source_reader_blocks_checked_destroy(void)
 }
 
 static void
+test_source_reader_blocks_radix_sort(void)
+{
+    col_rel_t *rel = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    int64_t *before = NULL;
+    uint32_t rows;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+
+    CHECK(rel != NULL, "radix sort reader exclusion relation");
+    for (int64_t value = 40; value > 0; value--)
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "radix sort reader exclusion seed");
+    rows = rel->nrows;
+    before = (int64_t *)malloc((size_t)rows * sizeof(*before));
+    CHECK(before != NULL, "radix sort reader exclusion snapshot");
+    memcpy(before, rel->columns[0], (size_t)rows * sizeof(*before));
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "radix sort reader acquisition");
+    CHECK(col_rel_radix_sort(rel, 0, rows) == EBUSY,
+        "reader blocks radix sort");
+    CHECK(rel->nrows == rows
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && memcmp(before, rel->columns[0], (size_t)rows * sizeof(*before)) == 0,
+        "reader-blocked radix sort is transactional");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "radix sort reader release");
+    CHECK(col_rel_radix_sort(rel, 0, rows) == 0
+        && rel->columns[0][0] == 1
+        && rel->columns[0][rows - 1u] == 40,
+        "radix sort retry succeeds after reader release");
+    free(before);
+    cleanup_relations();
+}
+
+static void
 test_source_reader_blocks_direct_append_row(void)
 {
     col_rel_t *rel = new_relation();
@@ -2170,6 +2209,7 @@ main(void)
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
+    test_source_reader_blocks_radix_sort();
     test_source_reader_blocks_direct_append_row();
     test_source_reader_blocks_append_row();
     test_source_reader_blocks_append_all();
