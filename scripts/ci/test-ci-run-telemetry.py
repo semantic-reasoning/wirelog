@@ -223,6 +223,10 @@ class SkipCascade(unittest.TestCase):
         # silently back to the generic sentence or to the raw key.
         self.assertEqual(set(tool.NO_EXECUTION_REASONS),
                          set(tool.NO_RUN_LABELS))
+        # Two conclusions sharing a term would render "1 stale, 1 stale",
+        # which the reader cannot take apart.
+        labels = list(tool.NO_RUN_LABELS.values())
+        self.assertEqual(len(set(labels)), len(labels), labels)
         # And a conclusion neither table has met still gets a true sentence
         # and a term naming itself, rather than borrowing another's.
         self.assertEqual(tool.no_run_label("a_conclusion_from_the_future"),
@@ -235,10 +239,20 @@ class SkipCascade(unittest.TestCase):
     def test_each_no_run_conclusion_says_what_happened_in_its_own_words(self):
         sentences = list(tool.NO_EXECUTION_REASONS.values())
         self.assertEqual(len(set(sentences)), len(sentences), sentences)
-        self.assertEqual(tool.NO_EXECUTION_REASONS["stale"],
-                         "job stale; no execution")
-        self.assertEqual(tool.NO_EXECUTION_REASONS["startup_failure"],
-                         "job failed to start; no execution")
+        self.assertEqual(tool.NO_EXECUTION_REASONS, {
+            "skipped": "job skipped; no execution",
+            "cancelled": "job cancelled before it ran; no execution",
+            "stale": "job stale; no execution",
+            "startup_failure": "job failed to start; no execution",
+            "action_required": "job awaiting approval; no execution",
+        })
+        self.assertEqual(tool.NO_RUN_LABELS, {
+            "skipped": "skipped",
+            "cancelled": "cancelled before running",
+            "stale": "stale",
+            "startup_failure": "failed to start",
+            "action_required": "awaiting approval",
+        })
 
     def test_a_cancellation_still_reaches_the_first_failure_sentence(self):
         # Once a job that did not run leaves the executed list, scanning
@@ -353,6 +367,24 @@ class SkipCascade(unittest.TestCase):
                 entry = next(job for job in tool.analyze(run, mutated)["jobs"]
                              if job["name"] == victim)
                 self.assertTrue(entry["ran"])
+
+    def test_a_run_mixing_no_run_conclusions_names_each_kind_once(self):
+        # One table names every term, skipped included.  A second spelling
+        # beside it would double the skipped term on any run carrying a
+        # skipped job, and a run carrying two kinds pins their order too.
+        run, jobs = fixture("run-skip-cascade")
+        mutated = copy.deepcopy(jobs)
+        victim = next(job["name"] for job in mutated["jobs"]
+                      if job["conclusion"] != "skipped")
+        for job in mutated["jobs"]:
+            if job["name"] == victim:
+                job["conclusion"] = "startup_failure"
+                job["started_at"] = job["created_at"]
+                job["completed_at"] = job["created_at"]
+                job["steps"] = []
+        counts = tool.analyze(run, mutated)["job_counts"]
+        self.assertEqual(tool.job_count_phrase(counts),
+                         "9 executed, 1 failed to start, 5 skipped")
 
     def test_the_summary_terms_do_not_reorder_with_the_job_list(self):
         # Three distinct no-run conclusions in one run.  Without a sort the
@@ -1515,17 +1547,22 @@ class CriticalPath(unittest.TestCase):
         self.assertFalse(entry["ran"])
         self.assertIsNone(entry["metrics"]["queue_delay"]["seconds"])
 
-    def test_a_conclusion_that_never_dispatches_needs_no_stamps(self):
-        # `stale` and `startup_failure` are jobs GitHub never ran.  Stamped
-        # the never-run way they used to report queue 0 and wall 0.
+    def test_a_weighed_conclusion_with_never_run_stamps_reads_as_never_run(
+            self):
+        # The conclusion decides only who is asked.  `skipped` and an
+        # outcome that proves execution settle it without the stamps;
+        # every other conclusion is weighed, and these are the stamps a job
+        # that never ran carries.  None of these subjects is settled by its
+        # conclusion: each of them, stamped a different way, can read as
+        # having run -- which is what the tests below this one show.
         run, jobs = fixture("run-success")
         # Named rather than looped over the constant, which would shrink
         # with it and prove nothing.
         self.assertEqual(tool.NEVER_DISPATCHED, ("skipped",))
         self.assertEqual(tool.CONCLUSIONS_THAT_RAN,
                          ("success", "failure", "timed_out"))
-        for conclusion in ("skipped", "stale", "startup_failure",
-                           "cancelled", "neutral", "action_required",
+        for conclusion in ("stale", "startup_failure", "cancelled",
+                           "neutral", "action_required",
                            "a_conclusion_from_the_future"):
             with self.subTest(conclusion=conclusion):
                 mutated = copy.deepcopy(jobs)
