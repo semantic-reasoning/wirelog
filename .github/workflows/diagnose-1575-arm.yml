@@ -70,6 +70,34 @@ jobs:
             tests/test_col_rel_deep_copy tests/test_tdd_decision_stats \
             tests/test_tdd_decision_stats_nofusion \
             2>&1 | tee diagnostics-1575/build.log
+      - name: Sample reproducers under parent GDB
+        run: |
+          mkdir -p parent-gdb-1575
+          inferior_ldpath="$PWD/builddir-san/subprojects/nanoarrow:$PWD/builddir-san/subprojects/xxHash-0.8.3"
+          for target in test_compaction test_diff_join test_col_rel_deep_copy \
+            test_tdd_decision_stats test_tdd_decision_stats_nofusion; do
+            command=(env -i PATH=/usr/bin:/bin LANG=C.UTF-8 DEBUGINFOD_URLS=
+              timeout --signal=INT --kill-after=5s 10s gdb --nx --batch
+              -ex 'set pagination off' -ex 'set confirm off'
+              -ex 'set debuginfod enabled off'
+              -ex "set environment LD_LIBRARY_PATH $inferior_ldpath"
+              -ex 'set environment ASAN_OPTIONS abort_on_error=1:halt_on_error=1:print_stacktrace=1'
+              -ex 'set environment UBSAN_OPTIONS abort_on_error=1:halt_on_error=1:print_stacktrace=1'
+              -ex run -ex 'thread apply all bt' -ex kill
+              --args "$PWD/builddir-san/tests/$target")
+            printf '%q ' "${command[@]}" > "parent-gdb-1575/$target.command"
+            printf '\n' >> "parent-gdb-1575/$target.command"
+            rc=0
+            "${command[@]}" > "parent-gdb-1575/$target.log" 2>&1 || rc=$?
+            printf '%s\n' "$rc" > "parent-gdb-1575/$target.exitcode"
+          done
+      - name: Upload parent GDB samples
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: parent-gdb-1575-arm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: parent-gdb-1575/
+          if-no-files-found: warn
       - name: Run bounded diagnostics
         run: |
           set -o pipefail
