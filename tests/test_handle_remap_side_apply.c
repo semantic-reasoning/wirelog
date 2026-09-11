@@ -398,6 +398,76 @@ cleanup:
     col_rel_destroy(rel);
 }
 
+static void
+test_apply_session_transaction(void)
+{
+    TEST("session remap preflights all relations before writing");
+
+    wl_col_session_t sess = { 0 };
+    wl_handle_remap_t *remap = NULL;
+    col_rel_t *rels[3] = { 0 };
+    sess.rels = rels;
+    sess.nrels = 3u;
+    sess.rel_cap = 3u;
+    for (uint32_t i = 0; i < 3u; i++) {
+        char tag[16];
+        snprintf(tag, sizeof(tag), "txn%u", i);
+        nested_ud_t ud = { i };
+        rels[i] = build_side_relation(tag, ACCEPT_ARITY, 2u,
+                nested_old_cell, &ud);
+        ASSERT(rels[i] != NULL, "build transaction relation");
+    }
+
+    int rc = wl_handle_remap_create(8u, &remap);
+    ASSERT(rc == 0 && remap != NULL, "transaction remap create");
+    for (uint32_t i = 0; i < 3u; i++) {
+        for (uint32_t r = 0; r < 2u; r++) {
+            if (i == 2u && r == 1u)
+                continue;
+            rc = wl_handle_remap_insert(remap, nested_own_handle(i, r),
+                    nested_new_own_handle(i, r));
+            ASSERT(rc == 0, "transaction remap insert");
+        }
+    }
+
+    uint64_t out_rels = 99u;
+    uint64_t out_cells = 99u;
+    rc = wl_handle_remap_apply_session_side_relations(&sess, remap,
+            &out_rels, &out_cells);
+    ASSERT(rc == EIO, "late remap miss must fail transaction");
+    ASSERT(out_rels == 0 && out_cells == 0,
+        "failed transaction counters must remain zero");
+    for (uint32_t i = 0; i < 3u; i++)
+        for (uint32_t r = 0; r < 2u; r++)
+            ASSERT(rels[i]->columns[0][r] == nested_own_handle(i, r),
+                "failed transaction changed a relation");
+
+    /* A reader on a later relation blocks the complete sweep. */
+    rc = wl_handle_remap_insert(remap, nested_own_handle(2u, 1u),
+            nested_new_own_handle(2u, 1u));
+    ASSERT(rc == 0, "complete remap insert");
+    wl_columnar_source_access_reader_t reader = { 0 };
+    ASSERT(col_rel_source_reader_acquire(rels[1], &reader) == 0,
+        "acquire later relation reader");
+    rc = wl_handle_remap_apply_session_side_relations(&sess, remap,
+            &out_rels, &out_cells);
+    ASSERT(rc == EBUSY, "later reader must block complete sweep");
+    ASSERT(out_rels == 0 && out_cells == 0,
+        "reader denial counters must remain zero");
+    ASSERT(col_rel_source_reader_release(&reader) == 0,
+        "release later relation reader");
+    rc = wl_handle_remap_apply_session_side_relations(&sess, remap,
+            &out_rels, &out_cells);
+    ASSERT(rc == 0 && out_rels == 3u && out_cells == 6u,
+        "retry after reader release must remap all relations");
+
+    PASS();
+cleanup:
+    wl_handle_remap_free(remap);
+    for (uint32_t i = 0; i < 3u; i++)
+        col_rel_destroy(rels[i]);
+}
+
 /* ======================================================================== */
 /* Case 4: NULL / EINVAL coverage                                            */
 /* ======================================================================== */
@@ -473,6 +543,7 @@ main(void)
     test_apply_side_relation_flat();
     test_apply_session_100_nested();
     test_apply_eio_partial_rewrite();
+    test_apply_session_transaction();
     test_apply_einval_coverage();
 
     printf("\nResults: %d/%d passed, %d failed\n",

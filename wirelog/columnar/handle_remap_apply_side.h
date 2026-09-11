@@ -97,7 +97,8 @@ wl_handle_remap_apply_side_relation(col_rel_t *rel,
  *                       column 0.
  *
  * Walk @sess->rels[0..nrels), filter by the __compound_ name prefix,
- * and rewrite column 0 of each matched relation through @remap.
+ * and rewrite column 0 of each matched relation through @remap as one
+ * transaction. All canonical owners are admitted before any write.
  *
  * This driver covers ONLY column 0 (the row's own handle).  Nested
  * arg-column rewrites stay caller-driven via
@@ -111,12 +112,10 @@ wl_handle_remap_apply_side_relation(col_rel_t *rel,
  * Returns:
  *   0 on success.
  *   EINVAL if @sess or @remap is NULL.
- *   EIO    on the first relation whose column 0 fails the lookup;
- *          the iteration aborts at that point.  @out_rels_rewritten
- *          and @out_total_cells reflect the prefix that succeeded.
- *          Per #589's contract the failing relation is partially
- *          rewritten through the row before the missing handle and
- *          must be treated as poisoned by the caller.
+ *   EBUSY  if any canonical owner is being read or has live aliases.
+ *   EIO    if any relation's column 0 fails the lookup. No relation is
+ *          rewritten and both output counters remain zero.
+ *   ENOMEM if transaction bookkeeping cannot be allocated.
  */
 int
 wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,

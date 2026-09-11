@@ -80,4 +80,21 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
     const wl_handle_remap_t *remap,
     uint64_t *out_rewrites);
 
+/* Session-wide remap transactions acquire the relation writer before
+ * calling these two-phase helpers.  Preflight performs every lookup without
+ * writing; the held apply is therefore infallible once preflight succeeds. */
+int
+wl_handle_remap_preflight_columns(const col_rel_t *rel,
+    const uint32_t *handle_col_idx,
+    uint32_t handle_col_count,
+    const wl_handle_remap_t *remap,
+    uint64_t *out_rewrites);
+
+int
+wl_handle_remap_apply_columns_held(col_rel_t *rel,
+    const uint32_t *handle_col_idx,
+    uint32_t handle_col_count,
+    const wl_handle_remap_t *remap,
+    uint64_t *out_rewrites);
+
 #endif /* WL_COLUMNAR_HANDLE_REMAP_APPLY_H */
