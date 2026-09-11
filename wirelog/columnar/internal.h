@@ -2304,6 +2304,10 @@ int
 col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels);
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src);
+int
+col_rel_install_shared_view_under_writer(col_rel_t *dst,
+    const col_rel_t *src, wl_columnar_source_access_writer_t *writer,
+    wl_columnar_source_access_reader_t *source_reader);
 
 /* Source-storage ownership helpers (Issue #1493).  These are internal
  * bookkeeping operations; caller exclusion and public teardown remain the

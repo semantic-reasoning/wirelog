@@ -107,6 +107,50 @@ test_invalid_and_cross_thread(void)
 }
 
 static void
+test_transferable_reader_promotion(void)
+{
+    wl_columnar_source_access_gate_t gate = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 }, extra = { 0 }, copy;
+    wl_columnar_source_access_writer_t writer = { 0 };
+
+    wl_columnar_source_access_gate_init(&gate);
+    CHECK(wl_columnar_source_access_reader_acquire_transferable(&gate,
+        &reader) == 0, "transferable reader acquired for promotion");
+    copy = reader;
+    CHECK(wl_columnar_source_access_reader_promote_to_writer(&copy,
+        &writer) == EINVAL, "copied transferable reader cannot be promoted");
+    CHECK(wl_columnar_source_access_reader_acquire_transferable(&gate,
+        &extra) == 0, "additional transferable reader acquired");
+    CHECK(wl_columnar_source_access_reader_promote_to_writer(&reader,
+        &writer) == EBUSY, "promotion denied while another reader exists");
+    CHECK(atomic_load_explicit(&gate.state, memory_order_relaxed) == 2
+        && reader.owner == &gate && writer.owner == NULL,
+        "failed promotion preserves tokens and reader count");
+    CHECK(wl_columnar_source_access_reader_release(&extra) == 0,
+        "extra reader released");
+    CHECK(wl_columnar_source_access_reader_promote_to_writer(&reader,
+        &writer) == 0, "sole transferable reader promoted");
+    CHECK(atomic_load_explicit(&gate.state, memory_order_relaxed)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && reader.owner == &gate && writer.owner == &gate,
+        "promotion atomically replaces sole reader with writer");
+    CHECK(wl_columnar_source_access_reader_acquire(&gate, &extra) == EBUSY,
+        "promoted writer excludes new readers");
+    CHECK(wl_columnar_source_access_writer_downgrade_to_reader(&writer,
+        &reader) == 0, "writer downgraded to same transferable reader");
+    CHECK(atomic_load_explicit(&gate.state, memory_order_relaxed) == 1
+        && writer.owner == NULL && reader.owner == &gate,
+        "downgrade preserves one transferable reader");
+    CHECK(wl_columnar_source_access_reader_promote_to_writer(&reader,
+        &writer) == 0, "transferable reader promoted for retirement");
+    CHECK(wl_columnar_source_access_writer_retire_promoted_reader(&writer,
+        &reader) == 0, "promoted reader retired");
+    CHECK(atomic_load_explicit(&gate.state, memory_order_relaxed) == 0
+        && writer.owner == NULL && reader.owner == NULL,
+        "retirement clears both tokens and gate");
+}
+
+static void
 test_reader_overflow(void)
 {
     wl_columnar_source_access_gate_t gate = { 0 };
@@ -268,6 +312,7 @@ main(void)
     printf("Source access gate tests (#1492)\n");
     test_lifecycle();
     test_invalid_and_cross_thread();
+    test_transferable_reader_promotion();
     test_reader_overflow();
     test_concurrent_readers();
     test_writer_publication();

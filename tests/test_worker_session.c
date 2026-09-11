@@ -1155,6 +1155,26 @@ test_shared_view_relation_destroy(void)
             ok = 0;
     }
 
+    wl_columnar_source_access_reader_t external_reader = { 0 };
+    int64_t *refresh_column = worker_rel->columns[0];
+    uint64_t refresh_generation = worker_rel->view_generation;
+    if (col_rel_source_reader_acquire(worker_rel, &external_reader) != 0) {
+        ok = 0;
+    } else {
+        if (wl_columnar_session_install_shared_view(&worker, worker_rel,
+            src) != EBUSY
+            || worker_rel->columns[0] != refresh_column
+            || worker_rel->view_generation != refresh_generation
+            || atomic_load_explicit(&src->source_access.state,
+            memory_order_acquire) != 2
+            || src->storage_alias_borrows != 1)
+            ok = 0;
+        if (col_rel_source_reader_release(&external_reader) != 0
+            || atomic_load_explicit(&src->source_access.state,
+            memory_order_acquire) != 1)
+            ok = 0;
+    }
+
     char *source_name = src->name;
     uint64_t source_identity = src->relation_identity;
     if (col_rel_destroy_checked(src) != EBUSY
@@ -1174,6 +1194,33 @@ test_shared_view_relation_destroy(void)
         FAIL("replacement source creation");
         return 1;
     }
+
+    wl_columnar_source_access_reader_t old_owner_reader = { 0 };
+    int64_t *rebind_column = worker_rel->columns[0];
+    uint64_t rebind_generation = worker_rel->view_generation;
+    if (col_rel_source_reader_acquire(src, &old_owner_reader) != 0) {
+        col_rel_destroy(next_src);
+        col_worker_session_destroy(&worker);
+        col_rel_destroy(src);
+        cleanup_coordinator(coord, plan, prog);
+        FAIL("old source reader acquire");
+        return 1;
+    }
+    if (wl_columnar_session_install_shared_view(&worker, worker_rel,
+        next_src) != EBUSY
+        || worker_rel->columns[0] != rebind_column
+        || worker_rel->view_generation != rebind_generation
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 2
+        || src->storage_alias_borrows != 1
+        || atomic_load_explicit(&next_src->source_access.state,
+        memory_order_acquire) != 0
+        || next_src->storage_alias_borrows != 0)
+        ok = 0;
+    if (col_rel_source_reader_release(&old_owner_reader) != 0
+        || atomic_load_explicit(&src->source_access.state,
+        memory_order_acquire) != 1)
+        ok = 0;
 
     wl_columnar_source_access_writer_t writer = { 0 };
     if (wl_columnar_source_access_writer_acquire(&next_src->source_access,

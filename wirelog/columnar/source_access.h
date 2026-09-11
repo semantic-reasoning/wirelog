@@ -236,6 +236,86 @@ wl_columnar_source_access_writer_acquire(
     return 0;
 }
 
+/* Session refresh may temporarily need exclusive descriptor access while
+ * retaining the lifetime lease represented by its stable transferable reader.
+ * Promotion is deliberately non-blocking and succeeds only for the sole
+ * reader, so unrelated readers are never displaced. */
+static inline int
+wl_columnar_source_access_reader_promote_to_writer(
+    wl_columnar_source_access_reader_t *reader,
+    wl_columnar_source_access_writer_t *writer)
+{
+    uint64_t expected = 1;
+    if (!reader || !writer || !reader->owner
+        || reader->identity != (uintptr_t)reader || !reader->transferable
+        || reader->thread_valid || writer->owner || writer->identity != 0
+        || writer->thread_valid)
+        return EINVAL;
+    if (!atomic_compare_exchange_strong_explicit(&reader->owner->state,
+        &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+        memory_order_relaxed))
+        return EBUSY;
+    writer->owner = reader->owner;
+    writer->identity = (uintptr_t)writer;
+#if defined(WL_HAVE_C11_THREADS)
+    writer->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    writer->owner_thread = GetCurrentThreadId();
+#else
+    writer->owner_thread = pthread_self();
+#endif
+    writer->thread_valid = true;
+    return 0;
+}
+
+static inline int
+wl_columnar_source_access_writer_downgrade_to_reader(
+    wl_columnar_source_access_writer_t *writer,
+    wl_columnar_source_access_reader_t *reader)
+{
+    uint64_t expected = WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+    if (!writer || !reader || !writer->owner
+        || writer->identity != (uintptr_t)writer
+        || !wl_columnar_source_access_writer_thread_equal(writer)
+        || !reader->owner || reader->owner != writer->owner
+        || reader->identity != (uintptr_t)reader || !reader->transferable
+        || reader->thread_valid)
+        return EINVAL;
+    if (!atomic_compare_exchange_strong_explicit(&writer->owner->state,
+        &expected, 1, memory_order_release, memory_order_relaxed))
+        return EINVAL;
+    writer->owner = NULL;
+    writer->identity = 0;
+    writer->thread_valid = false;
+    return 0;
+}
+
+static inline int
+wl_columnar_source_access_writer_retire_promoted_reader(
+    wl_columnar_source_access_writer_t *writer,
+    wl_columnar_source_access_reader_t *reader)
+{
+    uint64_t expected = WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+    if (!writer || !reader || !writer->owner
+        || writer->identity != (uintptr_t)writer
+        || !wl_columnar_source_access_writer_thread_equal(writer)
+        || !reader->owner || reader->owner != writer->owner
+        || reader->identity != (uintptr_t)reader || !reader->transferable
+        || reader->thread_valid)
+        return EINVAL;
+    if (!atomic_compare_exchange_strong_explicit(&writer->owner->state,
+        &expected, 0, memory_order_release, memory_order_relaxed))
+        return EINVAL;
+    writer->owner = NULL;
+    writer->identity = 0;
+    writer->thread_valid = false;
+    reader->owner = NULL;
+    reader->identity = 0;
+    reader->thread_valid = false;
+    reader->transferable = false;
+    return 0;
+}
+
 static inline int
 wl_columnar_source_access_writer_release(
     wl_columnar_source_access_writer_t *token)

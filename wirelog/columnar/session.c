@@ -397,24 +397,88 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
     wl_columnar_session_source_lease_t **slot;
     wl_columnar_session_source_lease_t *old_lease;
     wl_columnar_session_source_lease_t *new_lease = NULL;
-    col_rel_t *owner = NULL;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *source_owner = NULL;
+    col_rel_t *destination_owner = NULL;
+    bool destination_is_alias;
     int rc;
 
     if (!sess || !dst || !src)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(src, &owner);
+    rc = col_rel_storage_owner_resolve(src, &source_owner);
     if (rc != 0)
         return rc;
+    rc = col_rel_storage_owner_resolve(dst, &destination_owner);
+    if (rc != 0)
+        return rc;
+    destination_is_alias = dst != destination_owner;
     slot = wl_columnar_session_source_lease_slot(sess, dst);
     old_lease = *slot;
-    if (!old_lease || old_lease->owner != owner
-        || old_lease->owner_identity != owner->relation_identity) {
-        rc = wl_columnar_session_source_lease_prepare(dst, owner,
+
+    if (destination_is_alias) {
+        /* An installed session alias must have its lifetime lease registered.
+         * Promote that exact token so descriptor replacement is exclusive
+         * without opening an owner-lifetime gap. */
+        if (!old_lease || old_lease->owner != destination_owner
+            || old_lease->owner_identity
+            != destination_owner->relation_identity)
+            return EINVAL;
+        if (source_owner != destination_owner) {
+            rc = wl_columnar_session_source_lease_prepare(dst, source_owner,
+                    &new_lease);
+            if (rc != 0)
+                return rc;
+        }
+        rc = wl_columnar_source_access_reader_promote_to_writer(
+            &old_lease->reader, &writer);
+        if (rc != 0) {
+            if (new_lease) {
+                int release_rc
+                    = wl_columnar_session_source_lease_release(new_lease);
+                assert(release_rc == 0);
+            }
+            return rc;
+        }
+        rc = col_rel_install_shared_view_under_writer(dst, src, &writer,
+                new_lease ? &new_lease->reader : NULL);
+        if (rc != 0) {
+            int rollback_rc
+                = wl_columnar_source_access_writer_downgrade_to_reader(
+                    &writer, &old_lease->reader);
+            assert(rollback_rc == 0);
+            if (new_lease) {
+                int release_rc
+                    = wl_columnar_session_source_lease_release(new_lease);
+                assert(release_rc == 0);
+            }
+            return rc;
+        }
+        if (!new_lease) {
+            rc = wl_columnar_source_access_writer_downgrade_to_reader(
+                &writer, &old_lease->reader);
+            assert(rc == 0);
+            return rc;
+        }
+
+        rc = wl_columnar_source_access_writer_retire_promoted_reader(
+            &writer, &old_lease->reader);
+        assert(rc == 0);
+        if (rc != 0)
+            return rc;
+        new_lease->next = old_lease->next;
+        *slot = new_lease;
+        old_lease->next = NULL;
+        free(old_lease);
+        return 0;
+    }
+
+    if (!old_lease || old_lease->owner != source_owner
+        || old_lease->owner_identity != source_owner->relation_identity) {
+        rc = wl_columnar_session_source_lease_prepare(dst, source_owner,
                 &new_lease);
         if (rc != 0)
             return rc;
     }
-
     rc = col_rel_install_shared_view(dst, src);
     if (rc != 0) {
         if (new_lease) {
@@ -426,7 +490,6 @@ wl_columnar_session_install_shared_view(wl_col_session_t *sess,
     }
     if (!new_lease)
         return 0;
-
     if (old_lease) {
         new_lease->next = old_lease->next;
         *slot = new_lease;

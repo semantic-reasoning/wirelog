@@ -285,6 +285,47 @@ test_source_reader_blocks_schema_publication(void)
 }
 
 static void
+test_source_reader_blocks_compound_publication(void)
+{
+    col_rel_t *rel = new_relation();
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 3u, 1u
+    };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t *map_before;
+    wirelog_compound_kind_t kind_before;
+    uint32_t count_before;
+    uint32_t offset_before;
+    uint64_t view_before;
+
+    CHECK(rel != NULL, "compound publication relation");
+    map_before = rel->compound_arity_map;
+    kind_before = rel->compound_kind;
+    count_before = rel->compound_count;
+    offset_before = rel->inline_physical_offset;
+    view_before = rel->view_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "compound publication source reader");
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == EBUSY,
+        "compound publication denied by source reader");
+    CHECK(rel->compound_arity_map == map_before
+        && rel->compound_kind == kind_before
+        && rel->compound_count == count_before
+        && rel->inline_physical_offset == offset_before
+        && rel->view_generation == view_before,
+        "compound denial preserves metadata and generation");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "compound publication source reader release");
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == 0,
+        "compound publication retry succeeds");
+    CHECK(rel->compound_kind == WIRELOG_COMPOUND_KIND_SIDE
+        && rel->compound_arity_map && rel->compound_arity_map[0] == 1u
+        && rel->view_generation == view_before + 1u,
+        "compound retry publishes one view epoch");
+    cleanup_relations();
+}
+
+static void
 test_live_storage_alias_blocks_metadata_publication(void)
 {
     col_rel_t *owner = new_relation();
@@ -292,8 +333,15 @@ test_live_storage_alias_blocks_metadata_publication(void)
     col_rel_t *empty_owner = NULL;
     col_rel_t *empty_alias = NULL;
     wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 3u, 1u
+    };
     wirelog_column_type_t *types_before;
     int64_t **columns_before;
+    uint32_t *compound_arity_before;
+    wirelog_compound_kind_t compound_kind_before;
+    uint32_t compound_count_before;
+    uint32_t inline_offset_before;
     uint64_t view_before;
 
     CHECK(owner && alias, "metadata alias relations");
@@ -301,15 +349,25 @@ test_live_storage_alias_blocks_metadata_publication(void)
         "metadata live storage alias installation");
     types_before = owner->column_types;
     columns_before = owner->columns;
+    compound_arity_before = owner->compound_arity_map;
+    compound_kind_before = owner->compound_kind;
+    compound_count_before = owner->compound_count;
+    inline_offset_before = owner->inline_physical_offset;
     view_before = owner->view_generation;
     CHECK(owner->storage_alias_borrows == 1,
         "metadata owner records live storage alias");
     CHECK(col_rel_set_column_types(owner, &type, 1) == EBUSY,
         "column type publication denied by live storage alias");
+    CHECK(col_rel_apply_compound_schema(owner, &logical, 1u) == EBUSY,
+        "compound publication denied by live storage alias");
     CHECK(col_rel_set_schema(owner, 1, NULL) == 0,
         "initialized schema no-op succeeds with live storage alias");
     CHECK(owner->column_types == types_before
         && owner->columns == columns_before
+        && owner->compound_arity_map == compound_arity_before
+        && owner->compound_kind == compound_kind_before
+        && owner->compound_count == compound_count_before
+        && owner->inline_physical_offset == inline_offset_before
         && owner->view_generation == view_before,
         "alias no-op preserves metadata and generation");
     cleanup_relations();
@@ -330,6 +388,91 @@ test_live_storage_alias_blocks_metadata_publication(void)
     CHECK(empty_owner->ncols == 0 && !empty_owner->schema_ok
         && empty_owner->view_generation == view_before,
         "alias-denied uninitialized schema preserves owner state");
+    cleanup_relations();
+}
+
+static void
+test_destination_reader_blocks_shared_view_publication(void)
+{
+    col_rel_t *src = new_relation();
+    col_rel_t *dst = new_relation();
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t view_before;
+
+    CHECK(src && dst, "shared-view compound relations");
+    CHECK(col_rel_apply_compound_schema(src, &logical, 1u) == 0,
+        "shared-view source compound metadata");
+    view_before = dst->view_generation;
+    CHECK(col_rel_source_reader_acquire(dst, &reader) == 0,
+        "shared-view destination reader");
+    CHECK(col_rel_install_shared_view(dst, src) == EBUSY,
+        "shared-view publication denied by destination reader");
+    CHECK(dst->view_generation == view_before && dst->storage_owner == dst,
+        "shared-view denial preserves destination state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "shared-view destination reader release");
+    CHECK(col_rel_install_shared_view(dst, src) == 0,
+        "shared-view publication retry succeeds");
+    CHECK(dst->view_generation != view_before
+        && dst->compound_kind == WIRELOG_COMPOUND_KIND_SIDE,
+        "shared-view retry publishes compound metadata");
+    cleanup_relations();
+}
+
+static void
+test_alias_reader_blocks_shared_view_rebind(void)
+{
+    col_rel_t *old_owner = new_relation();
+    col_rel_t *new_owner = new_relation();
+    col_rel_t *alias = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+    CHECK(old_owner && new_owner && alias, "alias rebind relations");
+    CHECK(col_rel_install_shared_view(alias, old_owner) == 0,
+        "initial alias install");
+
+    int64_t *old_column = alias->columns[0];
+    uint64_t old_generation = alias->view_generation;
+    uint32_t old_borrows = old_owner->storage_alias_borrows;
+    CHECK(col_rel_source_reader_acquire(alias, &reader) == 0,
+        "same-owner alias reader acquire");
+    CHECK(col_rel_install_shared_view(alias, old_owner) == EBUSY,
+        "same-owner refresh rejected while alias reader is live");
+    CHECK(alias->columns[0] == old_column
+        && alias->view_generation == old_generation
+        && old_owner->storage_alias_borrows == old_borrows,
+        "denied same-owner refresh preserves descriptor and borrow count");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "same-owner alias reader release");
+    CHECK(col_rel_install_shared_view(alias, old_owner) == 0,
+        "same-owner refresh succeeds after readers drain");
+    CHECK(old_owner->storage_alias_borrows == old_borrows,
+        "same-owner refresh keeps borrow count balanced");
+
+    old_column = alias->columns[0];
+    old_generation = alias->view_generation;
+    old_borrows = old_owner->storage_alias_borrows;
+    uint32_t new_borrows = new_owner->storage_alias_borrows;
+    CHECK(col_rel_source_reader_acquire(alias, &reader) == 0,
+        "different-owner alias reader acquire");
+    CHECK(col_rel_install_shared_view(alias, new_owner) == EBUSY,
+        "different-owner rebind rejected while alias reader is live");
+    CHECK(alias->columns[0] == old_column
+        && alias->view_generation == old_generation
+        && alias->storage_owner == old_owner
+        && old_owner->storage_alias_borrows == old_borrows
+        && new_owner->storage_alias_borrows == new_borrows,
+        "denied rebind preserves descriptor and both borrow counts");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "different-owner alias reader release");
+    CHECK(col_rel_install_shared_view(alias, new_owner) == 0,
+        "different-owner rebind succeeds after readers drain");
+    CHECK(alias->storage_owner == new_owner
+        && old_owner->storage_alias_borrows == 0
+        && new_owner->storage_alias_borrows == 1,
+        "successful rebind transfers exactly one alias borrow");
     cleanup_relations();
 }
 
@@ -2401,6 +2544,9 @@ main(void)
     test_source_reader_blocks_column_type_publication();
     test_source_reader_blocks_schema_publication();
     test_live_storage_alias_blocks_metadata_publication();
+    test_source_reader_blocks_compound_publication();
+    test_destination_reader_blocks_shared_view_publication();
+    test_alias_reader_blocks_shared_view_rebind();
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
