@@ -4590,12 +4590,33 @@ test_tdd_nonrecursive_exe = executable(
 
 test('tdd_nonrecursive', test_tdd_nonrecursive_exe)
 
+# #1572 moved this target onto testlib_prod because it needed no per-target
+# macros.  The BDX seed fault injectors are compiled into eval.c behind
+# -DWL_TEST_BDX_SEED, so this target is no longer one of the "equivalent"
+# ones: linking the shared library would leave every hook undefined.  The
+# sources come back, as they do for the other hook-bearing targets.
 test_tdd_recursive_exe = executable(
   'test_tdd_recursive',
   files('test_tdd_recursive.c'),
+  backend_src,
+  parser_src,
+  ir_src,
+  optimizer_src,
+  arena_src,
+  io_src,
+  thread_src,
+  workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  link_with: [testlib_prod],
+  # --wrap is GNU ld only, so the allocation-failure sweep is Linux-only and
+  # its define travels with it; test_bdx_seed_allocation_failure_is_atomic has
+  # an #else branch for the platforms that do not get it.
+  c_args: host_machine.system() == 'linux'
+    ? ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_ALLOC_WRAP=1']
+    : ['-DWL_TEST_BDX_SEED=1'],
+  link_args: host_machine.system() == 'linux'
+    ? ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc'] : [],
+  override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
 )
 
 test('tdd_recursive', test_tdd_recursive_exe)
