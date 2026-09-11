@@ -1706,79 +1706,12 @@ tdd_worker_nonrecursive_fn(void *arg)
 }
 
 /*
- * tdd_merge_worker_results:
- * After workers complete evaluation, merge their derived IDB relations
- * back into the coordinator session.
- *
- * For each relation in the stratum plan, collects all worker outputs
- * and appends them into a single coordinator-owned relation.
+ * tdd_merge_worker_results is defined below the checked staging helpers.
+ * Keeping the declaration here leaves the evaluator's phase layout intact.
  */
 static int
 tdd_merge_worker_results(const wl_plan_stratum_t *sp,
-    wl_col_session_t *coord)
-{
-    uint32_t W = coord->tdd_workers_count;
-    int rc = 0;
-
-    for (uint32_t ri = 0; ri < sp->relation_count && rc == 0; ri++) {
-        const char *rel_name = sp->relations[ri].name;
-
-        /* Find or create target relation in coordinator */
-        col_rel_t *target = session_find_rel(coord, rel_name);
-
-        for (uint32_t w = 0; w < W && rc == 0; w++) {
-            col_rel_t *wrel
-                = session_find_rel(&coord->tdd_workers[w], rel_name);
-            if (!wrel || wrel->nrows == 0)
-                continue;
-
-            if (!target) {
-                /* First non-empty result: move to coordinator */
-                target = col_rel_new_auto(rel_name, wrel->ncols);
-                if (!target) {
-                    rc = ENOMEM;
-                    break;
-                }
-                rc = session_add_rel(coord, target);
-                if (rc != 0) {
-                    col_rel_destroy(target);
-                    target = NULL;
-                    break;
-                }
-            }
-
-            /* Set schema if coordinator relation was pre-registered with 0 cols */
-            if (target->ncols == 0 && wrel->ncols > 0) {
-                rc = col_rel_set_schema(target, wrel->ncols,
-                        (const char *const *)wrel->col_names);
-                if (rc != 0)
-                    break;
-            }
-
-            rc = col_rel_append_all(target, wrel, NULL);
-        }
-
-        /* Issue #353: When all workers produced empty results, the relation
-         * was never registered on the coordinator.  Subsequent strata that
-         * reference it (e.g. recursive stratum reading non-recursive output)
-         * would fail with ENOENT.  Register an empty relation so downstream
-         * strata can find it. */
-        if (!target && rc == 0) {
-            target = col_rel_new_auto(rel_name, 0);
-            if (!target) {
-                rc = ENOMEM;
-            } else {
-                rc = session_add_rel(coord, target);
-                if (rc != 0) {
-                    col_rel_destroy(target);
-                    target = NULL;
-                }
-            }
-        }
-    }
-
-    return rc;
-}
+    wl_col_session_t *coord);
 
 /*
  * tdd_dedup_rel:
@@ -1933,16 +1866,6 @@ tdd_dedup_rel(col_rel_t *r)
     wl_columnar_relation_touch_view(r);
 }
 
-/* Build one BDX coordinator seed privately, then publish it as a single
- * relation replacement.  The worker partitions are read-only inputs; in
- * particular, cidb is not reset until every append, sort, and dedup step has
- * succeeded.  This is deliberately relation-scoped: callers must sequence
- * separate coordinator relations independently. */
-#ifdef WL_TEST_BDX_SEED
-static int bdx_seed_test_fail_worker = -1;
-static bool bdx_seed_test_fail_sort;
-#endif
-
 static int
 tdd_bdx_sort_candidate(col_rel_t *candidate)
 {
@@ -2000,6 +1923,11 @@ cleanup:
     free(used);
     return rc;
 }
+
+#ifdef WL_TEST_BDX_SEED
+static int bdx_seed_test_fail_worker = -1;
+static bool bdx_seed_test_fail_sort;
+#endif
 
 static int
 tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
@@ -2100,6 +2028,312 @@ cleanup:
     col_rel_destroy(candidate);
     return rc;
 }
+
+#ifdef WL_TEST_TDD_MERGE
+static int tdd_merge_test_fail_worker = -1;
+static bool tdd_merge_test_fail_sort;
+static bool tdd_merge_test_fail_overflow;
+#endif
+
+/* Return the number of logical entries in an inline compound arity map.
+ * The map is valid only when its widths cover exactly the physical schema. */
+static bool
+tdd_compound_map_entries(const col_rel_t *rel, uint32_t *entries_out)
+{
+    uint32_t entries = 0;
+    uint32_t physical = 0;
+
+    if (!rel || !entries_out)
+        return false;
+    if (rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE) {
+        *entries_out = 0;
+        return rel->compound_arity_map == NULL
+               && rel->compound_count == 0;
+    }
+    if (!rel->compound_arity_map || rel->ncols == 0
+        || rel->compound_count == 0)
+        return false;
+    while (physical < rel->ncols) {
+        uint32_t arity;
+
+        if (entries >= rel->ncols)
+            return false;
+        arity = rel->compound_arity_map[entries];
+        if (arity == 0 || arity > rel->ncols - physical)
+            return false;
+        physical += arity;
+        entries++;
+    }
+    *entries_out = entries;
+    return true;
+}
+
+/* Worker results must have identical physical and logical schema metadata
+ * before any result row is copied into the private candidate. */
+static bool
+tdd_relation_schema_compatible(const col_rel_t *expected,
+    const col_rel_t *actual)
+{
+    uint32_t expected_entries;
+    uint32_t actual_entries;
+
+    if (!expected || !actual || expected->ncols != actual->ncols
+        || expected->declared_ncols != actual->declared_ncols
+        || expected->schema_ok != actual->schema_ok
+        || expected->has_graph_column != actual->has_graph_column
+        || expected->graph_col_idx != actual->graph_col_idx
+        || expected->compound_kind != actual->compound_kind
+        || expected->compound_count != actual->compound_count
+        || expected->inline_physical_offset
+        != actual->inline_physical_offset)
+        return false;
+
+    if ((expected->column_types == NULL)
+        != (actual->column_types == NULL))
+        return false;
+    if (expected->column_types) {
+        for (uint32_t col = 0; col < expected->ncols; col++) {
+            if (expected->column_types[col] != actual->column_types[col])
+                return false;
+        }
+    }
+
+    if ((expected->col_names == NULL) != (actual->col_names == NULL))
+        return false;
+    if (expected->col_names) {
+        for (uint32_t col = 0; col < expected->ncols; col++) {
+            if ((expected->col_names[col] == NULL)
+                != (actual->col_names[col] == NULL))
+                return false;
+            if (expected->col_names[col]
+                && strcmp(expected->col_names[col], actual->col_names[col])
+                != 0)
+                return false;
+        }
+    }
+
+    if (!tdd_compound_map_entries(expected, &expected_entries)
+        || !tdd_compound_map_entries(actual, &actual_entries)
+        || expected_entries != actual_entries)
+        return false;
+    for (uint32_t entry = 0; entry < expected_entries; entry++) {
+        if (expected->compound_arity_map[entry]
+            != actual->compound_arity_map[entry])
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Merge one coordinator relation transactionally.  The target is never
+ * changed while worker results are being checked, appended, sorted, or
+ * deduplicated.  When *target_io is NULL, the completed candidate is
+ * returned through that slot so the caller can register it after staging.
+ * This is intentionally relation-scoped; callers still sequence relations
+ * independently.
+ */
+static int
+tdd_merge_relation_results(col_rel_t **target_io, const char *rel_name,
+    col_rel_t *const *worker_rels, uint32_t worker_count)
+{
+    col_rel_t *target;
+    col_rel_t *candidate = NULL;
+    col_rel_t *schema_source = NULL;
+    col_rel_replacement_t replacement;
+    int rc = 0;
+
+    if (!target_io || !rel_name || (!worker_rels && worker_count > 0))
+        return EINVAL;
+    target = *target_io;
+
+    for (uint32_t w = 0; w < worker_count; w++) {
+        col_rel_t *worker = worker_rels[w];
+        if (!worker || worker->nrows == 0)
+            continue;
+        if (!schema_source)
+            schema_source = worker;
+        else if (!tdd_relation_schema_compatible(schema_source, worker))
+            return EINVAL;
+    }
+
+    if (!schema_source) {
+        if (target)
+            return 0;
+        candidate = col_rel_new_auto(rel_name, 0);
+        if (!candidate)
+            return ENOMEM;
+        *target_io = candidate;
+        return 0;
+    }
+
+    if (target && target->ncols != 0) {
+        rc = col_rel_deep_copy(target, &candidate, NULL);
+        if (rc != 0)
+            return rc;
+    } else {
+        candidate = col_rel_new_like(rel_name, schema_source);
+        if (!candidate)
+            return ENOMEM;
+        if (target && target->nrows != 0) {
+            col_rel_destroy(candidate);
+            return EINVAL;
+        }
+    }
+
+    for (uint32_t w = 0; w < worker_count; w++) {
+        col_rel_t *worker = worker_rels[w];
+        uint32_t total_rows;
+
+        if (!worker || worker->nrows == 0)
+            continue;
+        if (!tdd_relation_schema_compatible(candidate, worker)) {
+            rc = EINVAL;
+            goto cleanup;
+        }
+#ifdef WL_TEST_TDD_MERGE
+        if (tdd_merge_test_fail_worker == (int)w) {
+            tdd_merge_test_fail_worker = -1;
+            rc = ENOMEM;
+            goto cleanup;
+        }
+        if (tdd_merge_test_fail_overflow) {
+            tdd_merge_test_fail_overflow = false;
+            rc = EOVERFLOW;
+            goto cleanup;
+        }
+#endif
+        if (wl_columnar_eval_checked_row_add(candidate->nrows,
+            worker->nrows, &total_rows) != 0) {
+            rc = EOVERFLOW;
+            goto cleanup;
+        }
+        rc = col_rel_append_all(candidate, worker, NULL);
+        if (rc != 0)
+            goto cleanup;
+    }
+
+    if (candidate->nrows > 1 && candidate->ncols > 0) {
+        if (!tdd_relation_rows_sorted(candidate)) {
+#ifdef WL_TEST_TDD_MERGE
+            if (tdd_merge_test_fail_sort) {
+                tdd_merge_test_fail_sort = false;
+                rc = ENOMEM;
+                goto cleanup;
+            }
+#endif
+            rc = tdd_bdx_sort_candidate(candidate);
+            if (rc != 0)
+                goto cleanup;
+        }
+
+        uint32_t out = 1;
+        for (uint32_t row = 1; row < candidate->nrows; row++) {
+            bool duplicate = true;
+            for (uint32_t col = 0; col < candidate->ncols; col++) {
+                if (candidate->columns[col][row - 1]
+                    != candidate->columns[col][row]) {
+                    duplicate = false;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                if (out != row)
+                    col_columns_copy_row(candidate->columns, out,
+                        (int64_t *const *)candidate->columns, row,
+                        candidate->ncols);
+                if (candidate->timestamps)
+                    candidate->timestamps[out] = candidate->timestamps[row];
+                out++;
+            }
+        }
+        candidate->nrows = out;
+        candidate->sorted_nrows = out;
+        wl_columnar_relation_touch_view(candidate);
+    }
+
+    if (!target) {
+        *target_io = candidate;
+        candidate = NULL;
+        rc = 0;
+        goto cleanup;
+    }
+
+    memset(&replacement, 0, sizeof(replacement));
+    rc = col_rel_prepare_replacement(target, candidate, &replacement);
+    if (rc == 0)
+        rc = col_rel_commit_replacement_locked(target, &replacement);
+    if (rc != 0)
+        col_rel_discard_replacement(&replacement);
+
+cleanup:
+    col_rel_destroy(candidate);
+    return rc;
+}
+
+static int
+tdd_merge_worker_results(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord)
+{
+    uint32_t worker_count;
+
+    if (!sp || !coord)
+        return EINVAL;
+    worker_count = coord->tdd_workers_count;
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const char *rel_name = sp->relations[ri].name;
+        col_rel_t *target = session_find_rel(coord, rel_name);
+        col_rel_t **worker_rels = (col_rel_t **)calloc(worker_count,
+                sizeof(*worker_rels));
+        int rc;
+
+        if (!worker_rels)
+            return ENOMEM;
+        for (uint32_t w = 0; w < worker_count; w++)
+            worker_rels[w] = session_find_rel(
+                &coord->tdd_workers[w], rel_name);
+        rc = tdd_merge_relation_results(&target, rel_name,
+                worker_rels, worker_count);
+        free(worker_rels);
+        if (rc != 0)
+            return rc;
+        if (!session_find_rel(coord, rel_name)) {
+            rc = session_add_rel(coord, target);
+            if (rc != 0) {
+                col_rel_destroy(target);
+                return rc;
+            }
+        }
+    }
+    return 0;
+}
+
+#ifdef WL_TEST_TDD_MERGE
+int
+wl_columnar_eval_test_tdd_merge(col_rel_t **target,
+    col_rel_t *const *worker_rels, uint32_t worker_count)
+{
+    return tdd_merge_relation_results(target, "test", worker_rels,
+               worker_count);
+}
+
+void
+wl_columnar_eval_test_tdd_merge_fail_worker(uint32_t worker_index)
+{
+    tdd_merge_test_fail_worker = (int)worker_index;
+}
+
+void
+wl_columnar_eval_test_tdd_merge_fail_sort_once(void)
+{
+    tdd_merge_test_fail_sort = true;
+}
+
+void
+wl_columnar_eval_test_tdd_merge_fail_overflow_once(void)
+{
+    tdd_merge_test_fail_overflow = true;
+}
+#endif
 
 #ifdef WL_TEST_BDX_SEED
 void

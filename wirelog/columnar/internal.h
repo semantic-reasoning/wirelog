@@ -2195,6 +2195,17 @@ wl_columnar_eval_test_bdx_seed_fail_worker(uint32_t worker_index);
 void
 wl_columnar_eval_test_bdx_seed_fail_sort_once(void);
 #endif
+#ifdef WL_TEST_TDD_MERGE
+int
+wl_columnar_eval_test_tdd_merge(col_rel_t **target,
+    col_rel_t *const *worker_rels, uint32_t worker_count);
+void
+wl_columnar_eval_test_tdd_merge_fail_worker(uint32_t worker_index);
+void
+wl_columnar_eval_test_tdd_merge_fail_sort_once(void);
+void
+wl_columnar_eval_test_tdd_merge_fail_overflow_once(void);
+#endif
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like);
