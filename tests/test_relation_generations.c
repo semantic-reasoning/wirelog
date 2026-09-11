@@ -227,89 +227,109 @@ test_source_reader_blocks_column_type_publication(void)
     cleanup_relations();
 }
 
-/*
- * A live storage alias borrows the owner's column buffers.  Publishing
- * column types may reinterpret those row lanes in place, so the alias must
- * be denied rather than allowed to observe a mixed descriptor.  This is the
- * branch that separates published-metadata admission from the plain source
- * writer, which admits an owner that has outstanding alias borrows.
- */
 static void
-test_live_alias_blocks_column_type_publication(void)
+test_source_reader_blocks_schema_publication(void)
 {
-    col_rel_t *rel = new_relation();
-    col_rel_t *alias = new_relation();
-    int64_t value = 23;
-    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
-    uint64_t view_before;
-    wirelog_column_type_t *types_before;
-    int64_t **columns_before;
-
-    CHECK(rel != NULL && alias != NULL, "aliased publication relations");
-    CHECK(col_rel_append_row(rel, &value) == 0,
-        "aliased publication source row");
-    CHECK(col_rel_install_shared_view(alias, rel) == 0,
-        "aliased publication shared view");
-    CHECK(rel->storage_alias_borrows == 1,
-        "aliased publication borrow recorded");
-    view_before = rel->view_generation;
-    types_before = rel->column_types;
-    columns_before = rel->columns;
-    CHECK(col_rel_set_column_types(rel, &type, 1) == EBUSY,
-        "typed publication denied by live alias");
-    CHECK(rel->column_types == types_before && rel->columns == columns_before
-        && rel->view_generation == view_before
-        && rel->storage_alias_borrows == 1,
-        "aliased publication denial preserves relation state");
-    CHECK(col_rel_storage_alias_release(alias) == 0,
-        "aliased publication alias release");
-    CHECK(rel->storage_alias_borrows == 0,
-        "aliased publication borrow retired");
-    CHECK(col_rel_set_column_types(rel, &type, 1) == 0,
-        "typed publication retry succeeds after alias release");
-    CHECK(rel->column_types && rel->column_types[0] == type
-        && rel->view_generation == view_before + 1u,
-        "aliased publication retry publishes one view epoch");
-    cleanup_relations();
-}
-
-/*
- * col_rel_set_schema publishes the canonical descriptor and is admitted on
- * the same gate.  A relation whose schema is already initialised makes the
- * underlying publication a no-op, which keeps this test on the admission
- * decision itself rather than on the descriptor rewrite.
- */
-static void
-test_publication_guards_cover_schema(void)
-{
-    col_rel_t *rel = new_relation();
-    col_rel_t *alias = new_relation();
-    int64_t value = 31;
+    col_rel_t *rel = NULL;
+    const char *names[] = { "left", "right" };
     wl_columnar_source_access_reader_t reader = { 0 };
     uint32_t ncols_before;
+    uint32_t capacity_before;
+    int64_t **columns_before;
+    bool schema_ok_before;
     uint64_t view_before;
 
-    CHECK(rel != NULL && alias != NULL, "schema publication relations");
-    CHECK(col_rel_append_row(rel, &value) == 0,
-        "schema publication source row");
+    rel = new_relation();
+    CHECK(rel != NULL, "initialized schema no-op relation");
     ncols_before = rel->ncols;
+    capacity_before = rel->capacity;
+    columns_before = rel->columns;
+    schema_ok_before = rel->schema_ok;
+    view_before = rel->view_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "initialized schema no-op active reader");
+    CHECK(col_rel_set_schema(rel, 2, names) == 0,
+        "initialized schema no-op succeeds with active reader");
+    CHECK(rel->ncols == ncols_before && rel->capacity == capacity_before
+        && rel->columns == columns_before && rel->schema_ok == schema_ok_before
+        && rel->view_generation == view_before,
+        "initialized schema no-op preserves relation state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "initialized schema no-op reader release");
+    cleanup_relations();
+
+    CHECK(col_rel_alloc(&rel, "schema_publication") == 0,
+        "schema publication relation allocation");
+    track_relation(rel);
+    ncols_before = rel->ncols;
+    capacity_before = rel->capacity;
+    columns_before = rel->columns;
+    schema_ok_before = rel->schema_ok;
     view_before = rel->view_generation;
     CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
         "schema publication source reader");
-    CHECK(col_rel_set_schema(rel, 1, NULL) == EBUSY,
+    CHECK(col_rel_set_schema(rel, 2, names) == EBUSY,
         "schema publication denied by source reader");
+    CHECK(rel->ncols == ncols_before && rel->capacity == capacity_before
+        && rel->columns == columns_before && rel->schema_ok == schema_ok_before
+        && rel->view_generation == view_before,
+        "schema publication denial preserves relation state");
     CHECK(col_rel_source_reader_release(&reader) == 0,
         "schema publication source reader release");
-    CHECK(col_rel_install_shared_view(alias, rel) == 0,
-        "schema publication shared view");
-    CHECK(col_rel_set_schema(rel, 1, NULL) == EBUSY,
-        "schema publication denied by live alias");
-    CHECK(col_rel_storage_alias_release(alias) == 0,
-        "schema publication alias release");
-    CHECK(col_rel_set_schema(rel, 1, NULL) == 0,
+    CHECK(col_rel_set_schema(rel, 2, names) == 0,
         "schema publication retry succeeds");
-    CHECK(rel->ncols == ncols_before && rel->view_generation == view_before,
-        "schema publication admission leaves an initialised schema alone");
+    CHECK(rel->ncols == 2 && rel->schema_ok
+        && rel->view_generation == view_before + 1u,
+        "schema publication retry publishes one view epoch");
+    cleanup_relations();
+}
+
+static void
+test_live_storage_alias_blocks_metadata_publication(void)
+{
+    col_rel_t *owner = new_relation();
+    col_rel_t *alias = new_relation();
+    col_rel_t *empty_owner = NULL;
+    col_rel_t *empty_alias = NULL;
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    wirelog_column_type_t *types_before;
+    int64_t **columns_before;
+    uint64_t view_before;
+
+    CHECK(owner && alias, "metadata alias relations");
+    CHECK(col_rel_install_shared_view(alias, owner) == 0,
+        "metadata live storage alias installation");
+    types_before = owner->column_types;
+    columns_before = owner->columns;
+    view_before = owner->view_generation;
+    CHECK(owner->storage_alias_borrows == 1,
+        "metadata owner records live storage alias");
+    CHECK(col_rel_set_column_types(owner, &type, 1) == EBUSY,
+        "column type publication denied by live storage alias");
+    CHECK(col_rel_set_schema(owner, 1, NULL) == 0,
+        "initialized schema no-op succeeds with live storage alias");
+    CHECK(owner->column_types == types_before
+        && owner->columns == columns_before
+        && owner->view_generation == view_before,
+        "alias no-op preserves metadata and generation");
+    cleanup_relations();
+
+    CHECK(col_rel_alloc(&empty_owner, "empty_schema_owner") == 0,
+        "uninitialized schema owner allocation");
+    track_relation(empty_owner);
+    CHECK(col_rel_alloc(&empty_alias, "empty_schema_alias") == 0,
+        "uninitialized schema alias allocation");
+    track_relation(empty_alias);
+    CHECK(col_rel_install_shared_view(empty_alias, empty_owner) == 0,
+        "uninitialized schema owner live alias installation");
+    view_before = empty_owner->view_generation;
+    CHECK(empty_owner->storage_alias_borrows == 1,
+        "uninitialized schema owner records live alias");
+    CHECK(col_rel_set_schema(empty_owner, 1, NULL) == EBUSY,
+        "uninitialized schema publication denied by live alias");
+    CHECK(empty_owner->ncols == 0 && !empty_owner->schema_ok
+        && empty_owner->view_generation == view_before,
+        "alias-denied uninitialized schema preserves owner state");
     cleanup_relations();
 }
 
@@ -2379,8 +2399,8 @@ main(void)
 {
     test_same_row_count_mutation();
     test_source_reader_blocks_column_type_publication();
-    test_live_alias_blocks_column_type_publication();
-    test_publication_guards_cover_schema();
+    test_source_reader_blocks_schema_publication();
+    test_live_storage_alias_blocks_metadata_publication();
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();

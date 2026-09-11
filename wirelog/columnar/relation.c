@@ -1087,18 +1087,51 @@ fail:
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
 {
+    wl_columnar_source_access_reader_t reader = { 0 };
     wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
     int rc;
     int release_rc;
 
     if (!r)
         return EINVAL;
-    rc = col_rel_published_writer_acquire(r, &writer);
+
+    /* Preserve the initialized-schema no-op even while other readers or
+     * storage aliases are live. The reader lease makes this check safe
+     * against a concurrent schema publisher; if initialization is still
+     * needed, drop it before entering the exclusive publication path. */
+    rc = col_rel_source_reader_acquire(r, &reader);
     if (rc != 0)
         return rc;
-    rc = col_rel_set_schema_impl(r, ncols, col_names);
+    if (r->ncols != 0) {
+        release_rc = col_rel_source_reader_release(&reader);
+        return release_rc;
+    }
+    rc = col_rel_source_reader_release(&reader);
+    if (rc != 0)
+        return rc;
+
+    /* The schema may have become initialized after the reader precheck but
+     * before writer admission. Acquire the canonical owner's writer without
+     * applying the alias policy yet, then decide under the writer: an
+     * initialized schema is still an idempotent no-op, while a live alias
+     * blocks only a schema that would actually be published. */
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_source_access_writer_acquire(
+        &owner->source_access, &writer);
+    if (rc != 0)
+        return rc;
+    if (r->ncols != 0) {
+        rc = 0;
+    } else if (owner->storage_alias_borrows > 0) {
+        rc = EBUSY;
+    } else {
+        rc = col_rel_set_schema_impl(r, ncols, col_names);
+    }
     release_rc = wl_columnar_source_access_writer_release(&writer);
-    if (rc == 0 && release_rc != 0)
+    if (release_rc != 0)
         rc = release_rc;
     return rc;
 }
