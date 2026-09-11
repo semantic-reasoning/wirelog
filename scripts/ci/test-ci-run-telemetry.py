@@ -487,7 +487,8 @@ class CriticalPathPlaceholder(unittest.TestCase):
         path = tool.analyze(*fixture("run-success"))["critical_path"]
         for key in ("observed", "graph"):
             self.assertEqual(path[key]["status"], "unavailable")
-            self.assertIn("unit 2", path[key]["reason"])
+            self.assertIn("no dependency graph was supplied",
+                          path[key]["reason"])
         # An empty list would read as "compared the graph, found no drift".
         self.assertIsNone(path["graph_drift"])
 
@@ -604,7 +605,8 @@ class GraphAbsence(unittest.TestCase):
             metric = job["metrics"]["scheduler_release_latency"]
             with self.subTest(job=job["name"]):
                 self.assertEqual(metric["status"], "unavailable")
-                self.assertIn("unit 2", metric["reason"])
+                self.assertIn("no dependency graph was supplied",
+                              metric["reason"])
 
     def test_a_root_job_is_named_as_a_root_once_a_graph_exists(self):
         run, jobs = fixture("run-success")
@@ -643,6 +645,355 @@ class GraphAbsence(unittest.TestCase):
                     self.assertIs(
                         job["metrics"]["scheduler_release_latency"]["additive"],
                         True)
+
+
+class DependencyGraph(unittest.TestCase):
+    """The graph is read from the workflow files, never hard-coded: #1574 will
+    change it, and a copy here would drift exactly when that happens."""
+
+    WORKFLOW = SCRIPT_DIR.parent.parent / ".github" / "workflows" / "ci-pr.yml"
+
+    def setUp(self):
+        self.graph = tool.extract_graph(self.WORKFLOW)
+
+    def test_the_reusable_lint_workflow_is_expanded_into_its_jobs(self):
+        # `lint` is `uses: ./.github/workflows/lint-pr.yml`; the API never
+        # reports a job by that name, so an unexpanded node would match
+        # nothing and sever the edge between the freeze gate and every build.
+        self.assertNotIn("lint", self.graph)
+        self.assertIn("lint / EditorConfig check", self.graph)
+        self.assertIn("lint / uncrustify check", self.graph)
+        self.assertEqual(self.graph["lint / uncrustify check"],
+                         ["lint / EditorConfig check"])
+        # The caller's own dependency lands on the callee's root.
+        self.assertEqual(self.graph["lint / EditorConfig check"],
+                         ["RC changelog freeze gate"])
+        # The caller's dependents attach to the callee's sink.
+        self.assertIn("lint / uncrustify check",
+                      self.graph["Build / ubuntu-latest / gcc"])
+
+    def test_every_job_has_an_entry_and_roots_are_explicit(self):
+        # A job missing from the graph must be a gap, never mistaken for a
+        # root, which is why roots carry an explicit empty list.
+        self.assertEqual(len(self.graph), 12)
+        self.assertEqual(self.graph["Detect build-triggering changes"], [])
+        self.assertEqual(self.graph["RC changelog freeze gate"], [])
+
+    def test_the_default_workflow_path_resolves_from_any_directory(self):
+        # It is anchored to the script, not the working directory, because the
+        # tool runs from a build directory under meson.  Asserted explicitly:
+        # report() degrades gracefully when the file is missing, so a wrong
+        # default would otherwise cost the critical path in silence.
+        self.assertTrue(Path(tool.DEFAULT_WORKFLOW).is_file(),
+                        f"{tool.DEFAULT_WORKFLOW} does not exist")
+        self.assertEqual(Path(tool.DEFAULT_WORKFLOW),
+                         self.WORKFLOW.resolve())
+        self.assertEqual(len(tool.extract_graph(tool.DEFAULT_WORKFLOW)), 12)
+
+    def test_the_on_section_is_not_read_as_jobs(self):
+        for spurious in ("pull_request", "workflow_call", "lint / workflow_call"):
+            self.assertNotIn(spurious, self.graph)
+
+    def test_every_node_resolves_against_a_real_run(self):
+        _, jobs = fixture("run-success")
+        names = [j["name"] for j in jobs["jobs"]]
+        edges, drift = tool.match_graph_to_jobs(self.graph, names)
+        self.assertEqual(drift["nodes_without_job"], [])
+        self.assertEqual(drift["jobs_without_node"], [])
+        self.assertEqual(set(edges), set(names))
+
+    def test_matrix_placeholders_match_expanded_names(self):
+        pattern = tool.name_pattern("Build / ${{ matrix.os }} / ${{ m }}")
+        self.assertTrue(pattern.match("Build / windows-latest / msvc"))
+        self.assertFalse(pattern.match("Sanitizers / ubuntu-latest / gcc"))
+
+    def test_an_unreadable_needs_form_is_refused_not_read_as_a_root(self):
+        # Block lists and wrapped flow lists are legal YAML this parser does
+        # not read.  Returning [] would call the job a root and sever its
+        # edges with nothing in the drift report to show for it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".github" / "workflows").mkdir(parents=True)
+            source = self.WORKFLOW.read_text().replace(
+                "    needs: [sanitizer-matrix, build-scope]",
+                "    needs:\n      - sanitizer-matrix\n      - build-scope", 1)
+            (root / ".github" / "workflows" / "ci-pr.yml").write_text(source)
+            (root / ".github" / "workflows" / "lint-pr.yml").write_text(
+                (self.WORKFLOW.parent / "lint-pr.yml").read_text())
+            with self.assertRaises(tool.WorkflowParseError) as caught:
+                tool.extract_graph(root / ".github" / "workflows" / "ci-pr.yml")
+            self.assertIn("sever", str(caught.exception))
+
+    def test_a_literal_node_wins_over_a_matrix_pattern(self):
+        # Otherwise correctness depends on which job happens to be declared
+        # first, and #1574 reorders jobs.
+        graph = {"Build / ${{ matrix.os }} / ${{ matrix.compiler }}": ["Wide"],
+                 "Build / ubuntu-latest / gcc": ["Narrow"],
+                 "Wide": [], "Narrow": []}
+        jobs = ["Build / ubuntu-latest / gcc", "Build / macos-latest / clang",
+                "Wide", "Narrow"]
+        edges, drift = tool.match_graph_to_jobs(graph, jobs)
+        self.assertEqual(edges["Build / ubuntu-latest / gcc"], ["Narrow"])
+        self.assertEqual(edges["Build / macos-latest / clang"], ["Wide"])
+        self.assertEqual(drift["nodes_without_job"], [])
+
+    def test_placeholder_text_does_not_count_as_specificity(self):
+        # Length alone would let a node whose placeholder name happens to be
+        # long outrank a shorter but more literal one.
+        graph = {"${{ matrix.a_very_long_placeholder_name }}": ["Wide"],
+                 "Build / ${{ os }}": ["Narrow"], "Wide": [], "Narrow": []}
+        edges, _ = tool.match_graph_to_jobs(
+            graph, ["Build / linux", "Wide", "Narrow"])
+        self.assertEqual(edges["Build / linux"], ["Narrow"])
+
+    def test_a_dependency_never_claims_a_job_that_resolved_elsewhere(self):
+        # Expanding a dependency by re-matching its pattern let a node claim
+        # jobs owned by a more specific node, which could make a job its own
+        # dependency and leave a cycle with nothing in the drift report.
+        graph = {"Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}": [],
+                 "Sanitizers / tsan / ${{ matrix.compiler }}":
+                     ["Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}"]}
+        jobs = ["Sanitizers / ubuntu-latest / gcc", "Sanitizers / tsan / gcc"]
+        edges, _ = tool.match_graph_to_jobs(graph, jobs)
+        for job, deps in edges.items():
+            with self.subTest(job=job):
+                self.assertNotIn(job, deps, "a job cannot depend on itself")
+        self.assertEqual(edges["Sanitizers / tsan / gcc"],
+                         ["Sanitizers / ubuntu-latest / gcc"])
+
+    def test_drift_is_reported_when_the_run_and_the_graph_disagree(self):
+        edges, drift = tool.match_graph_to_jobs(
+            {"A job that never ran": []}, ["Some other job"])
+        self.assertEqual(drift["nodes_without_job"], ["A job that never ran"])
+        self.assertEqual(drift["jobs_without_node"], ["Some other job"])
+
+
+class CriticalPath(unittest.TestCase):
+    WORKFLOW = SCRIPT_DIR.parent.parent / ".github" / "workflows" / "ci-pr.yml"
+
+    def _analyze(self, name):
+        run, jobs = fixture(name)
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in jobs["jobs"]])
+        return tool.analyze(run, jobs, edges, drift)
+
+    def test_the_walk_follows_dependencies_not_the_nearest_finisher(self):
+        path = self._analyze("run-success")["critical_path"]["observed"]
+        chain = path["evidence"]["chain"]
+        self.assertEqual(chain[-1], "TSan / ubuntu-latest / clang")
+        # The nearest job to finish before TSan started was a macOS matrix
+        # build that TSan does not depend on; taking it would have produced a
+        # plausible and wrong path.
+        self.assertNotIn("Build / macos-latest / clang", chain)
+        self.assertIn("Sanitizers / ubuntu-latest / clang", chain)
+        self.assertEqual(chain[0], "RC changelog freeze gate")
+
+    def test_the_observed_path_counts_queueing_and_the_graph_path_does_not(self):
+        paths = self._analyze("run-success")["critical_path"]
+        # The gap between them is the queueing on the path, which is the
+        # measurement #1574 needs before it reorders the graph.
+        self.assertGreater(paths["observed"]["seconds"],
+                           paths["graph"]["seconds"])
+
+    def test_a_skip_cascade_whose_chain_avoids_it_stays_measured(self):
+        # Every edge on the reported chain is known, so the number is final.
+        # Flagging it because some unrelated edge elsewhere was unavailable
+        # would attach a caveat that does not apply to the value shown.
+        paths = self._analyze("run-skip-cascade")["critical_path"]
+        self.assertEqual(paths["graph"]["status"], "measured")
+        self.assertNotIn("Build / ubuntu-24.04-arm / gcc",
+                         paths["graph"]["evidence"]["chain"])
+
+    def _with_skipped(self, job_name):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == job_name:
+                job["conclusion"] = "skipped"
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        return tool.analyze(run, mutated, edges, drift)
+
+    def test_a_chain_through_a_skipped_dependency_degrades_and_names_it(self):
+        paths = self._with_skipped("lint / EditorConfig check")["critical_path"]
+        graph = paths["graph"]
+        self.assertEqual(graph["status"], "partial")
+        self.assertIn("node weights only", graph["reason"])
+        self.assertIsNotNone(graph["seconds"])
+        # The caveat names the edges it applies to, so a reader can see which
+        # part of the number is node weight alone.
+        self.assertIn("RC changelog freeze gate -> lint / EditorConfig check",
+                      graph["evidence"]["unusable_edges"])
+
+    def test_the_observed_walk_stops_rather_than_inventing_a_hop(self):
+        paths = self._with_skipped("lint / EditorConfig check")["critical_path"]
+        observed = paths["observed"]
+        self.assertEqual(observed["status"], "partial")
+        self.assertIn("did not run", observed["reason"])
+        # It stopped at the job whose dependency was skipped instead of
+        # walking through it at zero weight.
+        self.assertEqual(observed["evidence"]["chain"][0],
+                         "lint / uncrustify check")
+
+    def test_a_job_outside_the_graph_stops_the_walk_as_partial(self):
+        run, jobs = fixture("run-success")
+        graph = tool.extract_graph(self.WORKFLOW)
+        del graph["TSan / ubuntu-latest / ${{ matrix.compiler }}"]
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in jobs["jobs"]])
+        report = tool.analyze(run, jobs, edges, drift)
+        observed = report["critical_path"]["observed"]
+        # Before this, a job with no node got an empty edge list, which is
+        # indistinguishable from a root, and the walk reported a confident
+        # one-hop path a third the length of the real one.
+        self.assertEqual(observed["status"], "partial")
+        self.assertIn("not in the dependency graph", observed["reason"])
+        self.assertIn("TSan", drift["jobs_without_node"][0])
+
+    def test_a_run_missing_declared_jobs_is_flagged_not_reported_flat(self):
+        # The one-job rerun fixture walks cleanly to its root, but eleven jobs
+        # the graph declares never appear; a bare number would read as a
+        # complete path over a complete run.
+        report = self._analyze("run-rerun")
+        observed = report["critical_path"]["observed"]
+        self.assertEqual(observed["status"], "partial")
+        self.assertIn("absent from this run", observed["reason"])
+        self.assertEqual(len(report["critical_path"]["graph_drift"]
+                             ["nodes_without_job"]), 11)
+
+    def test_a_hop_the_run_did_not_time_is_not_summed_as_zero(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                job["started_at"] = None     # completed, but never started
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        observed = tool.analyze(run, mutated, edges,
+                                drift)["critical_path"]["observed"]
+        # Summing that hop as zero reported 5206 against a true 10362 and
+        # called it measured: a 50 per cent error presented as final.
+        self.assertEqual(observed["status"], "partial")
+        self.assertIn("not timed", observed["reason"])
+        self.assertEqual(observed["evidence"]["unmeasured_hops"],
+                         ["Sanitizers / ubuntu-latest / clang"])
+
+    def test_an_untimed_node_on_the_graph_chain_is_named_too(self):
+        run, jobs = fixture("run-success")
+        mutated = copy.deepcopy(jobs)
+        for job in mutated["jobs"]:
+            # The lint segment is the only route from the freeze gate to the
+            # builds, so the longest path cannot route around it the way it
+            # routes around a zero-weight leaf.
+            if job["name"] == "lint / uncrustify check":
+                job["started_at"] = None
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in mutated["jobs"]])
+        path = tool.analyze(run, mutated, edges, drift)["critical_path"]["graph"]
+        self.assertEqual(path["status"], "partial")
+        self.assertIn("not timed", path["reason"])
+        self.assertIn("lint / uncrustify check",
+                      path["evidence"]["unmeasured_nodes"])
+
+    def test_the_observed_total_says_what_it_omits(self):
+        path = self._analyze("run-success")["critical_path"]["observed"]
+        self.assertIn("lower bound", path["evidence"]["note"])
+        # Per-hop weights are published, not just the chain, so the total can
+        # be checked rather than taken on trust.
+        hops = path["evidence"]["hops"]
+        self.assertEqual(
+            sum((h["queue_delay"] or 0) + (h["job_wall"] or 0) for h in hops),
+            path["seconds"])
+
+    def test_without_a_graph_both_paths_say_so(self):
+        report = tool.analyze(*fixture("run-success"))
+        path = report["critical_path"]
+        for key in ("observed", "graph"):
+            self.assertEqual(path[key]["status"], "unavailable")
+            self.assertIn("no dependency graph was supplied",
+                          path[key]["reason"])
+        self.assertIsNone(path["graph_drift"])
+
+
+class Aggregation(unittest.TestCase):
+    def _reports(self):
+        return [tool.analyze(*fixture(name))
+                for name in ("run-success", "run-skip-cascade")]
+
+    def test_cells_are_job_and_population_never_pooled(self):
+        doc = tool.aggregate_reports(self._reports())
+        self.assertFalse(doc["pooled"])
+        # One run spans both, which is why a run-level filter would refuse
+        # every real input.
+        self.assertIn("hosted", doc["populations"])
+        self.assertIn("self-hosted", doc["populations"])
+        for cell in doc["cells"]:
+            self.assertIn("population", cell)
+            self.assertIn("conclusion", cell)
+
+    def test_a_cell_spanning_several_self_hosted_machines_says_so(self):
+        # Hosted runners are fungible ephemeral VMs, so pooling them is right.
+        # Self-hosted boxes are not, and the fixtures show the same job landing
+        # on different ones between runs.
+        first = tool.analyze(*fixture("run-skip-cascade"))
+        # The clock-skew capture is the same workflow on different machines;
+        # give it the same conclusion so the two land in one cell, which is
+        # what happens across a real baseline window.
+        second = tool.analyze(*fixture("run-clock-skew"))
+        second["conclusion"] = first["conclusion"]
+        doc = tool.aggregate_reports([first, second])
+        mixed = [c for c in doc["cells"] if c["mixed_machines"]]
+        self.assertTrue(mixed, "the fixtures move a job between machines")
+        for cell in mixed:
+            self.assertEqual(cell["population"], "self-hosted")
+            self.assertGreater(len(cell["runner_names"]), 1)
+
+    def test_a_hosted_cell_is_not_flagged_as_mixed(self):
+        doc = tool.aggregate_reports([tool.analyze(*fixture("run-success"))])
+        hosted = [c for c in doc["cells"] if c["population"] == "hosted"]
+        self.assertTrue(hosted)
+        for cell in hosted:
+            self.assertFalse(cell["mixed_machines"])
+
+    def test_failed_and_successful_runs_are_kept_apart(self):
+        doc = tool.aggregate_reports(self._reports())
+        conclusions = {cell["conclusion"] for cell in doc["cells"]}
+        self.assertEqual(conclusions, {"success", "failure"})
+
+    def test_n_is_per_metric_so_a_skipped_job_contributes_to_none(self):
+        doc = tool.aggregate_reports(self._reports())
+        skipped = [c for c in doc["cells"] if c["population"] == "none"]
+        self.assertTrue(skipped, "the failed run skipped five jobs")
+        for cell in skipped:
+            for name, stats in cell["metrics"].items():
+                with self.subTest(job=cell["job"], metric=name):
+                    self.assertEqual(stats["n"], 0)
+                    self.assertIsNone(stats["median"])
+
+    def test_an_unknown_attempt_is_not_called_a_rerun(self):
+        reports = self._reports()
+        reports[0] = dict(reports[0], run_attempt=None)
+        doc = tool.aggregate_reports(reports)
+        self.assertEqual([e["reason"] for e in doc["excluded"]],
+                         ["run_attempt unknown"])
+
+    def test_a_rerun_is_excluded_and_named(self):
+        reports = self._reports() + [tool.analyze(*fixture("run-rerun"))]
+        doc = tool.aggregate_reports(reports)
+        self.assertEqual([e["reason"] for e in doc["excluded"]],
+                         ["run_attempt > 1"])
+
+    def test_percentiles_are_nearest_rank_and_say_when_they_are_the_maximum(self):
+        self.assertEqual(tool.percentile_nearest_rank([1, 2, 3, 4], 0.5), 2)
+        self.assertEqual(tool.percentile_nearest_rank([1, 2, 3, 4], 0.95), 4)
+        self.assertIsNone(tool.percentile_nearest_rank([], 0.5))
+        summary = tool.summarize([5, 1, 3])
+        self.assertEqual(summary["median"], 3)
+        self.assertTrue(summary["p95_is_sample_max"])
 
 
 class Populations(unittest.TestCase):
@@ -744,6 +1095,21 @@ class Rendering(unittest.TestCase):
         self.assertIn("10 executed, 5 skipped", text)
         self.assertIn("first_failure_latency", text)
         self.assertNotIn("| 0 |", text.split("Per job")[0])
+
+    WORKFLOW = SCRIPT_DIR.parent.parent / ".github" / "workflows" / "ci-pr.yml"
+
+    def test_the_summary_says_the_three_totals_are_not_independent(self):
+        run, jobs = fixture("run-success")
+        graph = tool.extract_graph(self.WORKFLOW)
+        edges, drift = tool.match_graph_to_jobs(
+            graph, [j["name"] for j in jobs["jobs"]])
+        report = tool.analyze(run, jobs, edges, drift)
+        text = tool.render_markdown(report)
+        # All three appear adjacent in the table; without this a reader sees
+        # 10366 / 10366 / 10362 and counts three agreeing measurements.
+        self.assertIn("not three independent measurements", text)
+        self.assertIn("by construction", text)
+        self.assertIn("lower bound", text)
 
     def test_report_command_writes_both_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
