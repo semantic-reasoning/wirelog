@@ -2141,6 +2141,12 @@ wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
 int
+col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
+    wl_columnar_source_access_writer_t *writer);
+int
+col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
+    wl_columnar_source_access_writer_t *writer);
+int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 int
 col_rel_col_idx(const col_rel_t *r, const char *name);

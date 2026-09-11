@@ -407,7 +407,7 @@ tdd_shared_view_deep_copy_fallback(wl_col_session_t *sess, col_rel_t *dst,
         rc = release_rc;
     if (rc == 0 && sess) {
         /* append_all also detaches an empty shared destination before it
-         * returns, so a successful fallback must retire the old lease. */
+        * returns, so a successful fallback must retire the old lease. */
         int retire_rc
             = wl_columnar_session_retire_source_lease(sess, dst);
         if (retire_rc != 0)
@@ -1576,14 +1576,15 @@ tdd_worker_subpass_fn(void *arg)
             rc2 = col_op_consolidate_incremental_delta(r, snap[ri], delta,
                     &fast_flag);
         }
-        col_session_invalidate_arrangements(&sess->base,
-            sp->relations[ri].name);
-
         /* rc2 != 0 propagates as a worker error so any_new is not set.
          * Sources: col_op_consolidate_incremental_delta (EOVERFLOW/ENOMEM)
          * or col_rel_append_row (ENOMEM) from the hash-set dedup path.
          * Both are hard errors requiring coordinator intervention. */
         if (rc2 != 0) {
+            /* Sorting/deduplication may have changed the source before a
+             * later admission error.  Keep arrangements coherent on error. */
+            col_session_invalidate_arrangements(&sess->base,
+                sp->relations[ri].name);
             col_rel_destroy(delta);
             ctx->rc = rc2;
             free(snap);
@@ -1592,6 +1593,10 @@ tdd_worker_subpass_fn(void *arg)
             sess->diff_operators_active = saved_diff;
             TDD_WORKER_RETURN();
         }
+
+        /* Consolidation changed the relation only after rc2 succeeded. */
+        col_session_invalidate_arrangements(&sess->base,
+            sp->relations[ri].name);
 
         if (delta->nrows > 0) {
             /* Stamp timestamps (eval_serial.c:653-681) */
