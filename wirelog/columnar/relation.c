@@ -4110,7 +4110,45 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
 int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 {
-    return col_rel_radix_sort_impl(r, start_row, nrows, false, NULL);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    bool alias_release_pending = false;
+    int rc;
+
+    if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
+        return EINVAL;
+    if (nrows <= 1)
+        return 0;
+
+    /* Sorting rewrites every column in the selected range and publishes a
+     * view epoch.  Hold canonical-owner admission over the entire COW,
+     * permutation, and publication transaction so readers cannot observe a
+     * partially reordered relation.  Callers that run the sort inside a
+     * wider transaction of their own take col_rel_radix_sort_deferred()
+     * instead and carry both the lease and the alias themselves; this
+     * entry point is the standalone one, so it owns both here. */
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_source_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    if (r == owner && owner->storage_alias_borrows > 0) {
+        rc = EBUSY;
+        goto release_writer;
+    }
+
+    rc = col_rel_radix_sort_impl(r, start_row, nrows, true,
+            &alias_release_pending);
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(r);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+release_writer:
+    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 int
@@ -4134,20 +4172,20 @@ col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row,
  * Sets r->sorted_nrows = r->nrows on completion.
  * Falls back to insertion sort on allocation failure.
  */
-void
+int
 col_rel_radix_sort_int64(col_rel_t *r)
 {
     if (!r || r->ncols == 0) {
         if (r)
             r->sorted_nrows = r->nrows;
-        return;
+        return 0;
     }
     if (r->nrows <= 1) {
         r->sorted_nrows = r->nrows;
-        return;
+        return 0;
     }
     if (r->ncols == 0)
-        return;
+        return 0;
 
     /* col_rel_radix_sort() detaches a shared view itself (through the
      * admitted col_rel_cow_unshare) and rolls the detach back if the sort
@@ -4155,4 +4193,5 @@ col_rel_radix_sort_int64(col_rel_t *r)
     int rc = col_rel_radix_sort(r, 0, r->nrows);
     if (rc == 0)
         r->sorted_nrows = r->nrows;
+    return rc;
 }
