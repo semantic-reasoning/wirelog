@@ -540,6 +540,7 @@ test_copy_and_shared_semantics(void)
     uint64_t old_view;
     uint64_t old_storage;
     CHECK(col_rel_append_row(src, &row) == 0, "copy seed");
+    src->declared_ncols = 7u;
     source_view = src->view_generation;
     source_storage = src->storage_generation;
     old_view = view->view_generation;
@@ -548,6 +549,8 @@ test_copy_and_shared_semantics(void)
     track_relation(copy);
     CHECK(copy->relation_identity != src->relation_identity,
         "deep copy receives a fresh identity");
+    CHECK(copy->declared_ncols == src->declared_ncols,
+        "deep copy preserves the declared column count");
     CHECK(copy->view_generation == src->view_generation
         && copy->storage_generation == src->storage_generation,
         "deep copy preserves the source snapshot generations");
@@ -2487,6 +2490,7 @@ test_staged_replacement_contract(void)
     int64_t *old_columns;
     char *old_name;
     col_rel_replacement_t replacement;
+    wl_columnar_source_access_writer_t writer = { 0 };
 
     CHECK(dst && candidate, "replacement setup");
     CHECK(col_rel_append_row(dst, &old_value) == 0
@@ -2509,8 +2513,12 @@ test_staged_replacement_contract(void)
         && dst->storage_generation == storage_before
         && dst->retained_reserved_bytes == reserved_before,
         "replacement preparation leaves destination unchanged");
-    CHECK(col_rel_commit_replacement_locked(dst, &replacement) == 0,
-        "replacement commit succeeds");
+    col_rel_commit_replacement_locked(dst, &replacement);
+    CHECK(wl_columnar_source_access_writer_acquire(
+            &dst->source_access, &writer) == 0,
+        "replacement commit releases its writer");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "replacement commit writer can be released");
     CHECK(dst->relation_identity == identity && dst->name == old_name
         && strcmp(dst->name, "generation_test") == 0
         && dst->columns[0] != old_columns
@@ -2542,9 +2550,9 @@ test_staged_replacement_contract(void)
             && col_rel_append_row(dst, &old_value) == 0
             && col_rel_append_row(candidate, &new_value) == 0,
             "replacement admission rows");
-        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
-            && col_rel_commit_replacement_locked(dst, &replacement) == 0,
-            "replacement admission commit");
+        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+            "replacement admission prepare");
+        col_rel_commit_replacement_locked(dst, &replacement);
         reserved_after = col_rel_transport_bytes(dst);
         CHECK(dst->retained_reserved_bytes == reserved_after
             && wl_columnar_memory_reserved(
@@ -2576,9 +2584,9 @@ test_staged_replacement_contract(void)
         "replacement reader denial preserves state");
     CHECK(col_rel_source_reader_release(&reader) == 0,
         "replacement reader release");
-    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0
-        && col_rel_commit_replacement_locked(dst, &replacement) == 0,
-        "replacement retries after reader release");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "replacement retries after reader release prepare");
+    col_rel_commit_replacement_locked(dst, &replacement);
     cleanup_relations();
 
     dst = new_relation();
