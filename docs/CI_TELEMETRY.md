@@ -11,13 +11,22 @@ in CI, registered in `tests/meson.build` under the `abi` suite.
 
 ## What it does not do
 
-It does not change `ci-pr.yml`.  Measurement lands before the changes it
-justifies; #1574, #1571, #1572 and #1573 are where those belong.
+It does not change `ci-pr.yml`.  The changes this measurement informs belong
+to #1574, #1571, #1572 and #1573, the publication path to #1577, and runner
+placement to #1581, which exists because this measurement found the effect.
+Two of those sequence behind this issue: #1574 names it an explicit
+prerequisite, and #1577 ships the publication path second by design.  #1571
+and #1573 say they can start independently, #1572 says only that timing
+telemetry supplies it performance evidence, and #1581's one prerequisite is
+item 17 of #1583 rather than this issue -- or, failing that, naming the single
+table it regenerates -- though it is the issue here that this measurement
+caused.  So "measure first" is the ordering this issue chose rather than one
+all six are waiting on.
 
 It does not read job logs, so it reports no per-test durations and no
 compiler-cache hit rate.  Issue #1570's scope line asks for slow tests and
-cold/warm cache context; that part is **not** delivered here and is carried by
-a follow-up.  See "Known gaps".
+cold/warm cache context; that part is **not** delivered here and is carried
+by #1580.  See "Known gaps".
 
 It never substitutes zero for something it could not measure.  Most of the
 design below follows from that one rule.
@@ -79,9 +88,9 @@ was not observed.
 Each metric under `metrics` carries an `additive` flag saying whether it may be
 summed along a path: `queue_delay`, `job_wall` and `scheduler_release_latency`
 are additive, `upstream_elapsed` is not.  The flag is set in every state, so a
-missing key never has to be interpreted. (Two docstrings in the source call the
-additive one singular.  The flag is right and they are stale; a follow-up
-carries the fix.)
+missing key never has to be interpreted.  (Two docstrings in the source call
+the additive one singular.  The flag is right and they are stale; #1583 carries
+the fix.)
 
 ### Per job
 
@@ -100,9 +109,9 @@ its runner population beside them, eight columns in all.
 
 `upstream_elapsed` and `scheduler_release_latency` have no column in either
 report, so read those from `run-{id}.json`, where `unaccounted` is likewise a
-sibling of `metrics` rather than a key inside it. `upstream_elapsed` is also
-pooled into every aggregate cell without being displayed there; a follow-up
-covers giving it a column.
+sibling of `metrics` rather than a key inside it.  `upstream_elapsed` is also
+pooled into every aggregate cell without being displayed there; #1583 covers
+giving it a column.
 
 Under the per-job table the report lists why any number it printed is not
 final: the status and the reason.  More than three entries sharing one reason
@@ -139,8 +148,9 @@ The two possible mistakes are not symmetric, which is why the rule points this
 way.  An unrecognised conclusion read as executed fabricates a zero that looks
 like a measurement in the artefact, drags an aggregate's sample size with it,
 and is indistinguishable from a real duration.  Read as never run, a job that
-really ran and lost every stamp and every step disappears from the per-job
-table with a sentence saying so, and from the count of jobs that ran.
+really ran and lost every stamp and every step fabricates no per-job number:
+it drops out of the count of jobs that ran, and its row reports `unavailable`
+in all six metric columns.
 
 That second mistake is not free, and the document should not pretend it is.
 `run_wall_clock` and `pr_feedback` are computed over the jobs that ran, and a
@@ -152,17 +162,18 @@ It is still the better direction, because the other one fabricates a number
 where none exists and does so on every job it mistakes; but "this tool may
 under-claim" is the honest summary, not "the worst case is an absence".
 
-A job wrongly judged never-run is visible rather than silent: its row stays in
-the per-job table with `unavailable` in all six metric columns. What is silent
-is its effect on the two run-level totals above.
+What is silent is not the job but its effect on the two run-level totals
+above.
 
 A job that did not run carries `ran: false` and is counted in the run summary
 under its own conclusion -- as a count, not by name: the line reads `jobs: 15
 (10 executed, 5 skipped)`.  It still gets a per-job table row, with
-`unavailable` in all six metric columns and `none` for its population; what it
-is excused from is the explanation block under the table, which would otherwise
-repeat one sentence six times for a job nobody expected a number from.  The
-table row is where such a job is visible by name.
+`unavailable` in all six metric columns, and `none` for its population when it
+never reached a runner -- a job weighed as never-run that did reach one still
+reports the pool it landed on.  What it is excused from is the explanation
+block under the table, which would otherwise repeat one sentence six times for
+a job nobody expected a number from.  The table row is where such a job is
+visible by name.
 
 One metric can survive such a job: `scheduler_release_latency` ends at the
 job's *creation*, which happens whether or not the job then dispatches.  It is
@@ -228,13 +239,14 @@ recorded under `skipped_steps`.  A phase whose every step was skipped reports
 | `first_failure_latency` | run start to the completion of the earliest-completing job that concluded `failure` or `timed_out`; its evidence names the job, its conclusion, and the steps that failed |
 | `total_required_check_completion` | run start to the last *required* check completing, where the required set is knowable |
 
-`total_required_check_completion` is the one metric that is not computed. This
+`total_required_check_completion` is the one metric that is not computed.  This
 repository publishes no `required_status_checks` rule -- rulesets 13129249 and
-13670289 carry none and `branches/main/protection` answers 404 -- so the tool
-emits a fixed `unavailable` naming those three facts, and `required_checks`
-declares `pr_feedback` as the surrogate.  Adding a required-checks rule will
-not change the string: the answer is written into the source, and making it
-react to the repository is a follow-up.
+13670289 carry none, `branches/main/protection` answers 404, and a third
+ruleset, 19420631, is disabled and carries only a Copilot review rule -- so the
+tool emits a fixed `unavailable` naming the first two rulesets and the 404, and
+`required_checks` declares `pr_feedback` as the surrogate.  Adding a
+required-checks rule will not change the string: the answer is written into the
+source, and making it react to the repository is #1582.
 
 `first_failure_latency`'s `failed_steps` list is what tells #1573 whether the
 binary-size gate fired late or early: the job name alone does not say which
@@ -248,7 +260,7 @@ N` -- and divides the run into `executed`, `skipped` and `never_ran`, plus
 `did_not_run_by_conclusion`, a map from GitHub's conclusion to a count.  That
 map is open-ended: expect keys this document does not list.  `skipped` is a
 second spelling of `did_not_run_by_conclusion["skipped"]`, kept so a JSON
-consumer written against the earlier shape still works. In that rendered
+consumer written against the earlier shape still works.  In that rendered
 summary line, every term naming a job that did not run comes from one label
 table, and a conclusion the table has not met names itself; `executed` is the
 one literal.  The per-job reasons come from a second table, which is why adding
@@ -263,8 +275,8 @@ Two, reported side by side.
   job_wall` per hop.  It follows the graph rather than taking the nearest
   earlier finisher, which on real runs picks a macOS matrix build as the
   predecessor of a TSan job that does not depend on it.
-- **`graph`** takes the longest path over the declared graph, weighting
-  each node by `job_wall` and each edge by `scheduler_release_latency`. It
+- **`graph`** takes the longest path over the declared graph, weighting each
+  node by `job_wall` and each edge by `scheduler_release_latency`.  It
   excludes queueing.
 
 Their difference is the part of the wait the scheduler added rather than the
@@ -288,7 +300,7 @@ refuses to step into such a job -- walking through it at zero weight would
 erase the gap it represents -- so the chain **stops there**, and the path is
 `partial` with the reason `walk stopped: X's dependencies did not run`.  The
 graph walk instead routes **through** it at a zero node weight, keeping the
-chain intact and qualifying the total. So a short `observed` chain and a short
+chain intact and qualifying the total.  So a short `observed` chain and a short
 `graph` chain mean opposite things, and the reason string is the only way to
 tell a path that ended from a path that was cut off.  Read the status, not the
 length.
@@ -336,27 +348,26 @@ direction that cannot overstate.
 - Aggregation never pools across runner populations, and a pooled cell
   that still spans more than one self-hosted machine is flagged, because those
   machines are not interchangeable.
-- The aggregate carries no per-cell reason, so feed it completed,
-  first-attempt runs.  Note what that does and does not guard against.  A
-  per-job metric is never `partial`: only `run_wall_clock`, `pr_feedback` and
-  the two critical paths are ever downgraded, and none of those is pooled.
-  Exclusion is per metric rather than per job, which is what makes a live run
-  dangerous to pool.  A job that has started but not finished yields
-  `unavailable` for `job_wall` only: its `queue_delay` and `upstream_elapsed`
-  are `measured` and pool normally.  So a half-done run contributes wall times
-  for its finished jobs alone -- biased fast -- while also contributing the
-  queue delays of the jobs still running, so the two metrics end up pooled over
-  different sets of jobs.  Which way that biases the queue figures depends on
-  where the capture falls, and this baseline cannot say: it contains no
-  half-done run.  Each metric's `n` says how many values it actually pooled --
-  in the JSON for all three, in the markdown for `queue_delay` and `job_wall`,
-  which are the two with columns.  That gives a partial check: a cell whose
-  `queue n` exceeds its `wall n` pooled queue delays from jobs whose wall
-  times it did not, so the two columns are not describing the same jobs.  It
-  is neither necessary nor sufficient for "a live run got in".  A completed
-  run trips it too when a job lost its completion stamp, and it stays silent
-  on a live run whose unfinished jobs have not started, since those have no
-  `queue_delay` either.
+- The aggregate carries no per-cell reason, so feed it completed, first-attempt
+  runs.  Note what that does and does not guard against.  A per-job metric is
+  never `partial`: only `run_wall_clock`, `pr_feedback` and the two critical
+  paths are ever downgraded, and none of those is pooled.  Exclusion is per
+  metric rather than per job, which is what makes a live run dangerous to pool.
+  A job that has started but not finished yields `unavailable` for `job_wall`
+  only: its `queue_delay` and `upstream_elapsed` are `measured` and pool
+  normally.  So a half-done run contributes wall times for its finished jobs
+  alone -- biased fast -- while also contributing the queue delays of the jobs
+  still running, so the two metrics end up pooled over different sets of jobs.
+  Which way that biases the queue figures depends on where the capture falls,
+  and this baseline cannot say: it contains no half-done run.  Each metric's
+  `n` says how many values it actually pooled -- in the JSON for all three, in
+  the markdown for `queue_delay` and `job_wall`, which are the two with
+  columns.  That gives a partial check: a cell whose `queue n` exceeds its
+  `wall n` pooled queue delays from jobs whose wall times it did not, so the
+  two columns are not describing the same jobs.  It is neither necessary nor
+  sufficient for "a live run got in".  A completed run trips it too when a job
+  lost its completion stamp, and it stays silent on a live run whose unfinished
+  jobs have not started, since those have no `queue_delay` either.
 - Half of "completed, first-attempt" the tool enforces itself: a report
   whose `run_attempt` is not 1, or is missing, is dropped into the aggregate's
   `excluded` list with the reason.  Cells are keyed by job name, runner
@@ -366,14 +377,17 @@ direction that cannot overstate.
 
 ## Known limits of the rule above
 
-These follow from the design rather than from missing work, and none of them
-affects the baseline, which was taken from completed successful runs.
+None of them affects the baseline, which was taken from completed successful
+runs, but they are not all alike in whether anything is filed to change them.
+Four have an owner: limits 1, 3 and 6 are items 7, 8 and 9 of #1583, and limit
+5 names #1582 item 15.  Limits 2 and 4 have none, and follow from the design
+rather than from missing work.
 
-1. A job cancelled while it was still queued is reported with no
-   durations at all, including the `created_at` to `started_at` wait it
-   genuinely accrued.  One flag gates all six metrics.  Splitting "ran" from
-   "was queued" would recover a real queue measurement, which is the thing
-   #1570 exists to measure.
+1. A job cancelled while it was still queued is reported with no durations at
+   all, including the `created_at` to `started_at` wait it genuinely accrued.
+   One flag gates all six metrics.  Splitting "ran" from "was queued" would
+   recover a real queue measurement, which is the thing #1570 exists to
+   measure.
 2. `failure` is treated as proof of execution, and a self-hosted job that
    exhausts the queue limit, or whose `runs-on` matches no runner, can reach it
    without dispatching.  Routing `failure` through the evidence instead would
@@ -391,11 +405,19 @@ affects the baseline, which was taken from completed successful runs.
    than the feedback a reviewer actually waits for.  The reader's signal is
    that job's per-job row, which is present and reads `unavailable`; the run
    summary gives a count by conclusion but no name.
-5. `pr_feedback` -- the headline run-level number, and the declared
-   surrogate for the required set -- is scoped by `PINNED_CHECK_PREFIXES`, a
-   hand-maintained literal.  It is not checked against the run and not covered
-   by `graph_drift`, so renaming a job in `ci-pr.yml` silently changes what the
-   number means rather than reporting drift.  #1574 renames jobs.
+5. `pr_feedback` -- the headline run-level number, and the declared surrogate
+   for a required set this repository does not publish -- is scoped by
+   `PINNED_CHECK_PREFIXES`, a hand-maintained tuple matched by prefix against
+   job names.  It is not checked against the run and not covered by
+   `graph_drift`.  Today it matches every job in `ci-pr.yml`, which is why
+   `pr_feedback` equals `run_wall_clock` on this baseline.  A rename changes
+   what the number covers, and so does an *added* job that matches no prefix --
+   the case #1582 item 15 records and no issue has promised against.  Two
+   traces exist and both are weak.  `non_pinned_executed` in the JSON evidence
+   counts the jobs that fell outside the list, but the report mentions it only
+   when it is zero, so a lapse shows up as a caveat disappearing rather than a
+   warning appearing.  And `pr_feedback` diverges from `run_wall_clock` in the
+   run-level table only when the unmatched job is the last to finish.
 6. Adding a conclusion to the tool means touching its reason table, its
    label table and, if it proves execution, the ran list.  Nothing forces an
    author to find all three; the reason and label tables are pinned against
@@ -415,10 +437,16 @@ CI artefacts for the old ones will miss silently.
 
 ## Measured baseline
 
-**Sample.** Seven `CI PR` runs, all `conclusion: success`, all `run_attempt:
+**Sample.**  Seven `CI PR` runs, all `conclusion: success`, all `run_attempt:
 1`, all from 2026-09-10, 126 jobs in total.  Failed runs were excluded on
 purpose: a failure truncates the graph, so its critical path measures a
-different thing.
+different thing.  These seven are not that day's successful runs; by the same
+first-attempt rule the sample itself applies, they are the last seven of
+twenty-eight, and `CI PR` ran sixty-five times in all, sixty-three of them
+first attempts.  The selection is recency, not a random draw, so the sample is
+the day's tail -- which is also where the three clustered runs below sit.
+Unless a figure says otherwise, anything below that counts *other runs* counts
+only these seven.
 
 | start (UTC) | run | head | branch | self-hosted jobs |
 |---|---|---|---|---|
@@ -436,23 +464,30 @@ each other**, and those three are exactly the three that queue heavily.
 Nothing here separates "this pipeline queues" from "three PRs were pushed at
 the same minute".
 
-Nor is there a clean control to compare against.  Taking each run's window as
-its start plus its wall clock, every one of the seven overlaps two or three
-others: the first three overlap each other, and the fourth overlaps the cluster
-it precedes.  That is a loose test: an overlapping run may have nothing
-executing.  Sampling each run's window at one-minute resolution, two of the
-seven spend 45 percent of it with no foreign job running at all, and the mean
-number running ranges from 3.2 to 6.0 across the seven.  So the runs are not
-uniformly contended -- but none is cleanly isolated either.
+Nor is there a clean control to compare against, and the sample cannot see most
+of the contention.  Taking each run's window as its start plus its wall clock,
+every one of the seven overlaps two or three *of the other six*: the first
+three overlap each other, and the fourth overlaps the cluster it precedes.
+Against the day's sixty-five `CI PR` runs the test gives five to sixteen
+overlapping runs each -- the same range whether a retried run is taken as one
+window or attempt by attempt -- so the in-sample count understates real
+concurrency several-fold, and it counts no other workflow at all.  That is also
+a loose test: an overlapping run may have nothing executing.  Sampling each
+run's window at one-minute resolution, two of the seven spend 45 percent of it
+with no job from the other six running, and the mean number of those running
+ranges from 3.2 to 6.0.  Read both as within-sample quantities.  So the runs
+are not uniformly contended -- and none is isolated, in the sample or outside
+it.
 
 What the sample does show is where the long waits sit.  Twelve jobs queued 1000
-s or more; the next longest wait in the sample is 892 s. Here is every one of
-them, with the run it belongs to and the number of runs in flight when it was
-created -- by the same start-plus-wall-clock window as above, but counting the
-job's own run.  This is an instantaneous count at one moment, so it does not
-line up with the whole-window overlaps quoted in the paragraph above:
+s or more; the next longest wait in the sample is 892 s.  Here is every one of
+them, with the run it belongs to and the number of *sampled* runs in flight
+when it was created -- by the same start-plus-wall-clock window as above, but
+counting the job's own run.  This is an instantaneous count at one moment, so
+it does not line up with the whole-window overlaps quoted in the paragraph
+above:
 
-| created | queue | in flight | run | job |
+| created | queue | sampled runs | run | job |
 |---|---|---|---|---|
 | 18:59:50 | 1145 s | 4 | 34514413925 | `Sanitizers / macos-latest / clang` |
 | 18:59:50 | 1202 s | 4 | 34514413925 | `Sanitizers / ubuntu-latest / gcc` |
@@ -467,18 +502,35 @@ line up with the whole-window overlaps quoted in the paragraph above:
 | 20:25:47 | 1645 s | 2 | 34514413925 | `TSan / ubuntu-latest / clang` |
 | 20:25:47 | 1979 s | 2 | 34514413925 | `TSan-native / ubuntu-latest / gcc` |
 
-They fall in an eighty-six minute span, and the in-flight column is printed so
-a reader can see that concurrency was not constant across it.  The table
+They fall in an eighty-six minute span.  The `sampled runs` column counts only
+the sampled seven, and over this span it does not merely undercount, it points
+the wrong way: across all sixty-five `CI PR` runs of the day the count at those
+five creation stamps is 7, 9, 11, 11, 12 against a sampled 4, 4, 3, 3, 2.  A
+run counts while any of its attempts is in flight, each attempt taking its own
+start and end, so a retried run counts during its attempts and not in the gaps
+between them.  That distinction is not academic here: one of the sixty-five was
+retried twice, and treating it as one window opening at its last attempt's
+start loses the two earlier attempts and undercounts the 19:22:00 stamp by one.
+Read the column as a property of the sample, never as concurrency.  The table
 locates the long waits; it does not explain them, and it cannot be pushed into
-explaining them.  Little of it is independent -- twelve rows, but five
-creation stamps and three runs, eight rows from one run -- and it is a
-threshold selection, so the groups it appears to form are shaped by the
-threshold as much as by anything in the pipeline.  Comparing those groups
-against each other supports no conclusion: on the full 126 jobs the same
-comparison points the other way, and that in turn is confounded with the time
-of day these three runs happened to land.  A sample that could apportion any
-of this would space the runs deliberately and record the queue depth at each
-job's creation; this one does neither.
+explaining them.  Little of it is independent -- twelve rows, but five creation
+stamps and three runs, eight rows from one run -- and it is a threshold
+selection, so the groups it appears to form are shaped by the threshold as much
+as by anything in the pipeline.  Comparing those groups against each other
+supports no conclusion: on the full 126 jobs the same comparison points the
+other way -- nearest-rank median queue delay is 384, 13, 10 and 3 s at four,
+three, two and one sampled runs in flight -- a count that sees six other runs
+at most, where the day had sixty-four.  The two ends of that gradient are drawn
+from disjoint sets of runs -- four in flight is only the three simultaneous
+runs, one in flight only the two that spend 45 percent of their window with no
+job from the other six running -- while the middle two groups draw on four and
+five runs each.  Within a run the direction is not even consistent: of the six
+runs that span more than one level, three follow it, one is flat, one inverts,
+and one runs 834, 415 and 1645 s (n = 10, 5 and 3) as its own concurrency
+falls.  So the comparison is confounded with run identity, since branch, head
+commit, self-hosted placement and the time of day all travel with the run.  A
+sample that could apportion any of this would space the runs deliberately and
+record the queue depth at each job's creation; this one does neither.
 
 Two of the seven sit on the same branch.  That matters for the cache argument
 below rather than for the timings: the GitHub Actions cache is branch-scoped,
@@ -489,25 +541,33 @@ are ordinary nearest-rank percentiles; the aggregate's per-cell columns are
 sample maxima instead, since every cell is far under the n = 20 threshold (1 to
 7 across all cells, 1 to 6 in the placement table below).
 
-The sample is not on hosted runners only, which #1570's scope line asks for. 96
-of the 126 jobs ran on GitHub-hosted runners and 30 on four self-hosted
-machines.  The labels in use do not control that split -- both pools answer to
-`ubuntu-latest` and `windows-latest` -- though the workflow could: self-hosted
-runners always carry an implicit `self-hosted` label, so `runs-on:
-[self-hosted, ubuntu-latest]` would pin jobs to that pool today.  Pinning the
-other way needs either a label the self-hosted machines do not answer, or for
-those machines to stop answering the bare labels.  No label in this sample is a
-candidate: the two that only ever reached hosted runners, `ubuntu-24.04-arm`
-and `macos-latest` at 14 of 14 jobs each, select a different OS or
-architecture, so they cannot stand in for `ubuntu-latest` on these jobs.  The
-capture could not settle it anyway -- it records the labels each job requested,
-not what each machine offers.  The split moves a single job's duration by as
-much as 3022 s of median wall time.  Nothing in this baseline ranks that
-against the other effects below.  No measurement compares them; they are not
-even the same kind of quantity -- a per-job median difference, a per-run path
-range, a share of summed execution -- and the placement gap's cause is not
-established at all. Read what follows as four separate measurements, not as a
-league table.
+The sample is not on hosted runners only, which #1570's acceptance asks for,
+and #1570 should not be read as having delivered that.  #1581 carries it:
+controlling the split is its first scope item, and its re-measurement pins one
+arm of each pair to the hosted pool, which is a hosted-only baseline.  It is
+not the same shape as the one published here: #1581 pairs on a single head
+commit where these medians and p95s spread over seven, it covers the eight job
+classes of its own table rather than all eighteen jobs a run carries, and its
+acceptance asks for the variance *after* the change where #1570 asks for a
+before-change baseline.  It answers the placement question rather than
+reproducing this distribution on hosted runners alone.  96 of the 126 jobs ran
+on GitHub-hosted runners and 30 on four self-hosted machines.  The labels in
+use do not control that split -- both pools answer to `ubuntu-latest` and
+`windows-latest` -- though the workflow could: self-hosted runners always carry
+an implicit `self-hosted` label, so `runs-on: [self-hosted, ubuntu-latest]`
+would pin jobs to that pool today.  Pinning the other way needs either a label
+the self-hosted machines do not answer, or for those machines to stop answering
+the bare labels.  No label in this sample is a candidate: the two that only
+ever reached hosted runners, `ubuntu-24.04-arm` and `macos-latest` at 14 of 14
+jobs each, select a different OS or architecture, so they cannot stand in for
+`ubuntu-latest` on these jobs.  The capture could not settle it anyway -- it
+records the labels each job requested, not what each machine offers.  The split
+moves a single job's duration by as much as 3022 s of median wall time.
+Nothing in this baseline ranks that against the other effects below.  No
+measurement compares them; they are not even the same kind of quantity -- a
+per-job median difference, a per-run path range, a share of summed execution --
+and the placement gap's cause is not established at all.  Read what follows as
+four separate measurements, not as a league table.
 
 **How long a PR waits.**
 
@@ -515,13 +575,27 @@ league table.
 |---|---|---|---|
 | `run_wall_clock` | 7 | 7414 s | 10366 s |
 | `pr_feedback` | 7 | 7414 s | 10366 s |
+| `first_failure_latency` | 0 | unavailable | unavailable |
 | `total_required_check_completion` | 0 | unavailable | unavailable |
 
-`total_required_check_completion` is unavailable, not zero: this repository has
-no `required_status_checks` rule, in either ruleset (13129249, 13670289), and
-`branches/main/protection` answers 404.  The report records `pr_feedback` as
-the surrogate and says so.  Any later comparison against a repository that does
-pin required checks must not treat these two as the same measurement.
+Both `unavailable` rows are unavailable rather than zero, for different
+reasons.  `total_required_check_completion`: this repository has no
+`required_status_checks` rule in any of its three rulesets -- 13129249 and
+13670289 are active and carry none, 19420631 is disabled and carries only a
+Copilot review rule -- and `branches/main/protection` answers 404.  The report
+records `pr_feedback` as the surrogate and says so.  Any later comparison
+against a repository that does pin required checks must not treat these two as
+the same measurement.
+
+`first_failure_latency`: all seven runs succeeded, so there is no first failure
+to time.  #1570's acceptance asks for this figure, and #1570 should not be read
+as having delivered it; this sample cannot supply it -- the runs were chosen
+successful on purpose, because a failure truncates the graph and its critical
+path measures a different thing.  Getting it needs a second sample of failed
+runs, read for this metric alone.  Both #1573 and #1574 need this figure for
+their own before-and-after comparisons, so both will produce one.  Neither
+covers publishing it as part of *this* baseline, which is what #1583 item 23
+carries.
 
 **Where the time goes.**  Across all 126 jobs:
 
@@ -567,8 +641,8 @@ but they are not simply the two worst: a run that still terminated at the
 Windows build queued 1855 s.  Heavy queueing does not by itself move where the
 path ends.
 
-**Execution time dominates, and compilation dominates execution.** Phase totals
-summed over all 126 jobs:
+**Execution time dominates, and compilation dominates execution.**  Phase
+totals summed over all 126 jobs:
 
 | phase | seconds | share of `job_wall` |
 |---|---|---|
@@ -588,12 +662,14 @@ run, but on its own that would prove less than it looks: the three
 The 4 seconds is the claim that carries.
 
 **The same job's duration differs by 2.4x to 4.5x between the two runner
-pools.**  Both the GitHub-hosted pool and four self-hosted machines answer to
-the plain `ubuntu-latest` and `windows-latest` labels -- three of the four
-machines to `ubuntu-latest` and one to `windows-latest`, none to both -- so the
-same job lands on either pool from run to run and nothing in the workflow
-chooses.  The eight jobs below are the compile-heavy ones; four shorter jobs go
-the other way and are named after the table.
+pools.**  Both the GitHub-hosted pool and the self-hosted pool of four machines
+answer the plain `ubuntu-latest` and `windows-latest` labels, so the same job
+lands on either pool from run to run and nothing in the workflow chooses.
+Three of the four machines served only `ubuntu-latest` jobs here and one served
+only `windows-latest`, and none served both -- but that is what they were sent,
+not what they offer, and the `windows-latest` machine rests on n = 2.  The
+eight jobs below are the compile-heavy ones; four shorter jobs go the other way
+and are named after the table.
 
 | job | hosted n/median | self-hosted n/median | ratio |
 |---|---|---|---|
@@ -615,19 +691,23 @@ uncrustify check`, `RC changelog freeze gate` and `Detect build-triggering
 changes` are slower self-hosted, which is fixed startup overhead on a job that
 does almost no work.
 
-Four things bound how hard these ratios can be pushed.  Sample sizes per cell
+Five things bound how hard these ratios can be pushed.  Sample sizes per cell
 are 1 to 6 here, though the aggregate's other cells reach 7.  The two sides of
 a cell come from different head commits, and two of the seven runs from one
 branch, since each run contributed whichever placement it happened to get.
-Self-hosted placement is far from uniform: the seven runs took 0, 2, 3, 6, 6, 6
-and 7 of their eighteen jobs self-hosted.  And six of these eight self-hosted
-cells pool more than one machine -- the aggregate flags them for exactly this
-reason, `yes` in its `mixed machines` column and `"mixed_machines": true` in
-its JSON, since those machines are not interchangeable.  Two rows are worse
-than flagged: `Build / ubuntu-latest / clang` and `mbedtls-enabled /
-ubuntu-latest / gcc` each have n = 2 spanning two machines, so each self-hosted
-median is one machine's single sample.  Treat the ratios as an order of
-magnitude, not a calibration.
+Self-hosted placement is far from uniform: the seven runs took 0, 2, 3, 6, 6,
+6 and 7 of their eighteen jobs self-hosted.  And six of these eight
+self-hosted cells pool more than one machine -- the aggregate flags them for
+exactly this reason, `yes` in its `mixed machines` column and
+`"mixed_machines": true` in its JSON, since those machines are not
+interchangeable.  Two rows are worse than flagged: `Build / ubuntu-latest /
+clang` and `mbedtls-enabled / ubuntu-latest / gcc` each have n = 2 spanning
+two machines, so each self-hosted median is one machine's single sample.  And
+every one of the 126 jobs is from a single day, so hosted throughput -- the
+one side of every ratio outside this repository's control -- varies however it
+varied that day, unmeasured and uncontrolled.  #1581's paired same-commit
+design does not remove that bound; it holds it deliberately instead of by
+accident.  Treat the ratios as an order of magnitude, not a calibration.
 
 **The cause is not established, and the obvious mechanism for it is not.**  A
 warm compiler cache would land exactly where this gap is, and nothing here
@@ -637,11 +717,13 @@ workflow level and each compiling job runs a `Setup sccache` step, so both
 pools route through the same GitHub Actions cache backend rather than through
 anything local to a machine.  Nothing in this measurement bounds how much of
 the gap is cache behaviour and how much is machine throughput -- it could be
-all of one.  Deciding needs the per-run cache hit rate, which lives in the job
-log and which this tool does not read. That is gap 1 below, and it is the same
-signal #1571 is chasing.
+all of one.  The per-run cache hit rate would bound it, and it lives in the
+job log this tool does not read -- that is gap 1 below, filed as #1580, and it
+is the same signal #1571 is chasing.  It is not the only route: running one
+commit through both pools would separate them without any log, which is
+what #1581 proposes.
 
-**Clock skew.**  22 `runner_clock_skew` anomalies across the seven runs. The
+**Clock skew.**  22 `runner_clock_skew` anomalies across the seven runs.  The
 split is by machine rather than by pool: 20 of the 22 are the two
 `semantic-reasoning-i401-6*` machines, consistently 8 to 9 seconds behind
 GitHub's clock, and the other two are one hosted runner and one self-hosted
@@ -685,24 +767,25 @@ lever sized against the wrong one is mis-sized.
   reading and the second the optimistic one, and neither is a promise: both
   assume the terminal job stays terminal.
 
-  Three different chains produce those numbers.  Five runs end at `Build /
-  windows-latest / msvc`, which `build-matrix` reaches only after `build-arm`
-  and `build-mbedtls`, both of which need `build-primary`, which needs `lint`,
-  which needs `rc-changelog-freeze` -- four of those runs enter through
-  `build-mbedtls` and one through `build-arm`.  The other two end at `TSan /
-  ubuntu-latest / clang`, where `tsan` needs `sanitizer-matrix` and
-  `sanitizer-matrix` needs `lint`.  Every build and sanitizer job named here
-  also needs `build-scope`; `lint` needs only `rc-changelog-freeze`.  Every
-  observed chain in the baseline starts at `rc-changelog-freeze` because the
-  walk enters through `lint`, and `rc-changelog-freeze` behind it is a root --
-  `build-scope` is a root too, so rootness alone does not pick the branch.
+  Three different chains produce those numbers, as `ci-pr.yml` stands today.
+  Five runs end at `Build / windows-latest / msvc`, which `build-matrix`
+  reaches only after `build-arm` and `build-mbedtls`, both of which need
+  `build-primary`, which needs `lint`, which needs `rc-changelog-freeze` --
+  four of those runs enter through `build-mbedtls` and one through `build-arm`.
+  The other two end at `TSan / ubuntu-latest / clang`, where `tsan` needs
+  `sanitizer-matrix` and `sanitizer-matrix` needs `lint`.  Every build and
+  sanitizer job named here also needs `build-scope`; `lint` needs only
+  `rc-changelog-freeze`.  Every observed chain in the baseline starts at
+  `rc-changelog-freeze` because the walk enters through `lint`, and
+  `rc-changelog-freeze` behind it is a root -- `build-scope` is a root too, so
+  rootness alone does not pick the branch.
 
   The chains do not sort the figures cleanly.  The two TSan runs rank fifth and
   seventh of seven in both series -- a `build-mbedtls` run sits between them in
   each, at a conservative 3566 s and an optimistic 4560 s -- and in the
   conservative series a single Sanitizers job is almost the whole figure for
-  each: 3252 s of 3293, and 3861 s of 3904. The two went through different legs
-  of the matrix, the gcc and the clang sanitizer job respectively.  The
+  each: 3252 s of 3293, and 3861 s of 3904.  The two went through different
+  legs of the matrix, the gcc and the clang sanitizer job respectively.  The
   conservative minimum, 1675 s, is the one run that entered through
   `build-arm`, on a 681 s hop where the four `build-mbedtls` runs carry 1483,
   2268, 2272 and 2434 s.
@@ -725,93 +808,153 @@ lever sized against the wrong one is mis-sized.
   Reordering does not reduce total compile seconds.  It changes how many of
   them are serialized on the path, which is the 50 to 84 percent above, not the
   87.
-- **Runner placement**, which no open issue owned before this
-  measurement: 2.4x to 4.5x on the same job, up to 3022 s of median difference
-  on `Build / windows-latest / msvc`.  Its cause is not established -- see the
-  cache confound above -- so this is a variance worth removing before other
-  measurements are taken, ahead of being a lever worth pulling.
+- **Runner placement**, which no open issue owned before this measurement and
+  which #1581 owns now: 2.4x to 4.5x on the same job, up to 3022 s of median
+  difference on `Build / windows-latest / msvc`.  Its cause is not established
+  -- see the cache confound above -- so this is a variance worth removing
+  before other measurements are taken, ahead of being a lever worth pulling.
 - **Queueing** is a tail, not a median: 12 s on a good run, 4853 s on a
   bad one.  Whether the tail is the pipeline or the three concurrent runs that
   produced it is exactly what this sample cannot say.
-- **#1571 (compiler cache) and #1572 (duplicate test compilation)** act
-  on compile time, which dominates by either denominator: 87 percent of summed
-  execution, a median 72 percent of the observed path.  #1571 is also the issue
-  that would settle the placement question.
+- **#1571 (compiler cache) and #1572 (duplicate test compilation)** act on
+  compile time, which dominates by either denominator: 87 percent of summed
+  execution, a median 72 percent of the observed path.  Neither settles the
+  placement question.  #1580 would supply the per-run hit rate and #1571 a
+  cache-disabled control, but #1571's own controls compare "equivalent
+  SHA/compiler/runner/configuration", holding the runner constant -- the one
+  comparison that cannot separate the two pools.  #1581 owns that question and
+  settles it by running the same commit through both pools, which needs
+  neither of them.
 
   That is a direction for #1572, not a size.  This tool attributes compile
   seconds per job; nothing in the job and step API says *which* translation
-  units a job compiled, so the share of those seconds that is duplicated across
-  jobs cannot be derived from this capture at all. Sizing #1572 needs a
-  build-level instrument.  See gap 2 below.
-- **#1573 (binary-size gate).**  `Check binary size` ran once per run, on
-  `Build / ubuntu-latest / gcc`, and took under a second every time, so the
-  gate costs nothing to run.  Its cost is where it sits: step 12 of 16, entered
-  6 to 21 minutes into its job (391 to 1251 s, median 948 -- a job stamp
-  subtracted from a step stamp, so it crosses the two clocks, immaterial at
-  this size), which is 126 to 277 s after the `Build` step it guards has
-  finished (median 158).  Five steps separate them -- `Test`, then a clang-tidy
-  install and the tidy ratchet gate, then a syft install and the SBOM gate --
-  and the tidy pair, which the size check has nothing to do with, is the larger
-  contributor in four of the seven runs. So moving the gate up would cut about
-  two to four and a half minutes from the wait for a size verdict, not the
-  six-to-twenty-one the job offset suggests; most of that offset is the compile
-  itself -- 55 to 84 percent of it in six of the seven runs, and just under
-  half in the seventh.  On a passing run that buys nothing: the gate takes
-  under a second either way.  What it buys is failure-signal latency on a run
-  where the gate fails, which is what #1573 is about.
+  units a job compiled, so the share of those seconds that is duplicated --
+  which for #1572 is repeated work inside one build, not work repeated across
+  jobs -- cannot be derived from this capture at all.  Sizing #1572 needs a
+  build-level instrument.  See gap 3 below.
+- **#1573 (early size failure, and specialized builds scoped to their
+  contracts).**  The measurement speaks to both halves, in different terms: the
+  first it sizes only in part, the second it only locates.  `Check binary size`
+  ran once per run, on `Build / ubuntu-latest / gcc`, and took under a second
+  every time, so the gate costs nothing to run on a run where everything before
+  it passed -- which all seven were.  What it costs where an earlier gate
+  fails, the case #1573's first half exists for, has no observations here.  Its
+  cost is where it sits: step 12 of 16, entered 6 to 21 minutes into its job
+  (391 to 1251 s, median 948 -- a job stamp subtracted from a step stamp, so it
+  crosses the two clocks, immaterial at this size), which is 126 to 277 s after
+  the `Build` step it guards has finished (median 158).  Five steps separate
+  them -- `Test`, then a clang-tidy install and the tidy ratchet gate, then a
+  syft install and the SBOM gate -- and the tidy pair, which the size check has
+  nothing to do with, is the larger contributor in four of the seven runs.
+  Moving the gate up past those five alone would cut about two to four and a
+  half minutes from the wait for a size verdict.  #1573 proposes more than
+  that: building the production shared-library target first puts the gate ahead
+  of the compile as well, and the compile is 195 to 1042 s of the same offset
+  -- 55 to 84 percent of it in six of the seven runs, and just under half in
+  the seventh.  The sample brackets that larger saving without locating it: the
+  shared-library build is somewhere between nothing and the whole compile, so
+  the saving is at least the gap and at most the gap plus the compile -- 126 to
+  277 s at the low end, 347 to 1222 s at the high end, per run.  Narrowing it
+  needs an observation this sample does not contain, because `Build` here is an
+  unrestricted `meson compile`, the whole default target set, never the
+  shared-library target alone.  On a passing run that buys nothing: the gate
+  takes under a second either way.  What it buys is failure-signal latency on a
+  run where the gate fails, which is the first half of #1573.
   `first_failure_latency` does not measure this interval: it runs from the
   run's start to the failing *job's* completion.  `failed_steps` is what names
   the step.
 
+  The second half -- scoping the mbedTLS and native-TSan builds to their
+  documented contracts -- is what the evidence below speaks to.  That evidence
+  appears under #1574 above as well, only because that is where the critical
+  path is discussed.  `mbedtls-enabled / ubuntu-latest / gcc` sits on the
+  observed chain in four of the seven runs, carrying 1483, 2268, 2272 and 2434
+  s, and it is the 3.7x row of the placement table.  A job that runs the full
+  default build to validate a narrower contract is paying that on the critical
+  path.  `TSan-native / ubuntu-latest / gcc` sits on no observed chain in this
+  baseline, so what the measurement lacks for the native-TSan half is
+  critical-path presence rather than cost: it has a measured wall, median 1320
+  s hosted over n = 4 against 433 s self-hosted over n = 3, and a share of the
+  87 percent.  And it does not show how much of the mbedTLS cost the
+  contract actually needs -- that is a build-level question, the same one gap 3
+  raises for #1572.
+
 ## Known gaps
 
-The first two are things this tool cannot measure: one is a scope line of
-#1570 it does not deliver, the other is a question #1572 will ask that
-the job and step API cannot answer.  The third is a defect: on a run that
-triggers it the tool publishes a wrong number as final, with nothing in the
-artefact saying so.  It does not fire on `ci-pr.yml` as it stands, because no
-two jobs in it share a name, and it is listed rather than fixed here so that
-the fix is reviewed on its own.  The rest are limits that would mislead on some
-run other than the ones the baseline above was taken from.  A follow-up issue
-carries all of them together with the internal ones this list omits.
+The first two entries cover three #1570 scope lines this branch does not meet:
+one is a measurement the job and step API cannot yield at all, the others are
+delivery rather than measurement -- the numbers exist, but not where the issue
+says they should appear.  The third entry is not a #1570 criterion at all; it
+is the question #1572 will ask, which this capture cannot answer either.  One
+of #1570's acceptance bullets also goes unmet in two of its three asks, and
+they are recorded where their numbers are, under "Measured baseline": the
+hosted-only sample and first-failure latency.  Its remaining ask, median and
+p95 with sample-size limitations, is delivered.  A second bullet is short
+rather than absent -- "Reproducing the baseline" below records that six of the
+seven baseline tables are derived by hand -- from the per-run JSON, except the
+long-wait table's `sampled runs` column, which is not in those files either --
+and that the seventh is only partly machine-generated, which #1583 item 17
+carries.  Gap 4 below is where a third bullet, "Failed runs preserve useful
+timing evidence; missing telemetry never silently represents successful
+validation", is half unmet: the first clause holds, but on a run that triggers
+gap 4 the tool publishes a wrong number as final, with nothing in the artefact
+saying so.  It does not fire on `ci-pr.yml` as it stands, because no two jobs
+in it share a name, and it is listed rather than fixed here so that the fix is
+reviewed on its own.  Gaps 5 to 9 are limits that would mislead on some run
+other than the ones the baseline above was taken from.  #1582 carries the
+defect and the two limits that sit in the same walkers, #1583 the remaining
+three.  Internal items this list omits go to both: #1582 takes the two named at
+the `pr_feedback` limit and the required-checks metric, #1583 the rest.  This
+accounting is not claimed to be exhaustive; of everything in this document it
+is the part most likely to be incomplete.
 
 1. **Slow tests and cold/warm cache context are not captured.**  #1570's
    scope asks for them.  Both need job logs, and this tool deliberately reads
    only the job and step API, which bounds its request count and keeps it
-   offline after `fetch`.  Filed as a follow-up; #1570 should not be read as
-   having delivered this.
-2. **Duplicated compilation is not visible.**  Compile seconds are
-   attributed per job, but the API names no translation units, so nothing here
-   separates work done twice from work done once.  #1572 gets a direction from
-   this baseline and no size, and no capture this tool can take will supply
-   one.
-3. **Defect.**  Two jobs with the same name in one run collapse in the
+   offline after `fetch`.  Filed as #1580; #1570 should not be read as having
+   delivered this.
+2. **The report reaches an operator, not the pull request author.**  #1570
+   asks for two things this tool produces but does not deliver:
+   machine-readable timing published with a concise job summary, and reports
+   preserved after failures.  Both exist for someone who runs the script by
+   hand.  Neither reaches a pull request author, because the tool is wired
+   into no workflow.  #1577 carries the `workflow_run` publication path;
+   until it closes, #1570 should not be read as having delivered those two
+   criteria either.
+3. **Duplicated compilation is not visible.**  Compile seconds are attributed
+   per job, but the API names no translation units, so nothing here separates
+   work done twice from work done once.  #1572 gets a direction from this
+   baseline and no size, and no capture this tool can take will supply one.
+4. **Defect.**  Two jobs with the same name in one run collapse in the
    per-name index and produce no drift entry.  This also defeats the run-wide
    rule in "Critical paths" above: an untimed job whose name is shared with a
    timed one is filtered out as though it were on the chain, and the total is
    published as final.
-4. An untimed node weighs zero while the graph walk is *choosing* a
+5. An untimed node weighs zero while the graph walk is *choosing* a
    chain, so the reported chain can be the wrong one.  The tool says so rather
    than fixing it.  The same is true of an unusable edge weight, and only
    on-chain unusable edges are reported.
-5. A per-edge release latency uses the dependent's single value for
+6. A per-edge release latency uses the dependent's single value for
    every incoming edge, which understates when the path enters through an
    earlier-finishing dependency.
-6. An unreadable `--workflow` leaves the critical path reporting "no
+7. An unreadable `--workflow` leaves the critical path reporting "no
    dependency graph was supplied", which is true of what reached the walker but
    not of what the operator passed.  The distinction survives only on stderr.
    Relatedly, a graph that *was* supplied and resolved to no jobs is reported
    correctly by the critical path and incorrectly by each job's release
    latency, because the two derive the fact differently.
-7. `upstream_elapsed` is pooled into every aggregate cell and printed by
+8. `upstream_elapsed` is pooled into every aggregate cell and printed by
    neither report.  It also influences which aggregate rows are suppressed.
-8. The explanation block groups by status and reason across the whole run,
+9. The explanation block groups by status and reason across the whole run,
    not per job, so how it scales depends on the reason.  One confined to a
    single column collapses to a single counted line once more than three
    entries share it, and is itemized below that; one spanning several columns
    is itemized however many there are, because a count there would name
-   neither the job nor the number.  A run where every job is degraded several
-   ways is therefore several lines per job -- bounded and linear, but long.
+   neither the job nor the number.  A run whose reasons span several columns
+   is therefore several lines per job -- bounded and linear, but long.
+   Reasons confined to one column, which is the common case, collapse
+   instead: the baseline's `run-34477686557.md` reports `configure` on five
+   jobs in a single line.
 
 ## Reproducing the baseline
 
@@ -838,15 +981,18 @@ Two things that sequence does not do for you.
 
 `aggregate` pools per-job cells only, over `queue_delay`, `job_wall` and
 `upstream_elapsed`.  It emits no run-level statistics, no phase pooling and no
-`sum` column anywhere.  So of the tables above only the runner-placement one
-falls out of `success-7.md`, and even there the compile ratios beside it do
-not; the sample, run-level, job-lifetime, critical-path and phase tables are
-all derived from the seven `run-{id}.json` files by hand.
+`sum` column anywhere.  So of the seven baseline tables only the runner
+placement one falls out of `success-7.md`, and only its `n` and median columns
+do; the `ratio` column beside them and the compile ratios below it are derived
+by hand.  The other six -- sample, long-wait, run-level, job-lifetime,
+critical-path and phase -- are derived from the seven `run-{id}.json` files by
+hand, and the long-wait table's `sampled runs` column is not in those files
+either: it is cross-run window arithmetic the tool never emits.
 
 `report` reads the dependency graph from the **working tree's** `ci-pr.yml`,
 not from each run's head commit, and the seven runs sit at seven different
 commits.  The numbers above were produced against `ci-pr.yml` as of this
-commit.  Re-running `report` over the same `raw/` after #1574 changes the graph
+commit.  Re-running `report` over the same `raw/` if #1574 changes the graph
 will yield different critical-path figures for the same runs, signalled only by
 `graph_drift` and only where a name actually moved.  Pass `--workflow` with the
 file as of the run's commit to compare like with like.
@@ -859,6 +1005,6 @@ python3 scripts/ci/test-ci-run-telemetry.py          # same tests, directly
 ```
 
 The fixtures under `scripts/ci/ci-telemetry-fixtures/` are trimmed captures of
-real runs -- a success, a skip cascade, a clock-skewed run -- plus hand-written
-queued, missing-data and re-run cases.  The self-test uses no network, no `gh`
-and no build directory.
+real runs -- a success, a skip cascade, which is also the failed-run case, and
+a clock-skewed run -- plus hand-written queued, missing-data and re-run cases.
+The self-test uses no network, no `gh` and no build directory.
