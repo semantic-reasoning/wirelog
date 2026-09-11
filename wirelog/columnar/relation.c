@@ -3855,10 +3855,30 @@ insertion:
 int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 {
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    bool alias_release_pending = false;
+    int rc;
+
     if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
         return EINVAL;
     if (nrows <= 1)
         return 0;
+
+    /* Sorting rewrites every column in the selected range and publishes a
+     * view epoch.  Hold canonical-owner admission over the entire COW,
+     * permutation, and publication transaction so readers cannot observe a
+     * partially reordered relation. */
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_source_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    if (r == owner && owner->storage_alias_borrows > 0) {
+        rc = EBUSY;
+        goto release_writer;
+    }
 
     int64_t **old_columns = NULL;
     bool *old_shared = NULL;
@@ -3873,7 +3893,8 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         if (!old_columns || !old_shared) {
             free((void *)old_columns);
             free(old_shared);
-            return ENOMEM;
+            rc = ENOMEM;
+            goto release_writer;
         }
         memcpy((void *)old_columns, (const void *)r->columns,
             (size_t)r->ncols * sizeof(*old_columns));
@@ -3882,14 +3903,16 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         ledger_before = col_rel_owned_ledger_bytes(r);
         old_view = r->view_generation;
         old_storage = r->storage_generation;
-        if (col_rel_cow_unshare(r, 0) != 0) {
+        if (col_rel_cow_unshare_impl(r, 0, true) != 0) {
             free((void *)old_columns);
             free(old_shared);
-            return ENOMEM;
+            rc = ENOMEM;
+            goto release_writer;
         }
+        alias_release_pending = true;
     }
 
-    int rc = col_rel_radix_sort_raw(r, start_row, nrows);
+    rc = col_rel_radix_sort_raw(r, start_row, nrows);
     if (rc != 0 && borrowed) {
         for (uint32_t c = 0; c < r->ncols; c++) {
             int64_t *current = NULL;
@@ -3911,9 +3934,18 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         /* The detach was rolled back; its storage epoch goes with it. */
         r->view_generation = old_view;
         r->storage_generation = old_storage;
+        alias_release_pending = false;
+    }
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(r);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
     }
     free((void *)old_columns);
     free(old_shared);
+release_writer:
+    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
     return rc;
 }
 
@@ -3928,20 +3960,20 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
  * Sets r->sorted_nrows = r->nrows on completion.
  * Falls back to insertion sort on allocation failure.
  */
-void
+int
 col_rel_radix_sort_int64(col_rel_t *r)
 {
     if (!r || r->ncols == 0) {
         if (r)
             r->sorted_nrows = r->nrows;
-        return;
+        return 0;
     }
     if (r->nrows <= 1) {
         r->sorted_nrows = r->nrows;
-        return;
+        return 0;
     }
     if (r->ncols == 0)
-        return;
+        return 0;
 
     /* col_rel_radix_sort() detaches a shared view itself (through the
      * admitted col_rel_cow_unshare) and rolls the detach back if the sort
@@ -3949,4 +3981,5 @@ col_rel_radix_sort_int64(col_rel_t *r)
     int rc = col_rel_radix_sort(r, 0, r->nrows);
     if (rc == 0)
         r->sorted_nrows = r->nrows;
+    return rc;
 }

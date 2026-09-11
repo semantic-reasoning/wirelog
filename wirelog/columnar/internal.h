@@ -2199,7 +2199,7 @@ int col_rel_set(col_rel_t *, uint32_t row, uint32_t col, int64_t val);
 /* Test seam for the non-wrapping relation identity allocator. */
 int
 col_rel_test_set_next_identity(uint64_t next);
-void
+int
 col_rel_radix_sort_int64(col_rel_t *r);
 
 /** Stable LSD radix sort of a row-major int64_t buffer by a single key
