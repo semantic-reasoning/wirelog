@@ -25,6 +25,7 @@
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +92,35 @@ build_plan(const char *src)
     }
     plan_fixture_hold(prog);
     return plan;
+}
+
+typedef struct {
+    uint32_t count;
+    int32_t diff;
+    int64_t value;
+} compact_delta_collector_t;
+
+static void
+collect_compact_delta(const char *relation, const int64_t *row,
+    uint32_t ncols, int32_t diff, void *user_data)
+{
+    compact_delta_collector_t *collector = user_data;
+
+    if (strcmp(relation, "r") != 0 || ncols != 1)
+        return;
+    collector->count++;
+    collector->diff = diff;
+    collector->value = row[0];
+}
+
+static col_rel_t *
+find_session_relation(wl_col_session_t *sess, const char *name)
+{
+    for (uint32_t i = 0; i < sess->nrels; i++) {
+        if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0)
+            return sess->rels[i];
+    }
+    return NULL;
 }
 
 /* ======================================================================== */
@@ -681,6 +711,257 @@ test_relation_ledger_lifecycle(void)
     return 0;
 }
 
+/* Issue #1495: compaction must exclude readers and live owner aliases before
+ * it can free or replace relation storage. */
+static int
+test_compact_source_exclusion(void)
+{
+    TEST("compaction source exclusion and retry");
+
+    col_rel_t *rel = col_rel_new_auto("compact_exclusion", 1);
+    if (!rel) {
+        FAIL("relation allocation failed");
+        return 1;
+    }
+    for (uint32_t i = 0; i < 65; i++) {
+        int64_t row = (int64_t)i;
+        if (col_rel_append_row(rel, &row) != 0) {
+            FAIL("relation growth failed");
+            col_rel_destroy(rel);
+            return 1;
+        }
+    }
+    rel->nrows = 1;
+    int64_t *columns_before = rel->columns[0];
+    uint32_t capacity_before = rel->capacity;
+    uint64_t generation_before = rel->storage_generation;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    if (col_rel_source_reader_acquire(rel, &reader) != 0
+        || col_rel_compact(rel) != EBUSY
+        || rel->columns[0] != columns_before
+        || rel->capacity != capacity_before
+        || rel->nrows != 1
+        || rel->storage_generation != generation_before) {
+        FAIL("reader-blocked non-empty compaction changed relation state");
+        (void)col_rel_source_reader_release(&reader);
+        col_rel_destroy(rel);
+        return 1;
+    }
+    if (col_rel_source_reader_release(&reader) != 0
+        || col_rel_compact(rel) != 0
+        || rel->capacity >= capacity_before) {
+        FAIL("compaction did not succeed after reader release");
+        col_rel_destroy(rel);
+        return 1;
+    }
+
+    rel->nrows = 0;
+    columns_before = rel->columns[0];
+    capacity_before = rel->capacity;
+    generation_before = rel->storage_generation;
+    if (col_rel_source_reader_acquire(rel, &reader) != 0
+        || col_rel_compact(rel) != EBUSY
+        || rel->columns[0] != columns_before
+        || rel->capacity != capacity_before
+        || rel->nrows != 0
+        || rel->storage_generation != generation_before) {
+        FAIL("reader-blocked empty compaction changed relation state");
+        (void)col_rel_source_reader_release(&reader);
+        col_rel_destroy(rel);
+        return 1;
+    }
+    if (col_rel_source_reader_release(&reader) != 0
+        || col_rel_compact(rel) != 0
+        || rel->columns != NULL || rel->capacity != 0) {
+        FAIL("empty compaction did not succeed after reader release");
+        col_rel_destroy(rel);
+        return 1;
+    }
+    col_rel_destroy(rel);
+
+    col_rel_t *owner = col_rel_new_auto("compact_owner", 1);
+    col_rel_t *alias = col_rel_new_auto("compact_alias", 1);
+    if (!owner || !alias) {
+        FAIL("alias relation allocation failed");
+        col_rel_destroy(owner);
+        col_rel_destroy(alias);
+        return 1;
+    }
+    int64_t value = 7;
+    if (col_rel_append_row(owner, &value) != 0
+        || col_rel_install_shared_view(alias, owner) != 0) {
+        FAIL("shared-view setup failed");
+        col_rel_destroy(alias);
+        col_rel_destroy(owner);
+        return 1;
+    }
+    columns_before = owner->columns[0];
+    generation_before = owner->storage_generation;
+    if (col_rel_compact(owner) != EBUSY
+        || owner->columns[0] != columns_before
+        || owner->storage_generation != generation_before
+        || owner->storage_alias_borrows != 1) {
+        FAIL("owner compaction ignored a live alias");
+        col_rel_destroy(alias);
+        col_rel_destroy(owner);
+        return 1;
+    }
+    col_rel_destroy(alias);
+    col_rel_destroy(owner);
+
+    col_rel_t *first = col_rel_new_auto("compact_first", 1);
+    col_rel_t *second = col_rel_new_auto("compact_second", 1);
+    if (!first || !second) {
+        FAIL("batch relation allocation failed");
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+        return 1;
+    }
+    for (uint32_t i = 0; i < 65; i++) {
+        int64_t row = (int64_t)i;
+        if (col_rel_append_row(first, &row) != 0
+            || col_rel_append_row(second, &row) != 0) {
+            FAIL("batch relation growth failed");
+            col_rel_destroy(first);
+            col_rel_destroy(second);
+            return 1;
+        }
+    }
+    first->nrows = 1;
+    second->nrows = 1;
+    col_rel_t *batch[] = { first, second };
+    int64_t *first_columns_before = first->columns[0];
+    uint32_t first_capacity_before = first->capacity;
+    if (col_rel_source_reader_acquire(second, &reader) != 0
+        || col_rel_compact_many(batch, 2) != EBUSY
+        || first->columns[0] != first_columns_before
+        || first->capacity != first_capacity_before) {
+        FAIL("batch compaction partially applied before EBUSY");
+        (void)col_rel_source_reader_release(&reader);
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+        return 1;
+    }
+    if (col_rel_source_reader_release(&reader) != 0
+        || col_rel_compact_many(batch, 2) != 0
+        || first->capacity >= first_capacity_before) {
+        FAIL("batch compaction retry failed");
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+        return 1;
+    }
+    col_rel_destroy(first);
+    col_rel_destroy(second);
+
+    PASS();
+    return 0;
+}
+
+/* Issue #1495: a reader-blocked compaction occurs after evaluation but before
+ * staged delta publication and retraction cleanup.  Retrying must publish the
+ * staged insertion delta exactly once and complete pending retraction cleanup. */
+static int
+test_session_compaction_reader_retry(void)
+{
+    TEST("session compaction reader retry preserves staged delta");
+
+    wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    wl_session_t *session = NULL;
+    compact_delta_collector_t collector = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool reader_acquired = false;
+    int rc = 0;
+
+    if (!plan || wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) != 0 || !session) {
+        FAIL("session setup failed");
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        return 1;
+    }
+    wl_session_set_delta_cb(session, collect_compact_delta, &collector);
+
+    int64_t value = 42;
+    if (wl_session_insert(session, "a", &value, 1, 1) != 0) {
+        FAIL("incremental insertion setup failed");
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        return 1;
+    }
+    wl_col_session_t *sess = (wl_col_session_t *)session;
+    col_rel_t *a_rel = find_session_relation(sess, "a");
+    if (!a_rel || col_rel_source_reader_acquire(a_rel, &reader) != 0) {
+        FAIL("source reader acquisition failed");
+        wl_session_destroy(session);
+        wl_plan_free(plan);
+        return 1;
+    }
+    reader_acquired = true;
+
+    rc = wl_session_step(session);
+    if (rc != EBUSY || collector.count != 0 || !sess->pending_input_change
+        || !sess->last_inserted_relation) {
+        FAIL("reader-blocked step published or committed retry state");
+        goto cleanup;
+    }
+    if (col_rel_source_reader_release(&reader) != 0) {
+        FAIL("source reader release failed");
+        goto cleanup;
+    }
+    reader_acquired = false;
+
+    rc = wl_session_step(session);
+    if (rc != 0 || collector.count != 1 || collector.diff != 1
+        || collector.value != value || sess->pending_input_change
+        || sess->last_inserted_relation) {
+        FAIL("retry did not publish one staged delta exactly once");
+        goto cleanup;
+    }
+
+    collector.count = 0;
+    if (wl_session_remove(session, "a", &value, 1, 1) != 0) {
+        FAIL("incremental removal setup failed");
+        goto cleanup;
+    }
+    if (col_rel_source_reader_acquire(a_rel, &reader) != 0) {
+        FAIL("retraction source reader acquisition failed");
+        goto cleanup;
+    }
+    reader_acquired = true;
+    rc = wl_session_step(session);
+    if (rc != EBUSY || collector.count != 0 || !sess->pending_input_change
+        || !sess->last_removed_relation || !sess->retraction_seeded
+        || !find_session_relation(sess, "$r$a")) {
+        FAIL("reader-blocked retraction committed retry state");
+        goto cleanup;
+    }
+    if (col_rel_source_reader_release(&reader) != 0) {
+        FAIL("retraction source reader release failed");
+        goto cleanup;
+    }
+    reader_acquired = false;
+    rc = wl_session_step(session);
+    if (rc != 0 || sess->pending_input_change || sess->last_removed_relation
+        || sess->retraction_seeded || find_session_relation(sess, "$r$a")) {
+        FAIL("retraction retry did not clear pending cleanup state");
+        goto cleanup;
+    }
+
+    PASS();
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    return 0;
+
+cleanup:
+    if (reader_acquired)
+        (void)col_rel_source_reader_release(&reader);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    return 1;
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -697,6 +978,8 @@ main(void)
     test_compact_empty_relation();
     test_compact_insert_retract_cycle();
     test_relation_ledger_lifecycle();
+    test_compact_source_exclusion();
+    test_session_compaction_reader_retry();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);
