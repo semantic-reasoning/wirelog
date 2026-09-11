@@ -1620,9 +1620,10 @@ tdd_worker_subpass_fn(void *arg)
             }
 
             /* Enable target timestamps */
-            if (col_rel_enable_timestamps(r) != 0) {
+            int timestamp_rc = col_rel_enable_timestamps(r);
+            if (timestamp_rc != 0) {
                 col_rel_destroy(delta);
-                ctx->rc = ENOMEM;
+                ctx->rc = timestamp_rc;
                 free(snap);
                 sess->tdd_subpass_active = saved_tdd_subpass;
                 sess->tdd_outbound_only_active = saved_outbound_only;

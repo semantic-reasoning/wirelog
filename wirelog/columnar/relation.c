@@ -751,7 +751,7 @@ col_rel_attach_memory_governor(col_rel_t *r,
 }
 
 int
-col_rel_enable_timestamps(col_rel_t *r)
+col_rel_enable_timestamps_locked(col_rel_t *r)
 {
     wl_columnar_memory_reservation_t pending;
     int reserve_rc;
@@ -794,6 +794,27 @@ col_rel_enable_timestamps(col_rel_t *r)
 fail:
     col_rel_reservation_rollback(&pending);
     return ENOMEM;
+}
+
+int
+col_rel_enable_timestamps(col_rel_t *r)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    if (r->timestamps || r->capacity == 0)
+        return 0;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_enable_timestamps_locked(r);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 /*

@@ -269,6 +269,166 @@ test_source_reader_blocks_compound_publication(void)
 }
 
 static void
+test_source_reader_blocks_timestamp_publication(void)
+{
+    col_rel_t *rel = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_delta_timestamp_t *timestamps;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t owner_generation;
+    uint64_t reserved_bytes;
+    uint64_t ledger_ts_bytes;
+
+    CHECK(col_rel_alloc(&rel, "empty_timestamp_reader") == 0
+        && track_relation(rel) != NULL,
+        "empty timestamp publication relation");
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "empty timestamp publication source reader");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps == NULL
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation,
+        "empty timestamp publication remains a no-op with reader");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "empty timestamp publication reader release");
+    cleanup_relations();
+
+    rel = NULL;
+    CHECK(col_rel_alloc(&rel, "empty_timestamp_test") == 0
+        && track_relation(rel) != NULL,
+        "empty timestamp publication relation");
+    {
+        int64_t value = 17;
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "timestamp publication seed");
+    }
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    owner_generation = rel->storage_owner_generation;
+    reserved_bytes = rel->retained_reserved_bytes;
+    ledger_ts_bytes = rel->ledger_ts_bytes;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "timestamp publication source reader");
+    CHECK(col_rel_enable_timestamps(rel) == EBUSY,
+        "timestamp publication denied by source reader");
+    CHECK(rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->storage_owner_generation == owner_generation
+        && rel->retained_reserved_bytes == reserved_bytes
+        && rel->ledger_ts_bytes == ledger_ts_bytes,
+        "timestamp publication denial preserves relation state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "timestamp publication source reader release");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps != timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation != storage_generation,
+        "timestamp publication succeeds after reader release");
+    cleanup_relations();
+
+    rel = new_relation();
+    CHECK(rel != NULL, "idempotent reader timestamp relation");
+    {
+        int64_t value = 19;
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "idempotent reader timestamp seed");
+    }
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "idempotent reader timestamp setup");
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "idempotent reader timestamp source reader");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation,
+        "idempotent timestamp publication remains a no-op with reader");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "idempotent reader timestamp reader release");
+    cleanup_relations();
+
+    rel = NULL;
+    col_rel_t *alias = NULL;
+    CHECK(col_rel_alloc(&rel, "empty_timestamp_owner") == 0
+        && track_relation(rel) != NULL
+        && col_rel_alloc(&alias, "empty_timestamp_alias") == 0
+        && track_relation(alias) != NULL,
+        "empty timestamp publication alias relations");
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    CHECK(col_rel_install_shared_view(alias, rel) == 0,
+        "empty timestamp publication alias install");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps == NULL
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation,
+        "empty timestamp publication remains a no-op with alias");
+    CHECK(col_rel_storage_alias_release(alias) == 0,
+        "empty timestamp publication alias release");
+    cleanup_relations();
+
+    rel = new_relation();
+    alias = new_relation();
+    CHECK(rel && alias, "idempotent timestamp publication alias relations");
+    {
+        int64_t value = 23;
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "idempotent timestamp publication alias seed");
+    }
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "idempotent timestamp publication alias setup");
+    CHECK(col_rel_install_shared_view(alias, rel) == 0,
+        "idempotent timestamp publication alias install");
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    owner_generation = rel->storage_owner_generation;
+    reserved_bytes = rel->retained_reserved_bytes;
+    ledger_ts_bytes = rel->ledger_ts_bytes;
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "idempotent timestamp publication remains a no-op with alias");
+    CHECK(rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->storage_owner_generation == owner_generation
+        && rel->retained_reserved_bytes == reserved_bytes
+        && rel->ledger_ts_bytes == ledger_ts_bytes,
+        "idempotent timestamp publication with alias preserves state");
+    CHECK(col_rel_storage_alias_release(alias) == 0,
+        "idempotent timestamp publication alias release");
+    cleanup_relations();
+
+#ifdef WL_TEST_ALLOC_WRAP
+    rel = new_relation();
+    CHECK(rel != NULL, "timestamp publication allocation relation");
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    allocation_calls = 0;
+    allocation_fail_at = 0;
+    CHECK(col_rel_enable_timestamps(rel) == ENOMEM,
+        "timestamp publication allocation failure");
+    allocation_fail_at = -1;
+    CHECK(rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->retained_reserved_bytes == 0
+        && rel->ledger_ts_bytes == 0,
+        "timestamp allocation failure rolls back state");
+    CHECK(col_rel_enable_timestamps(rel) == 0 && rel->timestamps != NULL,
+        "timestamp publication retries after allocation failure");
+    cleanup_relations();
+#endif
+}
+
+static void
 test_destination_reader_blocks_shared_view_publication(void)
 {
     col_rel_t *src = new_relation();
@@ -2314,6 +2474,7 @@ main(void)
     test_same_row_count_mutation();
     test_source_reader_blocks_column_type_publication();
     test_source_reader_blocks_compound_publication();
+    test_source_reader_blocks_timestamp_publication();
     test_destination_reader_blocks_shared_view_publication();
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
