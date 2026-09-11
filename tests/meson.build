@@ -5914,6 +5914,26 @@ test_session_admission_exe = executable(
 test('session_admission', test_session_admission_exe,
      suite: 'unit', timeout: 60)
 
+if host_machine.system() == 'darwin'
+  test_thread_mach_before_exe = executable(
+    'test_thread_mach_before',
+    files('test_thread_mach_before.c'),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [threads_dep],
+    install: false,
+  )
+  test('thread_mach_before', test_thread_mach_before_exe)
+
+  test_thread_mach_after_exe = executable(
+    'test_thread_mach_after',
+    files('test_thread_mach_after.c'),
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [threads_dep],
+    install: false,
+  )
+  test('thread_mach_after', test_thread_mach_after_exe)
+endif
+
 test_extension_filter_exe = executable(
   'test_extension_filter',
   files('test_extension_filter.c'),

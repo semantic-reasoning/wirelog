@@ -20,8 +20,8 @@ typedef enum {
 } test_operation_t;
 
 typedef struct {
-    mutex_t mutex;
-    cond_t changed;
+    wl_mutex_t mutex;
+    wl_cond_t changed;
     test_operation_t blocked_operation;
     bool operation_entered;
     bool release_operation;
@@ -49,15 +49,15 @@ record_operation(fake_session_t *session, test_operation_t operation)
 {
     test_sync_t *sync = session->sync;
 
-    mutex_lock(&sync->mutex);
+    wl_mutex_lock(&sync->mutex);
     sync->calls[operation]++;
     if (sync->blocked_operation == operation) {
         sync->operation_entered = true;
-        cond_broadcast(&sync->changed);
+        wl_cond_broadcast(&sync->changed);
         while (!sync->release_operation)
-            cond_wait(&sync->changed, &sync->mutex);
+            wl_cond_wait(&sync->changed, &sync->mutex);
     }
-    mutex_unlock(&sync->mutex);
+    wl_mutex_unlock(&sync->mutex);
 }
 
 static int
@@ -81,10 +81,10 @@ fake_destroy(wl_session_t *base)
     fake_session_t *session = (fake_session_t *)base;
     test_sync_t *sync = session->sync;
 
-    mutex_lock(&sync->mutex);
+    wl_mutex_lock(&sync->mutex);
     sync->backend_destroy_entered = true;
-    cond_broadcast(&sync->changed);
-    mutex_unlock(&sync->mutex);
+    wl_cond_broadcast(&sync->changed);
+    wl_mutex_unlock(&sync->mutex);
     free(session);
 }
 
@@ -189,10 +189,10 @@ destroy_thread(void *opaque)
     thread_context_t *ctx = (thread_context_t *)opaque;
 
     wl_session_destroy(ctx->session);
-    mutex_lock(&ctx->sync->mutex);
+    wl_mutex_lock(&ctx->sync->mutex);
     ctx->sync->destroy_returned = true;
-    cond_broadcast(&ctx->sync->changed);
-    mutex_unlock(&ctx->sync->mutex);
+    wl_cond_broadcast(&ctx->sync->changed);
+    wl_mutex_unlock(&ctx->sync->mutex);
     return NULL;
 }
 
@@ -221,8 +221,8 @@ run_destroy_race(test_operation_t blocked_operation)
     test_sync_t sync = { 0 };
     thread_context_t operation_ctx = { 0 };
     thread_context_t destroy_ctx = { 0 };
-    thread_t operation_tid;
-    thread_t destroy_tid;
+    wl_thread_t operation_tid;
+    wl_thread_t destroy_tid;
     wl_session_t *session = NULL;
     unsigned before[TEST_OP_COUNT];
     int64_t row = 1;
@@ -231,12 +231,12 @@ run_destroy_race(test_operation_t blocked_operation)
     int denied_rc = 0;
     int failures = 0;
 
-    if (mutex_init(&sync.mutex) != 0) {
+    if (wl_mutex_init(&sync.mutex) != 0) {
         fprintf(stderr, "FAIL: synchronization initialization\n");
         return 1;
     }
-    if (cond_init(&sync.changed) != 0) {
-        mutex_destroy(&sync.mutex);
+    if (wl_cond_init(&sync.changed) != 0) {
+        wl_mutex_destroy(&sync.mutex);
         fprintf(stderr, "FAIL: synchronization initialization\n");
         return 1;
     }
@@ -244,8 +244,8 @@ run_destroy_race(test_operation_t blocked_operation)
     creation_sync = &sync;
     if (wl_session_create(&fake_backend, NULL, 1, &session) != 0
         || !session) {
-        cond_destroy(&sync.changed);
-        mutex_destroy(&sync.mutex);
+        wl_cond_destroy(&sync.changed);
+        wl_mutex_destroy(&sync.mutex);
         fprintf(stderr, "FAIL: fake session creation\n");
         return 1;
     }
@@ -253,30 +253,31 @@ run_destroy_race(test_operation_t blocked_operation)
     operation_ctx.session = session;
     operation_ctx.sync = &sync;
     operation_ctx.operation = blocked_operation;
-    if (thread_create(&operation_tid, operation_thread, &operation_ctx) != 0) {
+    if (wl_thread_create(&operation_tid, operation_thread,
+        &operation_ctx) != 0) {
         wl_session_destroy(session);
-        cond_destroy(&sync.changed);
-        mutex_destroy(&sync.mutex);
+        wl_cond_destroy(&sync.changed);
+        wl_mutex_destroy(&sync.mutex);
         fprintf(stderr, "FAIL: operation thread creation\n");
         return 1;
     }
 
-    mutex_lock(&sync.mutex);
+    wl_mutex_lock(&sync.mutex);
     while (!sync.operation_entered)
-        cond_wait(&sync.changed, &sync.mutex);
-    mutex_unlock(&sync.mutex);
+        wl_cond_wait(&sync.changed, &sync.mutex);
+    wl_mutex_unlock(&sync.mutex);
 
     destroy_ctx.session = session;
     destroy_ctx.sync = &sync;
-    if (thread_create(&destroy_tid, destroy_thread, &destroy_ctx) != 0) {
-        mutex_lock(&sync.mutex);
+    if (wl_thread_create(&destroy_tid, destroy_thread, &destroy_ctx) != 0) {
+        wl_mutex_lock(&sync.mutex);
         sync.release_operation = true;
-        cond_broadcast(&sync.changed);
-        mutex_unlock(&sync.mutex);
-        thread_join(&operation_tid);
+        wl_cond_broadcast(&sync.changed);
+        wl_mutex_unlock(&sync.mutex);
+        wl_thread_join(&operation_tid);
         wl_session_destroy(session);
-        cond_destroy(&sync.changed);
-        mutex_destroy(&sync.mutex);
+        wl_cond_destroy(&sync.changed);
+        wl_mutex_destroy(&sync.mutex);
         fprintf(stderr, "FAIL: destroy thread creation\n");
         return 1;
     }
@@ -293,12 +294,12 @@ run_destroy_race(test_operation_t blocked_operation)
     failures += expect(denied_rc == EBUSY,
             "new operation denied while destroy waits");
 
-    mutex_lock(&sync.mutex);
+    wl_mutex_lock(&sync.mutex);
     for (unsigned i = 0; i < TEST_OP_COUNT; i++)
         before[i] = sync.calls[i];
     failures += expect(!sync.backend_destroy_entered,
             "backend destroy waits for active operation");
-    mutex_unlock(&sync.mutex);
+    wl_mutex_unlock(&sync.mutex);
 
     failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EBUSY,
             "insert denied after admission closes");
@@ -315,27 +316,27 @@ run_destroy_race(test_operation_t blocked_operation)
     failures += expect(wl_session_memory_governor(session) == NULL,
             "memory governor access denied after admission closes");
 
-    mutex_lock(&sync.mutex);
+    wl_mutex_lock(&sync.mutex);
     for (unsigned i = 0; i < TEST_OP_COUNT; i++)
         failures += expect(sync.calls[i] == before[i],
                 "denied operation did not enter backend");
     sync.release_operation = true;
-    cond_broadcast(&sync.changed);
-    mutex_unlock(&sync.mutex);
+    wl_cond_broadcast(&sync.changed);
+    wl_mutex_unlock(&sync.mutex);
 
-    thread_join(&operation_tid);
-    thread_join(&destroy_tid);
+    wl_thread_join(&operation_tid);
+    wl_thread_join(&destroy_tid);
     failures += expect(operation_ctx.rc == 0,
             "admitted operation completes successfully");
-    mutex_lock(&sync.mutex);
+    wl_mutex_lock(&sync.mutex);
     failures += expect(sync.backend_destroy_entered,
             "backend destroy runs after operation completes");
     failures += expect(sync.destroy_returned,
             "session destroy returns synchronously");
-    mutex_unlock(&sync.mutex);
+    wl_mutex_unlock(&sync.mutex);
 
-    cond_destroy(&sync.changed);
-    mutex_destroy(&sync.mutex);
+    wl_cond_destroy(&sync.changed);
+    wl_mutex_destroy(&sync.mutex);
     return failures;
 }
 
