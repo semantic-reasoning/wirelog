@@ -2214,6 +2214,8 @@ void
 wl_columnar_eval_test_tdd_merge_fail_sort_once(void);
 void
 wl_columnar_eval_test_tdd_merge_fail_overflow_once(void);
+int
+wl_columnar_eval_test_tdd_owner_registration_rollback(void);
 #endif
 #ifdef WL_TEST_TDD_RESET_RESTORE
 int

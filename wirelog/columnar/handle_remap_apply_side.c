@@ -187,7 +187,7 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
     for (uint32_t i = 0; i < target_count; i++) {
         uint64_t ignored = 0;
         rc = wl_handle_remap_preflight_columns(targets[i].rel,
-            (uint32_t[]){ 0u }, 1u, remap, &ignored);
+                (uint32_t[]){ 0u }, 1u, remap, &ignored);
         if (rc != 0)
             goto fail;
     }
@@ -203,7 +203,7 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
             continue;
         uint64_t rewrites = 0;
         rc = wl_handle_remap_apply_columns_held(targets[i].rel,
-            (uint32_t[]){ 0u }, 1u, remap, &rewrites);
+                (uint32_t[]){ 0u }, 1u, remap, &rewrites);
         if (rc != 0)
             goto fail;
         cells += rewrites;

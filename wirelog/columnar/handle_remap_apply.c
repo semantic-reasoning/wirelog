@@ -125,7 +125,7 @@ wl_handle_remap_preflight_columns(const col_rel_t *rel,
     if (out_rewrites)
         *out_rewrites = 0;
     int rc = wl_handle_remap_validate_columns_(rel, handle_col_idx,
-        handle_col_count, remap);
+            handle_col_count, remap);
     if (rc != 0)
         return rc;
 
@@ -161,9 +161,9 @@ wl_handle_remap_apply_columns_held(col_rel_t *rel,
     if (out_rewrites)
         *out_rewrites = 0;
     int rc = wl_handle_remap_validate_columns_(rel, handle_col_idx,
-        handle_col_count, remap);
+            handle_col_count, remap);
     if (rc != 0)
         return rc;
     return wl_handle_remap_apply_columns_raw_(rel, handle_col_idx,
-        handle_col_count, remap, out_rewrites);
+               handle_col_count, remap, out_rewrites);
 }
