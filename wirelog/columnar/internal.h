@@ -2260,6 +2260,9 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     wl_columnar_source_access_writer_t *writer,
     bool *out_alias_release_pending);
 int
+col_rel_reset_rows_locked(col_rel_t *r,
+    wl_columnar_source_access_writer_t *writer);
+int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 int
 col_rel_col_idx(const col_rel_t *r, const char *name);
