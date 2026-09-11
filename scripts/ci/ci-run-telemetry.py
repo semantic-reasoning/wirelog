@@ -49,6 +49,8 @@ Usage:
   ci-run-telemetry.py fetch  --run-id ID [--run-id ID ...] [--out DIR]
                             [--max-requests N] [--repo OWNER/NAME]
   ci-run-telemetry.py report --run-id ID [--run-id ID ...] [--out DIR]
+                             [--workflow FILE]
+  ci-run-telemetry.py aggregate [--run-id ID ...] [--out DIR] [--label NAME]
 
 `fetch` costs two requests for a run whose jobs fit one page, plus any
 retries, which are charged to the same budget.  `--out` defaults to
@@ -85,10 +87,14 @@ CLOCK_SKEW_TOLERANCE_S = 2
 # same rounding slack when checking that relation.
 RELEASE_TOLERANCE_S = 2
 
-GRAPH_PENDING = ("needs-graph extraction is not implemented in this tool "
-                 "version; see #1570 unit 2")
+GRAPH_NOT_SUPPLIED = ("no dependency graph was supplied, so the critical "
+                      "path cannot be walked")
 
 DEFAULT_OUT_DIR = "ci-telemetry"
+# Resolved from this file, not the working directory: the default has to hold
+# when the tool runs from a build directory or anywhere else.
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_WORKFLOW = str(REPO_ROOT / ".github" / "workflows" / "ci-pr.yml")
 JOBS_PER_PAGE = 100
 DEFAULT_MAX_REQUESTS = 40
 RETRY_SLEEPS_S = (1, 2, 4, 8)
@@ -308,14 +314,19 @@ def job_phases(job: dict) -> tuple:
         start = parse_ts(step.get("started_at"))
         end = parse_ts(step.get("completed_at"))
         if start is None or end is None:
-            unusable.append({"step": name, "phase": phase,
-                             "reason": "step has no usable interval"})
+            # A step that has not finished is not a broken step; saying so
+            # would drown the ones that are.
+            reason = ("step has not finished"
+                      if step.get("status") != "completed"
+                      else "step has no usable interval")
+            unusable.append({"step": name, "phase": phase, "reason": reason,
+                             "finished": step.get("status") == "completed"})
             continue
         seconds = math.floor((end - start).total_seconds())
         if seconds < 0:
             unusable.append({"step": name, "phase": phase,
                              "reason": "step ends before it starts",
-                             "raw_seconds": seconds})
+                             "raw_seconds": seconds, "finished": True})
             continue
         totals[phase] = totals.get(phase, 0) + seconds
         evidence.setdefault(phase, []).append(name)
@@ -359,8 +370,8 @@ def analyze_job(job: dict, t0_iso: str, completed_by_name: dict) -> dict:
         reason = "job skipped; no execution"
         entry["metrics"] = {
             "upstream_elapsed": non_additive(unavailable(reason)),
-            "queue_delay": unavailable(reason),
-            "job_wall": unavailable(reason),
+            "queue_delay": additive(unavailable(reason)),
+            "job_wall": additive(unavailable(reason)),
         }
         entry["phases"] = {p: unavailable(reason) for p in PHASES}
         entry["unmapped_steps"] = []
@@ -380,10 +391,13 @@ def analyze_job(job: dict, t0_iso: str, completed_by_name: dict) -> dict:
         "upstream_elapsed": non_additive(
             interval(t0_iso, job.get("created_at"),
                      "run or job creation time missing")),
-        "queue_delay": interval(job.get("created_at"), job.get("started_at"),
-                                "job never started"),
-        "job_wall": interval(job.get("started_at"), job.get("completed_at"),
-                             "job has not completed"),
+        # Summable along a path, and the critical path does sum them.
+        "queue_delay": additive(
+            interval(job.get("created_at"), job.get("started_at"),
+                     "job never started")),
+        "job_wall": additive(
+            interval(job.get("started_at"), job.get("completed_at"),
+                     "job has not completed")),
     }
 
     phases, unmapped, unusable, skipped, accounted = job_phases(job)
@@ -438,7 +452,7 @@ def release_latency(job: dict, jobs_by_name: dict, needs: dict) -> dict:
     the only per-job wait that may be summed along a path."""
     name = job.get("name") or ""
     if not needs:
-        return unavailable("dependency graph not supplied; see #1570 unit 2")
+        return unavailable(GRAPH_NOT_SUPPLIED)
     if name not in needs:
         # Not the same as having no dependencies: the extractor may simply
         # have missed this job, and calling that a root would hide the gap.
@@ -466,6 +480,334 @@ def release_latency(job: dict, jobs_by_name: dict, needs: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Dependency graph
+# ---------------------------------------------------------------------------
+#
+# Read from the workflow files rather than hard-coded: #1574 is going to change
+# this graph, and a copy in here would drift exactly when it matters.  Parsed
+# by pinned regex because the repository has no YAML parser and adding one for
+# a measurement instrument is not worth the dependency.
+
+JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.MULTILINE)
+NAME_RE = re.compile(r"^    name:\s*(.+?)\s*$", re.MULTILINE)
+NEEDS_LIST_RE = re.compile(r"^    needs:\s*\[(.*?)\]\s*$", re.MULTILINE)
+NEEDS_ONE_RE = re.compile(r"^    needs:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
+NEEDS_ANY_RE = re.compile(r"^    needs:", re.MULTILINE)
+
+
+class WorkflowParseError(Exception):
+    """A `needs:` this parser cannot read.  Refused rather than returned as an
+    empty list, because an empty list means "root job" and a job wrongly called
+    a root severs an edge without leaving any trace in the drift report."""
+USES_LOCAL_RE = re.compile(r"^    uses:\s*(\./[^\s]+)\s*$", re.MULTILINE)
+EXPRESSION_RE = re.compile(r"\$\{\{.*?\}\}")
+
+
+JOBS_SECTION_RE = re.compile(r"^jobs:\s*$", re.MULTILINE)
+TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:", re.MULTILINE)
+
+
+def split_jobs(text: str) -> dict:
+    """Map job key to its block, within the `jobs:` section only.  Scoping
+    matters: `on:` also carries two-space keys, and without this `pull_request`
+    and `workflow_call` are read as jobs."""
+    section = JOBS_SECTION_RE.search(text)
+    if not section:
+        return {}
+    start = section.end()
+    following = TOP_LEVEL_KEY_RE.search(text, start)
+    text = text[start:following.start() if following else len(text)]
+    keys = [(m.group(1), m.start()) for m in JOB_KEY_RE.finditer(text)]
+    blocks = {}
+    for index, (key, start) in enumerate(keys):
+        end = keys[index + 1][1] if index + 1 < len(keys) else len(text)
+        blocks[key] = text[start:end]
+    return blocks
+
+
+def parse_needs(block: str, job_key: str = "?") -> list:
+    match = NEEDS_LIST_RE.search(block)
+    if match:
+        return [item.strip() for item in match.group(1).split(",")
+                if item.strip()]
+    match = NEEDS_ONE_RE.search(block)
+    if match:
+        return [match.group(1)]
+    if NEEDS_ANY_RE.search(block):
+        raise WorkflowParseError(
+            f"job {job_key!r} declares needs in a form this parser cannot "
+            f"read (only `needs: a` and `needs: [a, b]` on one line); "
+            f"reading it as a root would sever its edges silently")
+    return []
+
+
+def name_pattern(display_name: str):
+    """A matrix job's display name carries `${{ ... }}` placeholders; the API
+    reports them expanded.  Match on the literal parts around them."""
+    parts = [re.escape(part) for part in EXPRESSION_RE.split(display_name)]
+    return re.compile("^" + ".+".join(parts) + "$")
+
+
+def extract_graph(workflow_path) -> dict:
+    """Nodes keyed by API display name, each mapping to the display names it
+    needs.  A job that calls a reusable workflow is expanded into that
+    workflow's jobs, named `<caller key> / <callee display name>` the way the
+    API reports them: without this the `lint` node matches nothing, its edge is
+    severed, and the graph misses the segment between the freeze gate and every
+    build.  Every job gets an entry -- an empty list for a genuine root -- so a
+    job missing from the result is a gap, never a root."""
+    workflow_path = Path(workflow_path)
+    text = workflow_path.read_text(encoding="utf-8")
+    blocks = split_jobs(text)
+
+    display: dict = {}
+    expansion: dict = {}
+    for key, block in blocks.items():
+        local = USES_LOCAL_RE.search(block)
+        if local:
+            # removeprefix, not lstrip: lstrip takes a character set and
+            # would eat the leading dot of `.github`.
+            relative = local.group(1).removeprefix("./")
+            callee = workflow_path.parent.parent.parent / relative
+            callee_blocks = split_jobs(
+                Path(callee).read_text(encoding="utf-8"))
+            inner = {}
+            for sub_key, sub_block in callee_blocks.items():
+                sub_name = NAME_RE.search(sub_block)
+                inner[sub_key] = (f"{key} / {sub_name.group(1)}"
+                                  if sub_name else f"{key} / {sub_key}")
+            expansion[key] = {
+                "names": inner,
+                "needs": {sub: parse_needs(sub_block, sub)
+                          for sub, sub_block in callee_blocks.items()},
+            }
+            continue
+        name = NAME_RE.search(block)
+        display[key] = name.group(1) if name else key
+
+    graph: dict = {}
+    for key, block in blocks.items():
+        outer_needs = parse_needs(block, key)
+        if key in expansion:
+            inner = expansion[key]
+            for sub, sub_name in inner["names"].items():
+                edges = [inner["names"][dep] for dep in inner["needs"][sub]
+                         if dep in inner["names"]]
+                if not inner["needs"][sub]:
+                    # A callee root inherits the caller's dependencies.
+                    edges = [resolve_edge(dep, display, expansion)
+                             for dep in outer_needs]
+                    edges = [e for group in edges for e in group]
+                graph[sub_name] = edges
+            continue
+        edges = [resolve_edge(dep, display, expansion) for dep in outer_needs]
+        graph[display[key]] = [e for group in edges for e in group]
+    return graph
+
+
+def resolve_edge(dep_key: str, display: dict, expansion: dict) -> list:
+    """An edge onto a reusable-workflow call lands on that workflow's sinks --
+    the jobs nothing inside it depends on."""
+    if dep_key in expansion:
+        inner = expansion[dep_key]
+        depended_on = {d for deps in inner["needs"].values() for d in deps}
+        return [inner["names"][sub] for sub in inner["names"]
+                if sub not in depended_on]
+    return [display[dep_key]] if dep_key in display else []
+
+
+def match_graph_to_jobs(graph: dict, job_names: list) -> tuple:
+    """Resolve graph node names, which may carry matrix placeholders, against
+    the names the API actually reported.  Returns (edges by job name, drift)."""
+    # Most specific first: a matrix node such as `Build / .+ / .+` would
+    # otherwise shadow the literal `Build / ubuntu-latest / gcc` whenever it
+    # happened to be declared earlier, and #1574 reorders jobs.
+    # R7: placeholder text adds length without adding specificity, so measure
+    # the literal part only.
+    ordered = sorted(graph, key=lambda node: (node.count("${{"),
+                                              -len(EXPRESSION_RE.sub("", node))))
+    patterns = [(node, name_pattern(node)) for node in ordered]
+    resolved: dict = {}
+    node_of_job: dict = {}
+    matched_nodes = set()
+    for job_name in job_names:
+        for node, pattern in patterns:
+            if pattern.match(job_name):
+                matched_nodes.add(node)
+                node_of_job[job_name] = node
+                resolved[job_name] = set(graph[node])
+                break
+    # Which jobs each node owns, decided once by the specificity rule above.
+    # Expanding a dependency by re-matching its pattern would let it claim
+    # jobs that resolved to a different node, which can make a job its own
+    # dependency and leave a cycle behind with nothing in the drift report.
+    jobs_of_node: dict = {}
+    for job_name, node in node_of_job.items():
+        jobs_of_node.setdefault(node, []).append(job_name)
+
+    edges: dict = {}
+    for job_name in job_names:
+        if job_name not in resolved:
+            # Deliberately absent, not empty: an empty list is a root, and the
+            # observed walk has to be able to tell the two apart.
+            continue
+        concrete = set()
+        for dep_node in resolved[job_name]:
+            concrete.update(jobs_of_node.get(dep_node, []))
+        concrete.discard(job_name)
+        edges[job_name] = sorted(concrete)
+    drift = {
+        "jobs_without_node": sorted(n for n in job_names if n not in resolved),
+        "nodes_without_job": sorted(set(graph) - matched_nodes),
+    }
+    return edges, drift
+
+
+def _seconds(metric: dict):
+    return metric["seconds"] if metric.get("status") in ("measured",
+                                                         "partial") else None
+
+
+def observed_path(analyzed: list, edges: dict, drift: dict) -> dict:
+    """Walk back from the last job to finish, hop by hop, through its actual
+    dependencies.  Taking the nearest earlier finisher instead would be wrong
+    and quietly so: on a real run it picks a macOS matrix build as the
+    predecessor of a TSan job that does not depend on it.  Where the graph
+    cannot resolve a hop the walk stops and says the path is partial rather
+    than attaching a plausible neighbour."""
+    by_name = {entry["name"]: entry for entry in analyzed}
+    finished = [e for e in analyzed
+                if _seconds(e["metrics"]["job_wall"]) is not None
+                and e.get("completed_at")]
+    if not finished:
+        return unavailable("no job has completed")
+    current = max(finished, key=lambda e: ts_key(e["completed_at"]))
+    chain = [current["name"]]
+    truncated = None
+    seen = {current["name"]}
+    while True:
+        if current["name"] not in edges:
+            truncated = f"{current['name']} is not in the dependency graph"
+            break
+        candidates = [by_name[name] for name in edges[current["name"]]
+                      if name in by_name and name not in seen]
+        # A skipped job has a completion stamp but no duration, and walking
+        # through it at zero weight would drop the very gap it represents.
+        candidates = [c for c in candidates if c.get("completed_at")
+                      and c["conclusion"] != "skipped"]
+        if not candidates:
+            if edges[current["name"]]:
+                truncated = (f"{current['name']}'s dependencies did not run")
+            break
+        current = max(candidates, key=lambda e: ts_key(e["completed_at"]))
+        seen.add(current["name"])
+        chain.append(current["name"])
+    chain.reverse()
+    total = sum(
+        (_seconds(by_name[n]["metrics"]["queue_delay"]) or 0)
+        + (_seconds(by_name[n]["metrics"]["job_wall"]) or 0) for n in chain)
+    hops = [{"job": name,
+             "queue_delay": _seconds(by_name[name]["metrics"]["queue_delay"]),
+             "job_wall": _seconds(by_name[name]["metrics"]["job_wall"])}
+            for name in chain]
+    # A hop the run did not time contributes nothing to the sum, so the total
+    # is short by however long that job actually took.  Name it rather than
+    # letting `or 0` present the shortfall as a measurement.
+    unmeasured = [hop["job"] for hop in hops
+                  if hop["queue_delay"] is None or hop["job_wall"] is None]
+    metric = measured(total, {
+        "chain": chain, "hops": hops,
+        "weights": "queue_delay + job_wall per hop",
+        "note": ("a lower bound on run wall clock: it omits the first job's "
+                 "upstream wait and every scheduler release latency"),
+    })
+    if unmeasured:
+        metric["evidence"]["unmeasured_hops"] = unmeasured
+    reasons = []
+    if unmeasured:
+        reasons.append(f"{len(unmeasured)} hop(s) on this chain were not "
+                       f"timed and contribute nothing to the total")
+    if truncated:
+        reasons.append(f"walk stopped: {truncated}")
+    if drift.get("nodes_without_job"):
+        # The run does not contain jobs the declared graph expects, so this
+        # path may be short because those jobs are absent rather than because
+        # the chain ends here.
+        reasons.append(f"{len(drift['nodes_without_job'])} declared jobs are "
+                       f"absent from this run; see drift")
+    if reasons:
+        metric["status"] = "partial"
+        metric["reason"] = "; ".join(reasons)
+    return metric
+
+
+def graph_path(analyzed: list, edges: dict, drift: dict) -> dict:
+    """Longest path over the declared graph, weighting each node by its wall
+    time and each edge by the wait between the dependency finishing and the
+    dependent being created.  Inside a skip cascade every edge weight is
+    unavailable, so the path falls back to node weights alone and says so
+    rather than disappearing."""
+    by_name = {entry["name"]: entry for entry in analyzed}
+    if not edges:
+        return unavailable(GRAPH_NOT_SUPPLIED)
+    best: dict = {}
+    unusable_edges: set = set()
+
+    def visit(name, stack):
+        if name in best:
+            return best[name]
+        if name in stack:            # a cycle cannot occur in a needs DAG,
+            return 0, [name]         # but never spin if the data says one does
+        stack = stack | {name}
+        entry = by_name.get(name)
+        node_weight = _seconds(entry["metrics"]["job_wall"]) or 0 if entry else 0
+        best_total, best_chain = node_weight, [name]
+        for dep in edges.get(name, []):
+            if dep not in by_name:
+                continue
+            dep_total, dep_chain = visit(dep, stack)
+            edge = by_name[name]["metrics"]["scheduler_release_latency"]
+            edge_weight = _seconds(edge)
+            if edge_weight is None:
+                edge_weight = 0
+            total = dep_total + edge_weight + node_weight
+            if total > best_total:
+                best_total, best_chain = total, dep_chain + [name]
+        best[name] = (best_total, best_chain)
+        return best[name]
+
+    results = [visit(name, frozenset()) for name in by_name]
+    if not results:
+        return unavailable("no job to walk")
+    total, chain = max(results, key=lambda pair: pair[0])
+    unmeasured_nodes = [name for name in chain
+                        if _seconds(by_name[name]["metrics"]["job_wall"])
+                        is None]
+    # Only the edges on the chain being reported can qualify this number.
+    for index, name in enumerate(chain[1:], start=1):
+        if _seconds(by_name[name]["metrics"]["scheduler_release_latency"]) is None:
+            unusable_edges.add(f"{chain[index - 1]} -> {name}")
+    metric = measured(total, {"chain": chain,
+                              "weights": "job_wall per node, "
+                                         "scheduler_release_latency per edge"})
+    reasons = []
+    if unmeasured_nodes:
+        reasons.append(f"{len(unmeasured_nodes)} job(s) on this chain were "
+                       f"not timed and contribute nothing to the total")
+        metric["evidence"]["unmeasured_nodes"] = unmeasured_nodes
+    if unusable_edges:
+        reasons.append("edge weights unavailable on this chain; node weights "
+                       "only (a skip cascade batches job creation)")
+        metric["evidence"]["unusable_edges"] = sorted(unusable_edges)
+    if drift["jobs_without_node"] or drift["nodes_without_job"]:
+        reasons.append("the declared graph and the run disagree; see drift")
+    if reasons:
+        metric["status"] = "partial"
+        metric["reason"] = "; ".join(reasons)
+    return metric
+
+
+# ---------------------------------------------------------------------------
 # Run-level analysis
 # ---------------------------------------------------------------------------
 
@@ -473,7 +815,10 @@ def pinned_check(name: str) -> bool:
     return any(name.startswith(prefix) for prefix in PINNED_CHECK_PREFIXES)
 
 
-def analyze(run: dict, jobs_doc: dict, needs: dict | None = None) -> dict:
+def analyze(run: dict, jobs_doc: dict, needs: dict | None = None,
+            drift: dict | None = None) -> dict:
+    """@needs is the resolved per-job dependency map and @drift is where it and
+    the run disagree; both come from match_graph_to_jobs."""
     needs = needs or {}
     jobs = jobs_doc.get("jobs") or []
     t0_iso = run.get("run_started_at") or run.get("created_at")
@@ -580,15 +925,34 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None) -> dict:
                 "reason": residual.get("reason"),
             })
         for item in entry.get("unusable_steps") or []:
+            # Only a finished step with unusable timestamps is anomalous.
+            if not item.get("finished"):
+                continue
             anomalies.append({
                 "kind": "unusable_step", "job": entry["name"],
                 "step": item.get("step"), "reason": item.get("reason"),
             })
 
+    if needs:
+        drift = drift or {"jobs_without_node": [], "nodes_without_job": []}
+        critical_path = {
+            "observed": observed_path(analyzed, needs, drift),
+            "graph": graph_path(analyzed, needs, drift),
+            "graph_drift": drift,
+        }
+    else:
+        critical_path = {
+            "observed": unavailable(GRAPH_NOT_SUPPLIED),
+            "graph": unavailable(GRAPH_NOT_SUPPLIED),
+            # Not [].  An empty value here would read as "compared, no drift".
+            "graph_drift": None,
+        }
+
     unmapped = sorted({name for entry in analyzed
                        for name in entry["unmapped_steps"]})
     unusable = sorted({item["step"] for entry in analyzed
-                       for item in entry.get("unusable_steps") or []})
+                       for item in entry.get("unusable_steps") or []
+                       if item.get("finished")})
 
     return {
         "schema": SCHEMA,
@@ -621,16 +985,156 @@ def analyze(run: dict, jobs_doc: dict, needs: dict | None = None) -> dict:
             "surrogate": "pr_feedback",
             "reason": "the required set is not queryable in this repository",
         },
-        "critical_path": {
-            "observed": unavailable(GRAPH_PENDING),
-            "graph": unavailable(GRAPH_PENDING),
-            # Not [].  An empty list here would read as "compared, no drift".
-            "graph_drift": None,
-        },
+        "critical_path": critical_path,
         "anomalies": anomalies,
         "unmapped_steps": unmapped,
         "unusable_steps": unusable,
     }
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+#
+# Cells are (job name, runner population).  No run in this repository is
+# single-population -- one run spans GitHub-hosted runners and several
+# self-hosted ones, and the same job lands on different ones between runs -- so
+# a run-level population filter would refuse every real input and a pooled
+# median would average two different machines.  "Hosted-runner baseline"
+# therefore means hosted-runner job samples.
+
+AGGREGATED_METRICS = ("queue_delay", "job_wall", "upstream_elapsed")
+
+
+def percentile_nearest_rank(sorted_values: list, fraction: float):
+    """Nearest-rank, pinned so the doc and the tool cannot drift.  With a small
+    sample this returns the maximum, which is why the report says so rather
+    than presenting it as an estimate."""
+    if not sorted_values:
+        return None
+    rank = math.ceil(fraction * len(sorted_values))
+    return sorted_values[max(rank, 1) - 1]
+
+
+def summarize(values: list) -> dict:
+    ordered = sorted(values)
+    return {
+        "n": len(ordered),
+        "median": percentile_nearest_rank(ordered, 0.5),
+        "p95": percentile_nearest_rank(ordered, 0.95),
+        "max": ordered[-1] if ordered else None,
+        "p95_is_sample_max": len(ordered) < 20,
+    }
+
+
+def aggregate_reports(reports: list) -> dict:
+    """Per-(job, population) cells across runs, kept separate by conclusion so
+    a failed run's truncated timings never dilute a successful one's."""
+    cells: dict = {}
+    excluded = []
+    runs = []
+    for report in reports:
+        conclusion = report.get("conclusion") or report.get("status")
+        attempt = report.get("run_attempt")
+        if attempt is None:
+            excluded.append({"run_id": report.get("run_id"),
+                             "reason": "run_attempt unknown"})
+            continue
+        if attempt != 1:
+            excluded.append({"run_id": report.get("run_id"),
+                             "reason": "run_attempt > 1"})
+            continue
+        runs.append({"run_id": report.get("run_id"), "conclusion": conclusion,
+                     "head_sha": report.get("head_sha")})
+        for job in report.get("jobs") or []:
+            key = f"{job['name']}\u0000{job['population']}\u0000{conclusion}"
+            cell = cells.setdefault(key, {
+                "job": job["name"], "population": job["population"],
+                "conclusion": conclusion, "runner_names": set(),
+                "samples": {name: [] for name in AGGREGATED_METRICS},
+            })
+            if job.get("runner_name"):
+                cell["runner_names"].add(job["runner_name"])
+            for name in AGGREGATED_METRICS:
+                value = _seconds(job["metrics"][name])
+                if value is not None:
+                    cell["samples"][name].append(value)
+    summary = []
+    for cell in cells.values():
+        summary.append({
+            "job": cell["job"], "population": cell["population"],
+            "conclusion": cell["conclusion"],
+            # Hosted runners are fungible ephemeral machines; self-hosted ones
+            # are not, so a cell spanning several of them is a mixture and has
+            # to say so rather than hide behind the population label.
+            "runner_names": sorted(cell["runner_names"]),
+            "mixed_machines": len(cell["runner_names"]) > 1
+                              and cell["population"] == "self-hosted",
+            # n is per metric, not per cell: a skipped job contributes to
+            # neither, and a failed run truncates some metrics and not others.
+            "metrics": {name: summarize(values)
+                        for name, values in cell["samples"].items()},
+        })
+    summary.sort(key=lambda c: (c["conclusion"], c["job"], c["population"]))
+    # "none" is the absence of a runner, not a population of one.
+    populations = sorted({c["population"] for c in summary} - {"none"})
+    return {
+        "schema": SCHEMA,
+        "generated_at": now_iso(),
+        "runs": runs,
+        "excluded": excluded,
+        "populations": populations,
+        "pooled": False,
+        "note": ("cells are (job, population, conclusion); populations are "
+                 "never pooled because one run spans several and the same job "
+                 "moves between them.  Within self-hosted, a cell may still "
+                 "span several machines; `mixed_machines` says which do"),
+        "cells": summary,
+    }
+
+
+def render_aggregate_markdown(doc: dict) -> str:
+    lines = [
+        f"# CI telemetry baseline over {len(doc['runs'])} runs",
+        "",
+        f"- populations: {', '.join(doc['populations']) or 'none'}; "
+        f"never pooled",
+        f"- excluded: {len(doc['excluded'])}",
+        "",
+        "Seconds. `n` is per metric: a skipped job contributes to none, and a "
+        "failed run truncates some.",
+        "",
+        "| conclusion | job | population | queue n | queue med | queue p95 | "
+        "wall n | wall med | wall p95 | mixed machines |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    def num(value):
+        # A cell with no samples prints an em dash, not "None" and not 0.
+        return "--" if value is None else str(value)
+
+    for cell in doc["cells"]:
+        q, w = cell["metrics"]["queue_delay"], cell["metrics"]["job_wall"]
+        if all(stats["n"] == 0 for stats in cell["metrics"].values()):
+            # A cell with no samples in any metric is a job that only ever
+            # skipped; it is counted below rather than given a row of dashes.
+            continue
+        lines.append(
+            f"| {cell['conclusion']} | {cell['job']} | {cell['population']} "
+            f"| {q['n']} | {num(q['median'])} | {num(q['p95'])} "
+            f"| {w['n']} | {num(w['median'])} | {num(w['p95'])} "
+            f"| {'yes' if cell['mixed_machines'] else ''} |")
+    empty = sum(1 for c in doc["cells"]
+                if all(stats["n"] == 0 for stats in c["metrics"].values()))
+    if empty:
+        lines += ["", f"{empty} further cells contributed no sample to any "
+                  "metric (jobs that only ever skipped)."]
+    if any(c["metrics"]["queue_delay"]["p95_is_sample_max"]
+           for c in doc["cells"] if c["metrics"]["queue_delay"]["n"]):
+        lines += ["", "Both columns are nearest-rank, so `med` is a sample "
+                  "value rather than the midpoint of two. Where n < 20 the "
+                  "p95 column is the sample maximum, not a percentile "
+                  "estimate."]
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +1167,41 @@ def render_markdown(report: dict) -> str:
     ]
     for key, metric in report["metrics"].items():
         lines.append(f"| {key} | {cell(metric)} |")
+    path = report["critical_path"]
+    caveats = []
+    feedback = report["metrics"].get("pr_feedback") or {}
+    if (feedback.get("evidence") or {}).get("non_pinned_executed") == 0:
+        caveats.append("`pr_feedback` equals `run_wall_clock` by construction "
+                       "here, not by corroboration: every executed job is a "
+                       "pinned check.")
+    note = (path["observed"].get("evidence") or {}).get("note")
+    if note:
+        caveats.append(f"`critical_path.observed` is {note}.")
+    for key in ("observed", "graph"):
+        metric = path[key]
+        lines.append(f"| critical_path.{key} | {cell(metric)} |")
+    chain = (path["observed"].get("evidence") or {}).get("chain")
+    if chain:
+        hops = {hop["job"]: hop
+                for hop in (path["observed"].get("evidence") or {}).get(
+                    "hops") or []}
+        lines += ["", "Critical path, in order. Seconds are queue then wall:",
+                  ""]
+        for name in chain:
+            hop = hops.get(name) or {}
+            lines.append(f"- {name}"
+                         f" ({hop.get('queue_delay')} / {hop.get('job_wall')})")
+    if caveats:
+        lines += ["", "These are not three independent measurements:", ""]
+        lines += [f"- {text}" for text in caveats]
+    drift = path.get("graph_drift")
+    if drift and (drift.get("jobs_without_node")
+                  or drift.get("nodes_without_job")):
+        lines += ["", "The declared graph and the run disagree:", ""]
+        for name in drift.get("jobs_without_node") or []:
+            lines.append(f"- job with no node: {name}")
+        for name in drift.get("nodes_without_job") or []:
+            lines.append(f"- node with no job: {name}")
     lines += [
         "",
         "Per job, seconds. A skipped job has no durations at all.",
@@ -813,7 +1352,26 @@ def cmd_report(args) -> int:
         if run.get("id") is not None and run.get("id") != run_id:
             return die(f"{run_path} holds run {run.get('id')}, not {run_id}; "
                        f"the saved pair does not belong together")
-        report = analyze(run, json.loads(jobs_path.read_text()))
+        jobs_doc = json.loads(jobs_path.read_text())
+        edges, drift = None, None
+        if args.workflow:
+            try:
+                graph = extract_graph(args.workflow)
+            except (OSError, WorkflowParseError) as exc:
+                # A missing workflow costs the critical path, not the report:
+                # the per-job timings are the bulk of the value and they do
+                # not depend on the graph.
+                print(f"ci-run-telemetry: no dependency graph "
+                      f"({exc}); the critical path will say so",
+                      file=sys.stderr)
+                graph = None
+            if not graph:
+                print("ci-run-telemetry: the workflow declares no jobs; the "
+                      "critical path will say so", file=sys.stderr)
+            else:
+                names = [j.get("name") for j in jobs_doc.get("jobs") or []]
+                edges, drift = match_graph_to_jobs(graph, names)
+        report = analyze(run, jobs_doc, edges, drift)
         (out / f"run-{run_id}.json").write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n")
         (out / f"run-{run_id}.md").write_text(render_markdown(report))
@@ -821,6 +1379,29 @@ def cmd_report(args) -> int:
         print(f"ci-run-telemetry: run {run_id}: {counts['executed']} executed, "
               f"{counts['skipped']} skipped, "
               f"{len(report['anomalies'])} anomalies")
+    return 0
+
+
+def cmd_aggregate(args) -> int:
+    out = Path(args.out)
+    if args.run_id:
+        paths = [out / f"run-{run_id}.json" for run_id in args.run_id]
+        missing = [str(path) for path in paths if not path.exists()]
+        if missing:
+            return die(f"no report at {', '.join(missing)} (run `report` first)")
+    else:
+        paths = sorted(path for path in out.glob("run-*.json")
+                       if path.name != f"{args.label}.json")
+    if not paths:
+        return die(f"no reports under {out} (run `report` first)")
+    reports = [json.loads(path.read_text()) for path in paths]
+    doc = aggregate_reports(reports)
+    (out / f"{args.label}.json").write_text(
+        json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    (out / f"{args.label}.md").write_text(render_aggregate_markdown(doc))
+    print(f"ci-run-telemetry: {args.label}: {len(doc['runs'])} runs, "
+          f"{len(doc['cells'])} cells, populations "
+          f"{', '.join(doc['populations']) or 'none'}")
     return 0
 
 
@@ -846,7 +1427,22 @@ def main(argv=None) -> int:
                         help="workflow run id; repeat for several runs")
     report.add_argument("--out", default=DEFAULT_OUT_DIR,
                         help=f"output directory (default {DEFAULT_OUT_DIR}/)")
+    report.add_argument("--workflow", default=DEFAULT_WORKFLOW,
+                        help="workflow file the dependency graph is read from "
+                             f"(default {DEFAULT_WORKFLOW}); pass an empty "
+                             "value to skip the critical path")
     report.set_defaults(func=cmd_report)
+
+    aggregate = sub.add_parser(
+        "aggregate", help="combine reports into per-(job, population) cells")
+    aggregate.add_argument("--run-id", type=int, action="append",
+                           help="restrict to these runs; default every report "
+                                "in the output directory")
+    aggregate.add_argument("--out", default=DEFAULT_OUT_DIR,
+                           help=f"output directory (default {DEFAULT_OUT_DIR}/)")
+    aggregate.add_argument("--label", default="baseline",
+                           help="name for the written files (default baseline)")
+    aggregate.set_defaults(func=cmd_aggregate)
 
     args = parser.parse_args(argv)
     if getattr(args, "max_requests", 1) < 1:
