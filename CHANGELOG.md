@@ -6,6 +6,36 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Performance
+
+### Security
+
+### Documentation
+
+## [0.62.0] - 2026-09-12
+
+### Added
+
+- **Session memory budgets now admit selected engine-owned allocations before
+  growth**: reservations cover fixed evaluation/delta/compound arenas,
+  arrangements, retained EDB relations and timestamps, program intern-table
+  growth, and public result buffers. Budgets can be set with
+  `WIRELOG_MEMORY_BUDGET` or resolved from supported cgroup/address-space
+  limits and, on Windows, a supplied Job Object limit. This is a per-session
+  admission contract, not a process-wide OOM guarantee; parser, IR, and plan
+  allocations remain outside its scope
+  (#1368, #1369, #1415, #1417, #1418, #1424, #1430, #1431, #1448).
+- **Built-in CSV fact loading streams input in bounded batches** and admits
+  its transient staging buffers before allocation; custom I/O adapters and
+  their public ABI are unchanged (#1402, #1405, #1429).
 - **Per-stratum TDD execution diagnostics** distinguish admission, selected
   worker width, submitted work, completed barriers, and serial replay. Exact
   result controls cover fused and unfused execution (#1378).
@@ -24,6 +54,15 @@ All notable changes to wirelog are documented in this file.
   documents units, overhead, and the DOOP W=1/W=2 and fixture baselines.
 
 ### Changed
+
+- **Persistent keyed joins can produce resumable sub-batches** when
+  `WIRELOG_JOIN_BATCH_BYTES` opts in. Unsupported join shapes fall back unless
+  `WIRELOG_JOIN_BATCH_STRICT=1` is set, in which case unsupported shapes fail.
+  The final result is still materialized in full; this bounds producer memory,
+  not total result memory (#1446).
+- **Heap-owned bulk relation appends use memory-budget admission**: growth by
+  `col_rel_append_all()` now consults the session memory governor, and denied
+  admission leaves the destination unchanged (#1503, #1476).
 
 ### Deprecated
 
