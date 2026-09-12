@@ -17,6 +17,7 @@
 #include "../wirelog/passes/jpp.h"
 #include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
+#include "plan_fixture.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -73,9 +74,14 @@ make_plan(const char *src)
 
     wl_plan_t *plan = NULL;
     int rc = wl_plan_from_program(prog, &plan);
-    wirelog_program_free(prog);
-    if (rc != 0)
+    if (rc != 0) {
+        wirelog_program_free(prog);
         return NULL;
+    }
+    /* The plan borrows the program's intern table; keep the program alive
+     * until exit (Issue #1431), which is also what the program-lifetime
+     * gate (Issue #1471) enforces for every plan-building helper. */
+    plan_fixture_hold(prog);
     return plan;
 }
 
