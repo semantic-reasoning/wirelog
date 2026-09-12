@@ -14,6 +14,7 @@
 
 #include "../wirelog-internal.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -227,6 +228,27 @@ col_rel_source_writer_acquire(const col_rel_t *rel,
     rc = col_rel_storage_owner_resolve(rel, &owner);
     if (rc != 0)
         return rc;
+    return wl_columnar_source_access_writer_acquire(
+        &owner->source_access, token);
+}
+
+/* Metadata/type publication rewrites the canonical relation descriptor and,
+ * for types, may reinterpret existing row lanes.  A live storage alias must
+ * therefore be denied rather than allowed to observe a mixed descriptor. */
+static int
+col_rel_published_writer_acquire(const col_rel_t *rel,
+    wl_columnar_source_access_writer_t *token)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!rel || !token)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0)
+        return rc;
+    if (owner->storage_alias_borrows > 0)
+        return EBUSY;
     return wl_columnar_source_access_writer_acquire(
         &owner->source_access, token);
 }
@@ -730,7 +752,7 @@ col_rel_attach_memory_governor(col_rel_t *r,
 }
 
 int
-col_rel_enable_timestamps(col_rel_t *r)
+col_rel_enable_timestamps_locked(col_rel_t *r)
 {
     wl_columnar_memory_reservation_t pending;
     int reserve_rc;
@@ -773,6 +795,27 @@ col_rel_enable_timestamps(col_rel_t *r)
 fail:
     col_rel_reservation_rollback(&pending);
     return ENOMEM;
+}
+
+int
+col_rel_enable_timestamps(col_rel_t *r)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    if (r->timestamps || r->capacity == 0)
+        return 0;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_enable_timestamps_locked(r);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 /*
@@ -922,8 +965,9 @@ col_rel_destroy(col_rel_t *r)
  * Called lazily on first insert (EDB) or when relation is first produced.
  * Returns 0 on success, ENOMEM/EINVAL on failure.
  */
-int
-col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
+static int
+col_rel_set_schema_impl(col_rel_t *r, uint32_t ncols,
+    const char *const *col_names)
 {
     wl_columnar_memory_reservation_t pending;
     int pending_rc;
@@ -1028,6 +1072,25 @@ fail:
     r->capacity = 0;
     r->ncols = 0;
     return failure_rc;
+}
+
+int
+col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_set_schema_impl(r, ncols, col_names);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 static int
@@ -1193,7 +1256,20 @@ int
 col_rel_set_column_types(col_rel_t *r, const wirelog_column_type_t *types,
     uint32_t ncols)
 {
-    return col_rel_set_column_types_impl(r, types, ncols, true);
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_set_column_types_impl(r, types, ncols, true);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
 }
 
 int
@@ -1325,8 +1401,8 @@ col_rel_compute_physical_layout(const col_rel_logical_col_t *logical_cols,
     return 0;
 }
 
-int
-col_rel_apply_compound_schema(col_rel_t *r,
+static int
+col_rel_apply_compound_schema_impl(col_rel_t *r,
     const col_rel_logical_col_t *logical_cols,
     uint32_t logical_ncols)
 {
@@ -1341,10 +1417,16 @@ col_rel_apply_compound_schema(col_rel_t *r,
      * here, but the prefix sum walks every column exactly once. */
     uint32_t compound_count = 0u;
     uint32_t inline_offset = 0u;
+    uint32_t physical_ncols = 0u;
     int rc = col_rel_compute_physical_layout(logical_cols, logical_ncols,
-            NULL, NULL, &inline_offset, &compound_count);
+            &physical_ncols, NULL, &inline_offset, &compound_count);
     if (rc != 0)
         return rc;
+    if (r->ncols != 0 && physical_ncols != r->ncols)
+        return EINVAL;
+    if (!wl_columnar_relation_generation_valid(r->view_generation)
+        || r->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
 
     uint32_t *arity_map
         = (uint32_t *)malloc((size_t)logical_ncols * sizeof(uint32_t));
@@ -1504,13 +1586,34 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
 }
 
 int
-col_rel_append_row(col_rel_t *r, const int64_t *row)
+col_rel_apply_compound_schema(col_rel_t *r,
+    const col_rel_logical_col_t *logical_cols,
+    uint32_t logical_ncols)
 {
     wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+    int release_rc;
+
+    if (!r)
+        return EINVAL;
+    rc = col_rel_published_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_apply_compound_schema_impl(r, logical_cols, logical_ncols);
+    release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc == 0 && release_rc != 0)
+        rc = release_rc;
+    return rc;
+}
+
+static int
+col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
+    wl_columnar_source_access_writer_t *writer, bool writer_held)
+{
     bool alias_release_pending = false;
     int rc;
 
-    if (!r || !row)
+    if (!r || !row || !writer)
         return EINVAL;
     /* Do all structural validation before any resize, COW, or timestamp
      * publication.  In particular, a zero-column or partially initialized
@@ -1539,9 +1642,11 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
      * but before any resize, COW, timestamp, value, or generation mutation.
      * A reader on an alias therefore excludes append on every view of the
      * same backing storage. */
-    rc = col_rel_source_writer_acquire(r, &writer);
-    if (rc != 0)
-        return rc;
+    if (!writer_held) {
+        rc = col_rel_source_writer_acquire(r, writer);
+        if (rc != 0)
+            return rc;
+    }
 
     bool needs_resize = r->nrows >= r->capacity;
     if (needs_resize) {
@@ -1645,9 +1750,120 @@ release_writer:
         if (alias_rc != 0 && rc == 0)
             rc = alias_rc;
     }
-    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+    if (!writer_held
+        && wl_columnar_source_access_writer_release(writer) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
+}
+
+int
+col_rel_append_row(col_rel_t *r, const int64_t *row)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    return col_rel_append_row_impl(r, row, &writer, false);
+}
+
+int
+col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
+    wl_columnar_source_access_writer_t *writer)
+{
+    return col_rel_append_row_impl(r, row, writer, true);
+}
+
+/* Reserve the complete destination shape before a multi-row operation starts.
+ * The caller holds the destination writer.  This keeps subsequent locked
+ * appends allocation-free, so a destination admission failure cannot leave
+ * a partially emitted delta after the source has been transformed. */
+int
+col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
+    wl_columnar_source_access_writer_t *writer)
+{
+    if (!r || !writer || additional > UINT32_MAX - r->nrows)
+        return EINVAL;
+    uint32_t required = r->nrows + additional;
+    /* A shared view can have spare capacity but still needs COW before the
+     * first locked append.  Perform that fallible transition up front. */
+    if (r->col_shared && required <= r->capacity)
+        return col_rel_cow_unshare_impl(r, 0, false);
+    if (required <= r->capacity)
+        return 0;
+    if (r->storage_owner == r && r->storage_alias_borrows > 0)
+        return EBUSY;
+
+    uint32_t new_cap = r->capacity ? r->capacity : COL_REL_INIT_CAP;
+    while (new_cap < required) {
+        if (new_cap > UINT32_MAX / 2u)
+            return ENOMEM;
+        new_cap *= 2u;
+    }
+    if (r->col_shared || r->arena_owned)
+        return col_rel_grow_owned_transition_impl(r, new_cap, false);
+
+    uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
+    wl_columnar_memory_reservation_t pending;
+    int pending_rc = 0;
+    uint64_t new_bytes = 0;
+    bool admitted = r->memory_governor != NULL;
+    if (admitted) {
+        pending_rc = col_rel_reserve_retained(r, new_cap, &pending);
+        if (pending_rc < 0
+            || !col_rel_retained_bytes(r->ncols, new_cap,
+            r->timestamps != NULL, &new_bytes)) {
+            if (pending_rc > 0)
+                col_rel_reservation_rollback(&pending);
+            return ENOMEM;
+        }
+    }
+    int64_t **new_cols = NULL;
+    col_delta_timestamp_t *new_ts = NULL;
+    int rc = col_rel_prepare_resize(r, new_cap, &new_cols, &new_ts);
+    if (rc != 0) {
+        if (admitted)
+            col_rel_reservation_rollback(&pending);
+        return rc;
+    }
+    if (admitted && pending_rc > 0
+        && col_rel_publish_retained_reservation(r, &pending, new_bytes) != 0) {
+        col_rel_reservation_rollback(&pending);
+        col_columns_free(new_cols, r->ncols);
+        free(new_ts);
+        return ENOMEM;
+    }
+    col_rel_publish_resize(r, new_cols, new_ts, new_cap);
+    col_rel_ledger_reconcile(r, ledger_before);
+    wl_columnar_relation_touch_storage(r);
+    return 0;
+}
+
+int
+col_rel_reset_rows_locked(col_rel_t *r,
+    wl_columnar_source_access_writer_t *writer)
+{
+    col_rel_t *owner = NULL;
+    if (!r || !writer || !writer->owner
+        || writer->identity != (uintptr_t)writer
+        || !writer->thread_valid
+        || !wl_columnar_source_access_writer_thread_equal(writer)
+        || col_rel_storage_owner_resolve(r, &owner) != 0
+        || writer->owner != &owner->source_access)
+        return EINVAL;
+    if (owner->storage_alias_borrows > 0)
+        return EBUSY;
+    r->nrows = 0;
+    r->sorted_nrows = 0;
+    r->base_nrows = 0;
+    r->run_count = 0;
+    memset(r->run_ends, 0, sizeof(r->run_ends));
+    uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
+    free(r->timestamps);
+    r->timestamps = NULL;
+    free(r->dedup_slots);
+    r->dedup_slots = NULL;
+    r->dedup_cap = 0;
+    r->dedup_count = 0;
+    col_rel_ledger_reconcile(r, ledger_before);
+    wl_columnar_relation_touch_replacement(r);
+    return 0;
 }
 
 /* Copy all rows from src into dst (must have same ncols).
@@ -2365,8 +2581,12 @@ prepare_fail:
 int
 col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
 {
-    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_reader_t source_reader = { 0 };
+    wl_columnar_source_access_reader_t destination_reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
+    col_rel_t *destination_owner = NULL;
+    bool same_owner;
     int rc;
 
     if (!dst || !src)
@@ -2374,11 +2594,51 @@ col_rel_install_shared_view(col_rel_t *dst, const col_rel_t *src)
     rc = col_rel_storage_owner_resolve(src, &owner);
     if (rc != 0)
         return rc;
-    rc = col_rel_source_reader_acquire(owner, &reader);
+    rc = col_rel_storage_owner_resolve(dst, &destination_owner);
     if (rc != 0)
         return rc;
+    same_owner = owner == destination_owner;
+    if (same_owner) {
+        /* Rebinding an existing alias is a descriptor refresh, not a source
+         * storage mutation.  Keep the source reader lease across the refresh;
+         * session-owned aliases already retain this lease for their lifetime,
+         * and attempting a writer here would deadlock those callers. */
+        rc = col_rel_source_reader_acquire(owner, &source_reader);
+        if (rc != 0)
+            return rc;
+    } else {
+        rc = col_rel_source_reader_acquire(owner, &source_reader);
+        if (rc != 0)
+            return rc;
+        if (destination_owner->storage_alias_borrows > 0) {
+            /* Replacing an alias must coexist with the session lease that
+             * protects the old owner.  A writer cannot be admitted while
+             * that lease is live; a second reader pins the old owner until
+             * the descriptor transition has committed. */
+            rc = col_rel_source_reader_acquire(destination_owner,
+                    &destination_reader);
+            if (rc != 0) {
+                (void)col_rel_source_reader_release(&source_reader);
+                return rc;
+            }
+        } else {
+            rc = col_rel_published_writer_acquire(dst, &writer);
+            if (rc != 0) {
+                (void)col_rel_source_reader_release(&source_reader);
+                return rc;
+            }
+        }
+    }
     rc = col_rel_install_shared_view_unprotected(dst, src);
-    if (col_rel_source_reader_release(&reader) != 0 && rc == 0)
+    if (writer.owner
+        && wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    if (destination_reader.owner
+        && col_rel_source_reader_release(&destination_reader) != 0
+        && rc == 0)
+        rc = EINVAL;
+    if (source_reader.owner
+        && col_rel_source_reader_release(&source_reader) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
 }
@@ -2784,6 +3044,7 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
     dst->storage_generation = src->storage_generation;
     col_rel_storage_owner_init(dst);
     dst->ncols = src->ncols;
+    dst->declared_ncols = src->declared_ncols;
     dst->nrows = src->nrows;
     dst->capacity = src->capacity;
     dst->sorted_nrows = src->sorted_nrows;
@@ -3008,6 +3269,356 @@ col_rel_deep_copy(const col_rel_t *src, col_rel_t **out, wl_arena_t *arena)
 
     *out = dst;
     return 0;
+}
+
+static int
+col_rel_replacement_compound_entries(const col_rel_t *candidate,
+    uint32_t *out_entries)
+{
+    uint32_t entries = 0;
+    uint32_t physical_count = 0;
+
+    if (!candidate || !out_entries)
+        return EINVAL;
+    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
+        *out_entries = 0;
+        return 0;
+    }
+    if (!candidate->compound_arity_map || candidate->ncols == 0)
+        return EINVAL;
+    while (physical_count < candidate->ncols) {
+        uint32_t arity = candidate->compound_arity_map[entries];
+        if (arity == 0 || arity > candidate->ncols - physical_count)
+            return EINVAL;
+        physical_count += arity;
+        entries++;
+    }
+    *out_entries = entries;
+    return 0;
+}
+
+static int
+col_rel_replacement_validate_candidate(const col_rel_t *candidate)
+{
+    uint64_t ignored_bytes;
+    uint32_t compound_entries;
+
+    if (!candidate || candidate->nrows > candidate->capacity
+        || !wl_columnar_relation_generation_valid(
+            candidate->view_generation)
+        || !wl_columnar_relation_generation_valid(
+            candidate->storage_generation))
+        return EINVAL;
+    if (candidate->view_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || candidate->storage_generation
+        >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
+        candidate->timestamps != NULL, &ignored_bytes))
+        return EOVERFLOW;
+    if (candidate->ncols > 0 && candidate->capacity > 0) {
+        if (!candidate->columns)
+            return EINVAL;
+        for (uint32_t c = 0; c < candidate->ncols; c++)
+            if (!candidate->columns[c])
+                return EINVAL;
+    }
+    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_NONE) {
+        if (candidate->compound_arity_map || candidate->compound_count != 0
+            || candidate->inline_physical_offset != 0)
+            return EINVAL;
+    }
+    if (col_rel_replacement_compound_entries(candidate, &compound_entries)
+        != 0)
+        return EINVAL;
+    if (candidate->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+        && candidate->compound_count > compound_entries)
+        return EINVAL;
+    return 0;
+}
+
+static bool
+col_rel_replacement_old_reservation_valid(const col_rel_t *dst)
+{
+    uint64_t state;
+
+    if (!dst || dst->retained_reserved_bytes == 0)
+        return true;
+    if (dst->retained_reservation.identity != &dst->retained_reservation)
+        return false;
+    state = atomic_load_explicit(&dst->retained_reservation.state,
+            memory_order_acquire);
+    return state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
+}
+
+static int
+col_rel_prepare_replacement_impl(col_rel_t *dst, const col_rel_t *candidate,
+    col_rel_replacement_t *replacement, bool writer_held)
+{
+    uint64_t planned_bytes;
+    uint64_t staged_bytes;
+    uint32_t compound_entries;
+    int rc;
+
+    if (!dst || !candidate || !replacement || dst == candidate)
+        return EINVAL;
+
+    rc = col_rel_replacement_validate_candidate(candidate);
+    if (rc != 0)
+        return rc;
+    if (dst->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || dst->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    if (!col_rel_replacement_old_reservation_valid(dst))
+        return EINVAL;
+    if (!col_rel_retained_bytes(candidate->ncols, candidate->capacity,
+        candidate->timestamps != NULL, &planned_bytes))
+        return EOVERFLOW;
+
+    if (writer_held) {
+        col_rel_t *owner = NULL;
+        if (!replacement->writer_acquired
+            || col_rel_storage_owner_resolve(dst, &owner) != 0
+            || replacement->writer.owner != &owner->source_access
+            || !wl_columnar_source_access_writer_thread_equal(
+                &replacement->writer)) {
+            rc = EINVAL;
+            goto fail;
+        }
+    } else {
+        rc = col_rel_published_writer_acquire(dst, &replacement->writer);
+        if (rc != 0)
+            return rc;
+        replacement->writer_acquired = true;
+    }
+
+    /* Reserve the complete private shape before deep_copy allocates it.  The
+     * candidate may borrow arena/shared storage, but publication always owns
+     * its replacement, so admission is based on the full retained shape. */
+    replacement->reserved_bytes = planned_bytes;
+    if (dst->memory_governor && planned_bytes > 0) {
+        wl_columnar_memory_admission_status_t status;
+        wl_columnar_memory_governor_t *governor
+            = wl_columnar_memory_governor_ref_get(dst->memory_governor);
+
+        status = wl_columnar_memory_reserve_checked(governor, planned_bytes,
+                &replacement->reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            goto allocation_failure;
+        if (!wl_columnar_memory_commit(&replacement->reservation, dst))
+            goto allocation_failure;
+        replacement->reservation_active = true;
+    }
+
+    rc = col_rel_deep_copy(candidate, &replacement->staged, NULL);
+    if (rc != 0)
+        goto fail;
+    /* col_rel_deep_copy historically degrades malformed compound metadata to
+     * NONE.  A publication primitive must reject that loss instead of
+     * silently publishing a different schema. */
+    if (replacement->staged->compound_kind != candidate->compound_kind
+        || replacement->staged->compound_count != candidate->compound_count
+        || replacement->staged->inline_physical_offset
+        != candidate->inline_physical_offset)
+        goto invalid;
+    if (candidate->compound_arity_map) {
+        if (col_rel_replacement_compound_entries(candidate,
+            &compound_entries) != 0
+            || !replacement->staged->compound_arity_map
+            || memcmp(replacement->staged->compound_arity_map,
+            candidate->compound_arity_map,
+            (size_t)compound_entries * sizeof(uint32_t)) != 0)
+            goto invalid;
+    }
+    if (candidate->dedup_cap > 0) {
+        if (!candidate->dedup_slots)
+            goto invalid;
+        replacement->staged->dedup_slots = (uint64_t *)malloc(
+            (size_t)candidate->dedup_cap
+            * sizeof(*replacement->staged->dedup_slots));
+        if (!replacement->staged->dedup_slots)
+            goto allocation_failure;
+        memcpy(replacement->staged->dedup_slots, candidate->dedup_slots,
+            (size_t)candidate->dedup_cap
+            * sizeof(*replacement->staged->dedup_slots));
+        replacement->staged->dedup_cap = candidate->dedup_cap;
+        replacement->staged->dedup_count = candidate->dedup_count;
+    }
+
+    staged_bytes = col_rel_transport_bytes(replacement->staged);
+    if (staged_bytes == UINT64_MAX || staged_bytes != planned_bytes)
+        goto overflow;
+    return 0;
+
+invalid:
+    rc = EINVAL;
+    goto fail;
+overflow:
+    rc = EOVERFLOW;
+    goto fail;
+allocation_failure:
+    rc = ENOMEM;
+fail:
+    col_rel_discard_replacement(replacement);
+    return rc;
+}
+
+int
+col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
+    col_rel_replacement_t *replacement)
+{
+    if (!dst || !candidate || !replacement)
+        return EINVAL;
+    memset(replacement, 0, sizeof(*replacement));
+    wl_columnar_memory_reservation_init(&replacement->reservation);
+    return col_rel_prepare_replacement_impl(dst, candidate, replacement,
+               false);
+}
+
+int
+col_rel_prepare_replacement_locked(col_rel_t *dst,
+    const col_rel_t *candidate, col_rel_replacement_t *replacement)
+{
+    int rc;
+
+    if (!dst || !candidate || !replacement)
+        return EINVAL;
+    rc = col_rel_prepare_replacement_impl(dst, candidate, replacement, true);
+    if (rc != 0 && replacement->writer_acquired)
+        col_rel_discard_replacement(replacement);
+    return rc;
+}
+
+void
+col_rel_commit_replacement_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement)
+{
+    col_rel_t old;
+    col_rel_t *staged;
+    wl_columnar_memory_reservation_t new_reservation;
+    char *name;
+    char *staged_name;
+    wl_mem_ledger_t *ledger;
+    wl_columnar_memory_governor_ref_t *governor;
+    uint64_t identity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t ledger_before;
+    uint64_t ledger_ts_bytes;
+    uint64_t gate_state;
+    bool has_new_reservation;
+    int release_rc;
+
+    /* Preparation establishes all fallible invariants.  Publication is a
+     * no-fail operation: callers must not attempt to roll it back after the
+     * destination has been replaced. */
+    assert(dst && replacement && replacement->staged
+        && replacement->writer_acquired
+        && replacement->writer.owner == &dst->source_access
+        && wl_columnar_source_access_writer_thread_equal(
+            &replacement->writer));
+    staged = replacement->staged;
+    assert(staged->nrows <= staged->capacity
+        && dst->view_generation < WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        && dst->storage_generation < WL_COLUMNAR_REL_GENERATION_INVALID - 1u);
+
+    has_new_reservation = replacement->reservation_active;
+    wl_columnar_memory_reservation_init(&new_reservation);
+    if (has_new_reservation
+        && !wl_columnar_memory_reservation_move(&new_reservation,
+        &replacement->reservation)) {
+        assert(false && "prepared replacement reservation must be movable");
+        abort();
+    }
+
+    old = *dst;
+    name = old.name;
+    staged_name = staged->name;
+    ledger = old.mem_ledger;
+    governor = old.memory_governor;
+    identity = old.relation_identity;
+    view_generation = old.view_generation;
+    storage_generation = old.storage_generation;
+    ledger_before = col_rel_owned_ledger_bytes(&old);
+    ledger_ts_bytes = old.ledger_ts_bytes;
+    gate_state = atomic_load_explicit(&old.source_access.state,
+            memory_order_acquire);
+
+    if (old.retained_reserved_bytes > 0)
+        (void)wl_columnar_memory_release(&old.retained_reservation);
+
+    *dst = *staged;
+    dst->name = name;
+    staged->name = NULL;
+    free(staged_name);
+    free(staged);
+    replacement->staged = NULL;
+
+    dst->relation_identity = identity;
+    dst->view_generation = view_generation;
+    dst->storage_generation = storage_generation;
+    dst->pool_owned = old.pool_owned;
+    dst->mem_ledger = ledger;
+    dst->memory_governor = governor;
+    dst->retained_reserved_bytes = 0;
+    wl_columnar_memory_reservation_init(&dst->retained_reservation);
+    if (has_new_reservation) {
+        (void)wl_columnar_memory_reservation_move(
+            &dst->retained_reservation, &new_reservation);
+        dst->retained_reserved_bytes = replacement->reserved_bytes;
+    }
+    dst->ledger_ts_bytes = ledger_ts_bytes;
+    dst->storage_owner = dst;
+    dst->storage_owner_identity = identity;
+    dst->storage_alias_borrows = 0;
+    atomic_store_explicit(&dst->source_access.state, gate_state,
+        memory_order_release);
+    col_rel_ledger_reconcile(dst, ledger_before);
+    wl_columnar_relation_touch_replacement(dst);
+
+    replacement->reservation_active = false;
+    old.name = NULL;
+    old.mem_ledger = NULL;
+    old.memory_governor = NULL;
+    old.retained_reserved_bytes = 0;
+    old.ledger_ts_bytes = 0;
+    old.storage_owner = &old;
+    old.storage_owner_identity = old.relation_identity;
+    old.storage_alias_borrows = 0;
+    col_rel_storage_owner_init(&old);
+    col_rel_free_contents(&old);
+
+    release_rc = wl_columnar_source_access_writer_release(
+        &replacement->writer);
+    /* The token is valid for the whole publication.  A release error can
+     * only indicate an internal contract violation after state was already
+     * published; it is therefore diagnostic, never a commit failure. */
+    assert(release_rc == 0);
+    (void)release_rc;
+    replacement->writer_acquired = false;
+}
+
+void
+col_rel_discard_replacement(col_rel_replacement_t *replacement)
+{
+    if (!replacement)
+        return;
+    if (replacement->staged) {
+        col_rel_destroy(replacement->staged);
+        replacement->staged = NULL;
+    }
+    if (replacement->reservation_active) {
+        (void)wl_columnar_memory_release(&replacement->reservation);
+        replacement->reservation_active = false;
+    }
+    if (replacement->writer_acquired) {
+        (void)wl_columnar_source_access_writer_release(
+            &replacement->writer);
+        replacement->writer_acquired = false;
+    }
+    replacement->reserved_bytes = 0;
 }
 
 /* ---- radix sort by single key column ----------------------------------- */

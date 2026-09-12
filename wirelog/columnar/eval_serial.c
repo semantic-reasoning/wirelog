@@ -707,10 +707,21 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 int rc2 = col_op_consolidate_incremental_delta(r, snap[ri],
                         delta, &fast_flag);
                 uint64_t cons_elapsed = now_ns() - cons_t0;
+                if (rc2 != 0) {
+                    /* The source may have been sorted before a later
+                     * admission error; invalidate cached arrangements too. */
+                    col_session_invalidate_arrangements(&sess->base,
+                        sp->relations[ri].name);
+                    col_rel_destroy(delta);
+                    outer_rc = rc2;
+                    goto stride_error;
+                }
+
                 sess->consolidation_ns += cons_elapsed;
                 sess->consolidate_fast_hits += (uint64_t)fast_flag;
                 sess->consolidate_slow_hits += (uint64_t)(1 - fast_flag);
-                /* Invalidate arrangements for this relation (data changed). */
+                /* Invalidate arrangements for this relation only after the
+                 * consolidation transaction has committed. */
                 col_session_invalidate_arrangements(&sess->base,
                     sp->relations[ri].name);
                 /* Per-call trace: WL_LOG=CONSOLIDATION:5 (or legacy
@@ -722,11 +733,6 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     cons_old, cons_new, (double)cons_elapsed / 1000.0,
                     cons_old > 0 ? (double)cons_new / (double)cons_old
                                      : 0.0);
-                if (rc2 != 0) {
-                    col_rel_destroy(delta);
-                    outer_rc = rc2;
-                    goto stride_error;
-                }
 
                 if (delta->nrows > 0) {
                     /* Stamp each new row with its provenance (eff_iter, stratum).
@@ -749,9 +755,10 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     /* Phase 4: Enable timestamp tracking on target relation to
                      * preserve provenance through consolidation.  This enables
                      * frontier computation to determine convergence. */
-                    if (col_rel_enable_timestamps(r) != 0) {
+                    int timestamp_rc = col_rel_enable_timestamps(r);
+                    if (timestamp_rc != 0) {
                         col_rel_destroy(delta);
-                        outer_rc = ENOMEM;
+                        outer_rc = timestamp_rc;
                         goto stride_error;
                     }
 

@@ -337,6 +337,32 @@ wl_columnar_session_source_leases_release_all(wl_col_session_t *sess)
     }
 }
 
+/* Row removal rewrites the canonical relation storage in place.  Admit the
+ * operation before the first source read so a competing reader, writer, or
+ * live storage alias cannot observe a partially compacted relation. */
+static int
+session_relation_writer_acquire(col_rel_t *relation, col_rel_t **owner_out,
+    wl_columnar_source_access_writer_t *writer)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!relation || !owner_out || !writer)
+        return EINVAL;
+    *owner_out = NULL;
+    rc = col_rel_storage_owner_resolve(relation, &owner);
+    if (rc != 0)
+        return rc;
+    if (owner->storage_alias_borrows > 0)
+        return EBUSY;
+    rc = wl_columnar_source_access_writer_acquire(
+        &owner->source_access, writer);
+    if (rc != 0)
+        return rc;
+    *owner_out = owner;
+    return 0;
+}
+
 int
 wl_columnar_session_install_shared_view(wl_col_session_t *sess,
     col_rel_t *dst, const col_rel_t *src)
@@ -2599,13 +2625,22 @@ col_session_remove(wl_session_t *session, const char *relation,
     if (r->ncols != num_cols)
         return EINVAL;
 
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    int writer_rc = session_relation_writer_acquire(r, &owner, &writer);
+    (void)owner;
+    if (writer_rc != 0)
+        return writer_rc;
+
     int64_t row_stack[COL_STACK_MAX];
     int64_t *row_buf = row_stack;
     if (num_cols > COL_STACK_MAX) {
         row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
         if (!row_buf)
-            return ENOMEM;
+            writer_rc = ENOMEM;
     }
+    if (writer_rc != 0)
+        goto remove_release;
 
     /* Compact: remove matching rows */
     for (uint32_t di = 0; di < num_rows; di++) {
@@ -2632,12 +2667,19 @@ next_del:;
         if (r->nrows != old_nrows)
             wl_columnar_relation_touch_view(r);
     }
-    if (row_buf != row_stack)
-        free(row_buf);
     session_invalidate_relation_caches(sess, r->name);
     sess->pending_input_change = true;
     sess->snapshot_stable_valid = false;
-    return 0;
+
+remove_release:
+    if (row_buf != row_stack)
+        free(row_buf);
+    if (writer.owner) {
+        int release_rc = wl_columnar_source_access_writer_release(&writer);
+        if (writer_rc == 0 && release_rc != 0)
+            writer_rc = release_rc;
+    }
+    return writer_rc;
 }
 
 /*
@@ -2672,13 +2714,22 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
     if (r->ncols != num_cols)
         return EINVAL;
 
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    int writer_rc = session_relation_writer_acquire(r, &owner, &writer);
+    (void)owner;
+    if (writer_rc != 0)
+        return writer_rc;
+
     /* Allocate $r$<name> delta relation to collect removed rows */
     char rname[256];
     snprintf(rname, sizeof(rname), "$r$%s", r->name);
 
     col_rel_t *rdelta = col_rel_new_auto(rname, num_cols);
-    if (!rdelta)
-        return ENOMEM;
+    if (!rdelta) {
+        writer_rc = ENOMEM;
+        goto incremental_release_no_buf;
+    }
 
     /* Append each removed row to the delta relation.
      * We need to track which rows are actually being removed from the EDB,
@@ -2694,7 +2745,8 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
                 rc = col_rel_append_row(rdelta, del);
                 if (rc != 0) {
                     col_rel_destroy(rdelta);
-                    return rc;
+                    writer_rc = rc;
+                    goto incremental_release_no_buf;
                 }
                 break; /* Only one copy per removal request */
             }
@@ -2707,18 +2759,19 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
         row_buf = (int64_t *)malloc(num_cols * sizeof(int64_t));
         if (!row_buf) {
             col_rel_destroy(rdelta);
-            return ENOMEM;
+            writer_rc = ENOMEM;
+            goto incremental_release;
         }
     }
 
-    /* Register $r$<name> in session (replacing any prior) */
-    session_remove_rel(sess, rname);
+    /* Register $r$<name> in session.  session_add_rel performs replacement
+     * transactionally; removing the old delta first would lose a pending
+     * retraction if admission of the replacement failed. */
     rc = session_add_rel(sess, rdelta);
     if (rc != 0) {
         col_rel_destroy(rdelta);
-        if (row_buf != row_stack)
-            free(row_buf);
-        return rc;
+        writer_rc = rc;
+        goto incremental_release;
     }
 
     /* Remove rows from the EDB using existing compact logic */
@@ -2746,9 +2799,6 @@ next_del_incr:;
         if (r->nrows != old_nrows)
             wl_columnar_relation_touch_view(r);
     }
-    if (row_buf != row_stack)
-        free(row_buf);
-
     /* Clamp base_nrows to current row count */
     if (r->base_nrows > r->nrows)
         r->base_nrows = r->nrows;
@@ -2764,7 +2814,18 @@ next_del_incr:;
     sess->outer_epoch++;
     sess->pending_input_change = true;
 
-    return 0;
+    writer_rc = 0;
+
+incremental_release:
+    if (row_buf != row_stack)
+        free(row_buf);
+incremental_release_no_buf:
+    if (writer.owner) {
+        int release_rc = wl_columnar_source_access_writer_release(&writer);
+        if (writer_rc == 0 && release_rc != 0)
+            writer_rc = release_rc;
+    }
+    return writer_rc;
 }
 
 /*
@@ -3024,27 +3085,105 @@ col_session_emit_snapshot(const wl_plan_t *plan, wl_col_session_t *sess,
     return 0;
 }
 
-static void
+static int
 col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
 {
+    col_rel_t **targets = NULL;
+    col_rel_t **owners = NULL;
+    wl_columnar_source_access_writer_t *writers = NULL;
+    uint32_t target_count = 0;
+    uint32_t owner_count = 0;
+    int rc = 0;
+
+    if (!plan || !sess)
+        return EINVAL;
+    targets = (col_rel_t **)calloc(sess->nrels ? sess->nrels : 1,
+            sizeof(*targets));
+    owners = (col_rel_t **)calloc(sess->nrels ? sess->nrels : 1,
+            sizeof(*owners));
+    writers = (wl_columnar_source_access_writer_t *)calloc(
+        sess->nrels ? sess->nrels : 1, sizeof(*writers));
+    if (!targets || !owners || !writers) {
+        free(targets);
+        free(owners);
+        free(writers);
+        return ENOMEM;
+    }
+
+    /* Collect each relation once and resolve all owners before mutation. */
     for (uint32_t si = 0; si < plan->stratum_count; si++) {
         const wl_plan_stratum_t *sp = &plan->strata[si];
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
             if (!r)
                 continue;
-            r->nrows = 0;
-            r->sorted_nrows = 0;
-            r->run_count = 0;
-            r->base_nrows = 0;
-            wl_columnar_relation_touch_view(r);
-            col_session_invalidate_arrangements(&sess->base, r->name);
+            bool known_target = false;
+            for (uint32_t i = 0; i < target_count; i++)
+                if (targets[i] == r)
+                    known_target = true;
+            if (known_target)
+                continue;
+            col_rel_t *owner = NULL;
+            rc = col_rel_storage_owner_resolve(r, &owner);
+            if (rc != 0 || owner->storage_alias_borrows > 0) {
+                rc = rc != 0 ? rc : EBUSY;
+                goto cleanup;
+            }
+            targets[target_count++] = r;
+            bool known_owner = false;
+            for (uint32_t i = 0; i < owner_count; i++)
+                if (owners[i] == owner)
+                    known_owner = true;
+            if (!known_owner)
+                owners[owner_count++] = owner;
         }
     }
+
+    for (uint32_t i = 1; i < owner_count; i++) {
+        col_rel_t *key = owners[i];
+        uint32_t j = i;
+        while (j > 0 && (uintptr_t)owners[j - 1] > (uintptr_t)key) {
+            owners[j] = owners[j - 1];
+            j--;
+        }
+        owners[j] = key;
+    }
+    for (uint32_t i = 0; i < owner_count; i++) {
+        rc = wl_columnar_source_access_writer_acquire(
+            &owners[i]->source_access, &writers[i]);
+        if (rc != 0)
+            goto cleanup;
+    }
+
+    /* Every writer is held: all logical resets below are non-fallible. */
+    for (uint32_t i = 0; i < target_count; i++) {
+        col_rel_t *owner = NULL;
+        rc = col_rel_storage_owner_resolve(targets[i], &owner);
+        if (rc != 0)
+            goto cleanup;
+        wl_columnar_source_access_writer_t *writer = NULL;
+        for (uint32_t j = 0; j < owner_count; j++)
+            if (owners[j] == owner)
+                writer = &writers[j];
+        rc = col_rel_reset_rows_locked(targets[i], writer);
+        if (rc != 0)
+            goto cleanup;
+        col_session_invalidate_arrangements(&sess->base, targets[i]->name);
+    }
+
     col_mat_cache_release_pins(&sess->mat_cache);
     assert(sess->mat_cache.active_pins == 0);
     col_mat_cache_clear(&sess->mat_cache);
     assert(sess->mat_cache.active_pins == 0);
+
+cleanup:
+    for (uint32_t i = owner_count; i > 0; i--)
+        if (writers[i - 1].owner)
+            (void)wl_columnar_source_access_writer_release(&writers[i - 1]);
+    free(targets);
+    free(owners);
+    free(writers);
+    return rc;
 }
 
 /* Snapshot/step completion is the coordinator's quiescent boundary.  Explicit
@@ -3151,7 +3290,9 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         && (sess->pending_full_input_eval
         || (sess->pending_input_change
         && sess->last_inserted_relation == NULL))) {
-        col_session_clear_idb_rows(plan, sess);
+        int clear_rc = col_session_clear_idb_rows(plan, sess);
+        if (clear_rc != 0)
+            return clear_rc;
     }
 
     /* Phase 4 incremental skip: when last_inserted_relation is set, only

@@ -194,6 +194,272 @@ test_same_row_count_mutation(void)
 }
 
 static void
+test_source_reader_blocks_column_type_publication(void)
+{
+    col_rel_t *rel = new_relation();
+    int64_t value = 17;
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t view_before;
+    wirelog_column_type_t *types_before;
+    int64_t **columns_before;
+
+    CHECK(rel != NULL, "typed publication relation");
+    CHECK(col_rel_append_row(rel, &value) == 0,
+        "typed publication source row");
+    view_before = rel->view_generation;
+    types_before = rel->column_types;
+    columns_before = rel->columns;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "typed publication source reader");
+    CHECK(col_rel_set_column_types(rel, &type, 1) == EBUSY,
+        "typed publication denied by source reader");
+    CHECK(rel->column_types == types_before && rel->columns == columns_before
+        && rel->view_generation == view_before,
+        "typed publication denial preserves relation state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "typed publication source reader release");
+    CHECK(col_rel_set_column_types(rel, &type, 1) == 0,
+        "typed publication retry succeeds");
+    CHECK(rel->column_types && rel->column_types[0] == type
+        && rel->view_generation == view_before + 1u,
+        "typed publication retry publishes one view epoch");
+    cleanup_relations();
+}
+
+static void
+test_source_reader_blocks_compound_publication(void)
+{
+    col_rel_t *rel = new_relation();
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 3u, 1u
+    };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t *map_before;
+    wirelog_compound_kind_t kind_before;
+    uint32_t count_before;
+    uint32_t offset_before;
+    uint64_t view_before;
+
+    CHECK(rel != NULL, "compound publication relation");
+    map_before = rel->compound_arity_map;
+    kind_before = rel->compound_kind;
+    count_before = rel->compound_count;
+    offset_before = rel->inline_physical_offset;
+    view_before = rel->view_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "compound publication source reader");
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == EBUSY,
+        "compound publication denied by source reader");
+    CHECK(rel->compound_arity_map == map_before
+        && rel->compound_kind == kind_before
+        && rel->compound_count == count_before
+        && rel->inline_physical_offset == offset_before
+        && rel->view_generation == view_before,
+        "compound denial preserves metadata and generation");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "compound publication source reader release");
+    CHECK(col_rel_apply_compound_schema(rel, &logical, 1u) == 0,
+        "compound publication retry succeeds");
+    CHECK(rel->compound_kind == WIRELOG_COMPOUND_KIND_SIDE
+        && rel->compound_arity_map && rel->compound_arity_map[0] == 1u
+        && rel->view_generation == view_before + 1u,
+        "compound retry publishes one view epoch");
+    cleanup_relations();
+}
+
+static void
+test_source_reader_blocks_timestamp_publication(void)
+{
+    col_rel_t *rel = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_delta_timestamp_t *timestamps;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t owner_generation;
+    uint64_t reserved_bytes;
+    uint64_t ledger_ts_bytes;
+
+    CHECK(col_rel_alloc(&rel, "empty_timestamp_reader") == 0
+        && track_relation(rel) != NULL,
+        "empty timestamp publication relation");
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "empty timestamp publication source reader");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps == NULL
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation,
+        "empty timestamp publication remains a no-op with reader");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "empty timestamp publication reader release");
+    cleanup_relations();
+
+    rel = NULL;
+    CHECK(col_rel_alloc(&rel, "empty_timestamp_test") == 0
+        && track_relation(rel) != NULL,
+        "empty timestamp publication relation");
+    {
+        int64_t value = 17;
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "timestamp publication seed");
+    }
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    owner_generation = rel->storage_owner_generation;
+    reserved_bytes = rel->retained_reserved_bytes;
+    ledger_ts_bytes = rel->ledger_ts_bytes;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "timestamp publication source reader");
+    CHECK(col_rel_enable_timestamps(rel) == EBUSY,
+        "timestamp publication denied by source reader");
+    CHECK(rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->storage_owner_generation == owner_generation
+        && rel->retained_reserved_bytes == reserved_bytes
+        && rel->ledger_ts_bytes == ledger_ts_bytes,
+        "timestamp publication denial preserves relation state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "timestamp publication source reader release");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps != timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation != storage_generation,
+        "timestamp publication succeeds after reader release");
+    cleanup_relations();
+
+    rel = new_relation();
+    CHECK(rel != NULL, "idempotent reader timestamp relation");
+    {
+        int64_t value = 19;
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "idempotent reader timestamp seed");
+    }
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "idempotent reader timestamp setup");
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "idempotent reader timestamp source reader");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation,
+        "idempotent timestamp publication remains a no-op with reader");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "idempotent reader timestamp reader release");
+    cleanup_relations();
+
+    rel = NULL;
+    col_rel_t *alias = NULL;
+    CHECK(col_rel_alloc(&rel, "empty_timestamp_owner") == 0
+        && track_relation(rel) != NULL
+        && col_rel_alloc(&alias, "empty_timestamp_alias") == 0
+        && track_relation(alias) != NULL,
+        "empty timestamp publication alias relations");
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    CHECK(col_rel_install_shared_view(alias, rel) == 0,
+        "empty timestamp publication alias install");
+    CHECK(col_rel_enable_timestamps(rel) == 0
+        && rel->timestamps == NULL
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation,
+        "empty timestamp publication remains a no-op with alias");
+    CHECK(col_rel_storage_alias_release(alias) == 0,
+        "empty timestamp publication alias release");
+    cleanup_relations();
+
+    rel = new_relation();
+    alias = new_relation();
+    CHECK(rel && alias, "idempotent timestamp publication alias relations");
+    {
+        int64_t value = 23;
+        CHECK(col_rel_append_row(rel, &value) == 0,
+            "idempotent timestamp publication alias seed");
+    }
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "idempotent timestamp publication alias setup");
+    CHECK(col_rel_install_shared_view(alias, rel) == 0,
+        "idempotent timestamp publication alias install");
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    owner_generation = rel->storage_owner_generation;
+    reserved_bytes = rel->retained_reserved_bytes;
+    ledger_ts_bytes = rel->ledger_ts_bytes;
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "idempotent timestamp publication remains a no-op with alias");
+    CHECK(rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->storage_owner_generation == owner_generation
+        && rel->retained_reserved_bytes == reserved_bytes
+        && rel->ledger_ts_bytes == ledger_ts_bytes,
+        "idempotent timestamp publication with alias preserves state");
+    CHECK(col_rel_storage_alias_release(alias) == 0,
+        "idempotent timestamp publication alias release");
+    cleanup_relations();
+
+#ifdef WL_TEST_ALLOC_WRAP
+    rel = new_relation();
+    CHECK(rel != NULL, "timestamp publication allocation relation");
+    timestamps = rel->timestamps;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    allocation_calls = 0;
+    allocation_fail_at = 0;
+    CHECK(col_rel_enable_timestamps(rel) == ENOMEM,
+        "timestamp publication allocation failure");
+    allocation_fail_at = -1;
+    CHECK(rel->timestamps == timestamps
+        && rel->view_generation == view_generation
+        && rel->storage_generation == storage_generation
+        && rel->retained_reserved_bytes == 0
+        && rel->ledger_ts_bytes == 0,
+        "timestamp allocation failure rolls back state");
+    CHECK(col_rel_enable_timestamps(rel) == 0 && rel->timestamps != NULL,
+        "timestamp publication retries after allocation failure");
+    cleanup_relations();
+#endif
+}
+
+static void
+test_destination_reader_blocks_shared_view_publication(void)
+{
+    col_rel_t *src = new_relation();
+    col_rel_t *dst = new_relation();
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t view_before;
+
+    CHECK(src && dst, "shared-view compound relations");
+    CHECK(col_rel_apply_compound_schema(src, &logical, 1u) == 0,
+        "shared-view source compound metadata");
+    view_before = dst->view_generation;
+    CHECK(col_rel_source_reader_acquire(dst, &reader) == 0,
+        "shared-view destination reader");
+    CHECK(col_rel_install_shared_view(dst, src) == EBUSY,
+        "shared-view publication denied by destination reader");
+    CHECK(dst->view_generation == view_before && dst->storage_owner == dst,
+        "shared-view denial preserves destination state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "shared-view destination reader release");
+    CHECK(col_rel_install_shared_view(dst, src) == 0,
+        "shared-view publication retry succeeds");
+    CHECK(dst->view_generation != view_before
+        && dst->compound_kind == WIRELOG_COMPOUND_KIND_SIDE,
+        "shared-view retry publishes compound metadata");
+    cleanup_relations();
+}
+
+static void
 test_storage_only_cow_and_compaction(void)
 {
     col_rel_t *src = new_relation();
@@ -274,6 +540,7 @@ test_copy_and_shared_semantics(void)
     uint64_t old_view;
     uint64_t old_storage;
     CHECK(col_rel_append_row(src, &row) == 0, "copy seed");
+    src->declared_ncols = 7u;
     source_view = src->view_generation;
     source_storage = src->storage_generation;
     old_view = view->view_generation;
@@ -282,6 +549,8 @@ test_copy_and_shared_semantics(void)
     track_relation(copy);
     CHECK(copy->relation_identity != src->relation_identity,
         "deep copy receives a fresh identity");
+    CHECK(copy->declared_ncols == src->declared_ncols,
+        "deep copy preserves the declared column count");
     CHECK(copy->view_generation == src->view_generation
         && copy->storage_generation == src->storage_generation,
         "deep copy preserves the source snapshot generations");
@@ -2163,10 +2432,237 @@ test_empty_append_detaches_shared_destination(void)
     owned_relation_count = 0;
 }
 
+static void
+test_checked_reset_rows_locked(void)
+{
+    col_rel_t *rel = new_relation();
+    CHECK(rel != NULL, "checked reset relation allocation");
+    int64_t row = 7;
+    CHECK(col_rel_append_row(rel, &row) == 0,
+        "checked reset first row");
+    row = 8;
+    CHECK(col_rel_append_row(rel, &row) == 0,
+        "checked reset second row");
+    CHECK(col_rel_enable_timestamps(rel) == 0,
+        "checked reset timestamps");
+    rel->dedup_slots = (uint64_t *)calloc(4u, sizeof(uint64_t));
+    CHECK(rel->dedup_slots != NULL, "checked reset dedup slots");
+    rel->dedup_cap = 4u;
+    rel->dedup_count = 2u;
+    uint64_t old_view = rel->view_generation;
+    uint64_t old_storage = rel->storage_generation;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    CHECK(wl_columnar_source_access_writer_acquire(
+            &rel->source_access, &writer) == 0,
+        "checked reset writer admission");
+    CHECK(col_rel_reset_rows_locked(rel, &writer) == 0,
+        "checked reset succeeds under writer");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "checked reset writer release");
+    CHECK(rel->nrows == 0 && rel->sorted_nrows == 0
+        && rel->base_nrows == 0 && rel->run_count == 0,
+        "checked reset clears row metadata");
+    CHECK(rel->timestamps == NULL && rel->dedup_slots == NULL
+        && rel->dedup_cap == 0 && rel->dedup_count == 0,
+        "checked reset clears derived row state");
+    CHECK(rel->view_generation != old_view
+        && rel->storage_generation != old_storage,
+        "checked reset publishes both generations");
+    cleanup_relations();
+}
+
+static void
+test_staged_replacement_contract(void)
+{
+    col_rel_t *dst = new_relation();
+    col_rel_t *candidate = new_relation();
+    const wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    const col_rel_logical_col_t logical = {
+        WIRELOG_COMPOUND_KIND_SIDE, 2u, 1u
+    };
+    int64_t old_value = 11;
+    int64_t new_value = 29;
+    uint64_t identity;
+    uint64_t view_before;
+    uint64_t storage_before;
+    uint64_t reserved_before;
+    uint64_t ledger_before;
+    int64_t *old_columns;
+    char *old_name;
+    col_rel_replacement_t replacement;
+    wl_columnar_source_access_writer_t writer = { 0 };
+
+    CHECK(dst && candidate, "replacement setup");
+    CHECK(col_rel_append_row(dst, &old_value) == 0
+        && col_rel_set_column_types(candidate, &type, 1u) == 0
+        && col_rel_append_row(candidate, &new_value) == 0
+        && col_rel_enable_timestamps(candidate) == 0
+        && col_rel_apply_compound_schema(candidate, &logical, 1u) == 0,
+        "replacement candidate publication data");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    reserved_before = dst->retained_reserved_bytes;
+    ledger_before = col_rel_owned_ledger_bytes(dst);
+    old_columns = dst->columns[0];
+    old_name = dst->name;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "replacement prepare succeeds");
+    CHECK(dst->relation_identity == identity && dst->columns[0] == old_columns
+        && dst->nrows == 1 && dst->view_generation == view_before
+        && dst->storage_generation == storage_before
+        && dst->retained_reserved_bytes == reserved_before,
+        "replacement preparation leaves destination unchanged");
+    col_rel_commit_replacement_locked(dst, &replacement);
+    CHECK(wl_columnar_source_access_writer_acquire(
+            &dst->source_access, &writer) == 0,
+        "replacement commit releases its writer");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "replacement commit writer can be released");
+    CHECK(dst->relation_identity == identity && dst->name == old_name
+        && strcmp(dst->name, "generation_test") == 0
+        && dst->columns[0] != old_columns
+        && dst->nrows == 1 && dst->columns[0][0] == new_value
+        && dst->timestamps != NULL
+        && dst->compound_kind == WIRELOG_COMPOUND_KIND_SIDE
+        && dst->view_generation == view_before + 1u
+        && dst->storage_generation == storage_before + 1u
+        && col_rel_owned_ledger_bytes(dst) == ledger_before
+        && dst->retained_reserved_bytes == reserved_before,
+        "replacement preserves identity and publishes one epoch");
+    cleanup_relations();
+
+    {
+        wl_columnar_memory_resolution_t resolution = { 0 };
+        wl_columnar_memory_governor_ref_t *ref;
+        uint64_t reserved_after;
+
+        resolution.budget_bytes = 4096u;
+        resolution.usable_bytes = 4096u;
+        resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+        resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+        resolution.status = WL_COLUMNAR_MEMORY_OK;
+        ref = wl_columnar_memory_governor_ref_create(&resolution);
+        dst = new_relation();
+        candidate = new_relation();
+        CHECK(ref && dst && candidate, "replacement admission setup");
+        CHECK(col_rel_attach_memory_governor(dst, ref) == 0
+            && col_rel_append_row(dst, &old_value) == 0
+            && col_rel_append_row(candidate, &new_value) == 0,
+            "replacement admission rows");
+        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+            "replacement admission prepare");
+        col_rel_commit_replacement_locked(dst, &replacement);
+        reserved_after = col_rel_transport_bytes(dst);
+        CHECK(dst->retained_reserved_bytes == reserved_after
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == reserved_after,
+            "replacement preserves memory admission accounting");
+        cleanup_relations();
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+    }
+
+    dst = new_relation();
+    candidate = new_relation();
+    CHECK(dst && candidate, "replacement reader setup");
+    CHECK(col_rel_append_row(dst, &old_value) == 0
+        && col_rel_append_row(candidate, &new_value) == 0,
+        "replacement reader rows");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    old_columns = dst->columns[0];
+    wl_columnar_source_access_reader_t reader = { 0 };
+    CHECK(col_rel_source_reader_acquire(dst, &reader) == 0,
+        "replacement reader acquire");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EBUSY,
+        "replacement reader denied");
+    CHECK(dst->relation_identity == identity && dst->columns[0] == old_columns
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement reader denial preserves state");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "replacement reader release");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+        "replacement retries after reader release prepare");
+    col_rel_commit_replacement_locked(dst, &replacement);
+    cleanup_relations();
+
+    dst = new_relation();
+    candidate = new_relation();
+    CHECK(dst && candidate, "replacement alias setup");
+    CHECK(col_rel_append_row(dst, &old_value) == 0
+        && col_rel_install_shared_view(candidate, dst) == 0,
+        "replacement live alias setup");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EBUSY,
+        "replacement live alias denied");
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement alias denial preserves state");
+    CHECK(col_rel_storage_alias_release(candidate) == 0,
+        "replacement alias release");
+    cleanup_relations();
+
+    dst = new_relation();
+    candidate = new_relation();
+    CHECK(dst && candidate, "replacement rollback setup");
+    identity = dst->relation_identity;
+    view_before = dst->view_generation;
+    storage_before = dst->storage_generation;
+    candidate->nrows = candidate->capacity + 1u;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EINVAL,
+        "replacement row overflow rejected");
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement overflow preserves state");
+    candidate->nrows = 0;
+    candidate->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+    candidate->compound_count = 1u;
+    candidate->compound_arity_map = (uint32_t *)calloc(1u, sizeof(uint32_t));
+    CHECK(candidate->compound_arity_map != NULL,
+        "replacement malformed schema map allocation");
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == EINVAL,
+        "replacement schema failure rejected");
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement schema failure preserves state");
+    free(candidate->compound_arity_map);
+    candidate->compound_arity_map = NULL;
+    candidate->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+    candidate->compound_count = 0;
+#ifdef WL_TEST_ALLOC_WRAP
+    allocation_calls = 0;
+    allocation_fail_at = 0;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == ENOMEM,
+        "replacement allocation failure rejected");
+    allocation_fail_at = -1;
+    CHECK(dst->relation_identity == identity
+        && dst->view_generation == view_before
+        && dst->storage_generation == storage_before,
+        "replacement allocation failure preserves state");
+#endif
+    dst->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    CHECK(col_rel_prepare_replacement(dst, candidate, &replacement)
+        == EOVERFLOW,
+        "replacement generation overflow rejected");
+    cleanup_relations();
+}
+
 int
 main(void)
 {
     test_same_row_count_mutation();
+    test_source_reader_blocks_column_type_publication();
+    test_source_reader_blocks_compound_publication();
+    test_source_reader_blocks_timestamp_publication();
+    test_destination_reader_blocks_shared_view_publication();
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
@@ -2192,6 +2688,8 @@ main(void)
     test_resize_failure_atomicity();
     test_shared_view_relation_metadata();
     test_empty_append_detaches_shared_destination();
+    test_checked_reset_rows_locked();
+    test_staged_replacement_contract();
     test_identity_exhaustion();
     if (failures != 0)
         return EXIT_FAILURE;

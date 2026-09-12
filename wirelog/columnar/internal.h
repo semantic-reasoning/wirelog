@@ -496,6 +496,18 @@ typedef struct col_rel {
     wl_columnar_source_access_gate_t source_access;
 } col_rel_t;
 
+/* A private, fully staged publication for a canonical relation.  The staged
+ * relation owns every buffer until commit or discard; the writer token keeps
+ * the destination's canonical owner stable across that interval. */
+typedef struct col_rel_replacement {
+    col_rel_t *staged;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_source_access_writer_t writer;
+    uint64_t reserved_bytes;
+    bool reservation_active;
+    bool writer_acquired;
+} col_rel_replacement_t;
+
 #ifdef WL_TEST_APPEND_HOOK
 /* Test-only seam for the append ownership-transition window.  This is not
  * part of the installed/public header surface. */
@@ -1918,6 +1930,29 @@ void
 col_rel_destroy(col_rel_t *r);
 int
 col_rel_destroy_checked(col_rel_t *r);
+/* Prepare a private replacement without changing @dst.  The canonical writer
+ * remains held in @replacement until commit or discard. */
+int
+col_rel_prepare_replacement(col_rel_t *dst, const col_rel_t *candidate,
+    col_rel_replacement_t *replacement);
+/* Prepare a replacement after the caller has already admitted the
+ * destination's canonical writer into replacement->writer.  This is used by
+ * multi-relation transactions so all writers can be acquired before any
+ * candidate is prepared or published. */
+int
+col_rel_prepare_replacement_locked(col_rel_t *dst,
+    const col_rel_t *candidate, col_rel_replacement_t *replacement);
+/* Publish a prepared replacement while its canonical writer is held.  The
+ * preparation contract makes this path no-fail: it performs no allocation,
+ * schema construction, or memory admission, and writer release is diagnostic
+ * only because publication has already completed. */
+void
+col_rel_commit_replacement_locked(col_rel_t *dst,
+    col_rel_replacement_t *replacement);
+/* Release a prepared replacement and its writer; safe after any prepare error
+ * and idempotent after commit. */
+void
+col_rel_discard_replacement(col_rel_replacement_t *replacement);
 int
 col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names);
 int
@@ -2019,6 +2054,9 @@ col_rel_reserve_capacity_admitted(col_rel_t *r, uint32_t new_cap,
     bool *denied);
 int
 col_rel_enable_timestamps(col_rel_t *rel);
+/* Enable timestamp storage while the canonical owner writer is held. */
+int
+col_rel_enable_timestamps_locked(col_rel_t *rel);
 /* Promote arena-backed relation columns to private heap storage.  Admission
  * and copying are transactional; ENOMEM leaves the relation unchanged. */
 int
@@ -2198,6 +2236,15 @@ wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
 int
+col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
+    wl_columnar_source_access_writer_t *writer);
+int
+col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
+    wl_columnar_source_access_writer_t *writer);
+int
+col_rel_reset_rows_locked(col_rel_t *r,
+    wl_columnar_source_access_writer_t *writer);
+int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 int
 col_rel_col_idx(const col_rel_t *r, const char *name);
@@ -2205,6 +2252,41 @@ col_rel_t *
 col_rel_new_auto(const char *name, uint32_t ncols);
 col_rel_t *
 col_rel_new_like(const char *name, const col_rel_t *src);
+#ifdef WL_TEST_BDX_SEED
+int
+wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
+    col_rel_t *const *worker_idbs, uint32_t worker_count);
+void
+wl_columnar_eval_test_bdx_seed_fail_worker(uint32_t worker_index);
+void
+wl_columnar_eval_test_bdx_seed_fail_sort_once(void);
+#endif
+#ifdef WL_TEST_TDD_MERGE
+int
+wl_columnar_eval_test_tdd_merge(col_rel_t **target,
+    col_rel_t *const *worker_rels, uint32_t worker_count);
+void
+wl_columnar_eval_test_tdd_merge_fail_worker(uint32_t worker_index);
+void
+wl_columnar_eval_test_tdd_merge_fail_sort_once(void);
+void
+wl_columnar_eval_test_tdd_merge_fail_overflow_once(void);
+int
+wl_columnar_eval_test_tdd_owner_registration_rollback(void);
+#endif
+#ifdef WL_TEST_TDD_RESET_RESTORE
+int
+wl_columnar_eval_test_tdd_reset(col_rel_t *relation);
+int
+wl_columnar_eval_test_tdd_save(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_rel_t ***out_saved);
+int
+wl_columnar_eval_test_tdd_restore(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord, col_rel_t **saved);
+void
+wl_columnar_eval_test_tdd_free_saved(const wl_plan_stratum_t *sp,
+    col_rel_t **saved);
+#endif
 col_rel_t *
 col_rel_pool_new_like(delta_pool_t *pool, const char *name,
     const col_rel_t *like);

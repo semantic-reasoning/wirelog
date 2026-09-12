@@ -24,6 +24,40 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_TEST_ALLOC_WRAP
+void *__real_malloc(size_t size);
+void *__real_calloc(size_t count, size_t size);
+void *__real_realloc(void *ptr, size_t size);
+
+static long allocation_fail_at = -1;
+static long allocation_calls;
+
+static bool
+fail_this_allocation(void)
+{
+    return allocation_fail_at >= 0
+           && allocation_calls++ == allocation_fail_at;
+}
+
+void *
+__wrap_malloc(size_t size)
+{
+    return fail_this_allocation() ? NULL : __real_malloc(size);
+}
+
+void *
+__wrap_calloc(size_t count, size_t size)
+{
+    return fail_this_allocation() ? NULL : __real_calloc(count, size);
+}
+
+void *
+__wrap_realloc(void *ptr, size_t size)
+{
+    return fail_this_allocation() ? NULL : __real_realloc(ptr, size);
+}
+#endif
+
 /* ======================================================================== */
 /* Test Harness                                                             */
 /* ======================================================================== */
@@ -771,6 +805,1079 @@ test_bdx_selfjoin_w4_shuffled_duplicates(void)
     return 0;
 }
 
+static col_rel_t *
+make_seed_relation(const char *name, const int64_t *rows, uint32_t nrows,
+    uint32_t ncols)
+{
+    col_rel_t *rel = col_rel_new_auto(name, ncols);
+    if (!rel)
+        return NULL;
+    for (uint32_t row = 0; row < nrows; row++) {
+        if (col_rel_append_row(rel, rows + (size_t)row * ncols) != 0) {
+            col_rel_destroy(rel);
+            return NULL;
+        }
+    }
+    return rel;
+}
+
+typedef struct {
+    uint32_t nrows;
+    uint32_t ncols;
+    uint32_t capacity;
+    int64_t **columns;
+    char **col_names;
+    col_delta_timestamp_t *timestamps;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint64_t ledger_ts_bytes;
+    uint64_t owned_ledger_bytes;
+    uint64_t *dedup_slots;
+    uint32_t dedup_cap;
+    uint32_t dedup_count;
+    int64_t first_row[2];
+    col_delta_timestamp_t first_timestamp;
+} bdx_seed_snapshot_t;
+
+static void
+capture_bdx_seed_snapshot(const col_rel_t *rel, bdx_seed_snapshot_t *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->nrows = rel->nrows;
+    snapshot->ncols = rel->ncols;
+    snapshot->capacity = rel->capacity;
+    snapshot->columns = rel->columns;
+    snapshot->col_names = rel->col_names;
+    snapshot->timestamps = rel->timestamps;
+    snapshot->view_generation = rel->view_generation;
+    snapshot->storage_generation = rel->storage_generation;
+    snapshot->ledger_ts_bytes = rel->ledger_ts_bytes;
+    snapshot->owned_ledger_bytes = col_rel_owned_ledger_bytes(rel);
+    snapshot->dedup_slots = rel->dedup_slots;
+    snapshot->dedup_cap = rel->dedup_cap;
+    snapshot->dedup_count = rel->dedup_count;
+    if (rel->nrows > 0 && rel->ncols >= 2) {
+        snapshot->first_row[0] = rel->columns[0][0];
+        snapshot->first_row[1] = rel->columns[1][0];
+    }
+    if (rel->timestamps && rel->nrows > 0)
+        snapshot->first_timestamp = rel->timestamps[0];
+}
+
+static bool
+bdx_seed_snapshot_unchanged(const col_rel_t *rel,
+    const bdx_seed_snapshot_t *snapshot)
+{
+    return rel->nrows == snapshot->nrows
+           && rel->ncols == snapshot->ncols
+           && rel->capacity == snapshot->capacity
+           && rel->columns == snapshot->columns
+           && rel->col_names == snapshot->col_names
+           && rel->timestamps == snapshot->timestamps
+           && rel->view_generation == snapshot->view_generation
+           && rel->storage_generation == snapshot->storage_generation
+           && rel->ledger_ts_bytes == snapshot->ledger_ts_bytes
+           && col_rel_owned_ledger_bytes(rel) == snapshot->owned_ledger_bytes
+           && rel->dedup_slots == snapshot->dedup_slots
+           && rel->dedup_cap == snapshot->dedup_cap
+           && rel->dedup_count == snapshot->dedup_count
+           && (rel->nrows == 0 || (rel->columns[0][0]
+           == snapshot->first_row[0]
+           && rel->columns[1][0] == snapshot->first_row[1]))
+           && (!rel->timestamps || rel->nrows == 0
+           || memcmp(&rel->timestamps[0], &snapshot->first_timestamp,
+           sizeof(snapshot->first_timestamp)) == 0);
+}
+
+static void
+prepare_bdx_seed_metadata(col_rel_t *rel)
+{
+    rel->dedup_slots = (uint64_t *)calloc(4, sizeof(*rel->dedup_slots));
+    rel->dedup_cap = 4;
+    rel->dedup_count = 2;
+    rel->dedup_slots[1] = 0x1111;
+    rel->dedup_slots[3] = 0x3333;
+    (void)col_rel_enable_timestamps(rel);
+    rel->timestamps[0].iteration = 17;
+    rel->timestamps[0].multiplicity = -4;
+}
+
+static int
+test_bdx_seed_reader_denial_and_retry(void)
+{
+    TEST("BDX seed reader denial preserves cidb and retries");
+
+    const int64_t initial[] = { 99, 100 };
+    const int64_t worker_rows[] = { 2, 3, 1, 2, 2, 3 };
+    col_rel_t *cidb = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *worker = make_seed_relation("r", worker_rows, 3, 2);
+    col_rel_t *workers[] = { worker };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint64_t generation;
+    int rc;
+
+    if (!cidb || !worker || col_rel_source_reader_acquire(cidb, &reader) != 0) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("seed reader setup");
+        return 1;
+    }
+    generation = cidb->view_generation;
+    rc = wl_columnar_eval_test_bdx_seed(cidb, workers, 1);
+    if (rc != EBUSY || cidb->nrows != 1
+        || cidb->columns[0][0] != 99 || cidb->columns[1][0] != 100
+        || cidb->view_generation != generation) {
+        col_rel_source_reader_release(&reader);
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("active reader was not denied transactionally");
+        return 1;
+    }
+    if (col_rel_source_reader_release(&reader) != 0
+        || wl_columnar_eval_test_bdx_seed(cidb, workers, 1) != 0
+        || cidb->nrows != 2
+        || cidb->columns[0][0] != 1 || cidb->columns[1][0] != 2
+        || cidb->columns[0][1] != 2 || cidb->columns[1][1] != 3) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("seed retry or dedup result");
+        return 1;
+    }
+    col_rel_destroy(cidb);
+    col_rel_destroy(worker);
+    PASS();
+    return 0;
+}
+
+static int
+test_bdx_seed_alias_denial_and_retry(void)
+{
+    TEST("BDX seed live-alias denial preserves cidb and retries");
+
+    const int64_t initial[] = { 7, 8 };
+    const int64_t worker_rows[] = { 4, 5, 4, 5 };
+    col_rel_t *cidb = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *worker = make_seed_relation("r", worker_rows, 2, 2);
+    col_rel_t *alias = col_rel_new_auto("alias", 2);
+    col_rel_t *workers[] = { worker };
+    int rc;
+
+    if (!cidb || !worker || !alias
+        || col_rel_install_shared_view(alias, cidb) != 0) {
+        col_rel_destroy(alias);
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("seed alias setup");
+        return 1;
+    }
+    rc = wl_columnar_eval_test_bdx_seed(cidb, workers, 1);
+    if (rc != EBUSY || cidb->nrows != 1
+        || cidb->columns[0][0] != 7 || cidb->columns[1][0] != 8) {
+        col_rel_storage_alias_release(alias);
+        col_rel_destroy(alias);
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("live alias was not denied transactionally");
+        return 1;
+    }
+    if (col_rel_storage_alias_release(alias) != 0
+        || wl_columnar_eval_test_bdx_seed(cidb, workers, 1) != 0
+        || cidb->nrows != 1
+        || cidb->columns[0][0] != 4 || cidb->columns[1][0] != 5) {
+        col_rel_destroy(alias);
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("alias retry or dedup result");
+        return 1;
+    }
+    col_rel_destroy(alias);
+    col_rel_destroy(cidb);
+    col_rel_destroy(worker);
+    PASS();
+    return 0;
+}
+
+static int
+test_bdx_seed_staging_failure_is_atomic(void)
+{
+    TEST("BDX seed staging failure leaves cidb unchanged");
+
+    const int64_t initial[] = { 11, 12 };
+    const int64_t bad_rows[] = { 1, 2, 3 };
+    col_rel_t *cidb = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *bad_worker = make_seed_relation("r", bad_rows, 1, 3);
+    col_rel_t *workers[] = { bad_worker };
+    uint64_t generation;
+    int rc;
+
+    if (!cidb || !bad_worker) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(bad_worker);
+        FAIL("seed staging setup");
+        return 1;
+    }
+    generation = cidb->view_generation;
+    rc = wl_columnar_eval_test_bdx_seed(cidb, workers, 1);
+    if (rc != EINVAL || cidb->nrows != 1
+        || cidb->ncols != 2 || cidb->columns[0][0] != 11
+        || cidb->columns[1][0] != 12
+        || cidb->view_generation != generation) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(bad_worker);
+        FAIL("schema staging failure changed cidb");
+        return 1;
+    }
+    col_rel_destroy(cidb);
+    col_rel_destroy(bad_worker);
+    PASS();
+    return 0;
+}
+
+static int
+test_bdx_seed_second_worker_failure_is_atomic(void)
+{
+    TEST("BDX seed second-worker staging failure is atomic");
+
+    const int64_t initial[] = { 11, 12 };
+    const int64_t worker0_rows[] = { 1, 2, 2, 3 };
+    const int64_t worker1_rows[] = { 3, 4, 3, 4 };
+    col_rel_t *cidb = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *worker0 = make_seed_relation("r", worker0_rows, 2, 2);
+    col_rel_t *worker1 = make_seed_relation("r", worker1_rows, 2, 2);
+    col_rel_t *workers[] = { worker0, worker1 };
+    bdx_seed_snapshot_t snapshot;
+    int rc;
+
+    if (!cidb || !worker0 || !worker1) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker0);
+        col_rel_destroy(worker1);
+        FAIL("second-worker staging setup");
+        return 1;
+    }
+    prepare_bdx_seed_metadata(cidb);
+    capture_bdx_seed_snapshot(cidb, &snapshot);
+    wl_columnar_eval_test_bdx_seed_fail_worker(1);
+    rc = wl_columnar_eval_test_bdx_seed(cidb, workers, 2);
+    if (rc != ENOMEM || !bdx_seed_snapshot_unchanged(cidb, &snapshot)) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker0);
+        col_rel_destroy(worker1);
+        FAIL("second-worker failure changed cidb");
+        return 1;
+    }
+    col_rel_destroy(cidb);
+    col_rel_destroy(worker0);
+    col_rel_destroy(worker1);
+    PASS();
+    return 0;
+}
+
+static int
+test_bdx_seed_sort_failure_is_atomic(void)
+{
+    TEST("BDX seed sort failure is atomic");
+
+    const int64_t initial[] = { 11, 12 };
+    const int64_t worker_rows[] = { 2, 3, 1, 2 };
+    col_rel_t *cidb = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *worker = make_seed_relation("r", worker_rows, 2, 2);
+    col_rel_t *workers[] = { worker };
+    bdx_seed_snapshot_t snapshot;
+    int rc;
+
+    if (!cidb || !worker) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("sort failure setup");
+        return 1;
+    }
+    prepare_bdx_seed_metadata(cidb);
+    capture_bdx_seed_snapshot(cidb, &snapshot);
+    wl_columnar_eval_test_bdx_seed_fail_sort_once();
+    rc = wl_columnar_eval_test_bdx_seed(cidb, workers, 1);
+    if (rc != ENOMEM || !bdx_seed_snapshot_unchanged(cidb, &snapshot)) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("sort failure changed cidb");
+        return 1;
+    }
+    col_rel_destroy(cidb);
+    col_rel_destroy(worker);
+    PASS();
+    return 0;
+}
+
+static int
+test_bdx_seed_allocation_failure_is_atomic(void)
+{
+#ifdef WL_TEST_ALLOC_WRAP
+    TEST("BDX seed allocation failure is atomic");
+
+    const int64_t initial[] = { 11, 12 };
+    const int64_t worker_rows[] = { 2, 3, 1, 2 };
+    bool observed_failure = false;
+
+    for (long fail_at = 0; fail_at < 64 && !observed_failure; fail_at++) {
+        col_rel_t *cidb = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker = make_seed_relation("r", worker_rows, 2, 2);
+        col_rel_t *workers[] = { worker };
+        bdx_seed_snapshot_t snapshot;
+        int rc;
+        if (!cidb || !worker) {
+            col_rel_destroy(cidb);
+            col_rel_destroy(worker);
+            FAIL("allocation failure setup");
+            return 1;
+        }
+        prepare_bdx_seed_metadata(cidb);
+        capture_bdx_seed_snapshot(cidb, &snapshot);
+        allocation_calls = 0;
+        allocation_fail_at = fail_at;
+        rc = wl_columnar_eval_test_bdx_seed(cidb, workers, 1);
+        allocation_fail_at = -1;
+        if (rc == ENOMEM) {
+            observed_failure = true;
+            if (!bdx_seed_snapshot_unchanged(cidb, &snapshot)) {
+                col_rel_destroy(cidb);
+                col_rel_destroy(worker);
+                FAIL("allocation failure changed cidb");
+                return 1;
+            }
+        } else if (rc != 0) {
+            col_rel_destroy(cidb);
+            col_rel_destroy(worker);
+            FAIL("unexpected allocation failure result");
+            return 1;
+        }
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+    }
+    allocation_fail_at = -1;
+    if (!observed_failure) {
+        FAIL("allocation failure seam was not exercised");
+        return 1;
+    }
+    PASS();
+    return 0;
+#else
+    fputs("BDX seed allocation failure coverage skipped\n", stderr);
+    return 0;
+#endif
+}
+
+static int
+test_bdx_seed_success_preserves_timestamps(void)
+{
+    TEST("BDX seed success preserves timestamp values and accounting");
+
+    const int64_t initial[] = { 11, 12 };
+    const int64_t worker_rows[] = { 2, 3, 1, 2, 2, 3 };
+    col_rel_t *cidb = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *worker = make_seed_relation("r", worker_rows, 3, 2);
+    col_rel_t *workers[] = { worker };
+    wl_mem_ledger_t ledger;
+    int rc;
+
+    if (!cidb || !worker || col_rel_enable_timestamps(cidb) != 0
+        || col_rel_enable_timestamps(worker) != 0) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("timestamp success setup");
+        return 1;
+    }
+    wl_mem_ledger_init(&ledger, 0);
+    cidb->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(cidb, 0);
+    worker->timestamps[0].iteration = 20;
+    worker->timestamps[0].multiplicity = 2;
+    worker->timestamps[1].iteration = 10;
+    worker->timestamps[1].multiplicity = 1;
+    worker->timestamps[2].iteration = 30;
+    worker->timestamps[2].multiplicity = 3;
+    rc = wl_columnar_eval_test_bdx_seed(cidb, workers, 1);
+    if (rc != 0 || cidb->nrows != 2 || !cidb->timestamps
+        || cidb->columns[0][0] != 1 || cidb->columns[1][0] != 2
+        || cidb->timestamps[0].iteration != 10
+        || cidb->timestamps[0].multiplicity != 1
+        || cidb->columns[0][1] != 2 || cidb->columns[1][1] != 3
+        || cidb->timestamps[1].iteration != 20
+        || cidb->timestamps[1].multiplicity != 2
+        || cidb->ledger_ts_bytes != col_rel_timestamp_ledger_bytes(cidb)
+        || cidb->ledger_ts_bytes == 0) {
+        col_rel_destroy(cidb);
+        col_rel_destroy(worker);
+        FAIL("timestamp values or accounting not preserved");
+        return 1;
+    }
+    col_rel_destroy(cidb);
+    col_rel_destroy(worker);
+    PASS();
+    return 0;
+}
+
+#ifdef WL_TEST_TDD_RESET_RESTORE
+static int
+test_tdd_reset_restore_transaction(void)
+{
+    TEST("TDD coordinator reset/restore preserves state transactionally");
+
+    const int64_t rows[] = { 7, 8, 9, 10 };
+    col_rel_t *rel = make_seed_relation("r", rows, 2, 2);
+    col_rel_t *alias = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_col_session_t coord = { 0 };
+    wl_plan_relation_t plan_rel = { 0 };
+    wl_plan_stratum_t stratum = { 0 };
+    col_rel_t **saved = NULL;
+    uint64_t *saved_dedup = NULL;
+    int64_t first0;
+    int64_t first1;
+    uint64_t generation;
+    int rc;
+
+    if (!rel || col_rel_enable_timestamps(rel) != 0) {
+        col_rel_destroy(rel);
+        FAIL("reset/restore setup");
+        return 1;
+    }
+    rel->timestamps[0].iteration = 12;
+    rel->timestamps[0].multiplicity = -3;
+    rel->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    rel->compound_count = 1;
+    rel->compound_arity_map = (uint32_t *)calloc(2,
+            sizeof(*rel->compound_arity_map));
+    if (!rel->compound_arity_map) {
+        col_rel_destroy(rel);
+        FAIL("compound metadata setup");
+        return 1;
+    }
+    rel->compound_arity_map[0] = 1;
+    rel->compound_arity_map[1] = 1;
+    rel->dedup_slots = (uint64_t *)calloc(4, sizeof(*rel->dedup_slots));
+    if (!rel->dedup_slots) {
+        col_rel_destroy(rel);
+        FAIL("dedup setup");
+        return 1;
+    }
+    rel->dedup_cap = 4;
+    rel->dedup_count = 1;
+    rel->dedup_slots[1] = 0xfeed;
+    first0 = rel->columns[0][0];
+    first1 = rel->columns[1][0];
+    generation = rel->view_generation;
+
+    rc = col_rel_source_reader_acquire(rel, &reader);
+    if (rc != 0 || wl_columnar_eval_test_tdd_reset(rel) != EBUSY
+        || rel->nrows != 2 || rel->columns[0][0] != first0
+        || rel->columns[1][0] != first1
+        || rel->view_generation != generation
+        || col_rel_source_reader_release(&reader) != 0) {
+        col_rel_destroy(rel);
+        FAIL("reader denial changed coordinator relation");
+        return 1;
+    }
+
+    alias = col_rel_new_auto("alias", 2);
+    if (!alias || col_rel_install_shared_view(alias, rel) != 0
+        || wl_columnar_eval_test_tdd_reset(rel) != EBUSY
+        || rel->nrows != 2 || rel->columns[0][0] != first0
+        || col_rel_storage_alias_release(alias) != 0) {
+        if (alias)
+            col_rel_storage_alias_release(alias);
+        col_rel_destroy(alias);
+        col_rel_destroy(rel);
+        FAIL("live alias denial changed coordinator relation");
+        return 1;
+    }
+    col_rel_destroy(alias);
+
+    rc = wl_columnar_eval_test_tdd_reset(rel);
+    if (rc != 0 || rel->nrows != 0 || rel->ncols != 2
+        || rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+        || rel->timestamps != NULL || rel->dedup_slots != NULL) {
+        col_rel_destroy(rel);
+        FAIL("successful reset did not preserve schema and clear rows");
+        return 1;
+    }
+
+#ifdef WL_TEST_ALLOC_WRAP
+    {
+        bool observed_failure = false;
+        for (long fail_at = 0; fail_at < 64 && !observed_failure;
+            fail_at++) {
+            col_rel_t *candidate = make_seed_relation("r", rows, 2, 2);
+            bdx_seed_snapshot_t snapshot;
+            if (!candidate) {
+                FAIL("reset allocation setup");
+                return 1;
+            }
+            capture_bdx_seed_snapshot(candidate, &snapshot);
+            allocation_calls = 0;
+            allocation_fail_at = fail_at;
+            rc = wl_columnar_eval_test_tdd_reset(candidate);
+            allocation_fail_at = -1;
+            if (rc == ENOMEM) {
+                observed_failure = true;
+                if (!bdx_seed_snapshot_unchanged(candidate, &snapshot)) {
+                    col_rel_destroy(candidate);
+                    FAIL("reset allocation failure changed relation");
+                    return 1;
+                }
+            } else if (rc != 0) {
+                col_rel_destroy(candidate);
+                FAIL("unexpected reset allocation result");
+                return 1;
+            }
+            col_rel_destroy(candidate);
+        }
+        if (!observed_failure) {
+            FAIL("reset allocation failure seam was not exercised");
+            return 1;
+        }
+    }
+#endif
+
+    {
+        col_rel_t *overflow = make_seed_relation("overflow", rows, 2, 2);
+        bdx_seed_snapshot_t snapshot;
+        if (!overflow) {
+            FAIL("reset overflow setup");
+            return 1;
+        }
+        overflow->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+        capture_bdx_seed_snapshot(overflow, &snapshot);
+        rc = wl_columnar_eval_test_tdd_reset(overflow);
+        if (rc != EOVERFLOW || !bdx_seed_snapshot_unchanged(overflow,
+            &snapshot)) {
+            col_rel_destroy(overflow);
+            FAIL("reset overflow was not transactional");
+            return 1;
+        }
+        col_rel_destroy(overflow);
+    }
+
+    if (session_add_rel(&coord, rel) != 0) {
+        col_rel_destroy(rel);
+        FAIL("restore session registration");
+        return 1;
+    }
+    plan_rel.name = "r";
+    stratum.relations = &plan_rel;
+    stratum.relation_count = 1;
+    saved_dedup = (uint64_t *)calloc(4, sizeof(*saved_dedup));
+    if (!saved_dedup) {
+        session_remove_rel(&coord, "r");
+        free(coord.rels);
+        FAIL("restore dedup setup");
+        return 1;
+    }
+    /* Restore starts from a published relation with its own metadata. */
+    rel = session_find_rel(&coord, "r");
+    rel->nrows = 0;
+    rel->dedup_slots = saved_dedup;
+    rel->dedup_cap = 4;
+    rel->dedup_count = 1;
+    rel->dedup_slots[2] = 0xbeef;
+
+    {
+        col_rel_t *bad = col_rel_new_auto("r", 2);
+        col_rel_t *bad_saved[1] = { bad };
+        uint64_t before_generation = rel->view_generation;
+        if (!bad) {
+            session_remove_rel(&coord, "r");
+            free(coord.rels);
+            FAIL("restore schema setup");
+            return 1;
+        }
+        bad->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+        bad->compound_count = 1;
+        bad->compound_arity_map = (uint32_t *)calloc(2,
+                sizeof(*bad->compound_arity_map));
+        if (!bad->compound_arity_map) {
+            col_rel_destroy(bad);
+            session_remove_rel(&coord, "r");
+            free(coord.rels);
+            FAIL("restore schema metadata setup");
+            return 1;
+        }
+        bad->compound_arity_map[0] = 0;
+        bad->compound_arity_map[1] = 1;
+        if (wl_columnar_eval_test_tdd_restore(&stratum, &coord,
+            bad_saved) != EINVAL
+            || rel->view_generation != before_generation
+            || rel->nrows != 0) {
+            col_rel_destroy(bad);
+            session_remove_rel(&coord, "r");
+            free(coord.rels);
+            FAIL("restore schema failure changed relation");
+            return 1;
+        }
+        col_rel_destroy(bad);
+    }
+
+    if (col_rel_enable_timestamps(rel) != 0
+        || wl_columnar_eval_test_tdd_save(&stratum, &coord, &saved) != 0) {
+        session_remove_rel(&coord, "r");
+        free(coord.rels);
+        FAIL("lossless snapshot setup");
+        return 1;
+    }
+
+    rel = session_find_rel(&coord, "r");
+    rel->nrows = 0;
+    if (col_rel_source_reader_acquire(rel, &reader) != 0
+        || wl_columnar_eval_test_tdd_restore(&stratum, &coord, saved)
+        != EBUSY
+        || rel->nrows != 0
+        || col_rel_source_reader_release(&reader) != 0
+        || wl_columnar_eval_test_tdd_restore(&stratum, &coord, saved) != 0) {
+        wl_columnar_eval_test_tdd_free_saved(&stratum, saved);
+        session_remove_rel(&coord, "r");
+        free(coord.rels);
+        FAIL("restore reader denial or retry");
+        return 1;
+    }
+    rel = session_find_rel(&coord, "r");
+    if (!rel || rel->nrows != 0 || !rel->timestamps
+        || rel->dedup_cap != 4 || rel->dedup_count != 1
+        || rel->dedup_slots[2] != 0xbeef
+        || rel->compound_kind != WIRELOG_COMPOUND_KIND_INLINE) {
+        wl_columnar_eval_test_tdd_free_saved(&stratum, saved);
+        session_remove_rel(&coord, "r");
+        free(coord.rels);
+        FAIL("restore did not preserve relation metadata");
+        return 1;
+    }
+    wl_columnar_eval_test_tdd_free_saved(&stratum, saved);
+    session_remove_rel(&coord, "r");
+    session_rel_free_hash(&coord);
+    free(coord.rels);
+
+    /* Admission covers the complete relation set before publication.  A
+     * reader on the second relation must not leave the first relation
+     * restored while the second remains untouched. */
+    {
+        wl_col_session_t multi = { 0 };
+        wl_plan_relation_t multi_plan[2] = { { 0 }, { 0 } };
+        wl_plan_stratum_t multi_stratum = { 0 };
+        col_rel_t *a = make_seed_relation("a", rows, 2, 2);
+        const int64_t rows_b[] = { 11, 12, 13, 14 };
+        col_rel_t *b = make_seed_relation("b", rows_b, 2, 2);
+        col_rel_t **multi_saved = NULL;
+        wl_columnar_source_access_reader_t b_reader = { 0 };
+
+        if (!a || !b || session_add_rel(&multi, a) != 0
+            || session_add_rel(&multi, b) != 0) {
+            col_rel_destroy(a);
+            col_rel_destroy(b);
+            session_rel_free_hash(&multi);
+            free(multi.rels);
+            FAIL("multi-relation restore setup");
+            return 1;
+        }
+        multi_plan[0].name = "a";
+        multi_plan[1].name = "b";
+        multi_stratum.relations = multi_plan;
+        multi_stratum.relation_count = 2;
+        if (wl_columnar_eval_test_tdd_save(&multi_stratum, &multi,
+            &multi_saved) != 0) {
+            session_remove_rel(&multi, "a");
+            session_remove_rel(&multi, "b");
+            session_rel_free_hash(&multi);
+            free(multi.rels);
+            FAIL("multi-relation snapshot setup");
+            return 1;
+        }
+        session_find_rel(&multi, "a")->nrows = 0;
+        session_find_rel(&multi, "b")->nrows = 0;
+        if (col_rel_source_reader_acquire(session_find_rel(&multi, "b"),
+            &b_reader) != 0
+            || wl_columnar_eval_test_tdd_restore(&multi_stratum, &multi,
+            multi_saved) != EBUSY
+            || session_find_rel(&multi, "a")->nrows != 0
+            || session_find_rel(&multi, "b")->nrows != 0
+            || col_rel_source_reader_release(&b_reader) != 0
+            || wl_columnar_eval_test_tdd_restore(&multi_stratum, &multi,
+            multi_saved) != 0
+            || session_find_rel(&multi, "a")->nrows != 2
+            || session_find_rel(&multi, "b")->nrows != 2) {
+            col_rel_source_reader_release(&b_reader);
+            wl_columnar_eval_test_tdd_free_saved(&multi_stratum, multi_saved);
+            session_remove_rel(&multi, "a");
+            session_remove_rel(&multi, "b");
+            session_rel_free_hash(&multi);
+            free(multi.rels);
+            FAIL("multi-relation reader admission or retry");
+            return 1;
+        }
+        wl_columnar_eval_test_tdd_free_saved(&multi_stratum, multi_saved);
+        session_remove_rel(&multi, "a");
+        session_remove_rel(&multi, "b");
+        session_rel_free_hash(&multi);
+        free(multi.rels);
+    }
+
+    /* A malformed candidate for an absent relation must fail before any
+     * candidate is registered, leaving the session registry unchanged. */
+    {
+        wl_col_session_t fresh = { 0 };
+        wl_plan_relation_t fresh_plan[2] = { { 0 }, { 0 } };
+        wl_plan_stratum_t fresh_stratum = { 0 };
+        col_rel_t *bad = col_rel_new_auto("missing", 2);
+        col_rel_t *bad_saved[2] = { bad, NULL };
+
+        fresh_plan[0].name = "missing";
+        fresh_plan[1].name = "also_missing";
+        fresh_stratum.relations = fresh_plan;
+        fresh_stratum.relation_count = 2;
+        bad->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+        bad->compound_count = 1;
+        bad->compound_arity_map = (uint32_t *)calloc(2,
+                sizeof(*bad->compound_arity_map));
+        if (!bad->compound_arity_map) {
+            col_rel_destroy(bad);
+            FAIL("new-relation cleanup setup");
+            return 1;
+        }
+        bad->compound_arity_map[0] = 0;
+        bad->compound_arity_map[1] = 1;
+        if (wl_columnar_eval_test_tdd_restore(&fresh_stratum, &fresh,
+            bad_saved) != EINVAL || fresh.nrels != 0
+            || session_find_rel(&fresh, "missing")
+            || session_find_rel(&fresh, "also_missing")) {
+            col_rel_destroy(bad);
+            session_rel_free_hash(&fresh);
+            free(fresh.rels);
+            FAIL("failed restore left a new relation registered");
+            return 1;
+        }
+        col_rel_destroy(bad);
+        session_rel_free_hash(&fresh);
+        free(fresh.rels);
+    }
+    PASS();
+    return 0;
+}
+#endif
+
+#ifdef WL_TEST_TDD_MERGE
+static int
+test_tdd_merge_transactional_publication(void)
+{
+    TEST("TDD merge stages worker results before relation publication");
+
+    const int64_t initial[] = { 9, 9 };
+    const int64_t worker0_rows[] = { 2, 3, 1, 2 };
+    const int64_t worker1_rows[] = { 4, 5, 4, 5 };
+    int rc;
+
+    /* A live reader denies publication, then the same transaction retries. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *workers[] = { worker };
+        wl_columnar_source_access_reader_t reader = { 0 };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker
+            || col_rel_source_reader_acquire(target, &reader) != 0) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge reader setup");
+            return 1;
+        }
+        capture_bdx_seed_snapshot(target, &snapshot);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EBUSY || !bdx_seed_snapshot_unchanged(target, &snapshot)
+            || col_rel_source_reader_release(&reader) != 0) {
+            col_rel_source_reader_release(&reader);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge reader denial or retry");
+            return 1;
+        }
+        if (wl_columnar_eval_test_tdd_merge(&target, workers, 1) != 0
+            || target->nrows != 3 || target->columns[0][0] != 1
+            || target->columns[1][0] != 2) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge reader retry");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+    }
+
+    /* A live alias is also denied without changing rows or metadata. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *alias = col_rel_new_auto("alias", 2);
+        col_rel_t *workers[] = { worker };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker || !alias
+            || col_rel_install_shared_view(alias, target) != 0) {
+            col_rel_destroy(alias);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge alias setup");
+            return 1;
+        }
+        capture_bdx_seed_snapshot(target, &snapshot);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EBUSY || !bdx_seed_snapshot_unchanged(target, &snapshot)
+            || col_rel_storage_alias_release(alias) != 0) {
+            col_rel_storage_alias_release(alias);
+            col_rel_destroy(alias);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge alias denial or retry");
+            return 1;
+        }
+        if (wl_columnar_eval_test_tdd_merge(&target, workers, 1) != 0) {
+            col_rel_destroy(alias);
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge alias retry");
+            return 1;
+        }
+        col_rel_destroy(alias);
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+    }
+
+    /* Failure in the second worker must not publish the first worker. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker0 = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *worker1 = make_seed_relation("r", worker1_rows, 2, 2);
+        col_rel_t *workers[] = { worker0, worker1 };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker0 || !worker1) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker0);
+            col_rel_destroy(worker1);
+            FAIL("merge failure setup");
+            return 1;
+        }
+        prepare_bdx_seed_metadata(target);
+        capture_bdx_seed_snapshot(target, &snapshot);
+        wl_columnar_eval_test_tdd_merge_fail_worker(1);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 2);
+        if (rc != ENOMEM || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker0);
+            col_rel_destroy(worker1);
+            FAIL("second worker failure changed target");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(worker0);
+        col_rel_destroy(worker1);
+    }
+
+    /* Schema, overflow, and sort errors all preserve the target. */
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        const int64_t bad_schema_rows[] = { 1, 2, 3, 4, 5, 6 };
+        col_rel_t *bad_schema = make_seed_relation("r", bad_schema_rows, 2,
+                3);
+        col_rel_t *valid_worker = make_seed_relation("r", worker0_rows, 2,
+                2);
+        col_rel_t *workers[] = { bad_schema };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !bad_schema || !valid_worker) {
+            col_rel_destroy(target);
+            col_rel_destroy(bad_schema);
+            col_rel_destroy(valid_worker);
+            FAIL("merge schema setup");
+            return 1;
+        }
+        capture_bdx_seed_snapshot(target, &snapshot);
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(bad_schema);
+            col_rel_destroy(valid_worker);
+            FAIL("schema failure changed target");
+            return 1;
+        }
+        workers[0] = valid_worker;
+        wl_columnar_eval_test_tdd_merge_fail_overflow_once();
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != EOVERFLOW || !bdx_seed_snapshot_unchanged(target,
+            &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(bad_schema);
+            col_rel_destroy(valid_worker);
+            FAIL("overflow failure changed target");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(bad_schema);
+        col_rel_destroy(valid_worker);
+    }
+
+    {
+        col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+        col_rel_t *worker = make_seed_relation("r", worker0_rows, 2, 2);
+        col_rel_t *workers[] = { worker };
+        bdx_seed_snapshot_t snapshot;
+
+        if (!target || !worker) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("merge sort setup");
+            return 1;
+        }
+        prepare_bdx_seed_metadata(target);
+        capture_bdx_seed_snapshot(target, &snapshot);
+        wl_columnar_eval_test_tdd_merge_fail_sort_once();
+        rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+        if (rc != ENOMEM || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+            col_rel_destroy(target);
+            col_rel_destroy(worker);
+            FAIL("sort failure changed target");
+            return 1;
+        }
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+    }
+
+    PASS();
+    return 0;
+}
+
+static int
+test_tdd_merge_schema_mismatch_rollback(void)
+{
+    TEST("TDD merge rejects complete schema mismatches before staging");
+
+    const int64_t initial[] = { 9, 9 };
+    const int64_t worker_rows[] = { 2, 3 };
+    col_rel_t *target = make_seed_relation("r", initial, 1, 2);
+    col_rel_t *worker = make_seed_relation("r", worker_rows, 1, 2);
+    col_rel_t *workers[] = { worker };
+    bdx_seed_snapshot_t snapshot;
+    int rc;
+
+    if (!target || !worker) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("schema mismatch setup");
+        return 1;
+    }
+    prepare_bdx_seed_metadata(target);
+    capture_bdx_seed_snapshot(target, &snapshot);
+
+    worker->declared_ncols = target->declared_ncols + 1;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("declared width mismatch changed target");
+        return 1;
+    }
+    worker->declared_ncols = target->declared_ncols;
+
+    worker->schema_ok = false;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("schema state mismatch changed target");
+        return 1;
+    }
+    worker->schema_ok = target->schema_ok;
+
+    free(worker->column_types);
+    worker->column_types = (wirelog_column_type_t *)malloc(
+        worker->ncols * sizeof(*worker->column_types));
+    if (!worker->column_types) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column type mismatch setup");
+        return 1;
+    }
+    for (uint32_t col = 0; col < worker->ncols; col++)
+        worker->column_types[col] = WIRELOG_TYPE_FLOAT;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column type mismatch changed target");
+        return 1;
+    }
+    free(worker->column_types);
+    worker->column_types = NULL;
+
+    free(worker->col_names[0]);
+    worker->col_names[0] = strdup("different");
+    if (!worker->col_names[0]) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column name mismatch setup");
+        return 1;
+    }
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column name mismatch changed target");
+        return 1;
+    }
+    free(worker->col_names[0]);
+    worker->col_names[0] = strdup(target->col_names[0]);
+    if (!worker->col_names[0]) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("compound mismatch setup");
+        return 1;
+    }
+
+    worker->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    worker->compound_count = 1;
+    worker->compound_arity_map = (uint32_t *)malloc(2 * sizeof(uint32_t));
+    if (!worker->compound_arity_map) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("compound map mismatch setup");
+        return 1;
+    }
+    worker->compound_arity_map[0] = 1;
+    worker->compound_arity_map[1] = 1;
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("compound schema mismatch changed target");
+        return 1;
+    }
+
+    col_rel_destroy(target);
+    col_rel_destroy(worker);
+    PASS();
+    return 0;
+}
+
+static int
+test_tdd_owner_registration_rollback(void)
+{
+    TEST(
+        "owner exchange removes an earlier delta registration on later-worker failure");
+    if (wl_columnar_eval_test_tdd_owner_registration_rollback() != 0) {
+        FAIL("owner delta registration rollback");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+#endif
+
 /* ======================================================================== */
 /* Microbenchmark: Filtered-join arrangement cache (Issue #433)             */
 /* ======================================================================== */
@@ -968,6 +2075,21 @@ main(void)
     test_bdx_selfjoin_w2();
     test_bdx_selfjoin_w4();
     test_bdx_selfjoin_w4_shuffled_duplicates();
+    test_bdx_seed_reader_denial_and_retry();
+    test_bdx_seed_alias_denial_and_retry();
+    test_bdx_seed_staging_failure_is_atomic();
+    test_bdx_seed_second_worker_failure_is_atomic();
+    test_bdx_seed_sort_failure_is_atomic();
+    test_bdx_seed_allocation_failure_is_atomic();
+    test_bdx_seed_success_preserves_timestamps();
+#ifdef WL_TEST_TDD_RESET_RESTORE
+    test_tdd_reset_restore_transaction();
+#endif
+#ifdef WL_TEST_TDD_MERGE
+    test_tdd_merge_transactional_publication();
+    test_tdd_merge_schema_mismatch_rollback();
+    test_tdd_owner_registration_rollback();
+#endif
     test_filt_arr_bench_w1();
     test_filt_arr_bench_w4();
 

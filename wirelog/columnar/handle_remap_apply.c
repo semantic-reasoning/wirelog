@@ -12,6 +12,44 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <stdlib.h>
+
+static int
+wl_handle_remap_validate_columns_(const col_rel_t *rel,
+    const uint32_t *handle_col_idx, uint32_t handle_col_count,
+    const wl_handle_remap_t *remap)
+{
+    if (!rel || !remap)
+        return EINVAL;
+    if (handle_col_count > 0 && !handle_col_idx)
+        return EINVAL;
+    for (uint32_t k = 0; k < handle_col_count; k++)
+        if (handle_col_idx[k] >= rel->ncols)
+            return EINVAL;
+    return 0;
+}
+
+static int
+wl_handle_remap_apply_columns_raw_(col_rel_t *rel,
+    const uint32_t *handle_col_idx, uint32_t handle_col_count,
+    const wl_handle_remap_t *remap, uint64_t *out_rewrites)
+{
+    uint64_t rewrites = 0;
+    for (uint32_t k = 0; k < handle_col_count; k++) {
+        uint32_t c = handle_col_idx[k];
+        int64_t *col = rel->columns[c];
+        for (uint32_t r = 0; r < rel->nrows; r++) {
+            int64_t old_h = col[r];
+            if (old_h == 0)
+                continue;
+            col[r] = wl_handle_remap_lookup(remap, old_h);
+            rewrites++;
+        }
+    }
+    if (out_rewrites)
+        *out_rewrites = rewrites;
+    return 0;
+}
 
 int
 wl_handle_remap_apply_columns(col_rel_t *rel,
@@ -77,4 +115,55 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
         rel->name ? rel->name : "(anon)", handle_col_count, rel->nrows,
         rewrites);
     return 0;
+}
+
+int
+wl_handle_remap_preflight_columns(const col_rel_t *rel,
+    const uint32_t *handle_col_idx, uint32_t handle_col_count,
+    const wl_handle_remap_t *remap, uint64_t *out_rewrites)
+{
+    if (out_rewrites)
+        *out_rewrites = 0;
+    int rc = wl_handle_remap_validate_columns_(rel, handle_col_idx,
+            handle_col_count, remap);
+    if (rc != 0)
+        return rc;
+
+    uint64_t rewrites = 0;
+    for (uint32_t k = 0; k < handle_col_count; k++) {
+        uint32_t c = handle_col_idx[k];
+        const int64_t *col = rel->columns[c];
+        for (uint32_t r = 0; r < rel->nrows; r++) {
+            int64_t old_h = col[r];
+            if (old_h == 0)
+                continue;
+            if (wl_handle_remap_lookup(remap, old_h) == 0) {
+                WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
+                    "event=remap_apply_miss rel=%s col=%u row=%u "
+                    "handle=0x%" PRIx64,
+                    rel->name ? rel->name : "(anon)", c, r,
+                    (uint64_t)old_h);
+                return EIO;
+            }
+            rewrites++;
+        }
+    }
+    if (out_rewrites)
+        *out_rewrites = rewrites;
+    return 0;
+}
+
+int
+wl_handle_remap_apply_columns_held(col_rel_t *rel,
+    const uint32_t *handle_col_idx, uint32_t handle_col_count,
+    const wl_handle_remap_t *remap, uint64_t *out_rewrites)
+{
+    if (out_rewrites)
+        *out_rewrites = 0;
+    int rc = wl_handle_remap_validate_columns_(rel, handle_col_idx,
+            handle_col_count, remap);
+    if (rc != 0)
+        return rc;
+    return wl_handle_remap_apply_columns_raw_(rel, handle_col_idx,
+               handle_col_count, remap, out_rewrites);
 }
