@@ -6,6 +6,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Intern write-path microbenchmark** (#1472). `bench_intern` reports the
+  cost per `wl_intern_put()` for unique and duplicate puts at 1, 4 and 8
+  writers, with and without an enforcing memory governor, plus the share of
+  time spent in slot-array resizes and id-segment opens for a single writer,
+  and exits non-zero when a put is denied or a duplicate put reserves
+  governor bytes. A smoke test runs every scenario; the release-build
+  baseline is recorded in `docs/INTERN_PERF.md`. No gate is attached.
+
 ### Changed
 
 ### Deprecated
