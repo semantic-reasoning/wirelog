@@ -72,13 +72,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build linux-tools-common linux-tools-generic
+          sudo apt-get install -y ninja-build linux-tools-common linux-tools-generic
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          pip install meson ninja
           choco install pkgconfiglite -y
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       # Best-effort: request the 'performance' cpufreq governor. On
       # GitHub's ubuntu-latest the governor is usually already
@@ -307,7 +309,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl meson ninja-build unzip linux-tools-common linux-tools-generic
+          sudo apt-get install -y ninja-build curl unzip linux-tools-common linux-tools-generic
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Verify stable timing host
         shell: bash
@@ -432,10 +437,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install dependencies
+      - name: Install Ninja
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build
+          sudo apt-get install -y ninja-build
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure debug + TSan
         run: >
