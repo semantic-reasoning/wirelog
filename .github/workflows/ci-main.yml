@@ -76,7 +76,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build abigail-tools
+          sudo apt-get install -y ninja-build abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
@@ -97,18 +97,20 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install meson ninja coreutils gnu-tar
+          brew install ninja coreutils gnu-tar
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          pip install meson ninja
           # pkgconfiglite ships from a SourceForge mirror without a
           # checksum; chocolatey's default policy now blocks empty
           # checksums for non-secure sources, so opt in explicitly.
           choco install pkgconfiglite -y --allow-empty-checksums
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure (Linux / macOS)
         if: runner.os != 'Windows'
@@ -231,7 +233,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build pkg-config libmbedtls-dev
+          sudo apt-get install -y ninja-build pkg-config libmbedtls-dev
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure with mbedTLS enabled
         run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
@@ -299,7 +304,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build abigail-tools
+          sudo apt-get install -y ninja-build abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
@@ -307,9 +312,12 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install meson ninja coreutils gnu-tar
+          brew install ninja coreutils gnu-tar
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure with sanitizers
         run: >
@@ -369,10 +377,13 @@ jobs:
       - name: Install dependencies (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build abigail-tools
+          sudo apt-get install -y ninja-build abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       # Force POSIX pthreads for TSan (C11 threads.h is uninstrumented)
       - name: Configure with TSan

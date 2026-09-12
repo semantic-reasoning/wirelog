@@ -68,10 +68,22 @@ jobs:
           fetch-depth: 0
       - name: Verify tagged commit
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      # Keep helper code tied to this workflow revision. The source checkout
+      # above may be an older immutable tag without the shared setup action.
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build b3sum
+          sudo apt-get install -y ninja-build b3sum
+
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
       - name: Build and test default suite
         run: |
           meson setup build-default -Dtests=true --buildtype=debug
@@ -89,10 +101,19 @@ jobs:
           fetch-depth: 0
       - name: Verify tagged commit
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build abigail-tools b3sum
+          sudo apt-get install -y ninja-build abigail-tools b3sum
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
       # WIRELOG_ABI_REQUIRED=1: this is the GA ABI gate, and a gate that skips
       # asserts nothing. abigail-tools is installed above, so abidiff is present
       # here and a skip means something is wrong rather than unavailable.
@@ -118,10 +139,19 @@ jobs:
           fetch-depth: 0
       - name: Verify tagged commit
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang meson ninja-build
+          sudo apt-get install -y clang ninja-build
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
       - name: Build fuzz targets
         run: |
           CC=clang meson setup build-fuzz -Denable_fuzz=true -Db_sanitize=address -Db_lundef=false -Dtests=true
@@ -150,8 +180,17 @@ jobs:
           fetch-depth: 0
       - name: Verify tagged commit
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build libmbedtls-dev
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libmbedtls-dev
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
       - name: Build and test enabled crypto validation
         run: |
           meson setup build-mbedtls -Dtests=true -DmbedTLS=enabled --buildtype=debug
@@ -174,12 +213,22 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build b3sum
-      - name: Verify tagged commit and hosted runner prerequisites
+          sudo apt-get install -y ninja-build b3sum
+      - name: Verify tagged commit
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
+      - name: Verify hosted runner prerequisites
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           test "$WIRELOG_GA_ISOLATION_CONTROL" = github-hosted-runner
           test "$WIRELOG_GA_ISOLATION_ASSERTION" = hosted-runner
           command -v meson
@@ -248,10 +297,17 @@ jobs:
           fetch-depth: 0
       - name: Verify tagged commit
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Checkout workflow tools
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow-tools
+          fetch-depth: 1
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build jq
+          sudo apt-get install -y ninja-build jq
           # Must match ci-pr.yml's pin: sbom/snapshot.txt is sensitive to the
           # syft cataloger set, so two versions would disagree about the
           # baseline. test-required-gates.sh asserts they are equal.
@@ -259,6 +315,8 @@ jobs:
           curl -sSfL \
             "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin syft
+      - name: Set up Meson 1.12.0
+        uses: ./workflow-tools/.github/actions/setup-meson
       # WIRELOG_SBOM_REQUIRED=1 for the same reason the ABI job sets its own:
       # syft is installed directly above, so a skip here means something is
       # wrong rather than unavailable, and a gate that skips asserts nothing.

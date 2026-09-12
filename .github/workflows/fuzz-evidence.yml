@@ -97,10 +97,11 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang meson ninja-build
+          sudo apt-get install -y clang ninja-build
           clang --version
-          meson --version
-          ninja --version
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure fuzz build
         shell: bash
