@@ -57,7 +57,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build abigail-tools
+          sudo apt-get install -y ninja-build abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
@@ -65,9 +65,12 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install meson ninja coreutils gnu-tar
+          brew install ninja coreutils gnu-tar
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure ASan/UBSan
         run: >
@@ -133,15 +136,18 @@ jobs:
         run: |
           if [ "${{ matrix.platform }}" = "linux" ]; then
             sudo apt-get update
-            sudo apt-get install -y meson ninja-build libmbedtls-dev
+            sudo apt-get install -y ninja-build libmbedtls-dev
             if [ "${{ matrix.compiler }}" = "clang" ]; then
               sudo apt-get install -y clang
             fi
           else
-            brew install meson ninja mbedtls coreutils gnu-tar
+            brew install ninja mbedtls coreutils gnu-tar
             echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
             echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
           fi
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure TSan
         run: |
@@ -185,7 +191,10 @@ jobs:
       - name: Install MSan fuzz dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang meson ninja-build
+          sudo apt-get install -y clang ninja-build
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure MSan fuzz build
         env:

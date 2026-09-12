@@ -50,6 +50,7 @@ on:
       - 'cross/**'
       - 'scripts/ci/check-android-alignment.sh'
       - '.github/workflows/android.yml'
+      - '.github/actions/setup-meson/action.yml'
   push:
     branches:
       - main
@@ -62,6 +63,7 @@ on:
       - 'cross/**'
       - 'scripts/ci/check-android-alignment.sh'
       - '.github/workflows/android.yml'
+      - '.github/actions/setup-meson/action.yml'
 
 permissions:
   contents: read
@@ -80,7 +82,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build binutils file
+          sudo apt-get install -y ninja-build binutils file
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Install NDK r27c
         id: setup-ndk
@@ -190,7 +195,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build binutils
+          sudo apt-get install -y ninja-build binutils
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Build host Linux .so (no -Dandroid; expect 4 KB alignment)
         run: |
@@ -225,7 +233,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build binutils
+          sudo apt-get install -y ninja-build binutils
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Install NDK r27c
         id: setup-ndk

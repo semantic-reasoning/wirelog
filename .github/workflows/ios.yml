@@ -25,8 +25,11 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Install dependencies
-        run: brew install meson ninja
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
 
       - name: Configure iOS arm64
         run: >

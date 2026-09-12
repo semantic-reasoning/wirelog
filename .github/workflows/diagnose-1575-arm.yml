@@ -7,6 +7,7 @@ on:
       - '.github/workflows/diagnose-1575-arm.yml'
       - 'scripts/ci/diagnose-arm-sanitizer-timeouts.py'
       - 'scripts/ci/test-diagnose-arm-sanitizer-timeouts.py'
+      - '.github/actions/setup-meson/action.yml'
 
 permissions:
   contents: read
@@ -27,17 +28,17 @@ jobs:
             uname -a
             cat /etc/os-release
           } > diagnostics-1575/host.log 2>&1
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          enable-cache: false
       - name: Install tools
         run: |
           set -o pipefail
           {
             sudo apt-get update
-            sudo apt-get install -y meson ninja-build gdb procps libmbedtls-dev
-            uv venv .venv-diagnose
+            sudo apt-get install -y ninja-build gdb procps libmbedtls-dev
           } 2>&1 | tee diagnostics-1575/setup.log
+      - name: Set up Meson 1.12.0
+        uses: ./.github/actions/setup-meson
+      - name: Create diagnostic Python environment
+        run: uv venv .venv-diagnose
       - name: Record tool versions
         run: |
           {

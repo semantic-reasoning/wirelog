@@ -1,0 +1,56 @@
+name: Set up pinned Meson
+description: Install Meson 1.12.0 and Windows Ninja in an isolated uv environment
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: 0.12.13
+        enable-cache: false
+
+    - name: Install Meson 1.12.0 (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        tool_venv="$RUNNER_TEMP/wirelog-ci-tools"
+        uv venv --system-site-packages "$tool_venv"
+        uv pip install --python "$tool_venv/bin/python" 'meson==1.12.0'
+        export PATH="$tool_venv/bin:$PATH"
+        echo "$tool_venv/bin" >> "$GITHUB_PATH"
+        test "$(command -v meson)" = "$tool_venv/bin/meson"
+        test "$(meson --version)" = '1.12.0'
+        command -v python
+        python --version
+        command -v ninja
+        ninja --version
+
+    - name: Install Meson 1.12.0 and Ninja (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $toolVenv = Join-Path $env:RUNNER_TEMP 'wirelog-ci-tools'
+        $toolScripts = Join-Path $toolVenv 'Scripts'
+        $toolPython = Join-Path $toolScripts 'python.exe'
+        uv venv --system-site-packages $toolVenv
+        uv pip install --python $toolPython 'meson==1.12.0' ninja
+        $env:PATH = "$toolScripts;$env:PATH"
+        Add-Content -Path $env:GITHUB_PATH -Value $toolScripts
+        $mesonPath = (Get-Command meson).Source
+        if ($mesonPath -ne (Join-Path $toolScripts 'meson.exe')) {
+          throw "Expected Meson from $toolScripts, got $mesonPath"
+        }
+        $mesonVersion = (& meson --version).Trim()
+        if ($mesonVersion -ne '1.12.0') {
+          throw "Expected Meson 1.12.0, got $mesonVersion"
+        }
+        Get-Command python
+        python --version
+        $ninjaPath = (Get-Command ninja).Source
+        if ($ninjaPath -ne (Join-Path $toolScripts 'ninja.exe')) {
+          throw "Expected Ninja from $toolScripts, got $ninjaPath"
+        }
+        Get-Command ninja
+        ninja --version
