@@ -62,7 +62,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 # Extract current dependency list as "name@version:license"
 # Release verification checks out workflow helpers under this nested directory;
-# they are not part of the tagged source inventory.
+# exclude those files while retaining local-action declarations in workflows.
 syft dir:"$repo_root" --exclude '**/workflow-tools/**' -o syft-json 2>/dev/null \
   | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' \
   | LC_ALL=C sort > "$tmpdir/current.txt"
