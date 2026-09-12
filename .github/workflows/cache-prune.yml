@@ -1,0 +1,105 @@
+name: Cache Prune
+
+# Issue #1571: keep the repository's Actions cache inside GitHub's 10 GiB
+# per-repository quota so PR-CI sccache writes stop failing.
+#
+# Root cause (measured on 2026-09-12, not inferred):
+#   * PR #1533 job 103174971875: 14,560 compile requests, 10,639 misses,
+#     10,481 cache-WRITE errors, ~27% hit rate.
+#   * CI run 34685582951 (build-primary gcc): 14,939 requests, 3,535 hits
+#     (23.73%), 11,359 misses, 11,066 write errors, 293 writes succeeded,
+#     0 read errors, 0 timeouts.  Reads work; writes are the failure mode,
+#     and the build still passes (sccache is best-effort).
+#   * Full cache listing: 170,580 entries totalling 10.08 GiB -- AT/OVER
+#     GitHub's 10 GiB per-repository quota.  sccache stores every miss as
+#     one small content-addressed entry and never deletes; GitHub only
+#     reclaims entries untouched for 90 days.  Once the quota fills, every
+#     new write fails until space is freed.
+#   * Every listed entry had been accessed within the previous ~2 days, so
+#     a "delete entries older than N days" policy deletes nothing.  The
+#     correct policy is LRU quota management (delete oldest-accessed until
+#     back under a target).
+#
+# What this workflow does:
+#   Runs scripts/ci/prune-gha-cache.py, which lists the repository caches
+#   and, when the total exceeds --target-bytes (default 8 GiB = 80% of the
+#   quota), deletes the OLDEST-accessed entries first until back under the
+#   target.  Safety rails:
+#     * entries accessed within --min-age-minutes (default 60) are never
+#       deleted, protecting caches a job is using right now;
+#     * at most --max-deletes entries per run, and deletes are paced at
+#       ~0.85 s apart (~4,200/hour), under the 5,000/hour core rate limit;
+#     * HTTP 401/403 aborts the run (clean, non-zero exit); HTTP 429 aborts
+#       with "re-run later"; HTTP 404 (already gone) is treated as success.
+#   Runs are idempotent: each run only deletes what is needed to get back
+#   under the target, so scheduled runs converge and then no-op.
+#
+# Pacing math (why the defaults):
+#   DELETE pacing is 0.85 s/entry (~4,200/hour), under the 5,000/hour core
+#   rate limit with margin.  --max-deletes 22000 therefore takes ~5.2 hours,
+#   inside the 360-minute job timeout with headroom for the ~1,700 listing
+#   pages.  Steady state (a few hundred entries per day) needs a fraction of
+#   one run.
+#
+# Observability:
+#   Every run prints a JSON report (entry counts, sizes, deletions, freed
+#   bytes, abort reason).  Watch the "Cache Prune" runs after merge: PR-CI
+#   write errors should drop to ~0 within a day or two as the backlog drains,
+#   with the hit rate unchanged or improving.
+
+on:
+  schedule:
+    # Daily at 06:30 UTC (off-peak for PR bursts).
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+    inputs:
+      target-bytes:
+        description: 'Evict oldest entries until total cache is at or under this many bytes'
+        required: false
+        default: '8589934592'  # 8 GiB = 80% of the 10 GiB quota
+      min-age-minutes:
+        description: 'Minimum minutes since last access before an entry may be deleted'
+        required: false
+        default: '60'
+      max-deletes:
+        description: 'Maximum cache entries to delete in this run'
+        required: false
+        default: '22000'
+
+permissions:
+  # DELETE /repos/{owner}/{repo}/actions/caches/{id} requires actions:write.
+  # No other workflow in this repo uses this permission.
+  actions: write
+  contents: read
+
+concurrency:
+  group: cache-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: Prune Actions caches to quota
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Run prune selftests (mock API)
+        run: python3 scripts/ci/test-prune-gha-cache.py
+
+      - name: Prune cache entries to quota (issue #1571)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_BYTES: ${{ inputs.target-bytes || '8589934592' }}
+          MIN_AGE_MINUTES: ${{ inputs.min-age-minutes || '60' }}
+          MAX_DELETES: ${{ inputs.max-deletes || '22000' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/prune-gha-cache.py \
+            --repo "$REPO" \
+            --target-bytes "$TARGET_BYTES" \
+            --min-age-minutes "$MIN_AGE_MINUTES" \
+            --max-deletes "$MAX_DELETES"

@@ -22,9 +22,17 @@ permissions:
   actions: read
   contents: read
 
-# Compiler caching: route gcc/clang/MSVC through sccache with the GitHub
-# Actions cache backend. Set workflow-wide so every build job's compile steps
-# pick it up; non-build jobs simply ignore it.
+# Compiler caching (sccache + GitHub Actions cache backend) is SCOPED per job:
+#   * Sanitizer legs (sanitizer-matrix, tsan, tsan-native) KEEP sccache --
+#     their compiles are slow enough that a cache hit pays for itself
+#     (measured 2026-09-12: sanitizer compile 1.843s gcc / 1.395s clang,
+#     vs a 0.486s cache hit).
+#   * Plain build legs (build-primary / build-arm / build-matrix /
+#     build-mbedtls) build directly WITHOUT sccache, because a cache
+#     round-trip costs MORE than a plain compile there (0.159s plain compile
+#     vs a 0.507s cache hit).  See issue #1571 for the full evidence.
+# SCCACHE_GHA_ENABLED only takes effect where sccache is actually invoked,
+# i.e. the sanitizer legs; it is inert in the plain build legs.
 env:
   SCCACHE_GHA_ENABLED: "true"
 
@@ -135,9 +143,6 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-    env:
-      CC: sccache gcc
-
     steps:
       # fetch-depth 0: the clang-tidy backlog monotonicity check below
       # compares against the MERGE BASE with the base branch, and a shallow
@@ -145,9 +150,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Install dependencies
         run: |
@@ -288,14 +290,9 @@ jobs:
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
-    env:
-      CC: sccache gcc
 
     steps:
       - uses: actions/checkout@v5
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Install dependencies
         run: |
@@ -352,9 +349,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -384,7 +378,7 @@ jobs:
         if: runner.os != 'Windows'
         run: meson setup builddir -Dtests=true -DmbedTLS=disabled
         env:
-          CC: sccache ${{ matrix.cc }}
+          CC: ${{ matrix.cc }}
 
       - name: Configure (Windows / MSVC)
         if: runner.os == 'Windows'
@@ -403,8 +397,8 @@ jobs:
           if (-not $clExe) { throw 'cl.exe was not found under the MSVC toolset' }
           $env:PATH = "$(Split-Path -Parent $clExe);$env:PATH"
           Get-Command cl.exe
-          $env:CC = 'sccache cl'
-          $env:CXX = 'sccache cl'
+          $env:CC = 'cl'
+          $env:CXX = 'cl'
           meson setup builddir -Dtests=true -DmbedTLS=disabled
 
       - name: Build (Linux / macOS)
@@ -480,9 +474,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -491,7 +482,7 @@ jobs:
       - name: Configure with mbedTLS enabled
         run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
         env:
-          CC: sccache gcc
+          CC: gcc
 
       - name: Build with mbedTLS enabled
         run: meson compile -C builddir-mbedtls
