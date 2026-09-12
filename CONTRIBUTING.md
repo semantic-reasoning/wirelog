@@ -128,6 +128,52 @@ sudo cpupower frequency-set -g performance     # if available
 taskset -c 0 WIRELOG_PERF_GATE=1 meson test -C build-perf --suite perf --print-errorlogs
 ```
 
+### Shell-gate walltime budget
+
+Every shell-seeded test (a test whose command runs a `.sh` script) carries an
+explicit `timeout:` enforced by the *timeout* gate
+(`scripts/ci/check-shell-gate-timeouts.py`, #1464). A timeout is a hang
+detector, not a drift detector: a gate that quietly goes from 3s to 110s still
+passes everything. The *walltime budget* gate closes that gap.
+
+Because its measurement input (`build/meson-logs/testlog.json`) exists only
+after `meson test`, it runs as a **post-suite CI step** in
+`ci-pr.yml` (`build-matrix`, all three OSes) and `release-tag.yml` (the
+`default` job), not as a suite member -- a suite-registered gate would always
+see an empty log and skip (the #1301 always-skip shape).
+
+* The step fails any shell-seeded test whose measured duration exceeds
+  **50%** of its own `timeout`, by name, printing both numbers.
+* `WIRELOG_WALLTIME_REQUIRED=1` (set on every step) turns a would-be skip --
+  no shell gates measured -- into a failure, so a green run cannot hide a gate
+  that asserted nothing. `scripts/ci/test-required-gates.sh` pins the wiring.
+* `scripts/ci/check-shell-gate-walltime.py` is the gate;
+  `scripts/ci/test-check-shell-gate-walltime.py` is its self-test (registered
+  as `meson test --suite abi:shell_gate_walltime_selftest`, pure Python so it
+  asserts on every matrix OS).
+
+The 50% budget is calibrated against a measured Linux baseline (ubuntu-latest,
+`meson test`, `build/meson-logs/testlog.json`), 43 shell-seeded tests
+registered, 37 executed in the default suite. Worst observed shares of their
+own timeout:
+
+| test | timeout | duration (s) | % of timeout |
+|---|---|---|---|
+| doop_validation | 90s | 26.96 | 30.0% |
+| bash_construct_ratchet_selftest | 120s | 16.20 | 13.5% |
+| memory_pressure_contract | 120s | 14.34 | 12.0% |
+| log_abi_compile_erasure | 180s | 19.40 | 10.8% |
+| threading_doc | 120s | 3.72 | 3.1% |
+
+The next 32 gates all sit at 3.1% or below, the remainder under 1%. So the
+50% budget is ~1.7x the single worst case and an order of magnitude above the
+next cluster: it flags a genuine drift without tripping on the slow-but-stable
+gates above. Regenerate the table from any Linux build with:
+
+```sh
+python3 scripts/ci/check-shell-gate-walltime.py build --fraction 0.5
+```
+
 ### Internal commit-series labels in source comments
 
 Internal commit-series labels (such as `Phase 2A`, `Phase 3C-001`,

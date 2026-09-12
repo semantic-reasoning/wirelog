@@ -787,6 +787,15 @@ test('ci_run_telemetry_selftest', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-run-telemetry.py'],
      suite: 'abi',
      timeout: 60)
+# Issue #1487: the shell-gate walltime budget is a POST-SUITE gate -- it reads
+# meson-logs/testlog.json, which exists only after `meson test` -- so it runs
+# as a CI step in ci-pr.yml and release-tag.yml, not as a suite member.  Only
+# its self-test lives in the suite: pure Python over synthetic testlog +
+# introspection, so it asserts on every matrix OS (Linux/macOS/Windows) with no
+# bash and no prior `meson test`.
+test('shell_gate_walltime_selftest', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-check-shell-gate-walltime.py'],
+     suite: 'abi')
 
 # Issue #1464: the pre-commit hook installer must never leave an empty,
 # non-executable hook behind on a console whose locale cannot encode its

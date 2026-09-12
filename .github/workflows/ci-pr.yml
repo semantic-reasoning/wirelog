@@ -461,6 +461,27 @@ jobs:
           $env:CXX = 'cl'
           meson test -C builddir --print-errorlogs
 
+      # Issue #1487: a shell gate that drifts from 3s to 110s still passes its
+      # timeout (a hang detector, not a drift detector). Post-suite, this step
+      # reads the testlog Meson just wrote and fails every shell-seeded test
+      # whose duration exceeded 50% of its own timeout, by name with both
+      # numbers. WIRELOG_WALLTIME_REQUIRED=1 turns every would-be skip into a
+      # failure so a gate that asserts nothing is loud, not green. Bash is
+      # present on all three runners, so shell gates register and run here; the
+      # gate measures exactly the ones that ran.
+      - name: Shell gate walltime budget (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: python3 scripts/ci/check-shell-gate-walltime.py builddir --fraction 0.5
+        env:
+          WIRELOG_WALLTIME_REQUIRED: "1"
+
+      - name: Shell gate walltime budget (Windows / MSVC)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python scripts/ci/check-shell-gate-walltime.py builddir --fraction 0.5
+        env:
+          WIRELOG_WALLTIME_REQUIRED: "1"
+
   # ==========================================================================
   # Phase: Build mbedTLS (gated by build-primary)
   # Optional crypto coverage; must pass before build-matrix proceeds.

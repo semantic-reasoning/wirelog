@@ -6,6 +6,24 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Shell-gate walltime budget gate** (#1487):
+  `scripts/ci/check-shell-gate-walltime.py` reads
+  `builddir/meson-logs/testlog.json` after the suite and fails when
+  any shell-seeded test (same classifier as the #1464 timeout gate)
+  took more than 50% of its Meson timeout (`--fraction` overrides
+  the default).  Runs post-suite in `ci-pr.yml` on all three matrix
+  OSes and in the `release-tag.yml` default job;
+  `WIRELOG_WALLTIME_REQUIRED=1` escalates the advisory skip to a
+  hard failure.  The self-test
+  (`scripts/ci/test-check-shell-gate-walltime.py`,
+  `meson test --suite abi:shell_gate_walltime_selftest`) covers the
+  pass / over-budget / worst-run / non-positive-timeout /
+  command-join / missing-input / corrupt-testlog / escalation /
+  fraction-override / usage-error paths.  `CONTRIBUTING.md` records
+  the Linux baseline for calibration (worst: `doop_validation`
+  26.96s of 90s = 30.0%; 37 of 43 registered shell-seeded tests
+  measured; all others within 13.5%).
+
 ### Changed
 
 ### Deprecated
@@ -36,6 +54,25 @@ All notable changes to wirelog are documented in this file.
 - **Built-in CSV fact loading streams input in bounded batches** and admits
   its transient staging buffers before allocation; custom I/O adapters and
   their public ABI are unchanged (#1402, #1405, #1429).
+
+- **Shell-gate walltime budget gate** (#1487):
+  `scripts/ci/check-shell-gate-walltime.py` reads
+  `builddir/meson-logs/testlog.json` after the suite and fails when
+  any shell-seeded test (same classifier as the #1464 timeout gate)
+  took more than 50% of its Meson timeout (`--fraction` overrides
+  the default).  Runs post-suite in `ci-pr.yml` on all three matrix
+  OSes and in the `release-tag.yml` default job;
+  `WIRELOG_WALLTIME_REQUIRED=1` escalates the advisory skip to a
+  hard failure.  The self-test
+  (`scripts/ci/test-check-shell-gate-walltime.py`,
+  `meson test --suite abi:shell_gate_walltime_selftest`) covers the
+  pass / over-budget / worst-run / non-positive-timeout /
+  command-join / missing-input / corrupt-testlog / escalation /
+  fraction-override / usage-error paths.  `CONTRIBUTING.md` records
+  the Linux baseline for calibration (worst: `doop_validation`
+  26.96s of 90s = 30.0%; 37 of 43 registered shell-seeded tests
+  measured; all others within 13.5%).
+
 - **Per-stratum TDD execution diagnostics** distinguish admission, selected
   worker width, submitted work, completed barriers, and serial replay. Exact
   result controls cover fused and unfused execution (#1378).
