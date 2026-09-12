@@ -77,6 +77,14 @@ jobs:
           meson setup build-default -Dtests=true --buildtype=debug
           meson compile -C build-default
           meson test -C build-default --print-errorlogs
+      # Issue #1487: post-suite walltime budget for the shell gates, measured
+      # from the testlog Meson just wrote. WIRELOG_WALLTIME_REQUIRED=1 turns a
+      # would-be skip (no shell gates measured) into a failure, so a green tag
+      # cannot hide a gate that asserted nothing.
+      - name: Shell gate walltime budget
+        run: python3 scripts/ci/check-shell-gate-walltime.py build-default --fraction 0.5
+        env:
+          WIRELOG_WALLTIME_REQUIRED: "1"
 
   abi:
     name: Tag / ABI

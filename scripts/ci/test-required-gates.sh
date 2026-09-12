@@ -92,6 +92,26 @@ sbom_fails_when_required() {
 assert 'check-sbom-snapshot.sh skips when advisory' sbom_skips_when_advisory
 assert 'check-sbom-snapshot.sh fails when WIRELOG_SBOM_REQUIRED=1' sbom_fails_when_required
 
+# The walltime budget gate (#1487) is a POST-SUITE Python gate: it reads
+# meson-logs/testlog.json, which $empty does not have, so it reaches its
+# genuine missing-log skip route. Python is launched explicitly (the gate is a
+# .py, not a .sh); same advisory-skip / required-fail contract as the rest.
+walltime_skips_when_advisory() {
+    local st=0
+    ( unset WIRELOG_WALLTIME_REQUIRED
+      python3 "$root/scripts/ci/check-shell-gate-walltime.py" "$empty" ) >/dev/null 2>&1 || st=$?
+    [ "$st" = 77 ]
+}
+walltime_fails_when_required() {
+    local st=0
+    ( export WIRELOG_WALLTIME_REQUIRED=1
+      python3 "$root/scripts/ci/check-shell-gate-walltime.py" "$empty" ) >/dev/null 2>&1 || st=$?
+    [ "$st" = 1 ]
+}
+assert 'check-shell-gate-walltime.py skips when advisory' walltime_skips_when_advisory
+assert 'check-shell-gate-walltime.py fails when WIRELOG_WALLTIME_REQUIRED=1' \
+    walltime_fails_when_required
+
 # --- 2. wiring --------------------------------------------------------------
 # Assert on the job/step that must carry it, not merely on the file: the
 # variable appearing anywhere in a workflow would satisfy a bare grep while
@@ -129,6 +149,16 @@ assert 'ci-pr.yml SBOM step sets WIRELOG_SBOM_REQUIRED' \
     sets_in_step ci-pr.yml 'SBOM snapshot gate' WIRELOG_SBOM_REQUIRED
 assert 'release-tag.yml Tag/SBOM sets WIRELOG_SBOM_REQUIRED' \
     sets_in_step release-tag.yml 'Build and test SBOM suite' WIRELOG_SBOM_REQUIRED
+
+# #1487: the walltime budget is a post-suite step, so it has two OS-split steps
+# in the PR matrix and one in the release default job. Each must carry the
+# escalation, else the required contract above is unenforced in CI.
+assert 'ci-pr.yml walltime step (Linux/macOS) sets WIRELOG_WALLTIME_REQUIRED' \
+    sets_in_step ci-pr.yml 'Shell gate walltime budget (Linux / macOS)' WIRELOG_WALLTIME_REQUIRED
+assert 'ci-pr.yml walltime step (Windows) sets WIRELOG_WALLTIME_REQUIRED' \
+    sets_in_step ci-pr.yml 'Shell gate walltime budget (Windows / MSVC)' WIRELOG_WALLTIME_REQUIRED
+assert 'release-tag.yml default job sets WIRELOG_WALLTIME_REQUIRED' \
+    sets_in_step release-tag.yml 'Shell gate walltime budget' WIRELOG_WALLTIME_REQUIRED
 
 # release-verification must WAIT ON every verification job, not merely agree
 # with itself about how many there are. Comparing counts caught drift between
