@@ -93,8 +93,9 @@ refute() {
 # A fixture repo_root holding a copy of the real script. Nothing here can reach
 # the working tree: repo_root is derived from the script's own directory.
 repo="$tmp/repo"
-mkdir -p "$repo/scripts/release" "$repo/subprojects/nanoarrow" "$repo/bin"
+mkdir -p "$repo/scripts/release" "$repo/scripts/ci" "$repo/subprojects/nanoarrow" "$repo/bin"
 cp "$root/scripts/release/generate-sbom.sh" "$repo/scripts/release/"
+cp "$root/scripts/ci/check-sbom-snapshot.sh" "$repo/scripts/ci/"
 printf "project('wirelog', 'c',\n  version: '9.9.9-dev',\n)\n" > "$repo/meson.build"
 
 # Entries chosen so C and en_US collation disagree: glibc's en_US ignores the
@@ -113,18 +114,30 @@ cat > "$repo/bin/syft" <<'EOS'
 # as unused.
 outfile=""
 prev=""
+exclude_workflow_tools=0
 for a in "$@"; do
     case "$a" in dir:*) printf '%s\n' "${a#dir:}" >> "$SYFT_SCANNED" ;; esac
+    case "$prev" in
+        --exclude)
+            printf '%s\n' "$a" >> "$SYFT_EXCLUDES"
+            [[ "$a" == '**/workflow-tools/**' ]] && exclude_workflow_tools=1
+            ;;
+    esac
     case "$prev" in -o) case "$a" in *=*) outfile=${a#*=} ;; esac ;; esac
     prev=$a
 done
 emit() {
-cat <<'JSON'
+    local workflow_tools_artifact=""
+    if [[ "$exclude_workflow_tools" != 1 || "${SYFT_IGNORE_EXCLUDE:-0}" == 1 ]]; then
+        workflow_tools_artifact='{"name":"./workflow-tools/.github/actions/setup-meson","version":"UNKNOWN","licenses":[]},'
+    fi
+cat <<JSON
 {"artifacts":[
   {"name":"zlib","version":"1.3","licenses":[{"value":"Zlib"}]},
   {"name":"./.github/workflows/lint-pr.yml","version":"UNKNOWN","licenses":[]},
   {"name":"actions/checkout","version":"v5","licenses":[]},
   {"name":"./.github/workflows/lint-main.yml","version":"UNKNOWN","licenses":[]},
+  $workflow_tools_artifact
   {"name":"r-lib/actions","version":"v2","licenses":[]}
 ]}
 JSON
@@ -134,7 +147,10 @@ EOS
 chmod +x "$repo/bin/syft"
 
 scanned="$tmp/scanned.txt"
-gen() { SYFT_SCANNED="$scanned" PATH="$repo/bin:$PATH" \
+excludes="$tmp/excludes.txt"
+: > "$scanned"
+: > "$excludes"
+gen() { SYFT_SCANNED="$scanned" SYFT_EXCLUDES="$excludes" PATH="$repo/bin:$PATH" \
         "$repo/scripts/release/generate-sbom.sh" "$@"; }
 
 # --- the parameter, which is the point of the issue ------------------------
@@ -144,6 +160,39 @@ assert 'the snapshot lands in the given directory' test -f "$out/snapshot.txt"
 assert 'the SPDX document lands there too' test -f "$out/wirelog-9.9.9.spdx.json"
 assert 'the CycloneDX document lands there too' test -f "$out/wirelog-9.9.9.cdx.json"
 refute 'the default directory is not touched when one is given' test -e "$repo/sbom"
+
+all_scans_exclude_workflow_tools() {
+    [[ $(wc -l < "$scanned") -eq 3 && $(wc -l < "$excludes") -eq 3 ]] || return 1
+    ! grep -qvxF '**/workflow-tools/**' "$excludes"
+}
+assert 'every generated SBOM excludes nested workflow-tools checkouts' \
+    all_scans_exclude_workflow_tools
+refute 'the generated baseline omits the non-product workflow-tools checkout' \
+    grep -Fq './workflow-tools/.github/actions/setup-meson' "$out/snapshot.txt"
+refute 'the committed baseline omits the non-product workflow-tools checkout' \
+    grep -Fq './workflow-tools/' "$root/sbom/snapshot.txt"
+
+# The gate must use the same scan boundary as the generator. A full helper
+# checkout lives below repo_root during release verification and is not part
+# of the tagged source inventory.
+mkdir -p "$repo/sbom"
+cp "$out/snapshot.txt" "$repo/sbom/snapshot.txt"
+check_excludes="$tmp/check-excludes.txt"
+check_snapshot() {
+    SYFT_EXCLUDES="$check_excludes" PATH="$repo/bin:$PATH" \
+        "$repo/scripts/ci/check-sbom-snapshot.sh"
+}
+expect_status 'the snapshot gate accepts its generated baseline' 0 check_snapshot
+assert 'the snapshot gate passes the exact workflow-tools exclusion' \
+    test "$(wc -l < "$check_excludes")" -eq 1
+assert 'the snapshot gate passes the exact workflow-tools exclusion' \
+    grep -Fxq '**/workflow-tools/**' "$check_excludes"
+check_snapshot_with_unexcluded_checkout() {
+    SYFT_IGNORE_EXCLUDE=1 SYFT_EXCLUDES="$tmp/ignored-excludes.txt" \
+        PATH="$repo/bin:$PATH" "$repo/scripts/ci/check-sbom-snapshot.sh"
+}
+expect_status 'the snapshot gate rejects an unexcluded helper checkout' \
+    1 check_snapshot_with_unexcluded_checkout
 
 # What the generator SCANS, not just where it writes. The script takes a
 # build_root it does not read; if that ever changes the SBOM would describe a

@@ -64,11 +64,18 @@ mkdir -p "$out_dir"
 
 output_prefix="$out_dir/wirelog-${version}"
 
+# Release verification checks out the workflow revision under a nested
+# workflow-tools/ directory. It is CI tooling, not part of the tagged source
+# inventory, so keep that checkout out of every generated SBOM format.
+syft_scan() {
+    syft dir:"$repo_root" --exclude '**/workflow-tools/**' "$@"
+}
+
 echo "generate-sbom: Generating SPDX 2.3..."
-syft dir:"$repo_root" -o spdx-json@2.3="${output_prefix}.spdx.json"
+syft_scan -o spdx-json@2.3="${output_prefix}.spdx.json"
 
 echo "generate-sbom: Generating CycloneDX 1.5..."
-syft dir:"$repo_root" -o cyclonedx-json@1.5="${output_prefix}.cdx.json"
+syft_scan -o cyclonedx-json@1.5="${output_prefix}.cdx.json"
 
 echo "generate-sbom: Updating snapshot baseline..."
 # Extract normalized dependency list: name@version:license.
@@ -76,7 +83,7 @@ echo "generate-sbom: Updating snapshot baseline..."
 # operator's locale: glibc's en_US collation ignores leading punctuation, so
 # regenerating under it reorders the "./.github/workflows/..." entries and
 # buries the real dependency change in unrelated diff noise.
-syft dir:"$repo_root" -o syft-json 2>/dev/null \
+syft_scan -o syft-json 2>/dev/null \
   | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' \
   | LC_ALL=C sort > "$out_dir/snapshot.txt"
 
