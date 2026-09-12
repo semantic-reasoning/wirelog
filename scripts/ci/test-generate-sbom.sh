@@ -127,9 +127,10 @@ for a in "$@"; do
     prev=$a
 done
 emit() {
-    local workflow_tools_artifact=""
+    local workflow_tools_artifact='{"name":"./workflow-tools/.github/actions/setup-meson","version":"UNKNOWN","licenses":[]},'
+    local nested_workflow_tools_artifact=""
     if [[ "$exclude_workflow_tools" != 1 || "${SYFT_IGNORE_EXCLUDE:-0}" == 1 ]]; then
-        workflow_tools_artifact='{"name":"./workflow-tools/.github/actions/setup-meson","version":"UNKNOWN","licenses":[]},'
+        nested_workflow_tools_artifact='{"name":"./workflow-tools/.github/workflows/release-tag.yml","version":"UNKNOWN","licenses":[]},'
     fi
 cat <<JSON
 {"artifacts":[
@@ -138,6 +139,7 @@ cat <<JSON
   {"name":"actions/checkout","version":"v5","licenses":[]},
   {"name":"./.github/workflows/lint-main.yml","version":"UNKNOWN","licenses":[]},
   $workflow_tools_artifact
+  $nested_workflow_tools_artifact
   {"name":"r-lib/actions","version":"v2","licenses":[]}
 ]}
 JSON
@@ -167,10 +169,14 @@ all_scans_exclude_workflow_tools() {
 }
 assert 'every generated SBOM excludes nested workflow-tools checkouts' \
     all_scans_exclude_workflow_tools
-refute 'the generated baseline omits the non-product workflow-tools checkout' \
-    grep -Fq './workflow-tools/.github/actions/setup-meson' "$out/snapshot.txt"
-refute 'the committed baseline omits the non-product workflow-tools checkout' \
-    grep -Fq './workflow-tools/' "$root/sbom/snapshot.txt"
+assert 'the generated baseline retains the declared workflow-tools action reference once' \
+    test "$(grep -Fxc './workflow-tools/.github/actions/setup-meson@UNKNOWN:NOASSERTION' "$out/snapshot.txt")" -eq 1
+refute 'the generated baseline excludes nested workflow-tools workflow files' \
+    grep -Fq './workflow-tools/.github/workflows/' "$out/snapshot.txt"
+assert 'the committed baseline retains the declared workflow-tools action reference once' \
+    test "$(grep -Fxc './workflow-tools/.github/actions/setup-meson@UNKNOWN:NOASSERTION' "$root/sbom/snapshot.txt")" -eq 1
+refute 'the committed baseline excludes nested workflow-tools workflow files' \
+    grep -Fq './workflow-tools/.github/workflows/' "$root/sbom/snapshot.txt"
 
 # The gate must use the same scan boundary as the generator. A full helper
 # checkout lives below repo_root during release verification and is not part

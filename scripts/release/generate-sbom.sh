@@ -65,8 +65,9 @@ mkdir -p "$out_dir"
 output_prefix="$out_dir/wirelog-${version}"
 
 # Release verification checks out the workflow revision under a nested
-# workflow-tools/ directory. It is CI tooling, not part of the tagged source
-# inventory, so keep that checkout out of every generated SBOM format.
+# workflow-tools/ directory. Exclude that checkout's files from the tagged
+# source inventory. The workflow cataloger still reports the local-action
+# declaration in release-tag.yml, which remains a legitimate snapshot entry.
 syft_scan() {
     syft dir:"$repo_root" --exclude '**/workflow-tools/**' "$@"
 }
