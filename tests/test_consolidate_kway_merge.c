@@ -1490,6 +1490,51 @@ test_hash_allocation_oom_is_not_fallback(void)
 }
 
 static void
+test_hash_float_signed_zero_lexicographic_order(void)
+{
+    const uint32_t row_count = 10001;
+    col_rel_t *rel = test_rel_alloc(2);
+    wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_FLOAT,
+        WIRELOG_TYPE_FLOAT,
+    };
+    uint32_t boundaries[] = { 0, row_count };
+    int64_t row[] = { 0, 0 };
+    int64_t expected_second[] = {
+        wl_columnar_float_to_bits(1.0),
+        wl_columnar_float_to_bits(2.0),
+    };
+
+    TEST("hash sort preserves float signed-zero lexicographic equivalence");
+    ASSERT(rel != NULL, "relation allocation failed");
+    if (col_rel_set_column_types(rel, types, 2) != 0) {
+        test_rel_free(rel);
+        FAIL("failed to set float column types");
+    }
+    for (uint32_t i = 0; i < row_count; i++) {
+        row[1] = wl_columnar_float_to_bits(i % 2 == 0 ? 2.0 : 1.0);
+        if (test_rel_append_row(rel, row) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append signed-zero fixture row");
+        }
+        /* Exercise non-canonical input bits that can enter through raw views. */
+        if (i % 2 == 0)
+            rel->columns[0][i] = INT64_MIN;
+    }
+
+    if (col_op_consolidate_kway_merge(rel, boundaries, 1) != 0
+        || rel->nrows != 2 || rel->columns[0][0] != 0
+        || rel->columns[0][1] != 0
+        || rel->columns[1][0] != expected_second[0]
+        || rel->columns[1][1] != expected_second[1]) {
+        test_rel_free(rel);
+        FAIL("signed-zero keys must tie and sort by the next float column");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
 test_hash_heuristic_fallback_succeeds(void)
 {
     const uint32_t row_count = 10001;
@@ -1770,6 +1815,7 @@ main(void)
     test_consolidate_scratch_admission();
     test_later_segment_sort_oom_is_transactional();
     test_hash_allocation_oom_is_not_fallback();
+    test_hash_float_signed_zero_lexicographic_order();
     test_hash_heuristic_fallback_succeeds();
     test_k16_workspace_is_preallocated();
     test_float_insertion_workspace();
