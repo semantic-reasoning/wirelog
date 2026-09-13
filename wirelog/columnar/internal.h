@@ -110,6 +110,14 @@ wl_columnar_float_compare_bits(int64_t left_bits, int64_t right_bits)
 /* Platform Shims                                                           */
 /* ======================================================================== */
 
+/* Marks a return value that a caller must not discard.  GCC/Clang only:
+ * the Windows leg builds with MSVC cl.exe, which rejects GNU attributes. */
+#if defined(_MSC_VER)
+#define WL_MUST_CHECK
+#else
+#define WL_MUST_CHECK __attribute__((warn_unused_result))
+#endif
+
 /* GCC/Clang extension not supported on MSVC */
 #ifdef _MSC_VER
 #define UNUSED
@@ -2302,7 +2310,7 @@ col_rel_test_set_next_identity(uint64_t next);
  * borrows or the source gate is contended, ENOMEM on allocation failure.
  * sorted_nrows is advanced only on success, so a caller that depends on the
  * ordering must check the result rather than assume it. */
-int
+WL_MUST_CHECK int
 col_rel_radix_sort_int64(col_rel_t *r);
 
 typedef struct {
