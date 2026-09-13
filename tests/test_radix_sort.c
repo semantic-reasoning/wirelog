@@ -128,7 +128,7 @@ test_empty(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     if (r->sorted_nrows != 0) {
         col_rel_destroy(r);
@@ -156,7 +156,7 @@ test_single_row(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, row, 1, 2, "single row unchanged");
     col_rel_destroy(r);
@@ -179,7 +179,7 @@ test_already_sorted(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, rows, 5, 1, "already sorted");
     col_rel_destroy(r);
@@ -203,7 +203,7 @@ test_reverse_sorted(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, 5, 1, "reverse sorted");
     col_rel_destroy(r);
@@ -227,7 +227,7 @@ test_duplicates(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, 6, 1, "duplicates");
     col_rel_destroy(r);
@@ -251,7 +251,7 @@ test_negatives(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, 6, 1, "negatives");
     col_rel_destroy(r);
@@ -279,7 +279,7 @@ test_boundary_values(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, 5, 1, "boundary values");
     col_rel_destroy(r);
@@ -316,7 +316,7 @@ test_multi_col(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, 5, 2, "multi-col lex");
     col_rel_destroy(r);
@@ -350,7 +350,7 @@ test_multi_col_neg(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, 4, 2, "multi-col neg");
     col_rel_destroy(r);
@@ -395,7 +395,7 @@ test_random_1col(void)
         FAIL("alloc"); return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, NRAND, 1, "random 1-col");
     col_rel_destroy(r);
@@ -425,7 +425,7 @@ test_sorted_nrows_set(void)
         return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     if (r->sorted_nrows != r->nrows) {
         char msg[64];
@@ -480,7 +480,7 @@ test_boundary_nrows(uint32_t nrows, const char *label)
         return 1;
     }
 
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
 
     int ok = check_sorted(r, expected, nrows, 1, label);
     col_rel_destroy(r);
@@ -535,7 +535,7 @@ test_float_order(void)
             return 1;
         }
     }
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
     for (uint32_t i = 0; i < r->nrows; i++) {
         double got = wl_columnar_float_from_bits(col_rel_get(r, i, 0));
         if (got != values[i]) {

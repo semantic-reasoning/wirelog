@@ -155,7 +155,7 @@ bench_radix_sort(uint32_t nrows, uint32_t ncols)
         return -1.0;
 
     bench_time_t t0 = bench_time_now();
-    col_rel_radix_sort_int64(r);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
     bench_time_t t1 = bench_time_now();
 
     col_rel_destroy(r);

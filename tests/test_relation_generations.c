@@ -1624,7 +1624,7 @@ test_shared_mutation_cow_and_append_validation(void)
         "shared all-row sort view");
     uint64_t all_view_before = all_view->view_generation;
     uint64_t all_storage_before = all_view->storage_generation;
-    col_rel_radix_sort_int64(all_view);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(all_view));
     CHECK(source->columns[0][0] == first && source->columns[0][1] == second
         && source->view_generation == source_view
         && source->storage_generation == source_storage
@@ -1725,7 +1725,7 @@ test_large_sort_epochs(void)
             "large sort input append");
     }
     uint64_t view_before = rel->view_generation;
-    col_rel_radix_sort_int64(rel);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(rel));
     CHECK(rel->view_generation == view_before + 1u,
         "k16 sort advances view exactly once");
     CHECK(rel->columns[0][0] == 1 && rel->columns[0][49999] == 50000,
@@ -1737,7 +1737,7 @@ test_large_sort_epochs(void)
         "large sort shared-view setup");
     view_before = view->view_generation;
     uint64_t storage_before = view->storage_generation;
-    col_rel_radix_sort_int64(view);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(view));
     CHECK(view->view_generation == view_before + 1u
         && view->storage_generation == storage_before + 1u,
         "shared k16 sort publishes one view and storage epoch");

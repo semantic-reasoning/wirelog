@@ -111,11 +111,28 @@ wl_columnar_float_compare_bits(int64_t left_bits, int64_t right_bits)
 /* ======================================================================== */
 
 /* Marks a return value that a caller must not discard.  GCC/Clang only:
- * the Windows leg builds with MSVC cl.exe, which rejects GNU attributes. */
+ * the Windows leg builds with MSVC cl.exe, which rejects GNU attributes.
+ *
+ * There is no -Werror in this build, so the attribute does not fail a
+ * compile on its own; it earns its keep through the clang-tidy ratchet,
+ * which fails on any diagnostic in an allowlisted libwirelog source and
+ * sees -Wunused-result through the -Wall every target carries.
+ *
+ * WL_IGNORE_RESULT marks a discard that is deliberate.  A plain (void)
+ * cast does not silence warn_unused_result on GCC -- only clang honours
+ * that -- so the value has to be bound and then discarded.  Using the
+ * macro rather than an ad-hoc dummy keeps intentional discards greppable
+ * and stops them from reading like oversights. */
 #if defined(_MSC_VER)
 #define WL_MUST_CHECK
+#define WL_IGNORE_RESULT(expr) ((void)(expr))
 #else
 #define WL_MUST_CHECK __attribute__((warn_unused_result))
+#define WL_IGNORE_RESULT(expr)                \
+        do {                                      \
+            __typeof__(expr) wl_ignored_ = (expr); \
+            (void)wl_ignored_;                    \
+        } while (0)
 #endif
 
 /* GCC/Clang extension not supported on MSVC */
