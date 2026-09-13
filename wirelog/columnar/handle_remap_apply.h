@@ -72,6 +72,11 @@
  *         is in a half-remapped state; the caller MUST treat it as
  *         poisoned: discard, restore from a snapshot, or abort.  There is no
  *         in-band roll-back primitive.
+ *   EBUSY if the source-access gate is occupied by a reader or concurrent
+ *         writer, or if the relation storage is borrowed or shared.  No cell
+ *         or relation metadata is changed in this case, and @out_rewrites is
+ *         set to zero.  Retrying this relation operation after the conflict
+ *         clears is safe.
  */
 int
 wl_handle_remap_apply_columns(col_rel_t *rel,

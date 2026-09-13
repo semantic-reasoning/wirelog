@@ -335,6 +335,7 @@ test_apply_reader_exclusion(void)
     col_rel_t *rel = build_relation(40u, 1u);
     wl_handle_remap_t *remap = NULL;
     wl_columnar_source_access_reader_t reader = { 0 };
+    int reader_acquired = 0;
     uint32_t handle_col = 0u;
     uint64_t rewrites = 99u;
     ASSERT(rel != NULL, "build_relation");
@@ -347,6 +348,7 @@ test_apply_reader_exclusion(void)
     uint64_t generation = rel->view_generation;
     ASSERT(col_rel_source_reader_acquire(rel, &reader) == 0,
         "reader acquire");
+    reader_acquired = 1;
     ASSERT(wl_handle_remap_apply_columns(rel, &handle_col, 1u, remap,
         &rewrites) == EBUSY, "reader must block remap");
     ASSERT(rewrites == 0u && rel->columns[0][0] == before
@@ -354,12 +356,15 @@ test_apply_reader_exclusion(void)
         "blocked remap must be transactional");
     ASSERT(col_rel_source_reader_release(&reader) == 0,
         "reader release");
+    reader_acquired = 0;
     rewrites = 0u;
     ASSERT(wl_handle_remap_apply_columns(rel, &handle_col, 1u, remap,
         &rewrites) == 0 && rewrites == 40u,
         "remap retry must succeed");
     PASS();
 cleanup:
+    if (reader_acquired)
+        (void)col_rel_source_reader_release(&reader);
     wl_handle_remap_free(remap);
     col_rel_destroy(rel);
 }

@@ -133,17 +133,19 @@ wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
                 remap, &r);
         cells += r;
         if (rc != 0) {
-            /* Propagate EIO with the prefix that succeeded; the
-             * relation we failed on is now partially rewritten
-             * (poisoned per #589 contract).  The session is also
-             * poisoned -- the caller (rotation helper) treats the
-             * whole session as a failed rotation. */
+            /* Propagate the failure with the prefix that succeeded.
+             * EIO leaves the failing relation partially rewritten
+             * (poisoned per #589 contract), while EBUSY leaves the
+             * current relation unchanged.  Retry only that blocked
+             * relation after the reader/concurrent-writer gate and any
+             * borrowed/shared condition clear; do not replay a completed
+             * prefix without first restoring it. */
             if (out_rels_rewritten)
                 *out_rels_rewritten = rels;
             if (out_total_cells)
                 *out_total_cells = cells;
             WL_LOG(WL_LOG_SEC_COMPOUND, WL_LOG_ERROR,
-                "event=remap_apply_side_session_eio rel=%s "
+                "event=remap_apply_side_session_failed rel=%s "
                 "rels_rewritten=%" PRIu64 " cells=%" PRIu64,
                 rel->name ? rel->name : "(anon)", rels, cells);
             return rc;
