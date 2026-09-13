@@ -431,8 +431,8 @@ col_rel_row_cmp_raw(const col_rel_t *r, uint32_t row_idx,
  *
  * When the total row count greatly exceeds the unique count (common in
  * recursive Datalog joins), hash-based dedup is O(N) vs O(N * passes)
- * for radix sort + O(N) merge.  After dedup, the small unique set is
- * sorted with radix sort.
+ * for radix sort + O(N) merge. After dedup, the small unique set is
+ * sorted in place with heapsort.
  *
  * Returns 0 on success, -1 when the unique-count heuristic requests fallback,
  * and ENOMEM for allocation failures. The relation is untouched on failure.
@@ -479,51 +479,49 @@ col_op_consolidate_hash_rows_compare(const col_rel_t *rel,
 }
 
 static void
-col_op_consolidate_hash_rows_sort_range(const col_rel_t *rel, int64_t *rows,
-    int64_t *scratch, uint32_t begin, uint32_t end, uint32_t ncols)
+col_op_consolidate_hash_rows_swap(int64_t *rows, uint32_t left,
+    uint32_t right, uint32_t ncols)
 {
-    if (end - begin <= 1)
-        return;
-    uint32_t mid = begin + (end - begin) / 2u;
-    col_op_consolidate_hash_rows_sort_range(rel, rows, scratch, begin, mid,
-        ncols);
-    col_op_consolidate_hash_rows_sort_range(rel, rows, scratch, mid, end,
-        ncols);
+    int64_t *left_row = rows + (size_t)left * ncols;
+    int64_t *right_row = rows + (size_t)right * ncols;
+    for (uint32_t c = 0; c < ncols; c++) {
+        int64_t value = left_row[c];
+        left_row[c] = right_row[c];
+        right_row[c] = value;
+    }
+}
 
-    uint32_t left = begin;
-    uint32_t right = mid;
-    uint32_t out = begin;
-    while (left < mid && right < end) {
-        const int64_t *left_row = rows + (size_t)left * ncols;
-        const int64_t *right_row = rows + (size_t)right * ncols;
-        const int64_t *selected
-            = col_op_consolidate_hash_rows_compare(rel, left_row, right_row,
-                ncols) <= 0 ? left_row : right_row;
-        memcpy(scratch + (size_t)out * ncols, selected,
-            (size_t)ncols * sizeof(*rows));
-        if (selected == left_row)
-            left++;
-        else
-            right++;
-        out++;
+static void
+col_op_consolidate_hash_rows_sift_down(const col_rel_t *rel, int64_t *rows,
+    uint32_t root, uint32_t count, uint32_t ncols)
+{
+    while (root < count / 2u) {
+        uint32_t child = root * 2u + 1u;
+        if (child + 1u < count
+            && col_op_consolidate_hash_rows_compare(rel,
+            rows + (size_t)child * ncols,
+            rows + (size_t)(child + 1u) * ncols, ncols) < 0)
+            child++;
+        if (col_op_consolidate_hash_rows_compare(rel,
+            rows + (size_t)root * ncols,
+            rows + (size_t)child * ncols, ncols) >= 0)
+            return;
+        col_op_consolidate_hash_rows_swap(rows, root, child, ncols);
+        root = child;
     }
-    while (left < mid) {
-        memcpy(scratch + (size_t)out * ncols,
-            rows + (size_t)left * ncols,
-            (size_t)ncols * sizeof(*rows));
-        left++;
-        out++;
+}
+
+static void
+col_op_consolidate_hash_rows_sort(const col_rel_t *rel, int64_t *rows,
+    uint32_t count, uint32_t ncols)
+{
+    for (uint32_t root = count / 2u; root > 0;)
+        col_op_consolidate_hash_rows_sift_down(rel, rows, --root, count,
+            ncols);
+    for (uint32_t end = count; end > 1u;) {
+        col_op_consolidate_hash_rows_swap(rows, 0, --end, ncols);
+        col_op_consolidate_hash_rows_sift_down(rel, rows, 0, end, ncols);
     }
-    while (right < end) {
-        memcpy(scratch + (size_t)out * ncols,
-            rows + (size_t)right * ncols,
-            (size_t)ncols * sizeof(*rows));
-        right++;
-        out++;
-    }
-    memcpy(rows + (size_t)begin * ncols,
-        scratch + (size_t)begin * ncols,
-        (size_t)(end - begin) * ncols * sizeof(*rows));
 }
 
 static int
@@ -671,20 +669,9 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
     free(ht_vals);
     free(ht_used);
 
-    /* Sort the staged unique rows before publishing any mutation.  If scratch
-     * allocation fails, the caller can safely fall back to sort+merge with
-     * the original relation untouched. */
-    if (uniq_count > 1) {
-        int64_t *scratch = (int64_t *)col_op_consolidate_malloc(
-            (size_t)uniq_count * row_bytes, "hash_sort_scratch");
-        if (!scratch) {
-            free(uniq_buf);
-            return ENOMEM;
-        }
-        col_op_consolidate_hash_rows_sort_range(rel, uniq_buf, scratch, 0,
-            uniq_count, nc);
-        free(scratch);
-    }
+    /* Sort staged rows in place before publishing any mutation. */
+    if (uniq_count > 1)
+        col_op_consolidate_hash_rows_sort(rel, uniq_buf, uniq_count, nc);
 
     /* Detach only after hash/sort staging is complete.  All emitted rows
      * came from the validated source relation, so publish has no expected
@@ -715,8 +702,8 @@ col_op_consolidate_hash_dedup(col_rel_t *rel,
  * Deduplicates on-the-fly during merge. Writes merged result back into rel.
  *
  * For K=1: just sort + dedup in-place.
- * For K=2: optimized 2-way merge (no heap overhead).
- * For K>=3: min-heap merge with O(M log K) comparisons.
+ * For K>=2: min-heap merge with O(M log K) comparisons. K=2 uses a
+ * stack-allocated heap to avoid a separate heap allocation.
  *
  * @rel            Relation containing K concatenated segments.
  * @seg_boundaries Array of (seg_count+1) offsets [s0, s1, ..., sK].
@@ -759,6 +746,13 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     size_t segment_total_bytes;
     size_t additional_scratch_bytes;
     wl_columnar_radix_workspace_t sort_workspace = { 0 };
+    uint32_t *seg_starts = NULL;
+    uint32_t *seg_ends = NULL;
+    int64_t *merged = NULL;
+    heap_entry_t stack_heap[2];
+    heap_entry_t *heap = stack_heap;
+    heap_entry_t *heap_storage = NULL;
+    int result = 0;
     if (!col_op_consolidate_size_multiply(seg_count, sizeof(uint32_t),
         &segment_bytes)
         || !col_op_consolidate_size_multiply(seg_count, sizeof(heap_entry_t),
@@ -832,26 +826,22 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
 
     /* Allocate every buffer that can fail before the first in-place sort or
      * dedup mutation.  The workspace reservation includes these buffers. */
-    uint32_t *seg_starts = (uint32_t *)col_op_consolidate_malloc(
+    seg_starts = (uint32_t *)col_op_consolidate_malloc(
         segment_bytes, "segment_starts");
-    uint32_t *seg_ends = (uint32_t *)col_op_consolidate_malloc(
+    seg_ends = (uint32_t *)col_op_consolidate_malloc(
         segment_bytes, "segment_ends");
-    int64_t *merged = NULL;
-    heap_entry_t *heap = NULL;
     if (seg_count >= 2)
         merged = (int64_t *)col_op_consolidate_malloc(
             merged_alloc_bytes, "merge_output");
     if (seg_count >= 3)
-        heap = (heap_entry_t *)col_op_consolidate_malloc(heap_bytes,
+        heap_storage = (heap_entry_t *)col_op_consolidate_malloc(heap_bytes,
                 "merge_heap");
+    if (heap_storage)
+        heap = heap_storage;
     if (!seg_starts || !seg_ends || (seg_count >= 2 && !merged)
-        || (seg_count >= 3 && !heap)) {
-        free(seg_starts);
-        free(seg_ends);
-        free(merged);
-        free(heap);
-        wl_columnar_radix_workspace_destroy(&sort_workspace);
-        return ENOMEM;
+        || (seg_count >= 3 && !heap_storage)) {
+        result = ENOMEM;
+        goto cleanup;
     }
 
     /* Every buffer allocation is now complete.  A shared view may detach
@@ -859,12 +849,8 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     if (rel->col_shared) {
         int cow_rc = col_rel_cow_unshare_with_source_writer(rel, writer);
         if (cow_rc != 0) {
-            wl_columnar_radix_workspace_destroy(&sort_workspace);
-            free(seg_starts);
-            free(seg_ends);
-            free(merged);
-            free(heap);
-            return cow_rc;
+            result = cow_rc;
+            goto cleanup;
         }
         *alias_release_pending = true;
     }
@@ -894,12 +880,8 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
                     wl_columnar_relation_radix_sort_with_workspace(rel,
                         start, count, writer, &sort_workspace);
                 if (sort_rc != 0) {
-                    wl_columnar_radix_workspace_destroy(&sort_workspace);
-                    free(seg_starts);
-                    free(seg_ends);
-                    free(merged);
-                    free(heap);
-                    return sort_rc;
+                    result = sort_rc;
+                    goto cleanup;
                 }
             }
 
@@ -922,79 +904,11 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
     if (seg_count == 1) {
         rel->nrows = seg_ends[0];
         wl_columnar_relation_touch_view(rel);
-        free(seg_starts);
-        free(seg_ends);
-        free(merged);
-        free(heap);
-        wl_columnar_radix_workspace_destroy(&sort_workspace);
-        return 0;
+        goto cleanup;
     }
 
-    if (seg_count == 2) {
-        /* Optimized 2-way merge (no heap) */
-        uint32_t i = seg_starts[0], j = seg_starts[1];
-        uint32_t i_end = seg_ends[0], j_end = seg_ends[1];
-        uint32_t out = 0;
-        int64_t *last_row = NULL;
-
-        while (i < i_end && j < j_end) {
-            int cmp = col_rel_row_cmp(rel, i, j);
-            uint32_t row_to_add_idx;
-
-            if (cmp <= 0) {
-                row_to_add_idx = i;
-                i++;
-                if (cmp == 0)
-                    j++; /* skip duplicate */
-            } else {
-                row_to_add_idx = j;
-                j++;
-            }
-
-            if (last_row == NULL
-                || col_rel_row_cmp_raw(rel, row_to_add_idx, last_row)
-                != 0) {
-                col_rel_row_copy_out(rel, row_to_add_idx,
-                    merged + (size_t)out * nc);
-                last_row = merged + (size_t)out * nc;
-                out++;
-            }
-        }
-
-        while (i < i_end) {
-            if (last_row == NULL
-                || col_rel_row_cmp_raw(rel, i, last_row) != 0) {
-                col_rel_row_copy_out(rel, i, merged + (size_t)out * nc);
-                last_row = merged + (size_t)out * nc;
-                out++;
-            }
-            i++;
-        }
-
-        while (j < j_end) {
-            if (last_row == NULL
-                || col_rel_row_cmp_raw(rel, j, last_row) != 0) {
-                col_rel_row_copy_out(rel, j, merged + (size_t)out * nc);
-                last_row = merged + (size_t)out * nc;
-                out++;
-            }
-            j++;
-        }
-
-        /* Scatter flat merged buffer back into column-major */
-        for (uint32_t r = 0; r < out; r++)
-            col_rel_row_copy_in_raw(rel, r, merged + (size_t)r * nc);
-        rel->nrows = out;
-        wl_columnar_relation_touch_view(rel);
-        free(merged);
-        free(seg_starts);
-        free(seg_ends);
-        free(heap);
-        wl_columnar_radix_workspace_destroy(&sort_workspace);
-        return 0;
-    }
-
-    /* General K-way merge (K >= 3) using min-heap.
+    /* Merge K sorted segments with a min-heap. K=2 uses stack storage;
+     * larger merges use the admitted heap allocation.
      *
      * Heap entries: (segment_index, current_row_pointer).
      * Heap property: parent row <= child rows (lexicographic).
@@ -1071,12 +985,14 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
         col_rel_row_copy_in_raw(rel, r, merged + (size_t)r * nc);
     rel->nrows = out;
     wl_columnar_relation_touch_view(rel);
+
+cleanup:
     free(merged);
-    free(heap);
+    free(heap_storage);
     free(seg_starts);
     free(seg_ends);
     wl_columnar_radix_workspace_destroy(&sort_workspace);
-    return 0;
+    return result;
 }
 
 int
