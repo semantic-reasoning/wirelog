@@ -224,8 +224,17 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         return eval_stack_push(stack, work, work_owned);
     }
 
-    /* Fallback: radix sort + dedup */
-    col_rel_radix_sort_int64(work);
+    /* Fallback: radix sort + dedup.  As in col_op_consolidate, the dedup is
+     * a correct compaction only over a sorted relation and it publishes
+     * sorted_nrows unconditionally, so a refused sort fails the operation. */
+    {
+        int sort_rc = col_rel_radix_sort_int64(work);
+        if (sort_rc != 0) {
+            if (work_owned)
+                col_rel_destroy(work);
+            return sort_rc;
+        }
+    }
 
     uint32_t out_r = 1;
     for (uint32_t r = 1; r < nr; r++) {
