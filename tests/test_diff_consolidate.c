@@ -600,8 +600,8 @@ test_blocked_sort_does_not_dedup_unsorted(void)
     rc = col_op_consolidate_diff(&stack, sess);
 
     if (col_rel_source_reader_release(&reader) != 0) {
+        eval_stack_drain(&stack);
         destroy_mock_session(sess);
-        /* rel is owned by the stack entry the operator handed back. */
         FAIL("source reader release failed");
         return;
     }

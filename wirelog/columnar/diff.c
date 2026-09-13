@@ -234,8 +234,12 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
              * to land here is EBUSY from a live source reader, and
              * col_rel_destroy_checked() refuses on exactly that predicate,
              * so the destroy would be a guaranteed no-op and work -- already
-             * off the stack -- would leak.  Hand it back instead; the
-             * evaluator drains the stack when an operator fails. */
+             * off the stack -- would leak unconditionally.  Handing it back
+             * defers the free to the evaluator's drain, which frees it
+             * whenever the reader has been released by then.  The drain's
+             * own destroy can still be refused while a reader is live; that
+             * residual belongs to eval_entry_dispose and is tracked
+             * separately. */
             if (eval_stack_push(stack, work, work_owned) != 0 && work_owned)
                 col_rel_destroy(work);
             return sort_rc;

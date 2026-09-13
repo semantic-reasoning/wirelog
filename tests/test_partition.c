@@ -121,8 +121,8 @@ verify_partition_coverage(const col_rel_t *src, col_rel_t **parts,
         return 0;
     }
 
-    col_rel_radix_sort_int64(src_copy);
-    col_rel_radix_sort_int64(merged);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(src_copy));
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(merged));
 
     int ok = (src_copy->nrows == merged->nrows);
     for (uint32_t i = 0; i < src_copy->nrows && ok; i++)
@@ -557,8 +557,8 @@ test_merge_roundtrip(void)
         col_rel_row_copy_out(src, i, src_flat2 + (size_t)i * 4);
     col_rel_t *src_copy = make_rel(4, src_flat2, src->nrows);
     free(src_flat2);
-    col_rel_radix_sort_int64(src_copy);
-    col_rel_radix_sort_int64(merged);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(src_copy));
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(merged));
 
     int ok = (src_copy->nrows == merged->nrows);
     for (uint32_t i = 0; i < src_copy->nrows && ok; i++)

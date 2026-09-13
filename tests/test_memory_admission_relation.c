@@ -100,7 +100,7 @@ test_cow_exact_fit_and_denial(void)
             "spare-capacity append COW");
         CHECK(view->col_shared == NULL, "exact-fit COW was published");
         CHECK(view->columns[0] != borrowed, "COW retained borrowed buffer");
-        col_rel_radix_sort_int64(view);
+        WL_IGNORE_RESULT(col_rel_radix_sort_int64(view));
         CHECK(view->columns[0][0] == 1 && view->columns[0][1] == 5
             && view->columns[0][2] == 9,
             "COW append/sort did not preserve copied rows");
@@ -123,7 +123,7 @@ test_cow_exact_fit_and_denial(void)
     CHECK(view != NULL, "COW denial setup");
     if (view) {
         int64_t *borrowed = view->columns[0];
-        col_rel_radix_sort_int64(view);
+        WL_IGNORE_RESULT(col_rel_radix_sort_int64(view));
         CHECK(view->col_shared != NULL && view->columns[0] == borrowed,
             "denied COW changed ownership");
         CHECK(view->columns[0][0] == 9 && view->columns[0][1] == 1,
@@ -686,7 +686,7 @@ test_cow_ledger_reconcile_is_exact_once(void)
             "COW ledger shared view");
         view->mem_ledger = &ledger;
         col_rel_ledger_reconcile(view, 0);
-        col_rel_radix_sort_int64(view);
+        WL_IGNORE_RESULT(col_rel_radix_sort_int64(view));
         wl_mem_ledger_snapshot(&ledger, &snapshot);
         CHECK(snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION]
             == (uint64_t)view->capacity * sizeof(int64_t),

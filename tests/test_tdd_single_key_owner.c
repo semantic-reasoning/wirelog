@@ -119,8 +119,8 @@ relation_equal(wl_session_t *left, wl_session_t *right, const char *name)
     if (lr->ncols != rr->ncols || lr->nrows != rr->nrows)
         return 0;
 
-    col_rel_radix_sort_int64(lr);
-    col_rel_radix_sort_int64(rr);
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(lr));
+    WL_IGNORE_RESULT(col_rel_radix_sort_int64(rr));
     for (uint32_t c = 0; c < lr->ncols; c++)
         for (uint32_t r = 0; r < lr->nrows; r++)
             if (lr->columns[c][r] != rr->columns[c][r])

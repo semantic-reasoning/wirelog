@@ -1844,7 +1844,7 @@ tdd_dedup_rel(col_rel_t *r)
             /* The status is deliberately discarded: the post-condition
              * check below is stronger, catching both a refused sort and a
              * relation that was never sorted to begin with. */
-            (void)col_rel_radix_sort_int64(r);
+            WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
             if (!tdd_relation_rows_sorted(r))
                 return;
         } else {
@@ -1858,7 +1858,7 @@ tdd_dedup_rel(col_rel_t *r)
                 free(keep);
                 /* Discarded for the same reason as above: the
                  * post-condition check is the stronger guard. */
-                (void)col_rel_radix_sort_int64(r);
+                WL_IGNORE_RESULT(col_rel_radix_sort_int64(r));
                 if (!tdd_relation_rows_sorted(r))
                     return;
                 /* Fall through to the sorted dedup below. */
