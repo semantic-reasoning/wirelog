@@ -3449,7 +3449,10 @@ test_session_exe = executable(
   arena_src,
   thread_src,
   workqueue_src,
-  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_args: host_machine.system() == 'linux' ? ['-Wl,--wrap=malloc'] : [],
+  c_args: host_machine.system() == 'linux' ?
+    ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_ALLOC_WRAP=1'] :
+    ['-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
 )

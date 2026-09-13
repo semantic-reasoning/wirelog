@@ -30,6 +30,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_TEST_ALLOC_WRAP
+void *__real_malloc(size_t size);
+static bool fail_next_malloc;
+
+void *
+__wrap_malloc(size_t size)
+{
+    if (fail_next_malloc) {
+        fail_next_malloc = false;
+        return NULL;
+    }
+    return __real_malloc(size);
+}
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -1621,6 +1636,229 @@ test_session_relation(wl_session_t *session, const char *name)
     return NULL;
 }
 
+static bool
+test_session_remove_alias_borrow_case(bool incremental)
+{
+    const int64_t rows[] = { 1, 2, 3 };
+    const int64_t remove_row[] = { 2 };
+    wl_plan_t *ffi = NULL;
+    wl_session_t *session = NULL;
+    col_rel_t *alias = NULL;
+    col_rel_t *input = NULL;
+    col_rel_t *derived = NULL;
+    wl_col_session_t *sess;
+    delta_collector_t deltas = { 0 };
+    uint32_t before_nrels = 0;
+    uint32_t before_outer_epoch = 0;
+    uint32_t before_input_rows = 0;
+    uint32_t before_derived_rows = 0;
+    uint32_t before_input_base = 0;
+    uint32_t before_delta_count = 0;
+    uint64_t before_input_view = 0;
+    uint64_t before_input_storage = 0;
+    uint64_t before_derived_view = 0;
+    uint64_t before_derived_storage = 0;
+    const char *before_last_inserted = NULL;
+    const char *before_last_removed = NULL;
+    bool before_pending = false;
+    bool before_pending_full = false;
+    bool before_snapshot_stable = false;
+    bool before_delta_seeded = false;
+    bool before_retraction_seeded = false;
+    bool before_rdelta_present = false;
+    bool before_d_delta_present = false;
+    bool ok = false;
+    int rc;
+
+    ffi = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\n"
+            "r(x) :- a(x).\n");
+    if (!ffi)
+        goto cleanup;
+    rc = wl_session_create(wl_backend_columnar(), ffi, 1, &session);
+    if (rc != 0 || !session)
+        goto cleanup;
+    if (incremental)
+        wl_session_set_delta_cb(session, collect_delta, &deltas);
+    rc = wl_session_insert(session, "a", rows, 3, 1);
+    if (rc == 0)
+        rc = wl_session_step(session);
+    if (rc != 0)
+        goto cleanup;
+
+    sess = COL_SESSION(session);
+    input = test_session_relation(session, "a");
+    derived = test_session_relation(session, "r");
+    if (!input || !derived || input->nrows != 3 || derived->nrows != 3)
+        goto cleanup;
+    alias = col_rel_new_auto("test_alias_a", input->ncols);
+    if (!alias || col_rel_install_shared_view(alias, input) != 0)
+        goto cleanup;
+
+    before_nrels = sess->nrels;
+    before_outer_epoch = sess->outer_epoch;
+    before_input_rows = input->nrows;
+    before_derived_rows = derived->nrows;
+    before_input_base = input->base_nrows;
+    before_input_view = input->view_generation;
+    before_input_storage = input->storage_generation;
+    before_derived_view = derived->view_generation;
+    before_derived_storage = derived->storage_generation;
+    before_last_inserted = sess->last_inserted_relation;
+    before_last_removed = sess->last_removed_relation;
+    before_pending = sess->pending_input_change;
+    before_pending_full = sess->pending_full_input_eval;
+    before_snapshot_stable = sess->snapshot_stable_valid;
+    before_delta_seeded = sess->delta_seeded;
+    before_retraction_seeded = sess->retraction_seeded;
+    before_delta_count = (uint32_t)deltas.count;
+    before_rdelta_present = test_session_relation(session, "$r$a") != NULL;
+    before_d_delta_present = test_session_relation(session, "$d$a") != NULL;
+
+    rc = wl_session_remove(session, "a", remove_row, 1, 1);
+    if (rc != EBUSY || input->storage_alias_borrows != 1
+        || input->nrows != before_input_rows
+        || input->columns[0][0] != rows[0]
+        || input->columns[0][1] != rows[1]
+        || input->columns[0][2] != rows[2]
+        || derived->nrows != before_derived_rows
+        || derived->columns[0][0] != rows[0]
+        || derived->columns[0][1] != rows[1]
+        || derived->columns[0][2] != rows[2]
+        || input->base_nrows != before_input_base
+        || input->view_generation != before_input_view
+        || input->storage_generation != before_input_storage
+        || derived->view_generation != before_derived_view
+        || derived->storage_generation != before_derived_storage
+        || sess->nrels != before_nrels
+        || sess->outer_epoch != before_outer_epoch
+        || sess->last_inserted_relation != before_last_inserted
+        || sess->last_removed_relation != before_last_removed
+        || sess->pending_input_change != before_pending
+        || sess->pending_full_input_eval != before_pending_full
+        || sess->snapshot_stable_valid != before_snapshot_stable
+        || sess->delta_seeded != before_delta_seeded
+        || sess->retraction_seeded != before_retraction_seeded
+        || (uint32_t)deltas.count != before_delta_count
+        || (test_session_relation(session, "$r$a") != NULL)
+        != before_rdelta_present
+        || (test_session_relation(session, "$d$a") != NULL)
+        != before_d_delta_present)
+        goto cleanup;
+
+    col_rel_destroy(alias);
+    alias = NULL;
+    if (input->storage_alias_borrows != 0)
+        goto cleanup;
+    rc = wl_session_remove(session, "a", remove_row, 1, 1);
+    if (rc != 0 || input->nrows != 2 || input->columns[0][0] != rows[0]
+        || input->columns[0][1] != rows[2])
+        goto cleanup;
+    if (incremental) {
+        col_rel_t *rdelta = test_session_relation(session, "$r$a");
+        if (!rdelta || rdelta->nrows != 1
+            || rdelta->columns[0][0] != remove_row[0]
+            || sess->nrels != before_nrels + 1u
+            || sess->last_removed_relation != input->name)
+            goto cleanup;
+    } else if (sess->nrels != before_nrels
+        || test_session_relation(session, "$r$a") != NULL) {
+        goto cleanup;
+    }
+    ok = true;
+
+cleanup:
+    /* The standalone alias must release its borrow before session teardown. */
+    if (alias)
+        col_rel_destroy(alias);
+    if (session)
+        wl_session_destroy(session);
+    if (ffi)
+        wl_plan_free(ffi);
+    return ok;
+}
+
+static void
+test_session_remove_live_alias(void)
+{
+    TEST(
+        "session: direct removal rejects a live storage alias transactionally");
+    if (!test_session_remove_alias_borrow_case(false)) {
+        FAIL("direct alias-blocked removal changed state or retry failed");
+        return;
+    }
+    PASS();
+
+    TEST(
+        "session: incremental removal rejects a live storage alias transactionally");
+    if (!test_session_remove_alias_borrow_case(true)) {
+        FAIL("incremental alias-blocked removal changed state or retry failed");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_session_remove_wide_alias_before_allocation(void)
+{
+    TEST("session: direct removal rejects wide live aliases before allocation");
+
+    wl_plan_t *ffi = build_plan(".decl a(x: int32)\n");
+    wl_session_t *session = NULL;
+    col_rel_t *wide = NULL;
+    col_rel_t *alias = NULL;
+    int64_t remove_row[COL_STACK_MAX + 1u] = { 0 };
+    int rc = ffi ? wl_session_create(wl_backend_columnar(), ffi, 1, &session)
+                 : ENOMEM;
+    if (rc != 0 || !session)
+        goto fail;
+
+    wide = col_rel_new_auto("wide", COL_STACK_MAX + 1u);
+    alias = col_rel_new_auto("wide_alias", COL_STACK_MAX + 1u);
+    if (!wide || !alias || session_add_rel(COL_SESSION(session), wide) != 0)
+        goto fail;
+    wide = NULL; /* session owns it now */
+    if (col_rel_install_shared_view(alias,
+        test_session_relation(session, "wide")) != 0)
+        goto fail;
+
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_malloc = true;
+#endif
+    rc = wl_session_remove(session, "wide", remove_row, 1,
+            COL_STACK_MAX + 1u);
+#ifdef WL_TEST_ALLOC_WRAP
+    bool allocation_was_not_attempted = fail_next_malloc;
+    fail_next_malloc = false;
+    if (rc != EBUSY || !allocation_was_not_attempted)
+        goto fail;
+#else
+    if (rc != EBUSY)
+        goto fail;
+#endif
+
+    col_rel_destroy(alias);
+    alias = NULL;
+    wl_session_destroy(session);
+    wl_plan_free(ffi);
+    PASS();
+    return;
+
+fail:
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_malloc = false;
+#endif
+    if (alias)
+        col_rel_destroy(alias);
+    if (wide)
+        col_rel_destroy(wide);
+    if (session)
+        wl_session_destroy(session);
+    if (ffi)
+        wl_plan_free(ffi);
+    FAIL("wide alias removal attempted allocation or did not return EBUSY");
+}
+
 static void
 test_session_remove_reader_exclusion(void)
 {
@@ -2208,6 +2446,8 @@ main(void)
     /* GREEN: diff=-1 retraction deltas now implemented */
     test_session_remove_single_delta();
     test_session_remove_nonexistent();
+    test_session_remove_live_alias();
+    test_session_remove_wide_alias_before_allocation();
     test_session_remove_reader_exclusion();
     test_session_remove_incremental_reader_exclusion();
     test_session_full_idb_clear_reader_exclusion();
