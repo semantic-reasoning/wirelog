@@ -2297,6 +2297,7 @@ test_consolidate_incremental_delta_exe = executable(
   workqueue_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_TEST_CONSOLIDATE_HOOK=1'],
 )
 
 test('consolidate_incremental_delta', test_consolidate_incremental_delta_exe)
