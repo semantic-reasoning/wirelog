@@ -33,6 +33,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../wirelog/columnar/source_access.h"
+
 /*
  * ArrowSchema stub: replicates the layout used in test_consolidate_kway_merge.c
  */
@@ -123,6 +125,11 @@ typedef struct {
     uint64_t relation_identity;
     uint64_t view_generation;
     uint64_t storage_generation;
+    void *storage_owner;
+    uint64_t storage_owner_identity;
+    uint64_t storage_owner_generation;
+    uint32_t storage_alias_borrows;
+    wl_columnar_source_access_gate_t source_access;
 } col_rel_t;
 
 /* Column-major helpers (inline, matching internal.h) */
@@ -184,6 +191,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 static int test_count = 0;
 static int pass_count = 0;
 static int fail_count = 0;
+static uint64_t test_relation_identity = 1;
 
 #define TEST(name)                                      \
         do {                                                \
@@ -219,6 +227,13 @@ test_rel_alloc(uint32_t ncols)
     col_rel_t *r = (col_rel_t *)calloc(1, sizeof(col_rel_t));
     if (!r)
         return NULL;
+    r->relation_identity = test_relation_identity++;
+    r->view_generation = 1;
+    r->storage_generation = 1;
+    r->storage_owner = r;
+    r->storage_owner_identity = r->relation_identity;
+    r->storage_owner_generation = r->storage_generation;
+    wl_columnar_source_access_gate_init(&r->source_access);
     r->ncols = ncols;
     if (ncols > 0) {
         r->col_names = (char **)calloc(ncols, sizeof(char *));

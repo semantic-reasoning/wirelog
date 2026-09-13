@@ -33,6 +33,19 @@ wl_columnar_append_transition_hook_t wl_columnar_append_transition_hook;
 wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #endif
 
+static void *
+wl_columnar_relation_radix_malloc(size_t size, const char *site)
+{
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+    if (wl_columnar_consolidate_alloc_hook
+        && wl_columnar_consolidate_alloc_hook(site))
+        return NULL;
+#else
+    (void)site;
+#endif
+    return malloc(size);
+}
+
 static int
 col_rel_new_identity(uint64_t *out)
 {
@@ -215,7 +228,7 @@ col_rel_source_reader_release(wl_columnar_source_access_reader_t *token)
     return wl_columnar_source_access_reader_release(token);
 }
 
-static int
+int
 col_rel_source_writer_acquire(const col_rel_t *rel,
     wl_columnar_source_access_writer_t *token)
 {
@@ -711,6 +724,25 @@ fail:
         free((void *)private_cols);
     }
     return ENOMEM;
+}
+
+int
+col_rel_cow_unshare_with_source_writer(col_rel_t *r,
+    const wl_columnar_source_access_writer_t *writer)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!r || !writer)
+        return EINVAL;
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    if (writer->owner != &owner->source_access
+        || writer->identity != (uintptr_t)writer
+        || !wl_columnar_source_access_writer_thread_equal(writer))
+        return EINVAL;
+    return col_rel_cow_unshare_impl(r, 0, true);
 }
 
 int
@@ -3209,15 +3241,24 @@ col_radix_sort_rows_by_key(int64_t *data, uint32_t nrows, uint32_t ncols,
  * O(n^2) but low constant overhead — faster than radix sort for small N.
  */
 static int
-col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace)
 {
     uint32_t nc = r->ncols;
+#if SIZE_MAX <= UINT32_MAX
+    if (nrows == UINT32_MAX)
+        return EOVERFLOW;
+#endif
     size_t row_count = (size_t)nrows + 1u;
     if (nc != 0 && row_count > SIZE_MAX
         / ((size_t)nc * sizeof(int64_t)))
         return EOVERFLOW;
-    int64_t *work = (int64_t *)malloc(
-        row_count * nc * sizeof(*work));
+    size_t work_count = row_count * nc;
+    bool owns_work = workspace == NULL;
+    int64_t *work = workspace ? workspace->insertion_rows
+        : (int64_t *)malloc(work_count * sizeof(*work));
+    if (workspace && workspace->insertion_capacity < nrows)
+        return EINVAL;
     if (!work)
         return ENOMEM;
     for (uint32_t i = 0; i < nrows; i++)
@@ -3268,7 +3309,8 @@ col_rel_insertion_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     for (uint32_t c = 0; c < nc; c++)
         for (uint32_t i = 0; i < nrows; i++)
             r->columns[c][start_row + i] = work[(size_t)i * nc + c];
-    free(work);
+    if (owns_work)
+        free(work);
     return 0;
 }
 
@@ -3690,7 +3732,8 @@ radix_uniform_count_fused_k16_scalar(const int64_t *col_data,
  * Called for nrows >= 50000 where fewer passes justify the larger histogram.
  */
 static int
-radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace)
 {
     uint32_t nc = r->ncols;
 
@@ -3698,19 +3741,33 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     const uint32_t num_passes = 64u / radix_bits;  /* 4 for k=16 */
     const uint32_t hist_size = 1u << radix_bits;   /* 65536 for k=16 */
 
-    uint32_t *perm_a = (uint32_t *)malloc(nrows * sizeof(uint32_t));
-    uint32_t *perm_b = (uint32_t *)malloc(nrows * sizeof(uint32_t));
-    uint16_t *bv_cache = (uint16_t *)malloc(nrows * sizeof(uint16_t));
-    uint32_t *count = (uint32_t *)malloc(hist_size * sizeof(uint32_t));
+    bool owns_workspace = workspace == NULL;
+    uint32_t *perm_a = workspace ? workspace->perm_a
+        : (uint32_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(uint32_t), "radix_perm_a");
+    uint32_t *perm_b = workspace ? workspace->perm_b
+        : (uint32_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(uint32_t), "radix_perm_b");
+    uint16_t *bv_cache = workspace ? workspace->short_values
+        : (uint16_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(uint16_t), "radix_short_values");
+    uint32_t *count = workspace ? workspace->count16
+        : (uint32_t *)wl_columnar_relation_radix_malloc(
+        hist_size * sizeof(uint32_t), "radix_count16");
+    if (workspace && workspace->k16_capacity < nrows)
+        return EINVAL;
     if (!perm_a || !perm_b || !bv_cache || !count) {
-        free(perm_a);
-        free(perm_b);
-        free(bv_cache);
-        free(count);
+        if (owns_workspace) {
+            free(perm_a);
+            free(perm_b);
+            free(bv_cache);
+            free(count);
+        }
         /* The transactional insertion fallback is intentionally limited to
          * small inputs.  Running O(n^2) insertion sort for a failed 50K-row
          * k16 allocation would turn an allocation failure into a timeout. */
-        return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows)
+        return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows,
+                   workspace)
                            : ENOMEM;
     }
 
@@ -3782,12 +3839,16 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 #ifdef WL_RADIX_BENCH
     _t0 = now_ns();
 #endif
-    int64_t *temp_col = (int64_t *)malloc(nrows * sizeof(int64_t));
+    int64_t *temp_col = workspace ? workspace->temp_column
+        : (int64_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(int64_t), "radix_temp_column");
     if (!temp_col) {
-        free(perm_a);
-        free(perm_b);
-        free(bv_cache);
-        free(count);
+        if (owns_workspace) {
+            free(perm_a);
+            free(perm_b);
+            free(bv_cache);
+            free(count);
+        }
         return ENOMEM;
     }
     for (uint32_t c = 0; c < nc; c++) {
@@ -3799,11 +3860,13 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         }
         memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
     }
-    free(temp_col);
-    free(perm_a);
-    free(perm_b);
-    free(bv_cache);
-    free(count);
+    if (owns_workspace) {
+        free(temp_col);
+        free(perm_a);
+        free(perm_b);
+        free(bv_cache);
+        free(count);
+    }
 #ifdef WL_RADIX_BENCH
     _tA = now_ns() - _t0;
     if (wl_columnar_relation_radix_bench_enabled()) {
@@ -3842,7 +3905,8 @@ radix_sort_k16(col_rel_t *r, uint32_t start_row, uint32_t nrows)
  * Falls back to insertion sort on allocation failure.
  */
 static int
-col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    const wl_columnar_radix_workspace_t *workspace)
 {
     if (nrows <= 1)
         return 0;
@@ -3878,7 +3942,7 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows)
      * already yields fewer total iterations than 8-pass k=8+SIMD, and a
      * 256KB histogram makes SIMD gather impractical (cache pressure). */
     if (nrows >= 50000u) {
-        int rc = radix_sort_k16(r, start_row, nrows);
+        int rc = radix_sort_k16(r, start_row, nrows, workspace);
         if (rc == 0)
             wl_columnar_relation_touch_view(r);
         return rc;
@@ -3891,14 +3955,26 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     const uint32_t radix_bits = 8u;
     const uint32_t num_passes = 64u / radix_bits;  /* 8 for k=8 */
 
-    uint32_t *perm_a = (uint32_t *)malloc(nrows * sizeof(uint32_t));
-    uint32_t *perm_b = (uint32_t *)malloc(nrows * sizeof(uint32_t));
-    uint8_t  *bv_cache = (uint8_t *)malloc(nrows);
+    bool owns_workspace = workspace == NULL;
+    uint32_t *perm_a = workspace ? workspace->perm_a
+        : (uint32_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(uint32_t), "radix_perm_a");
+    uint32_t *perm_b = workspace ? workspace->perm_b
+        : (uint32_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(uint32_t), "radix_perm_b");
+    uint8_t *bv_cache = workspace ? workspace->byte_values
+        : (uint8_t *)wl_columnar_relation_radix_malloc(
+        nrows, "radix_byte_values");
+    if (workspace && workspace->k8_capacity < nrows)
+        return EINVAL;
     if (!perm_a || !perm_b || !bv_cache) {
-        free(perm_a);
-        free(perm_b);
-        free(bv_cache);
-        return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows)
+        if (owns_workspace) {
+            free(perm_a);
+            free(perm_b);
+            free(bv_cache);
+        }
+        return nrows <= 32 ? col_rel_insertion_sort(r, start_row, nrows,
+                   workspace)
                            : ENOMEM;
     }
 
@@ -3977,11 +4053,15 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows)
     _t0 = now_ns();
 #endif
     /* Apply permutation per-column (Issue #334): contiguous access pattern. */
-    int64_t *temp_col = (int64_t *)malloc(nrows * sizeof(int64_t));
+    int64_t *temp_col = workspace ? workspace->temp_column
+        : (int64_t *)wl_columnar_relation_radix_malloc(
+        nrows * sizeof(int64_t), "radix_temp_column");
     if (!temp_col) {
-        free(perm_a);
-        free(perm_b);
-        free(bv_cache);
+        if (owns_workspace) {
+            free(perm_a);
+            free(perm_b);
+            free(bv_cache);
+        }
         return ENOMEM;
     }
     for (uint32_t c = 0; c < nc; c++) {
@@ -3994,10 +4074,12 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         }
         memcpy(col + start_row, temp_col, nrows * sizeof(int64_t));
     }
-    free(temp_col);
-    free(perm_a);
-    free(perm_b);
-    free(bv_cache);
+    if (owns_workspace) {
+        free(temp_col);
+        free(perm_a);
+        free(perm_b);
+        free(bv_cache);
+    }
 #ifdef WL_RADIX_BENCH
     _tA = now_ns() - _t0;
     if (wl_columnar_relation_radix_bench_enabled()) {
@@ -4018,18 +4100,224 @@ col_rel_radix_sort_raw(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 
 insertion:
     {
-        int rc = col_rel_insertion_sort(r, start_row, nrows);
+        int rc = col_rel_insertion_sort(r, start_row, nrows, workspace);
         if (rc == 0)
             wl_columnar_relation_touch_view(r);
         return rc;
     }
 }
 
-/* COW is performed outside the algorithm so the direct range API and the
- * all-row wrapper share the same borrowed-storage contract.  Consolidation
- * can defer releasing the old canonical-owner lease until its complete
- * mutation transaction has finished.  A failed sort discards the private
- * copy and restores the original borrowed view. */
+static bool
+col_rel_size_multiply(size_t left, size_t right, size_t *out)
+{
+    if (!out || (right != 0 && left > SIZE_MAX / right))
+        return false;
+    *out = left * right;
+    return true;
+}
+
+static bool
+col_rel_size_add(size_t left, size_t right, size_t *out)
+{
+    if (!out || left > SIZE_MAX - right)
+        return false;
+    *out = left + right;
+    return true;
+}
+
+void
+wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace)
+{
+    if (!workspace)
+        return;
+    free(workspace->perm_a);
+    free(workspace->perm_b);
+    free(workspace->bucket_values);
+    free(workspace->count16);
+    free(workspace->temp_column);
+    free(workspace->insertion_rows);
+    if (workspace->admission_active)
+        (void)wl_columnar_memory_release(&workspace->admission);
+    memset(workspace, 0, sizeof(*workspace));
+}
+
+int
+wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
+    const uint32_t *seg_boundaries, uint32_t seg_count,
+    uint64_t additional_scratch_bytes,
+    wl_columnar_radix_workspace_t *workspace)
+{
+    uint32_t k8_rows = 0;
+    uint32_t k16_rows = 0;
+    uint32_t insertion_rows = 0;
+    bool has_float = false;
+    size_t permutation_bytes = 0;
+    size_t temp_column_bytes = 0;
+    size_t bucket_bytes = 0;
+    size_t count16_bytes = 0;
+    size_t insertion_bytes = 0;
+    size_t workspace_bytes = 0;
+    uint64_t total_scratch_bytes;
+
+    if (!rel || !seg_boundaries || seg_count == 0 || !workspace)
+        return EINVAL;
+    memset(workspace, 0, sizeof(*workspace));
+    for (uint32_t c = 0; rel->column_types && c < rel->ncols; c++)
+        has_float |= rel->column_types[c] == WIRELOG_TYPE_FLOAT;
+
+    for (uint32_t s = 0; s < seg_count; s++) {
+        uint32_t start = seg_boundaries[s];
+        uint32_t end = seg_boundaries[s + 1];
+        uint32_t count = end - start;
+        bool sorted = true;
+        for (uint32_t row = start + 1; row < end; row++) {
+            if (col_rel_row_cmp(rel, row - 1, row) > 0) {
+                sorted = false;
+                break;
+            }
+        }
+        if (sorted || count <= 1)
+            continue;
+        if (has_float || count <= 32) {
+            if (count > insertion_rows)
+                insertion_rows = count;
+        } else if (count >= 50000u) {
+            if (count > k16_rows)
+                k16_rows = count;
+        } else if (count > k8_rows) {
+            k8_rows = count;
+        }
+    }
+
+    uint32_t permutation_rows = k8_rows > k16_rows ? k8_rows : k16_rows;
+    if (permutation_rows > 0) {
+        if (!col_rel_size_multiply(permutation_rows, sizeof(uint32_t),
+            &permutation_bytes)
+            || !col_rel_size_multiply(permutation_rows, sizeof(int64_t),
+            &temp_column_bytes))
+            goto overflow;
+        if (!col_rel_size_multiply(permutation_bytes, 2u, &workspace_bytes)
+            || !col_rel_size_add(workspace_bytes, temp_column_bytes,
+            &workspace_bytes))
+            goto overflow;
+    }
+    if (k8_rows > 0 || k16_rows > 0) {
+        size_t k16_bucket_bytes;
+        if (!col_rel_size_multiply(k16_rows, sizeof(uint16_t),
+            &k16_bucket_bytes))
+            goto overflow;
+        bucket_bytes = k8_rows > k16_bucket_bytes
+            ? k8_rows : k16_bucket_bytes;
+        if (!col_rel_size_add(workspace_bytes, bucket_bytes,
+            &workspace_bytes))
+            goto overflow;
+    }
+    if (k16_rows > 0) {
+        if (!col_rel_size_multiply(65536u, sizeof(uint32_t), &count16_bytes)
+            || !col_rel_size_add(workspace_bytes, count16_bytes,
+            &workspace_bytes))
+            goto overflow;
+    }
+    if (insertion_rows > 0) {
+#if SIZE_MAX <= UINT32_MAX
+        if (insertion_rows == UINT32_MAX)
+            goto overflow;
+#endif
+        size_t row_slots = (size_t)insertion_rows + 1u;
+        if (!col_rel_size_multiply(row_slots, rel->ncols, &insertion_bytes)
+            || !col_rel_size_multiply(insertion_bytes, sizeof(int64_t),
+            &insertion_bytes)
+            || !col_rel_size_add(workspace_bytes, insertion_bytes,
+            &workspace_bytes))
+            goto overflow;
+    }
+    if ((uint64_t)workspace_bytes > UINT64_MAX - additional_scratch_bytes)
+        goto overflow;
+    total_scratch_bytes = (uint64_t)workspace_bytes
+        + additional_scratch_bytes;
+    if (rel->memory_governor && total_scratch_bytes > 0) {
+        wl_columnar_memory_reservation_init(&workspace->admission);
+        wl_columnar_memory_admission_status_t admission_status
+            = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(rel->memory_governor),
+                total_scratch_bytes, &workspace->admission);
+        if (admission_status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && admission_status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            goto no_memory;
+        workspace->admission_active = true;
+    }
+
+    if (permutation_rows > 0) {
+        workspace->perm_a = (uint32_t *)wl_columnar_relation_radix_malloc(
+            permutation_bytes, "radix_workspace_perm_a");
+        workspace->perm_b = (uint32_t *)wl_columnar_relation_radix_malloc(
+            permutation_bytes, "radix_workspace_perm_b");
+        workspace->temp_column = (int64_t *)wl_columnar_relation_radix_malloc(
+            temp_column_bytes, "radix_workspace_temp_column");
+        if (!workspace->perm_a || !workspace->perm_b
+            || !workspace->temp_column)
+            goto no_memory;
+    }
+    if (k8_rows > 0 || k16_rows > 0) {
+        workspace->bucket_values = wl_columnar_relation_radix_malloc(
+            bucket_bytes,
+            "radix_workspace_bucket_values");
+        if (!workspace->bucket_values)
+            goto no_memory;
+        workspace->byte_values = (uint8_t *)workspace->bucket_values;
+        workspace->short_values = (uint16_t *)workspace->bucket_values;
+        workspace->k8_capacity = k8_rows;
+        workspace->k16_capacity = k16_rows;
+    }
+    if (k16_rows > 0) {
+        workspace->count16 = (uint32_t *)wl_columnar_relation_radix_malloc(
+            count16_bytes, "radix_workspace_count16");
+        if (!workspace->count16)
+            goto no_memory;
+    }
+    if (insertion_rows > 0) {
+        workspace->insertion_rows =
+            (int64_t *)wl_columnar_relation_radix_malloc(
+            insertion_bytes, "radix_workspace_insertion_rows");
+        if (!workspace->insertion_rows)
+            goto no_memory;
+        workspace->insertion_capacity = insertion_rows;
+    }
+    return 0;
+
+overflow:
+    wl_columnar_radix_workspace_destroy(workspace);
+    return ENOMEM;
+no_memory:
+    wl_columnar_radix_workspace_destroy(workspace);
+    return ENOMEM;
+}
+
+int
+wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
+    uint32_t start_row,
+    uint32_t nrows, const wl_columnar_source_access_writer_t *writer,
+    const wl_columnar_radix_workspace_t *workspace)
+{
+    col_rel_t *owner = NULL;
+    int rc;
+
+    if (!r || !workspace || start_row > r->nrows
+        || nrows > r->nrows - start_row)
+        return EINVAL;
+    if (nrows <= 1)
+        return 0;
+    rc = col_rel_storage_owner_resolve(r, &owner);
+    if (rc != 0)
+        return rc;
+    if (!writer || writer->owner != &owner->source_access
+        || writer->identity != (uintptr_t)writer
+        || !wl_columnar_source_access_writer_thread_equal(writer)
+        || r->col_shared || (r == owner && owner->storage_alias_borrows > 0))
+        return EINVAL;
+    return col_rel_radix_sort_raw(r, start_row, nrows, workspace);
+}
+
 static int
 col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     bool defer_alias_release, bool *out_alias_release_pending)
@@ -4076,7 +4364,7 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
 #endif
     }
 
-    int rc = col_rel_radix_sort_raw(r, start_row, nrows);
+    int rc = col_rel_radix_sort_raw(r, start_row, nrows, NULL);
     if (rc != 0 && borrowed) {
         for (uint32_t c = 0; c < r->ncols; c++) {
             int64_t *current = NULL;
@@ -4107,10 +4395,13 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
     return rc;
 }
 
+/* Sort under a writer lease the caller already holds, so a wider mutation
+ * transaction can keep admission across the sort.  The alias taken by the
+ * deferred COW is released here, since the sort owns that borrow. */
 int
-col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+col_rel_radix_sort_with_source_writer(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows, const wl_columnar_source_access_writer_t *writer)
 {
-    wl_columnar_source_access_writer_t writer = { 0 };
     col_rel_t *owner = NULL;
     bool alias_release_pending = false;
     int rc;
@@ -4119,25 +4410,15 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         return EINVAL;
     if (nrows <= 1)
         return 0;
-
-    /* Sorting rewrites every column in the selected range and publishes a
-     * view epoch.  Hold canonical-owner admission over the entire COW,
-     * permutation, and publication transaction so readers cannot observe a
-     * partially reordered relation.  Callers that run the sort inside a
-     * wider transaction of their own take col_rel_radix_sort_deferred()
-     * instead and carry both the lease and the alias themselves; this
-     * entry point is the standalone one, so it owns both here. */
     rc = col_rel_storage_owner_resolve(r, &owner);
     if (rc != 0)
         return rc;
-    rc = col_rel_source_writer_acquire(r, &writer);
-    if (rc != 0)
-        return rc;
-    if (r == owner && owner->storage_alias_borrows > 0) {
-        rc = EBUSY;
-        goto release_writer;
-    }
-
+    if (!writer || writer->owner != &owner->source_access
+        || writer->identity != (uintptr_t)writer
+        || !wl_columnar_source_access_writer_thread_equal(writer))
+        return EINVAL;
+    if (r == owner && owner->storage_alias_borrows > 0)
+        return EBUSY;
     rc = col_rel_radix_sort_impl(r, start_row, nrows, true,
             &alias_release_pending);
     if (alias_release_pending) {
@@ -4145,12 +4426,32 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         if (alias_rc != 0 && rc == 0)
             rc = alias_rc;
     }
-release_writer:
+    return rc;
+}
+
+/* Standalone entry point: takes the canonical-owner lease itself and holds
+ * it across the whole COW, permutation and publication transaction. */
+int
+col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc;
+
+    if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
+        return EINVAL;
+    if (nrows <= 1)
+        return 0;
+    rc = col_rel_source_writer_acquire(r, &writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_radix_sort_with_source_writer(r, start_row, nrows, &writer);
     if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
         rc = EINVAL;
     return rc;
 }
 
+/* Consolidation variant: the caller carries both the lease and the alias
+ * for the rest of its transaction, so neither is released here. */
 int
 col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row,
     uint32_t nrows, bool *out_alias_release_pending)
@@ -4172,20 +4473,20 @@ col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row,
  * Sets r->sorted_nrows = r->nrows on completion.
  * Falls back to insertion sort on allocation failure.
  */
-int
+void
 col_rel_radix_sort_int64(col_rel_t *r)
 {
     if (!r || r->ncols == 0) {
         if (r)
             r->sorted_nrows = r->nrows;
-        return 0;
+        return;
     }
     if (r->nrows <= 1) {
         r->sorted_nrows = r->nrows;
-        return 0;
+        return;
     }
     if (r->ncols == 0)
-        return 0;
+        return;
 
     /* col_rel_radix_sort() detaches a shared view itself (through the
      * admitted col_rel_cow_unshare) and rolls the detach back if the sort
@@ -4193,5 +4494,4 @@ col_rel_radix_sort_int64(col_rel_t *r)
     int rc = col_rel_radix_sort(r, 0, r->nrows);
     if (rc == 0)
         r->sorted_nrows = r->nrows;
-    return rc;
 }
