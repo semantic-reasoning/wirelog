@@ -4293,6 +4293,10 @@ no_memory:
     return ENOMEM;
 }
 
+/* Requires !r->col_shared, which is exactly the condition that makes the
+* COW/rollback block in col_rel_radix_sort_impl a no-op, so this calls
+* col_rel_radix_sort_raw directly to thread the caller's workspace through.
+* It takes no alias and performs no COW, so it has nothing to release. */
 int
 wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
     uint32_t start_row,
@@ -4320,7 +4324,7 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
 
 static int
 col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
-    bool defer_alias_release, bool *out_alias_release_pending)
+    bool consolidation_transaction, bool *out_alias_release_pending)
 {
     if (out_alias_release_pending)
         *out_alias_release_pending = false;
@@ -4351,13 +4355,17 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         ledger_before = col_rel_owned_ledger_bytes(r);
         old_view = r->view_generation;
         old_storage = r->storage_generation;
-        if (col_rel_cow_unshare_impl(r, 0, defer_alias_release) != 0) {
+        /* Always defer: every caller now holds the alias across the sort
+         * and releases it afterwards (or hands it back).  Releasing inside
+         * the COW and then rolling back would restore a borrowed view whose
+         * borrow the owner no longer counts. */
+        if (col_rel_cow_unshare_impl(r, 0, true) != 0) {
             free((void *)old_columns);
             free(old_shared);
             return ENOMEM;
         }
 #ifdef WL_TEST_CONSOLIDATE_HOOK
-        if (defer_alias_release
+        if (consolidation_transaction
             && wl_columnar_consolidation_transition_hook)
             wl_columnar_consolidation_transition_hook(r,
                 WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH);
@@ -4386,8 +4394,7 @@ col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         /* The detach was rolled back; its storage epoch goes with it. */
         r->view_generation = old_view;
         r->storage_generation = old_storage;
-    } else if (borrowed && defer_alias_release
-        && out_alias_release_pending) {
+    } else if (borrowed && out_alias_release_pending) {
         *out_alias_release_pending = true;
     }
     free((void *)old_columns);
@@ -4419,7 +4426,7 @@ col_rel_radix_sort_with_source_writer(col_rel_t *r, uint32_t start_row,
         return EINVAL;
     if (r == owner && owner->storage_alias_borrows > 0)
         return EBUSY;
-    rc = col_rel_radix_sort_impl(r, start_row, nrows, true,
+    rc = col_rel_radix_sort_impl(r, start_row, nrows, false,
             &alias_release_pending);
     if (alias_release_pending) {
         int alias_rc = col_rel_storage_alias_release(r);
@@ -4451,7 +4458,14 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
 }
 
 /* Consolidation variant: the caller carries both the lease and the alias
- * for the rest of its transaction, so neither is released here. */
+ * for the rest of its transaction, so neither is released here.
+ *
+ * Unlike the other entry points this one validates nothing -- it takes no
+ * writer and skips the storage_alias_borrows check.  The caller must have
+ * resolved the canonical owner, acquired its writer, and rejected
+ * outstanding alias borrows before calling; col_op_consolidate_incremental_-
+ * delta does all three.  Making every mutating entry validate uniformly is
+ * tracked separately. */
 int
 col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row,
     uint32_t nrows, bool *out_alias_release_pending)
@@ -4473,25 +4487,32 @@ col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row,
  * Sets r->sorted_nrows = r->nrows on completion.
  * Falls back to insertion sort on allocation failure.
  */
-void
+int
 col_rel_radix_sort_int64(col_rel_t *r)
 {
     if (!r || r->ncols == 0) {
         if (r)
             r->sorted_nrows = r->nrows;
-        return;
+        return 0;
     }
     if (r->nrows <= 1) {
         r->sorted_nrows = r->nrows;
-        return;
+        return 0;
     }
-    if (r->ncols == 0)
-        return;
 
     /* col_rel_radix_sort() detaches a shared view itself (through the
      * admitted col_rel_cow_unshare) and rolls the detach back if the sort
-     * cannot allocate, so no COW happens here. */
+     * cannot allocate, so no COW happens here.  It takes the canonical-owner
+     * lease, so it can also refuse with EBUSY when the relation is an owner
+     * with live alias borrows or the gate is contended.  Callers must not
+     * treat the relation as sorted afterwards: sorted_nrows is left alone
+     * here, and the status is returned so a caller that depends on the
+     * ordering can stop rather than silently dedup an unsorted relation. */
     int rc = col_rel_radix_sort(r, 0, r->nrows);
     if (rc == 0)
         r->sorted_nrows = r->nrows;
+    else
+        WL_LOG(WL_LOG_SEC_CONSOLIDATION, WL_LOG_ERROR,
+            "radix sort refused for %s: rc=%d", r->name ? r->name : "?", rc);
+    return rc;
 }

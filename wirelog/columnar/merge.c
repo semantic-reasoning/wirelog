@@ -1225,8 +1225,20 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         return eval_stack_push(stack, work, work_owned);
     }
 
-    /* Fallback: radix sort + dedup (sorted_nrows == 0 or full re-sort) */
-    col_rel_radix_sort_int64(work);
+    /* Fallback: radix sort + dedup (sorted_nrows == 0 or full re-sort).
+     * The dedup below keeps only rows that differ from their predecessor,
+     * which is a correct compaction only over a sorted relation, and it
+     * publishes sorted_nrows unconditionally.  A refused sort must therefore
+     * fail the operation rather than silently drop rows and mark the result
+     * sorted. */
+    {
+        int sort_rc = col_rel_radix_sort_int64(work);
+        if (sort_rc != 0) {
+            if (work_owned)
+                col_rel_destroy(work);
+            return sort_rc;
+        }
+    }
 
     /* Compact: keep only unique rows */
     uint32_t out_r = 1; /* first row always kept */

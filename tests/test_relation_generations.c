@@ -1866,10 +1866,23 @@ test_sort_failure_atomicity(void)
     bool *old_flags = view->col_shared;
     uint64_t old_view = view->view_generation;
     uint64_t old_storage = view->storage_generation;
+    uint32_t old_borrows = source->storage_alias_borrows;
+    col_rel_t *old_owner = view->storage_owner;
     allocation_calls = 0;
     allocation_fail_at = 4; /* backups and COW succeed; k8 setup fails. */
-    col_rel_radix_sort_int64(view);
+    CHECK(col_rel_radix_sort_int64(view) != 0,
+        "shared sort failure reports the refusal");
     allocation_fail_at = -1;
+    /* The rollback restores the borrowed view, so the alias borrow it was
+     * taken under must still be counted and the view must still name the
+     * source as its storage owner.  Releasing the alias inside the COW and
+     * then rolling back would leave a view pointing into buffers the source
+     * no longer counts, which col_rel_storage_owner_destroy_status would
+     * then report as not busy. */
+    CHECK(source->storage_alias_borrows == old_borrows,
+        "shared sort failure keeps the alias borrow counted");
+    CHECK(view->storage_owner == old_owner,
+        "shared sort failure keeps the view's storage owner");
     CHECK(view->columns[0] == old_column,
         "shared sort failure restores borrowed column");
     CHECK(view->col_shared != NULL && view->col_shared[0],

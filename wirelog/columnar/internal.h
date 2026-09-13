@@ -2297,7 +2297,12 @@ int col_rel_set(col_rel_t *, uint32_t row, uint32_t col, int64_t val);
 /* Test seam for the non-wrapping relation identity allocator. */
 int
 col_rel_test_set_next_identity(uint64_t next);
-void
+/* Sorts all rows.  Returns 0, or the status col_rel_radix_sort() refused
+ * with -- EBUSY when the relation is a canonical owner with live alias
+ * borrows or the source gate is contended, ENOMEM on allocation failure.
+ * sorted_nrows is advanced only on success, so a caller that depends on the
+ * ordering must check the result rather than assume it. */
+int
 col_rel_radix_sort_int64(col_rel_t *r);
 
 typedef struct {

@@ -559,12 +559,79 @@ test_sorted_nrows_set_correctly(void)
  * MAIN
  * ======================================================================== */
 
+/* A refused sort must fail the operation rather than run the dedup loop.
+ *
+ * The fallback path sorts with col_rel_radix_sort_int64() and then keeps
+ * only rows that differ from their predecessor -- a correct compaction
+ * only over a sorted relation -- before publishing sorted_nrows
+ * unconditionally.  col_rel_radix_sort_int64() became fallible when the
+ * sort started taking the canonical-owner lease: a live source reader now
+ * refuses it with EBUSY.  Swallowing that would drop every row that is not
+ * adjacent-equal and then mark the unsorted remainder as sorted, which is
+ * silent data loss.  This pins the propagation instead. */
+static void
+test_blocked_sort_does_not_dedup_unsorted(void)
+{
+    TEST("reader-blocked fallback sort fails instead of deduping");
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *rel = col_rel_new_auto("test", 1);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    const int64_t rows[] = { 4, 1, 4, 2 };
+    eval_stack_t stack;
+    int rc;
+
+    for (uint32_t i = 0; i < 4; i++)
+        col_rel_append_row(rel, &rows[i]);
+    /* sorted_nrows == 0 routes the operator to the sort+dedup fallback. */
+    ASSERT_TRUE(rel->sorted_nrows == 0, "fixture must reach the fallback");
+    if (col_rel_source_reader_acquire(rel, &reader) != 0) {
+        col_rel_destroy(rel);
+        destroy_mock_session(sess);
+        FAIL("source reader acquisition failed");
+        return;
+    }
+
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, rel, true);
+    rc = col_op_consolidate_diff(&stack, sess);
+
+    if (col_rel_source_reader_release(&reader) != 0) {
+        destroy_mock_session(sess);
+        FAIL("source reader release failed");
+        return;
+    }
+    if (rc == 0) {
+        destroy_mock_session(sess);
+        FAIL("blocked sort must not report success");
+        return;
+    }
+    /* The duplicate 4 is not adjacent while unsorted, so a swallowed
+     * failure would have compacted four rows to three and claimed them
+     * sorted.  Nothing may have moved. */
+    if (rel->nrows != 4 || rel->sorted_nrows != 0) {
+        destroy_mock_session(sess);
+        FAIL("blocked sort must leave rows and sorted_nrows untouched");
+        return;
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        if (col_rel_get(rel, i, 0) != rows[i]) {
+            destroy_mock_session(sess);
+            FAIL("blocked sort must not reorder or drop rows");
+            return;
+        }
+    }
+    col_rel_destroy(rel);
+    destroy_mock_session(sess);
+    PASS;
+}
+
 int
 main(void)
 {
     printf("=== Differential Consolidate Tests (Issue #263) ===\n\n");
 
     test_empty_relation();
+    test_blocked_sort_does_not_dedup_unsorted();
     test_single_row();
     test_already_sorted_unique();
     test_unsorted_full_sort();

@@ -383,7 +383,15 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     for (uint32_t ri = 0; ri < nrels; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
         if (r && r->nrows > 1) {
-            col_rel_radix_sort_int64(r);
+            /* The comment above states the precondition this establishes.
+             * A refused sort leaves the prefix unsorted, so continuing would
+             * produce exactly the spurious rows it warns about. */
+            int sort_rc = col_rel_radix_sort_int64(r);
+            if (sort_rc != 0) {
+                free((void *)delta_rels);
+                free(snap);
+                return sort_rc;
+            }
         }
     }
 
