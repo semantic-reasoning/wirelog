@@ -468,6 +468,56 @@ cleanup:
         col_rel_destroy(rels[i]);
 }
 
+static void
+test_apply_session_rejects_live_storage_alias(void)
+{
+    TEST("session remap rejects a canonical owner with a live alias");
+
+    wl_col_session_t sess = { 0 };
+    wl_handle_remap_t *remap = NULL;
+    col_rel_t *owner = NULL;
+    col_rel_t *alias = NULL;
+    col_rel_t *rels[1] = { 0 };
+    sess.rels = rels;
+    sess.nrels = 1u;
+    sess.rel_cap = 1u;
+
+    owner = build_side_relation("alias_owner", 1u, 2u, flat_old, NULL);
+    ASSERT(owner != NULL, "build canonical side-relation owner");
+    rels[0] = owner;
+    alias = col_rel_new_like("alias_view", owner);
+    ASSERT(alias != NULL, "build shared-view alias");
+    ASSERT(col_rel_install_shared_view(alias, owner) == 0,
+        "install live shared-view alias");
+    ASSERT(owner->storage_alias_borrows == 1u,
+        "owner records the live alias borrow");
+
+    int rc = wl_handle_remap_create(2u, &remap);
+    ASSERT(rc == 0 && remap != NULL, "alias remap create");
+    for (uint32_t r = 0; r < 2u; r++) {
+        rc = wl_handle_remap_insert(remap, flat_old(r, 0u, NULL),
+                flat_new(r, 0u));
+        ASSERT(rc == 0, "alias remap insert");
+    }
+
+    uint64_t out_rels = 99u;
+    uint64_t out_cells = 99u;
+    rc = wl_handle_remap_apply_session_side_relations(&sess, remap,
+            &out_rels, &out_cells);
+    ASSERT(rc == EBUSY, "live shared-view alias must block session remap");
+    ASSERT(out_rels == 0u && out_cells == 0u,
+        "alias denial counters must remain zero");
+    for (uint32_t r = 0; r < 2u; r++)
+        ASSERT(owner->columns[0][r] == flat_old(r, 0u, NULL),
+            "alias denial must preserve owner handle data");
+
+    PASS();
+cleanup:
+    wl_handle_remap_free(remap);
+    col_rel_destroy(alias);
+    col_rel_destroy(owner);
+}
+
 /* ======================================================================== */
 /* Case 4: NULL / EINVAL coverage                                            */
 /* ======================================================================== */
@@ -585,6 +635,7 @@ main(void)
     test_apply_session_100_nested();
     test_apply_eio_partial_rewrite();
     test_apply_session_transaction();
+    test_apply_session_rejects_live_storage_alias();
     test_apply_einval_coverage();
     test_apply_side_reader_exclusion();
 
