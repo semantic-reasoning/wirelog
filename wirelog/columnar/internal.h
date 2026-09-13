@@ -2285,6 +2285,10 @@ int col_rel_storage_owner_destroy_status(const col_rel_t *owner);
 int col_rel_source_reader_acquire(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
 int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
+int col_rel_source_writer_acquire(const col_rel_t *,
+    wl_columnar_source_access_writer_t *);
+int col_rel_cow_unshare_with_source_writer(col_rel_t *,
+    const wl_columnar_source_access_writer_t *);
 
 /* Checked single-cell mutation.  The implementation lives in relation.c so
  * it can hold canonical-owner source admission across COW and publication. */
@@ -2293,8 +2297,37 @@ int col_rel_set(col_rel_t *, uint32_t row, uint32_t col, int64_t val);
 /* Test seam for the non-wrapping relation identity allocator. */
 int
 col_rel_test_set_next_identity(uint64_t next);
-int
+void
 col_rel_radix_sort_int64(col_rel_t *r);
+
+typedef struct {
+    uint32_t *perm_a;
+    uint32_t *perm_b;
+    void *bucket_values;
+    uint8_t *byte_values;
+    uint16_t *short_values;
+    uint32_t *count16;
+    int64_t *temp_column;
+    int64_t *insertion_rows;
+    uint32_t k8_capacity;
+    uint32_t k16_capacity;
+    uint32_t insertion_capacity;
+    wl_columnar_memory_reservation_t admission;
+    bool admission_active;
+} wl_columnar_radix_workspace_t;
+
+int
+wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
+    const uint32_t *seg_boundaries, uint32_t seg_count,
+    uint64_t additional_scratch_bytes,
+    wl_columnar_radix_workspace_t *workspace);
+void
+wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace);
+int
+wl_columnar_relation_radix_sort_with_workspace(col_rel_t *rel,
+    uint32_t start_row,
+    uint32_t nrows, const wl_columnar_source_access_writer_t *writer,
+    const wl_columnar_radix_workspace_t *workspace);
 
 /** Stable LSD radix sort of a row-major int64_t buffer by a single key
  *  column.  Used by arrangement.c (sarr_build) and lftj.c
@@ -2316,6 +2349,10 @@ wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
  *  Phase C: permutation-apply uses col_rel_row_copy_out/in. */
 int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows);
+/* Sort under an already-held source writer admission. */
+int
+col_rel_radix_sort_with_source_writer(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows, const wl_columnar_source_access_writer_t *writer);
 
 /* Consolidation keeps the old canonical-owner alias lease through the full
  * mutation transaction, releasing it from its centralized cleanup path. */
@@ -2657,6 +2694,11 @@ row_cmp_dispatch(const int64_t *a, const int64_t *b, uint32_t ncols);
 int
 col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     uint32_t seg_count);
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+typedef bool (*wl_columnar_consolidate_alloc_hook_t)(const char *site);
+extern wl_columnar_consolidate_alloc_hook_t
+    wl_columnar_consolidate_alloc_hook;
+#endif
 int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     col_rel_t *delta_out, int *out_fast_path);

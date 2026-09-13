@@ -111,7 +111,12 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t delta_count = nr - sn;
 
         /* Phase 1: sort only the unsorted suffix using radix sort */
-        col_rel_radix_sort(work, sn, delta_count);
+        int sort_rc = col_rel_radix_sort(work, sn, delta_count);
+        if (sort_rc != 0) {
+            if (work_owned)
+                col_rel_destroy(work);
+            return sort_rc;
+        }
 
         /* Phase 1b: dedup within suffix */
         uint32_t d_unique = 1;

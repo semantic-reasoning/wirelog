@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200112L
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -66,6 +67,51 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 static int test_count = 0;
 static int pass_count = 0;
 static int fail_count = 0;
+static const char *consolidate_fail_site = NULL;
+static bool consolidate_fail_used = false;
+static uint32_t consolidate_fail_match = 1;
+static uint32_t consolidate_seen_matches = 0;
+
+static bool
+test_consolidate_alloc_should_fail(const char *site)
+{
+    if (consolidate_fail_site && !consolidate_fail_used
+        && strcmp(site, consolidate_fail_site) == 0) {
+        consolidate_seen_matches++;
+        if (consolidate_seen_matches == consolidate_fail_match) {
+            consolidate_fail_used = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+wl_columnar_consolidate_alloc_hook_t wl_columnar_consolidate_alloc_hook
+    = test_consolidate_alloc_should_fail;
+
+static void
+fail_consolidate_allocation_at(const char *site)
+{
+    consolidate_fail_site = site;
+    consolidate_fail_used = false;
+    consolidate_fail_match = 1;
+    consolidate_seen_matches = 0;
+}
+
+static void
+fail_consolidate_allocation_on_match(const char *site, uint32_t match)
+{
+    consolidate_fail_site = site;
+    consolidate_fail_used = false;
+    consolidate_fail_match = match;
+    consolidate_seen_matches = 0;
+}
+
+static void
+clear_consolidate_allocation_failure(void)
+{
+    consolidate_fail_site = NULL;
+}
 
 #define TEST(name)                                      \
         do {                                                \
@@ -98,13 +144,14 @@ static int fail_count = 0;
 static col_rel_t *
 test_rel_alloc(uint32_t ncols)
 {
-    col_rel_t *r = (col_rel_t *)calloc(1, sizeof(col_rel_t));
-    if (!r)
+    col_rel_t *r = NULL;
+    if (col_rel_alloc(&r, "consolidate_test") != 0)
         return NULL;
     r->ncols = ncols;
     if (ncols > 0) {
         r->col_names = (char **)calloc(ncols, sizeof(char *));
         if (!r->col_names) {
+            free(r->name);
             free(r);
             return NULL;
         }
@@ -116,6 +163,7 @@ test_rel_alloc(uint32_t ncols)
                 for (uint32_t j = 0; j < i; j++)
                     free(r->col_names[j]);
                 free((void *)r->col_names);
+                free(r->name);
                 free(r);
                 return NULL;
             }
@@ -154,17 +202,7 @@ static int test_row_match(const col_rel_t *r, uint32_t row,
 static void
 test_rel_free(col_rel_t *r)
 {
-    if (!r)
-        return;
-    free(r->name);
-    col_columns_free(r->columns, r->ncols);
-    free(r->row_scratch);
-    if (r->col_names) {
-        for (uint32_t i = 0; i < r->ncols; i++)
-            free(r->col_names[i]);
-        free((void *)r->col_names);
-    }
-    free(r);
+    col_rel_destroy(r);
 }
 
 /* ----------------------------------------------------------------
@@ -787,6 +825,791 @@ test_wide_rows_k4_sort_correctness(void)
     PASS();
 }
 
+static void
+test_source_reader_blocks_consolidation_sort(void)
+{
+    col_rel_t *rel = test_rel_alloc(1);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t boundaries[] = { 0, 4 };
+    int64_t rows[] = { 4, 1, 3, 2 };
+    int64_t before[4];
+    int rc;
+
+    TEST("source reader blocks consolidation sort transactionally");
+    ASSERT(rel != NULL, "relation allocation failed");
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(rel, &rows[i]) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append fixture row");
+        }
+    }
+    memcpy(before, rel->columns[0], sizeof(before));
+    if (col_rel_source_reader_acquire(rel, &reader) != 0) {
+        test_rel_free(rel);
+        FAIL("source reader acquisition failed");
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    if (col_rel_source_reader_release(&reader) != 0) {
+        test_rel_free(rel);
+        FAIL("source reader release failed");
+    }
+    if (rc != EBUSY) {
+        test_rel_free(rel);
+        FAIL("consolidation should propagate sort EBUSY");
+    }
+    if (rel->nrows != 4
+        || memcmp(before, rel->columns[0], sizeof(before)) != 0) {
+        test_rel_free(rel);
+        FAIL("blocked consolidation must leave rows unchanged");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_source_reader_blocks_sorted_dedup(void)
+{
+    col_rel_t *rel = test_rel_alloc(1);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t boundaries[] = { 0, 4 };
+    int64_t rows[] = { 1, 1, 2, 3 };
+    int64_t before[4];
+    int rc;
+
+    TEST("source reader blocks sorted-segment dedup transactionally");
+    ASSERT(rel != NULL, "relation allocation failed");
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(rel, &rows[i]) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append fixture row");
+        }
+    }
+    memcpy(before, rel->columns[0], sizeof(before));
+    if (col_rel_source_reader_acquire(rel, &reader) != 0) {
+        test_rel_free(rel);
+        FAIL("source reader acquisition failed");
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    if (col_rel_source_reader_release(&reader) != 0) {
+        test_rel_free(rel);
+        FAIL("source reader release failed");
+    }
+    if (rc != EBUSY) {
+        test_rel_free(rel);
+        FAIL("consolidation should reject an active source reader");
+    }
+    if (rel->nrows != 4
+        || memcmp(before, rel->columns[0], sizeof(before)) != 0) {
+        test_rel_free(rel);
+        FAIL("reader-blocked sorted dedup must leave rows unchanged");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_source_reader_blocks_large_hash_dedup(void)
+{
+    const uint32_t row_count = 10001;
+    col_rel_t *rel = test_rel_alloc(1);
+    wl_columnar_source_access_reader_t reader = { 0 };
+    uint32_t boundaries[] = { 0, row_count };
+    int64_t *before = (int64_t *)malloc((size_t)row_count * sizeof(*before));
+    int rc;
+
+    TEST("source reader blocks large hash dedup transactionally");
+    if (!rel || !before) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("relation or row snapshot allocation failed");
+    }
+    for (uint32_t i = 0; i < row_count; i++) {
+        int64_t value = (int64_t)(i % 100u);
+        if (test_rel_append_row(rel, &value) != 0) {
+            free(before);
+            test_rel_free(rel);
+            FAIL("failed to append fixture row");
+        }
+    }
+    memcpy(before, rel->columns[0], (size_t)row_count * sizeof(*before));
+    if (col_rel_source_reader_acquire(rel, &reader) != 0) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("source reader acquisition failed");
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    if (col_rel_source_reader_release(&reader) != 0) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("source reader release failed");
+    }
+    if (rc != EBUSY) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("large consolidation should reject an active source reader");
+    }
+    if (rel->nrows != row_count
+        || memcmp(before, rel->columns[0],
+        (size_t)row_count * sizeof(*before)) != 0) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("reader-blocked hash dedup must leave rows unchanged");
+    }
+    free(before);
+    if (col_op_consolidate_kway_merge(rel, boundaries, 1) != 0) {
+        test_rel_free(rel);
+        FAIL("large hash dedup should succeed after reader release");
+    }
+    if (rel->nrows != 100 || !test_rel_is_sorted_unique(rel)) {
+        test_rel_free(rel);
+        FAIL("large hash dedup should produce sorted unique rows");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_shared_view_sorted_dedup_is_copy_on_write(void)
+{
+    col_rel_t *source = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, 4 };
+    int64_t rows[] = { 1, 1, 2, 3 };
+    int64_t source_before[4];
+    int64_t *source_column;
+
+    TEST("shared-view sorted dedup preserves source storage");
+    if (!source || !view) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("relation allocation failed");
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(source, &rows[i]) != 0) {
+            test_rel_free(view);
+            test_rel_free(source);
+            FAIL("failed to append source row");
+        }
+    }
+    if (col_rel_install_shared_view(view, source) != 0) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("failed to install shared view");
+    }
+    memcpy(source_before, source->columns[0], sizeof(source_before));
+    source_column = source->columns[0];
+    if (col_op_consolidate_kway_merge(view, boundaries, 1) != 0) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("shared-view consolidation failed");
+    }
+    if (source->columns[0] != source_column || source->nrows != 4
+        || memcmp(source_before, source->columns[0], sizeof(source_before)) != 0
+        || view->nrows != 3 || !test_rel_is_sorted_unique(view)) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("shared-view dedup must detach and preserve source rows");
+    }
+    test_rel_free(view);
+    test_rel_free(source);
+    PASS();
+}
+
+static void
+test_shared_view_merge_scatter_is_copy_on_write(void)
+{
+    col_rel_t *source = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, 2, 4 };
+    int64_t rows[] = { 1, 4, 2, 3 };
+    int64_t source_before[4];
+    int64_t *source_column;
+
+    TEST("shared-view merge scatter preserves source storage");
+    if (!source || !view) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("relation allocation failed");
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(source, &rows[i]) != 0) {
+            test_rel_free(view);
+            test_rel_free(source);
+            FAIL("failed to append source row");
+        }
+    }
+    if (col_rel_install_shared_view(view, source) != 0) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("failed to install shared view");
+    }
+    memcpy(source_before, source->columns[0], sizeof(source_before));
+    source_column = source->columns[0];
+    if (col_op_consolidate_kway_merge(view, boundaries, 2) != 0) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("shared-view merge failed");
+    }
+    if (source->columns[0] != source_column || source->nrows != 4
+        || memcmp(source_before, source->columns[0], sizeof(source_before)) != 0
+        || view->nrows != 4 || !test_rel_is_sorted_unique(view)) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("shared-view scatter must detach and preserve source rows");
+    }
+    test_rel_free(view);
+    test_rel_free(source);
+    PASS();
+}
+
+static void
+test_shared_view_merge_oom_preserves_view_state(void)
+{
+    col_rel_t *source = test_rel_alloc(1);
+    col_rel_t *view = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, 2, 4 };
+    int64_t rows[] = { 4, 1, 3, 2 };
+    int64_t before[4];
+    int64_t *view_column;
+    int64_t *source_column;
+    bool *shared_flags;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    col_rel_t *storage_owner;
+    uint64_t owner_identity;
+    uint64_t owner_generation;
+    uint32_t alias_borrows;
+    int rc;
+
+    TEST("shared-view merge OOM preserves view and owner metadata");
+    if (!source || !view) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("relation allocation failed");
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(source, &rows[i]) != 0) {
+            test_rel_free(view);
+            test_rel_free(source);
+            FAIL("failed to append fixture row");
+        }
+    }
+    if (col_rel_install_shared_view(view, source) != 0) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("failed to install shared view");
+    }
+    memcpy(before, view->columns[0], sizeof(before));
+    view_column = view->columns[0];
+    source_column = source->columns[0];
+    shared_flags = view->col_shared;
+    view_generation = view->view_generation;
+    storage_generation = view->storage_generation;
+    storage_owner = view->storage_owner;
+    owner_identity = view->storage_owner_identity;
+    owner_generation = view->storage_owner_generation;
+    alias_borrows = source->storage_alias_borrows;
+
+    fail_consolidate_allocation_at("merge_output");
+    rc = col_op_consolidate_kway_merge(view, boundaries, 2);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("shared-view merge output OOM should be injected");
+    }
+    if (view->nrows != 4 || view->columns[0] != view_column
+        || view->col_shared != shared_flags || !view->col_shared[0]
+        || view->view_generation != view_generation
+        || view->storage_generation != storage_generation
+        || view->storage_owner != storage_owner
+        || view->storage_owner_identity != owner_identity
+        || view->storage_owner_generation != owner_generation
+        || source->storage_alias_borrows != alias_borrows
+        || source->columns[0] != source_column
+        || memcmp(before, view->columns[0], sizeof(before)) != 0
+        || memcmp(before, source->columns[0], sizeof(before)) != 0) {
+        test_rel_free(view);
+        test_rel_free(source);
+        FAIL("shared-view merge OOM must preserve rows and ownership state");
+    }
+    test_rel_free(view);
+    test_rel_free(source);
+    PASS();
+}
+
+static void
+test_merge_output_oom_is_transactional(void)
+{
+    col_rel_t *rel = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, 2, 4 };
+    int64_t rows[] = { 4, 1, 3, 2 };
+    int64_t before[4];
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    int rc;
+
+    TEST("merge output allocation failure leaves relation unchanged");
+    ASSERT(rel != NULL, "relation allocation failed");
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(rel, &rows[i]) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append fixture row");
+        }
+    }
+    memcpy(before, rel->columns[0], sizeof(before));
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    fail_consolidate_allocation_at("merge_output");
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used) {
+        test_rel_free(rel);
+        FAIL("merge output OOM should be injected and propagated");
+    }
+    if (rel->nrows != 4 || rel->view_generation != view_generation
+        || rel->storage_generation != storage_generation
+        || memcmp(before, rel->columns[0], sizeof(before)) != 0) {
+        test_rel_free(rel);
+        FAIL("merge output OOM must leave relation unchanged");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_merge_heap_oom_is_transactional(void)
+{
+    col_rel_t *rel = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, 2, 4, 6 };
+    int64_t rows[] = { 6, 1, 4, 2, 5, 3 };
+    int64_t before[6];
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    int rc;
+
+    TEST("merge heap allocation failure leaves relation unchanged");
+    ASSERT(rel != NULL, "relation allocation failed");
+    for (uint32_t i = 0; i < 6; i++) {
+        if (test_rel_append_row(rel, &rows[i]) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append fixture row");
+        }
+    }
+    memcpy(before, rel->columns[0], sizeof(before));
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    fail_consolidate_allocation_at("merge_heap");
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 3);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used) {
+        test_rel_free(rel);
+        FAIL("merge heap OOM should be injected and propagated");
+    }
+    if (rel->nrows != 6 || rel->view_generation != view_generation
+        || rel->storage_generation != storage_generation
+        || memcmp(before, rel->columns[0], sizeof(before)) != 0) {
+        test_rel_free(rel);
+        FAIL("merge heap OOM must leave relation unchanged");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static wl_columnar_memory_governor_ref_t *
+test_consolidate_governor_create(uint64_t usable_bytes)
+{
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    resolution.budget_bytes = usable_bytes;
+    resolution.usable_bytes = usable_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static void
+test_consolidate_scratch_admission(void)
+{
+    uint32_t boundaries[] = { 0, 2, 4 };
+    int64_t rows[] = { 4, 1, 3, 2 };
+    int64_t before[4];
+    wl_columnar_memory_governor_ref_t *ref;
+    col_rel_t *source;
+    int64_t *borrowed_column;
+    bool *shared_flags;
+    uint32_t alias_borrows;
+    col_rel_t *rel;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    col_rel_t *storage_owner;
+    int rc;
+
+    TEST("consolidation scratch is governor-admitted and released");
+    source = test_rel_alloc(1);
+    rel = test_rel_alloc(1);
+    if (!source || !rel) {
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("relation allocation failed");
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(source, &rows[i]) != 0) {
+            test_rel_free(rel);
+            test_rel_free(source);
+            FAIL("failed to append source fixture row");
+        }
+    }
+    ref = test_consolidate_governor_create(1);
+    if (!ref || col_rel_attach_memory_governor(rel, ref) != 0
+        || col_rel_install_shared_view(rel, source) != 0) {
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("failed to attach constrained governor/shared view");
+    }
+    memcpy(before, rel->columns[0], sizeof(before));
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    storage_owner = rel->storage_owner;
+    borrowed_column = rel->columns[0];
+    shared_flags = rel->col_shared;
+    alias_borrows = source->storage_alias_borrows;
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    if (rc != ENOMEM || rel->nrows != 4
+        || rel->view_generation != view_generation
+        || rel->storage_generation != storage_generation
+        || rel->storage_owner != storage_owner
+        || rel->columns[0] != borrowed_column
+        || rel->col_shared != shared_flags || !rel->col_shared[0]
+        || source->storage_alias_borrows != alias_borrows
+        || memcmp(before, source->columns[0], sizeof(before)) != 0
+        || memcmp(before, rel->columns[0], sizeof(before)) != 0
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        test_rel_free(rel);
+        test_rel_free(source);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL(
+            "denied shared-view scratch admission must preserve ownership/data");
+    }
+    test_rel_free(rel);
+    test_rel_free(source);
+    wl_columnar_memory_governor_ref_release(ref);
+
+    rel = test_rel_alloc(1);
+    if (!rel) {
+        FAIL("relation allocation failed");
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(rel, &rows[i]) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append success fixture row");
+        }
+    }
+    ref = test_consolidate_governor_create(1024u * 1024u);
+    if (!ref || col_rel_attach_memory_governor(rel, ref) != 0) {
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        test_rel_free(rel);
+        FAIL("failed to attach sufficient memory governor");
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    if (rc != 0 || !test_rel_is_sorted_unique(rel)
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        test_rel_free(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("admitted scratch must succeed and release reservation");
+    }
+    test_rel_free(rel);
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+static void
+test_later_segment_sort_oom_is_transactional(void)
+{
+    const uint32_t segment_rows = 40;
+    const uint32_t row_count = segment_rows * 2;
+    col_rel_t *rel = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, segment_rows, row_count };
+    int64_t *before = (int64_t *)malloc((size_t)row_count * sizeof(*before));
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    int rc;
+
+    TEST("radix workspace OOM precedes mutation and is reused");
+    if (!rel || !before) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("relation or snapshot allocation failed");
+    }
+    for (uint32_t i = 0; i < segment_rows; i++) {
+        int64_t value = (int64_t)(segment_rows - i);
+        if (test_rel_append_row(rel, &value) != 0) {
+            free(before);
+            test_rel_free(rel);
+            FAIL("failed to append first segment fixture row");
+        }
+    }
+    for (uint32_t i = 0; i < segment_rows; i++) {
+        int64_t value = (int64_t)(row_count - i);
+        if (test_rel_append_row(rel, &value) != 0) {
+            free(before);
+            test_rel_free(rel);
+            FAIL("failed to append second segment fixture row");
+        }
+    }
+    memcpy(before, rel->columns[0], (size_t)row_count * sizeof(*before));
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    fail_consolidate_allocation_at("radix_workspace_perm_a");
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("radix workspace allocation failure should propagate");
+    }
+    if (rel->nrows != row_count || rel->view_generation != view_generation
+        || rel->storage_generation != storage_generation
+        || memcmp(before, rel->columns[0],
+        (size_t)row_count * sizeof(*before)) != 0) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("workspace OOM must leave the original relation unchanged");
+    }
+    fail_consolidate_allocation_on_match("radix_workspace_perm_a", 2);
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    clear_consolidate_allocation_failure();
+    if (rc != 0 || consolidate_fail_used || !test_rel_is_sorted_unique(rel)) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("later segment sorting must reuse preallocated workspace");
+    }
+    free(before);
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_hash_allocation_oom_is_not_fallback(void)
+{
+    const uint32_t row_count = 10001;
+    col_rel_t *source = test_rel_alloc(1);
+    col_rel_t *rel = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, row_count };
+    int64_t *before = (int64_t *)malloc((size_t)row_count * sizeof(*before));
+    int64_t *column;
+    bool *shared;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    uint32_t alias_borrows;
+    int rc;
+
+    TEST("shared-view hash OOM preserves rows and ownership metadata");
+    if (!source || !rel || !before) {
+        free(before);
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("relation or snapshot allocation failed");
+    }
+    for (uint32_t i = 0; i < row_count; i++) {
+        int64_t value = (int64_t)(i % 100u);
+        if (test_rel_append_row(source, &value) != 0) {
+            free(before);
+            test_rel_free(rel);
+            test_rel_free(source);
+            FAIL("failed to append fixture row");
+        }
+    }
+    if (col_rel_install_shared_view(rel, source) != 0) {
+        free(before);
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("failed to install shared view");
+    }
+    memcpy(before, rel->columns[0], (size_t)row_count * sizeof(*before));
+    column = rel->columns[0];
+    shared = rel->col_shared;
+    view_generation = rel->view_generation;
+    storage_generation = rel->storage_generation;
+    alias_borrows = source->storage_alias_borrows;
+    fail_consolidate_allocation_at("hash_table");
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used) {
+        free(before);
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("shared-view hash OOM should be injected");
+    }
+    if (rel->nrows != row_count || rel->view_generation != view_generation
+        || rel->storage_generation != storage_generation
+        || rel->columns[0] != column || rel->col_shared != shared
+        || !rel->col_shared[0] || source->storage_alias_borrows != alias_borrows
+        || source->columns[0] != column
+        || memcmp(before, rel->columns[0],
+        (size_t)row_count * sizeof(*before)) != 0
+        || memcmp(before, source->columns[0],
+        (size_t)row_count * sizeof(*before)) != 0) {
+        free(before);
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("hash table OOM must preserve shared-view metadata");
+    }
+    fail_consolidate_allocation_at("hash_sort_scratch");
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used) {
+        free(before);
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("shared-view hash scratch OOM should be injected");
+    }
+    if (rel->nrows != row_count || rel->view_generation != view_generation
+        || rel->storage_generation != storage_generation
+        || rel->columns[0] != column || rel->col_shared != shared
+        || !rel->col_shared[0] || source->storage_alias_borrows != alias_borrows
+        || source->columns[0] != column
+        || memcmp(before, rel->columns[0],
+        (size_t)row_count * sizeof(*before)) != 0
+        || memcmp(before, source->columns[0],
+        (size_t)row_count * sizeof(*before)) != 0) {
+        free(before);
+        test_rel_free(rel);
+        test_rel_free(source);
+        FAIL("hash scratch OOM must preserve shared-view metadata");
+    }
+    free(before);
+    test_rel_free(rel);
+    test_rel_free(source);
+    PASS();
+}
+
+static void
+test_hash_heuristic_fallback_succeeds(void)
+{
+    const uint32_t row_count = 10001;
+    col_rel_t *rel = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, row_count };
+    int rc;
+
+    TEST("hash unique-count heuristic falls back successfully");
+    ASSERT(rel != NULL, "relation allocation failed");
+    for (uint32_t i = 0; i < row_count; i++) {
+        int64_t value = (int64_t)(row_count - i);
+        if (test_rel_append_row(rel, &value) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append fixture row");
+        }
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    if (rc != 0 || rel->nrows != row_count
+        || !test_rel_is_sorted_unique(rel)) {
+        test_rel_free(rel);
+        FAIL("heuristic fallback should preserve the sorted unique relation");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_k16_workspace_is_preallocated(void)
+{
+    const uint32_t row_count = 50001;
+    col_rel_t *rel = test_rel_alloc(1);
+    uint32_t boundaries[] = { 0, row_count };
+    int64_t *before = (int64_t *)malloc((size_t)row_count * sizeof(*before));
+    int rc;
+
+    TEST("k16 workspace OOM is transactional and successful sort reuses it");
+    if (!rel || !before) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("relation or snapshot allocation failed");
+    }
+    for (uint32_t i = 0; i < row_count; i++) {
+        int64_t value = (int64_t)(row_count - i);
+        if (test_rel_append_row(rel, &value) != 0) {
+            free(before);
+            test_rel_free(rel);
+            FAIL("failed to append k16 fixture row");
+        }
+    }
+    memcpy(before, rel->columns[0], (size_t)row_count * sizeof(*before));
+    fail_consolidate_allocation_at("radix_workspace_count16");
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used
+        || rel->nrows != row_count
+        || memcmp(before, rel->columns[0],
+        (size_t)row_count * sizeof(*before)) != 0) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("k16 workspace OOM must happen before mutation");
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    if (rc != 0 || rel->nrows != row_count || !test_rel_is_sorted_unique(rel)) {
+        free(before);
+        test_rel_free(rel);
+        FAIL("k16 workspace sort should complete successfully");
+    }
+    free(before);
+    test_rel_free(rel);
+    PASS();
+}
+
+static void
+test_float_insertion_workspace(void)
+{
+    col_rel_t *rel = test_rel_alloc(1);
+    wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+    uint32_t boundaries[] = { 0, 4 };
+    int64_t values[] = {
+        wl_columnar_float_to_bits(3.0),
+        wl_columnar_float_to_bits(1.0),
+        wl_columnar_float_to_bits(2.0),
+        wl_columnar_float_to_bits(1.0),
+    };
+    int64_t expected[] = {
+        wl_columnar_float_to_bits(1.0),
+        wl_columnar_float_to_bits(2.0),
+        wl_columnar_float_to_bits(3.0),
+    };
+
+    TEST("typed-float insertion workspace is preallocated and reused");
+    ASSERT(rel != NULL, "relation allocation failed");
+    if (col_rel_set_column_types(rel, &type, 1) != 0) {
+        test_rel_free(rel);
+        FAIL("failed to set float type");
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        if (test_rel_append_row(rel, &values[i]) != 0) {
+            test_rel_free(rel);
+            FAIL("failed to append float fixture row");
+        }
+    }
+    fail_consolidate_allocation_at("radix_workspace_insertion_rows");
+    int rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used || rel->nrows != 4
+        || memcmp(rel->columns[0], values, sizeof(values)) != 0) {
+        test_rel_free(rel);
+        FAIL("float workspace OOM must precede mutation");
+    }
+    if (col_op_consolidate_kway_merge(rel, boundaries, 1) != 0
+        || rel->nrows != 3
+        || memcmp(rel->columns[0], expected, sizeof(expected)) != 0) {
+        test_rel_free(rel);
+        FAIL("typed-float sort should deduplicate in numeric order");
+    }
+    test_rel_free(rel);
+    PASS();
+}
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -806,6 +1629,20 @@ main(void)
     test_empty_middle_segment();
     test_large_unsorted_k2_sort_correctness();
     test_wide_rows_k4_sort_correctness();
+    test_source_reader_blocks_consolidation_sort();
+    test_source_reader_blocks_sorted_dedup();
+    test_source_reader_blocks_large_hash_dedup();
+    test_shared_view_sorted_dedup_is_copy_on_write();
+    test_shared_view_merge_scatter_is_copy_on_write();
+    test_shared_view_merge_oom_preserves_view_state();
+    test_merge_output_oom_is_transactional();
+    test_merge_heap_oom_is_transactional();
+    test_consolidate_scratch_admission();
+    test_later_segment_sort_oom_is_transactional();
+    test_hash_allocation_oom_is_not_fallback();
+    test_hash_heuristic_fallback_succeeds();
+    test_k16_workspace_is_preallocated();
+    test_float_insertion_workspace();
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);

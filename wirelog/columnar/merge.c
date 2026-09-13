@@ -38,6 +38,63 @@
 #include <arm_neon.h>
 #endif
 
+static void *
+col_op_consolidate_malloc(size_t size, const char *site)
+{
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+    if (wl_columnar_consolidate_alloc_hook
+        && wl_columnar_consolidate_alloc_hook(site))
+        return NULL;
+#else
+    (void)site;
+#endif
+    return malloc(size);
+}
+
+static void *
+col_op_consolidate_calloc(size_t count, size_t size, const char *site)
+{
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+    if (wl_columnar_consolidate_alloc_hook
+        && wl_columnar_consolidate_alloc_hook(site))
+        return NULL;
+#else
+    (void)site;
+#endif
+    return calloc(count, size);
+}
+
+static void *
+col_op_consolidate_realloc(void *ptr, size_t size, const char *site)
+{
+#ifdef WL_TEST_CONSOLIDATE_ALLOC_HOOK
+    if (wl_columnar_consolidate_alloc_hook
+        && wl_columnar_consolidate_alloc_hook(site))
+        return NULL;
+#else
+    (void)site;
+#endif
+    return realloc(ptr, size);
+}
+
+static bool
+col_op_consolidate_size_multiply(size_t left, size_t right, size_t *out)
+{
+    if (!out || (right != 0 && left > SIZE_MAX / right))
+        return false;
+    *out = left * right;
+    return true;
+}
+
+static bool
+col_op_consolidate_size_add(size_t left, size_t right, size_t *out)
+{
+    if (!out || left > SIZE_MAX - right)
+        return false;
+    *out = left + right;
+    return true;
+}
+
 /* --- CONCAT -------------------------------------------------------------- */
 
 int
@@ -371,8 +428,8 @@ col_rel_row_cmp_raw(const col_rel_t *r, uint32_t row_idx,
  * for radix sort + O(N) merge.  After dedup, the small unique set is
  * sorted with radix sort.
  *
- * Returns 0 on success, -1 to signal fallback to sort+merge (too many
- * uniques or allocation failure).
+ * Returns 0 on success, -1 when the unique-count heuristic requests fallback,
+ * and ENOMEM for allocation failures. The relation is untouched on failure.
  */
 static uint32_t
 col_op_consolidate_hash_row(const col_rel_t *rel, const int64_t *row,
@@ -396,7 +453,77 @@ col_op_consolidate_hash_rows_equal(const col_rel_t *rel,
 }
 
 static int
-col_op_consolidate_hash_dedup(col_rel_t *rel)
+col_op_consolidate_hash_rows_compare(const col_rel_t *rel,
+    const int64_t *left, const int64_t *right, uint32_t ncols)
+{
+    for (uint32_t c = 0; c < ncols; c++) {
+        if (rel->column_types
+            && rel->column_types[c] == WIRELOG_TYPE_FLOAT) {
+            int cmp = wl_columnar_float_compare_bits(left[c], right[c]);
+            if (cmp != 0)
+                return cmp;
+        } else {
+            if (left[c] < right[c])
+                return -1;
+            if (left[c] > right[c])
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void
+col_op_consolidate_hash_rows_sort_range(const col_rel_t *rel, int64_t *rows,
+    int64_t *scratch, uint32_t begin, uint32_t end, uint32_t ncols)
+{
+    if (end - begin <= 1)
+        return;
+    uint32_t mid = begin + (end - begin) / 2u;
+    col_op_consolidate_hash_rows_sort_range(rel, rows, scratch, begin, mid,
+        ncols);
+    col_op_consolidate_hash_rows_sort_range(rel, rows, scratch, mid, end,
+        ncols);
+
+    uint32_t left = begin;
+    uint32_t right = mid;
+    uint32_t out = begin;
+    while (left < mid && right < end) {
+        const int64_t *left_row = rows + (size_t)left * ncols;
+        const int64_t *right_row = rows + (size_t)right * ncols;
+        const int64_t *selected
+            = col_op_consolidate_hash_rows_compare(rel, left_row, right_row,
+                ncols) <= 0 ? left_row : right_row;
+        memcpy(scratch + (size_t)out * ncols, selected,
+            (size_t)ncols * sizeof(*rows));
+        if (selected == left_row)
+            left++;
+        else
+            right++;
+        out++;
+    }
+    while (left < mid) {
+        memcpy(scratch + (size_t)out * ncols,
+            rows + (size_t)left * ncols,
+            (size_t)ncols * sizeof(*rows));
+        left++;
+        out++;
+    }
+    while (right < end) {
+        memcpy(scratch + (size_t)out * ncols,
+            rows + (size_t)right * ncols,
+            (size_t)ncols * sizeof(*rows));
+        right++;
+        out++;
+    }
+    memcpy(rows + (size_t)begin * ncols,
+        scratch + (size_t)begin * ncols,
+        (size_t)(end - begin) * ncols * sizeof(*rows));
+}
+
+static int
+col_op_consolidate_hash_dedup(col_rel_t *rel,
+    const wl_columnar_source_access_writer_t *writer,
+    bool *alias_release_pending)
 {
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
@@ -405,32 +532,36 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
     /* Hash table: open addressing, power-of-2 capacity */
     uint32_t ht_cap = 8192;
     uint32_t ht_mask = ht_cap - 1;
-    int64_t *ht_vals = (int64_t *)malloc((size_t)ht_cap * row_bytes);
-    uint8_t *ht_used = (uint8_t *)calloc(ht_cap, 1);
+    int64_t *ht_vals = (int64_t *)col_op_consolidate_malloc(
+        (size_t)ht_cap * row_bytes, "hash_table");
+    uint8_t *ht_used = (uint8_t *)col_op_consolidate_calloc(ht_cap, 1,
+            "hash_table_used");
     if (!ht_vals || !ht_used) {
         free(ht_vals);
         free(ht_used);
-        return -1;
+        return ENOMEM;
     }
 
     /* Unique row buffer (row-major flat array) */
     uint32_t uniq_cap = 4096;
     uint32_t uniq_count = 0;
-    int64_t *uniq_buf = (int64_t *)malloc((size_t)uniq_cap * row_bytes);
+    int64_t *uniq_buf = (int64_t *)col_op_consolidate_malloc(
+        (size_t)uniq_cap * row_bytes, "hash_unique_rows");
     if (!uniq_buf) {
         free(ht_vals);
         free(ht_used);
-        return -1;
+        return ENOMEM;
     }
 
     int64_t _rb[COL_STACK_MAX];
     int64_t *rb = nc <= COL_STACK_MAX ? _rb
-        : (int64_t *)malloc((size_t)nc * sizeof(int64_t));
+        : (int64_t *)col_op_consolidate_malloc((size_t)nc * sizeof(int64_t),
+            "hash_row_scratch");
     if (!rb) {
         free(ht_vals);
         free(ht_used);
         free(uniq_buf);
-        return -1;
+        return ENOMEM;
     }
 
     for (uint32_t r = 0; r < nr; r++) {
@@ -466,10 +597,10 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
                 /* Rehash to 2x capacity */
                 uint32_t new_cap = ht_cap * 2;
                 uint32_t new_mask = new_cap - 1;
-                int64_t *new_vals
-                    = (int64_t *)malloc((size_t)new_cap * row_bytes);
-                uint8_t *new_used
-                    = (uint8_t *)calloc(new_cap, 1);
+                int64_t *new_vals = (int64_t *)col_op_consolidate_malloc(
+                    (size_t)new_cap * row_bytes, "hash_rehash_rows");
+                uint8_t *new_used = (uint8_t *)col_op_consolidate_calloc(
+                    new_cap, 1, "hash_rehash_used");
                 if (!new_vals || !new_used) {
                     free(new_vals);
                     free(new_used);
@@ -477,7 +608,7 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
                     free(ht_vals);
                     free(ht_used);
                     free(uniq_buf);
-                    return -1;
+                    return ENOMEM;
                 }
 
                 for (uint32_t s = 0; s < ht_cap; s++) {
@@ -513,14 +644,14 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
             /* Grow unique buffer if needed */
             if (uniq_count >= uniq_cap) {
                 uniq_cap *= 2;
-                int64_t *nb = (int64_t *)realloc(uniq_buf,
-                        (size_t)uniq_cap * row_bytes);
+                int64_t *nb = (int64_t *)col_op_consolidate_realloc(uniq_buf,
+                        (size_t)uniq_cap * row_bytes, "hash_unique_grow");
                 if (!nb) {
                     if (rb != _rb) free(rb);
                     free(ht_vals);
                     free(ht_used);
                     free(uniq_buf);
-                    return -1;
+                    return ENOMEM;
                 }
                 uniq_buf = nb;
             }
@@ -534,30 +665,39 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
     free(ht_vals);
     free(ht_used);
 
-    /* Write unique rows back to relation */
+    /* Sort the staged unique rows before publishing any mutation.  If scratch
+     * allocation fails, the caller can safely fall back to sort+merge with
+     * the original relation untouched. */
+    if (uniq_count > 1) {
+        int64_t *scratch = (int64_t *)col_op_consolidate_malloc(
+            (size_t)uniq_count * row_bytes, "hash_sort_scratch");
+        if (!scratch) {
+            free(uniq_buf);
+            return ENOMEM;
+        }
+        col_op_consolidate_hash_rows_sort_range(rel, uniq_buf, scratch, 0,
+            uniq_count, nc);
+        free(scratch);
+    }
+
+    /* Detach only after hash/sort staging is complete.  All emitted rows
+     * came from the validated source relation, so publish has no expected
+     * validation failure and performs no allocation. */
+    if (rel->col_shared) {
+        int cow_rc = col_rel_cow_unshare_with_source_writer(rel, writer);
+        if (cow_rc != 0) {
+            free(uniq_buf);
+            return cow_rc;
+        }
+        *alias_release_pending = true;
+    }
+
+    /* Publish the complete sorted result only after all fallible work. */
     for (uint32_t r = 0; r < uniq_count; r++)
         col_rel_row_copy_in_raw(rel, r, uniq_buf + (size_t)r * nc);
     rel->nrows = uniq_count;
     wl_columnar_relation_touch_view(rel);
     free(uniq_buf);
-
-    /* Sort the small unique set */
-    if (uniq_count > 1) {
-        col_rel_radix_sort(rel, 0, uniq_count);
-
-        /* Final dedup pass (hash guarantees value-uniqueness, but ensure
-         * sorted order has no adjacent duplicates for determinism) */
-        uint32_t out = 1;
-        for (uint32_t i = 1; i < uniq_count; i++) {
-            if (col_rel_row_cmp(rel, i - 1, i) != 0) {
-                if (out != i)
-                    col_rel_row_move_raw(rel, out, i);
-                out++;
-            }
-        }
-        rel->nrows = out;
-        wl_columnar_relation_touch_view(rel);
-    }
 
     return 0;
 }
@@ -575,12 +715,21 @@ col_op_consolidate_hash_dedup(col_rel_t *rel)
  * @rel            Relation containing K concatenated segments.
  * @seg_boundaries Array of (seg_count+1) offsets [s0, s1, ..., sK].
  * @seg_count      Number of segments K.
- * @return         0 on success, ENOMEM on allocation failure.
+ * @return         0 on success; EBUSY if a source reader or storage alias
+ *                 prevents exclusive mutation; ENOMEM on allocation failure.
  */
-int
-col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
-    uint32_t seg_count)
+static int
+col_op_consolidate_kway_merge_impl(col_rel_t *rel,
+    const uint32_t *seg_boundaries, uint32_t seg_count,
+    const wl_columnar_source_access_writer_t *writer,
+    bool *alias_release_pending)
 {
+    typedef struct {
+        uint32_t seg;    /* segment index */
+        uint32_t cursor; /* current row index within rel->data */
+        uint32_t end;    /* one-past-end row index for this segment */
+    } heap_entry_t;
+
     if (!wl_columnar_relation_float_values_valid(rel))
         return EINVAL;
     uint32_t nc = rel->ncols;
@@ -588,29 +737,109 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
 
     if (nr <= 1)
         return 0;
+    if (!seg_boundaries || seg_count == 0
+        || seg_boundaries[0] != 0 || seg_boundaries[seg_count] != nr)
+        return EINVAL;
+    for (uint32_t s = 0; s < seg_count; s++) {
+        if (seg_boundaries[s] > seg_boundaries[s + 1]
+            || seg_boundaries[s + 1] > nr)
+            return EINVAL;
+    }
+    size_t segment_bytes;
+    size_t heap_bytes;
+    size_t row_bytes = 0;
+    size_t merged_bytes = 0;
+    size_t merged_alloc_bytes = 0;
+    size_t segment_total_bytes;
+    size_t additional_scratch_bytes;
+    wl_columnar_radix_workspace_t sort_workspace = { 0 };
+    if (!col_op_consolidate_size_multiply(seg_count, sizeof(uint32_t),
+        &segment_bytes)
+        || !col_op_consolidate_size_multiply(seg_count, sizeof(heap_entry_t),
+        &heap_bytes))
+        return ENOMEM;
+    if (!col_op_consolidate_size_multiply(segment_bytes, 2u,
+        &segment_total_bytes))
+        return ENOMEM;
+    additional_scratch_bytes = segment_total_bytes;
+    if (seg_count >= 2) {
+        if (!col_op_consolidate_size_multiply(nc, sizeof(int64_t),
+            &row_bytes)
+            || !col_op_consolidate_size_multiply(nr, row_bytes,
+            &merged_bytes))
+            return ENOMEM;
+        merged_alloc_bytes = merged_bytes ? merged_bytes : sizeof(int64_t);
+        if (!col_op_consolidate_size_add(additional_scratch_bytes,
+            merged_alloc_bytes, &additional_scratch_bytes))
+            return ENOMEM;
+    }
+    if (seg_count >= 3
+        && !col_op_consolidate_size_add(additional_scratch_bytes, heap_bytes,
+        &additional_scratch_bytes))
+        return ENOMEM;
 
     /* Hash-based dedup for large datasets (#369): O(N) scan + O(U log U) sort
      * where U is the unique count.  When U << N (common in recursive Datalog
      * joins), this is much faster than sorting all N rows. */
     if (nr > 10000) {
-        int rc = col_op_consolidate_hash_dedup(rel);
+        int rc = col_op_consolidate_hash_dedup(rel, writer,
+                alias_release_pending);
         if (rc == 0)
             return 0;
-        /* rc == -1: too many uniques or alloc failure, fall through */
+        if (rc != -1)
+            return rc;
+        /* The unique-count heuristic requests the ordinary sort+merge path. */
+    }
+
+    int workspace_rc = wl_columnar_radix_workspace_prepare(rel,
+            seg_boundaries, seg_count, additional_scratch_bytes,
+            &sort_workspace);
+    if (workspace_rc != 0)
+        return workspace_rc;
+
+    /* Allocate every buffer that can fail before the first in-place sort or
+     * dedup mutation.  The workspace reservation includes these buffers. */
+    uint32_t *seg_starts = (uint32_t *)col_op_consolidate_malloc(
+        segment_bytes, "segment_starts");
+    uint32_t *seg_ends = (uint32_t *)col_op_consolidate_malloc(
+        segment_bytes, "segment_ends");
+    int64_t *merged = NULL;
+    heap_entry_t *heap = NULL;
+    if (seg_count >= 2)
+        merged = (int64_t *)col_op_consolidate_malloc(
+            merged_alloc_bytes, "merge_output");
+    if (seg_count >= 3)
+        heap = (heap_entry_t *)col_op_consolidate_malloc(heap_bytes,
+                "merge_heap");
+    if (!seg_starts || !seg_ends || (seg_count >= 2 && !merged)
+        || (seg_count >= 3 && !heap)) {
+        free(seg_starts);
+        free(seg_ends);
+        free(merged);
+        free(heap);
+        wl_columnar_radix_workspace_destroy(&sort_workspace);
+        return ENOMEM;
+    }
+
+    /* Every buffer allocation is now complete.  A shared view may detach
+     * before the first segment mutation; later sorting uses only workspace. */
+    if (rel->col_shared) {
+        int cow_rc = col_rel_cow_unshare_with_source_writer(rel, writer);
+        if (cow_rc != 0) {
+            wl_columnar_radix_workspace_destroy(&sort_workspace);
+            free(seg_starts);
+            free(seg_ends);
+            free(merged);
+            free(heap);
+            return cow_rc;
+        }
+        *alias_release_pending = true;
     }
 
     /* Sort each segment in-place using radix sort.
      * Optimization (#369): skip sort for already-sorted segments (e.g.,
      * from consolidated IDB reads). Also dedup within each segment after
      * sort to reduce merge input. Track per-segment unique counts. */
-    /* MSVC does not support VLAs; use heap allocation for portability. */
-    uint32_t *seg_starts = (uint32_t *)malloc(seg_count * sizeof(uint32_t));
-    uint32_t *seg_ends = (uint32_t *)malloc(seg_count * sizeof(uint32_t));
-    if (!seg_starts || !seg_ends) {
-        free(seg_starts);
-        free(seg_ends);
-        return ENOMEM;
-    }
 
     for (uint32_t s = 0; s < seg_count; s++) {
         uint32_t start = seg_boundaries[s];
@@ -627,8 +856,19 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
                     break;
                 }
             }
-            if (!already_sorted)
-                col_rel_radix_sort(rel, start, count);
+            if (!already_sorted) {
+                int sort_rc =
+                    wl_columnar_relation_radix_sort_with_workspace(rel,
+                        start, count, writer, &sort_workspace);
+                if (sort_rc != 0) {
+                    wl_columnar_radix_workspace_destroy(&sort_workspace);
+                    free(seg_starts);
+                    free(seg_ends);
+                    free(merged);
+                    free(heap);
+                    return sort_rc;
+                }
+            }
 
             /* Intra-segment dedup: compact unique rows to reduce merge */
             uint32_t out_r = start + 1;
@@ -651,15 +891,10 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         wl_columnar_relation_touch_view(rel);
         free(seg_starts);
         free(seg_ends);
+        free(merged);
+        free(heap);
+        wl_columnar_radix_workspace_destroy(&sort_workspace);
         return 0;
-    }
-
-    /* Allocate merge output buffer */
-    int64_t *merged = (int64_t *)malloc((size_t)nr * nc * sizeof(int64_t));
-    if (!merged) {
-        free(seg_starts);
-        free(seg_ends);
-        return ENOMEM;
     }
 
     if (seg_count == 2) {
@@ -721,6 +956,8 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
         free(merged);
         free(seg_starts);
         free(seg_ends);
+        free(heap);
+        wl_columnar_radix_workspace_destroy(&sort_workspace);
         return 0;
     }
 
@@ -729,21 +966,7 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
      * Heap entries: (segment_index, current_row_pointer).
      * Heap property: parent row <= child rows (lexicographic).
      */
-    typedef struct {
-        uint32_t seg;    /* segment index */
-        uint32_t cursor; /* current row index within rel->data */
-        uint32_t end;    /* one-past-end row index for this segment */
-    } heap_entry_t;
-
     /* Build initial heap from non-empty segments */
-    heap_entry_t *heap
-        = (heap_entry_t *)malloc(seg_count * sizeof(heap_entry_t));
-    if (!heap) {
-        free(merged);
-        free(seg_starts);
-        free(seg_ends);
-        return ENOMEM;
-    }
 
     uint32_t heap_size = 0;
     for (uint32_t s = 0; s < seg_count; s++) {
@@ -819,7 +1042,51 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     free(heap);
     free(seg_starts);
     free(seg_ends);
+    wl_columnar_radix_workspace_destroy(&sort_workspace);
     return 0;
+}
+
+int
+col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
+    uint32_t seg_count)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *owner = NULL;
+    bool alias_release_pending = false;
+    int rc;
+
+    if (!rel)
+        return EINVAL;
+    rc = col_rel_source_writer_acquire(rel, &writer);
+    if (rc != 0)
+        return rc;
+    if (!wl_columnar_relation_float_values_valid(rel)) {
+        rc = EINVAL;
+        goto release_writer;
+    }
+    if (rel->nrows <= 1) {
+        rc = 0;
+        goto release_writer;
+    }
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0)
+        goto release_writer;
+    if (rel == owner && owner->storage_alias_borrows > 0) {
+        rc = EBUSY;
+        goto release_writer;
+    }
+
+    rc = col_op_consolidate_kway_merge_impl(rel, seg_boundaries, seg_count,
+            &writer, &alias_release_pending);
+release_writer:
+    if (alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(rel);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+    if (wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
+        rc = EINVAL;
+    return rc;
 }
 
 int
@@ -898,7 +1165,12 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
         uint32_t delta_count = nr - sn;
 
         /* Phase 1: sort only the unsorted suffix using radix sort */
-        col_rel_radix_sort(work, sn, delta_count);
+        int sort_rc = col_rel_radix_sort(work, sn, delta_count);
+        if (sort_rc != 0) {
+            if (work_owned)
+                col_rel_destroy(work);
+            return sort_rc;
+        }
 
         /* Phase 1b: dedup within suffix */
         uint32_t d_unique = 1;
@@ -1053,7 +1325,9 @@ col_op_consolidate_incremental(col_rel_t *rel, uint32_t old_nrows)
     uint32_t delta_count = nr - old_nrows;
 
     /* Phase 1: sort only the new delta rows using radix sort */
-    col_rel_radix_sort(rel, old_nrows, delta_count);
+    int sort_rc = col_rel_radix_sort(rel, old_nrows, delta_count);
+    if (sort_rc != 0)
+        return sort_rc;
 
     /* Phase 1b: dedup within delta */
     uint32_t d_unique = 1;
