@@ -1611,6 +1611,135 @@ test_float_insertion_workspace(void)
 }
 
 /* ----------------------------------------------------------------
+ * Zero-arity relations (.decl p()) hold rows without column storage:
+ * col_rel_prepare_resize() skips the allocation when ncols == 0 and
+ * col_rel_append_row() still counts the empty tuple.  Such a relation
+ * therefore reaches the k-way merge with nrows > 1 and ncols == 0, and
+ * its merge-output buffer is sized from nc * sizeof(int64_t) * nr == 0.
+ *
+ * col_op_consolidate_malloc() is a thin malloc() wrapper whose NULL is
+ * read as exhaustion, and malloc(0) may return NULL on a conforming
+ * libc, so a zero-sized merge output would be a spurious ENOMEM.  The
+ * sizing code keeps the request unconditionally non-zero; this test
+ * pins that, plus the surrounding behaviour:
+ *
+ *   - the zero-width merge output is a real allocation the OOM hook can
+ *     intercept, and that injection is transactional;
+ *   - the merge dedups the identical empty tuples to one row;
+ *   - the request is strictly larger than the segment scratch alone.
+ *
+ * The last one is the size assertion, and the memory governor is the
+ * seam that makes it observable: merged_alloc_bytes is admitted as part
+ * of the consolidation scratch, so a budget covering only the two
+ * segment arrays must be refused while one extra int64_t admits.  A
+ * mutation that drops the non-zero guarantee is caught there -- it is
+ * not caught by the allocation hook, which receives only a site name,
+ * nor by malloc(0) itself, which returns non-NULL on glibc.
+ * ---------------------------------------------------------------- */
+
+/* Three appended empty tuples across two segments; the caller owns it. */
+static col_rel_t *
+zero_arity_fixture(void)
+{
+    col_rel_t *rel = test_rel_alloc(0);
+    if (!rel)
+        return NULL;
+    for (int i = 0; i < 3; i++) {
+        /* col_rel_append_row is the production path; the file-local
+         * helper cannot be used because col_columns_alloc() refuses
+         * ncols == 0.  No column is read, but row must be non-NULL. */
+        int64_t empty_tuple = 0;
+        if (col_rel_append_row(rel, &empty_tuple) != 0) {
+            test_rel_free(rel);
+            return NULL;
+        }
+    }
+    if (rel->nrows != 3 || rel->ncols != 0 || rel->columns != NULL) {
+        test_rel_free(rel);
+        return NULL;
+    }
+    return rel;
+}
+
+static void
+test_zero_arity_merge_output_is_never_zero_sized(void)
+{
+    const uint32_t boundaries[] = { 0, 1, 3 };
+    /* segment_starts + segment_ends for seg_count == 2.  A zero-arity
+     * relation adds no radix workspace, so this is the whole scratch
+     * requirement apart from the merge output itself. */
+    const uint64_t segment_scratch = 2u * 2u * sizeof(uint32_t);
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    col_rel_t *rel = NULL;
+    int rc;
+
+    TEST("zero-arity merge keeps a non-zero merge output allocation");
+
+    /* (1) The merge output is a real, interceptable allocation, and the
+     * injected failure leaves the rows untouched. */
+    rel = zero_arity_fixture();
+    if (!rel)
+        FAIL("failed to build the zero-arity fixture");
+    fail_consolidate_allocation_at("merge_output");
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    clear_consolidate_allocation_failure();
+    if (rc != ENOMEM || !consolidate_fail_used || rel->nrows != 3) {
+        test_rel_free(rel);
+        FAIL("zero-arity merge output allocation was not injectable");
+    }
+    test_rel_free(rel);
+
+    /* (2) A budget covering only the segment scratch must be refused:
+     * the merge output still asks for more than zero bytes. */
+    rel = zero_arity_fixture();
+    ref = test_consolidate_governor_create(segment_scratch);
+    if (!rel || !ref || col_rel_attach_memory_governor(rel, ref) != 0) {
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        test_rel_free(rel);
+        FAIL("failed to attach the segment-sized governor");
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    if (rc == ENOMEM && rel->nrows != 3)
+        rc = -1; /* a denied admission must leave the rows alone */
+    test_rel_free(rel);
+    wl_columnar_memory_governor_ref_release(ref);
+    if (rc == -1)
+        FAIL("denied scratch admission must not disturb the rows");
+    if (rc != ENOMEM)
+        FAIL("a zero-sized merge output would have been admitted here");
+
+    /* (3) One extra int64_t of budget admits it, and the merge dedups
+     * the identical empty tuples to a single row. */
+    rel = zero_arity_fixture();
+    ref = test_consolidate_governor_create(segment_scratch
+            + sizeof(int64_t));
+    if (!rel || !ref || col_rel_attach_memory_governor(rel, ref) != 0) {
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        test_rel_free(rel);
+        FAIL("failed to attach the admitting governor");
+    }
+    rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+    if (rc != 0 || rel->nrows != 1) {
+        test_rel_free(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("zero-arity merge did not dedup under an exact budget");
+    }
+    /* The scratch is transient: it must be given back, or a second
+     * consolidation under the same exact budget could not be admitted. */
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        test_rel_free(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("consolidation scratch was not released back to the governor");
+    }
+    test_rel_free(rel);
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+}
+
+/* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
 int
@@ -1636,6 +1765,7 @@ main(void)
     test_shared_view_merge_scatter_is_copy_on_write();
     test_shared_view_merge_oom_preserves_view_state();
     test_merge_output_oom_is_transactional();
+    test_zero_arity_merge_output_is_never_zero_sized();
     test_merge_heap_oom_is_transactional();
     test_consolidate_scratch_admission();
     test_later_segment_sort_oom_is_transactional();

@@ -77,6 +77,12 @@ col_op_consolidate_realloc(void *ptr, size_t size, const char *site)
     return realloc(ptr, size);
 }
 
+/* The operand roles are load-bearing at the merge-output sizing site: the
+ * `right != 0` test below is one of the two constructs that would pin that
+ * allocation's extent to a constant and revive a false
+ * clang-analyzer-security.ArrayBound there.  Rewriting this guard in terms
+ * of `left` is semantically identical but breaks the tidy ratchet 700 lines
+ * away; see the comment in the `seg_count >= 2` block and issue #1592. */
 static bool
 col_op_consolidate_size_multiply(size_t left, size_t right, size_t *out)
 {
@@ -763,12 +769,39 @@ col_op_consolidate_kway_merge_impl(col_rel_t *rel,
         return ENOMEM;
     additional_scratch_bytes = segment_total_bytes;
     if (seg_count >= 2) {
+        /* Both the zero test inside col_op_consolidate_size_multiply's
+         * `right != 0` guard and a `merged_bytes == 0` test would pin the
+         * merge-output extent to a small constant, after which the
+         * analyzer can no longer see that nc is the same width the buffer
+         * was sized with, and reports the raw_row[c] reads in
+         * col_rel_row_cmp_raw as out of bounds.  Two things keep it
+         * symbolic, and they are pinned by different checks.  Keeping nr
+         * -- known > 1 from the early return above -- as the right operand
+         * is what the tidy ratchet guards: swapping it back reintroduces
+         * clang-analyzer-security.ArrayBound, and merge.c is an
+         * allowlisted file the ratchet holds clean.  Replacing the
+         * unconditional add with a `merged_bytes == 0` test does the same.
+         * Deleting the slack outright is analyzer-clean, so the ratchet
+         * would not catch it; what it reintroduces is the zero-sized
+         * allocation below, which the zero-arity merge test pins instead.
+         *
+         * The slack also earns its place without the analyzer: a zero-arity
+         * relation (.decl p()) reaches this path with nc == 0, and
+         * col_op_consolidate_malloc is a thin malloc() wrapper whose NULL
+         * is read as exhaustion below, so a zero-sized merge output would
+         * be a spurious ENOMEM on a libc where malloc(0) returns NULL.
+         *
+         * This is defensive, not curative: it keeps the extent symbolic
+         * rather than giving the analyzer the width invariant that
+         * col_rel_row_cmp_raw actually relies on.  Issue #1592 tracks
+         * removing the need for both constructs. */
         if (!col_op_consolidate_size_multiply(nc, sizeof(int64_t),
             &row_bytes)
-            || !col_op_consolidate_size_multiply(nr, row_bytes,
-            &merged_bytes))
+            || !col_op_consolidate_size_multiply(row_bytes, nr,
+            &merged_bytes)
+            || !col_op_consolidate_size_add(merged_bytes, sizeof(int64_t),
+            &merged_alloc_bytes))
             return ENOMEM;
-        merged_alloc_bytes = merged_bytes ? merged_bytes : sizeof(int64_t);
         if (!col_op_consolidate_size_add(additional_scratch_bytes,
             merged_alloc_bytes, &additional_scratch_bytes))
             return ENOMEM;
