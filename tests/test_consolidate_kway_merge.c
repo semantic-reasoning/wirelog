@@ -435,6 +435,47 @@ test_three_copies_heap_merge(void)
     PASS();
 }
 
+static void
+test_two_way_merge_empty_segments_uses_no_heap_allocation(void)
+{
+    int64_t rows[][2] = { { 3, 3 }, { 1, 1 }, { 1, 1 } };
+    int64_t expected[][2] = { { 1, 1 }, { 3, 3 } };
+    uint32_t empty_left[] = { 0, 0, 3 };
+    uint32_t empty_right[] = { 0, 3, 3 };
+
+    TEST("two-way heap merge handles empty segments without heap allocation");
+    for (uint32_t empty_side = 0; empty_side < 2; empty_side++) {
+        col_rel_t *rel = test_rel_alloc(2);
+        uint32_t *boundaries
+            = empty_side == 0 ? empty_left : empty_right;
+        ASSERT(rel != NULL, "relation allocation failed");
+        for (uint32_t row = 0; row < 3; row++) {
+            if (test_rel_append_row(rel, rows[row]) != 0) {
+                test_rel_free(rel);
+                FAIL("failed to append empty-segment fixture row");
+            }
+        }
+        fail_consolidate_allocation_at("merge_heap");
+        int rc = col_op_consolidate_kway_merge(rel, boundaries, 2);
+        clear_consolidate_allocation_failure();
+        if (rc != 0 || consolidate_fail_used || rel->nrows != 2
+            || !test_rel_is_sorted_unique(rel)) {
+            test_rel_free(rel);
+            FAIL("two-way merge should handle empty segments on stack");
+        }
+        for (uint32_t row = 0; row < 2; row++) {
+            int64_t actual[2];
+            col_rel_row_copy_out(rel, row, actual);
+            if (test_row_cmp(actual, expected[row], 2) != 0) {
+                test_rel_free(rel);
+                FAIL("two-way merge returned an unexpected row");
+            }
+        }
+        test_rel_free(rel);
+    }
+    PASS();
+}
+
 /* ================================================================
  * Test 4: Merged output is lexicographically sorted (per-segment sort)
  *
@@ -1460,14 +1501,14 @@ test_hash_allocation_oom_is_not_fallback(void)
         test_rel_free(source);
         FAIL("hash table OOM must preserve shared-view metadata");
     }
-    fail_consolidate_allocation_at("hash_sort_scratch");
+    fail_consolidate_allocation_at("hash_unique_rows");
     rc = col_op_consolidate_kway_merge(rel, boundaries, 1);
     clear_consolidate_allocation_failure();
     if (rc != ENOMEM || !consolidate_fail_used) {
         free(before);
         test_rel_free(rel);
         test_rel_free(source);
-        FAIL("shared-view hash scratch OOM should be injected");
+        FAIL("shared-view hash result OOM should be injected");
     }
     if (rel->nrows != row_count || rel->view_generation != view_generation
         || rel->storage_generation != storage_generation
@@ -1481,7 +1522,7 @@ test_hash_allocation_oom_is_not_fallback(void)
         free(before);
         test_rel_free(rel);
         test_rel_free(source);
-        FAIL("hash scratch OOM must preserve shared-view metadata");
+        FAIL("hash result OOM must preserve shared-view metadata");
     }
     free(before);
     test_rel_free(rel);
@@ -1797,6 +1838,7 @@ main(void)
     test_single_copy_passthrough();
     test_two_copies_direct_merge();
     test_three_copies_heap_merge();
+    test_two_way_merge_empty_segments_uses_no_heap_allocation();
     test_per_segment_sort_before_merge();
     test_cross_segment_dedup();
     test_large_dataset_performance();
