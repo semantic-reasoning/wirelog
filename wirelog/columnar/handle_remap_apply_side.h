@@ -76,6 +76,10 @@
  *   EIO    if any non-zero handle in column 0 or @nested_arg_idx
  *          is missing from @remap.  See wl_handle_remap_apply_columns
  *          for the partial-rewrite/poisoned-relation contract.
+ *   EBUSY  if the source-access gate is occupied by a reader or concurrent
+ *          writer, or if the relation storage is borrowed or shared.  The
+ *          relation is unchanged and @out_rewrites is set to zero; retrying
+ *          this relation operation after the conflict clears is safe.
  */
 int
 wl_handle_remap_apply_side_relation(col_rel_t *rel,
@@ -117,6 +121,14 @@ wl_handle_remap_apply_side_relation(col_rel_t *rel,
  *          Per #589's contract the failing relation is partially
  *          rewritten through the row before the missing handle and
  *          must be treated as poisoned by the caller.
+ *   EBUSY  on the first relation whose source-access gate is occupied by a
+ *          reader or concurrent writer, or whose storage is borrowed or
+ *          shared.  That relation is unchanged and contributes zero cells,
+ *          but earlier side-relations may already have been processed.
+ *          @out_rels_rewritten and @out_total_cells reflect that successful
+ *          prefix.  Do not rerun the whole pass without restoring that
+ *          prefix: resume from the blocked relation and unprocessed suffix,
+ *          or restore the completed prefix before restarting the whole pass.
  */
 int
 wl_handle_remap_apply_session_side_relations(struct wl_col_session_t *sess,
