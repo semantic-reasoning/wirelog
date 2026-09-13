@@ -576,7 +576,11 @@ test_blocked_sort_does_not_dedup_unsorted(void)
     wl_col_session_t *sess = make_mock_session();
     col_rel_t *rel = col_rel_new_auto("test", 1);
     wl_columnar_source_access_reader_t reader = { 0 };
-    const int64_t rows[] = { 4, 1, 4, 2 };
+    /* Sorted this dedups 4 -> 2; left unsorted the trailing pair is the
+     * only adjacent match, so it dedups 4 -> 3.  A swallowed failure
+     * therefore both loses a row and marks the result sorted, and each is
+     * an independent kill of the mutant. */
+    const int64_t rows[] = { 4, 1, 4, 4 };
     eval_stack_t stack;
     int rc;
 
@@ -597,24 +601,30 @@ test_blocked_sort_does_not_dedup_unsorted(void)
 
     if (col_rel_source_reader_release(&reader) != 0) {
         destroy_mock_session(sess);
+        /* rel is owned by the stack entry the operator handed back. */
         FAIL("source reader release failed");
         return;
     }
     if (rc == 0) {
+        col_rel_destroy(rel);
         destroy_mock_session(sess);
         FAIL("blocked sort must not report success");
         return;
     }
-    /* The duplicate 4 is not adjacent while unsorted, so a swallowed
-     * failure would have compacted four rows to three and claimed them
-     * sorted.  Nothing may have moved. */
+    /* rel is still live to inspect because the operator hands it back to
+     * the stack rather than destroying it on this path.  The reader is
+     * released above, so the destroy below succeeds. */
+    /* Nothing may have moved: not the row count, not the order, and not
+     * the sorted marking. */
     if (rel->nrows != 4 || rel->sorted_nrows != 0) {
+        col_rel_destroy(rel);
         destroy_mock_session(sess);
         FAIL("blocked sort must leave rows and sorted_nrows untouched");
         return;
     }
     for (uint32_t i = 0; i < 4; i++) {
         if (col_rel_get(rel, i, 0) != rows[i]) {
+            col_rel_destroy(rel);
             destroy_mock_session(sess);
             FAIL("blocked sort must not reorder or drop rows");
             return;

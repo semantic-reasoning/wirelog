@@ -1841,7 +1841,10 @@ tdd_dedup_rel(col_rel_t *r)
             /* The hash table cannot represent this row count safely.
              * Sorting has no capacity-doubling arithmetic and preserves the
              * same deduplication result. */
-            col_rel_radix_sort_int64(r);
+            /* The status is deliberately discarded: the post-condition
+             * check below is stronger, catching both a refused sort and a
+             * relation that was never sorted to begin with. */
+            (void)col_rel_radix_sort_int64(r);
             if (!tdd_relation_rows_sorted(r))
                 return;
         } else {
@@ -1853,7 +1856,9 @@ tdd_dedup_rel(col_rel_t *r)
                 /* Allocation failure: fall back to sort-based path */
                 free(ht);
                 free(keep);
-                col_rel_radix_sort_int64(r);
+                /* Discarded for the same reason as above: the
+                 * post-condition check is the stronger guard. */
+                (void)col_rel_radix_sort_int64(r);
                 if (!tdd_relation_rows_sorted(r))
                     return;
                 /* Fall through to the sorted dedup below. */
@@ -4271,13 +4276,25 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         return rc;
     }
 
-    /* Sort pre-existing IDB data on workers (eval_serial.c:309-314) */
+    /* Sort pre-existing IDB data on workers (eval_serial.c:309-314).
+    * The serial twin of this loop propagates a refused sort for the same
+    * reason: it establishes the sorted prefix that
+    * col_op_consolidate_incremental_delta requires, and continuing on an
+    * unsorted prefix makes the two-pointer merge miss duplicates. */
     for (uint32_t w = 0; w < W; w++) {
         for (uint32_t ri = 0; ri < nrels; ri++) {
             col_rel_t *r = session_find_rel(&coord->tdd_workers[w],
                     sp->relations[ri].name);
-            if (r && r->nrows > 1)
-                col_rel_radix_sort_int64(r);
+            if (r && r->nrows > 1) {
+                int sort_rc = col_rel_radix_sort_int64(r);
+                if (sort_rc != 0) {
+                    tdd_cleanup_workers(coord);
+                    tdd_free_saved_coord_idb(sp, owner_fallback_saved);
+                    tdd_free_saved_coord_idb(sp, global_read_saved);
+                    coord->tdd_total_ns += now_ns() - tdd_total_t0;
+                    return sort_rc;
+                }
+            }
         }
     }
 

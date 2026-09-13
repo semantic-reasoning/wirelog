@@ -1234,7 +1234,13 @@ col_op_consolidate(eval_stack_t *stack, wl_col_session_t *sess)
     {
         int sort_rc = col_rel_radix_sort_int64(work);
         if (sort_rc != 0) {
-            if (work_owned)
+            /* Do not destroy work here.  The refusal that is most likely
+             * to land here is EBUSY from a live source reader, and
+             * col_rel_destroy_checked() refuses on exactly that predicate,
+             * so the destroy would be a guaranteed no-op and work -- already
+             * off the stack -- would leak.  Hand it back instead; the
+             * evaluator drains the stack when an operator fails. */
+            if (eval_stack_push(stack, work, work_owned) != 0 && work_owned)
                 col_rel_destroy(work);
             return sort_rc;
         }

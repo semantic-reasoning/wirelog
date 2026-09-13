@@ -4512,7 +4512,7 @@ col_rel_radix_sort_int64(col_rel_t *r)
     if (rc == 0)
         r->sorted_nrows = r->nrows;
     else
-        WL_LOG(WL_LOG_SEC_CONSOLIDATION, WL_LOG_ERROR,
+        WL_LOG(WL_LOG_SEC_CONSOLIDATION, WL_LOG_WARN,
             "radix sort refused for %s: rc=%d", r->name ? r->name : "?", rc);
     return rc;
 }
