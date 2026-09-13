@@ -1673,15 +1673,24 @@ col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
  * a partially emitted delta after the source has been transformed. */
 int
 col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
-    wl_columnar_source_access_writer_t *writer)
+    wl_columnar_source_access_writer_t *writer,
+    bool *out_alias_release_pending)
 {
-    if (!r || !writer || additional > UINT32_MAX - r->nrows)
+    if (!r || !writer || !out_alias_release_pending
+        || additional > UINT32_MAX - r->nrows)
         return EINVAL;
+    *out_alias_release_pending = false;
     uint32_t required = r->nrows + additional;
+    bool alias_release_pending = r->storage_owner
+        && r->storage_owner != r;
     /* A shared view can have spare capacity but still needs COW before the
      * first locked append.  Perform that fallible transition up front. */
-    if (r->col_shared && required <= r->capacity)
-        return col_rel_cow_unshare_impl(r, 0, false);
+    if (r->col_shared && required <= r->capacity) {
+        int rc = col_rel_cow_unshare_impl(r, 0, true);
+        if (rc == 0)
+            *out_alias_release_pending = alias_release_pending;
+        return rc;
+    }
     if (required <= r->capacity)
         return col_rel_reserve_capacity_admitted(r, r->capacity, NULL);
     if (r->storage_owner == r && r->storage_alias_borrows > 0)
@@ -1693,8 +1702,12 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
             return ENOMEM;
         new_cap *= 2u;
     }
-    if (r->col_shared || r->arena_owned)
-        return col_rel_grow_owned_transition_impl(r, new_cap, false);
+    if (r->col_shared || r->arena_owned) {
+        int rc = col_rel_grow_owned_transition_impl(r, new_cap, true);
+        if (rc == 0)
+            *out_alias_release_pending = alias_release_pending;
+        return rc;
+    }
 
     uint64_t ledger_before = col_rel_owned_ledger_bytes(r);
     wl_columnar_memory_reservation_t pending;
@@ -4012,13 +4025,17 @@ insertion:
     }
 }
 
-/* Public sort entry point.  COW is performed outside the algorithm so the
- * direct range API and the all-row wrapper share the same borrowed-storage
- * contract.  A failed sort discards the private copy and restores the
- * original borrowed view. */
-int
-col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+/* COW is performed outside the algorithm so the direct range API and the
+ * all-row wrapper share the same borrowed-storage contract.  Consolidation
+ * can defer releasing the old canonical-owner lease until its complete
+ * mutation transaction has finished.  A failed sort discards the private
+ * copy and restores the original borrowed view. */
+static int
+col_rel_radix_sort_impl(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    bool defer_alias_release, bool *out_alias_release_pending)
 {
+    if (out_alias_release_pending)
+        *out_alias_release_pending = false;
     if (!r || start_row > r->nrows || nrows > r->nrows - start_row)
         return EINVAL;
     if (nrows <= 1)
@@ -4046,11 +4063,17 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         ledger_before = col_rel_owned_ledger_bytes(r);
         old_view = r->view_generation;
         old_storage = r->storage_generation;
-        if (col_rel_cow_unshare(r, 0) != 0) {
+        if (col_rel_cow_unshare_impl(r, 0, defer_alias_release) != 0) {
             free((void *)old_columns);
             free(old_shared);
             return ENOMEM;
         }
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+        if (defer_alias_release
+            && wl_columnar_consolidation_transition_hook)
+            wl_columnar_consolidation_transition_hook(r,
+                WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH);
+#endif
     }
 
     int rc = col_rel_radix_sort_raw(r, start_row, nrows);
@@ -4075,10 +4098,29 @@ col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
         /* The detach was rolled back; its storage epoch goes with it. */
         r->view_generation = old_view;
         r->storage_generation = old_storage;
+    } else if (borrowed && defer_alias_release
+        && out_alias_release_pending) {
+        *out_alias_release_pending = true;
     }
     free((void *)old_columns);
     free(old_shared);
     return rc;
+}
+
+int
+col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows)
+{
+    return col_rel_radix_sort_impl(r, start_row, nrows, false, NULL);
+}
+
+int
+col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row,
+    uint32_t nrows, bool *out_alias_release_pending)
+{
+    if (!out_alias_release_pending)
+        return EINVAL;
+    return col_rel_radix_sort_impl(r, start_row, nrows, true,
+               out_alias_release_pending);
 }
 
 /*

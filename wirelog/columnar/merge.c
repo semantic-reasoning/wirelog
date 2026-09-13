@@ -1293,10 +1293,32 @@ col_op_consolidate_incremental_delta_fail(col_rel_t *delta_out,
 }
 
 static int
+col_op_consolidate_incremental_delta_append_locked(col_rel_t *delta_out,
+    const int64_t *row, wl_columnar_source_access_writer_t *delta_writer,
+    bool *test_hook_called)
+{
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+    if (test_hook_called && !*test_hook_called
+        && wl_columnar_consolidation_transition_hook) {
+        *test_hook_called = true;
+        wl_columnar_consolidation_transition_hook(delta_out,
+            WL_COLUMNAR_CONSOLIDATION_TEST_APPEND_AFTER_DETACH);
+    }
+#else
+    (void)test_hook_called;
+#endif
+    return col_rel_append_row_locked(delta_out, row, delta_writer);
+}
+
+static int
 col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     col_rel_t *delta_out, int *out_fast_path,
-    wl_columnar_source_access_writer_t *delta_writer)
+    wl_columnar_source_access_writer_t *delta_writer,
+    bool *out_rel_alias_release_pending)
 {
+    if (!out_rel_alias_release_pending)
+        return EINVAL;
+    *out_rel_alias_release_pending = false;
     if (!wl_columnar_relation_float_values_valid(rel)
         || (delta_out && !wl_columnar_relation_float_values_valid(delta_out)))
         return EINVAL;
@@ -1305,6 +1327,7 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     uint32_t delta_initial_nrows = delta_out ? delta_out->nrows : 0;
     uint32_t nc = rel->ncols;
     uint32_t nr = rel->nrows;
+    bool delta_append_hook_called = false;
 
     if (nr == 0 || old_nrows >= nr) {
         if (out_fast_path)
@@ -1317,7 +1340,8 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
     /* Phase 1: sort only the new delta rows using radix sort.  Sorting can
      * allocate permutation buffers, so do not continue with an unsorted
      * source if admission fails. */
-    int sort_rc = col_rel_radix_sort(rel, old_nrows, delta_count);
+    int sort_rc = col_rel_radix_sort_deferred(rel, old_nrows, delta_count,
+            out_rel_alias_release_pending);
     if (sort_rc != 0)
         return col_op_consolidate_incremental_delta_fail(delta_out,
                    delta_initial_nrows, sort_rc);
@@ -1371,8 +1395,9 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             for (uint32_t k = 0; k < d_unique; k++) {
                 for (uint32_t c = 0; c < nc; c++)
                     dr[c] = rel->columns[c][old_nrows + k];
-                int rc = col_rel_append_row_locked(delta_out, dr,
-                        delta_writer);
+                int rc = col_op_consolidate_incremental_delta_append_locked(
+                    delta_out, dr, delta_writer,
+                    &delta_append_hook_called);
                 if (rc != 0) {
                     col_row_buf_release(&drb);
                     return col_op_consolidate_incremental_delta_fail(
@@ -1439,8 +1464,10 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
                 if (delta_out) {
                     for (uint32_t c = 0; c < nc; c++)
                         dr[c] = rel->columns[c][old_nrows + novel_count];
-                    int rc = col_rel_append_row_locked(delta_out, dr,
-                            delta_writer);
+                    int rc
+                        = col_op_consolidate_incremental_delta_append_locked(
+                            delta_out, dr, delta_writer,
+                            &delta_append_hook_called);
                     if (rc != 0) {
                         col_row_buf_release(&drb);
                         return col_op_consolidate_incremental_delta_fail(
@@ -1563,8 +1590,9 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
             if (delta_out) {
                 for (uint32_t c = 0; c < nc; c++)
                     delta_row[c] = merged_cols[c][out];
-                int rc = col_rel_append_row_locked(delta_out, delta_row,
-                        delta_writer);
+                int rc = col_op_consolidate_incremental_delta_append_locked(
+                    delta_out, delta_row, delta_writer,
+                    &delta_append_hook_called);
                 if (rc != 0) {
                     col_row_buf_release(&delta_rb);
                     return col_op_consolidate_incremental_delta_fail(
@@ -1586,8 +1614,9 @@ col_op_consolidate_incremental_delta_impl(col_rel_t *rel, uint32_t old_nrows,
         if (delta_out) {
             for (uint32_t c = 0; c < nc; c++)
                 delta_row[c] = merged_cols[c][out];
-            int rc = col_rel_append_row_locked(delta_out, delta_row,
-                    delta_writer);
+            int rc = col_op_consolidate_incremental_delta_append_locked(
+                delta_out, delta_row, delta_writer,
+                &delta_append_hook_called);
             if (rc != 0) {
                 col_row_buf_release(&delta_rb);
                 return col_op_consolidate_incremental_delta_fail(
@@ -1647,6 +1676,8 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     wl_columnar_source_access_writer_t *delta_writer_ptr = NULL;
     bool rel_acquired = false;
     bool delta_acquired = false;
+    bool rel_alias_release_pending = false;
+    bool delta_alias_release_pending = false;
     int rc;
 
     if (!wl_columnar_relation_float_values_valid(rel)
@@ -1707,15 +1738,28 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
         uint32_t delta_count = rel->nrows > old_nrows
             ? rel->nrows - old_nrows : 0;
         rc = col_rel_reserve_rows_locked(delta_out, delta_count,
-                delta_writer_ptr);
+                delta_writer_ptr, &delta_alias_release_pending);
         if (rc != 0)
             goto cleanup;
     }
 
     rc = col_op_consolidate_incremental_delta_impl(rel, old_nrows,
-            delta_out, out_fast_path, delta_writer_ptr);
+            delta_out, out_fast_path, delta_writer_ptr,
+            &rel_alias_release_pending);
 
 cleanup:
+    /* Keep each old canonical-owner gate closed until every mutation is
+     * complete, then end the deferred aliases before releasing its writer. */
+    if (delta_alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(delta_out);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
+    if (rel_alias_release_pending) {
+        int alias_rc = col_rel_storage_alias_release(rel);
+        if (alias_rc != 0 && rc == 0)
+            rc = alias_rc;
+    }
     if (delta_acquired
         && wl_columnar_source_access_writer_release(&delta_writer) != 0
         && rc == 0)

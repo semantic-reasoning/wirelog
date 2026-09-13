@@ -510,6 +510,18 @@ typedef void (*wl_columnar_set_transition_hook_t)(col_rel_t *);
 extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #endif
 
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+/* Test-only probes for the two consolidation COW windows. */
+typedef enum wl_columnar_consolidation_test_stage {
+    WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH = 1,
+    WL_COLUMNAR_CONSOLIDATION_TEST_APPEND_AFTER_DETACH = 2
+} wl_columnar_consolidation_test_stage_t;
+typedef void (*wl_columnar_consolidation_transition_hook_t)(col_rel_t *,
+    wl_columnar_consolidation_test_stage_t);
+extern wl_columnar_consolidation_transition_hook_t
+    wl_columnar_consolidation_transition_hook;
+#endif
+
 /* MSVC in its default C mode neither defines __STDC_VERSION__ >= 201112L
  * nor accepts offsetof() inside _Static_assert (C2059); mirror the guard
  * used by diff_trace.c so the layout contract is still checked everywhere
@@ -2220,7 +2232,8 @@ col_rel_append_row_locked(col_rel_t *r, const int64_t *row,
     wl_columnar_source_access_writer_t *writer);
 int
 col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
-    wl_columnar_source_access_writer_t *writer);
+    wl_columnar_source_access_writer_t *writer,
+    bool *out_alias_release_pending);
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
 int
@@ -2303,6 +2316,12 @@ wl_columnar_relation_radix_sort_rows_by_key_typed(int64_t *data,
  *  Phase C: permutation-apply uses col_rel_row_copy_out/in. */
 int
 col_rel_radix_sort(col_rel_t *r, uint32_t start_row, uint32_t nrows);
+
+/* Consolidation keeps the old canonical-owner alias lease through the full
+ * mutation transaction, releasing it from its centralized cleanup path. */
+int
+col_rel_radix_sort_deferred(col_rel_t *r, uint32_t start_row, uint32_t nrows,
+    bool *out_alias_release_pending);
 
 /* ======================================================================== */
 /* Cache & Materialized Join (columnar/cache.c)                             */

@@ -30,6 +30,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../wirelog/thread.h"
+
 /*
  * ArrowSchema stub: replicates the layout of struct ArrowSchema from
  * nanoarrow.h so that col_rel_t has the correct field offsets without
@@ -49,6 +51,164 @@ int
 col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     col_rel_t *delta_out,
     int *out_fast_path);
+
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+typedef struct consolidation_pause_state {
+    wl_mutex_t mutex;
+    wl_cond_t condition;
+    col_rel_t *expected_relation;
+    col_rel_t *expected_owner;
+    int64_t *old_columns;
+    uint32_t expected_nrows;
+    int64_t expected_values[4];
+    wl_columnar_consolidation_test_stage_t expected_stage;
+    bool hook_reached;
+    bool resume;
+    bool operation_done;
+    bool hook_state_ok;
+    int operation_rc;
+    int reader_rc;
+} consolidation_pause_state_t;
+
+static consolidation_pause_state_t *consolidation_pause_state;
+
+wl_columnar_consolidation_transition_hook_t
+    wl_columnar_consolidation_transition_hook;
+
+static void
+consolidation_pause_hook(col_rel_t *relation,
+    wl_columnar_consolidation_test_stage_t stage)
+{
+    consolidation_pause_state_t *state = consolidation_pause_state;
+    if (!state || wl_mutex_lock(&state->mutex) != 0)
+        return;
+    state->hook_state_ok = stage == state->expected_stage
+        && relation == state->expected_relation
+        && relation->storage_owner == state->expected_owner
+        && relation->col_shared == NULL
+        && relation->columns[0] != state->old_columns
+        && relation->nrows == state->expected_nrows
+        && state->expected_owner->storage_alias_borrows > 0;
+    for (uint32_t i = 0; state->hook_state_ok && i < relation->nrows; i++)
+        state->hook_state_ok = relation->columns[0][i]
+            == state->expected_values[i];
+    state->hook_reached = true;
+    (void)wl_cond_broadcast(&state->condition);
+    while (!state->resume)
+        if (wl_cond_wait(&state->condition, &state->mutex) != 0)
+            break;
+    (void)wl_mutex_unlock(&state->mutex);
+}
+
+typedef struct consolidation_operation {
+    consolidation_pause_state_t *state;
+    col_rel_t *rel;
+    uint32_t old_nrows;
+    col_rel_t *delta_out;
+} consolidation_operation_t;
+
+static void *
+consolidation_operation_thread(void *opaque)
+{
+    consolidation_operation_t *operation = opaque;
+    consolidation_pause_state_t *state = operation->state;
+    state->operation_rc = col_op_consolidate_incremental_delta(
+        operation->rel, operation->old_nrows, operation->delta_out, NULL);
+    if (wl_mutex_lock(&state->mutex) == 0) {
+        state->operation_done = true;
+        (void)wl_cond_broadcast(&state->condition);
+        (void)wl_mutex_unlock(&state->mutex);
+    }
+    return NULL;
+}
+
+static bool
+run_consolidation_during_pause(col_rel_t *rel, uint32_t old_nrows,
+    col_rel_t *delta_out, col_rel_t *expected_relation,
+    col_rel_t *expected_owner, wl_columnar_consolidation_test_stage_t stage,
+    const int64_t *expected_values, uint32_t expected_nrows,
+    int64_t *old_columns, int *out_reader_rc, int *out_operation_rc,
+    bool *out_hook_state_ok)
+{
+    consolidation_pause_state_t state = { 0 };
+    consolidation_operation_t operation = { &state, rel, old_nrows,
+                                            delta_out };
+    wl_thread_t operation_thread;
+    bool mutex_ready = false;
+    bool cond_ready = false;
+    bool thread_ready = false;
+    bool reached;
+
+    if (wl_mutex_init(&state.mutex) != 0)
+        goto cleanup;
+    mutex_ready = true;
+    if (wl_cond_init(&state.condition) != 0)
+        goto cleanup;
+    cond_ready = true;
+    state.expected_relation = expected_relation;
+    state.expected_owner = expected_owner;
+    state.old_columns = old_columns;
+    state.expected_nrows = expected_nrows;
+    state.expected_stage = stage;
+    for (uint32_t i = 0; i < expected_nrows; i++)
+        state.expected_values[i] = expected_values[i];
+    consolidation_pause_state = &state;
+    wl_columnar_consolidation_transition_hook = consolidation_pause_hook;
+    if (wl_thread_create(&operation_thread, consolidation_operation_thread,
+        &operation) != 0)
+        goto cleanup;
+    thread_ready = true;
+
+    if (wl_mutex_lock(&state.mutex) != 0)
+        goto cleanup;
+    while (!state.hook_reached && !state.operation_done)
+        if (wl_cond_wait(&state.condition, &state.mutex) != 0)
+            break;
+    reached = state.hook_reached;
+    (void)wl_mutex_unlock(&state.mutex);
+
+    if (reached) {
+        wl_columnar_source_access_reader_t reader = { 0 };
+        state.reader_rc = col_rel_source_reader_acquire(expected_relation,
+                &reader);
+        if (state.reader_rc == 0)
+            (void)col_rel_source_reader_release(&reader);
+        if (wl_mutex_lock(&state.mutex) == 0) {
+            state.resume = true;
+            (void)wl_cond_broadcast(&state.condition);
+            (void)wl_mutex_unlock(&state.mutex);
+        }
+    }
+    if (thread_ready) {
+        (void)wl_thread_join(&operation_thread);
+        thread_ready = false;
+    }
+
+    if (out_reader_rc)
+        *out_reader_rc = reached ? state.reader_rc : EINVAL;
+    if (out_operation_rc)
+        *out_operation_rc = state.operation_rc;
+    if (out_hook_state_ok)
+        *out_hook_state_ok = reached && state.hook_state_ok;
+
+cleanup:
+    if (thread_ready) {
+        if (wl_mutex_lock(&state.mutex) == 0) {
+            state.resume = true;
+            (void)wl_cond_broadcast(&state.condition);
+            (void)wl_mutex_unlock(&state.mutex);
+        }
+        (void)wl_thread_join(&operation_thread);
+    }
+    wl_columnar_consolidation_transition_hook = NULL;
+    consolidation_pause_state = NULL;
+    if (cond_ready)
+        wl_cond_destroy(&state.condition);
+    if (mutex_ready)
+        wl_mutex_destroy(&state.mutex);
+    return out_reader_rc && out_operation_rc && out_hook_state_ok;
+}
+#endif
 
 /* ----------------------------------------------------------------
  * Test framework  (matches wirelog convention: test_workqueue.c)
@@ -968,6 +1128,101 @@ test_source_exclusion_is_transactional(void)
     PASS();
 }
 
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+static void
+test_shared_source_reader_excluded_through_sort(void)
+{
+    TEST("shared source keeps owner writer through detach and radix sort");
+
+    col_rel_t *owner = test_rel_alloc(1);
+    col_rel_t *rel = test_rel_alloc(1);
+    ASSERT(owner && rel, "allocate shared source relations");
+    int64_t values[] = { 10, 30, 20 };
+    for (uint32_t i = 0; i < 3; i++)
+        ASSERT(test_rel_append_row(owner, &values[i]) == 0,
+            "append shared source row");
+    ASSERT(col_rel_install_shared_view(rel, owner) == 0,
+        "install shared source view");
+    int64_t *old_columns = rel->columns[0];
+    int reader_rc = EINVAL;
+    int operation_rc = EINVAL;
+    bool hook_state_ok = false;
+    ASSERT(run_consolidation_during_pause(rel, 1, NULL, rel, owner,
+        WL_COLUMNAR_CONSOLIDATION_TEST_SORT_AFTER_DETACH, values, 3,
+        old_columns, &reader_rc, &operation_rc, &hook_state_ok),
+        "run source consolidation with deterministic pause");
+    ASSERT(hook_state_ok && reader_rc == EBUSY,
+        "source reader is excluded after detach and before sort");
+    ASSERT(operation_rc == 0 && rel->nrows == 3
+        && rel->storage_owner == rel && owner->storage_alias_borrows == 0,
+        "source consolidation commits and releases deferred alias");
+    ASSERT(test_rel_is_sorted(rel) && test_rel_is_unique(rel)
+        && rel->columns[0][0] == 10
+        && rel->columns[0][1] == 20
+        && rel->columns[0][2] == 30,
+        "detached source rows sort and consolidate correctly");
+    ASSERT(owner->columns[0] == old_columns
+        && owner->columns[0][0] == 10
+        && owner->columns[0][1] == 30
+        && owner->columns[0][2] == 20,
+        "canonical source owner remains unchanged");
+    wl_columnar_source_access_reader_t reader = { 0 };
+    ASSERT(col_rel_source_reader_acquire(rel, &reader) == 0
+        && col_rel_source_reader_release(&reader) == 0,
+        "source reader succeeds after consolidation cleanup");
+    test_rel_free(rel);
+    test_rel_free(owner);
+    PASS();
+}
+
+static void
+test_shared_delta_reader_excluded_through_append(void)
+{
+    TEST("shared delta keeps owner writer through post-detach append");
+
+    col_rel_t *rel = test_rel_alloc(1);
+    col_rel_t *owner = test_rel_alloc(1);
+    col_rel_t *delta_out = test_rel_alloc(1);
+    ASSERT(rel && owner && delta_out, "allocate shared delta relations");
+    int64_t values[] = { 2, 1 };
+    ASSERT(test_rel_append_row(rel, &values[0]) == 0
+        && test_rel_append_row(rel, &values[1]) == 0,
+        "append source delta rows");
+    ASSERT(col_rel_install_shared_view(delta_out, owner) == 0,
+        "install shared delta output view");
+    ASSERT(delta_out->capacity > delta_out->nrows,
+        "shared delta view has spare capacity");
+    int64_t *old_columns = delta_out->columns[0];
+    int reader_rc = EINVAL;
+    int operation_rc = EINVAL;
+    bool hook_state_ok = false;
+    ASSERT(run_consolidation_during_pause(rel, 0, delta_out, delta_out,
+        owner, WL_COLUMNAR_CONSOLIDATION_TEST_APPEND_AFTER_DETACH,
+        NULL, 0, old_columns, &reader_rc, &operation_rc, &hook_state_ok),
+        "run delta consolidation with deterministic pause");
+    ASSERT(hook_state_ok && reader_rc == EBUSY,
+        "delta reader is excluded at the first post-detach append");
+    ASSERT(operation_rc == 0 && delta_out->nrows == 2
+        && delta_out->storage_owner == delta_out
+        && owner->storage_alias_borrows == 0,
+        "delta consolidation commits and releases deferred alias");
+    ASSERT(test_rel_is_sorted(delta_out) && test_rel_is_unique(delta_out)
+        && delta_out->columns[0][0] == 1
+        && delta_out->columns[0][1] == 2,
+        "delta output rows are correct and ordered");
+    ASSERT(owner->nrows == 0 && owner->columns[0] == old_columns,
+        "canonical delta owner remains unchanged");
+    wl_columnar_source_access_reader_t reader = { 0 };
+    ASSERT(col_rel_source_reader_acquire(delta_out, &reader) == 0
+        && col_rel_source_reader_release(&reader) == 0,
+        "delta reader succeeds after consolidation cleanup");
+    test_rel_free(delta_out);
+    test_rel_free(owner);
+    test_rel_free(rel);
+    PASS();
+}
+#endif
+
 /* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
@@ -997,6 +1252,10 @@ main(void)
     test_fastpath_counter_null_safe();
     test_initialized_zero_column_relation();
     test_source_exclusion_is_transactional();
+#ifdef WL_TEST_CONSOLIDATE_HOOK
+    test_shared_source_reader_excluded_through_sort();
+    test_shared_delta_reader_excluded_through_append();
+#endif
 
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n", pass_count,
         fail_count, test_count);
