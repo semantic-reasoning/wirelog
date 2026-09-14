@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **114**).
+match the script's count (currently **116**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -468,7 +468,8 @@ gate and token state unchanged.
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 
-21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 + 12 = **114 atomic call sites**.
+21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 + 12 = **114 atomic call sites**
+through the inactive source gate.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -487,6 +488,23 @@ discards a CR from a CRLF copy of this document, and the strip is applied
 to both inputs so neither depends on the other's shape.
 `scripts/ci/test-threading-doc.sh` covers the CRLF inventory case through
 a stub helper.
+
+### 5.14 `wirelog/columnar/relation.c` — session shared-view lease upgrade (2 rows)
+
+Session-managed shared-view refresh may replace destination descriptors, so
+the destination owner's source gate must exclude concurrent readers. When the
+session lends its own transferable lifetime lease, the sole reader is
+atomically upgraded to the writer sentinel and restored after publication;
+additional readers make the upgrade fail without changing the gate. The
+release store restores the session's lifetime protection even when preparing
+the replacement fails.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Upgrade exactly the session's sole transferable destination-owner reader; reject additional readers before replacing descriptors |
+| `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_store_explicit` | release | Restore the session lifetime reader after publication or preparation failure |
+
+The complete source audit now contains **116 atomic call sites**.
 
 ---
 
