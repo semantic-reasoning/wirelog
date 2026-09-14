@@ -3822,7 +3822,19 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     bool old_reservation_moved = false;
     bool has_new_reservation;
 
+    /* Preparation establishes all fallible invariants.  Publication is a
+     * no-fail operation: callers must not attempt to roll it back after the
+     * destination has been replaced. */
+    assert(dst && replacement && replacement->staged
+        && replacement->writer_acquired
+        && replacement->writer.owner == &dst->source_access
+        && wl_columnar_source_access_writer_thread_equal(
+            &replacement->writer));
     staged = replacement->staged;
+    assert(staged->nrows <= staged->capacity
+        && dst->view_generation < WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        && dst->storage_generation < WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        && col_rel_replacement_old_reservation_valid(dst));
 
     has_new_reservation = replacement->reservation_active;
     wl_columnar_memory_reservation_init(&old_reservation);
@@ -3830,6 +3842,8 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     if (dst->retained_reserved_bytes > 0) {
         if (!wl_columnar_memory_reservation_move(&old_reservation,
             &dst->retained_reservation)) {
+            assert(false
+                && "prepared old reservation must be movable");
             abort();
         }
         old_reservation_moved = true;
@@ -3843,28 +3857,17 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
             if (!restored)
                 abort();
         }
+        assert(false && "prepared new reservation must be movable");
         abort();
     }
-    if (old_reservation_moved
-        && !wl_columnar_memory_release(&old_reservation)) {
-        if (has_new_reservation) {
-            bool restored_new = wl_columnar_memory_reservation_move(
-                &replacement->reservation, &new_reservation);
-            if (!restored_new)
-                abort();
-        }
-        {
-            bool restored_old = wl_columnar_memory_reservation_move(
-                &dst->retained_reservation, &old_reservation);
-            if (!restored_old)
-                abort();
-        }
-        abort();
-    }
-
     /* All fallible admission/token operations are complete.  From here to
      * publication there are no allocations or reservation moves. */
     old = *dst;
+    /* A structure snapshot copies the reservation's self-identity.  It is
+     * only the old relation payload that is freed below, so give that
+     * temporary relation an initialized empty token instead of retaining a
+     * copied identity that points back into dst. */
+    wl_columnar_memory_reservation_init(&old.retained_reservation);
     name = old.name;
     staged_name = staged->name;
     ledger = old.mem_ledger;
@@ -3878,16 +3881,27 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
             memory_order_acquire);
     reserved_bytes = has_new_reservation ? replacement->reserved_bytes : 0;
 
-    *dst = *staged;
+    if (has_new_reservation
+        && !wl_columnar_memory_reservation_move(
+            &dst->retained_reservation, &new_reservation))
+        abort();
+
+    /* Copy only the staged payload ranges. Relation identity, memory and
+     * source-access ownership live in the gaps and must remain coordinator
+     * owned; copying the whole descriptor would also copy embedded tokens. */
+    memcpy((unsigned char *)dst + offsetof(col_rel_t, ncols),
+        (const unsigned char *)staged + offsetof(col_rel_t, ncols),
+        offsetof(col_rel_t, pool_owned) - offsetof(col_rel_t, ncols));
+    dst->arena_owned = staged->arena_owned;
+    memcpy((unsigned char *)dst + offsetof(col_rel_t, row_scratch),
+        (const unsigned char *)staged + offsetof(col_rel_t, row_scratch),
+        offsetof(col_rel_t, relation_identity)
+        - offsetof(col_rel_t, row_scratch));
+
     dst->name = name;
     dst->pool_owned = old.pool_owned;
     dst->mem_ledger = ledger;
     dst->memory_governor = governor;
-    wl_columnar_memory_reservation_init(&dst->retained_reservation);
-    if (has_new_reservation
-        && !wl_columnar_memory_reservation_move(&dst->retained_reservation,
-        &new_reservation))
-        abort();
     dst->retained_reserved_bytes = reserved_bytes;
     dst->ledger_ts_bytes = ledger_ts_bytes;
     dst->relation_identity = identity;
@@ -3921,8 +3935,22 @@ col_rel_commit_replacement_locked(col_rel_t *dst,
     col_rel_storage_owner_init(&old);
     col_rel_free_contents(&old);
 
+    /* Keep the old admission live until its buffers have actually been
+     * freed. Releasing it before col_rel_free_contents() would let another
+     * admission consume budget while those bytes were still resident. */
+    if (old_reservation_moved) {
+        bool released = wl_columnar_memory_release(&old_reservation);
+        assert(released && "old reservation release must succeed");
+        if (!released)
+            abort();
+    }
+
     release_rc = wl_columnar_source_access_writer_release(
         &replacement->writer);
+    /* The token is valid for the whole publication.  A release error can
+     * only indicate an internal contract violation after state was already
+     * published; it is therefore diagnostic, never a commit failure. */
+    assert(release_rc == 0);
     (void)release_rc;
     replacement->writer_acquired = false;
 }

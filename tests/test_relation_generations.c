@@ -2876,6 +2876,7 @@ test_staged_replacement_contract(void)
     {
         wl_columnar_memory_resolution_t resolution = { 0 };
         wl_columnar_memory_governor_ref_t *ref;
+        uint64_t reserved_before;
         uint64_t reserved_after;
 
         resolution.budget_bytes = 4096u;
@@ -2888,18 +2889,39 @@ test_staged_replacement_contract(void)
         candidate = new_relation();
         CHECK(ref && dst && candidate, "replacement admission setup");
         CHECK(col_rel_attach_memory_governor(dst, ref) == 0
-            && col_rel_append_row(dst, &old_value) == 0
-            && col_rel_append_row(candidate, &new_value) == 0,
+            && col_rel_append_row(dst, &old_value) == 0,
             "replacement admission rows");
+        reserved_before = dst->retained_reserved_bytes;
+        for (uint32_t row = 0; row < 64u; row++)
+            CHECK(col_rel_append_row(candidate, &new_value) == 0,
+                "replacement candidate grows beyond old reservation");
         CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
             "replacement admission prepare");
         col_rel_commit_replacement_locked(dst, &replacement);
         reserved_after = col_rel_transport_bytes(dst);
-        CHECK(dst->retained_reserved_bytes == reserved_after
+        CHECK(reserved_after > reserved_before
+            && dst->retained_reserved_bytes == reserved_after
+            && dst->retained_reservation.identity
+            == &dst->retained_reservation
             && wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(ref)) == reserved_after,
-            "replacement preserves memory admission accounting");
+            "replacement increases reservation without losing token identity");
+
+        candidate = track_relation(col_rel_new_auto("generation_test", 0));
+        CHECK(candidate, "zero-byte replacement candidate setup");
+        CHECK(col_rel_prepare_replacement(dst, candidate, &replacement) == 0,
+            "zero-byte replacement prepare");
+        col_rel_commit_replacement_locked(dst, &replacement);
+        CHECK(dst->retained_reserved_bytes == 0
+            && dst->retained_reservation.identity
+            == &dst->retained_reservation
+            && wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "zero-byte replacement releases old reservation");
         cleanup_relations();
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(ref)) == 0,
+            "replacement destruction releases final reservation");
         if (ref)
             wl_columnar_memory_governor_ref_release(ref);
     }

@@ -29,16 +29,12 @@
 #if defined(_MSC_VER)
 #define WL_COLUMNAR_EVAL_NOINLINE __declspec(noinline)
 #define WL_COLUMNAR_EVAL_COLD
-#define WL_COLUMNAR_EVAL_TXN_TEXT
 #elif defined(__GNUC__) || defined(__clang__)
 #define WL_COLUMNAR_EVAL_NOINLINE __attribute__((noinline))
 #define WL_COLUMNAR_EVAL_COLD __attribute__((cold))
-#define WL_COLUMNAR_EVAL_TXN_TEXT __attribute__((noipa, used, \
-            section(".wirelog_tdd_txn")))
 #else
 #define WL_COLUMNAR_EVAL_NOINLINE
 #define WL_COLUMNAR_EVAL_COLD
-#define WL_COLUMNAR_EVAL_TXN_TEXT
 #endif
 
 /* Only the standalone decision regression targets enable this wrapper. */
@@ -1969,31 +1965,10 @@ tdd_sort_dedup_candidate(col_rel_t *candidate)
         if (rc != 0)
             return rc;
     }
-
-    uint32_t out = 1;
-    for (uint32_t row = 1; row < candidate->nrows; row++) {
-        bool duplicate = true;
-        for (uint32_t col = 0; col < candidate->ncols; col++) {
-            if (candidate->columns[col][row - 1]
-                != candidate->columns[col][row]) {
-                duplicate = false;
-                break;
-            }
-        }
-        if (!duplicate) {
-            if (out != row)
-                col_columns_copy_row(candidate->columns, out,
-                    (int64_t *const *)candidate->columns, row,
-                    candidate->ncols);
-            if (candidate->timestamps)
-                candidate->timestamps[out] = candidate->timestamps[row];
-            out++;
-        }
-    }
-    candidate->nrows = out;
-    candidate->sorted_nrows = out;
-    wl_columnar_relation_touch_view(candidate);
-    return 0;
+    int rc = tdd_dedup_rel(candidate);
+    if (rc == 0)
+        candidate->sorted_nrows = candidate->nrows;
+    return rc;
 }
 
 #ifdef WL_TEST_BDX_SEED
@@ -2001,7 +1976,7 @@ static int bdx_seed_test_fail_worker = -1;
 static bool bdx_seed_test_fail_sort;
 #endif
 
-WL_COLUMNAR_EVAL_NOINLINE static int
+static int
 tdd_seed_bdx_coordinator_idb(col_rel_t *cidb, col_rel_t *const *worker_idbs,
     uint32_t worker_count)
 {
@@ -2197,7 +2172,7 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
  * separate relations independently, so a later relation failure does not
  * roll back an earlier relation's publication.
  */
-WL_COLUMNAR_EVAL_NOINLINE static int
+static int
 tdd_merge_relation_results(col_rel_t **target_io, const char *rel_name,
     col_rel_t *const *worker_rels, uint32_t worker_count)
 {
@@ -4498,7 +4473,7 @@ tdd_owner_stage_delta_candidate(col_rel_t *target, const char *name,
  * particular, worker delta slots are never removed before the transaction has
  * a complete private replacement for every relation. */
 WL_COLUMNAR_EVAL_NOINLINE WL_COLUMNAR_EVAL_COLD
-WL_COLUMNAR_EVAL_TXN_TEXT static int
+static int
 tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
     wl_col_session_t *coord, col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
     bool *out_any_accepted, uint32_t *out_accepted_rows)
