@@ -496,13 +496,13 @@ the destination owner's source gate must exclude concurrent readers. When the
 session lends its own transferable lifetime lease, the sole reader is
 atomically upgraded to the writer sentinel and restored after publication;
 additional readers make the upgrade fail without changing the gate. The
-release store restores the session's lifetime protection even when preparing
-the replacement fails.
+release exchange restores the session's lifetime protection even when
+preparing the replacement fails.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Upgrade exactly the session's sole transferable destination-owner reader; retry spurious failure and reject additional readers before replacing descriptors |
-| `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_store_explicit` | release | Restore the session lifetime reader after publication or preparation failure |
+| `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_exchange_explicit` | release | Atomically restore the session lifetime reader after publication or preparation failure; MSVC requires an interlocked operation under `/volatile:iso` |
 
 The complete source audit now contains **116 atomic call sites**.
 

@@ -19,10 +19,10 @@
 #      regression fails within minutes instead of ~24.
 #
 # The wiring half runs FIRST and needs only awk + the workflow file; the
-# behavioural half needs cc/size and is the only part that may skip (exit
-# 77).  This order guarantees the revert guard is always enforced even on a
-# host lacking a C toolchain, so a binutils-less runner cannot silently drop
-# the guard.  Invoked as `sh test-early-size-gate.sh <repo-root>` by the
+# behavioural half needs cc/size and platform-specific size tools, and is the
+# only part that may skip (exit 77). This order guarantees the revert guard is
+# always enforced even on a host lacking a C toolchain or supported binary
+# format. Invoked as `sh test-early-size-gate.sh <repo-root>` by the
 # meson test, so stay POSIX-sh clean: no `(( ))`, no arrays, no pipefail.
 set -eu
 
@@ -129,6 +129,25 @@ tssmoke=$(get ts smoke)
 assert 'tsan-native leg compiles the wirelog target' test -n "$tse"
 assert 'tsan-native leg does not full-compile the default set' test -z "$tsfull"
 assert 'tsan-native leg still runs the threading_doc smoke' test -n "$tssmoke"
+
+# The production size gate has format-aware readers only for ELF and Mach-O.
+# Keep enforcing the platform-independent wiring assertions above, but do not
+# pass those format-specific fixtures to MinGW or another unsupported toolchain.
+if [ "$failures" -gt 0 ]; then
+    printf 'test-early-size-gate: %s case(s) failed\n' "$failures" >&2
+    exit 1
+fi
+
+platform=$(uname -s)
+case "$platform" in
+    Linux|Darwin)
+        ;;
+    *)
+        printf 'test-early-size-gate: wiring OK; SKIP behavior half: unsupported platform %s\n' \
+            "$platform"
+        exit 77
+        ;;
+esac
 
 # --- 2. behaviour (needs cc/size/gate/baseline; the only part that may skip)
 gate="$root/scripts/ci/check-text-size.sh"
