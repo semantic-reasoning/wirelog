@@ -1245,6 +1245,19 @@ if sh.found()
        timeout: 120)
 endif
 
+# Issue #1573: the early binary-size gate and the scoped CI builds are pinned
+# by a self-test with the same two halves as #1303: the gate script's own
+# fail/pass paths are driven with real fixture libraries, and the workflow
+# wiring (step order + explicit target lines) is asserted, so a silent revert
+# of the workflow cannot leave the suite green.
+if sh.found()
+  test('early_size_gate', sh,
+       args: [meson.project_source_root() / 'scripts/ci/test-early-size-gate.sh',
+              meson.project_source_root()],
+       suite: 'abi',
+       timeout: 120)
+endif
+
 # Issue #750: the release workflow's signing and publication steps and the
 # published verifier must agree on identity, issuer and artifact naming, and
 # the signing step must stay behind the verification gate. The release workflow
