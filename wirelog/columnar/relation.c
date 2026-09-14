@@ -2774,10 +2774,12 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
          * even on preparation failure.  Keep the token intact for restoration
          * before the session either reuses or retires the old lease. */
         uint64_t expected = 1u;
-        lease_upgraded = atomic_compare_exchange_strong_explicit(
-            &destination_owner->source_access.state, &expected,
-            WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
-            memory_order_relaxed);
+        do {
+            lease_upgraded = atomic_compare_exchange_weak_explicit(
+                &destination_owner->source_access.state, &expected,
+                WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+                memory_order_relaxed);
+        } while (!lease_upgraded && expected == 1u);
         rc = lease_upgraded ? 0 : EBUSY;
     } else {
         /* Alias readers use the canonical owner's gate too.  Refreshing the

@@ -501,7 +501,7 @@ the replacement fails.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Upgrade exactly the session's sole transferable destination-owner reader; reject additional readers before replacing descriptors |
+| `relation.c:wl_columnar_relation_install_shared_view_with_lease` | `destination_owner->source_access.state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Upgrade exactly the session's sole transferable destination-owner reader; retry spurious failure and reject additional readers before replacing descriptors |
 | `relation.c:wl_columnar_relation_install_shared_view_with_lease#2` | `destination_owner->source_access.state` | `atomic_store_explicit` | release | Restore the session lifetime reader after publication or preparation failure |
 
 The complete source audit now contains **116 atomic call sites**.
