@@ -885,6 +885,11 @@ configures and compiles with `-Dthreads=native` plus
 `-Db_sanitize=thread`, then runs only a policy/documentation smoke. It
 does not execute the full runtime test suite under native C11 TSan.
 Runtime coverage for the native C11 backend comes from the ordinary
+non-TSan matrix.  Since #1573 the leg builds exactly the `wirelog`
+shared-library target -- the target that compiles and links
+`wirelog/thread_c11.c` under `-Dthreads=native` -- instead of the full
+default target set, so the documented compile/link coverage is preserved
+while the remaining targets' backend coverage stays with the ordinary
 non-TSan matrix.
 
 ### TSan coverage matrix

@@ -162,6 +162,32 @@ jobs:
       - name: Configure
         run: meson setup builddir -Dtests=true -DmbedTLS=disabled
 
+      # =======================================================================
+      # Early binary-size gate (Issue #1573; the gate itself is Issue #460's)
+      #
+      # Build ONLY the production shared library, then run the size gate
+      # immediately -- before the full build, the test suite, clang-tidy and
+      # the SBOM scan.  Before #1573 the gate ran last among the primary
+      # gates: in PR #1533, job 103174971875, the size failure arrived
+      # ~24 minutes after the job began.  Now a size regression fails this
+      # job within minutes of configuration.
+      #
+      # Nothing about the check itself changed: same step name, same script,
+      # same library artifact, same baseline (tests/baseline_size.txt) and
+      # same 5120-byte budget.  `meson compile -C builddir wirelog` builds
+      # exactly the `wirelog` target (verified on meson 1.12.0: 90 build
+      # steps, zero test artifacts), and the full Build step below reuses
+      # those objects.  Passing runs continue into every existing gate.
+      # =======================================================================
+      - name: Build production library for early size gate
+        run: |
+          early_start=$(date +%s)
+          meson compile -C builddir wirelog
+          echo "Early size-gate library build: $(( $(date +%s) - early_start ))s"
+
+      - name: Check binary size
+        run: scripts/ci/check-text-size.sh builddir/libwirelog.so
+
       - name: Build
         run: meson compile -C builddir
 
@@ -260,12 +286,6 @@ jobs:
             syft dir:. -o syft-json 2>/dev/null | jq -r '.artifacts[] | "\(.name)@\(.version // "unknown"):\((.licenses // [{}])[0].value // "NOASSERTION")"' | LC_ALL=C sort | head -20
             exit 1
           }
-
-      # =======================================================================
-      # Binary size regression gate (Issue #460)
-      # =======================================================================
-      - name: Check binary size
-        run: scripts/ci/check-text-size.sh builddir/libwirelog.so
 
       # =======================================================================
       # Path A example compile-check (Issue #462)
@@ -516,8 +536,18 @@ jobs:
         env:
           CC: gcc
 
+      # Scoped build (Issue #1573): this job's contract is the enabled-flag
+      # grep below, the two crypto tests and the metadata-free prefix
+      # discovery (which builds its own temp tree).  Both test targets
+      # compile backend_src -- including wirelog/columnar/expr.c, the
+      # WL_MBEDTLS_ENABLED consumer, a project-wide argument (meson.build)
+      # -- so compiling exactly those two targets preserves the
+      # crypto-compiler coverage this job uniquely asserts; the rest of the
+      # default target set is covered by the other jobs.  Verified on meson
+      # 1.12.0: `meson compile -C dir <target...>` builds only the named
+      # targets.
       - name: Build with mbedTLS enabled
-        run: meson compile -C builddir-mbedtls
+        run: meson compile -C builddir-mbedtls test_cryptographic_hashes test_symbol_digests
 
       - name: Verify enabled compile flag
         run: grep -R -- '-DWL_MBEDTLS_ENABLED=1' builddir-mbedtls/compile_commands.json
@@ -736,8 +766,17 @@ jobs:
         env:
           CC: sccache gcc
 
+      # Scoped build (Issue #1573): this leg's documented contract is that
+      # wirelog/thread_c11.c stays compiled and linked under -Dthreads=native
+      # plus -Db_sanitize=thread (docs/THREADING.md, section 11) and that the
+      # threading_doc policy smoke below runs.  Under native threads
+      # thread_c11.c is a source of the `wirelog` shared-library target, so
+      # compiling exactly that target preserves the documented compile/link
+      # coverage; the remaining default targets' backend coverage comes from
+      # the ordinary non-TSan matrix.  Verified on meson 1.12.0: `meson
+      # compile -C dir wirelog` builds only the library.
       - name: Build with TSan (native threads)
-        run: meson compile -C builddir-tsan-native
+        run: meson compile -C builddir-tsan-native wirelog
 
       - name: Policy smoke (native threads under TSan)
         run: |
