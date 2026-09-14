@@ -1949,12 +1949,12 @@ test_tdd_merge_schema_mismatch_rollback(void)
         side_target->compound_count = 0;
         side_target->inline_physical_offset = 0;
         side_target->compound_arity_map = (uint32_t *)malloc(
-                2 * sizeof(*side_target->compound_arity_map));
+            2 * sizeof(*side_target->compound_arity_map));
         side_worker->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
         side_worker->compound_count = 0;
         side_worker->inline_physical_offset = 0;
         side_worker->compound_arity_map = (uint32_t *)malloc(
-                2 * sizeof(*side_worker->compound_arity_map));
+            2 * sizeof(*side_worker->compound_arity_map));
         if (!side_target->compound_arity_map
             || !side_worker->compound_arity_map) {
             col_rel_destroy(side_target);
@@ -1983,7 +1983,7 @@ test_tdd_merge_schema_mismatch_rollback(void)
         capture_bdx_seed_snapshot(side_target, &snapshot);
         free(side_worker->compound_arity_map);
         side_worker->compound_arity_map = (uint32_t *)malloc(
-                sizeof(*side_worker->compound_arity_map));
+            sizeof(*side_worker->compound_arity_map));
         if (!side_worker->compound_arity_map) {
             col_rel_destroy(side_target);
             col_rel_destroy(side_worker);
@@ -1994,7 +1994,7 @@ test_tdd_merge_schema_mismatch_rollback(void)
         }
         side_worker->compound_arity_map[0] = 2;
         if (wl_columnar_eval_test_tdd_merge(&side_target, side_workers, 1)
-                != EINVAL
+            != EINVAL
             || !bdx_seed_snapshot_unchanged(side_target, &snapshot)
             || side_target->compound_arity_map[0] != 1
             || side_target->compound_arity_map[1] != 1) {

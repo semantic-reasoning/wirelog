@@ -460,6 +460,9 @@ test_apply_session_transaction(void)
             &out_rels, &out_cells);
     ASSERT(rc == 0 && out_rels == 3u && out_cells == 6u,
         "retry after reader release must remap all relations");
+    ASSERT(rels[0]->dedup_slots == NULL && rels[0]->dedup_cap == 0u
+        && rels[0]->dedup_count == 0u,
+        "successful transaction must invalidate relation dedup cache");
 
     PASS();
 cleanup:
