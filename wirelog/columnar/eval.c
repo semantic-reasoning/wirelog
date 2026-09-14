@@ -2153,7 +2153,7 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
         != actual->inline_physical_offset)
         return false;
 
-    if (expected->column_types && !actual->column_types)
+    if ((expected->column_types == NULL) != (actual->column_types == NULL))
         return false;
     if (expected->column_types) {
         for (uint32_t col = 0; col < expected->ncols; col++) {

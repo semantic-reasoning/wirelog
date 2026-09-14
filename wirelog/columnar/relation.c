@@ -20,6 +20,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(offsetof(col_rel_t, pool_owned)
+    == offsetof(col_rel_t, timestamps)
+    + sizeof(((col_rel_t *)0)->timestamps),
+    "replacement payload range must end before relation ownership fields");
+_Static_assert(offsetof(col_rel_t, row_scratch)
+    == offsetof(col_rel_t, ledger_ts_bytes)
+    + sizeof(((col_rel_t *)0)->ledger_ts_bytes),
+    "replacement payload range must start after ledger ownership fields");
+_Static_assert(offsetof(col_rel_t, relation_identity)
+    >= offsetof(col_rel_t, declared_ncols)
+    + sizeof(((col_rel_t *)0)->declared_ncols)
+    && offsetof(col_rel_t, relation_identity)
+    < offsetof(col_rel_t, declared_ncols)
+    + sizeof(((col_rel_t *)0)->declared_ncols) + _Alignof(uint64_t),
+    "replacement payload range must end before identity and access fields");
+#endif /* C11 _Static_assert */
+
 /* wl_atomic_u64 and the atomic_*_explicit shims come from mem_ledger.h
  * (via internal.h): C11 <stdatomic.h> elsewhere, _Interlocked* on MSVC,
  * which has no C11 atomics in its default C mode.  Relaxed ordering is

@@ -827,6 +827,7 @@ typedef struct {
     uint32_t capacity;
     int64_t **columns;
     char **col_names;
+    wirelog_column_type_t *column_types;
     col_delta_timestamp_t *timestamps;
     uint64_t view_generation;
     uint64_t storage_generation;
@@ -836,6 +837,7 @@ typedef struct {
     uint32_t dedup_cap;
     uint32_t dedup_count;
     int64_t first_row[2];
+    wirelog_column_type_t first_column_types[2];
     col_delta_timestamp_t first_timestamp;
 } bdx_seed_snapshot_t;
 
@@ -848,6 +850,11 @@ capture_bdx_seed_snapshot(const col_rel_t *rel, bdx_seed_snapshot_t *snapshot)
     snapshot->capacity = rel->capacity;
     snapshot->columns = rel->columns;
     snapshot->col_names = rel->col_names;
+    snapshot->column_types = rel->column_types;
+    if (rel->column_types && rel->ncols >= 2) {
+        snapshot->first_column_types[0] = rel->column_types[0];
+        snapshot->first_column_types[1] = rel->column_types[1];
+    }
     snapshot->timestamps = rel->timestamps;
     snapshot->view_generation = rel->view_generation;
     snapshot->storage_generation = rel->storage_generation;
@@ -873,6 +880,10 @@ bdx_seed_snapshot_unchanged(const col_rel_t *rel,
            && rel->capacity == snapshot->capacity
            && rel->columns == snapshot->columns
            && rel->col_names == snapshot->col_names
+           && rel->column_types == snapshot->column_types
+           && (!rel->column_types || rel->ncols < 2
+           || (rel->column_types[0] == snapshot->first_column_types[0]
+           && rel->column_types[1] == snapshot->first_column_types[1]))
            && rel->timestamps == snapshot->timestamps
            && rel->view_generation == snapshot->view_generation
            && rel->storage_generation == snapshot->storage_generation
@@ -1774,6 +1785,50 @@ test_tdd_merge_schema_mismatch_rollback(void)
     prepare_bdx_seed_metadata(target);
     capture_bdx_seed_snapshot(target, &snapshot);
 
+    /* Type metadata must be present on both sides or neither side. */
+    target->column_types = (wirelog_column_type_t *)malloc(
+        target->ncols * sizeof(*target->column_types));
+    if (!target->column_types) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("typed target setup");
+        return 1;
+    }
+    for (uint32_t col = 0; col < target->ncols; col++)
+        target->column_types[col] = WIRELOG_TYPE_INT64;
+    capture_bdx_seed_snapshot(target, &snapshot);
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("typed target with untyped worker changed target");
+        return 1;
+    }
+
+    free(target->column_types);
+    target->column_types = NULL;
+    worker->column_types = (wirelog_column_type_t *)malloc(
+        worker->ncols * sizeof(*worker->column_types));
+    if (!worker->column_types) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("typed worker setup");
+        return 1;
+    }
+    for (uint32_t col = 0; col < worker->ncols; col++)
+        worker->column_types[col] = WIRELOG_TYPE_INT64;
+    capture_bdx_seed_snapshot(target, &snapshot);
+    rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
+    if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("untyped target with typed worker changed target");
+        return 1;
+    }
+    free(worker->column_types);
+    worker->column_types = NULL;
+    capture_bdx_seed_snapshot(target, &snapshot);
+
     worker->declared_ncols = target->declared_ncols + 1;
     rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
     if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
@@ -1794,15 +1849,25 @@ test_tdd_merge_schema_mismatch_rollback(void)
     }
     worker->schema_ok = target->schema_ok;
 
-    free(worker->column_types);
+    target->column_types = (wirelog_column_type_t *)malloc(
+        target->ncols * sizeof(*target->column_types));
+    if (!target->column_types) {
+        col_rel_destroy(target);
+        col_rel_destroy(worker);
+        FAIL("column type mismatch target setup");
+        return 1;
+    }
+    for (uint32_t col = 0; col < target->ncols; col++)
+        target->column_types[col] = WIRELOG_TYPE_INT64;
     worker->column_types = (wirelog_column_type_t *)malloc(
         worker->ncols * sizeof(*worker->column_types));
     if (!worker->column_types) {
         col_rel_destroy(target);
         col_rel_destroy(worker);
-        FAIL("column type mismatch setup");
+        FAIL("column type mismatch worker setup");
         return 1;
     }
+    capture_bdx_seed_snapshot(target, &snapshot);
     for (uint32_t col = 0; col < worker->ncols; col++)
         worker->column_types[col] = WIRELOG_TYPE_FLOAT;
     rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
@@ -1814,6 +1879,9 @@ test_tdd_merge_schema_mismatch_rollback(void)
     }
     free(worker->column_types);
     worker->column_types = NULL;
+    free(target->column_types);
+    target->column_types = NULL;
+    capture_bdx_seed_snapshot(target, &snapshot);
 
     free(worker->col_names[0]);
     worker->col_names[0] = strdup("different");
