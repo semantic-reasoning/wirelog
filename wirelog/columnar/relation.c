@@ -2795,8 +2795,8 @@ wl_columnar_relation_install_shared_view_with_lease(col_rel_t *dst,
     }
     rc = col_rel_install_shared_view_unprotected(dst, src);
     if (lease_upgraded)
-        atomic_store_explicit(&destination_owner->source_access.state, 1u,
-            memory_order_release);
+        (void)atomic_exchange_explicit(&destination_owner->source_access.state,
+            1u, memory_order_release);
     if (writer.owner
         && wl_columnar_source_access_writer_release(&writer) != 0 && rc == 0)
         rc = EINVAL;
