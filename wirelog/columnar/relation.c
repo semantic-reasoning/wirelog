@@ -21,9 +21,13 @@
 #include <string.h>
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+/* timestamps is a pointer, so sizeof() on the member expression trips
+ * bugprone-sizeof-expression even though the storage size is exactly what
+ * the adjacency check needs.  Spell the pointer size directly; if the
+ * member ever stops being a pointer the assert fails loudly rather than
+ * silently measuring the wrong thing. */
 _Static_assert(offsetof(col_rel_t, pool_owned)
-    == offsetof(col_rel_t, timestamps)
-    + sizeof(((col_rel_t *)0)->timestamps),
+    == offsetof(col_rel_t, timestamps) + sizeof(col_delta_timestamp_t *),
     "replacement payload range must end before relation ownership fields");
 _Static_assert(offsetof(col_rel_t, row_scratch)
     == offsetof(col_rel_t, ledger_ts_bytes)

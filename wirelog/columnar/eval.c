@@ -1910,37 +1910,44 @@ tdd_bdx_sort_candidate(col_rel_t *candidate)
     if (!candidate->timestamps)
         return col_rel_radix_sort(candidate, 0, candidate->nrows);
 
-    original_columns = col_columns_alloc(candidate->ncols,
-            candidate->nrows);
+    /* The saved copies below are sized from the row and column counts as
+     * they are now.  The permutation search then indexes them while the
+     * relation itself has been through a sort, so bound every loop by the
+     * counts the buffers were built from rather than re-reading the
+     * relation's fields across that call. */
+    const uint32_t nrows = candidate->nrows;
+    const uint32_t ncols = candidate->ncols;
+
+    original_columns = col_columns_alloc(ncols, nrows);
     original_timestamps = (col_delta_timestamp_t *)malloc(
-        (size_t)candidate->nrows * sizeof(*original_timestamps));
-    used = (bool *)calloc(candidate->nrows, sizeof(*used));
+        (size_t)nrows * sizeof(*original_timestamps));
+    used = (bool *)calloc(nrows, sizeof(*used));
     if (!original_columns || !original_timestamps || !used) {
-        col_columns_free(original_columns, candidate->ncols);
+        col_columns_free(original_columns, ncols);
         free(original_timestamps);
         free(used);
         return ENOMEM;
     }
-    for (uint32_t col = 0; col < candidate->ncols; col++)
+    for (uint32_t col = 0; col < ncols; col++)
         memcpy(original_columns[col], candidate->columns[col],
-            (size_t)candidate->nrows * sizeof(**original_columns));
+            (size_t)nrows * sizeof(**original_columns));
     memcpy(original_timestamps, candidate->timestamps,
-        (size_t)candidate->nrows * sizeof(*original_timestamps));
+        (size_t)nrows * sizeof(*original_timestamps));
 
-    rc = col_rel_radix_sort(candidate, 0, candidate->nrows);
+    rc = col_rel_radix_sort(candidate, 0, nrows);
     if (rc != 0)
         goto cleanup;
-    for (uint32_t row = 0; row < candidate->nrows; row++) {
+    for (uint32_t row = 0; row < nrows; row++) {
         uint32_t source = 0;
-        for (; source < candidate->nrows; source++) {
+        for (; source < nrows; source++) {
             bool match = !used[source];
-            for (uint32_t col = 0; match && col < candidate->ncols; col++)
+            for (uint32_t col = 0; match && col < ncols; col++)
                 match = candidate->columns[col][row]
                     == original_columns[col][source];
             if (match)
                 break;
         }
-        if (source == candidate->nrows) {
+        if (source == nrows) {
             rc = EINVAL;
             goto cleanup;
         }
@@ -1949,7 +1956,7 @@ tdd_bdx_sort_candidate(col_rel_t *candidate)
     }
 
 cleanup:
-    col_columns_free(original_columns, candidate->ncols);
+    col_columns_free(original_columns, ncols);
     free(original_timestamps);
     free(used);
     return rc;
@@ -2128,13 +2135,20 @@ tdd_relation_schema_compatible(const col_rel_t *expected,
         != actual->inline_physical_offset)
         return false;
 
-    if ((expected->column_types == NULL) != (actual->column_types == NULL))
-        return false;
-    if (expected->column_types) {
-        for (uint32_t col = 0; col < expected->ncols; col++) {
-            if (expected->column_types[col] != actual->column_types[col])
-                return false;
-        }
+    /* An absent column_types array means every column is INT64: that is how
+     * every consumer reads it, testing the pointer before the element (see
+     * the FLOAT checks in internal.h and merge.c).  A relation that spells
+     * that out explicitly is therefore the same schema as one that leaves
+     * it implicit, and the TDD delta does spell it out while its
+     * coordinator IDB does not.  Compare effective types rather than the
+     * presence of the array, or that pairing is rejected as a mismatch. */
+    for (uint32_t col = 0; col < expected->ncols; col++) {
+        wirelog_column_type_t expected_type = expected->column_types
+            ? expected->column_types[col] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t actual_type = actual->column_types
+            ? actual->column_types[col] : WIRELOG_TYPE_INT64;
+        if (expected_type != actual_type)
+            return false;
     }
 
     if ((expected->col_names == NULL) != (actual->col_names == NULL))
@@ -2312,7 +2326,7 @@ tdd_merge_worker_results(const wl_plan_stratum_t *sp,
                 &coord->tdd_workers[w], rel_name);
         rc = tdd_merge_relation_results(&target, rel_name,
                 worker_rels, worker_count);
-        free(worker_rels);
+        free((void *)worker_rels);
         if (rc != 0)
             return rc;
         if (!session_find_rel(coord, rel_name)) {
@@ -4682,7 +4696,7 @@ tdd_owner_exchange_deltas(const wl_plan_stratum_t *sp,
         accepted_total = next_accepted_rows;
         any_accepted = any_accepted || accepted_rows > 0;
         exchange_ns += now_ns() - prepare_t0;
-        free(parts);
+        free((void *)parts);
         col_rel_destroy(combined);
         continue;
 
@@ -4691,7 +4705,7 @@ fail:
             for (uint32_t w = 0; w < W; w++)
                 col_rel_destroy(parts[w]);
         }
-        free(parts);
+        free((void *)parts);
         col_rel_destroy(combined);
         tdd_publish_entries_discard(entries, entry_count);
         tdd_destroy_delta_slots(ctxs, W, nrels);
@@ -5403,7 +5417,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     worker_idbs[w] = session_find_rel(
                         &coord->tdd_workers[w], sp->relations[ri].name);
                 rc = tdd_seed_bdx_coordinator_idb(cidb, worker_idbs, W);
-                free(worker_idbs);
+                free((void *)worker_idbs);
                 if (rc != 0) {
                     free(bdx_snap);
                     bdx_snap = NULL;

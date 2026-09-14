@@ -1785,7 +1785,13 @@ test_tdd_merge_schema_mismatch_rollback(void)
     prepare_bdx_seed_metadata(target);
     capture_bdx_seed_snapshot(target, &snapshot);
 
-    /* Type metadata must be present on both sides or neither side. */
+    /* An absent column_types array means every column is INT64 -- that is
+     * how every consumer reads it -- so spelling INT64 out explicitly on
+     * one side only is the same schema, not a mismatch.  A real mismatch
+     * needs a differing effective type.  These two cases use UINT64 rather
+     * than FLOAT: a FLOAT column over integer bit patterns is rejected by
+     * float validation as well, so the assertion would hold even with the
+     * type comparison removed and would pin nothing. */
     target->column_types = (wirelog_column_type_t *)malloc(
         target->ncols * sizeof(*target->column_types));
     if (!target->column_types) {
@@ -1795,13 +1801,13 @@ test_tdd_merge_schema_mismatch_rollback(void)
         return 1;
     }
     for (uint32_t col = 0; col < target->ncols; col++)
-        target->column_types[col] = WIRELOG_TYPE_INT64;
+        target->column_types[col] = WIRELOG_TYPE_UINT64;
     capture_bdx_seed_snapshot(target, &snapshot);
     rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
     if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
         col_rel_destroy(target);
         col_rel_destroy(worker);
-        FAIL("typed target with untyped worker changed target");
+        FAIL("uint64 target with implicit-int64 worker changed target");
         return 1;
     }
 
@@ -1816,13 +1822,13 @@ test_tdd_merge_schema_mismatch_rollback(void)
         return 1;
     }
     for (uint32_t col = 0; col < worker->ncols; col++)
-        worker->column_types[col] = WIRELOG_TYPE_INT64;
+        worker->column_types[col] = WIRELOG_TYPE_UINT64;
     capture_bdx_seed_snapshot(target, &snapshot);
     rc = wl_columnar_eval_test_tdd_merge(&target, workers, 1);
     if (rc != EINVAL || !bdx_seed_snapshot_unchanged(target, &snapshot)) {
         col_rel_destroy(target);
         col_rel_destroy(worker);
-        FAIL("untyped target with typed worker changed target");
+        FAIL("implicit-int64 target with uint64 worker changed target");
         return 1;
     }
     free(worker->column_types);

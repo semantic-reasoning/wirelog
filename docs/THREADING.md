@@ -286,6 +286,10 @@ throughput by 2-10x.
 | `relation.c:col_rel_new_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Read the candidate identity before the non-wrapping CAS reservation loop; the counter only has to hand out distinct values, no other memory is published through it |
 | `relation.c:col_rel_new_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique relation identity and retry with the observed value after a lost race; uniqueness comes from the RMW, not from ordering |
 | `relation.c:col_rel_test_set_next_identity` | `wl_next_relation_identity` | `atomic_store_explicit` | `relaxed` | Test-only seam for selecting the terminal allocator state; production allocation is not concurrent with this reset |
+| `relation.c:col_rel_install_shared_view_under_writer` | `writer->owner->state` | `atomic_load_explicit` | `acquire` | Confirm the caller's lease is still the live writer state before installing a shared view through it; a stale lease would publish a view over storage the gate no longer protects |
+| `relation.c:col_rel_replacement_old_reservation_valid` | `dst->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Observe the reservation's published state before deciding the old payload's admission can be carried across the replacement |
+| `relation.c:col_rel_commit_replacement_locked` | `old.source_access.state` | `atomic_load_explicit` | `acquire` | Capture the gate state of the relation being replaced so the commit can restore it onto the new payload |
+| `relation.c:col_rel_commit_replacement_locked#2` | `dst->source_access.state` | `atomic_store_explicit` | `release` | Publish the captured gate state together with the replaced payload, so a reader that observes the new state also observes the payload it guards |
 
 These are the sites in `wirelog/` that use the **non-explicit** atomic APIs
 (`atomic_load`/`atomic_store`); they default to `memory_order_seq_cst`.
@@ -440,7 +444,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 
 ### 5.12 Existing inventory total
 
-21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 = **102 atomic call sites**
+21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 7 = **106 atomic call sites**
 before the inactive source-access contract below.
 
 ### 5.13 `wirelog/columnar/source_access.h` — inactive source gate (12 rows)
@@ -467,8 +471,11 @@ gate and token state unchanged.
 | `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
+| `source_access.h:wl_columnar_source_access_reader_promote_to_writer` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Linearize the promotion of the sole transferable reader to the exclusive writer; strong because a spurious failure here would surface as a false EBUSY to the caller |
+| `source_access.h:wl_columnar_source_access_writer_downgrade_to_reader` | `gate->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Publish writer payload completion while handing the gate back to a transferable reader in one step, so no window admits another writer |
+| `source_access.h:wl_columnar_source_access_writer_retire_promoted_reader` | `gate->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Publish writer payload completion and retire the promoted reader's slot together, leaving the gate free |
 
-21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 + 12 = **114 atomic call sites**.
+21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 7 + 15 = **121 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
