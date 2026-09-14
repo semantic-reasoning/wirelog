@@ -1168,9 +1168,9 @@ col_rel_set_schema(col_rel_t *r, uint32_t ncols, const char *const *col_names)
         return EINVAL;
 
     /* Preserve the initialized-schema no-op even while other readers or
-     * storage aliases are live. The reader lease makes this check safe
-     * against a concurrent schema publisher; if initialization is still
-     * needed, drop it before entering the exclusive publication path. */
+    * storage aliases are live. The reader lease makes this check safe
+    * against a concurrent schema publisher; if initialization is still
+    * needed, drop it before entering the exclusive publication path. */
     rc = col_rel_source_reader_acquire(r, &reader);
     if (rc != 0)
         return rc;
