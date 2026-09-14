@@ -2261,7 +2261,7 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
     writers = (wl_columnar_source_access_writer_t *)calloc(nrels,
             sizeof(*writers));
     if (!owners || !writers) {
-        free(owners);
+        free((void *)owners);
         free(writers);
         /* Compaction is best-effort housekeeping.  If its temporary
          * bookkeeping cannot be allocated, preserve every relation and let
@@ -2303,10 +2303,22 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
         if (!rels[i] || rels[i]->ncols == 0)
             continue;
         col_rel_t *owner = NULL;
-        (void)col_rel_storage_owner_resolve(rels[i], &owner);
         uint32_t owner_idx = 0;
-        while (owners[owner_idx] != owner)
+        /* Re-resolve rather than caching the first pass's answer, but do
+         * not assume the result: if the owner changed or the resolve now
+         * fails, the writer held for it is not the right one, so fail
+         * instead of compacting under the wrong lease.  The search is
+         * bounded by owner_count -- an unbounded scan would run past the
+         * array whenever the owner is absent. */
+        rc = col_rel_storage_owner_resolve(rels[i], &owner);
+        if (rc != 0)
+            goto cleanup;
+        while (owner_idx < owner_count && owners[owner_idx] != owner)
             owner_idx++;
+        if (owner_idx == owner_count) {
+            rc = EBUSY;
+            goto cleanup;
+        }
         rc = col_rel_compact_impl(rels[i], &writers[owner_idx]);
         if (rc != 0)
             goto cleanup;
@@ -2320,7 +2332,7 @@ cleanup:
             rc = EINVAL;
     }
     free(writers);
-    free(owners);
+    free((void *)owners);
     return rc;
 }
 
