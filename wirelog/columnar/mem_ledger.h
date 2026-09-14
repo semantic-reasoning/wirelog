@@ -97,6 +97,11 @@ wl_atomic_compare_exchange_weak_internal(volatile __int64 *ptr,
         wl_atomic_compare_exchange_weak_internal(                              \
             (volatile __int64 *)(ptr), (uint64_t *)(expected), \
             (uint64_t)(desired))
+#define atomic_compare_exchange_strong_explicit(ptr, expected, desired,      \
+            succ_order, fail_order)        \
+        wl_atomic_compare_exchange_weak_internal(                              \
+            (volatile __int64 *)(ptr), (uint64_t *)(expected), \
+            (uint64_t)(desired))
 #define atomic_exchange_explicit(ptr, val, order) \
         _InterlockedExchange64((volatile __int64 *)(ptr), (__int64)(val))
 
