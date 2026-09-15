@@ -1639,9 +1639,7 @@ test_diff_arrangement_pin_lifetime(void)
     ASSERT_TRUE(col_session_free_diff_arrangements(s) == 0,
         "teardown succeeds after release");
 
-    col_rel_destroy(source);
-    free(s->rels);
-    free(s);
+    destroy_mock_session(s);
     PASS;
 }
 
