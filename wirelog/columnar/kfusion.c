@@ -415,12 +415,16 @@ cleanup:
      * range for the next K-Fusion dispatch. */
     if (sess->delta_pool) {
         delta_pool_t *dp = sess->delta_pool;
-        for (uint32_t s = pool_slot_base; s < dp->slot_used; s++) {
-            col_rel_t *pr = (col_rel_t *)(dp->slab
-                + (size_t)s * dp->slot_size);
-            col_rel_free_contents(pr);
-        }
-        dp->slot_used = pool_slot_base;
+        uint32_t slot_limit = dp->slot_used;
+        int alias_rc = col_rel_pool_destroy_aliases_checked(dp,
+                pool_slot_base, slot_limit);
+        int root_rc = col_rel_pool_destroy_roots_checked(dp,
+                pool_slot_base, slot_limit);
+        int cleanup_rc = alias_rc != 0 ? alias_rc : root_rc;
+        if (cleanup_rc == 0)
+            dp->slot_used = pool_slot_base;
+        else if (rc == 0)
+            rc = cleanup_rc;
     }
     free((void *)results);
     COL_SESSION(sess)->kfusion_cleanup_ns += now_ns() - _phase_t0;
@@ -891,18 +895,23 @@ cleanup_wq:
                 col_rel_destroy(worker_sess[d].filt_cache[i].filtered);
         }
         free(worker_sess[d].filt_cache);
-        /* Free contents of pool-allocated relations before bulk destroy.
-         * delta_pool_destroy frees the slab/arena but skips individually
-         * malloc'd members (name, columns, col_names) -- leaks under ASAN.
-         * col_rel_free_contents zeroes each slot, so already-destroyed
-         * relations (via mat_cache or results cleanup) are safe no-ops. */
+        /* These per-invocation sessions are quiescent after the workqueue
+         * join. Refusal here is an internal lifetime invariant violation;
+         * stop before releasing the backing pool rather than losing the
+         * retained aliases or freeing their owner storage. */
         {
             delta_pool_t *dp = worker_sess[d].delta_pool;
             if (dp) {
-                for (uint32_t s = 0; s < dp->slot_used; s++) {
-                    col_rel_t *pr = (col_rel_t *)(dp->slab
-                        + (size_t)s * dp->slot_size);
-                    col_rel_free_contents(pr);
+                int alias_rc = col_rel_pool_destroy_aliases_checked(dp, 0,
+                        dp->slot_used);
+                int root_rc = col_rel_pool_destroy_roots_checked(dp, 0,
+                        dp->slot_used);
+                int cleanup_rc = alias_rc != 0 ? alias_rc : root_rc;
+                if (cleanup_rc != 0) {
+                    fprintf(stderr,
+                        "wirelog: K-Fusion pool relation teardown failed "
+                        "(worker=%u, rc=%d)\n", d, cleanup_rc);
+                    abort();
                 }
             }
         }

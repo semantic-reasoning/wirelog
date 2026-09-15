@@ -1041,6 +1041,123 @@ test_radix_sort_with_workspace_owner_with_borrows_is_busy(void)
 }
 
 static void
+test_legacy_storage_owner_metadata_initialization(void)
+{
+    col_rel_t *rel = new_relation();
+    wl_columnar_source_access_reader_t reader = { 0 };
+
+    CHECK(rel != NULL, "legacy metadata relation allocation");
+    rel->storage_owner = NULL;
+    rel->storage_owner_identity = 0;
+    rel->storage_owner_generation = 0;
+    CHECK(col_rel_source_reader_acquire(rel, &reader) == 0,
+        "legacy owner metadata initializes before reader publication");
+    CHECK(rel->storage_owner == rel
+        && rel->storage_owner_identity == rel->relation_identity
+        && rel->storage_owner_generation == rel->storage_generation,
+        "legacy relation gets canonical owner metadata");
+    CHECK(col_rel_source_reader_release(&reader) == 0,
+        "legacy source reader releases");
+    CHECK(col_rel_destroy_checked(rel) == 0,
+        "legacy initialized relation destroys cleanly");
+    owned_relation_count--;
+}
+
+typedef struct alias_borrow_reader_args {
+    col_rel_t *owner;
+    atomic_bool ready;
+    atomic_bool stop;
+    atomic_bool accounting_active;
+    atomic_uint_fast64_t reads_during_accounting;
+    int rc;
+} alias_borrow_reader_args_t;
+
+static void *
+read_alias_borrows_while_peer_lease_is_active(void *opaque)
+{
+    alias_borrow_reader_args_t *args = (alias_borrow_reader_args_t *)opaque;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    args->rc = col_rel_source_reader_acquire(args->owner, &reader);
+    atomic_store_explicit(&args->ready, true, memory_order_release);
+    if (args->rc != 0)
+        return NULL;
+
+    while (!atomic_load_explicit(&args->stop, memory_order_acquire)) {
+        uint64_t borrow_count
+            = col_rel_storage_alias_borrow_count(args->owner);
+        (void)borrow_count;
+        if (atomic_load_explicit(&args->accounting_active,
+            memory_order_acquire)) {
+            atomic_fetch_add_explicit(&args->reads_during_accounting, 1,
+                memory_order_relaxed);
+        }
+    }
+    args->rc = col_rel_source_reader_release(&reader);
+    return NULL;
+}
+
+static void
+test_peer_reader_alias_accounting_is_race_safe(void)
+{
+    enum { ACCOUNTING_ROUNDS = 2048 };
+    col_rel_t *owner = new_relation();
+    wl_thread_t reader_thread;
+    alias_borrow_reader_args_t args = { .owner = owner };
+    bool thread_started = false;
+    bool ok = owner != NULL;
+
+    CHECK(ok, "peer-reader alias owner allocation");
+    atomic_init(&args.ready, false);
+    atomic_init(&args.stop, false);
+    atomic_init(&args.accounting_active, false);
+    atomic_init(&args.reads_during_accounting, 0);
+    if (wl_thread_create(&reader_thread,
+        read_alias_borrows_while_peer_lease_is_active, &args) != 0) {
+        cleanup_relations();
+        CHECK(false, "peer-reader thread creation");
+        return;
+    }
+    thread_started = true;
+    while (!atomic_load_explicit(&args.ready, memory_order_acquire)) {
+    }
+    if (args.rc != 0)
+        ok = false;
+
+    for (uint32_t i = 0; ok && i < ACCOUNTING_ROUNDS; i++) {
+        col_rel_t *alias = col_rel_new_auto("borrow-race-alias", 1);
+        if (!alias) {
+            ok = false;
+            break;
+        }
+        atomic_store_explicit(&args.accounting_active, true,
+            memory_order_release);
+        int rc = col_rel_install_shared_view(alias, owner);
+        if (rc == 0)
+            rc = col_rel_destroy_checked(alias);
+        if (rc != 0) {
+            col_rel_destroy(alias);
+            ok = false;
+        }
+        atomic_store_explicit(&args.accounting_active, false,
+            memory_order_release);
+        if (owner->storage_alias_borrows != 0)
+            ok = false;
+    }
+
+    if (thread_started) {
+        atomic_store_explicit(&args.stop, true, memory_order_release);
+        if (wl_thread_join(&reader_thread) != 0)
+            ok = false;
+    }
+    ok = ok && args.rc == 0
+        && atomic_load_explicit(&args.reads_during_accounting,
+            memory_order_relaxed) > 0
+        && owner->storage_alias_borrows == 0;
+    CHECK(ok, "peer lease and concurrent alias accounting remain race-safe");
+    cleanup_relations();
+}
+
+static void
 test_source_reader_blocks_radix_sort(void)
 {
     col_rel_t *rel = new_relation();
@@ -3300,6 +3417,8 @@ main(void)
     test_storage_only_cow_and_compaction();
     test_flattened_storage_ownership();
     test_source_reader_blocks_checked_destroy();
+    test_legacy_storage_owner_metadata_initialization();
+    test_peer_reader_alias_accounting_is_race_safe();
     test_source_reader_blocks_radix_sort();
     test_radix_sort_locked_rejects_foreign_writer();
     test_radix_sort_locked_rejects_absent_writer_and_out();

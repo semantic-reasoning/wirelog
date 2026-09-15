@@ -116,6 +116,21 @@ void
 wl_session_testhook_set_default_options(const wl_session_options_t *options);
 const wl_session_options_t *
 wl_session_testhook_default_options(void);
+
+typedef void (*wl_session_testhook_fn)(wl_session_t *session);
+
+void
+wl_session_testhook_set_admission_closed(wl_session_testhook_fn fn);
+void
+wl_session_testhook_admission_closed(wl_session_t *session);
+void
+wl_session_testhook_set_before_workqueue_drain(wl_session_testhook_fn fn);
+void
+wl_session_testhook_before_workqueue_drain(wl_session_t *session);
+void
+wl_session_testhook_set_after_worker_lease_release(wl_session_testhook_fn fn);
+void
+wl_session_testhook_after_worker_lease_release(wl_session_t *session);
 #endif
 
 /**

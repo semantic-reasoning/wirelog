@@ -128,8 +128,9 @@ typedef struct {
     void *storage_owner;
     uint64_t storage_owner_identity;
     uint64_t storage_owner_generation;
-    uint32_t storage_alias_borrows;
+    wl_atomic_u64 storage_alias_borrows;
     wl_columnar_source_access_gate_t source_access;
+    wl_columnar_source_access_gate_t descriptor_access;
 } col_rel_t;
 
 /* Column-major helpers (inline, matching internal.h) */
