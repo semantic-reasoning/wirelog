@@ -35,6 +35,36 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 static int extension_destroy_calls;
 
+typedef struct alias_peer_reader_arg {
+    col_rel_t *source;
+    atomic_bool stop;
+    atomic_bool started;
+    atomic_bool failed;
+} alias_peer_reader_arg_t;
+
+static void *
+alias_peer_reader_loop(void *opaque)
+{
+    alias_peer_reader_arg_t *arg = (alias_peer_reader_arg_t *)opaque;
+    atomic_store_explicit(&arg->started, true, memory_order_release);
+    while (!atomic_load_explicit(&arg->stop, memory_order_acquire)) {
+        wl_columnar_source_access_reader_t reader = { 0 };
+        int rc = col_rel_source_reader_acquire(arg->source, &reader);
+        if (rc == 0) {
+            if (col_rel_source_reader_release(&reader) != 0) {
+                atomic_store_explicit(&arg->failed, true,
+                    memory_order_release);
+                return NULL;
+            }
+        } else if (rc != EBUSY && rc != EOVERFLOW) {
+            atomic_store_explicit(&arg->failed, true,
+                memory_order_release);
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
 #define TEST(name)                            \
         do {                                      \
             tests_run++;                          \
@@ -314,8 +344,10 @@ test_worker_borrows_extension_snapshot(void)
         wirelog_program_free(prog);
     }
     failures += extension_destroy_calls != 1;
-    if (registry)
-        failures += wirelog_extension_registry_destroy(registry) != 0;
+    if (registry) {
+        int registry_rc = wirelog_extension_registry_destroy(registry);
+        failures += registry_rc != 0;
+    }
     if (failures) {
         FAIL("worker snapshot lifetime");
         return 1;
@@ -1886,7 +1918,36 @@ test_worker_alias_chain_checked_teardown(void)
         && atomic_load_explicit(&source->source_access.state,
             memory_order_acquire) == 2;
 
-    col_worker_session_destroy(&worker_b);
+    /* A peer session may still read while this worker's alias is retired.
+     * Alias teardown must drop only the atomic borrow count and must not
+     * require the canonical owner's reader gate to be idle. */
+    alias_peer_reader_arg_t peer = { .source = source };
+    wl_thread_t peer_thread;
+    bool peer_started = wl_thread_create(&peer_thread, alias_peer_reader_loop,
+            &peer) == 0;
+    if (!peer_started)
+        ok = 0;
+    while (peer_started
+        && !atomic_load_explicit(&peer.started, memory_order_acquire)) {
+        /* The test thread has no blocking work before publishing started. */
+    }
+    wl_columnar_source_access_reader_t same_alias_reader = { 0 };
+    if (col_rel_source_reader_acquire(worker_b_rel, &same_alias_reader) != 0)
+        ok = 0;
+    if (col_worker_session_destroy_checked(&worker_b) != EBUSY
+        || worker_b.rels == NULL || source->storage_alias_borrows != 2)
+        ok = 0;
+    if (same_alias_reader.owner
+        && col_rel_source_reader_release(&same_alias_reader) != 0)
+        ok = 0;
+    if (col_worker_session_destroy_checked(&worker_b) != 0)
+        ok = 0;
+    if (peer_started) {
+        atomic_store_explicit(&peer.stop, true, memory_order_release);
+        if (wl_thread_join(&peer_thread) != 0
+            || atomic_load_explicit(&peer.failed, memory_order_acquire))
+            ok = 0;
+    }
     int destroy_with_a = col_rel_destroy_checked(source);
     if (destroy_with_a != EBUSY) {
         fprintf(stderr,

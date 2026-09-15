@@ -56,6 +56,11 @@ struct wl_session {
      */
     wl_session_admission_t *operation_admission;
     bool owns_operation_admission;
+    /* Backend teardown can refuse an alias cohort without losing ownership;
+     * wl_session_destroy() keeps this handle and admission state for retry. */
+    bool destroy_pending;
+    /* Non-owning result slot used while a backend destroy callback runs. */
+    bool *destroy_pending_out;
 };
 
 /* Wrapper functions that delegate to the backend vtable */

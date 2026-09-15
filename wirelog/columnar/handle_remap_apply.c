@@ -86,7 +86,9 @@ wl_handle_remap_apply_columns(col_rel_t *rel,
     if (rc != 0)
         return rc;
     writer_acquired = true;
-    if (rel == owner && owner->storage_alias_borrows > 0) {
+    if (rel == owner
+        && atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) > 0) {
         rc = EBUSY;
         goto cleanup;
     }

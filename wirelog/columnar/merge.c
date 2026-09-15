@@ -1020,7 +1020,9 @@ col_op_consolidate_kway_merge(col_rel_t *rel, const uint32_t *seg_boundaries,
     rc = col_rel_storage_owner_resolve(rel, &owner);
     if (rc != 0)
         goto release_writer;
-    if (rel == owner && owner->storage_alias_borrows > 0) {
+    if (rel == owner
+        && atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) > 0) {
         rc = EBUSY;
         goto release_writer;
     }
@@ -1938,13 +1940,17 @@ col_op_consolidate_incremental_delta(col_rel_t *rel, uint32_t old_nrows,
     rc = col_rel_storage_owner_resolve(rel, &rel_owner);
     if (rc != 0)
         return rc;
-    if (rel_owner == rel && rel->storage_alias_borrows > 0)
+    if (rel_owner == rel
+        && atomic_load_explicit(&rel->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return EBUSY;
     if (delta_out) {
         rc = col_rel_storage_owner_resolve(delta_out, &delta_owner);
         if (rc != 0)
             return rc;
-        if (delta_owner == delta_out && delta_out->storage_alias_borrows > 0)
+        if (delta_owner == delta_out
+            && atomic_load_explicit(&delta_out->storage_alias_borrows,
+            memory_order_acquire) > 0)
             return EBUSY;
     }
 

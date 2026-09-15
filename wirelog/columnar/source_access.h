@@ -51,6 +51,10 @@ wl_columnar_source_access_writer_claim(
 
 typedef struct wl_columnar_source_access_reader {
     wl_columnar_source_access_gate_t *owner;
+    /* Non-NULL for a reader acquired through a shared-view descriptor.  The
+     * canonical owner gate protects backing storage; this second gate keeps
+     * the alias descriptor alive until the reader releases it. */
+    wl_columnar_source_access_gate_t *descriptor;
     uintptr_t identity;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
@@ -116,13 +120,11 @@ wl_columnar_source_access_writer_thread_equal(
 }
 
 static inline int
-wl_columnar_source_access_reader_acquire(
-    wl_columnar_source_access_gate_t *gate,
-    wl_columnar_source_access_reader_t *token)
+wl_columnar_source_access_reader_gate_acquire(
+    wl_columnar_source_access_gate_t *gate)
 {
     uint64_t observed;
-    if (!gate || !token || token->owner || token->identity != 0
-        || token->thread_valid || token->transferable)
+    if (!gate)
         return EINVAL;
     observed = atomic_load_explicit(&gate->state, memory_order_acquire);
     for (;;) {
@@ -132,9 +134,17 @@ wl_columnar_source_access_reader_acquire(
             return EOVERFLOW;
         if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
             observed + 1u, memory_order_acquire, memory_order_relaxed))
-            break;
+            return 0;
     }
+}
+
+static inline void
+wl_columnar_source_access_reader_token_bind(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token, bool transferable)
+{
     token->owner = gate;
+    token->descriptor = NULL;
     token->identity = (uintptr_t)token;
 #if defined(WL_HAVE_C11_THREADS)
     token->owner_thread = thrd_current();
@@ -143,8 +153,24 @@ wl_columnar_source_access_reader_acquire(
 #else
     token->owner_thread = pthread_self();
 #endif
-    token->thread_valid = true;
-    token->transferable = false;
+    token->thread_valid = !transferable;
+    token->transferable = transferable;
+}
+
+static inline int
+wl_columnar_source_access_reader_acquire(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token)
+{
+    int rc;
+    if (!gate || !token || token->owner || token->descriptor
+        || token->identity != 0
+        || token->thread_valid || token->transferable)
+        return EINVAL;
+    rc = wl_columnar_source_access_reader_gate_acquire(gate);
+    if (rc != 0)
+        return rc;
+    wl_columnar_source_access_reader_token_bind(gate, token, false);
     return 0;
 }
 
@@ -157,24 +183,15 @@ wl_columnar_source_access_reader_acquire_transferable(
     wl_columnar_source_access_gate_t *gate,
     wl_columnar_source_access_reader_t *token)
 {
-    uint64_t observed;
-    if (!gate || !token || token->owner || token->identity != 0
+    int rc;
+    if (!gate || !token || token->owner || token->descriptor
+        || token->identity != 0
         || token->thread_valid || token->transferable)
         return EINVAL;
-    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
-    for (;;) {
-        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
-            return EBUSY;
-        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
-            return EOVERFLOW;
-        if (atomic_compare_exchange_weak_explicit(&gate->state, &observed,
-            observed + 1u, memory_order_acquire, memory_order_relaxed))
-            break;
-    }
-    token->owner = gate;
-    token->identity = (uintptr_t)token;
-    token->thread_valid = false;
-    token->transferable = true;
+    rc = wl_columnar_source_access_reader_gate_acquire(gate);
+    if (rc != 0)
+        return rc;
+    wl_columnar_source_access_reader_token_bind(gate, token, true);
     return 0;
 }
 
@@ -190,6 +207,21 @@ wl_columnar_source_access_reader_release(
         || (token->transferable && token->thread_valid))
         return EINVAL;
     gate = token->owner;
+    if (token->descriptor) {
+        uint64_t descriptor_state = atomic_load_explicit(
+            &token->descriptor->state, memory_order_acquire);
+        for (;;) {
+            if (descriptor_state == 0
+                || descriptor_state == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+                return EINVAL;
+            if (atomic_compare_exchange_weak_explicit(
+                    &token->descriptor->state, &descriptor_state,
+                    descriptor_state - 1u, memory_order_release,
+                    memory_order_relaxed))
+                break;
+        }
+        token->descriptor = NULL;
+    }
     observed = atomic_load_explicit(&gate->state, memory_order_acquire);
     for (;;) {
         if (observed == 0 || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)

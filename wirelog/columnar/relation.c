@@ -146,7 +146,8 @@ col_rel_storage_owner_init(col_rel_t *r)
     r->storage_owner = r;
     r->storage_owner_identity = r->relation_identity;
     r->storage_owner_generation = r->storage_generation;
-    r->storage_alias_borrows = 0;
+    atomic_store_explicit(&r->storage_alias_borrows, 0,
+        memory_order_relaxed);
     wl_columnar_source_access_gate_init(&r->source_access);
 }
 
@@ -187,11 +188,29 @@ col_rel_storage_alias_release(col_rel_t *alias)
     owner = alias->storage_owner;
     if (owner->storage_owner != owner
         || owner->storage_owner_identity != owner->relation_identity
-        || owner->storage_alias_borrows == 0
+        || atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) == 0
         || alias->storage_owner_identity != owner->relation_identity)
         return EINVAL;
-    owner->storage_alias_borrows--;
-    col_rel_storage_owner_init(alias);
+    uint64_t borrows = atomic_load_explicit(&owner->storage_alias_borrows,
+            memory_order_acquire);
+    for (;;) {
+        if (borrows == 0)
+            return EINVAL;
+        if (atomic_compare_exchange_weak_explicit(
+                &owner->storage_alias_borrows, &borrows, borrows - 1u,
+                memory_order_release, memory_order_relaxed))
+            break;
+    }
+    /* Preserve alias->source_access until the caller releases any descriptor
+     * writer that serialized retirement.  Reinitializing that gate here
+     * would invalidate its token and make a concurrent same-alias teardown
+     * indistinguishable from an already-free descriptor. */
+    alias->storage_owner = alias;
+    alias->storage_owner_identity = alias->relation_identity;
+    alias->storage_owner_generation = alias->storage_generation;
+    atomic_store_explicit(&alias->storage_alias_borrows, 0,
+        memory_order_relaxed);
     return 0;
 }
 
@@ -201,7 +220,8 @@ col_rel_storage_owner_destroy_status(const col_rel_t *owner)
     if (!owner || owner->storage_owner != owner
         || owner->storage_owner_identity != owner->relation_identity)
         return EINVAL;
-    if (owner->storage_alias_borrows != 0
+    if (atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) != 0
         || wl_columnar_source_access_gate_busy(&owner->source_access))
         return EBUSY;
     return 0;
@@ -212,14 +232,41 @@ col_rel_source_reader_acquire(const col_rel_t *rel,
     wl_columnar_source_access_reader_t *token)
 {
     col_rel_t *owner = NULL;
+    wl_columnar_source_access_reader_t descriptor_token = { 0 };
     int rc;
-    if (!rel || !token)
+    if (!rel || !token || token->owner || token->descriptor
+        || token->identity != 0 || token->thread_valid
+        || token->transferable)
         return EINVAL;
-    rc = col_rel_storage_owner_resolve(rel, &owner);
+    /* Pin the descriptor before reading storage_owner.  Teardown claims this
+     * gate before clearing the alias metadata, so an in-flight reader cannot
+     * resolve an owner and then dereference a retired descriptor. */
+    rc = wl_columnar_source_access_reader_gate_acquire(
+        &((col_rel_t *)rel)->source_access);
     if (rc != 0)
         return rc;
-    return wl_columnar_source_access_reader_acquire(
+    rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc != 0) {
+        wl_columnar_source_access_reader_token_bind(
+            &((col_rel_t *)rel)->source_access, &descriptor_token, false);
+        (void)wl_columnar_source_access_reader_release(&descriptor_token);
+        return rc;
+    }
+    if (owner == rel) {
+        wl_columnar_source_access_reader_token_bind(
+            &((col_rel_t *)rel)->source_access, token, false);
+        return 0;
+    }
+    rc = wl_columnar_source_access_reader_acquire(
         &owner->source_access, token);
+    if (rc != 0) {
+        wl_columnar_source_access_reader_token_bind(
+            &((col_rel_t *)rel)->source_access, &descriptor_token, false);
+        (void)wl_columnar_source_access_reader_release(&descriptor_token);
+        return rc;
+    }
+    token->descriptor = &((col_rel_t *)rel)->source_access;
+    return 0;
 }
 
 int
@@ -259,7 +306,8 @@ col_rel_published_writer_acquire(const col_rel_t *rel,
     rc = col_rel_storage_owner_resolve(rel, &owner);
     if (rc != 0)
         return rc;
-    if (owner->storage_alias_borrows > 0)
+    if (atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return EBUSY;
     return wl_columnar_source_access_writer_acquire(
         &owner->source_access, token);
@@ -289,7 +337,8 @@ col_rel_set(col_rel_t *r, uint32_t row, uint32_t col, int64_t val)
     rc = col_rel_source_writer_acquire(r, &writer);
     if (rc != 0)
         return rc;
-    if (r == owner && owner->storage_alias_borrows > 0) {
+    if (r == owner && atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) > 0) {
         rc = EBUSY;
         goto release_writer;
     }
@@ -909,7 +958,9 @@ col_rel_free_contents(col_rel_t *r)
 {
     if (!r)
         return;
-    if (r->storage_owner == r && r->storage_alias_borrows > 0)
+    if (r->storage_owner == r
+        && atomic_load_explicit(&r->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return;
     /* Alias bookkeeping is released before the relation is zeroed.  The
      * owner itself is not denied destruction here; #1494 wires this status
@@ -958,6 +1009,22 @@ col_rel_free_contents(col_rel_t *r)
     memset(r, 0, sizeof(*r));
 }
 
+/* Free a descriptor while its source-access writer is held.  The ordinary
+ * free path zeroes the embedded gate, which would invalidate that writer and
+ * briefly reopen the descriptor before its storage is released. */
+void
+col_rel_free_contents_preserve_source_gate(col_rel_t *r)
+{
+    uint64_t gate_state;
+    if (!r)
+        return;
+    gate_state = atomic_load_explicit(&r->source_access.state,
+            memory_order_relaxed);
+    col_rel_free_contents(r);
+    atomic_store_explicit(&r->source_access.state, gate_state,
+        memory_order_relaxed);
+}
+
 /*
  * col_rel_destroy:
  * Free contents and, if heap-allocated (pool_owned == false), the struct
@@ -968,8 +1035,32 @@ int
 col_rel_destroy_checked(col_rel_t *r)
 {
     int owner_status;
+    bool is_alias;
     if (!r)
         return 0;
+    is_alias = r->storage_owner && r->storage_owner != r;
+    if (is_alias) {
+        /* Alias retirement only changes the owner's atomic borrow count; it
+         * does not touch the owner's backing storage.  This is deliberately
+         * allowed while a peer source reader holds the owner gate.  The
+         * reader protects the backing owner, while worker teardown has
+         * already quiesced the alias descriptor itself. */
+        wl_columnar_source_access_writer_t descriptor_writer = { 0 };
+        if (wl_columnar_source_access_writer_acquire(
+                &r->source_access, &descriptor_writer) != 0)
+            return EBUSY;
+        bool from_pool = r->pool_owned;
+        if (col_rel_storage_alias_release(r) != 0) {
+            (void)wl_columnar_source_access_writer_release(
+                &descriptor_writer);
+            return EBUSY;
+        }
+        col_rel_free_contents_preserve_source_gate(r);
+        (void)wl_columnar_source_access_writer_release(&descriptor_writer);
+        if (!from_pool)
+            free(r);
+        return 0;
+    }
     owner_status = col_rel_storage_owner_destroy_status(r);
     if (owner_status == EBUSY)
         return EBUSY;
@@ -1685,7 +1776,9 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
          * shared views still point at those buffers, so refuse growth until
          * the aliases are released.  A shared-view destination is allowed
          * to COW/grow because it replaces its own alias safely. */
-        if (r->storage_owner == r && r->storage_alias_borrows > 0) {
+        if (r->storage_owner == r
+            && atomic_load_explicit(&r->storage_alias_borrows,
+            memory_order_acquire) > 0) {
             rc = EBUSY;
             goto release_writer;
         }
@@ -1827,7 +1920,9 @@ col_rel_reserve_rows_locked(col_rel_t *r, uint32_t additional,
     }
     if (required <= r->capacity)
         return col_rel_reserve_capacity_admitted(r, r->capacity, NULL);
-    if (r->storage_owner == r && r->storage_alias_borrows > 0)
+    if (r->storage_owner == r
+        && atomic_load_explicit(&r->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return EBUSY;
 
     uint32_t new_cap = r->capacity ? r->capacity : COL_REL_INIT_CAP;
@@ -1891,7 +1986,8 @@ col_rel_reset_rows_locked(col_rel_t *r,
         || col_rel_storage_owner_resolve(r, &owner) != 0
         || writer->owner != &owner->source_access)
         return EINVAL;
-    if (owner->storage_alias_borrows > 0)
+    if (atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return EBUSY;
     r->nrows = 0;
     r->sorted_nrows = 0;
@@ -2044,7 +2140,9 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     /* Replacing canonical-owner storage frees buffers still referenced by
      * live aliases.  Keep the raw-pointer alias model safe by refusing only
      * owner growth; alias destinations may still detach and grow privately. */
-    if (dst == dst_owner && dst_owner->storage_alias_borrows > 0
+    if (dst == dst_owner
+        && atomic_load_explicit(&dst_owner->storage_alias_borrows,
+        memory_order_acquire) > 0
         && new_nrows > dst->capacity) {
         rc = EBUSY;
         goto cleanup;
@@ -2367,7 +2465,8 @@ col_rel_compact(col_rel_t *r)
     /* A canonical owner cannot replace or discard storage while a shared
      * alias still points at it.  An alias itself may compact through the
      * transactional COW path below. */
-    if (owner == r && r->storage_alias_borrows > 0)
+    if (owner == r && atomic_load_explicit(&r->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return EBUSY;
     rc = col_rel_source_writer_acquire(r, &writer);
     if (rc != 0)
@@ -2410,7 +2509,8 @@ col_rel_compact_many(col_rel_t *const *rels, uint32_t nrels)
             continue;
         rc = col_rel_storage_owner_resolve(rels[i], &owner);
         if (rc != 0 || (owner == rels[i]
-            && owner->storage_alias_borrows > 0)) {
+            && atomic_load_explicit(&owner->storage_alias_borrows,
+            memory_order_acquire) > 0)) {
             rc = rc != 0 ? rc : EBUSY;
             goto cleanup;
         }
@@ -2525,10 +2625,14 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         return EINVAL;
     /* A relation with live flattened aliases cannot itself become an alias:
      * doing so would invalidate the children's canonical owner. */
-    if (dst->storage_alias_borrows > 0 || source_owner == dst
-        || source_owner->storage_alias_borrows == UINT32_MAX)
+    if (atomic_load_explicit(&dst->storage_alias_borrows,
+        memory_order_acquire) > 0 || source_owner == dst
+        || atomic_load_explicit(&source_owner->storage_alias_borrows,
+        memory_order_acquire) == UINT32_MAX)
         return source_owner == dst ? EINVAL : EBUSY;
-    if (old_owner != dst && old_owner->storage_alias_borrows == 0)
+    if (old_owner != dst
+        && atomic_load_explicit(&old_owner->storage_alias_borrows,
+        memory_order_acquire) == 0)
         return EINVAL;
     /* A shared-view publication is a new epoch on the destination.  Reserve
      * the next values before replacing any buffers so exhaustion cannot leave
@@ -2664,8 +2768,10 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         /* Ownership metadata is committed with the borrowed columns. Both
         * counters were validated before any destination state changed. */
         if (old_owner != dst)
-            old_owner->storage_alias_borrows--;
-        source_owner->storage_alias_borrows++;
+            (void)atomic_fetch_sub_explicit(&old_owner->storage_alias_borrows,
+                1, memory_order_release);
+        (void)atomic_fetch_add_explicit(&source_owner->storage_alias_borrows,
+            1, memory_order_release);
 
         /* Commit point: all allocations and schema preparation succeeded. */
         if (!old_arena_owned && old_columns) {
@@ -2726,7 +2832,8 @@ col_rel_install_shared_view_unprotected(col_rel_t *dst, const col_rel_t *src)
         dst->storage_owner = source_owner;
         dst->storage_owner_identity = source_owner->relation_identity;
         dst->storage_owner_generation = source_owner->storage_generation;
-        dst->storage_alias_borrows = 0;
+        atomic_store_explicit(&dst->storage_alias_borrows, 0,
+            memory_order_relaxed);
         dst->view_generation++;
         dst->storage_generation++;
         col_rel_ledger_reconcile(dst, ledger_before);
@@ -4645,7 +4752,9 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
     /* Contention is reported as EBUSY, matching col_rel_radix_sort_locked.
      * Folding it into the EINVAL conjunction above made one family answer a
      * caller two different ways for the same condition. */
-    if (r == owner && owner->storage_alias_borrows > 0)
+    if (r == owner
+        && atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return EBUSY;
     return col_rel_radix_sort_raw(r, start_row, nrows, workspace);
 }
@@ -4772,7 +4881,9 @@ col_rel_radix_sort_locked(col_rel_t *r, uint32_t start_row, uint32_t nrows,
         || writer->identity != (uintptr_t)writer
         || !wl_columnar_source_access_writer_thread_equal(writer))
         return EINVAL;
-    if (r == owner && owner->storage_alias_borrows > 0)
+    if (r == owner
+        && atomic_load_explicit(&owner->storage_alias_borrows,
+        memory_order_acquire) > 0)
         return EBUSY;
     if (nrows <= 1)
         return 0;
