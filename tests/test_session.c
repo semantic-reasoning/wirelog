@@ -549,6 +549,22 @@ test_retained_relation_admission(void)
         FAIL("exact-fit retained growth was not committed");
         return;
     }
+    rel->nrows = 1;
+    col_rel_compact(rel);
+    if (rel->capacity != 64u || rel->nrows != 1u
+        || rel->timestamps[0].iteration != 0
+        || col_rel_transport_bytes(rel) != initial_bytes
+        || rel->retained_reserved_bytes != initial_bytes
+        || atomic_load_explicit(&rel->retained_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != initial_bytes) {
+        col_rel_destroy(rel);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("governed non-empty compaction did not commit replacement");
+        return;
+    }
     rel->nrows = 0;
     col_rel_compact(rel);
     if (rel->capacity != 0u
@@ -607,6 +623,63 @@ test_retained_relation_admission(void)
             wl_columnar_memory_governor_ref_get(ref)) != 0) {
         wl_columnar_memory_governor_ref_release(ref);
         FAIL("denied relation reservation leaked after destroy");
+        return;
+    }
+    wl_columnar_memory_governor_ref_release(ref);
+    PASS();
+
+    TEST("batch compaction rolls back denied replacements");
+    resolution.usable_bytes = 4096u;
+    resolution.budget_bytes = 4096u;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    col_rel_t *first = NULL;
+    col_rel_t *second = NULL;
+    if (!ref || col_rel_alloc(&first, "batch-first") != 0
+        || col_rel_alloc(&second, "batch-second") != 0
+        || col_rel_attach_memory_governor(first, ref) != 0
+        || col_rel_attach_memory_governor(second, ref) != 0
+        || col_rel_set_schema(first, 1, NULL) != 0
+        || col_rel_set_schema(second, 2, NULL) != 0) {
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+        FAIL("batch compaction setup failed");
+        return;
+    }
+    int64_t first_row[1] = { 1 };
+    int64_t second_row[2] = { 1, 2 };
+    rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < 65u; i++) {
+        rc = col_rel_append_row(first, first_row);
+        if (rc == 0)
+            rc = col_rel_append_row(second, second_row);
+    }
+    atomic_store_explicit(
+        &wl_columnar_memory_governor_ref_get(ref)->usable_bytes, 3584u,
+        memory_order_release);
+    first->nrows = 1;
+    second->nrows = 1;
+    int batch_rc = col_rel_compact_many((col_rel_t *[]) { first, second }, 2);
+    if (rc != 0 || first->capacity != 128u || second->capacity != 128u
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 3072u
+        || batch_rc != 0
+        || first->capacity != 128u || second->capacity != 128u
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 3072u) {
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("batch replacement denial changed relation state");
+        return;
+    }
+    col_rel_destroy(first);
+    col_rel_destroy(second);
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(ref)) != 0) {
+        wl_columnar_memory_governor_ref_release(ref);
+        FAIL("batch replacement rollback leaked admission");
         return;
     }
     wl_columnar_memory_governor_ref_release(ref);
