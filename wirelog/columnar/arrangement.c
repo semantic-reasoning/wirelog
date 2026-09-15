@@ -26,6 +26,8 @@
 #define ARR_MAKE_HEAD(generation, row) \
         (((uint64_t)(generation) << 32) | (uint64_t)(row))
 
+static void diff_entry_reset(col_diff_arr_entry_t *entry);
+
 /* ======================================================================== */
 /* Arrangement Layer (Phase 3C)                                             */
 /* ======================================================================== */
@@ -1825,15 +1827,12 @@ col_session_invalidate_arrangements(wl_session_t *sess, const char *rel_name)
      * hash table state to force re-indexing on next access. */
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
         if (strcmp(cs->diff_arr_entries[i].rel_name, rel_name) == 0) {
-            col_diff_arrangement_t *darr = cs->diff_arr_entries[i].diff_arr;
-            if (darr) {
-                darr->indexed_rows = 0;
-                darr->base_nrows = 0;
-                darr->current_nrows = 0;
-                if (darr->ht_head) {
-                    memset(darr->ht_head, 0, darr->nbuckets * sizeof(uint32_t));
-                }
-            }
+            col_diff_arr_entry_t *entry = &cs->diff_arr_entries[i];
+            if (entry->pin_count > 0 || entry->transaction_pending
+                || entry->generation == UINT64_MAX)
+                entry->invalidation_deferred = true;
+            else
+                diff_entry_reset(entry);
         }
     }
 }
@@ -2288,6 +2287,44 @@ col_session_free_sorted_arrangements(wl_col_session_t *cs)
 /* Differential Arrangement Registry (Issue #263)                           */
 /* ======================================================================== */
 
+static bool
+diff_registry_has_pins(const wl_col_session_t *cs)
+{
+    if (!cs)
+        return false;
+    for (uint32_t i = 0; i < cs->diff_arr_count; i++)
+        if (cs->diff_arr_entries[i].pin_count > 0)
+            return true;
+    return false;
+}
+
+static uint64_t
+diff_entry_next_generation(uint64_t generation)
+{
+    return generation == UINT64_MAX ? UINT64_MAX : generation + 1u;
+}
+
+static void
+diff_entry_reset(col_diff_arr_entry_t *entry)
+{
+    col_diff_arrangement_t *arr;
+
+    if (!entry || !entry->diff_arr)
+        return;
+    arr = entry->diff_arr;
+    if (arr->ht_head)
+        memset(arr->ht_head, 0,
+            (size_t)arr->nbuckets * sizeof(*arr->ht_head));
+    if (arr->ht_next)
+        memset(arr->ht_next, 0,
+            (size_t)arr->ht_cap * sizeof(*arr->ht_next));
+    arr->base_nrows = 0;
+    arr->current_nrows = 0;
+    arr->indexed_rows = 0;
+    arr->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+    entry->generation = diff_entry_next_generation(entry->generation);
+}
+
 /*
  * col_session_get_diff_arrangement:
  *
@@ -2308,6 +2345,8 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
 {
     if (!cs || !rel_name || !source_rel || key_count == 0)
         return NULL;
+    if (cs->diff_txn_count > 0)
+        return NULL;
 
     /* Search existing entries. */
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
@@ -2324,27 +2363,30 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
             }
         }
         if (match) {
+            if (e->transaction_pending)
+                return NULL;
+            if (e->generation == UINT64_MAX)
+                return NULL;
             col_diff_arrangement_t *arr = e->diff_arr;
             if (!wl_columnar_relation_snapshot_equal(
                     arr->source_snapshot,
                     wl_columnar_relation_snapshot(source_rel))) {
-                if (arr->ht_head)
-                    memset(arr->ht_head, 0,
-                        (size_t)arr->nbuckets * sizeof(*arr->ht_head));
-                if (arr->ht_next)
-                    memset(arr->ht_next, 0,
-                        (size_t)arr->ht_cap * sizeof(*arr->ht_next));
-                arr->base_nrows = 0;
-                arr->current_nrows = 0;
-                arr->indexed_rows = 0;
-                arr->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
+                if (e->pin_count > 0) {
+                    e->invalidation_deferred = true;
+                    return NULL;
+                }
+                diff_entry_reset(e);
             }
             return e->diff_arr;
         }
     }
 
-    /* Not found: grow registry and create new entry. */
+    /* Not found: grow registry and create new entry.  A differential pin
+     * stores an entry address, so never relocate the flat registry beneath
+     * an active lease. */
     if (cs->diff_arr_count >= cs->diff_arr_cap) {
+        if (diff_registry_has_pins(cs))
+            return NULL;
         uint32_t new_cap = cs->diff_arr_cap ? cs->diff_arr_cap * 2u : 4u;
         col_diff_arr_entry_t *ne = (col_diff_arr_entry_t *)realloc(
             cs->diff_arr_entries, new_cap * sizeof(col_diff_arr_entry_t));
@@ -2369,6 +2411,7 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     }
     memcpy(e->key_cols, key_cols, key_count * sizeof(uint32_t));
     e->key_count = key_count;
+    e->generation = 1u;
 
     e->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
     if (!e->diff_arr) {
@@ -2384,16 +2427,97 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
 }
 
 int
+col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
+    const col_rel_t *source_rel, const uint32_t *key_cols, uint32_t key_count,
+    col_diff_arrangement_pin_t *pin)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    col_diff_arr_entry_t *entry = NULL;
+    col_diff_arrangement_t *arr;
+    col_relation_snapshot_t snapshot;
+
+    if (!cs || !rel_name || !source_rel || !key_cols || key_count == 0
+        || !pin)
+        return EINVAL;
+    if (!col_session_has_exact_relation(cs, source_rel, rel_name))
+        return EINVAL;
+    memset(pin, 0, sizeof(*pin));
+    if (col_rel_source_reader_acquire(source_rel, &reader) != 0)
+        return EBUSY;
+    arr = col_session_get_diff_arrangement(cs, rel_name, source_rel,
+            key_cols, key_count);
+    if (!arr) {
+        (void)col_rel_source_reader_release(&reader);
+        return EBUSY;
+    }
+    for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
+        col_diff_arr_entry_t *candidate = &cs->diff_arr_entries[i];
+        if (candidate->diff_arr == arr) {
+            entry = candidate;
+            break;
+        }
+    }
+    if (!entry || entry->pin_count == UINT32_MAX) {
+        (void)col_rel_source_reader_release(&reader);
+        return entry ? EOVERFLOW : EINVAL;
+    }
+    snapshot = wl_columnar_relation_snapshot(source_rel);
+    if (arr->source_snapshot.relation_identity == 0)
+        arr->source_snapshot = snapshot;
+    if (!wl_columnar_relation_snapshot_equal(arr->source_snapshot, snapshot)
+        || entry->generation == UINT64_MAX) {
+        (void)col_rel_source_reader_release(&reader);
+        return EBUSY;
+    }
+    entry->pin_count++;
+    pin->entry = entry;
+    pin->arr = arr;
+    pin->session = cs;
+    pin->source = source_rel;
+    pin->source_snapshot = snapshot;
+    pin->source_reader = reader;
+    pin->generation = entry->generation;
+    pin->active = true;
+    return 0;
+}
+
+void
+col_diff_arrangement_pin_release(col_diff_arrangement_pin_t *pin)
+{
+    col_diff_arr_entry_t *entry;
+    int rc;
+
+    if (!pin || !pin->active || !pin->entry)
+        return;
+    entry = pin->entry;
+    if (entry->pin_count > 0)
+        entry->pin_count--;
+    if (entry->pin_count == 0 && entry->invalidation_deferred) {
+        entry->invalidation_deferred = false;
+        diff_entry_reset(entry);
+    }
+    rc = col_rel_source_reader_release(&pin->source_reader);
+    (void)rc;
+    memset(pin, 0, sizeof(*pin));
+}
+
+int
 wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     const char *rel_name, const col_rel_t *source_rel,
     const uint32_t *key_cols, uint32_t key_count,
     wl_columnar_arrangement_diff_txn_t *txn)
 {
     col_diff_arrangement_t **slot = NULL;
+    uint32_t entry_index = UINT32_MAX;
+    col_diff_arr_entry_t *entry = NULL;
 
     if (!cs || !rel_name || !source_rel || !key_cols || key_count == 0
         || !txn)
         return EINVAL;
+    if (!col_session_has_exact_relation(cs, source_rel, rel_name))
+        return EINVAL;
+    if (cs->diff_txn_count > 0)
+        return EBUSY;
     memset(txn, 0, sizeof(*txn));
 
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
@@ -2409,6 +2533,11 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
             }
         }
         if (match) {
+            if (entry->pin_count > 0 || entry->transaction_pending)
+                return EBUSY;
+            entry->transaction_pending = true;
+            entry_index = i;
+            txn->entry = entry;
             slot = &entry->diff_arr;
             break;
         }
@@ -2416,6 +2545,8 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
 
     if (!slot) {
         if (cs->diff_arr_count >= cs->diff_arr_cap) {
+            if (diff_registry_has_pins(cs))
+                return EBUSY;
             uint32_t new_cap = cs->diff_arr_cap ? cs->diff_arr_cap * 2u : 4u;
             col_diff_arr_entry_t *entries = (col_diff_arr_entry_t *)realloc(
                 cs->diff_arr_entries, new_cap * sizeof(*entries));
@@ -2424,8 +2555,8 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
             cs->diff_arr_entries = entries;
             cs->diff_arr_cap = new_cap;
         }
-        col_diff_arr_entry_t *entry
-            = &cs->diff_arr_entries[cs->diff_arr_count];
+        entry_index = cs->diff_arr_count;
+        entry = &cs->diff_arr_entries[entry_index];
         memset(entry, 0, sizeof(*entry));
         entry->rel_name = wl_strdup(rel_name);
         entry->key_cols = (uint32_t *)malloc(
@@ -2439,6 +2570,8 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         memcpy(entry->key_cols, key_cols,
             (size_t)key_count * sizeof(*entry->key_cols));
         entry->key_count = key_count;
+        entry->generation = 1u;
+        entry->transaction_pending = true;
         entry->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
         if (!entry->diff_arr) {
             free(entry->rel_name);
@@ -2449,17 +2582,23 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         txn->entry = entry;
         txn->pending_entry = true;
         slot = &entry->diff_arr;
+        cs->diff_arr_count++;
     }
 
     txn->session = cs;
+    txn->entry_index = entry_index;
+    txn->entry_generation = txn->entry->generation;
     txn->persistent = *slot;
     txn->working = col_diff_arrangement_deep_copy(txn->persistent);
     if (!txn->working) {
         if (txn->pending_entry) {
-            free(txn->entry->rel_name);
-            free(txn->entry->key_cols);
+            free(entry->rel_name);
+            free(entry->key_cols);
             col_diff_arrangement_destroy(txn->persistent);
-            memset(txn->entry, 0, sizeof(*txn->entry));
+            memset(entry, 0, sizeof(*entry));
+            cs->diff_arr_count--;
+        } else {
+            entry->transaction_pending = false;
         }
         memset(txn, 0, sizeof(*txn));
         return ENOMEM;
@@ -2467,6 +2606,7 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     col_diff_arrangement_attach_ledger(txn->working,
         txn->pending_entry ? &cs->mem_ledger : txn->persistent->ledger);
     txn->slot = slot;
+    cs->diff_txn_count++;
 
     if (!wl_columnar_relation_snapshot_equal(txn->working->source_snapshot,
         wl_columnar_relation_snapshot(source_rel))) {
@@ -2485,17 +2625,31 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     return 0;
 }
 
-void
+int
 wl_columnar_arrangement_diff_txn_commit(
     wl_columnar_arrangement_diff_txn_t *txn)
 {
-    if (!txn || !txn->slot || !txn->persistent || !txn->working)
-        return;
-    *txn->slot = txn->working;
+    col_diff_arr_entry_t *entry;
+
+    if (!txn || !txn->session || !txn->persistent || !txn->working
+        || txn->entry_index >= txn->session->diff_arr_cap)
+        return EINVAL;
+    entry = &txn->session->diff_arr_entries[txn->entry_index];
+    if (entry->generation != txn->entry_generation
+        || entry->pin_count > 0 || !entry->transaction_pending
+        || entry->invalidation_deferred
+        || entry->diff_arr != txn->persistent)
+        return EBUSY;
+    if (entry->generation == UINT64_MAX)
+        return EOVERFLOW;
+    entry->diff_arr = txn->working;
     col_diff_arrangement_destroy(txn->persistent);
-    if (txn->pending_entry)
-        txn->session->diff_arr_count++;
+    entry->transaction_pending = false;
+    entry->generation++;
+    if (txn->session->diff_txn_count > 0)
+        txn->session->diff_txn_count--;
     memset(txn, 0, sizeof(*txn));
+    return 0;
 }
 
 void
@@ -2505,12 +2659,27 @@ wl_columnar_arrangement_diff_txn_abort(
     if (!txn)
         return;
     col_diff_arrangement_destroy(txn->working);
-    if (txn->pending_entry && txn->entry) {
-        free(txn->entry->rel_name);
-        free(txn->entry->key_cols);
+    if (txn->pending_entry && txn->session
+        && txn->entry_index < txn->session->diff_arr_cap) {
+        col_diff_arr_entry_t *entry
+            = &txn->session->diff_arr_entries[txn->entry_index];
+        free(entry->rel_name);
+        free(entry->key_cols);
         col_diff_arrangement_destroy(txn->persistent);
-        memset(txn->entry, 0, sizeof(*txn->entry));
+        memset(entry, 0, sizeof(*entry));
+        txn->session->diff_arr_count--;
+    } else if (txn->session
+        && txn->entry_index < txn->session->diff_arr_count) {
+        col_diff_arr_entry_t *entry
+            = &txn->session->diff_arr_entries[txn->entry_index];
+        entry->transaction_pending = false;
+        if (entry->invalidation_deferred) {
+            entry->invalidation_deferred = false;
+            diff_entry_reset(entry);
+        }
     }
+    if (txn->session && txn->session->diff_txn_count > 0)
+        txn->session->diff_txn_count--;
     memset(txn, 0, sizeof(*txn));
 }
 
@@ -2520,11 +2689,13 @@ wl_columnar_arrangement_diff_txn_abort(
  * Free all entries in the differential arrangement registry and reset it.
  * Called from col_session_destroy and when switching evaluation modes.
  */
-void
+int
 col_session_free_diff_arrangements(wl_col_session_t *cs)
 {
     if (!cs)
-        return;
+        return EINVAL;
+    if (diff_registry_has_pins(cs) || cs->diff_txn_count > 0)
+        return EBUSY;
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
         free(cs->diff_arr_entries[i].rel_name);
         free(cs->diff_arr_entries[i].key_cols);
@@ -2534,6 +2705,7 @@ col_session_free_diff_arrangements(wl_col_session_t *cs)
     cs->diff_arr_entries = NULL;
     cs->diff_arr_count = 0;
     cs->diff_arr_cap = 0;
+    return 0;
 }
 
 /*
@@ -2586,6 +2758,9 @@ col_diff_arr_entry_clone(const col_diff_arr_entry_t *src,
         dst->diff_arr->base_nrows = 0;
         dst->diff_arr->current_nrows = 0;
     }
+    dst->generation = src->generation ? src->generation : 1u;
+    dst->pin_count = 0;
+    dst->invalidation_deferred = false;
 
     return 0;
 }
