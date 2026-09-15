@@ -33,7 +33,7 @@ typedef enum {
 typedef struct {
     uint64_t input_identity;
     uint64_t arrangement_identity;
-    uint32_t generation;
+    uint64_t generation;
     uint64_t position;
     uint64_t sequence;
 } wl_columnar_continuation_cursor_t;

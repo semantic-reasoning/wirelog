@@ -18,12 +18,15 @@
 typedef struct {
     const col_rel_t *left;
     const col_rel_t *right;
-    const wl_plan_op_t *op;
+    uint32_t *project_indices;
+    uint32_t project_count;
     uint32_t *lk;
     uint32_t *rk;
     uint32_t kc;
     col_diff_arrangement_pin_t pin;
+    wl_columnar_source_access_reader_t left_source_reader;
     wl_columnar_source_access_reader_t source_reader;
+    bool left_source_reader_active;
     bool source_reader_active;
     col_diff_arrangement_t *arr;
     col_rel_t *batch;
@@ -102,8 +105,8 @@ producer_validate(void *context,
         || p->arr->indexed_rows != p->cursor.arr_indexed_rows
         || p->arr->indexed_rows != p->right->nrows)
         return false;
-    if (cursor->generation != (uint32_t)p->pin.generation
-        || c->arr_generation != (uint32_t)p->pin.generation)
+    if (cursor->generation != p->pin.generation
+        || c->arr_generation != p->pin.generation)
         return false;
     if (pos.rr != UINT32_MAX && pos.rr >= p->arr->ht_cap)
         return false;
@@ -145,14 +148,17 @@ producer_produce(void *context,
             if (col_join_keys_match_rel(p->left, lr, p->lk, p->right, rr,
                 p->rk, p->kc)) {
                 if (col_join_write_pair_at(p->batch, n, p->left, lr,
-                    p->right, rr, p->op->project_indices,
-                    p->op->project_count) != 0)
+                    p->right, rr, p->project_indices,
+                    p->project_count) != 0)
                     return WL_COLUMNAR_CONTINUATION_INVALID;
                 if (p->batch->timestamps) {
                     int64_t lm = p->left->timestamps
                         ? p->left->timestamps[lr].multiplicity : 1;
                     int64_t rm = p->right->timestamps
                         ? p->right->timestamps[rr].multiplicity : 1;
+                    /* The left input is the delta-driving side.  Preserve
+                     * its provenance; the right arrangement contributes
+                     * multiplicity but does not replace that provenance. */
                     if (p->left->timestamps)
                         p->batch->timestamps[n]
                             = p->left->timestamps[lr];
@@ -207,6 +213,10 @@ producer_release(void *context)
     if (!p)
         return;
     col_diff_arrangement_pin_release(&p->pin);
+    if (p->left_source_reader_active) {
+        (void)col_rel_source_reader_release(&p->left_source_reader);
+        p->left_source_reader_active = false;
+    }
     if (p->source_reader_active) {
         (void)col_rel_source_reader_release(&p->source_reader);
         p->source_reader_active = false;
@@ -232,6 +242,7 @@ producer_destroy(void *context)
     free(p->key_row);
     free(p->lk);
     free(p->rk);
+    free(p->project_indices);
     free(p);
 }
 
@@ -286,7 +297,8 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     if (out)
         *out = NULL;
     if (!sess || !op || !left || !lk || !rk || kc == 0 || !out
-        || !op->right_relation || batch_bytes == 0)
+        || !op->right_relation || batch_bytes == 0
+        || (op->project_count > 0 && !op->project_indices))
         return EINVAL;
     right = session_find_rel(sess, op->right_relation);
     if (!right)
@@ -296,12 +308,26 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
         return ENOMEM;
     p->left = left;
     p->right = right;
-    p->op = op;
     p->kc = kc;
+    p->project_count = op->project_count;
+    if (p->project_count > 0) {
+        p->project_indices = malloc((size_t)p->project_count
+                * sizeof(*p->project_indices));
+        if (!p->project_indices) {
+            rc = ENOMEM;
+            goto fail;
+        }
+        memcpy(p->project_indices, op->project_indices,
+            (size_t)p->project_count * sizeof(*p->project_indices));
+    }
     rc = col_rel_source_reader_acquire(right, &p->source_reader);
     if (rc != 0)
         goto fail;
     p->source_reader_active = true;
+    rc = col_rel_source_reader_acquire(left, &p->left_source_reader);
+    if (rc != 0)
+        goto fail;
+    p->left_source_reader_active = true;
     p->lk = malloc((size_t)kc * sizeof(*p->lk));
     p->rk = malloc((size_t)kc * sizeof(*p->rk));
     p->key_row = calloc(right->ncols ? right->ncols : 1u,
@@ -358,7 +384,7 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     p->cursor.right_identity = right->relation_identity;
     p->cursor.right_view_gen = right->view_generation;
     p->cursor.right_storage_gen = right->storage_generation;
-    p->cursor.arr_generation = (uint32_t)p->pin.generation;
+    p->cursor.arr_generation = p->pin.generation;
     p->cursor.arr_indexed_rows = p->arr->indexed_rows;
     p->cursor.left_is_delta = left_is_delta;
     p->cursor.timestamps = left->timestamps != NULL ||

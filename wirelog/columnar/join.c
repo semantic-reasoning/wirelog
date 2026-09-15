@@ -2342,6 +2342,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             bounded_rc = col_join_batch_run_to_relation(cont, sess,
                     bounded_out);
             wl_columnar_continuation_destroy(cont);
+            cont = NULL;
         }
         if (bounded_rc == 0) {
             free(lk);
