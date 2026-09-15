@@ -4615,10 +4615,15 @@ test_tdd_recursive_exe = executable(
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   # --wrap is GNU ld only, so the allocation-failure sweep is Linux-only and
   # its define travels with it; test_bdx_seed_allocation_failure_is_atomic has
-  # an #else branch for the platforms that do not get it.
+  # an #else branch for the platforms that do not get it.  WL_TEST_TDD_MERGE
+  # and WL_TEST_TDD_RESET_RESTORE gate plain-C fault injectors with no linker
+  # dependency, so they are defined on every platform; those sources compile
+  # into this executable directly and never into libwirelog.
   c_args: host_machine.system() == 'linux'
-    ? ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_ALLOC_WRAP=1']
-    : ['-DWL_TEST_BDX_SEED=1'],
+    ? ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_TDD_MERGE=1',
+       '-DWL_TEST_TDD_RESET_RESTORE=1', '-DWL_TEST_ALLOC_WRAP=1']
+    : ['-DWL_TEST_BDX_SEED=1', '-DWL_TEST_TDD_MERGE=1',
+       '-DWL_TEST_TDD_RESET_RESTORE=1'],
   link_args: host_machine.system() == 'linux'
     ? ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc', '-Wl,--wrap=realloc'] : [],
   override_options: host_machine.system() == 'linux' ? ['b_lto=false'] : [],
