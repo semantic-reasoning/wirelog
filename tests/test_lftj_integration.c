@@ -439,6 +439,12 @@ test_lftj_stack_overflow_releases_output(void)
     ASSERT(rc == ENOBUFS, "full stack must reject the LFTJ output");
     ASSERT(stack.top == COL_STACK_MAX,
         "failed LFTJ push must not change the stack depth");
+    wl_col_session_t *columnar = COL_SESSION(sess);
+    ASSERT(columnar->sarr_active_pins == 0,
+        "failed LFTJ push leaked sorted-arrangement probes");
+    for (uint32_t i = 0; i < columnar->sarr_count; i++)
+        ASSERT(columnar->sarr_entries[i].sarr.pin_count == 0,
+            "failed LFTJ push left a sorted arrangement pinned");
 
     eval_stack_drain(&stack);
     wl_session_destroy(sess);

@@ -864,18 +864,34 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     /* Allocate per-relation working arrays. */
     wl_lftj_input_t *inputs
         = (wl_lftj_input_t *)calloc(k, sizeof(wl_lftj_input_t));
+    col_sorted_arrangement_probe_t *sorted_probes
+        = (col_sorted_arrangement_probe_t *)calloc(
+            k, sizeof(col_sorted_arrangement_probe_t));
+    col_rel_t **relations
+        = (col_rel_t **)calloc(k, sizeof(col_rel_t *));
+    wl_columnar_source_access_reader_t *source_readers
+        = (wl_columnar_source_access_reader_t *)calloc(
+            k, sizeof(wl_columnar_source_access_reader_t));
+    bool *cache_backed = (bool *)calloc(k, sizeof(bool));
     uint32_t *ncols = (uint32_t *)malloc(k * sizeof(uint32_t));
     uint32_t *lftj_offsets = (uint32_t *)malloc(k * sizeof(uint32_t));
     uint32_t *binary_offsets = (uint32_t *)malloc(k * sizeof(uint32_t));
-    if (!inputs || !ncols || !lftj_offsets || !binary_offsets) {
+    if (!inputs || !sorted_probes || !relations || !source_readers
+        || !cache_backed || !ncols || !lftj_offsets || !binary_offsets) {
         free(inputs);
+        free(sorted_probes);
+        free(relations);
+        free(source_readers);
+        free(cache_backed);
         free(ncols);
         free(lftj_offsets);
         free(binary_offsets);
         return ENOMEM;
     }
 
-    /* Resolve each relation and populate LFTJ input descriptors. */
+    /* Resolve every relation and acquire every source reader before building
+    * any sorted cache.  This prevents a later input from observing a
+    * different source generation while earlier inputs are being prepared. */
     uint32_t total_binary_ncols = 0u;
     uint32_t lftj_nk_total = 0u;
     wirelog_column_type_t key_type = WIRELOG_TYPE_INT64;
@@ -899,35 +915,40 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             rc = EINVAL;
             goto cleanup_arrays;
         }
+        relations[i] = rel;
+        rc = col_rel_source_reader_acquire(rel, &source_readers[i]);
+        if (rc != 0)
+            goto cleanup_arrays;
+    }
 
-        /* Use the pre-sorted arrangement when available: wl_lftj_join still
-         * copies and sorts internally, but starting from a sorted copy
-         * reduces its qsort from O(N log N) to O(N). */
-        col_sorted_arr_t *sarr
-            = col_session_get_sorted_arrangement(sess, meta->rel_names[i], kc);
-        if (sarr && sarr->indexed_rows == rel->nrows && sarr->nrows > 0) {
+    /* Populate LFTJ input descriptors while all source generations remain
+     * stable under the readers acquired above. */
+    for (uint32_t i = 0; i < k; i++) {
+        col_rel_t *rel = relations[i];
+        uint32_t kc = meta->key_cols[i];
+
+        /* Use a leased pre-sorted arrangement when available.  The lease
+         * covers the source generation, sorted buffer, and registry entry
+         * until the join and all callbacks have stopped reading it. */
+        int pin_rc = col_session_acquire_sorted_arrangement_probe(
+            (wl_session_t *)sess, rel, kc, &sorted_probes[i]);
+        if (pin_rc == 0) {
+            col_sorted_arr_t *sarr = sorted_probes[i].arr;
             inputs[i].data = sarr->sorted;
             inputs[i].nrows = sarr->nrows;
+            cache_backed[i] = true;
+        } else if (pin_rc != ENOMEM && pin_rc != EBUSY) {
+            rc = pin_rc;
+            goto cleanup_arrays;
         } else {
-            /* Gather column-major into flat buffer for LFTJ */
+            /* A cache build may be unavailable, but the operator can still
+             * make an owned input copy.  The source reader acquired in the
+             * first pass keeps it stable while LFTJ consumes it. */
+            /* Gather column-major into flat buffer for LFTJ.  The source
+             * reader acquired in the first pass remains held through join. */
             int64_t *flat = (int64_t *)malloc(
                 (size_t)rel->nrows * rel->ncols * sizeof(int64_t));
             if (!flat) {
-                /* Free previously allocated flat buffers */
-                for (uint32_t j = 0; j < i; j++) {
-                    if (inputs[j].data != NULL) {
-                        col_sorted_arr_t *prev_sarr
-                            = col_session_get_sorted_arrangement(sess,
-                                meta->rel_names[j], meta->key_cols[j]);
-                        if (!(prev_sarr
-                            && prev_sarr->indexed_rows
-                            == inputs[j].nrows
-                            && prev_sarr->nrows > 0)) {
-                            free((void *)inputs[j].data);
-                            inputs[j].data = NULL;
-                        }
-                    }
-                }
                 rc = ENOMEM;
                 goto cleanup_arrays;
             }
@@ -986,19 +1007,58 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     }
 
 cleanup_arrays:
-    /* Free flat buffers allocated for non-sarr LFTJ inputs */
+    /* Release leases/readers before freeing any owned fallback buffers. */
     if (inputs) {
         for (uint32_t i = 0; i < k; i++) {
-            if (inputs[i].data) {
-                col_sorted_arr_t *sarr2
-                    = col_session_get_sorted_arrangement(sess,
-                        meta->rel_names[i], meta->key_cols[i]);
-                if (!(sarr2 && sarr2->sorted == inputs[i].data))
-                    free((void *)inputs[i].data);
+            if (sorted_probes && sorted_probes[i].active) {
+                int release_rc = col_sorted_arrangement_probe_release(
+                    &sorted_probes[i]);
+                if (release_rc != 0 && sorted_probes[i].active)
+                    release_rc = col_sorted_arrangement_probe_release(
+                        &sorted_probes[i]);
+                if (release_rc != 0) {
+                    /* The operation-local token is the only recoverable
+                     * owner of the pin.  Returning after losing it would
+                     * leave the session permanently pinned, so fail closed
+                     * rather than free the token storage. */
+                    fprintf(stderr,
+                        "wirelog: fatal sorted-arrangement probe release "
+                        "failure (%d)\n", release_rc);
+                    abort();
+                }
             }
+            /* Acquisition can fail after taking the source reader but before
+             * activating the probe.  Keep that token recoverable as well. */
+            if (sorted_probes && !sorted_probes[i].active
+                && sorted_probes[i].source_reader.owner) {
+                int release_rc = col_rel_source_reader_release(
+                    &sorted_probes[i].source_reader);
+                if (release_rc != 0) {
+                    fprintf(stderr,
+                        "wirelog: fatal sorted-arrangement reader release "
+                        "failure (%d)\n", release_rc);
+                    abort();
+                }
+            }
+            if (source_readers && source_readers[i].owner) {
+                int release_rc = col_rel_source_reader_release(
+                    &source_readers[i]);
+                if (release_rc != 0) {
+                    fprintf(stderr,
+                        "wirelog: fatal LFTJ source reader release "
+                        "failure (%d)\n", release_rc);
+                    abort();
+                }
+            }
+            if (inputs[i].data && (!cache_backed || !cache_backed[i]))
+                free((void *)inputs[i].data);
         }
     }
     free(inputs);
+    free(sorted_probes);
+    free(relations);
+    free(source_readers);
+    free(cache_backed);
     free(ncols);
     free(lftj_offsets);
     free(binary_offsets);

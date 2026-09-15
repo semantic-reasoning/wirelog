@@ -1049,3 +1049,13 @@ source may outlive the operation/session boundary.
 
 This is not a general concurrent-reader API. Filtered/materialization-cache
 extensions and the delegated #1435/#1507 work remain separate contracts.
+
+## 14. Sorted-arrangement lease contract
+
+LFTJ must acquire `col_sorted_arrangement_probe_t` before reading a cached
+sorted buffer. The probe binds the buffer and its registry entry to the exact
+source snapshot, holds a source reader for the duration of the join, and is
+released on every normal and error path. A live probe prevents source writes,
+sorted-buffer rebuild/free, and registry relocation. Stale entries are marked
+for deferred rebuild and become available again only after the final probe is
+released; teardown requires zero active sorted probes.
