@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **129**).
+match the script's count (currently **135**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -441,7 +441,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 ### 5.12 Existing inventory total
 
 21 + 4 + 5 + 19 + 1 + 1 + 1 + 37 + 5 + 5 + 3 = **102 atomic call sites**
-before the inactive source-access contract below.
+before the source-access contract below.
 
 ### 5.13 `wirelog/columnar/source_access.h` — relation source gate (11 rows)
 
@@ -528,14 +528,16 @@ a stub helper.
 ### 5.15 `wirelog/columnar/relation.c` — canonical staged replacement (6 rows)
 
 Staged replacement builds a candidate descriptor beside the destination and
-publishes it in one step, under a source writer the caller already holds. Two
-pieces of state have to cross that swap intact. The destination's retained
-memory reservation is validated before anything is staged, so a replacement
-never plans to release accounting that is no longer committed. The source
-gate's own state is captured from the outgoing descriptor and restored onto
-the committed one, because `*dst = *staged` overwrites the gate along with
+publishes it in one step, under a source writer the caller already holds.
+Three pieces of state have to cross that swap intact. The destination's
+retained memory reservation is validated before anything is staged, so a
+replacement never plans to release accounting that is no longer committed.
+Both gates' own states are captured from the outgoing descriptor and restored
+onto the committed one, because `*dst = *staged` overwrites them along with
 every other field: without the capture the writer lease held across
-prepare/commit would be discarded by the publication it is protecting.
+prepare/commit would be discarded by the publication it is protecting, and
+the peer descriptor reader it accounts for would be released against a zeroed
+gate -- which reports EINVAL after a commit that in fact succeeded.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
