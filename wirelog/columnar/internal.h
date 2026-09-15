@@ -2358,6 +2358,29 @@ wl_columnar_radix_workspace_prepare(const col_rel_t *rel,
     wl_columnar_radix_workspace_t *workspace);
 void
 wl_columnar_radix_workspace_destroy(wl_columnar_radix_workspace_t *workspace);
+/* Sort through a caller-supplied workspace.  Requires !rel->col_shared,
+ * which is what makes the deferred copy-on-write a no-op here, so this
+ * takes no alias and has none to release.
+ *
+ * A NULL relation or workspace, and a bad range, are refused at every row
+ * count.  Past those, nrows <= 1 returns 0 without reaching the writer,
+ * owner-linkage, shared-view, contention or workspace-capacity checks, so
+ * none of those statuses is reported for a range that short.
+ * col_rel_radix_sort_locked differs deliberately -- all of its checks run
+ * at every row count -- and the rest of the family short-circuits like this
+ * one.  Unifying that is #1601.
+ *
+ * EBUSY here is the same predicate and the same status
+ * col_rel_radix_sort_locked reports.  The EINVAL causes are this entry
+ * point's own: in particular a still-shared view is refused here, where
+ * col_rel_radix_sort_locked would unshare it through the copy-on-write and
+ * sort it (#1603).
+ *
+ * EINVAL: NULL relation or workspace; a bad range; an absent, foreign or
+ *         wrong-thread writer; a relation that is still a shared view; a
+ *         stale canonical-owner linkage; or a workspace whose capacity was
+ *         prepared for a smaller range than the one requested.
+ * EBUSY:  rel is its own canonical owner and has live alias borrows. */
 int
 wl_columnar_relation_radix_sort_with_workspace(col_rel_t *rel,
     uint32_t start_row,

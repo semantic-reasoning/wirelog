@@ -4535,8 +4535,13 @@ wl_columnar_relation_radix_sort_with_workspace(col_rel_t *r,
     if (!writer || writer->owner != &owner->source_access
         || writer->identity != (uintptr_t)writer
         || !wl_columnar_source_access_writer_thread_equal(writer)
-        || r->col_shared || (r == owner && owner->storage_alias_borrows > 0))
+        || r->col_shared)
         return EINVAL;
+    /* Contention is reported as EBUSY, matching col_rel_radix_sort_locked.
+     * Folding it into the EINVAL conjunction above made one family answer a
+     * caller two different ways for the same condition. */
+    if (r == owner && owner->storage_alias_borrows > 0)
+        return EBUSY;
     return col_rel_radix_sort_raw(r, start_row, nrows, workspace);
 }
 

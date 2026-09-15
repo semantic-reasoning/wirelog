@@ -683,6 +683,45 @@ test_radix_sort_locked_releases_the_alias_itself(void)
     cleanup_relations();
 }
 
+/* Issue #1594: the workspace variant reported a live alias borrow as EINVAL
+ * while the rest of the family reported the same condition as EBUSY, so one
+ * family answered a caller two different ways.  The k-way merge wrapper
+ * pre-checks the condition, which is why nothing caught the split. */
+static void
+test_radix_sort_with_workspace_owner_with_borrows_is_busy(void)
+{
+    col_rel_t *owner = new_relation();
+    col_rel_t *alias = new_relation();
+    wl_columnar_radix_workspace_t workspace = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    const uint32_t boundaries[] = { 0u, 2u };
+    int64_t high = 11, low = 4;
+    bool prepared = false;
+
+    CHECK(owner && alias, "workspace busy relations");
+    CHECK(col_rel_append_row(owner, &high) == 0, "workspace busy row 0");
+    CHECK(col_rel_append_row(owner, &low) == 0, "workspace busy row 1");
+    CHECK(col_rel_install_shared_view(alias, owner) == 0,
+        "workspace busy shared view");
+    CHECK(owner->storage_alias_borrows == 1, "workspace busy borrow");
+    /* One segment spanning both rows; the boundaries array carries
+     * seg_count + 1 entries. */
+    prepared = wl_columnar_radix_workspace_prepare(owner, boundaries, 1, 0,
+            &workspace) == 0;
+    CHECK(prepared, "workspace busy prepare");
+    CHECK(col_rel_source_writer_acquire(owner, &writer) == 0,
+        "workspace busy writer acquisition");
+    CHECK(wl_columnar_relation_radix_sort_with_workspace(owner, 0,
+        owner->nrows, &writer, &workspace) == EBUSY,
+        "workspace sort reports a live borrow as EBUSY");
+    CHECK(col_rel_get(owner, 0, 0) == high && col_rel_get(owner, 1, 0) == low,
+        "workspace busy refusal reorders nothing");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "workspace busy writer release");
+    wl_columnar_radix_workspace_destroy(&workspace);
+    cleanup_relations();
+}
+
 static void
 test_source_reader_blocks_radix_sort(void)
 {
@@ -2610,6 +2649,7 @@ main(void)
     test_radix_sort_locked_owner_with_borrows_is_busy();
     test_radix_sort_locked_hands_back_the_alias();
     test_radix_sort_locked_releases_the_alias_itself();
+    test_radix_sort_with_workspace_owner_with_borrows_is_busy();
     test_source_reader_blocks_direct_append_row();
     test_source_reader_blocks_append_row();
     test_source_reader_blocks_append_all();

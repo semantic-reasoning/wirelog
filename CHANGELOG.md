@@ -33,6 +33,20 @@ All notable changes to wirelog are documented in this file.
 
 ### Changed
 
+- **Radix-sort family reports contention uniformly as `EBUSY`** (#1594).
+  `wl_columnar_relation_radix_sort_with_workspace()` folded "the relation is
+  its own canonical storage owner and has live alias borrows" into the same
+  `EINVAL` conjunction it uses for a malformed writer, while the rest of the
+  family answered that condition with `EBUSY`.  It now returns `EBUSY`, so
+  one family no longer reports one condition two ways.  Callers that
+  discriminate on the status of that entry point should treat `EBUSY` as
+  retryable contention, while `EINVAL` continues to mean a malformed
+  request.  The symbol is internal and not exported from `libwirelog.so`,
+  and no in-tree caller branched on the distinction: the k-way merge
+  wrapper pre-checks the same predicate, which is why the split went
+  unnoticed.  A well-formed call with `nrows <= 1` still returns 0 without
+  reaching either check.
+
 ### Deprecated
 
 ### Removed
