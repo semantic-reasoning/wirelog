@@ -216,8 +216,11 @@ When cutting a release tag:
    The [release-tag verification workflow](../.github/workflows/release-tag.yml)
    runs the default and ABI suites, SBOM and mbedTLS validation, a
    60-second-per-target fuzz seed campaign, Tier-1 sanitizers, and a hosted
-   five-workload downstream matrix on the tagged commit. The downstream
-   matrix omits DOOP, which remains in `perf-nightly`; release performance/RSS
+   installed-candidate consumer smoke gate plus a hosted five-workload
+   downstream matrix on the tagged commit. The consumer gate compiles and
+   runs the supported easy and advanced-session examples against the exact
+   installed candidate and checks loader provenance. The downstream matrix
+   omits DOOP, which remains in `perf-nightly`; release performance/RSS
    gating is deferred until 0.80. The reusable Tier-1 sanitizer workflow verifies the
    ASan/UBSan Linux GCC, Linux Clang, Linux ARM64 GCC, and macOS Apple
    Clang legs plus the Linux GCC/Clang, Linux ARM64 GCC, and macOS Apple
