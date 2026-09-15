@@ -225,7 +225,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
             int rc = col_eval_relation_plan(rp, &stack, sess);
             if (rc != 0) {
-                eval_stack_drain(&stack);
+                int drain_rc = eval_stack_drain_to_session(&stack, sess);
+                if (rc == 0 && drain_rc != 0)
+                    rc = drain_rc;
                 return rc;
             }
 
@@ -234,11 +236,17 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
             eval_entry_t result = eval_stack_pop(&stack);
             if (result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-                eval_entry_dispose(&result);
-                eval_stack_drain(&stack);
-                return ENOTSUP;
+                int dispose_rc = eval_stack_dispose_entry(&stack, &result);
+                int drain_rc = eval_stack_drain_to_session(&stack, sess);
+                int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
+                int primary_rc = ENOTSUP;
+                if (primary_rc == 0 && cleanup_rc != 0)
+                    primary_rc = cleanup_rc;
+                return primary_rc;
             }
-            eval_stack_drain(&stack); /* drain any leftover entries */
+            int drain_rc = eval_stack_drain_to_session(&stack, sess);
+            if (drain_rc != 0)
+                return drain_rc; /* retain the refused entry on the stack */
 
             if (!result.rel)
                 continue;
@@ -587,7 +595,9 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
                 int rc = col_eval_relation_plan(rp, &stack, sess);
                 if (rc != 0) {
-                    eval_stack_drain(&stack);
+                    int drain_rc = eval_stack_drain_to_session(&stack, sess);
+                    if (rc == 0 && drain_rc != 0)
+                        rc = drain_rc;
                     outer_rc = rc;
                     goto stride_error;
                 }
@@ -597,12 +607,21 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 
                 eval_entry_t result = eval_stack_pop(&stack);
                 if (result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION) {
-                    eval_entry_dispose(&result);
-                    eval_stack_drain(&stack);
+                    int dispose_rc = eval_stack_dispose_entry(&stack, &result);
+                    int drain_rc = eval_stack_drain_to_session(&stack, sess);
+                    int cleanup_rc = dispose_rc != 0 ? dispose_rc : drain_rc;
                     outer_rc = ENOTSUP;
+                    if (outer_rc == 0 && cleanup_rc != 0)
+                        outer_rc = cleanup_rc;
                     goto stride_error;
                 }
-                eval_stack_drain(&stack);
+                {
+                    int drain_rc = eval_stack_drain_to_session(&stack, sess);
+                    if (drain_rc != 0) {
+                        outer_rc = drain_rc;
+                        goto stride_error;
+                    }
+                }
 
                 /* Post-eval skip: evaluation produced 0 rows — safety net for
                  * cases not caught by pre-scan (e.g. filters eliminating all

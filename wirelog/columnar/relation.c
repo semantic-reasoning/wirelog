@@ -329,6 +329,12 @@ col_rel_source_reader_acquire(const col_rel_t *rel,
             (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
         return rc;
     }
+    if (rel->pool_owned || rel->arena_owned
+        || owner->pool_owned || owner->arena_owned) {
+        (void)wl_columnar_source_access_gate_reader_release(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access);
+        return EINVAL;
+    }
     rc = wl_columnar_source_access_reader_acquire(&owner->source_access,
             token);
     if (rc != 0) {
