@@ -349,26 +349,75 @@ jobs:
           meson setup build-sbom -Dtests=true --buildtype=debug
           meson test -C build-sbom --suite sbom --print-errorlogs
 
+  perf-rss-status:
+    name: Tag / Perf-RSS availability status
+    needs: [validate-input]
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.status.outputs.status }}
+    steps:
+      - name: Inspect authoritative runner availability
+        id: status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=authoritative-runner-unavailable
+          # The repository token may not have Administration:read on public
+          # repositories.  Treat an unavailable inventory API as unavailable
+          # evidence; never turn an API error into a false stable-runner claim.
+          runners_json=$(gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/actions/runners" 2>/dev/null \
+              || printf '%s' '[]')
+          if jq -e '[.[].runners[] | select(.status == "online" and .busy == false) |
+                .labels[].name] | any(. == "wirelog-perf")' \
+                <<< "$runners_json" >/dev/null; then
+            status=authoritative-runner-available
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Perf/RSS release evidence status"
+            echo
+            echo "- status: `$status`"
+            echo "- hosted perf remains diagnostic and does not satisfy the B8 burn-in"
+            echo "- authoritative closure still requires 30 consecutive stable-runner nights"
+          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p release-perf-rss-status
+          printf '%s\n' "$status" > release-perf-rss-status/status.txt
+      - name: Upload status artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-perf-rss-status-${{ github.run_id }}
+          path: release-perf-rss-status/status.txt
+          retention-days: 35
+
   release-verification:
     name: Tag / release verification gate
     if: ${{ always() }}
     # Performance/RSS release gating is intentionally deferred until 0.80;
     # hosted runners do not provide the stable environment required by those
     # measurements.
-    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, downstream]
+    needs: [default, abi, sbom, fuzz, mbedtls, sanitizers, downstream, perf-rss-status]
     runs-on: ubuntu-latest
     steps:
       - name: Require every tagged verification job
         env:
           RESULTS: ${{ join(needs.*.result, ',') }}
+          PERF_RSS_STATUS: ${{ needs['perf-rss-status'].outputs.status }}
         run: |
           echo "verification results: $RESULTS"
+          echo "perf/RSS evidence status: $PERF_RSS_STATUS"
+          case "$PERF_RSS_STATUS" in
+            authoritative-runner-unavailable|authoritative-runner-available) ;;
+            *) echo "missing explicit perf/RSS evidence status" >&2; exit 1 ;;
+          esac
           IFS=',' read -ra statuses <<< "$RESULTS"
           # Count must track `needs:` above. It is asserted rather than derived
           # because `join(needs.*.result)` silently yields fewer entries if a
           # job is removed, and every remaining one could still be success --
           # the gate would pass having checked less than it names.
-          test "${#statuses[@]}" -eq 7
+          test "${#statuses[@]}" -eq 8
           for result in "${statuses[@]}"; do
             test "$result" = success
           done
