@@ -15,6 +15,7 @@
 #include <errno.h>
 
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/diff_join_batch.h"
 
 /* ========================================================================
  * TEST HARNESS MACROS
@@ -377,6 +378,7 @@ test_basic_join_correctness(void)
     col_rel_append_row(right, rr1);
     col_rel_append_row(right, rr2);
     session_add_rel(sess, right);
+    sess->join_batch_bytes = 64;
 
     wl_plan_op_t op = {0};
     op.op = WL_PLAN_OP_JOIN;
@@ -1643,6 +1645,98 @@ test_diff_arrangement_pin_lifetime(void)
     PASS;
 }
 
+static void
+test_diff_join_batch_signed_timestamps(void)
+{
+    const char *names[] = { "k", "v" };
+    const uint32_t key = 0;
+    char *left_keys[] = { "k" };
+    char *right_keys[] = { "k" };
+    wl_plan_op_t op = { 0 };
+    wl_col_session_t *s = make_mock_session();
+    col_rel_t *left = make_rel("left_batch", 2, names);
+    col_rel_t *right = make_rel("right_batch", 2, names);
+    col_rel_t *out = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    int64_t row[] = { 1, 10 };
+    int rc;
+
+    TEST("differential bounded join preserves signed timestamps");
+    ASSERT_TRUE(s && left && right, "differential batch fixture allocation");
+    ASSERT_TRUE(col_rel_append_row(left, row) == 0, "left batch row");
+    for (int64_t i = 0; i < 3; i++) {
+        int64_t right_row[] = { 1, 100 + i };
+        ASSERT_TRUE(col_rel_append_row(right, right_row) == 0,
+            "right batch row");
+    }
+    ASSERT_TRUE(col_rel_enable_timestamps(left) == 0
+        && col_rel_enable_timestamps(right) == 0,
+        "timestamp columns enabled");
+    left->timestamps[0].multiplicity = -2;
+    left->timestamps[0].iteration = 7;
+    left->timestamps[0].stratum = 3;
+    left->timestamps[0].worker = 2;
+    left->timestamps[0]._reserved = 0;
+    right->timestamps[0].multiplicity = 1;
+    right->timestamps[0].iteration = 99;
+    right->timestamps[0].stratum = 98;
+    right->timestamps[0].worker = 97;
+    right->timestamps[1].multiplicity = -1;
+    right->timestamps[2].multiplicity = 2;
+    ASSERT_TRUE(session_add_rel(s, right) == 0, "right relation registered");
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right_batch";
+    op.left_keys = (const char *const *)left_keys;
+    op.right_keys = (const char *const *)right_keys;
+    op.key_count = 1;
+    s->join_batch_bytes = 64;
+    ASSERT_TRUE(col_diff_join_batch_producer_create(s, &op, left, false,
+        &key, &key, 1, s->join_batch_bytes, &cont) == 0,
+        "differential batch producer created");
+    ASSERT_TRUE(col_rel_destroy_checked(left) == EBUSY,
+        "left relation remains protected while continuation is live");
+    out = col_rel_new_auto("diff_batch_out", 4);
+    ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0
+        && col_rel_enable_timestamps(out) == 0,
+        "differential batch output created");
+    rc = col_join_batch_run_to_relation(cont, s, out);
+    ASSERT_TRUE(rc == 0 && out->nrows == 3 && out->timestamps,
+        "differential batch completes across multiple batches");
+    bool seen_neg4 = false;
+    bool seen_pos2 = false;
+    bool seen_neg2 = false;
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        switch (out->timestamps[i].multiplicity) {
+        case -4:
+            seen_neg4 = true;
+            break;
+        case 2:
+            seen_pos2 = true;
+            break;
+        case -2:
+            seen_neg2 = true;
+            break;
+        default:
+            break;
+        }
+    }
+    ASSERT_TRUE(seen_neg4 && seen_pos2 && seen_neg2,
+        "each signed multiplicity product is preserved");
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        ASSERT_TRUE(out->timestamps[i].iteration == 7
+            && out->timestamps[i].stratum == 3
+            && out->timestamps[i].worker == 2
+            && out->timestamps[i]._reserved == 0,
+            "delta-driving provenance is preserved across differential join");
+    }
+
+    wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(out);
+    col_rel_destroy(left);
+    destroy_mock_session(s);
+    PASS;
+}
+
 /* ========================================================================
  * MAIN
  * ======================================================================== */
@@ -1664,6 +1758,7 @@ main(void)
     test_arrangement_incremental();
     test_diff_arrangement_txn_ledger_accounting();
     test_diff_arrangement_pin_lifetime();
+    test_diff_join_batch_signed_timestamps();
     test_late_abort_does_not_advance_arrangement();
     test_result_is_delta_flag();
     test_large_dataset();

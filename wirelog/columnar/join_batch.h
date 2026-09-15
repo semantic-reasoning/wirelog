@@ -71,7 +71,7 @@ typedef struct {
     uint64_t right_identity;
     uint64_t right_view_gen;
     uint64_t right_storage_gen;
-    uint32_t arr_generation;
+    uint64_t arr_generation;
     uint32_t arr_indexed_rows;
     bool left_is_delta;
     bool timestamps;          /* left carried timestamps at create */

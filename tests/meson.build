@@ -133,6 +133,7 @@ testlib_prod = static_library(
     '../wirelog/columnar/inline.c',
     '../wirelog/columnar/join.c',
     '../wirelog/columnar/join_batch.c',
+    '../wirelog/columnar/diff_join_batch.c',
     '../wirelog/columnar/kfusion.c',
     '../wirelog/columnar/kfusion_adaptive.c',
     '../wirelog/columnar/lftj.c',
@@ -1684,6 +1685,7 @@ backend_src = files(
   '../wirelog/columnar/delta_pool_admission.c',
   '../wirelog/columnar/continuation.c',
   '../wirelog/columnar/join_batch.c',
+  '../wirelog/columnar/diff_join_batch.c',
   '../wirelog/columnar/lftj.c',
   '../wirelog/columnar/mem_ledger.c',
   '../wirelog/columnar/memory_governor.c',
@@ -3687,6 +3689,7 @@ test_diff_arrangement_deep_copy_buckets_exe = executable(
   files('test_diff_arrangement_deep_copy_buckets.c'),
   '../wirelog/columnar/diff_arrangement.c',
   '../wirelog/columnar/mem_ledger.c',
+  '../wirelog/columnar/memory_governor.c',
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
 )

@@ -2413,7 +2413,8 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     e->key_count = key_count;
     e->generation = 1u;
 
-    e->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
+    e->diff_arr = col_diff_arrangement_create_with_memory_governor(
+        key_cols, key_count, 0, cs->memory_governor);
     if (!e->diff_arr) {
         free(e->rel_name);
         free(e->key_cols);
@@ -2572,7 +2573,8 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         entry->key_count = key_count;
         entry->generation = 1u;
         entry->transaction_pending = true;
-        entry->diff_arr = col_diff_arrangement_create(key_cols, key_count, 0);
+        entry->diff_arr = col_diff_arrangement_create_with_memory_governor(
+            key_cols, key_count, 0, cs->memory_governor);
         if (!entry->diff_arr) {
             free(entry->rel_name);
             free(entry->key_cols);
@@ -2594,7 +2596,8 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
     txn->entry_index = entry_index;
     txn->entry_generation = txn->entry->generation;
     txn->persistent = *slot;
-    txn->working = col_diff_arrangement_deep_copy(txn->persistent);
+    txn->working = col_diff_arrangement_deep_copy_with_memory_governor(
+        txn->persistent, cs->memory_governor);
     if (!txn->working) {
         if (txn->pending_entry) {
             free(entry->rel_name);

@@ -16,6 +16,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "columnar/memory_governor.h"
 #include <stdlib.h>
 
 typedef struct col_relation_snapshot {
@@ -55,6 +57,9 @@ typedef struct col_diff_arrangement {
     * bytes are charged to WL_MEM_SUBSYS_ARRANGEMENT on this ledger.  NULL
     * until col_diff_arrangement_attach_ledger(); deep copies start NULL. */
     struct wl_mem_ledger *ledger;
+    wl_columnar_memory_governor_ref_t *memory_governor;
+    wl_columnar_memory_reservation_t reservation;
+    uint64_t reserved_bytes;
 } col_diff_arrangement_t;
 
 /**
@@ -72,6 +77,10 @@ uint64_t col_diff_arrangement_bytes(const col_diff_arrangement_t *arr);
 void col_diff_arrangement_attach_ledger(col_diff_arrangement_t *arr,
     struct wl_mem_ledger *ledger);
 
+int col_diff_arrangement_attach_memory_governor(
+    col_diff_arrangement_t *arr,
+    wl_columnar_memory_governor_ref_t *memory_governor);
+
 /**
  * col_diff_arrangement_create - Create a new differential arrangement.
  *
@@ -83,6 +92,10 @@ void col_diff_arrangement_attach_ledger(col_diff_arrangement_t *arr,
  */
 col_diff_arrangement_t *col_diff_arrangement_create(
     const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id);
+
+col_diff_arrangement_t *col_diff_arrangement_create_with_memory_governor(
+    const uint32_t *key_cols, uint32_t key_count, uint32_t worker_id,
+    wl_columnar_memory_governor_ref_t *memory_governor);
 
 /**
  * col_diff_arrangement_destroy - Deallocate a differential arrangement.
@@ -136,6 +149,10 @@ void col_diff_arrangement_get_delta_range(
  */
 col_diff_arrangement_t *col_diff_arrangement_deep_copy(
     const col_diff_arrangement_t *arr);
+
+col_diff_arrangement_t *col_diff_arrangement_deep_copy_with_memory_governor(
+    const col_diff_arrangement_t *arr,
+    wl_columnar_memory_governor_ref_t *memory_governor);
 
 /**
  * col_diff_arrangement_reset_delta - Mark current rows as base for next epoch.
